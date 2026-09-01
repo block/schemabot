@@ -24,10 +24,11 @@ import (
 // race with concurrent lock holders.
 func TestClassifyRefusal(t *testing.T) {
 	tests := []struct {
-		name       string
-		err        error
-		wantReason string
-		wantDetail []string
+		name          string
+		err           error
+		wantReason    string
+		wantDetail    []string
+		wantNotDetail []string
 	}{
 		{
 			name: "privilege error is a refusal with provisioning detail",
@@ -60,6 +61,42 @@ func TestClassifyRefusal(t *testing.T) {
 				"pg_has_role(evil role, app/owner, 'USAGE')",
 				"membership must be inheritable",
 			},
+		},
+		{
+			name: "create-tier privilege refusal names the schema, not the absent table",
+			err: fmt.Errorf("check creation access: %w", &preflight.PrivilegeError{
+				Tier:  preflight.TierCreateTable,
+				Check: "has_schema_privilege(limited, 'public', 'CREATE')",
+				Grant: `GRANT CREATE ON SCHEMA "public" TO "limited"`,
+			}),
+			wantReason: "insufficient-privileges",
+			wantDetail: []string{
+				`in the schema that would hold table "users"`,
+				`GRANT CREATE ON SCHEMA "public" TO "limited"`,
+			},
+			wantNotDetail: []string{`on table "users"`},
+		},
+		{
+			name:       "IF NOT EXISTS create is a refusal that names the clause",
+			err:        fmt.Errorf("execute PostgreSQL CREATE TABLE %q: %w", "users", executor.ErrIfNotExistsUnsupported),
+			wantReason: "unsupported-create-step",
+			wantDetail: []string{"IF NOT EXISTS", "drop the clause"},
+		},
+		{
+			name:       "create collision is a refusal whoever took the name first",
+			err:        fmt.Errorf("execute: %w", executor.ErrCreateCollision),
+			wantReason: "create-collision",
+			wantDetail: []string{"already taken on the target", "re-plan"},
+		},
+		{
+			name:       "invariant violation fails closed as a refusal",
+			err:        fmt.Errorf("execute: %w", executor.ErrInvariantViolation),
+			wantReason: "engine-invariant-violation",
+			wantDetail: []string{"inspect the target and server logs"},
+		},
+		{
+			name: "external cancellation is operational",
+			err:  fmt.Errorf("execute: %w", executor.ErrCancelledExternally),
 		},
 		{
 			name:       "statement budget exhaustion is a refusal",
@@ -103,6 +140,23 @@ func TestClassifyRefusal(t *testing.T) {
 			for _, want := range tt.wantDetail {
 				assert.Contains(t, r.detail, want)
 			}
+			for _, notWant := range tt.wantNotDetail {
+				assert.NotContains(t, r.detail, notWant)
+			}
+		})
+	}
+}
+
+// TestRefusalForOutcomeTotalOverExecutorCodes pins the classifier to
+// pg-sprite's full outcome vocabulary: every code the executor can return
+// maps to an explicit disposition — refusal or operational — so a code added
+// upstream fails this test instead of silently draining into the generic
+// retryable tail.
+func TestRefusalForOutcomeTotalOverExecutorCodes(t *testing.T) {
+	for _, code := range executor.Codes() {
+		t.Run(string(code), func(t *testing.T) {
+			_, known := refusalForOutcome(code, "users")
+			assert.True(t, known, "outcome code %q has no explicit apply disposition", code)
 		})
 	}
 }
@@ -256,7 +310,7 @@ func TestValidateOptimisticApplyRefusesNonNativeShape(t *testing.T) {
 		Changes: []engine.SchemaChange{{
 			Namespace: "public",
 			TableChanges: []engine.TableChange{{
-				Table: "users", DDL: "CREATE TABLE public.users (id bigint PRIMARY KEY)",
+				Table: "users", DDL: "DROP TABLE public.users",
 			}},
 		}},
 		Credentials: &engine.Credentials{DSN: "postgres://localhost/app"},

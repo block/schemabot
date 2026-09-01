@@ -180,7 +180,6 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 		ErrorCode:    deriveErrorCode(progressState, resp.ErrorMessage),
 		ErrorMessage: resp.ErrorMessage,
 		Summary:      resp.Summary,
-		Volume:       resp.Volume,
 	}
 
 	for _, t := range resp.Tables {
@@ -435,6 +434,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	}
 	httpResp.ApplyID = apply.ApplyIdentifier
 	httpResp.Database = apply.Database
+	httpResp.DatabaseType = apply.DatabaseType
 	httpResp.Environment = apply.Environment
 	httpResp.Caller = apply.Caller
 	if apply.Repository != "" && apply.PullRequest > 0 {
@@ -1002,7 +1002,13 @@ func activeApplyResponseFromStorage(apply *storage.Apply, op *storage.ApplyOpera
 	}
 	if op != nil {
 		active.Deployment = op.Deployment
-		active.ExternalID = op.ExternalID
+		// A drive that is not operation-scoped records the remote apply id on
+		// the parent apply row, not the operation, so an empty operation-level
+		// id keeps the parent's rather than hiding the deployment's one remote
+		// handle.
+		if op.ExternalID != "" {
+			active.ExternalID = op.ExternalID
+		}
 		active.ExternalOperationID = op.ExternalOperationID
 		active.State = op.State
 		active.ErrorMessage = op.ErrorMessage
@@ -1013,10 +1019,6 @@ func activeApplyResponseFromStorage(apply *storage.Apply, op *storage.ApplyOpera
 		if op.CompletedAt != nil {
 			active.CompletedAt = op.CompletedAt.Format("2006-01-02T15:04:05Z07:00")
 		}
-	}
-	opts := storage.ParseApplyOptions(apply.Options)
-	if opts.Volume > 0 {
-		active.Volume = opts.Volume
 	}
 	return active
 }
@@ -1138,12 +1140,13 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 
 	// Build response from local records
 	httpResp := &apitypes.ProgressResponse{
-		State:       apply.State,
-		Engine:      apply.Engine,
-		ApplyID:     apply.ApplyIdentifier,
-		Database:    apply.Database,
-		Environment: apply.Environment,
-		Caller:      apply.Caller,
+		State:        apply.State,
+		Engine:       apply.Engine,
+		ApplyID:      apply.ApplyIdentifier,
+		Database:     apply.Database,
+		DatabaseType: apply.DatabaseType,
+		Environment:  apply.Environment,
+		Caller:       apply.Caller,
 	}
 	if apply.Repository != "" && apply.PullRequest > 0 {
 		httpResp.PullRequest = caller.PullRequestURL(apply.Repository, apply.PullRequest)
@@ -1261,12 +1264,9 @@ func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, t
 	return nil
 }
 
-// overlayApplyOptions populates volume and options on the response from the apply record.
+// overlayApplyOptions populates the options map on the response from the apply record.
 func overlayApplyOptions(resp *apitypes.ProgressResponse, apply *storage.Apply) {
 	opts := storage.ParseApplyOptions(apply.Options)
-	if opts.Volume > 0 {
-		resp.Volume = int32(opts.Volume)
-	}
 	optMap := make(map[string]string)
 	if opts.DeferCutover {
 		optMap["defer_cutover"] = "true"

@@ -105,10 +105,6 @@ func previewCommentAllOutput() {
 		{"APPLY CUTTING OVER", func() { fmt.Print(webhooktemplates.PreviewCommentApplyCuttingOver()) }},
 		{"CUTOVER COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAccepted()) }},
 		{"CUTOVER COMMAND ALREADY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAlreadyInProgress()) }},
-		{"VOLUME COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeCommandAccepted()) }},
-		{"VOLUME COMMAND INVALID LEVEL", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeInvalidLevel()) }},
-		{"VOLUME COMMAND MISSING APPLY ID", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeMissingApplyID()) }},
-		{"VOLUME CHANGED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeSupersededProgress()) }},
 		{"RESUMED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentResumeSupersededProgress()) }},
 		{"REVERT: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentRevertSupersededProgress()) }},
 		{"SKIP REVERT: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentSkipRevertSupersededProgress()) }},
@@ -177,6 +173,7 @@ func previewCommentPlanAllOutput() {
 		{"RECONCILIATION REQUIRED (COMPLETED)", func() { fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationCompleted()) }},
 		{"VITESS PLAN", func() { fmt.Print(webhooktemplates.PreviewCommentVitessPlan()) }},
 		{"VITESS PLAN: VSCHEMA REMOVAL (UNSAFE)", func() { fmt.Print(webhooktemplates.PreviewCommentVitessPlanVSchemaRemoval()) }},
+		{"POSTGRES PLAN", func() { fmt.Print(webhooktemplates.PreviewCommentPostgresPlan()) }},
 		{"SCHEMA CHANGE APPLY (LOCKED + OPTIONS)", func() { fmt.Print(webhooktemplates.PreviewCommentVitessApplyPlan()) }},
 		{"MYSQL MULTI-SCHEMA PLAN", func() { fmt.Print(webhooktemplates.PreviewCommentMySQLMultiSchema()) }},
 		{"MULTI-ENV PLAN (IDENTICAL)", func() { fmt.Print(webhooktemplates.PreviewCommentMultiEnvPlan()) }},
@@ -263,7 +260,6 @@ func previewCommentApplyFlowAllOutput() {
 		{"ACTOR AUTHORIZATION: DATABASE NOT CONFIGURED", func() { fmt.Print(webhooktemplates.PreviewCommentPRCommandDatabaseNotConfigured()) }},
 		// Single-table (most common case)
 		{"SINGLE TABLE: RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplySingleProgress()) }},
-		{"SINGLE TABLE: RUNNING (VOLUME TUNED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplySingleProgressVolume()) }},
 		{"SINGLE TABLE: COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentApplySingleCompleted()) }},
 		{"SINGLE TABLE: FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentApplySingleFailed()) }},
 		{"SINGLE TABLE: STOPPED", func() { fmt.Print(webhooktemplates.PreviewCommentApplySingleStopped()) }},
@@ -304,10 +300,6 @@ func previewCommentApplyFlowAllOutput() {
 		{"START COMMAND ALREADY PENDING", func() { fmt.Print(webhooktemplates.PreviewCommentStartCommandAlreadyRequested()) }},
 		{"CUTOVER COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAccepted()) }},
 		{"CUTOVER COMMAND ALREADY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAlreadyInProgress()) }},
-		{"VOLUME COMMAND ACCEPTED", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeCommandAccepted()) }},
-		{"VOLUME COMMAND INVALID LEVEL", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeInvalidLevel()) }},
-		{"VOLUME COMMAND MISSING APPLY ID", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeMissingApplyID()) }},
-		{"VOLUME CHANGED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentVolumeSupersededProgress()) }},
 		{"RESUMED: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentResumeSupersededProgress()) }},
 		{"REVERT: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentRevertSupersededProgress()) }},
 		{"SKIP REVERT: SUPERSEDED PROGRESS COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentSkipRevertSupersededProgress()) }},
@@ -350,13 +342,16 @@ func previewCommentShardedAllOutput() {
 		fn   func()
 	}{
 		{"PLAN: DIVERGENT SHARDS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanDivergent()) }},
+		{"PLAN: MANY SHARDS (32)", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanManyShards()) }},
 		{"PLAN: PARTIALLY APPLIED SHARDS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanPartiallyApplied()) }},
 		{"PLAN: UNSAFE CHANGE ON ONE SHARD", func() { fmt.Print(webhooktemplates.PreviewCommentShardedPlanUnsafe()) }},
 		{"APPLY IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyInProgress()) }},
 		{"APPLY FAILED (ONE SHARD FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyFailed()) }},
 		{"APPLY WITH DIVERGENT SHARDS", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyDivergent()) }},
+		{"APPLY ACROSS MULTIPLE KEYSPACES", func() { fmt.Print(webhooktemplates.PreviewCommentShardedApplyMultiKeyspace()) }},
 		{"SUMMARY: ALL SHARDS COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryCompleted()) }},
 		{"SUMMARY: HALT ON FAILURE (ONE SHARD FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryFailed()) }},
+		{"SUMMARY: CANCELLED AFTER PARTIAL LANDING", func() { fmt.Print(webhooktemplates.PreviewCommentShardedSummaryCancelledPartial()) }},
 	}
 	printSections(sections)
 }
@@ -452,7 +447,6 @@ func previewCLIApplyAllOutput() {
 		{"APPLY WATCH MODE", previewApplyWatchOutput},
 		{"STOP COMMAND", previewStopCommandOutput},
 		{"START COMMAND", previewStartCommandOutput},
-		{"VOLUME MODE", previewVolumeModeOutput},
 		{"STATUS LIST", previewStatusListOutput},
 		{"STATUS FOR DEPLOYMENT", previewStatusDeploymentOutput},
 		{"STATUS HISTORY", previewStatusHistoryOutput},

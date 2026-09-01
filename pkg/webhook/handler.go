@@ -969,7 +969,7 @@ func webhookMetadata(body []byte) (action, repo string) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return "", ""
 	}
-	return payload.Action, payload.Repository.FullName
+	return payload.Action, storage.CanonicalKey(payload.Repository.FullName)
 }
 
 // verifyHMAC validates a GitHub-style "sha256=<hex>" signature against the

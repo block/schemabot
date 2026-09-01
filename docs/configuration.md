@@ -69,6 +69,10 @@ databases:
         dsn: "file:/run/secrets/prod-dsn"
 ```
 
+Database keys under `databases:` and environment keys under `environments:`
+must be lowercase. The server refuses to start if either contains uppercase
+characters.
+
 ### Building DSNs from separate secrets
 
 If your deployment stores database connection metadata separately from passwords,
@@ -201,6 +205,9 @@ tern_deployments:
     production: "tern-production:9090"
 ```
 
+Deployment keys and their nested environment keys under `tern_deployments:`
+must be lowercase. The server refuses to start otherwise.
+
 In gRPC mode, `target` is an opaque identifier understood by the remote Tern service. SchemaBot stores the resolved `target` and `deployment` on each plan, then reuses that stored route during apply. Callers do not send target or deployment in plan/apply requests.
 
 The example above is a single SchemaBot deployment that owns both environments. In environment-isolated deployments, each SchemaBot config should contain only the targets for the environments that instance owns. Use `allowed_environments` to scope each instance.
@@ -245,12 +252,16 @@ Rules:
 
 - `deployments` is mutually exclusive with the scalar `target` / `deployment` fields and with a local `dsn` / `dsn_from`.
 - The map MUST contain at least one entry, each entry MUST set a non-empty `target`, and each map key MUST resolve through `tern_deployments` with an endpoint configured for this environment.
+- Keys under `deployments:` must be lowercase; the server refuses to start otherwise.
 - Until the orchestration path is wired, the map MUST contain exactly one entry; multi-entry maps are rejected at config load.
 - Single-deployment environments should continue to use the scalar `target` / `deployment` shape.
 
 ### Deployment Order
 
 `deployment_order` defines the rollout order across the `deployments` map for an environment, analogous to the server-wide `environment_order`. When set, it MUST list every key in `deployments` exactly once (no empty, duplicate, or unknown entries) and MUST accompany a `deployments` map. `ResolveDatabaseTargets` then returns deployments in this order. When omitted, deployments resolve in alphabetical key order, which stays the deterministic default.
+
+Every deployment name in `deployment_order` must be lowercase; the server
+refuses to start otherwise.
 
 ## Environment Order
 
@@ -263,6 +274,10 @@ environment_order:
 ```
 
 If omitted, SchemaBot defaults to `staging` before `production`. Before applying production from a PR comment, SchemaBot checks staging first because the server-owned `environment_order` says staging precedes production.
+
+Every environment name in the top-level or per-database `environment_order`
+must be lowercase; the server refuses to start otherwise. Values in
+`allowed_environments` have the same lowercase requirement.
 
 There are two related but separate concepts:
 
@@ -333,6 +348,43 @@ The override is validated at startup, fail-fast in both directions:
 
 Entries owned by another instance in the promotion chain (outside this instance's `allowed_environments`) may be absent from the database's local `environments`: the promotion gate verifies them through the peer's GitHub aggregate check, exactly as with the server-wide order. Instances sharing a database must declare the same effective order for it — render all instances' config from a single source.
 
+### Renaming identifiers
+
+When lowercasing an existing database key, rename the server config key, every
+consumer repository's `schemabot.yaml` `database:` value, and the schema
+directory in lockstep. Renaming while an apply is in flight is unsafe; drain
+all in-flight applies first.
+
+When upgrading to a release that folds repository identity at ingress, drain
+in-flight applies before upgrading. Rows written by earlier versions may
+carry mixed-case identity values — repository names, database names,
+environments, deployments, and lock owner values such as `Org/Repo#42`; on
+PostgreSQL, the folded lookups cannot match those rows again, so locks cannot
+be reacquired or released and checks duplicate instead of updating. Once
+every writer — server and workers — runs the folding release (a writer still
+on an earlier release would keep writing mixed-case rows, reintroducing the
+rows the fold cures), fold the stored rows once with
+
+```bash
+schemabot storage canonicalize-identity-keys --config /etc/schemabot/config.yaml
+```
+
+Run it inside the maintenance window with the server quiesced — the command
+connects to storage itself and works while the server is down. The fold
+row-locks every row it rewrites until its table's fold commits; under live
+traffic, lock lookups and `FOR UPDATE SKIP LOCKED` claims would skip those
+rows for the duration. The rewrite is one-way — original spellings are not
+recorded anywhere — so the command prompts before touching rows; pass
+`--auto-approve` (`-y`) for scripted maintenance windows. It only rewrites
+rows whose spelling is not already canonical, so rerunning it is safe.
+
+Each table folds in its own transaction. When two rows differ only by case
+(for example locks on `Foo` and `foo` of the same database type), that
+table's fold refuses rather than collapse them, naming the violated unique
+index — tables already folded stay folded. Delete or repair the duplicate
+rows by hand, then rerun to fold the rest. Force-release remains the
+fallback for any lock stranded before the fold runs.
+
 ## Hybrid Mode
 
 Both modes can be used simultaneously. Each database environment in the `databases` section chooses one route: local mode with `dsn`, or gRPC mode with `target` and `deployment`. This is useful when some databases are co-located with SchemaBot and others are in remote environments.
@@ -385,6 +437,22 @@ metrics_port: 9102
 The listener binds `:9102` by default; set `metrics_port` to move it. The API port (the `PORT` environment variable) does not serve `/metrics`.
 
 **Sizing:** each driver drives one claimed apply synchronously to a terminal state, and that includes waiting states such as deferred cutovers and revert windows, so a server's effective apply concurrency is `drivers × replicas`. Size that product to the number of applies you expect to be in flight at once, counting parked ones — a deferred cutover holds its driver for the full wait. A control plane that dispatches to remote servers bounds end-to-end concurrency with its own driver pool the same way.
+
+### Per-apply driver cap
+
+A single apply that fans out across many deployments or shards claims its operations like any other work. Without a bound it takes every driver on the plane and holds them for as long as its slowest operation runs, so no other database's work — and no stop or cancel — is picked up until it finishes.
+
+```yaml
+max_drivers_per_apply: 2
+```
+
+`max_drivers_per_apply` caps how many operations one apply may have in flight at once, across every replica. Size it against `drivers × replicas`: set too high it bounds nothing, set too low a sharded fan-out drives only a few operations at a time.
+
+The cap applies only to *starting* new operations — a first start, a resume after a stop, and a deferred deploy are all capped. Recovering an operation whose driver crashed, and consuming a stop or cancel request, are never capped: an apply already at its cap must still be able to recover and to be controlled, or the cap becomes the thing that wedges the apply it is bounding.
+
+**The cap is a steady-state bound, not a hard admission limit.** Each claim evaluates the count independently, so drivers polling in the same instant can all read the same pre-claim value and admit together — a pod restart or rolling deploy, where every driver's first poll lands at once, is the shape that produces it. The transient ceiling is the number of drivers claiming in that window; once those leases commit, the next claim counts them and the cap binds again. Size against the steady-state number, and do not treat the cap as a guarantee that an apply can never briefly exceed it.
+
+A multi-shard apply started with a manual `--defer-cutover` keeps its drivers while it waits: unlike the automatic barrier park, a manually deferred operation holds its claim and keeps heartbeating, so it stays counted. Cutting over such an apply therefore takes one `cutover` per capped batch rather than one for the whole fan-out, and shards that have not yet advanced are still subject to the manual-inaction timeout.
 
 ## Pending Drops
 
@@ -580,10 +648,8 @@ The defaults, and why they were chosen:
   instance and, with `enable_experimental_autoscaling` on, scales them
   dynamically from throttler feedback. A fixed thread count is the classic
   failure mode on large targets — throughput that made sense on one instance
-  class silently starves or overloads another. The operator control for copy
-  aggressiveness is the apply's `volume`, not a thread count — though on a
-  target where autoscaling is engaged, autoscaling's own thread counts take
-  over and `volume` has nothing left to tune. Set
+  class silently starves or overloads another, and autoscaling is why there is
+  no operator knob for copy aggressiveness. Set
   `enable_experimental_autoscaling: false` only as an incident kill switch when
   autoscaling misbehaves on a target fleet.
 - **`checkpoint_max_age: 72h`** — a checkpoint older than this is not resumed;
@@ -624,9 +690,13 @@ holding `ACCESS EXCLUSIVE`, and the size compared against the ceiling is the
 total relation size summed across the table's partition tree — indexes and
 TOAST included — so an index-heavy table cannot slip under it. Raising the
 ceiling converts an up-front refusal into a bounded attempt, not an unbounded
-lock: every apply still runs under short `lock_timeout` and
-`statement_timeout` budgets, so above the ceiling it is the statement
-timeout, not the ceiling, that stops a runaway rewrite.
+lock. An oversized table appears in the plan comment's **Cannot apply** section;
+adjust `postgres.native_safe_table_size_limit_bytes` if operators decide the
+target is safe for a bounded attempt. Every apply still runs under short
+`lock_timeout` and `statement_timeout` budgets, so above the ceiling it is the
+statement timeout, not the ceiling, that stops a runaway rewrite. A greenfield
+`CREATE TABLE` does not consult the ceiling: the gate bounds rewrites of
+existing data, and a table that does not exist yet has none.
 
 The server fails startup validation when
 `native_safe_table_size_limit_bytes` is zero or negative.
@@ -685,7 +755,13 @@ on the storage dialect:
 
 - **MySQL** diffs the embedded schema files against the live database and
   applies whatever DDL is needed (via Spirit) — new tables, new columns, and
-  index changes all converge automatically.
+  index changes all converge automatically. That convergence is bounded by a
+  hard five-minute startup budget, and an index added to an existing table
+  runs as Spirit online DDL — a table copy, not an in-place build — so its
+  cost grows with the table's row count. On a deployment whose storage
+  tables carry a long history, create a newly declared index by hand before
+  rolling out: the startup diff then finds nothing to do, instead of copying
+  the table inside the budget on every pod.
 - **PostgreSQL** creates missing tables and verifies that existing tables
   contain every column and standalone unique index declared by the embedded
   schema. Missing objects fail startup with the affected table and objects
@@ -717,7 +793,38 @@ on the storage dialect:
   ```
 
   Without it, every driver claim sorts the full claimable set before taking
-  one row, which slows claiming as apply history grows.
+  one row, which slows claiming as apply history grows. And one bootstrapped
+  before refused applies started naming the schema change holding the
+  database needs:
+
+  ```sql
+  CREATE INDEX idx_apply_operations_external_id ON apply_operations (external_id);
+  ```
+
+  Without it, resolving the holding change behind a refused apply scans the
+  full operation history for one remote identifier. On PostgreSQL the lookup
+  is an optimization, never load-bearing: the refusal still reads correctly,
+  it just gets slower to record as apply history grows. On MySQL the same
+  index is not optional — `EnsureSchema` applies it as a startup `ALTER`
+  under the budget described in the MySQL bullet above, and `apply_operations`
+  grows with total apply history, so large deployments should pre-create it
+  there too. And one bootstrapped before the webhook inbox claim ordering on
+  `webhook_events` was indexed needs:
+
+  ```sql
+  CREATE INDEX idx_webhook_events_created_id ON webhook_events (created_at, id);
+  ```
+
+  Without it, every webhook claim sorts the full claimable inbox before
+  taking one row, which slows claiming as delivery history grows. On MySQL
+  the same index arrives as a startup `ALTER` under the budget described in
+  the MySQL bullet above, and `webhook_events` grows with total delivery
+  history and has no retention sweep, so pre-create it there before rolling
+  out:
+
+  ```sql
+  ALTER TABLE `webhook_events` ADD INDEX `idx_created_id` (`created_at`, `id`);
+  ```
 
 The rest of this section describes the MySQL flow.
 
@@ -790,6 +897,9 @@ rest of the hint on the PR page. When omitted, plan comments are unchanged.
 ## Repository Allowlist
 
 By default, any repository with the GitHub App installed can use SchemaBot. Adding a `repos` section creates an allowlist — only listed repositories are permitted.
+
+Repository names in `repos:` and consumer `allowed_repos` lists are matched
+case-insensitively and normalized to lowercase when loaded.
 
 ```yaml
 # Local mode — repos as allowlist only
@@ -950,7 +1060,7 @@ Approval is checked at the time of `schemabot apply` and `schemabot apply-confir
 By default (`auth.type: none` or unset) the SchemaBot API is unauthenticated — every request is allowed, which suits local development and deployments where the network is the only boundary. Setting `auth.type` turns on per-request authentication and a two-tier authorization model:
 
 - **Read tier** — visibility: `status`, `progress`, `logs`, `locks` (list), history, database discovery, and `pull` (read a live schema).
-- **Write tier** — anything that stages or makes a change: `plan`, `apply`, controls (`stop`/`start`/`cutover`/`volume`/`revert`/`skip-revert`/`rollback`), `unlock`, and settings mutation. `plan` is a write because it stages a change against a database.
+- **Write tier** — anything that stages or makes a change: `plan`, `apply`, controls (`stop`/`start`/`cutover`/`revert`/`skip-revert`/`rollback`), `unlock`, and settings mutation. `plan` is a write because it stages a change against a database.
 
 Any unclassified `/api` route is treated as write (fail-closed). The `/webhook` and health endpoints are exempt — webhooks authenticate themselves via HMAC. Prometheus metrics are served on a dedicated listener (see [Metrics](#metrics)), not on the API port. Two authenticators are available.
 
@@ -1032,7 +1142,7 @@ Which environments accept scoped writes is a deployment policy, uniform across d
 
 The two value namespaces do not overlap and are verified by different systems, so they are deliberately separate fields: a GitHub team slug has no meaning in the groups header, and a forwarded group name is not a GitHub team. Grant each lane explicitly.
 
-The decision has two halves. The middleware admits any caller in `write_groups` or in any database's `operator_groups` to write-tier endpoints — it runs before the request body is parsed, so it cannot know the target. Each mutating handler then enforces the scope once the target database resolves: `plan` and `apply` from the request/stored plan, control operations (`stop`, `start`, `cutover`, `cancel`, `volume`, `release`, `revert`, `skip-revert`, `rollback plan`) from the stored apply, and lock acquire/release from the named database (locks are operator controls in the same family as stop/cancel and have no environment dimension, so the grant applies database-wide). Operations with no single target database — settings mutation, checks scan/synthesize/repos, webhook redrive — stay admin-only (`write_groups`). Operator members also get the read tier, deployment-wide.
+The decision has two halves. The middleware admits any caller in `write_groups` or in any database's `operator_groups` to write-tier endpoints — it runs before the request body is parsed, so it cannot know the target. Each mutating handler then enforces the scope once the target database resolves: `plan` and `apply` from the request/stored plan, control operations (`stop`, `start`, `cutover`, `cancel`, `release`, `revert`, `skip-revert`, `rollback plan`) from the stored apply, and lock acquire/release from the named database (locks are operator controls in the same family as stop/cancel and have no environment dimension, so the grant applies database-wide). Operations with no single target database — settings mutation, checks scan/synthesize/repos, webhook redrive — stay admin-only (`write_groups`). Operator members also get the read tier, deployment-wide.
 
 Two consequences of the environment-less lock grant are worth stating outright. First, a scoped operator's lock holds applies off **every** environment of their database, including environments outside `operator_environments` — an operator scoped to staging can still freeze production applies of their own database. That direction is fail-safe (a lock only ever prevents changes), so the grant deliberately allows it. Second, the reverse direction is not: force release (`force: true`) bypasses the lock ownership check, so it could undo another holder's safety brake — for example an admin's incident lock. Force release therefore stays admin-only (`write_groups`); a scoped operator can release only locks their own callers hold.
 

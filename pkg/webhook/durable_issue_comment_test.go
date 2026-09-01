@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
@@ -169,6 +170,34 @@ func TestDurableIssueCommentCommandQueuesAndAcks(t *testing.T) {
 			require.NotEmpty(t, event.Payload)
 		})
 	}
+}
+
+func TestIssueCommentWebhookCanonicalizesRepository(t *testing.T) {
+	events := newRecordingWebhookEventStore()
+	h := newDurableIssueCommentEnqueueHandler(t, events)
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e production", repo: "MixedCase/Sample-Repo",
+		userLogin: "MixedCaseUser", isPR: true,
+	}, nil)
+	req.Header.Set(headerDeliveryID, "mixed-case-issue-comment")
+	rr := httptest.NewRecorder()
+
+	h.ServeHTTP(rr, req)
+	h.DrainInProcessWebhookWork(t.Context())
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	event, err := events.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "mixed-case-issue-comment")
+	require.NoError(t, err)
+	require.NotNil(t, event)
+	assert.Equal(t, "mixedcase/sample-repo", event.Repository)
+	assert.Equal(t, "mixedcase/sample-repo#1", fmt.Sprintf("%s#%d", event.Repository, event.PullRequest))
+
+	var payload webhookPayload
+	require.NoError(t, json.Unmarshal(event.Payload, &payload))
+	require.NotNil(t, payload.Comment)
+	require.NotNil(t, payload.Comment.User)
+	assert.Equal(t, "MixedCaseUser", payload.Comment.User.Login)
+	assert.Equal(t, "schemabot apply -e production", payload.Comment.Body)
 }
 
 // A redelivered apply command (same delivery GUID) is deduplicated to a single

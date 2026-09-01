@@ -209,13 +209,6 @@ func TestServerApplyScopedRPCsRequireApplyID(t *testing.T) {
 			},
 		},
 		{
-			name: "volume",
-			call: func(ctx context.Context) error {
-				_, err := server.Volume(ctx, &ternv1.VolumeRequest{Volume: 5})
-				return err
-			},
-		},
-		{
 			name: "revert",
 			call: func(ctx context.Context) error {
 				_, err := server.Revert(ctx, &ternv1.RevertRequest{})

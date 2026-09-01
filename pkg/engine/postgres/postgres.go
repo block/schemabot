@@ -56,7 +56,7 @@ func New() *Engine {
 // table size ceiling expressed in bytes. Zero means unset and adopts
 // DefaultNativeSafeTableSizeLimitBytes. A negative value is kept as-is
 // rather than silently replaced with a ceiling the caller did not choose:
-// the preflight check rejects a non-positive limit loudly at apply time,
+// the plan-time preflight check rejects a non-positive limit before apply,
 // and server config validation rejects it at startup.
 func NewWithTableSizeLimit(tableSizeLimit int64) *Engine {
 	if tableSizeLimit == 0 {
@@ -113,10 +113,10 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, fmt.Errorf("open pg-sprite pool for PostgreSQL database %q: %w", req.Database, err)
 	}
 	defer pool.Close()
-	return planSchemas(ctx, pool, req)
+	return planSchemas(ctx, pool, req, e.tableSizeLimit)
 }
 
-func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanRequest) (*engine.PlanResult, error) {
+func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanRequest, tableSizeLimit int64) (*engine.PlanResult, error) {
 	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
 	if err != nil {
 		return nil, fmt.Errorf("select PostgreSQL statement parser: %w", err)
@@ -147,6 +147,10 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			changes, err = blockMissingPrivileges(ctx, pool, report, changes, tiers)
 			if err != nil {
 				return nil, fmt.Errorf("verify privileges for table %q in namespace %q: %w", desired.Table(), namespace, err)
+			}
+			changes, err = blockOversizedTable(ctx, pool, report, changes, tableSizeLimit)
+			if err != nil {
+				return nil, fmt.Errorf("verify size for table %q in namespace %q: %w", desired.Table(), namespace, err)
 			}
 			schemaChange.TableChanges = append(schemaChange.TableChanges, changes...)
 		}
@@ -231,6 +235,20 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 	if len(changes) != len(tiers) {
 		return nil, fmt.Errorf("verify privileges for table %q: %d planned changes carry %d privilege tiers", report.Table, len(changes), len(tiers))
 	}
+	// Checked before any verdict rewriting below: blocking dependent steps
+	// must never launder a report that carries executable work but names no
+	// target into a plan that skips the privilege check entirely.
+	if hasExecutableChanges(changes) && report.Table == "" {
+		return nil, fmt.Errorf("plan report carries executable steps but names no target table")
+	}
+	if report.TableExists != nil && !*report.TableExists {
+		// A privilege probe against a table that provably does not exist can
+		// only answer "table not found" — a dead end for the operator. Only
+		// the CREATE TABLE step's off-ladder tier states facts an absent
+		// target can satisfy; every other executable step depends on the
+		// table's creation, so that dependency is its accurate reason.
+		blockAbsentTableDependents(changes, tiers, report.Table)
+	}
 	required := make(map[preflight.Tier]bool)
 	for i, change := range changes {
 		if change.ExecutionMode == "" {
@@ -240,22 +258,16 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 	if len(required) == 0 {
 		return changes, nil
 	}
-	if report.Table == "" {
-		return nil, fmt.Errorf("plan report carries executable steps but names no target table")
-	}
-	if report.TableExists != nil && !*report.TableExists {
-		// A privilege probe against a table that provably does not exist can
-		// only answer "table not found" — a dead end for the operator. The
-		// executable steps here depend on the table's creation, and the
-		// CREATE TABLE statement itself is blocked by the per-statement
-		// verdict, so the accurate reason is that dependency, not a re-plan
-		// instruction that no re-plan can satisfy.
-		blockExecutableChanges(changes, fmt.Sprintf(
-			"table %q does not exist on the target; the statement that would create it is blocked, so this statement cannot run", report.Table))
-		return changes, nil
-	}
 	for _, tier := range slices.Sorted(maps.Keys(required)) {
-		_, err := preflight.CheckPrivileges(ctx, pool, report.Schema, report.Table, preflight.Requirement{Tier: tier})
+		var err error
+		if tier == preflight.TierCreateTable {
+			// The off-ladder create tier is checked against the schema, not
+			// the table: CheckPrivileges' ladder walks facts about an
+			// existing table, and a greenfield target has none.
+			_, err = preflight.CheckCreatePrivileges(ctx, pool, report.Schema)
+		} else {
+			_, err = preflight.CheckPrivileges(ctx, pool, report.Schema, report.Table, preflight.Requirement{Tier: tier})
+		}
 		if err == nil {
 			continue
 		}
@@ -276,6 +288,56 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 		return changes, nil
 	}
 	return changes, nil
+}
+
+// blockOversizedTable applies the native-safe table size ceiling to every
+// still-executable step. The apply path repeats the same CheckTable call, so
+// growth between plan and apply cannot bypass the ceiling. A typed refusal is
+// rendered as a blocked verdict; an operational failure fails planning rather
+// than producing an executable plan while the table size is unknown.
+func blockOversizedTable(ctx context.Context, pool *pgxpool.Pool, report pgplan.Report, changes []engine.TableChange, tableSizeLimit int64) ([]engine.TableChange, error) {
+	if !hasExecutableChanges(changes) {
+		return changes, nil
+	}
+	if report.Table == "" {
+		return nil, fmt.Errorf("plan report carries executable steps but names no target table")
+	}
+	if report.TableExists != nil && !*report.TableExists {
+		return changes, nil
+	}
+	_, err := preflight.CheckTable(ctx, pool, report.Schema, report.Table, tableSizeLimit)
+	if err == nil {
+		return changes, nil
+	}
+	r := classifyRefusal(err, report.Table)
+	if r == nil {
+		return nil, fmt.Errorf("check size for table %q: %w", report.Table, err)
+	}
+	blockExecutableChanges(changes, fmt.Sprintf("statement for table %q: %s", report.Table, r.detail))
+	return changes, nil
+}
+
+func hasExecutableChanges(changes []engine.TableChange) bool {
+	return slices.ContainsFunc(changes, func(change engine.TableChange) bool {
+		return change.ExecutionMode == ""
+	})
+}
+
+// blockAbsentTableDependents marks every still-executable step blocked,
+// except the CREATE TABLE tier's own step: a privilege probe against a table
+// that provably does not exist can only answer "table not found" — a dead end
+// for the operator — so each dependent step's accurate reason is its
+// dependency on the table's creation. The reason stays neutral about the
+// create step's own fate, which the privilege loop has not yet decided.
+// Steps already carrying a verdict keep it.
+func blockAbsentTableDependents(changes []engine.TableChange, tiers []preflight.Tier, table string) {
+	for i := range changes {
+		if changes[i].ExecutionMode == "" && tiers[i] != preflight.TierCreateTable {
+			changes[i].ExecutionMode = engine.ExecutionModeBlocked
+			changes[i].ModeReason = sanitizeReasonText(fmt.Sprintf(
+				"table %q does not exist on the target; this statement depends on the statement that creates it — see that statement's verdict", table))
+		}
+	}
 }
 
 // blockExecutableChanges marks every still-executable change blocked with the
@@ -428,12 +490,6 @@ func (e *Engine) Revert(ctx context.Context, req *engine.ControlRequest) (*engin
 // early — every committed change is already permanent.
 func (e *Engine) SkipRevert(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
 	return nil, engine.NewUnsupportedOperationError("skip-revert is not supported for PostgreSQL schema changes: changes commit directly with no revert window")
-}
-
-// Volume declines: PostgreSQL schema changes run statement phases with no
-// tunable row copy to retune.
-func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine.VolumeResult, error) {
-	return nil, engine.NewUnsupportedOperationError("volume is not supported for PostgreSQL schema changes: there is no tunable row copy")
 }
 
 // Compile-time check that Engine implements engine.Engine.

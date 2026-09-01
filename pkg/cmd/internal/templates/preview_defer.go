@@ -227,7 +227,6 @@ func previewDeferCuttingOutput() {
 	}
 	WriteProgress(data)
 
-	fmt.Println("Cutover in progress. This typically completes within seconds.")
 	fmt.Println("Tables are being renamed atomically...")
 }
 

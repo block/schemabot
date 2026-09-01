@@ -44,19 +44,17 @@ func parseFinalizerOperationKey(key string) (namespace string, ok bool) {
 }
 
 // isShardedApply reports whether the apply's operations are the per-shard
-// fan-out of a single keyspace within one deployment: at least one work
+// fan-out of one or more keyspaces within one deployment: at least one work
 // operation carries a "namespace/shard/table" key, every operation is a shard
-// or finalizer operation, they all share one deployment, and every shard work
-// operation is in the same namespace. A non-sharded multi-deployment apply
-// (empty operation keys), an apply spanning more than one deployment, and a
-// multi-keyspace apply all return false, so they keep the existing layout rather
-// than mislabelling — the sharded layout shows a single keyspace.
+// or finalizer operation, and they all share one deployment. A non-sharded
+// multi-deployment apply (empty operation keys) and an apply spanning more than
+// one deployment return false, so they keep the deployment-unit layout — their
+// operations differ by deployment, not shard.
 func isShardedApply(ops []*storage.ApplyOperation) bool {
 	deployment := ""
-	namespace := ""
 	hasShard := false
 	for _, op := range ops {
-		ns, _, _, isShard := parseShardOperationKey(op.OperationKey)
+		_, _, _, isShard := parseShardOperationKey(op.OperationKey)
 		if _, isFinalizer := parseFinalizerOperationKey(op.OperationKey); !isShard && !isFinalizer {
 			return false
 		}
@@ -66,30 +64,34 @@ func isShardedApply(ops []*storage.ApplyOperation) bool {
 			return false
 		}
 		if isShard {
-			if namespace == "" {
-				namespace = ns
-			} else if ns != namespace {
-				return false
-			}
 			hasShard = true
 		}
 	}
 	return hasShard
 }
 
+// shardWorkGroup is one shard's work within a keyspace: the (namespace, shard)
+// pair and its operations in resolved order, the unit a status row is derived
+// for.
+type shardWorkGroup struct {
+	namespace string
+	shard     string
+	ops       []*storage.ApplyOperation
+}
+
 // buildShardedApplyData projects the per-shard operation rows into the
-// sharded-apply comment input. Each shard work operation is one (shard, table)
-// cell carrying its DDL; per-shard status is derived through pkg/presentation
-// with the shard name as the operation identity, so the ordering labels
-// ("waiting for `-40`", "halted — `-40` failed") reference shards. Finalizer
-// (VSchema) operations are not shard work: each one becomes a VSchema change —
-// its keyspace from the operation key, its display status from the operation
-// state, and its diff from the stored plan's per-namespace diffs
-// (vschemaDiffs, see resolveShardedVSchemaDiffs) — rendered in the comment's
-// VSchema section. A failed
-// finalizer's error also stands in for the apply-level failure cause when the
-// apply row carries none, since a finalizer failure is operation-scoped and
-// leaves no failed shard row to name it.
+// sharded-apply comment input, grouped per keyspace in resolved order. Each
+// shard work operation is one (shard, table) cell carrying its DDL; per-shard
+// status is derived through pkg/presentation with the shard name as the
+// operation identity, so the ordering labels ("waiting for `-40`", "halted —
+// `-40` failed") reference shards. Finalizer (VSchema) operations are not
+// shard work: each one becomes a VSchema change — its keyspace from the
+// operation key, its display status from the operation state, and its diff
+// from the stored plan's per-namespace diffs (vschemaDiffs, see
+// resolveShardedVSchemaDiffs) — rendered in the comment's VSchema section. A
+// failed finalizer's error also stands in for the apply-level failure cause
+// when the apply row carries none, since a finalizer failure is
+// operation-scoped and leaves no failed shard row to name it.
 func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, released bool, tasks []*storage.Task, vschemaDiffs map[string]string, tenant string) templates.ShardedApplyData {
 	tasksByOp := groupTasksByOperation(tasks)
 	// Sort each operation's tasks by id so the joined DDL (and the change
@@ -101,12 +103,14 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 		sort.Slice(ts, func(i, j int) bool { return ts[i].ID < ts[j].ID })
 	}
 
-	keyspace := ""
-	cells := make([]templates.ShardCell, 0, len(ops))
-	// Group work operations by shard in resolved order so a shard with more than
-	// one table change (a divergent shard) collapses to one status row.
-	var shardOrder []string
-	opsByShard := make(map[string][]*storage.ApplyOperation)
+	// Group work operations by (keyspace, shard) in resolved order so a shard
+	// with more than one table change (a divergent shard) collapses to one
+	// status row, and keyspaces render in the order their shards first appear.
+	var keyspaceOrder []string
+	cellsByKeyspace := make(map[string][]templates.ShardCell)
+	var groupOrder []shardWorkGroup
+	type keyspaceShard struct{ namespace, shard string }
+	groupIndex := make(map[keyspaceShard]int)
 	var vschemaChanges []apitypes.VSchemaChange
 	finalizerError := ""
 	for _, op := range ops {
@@ -128,8 +132,8 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 			}
 			continue
 		}
-		if keyspace == "" {
-			keyspace = ns
+		if _, seen := cellsByKeyspace[ns]; !seen {
+			keyspaceOrder = append(keyspaceOrder, ns)
 		}
 		// An operation can carry more than one task for its (namespace, shard,
 		// table) — a shard plan may yield multiple statements for the same table —
@@ -142,11 +146,15 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 				ddls = append(ddls, t.DDL)
 			}
 		}
-		cells = append(cells, templates.ShardCell{Shard: shard, Table: table, DDL: strings.Join(ddls, "\n")})
-		if _, seen := opsByShard[shard]; !seen {
-			shardOrder = append(shardOrder, shard)
+		cellsByKeyspace[ns] = append(cellsByKeyspace[ns], templates.ShardCell{Shard: shard, Table: table, DDL: strings.Join(ddls, "\n")})
+		groupKey := keyspaceShard{namespace: ns, shard: shard}
+		i, seen := groupIndex[groupKey]
+		if !seen {
+			i = len(groupOrder)
+			groupIndex[groupKey] = i
+			groupOrder = append(groupOrder, shardWorkGroup{namespace: ns, shard: shard})
 		}
-		opsByShard[shard] = append(opsByShard[shard], op)
+		groupOrder[i].ops = append(groupOrder[i].ops, op)
 	}
 
 	// A finalizer failure is operation-scoped and does not write the parent
@@ -157,16 +165,26 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 		errorMessage = finalizerError
 	}
 
+	shardsByKeyspace := shardStatusesByKeyspace(groupOrder, len(keyspaceOrder) > 1, released, tasksByOp)
+	tablesByKeyspace := shardedTableStatusesByKeyspace(ops, tasksByOp)
+	keyspaces := make([]templates.ShardedKeyspace, 0, len(keyspaceOrder))
+	for _, ns := range keyspaceOrder {
+		keyspaces = append(keyspaces, templates.ShardedKeyspace{
+			Keyspace: ns,
+			Tables:   tablesByKeyspace[ns],
+			Shards:   shardsByKeyspace[ns],
+			Cells:    cellsByKeyspace[ns],
+		})
+	}
+
 	data := templates.ShardedApplyData{
 		State:          apply.State,
 		Environment:    apply.Environment,
 		Database:       apply.Database,
-		Keyspace:       keyspace,
 		ApplyID:        apply.ApplyIdentifier,
 		RequestedBy:    actorFromCaller(apply.Caller),
 		ErrorMessage:   errorMessage,
-		Shards:         shardStatuses(shardOrder, opsByShard, released, tasksByOp),
-		Cells:          cells,
+		Keyspaces:      keyspaces,
 		VSchemaChanges: vschemaChanges,
 		Tenant:         tenant,
 		Rollback:       apply.IsRollback(),
@@ -274,18 +292,31 @@ func isFinalizerFailureState(opState string) bool {
 	return state.IsState(opState, state.ApplyOperation.Failed, state.ApplyOperation.FailedRetryable)
 }
 
-// shardStatuses derives one status per shard. Each shard's operations are
-// aggregated to a single representative state, then the shards are projected
-// together through pkg/presentation (shard name as identity) so ordering labels
-// reference sibling shards.
-func shardStatuses(shardOrder []string, opsByShard map[string][]*storage.ApplyOperation, released bool, tasksByOp map[int64][]*storage.Task) []templates.ShardStatus {
-	inputs := make([]presentation.Operation, 0, len(shardOrder))
-	for _, shard := range shardOrder {
-		shardOps := opsByShard[shard]
-		st, errMsg := aggregateShardState(shardOps, tasksByOp)
-		first := shardOps[0]
+// shardStatusesByKeyspace derives one status per (keyspace, shard) group and
+// buckets the results per keyspace, preserving resolved order. Each shard's
+// operations are aggregated to a single representative state, then every
+// shard — across all keyspaces — is projected through pkg/presentation in one
+// pass so ordering labels reference sibling shards regardless of keyspace.
+// The presentation identity is the shard name; when the apply spans more than
+// one keyspace it is keyspace-qualified ("keyspace/shard"), because shard
+// names repeat across keyspaces (every unsharded keyspace's shard is "-") and
+// an ordering label naming a bare duplicate shard would be ambiguous. The
+// status row's own Shard stays the plain name either way — it renders under
+// its keyspace heading. Either way the identity is unique across groups —
+// bare names are unique within a single keyspace, qualified names are unique
+// by construction — so results key back to their groups by identity rather
+// than by output position.
+func shardStatusesByKeyspace(groups []shardWorkGroup, qualifyIdentity bool, released bool, tasksByOp map[int64][]*storage.Task) map[string][]templates.ShardStatus {
+	inputs := make([]presentation.Operation, 0, len(groups))
+	for _, g := range groups {
+		st, errMsg := aggregateShardState(g.ops, tasksByOp)
+		first := g.ops[0]
+		identity := g.shard
+		if qualifyIdentity {
+			identity = g.namespace + "/" + g.shard
+		}
 		inputs = append(inputs, presentation.Operation{
-			Deployment:        shard,
+			Deployment:        identity,
 			State:             st,
 			Barrier:           first.CutoverPolicy == storage.CutoverPolicyBarrier,
 			Parallel:          first.CutoverPolicy == storage.CutoverPolicyParallel,
@@ -296,10 +327,24 @@ func shardStatuses(shardOrder []string, opsByShard map[string][]*storage.ApplyOp
 		})
 	}
 	derived := presentation.Derive(inputs).Deployments
-	out := make([]templates.ShardStatus, 0, len(derived))
+	byIdentity := make(map[string]presentation.Deployment, len(derived))
 	for _, d := range derived {
-		out = append(out, templates.ShardStatus{
-			Shard: d.Deployment,
+		byIdentity[d.Deployment] = d
+	}
+	out := make(map[string][]templates.ShardStatus, len(groups))
+	for i, g := range groups {
+		d, ok := byIdentity[inputs[i].Deployment]
+		if !ok {
+			// Derive returns one deployment per input operation with its
+			// identity preserved; a missing identity means that contract broke.
+			// Omit the row rather than render some other shard's status under
+			// this shard's name.
+			slog.Warn("sharded apply comment will omit a shard status row: presentation returned no deployment for identity",
+				"identity", inputs[i].Deployment, "keyspace", g.namespace, "shard", g.shard)
+			continue
+		}
+		out[g.namespace] = append(out[g.namespace], templates.ShardStatus{
+			Shard: g.shard,
 			Emoji: d.Emoji,
 			Label: d.Label,
 			State: d.State,
@@ -307,6 +352,178 @@ func shardStatuses(shardOrder []string, opsByShard map[string][]*storage.ApplyOp
 		})
 	}
 	return out
+}
+
+// shardedTableStatusesByKeyspace derives one rollup per (keyspace, table) in
+// resolved order and buckets the results per keyspace — the table-unit view of
+// the same shard work shardStatusesByKeyspace rolls up per shard. Each shard's
+// entry carries the task-vocabulary state (and copy percent) of its (shard,
+// table) operation, and the table's aggregate is its most attention-worthy
+// shard state, so a table with one failed shard reads failed even while its
+// siblings copy.
+func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map[int64][]*storage.Task) map[string][]templates.ShardedTableStatus {
+	type keyspaceTable struct{ namespace, table string }
+	type tableRollup struct {
+		shards          []templates.ShardProgressData
+		rowsCopied      int64
+		rowsTotal       int64
+		etaSeconds      int64
+		shardsReporting int
+	}
+	var order []keyspaceTable
+	rollups := make(map[keyspaceTable]*tableRollup)
+	for _, op := range ops {
+		ns, shard, table, ok := parseShardOperationKey(op.OperationKey)
+		if !ok {
+			// Finalizers render in the VSchema section, not as a table.
+			continue
+		}
+		key := keyspaceTable{namespace: ns, table: table}
+		r := rollups[key]
+		if r == nil {
+			r = &tableRollup{}
+			rollups[key] = r
+			order = append(order, key)
+		}
+		sp := shardTaskProgress(op, tasksByOp[op.ID])
+		r.shards = append(r.shards, templates.ShardProgressData{
+			Shard:           shard,
+			Status:          sp.status,
+			PercentComplete: sp.percent,
+		})
+		// Rows sum across the shards that have reported; the ETA is the slowest
+		// reporting shard's. A shard counts as reporting only once it carries a
+		// row total, and all of its figures are gated on that together — the
+		// numerator, denominator, ETA, and coverage count always describe the
+		// same set of shards, so a shard with copied rows but no total yet
+		// cannot inflate the fraction's numerator alone. Shards whose dispatch
+		// wave has not started contribute nothing, and the renderer discloses
+		// the coverage instead of presenting a wave's figures as the table's.
+		if sp.rowsTotal > 0 {
+			r.shardsReporting++
+			r.rowsCopied += sp.rowsCopied
+			r.rowsTotal += sp.rowsTotal
+			if sp.etaSeconds > r.etaSeconds {
+				r.etaSeconds = sp.etaSeconds
+			}
+		}
+	}
+	out := make(map[string][]templates.ShardedTableStatus, len(order))
+	for _, key := range order {
+		r := rollups[key]
+		out[key.namespace] = append(out[key.namespace], templates.ShardedTableStatus{
+			Table:           key.table,
+			Status:          aggregateTableStatus(r.shards),
+			RowsCopied:      r.rowsCopied,
+			RowsTotal:       r.rowsTotal,
+			ETASeconds:      r.etaSeconds,
+			ShardsReporting: r.shardsReporting,
+			Shards:          r.shards,
+		})
+	}
+	return out
+}
+
+// shardProgress is one (shard, table) operation's display projection: the
+// state and copy figures of its most attention-worthy task.
+type shardProgress struct {
+	status     string
+	percent    int
+	rowsCopied int64
+	rowsTotal  int64
+	etaSeconds int64
+}
+
+// shardTaskProgress resolves one (shard, table) operation's display status and
+// copy figures from its most attention-worthy task — the task is where the
+// engine reports live shard state. The operation state stands in when the
+// operation has no tasks yet (dispatch creates them when its wave starts) or a
+// task has not reported state; it normalizes into the same vocabulary.
+func shardTaskProgress(op *storage.ApplyOperation, tasks []*storage.Task) shardProgress {
+	best := shardProgress{}
+	for _, t := range tasks {
+		status := t.State
+		if status == "" {
+			status = op.State
+		}
+		if best.status == "" || taskStateRank(status) > taskStateRank(best.status) {
+			best = shardProgress{
+				status:     status,
+				percent:    t.ProgressPercent,
+				rowsCopied: t.RowsCopied,
+				rowsTotal:  t.RowsTotal,
+				etaSeconds: int64(t.ETASeconds),
+			}
+		}
+	}
+	if best.status == "" {
+		return shardProgress{status: op.State}
+	}
+	return best
+}
+
+// aggregateTableStatus reduces a table's per-shard states to the one an
+// operator should act on first: failure over active work, active work over
+// waiting, waiting over done.
+func aggregateTableStatus(shards []templates.ShardProgressData) string {
+	best := shards[0].Status
+	for _, sh := range shards[1:] {
+		if taskStateRank(sh.Status) > taskStateRank(best) {
+			best = sh.Status
+		}
+	}
+	return best
+}
+
+// taskStateRank orders task states by how much they demand attention — the
+// task-vocabulary analogue of shardStateRank, normalizing first so operation
+// states fed through the no-task fallback rank the same way. Failure ranks
+// highest, then active work, then paused and queued work, then the settled
+// states. Pending outranks the revert window, matching deriveOverallState's
+// precedence: a table with undispatched shards still has work ahead of it,
+// however its landed shards hold, so the aggregate must not read as complete.
+func taskStateRank(s string) int {
+	switch state.NormalizeTaskStatus(s) {
+	case state.Task.Failed:
+		return 17
+	case state.Task.FailedRetryable:
+		return 16
+	case state.Task.CuttingOver:
+		return 15
+	case state.Task.Running:
+		return 14
+	case state.Task.PostChecksum:
+		return 13
+	case state.Task.Checksumming:
+		return 12
+	case state.Task.CatchingUp:
+		return 11
+	case state.Task.Reverting:
+		return 10
+	case state.Task.WaitingForCutover:
+		return 9
+	case state.Task.Recovering:
+		return 8
+	case state.Task.WaitingForDeploy:
+		return 7
+	case state.Task.Stopped:
+		return 6
+	case state.Task.Pending:
+		return 5
+	case state.Task.RevertWindow:
+		return 4
+	case state.Task.Cancelled:
+		return 2
+	case state.Task.Reverted:
+		return 1
+	case state.Task.Completed:
+		return 0
+	default:
+		// NormalizeTaskStatus maps unrecognized statuses to Task.Running, so
+		// this arm is reachable only if that mapping changes; rank it the same
+		// way so an unknown state still reads as active work.
+		return 14
+	}
 }
 
 // aggregateShardState reduces a shard's operations to its most significant

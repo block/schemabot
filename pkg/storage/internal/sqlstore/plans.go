@@ -36,6 +36,8 @@ type planStore struct {
 
 // Create stores a new plan and returns its ID.
 func (s *planStore) Create(ctx context.Context, plan *storage.Plan) (int64, error) {
+	canonicalizePlanIdentity(plan)
+
 	planDataJSON, err := json.Marshal(namespacesWithShardPlans(plan))
 	if err != nil {
 		return 0, fmt.Errorf("marshal plan data: %w", err)
@@ -98,6 +100,7 @@ func (s *planStore) GetByLock(ctx context.Context, lockID int64) ([]*storage.Pla
 // latestPlanForTarget take the first matching row as "the newest plan" and rely
 // on this deterministic order to avoid picking an older SHA on ties.
 func (s *planStore) GetByPR(ctx context.Context, repo string, pr int) ([]*storage.Plan, error) {
+	repo = storage.CanonicalKey(repo)
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+planColumns+`
 		FROM plans
@@ -119,6 +122,10 @@ func (s *planStore) GetByPR(ctx context.Context, repo string, pr int) ([]*storag
 // plans.created_at is datetime (second precision), so the id tiebreaker keeps
 // same-second plans in a deterministic newest-first order.
 func (s *planStore) List(ctx context.Context, opts storage.ListPlansOptions) ([]*storage.Plan, error) {
+	opts.Database = storage.CanonicalKey(opts.Database)
+	opts.Environment = storage.CanonicalKey(opts.Environment)
+	opts.Repository = storage.CanonicalKey(opts.Repository)
+
 	if opts.Limit <= 0 {
 		return nil, fmt.Errorf("list plans for database %q environment %q: limit must be positive, got %d", opts.Database, opts.Environment, opts.Limit)
 	}
@@ -176,8 +183,16 @@ func (s *planStore) Delete(ctx context.Context, id int64) error {
 
 // DeleteByPR removes all plans for a PR.
 func (s *planStore) DeleteByPR(ctx context.Context, repo string, pr int) error {
+	repo = storage.CanonicalKey(repo)
 	_, err := s.db.ExecContext(ctx, `DELETE FROM plans WHERE repository = ? AND pull_request = ?`, repo, pr)
 	return err
+}
+
+func canonicalizePlanIdentity(plan *storage.Plan) {
+	plan.Database = storage.CanonicalKey(plan.Database)
+	plan.DatabaseType = storage.CanonicalKey(plan.DatabaseType)
+	plan.Repository = storage.CanonicalKey(plan.Repository)
+	plan.Environment = storage.CanonicalKey(plan.Environment)
 }
 
 // scanPlan scans a single plan row, returning nil if not found.

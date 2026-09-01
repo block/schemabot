@@ -17,7 +17,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/e2e/testutil"
-	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -373,67 +372,6 @@ func TestBranchDDLError(t *testing.T) {
 		"SHOW COLUMNS FROM users LIKE 'ddl_error_recovery_col'")
 	require.NoError(t, err, "SHOW COLUMNS")
 	require.Greater(t, len(result.Rows), 0, "expected 'ddl_error_recovery_col' in branch DB after recovery")
-}
-
-// TestThrottleRatioBoundary verifies throttle ratio boundary validation.
-func TestThrottleRatioBoundary(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
-	ctx := t.Context()
-	branchName := createBranchWithDDL(t, ctx, "throttle-bounds",
-		map[string][]string{
-			"testapp_sharded": {"ALTER TABLE orders ADD COLUMN throttle_bounds_col varchar(50)"},
-		},
-		nil,
-	)
-
-	dr := createDeploy(t, ctx, branchName, false)
-	deploy(t, ctx, dr.Number, false)
-
-	// Valid: ratio 0.0 (full speed)
-	err := testClient.ThrottleDeployRequest(ctx, &psclient.ThrottleDeployRequestRequest{
-		Organization:  testOrg,
-		Database:      testDB,
-		Number:        dr.Number,
-		ThrottleRatio: 0.0,
-	})
-	assert.NoError(t, err, "throttle ratio 0.0 should succeed")
-
-	// Valid: ratio 0.95 (max throttle per PlanetScale)
-	err = testClient.ThrottleDeployRequest(ctx, &psclient.ThrottleDeployRequestRequest{
-		Organization:  testOrg,
-		Database:      testDB,
-		Number:        dr.Number,
-		ThrottleRatio: 0.95,
-	})
-	assert.NoError(t, err, "throttle ratio 0.95 should succeed")
-
-	// Invalid: ratio 1.0 (exceeds PlanetScale max of 0.95)
-	err = testClient.ThrottleDeployRequest(ctx, &psclient.ThrottleDeployRequestRequest{
-		Organization:  testOrg,
-		Database:      testDB,
-		Number:        dr.Number,
-		ThrottleRatio: 1.0,
-	})
-	assert.Error(t, err, "throttle ratio 1.0 should fail")
-
-	// Invalid: ratio -0.1
-	err = testClient.ThrottleDeployRequest(ctx, &psclient.ThrottleDeployRequestRequest{
-		Organization:  testOrg,
-		Database:      testDB,
-		Number:        dr.Number,
-		ThrottleRatio: -0.1,
-	})
-	assert.Error(t, err, "throttle ratio -0.1 should fail")
-
-	// Invalid: ratio 1.5
-	err = testClient.ThrottleDeployRequest(ctx, &psclient.ThrottleDeployRequestRequest{
-		Organization:  testOrg,
-		Database:      testDB,
-		Number:        dr.Number,
-		ThrottleRatio: 1.5,
-	})
-	assert.Error(t, err, "throttle ratio 1.5 should fail")
 }
 
 // TestRevertWindowExpiration verifies that the revert window auto-expires after

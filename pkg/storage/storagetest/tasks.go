@@ -13,6 +13,55 @@ import (
 
 // TestTasks runs the behavioral parity suite for storage.TaskStore.
 func TestTasks(t *testing.T, h Harness) {
+	t.Run("IdentityKeys_AreCaseInsensitive", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "task_mixed_case_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_task_mixed_case", 810)
+		task := newTask(apply, "task_mixed_case", "CaseSensitiveTable", time.Now().UTC().Truncate(time.Second))
+		task.Database = "MixedCase_DB"
+		task.DatabaseType = "MySQL"
+		task.Repository = "MixedCase/Sample-Repo"
+		task.PullRequest = 813
+		task.Environment = "StAgInG"
+		id, err := store.Tasks().Create(ctx, task)
+		require.NoError(t, err)
+		require.Equal(t, "mixedcase_db", task.Database)
+		require.Equal(t, "mysql", task.DatabaseType)
+		require.Equal(t, "mixedcase/sample-repo", task.Repository)
+		require.Equal(t, "staging", task.Environment)
+
+		byDatabase, err := store.Tasks().GetByDatabase(ctx, "MIXEDCASE_DB")
+		require.NoError(t, err)
+		require.Len(t, byDatabase, 1)
+		assert.Equal(t, id, byDatabase[0].ID)
+		assert.Equal(t, "mixedcase_db", byDatabase[0].Database)
+		assert.Equal(t, "mysql", byDatabase[0].DatabaseType)
+		assert.Equal(t, "mixedcase/sample-repo", byDatabase[0].Repository)
+		assert.Equal(t, "staging", byDatabase[0].Environment)
+		assert.Equal(t, "CaseSensitiveTable", byDatabase[0].TableName)
+
+		byPR, err := store.Tasks().GetByPR(ctx, "MIXEDCASE/SAMPLE-REPO", 813)
+		require.NoError(t, err)
+		require.Len(t, byPR, 1)
+		assert.Equal(t, id, byPR[0].ID)
+
+		listed, err := store.Tasks().List(ctx, storage.TaskFilter{
+			Repository: "mixedCASE/sample-REPO", PullRequest: 813, IncludeCompleted: true,
+		})
+		require.NoError(t, err)
+		require.Len(t, listed, 1)
+		assert.Equal(t, id, listed[0].ID)
+
+		owners, err := store.Tasks().FindTableOwners(ctx, storage.TableRef{
+			Database: "MIXEDCASE_DB", DatabaseType: "MYSQL", Environment: "STAGING", TableName: "CaseSensitiveTable",
+		})
+		require.NoError(t, err)
+		require.Len(t, owners, 1)
+		assert.Equal(t, "mixedcase/sample-repo", owners[0].Repository)
+		assert.Equal(t, 813, owners[0].PullRequest)
+	})
+
 	t.Run("Create_Get_Update", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)

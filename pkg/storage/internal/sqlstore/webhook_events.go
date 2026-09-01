@@ -33,6 +33,8 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 	if event.Event == "" {
 		return false, fmt.Errorf("webhook event type is required")
 	}
+	event.Repository = storage.CanonicalKey(event.Repository)
+
 	provider := event.Provider
 	if provider == "" {
 		provider = storage.WebhookProviderGitHub
@@ -182,6 +184,7 @@ func webhookClaimableArgs() []any {
 }
 
 func (s *webhookEventStore) HasEventForHead(ctx context.Context, provider, repository string, pullRequest int, headSHA string) (bool, error) {
+	repository = storage.CanonicalKey(repository)
 	if provider == "" {
 		provider = storage.WebhookProviderGitHub
 	}
@@ -267,21 +270,23 @@ func (s *webhookEventStore) coveringSuccessorQuery(provider string, event *stora
 // the live PR is worth a GitHub call at all — the common no-successor claim
 // stays storage-only.
 func (s *webhookEventStore) HasCoveringSuccessor(ctx context.Context, event *storage.WebhookEvent) (bool, error) {
-	if event.Repository == "" || event.PullRequest == 0 {
+	queryEvent := *event
+	queryEvent.Repository = storage.CanonicalKey(queryEvent.Repository)
+	if queryEvent.Repository == "" || queryEvent.PullRequest == 0 {
 		return false, fmt.Errorf("check covering successor for webhook event %d: repository and pull request are required for coalescing", event.ID)
 	}
 	provider := event.Provider
 	if provider == "" {
 		provider = storage.WebhookProviderGitHub
 	}
-	query, args := s.coveringSuccessorQuery(provider, event)
+	query, args := s.coveringSuccessorQuery(provider, &queryEvent)
 	var one int
 	err := s.db.QueryRowContext(ctx, query, args...).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("check covering successor for webhook event %d (repo=%s, pr=%d): %w", event.ID, event.Repository, event.PullRequest, err)
+		return false, fmt.Errorf("check covering successor for webhook event %d (repo=%s, pr=%d): %w", event.ID, queryEvent.Repository, event.PullRequest, err)
 	}
 	return true, nil
 }
@@ -311,10 +316,11 @@ func (s *webhookEventStore) HasCoveringSuccessor(ctx context.Context, event *sto
 // terminally failed / superseded rows never run — none of those may justify
 // discarding older work.
 func (s *webhookEventStore) SupersedeIfCovered(ctx context.Context, event *storage.WebhookEvent) (bool, error) {
+	repository := storage.CanonicalKey(event.Repository)
 	if event.LeaseToken == "" {
 		return false, fmt.Errorf("webhook event lease token is required")
 	}
-	if event.Repository == "" || event.PullRequest == 0 {
+	if repository == "" || event.PullRequest == 0 {
 		return false, fmt.Errorf("supersede webhook event %d: repository and pull request are required for coalescing", event.ID)
 	}
 	provider := event.Provider
@@ -322,7 +328,9 @@ func (s *webhookEventStore) SupersedeIfCovered(ctx context.Context, event *stora
 		provider = storage.WebhookProviderGitHub
 	}
 	autoPlanIn := placeholders(len(storage.AutoPlanPullRequestActions))
-	successorQuery, successorArgs := s.coveringSuccessorQuery(provider, event)
+	queryEvent := *event
+	queryEvent.Repository = repository
+	successorQuery, successorArgs := s.coveringSuccessorQuery(provider, &queryEvent)
 	args := []any{storage.WebhookEventSuperseded, event.ID, event.LeaseToken, storage.WebhookEventProcessing}
 	args = append(args, stringArgs(storage.AutoPlanPullRequestActions)...)
 	args = append(args, successorArgs...)
@@ -336,7 +344,7 @@ func (s *webhookEventStore) SupersedeIfCovered(ctx context.Context, event *stora
 			)
 	`, args...)
 	if err != nil {
-		return false, fmt.Errorf("supersede webhook event %d (repo=%s, pr=%d): %w", event.ID, event.Repository, event.PullRequest, err)
+		return false, fmt.Errorf("supersede webhook event %d (repo=%s, pr=%d): %w", event.ID, repository, event.PullRequest, err)
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
@@ -368,12 +376,33 @@ func (s *webhookEventStore) FindNext(ctx context.Context, owner string, leaseDur
 	}
 	defer rollbackTx(ctx, tx, "claim webhook event")
 
-	// Claim in two steps so the ordering filesort only ever handles narrow sort
-	// records. No index satisfies this ordering across the claimable
-	// predicate's OR-branches, so the sort packs every selected column into
-	// each sort record — selecting the payload JSON here would let a single
-	// oversized delivery exceed sort_buffer_size and fail every claim attempt
-	// (MySQL error 1038), wedging the whole inbox behind one wide row.
+	// The ORDER BY must be able to walk an index on (created_at, id) rather
+	// than sort. The claimable predicate ORs across several states, so no
+	// state-prefixed index serves the ordering; without one on the ordering
+	// pair the planner collects every claimable row and sorts it. On InnoDB
+	// that sort runs under FOR UPDATE and locks the whole candidate set before
+	// LIMIT 1 applies, turning SKIP LOCKED into a serializer — each driver
+	// skips everything a peer locked instead of taking the next free row.
+	// PostgreSQL locks rows only after the sort, so a single row is ever
+	// locked; there the index spares the sort itself. Each dialect's schema
+	// file names that index by its own convention.
+	//
+	// The index bounds locking, not reads. The walk starts at the oldest row
+	// and evaluates the claimable predicate per row, and in a healthy inbox
+	// the oldest rows are terminal ones — so a claim reads across all retained
+	// terminal history before reaching the first claimable row. Leading the
+	// index with state instead would bound those reads but lose the ordering
+	// (the predicate ORs across states), reinstating the sort. Bounding the
+	// reads is a retention job: only purging terminal rows keeps the history
+	// the walk crosses finite.
+	//
+	// Claiming stays two-step — id here, then a primary-key load — so a plan
+	// that does sort (the planner may prefer another index, and an
+	// already-bootstrapped PostgreSQL database gains this index only by hand)
+	// handles narrow sort records. Packing the payload JSON into each sort
+	// record would let a single oversized delivery exceed sort_buffer_size
+	// and fail every claim attempt (MySQL error 1038), wedging the whole
+	// inbox behind one wide row.
 	var id int64
 	err = tx.QueryRowContext(ctx, `
 		SELECT id

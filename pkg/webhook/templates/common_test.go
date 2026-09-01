@@ -78,6 +78,163 @@ func TestSanitizeCommentError(t *testing.T) {
 		assert.Equal(t, msg, sanitizeCommentError(msg))
 	})
 
+	redactionCases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "TLS CA bundle path",
+			in:   "failed to connect: cannot load TLS root certificate /etc/schemabot/ca/bundle.pem: permission denied",
+			want: "failed to connect: cannot load TLS root certificate [endpoint redacted]: permission denied",
+		},
+		{
+			name: "port-less private hostname",
+			in:   "connection to db-primary.foo.internal failed: timeout",
+			want: "connection to [endpoint redacted] failed: timeout",
+		},
+		{
+			name: "port-less managed database hostname",
+			in:   "connection to xyz.us-east-1.rds.amazonaws.com failed: timeout",
+			want: "connection to [endpoint redacted] failed: timeout",
+		},
+		{
+			name: "contextual port-less hostname",
+			in:   "connect to db-primary.private.example.com failed: timeout",
+			want: "connect to [endpoint redacted] failed: timeout",
+		},
+		{
+			name: "DNS resolver error",
+			in:   "dial tcp: lookup db.internal on 10.0.0.2:53: no such host",
+			want: "dial tcp: lookup [endpoint redacted] on [endpoint redacted]: no such host",
+		},
+		{
+			name: "vindex lookup is not a DNS error",
+			in:   `cannot drop lookup vindex "customers_email_lookup": still referenced`,
+			want: `cannot drop lookup vindex "customers_email_lookup": still referenced`,
+		},
+		{
+			name: "libpq authentication failure",
+			in:   "failed to connect to user=app_writer database=orders host=db.internal: password authentication failed",
+			want: "failed to connect to user=[endpoint redacted] database=[endpoint redacted] host=[endpoint redacted]: password authentication failed",
+		},
+		{
+			name: "libpq dbname fragment",
+			in:   "connect dbname=customer_data user=reporter sslmode=verify-full failed",
+			want: "connect dbname=[endpoint redacted] user=[endpoint redacted] sslmode=verify-full failed",
+		},
+		{
+			name: "pgconn SQLSTATE error",
+			in:   `failed to connect: FATAL: no pg_hba.conf entry for host "10.20.30.40", user "app_writer", database "orders", no encryption (SQLSTATE 28000)`,
+			want: `failed to connect: FATAL: no pg_hba.conf entry for host "[endpoint redacted]", user "[endpoint redacted]", database "[endpoint redacted]", no encryption (SQLSTATE 28000)`,
+		},
+		{
+			name: "pq SQLSTATE error",
+			in:   `pq: password authentication failed for user "app_writer" (SQLSTATE 28P01)`,
+			want: `pq: password authentication failed for user "[endpoint redacted]" (SQLSTATE 28P01)`,
+		},
+		{
+			name: "tab-separated pq identity",
+			in:   "pq: permission denied for database\t\"orders\" (SQLSTATE 42501)",
+			want: `pq: permission denied for database "[endpoint redacted]" (SQLSTATE 42501)`,
+		},
+		{
+			name: "pgx connect error keeps balanced backticks",
+			in:   "failed to connect to `user=app database=orders`: server error (SQLSTATE 28P01)",
+			want: "failed to connect to `user=[endpoint redacted] database=[endpoint redacted]`: server error (SQLSTATE 28P01)",
+		},
+		{
+			name: "backtick-delimited absolute path",
+			in:   "cannot read `/etc/schemabot/ca/bundle.pem`",
+			want: "cannot read `[endpoint redacted]`",
+		},
+		{
+			name: "bracket-delimited absolute path",
+			in:   "cannot read [/etc/schemabot/ca/bundle.pem]",
+			want: "cannot read [[endpoint redacted]]",
+		},
+		{
+			name: "libpq password",
+			in:   "host=db.internal user=app password=hunter2 dbname=orders",
+			want: "host=[endpoint redacted] user=[endpoint redacted] password=[endpoint redacted] dbname=[endpoint redacted]",
+		},
+		{
+			name: "libpq password containing a colon",
+			in:   "connect with password=p@ss:word failed",
+			want: "connect with password=[endpoint redacted] failed",
+		},
+		{
+			name: "libpq password containing commas",
+			in:   "password=a,b,c dbname=orders",
+			want: "password=[endpoint redacted] dbname=[endpoint redacted]",
+		},
+		{
+			name: "libpq password containing a semicolon",
+			in:   "auth failed for password=one;two",
+			want: "auth failed for password=[endpoint redacted]",
+		},
+		{
+			name: "libpq password with trailing text after a colon",
+			in:   "password=hunter:2x rejected",
+			want: "password=[endpoint redacted] rejected",
+		},
+		{
+			name: "MySQL access denied",
+			in:   "Error 1045 (28000): Access denied for user 'app_writer'@'10.20.30.40' (using password: YES)",
+			want: "Error 1045 (28000): Access denied for user [endpoint redacted] (using password: YES)",
+		},
+		{
+			name: "MySQL access denied to database",
+			in:   "Error 1044 (42000): Access denied for user 'app'@'%' to database 'orders'",
+			want: "Error 1044 (42000): Access denied for user [endpoint redacted] to database '[endpoint redacted]'",
+		},
+		{
+			name: "MySQL unknown database",
+			in:   "Error 1049 (42000): Unknown database 'orders'",
+			want: "Error 1049 (42000): Unknown database '[endpoint redacted]'",
+		},
+		{
+			name: "quoted database name in prose is not a MySQL error line",
+			in:   "database 'orders' has no deployment configured",
+			want: "database 'orders' has no deployment configured",
+		},
+		{
+			name: "lookup vindex prose is not a DNS error",
+			in:   "cannot use lookup vindex on unowned table users",
+			want: "cannot use lookup vindex on unowned table users",
+		},
+		{
+			name: "URL userinfo",
+			in:   "connect postgres://app:hunter2@db.internal/orders failed",
+			want: "connect postgres://[endpoint redacted]@[endpoint redacted]/orders failed",
+		},
+		{
+			name: "server prose is not a hostname context",
+			in:   "the server pkg.Handler panicked",
+			want: "the server pkg.Handler panicked",
+		},
+		{
+			name: "deliberate non-redactions",
+			in:   "relative ca/bundle.pem import github.com/block/schemabot docs https://example.com/docs/guide column users.email at 12:30:45",
+			want: "relative ca/bundle.pem import github.com/block/schemabot docs https://example.com/docs/guide column users.email at 12:30:45",
+		},
+		{
+			name: "libpq host with port",
+			in:   "host=db.internal:5432 connection refused",
+			want: "host=[endpoint redacted] connection refused",
+		},
+		{
+			name: "normal English and Go names",
+			in:   "context.DeadlineExceeded while pkg/webhook.foo handled pkg/webhook/inbox.go",
+			want: "context.DeadlineExceeded while pkg/webhook.foo handled pkg/webhook/inbox.go",
+		},
+	}
+	for _, tc := range redactionCases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, sanitizeCommentError(tc.in))
+		})
+	}
+
 	t.Run("long errors clamp by rune with truncation marker", func(t *testing.T) {
 		got := sanitizeCommentError(strings.Repeat("é", maxCommentErrorLen+100))
 		runes := []rune(got)
@@ -88,6 +245,12 @@ func TestSanitizeCommentError(t *testing.T) {
 	t.Run("errors at the limit are not clamped", func(t *testing.T) {
 		msg := strings.Repeat("x", maxCommentErrorLen)
 		assert.Equal(t, msg, sanitizeCommentError(msg))
+	})
+
+	t.Run("clamp never leaves a partial redaction marker", func(t *testing.T) {
+		prefix := strings.Repeat("x", maxCommentErrorLen-10)
+		got := sanitizeCommentError(prefix + " /etc/schemabot/ca/bundle.pem")
+		assert.Equal(t, prefix+" …", got)
 	})
 }
 

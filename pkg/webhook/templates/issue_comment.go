@@ -6,8 +6,6 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/caller"
-	"github.com/block/schemabot/pkg/storage"
-	"github.com/block/schemabot/pkg/webhook/action"
 )
 
 // RenderRollbackMissingArguments renders the message posted when `schemabot rollback`
@@ -95,27 +93,12 @@ type CutoverCommandAcceptedData struct {
 }
 
 // RenderControlMissingApplyID renders the message posted when an apply-scoped
-// control command is invoked without the required apply ID. The usage line
-// carries every flag the command requires, so a volume command also shows its
-// mandatory `-v` level.
+// control command is invoked without the required apply ID.
 func RenderControlMissingApplyID(command string) string {
 	usage := fmt.Sprintf("schemabot %s <apply-id> -e <environment>", command)
-	if command == action.Volume {
-		usage += fmt.Sprintf(" -v <%d-%d>", storage.MinVolume, storage.MaxVolume)
-	}
 	return offerSupportChannel(fmt.Sprintf("## Missing Apply ID\n\n"+
 		"Usage: `%s`\n\n"+
 		"Use `schemabot status -e <environment>` to find the apply ID.", usage))
-}
-
-// RenderVolumeInvalidLevel renders the message posted when a volume command
-// is missing the `-v` flag, carries a non-numeric value, or names a level
-// outside the supported range.
-func RenderVolumeInvalidLevel() string {
-	return offerSupportChannel(fmt.Sprintf("## Missing or Invalid Volume Level\n\n"+
-		"Usage: `schemabot volume <apply-id> -e <environment> -v <level>`\n\n"+
-		"The `-v` flag is required and must be a number between %d (slowest) and %d (fastest).",
-		storage.MinVolume, storage.MaxVolume))
 }
 
 // RenderStopCommandAccepted renders the acknowledgement posted when a PR
@@ -264,76 +247,6 @@ func PreviewCommentStartCommandAlreadyRequested() string {
 	})
 }
 
-// VolumeCommandAcceptedData contains data for a PR comment volume acknowledgement.
-type VolumeCommandAcceptedData struct {
-	ApplyID     string
-	Environment string
-	RequestedBy string
-	// Volume is the queued target level (1=slowest, 11=fastest).
-	Volume int32
-}
-
-// RenderVolumeCommandAccepted renders the acknowledgement posted when a PR
-// comment volume command queues a durable volume adjustment. The wording says
-// "shortly" rather than implying an immediate change: the new level takes
-// effect at the next progress check, so it is not yet in effect when this
-// posts.
-func RenderVolumeCommandAccepted(data VolumeCommandAcceptedData) string {
-	body := "## Volume Request Accepted\n\n" +
-		fmt.Sprintf("**Apply**: `%s`\n", data.ApplyID) +
-		fmt.Sprintf("**Environment**: `%s`\n", data.Environment)
-	if data.RequestedBy != "" {
-		body += fmt.Sprintf("**Requested by**: @%s\n", data.RequestedBy)
-	}
-	body += fmt.Sprintf("\nVolume change to %d requested. SchemaBot will adjust the speed of this schema change shortly; once the new level takes effect, a fresh progress comment will track the schema change at the new volume.\n", data.Volume)
-	return body
-}
-
-// PreviewCommentVolumeCommandAccepted renders a sample volume command
-// acknowledgement comment.
-func PreviewCommentVolumeCommandAccepted() string {
-	return RenderVolumeCommandAccepted(VolumeCommandAcceptedData{
-		ApplyID:     "apply-a1b2c3d4e5f67890",
-		Environment: "staging",
-		RequestedBy: "alice",
-		Volume:      8,
-	})
-}
-
-// PreviewCommentVolumeInvalidLevel renders the usage comment posted when a
-// volume command carries a missing or invalid level.
-func PreviewCommentVolumeInvalidLevel() string {
-	return RenderVolumeInvalidLevel()
-}
-
-// PreviewCommentVolumeMissingApplyID renders the usage comment posted when a
-// volume command is missing the required apply ID.
-func PreviewCommentVolumeMissingApplyID() string {
-	return RenderControlMissingApplyID(action.Volume)
-}
-
-// VolumeSupersededProgressData contains data for freezing a progress comment
-// that a volume change has superseded.
-type VolumeSupersededProgressData struct {
-	// Volume is the new level (1=slowest, 11=fastest) that took effect.
-	Volume int
-	// Repo is the "owner/name" repository, used to link the successor comment.
-	Repo string
-	// PR is the pull request number, used to link the successor comment.
-	PR int
-	// NewCommentID is the GitHub comment ID of the fresh progress comment now
-	// tracking the schema change.
-	NewCommentID int64
-	// PreviousBody is the superseded comment's last rendered body, preserved
-	// inside the folded details block.
-	PreviousBody string
-}
-
-// volumeSupersededPrefix opens every frozen body written when a volume change
-// superseded a progress comment; IsSupersededProgressComment keys on it so a
-// freeze retry can tell an already-frozen comment from a live one.
-const volumeSupersededPrefix = "⏩ Volume changed to"
-
 // supersededFoldMarker is the successor-link text renderSupersededFold embeds
 // in the headline of every frozen body. IsSupersededProgressComment requires
 // it alongside a flavor prefix, so a live comment that merely opens with the
@@ -342,8 +255,8 @@ const supersededFoldMarker = " [a new progress comment]("
 
 // SupersededProgressData contains the data every superseded-comment fold
 // shares: where the successor comment lives and the superseded comment's last
-// rendered body. Rotation flavors with no flavor-specific data render directly
-// from it; flavors that carry extra data (volume) keep their own struct.
+// rendered body. Every rotation flavor renders from it, differing only in its
+// headline and fold label.
 type SupersededProgressData struct {
 	// Repo is the "owner/name" repository, used to link the successor comment.
 	Repo string
@@ -367,16 +280,6 @@ func renderSupersededFold(headline, foldLabel, repo string, pr int, newCommentID
 		"%s"+supersededFoldMarker+"%s#issuecomment-%d).\n\n"+
 			"<details>\n<summary>%s</summary>\n\n%s\n\n</details>\n",
 		headline, caller.PullRequestURL(repo, pr), newCommentID, foldLabel, previousBody)
-}
-
-// RenderVolumeSupersededProgressComment renders the frozen body written over a
-// progress comment once a volume change rotates in a fresh one. The old
-// comment's final progress stays on the PR as a record, collapsed into a
-// details block, with a pointer to the comment where progress continues.
-func RenderVolumeSupersededProgressComment(data VolumeSupersededProgressData) string {
-	headline := fmt.Sprintf("%s **%d/%d** — progress continues in", volumeSupersededPrefix, data.Volume, storage.MaxVolume)
-	return renderSupersededFold(headline, "Progress before the volume change",
-		data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
 }
 
 // resumeSupersededPrefix opens every frozen body written when a resume
@@ -454,6 +357,14 @@ func RenderSupersededProgressComment(data SupersededProgressData) string {
 	return renderSupersededFold(genericSupersededPrefix+" — progress continues in", "Earlier progress",
 		data.Repo, data.PR, data.NewCommentID, data.PreviousBody)
 }
+
+// volumeSupersededPrefix opens the frozen bodies written when a volume change
+// superseded a progress comment, back when volume was a control operation.
+// Nothing renders it anymore, but such bodies are still on GitHub wherever the
+// binary that wrote one failed to clear its freeze marker; the recognition
+// list keeps the prefix so a freeze retry does not fold one of those bodies a
+// second time.
+const volumeSupersededPrefix = "⏩ Volume changed to"
 
 // IsSupersededProgressComment reports whether a comment body is already a
 // frozen superseded rendering — any rotation flavor — so a freeze retry does

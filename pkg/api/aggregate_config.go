@@ -3,6 +3,8 @@ package api
 import (
 	"fmt"
 	"strings"
+
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // Aggregate-check roles for a repository. In a multi-tenant aggregate check,
@@ -65,7 +67,7 @@ func (c *ServerConfig) AggregateRoleForRepo(repo string) string {
 	if c == nil {
 		return ""
 	}
-	repoConfig, ok := c.Repos[repo]
+	repoConfig, ok := c.Repos[storage.CanonicalKey(repo)]
 	if !ok || repoConfig.Aggregate == nil {
 		return ""
 	}
@@ -107,7 +109,7 @@ func (c *ServerConfig) ExpectedParticipantChecksForPR(repo string, changedFiles 
 	if c == nil {
 		return nil
 	}
-	repoConfig, ok := c.Repos[repo]
+	repoConfig, ok := c.Repos[storage.CanonicalKey(repo)]
 	if !ok || !repoConfig.Aggregate.isLeader() {
 		return nil
 	}

@@ -316,6 +316,7 @@ func synthesizedDeliveryGUID(repo string, pr int, headSHA string) string {
 // the enqueue are not atomic; a concurrent pod inserting between them can at
 // worst mislabel one metric increment, never affect the row itself.
 func (h *Handler) synthesizeMissingHeadDelivery(ctx context.Context, repo string, pr int, headSHA string, installationID int64) (inserted, resynthesized bool, err error) {
+	repo = storage.CanonicalKey(repo)
 	guid := synthesizedDeliveryGUID(repo, pr, headSHA)
 	if store := h.webhookEventStore(); store != nil {
 		prior, err := store.GetByDeliveryID(ctx, storage.WebhookProviderGitHub, guid)

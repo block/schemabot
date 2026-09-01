@@ -221,7 +221,10 @@ func (a Apply) MultiDeployment() bool {
 
 // Derive projects the ordered operations of one apply into its rollup. The input
 // must be in resolved deployment order (as returned by ListByApply); earlier
-// siblings are those before a given index.
+// siblings are those before a given index. The returned Deployments slice is
+// index-parallel to ops — one entry per operation, in the same order, each
+// carrying its operation's Deployment name — and callers rely on that
+// correspondence to key results back to their inputs.
 func Derive(ops []Operation) Apply {
 	children := make([]state.RolloutChild, len(ops))
 	for i, op := range ops {
@@ -282,11 +285,11 @@ func deriveDeployment(ops []Operation, i int) Deployment {
 	case state.ApplyOperation.FailedRetryable:
 		d.set(StateRetrying, "retrying", "🔁", true)
 	case state.ApplyOperation.Stopped:
-		d.set(StateStopped, "stopped — resume to continue", "⏸", true)
+		d.set(StateStopped, "stopped — resume to continue", "⏹️", true)
 	case state.ApplyOperation.RevertWindow:
 		d.set(StateRevertWindow, "in revert window", "⏳", true)
 	case state.ApplyOperation.Cancelled:
-		d.set(StateCancelled, "cancelled", "⛔", false)
+		d.set(StateCancelled, "cancelled", "🚫", false)
 	case state.ApplyOperation.Reverted:
 		d.set(StateReverted, "reverted", "↩️", false)
 	case state.ApplyOperation.Pending:
@@ -316,10 +319,10 @@ func derivePending(d *Deployment, ops []Operation, i int) {
 	}
 	if h, paused := blockingSibling(ops, i); h != nil {
 		if paused {
-			d.set(StatePaused, fmt.Sprintf("paused — %s failed; release or stop", h.Deployment), "⏸", true)
+			d.set(StatePaused, fmt.Sprintf("paused — %s failed; release or stop", h.Deployment), "⏸️", true)
 			return
 		}
-		d.set(StateHalted, fmt.Sprintf("halted — %s %s", h.Deployment, haltedReason(h.State)), "⏸", true)
+		d.set(StateHalted, fmt.Sprintf("halted — %s %s", h.Deployment, haltedReason(h.State)), "⏸️", true)
 		return
 	}
 	for j := range i {

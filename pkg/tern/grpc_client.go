@@ -198,7 +198,7 @@ type Config struct {
 // the remote-deployment outage monitor, which must observe an outage promptly
 // rather than ride it out.
 //
-// State-changing RPCs (Apply, Cutover, Stop, Cancel, Start, Volume, Revert,
+// State-changing RPCs (Apply, Cutover, Stop, Cancel, Start, Revert,
 // SkipRevert) are intentionally not retried here: re-sending them could
 // duplicate work or advance an apply twice, and the operator's durable
 // queue already owns redelivery for dispatch failures.
@@ -896,7 +896,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 	if apply.StartedAt == nil && !state.IsState(remoteState, state.Apply.Pending) {
 		apply.StartedAt = &now
 	}
-	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, false)
+	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, progress.Tables, false)
 	apply.UpdatedAt = now
 	if remoteProgressIsTerminal(progress.State, progress.Tables) {
 		if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now, scope); err != nil {
@@ -1008,7 +1008,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 	}
 	now := time.Now()
 	priorState, priorStartedAt, priorUpdatedAt := apply.State, apply.StartedAt, apply.UpdatedAt
-	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, false)
+	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, progress.Tables, false)
 	apply.UpdatedAt = now
 	// A stopped remote is not a cancel outcome: the data plane accepts Cancel
 	// for stopped applies and its own driver consumes the durable request, so
@@ -1164,7 +1164,7 @@ func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context,
 	if apply.StartedAt == nil && !state.IsState(remoteState, state.Apply.Pending) {
 		apply.StartedAt = &now
 	}
-	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, false)
+	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, progress.Tables, false)
 	apply.ErrorMessage = remoteProgressErrorMessage(apply.State, progress.ErrorMessage, apply.ErrorMessage)
 	apply.UpdatedAt = now
 	if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now, scope); err != nil {
@@ -1244,7 +1244,7 @@ func (c *GRPCClient) completeRemoteCancelFromTerminalProgress(ctx context.Contex
 	if apply.StartedAt == nil && !state.IsState(remoteState, state.Apply.Pending) {
 		apply.StartedAt = &now
 	}
-	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, false)
+	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, progress.Tables, false)
 	apply.ErrorMessage = remoteProgressErrorMessage(apply.State, progress.ErrorMessage, apply.ErrorMessage)
 	apply.UpdatedAt = now
 	if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now, scope); err != nil {
@@ -1429,10 +1429,6 @@ func (c *GRPCClient) terminalizeUndispatchedApplyOperation(ctx context.Context, 
 
 func (c *GRPCClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error) {
 	return c.client.Start(ctx, req)
-}
-
-func (c *GRPCClient) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error) {
-	return c.client.Volume(ctx, req)
 }
 
 func (c *GRPCClient) Revert(ctx context.Context, req *ternv1.RevertRequest) (*ternv1.RevertResponse, error) {
@@ -1902,35 +1898,6 @@ func (c *GRPCClient) mirrorRemoteDisplayMetadata(ctx context.Context, apply *sto
 	return blob
 }
 
-// mirrorRemoteVolume copies the volume level the data plane reports on a
-// progress response onto the in-memory apply options, so the poll's regular
-// parent-apply persistence records it. Volume changes are applied by the
-// data-plane driver against its own apply row, and the control plane only
-// learns the resulting level from progress responses — the PR comment and the
-// control-plane progress API both read the level from the control-plane apply
-// options. Returns true when the stored level changed so the caller can log
-// the transition. The logger is expected to carry the apply's identity
-// attributes already bound.
-func mirrorRemoteVolume(logger *slog.Logger, apply *storage.Apply, remoteVolume int32) bool {
-	if remoteVolume == 0 {
-		// The data plane reports 0 when no volume level was ever set on the
-		// apply; there is nothing to mirror.
-		return false
-	}
-	if remoteVolume < storage.MinVolume || remoteVolume > storage.MaxVolume {
-		logger.Warn("remote progress reported an out-of-range volume level; keeping the stored level",
-			append(apply.MutableLogAttrs(), "remote_volume", remoteVolume)...)
-		return false
-	}
-	opts := apply.GetOptions()
-	if opts.Volume == int(remoteVolume) {
-		return false
-	}
-	opts.Volume = int(remoteVolume)
-	apply.SetOptions(opts)
-	return true
-}
-
 // mirrorRemoteControlRejections records, on the control plane, the control
 // requests the data plane accepted and then failed. Accepting a control RPC
 // only means the request was queued: the engine call happens later on the data
@@ -1963,6 +1930,15 @@ func (c *GRPCClient) mirrorRemoteControlRejections(ctx context.Context, apply *s
 			continue
 		}
 		operation := storage.ControlOperation(entry.Operation)
+		if operation.Retired() {
+			// A data plane on a previous release reports its settled retired
+			// requests on every poll until the apply finishes; there is nothing
+			// left to mirror for an operation this release removed, and the
+			// entry recurs for the life of the drive, so it logs at debug.
+			logger.Debug("data plane reported a settled control request for a retired operation; nothing to mirror",
+				append(apply.MutableLogAttrs(), "operation", entry.Operation, "status", entry.Status)...)
+			continue
+		}
 		if !operation.Valid() {
 			logger.Warn("data plane reported a settled control request for an unrecognized operation; it will not reach the operator",
 				append(apply.MutableLogAttrs(), "operation", entry.Operation, "status", entry.Status)...)
@@ -2015,11 +1991,10 @@ func (c *GRPCClient) mirrorRemoteControlRejections(ctx context.Context, apply *s
 }
 
 // retireMirroredControlRejection clears a rejection this plane mirrored once the
-// data plane reports the same operation succeeded. It matters for an operation
-// this plane only proxies — volume, whose request lives entirely in the data
-// plane — because the mirrored row is the sole record here and no local request
-// lifecycle will ever reset it: without this the operator re-issues the command,
-// it works, and the PR keeps warning that it did not.
+// data plane reports the same operation succeeded. The mirrored row is this
+// plane's only record of that failure, so nothing else resets it: without this
+// the operator re-issues the command, it works, and the PR keeps warning that
+// it did not.
 func (c *GRPCClient) retireMirroredControlRejection(
 	ctx context.Context,
 	apply *storage.Apply,
@@ -2284,10 +2259,8 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 			return fmt.Errorf("dispatch %s apply_operation %d (apply %s): %w", kind, op.ID, apply.ApplyIdentifier, err)
 		}
 		if resp == nil || !resp.Accepted || resp.ApplyId == "" {
-			errMsg := fmt.Sprintf("remote %s apply was not accepted", kind)
-			if resp != nil && resp.ErrorMessage != "" {
-				errMsg = resp.ErrorMessage
-			}
+			holderApplyID := c.resolveConflictHolderApplyID(ctx, apply, resp.GetConflict())
+			errMsg := remoteApplyRejectionMessage(resp, holderApplyID, fmt.Sprintf("remote %s apply was not accepted", kind))
 			if markErr := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); markErr != nil {
 				return fmt.Errorf("mark %s apply_operation %d failed: %w", kind, op.ID, markErr)
 			}
@@ -3118,10 +3091,8 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		return fmt.Errorf("apply queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
 	}
 	if !resp.Accepted {
-		errMsg := resp.ErrorMessage
-		if errMsg == "" {
-			errMsg = "remote apply was not accepted"
-		}
+		holderApplyID := c.resolveConflictHolderApplyID(ctx, apply, resp.GetConflict())
+		errMsg := remoteApplyRejectionMessage(resp, holderApplyID, "remote apply was not accepted")
 		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, errMsg, false, scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after rejection: %w", apply.ApplyIdentifier, markErr)
 		}
@@ -4175,7 +4146,12 @@ func storedTaskResolvedForTerminalRemoteApply(remoteApplyState, storedTaskState 
 // progress into task state first, then derives apply state from stored tasks.
 // gRPC mode receives an apply state directly from the remote data plane, so the
 // control plane needs the same no-backward policy at the apply row boundary.
-func applyStateFromRemoteProgress(storedApplyState, remoteApplyState string, allowStoppedStoredApply bool) string {
+//
+// remoteTasks is the same report's per-table progress. It backs the one case
+// where the no-backward rank yields to the remote: a stored cutting_over that
+// the report contradicts with a table still in an earlier active phase (see
+// storedCutoverContradictedByEarlierActiveWork).
+func applyStateFromRemoteProgress(storedApplyState, remoteApplyState string, remoteTasks []*ternv1.TableProgress, allowStoppedStoredApply bool) string {
 	if remoteApplyState == "" {
 		return storedApplyState
 	}
@@ -4208,10 +4184,40 @@ func applyStateFromRemoteProgress(storedApplyState, remoteApplyState string, all
 	if state.IsState(storedApplyState, state.Apply.FailedRetryable) {
 		return storedApplyState
 	}
+	if storedCutoverContradictedByEarlierActiveWork(storedApplyState, remoteTasks) {
+		return remoteApplyState
+	}
 	if applyProgressRank(remoteApplyState) < applyProgressRank(storedApplyState) {
 		return storedApplyState
 	}
 	return remoteApplyState
+}
+
+// storedCutoverContradictedByEarlierActiveWork reports whether the stored
+// apply state says cutting_over while the remote report still shows a table
+// in an earlier active phase — queued, copying, or verifying. A cutover
+// surfaces at the apply level only when it is the least advanced work left,
+// so this pairing never describes a live drive: the stored value is a sample
+// of one table's cutover that the drive has since moved past, and the report
+// carrying the earlier-phase table is the corrected state — it wins over the
+// no-backward rank instead of being discarded as a regression. A parked
+// WAITING_FOR_CUTOVER table is not a contradiction: a cutover legitimately
+// proceeds while a sibling waits at the barrier for its own command.
+func storedCutoverContradictedByEarlierActiveWork(storedApplyState string, remoteTasks []*ternv1.TableProgress) bool {
+	if !state.IsState(storedApplyState, state.Apply.CuttingOver) {
+		return false
+	}
+	for _, remoteTask := range remoteTasks {
+		if remoteTask == nil {
+			continue
+		}
+		if state.IsState(state.NormalizeTaskStatus(remoteTask.Status),
+			state.Task.Pending, state.Task.Running,
+			state.Task.CatchingUp, state.Task.Checksumming, state.Task.PostChecksum) {
+			return true
+		}
+	}
+	return false
 }
 
 func applyProgressRank(applyState string) int {
@@ -4428,7 +4434,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				}
 				continue
 			}
-			newState = applyStateFromRemoteProgress(apply.State, remoteApplyState, allowStoppedAfterStart)
+			newState = applyStateFromRemoteProgress(apply.State, remoteApplyState, resp.Tables, allowStoppedAfterStart)
 			if !state.IsState(newState, remoteApplyState) {
 				logger.Debug("keeping stored gRPC apply state because remote progress reported earlier state",
 					append(apply.MutableLogAttrs(), "remote_state", remoteApplyState)...)
@@ -4436,10 +4442,6 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			apply.State = newState
 			apply.ErrorMessage = remoteProgressErrorMessage(apply.State, resp.ErrorMessage, apply.ErrorMessage)
 			apply.UpdatedAt = now
-			if mirrorRemoteVolume(logger, apply, resp.Volume) {
-				logger.Info("mirrored remote volume level onto control-plane apply options",
-					append(apply.MutableLogAttrs(), "volume", resp.Volume)...)
-			}
 			c.mirrorRemoteControlRejections(ctx, apply, remoteID, resp.SettledControlRequests)
 
 			if remoteProgressIsTerminal(resp.State, resp.Tables) {

@@ -43,7 +43,7 @@ func TestWriteProgressMultiDeploymentRendersAggregateAndSections(t *testing.T) {
 	assertLess(t, output, "✅ region-a — completed", "❌ region-b — failed")
 	assert.Contains(t, output, "External operation ID: remote-region-a")
 	assert.Contains(t, output, "External apply ID: remote-apply-region-a")
-	assertLess(t, output, "❌ region-b — failed", "⏸ region-c — halted — region-b failed")
+	assertLess(t, output, "❌ region-b — failed", "⏸️ region-c — halted — region-b failed")
 	assert.Contains(t, output, "users_a")
 	assert.Contains(t, output, "users_b")
 	assert.Contains(t, output, "users_c")

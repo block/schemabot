@@ -3,6 +3,7 @@ package ui
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"strings"
 	"time"
@@ -28,11 +29,14 @@ func FormatNumber(n int64) string {
 	return string(result)
 }
 
-// FormatBytes formats a byte count with binary units, one decimal place above
-// the byte range. Storage engines report sizes in bytes, and an operator
-// reading a table's footprint wants the magnitude, not the digits.
+// FormatBytesBinary formats a byte count with binary units (KiB/MiB), one
+// decimal place above the byte range. Storage engines report sizes in bytes,
+// and an operator reading a table's footprint wants the magnitude, not the
+// digits. Use this for a measured allocation figure; use FormatApproxBytes for
+// an estimate, which renders decimal units — the two disagree by 7% at a
+// gibibyte and diverge further up the scale.
 // Example: 1536 → "1.5 KiB", 1048576 → "1.0 MiB"
-func FormatBytes(b int64) string {
+func FormatBytesBinary(b int64) string {
 	const unit = 1024
 	if b < unit {
 		return fmt.Sprintf("%d B", b)
@@ -45,6 +49,64 @@ func FormatBytes(b int64) string {
 		}
 	}
 	return fmt.Sprintf("%.1f EiB", value/unit)
+}
+
+// FormatApproxRows renders an approximate row-count estimate compactly with a
+// leading tilde: 842 → "~842", 15_200 → "~15.2k", 2_340_000 → "~2.3M",
+// 5_100_000_000 → "~5.1B". Row estimates come from engine statistics and are
+// never exact, so the tilde is part of the format. Each unit's threshold sits
+// where the one-decimal rendering would round to 1000 of the smaller unit, so
+// a value rolls over to "~1M" rather than rendering as "~1000k".
+func FormatApproxRows(n int64) string {
+	if n < 0 {
+		n = 0
+	}
+	switch {
+	case n >= 999_950_000_000:
+		return "~" + trimTrailingZero(float64(n)/1e12) + "T"
+	case n >= 999_950_000:
+		return "~" + trimTrailingZero(float64(n)/1e9) + "B"
+	case n >= 999_950:
+		return "~" + trimTrailingZero(float64(n)/1e6) + "M"
+	case n >= 1_000:
+		return "~" + trimTrailingZero(float64(n)/1e3) + "k"
+	default:
+		return fmt.Sprintf("~%d", n)
+	}
+}
+
+// trimTrailingZero renders a scaled magnitude with one decimal, dropping a
+// trailing ".0" so round values stay short ("2.3", "12").
+func trimTrailingZero(v float64) string {
+	return strings.TrimSuffix(fmt.Sprintf("%.1f", v), ".0")
+}
+
+// FormatApproxBytes renders an approximate byte-size estimate compactly with a
+// leading tilde and decimal units: 812 → "~812 B", 48_200_000_000 → "~48.2 GB".
+// Byte estimates come from engine statistics and are never exact, so the tilde
+// is part of the format. Decimal units (not binary) because the value is an
+// order-of-magnitude signal, not an allocation figure — a measured allocation
+// belongs in FormatBytesBinary instead. Each unit's threshold
+// sits where the one-decimal rendering would round to 1000 of the smaller
+// unit, so a value rolls over to "~1 GB" rather than rendering as "~1000 MB".
+func FormatApproxBytes(b int64) string {
+	if b < 0 {
+		b = 0
+	}
+	switch {
+	case b >= 999_950_000_000_000:
+		return "~" + trimTrailingZero(float64(b)/1e15) + " PB"
+	case b >= 999_950_000_000:
+		return "~" + trimTrailingZero(float64(b)/1e12) + " TB"
+	case b >= 999_950_000:
+		return "~" + trimTrailingZero(float64(b)/1e9) + " GB"
+	case b >= 999_950:
+		return "~" + trimTrailingZero(float64(b)/1e6) + " MB"
+	case b >= 1_000:
+		return "~" + trimTrailingZero(float64(b)/1e3) + " KB"
+	default:
+		return fmt.Sprintf("~%d B", b)
+	}
 }
 
 // VSchemaStatusLabel maps an engine's vschema_status display value to a human
@@ -115,15 +177,56 @@ func ClampPercent(pct int) int {
 	return pct
 }
 
-// RowCopyDisplayPercent returns the percentage to show for row-copy progress.
-// A non-zero copied row count means copying has begun, so display at least 1%
-// even when integer progress rounds down to 0%.
+// RowCopyDisplayPercent returns the whole-number percentage for row-copy
+// progress bars and threshold comparisons. A non-zero copied row count means
+// copying has begun, so it reports at least 1% even when integer progress
+// rounds down to 0%. Textual percents render through FormatRowCopyPercent,
+// which shows the exact row-derived fraction instead of the bump.
 func RowCopyDisplayPercent(pct int, rowsCopied int64) int {
 	displayPercent := ClampPercent(pct)
 	if displayPercent == 0 && rowsCopied > 0 {
 		return 1
 	}
 	return displayPercent
+}
+
+// RowCopyFraction returns row-copy progress as a float percent in [0, 100],
+// preferring the exact fraction computed from the row counts over the
+// engine's whole-number percent, which has already lost the precision. With
+// no row counts to compute from, it falls back to the clamped whole-number
+// percent. Renderers comparing tables or shards by progress should compare
+// this value so the selection agrees with what FormatRowCopyPercent displays.
+func RowCopyFraction(pct int, rowsCopied, rowsTotal int64) float64 {
+	if rowsCopied > 0 && rowsTotal > 0 {
+		return math.Min(float64(rowsCopied)/float64(rowsTotal)*100, 100)
+	}
+	return float64(ClampPercent(pct))
+}
+
+// FormatRowCopyPercent renders row-copy progress as a percent string at its
+// true precision. When the row counts are known the percent is recomputed
+// from them and rendered with two decimals (e.g. "0.03%", "45.37%"), so
+// progress on a huge table reads as the fraction it is instead of a rounded
+// whole number. The rendering is bounded on both ends by what the counts say:
+// floored at 0.01% so an in-flight copy never reads as 0.00%, and capped at
+// 99.99% while copied rows still trail the total, so a copy never reads as
+// finished before it is — an operator deciding whether to keep waiting takes
+// "100.00%" as done. Without row counts it falls back to the engine's
+// whole-number percent, or "<1%" when copying has begun but there is no
+// total to compute a fraction from.
+func FormatRowCopyPercent(pct int, rowsCopied, rowsTotal int64) string {
+	if rowsCopied > 0 && rowsTotal > 0 {
+		frac := math.Max(RowCopyFraction(pct, rowsCopied, rowsTotal), 0.01)
+		if rowsCopied < rowsTotal {
+			frac = math.Min(frac, 99.99)
+		}
+		return fmt.Sprintf("%.2f%%", frac)
+	}
+	display := ClampPercent(pct)
+	if display == 0 && rowsCopied > 0 {
+		return "<1%"
+	}
+	return fmt.Sprintf("%d%%", display)
 }
 
 // NowFunc returns the current time. Override in previews for deterministic output.
@@ -270,20 +373,58 @@ func cleanSingleLintReason(reason string) string {
 	return reason
 }
 
-// Lint and safety messages quote SQL identifiers and types with single or
-// double quotes ('idx_category', "varchar"). The token pattern is restricted
-// to identifier and type characters so prose in quotes ("should not be
-// dropped") is left alone.
+// Lint and safety messages quote SQL identifiers and types with double
+// quotes ("idx_category", "varchar"). The token pattern is restricted to
+// identifier and type characters — including the comma and single quote that
+// parameterised and enumerated types carry ("decimal(10,2)",
+// "enum('active','archived')") — so prose in quotes ("should not be
+// dropped") is left alone. Two quoted shapes carry spaces and are still
+// unambiguously SQL: an operation or statement fragment led by a DDL keyword
+// ("DROP TABLE `t`", "TRUNCATE PARTITION"), and a type or key part followed
+// by attribute words ("int(11) unsigned", "created_at DESC").
 var (
-	singleQuotedIdentifier = regexp.MustCompile(`'([A-Za-z0-9_$.()]+)'`)
-	doubleQuotedIdentifier = regexp.MustCompile(`"([A-Za-z0-9_$.()]+)"`)
+	doubleQuotedIdentifier = regexp.MustCompile(`"([A-Za-z0-9_$.(),']+)"`)
+	quotedSQLFragment      = regexp.MustCompile(`"((?:ALTER|CREATE|DROP|RENAME|TRUNCATE|DISCARD|COALESCE)\b[^"]*)"`)
+	quotedTokenWithSuffix  = regexp.MustCompile(`"([A-Za-z0-9_$.(),']+(?: (?:unsigned|signed|zerofill|precision|varying|DESC))+)"`)
 )
 
-// CodeQuoteIdentifiers rewrites quoted SQL identifiers and types in a
-// human-authored message to markdown inline code, so index, column, and type
-// names read as code on markdown surfaces. Best-effort display formatting:
-// tokens that don't look like identifiers keep their original quotes.
+// codeSpan wraps content in a markdown inline code span. Content that itself
+// contains backticks (SQL fragments quote identifiers with them, doubling any
+// backtick embedded in a name) needs a delimiter run longer than the longest
+// backtick run in the content, plus padding spaces, or the span would close
+// mid-content.
+func codeSpan(content string) string {
+	if !strings.Contains(content, "`") {
+		return "`" + content + "`"
+	}
+	delimiter := strings.Repeat("`", longestBacktickRun(content)+1)
+	return delimiter + " " + content + " " + delimiter
+}
+
+// longestBacktickRun returns the length of the longest consecutive run of
+// backticks in s.
+func longestBacktickRun(s string) int {
+	longest, run := 0, 0
+	for _, r := range s {
+		if r == '`' {
+			run++
+			longest = max(longest, run)
+			continue
+		}
+		run = 0
+	}
+	return longest
+}
+
+// CodeQuoteIdentifiers rewrites quoted SQL identifiers, types, and operation
+// fragments in a human-authored message to markdown inline code, so index,
+// column, and type names read as code on markdown surfaces. Best-effort
+// display formatting: tokens that don't look like SQL keep their original
+// quotes.
 func CodeQuoteIdentifiers(message string) string {
-	message = singleQuotedIdentifier.ReplaceAllString(message, "`$1`")
-	return doubleQuotedIdentifier.ReplaceAllString(message, "`$1`")
+	message = quotedSQLFragment.ReplaceAllStringFunc(message, func(quoted string) string {
+		return codeSpan(quoted[1 : len(quoted)-1])
+	})
+	message = doubleQuotedIdentifier.ReplaceAllString(message, "`$1`")
+	return quotedTokenWithSuffix.ReplaceAllString(message, "`$1`")
 }

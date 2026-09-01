@@ -121,12 +121,8 @@ func formatShardLine(s ShardProgress) string {
 	case state.Task.Completed:
 		return fmt.Sprintf(indentShardLine+"%s✓ %s%s: %s rows\n", ANSIGreen, s.Shard, ANSIReset, ui.FormatNumber(s.RowsTotal))
 	case state.Task.Running:
-		pct := s.PercentComplete
-		if pct == 0 && s.RowsTotal > 0 {
-			pct = int(s.RowsCopied * 100 / s.RowsTotal)
-		}
-		pct = ui.RowCopyDisplayPercent(pct, s.RowsCopied)
-		detail := fmt.Sprintf("%d%% (%s/%s rows)", pct, ui.FormatNumber(ui.ClampRows(s.RowsCopied, s.RowsTotal)), ui.FormatNumber(s.RowsTotal))
+		detail := fmt.Sprintf("%s (%s/%s rows)", ui.FormatRowCopyPercent(s.PercentComplete, s.RowsCopied, s.RowsTotal),
+			ui.FormatNumber(ui.ClampRows(s.RowsCopied, s.RowsTotal)), ui.FormatNumber(s.RowsTotal))
 		if s.ETASeconds > 0 {
 			detail += fmt.Sprintf(" ETA %s", FormatDurationSeconds(s.ETASeconds))
 		}

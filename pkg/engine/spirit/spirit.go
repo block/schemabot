@@ -35,16 +35,16 @@ import (
 	"github.com/block/schemabot/pkg/mysqlconn"
 )
 
-// DefaultThreads is the default number of concurrent copier threads.
-// Matches volume 3 (default).
+// DefaultThreads is the default number of concurrent copier threads. Spirit's
+// write-thread autoscaler adjusts throughput from throttler feedback during the
+// copy, so this is a starting point rather than the throughput ceiling.
 const DefaultThreads = 2
 
 // DefaultLockWaitTimeout is how long Spirit waits for table locks. Spirit's
 // ForceKill (on by default) kills blocking transactions at 90% of this
 // timeout. It does not kill an explicit LOCK TABLES holder or a transaction
 // heavier than dbconn.TransactionWeightThreshold — those are left to finish
-// naturally within the timeout, since killing them is considered unsafe. This
-// is fixed regardless of volume — see Volume in control.go.
+// naturally within the timeout, since killing them is considered unsafe.
 const DefaultLockWaitTimeout = 10 * time.Second
 
 // Engine implements the engine.Engine interface for MySQL using Spirit.
@@ -53,11 +53,8 @@ type Engine struct {
 	spiritLogger *slog.Logger // Logger for Spirit (may filter debug logs)
 	linter       *lint.Linter
 
-	// Configuration; immutable after New. threads is the configured default
-	// Spirit copy thread count — each schema change starts from it and
-	// carries its own working copy on runningSchemaChange, which Volume
-	// retunes for that change only. lockWaitTimeout is not retuned by Volume:
-	// it is fixed for every schema change this engine runs.
+	// Configuration; immutable after New. Every schema change this engine runs
+	// starts from these values.
 	threads         int
 	lockWaitTimeout time.Duration
 	// debugLogs is toggled at runtime and read from the Spirit log filter on
@@ -70,8 +67,6 @@ type Engine struct {
 	checkpointMaxAge     time.Duration
 	checksumYieldTimeout time.Duration
 	autoscaling          bool
-
-	cpuHint int // Inferred CPU count from innodb_buffer_pool_instances (0 = unknown); guarded by mu
 
 	// onLog routes Spirit logs to the ApplyLogStore, with table context. It is
 	// swapped as drives hand the engine over and read from the log filter on
@@ -103,19 +98,18 @@ type runningSchemaChange struct {
 	logger       *slog.Logger
 	spiritLogger *slog.Logger
 
-	database                string            // MySQL database name parsed from DSN
-	tableNamespace          map[string]string // table name → namespace (from ApplyRequest.Changes)
-	tables                  []string
-	ddls                    []string // DDL statement for each table
-	originalDDLs            []string // Full statement list from Apply, in execution order; never overwritten so resume can run the whole plan
-	combinedStatement       string   // Original combined statement passed to Spirit (for checkpoint-safe restart)
-	runners                 []*spiritmigration.Runner
-	progressCallback        func() string // returns Summary from Spirit's Progress API
-	state                   engine.State
-	errorMessage            string // Error details when state is StateFailed
-	started                 time.Time
-	deferCutover            bool // Whether to defer cutover until manual trigger
-	volumeRestartInProgress bool // Set while stored stopped state should still be exposed as running progress.
+	database          string            // MySQL database name parsed from DSN
+	tableNamespace    map[string]string // table name → namespace (from ApplyRequest.Changes)
+	tables            []string
+	ddls              []string // DDL statement for each table
+	originalDDLs      []string // Full statement list from Apply, in execution order; never overwritten so resume can run the whole plan
+	combinedStatement string   // Original combined statement passed to Spirit (for checkpoint-safe restart)
+	runners           []*spiritmigration.Runner
+	progressCallback  func() string // returns Summary from Spirit's Progress API
+	state             engine.State
+	errorMessage      string // Error details when state is StateFailed
+	started           time.Time
+	deferCutover      bool // Whether to defer cutover until manual trigger
 
 	// lastLiveTables is the most recent per-table progress built from a live
 	// runner poll. The runners are closed by the time a drained outcome is
@@ -130,22 +124,13 @@ type runningSchemaChange struct {
 	directPolicy     directPolicy
 	directStatements []*directStatementProgress
 
-	// threads is the Spirit copy thread count for this schema change. It is
-	// initialized from the engine's configured default and retuned by Volume
-	// for this change only; it ends with the change, so the next schema
-	// change starts from the configured default again. lockWaitTimeout is not
-	// tracked per change: it is fixed engine-wide and Volume never adjusts it
-	// (see DefaultLockWaitTimeout).
-	threads int
-	volume  int32 // Explicit volume set via Volume for this change (0 = never set)
-
 	// For resume support
 	cancelFunc context.CancelFunc
 	host       string
 	username   string
 	password   string
 
-	// For waiting on schema change to finish (used by SetVolume)
+	// For waiting on schema change to finish
 	wg sync.WaitGroup
 }
 
@@ -498,21 +483,6 @@ func (e *Engine) HaltForShutdown(ctx context.Context) error {
 	}
 }
 
-// copySettings returns the Spirit copy settings for the tracked schema change,
-// falling back to the engine's configured default thread count when no change
-// is tracked. threads may be retuned by Volume for the tracked change only,
-// so a volume set on one schema change never affects a later one.
-// lockWaitTimeout is always the engine's configured value: Volume never
-// retunes it (see DefaultLockWaitTimeout).
-func (e *Engine) copySettings() (threads int, lockTimeout time.Duration) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if rm := e.runningSchemaChange; rm != nil {
-		return rm.threads, e.lockWaitTimeout
-	}
-	return e.threads, e.lockWaitTimeout
-}
-
 // Plan computes the schema changes needed by diffing current schema against desired.
 func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.PlanResult, error) {
 	if req.Credentials == nil || req.Credentials.DSN == "" {
@@ -769,17 +739,6 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// This ensures the old Spirit runner's DB connections are released.
 	e.Drain()
 
-	// Query CPU hint for volume scaling (best-effort, falls back to fixed counts)
-	e.mu.Lock()
-	cpuHint := e.cpuHint
-	e.mu.Unlock()
-	if cpuHint == 0 {
-		cpuHint = e.queryCPUHint(ctx, req.Credentials.DSN, logger)
-		e.mu.Lock()
-		e.cpuHint = cpuHint
-		e.mu.Unlock()
-	}
-
 	// Initialize running state and start background execution.
 	// Build a table→namespace lookup from the apply request. Each SchemaChange
 	// carries a namespace and a list of table changes. Spirit flattens all DDLs
@@ -806,7 +765,6 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		host:           host,
 		username:       username,
 		password:       password,
-		threads:        e.threads,
 	}
 	e.installRunningSchemaChange(rm)
 
@@ -1067,14 +1025,9 @@ func spiritPostCopyPhase(s status.State) bool {
 // state is authoritative for terminal outcomes: they are recorded before the
 // runner is closed, so a runner observed mid-teardown never changes the
 // recorded outcome. Spirit's status only refines a non-terminal state, e.g.
-// surfacing the sentinel wait for a deferred cutover. A stopped tracked state
-// with a volume restart in flight reports running because the schema change
-// is restarting with new settings.
+// surfacing the sentinel wait for a deferred cutover.
 func progressState(rm *runningSchemaChange, spiritState status.State) engine.State {
 	state := rm.state
-	if state == engine.StateStopped && rm.volumeRestartInProgress {
-		state = engine.StateRunning
-	}
 	if !state.IsTerminal() && spiritState == status.WaitingOnSentinelTable && rm.deferCutover {
 		state = engine.StateWaitingForCutover
 	}

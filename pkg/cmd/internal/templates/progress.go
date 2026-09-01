@@ -12,8 +12,8 @@ import (
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
-	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -35,12 +35,19 @@ func progressSymbol(changeType string) string {
 	}
 }
 
-// formatProgressDDL renders a DDL statement with syntax highlighting, indented under the table name.
-func formatProgressDDL(rawDDL string) string {
+// formatProgressDDLForDialect renders a DDL statement under the dialect's own
+// grammar with syntax highlighting, indented under the table name.
+func formatProgressDDLForDialect(dialect schema.Dialect, rawDDL string) string {
 	if rawDDL == "" {
 		return ""
 	}
-	return IndentSQL(ddl.FormatDDL(rawDDL), indentContent) + "\n"
+	if _, err := ddl.ParserForDialect(dialect); err != nil {
+		// A database type with no registered parser — empty (older server)
+		// or one this CLI doesn't know (newer server) — keeps the MySQL
+		// rendering rather than degrading to unformatted output.
+		dialect = schema.DialectMySQL
+	}
+	return IndentSQL(ddl.FormatDDLForDialect(dialect, rawDDL), indentContent) + "\n"
 }
 
 // indentContent is the indentation for DDL lines under a table name.
@@ -56,19 +63,6 @@ func FormatKeyspaceHeader(ns string) string {
 
 // nowFunc returns the current time. Overridden in previews for deterministic output.
 var nowFunc = time.Now
-
-// volumeBoxRow returns the detail-box row for an operator-set volume level.
-// The level only matters while the engine is actively working (copying,
-// draining, or verifying — volume stays adjustable through the post-copy
-// phases); on other states (stopped, waiting for cutover, terminal) it
-// carries no signal, and zero means the operator never set one, so the box
-// stays quiet.
-func volumeBoxRow(volume int, applyState string) (BoxRow, bool) {
-	if volume <= 0 || !state.IsRunningApplyState(applyState) {
-		return BoxRow{}, false
-	}
-	return BoxRow{"Volume", fmt.Sprintf("%d/%d", volume, storage.MaxVolume)}, true
-}
 
 // WriteProgress writes the schema change progress to stdout.
 func WriteProgress(data ProgressData) {
@@ -107,9 +101,6 @@ func WriteProgress(data ProgressData) {
 		rows = append(rows, BoxRow{"Environment", data.Environment})
 	}
 	rows = append(rows, BoxRow{"State", displayState})
-	if row, ok := volumeBoxRow(data.Volume, data.State); ok {
-		rows = append(rows, row)
-	}
 	rows = append(rows, callerAndSourceBoxRows(data.Caller, data.PullRequestURL)...)
 	if len(data.Options) > 0 {
 		var opts []string
@@ -410,7 +401,7 @@ func FormatProgressState(s string) string {
 	case state.Apply.Failed:
 		return ANSIRed + "✗ Failed" + ANSIReset
 	case state.Apply.Stopped:
-		return ANSIOrange + "⏸️  Stopped" + ANSIReset
+		return ANSIOrange + "⏹️  Stopped" + ANSIReset
 	case state.Apply.Cancelled:
 		return ANSIOrange + "🚫 Cancelled" + ANSIReset
 	case state.Apply.RevertWindow:
@@ -463,7 +454,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		// Pending = queued, not yet started
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⏳ Queued\n", t.TableName)
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDL(t.DDL))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -476,7 +467,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		}
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s\n", t.TableName, bar, label)
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDL(t.DDL))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -488,7 +479,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		// full bar that looks finished.
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⏩ Catching up on accumulated changes...\n", t.TableName, ui.ProgressBarRowCopy(100))
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDL(t.DDL))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		if t.RowsCopied > 0 {
 			fmt.Fprintf(&b, indentDetail+"Rows copied: %s\n", ui.FormatNumber(t.RowsCopied))
@@ -501,17 +492,19 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		// source. On a large table this can run for hours, so show how far the
 		// verify has progressed once Spirit has reported a total.
 		if t.ChecksumRowsTotal > 0 {
-			pct := ui.RowCopyDisplayPercent(int(math.Round(float64(t.ChecksumRowsChecked)*100/float64(t.ChecksumRowsTotal))), t.ChecksumRowsChecked)
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔍 Checksumming to verify data (%d%%)%s\n", t.TableName, ui.ProgressBarRowCopy(pct), pct, throttledSuffix(t))
+			checksumPct := int(math.Round(float64(t.ChecksumRowsChecked) * 100 / float64(t.ChecksumRowsTotal)))
+			pct := ui.RowCopyDisplayPercent(checksumPct, t.ChecksumRowsChecked)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔍 Checksumming to verify data (%s)%s\n", t.TableName, ui.ProgressBarRowCopy(pct),
+				ui.FormatRowCopyPercent(checksumPct, t.ChecksumRowsChecked, t.ChecksumRowsTotal), throttledSuffix(t))
 			if t.DDL != "" {
-				b.WriteString(formatProgressDDL(t.DDL))
+				b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 			}
 			fmt.Fprintf(&b, indentDetail+"Rows verified: %s / %s\n",
 				ui.FormatNumber(ui.ClampRows(t.ChecksumRowsChecked, t.ChecksumRowsTotal)), ui.FormatNumber(t.ChecksumRowsTotal))
 		} else {
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔍 Checksumming to verify data...%s\n", t.TableName, ui.ProgressBarRowCopy(100), throttledSuffix(t))
 			if t.DDL != "" {
-				b.WriteString(formatProgressDDL(t.DDL))
+				b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 			}
 		}
 		writeThrottleTooltip(&b, t)
@@ -524,7 +517,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		// catch-up so the display doesn't rewind to an earlier phase.
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⏩ Data verified, applying final changes...\n", t.TableName, ui.ProgressBarRowCopy(100))
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDL(t.DDL))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		if t.RowsCopied > 0 {
 			fmt.Fprintf(&b, indentDetail+"Rows copied: %s\n", ui.FormatNumber(t.RowsCopied))
@@ -536,7 +529,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		bar := ui.ProgressBarWaitingCutover()
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Waiting for cutover\n", t.TableName, bar)
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDL(t.DDL))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -545,9 +538,10 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		if recoveringIsCopyingRows(t) {
 			pct := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 			bar := ui.ProgressBarRowCopy(pct)
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Row copy in progress (%d%%)\n", t.TableName, bar, pct)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Row copy in progress (%s)\n", t.TableName, bar,
+				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal))
 			if t.DDL != "" {
-				b.WriteString(formatProgressDDL(t.DDL))
+				b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 			}
 			writeStructuredRowsAndETA(&b, t)
 			b.WriteString("\n")
@@ -557,7 +551,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		bar := ui.ProgressBarRowCopy(t.PercentComplete)
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Recovering state...\n", t.TableName, bar)
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDL(t.DDL))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -571,7 +565,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		}
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s\n", t.TableName, bar, label)
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDL(t.DDL))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -580,7 +574,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		bar := ui.ProgressBarFailed(ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied))
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s "+glyph.Failed+" Failed\n", t.TableName, bar)
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDL(t.DDL))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -594,7 +588,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: Retrying\n", t.TableName)
 		}
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDL(t.DDL))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -603,7 +597,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		bar := ui.ProgressBarWaitingCutover() // yellow — complete but revert available
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Complete (revert window open)\n", t.TableName, bar)
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDL(t.DDL))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -612,7 +606,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		bar := ui.ProgressBarWaitingCutover() // yellow — complete, revert window closing
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ✓ Complete (finalizing)\n", t.TableName, bar)
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDL(t.DDL))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -621,7 +615,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		bar := ui.ProgressBarWaitingCutover() // yellow — undoing the change
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ↩️ Reverting\n", t.TableName, bar)
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDL(t.DDL))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -633,7 +627,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		bar := ui.ProgressBar(100, ui.ColorOrange)
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ↩️ Reverted\n", t.TableName, bar)
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDL(t.DDL))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -642,12 +636,13 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		if t.PercentComplete > 0 || t.RowsCopied > 0 {
 			cancelledPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 			bar := ui.ProgressBar(cancelledPercent, ui.ColorOrange)
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⊘ Cancelled at %d%%\n", t.TableName, bar, cancelledPercent)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🚫 Cancelled at %s\n", t.TableName, bar,
+				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal))
 		} else {
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⊘ Cancelled (not started)\n", t.TableName)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: 🚫 Cancelled (not started)\n", t.TableName)
 		}
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDL(t.DDL))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -661,12 +656,13 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			// At 100% = was waiting for cutover when stopped
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⏹️ Stopped (was waiting for cutover)\n", t.TableName, bar)
 		case t.PercentComplete > 0 || t.RowsCopied > 0:
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⏹️ Stopped at %d%%\n", t.TableName, bar, stoppedPercent)
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⏹️ Stopped at %s\n", t.TableName, bar,
+				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal))
 		default:
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⏹️ Stopped (not started)\n", t.TableName)
 		}
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDL(t.DDL))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		if t.RowsTotal > 0 && (t.PercentComplete > 0 || t.RowsCopied > 0) {
 			fmt.Fprintf(&b, indentDetail+"Rows: %s / %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal))
@@ -688,9 +684,10 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			// Parsed successfully - show emoji progress bar with structured data
 			displayPercent := ui.RowCopyDisplayPercent(info.Percent, info.RowsCopied)
 			bar := ui.ProgressBarRowCopy(displayPercent)
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %d%%%s\n", t.TableName, bar, displayPercent, throttledSuffix(t))
+			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s%s\n", t.TableName, bar,
+				ui.FormatRowCopyPercent(info.Percent, info.RowsCopied, info.RowsTotal), throttledSuffix(t))
 			if t.DDL != "" {
-				b.WriteString(formatProgressDDL(t.DDL))
+				b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 			}
 			// Rows and ETA on the same line, rendered from the structured ETA
 			// so the CLI and PR comment show the same value via FormatETA.
@@ -702,7 +699,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			// Can't parse - show raw detail
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s:\n", t.TableName)
 			if t.DDL != "" {
-				b.WriteString(formatProgressDDL(t.DDL))
+				b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 			}
 			fmt.Fprintf(&b, "    %s\n", t.ProgressDetail)
 		}
@@ -713,7 +710,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		// bar that reads as stuck.
 		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⏳ Starting copy...%s\n", t.TableName, throttledSuffix(t))
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDL(t.DDL))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		writeStructuredRowsAndETA(&b, t)
 	case t.RowsTotal > 0:
@@ -725,10 +722,11 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		// Row copy in progress — show progress bar with structured fields
 		displayPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 		bar := ui.ProgressBarRowCopy(displayPercent)
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %d%%%s\n", t.TableName, bar, displayPercent, throttledSuffix(t))
+		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s%s\n", t.TableName, bar,
+			ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), throttledSuffix(t))
 
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDL(t.DDL))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 
 		writeStructuredRowsAndETA(&b, t)
@@ -751,7 +749,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Running...%s\n", t.TableName, bar, throttledSuffix(t))
 		}
 		if t.DDL != "" {
-			b.WriteString(formatProgressDDL(t.DDL))
+			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 	}
 
@@ -809,7 +807,7 @@ func formatEstimateExceededTable(t TableProgress, rowsCopied int64, activityBar,
 	var b strings.Builder
 	fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s%s\n", t.TableName, activityBar, activityLabel, throttledSuffix(t))
 	if t.DDL != "" {
-		b.WriteString(formatProgressDDL(t.DDL))
+		b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 	}
 	fmt.Fprintf(&b, indentDetail+"Rows copied: %s so far\n", ui.FormatNumber(rowsCopied))
 	fmt.Fprintf(&b, indentDetail+"%s"+glyph.Info+" %s%s\n", ANSIDim, ui.EstimateExceededTooltip, ANSIReset)
@@ -830,7 +828,7 @@ type StopData struct {
 
 // WriteStopSuccess writes the stop command success output.
 func WriteStopSuccess(data StopData) {
-	fmt.Printf("%s%s⏸️  Schema change stopped%s\n", ANSIBold, ANSIYellow, ANSIReset)
+	fmt.Printf("%s%s⏹️  Schema change stopped%s\n", ANSIBold, ANSIYellow, ANSIReset)
 	fmt.Println()
 	fmt.Printf("Database:    %s\n", data.Database)
 	fmt.Printf("Environment: %s\n", data.Environment)
@@ -944,7 +942,6 @@ type ActiveApplyData struct {
 	StartedAt           string
 	CompletedAt         string
 	UpdatedAt           string
-	Volume              int
 }
 
 // StatusListData contains data for rendering the status list.
@@ -1045,126 +1042,7 @@ func WriteStatusList(data StatusListData) {
 	writeStatusStateSummary(data.StateCounts)
 	fmt.Println()
 
-	// Calculate column widths from data
-	showDeployment := statusListShowsDeployment(data)
-	maxID := 8 // "APPLY ID"
-	maxExternal := len(statusExternalIDHeader(data))
-	maxDB := 8          // "DATABASE"
-	maxEnv := 3         // "ENV"
-	maxDeployment := 10 // "DEPLOYMENT"
-	maxState := 5       // "STATE"
-	maxStarted := 7     // "STARTED"
-	for _, a := range data.Applies {
-		maxID = maxLen(maxID, len(a.ApplyID))
-		if data.ShowExternalID {
-			maxExternal = maxLen(maxExternal, len(statusExternalID(data, a)))
-		}
-		maxDB = maxLen(maxDB, len(a.Database))
-		maxEnv = maxLen(maxEnv, len(a.Environment))
-		if showDeployment {
-			maxDeployment = maxLen(maxDeployment, len(a.Deployment))
-		}
-		maxState = maxLen(maxState, len(state.Label(a.State)))
-		maxStarted = maxLen(maxStarted, len(formatStartedAt(a.StartedAt)))
-	}
-
-	// Table header
-	switch {
-	case data.ShowExternalID && showDeployment:
-		fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
-			ANSIDim,
-			maxID, "APPLY ID",
-			maxExternal, statusExternalIDHeader(data),
-			maxDB, "DATABASE",
-			maxEnv, "ENV",
-			maxDeployment, "DEPLOYMENT",
-			maxState, "STATE",
-			maxStarted, "STARTED",
-			"SOURCE",
-			ANSIReset)
-	case data.ShowExternalID:
-		fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
-			ANSIDim,
-			maxID, "APPLY ID",
-			maxExternal, statusExternalIDHeader(data),
-			maxDB, "DATABASE",
-			maxEnv, "ENV",
-			maxState, "STATE",
-			maxStarted, "STARTED",
-			"SOURCE",
-			ANSIReset)
-	case showDeployment:
-		fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
-			ANSIDim,
-			maxID, "APPLY ID",
-			maxDB, "DATABASE",
-			maxEnv, "ENV",
-			maxDeployment, "DEPLOYMENT",
-			maxState, "STATE",
-			maxStarted, "STARTED",
-			"SOURCE",
-			ANSIReset)
-	default:
-		fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
-			ANSIDim,
-			maxID, "APPLY ID",
-			maxDB, "DATABASE",
-			maxEnv, "ENV",
-			maxState, "STATE",
-			maxStarted, "STARTED",
-			"SOURCE",
-			ANSIReset)
-	}
-
-	// Table rows
-	for _, a := range data.Applies {
-		label := state.Label(a.State)
-		colorFn := stateColorFunc(a.State)
-		padded := fmt.Sprintf("%-*s", maxState, label)
-		coloredState := padded
-		if colorFn != nil {
-			coloredState = colorFn(padded)
-		}
-
-		switch {
-		case data.ShowExternalID && showDeployment:
-			fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
-				maxID, a.ApplyID,
-				maxExternal, statusExternalID(data, a),
-				maxDB, a.Database,
-				maxEnv, a.Environment,
-				maxDeployment, a.Deployment,
-				coloredState,
-				maxStarted, formatStartedAt(a.StartedAt),
-				applySource(a.Caller))
-		case data.ShowExternalID:
-			fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
-				maxID, a.ApplyID,
-				maxExternal, statusExternalID(data, a),
-				maxDB, a.Database,
-				maxEnv, a.Environment,
-				coloredState,
-				maxStarted, formatStartedAt(a.StartedAt),
-				applySource(a.Caller))
-		case showDeployment:
-			fmt.Printf("  %-*s  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
-				maxID, a.ApplyID,
-				maxDB, a.Database,
-				maxEnv, a.Environment,
-				maxDeployment, a.Deployment,
-				coloredState,
-				maxStarted, formatStartedAt(a.StartedAt),
-				applySource(a.Caller))
-		default:
-			fmt.Printf("  %-*s  %-*s  %-*s  %s  %-*s  %s\n",
-				maxID, a.ApplyID,
-				maxDB, a.Database,
-				maxEnv, a.Environment,
-				coloredState,
-				maxStarted, formatStartedAt(a.StartedAt),
-				applySource(a.Caller))
-		}
-	}
+	writeStatusTable(statusListColumns(data), data.Applies, func(a ActiveApplyData) string { return a.State })
 
 	writeStatusListFooter(data)
 }
@@ -1217,36 +1095,156 @@ func writeFailedStatusList(data StatusListData) {
 	}
 }
 
-func statusExternalID(data StatusListData, a ActiveApplyData) string {
-	if a.ExternalOperationID != "" {
-		return a.ExternalOperationID
-	}
-	if data.Deployment != "" {
-		return "-"
-	}
-	if a.ExternalID == "" {
-		return "-"
-	}
-	return a.ExternalID
+// statusColumn is one column of a status table. An optional column is dropped
+// when no row on the page has a value for it, so an operator only ever sees the
+// columns their own fleet populates: a deployment that drives its applies
+// locally has no remote handles to show, and an unfiltered list of a
+// single-deployment fleet has no deployment to distinguish.
+type statusColumn[Row any] struct {
+	header   string
+	value    func(r Row) string
+	optional bool
+	colored  bool
+	last     bool
 }
 
-func statusExternalIDHeader(data StatusListData) string {
-	if data.Deployment != "" {
-		return "EXTERNAL OP ID"
+// writeStatusTable renders the aligned table every status surface shares: a
+// dimmed header row, then one indented line per row with each cell padded to
+// the column's widest value. rowState names a row's apply state so a colored
+// column can wrap its padded cell in that state's color; the separator
+// between cells stays outside the escape.
+func writeStatusTable[Row any](columns []statusColumn[Row], rows []Row, rowState func(Row) string) {
+	widths := statusColumnWidths(columns, rows)
+
+	fmt.Print("  " + ANSIDim)
+	for i, column := range columns {
+		fmt.Print(statusCell(column.header, widths[i], column.last))
+		if !column.last {
+			fmt.Print("  ")
+		}
 	}
-	return "EXTERNAL ID"
+	fmt.Println(ANSIReset)
+
+	for _, row := range rows {
+		fmt.Print("  ")
+		for i, column := range columns {
+			cell := statusCell(statusColumnValue(column, row), widths[i], column.last)
+			if column.colored {
+				if colorFn := stateColorFunc(rowState(row)); colorFn != nil {
+					cell = colorFn(cell)
+				}
+			}
+			fmt.Print(cell)
+			if !column.last {
+				fmt.Print("  ")
+			}
+		}
+		fmt.Println()
+	}
 }
 
-func statusListShowsDeployment(data StatusListData) bool {
-	if data.Deployment != "" {
-		return true
+// statusListColumns returns the columns the list renders, in order. The
+// deployment-filtered list names both remote handles the way the detail views
+// already do — the deployment's shared data-plane apply id and the
+// per-operation remote row id — and omits DEPLOYMENT, which every row repeats
+// back to the operator who named it.
+func statusListColumns(data StatusListData) []statusColumn[ActiveApplyData] {
+	columns := []statusColumn[ActiveApplyData]{
+		{header: "APPLY ID", value: func(a ActiveApplyData) string { return a.ApplyID }},
 	}
-	for _, apply := range data.Applies {
-		if apply.Deployment != "" {
+	if data.ShowExternalID {
+		if data.Deployment != "" {
+			columns = append(columns,
+				statusColumn[ActiveApplyData]{header: "EXTERNAL APPLY ID", optional: true, value: func(a ActiveApplyData) string { return a.ExternalID }},
+				statusColumn[ActiveApplyData]{header: "EXTERNAL OP ID", optional: true, value: func(a ActiveApplyData) string { return a.ExternalOperationID }},
+			)
+		} else {
+			// Unconditional: the operator asked for this column by flag, so an
+			// all-dash column positively answers "nothing recorded" — dropping
+			// it would be indistinguishable from the flag doing nothing.
+			columns = append(columns,
+				statusColumn[ActiveApplyData]{header: "EXTERNAL ID", value: unfilteredStatusExternalID},
+			)
+		}
+	}
+	columns = append(columns,
+		statusColumn[ActiveApplyData]{header: "DATABASE", value: func(a ActiveApplyData) string { return a.Database }},
+		statusColumn[ActiveApplyData]{header: "ENV", value: func(a ActiveApplyData) string { return a.Environment }},
+	)
+	if data.Deployment == "" {
+		columns = append(columns,
+			statusColumn[ActiveApplyData]{header: "DEPLOYMENT", optional: true, value: func(a ActiveApplyData) string { return a.Deployment }},
+		)
+	}
+	columns = append(columns,
+		statusColumn[ActiveApplyData]{header: "STATE", colored: true, value: func(a ActiveApplyData) string { return state.Label(a.State) }},
+		statusColumn[ActiveApplyData]{header: "STARTED", value: func(a ActiveApplyData) string { return formatStartedAt(a.StartedAt) }},
+		statusColumn[ActiveApplyData]{header: "SOURCE", last: true, value: func(a ActiveApplyData) string { return applySource(a.Caller) }},
+	)
+	return retainPopulatedStatusColumns(columns, data.Applies)
+}
+
+// retainPopulatedStatusColumns drops every optional column no row fills in.
+func retainPopulatedStatusColumns[Row any](columns []statusColumn[Row], rows []Row) []statusColumn[Row] {
+	retained := make([]statusColumn[Row], 0, len(columns))
+	for _, column := range columns {
+		if column.optional && !anyStatusRowFillsColumn(column, rows) {
+			continue
+		}
+		retained = append(retained, column)
+	}
+	return retained
+}
+
+func anyStatusRowFillsColumn[Row any](column statusColumn[Row], rows []Row) bool {
+	for _, row := range rows {
+		if column.value(row) != "" {
 			return true
 		}
 	}
 	return false
+}
+
+// statusColumnValue renders a row's cell, standing a dash in for a value this
+// row is missing from a column other rows on the page do fill.
+func statusColumnValue[Row any](column statusColumn[Row], row Row) string {
+	if value := column.value(row); value != "" {
+		return value
+	}
+	return "-"
+}
+
+// statusColumnWidths sizes each column by terminal cells rather than bytes,
+// so a multi-byte value — a non-ASCII database name, a state glyph — cannot
+// misalign every column to its right.
+func statusColumnWidths[Row any](columns []statusColumn[Row], rows []Row) []int {
+	widths := make([]int, len(columns))
+	for i, column := range columns {
+		widths[i] = ui.VisibleWidth(column.header)
+		for _, row := range rows {
+			widths[i] = maxLen(widths[i], ui.VisibleWidth(statusColumnValue(column, row)))
+		}
+	}
+	return widths
+}
+
+// statusCell pads a cell to its column width, leaving the last column ragged so
+// the row carries no trailing whitespace.
+func statusCell(value string, width int, last bool) string {
+	if last {
+		return value
+	}
+	return ui.PadVisible(value, width)
+}
+
+// unfilteredStatusExternalID collapses both remote handles into the single
+// EXTERNAL ID column an unfiltered list shows, preferring the per-operation row
+// id when the apply has one.
+func unfilteredStatusExternalID(a ActiveApplyData) string {
+	if a.ExternalOperationID != "" {
+		return a.ExternalOperationID
+	}
+	return a.ExternalID
 }
 
 func statusFailureActor(a ActiveApplyData, showExternalID bool) string {
@@ -1254,7 +1252,11 @@ func statusFailureActor(a ActiveApplyData, showExternalID bool) string {
 	if !showExternalID {
 		return actor
 	}
-	return actor + "; external_id=" + statusExternalID(StatusListData{}, a)
+	externalID := unfilteredStatusExternalID(a)
+	if externalID == "" {
+		externalID = "-"
+	}
+	return actor + "; external_id=" + externalID
 }
 
 func formatFailureTimestamp(a ActiveApplyData) string {
@@ -1316,6 +1318,18 @@ type DatabaseHistoryData struct {
 	Applies  []ApplyHistoryData
 }
 
+// databaseHistoryColumns returns the columns the history table renders, in order.
+func databaseHistoryColumns() []statusColumn[ApplyHistoryData] {
+	return []statusColumn[ApplyHistoryData]{
+		{header: "APPLY ID", value: func(a ApplyHistoryData) string { return a.ApplyID }},
+		{header: "ENV", value: func(a ApplyHistoryData) string { return a.Environment }},
+		{header: "STATE", colored: true, value: func(a ApplyHistoryData) string { return state.Label(a.State) }},
+		{header: "STARTED", value: func(a ApplyHistoryData) string { return formatStartedAt(a.StartedAt) }},
+		{header: "DURATION", value: func(a ApplyHistoryData) string { return formatApplyDuration(a.StartedAt, a.CompletedAt) }},
+		{header: "SOURCE", last: true, value: func(a ApplyHistoryData) string { return applySource(a.Caller) }},
+	}
+}
+
 // WriteDatabaseHistory writes the database history output.
 func WriteDatabaseHistory(data DatabaseHistoryData) {
 	if len(data.Applies) == 0 {
@@ -1323,53 +1337,10 @@ func WriteDatabaseHistory(data DatabaseHistoryData) {
 		return
 	}
 
-	// Header
 	fmt.Printf("%sSchema change history for %s%s\n", ANSIBold, data.Database, ANSIReset)
 	fmt.Println()
 
-	// Calculate column widths from data
-	maxID := 8      // "APPLY ID"
-	maxEnv := 3     // "ENV"
-	maxState := 5   // "STATE"
-	maxStarted := 7 // "STARTED"
-	maxDur := 8     // "DURATION"
-	for _, a := range data.Applies {
-		maxID = maxLen(maxID, len(a.ApplyID))
-		maxEnv = maxLen(maxEnv, len(a.Environment))
-		maxState = maxLen(maxState, len(state.Label(a.State)))
-		maxStarted = maxLen(maxStarted, len(formatStartedAt(a.StartedAt)))
-		maxDur = maxLen(maxDur, len(formatApplyDuration(a.StartedAt, a.CompletedAt)))
-	}
-
-	// Table header
-	fmt.Printf("  %s%-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n",
-		ANSIDim,
-		maxID, "APPLY ID",
-		maxEnv, "ENV",
-		maxState, "STATE",
-		maxStarted, "STARTED",
-		maxDur, "DURATION",
-		"SOURCE",
-		ANSIReset)
-
-	// Table rows
-	for _, a := range data.Applies {
-		label := state.Label(a.State)
-		colorFn := stateColorFunc(a.State)
-		padded := fmt.Sprintf("%-*s", maxState, label)
-		coloredState := padded
-		if colorFn != nil {
-			coloredState = colorFn(padded)
-		}
-
-		fmt.Printf("  %-*s  %-*s  %s  %-*s  %-*s  %s\n",
-			maxID, a.ApplyID,
-			maxEnv, a.Environment,
-			coloredState,
-			maxStarted, formatStartedAt(a.StartedAt),
-			maxDur, formatApplyDuration(a.StartedAt, a.CompletedAt),
-			applySource(a.Caller))
-	}
+	writeStatusTable(databaseHistoryColumns(), data.Applies, func(a ApplyHistoryData) string { return a.State })
 
 	fmt.Println()
 	fmt.Printf("%sUse '%s status <apply_id>' to view details%s\n", ANSIDim, cliname.Name(), ANSIReset)

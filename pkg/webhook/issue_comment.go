@@ -123,6 +123,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		})
 		return
 	}
+	payload.Repository.FullName = storage.CanonicalKey(payload.Repository.FullName)
 
 	var payloadInstallationID int64
 	if payload.Installation != nil {
@@ -524,11 +525,6 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.handleCutoverCommand(repo, pr, installationID, requestedBy, result)
 		})
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "cutover started"})
-	case action.Volume:
-		h.goSafe(repo, pr, installationID, deliveryID, func() {
-			h.handleVolumeCommand(repo, pr, installationID, requestedBy, result)
-		})
-		h.writeJSON(w, http.StatusOK, map[string]string{"message": "volume started"})
 	case action.SkipRevert:
 		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			h.handleSkipRevertCommand(repo, pr, installationID, requestedBy, result)
@@ -574,7 +570,7 @@ func (h *Handler) fansOutUnscopedCommand(repo string) bool {
 //   - unlock releases only the participant's own database locks (locks are
 //     keyed by database, not by apply);
 //   - rollback and the lifecycle controls (stop, cancel, start, release,
-//     cutover, volume, skip-revert, revert) route by apply identifier, which
+//     cutover, skip-revert, revert) route by apply identifier, which
 //     lives in exactly one deployment's storage — non-owners silently skip the
 //     lookup miss (see silentOnUnscopedFanOut) and only the owner acts;
 //   - rollback-confirm routes by the pinned pending rollback plan for the
@@ -587,7 +583,7 @@ func actionFansOutUnscoped(a string) bool {
 	case action.Plan, action.Apply, action.ApplyConfirm, action.Unlock,
 		action.Rollback, action.RollbackConfirm,
 		action.Stop, action.Cancel, action.Start, action.Release,
-		action.Cutover, action.Volume, action.SkipRevert, action.Revert:
+		action.Cutover, action.SkipRevert, action.Revert:
 		return true
 	default:
 		return false
@@ -641,10 +637,10 @@ func (h *Handler) postComment(repo string, pr int, installationID int64, body st
 }
 
 // postAndTrackComment creates a PR comment and stores its ID in apply_comments.
-// Progress comments record the apply's volume level at post time — derived
+// Progress comments record the apply's control phase at post time — derived
 // here, matching the observer's variant, so no caller can post a progress
-// comment that silently disables volume-rotation detection — and other comment
-// states carry no level.
+// comment that silently disables phase-rotation detection — and other comment
+// states carry no phase.
 func (h *Handler) postAndTrackComment(
 	ctx context.Context, repo string, pr int, installationID int64,
 	apply *storage.Apply, commentState string, body string,
@@ -668,8 +664,6 @@ func (h *Handler) postAndTrackComment(
 		GitHubCommentID: commentID,
 	}
 	if commentState == state.Comment.Progress {
-		level := apply.GetOptions().Volume
-		comment.PostedVolume = &level
 		phase := controlPhase(apply.State)
 		comment.PostedPhase = &phase
 	}
@@ -949,6 +943,7 @@ func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage
 			"repo", event.Repository, "pr", event.PullRequest)
 		return false, nil
 	}
+	payload.Repository.FullName = storage.CanonicalKey(payload.Repository.FullName)
 	if payload.Comment.User != nil && payload.Comment.User.Type == "Bot" {
 		h.logger.Info("durable issue_comment delivery ignored because the comment author is a bot",
 			"delivery_id", event.DeliveryID, "repo", event.Repository, "pr", event.PullRequest)
@@ -1065,14 +1060,15 @@ func durableIssueCommentCommand(event *storage.WebhookEvent) (CommandResult, str
 	if err != nil {
 		return CommandResult{}, "", 0, 0, "", err
 	}
-	if payload.Repository.FullName == "" || payload.Issue.Number == 0 {
+	repo := storage.CanonicalKey(payload.Repository.FullName)
+	if repo == "" || payload.Issue.Number == 0 {
 		return CommandResult{}, "", 0, 0, "", fmt.Errorf("durable issue_comment terminal notification %s is missing repo or PR", event.DeliveryID)
 	}
 	requestedBy := ""
 	if payload.Comment.User != nil {
 		requestedBy = payload.Comment.User.Login
 	}
-	return result, payload.Repository.FullName, payload.Issue.Number, installationID, requestedBy, nil
+	return result, repo, payload.Issue.Number, installationID, requestedBy, nil
 }
 
 // durableIssueCommentCommandReady reports whether the driver implements the

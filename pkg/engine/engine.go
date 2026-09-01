@@ -25,7 +25,7 @@ import (
 //  1. Plan() - Compute what changes are needed
 //  2. Apply() - Start executing the changes
 //  3. Progress() - Check current status (poll this)
-//  4. Control operations: Stop/Start/Cutover/Revert/SkipRevert/Volume
+//  4. Control operations: Stop/Start/Cutover/Revert/SkipRevert
 //
 // Engines must support resume: if the server restarts mid-schema-change, the engine
 // must be able to resume from where it left off using stored state.
@@ -62,9 +62,6 @@ type Engine interface {
 
 	// SkipRevert ends the revert window early, making changes permanent.
 	SkipRevert(ctx context.Context, req *ControlRequest) (*ControlResult, error)
-
-	// Volume adjusts the schema change speed (1=slowest, 11=fastest).
-	Volume(ctx context.Context, req *VolumeRequest) (*VolumeResult, error)
 }
 
 // Drainer is an optional interface that engines can implement to allow callers
@@ -701,7 +698,6 @@ const (
 	ControlCutover    ControlOperation = "cutover"
 	ControlRevert     ControlOperation = "revert"
 	ControlSkipRevert ControlOperation = "skip_revert"
-	ControlVolume     ControlOperation = "volume"
 )
 
 // ControlResumeValidator is an optional interface for engines whose resume
@@ -716,36 +712,6 @@ type ControlResult struct {
 	Accepted    bool
 	Message     string
 	ResumeState *ResumeState
-}
-
-// VolumeRequest adjusts the schema change speed. Volume is a 1-11 scale where
-// 1 = maximum throttle (least production impact) and 11 = no throttle (fastest).
-//
-// The same volume number has different effects per engine:
-//   - Spirit: controls thread count (1-16+) and chunk timing. Higher volume =
-//     more parallel copy threads = faster but more load. State is in-process
-//     and lost on driver crash (restarts with defaults).
-//   - PlanetScale/Vitess: controls a server-side rejection throttle ratio
-//     (0.0-0.95). Online DDL runs on a single thread per shard; the throttle
-//     ratio determines what fraction of write requests are rejected to limit
-//     replication lag impact. State is server-side and survives driver crashes.
-//
-// The scale provides a consistent user interface across engines, but the
-// underlying mechanisms are fundamentally different (concurrency control
-// vs rejection-based throttling).
-type VolumeRequest struct {
-	Database    string       // Target database (engines track by database)
-	Volume      int32        // 1 (max throttle) to 11 (no throttle)
-	ResumeState *ResumeState // State for querying progress
-	Credentials *Credentials // Resolved credentials (from discovery)
-}
-
-// VolumeResult is the response from volume adjustment.
-type VolumeResult struct {
-	Accepted       bool
-	PreviousVolume int32
-	NewVolume      int32
-	Message        string
 }
 
 // EncodeResumeState serializes a ResumeState to JSON for storage in Task.EngineMigrationID.

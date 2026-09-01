@@ -650,6 +650,7 @@ func shardedUnsafeChanges(shards []*apitypes.ShardPlanResponse) []templates.Unsa
 	if len(shards) == 0 {
 		return nil
 	}
+	total := plannedShardCount(shards)
 	type key struct{ table, reason string }
 	var order []key
 	byKey := make(map[key]*templates.UnsafeChangeData)
@@ -665,7 +666,7 @@ func shardedUnsafeChanges(shards []*apitypes.ShardPlanResponse) []templates.Unsa
 			k := key{table: unsafeChange.Table, reason: unsafeChange.Reason}
 			uc := byKey[k]
 			if uc == nil {
-				uc = &templates.UnsafeChangeData{Table: unsafeChange.Table, Reason: unsafeChange.Reason}
+				uc = &templates.UnsafeChangeData{Table: unsafeChange.Table, Reason: unsafeChange.Reason, ChangeType: unsafeChange.ChangeType, TotalShards: total}
 				byKey[k] = uc
 				order = append(order, k)
 			}
@@ -677,6 +678,19 @@ func shardedUnsafeChanges(shards []*apitypes.ShardPlanResponse) []templates.Unsa
 		out = append(out, *byKey[k])
 	}
 	return out
+}
+
+// plannedShardCount counts the shards the plan actually covers, so a shard
+// list rendered against it states coverage over what was planned rather than
+// over slots that carried no plan.
+func plannedShardCount(shards []*apitypes.ShardPlanResponse) int {
+	total := 0
+	for _, sp := range shards {
+		if sp != nil {
+			total++
+		}
+	}
+	return total
 }
 
 // msgDeferCutoverAllDirect rejects --defer-cutover on a plan whose every
@@ -708,6 +722,7 @@ func shardedDirectChanges(shards []*apitypes.ShardPlanResponse) []templates.Dire
 	if len(shards) == 0 {
 		return nil
 	}
+	total := plannedShardCount(shards)
 	type key struct{ table, reason string }
 	var order []key
 	byKey := make(map[key]*templates.DirectChangeData)
@@ -722,7 +737,7 @@ func shardedDirectChanges(shards []*apitypes.ShardPlanResponse) []templates.Dire
 			k := key{table: t.TableName, reason: t.ModeReason}
 			dc := byKey[k]
 			if dc == nil {
-				dc = &templates.DirectChangeData{Table: t.TableName, Reason: t.ModeReason}
+				dc = &templates.DirectChangeData{Table: t.TableName, Reason: t.ModeReason, TotalShards: total}
 				byKey[k] = dc
 				order = append(order, k)
 			}
@@ -744,6 +759,7 @@ func shardedBlockedChanges(shards []*apitypes.ShardPlanResponse) []templates.Blo
 	if len(shards) == 0 {
 		return nil
 	}
+	total := plannedShardCount(shards)
 	type key struct{ table, reason string }
 	var order []key
 	byKey := make(map[key]*templates.BlockedChangeData)
@@ -758,7 +774,7 @@ func shardedBlockedChanges(shards []*apitypes.ShardPlanResponse) []templates.Blo
 			k := key{table: t.TableName, reason: t.ModeReason}
 			bc := byKey[k]
 			if bc == nil {
-				bc = &templates.BlockedChangeData{Table: t.TableName, Reason: t.ModeReason}
+				bc = &templates.BlockedChangeData{Table: t.TableName, Reason: t.ModeReason, TotalShards: total}
 				byKey[k] = bc
 				order = append(order, k)
 			}
@@ -907,8 +923,9 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 			for _, t := range sc.TableChanges {
 				if uc, ok := t.UnsafeChange(); ok {
 					unsafe = append(unsafe, templates.UnsafeChangeData{
-						Table:  uc.Table,
-						Reason: uc.Reason,
+						Table:      uc.Table,
+						Reason:     uc.Reason,
+						ChangeType: uc.ChangeType,
 					})
 				}
 			}
@@ -920,8 +937,9 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		}
 		for _, uc := range sc.VSchemaUnsafeChanges() {
 			unsafe = append(unsafe, templates.UnsafeChangeData{
-				Table:  uc.Table,
-				Reason: uc.Reason,
+				Table:      uc.Table,
+				Reason:     uc.Reason,
+				ChangeType: uc.ChangeType,
 			})
 		}
 	}

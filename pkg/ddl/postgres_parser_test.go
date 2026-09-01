@@ -152,6 +152,31 @@ func TestPostgresParserCanonicalize(t *testing.T) {
 		assert.Contains(t, got, "NOT NULL")
 	})
 
+	t.Run("drop column keeps the explicit COLUMN keyword", func(t *testing.T) {
+		got := p.Canonicalize("alter table public.users drop column legacy")
+		assert.Equal(t, "ALTER TABLE public.users DROP COLUMN legacy", got)
+	})
+
+	t.Run("drop column keyword survives IF EXISTS and CASCADE", func(t *testing.T) {
+		got := p.Canonicalize("alter table users drop column if exists legacy cascade")
+		assert.Equal(t, "ALTER TABLE users DROP COLUMN IF EXISTS legacy CASCADE", got)
+	})
+
+	t.Run("quoted drop column identifiers keep the keyword", func(t *testing.T) {
+		got := p.Canonicalize(`alter table users drop column "Legacy"`)
+		assert.Equal(t, `ALTER TABLE users DROP COLUMN "Legacy"`, got)
+	})
+
+	t.Run("non-column drops are untouched", func(t *testing.T) {
+		got := p.Canonicalize("alter table users drop constraint users_pkey, alter column c drop default, alter column d drop not null")
+		assert.Equal(t, "ALTER TABLE users DROP CONSTRAINT users_pkey, ALTER COLUMN c DROP DEFAULT, ALTER COLUMN d DROP NOT NULL", got)
+	})
+
+	t.Run("mixed column and constraint drops rewrite only the column", func(t *testing.T) {
+		got := p.Canonicalize("alter table users drop column legacy, drop constraint users_pkey")
+		assert.Equal(t, "ALTER TABLE users DROP COLUMN legacy, DROP CONSTRAINT users_pkey", got)
+	})
+
 	t.Run("unparseable input is returned unchanged", func(t *testing.T) {
 		in := "THIS IS NOT SQL"
 		assert.Equal(t, in, p.Canonicalize(in))
@@ -241,5 +266,62 @@ func TestParsersDivergeOnDialectSpecificSyntax(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, tidbType, pgType)
 		assert.Equal(t, tidbTable, pgTable)
+	})
+}
+
+// CostScalesWithTableSize scopes the plan comment's table-size section: a
+// statement reports true when it builds an index, rewrites the table, or
+// scans it to validate a constraint or NOT NULL, so a size line renders
+// exactly for the changes whose cost grows with the table. Provably
+// metadata-only commands stay quiet.
+func TestPostgresCostScalesWithTableSize(t *testing.T) {
+	p := postgresStatementParser{}
+
+	tests := []struct {
+		name string
+		stmt string
+		want bool
+	}{
+		{"create index", `CREATE INDEX idx_created_at ON mutes (created_at)`, true},
+		{"create unique index", `CREATE UNIQUE INDEX uniq_slug ON mutes (slug)`, true},
+		{"add primary key", `ALTER TABLE mutes ADD PRIMARY KEY (id)`, true},
+		{"add unique constraint", `ALTER TABLE mutes ADD CONSTRAINT uniq_slug UNIQUE (slug)`, true},
+		{"add exclusion constraint", `ALTER TABLE mutes ADD CONSTRAINT excl_range EXCLUDE USING gist (during WITH &&)`, true},
+		{"alter column type", `ALTER TABLE mutes ALTER COLUMN count TYPE bigint`, true},
+		{"widen varchar", `ALTER TABLE mutes ALTER COLUMN reason TYPE varchar(500)`, true},
+		{"set not null", `ALTER TABLE mutes ALTER COLUMN reason SET NOT NULL`, true},
+		{"add foreign key", `ALTER TABLE mutes ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users (id)`, true},
+		{"add check constraint", `ALTER TABLE mutes ADD CONSTRAINT chk_positive CHECK (count > 0)`, true},
+		{"add column with volatile default", `ALTER TABLE mutes ADD COLUMN token uuid DEFAULT gen_random_uuid()`, true},
+		{"add column with inline unique", `ALTER TABLE mutes ADD COLUMN slug varchar(64) UNIQUE`, true},
+		{"add generated column", `ALTER TABLE mutes ADD COLUMN total int GENERATED ALWAYS AS (a + b) STORED`, true},
+		{"add foreign key not valid", `ALTER TABLE mutes ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users (id) NOT VALID`, false},
+		{"add check constraint not valid", `ALTER TABLE mutes ADD CONSTRAINT chk_positive CHECK (count > 0) NOT VALID`, false},
+		{"add column only", `ALTER TABLE mutes ADD COLUMN reason varchar(255)`, false},
+		{"add column with constant default", `ALTER TABLE mutes ADD COLUMN state text DEFAULT 'active'`, false},
+		{"add column with cast constant default", `ALTER TABLE mutes ADD COLUMN payload jsonb DEFAULT '{}'::jsonb`, false},
+		{"drop column", `ALTER TABLE mutes DROP COLUMN reason`, false},
+		{"set default", `ALTER TABLE mutes ALTER COLUMN count SET DEFAULT 0`, false},
+		{"drop not null", `ALTER TABLE mutes ALTER COLUMN reason DROP NOT NULL`, false},
+		{"drop constraint", `ALTER TABLE mutes DROP CONSTRAINT chk_positive`, false},
+		{"create table with primary key", `CREATE TABLE mutes (id BIGINT PRIMARY KEY)`, false},
+		{"drop index", `DROP INDEX idx_created_at`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := p.CostScalesWithTableSize(tt.stmt)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+
+	t.Run("unparseable statement is an error", func(t *testing.T) {
+		_, err := p.CostScalesWithTableSize("ALTER TABLE ADD INDEX WHAT")
+		assert.Error(t, err)
+	})
+
+	t.Run("multi-statement input is an error", func(t *testing.T) {
+		_, err := p.CostScalesWithTableSize("CREATE INDEX i ON a (c); DROP TABLE b")
+		assert.Error(t, err)
 	})
 }
