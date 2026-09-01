@@ -453,8 +453,9 @@ func TestEngineApplyPartitionedParentConcurrentIndexRefusal(t *testing.T) {
 // TestEngineApplyConcurrentIndexPreexistingInvalidRetryable proves an
 // invalid index already occupying the target name fails the build as a
 // retryable operational failure whose detail names the index and the
-// operator action — the executor fails closed on debris it cannot prove
-// its own, and clearing it makes a retry viable.
+// investigation step — the entry may be another actor's build still in
+// progress, so the advice is to check for one before any recovery, never a
+// statement to run.
 func TestEngineApplyConcurrentIndexPreexistingInvalidRetryable(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "invalid_index_test")
 	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
@@ -472,9 +473,10 @@ func TestEngineApplyConcurrentIndexPreexistingInvalidRetryable(t *testing.T) {
 	progress := awaitPostgresProgress(t, eng, "orders")
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "failed", progress.Metadata["phase"])
-	assert.True(t, progress.Retryable, "an operator can drop the invalid index; the drive must offer the retry")
+	assert.True(t, progress.Retryable, "an operator can clear the invalid index; the drive must offer the retry")
 	assert.Contains(t, progress.ErrorMessage, "orders_ref_idx")
-	assert.Contains(t, progress.ErrorMessage, "drop the invalid index")
+	assert.Contains(t, progress.ErrorMessage, "another actor's build")
+	assert.Contains(t, progress.ErrorMessage, "pg_stat_activity")
 }
 
 // applyRequest builds a single-statement apply request with the same identity

@@ -115,6 +115,15 @@ func TestClassifyRefusal(t *testing.T) {
 			err:  fmt.Errorf("execute: %w", &executor.BudgetError{Cause: executor.CauseLock, Budget: time.Second}),
 		},
 		{
+			name: "invalid-index verdict is operational even when it wraps a statement-budget cause",
+			err: fmt.Errorf("execute: %w", &executor.InvalidIndexError{
+				Schema:  "public",
+				Index:   "big_ref_idx",
+				Build:   &executor.BudgetError{Cause: executor.CauseStatement, Budget: time.Second},
+				Cleanup: executor.ErrBuildLeftInvalidIndex,
+			}),
+		},
+		{
 			name:       "oversized table is a refusal",
 			err:        fmt.Errorf("preflight: %w", &preflight.SizeError{TotalBytes: 2, LimitBytes: 1}),
 			wantReason: "table-too-large",
@@ -164,6 +173,64 @@ func TestRefusalForOutcomeTotalOverExecutorCodes(t *testing.T) {
 		t.Run(string(code), func(t *testing.T) {
 			_, known := refusalForOutcome(code, "users")
 			assert.True(t, known, "outcome code %q has no explicit apply disposition", code)
+		})
+	}
+}
+
+// TestConcurrentIndexBudgetFitsUnderApplyCeiling pins the ordering the two
+// bounds depend on: the server-side index budget must expire before the
+// client-side ceiling cancels the session, so an exhausted build surfaces as
+// the typed budget verdict — and its invalid-index catalog check still gets
+// to run — rather than as an ambiguous external cancellation.
+func TestConcurrentIndexBudgetFitsUnderApplyCeiling(t *testing.T) {
+	assert.Less(t, concurrentIndexBudget, optimisticApplyCeiling)
+}
+
+// TestInvalidIndexDetailMatchesVerdictOwnership pins the advice ladder to
+// the verdict code: a drop is named only for the build's own proven
+// leftover; a pre-existing entry gets an in-progress-build check; an
+// unproven verdict gets catalog inspection because the index may be healthy.
+// Every branch names the index and none renders the wrapped build or
+// cleanup errors, which may carry raw server text.
+func TestInvalidIndexDetailMatchesVerdictOwnership(t *testing.T) {
+	rawServerText := errors.New("ERROR: deadline exceeded at host db-internal-1.example.com")
+	tests := []struct {
+		name          string
+		err           *executor.InvalidIndexError
+		wantDetail    []string
+		wantNotDetail []string
+	}{
+		{
+			name: "own leftover names the drop",
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx",
+				Build: rawServerText, Cleanup: executor.ErrBuildLeftInvalidIndex},
+			wantDetail:    []string{`"public"."big_ref_idx"`, "drop the invalid index", "retry"},
+			wantNotDetail: []string{"db-internal-1"},
+		},
+		{
+			name: "pre-existing entry gets an in-progress-build check, never a drop",
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx",
+				Build: rawServerText, Cleanup: executor.ErrPreexistingInvalidIndex},
+			wantDetail:    []string{`"public"."big_ref_idx"`, "another actor's build", "pg_stat_activity"},
+			wantNotDetail: []string{"drop the invalid index", "db-internal-1"},
+		},
+		{
+			name: "unproven verdict gets catalog inspection, never a drop",
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx",
+				Build: rawServerText, Cleanup: rawServerText},
+			wantDetail:    []string{`"public"."big_ref_idx"`, "pg_index.indisvalid"},
+			wantNotDetail: []string{"drop the invalid index", "db-internal-1"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			detail := invalidIndexDetail(tt.err)
+			for _, want := range tt.wantDetail {
+				assert.Contains(t, detail, want)
+			}
+			for _, notWant := range tt.wantNotDetail {
+				assert.NotContains(t, detail, notWant)
+			}
 		})
 	}
 }

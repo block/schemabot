@@ -29,9 +29,11 @@ const (
 	// Server-side statement/lock timeouts bound queries once a session is
 	// healthy, but they cannot unwedge a hung dial or a black-holed
 	// connection — the ceiling guarantees the drive always reaches a
-	// terminal progress state. Generously above the worst legitimate run
-	// (retry attempts x statement limit plus backoffs) so it only fires on
-	// genuine hangs.
+	// terminal progress state. Above the worst legitimate run on either
+	// execution path — generously above the retry path's (retry attempts x
+	// statement limit plus backoffs), and above the concurrent index
+	// budget with enough headroom for session setup and the post-failure
+	// catalog verdict — so it only fires on genuine hangs.
 	optimisticApplyCeiling = 5 * time.Minute
 
 	// concurrentIndexBudget bounds one CREATE INDEX CONCURRENTLY build.
@@ -140,6 +142,28 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		return
 	}
 
+	var invalidErr *executor.InvalidIndexError
+	if errors.As(err, &invalidErr) {
+		// An invalid index — pre-existing or a build's own unrecovered
+		// leftover — is operational: an operator clears it and a retry can
+		// succeed. Checked before the refusal and budget arms because the
+		// verdict wraps the build failure that produced it (a budget-
+		// cancelled build leaves its own invalid index), and that inner
+		// cause must not be read as the outcome — the index the operator
+		// clears is. The detail is built from the typed identifiers and
+		// verdict code, never the wrapped build or cleanup errors, which
+		// may carry raw server text; the full cause lands in the server
+		// log below it.
+		logger.Error("PostgreSQL concurrent index build left or found an invalid index",
+			"namespace", change.namespace, "table", change.table,
+			"index_schema", invalidErr.Schema, "index", invalidErr.Index, "error", err)
+		result := progressResult(engine.StateFailed, "failed", started, change,
+			invalidIndexDetail(invalidErr))
+		result.Retryable = true
+		e.publishProgress(key, result, logger)
+		return
+	}
+
 	if r := classifyRefusal(err, change.table); r != nil {
 		// The taxonomy's reason survives in the operator-facing detail; no
 		// metadata carries it because nothing downstream consumes one yet.
@@ -161,25 +185,6 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		return
 	}
 
-	var invalidErr *executor.InvalidIndexError
-	if errors.As(err, &invalidErr) {
-		// An invalid index — pre-existing or a build's own unrecovered
-		// leftover — is operational: an operator clears it and a retry can
-		// succeed. The detail is built from the typed identifiers, never
-		// the wrapped build or cleanup errors, which may carry raw server
-		// text; the full cause lands in the server log below it.
-		logger.Error("PostgreSQL concurrent index build left or found an invalid index",
-			"namespace", change.namespace, "table", change.table,
-			"index_schema", invalidErr.Schema, "index", invalidErr.Index, "error", err)
-		result := progressResult(engine.StateFailed, "failed", started, change,
-			sanitizeReasonText(fmt.Sprintf(
-				"an invalid index %q.%q blocks this build on the target; drop the invalid index, then retry",
-				invalidErr.Schema, invalidErr.Index)))
-		result.Retryable = true
-		e.publishProgress(key, result, logger)
-		return
-	}
-
 	logger.Error("PostgreSQL native-safe schema change failed", "namespace", change.namespace, "table", change.table, "error", err)
 	result := progressResult(engine.StateFailed, "failed", started, change, "PostgreSQL schema change failed; see server logs")
 	// Operational failures are retryable by definition: classifyRefusal
@@ -187,6 +192,30 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	// a retry futile — the drive must not cancel the apply's remaining work.
 	result.Retryable = true
 	e.publishProgress(key, result, logger)
+}
+
+// invalidIndexDetail renders the operator-facing next step for an
+// invalid-index verdict, matching pg-sprite's own ownership standard: a drop
+// is named only when the entry is proven this build's own leftover. A
+// pre-existing invalid entry may be another actor's still-running build, and
+// an unproven verdict may sit on a healthy index — both get investigation
+// steps, never a statement to run. Only the typed identifiers are
+// interpolated, never the wrapped build or cleanup errors, which may carry
+// raw server text.
+func invalidIndexDetail(invalidErr *executor.InvalidIndexError) string {
+	name := fmt.Sprintf("%q.%q", invalidErr.Schema, invalidErr.Index)
+	var advice string
+	switch invalidErr.Code() {
+	case executor.CodeInvalidIndexOwnLeftover:
+		advice = fmt.Sprintf("this build left its own invalid index %s on the target; drop the invalid index, then retry", name)
+	case executor.CodeInvalidIndexPreexisting:
+		advice = fmt.Sprintf("an invalid index %s already occupies the name on the target and may be another actor's build still in progress; check pg_stat_activity before any recovery, then retry", name)
+	default:
+		// CodeInvalidIndexUnproven and any future verdict fail safe with
+		// investigation steps: the index under the name may be healthy.
+		advice = fmt.Sprintf("index %s may be invalid but its catalog state could not be verified; inspect pg_index.indisvalid on the target before any recovery, then retry", name)
+	}
+	return sanitizeReasonText(advice)
 }
 
 // refusal is a typed apply outcome that retrying cannot fix: the schema
@@ -233,6 +262,16 @@ func refusalForCause(err error, table string) *refusal {
 			detail += "; " + privilegeErr.Hint
 		}
 		return &refusal{reason: "insufficient-privileges", detail: detail}
+	}
+	// An invalid-index verdict is operational even when the build failure it
+	// wraps would classify as a refusal on its own — a budget-cancelled
+	// concurrent build leaves its own invalid index, and the index the
+	// operator clears is the outcome, not the inner budget exhaustion.
+	// Declined before the budget arm so the nested cause can never shadow
+	// the verdict.
+	var invalidErr *executor.InvalidIndexError
+	if errors.As(err, &invalidErr) {
+		return nil
 	}
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
