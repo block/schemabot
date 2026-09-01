@@ -25,10 +25,10 @@ import (
 // claim decisions that do not require aging a row.
 func TestApplyComments(t *testing.T, h Harness) {
 	// Upsert_And_Get verifies the tracked-comment round trip: an insert
-	// stores the posted level and control phase, a conflicting upsert for the
-	// same (apply_id, comment_state) slot rotates the recorded GitHub comment
-	// in place, and a summary comment — which carries no level or phase —
-	// reads back with nil pointers.
+	// stores the posted control phase, a conflicting upsert for the same
+	// (apply_id, comment_state) slot rotates the recorded GitHub comment in
+	// place, and a summary comment — which carries no phase — reads back with
+	// nil pointers.
 	t.Run("Upsert_And_Get", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -36,13 +36,11 @@ func TestApplyComments(t *testing.T, h Harness) {
 		lock := CreateLock(t, store, "comment_upsert_db", storage.DatabaseTypeMySQL)
 		apply := CreateApply(t, store, lock, "apply_comment_upsert", 700)
 
-		postedVolume := 3
 		noPhase := ""
 		comment := &storage.ApplyComment{
 			ApplyID:         apply.ID,
 			CommentState:    state.Comment.Progress,
 			GitHubCommentID: 111222333,
-			PostedVolume:    &postedVolume,
 			PostedPhase:     &noPhase,
 		}
 		require.NoError(t, store.ApplyComments().Upsert(ctx, comment))
@@ -53,8 +51,6 @@ func TestApplyComments(t *testing.T, h Harness) {
 		assert.Equal(t, apply.ID, retrieved.ApplyID)
 		assert.Equal(t, state.Comment.Progress, retrieved.CommentState)
 		assert.Equal(t, int64(111222333), retrieved.GitHubCommentID)
-		require.NotNil(t, retrieved.PostedVolume)
-		assert.Equal(t, 3, *retrieved.PostedVolume)
 		require.NotNil(t, retrieved.PostedPhase)
 		assert.Empty(t, *retrieved.PostedPhase)
 		assert.NotZero(t, retrieved.ID)
@@ -62,10 +58,8 @@ func TestApplyComments(t *testing.T, h Harness) {
 		assert.NotZero(t, retrieved.UpdatedAt)
 
 		// A rotation to a fresh comment upserts the same slot with the new
-		// comment ID, level, and control phase.
+		// comment ID and control phase.
 		comment.GitHubCommentID = 444555666
-		newVolume := 5
-		comment.PostedVolume = &newVolume
 		reverting := state.Apply.Reverting
 		comment.PostedPhase = &reverting
 		require.NoError(t, store.ApplyComments().Upsert(ctx, comment))
@@ -74,13 +68,11 @@ func TestApplyComments(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, retrieved)
 		assert.Equal(t, int64(444555666), retrieved.GitHubCommentID)
-		require.NotNil(t, retrieved.PostedVolume)
-		assert.Equal(t, 5, *retrieved.PostedVolume)
 		require.NotNil(t, retrieved.PostedPhase)
 		assert.Equal(t, state.Apply.Reverting, *retrieved.PostedPhase)
 
-		// A summary comment carries no level or control phase; the columns
-		// stay NULL and read back nil.
+		// A summary comment carries no control phase; the column stays NULL
+		// and reads back nil.
 		require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
 			ApplyID:         apply.ID,
 			CommentState:    state.Comment.Summary,
@@ -89,7 +81,6 @@ func TestApplyComments(t *testing.T, h Harness) {
 		retrieved, err = store.ApplyComments().Get(ctx, apply.ID, state.Comment.Summary)
 		require.NoError(t, err)
 		require.NotNil(t, retrieved)
-		assert.Nil(t, retrieved.PostedVolume)
 		assert.Nil(t, retrieved.PostedPhase)
 
 		// A missing slot reads back nil, not an error.
@@ -265,13 +256,13 @@ func TestApplyComments(t *testing.T, h Harness) {
 		lock := CreateLock(t, store, "comment_freeze_db", storage.DatabaseTypeMySQL)
 		apply := CreateApply(t, store, lock, "apply_comment_freeze", 707)
 
-		postedVolume := 5
+		postedPhase := state.Apply.Reverting
 		supersededID := int64(100)
 		require.NoError(t, store.ApplyComments().Upsert(ctx, &storage.ApplyComment{
 			ApplyID:                apply.ID,
 			CommentState:           state.Comment.Progress,
 			GitHubCommentID:        200,
-			PostedVolume:           &postedVolume,
+			PostedPhase:            &postedPhase,
 			PendingFreezeCommentID: &supersededID,
 		}))
 
@@ -288,8 +279,8 @@ func TestApplyComments(t *testing.T, h Harness) {
 		require.NotNil(t, retrieved)
 		assert.Nil(t, retrieved.PendingFreezeCommentID)
 		assert.Equal(t, int64(200), retrieved.GitHubCommentID)
-		require.NotNil(t, retrieved.PostedVolume)
-		assert.Equal(t, 5, *retrieved.PostedVolume)
+		require.NotNil(t, retrieved.PostedPhase)
+		assert.Equal(t, state.Apply.Reverting, *retrieved.PostedPhase)
 
 		require.NoError(t, store.ApplyComments().ClearPendingFreeze(ctx, apply.ID, state.Comment.Progress))
 		require.NoError(t, store.ApplyComments().ClearPendingFreeze(ctx, apply.ID+1000, state.Comment.Progress))

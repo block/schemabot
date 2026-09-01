@@ -694,18 +694,6 @@ CREATE TABLE users (
 		assert.NotContains(t, stripANSI(out), "Apply blocked: database locked", "start should not be blocked by locking")
 	})
 
-	t.Run("volume_works_while_locked", func(t *testing.T) {
-		// Volume should not be blocked by repo locks.
-		out, _ := runCLIWithErrorInDir(t, binPath, schemaDir, "volume",
-			"apply-lock-test",
-			"-e", "staging",
-			"-v", "5",
-			"--endpoint", endpoint,
-		)
-		// Should NOT show "Apply blocked: database locked" error
-		assert.NotContains(t, stripANSI(out), "Apply blocked: database locked", "volume should not be blocked by locking")
-	})
-
 	t.Run("apply_blocked_while_locked", func(t *testing.T) {
 		// Only apply should be blocked
 		out, err := runCLIWithErrorInDir(t, binPath, schemaDir, "apply",

@@ -440,7 +440,7 @@ func TestE2EResumeRotatesProgressComment(t *testing.T) {
 	select {
 	case edited := <-capture.edits:
 		assert.Equal(t, newProgressID, edited.CommentID, "later edits land on the new comment")
-		assert.Contains(t, edited.Body, "70%", "once running, the new comment shows real row-copy progress")
+		assert.Contains(t, edited.Body, "70.00%", "once running, the new comment shows real row-copy progress")
 	case created := <-capture.creates:
 		t.Fatalf("resume must rotate exactly once; got another new comment %d", created.ID)
 	case <-time.After(5 * time.Second):
@@ -783,14 +783,12 @@ func requireCommentCreate(t *testing.T, capture *commentCapture) int64 {
 }
 
 // applyCommentFixtureParams names the per-test identity of a comment-rotation
-// fixture. A zero volume with deferCutover unset seeds the apply without
-// options.
+// fixture. An unset deferCutover seeds the apply without options.
 type applyCommentFixtureParams struct {
 	repo         string
 	pr           int
 	database     string
 	applyState   string
-	volume       int
 	deferCutover bool
 }
 
@@ -854,8 +852,8 @@ func setupApplyCommentFixture(t *testing.T, p applyCommentFixtureParams) *applyC
 		Engine:          "spirit",
 		State:           p.applyState,
 	}
-	if p.volume != 0 || p.deferCutover {
-		apply.SetOptions(storage.ApplyOptions{Volume: p.volume, DeferCutover: p.deferCutover})
+	if p.deferCutover {
+		apply.SetOptions(storage.ApplyOptions{DeferCutover: p.deferCutover})
 	}
 	applyID, err := st.Applies().Create(ctx, apply)
 	require.NoError(t, err)
@@ -926,101 +924,6 @@ func (f *applyCommentFixture) newObserver(stor storage.Storage, clk clock.Clock)
 		Logger:         f.logger,
 		Clock:          clk,
 	})
-}
-
-// When an operator's volume change takes effect on a running apply, the
-// observer posts a fresh progress comment tracking the new level — a new
-// comment at the bottom of the PR timeline is where the operator looks for the
-// effect of the command they just issued. The prior progress comment is frozen
-// into a collapsed details block pointing at its successor, later progress
-// edits land on the new comment, and a tick without a level change does not
-// rotate again.
-func TestE2EVolumeChangeRotatesProgressComment(t *testing.T) {
-	ctx := t.Context()
-
-	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
-		repo:       "org/repo-volume",
-		pr:         143,
-		database:   "e2e_volume_db",
-		applyState: state.Apply.Running,
-		volume:     3,
-	})
-	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
-
-	// Seed the tracked progress comment the apply started with; the handler
-	// records the starting level from the apply's options.
-	h.postAndTrackComment(ctx, "org/repo-volume", 143, 12345, apply, state.Comment.Progress, "Copying at volume 3")
-	initialProgressID := requireCommentCreate(t, capture)
-
-	fake := clock.NewFake(task.CreatedAt)
-	obs := f.newObserver(st, fake)
-
-	// A tick at the level the comment was posted with edits in place.
-	fake.Advance(activeInterval + time.Second)
-	obs.OnProgress(apply, []*storage.Task{task})
-	select {
-	case edited := <-capture.edits:
-		assert.Equal(t, initialProgressID, edited.CommentID, "same-level ticks edit the tracked comment in place")
-		assert.Contains(t, edited.Body, "Volume: 3/11")
-	case created := <-capture.creates:
-		t.Fatalf("a tick without a volume change must not post a new comment, got %d", created.ID)
-	case <-time.After(5 * time.Second):
-		t.Fatal("expected an in-place edit of the tracked progress comment")
-	}
-
-	// The driver applied a volume change and recorded the new level on the
-	// apply options. The next tick rotates: a fresh progress comment tracks
-	// the new level.
-	apply.SetOptions(storage.ApplyOptions{Volume: 5})
-	task.RowsCopied = 600
-	fake.Advance(activeInterval + time.Second)
-	obs.OnProgress(apply, []*storage.Task{task})
-
-	var newProgressID int64
-	select {
-	case created := <-capture.creates:
-		newProgressID = created.ID
-		assert.Contains(t, created.Body, "Volume: 5/11", "the fresh comment tracks the new level")
-	case <-time.After(5 * time.Second):
-		t.Fatal("expected a new progress comment after the volume change")
-	}
-	assert.NotEqual(t, initialProgressID, newProgressID, "the volume change must post a new comment, not reuse the old one")
-
-	// The prior comment is frozen into a collapsed details block pointing at
-	// its successor, with the pre-change body preserved inside the fold.
-	select {
-	case edited := <-capture.edits:
-		assert.Equal(t, initialProgressID, edited.CommentID, "the freeze edit lands on the superseded comment")
-		assert.Contains(t, edited.Body, "Volume changed to **5/11**")
-		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", newProgressID), "the frozen comment links to its successor")
-		assert.Contains(t, edited.Body, "<details>")
-		assert.Contains(t, edited.Body, "Volume: 3/11", "the pre-change body is preserved inside the fold")
-	case <-time.After(5 * time.Second):
-		t.Fatal("expected the superseded progress comment to be frozen")
-	}
-
-	// The progress row tracks the new comment at the new level.
-	prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
-	require.NoError(t, err)
-	require.NotNil(t, prog)
-	assert.Equal(t, newProgressID, prog.GitHubCommentID)
-	require.NotNil(t, prog.PostedVolume)
-	assert.Equal(t, 5, *prog.PostedVolume)
-
-	// A later tick without another level change edits the new comment in place.
-	task.RowsCopied = 700
-	task.ProgressPercent = 70
-	fake.Advance(activeInterval + time.Second)
-	obs.OnProgress(apply, []*storage.Task{task})
-	select {
-	case edited := <-capture.edits:
-		assert.Equal(t, newProgressID, edited.CommentID, "later edits land on the new comment")
-		assert.Contains(t, edited.Body, "70%")
-	case created := <-capture.creates:
-		t.Fatalf("a volume change must rotate exactly once; got another new comment %d", created.ID)
-	case <-time.After(5 * time.Second):
-		t.Fatal("expected an in-place edit of the new progress comment on the next tick")
-	}
 }
 
 // When an operator's revert takes effect on an apply in its revert window, the
@@ -2162,122 +2065,6 @@ func TestE2EDeferredCutoverFreshObserverConsumesStaleCutoverRow(t *testing.T) {
 	}
 }
 
-// A fresh rotation comment that posted but was never recorded (a storage
-// outage between the post and the tracking write) is adopted before the
-// cutover prompt posts and before the post-cutover rotation runs, in the same
-// order the comments landed on the PR. The tracked row therefore always moves
-// forward — prior comment, adopted comment, post-cutover comment — and never
-// regresses to a stale comment after a newer one was tracked.
-func TestE2EPendingRotationAdoptedBeforeCutoverPrompt(t *testing.T) {
-	ctx := t.Context()
-
-	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
-		repo:       "org/repo-pending-adoption-cutover",
-		pr:         150,
-		database:   "e2e_pending_adoption_cutover_db",
-		applyState: state.Apply.Running,
-		volume:     3,
-	})
-	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
-
-	h.postAndTrackComment(ctx, "org/repo-pending-adoption-cutover", 150, 12345, apply, state.Comment.Progress, "Copying at volume 3")
-	initialProgressID := requireCommentCreate(t, capture)
-
-	failingStorage := &failingCommentUpsertStorage{Storage: st}
-	fake := clock.NewFake(task.CreatedAt)
-	obs := f.newObserver(failingStorage, fake)
-
-	// A volume change posts a fresh comment, but recording it as the tracked
-	// comment fails — it stays pending adoption.
-	apply.SetOptions(storage.ApplyOptions{Volume: 5, DeferCutover: true})
-	fake.Advance(activeInterval + time.Second)
-	obs.OnProgress(apply, []*storage.Task{task})
-
-	var volumeProgressID int64
-	select {
-	case created := <-capture.creates:
-		volumeProgressID = created.ID
-		assert.Contains(t, created.Body, "Volume: 5/11")
-	case <-time.After(5 * time.Second):
-		t.Fatal("expected the volume change to post a fresh progress comment")
-	}
-
-	// Storage heals and the apply reaches the deferred-cutover gate on the
-	// same tick. The pending comment is adopted first — freezing its
-	// predecessor — and only then does the cutover prompt post, matching the
-	// order the comments sit on the PR.
-	failingStorage.heal()
-	apply.State = state.Apply.CuttingOver
-	fake.Advance(activeInterval + time.Second)
-	obs.OnProgress(apply, []*storage.Task{task})
-
-	select {
-	case edited := <-capture.edits:
-		assert.Equal(t, initialProgressID, edited.CommentID, "adoption freezes the pending comment's predecessor")
-		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", volumeProgressID), "the frozen comment links to its adopted successor")
-	case <-time.After(5 * time.Second):
-		t.Fatal("expected the pending comment's predecessor to be frozen at the gate tick")
-	}
-	var cutoverPromptID int64
-	select {
-	case created := <-capture.creates:
-		cutoverPromptID = created.ID
-		assert.Contains(t, created.Body, "**Status**: Cutting Over")
-	case <-time.After(5 * time.Second):
-		t.Fatal("expected the cutover prompt to be posted at the gate")
-	}
-	prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
-	require.NoError(t, err)
-	require.NotNil(t, prog)
-	assert.Equal(t, volumeProgressID, prog.GitHubCommentID, "the tracked row records the adopted comment before the gate")
-
-	// The cutover completes into the revert window: the post-cutover rotation
-	// posts a fresh comment tracking the new phase and folds the spent prompt.
-	apply.State = state.Apply.RevertWindow
-	task.State = state.Task.RevertWindow
-	fake.Advance(activeInterval + time.Second)
-	obs.OnProgress(apply, []*storage.Task{task})
-
-	var postCutoverProgressID int64
-	select {
-	case created := <-capture.creates:
-		postCutoverProgressID = created.ID
-		assert.Contains(t, created.Body, "**Status**: Revert Window")
-	case <-time.After(5 * time.Second):
-		t.Fatal("expected the post-cutover rotation to post a fresh progress comment")
-	}
-	select {
-	case edited := <-capture.edits:
-		assert.Equal(t, cutoverPromptID, edited.CommentID, "the freeze edit lands on the cutover prompt")
-		assert.Contains(t, edited.Body, "Cutover complete")
-	case <-time.After(5 * time.Second):
-		t.Fatal("expected the cutover prompt to be frozen")
-	}
-
-	// The tracked row records the post-cutover comment and a later tick edits
-	// it in place: nothing regresses the row to the adopted comment.
-	prog, err = st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
-	require.NoError(t, err)
-	require.NotNil(t, prog)
-	assert.Equal(t, postCutoverProgressID, prog.GitHubCommentID, "the tracked row records the post-cutover comment")
-	require.NotNil(t, prog.PostedPhase)
-	assert.Equal(t, "revert_window", *prog.PostedPhase)
-	assert.Nil(t, prog.PendingFreezeCommentID)
-
-	task.RowsCopied = 900
-	task.ProgressPercent = 90
-	fake.Advance(activeInterval + time.Second)
-	obs.OnProgress(apply, []*storage.Task{task})
-	select {
-	case edited := <-capture.edits:
-		assert.Equal(t, postCutoverProgressID, edited.CommentID, "later edits land on the post-cutover comment")
-	case created := <-capture.creates:
-		t.Fatalf("no further rotation is owed; got new comment %d", created.ID)
-	case <-time.After(5 * time.Second):
-		t.Fatal("expected an in-place edit of the post-cutover comment")
-	}
-}
-
 // A control-phase rotation whose fresh comment posts to the PR but fails to
 // be recorded as the tracked comment must not freeze the prior comment: the
 // tracked row still points at it, so later progress edits land there. While
@@ -2597,217 +2384,6 @@ func (s *failingCommentSupersedeStorage) ApplyComments() storage.ApplyCommentSto
 }
 
 func (s *failingCommentSupersedeStorage) heal() { s.healed.Store(true) }
-
-// A volume-change rotation whose fresh comment posts to the PR but fails to be
-// recorded as the tracked comment must not freeze the prior comment: the
-// tracked row still points at the prior comment, so later progress edits land
-// there, and a frozen "superseded" body would fight those edits. While the
-// outage lasts, later ticks retry only the tracking write (adoption) — never
-// another post — so duplicates stay bounded at one. Once storage heals, the
-// next tick adopts the already-live fresh comment: the tracked row (and the
-// freeze owed to the prior comment, recorded in the same write) points at it,
-// the prior comment is frozen with a link to its successor, and progress edits
-// move to the adopted comment. A volume revert after adoption rotates again
-// off the adopted comment, so an operator's revert always gets its own fresh
-// comment.
-func TestE2EVolumeRotationUntrackedFreshCommentAdoptedWhenStorageHeals(t *testing.T) {
-	ctx := t.Context()
-
-	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
-		repo:       "org/repo-volume-untracked",
-		pr:         144,
-		database:   "e2e_volume_untracked_db",
-		applyState: state.Apply.Running,
-		volume:     3,
-	})
-	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
-
-	// Seed the tracked progress comment at the starting level through the real
-	// store, the way the accepted-apply handler does (recording the level from
-	// the apply's options).
-	h.postAndTrackComment(ctx, "org/repo-volume-untracked", 144, 12345, apply, state.Comment.Progress, "Copying at volume 3")
-	initialProgressID := requireCommentCreate(t, capture)
-
-	// The observer's comment-tracking writes hit the failing store; reads and
-	// every other store pass through.
-	failingStorage := &failingCommentUpsertStorage{Storage: st}
-	fake := clock.NewFake(task.CreatedAt)
-	obs := f.newObserver(failingStorage, fake)
-
-	// The level change posts the fresh comment, but recording it as the tracked
-	// comment fails — the prior comment must not be frozen.
-	apply.SetOptions(storage.ApplyOptions{Volume: 5})
-	fake.Advance(activeInterval + time.Second)
-	obs.OnProgress(apply, []*storage.Task{task})
-
-	var freshProgressID int64
-	select {
-	case created := <-capture.creates:
-		freshProgressID = created.ID
-		assert.Contains(t, created.Body, "Volume: 5/11", "the fresh comment renders the new level")
-	case <-time.After(5 * time.Second):
-		t.Fatal("expected the volume change to post a fresh progress comment")
-	}
-	select {
-	case edited := <-capture.edits:
-		t.Fatalf("no comment may be edited when the fresh comment was not tracked; got an edit of %d: %s", edited.CommentID, edited.Body)
-	case <-time.After(100 * time.Millisecond):
-	}
-
-	// While the outage lasts, a later tick retries only the tracking write — it
-	// does not post a duplicate for the same level — and its progress edit
-	// lands on the prior comment, still the tracked one.
-	task.RowsCopied = 700
-	task.ProgressPercent = 70
-	fake.Advance(activeInterval + time.Second)
-	obs.OnProgress(apply, []*storage.Task{task})
-
-	select {
-	case edited := <-capture.edits:
-		assert.Equal(t, initialProgressID, edited.CommentID, "progress edits continue on the prior tracked comment")
-		assert.Contains(t, edited.Body, "70%")
-	case created := <-capture.creates:
-		t.Fatalf("an untracked rotation must not repost for the same level; got another new comment %d", created.ID)
-	case <-time.After(5 * time.Second):
-		t.Fatal("expected an in-place edit of the prior tracked comment")
-	}
-
-	// Once storage heals, the next tick adopts the already-live fresh comment
-	// instead of posting another: the prior comment is frozen pointing at its
-	// successor, and the tick's progress edit lands on the adopted comment.
-	failingStorage.heal()
-	task.RowsCopied = 800
-	task.ProgressPercent = 80
-	fake.Advance(activeInterval + time.Second)
-	obs.OnProgress(apply, []*storage.Task{task})
-
-	select {
-	case edited := <-capture.edits:
-		assert.Equal(t, initialProgressID, edited.CommentID, "the freeze edit lands on the superseded comment")
-		assert.Contains(t, edited.Body, "Volume changed to **5/11**")
-		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", freshProgressID), "the frozen comment links to its adopted successor")
-		assert.Contains(t, edited.Body, "<details>")
-	case created := <-capture.creates:
-		t.Fatalf("adoption must not post another comment; got %d", created.ID)
-	case <-time.After(5 * time.Second):
-		t.Fatal("expected the superseded progress comment to be frozen after adoption")
-	}
-	select {
-	case edited := <-capture.edits:
-		assert.Equal(t, freshProgressID, edited.CommentID, "progress edits move to the adopted comment")
-		assert.Contains(t, edited.Body, "80%")
-	case <-time.After(5 * time.Second):
-		t.Fatal("expected a progress edit on the adopted comment")
-	}
-
-	// The tracked row now points at the adopted comment at the new level, with
-	// no freeze left owing.
-	prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
-	require.NoError(t, err)
-	require.NotNil(t, prog)
-	assert.Equal(t, freshProgressID, prog.GitHubCommentID)
-	require.NotNil(t, prog.PostedVolume)
-	assert.Equal(t, 5, *prog.PostedVolume)
-	assert.Nil(t, prog.PendingFreezeCommentID)
-
-	// An operator reverting the volume after adoption rotates again: a fresh
-	// comment at the reverted level, with the adopted comment frozen in turn.
-	apply.SetOptions(storage.ApplyOptions{Volume: 3})
-	fake.Advance(activeInterval + time.Second)
-	obs.OnProgress(apply, []*storage.Task{task})
-
-	var revertedProgressID int64
-	select {
-	case created := <-capture.creates:
-		revertedProgressID = created.ID
-		assert.Contains(t, created.Body, "Volume: 3/11", "the revert posts a fresh comment at the reverted level")
-	case <-time.After(5 * time.Second):
-		t.Fatal("expected a volume revert after adoption to rotate again")
-	}
-	select {
-	case edited := <-capture.edits:
-		assert.Equal(t, freshProgressID, edited.CommentID, "the adopted comment is frozen in turn")
-		assert.Contains(t, edited.Body, "Volume changed to **3/11**")
-		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", revertedProgressID), "the frozen comment links to the revert's fresh comment")
-	case <-time.After(5 * time.Second):
-		t.Fatal("expected the adopted comment to be frozen after the revert")
-	}
-}
-
-// A rotation that tracked its fresh comment but died before the freeze edit
-// landed leaves the pending-freeze marker on the tracked row. A later drive's
-// observer — with no in-memory state from the rotation — reconciles it on its
-// first volume check: the superseded comment is frozen pointing at its
-// successor and the marker is cleared, without posting anything new. The fold
-// uses the generic superseded rendering — the marker records which comment is
-// owed, not which rotation superseded it.
-func TestE2EVolumeRotationReconcilesPendingFreezeFromPriorDrive(t *testing.T) {
-	ctx := t.Context()
-
-	f := setupApplyCommentFixture(t, applyCommentFixtureParams{
-		repo:       "org/repo-volume-freeze",
-		pr:         145,
-		database:   "e2e_volume_freeze_db",
-		applyState: state.Apply.Running,
-		volume:     5,
-	})
-	st, apply, task, capture, h := f.st, f.apply, f.task, f.capture, f.handler
-
-	// Seed the two comments the prior drive left on the PR: the superseded
-	// comment still showing live progress, and the fresh comment it rotated to.
-	h.postAndTrackComment(ctx, "org/repo-volume-freeze", 145, 12345, apply, state.Comment.Progress, "Copying at volume 3")
-	supersededID := requireCommentCreate(t, capture)
-	h.postAndTrackComment(ctx, "org/repo-volume-freeze", 145, 12345, apply, state.Comment.Progress, "Copying at volume 5")
-	freshID := requireCommentCreate(t, capture)
-
-	// The prior drive recorded the freeze it owed in the same write that
-	// tracked the fresh comment, then died before the freeze edit landed.
-	postedVolume := 5
-	require.NoError(t, st.ApplyComments().Upsert(ctx, &storage.ApplyComment{
-		ApplyID:                apply.ID,
-		CommentState:           state.Comment.Progress,
-		GitHubCommentID:        freshID,
-		PostedVolume:           &postedVolume,
-		PendingFreezeCommentID: &supersededID,
-	}))
-
-	fake := clock.NewFake(task.CreatedAt)
-	obs := f.newObserver(st, fake)
-
-	// The new drive's first tick reconciles the owed freeze even though the
-	// levels already match — no rotation, no new comment.
-	fake.Advance(activeInterval + time.Second)
-	obs.OnProgress(apply, []*storage.Task{task})
-
-	select {
-	case edited := <-capture.edits:
-		assert.Equal(t, supersededID, edited.CommentID, "the reconciled freeze lands on the superseded comment")
-		assert.Contains(t, edited.Body, "Progress comment superseded",
-			"the owed fold uses the generic rendering since the superseding rotation is not recorded")
-		assert.Contains(t, edited.Body, fmt.Sprintf("#issuecomment-%d", freshID), "the frozen comment links to its successor")
-		assert.Contains(t, edited.Body, "Copying at volume 3", "the superseded body is preserved inside the fold")
-	case created := <-capture.creates:
-		t.Fatalf("reconciling a pending freeze must not post a new comment; got %d", created.ID)
-	case <-time.After(5 * time.Second):
-		t.Fatal("expected the pending freeze to be reconciled on the first tick")
-	}
-
-	// The marker is cleared once the freeze lands; the row still tracks the
-	// fresh comment.
-	prog, err := st.ApplyComments().Get(ctx, apply.ID, state.Comment.Progress)
-	require.NoError(t, err)
-	require.NotNil(t, prog)
-	assert.Nil(t, prog.PendingFreezeCommentID)
-	assert.Equal(t, freshID, prog.GitHubCommentID)
-
-	// The same tick's progress edit lands on the tracked fresh comment.
-	select {
-	case edited := <-capture.edits:
-		assert.Equal(t, freshID, edited.CommentID, "the tick's progress edit lands on the tracked comment")
-	case <-time.After(5 * time.Second):
-		t.Fatal("expected the tick's progress edit on the tracked comment")
-	}
-}
 
 func TestE2EReconcileMissingSummaryCommentsPostsSummary(t *testing.T) {
 	ctx := t.Context()

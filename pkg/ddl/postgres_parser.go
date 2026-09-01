@@ -185,6 +185,109 @@ func (postgresStatementParser) CreateIndex(stmt string) (string, string, bool, e
 	return indexNode.IndexStmt.GetIdxname(), indexNode.IndexStmt.GetRelation().GetRelname(), indexNode.IndexStmt.GetUnique(), nil
 }
 
+// CostScalesWithTableSize implements StatementParser. A standalone CREATE
+// INDEX always scans the table. An ALTER TABLE scales when any command is not
+// provably metadata-only: PRIMARY KEY, UNIQUE, and EXCLUDE adds build an
+// index; FOREIGN KEY and CHECK adds validate every row unless declared NOT
+// VALID; SET NOT NULL scans the table; a column type change can rewrite it;
+// and a column add is metadata-only only while its DEFAULT (if any) is a
+// constant. Plain drops, renames, and default changes report false.
+func (postgresStatementParser) CostScalesWithTableSize(stmt string) (bool, error) {
+	result, err := pgquery.Parse(stmt)
+	if err != nil {
+		return false, fmt.Errorf("parse statement %q: %w", statementPreview(stmt), err)
+	}
+	stmts := result.GetStmts()
+	if len(stmts) != 1 {
+		return false, fmt.Errorf(
+			"expected a single statement but %q parsed as %d statements; split with the parser's Split first",
+			statementPreview(stmt), len(stmts),
+		)
+	}
+	switch node := stmts[0].GetStmt().GetNode().(type) {
+	case *pgproto.Node_IndexStmt:
+		return true, nil
+	case *pgproto.Node_AlterTableStmt:
+		for _, cmd := range node.AlterTableStmt.GetCmds() {
+			if alterCmdScalesWithTableSize(cmd.GetAlterTableCmd()) {
+				return true, nil
+			}
+		}
+		return false, nil
+	default:
+		return false, nil
+	}
+}
+
+// alterCmdScalesWithTableSize reports whether one ALTER TABLE command forces
+// work proportional to the table's row count. The metadata-only cases are an
+// allowlist: a command shape this function doesn't recognize is assumed to
+// scale, so a new or exotic command over-reports size context rather than
+// hiding it on an expensive change.
+func alterCmdScalesWithTableSize(cmd *pgproto.AlterTableCmd) bool {
+	switch cmd.GetSubtype() { //nolint:exhaustive
+	case pgproto.AlterTableType_AT_DropColumn, pgproto.AlterTableType_AT_ColumnDefault,
+		pgproto.AlterTableType_AT_DropNotNull, pgproto.AlterTableType_AT_DropConstraint:
+		return false
+	case pgproto.AlterTableType_AT_AddColumn:
+		return addColumnScalesWithTableSize(cmd.GetDef().GetColumnDef())
+	case pgproto.AlterTableType_AT_AddConstraint:
+		constraint := cmd.GetDef().GetConstraint()
+		switch constraint.GetContype() { //nolint:exhaustive
+		case pgproto.ConstrType_CONSTR_PRIMARY, pgproto.ConstrType_CONSTR_UNIQUE,
+			pgproto.ConstrType_CONSTR_EXCLUSION:
+			// Index-backed constraints build their index regardless of NOT VALID.
+			return true
+		case pgproto.ConstrType_CONSTR_FOREIGN, pgproto.ConstrType_CONSTR_CHECK:
+			// FOREIGN KEY and CHECK scan every row to validate unless the
+			// constraint is declared NOT VALID.
+			return !constraint.GetSkipValidation()
+		default:
+			return true
+		}
+	default:
+		// AT_AlterColumnType can rewrite the table, AT_SetNotNull scans it,
+		// and anything unrecognized is assumed expensive.
+		return true
+	}
+}
+
+// addColumnScalesWithTableSize reports whether adding this column forces a
+// table rewrite or scan: an inline PRIMARY KEY or UNIQUE builds an index, a
+// generated or identity column is computed for every existing row, and a
+// non-constant DEFAULT is evaluated per row. A plain column with no DEFAULT
+// (or a constant one) is metadata-only.
+func addColumnScalesWithTableSize(col *pgproto.ColumnDef) bool {
+	for _, c := range col.GetConstraints() {
+		constraint := c.GetConstraint()
+		switch constraint.GetContype() { //nolint:exhaustive
+		case pgproto.ConstrType_CONSTR_PRIMARY, pgproto.ConstrType_CONSTR_UNIQUE,
+			pgproto.ConstrType_CONSTR_GENERATED, pgproto.ConstrType_CONSTR_IDENTITY:
+			return true
+		case pgproto.ConstrType_CONSTR_DEFAULT:
+			if !isConstantExpr(constraint.GetRawExpr()) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isConstantExpr reports whether a default-value expression is a bare
+// constant, possibly wrapped in type casts (DEFAULT 'x'::jsonb). Anything
+// else — a function call, an operator expression — may be volatile, and a
+// volatile default forces a full-table rewrite on ADD COLUMN.
+func isConstantExpr(node *pgproto.Node) bool {
+	switch expr := node.GetNode().(type) {
+	case *pgproto.Node_AConst:
+		return true
+	case *pgproto.Node_TypeCast:
+		return isConstantExpr(expr.TypeCast.GetArg())
+	default:
+		return false
+	}
+}
+
 // classifyPostgresNode maps one parsed statement node onto the pkg/ddl-owned
 // statement vocabulary and extracts the bare name of the first relation the
 // statement targets. Postgres expresses a table rename as

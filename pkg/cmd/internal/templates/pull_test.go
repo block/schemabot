@@ -91,12 +91,12 @@ func TestWritePullSchema_LintAuditRendersAsComments(t *testing.T) {
 
 	violations := captureStdout(t, func() {
 		WritePullSchema(response([]*apitypes.LintViolationResponse{
-			{Table: "users", Severity: "warning", Message: `Column "created_at" uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.`},
+			{Table: "users", Severity: "warning", Message: `Column "created_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.`},
 			{Table: "users", Severity: "error", Message: "Primary key column \"id\" has type \"int\"\nUse BIGINT UNSIGNED instead."},
 		}))
 	})
 	assert.Contains(t, violations, "-- Lint: 2 violations\n")
-	assert.Contains(t, violations, "--   [warning] users: Column \"created_at\" uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.\n")
+	assert.Contains(t, violations, "--   [warning] users: Column \"created_at\" uses \"TIMESTAMP\" which overflows on 2038-01-19. Consider using \"DATETIME\" instead.\n")
 	assert.Contains(t, violations, "--   [error] users: Primary key column \"id\" has type \"int\"\n--   Use BIGINT UNSIGNED instead.\n",
 		"every line of a multi-line message is a SQL comment")
 

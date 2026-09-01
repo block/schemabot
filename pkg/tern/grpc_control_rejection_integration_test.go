@@ -5,15 +5,78 @@ package tern
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
+	"os"
 	"testing"
+	"time"
 
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
+
+// newControlRequestClient builds a MySQL-type LocalClient backed by the shared
+// container, for tests that queue and settle durable control requests rather
+// than driving an apply to completion.
+func newControlRequestClient(t *testing.T, dsn string, stor storage.Storage) *LocalClient {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(client) })
+	return client
+}
+
+// dispatchQueuedApplyWithOptions dispatches an apply with one table change and
+// the given apply options through LocalClient.Apply, returning the stored
+// apply row, still queued for the operator.
+func dispatchQueuedApplyWithOptions(t *testing.T, stor storage.Storage, client *LocalClient, options map[string]string) *storage.Apply {
+	t.Helper()
+	ctx := t.Context()
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-control-%d", time.Now().UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     "testdb",
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      time.Now(),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"testdb": {Tables: []storage.TableChange{{
+				Namespace: "testdb",
+				Table:     "users",
+				DDL:       "ALTER TABLE `users` ADD COLUMN control_note VARCHAR(255)",
+				Operation: "alter",
+			}}},
+		},
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+	plan.ID = planID
+
+	resp, err := client.Apply(ctx, &ternv1.ApplyRequest{
+		PlanId:      plan.PlanIdentifier,
+		Database:    "testdb",
+		Type:        storage.DatabaseTypeMySQL,
+		Environment: localClientTestEnvironment,
+		Options:     options,
+	})
+	require.NoError(t, err)
+	require.True(t, resp.Accepted)
+
+	apply, err := stor.Applies().GetByApplyIdentifier(ctx, resp.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	require.Equal(t, state.Apply.Pending, apply.State, "a dispatched apply must be queued, not driven inline")
+	return apply
+}
 
 // setApplyEngine names the engine on a stored apply. The apply store's Update
 // deliberately leaves the engine alone — it is fixed at apply creation — so a
@@ -44,24 +107,15 @@ func TestLocalClient_ProgressReportsSettledControlRequests(t *testing.T) {
 	ctx := t.Context()
 	stor := createStorage(t, dsn)
 	defer utils.CloseAndLog(stor)
-	client, eng := newVolumeControlClient(t, dsn, stor)
-	eng.volumeErr = fmt.Errorf("throttle endpoint returned 404")
-
+	client := newControlRequestClient(t, dsn, stor)
 	apply := dispatchQueuedApplyWithOptions(t, stor, client, nil)
 
-	volumeResp, err := client.Volume(ctx, &ternv1.VolumeRequest{
-		ApplyId:     apply.ApplyIdentifier,
-		Environment: localClientTestEnvironment,
-		Volume:      7,
-	})
-	require.NoError(t, err)
-	require.True(t, volumeResp.Accepted, "acceptance means the request was queued, not that it took effect")
-
-	driveQueuedApply(t, stor, client, apply.ApplyIdentifier)
-	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationVolume, storage.ControlRequestFailed)
+	failLocallyQueuedControlRequest(t, dsn, stor, apply.ID, storage.ControlOperationCutover,
+		"cli:alice", "deploy request is not in a cutover-ready state")
+	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationCutover, storage.ControlRequestFailed)
 
 	// Progress projects the apply's engine onto the response, so the row must
-	// name a real one; the test engine stands in only for the Volume call.
+	// name a real one.
 	setApplyEngine(t, dsn, apply.ID, storage.EngineSpirit)
 
 	progress, err := client.Progress(ctx, &ternv1.ProgressRequest{
@@ -69,12 +123,12 @@ func TestLocalClient_ProgressReportsSettledControlRequests(t *testing.T) {
 		Environment: localClientTestEnvironment,
 	})
 	require.NoError(t, err)
-	require.Len(t, progress.SettledControlRequests, 1, "the failed volume request must travel on the progress response")
+	require.Len(t, progress.SettledControlRequests, 1, "the failed cutover request must travel on the progress response")
 
 	settled := progress.SettledControlRequests[0]
-	assert.Equal(t, string(storage.ControlOperationVolume), settled.Operation)
+	assert.Equal(t, string(storage.ControlOperationCutover), settled.Operation)
 	assert.Equal(t, string(storage.ControlRequestFailed), settled.Status)
-	assert.Contains(t, settled.ErrorMessage, "throttle endpoint returned 404")
+	assert.Contains(t, settled.ErrorMessage, "deploy request is not in a cutover-ready state")
 	assert.NotEmpty(t, settled.SettledAt, "an operator triaging the rejection needs when it settled")
 	assert.NotEmpty(t, settled.RequestedBy, "an operator triaging the rejection needs who issued the command")
 }
@@ -97,7 +151,7 @@ func TestGRPCClient_MirrorsRemoteControlRejection(t *testing.T) {
 	ctx := t.Context()
 	stor := createStorage(t, dsn)
 	defer utils.CloseAndLog(stor)
-	localClient, _ := newVolumeControlClient(t, dsn, stor)
+	localClient := newControlRequestClient(t, dsn, stor)
 	apply := dispatchQueuedApplyWithOptions(t, stor, localClient, nil)
 
 	server := &capturingTernServer{}
@@ -106,9 +160,9 @@ func TestGRPCClient_MirrorsRemoteControlRejection(t *testing.T) {
 	client.storage = stor
 
 	rejection := []*ternv1.SettledControlRequest{{
-		Operation:    string(storage.ControlOperationVolume),
+		Operation:    string(storage.ControlOperationRevert),
 		Status:       string(storage.ControlRequestFailed),
-		ErrorMessage: "throttle endpoint returned 404",
+		ErrorMessage: "deploy request is outside its revert window",
 		RequestedBy:  "cli:alice",
 	}, {
 		Operation: string(storage.ControlOperationCutover),
@@ -117,11 +171,11 @@ func TestGRPCClient_MirrorsRemoteControlRejection(t *testing.T) {
 
 	client.mirrorRemoteControlRejections(ctx, apply, apply.ExternalID, rejection)
 
-	stored, err := stor.ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationVolume)
+	stored, err := stor.ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationRevert)
 	require.NoError(t, err)
 	require.NotNil(t, stored, "the control plane must hold the rejection even though it never queued the request itself")
 	assert.Equal(t, storage.ControlRequestFailed, stored.Status)
-	assert.Contains(t, stored.ErrorMessage, "throttle endpoint returned 404")
+	assert.Contains(t, stored.ErrorMessage, "deploy request is outside its revert window")
 	assert.Equal(t, "cli:alice", stored.RequestedBy)
 
 	completed, err := stor.ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationCutover)
@@ -130,7 +184,7 @@ func TestGRPCClient_MirrorsRemoteControlRejection(t *testing.T) {
 
 	logs, err := stor.ApplyLogs().GetByApply(ctx, apply.ID)
 	require.NoError(t, err)
-	assert.Equal(t, 1, countLogMessages(logs, "Volume was accepted but not applied"),
+	assert.Equal(t, 1, countLogMessages(logs, "Revert was accepted but not applied"),
 		"the operator must find the rejection on the schema change's log")
 
 	// The data plane reports the same rejection on every poll until the
@@ -139,7 +193,7 @@ func TestGRPCClient_MirrorsRemoteControlRejection(t *testing.T) {
 	client.mirrorRemoteControlRejections(ctx, apply, apply.ExternalID, rejection)
 	logs, err = stor.ApplyLogs().GetByApply(ctx, apply.ID)
 	require.NoError(t, err)
-	assert.Equal(t, 1, countLogMessages(logs, "Volume was accepted but not applied"),
+	assert.Equal(t, 1, countLogMessages(logs, "Revert was accepted but not applied"),
 		"a rejection already recorded must be surfaced exactly once")
 }
 
@@ -162,7 +216,7 @@ func TestGRPCClient_MirrorLeavesAReissuedCommandPending(t *testing.T) {
 	ctx := t.Context()
 	stor := createStorage(t, dsn)
 	defer utils.CloseAndLog(stor)
-	localClient, _ := newVolumeControlClient(t, dsn, stor)
+	localClient := newControlRequestClient(t, dsn, stor)
 	apply := dispatchQueuedApplyWithOptions(t, stor, localClient, nil)
 
 	server := &capturingTernServer{}
@@ -203,8 +257,9 @@ func TestGRPCClient_MirrorLeavesAReissuedCommandPending(t *testing.T) {
 
 // The notice names who issued the command that did not take effect, so a second
 // operator whose re-issued command is rejected for the same reason has to be
-// reported under their own name. Volume is the case that reaches this: a pure
-// proxy queues no local request, so nothing else resets the mirrored row.
+// reported under their own name. A rejection this plane never queued a request
+// for reaches this: the mirrored row is the only record, so nothing else resets
+// it.
 func TestGRPCClient_MirrorReattributesARejectionToTheOperatorWhoReissuedIt(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -218,7 +273,7 @@ func TestGRPCClient_MirrorReattributesARejectionToTheOperatorWhoReissuedIt(t *te
 	ctx := t.Context()
 	stor := createStorage(t, dsn)
 	defer utils.CloseAndLog(stor)
-	localClient, _ := newVolumeControlClient(t, dsn, stor)
+	localClient := newControlRequestClient(t, dsn, stor)
 	apply := dispatchQueuedApplyWithOptions(t, stor, localClient, nil)
 
 	server := &capturingTernServer{}
@@ -228,9 +283,9 @@ func TestGRPCClient_MirrorReattributesARejectionToTheOperatorWhoReissuedIt(t *te
 
 	rejection := func(requestedBy string) []*ternv1.SettledControlRequest {
 		return []*ternv1.SettledControlRequest{{
-			Operation:    string(storage.ControlOperationVolume),
+			Operation:    string(storage.ControlOperationRevert),
 			Status:       string(storage.ControlRequestFailed),
-			ErrorMessage: "throttle endpoint returned 404",
+			ErrorMessage: "deploy request is outside its revert window",
 			RequestedBy:  requestedBy,
 		}}
 	}
@@ -238,7 +293,7 @@ func TestGRPCClient_MirrorReattributesARejectionToTheOperatorWhoReissuedIt(t *te
 	client.mirrorRemoteControlRejections(ctx, apply, apply.ExternalID, rejection("cli:alice"))
 	client.mirrorRemoteControlRejections(ctx, apply, apply.ExternalID, rejection("cli:bob"))
 
-	stored, err := stor.ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationVolume)
+	stored, err := stor.ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationRevert)
 	require.NoError(t, err)
 	require.NotNil(t, stored)
 	assert.Equal(t, "cli:bob", stored.RequestedBy,
@@ -246,11 +301,11 @@ func TestGRPCClient_MirrorReattributesARejectionToTheOperatorWhoReissuedIt(t *te
 	assert.Equal(t, storage.ControlRequestFailed, stored.Status)
 }
 
-// Volume is a pure proxy: the request lives entirely in the data plane, so the
-// mirrored row is the only record the control plane holds and no local request
-// lifecycle will ever reset it. When the operator re-issues the command and it
-// works, the data plane reports it completed — and the notice has to go, or the
-// PR keeps warning about a command that has since taken effect.
+// A rejection this plane never queued a request for leaves the mirrored row as
+// the only record the control plane holds, so no local request lifecycle will
+// ever reset it. When the operator re-issues the command and it works, the data
+// plane reports it completed — and the notice has to go, or the PR keeps warning
+// about a command that has since taken effect.
 func TestGRPCClient_MirrorRetiresARejectionTheDataPlaneLaterCompleted(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -264,7 +319,7 @@ func TestGRPCClient_MirrorRetiresARejectionTheDataPlaneLaterCompleted(t *testing
 	ctx := t.Context()
 	stor := createStorage(t, dsn)
 	defer utils.CloseAndLog(stor)
-	localClient, _ := newVolumeControlClient(t, dsn, stor)
+	localClient := newControlRequestClient(t, dsn, stor)
 	apply := dispatchQueuedApplyWithOptions(t, stor, localClient, nil)
 
 	server := &capturingTernServer{}
@@ -273,21 +328,21 @@ func TestGRPCClient_MirrorRetiresARejectionTheDataPlaneLaterCompleted(t *testing
 	client.storage = stor
 
 	client.mirrorRemoteControlRejections(ctx, apply, apply.ExternalID, []*ternv1.SettledControlRequest{{
-		Operation:    string(storage.ControlOperationVolume),
+		Operation:    string(storage.ControlOperationRevert),
 		Status:       string(storage.ControlRequestFailed),
-		ErrorMessage: "throttle endpoint returned 404",
+		ErrorMessage: "deploy request is outside its revert window",
 		RequestedBy:  "cli:alice",
 	}})
-	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationVolume, storage.ControlRequestFailed)
+	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationRevert, storage.ControlRequestFailed)
 
-	// The operator re-issues volume; this time the data plane applies it.
+	// The operator re-issues revert; this time the data plane applies it.
 	client.mirrorRemoteControlRejections(ctx, apply, apply.ExternalID, []*ternv1.SettledControlRequest{{
-		Operation:   string(storage.ControlOperationVolume),
+		Operation:   string(storage.ControlOperationRevert),
 		Status:      string(storage.ControlRequestCompleted),
 		RequestedBy: "cli:alice",
 	}})
 
-	stored, err := stor.ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationVolume)
+	stored, err := stor.ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationRevert)
 	require.NoError(t, err)
 	require.NotNil(t, stored)
 	assert.Equal(t, storage.ControlRequestCompleted, stored.Status,
@@ -348,7 +403,7 @@ func TestGRPCClient_MirrorKeepsTheOperatorNameOnALocallyQueuedRequest(t *testing
 	ctx := t.Context()
 	stor := createStorage(t, dsn)
 	defer utils.CloseAndLog(stor)
-	localClient, _ := newVolumeControlClient(t, dsn, stor)
+	localClient := newControlRequestClient(t, dsn, stor)
 	apply := dispatchQueuedApplyWithOptions(t, stor, localClient, nil)
 
 	server := &capturingTernServer{}
@@ -392,7 +447,7 @@ func TestGRPCClient_MirrorReattributesToANamedOperator(t *testing.T) {
 	ctx := t.Context()
 	stor := createStorage(t, dsn)
 	defer utils.CloseAndLog(stor)
-	localClient, _ := newVolumeControlClient(t, dsn, stor)
+	localClient := newControlRequestClient(t, dsn, stor)
 	apply := dispatchQueuedApplyWithOptions(t, stor, localClient, nil)
 
 	server := &capturingTernServer{}

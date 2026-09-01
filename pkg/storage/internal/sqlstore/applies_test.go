@@ -3734,7 +3734,6 @@ func TestApplyStore_Options(t *testing.T) {
 		AllowUnsafe:  true,
 		DeferCutover: true,
 		SkipRevert:   false,
-		Volume:       5,
 	})
 
 	id, err := store.Applies().Create(ctx, apply)
@@ -3748,7 +3747,6 @@ func TestApplyStore_Options(t *testing.T) {
 	assert.True(t, opts.AllowUnsafe)
 	assert.True(t, opts.DeferCutover)
 	assert.False(t, opts.SkipRevert)
-	assert.Equal(t, 5, opts.Volume)
 }
 
 func TestApplyStore_UpdateOptions(t *testing.T) {

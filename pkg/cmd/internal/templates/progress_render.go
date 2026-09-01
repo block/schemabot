@@ -188,7 +188,7 @@ func FormatApplyStopped() string {
 
 // FormatWatchFooter returns the footer shown during apply watch mode.
 func FormatWatchFooter() string {
-	return fmt.Sprintf("%sESC detach • %s • v volume%s", ANSIDim, StopKeyHint, ANSIReset)
+	return fmt.Sprintf("%sESC detach • %s%s", ANSIDim, StopKeyHint, ANSIReset)
 }
 
 func colorWrap(code string) func(string) string {
