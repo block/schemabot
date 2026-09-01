@@ -412,7 +412,7 @@ test-e2e-grpc: build ## Run gRPC e2e tests in isolated environment
 	E2E_SCHEMABOT_MYSQL_DSN="root:testpassword@tcp(localhost:15371)/schemabot" \
 	E2E_TERN_STAGING_MYSQL_DSN="root:testpassword@tcp(localhost:15372)/testapp" \
 	E2E_TERN_PRODUCTION_MYSQL_DSN="root:testpassword@tcp(localhost:15373)/testapp" \
-	$(GOTEST) -count=1 -v -tags=e2e -timeout=10m ./e2e/grpc/... ; \
+	$(GOTEST) -count=1 -v -tags=e2e -timeout=$(E2E_TEST_TIMEOUT) ./e2e/grpc/... ; \
 	TEST_EXIT_CODE=$$?; \
 	if [ $$TEST_EXIT_CODE -ne 0 ]; then \
 		echo "Capturing gRPC e2e container logs before teardown..."; \
