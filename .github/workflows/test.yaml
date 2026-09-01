@@ -649,7 +649,14 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Sized so setup (checkout, Go, cache restore, minikube start, plus the
+    # script's own image build and deploy — about five minutes) plus go
+    # test's per-binary timeout inside the script can land inside the job
+    # budget: a hung test panics with its goroutine dump instead of the
+    # runner cancelling the job first — or, on a slow run, cancelling it
+    # during the script's exit-trap cleanup after the suite already passed.
+    # Matches the sibling e2e-k8s-etre job's budget.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
