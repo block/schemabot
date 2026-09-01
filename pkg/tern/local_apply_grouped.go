@@ -118,6 +118,11 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	})
 
 	if err != nil {
+		// A cancelled drive is why the engine call returned, so the error
+		// describes the driver and not the change the engine already accepted.
+		if c.driveCancelled(ctx, apply, "while the engine was applying") {
+			return
+		}
 		newState := state.Apply.Failed
 		if c.shouldRetryEngineError(err) {
 			c.markApplyRetryableWithTasks(ctx, apply, tasks, err.Error())
@@ -159,6 +164,9 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 			// retry so the resume path reattaches to the in-flight work instead
 			// of abandoning it as terminal.
 			if saveErr := c.saveEngineResumeState(ctx, apply, tasks, resumeState); saveErr != nil {
+				if c.driveCancelled(ctx, apply, "while saving the engine resume state") {
+					return
+				}
 				logger.Warn("failed to save engine resume state after accepted apply; pausing apply for operator retry",
 					append(apply.MutableLogAttrs(), "error", saveErr)...)
 				c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to save engine resume state: %v", saveErr))
@@ -613,6 +621,12 @@ func applyQuiesceDecision(projectedApplyState string) (quiesce, retryablePause, 
 func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, ps *atomicPollState, options map[string]string, releaseAtCutoverBarrier bool) bool {
 	// Bind identity once for all decisions and state transitions in this progress tick.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
+	// The poll loop's select can pick a ready ticker over an equally ready
+	// ctx.Done(), so a tick can begin after the drive has been cancelled. Every
+	// engine call and storage write it made would fail on that context.
+	if c.driveCancelled(ctx, apply, "before a progress tick") {
+		return true
+	}
 	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 			"error", err)
@@ -627,6 +641,11 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		ResumeState: resumeState,
 	})
 	if err != nil {
+		// A cancelled drive is why the engine call failed, so the error says
+		// nothing about the deployment and must not be classified as one.
+		if c.driveCancelled(ctx, apply, "during a progress check") {
+			return true
+		}
 		// Permanent errors (e.g., deploy request not found) fail immediately.
 		var permanent *engine.PermanentError
 		if errors.As(err, &permanent) {
@@ -675,6 +694,9 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		}
 		if c.config.Type == storage.DatabaseTypeVitess {
 			if saveErr := c.saveEngineResumeState(ctx, apply, tasks, resumeState); saveErr != nil {
+				if c.driveCancelled(ctx, apply, "while saving the engine resume state") {
+					return true
+				}
 				logger.Error("failed to save Vitess engine resume state from progress polling",
 					append(apply.MutableLogAttrs(), "error", saveErr)...)
 				c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to save engine resume state from progress polling: %v", saveErr))
@@ -1102,7 +1124,14 @@ func (c *LocalClient) autoTriggerCutover(ctx context.Context, eng engine.Engine,
 			"Auto-triggering cutover (defer_cutover not set)", "", "")
 		ps.cutoverTriggerLogged = true
 	}
-	switch _, err := eng.Cutover(ctx, controlReq); {
+	_, err := eng.Cutover(ctx, controlReq)
+	// A cancelled drive is why the cutover call returned, so the error says
+	// nothing about the backend's willingness to cut over. The driver that
+	// reclaims the apply reattempts it from the stored state.
+	if err != nil && c.driveCancelled(ctx, apply, "while triggering cutover") {
+		return true
+	}
+	switch {
 	case err == nil:
 		ps.cutoverNotReadySince = time.Time{}
 		ps.cutoverNotReadyEscalated = false
