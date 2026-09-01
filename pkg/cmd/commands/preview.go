@@ -127,7 +127,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentDatabaseNotConfigured,
 		templates.PreviewCommentStartAccepted, templates.PreviewCommentStartPending,
 		templates.PreviewCommentCutoverAccepted, templates.PreviewCommentCutoverActive,
-		templates.PreviewCommentAppScopedDispatch, templates.PreviewCommentAppScopedHalted,
+		templates.PreviewCommentAppScopedDispatch, templates.PreviewCommentAppScopedDispatchLarge,
+		templates.PreviewCommentAppScopedHalted,
 		templates.PreviewCommentAppScopedNotAuthorized,
 		templates.PreviewCommentAppScopedRejected, templates.PreviewCommentAppFlagInvalid,
 		templates.PreviewCommentAppFlagConflicts:
@@ -335,6 +336,7 @@ Apply Command Comments (GitHub PR apply commands):
 
 App-Scoped Command Comments (--app expansion):
   comment_app_scoped_dispatch       App expansion summary (targeted + skipped databases)
+  comment_app_scoped_dispatch_large Fleet-sized expansion, database list collapses
   comment_app_scoped_halted         PR head advanced mid-dispatch, remaining databases not started
   comment_app_scoped_not_authorized Actor denied on one database, whole command denied
   comment_app_scoped_rejected       Fail-closed expansion rejection

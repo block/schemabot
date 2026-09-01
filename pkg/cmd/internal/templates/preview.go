@@ -213,6 +213,7 @@ const (
 
 	// App-scoped command comment previews (--app expansion)
 	PreviewCommentAppScopedDispatch      PreviewType = "comment_app_scoped_dispatch"       // App expansion summary: targeted + skipped databases
+	PreviewCommentAppScopedDispatchLarge PreviewType = "comment_app_scoped_dispatch_large" // Fleet-sized expansion: database list collapses
 	PreviewCommentAppScopedHalted        PreviewType = "comment_app_scoped_halted"         // PR head advanced mid-dispatch, remaining databases not started
 	PreviewCommentAppScopedNotAuthorized PreviewType = "comment_app_scoped_not_authorized" // Actor denied on one database, whole command denied
 	PreviewCommentAppScopedRejected      PreviewType = "comment_app_scoped_rejected"       // Fail-closed expansion rejection

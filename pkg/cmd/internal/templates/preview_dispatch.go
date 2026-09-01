@@ -315,6 +315,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAlreadyInProgress())
 	case PreviewCommentAppScopedDispatch:
 		fmt.Print(webhooktemplates.PreviewCommentAppScopedDispatch())
+	case PreviewCommentAppScopedDispatchLarge:
+		fmt.Print(webhooktemplates.PreviewCommentAppScopedDispatchLarge())
 	case PreviewCommentAppScopedHalted:
 		fmt.Print(webhooktemplates.PreviewCommentAppScopedDispatchHalted())
 	case PreviewCommentAppScopedNotAuthorized:
