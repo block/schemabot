@@ -3012,17 +3012,301 @@ Verify the database name, or run the command against the SchemaBot instance that
 
 **App**: `billing-service`
 **Requested by**: @jackjackbits
+**Commit**: `abcdef1234567890abcdef1234567890abcdef12` — every database applies this commit
 
-`schemabot apply --app billing-service` expands to **2** databases:
+`schemabot apply -e staging --app billing-service` is applying to **2** databases, one at a time in name order:
 
 - `billing-invoices`
 - `billing-ledger`
 
-**Skipped**:
+**Skipped** (2):
+
 - `billing-archive` — environment `staging` is not configured
 - `billing-reports` — no plan for this PR
 
-Each database runs as its own apply with its own progress comment and check.
+Each database runs as its own apply and posts its own progress comments and Check Run below this comment. If a new commit lands on the PR mid-dispatch, the remaining databases are not started and a halt notice is posted.
+
+</details>
+
+<details>
+<summary><a name="appscoped-apply-dispatch-summary-large-fleet"></a><strong>App-scoped Apply: Dispatch Summary (Large Fleet)</strong></summary>
+
+
+## App-Scoped Apply — Production
+
+**App**: `tenants`
+**Requested by**: @jackjackbits
+**Commit**: `abcdef1234567890abcdef1234567890abcdef12` — every database applies this commit
+
+`schemabot apply -e production --app tenants` is applying to **256** databases, one at a time in name order:
+
+<details>
+<summary>Show all 256 databases</summary>
+
+- `tenants-shard-001`
+- `tenants-shard-002`
+- `tenants-shard-003`
+- `tenants-shard-004`
+- `tenants-shard-005`
+- `tenants-shard-006`
+- `tenants-shard-007`
+- `tenants-shard-008`
+- `tenants-shard-009`
+- `tenants-shard-010`
+- `tenants-shard-011`
+- `tenants-shard-012`
+- `tenants-shard-013`
+- `tenants-shard-014`
+- `tenants-shard-015`
+- `tenants-shard-016`
+- `tenants-shard-017`
+- `tenants-shard-018`
+- `tenants-shard-019`
+- `tenants-shard-020`
+- `tenants-shard-021`
+- `tenants-shard-022`
+- `tenants-shard-023`
+- `tenants-shard-024`
+- `tenants-shard-025`
+- `tenants-shard-026`
+- `tenants-shard-027`
+- `tenants-shard-028`
+- `tenants-shard-029`
+- `tenants-shard-030`
+- `tenants-shard-031`
+- `tenants-shard-032`
+- `tenants-shard-033`
+- `tenants-shard-034`
+- `tenants-shard-035`
+- `tenants-shard-036`
+- `tenants-shard-037`
+- `tenants-shard-038`
+- `tenants-shard-039`
+- `tenants-shard-040`
+- `tenants-shard-041`
+- `tenants-shard-042`
+- `tenants-shard-043`
+- `tenants-shard-044`
+- `tenants-shard-045`
+- `tenants-shard-046`
+- `tenants-shard-047`
+- `tenants-shard-048`
+- `tenants-shard-049`
+- `tenants-shard-050`
+- `tenants-shard-051`
+- `tenants-shard-052`
+- `tenants-shard-053`
+- `tenants-shard-054`
+- `tenants-shard-055`
+- `tenants-shard-056`
+- `tenants-shard-057`
+- `tenants-shard-058`
+- `tenants-shard-059`
+- `tenants-shard-060`
+- `tenants-shard-061`
+- `tenants-shard-062`
+- `tenants-shard-063`
+- `tenants-shard-064`
+- `tenants-shard-065`
+- `tenants-shard-066`
+- `tenants-shard-067`
+- `tenants-shard-068`
+- `tenants-shard-069`
+- `tenants-shard-070`
+- `tenants-shard-071`
+- `tenants-shard-072`
+- `tenants-shard-073`
+- `tenants-shard-074`
+- `tenants-shard-075`
+- `tenants-shard-076`
+- `tenants-shard-077`
+- `tenants-shard-078`
+- `tenants-shard-079`
+- `tenants-shard-080`
+- `tenants-shard-081`
+- `tenants-shard-082`
+- `tenants-shard-083`
+- `tenants-shard-084`
+- `tenants-shard-085`
+- `tenants-shard-086`
+- `tenants-shard-087`
+- `tenants-shard-088`
+- `tenants-shard-089`
+- `tenants-shard-090`
+- `tenants-shard-091`
+- `tenants-shard-092`
+- `tenants-shard-093`
+- `tenants-shard-094`
+- `tenants-shard-095`
+- `tenants-shard-096`
+- `tenants-shard-097`
+- `tenants-shard-098`
+- `tenants-shard-099`
+- `tenants-shard-100`
+- `tenants-shard-101`
+- `tenants-shard-102`
+- `tenants-shard-103`
+- `tenants-shard-104`
+- `tenants-shard-105`
+- `tenants-shard-106`
+- `tenants-shard-107`
+- `tenants-shard-108`
+- `tenants-shard-109`
+- `tenants-shard-110`
+- `tenants-shard-111`
+- `tenants-shard-112`
+- `tenants-shard-113`
+- `tenants-shard-114`
+- `tenants-shard-115`
+- `tenants-shard-116`
+- `tenants-shard-117`
+- `tenants-shard-118`
+- `tenants-shard-119`
+- `tenants-shard-120`
+- `tenants-shard-121`
+- `tenants-shard-122`
+- `tenants-shard-123`
+- `tenants-shard-124`
+- `tenants-shard-125`
+- `tenants-shard-126`
+- `tenants-shard-127`
+- `tenants-shard-128`
+- `tenants-shard-129`
+- `tenants-shard-130`
+- `tenants-shard-131`
+- `tenants-shard-132`
+- `tenants-shard-133`
+- `tenants-shard-134`
+- `tenants-shard-135`
+- `tenants-shard-136`
+- `tenants-shard-137`
+- `tenants-shard-138`
+- `tenants-shard-139`
+- `tenants-shard-140`
+- `tenants-shard-141`
+- `tenants-shard-142`
+- `tenants-shard-143`
+- `tenants-shard-144`
+- `tenants-shard-145`
+- `tenants-shard-146`
+- `tenants-shard-147`
+- `tenants-shard-148`
+- `tenants-shard-149`
+- `tenants-shard-150`
+- `tenants-shard-151`
+- `tenants-shard-152`
+- `tenants-shard-153`
+- `tenants-shard-154`
+- `tenants-shard-155`
+- `tenants-shard-156`
+- `tenants-shard-157`
+- `tenants-shard-158`
+- `tenants-shard-159`
+- `tenants-shard-160`
+- `tenants-shard-161`
+- `tenants-shard-162`
+- `tenants-shard-163`
+- `tenants-shard-164`
+- `tenants-shard-165`
+- `tenants-shard-166`
+- `tenants-shard-167`
+- `tenants-shard-168`
+- `tenants-shard-169`
+- `tenants-shard-170`
+- `tenants-shard-171`
+- `tenants-shard-172`
+- `tenants-shard-173`
+- `tenants-shard-174`
+- `tenants-shard-175`
+- `tenants-shard-176`
+- `tenants-shard-177`
+- `tenants-shard-178`
+- `tenants-shard-179`
+- `tenants-shard-180`
+- `tenants-shard-181`
+- `tenants-shard-182`
+- `tenants-shard-183`
+- `tenants-shard-184`
+- `tenants-shard-185`
+- `tenants-shard-186`
+- `tenants-shard-187`
+- `tenants-shard-188`
+- `tenants-shard-189`
+- `tenants-shard-190`
+- `tenants-shard-191`
+- `tenants-shard-192`
+- `tenants-shard-193`
+- `tenants-shard-194`
+- `tenants-shard-195`
+- `tenants-shard-196`
+- `tenants-shard-197`
+- `tenants-shard-198`
+- `tenants-shard-199`
+- `tenants-shard-200`
+- `tenants-shard-201`
+- `tenants-shard-202`
+- `tenants-shard-203`
+- `tenants-shard-204`
+- `tenants-shard-205`
+- `tenants-shard-206`
+- `tenants-shard-207`
+- `tenants-shard-208`
+- `tenants-shard-209`
+- `tenants-shard-210`
+- `tenants-shard-211`
+- `tenants-shard-212`
+- `tenants-shard-213`
+- `tenants-shard-214`
+- `tenants-shard-215`
+- `tenants-shard-216`
+- `tenants-shard-217`
+- `tenants-shard-218`
+- `tenants-shard-219`
+- `tenants-shard-220`
+- `tenants-shard-221`
+- `tenants-shard-222`
+- `tenants-shard-223`
+- `tenants-shard-224`
+- `tenants-shard-225`
+- `tenants-shard-226`
+- `tenants-shard-227`
+- `tenants-shard-228`
+- `tenants-shard-229`
+- `tenants-shard-230`
+- `tenants-shard-231`
+- `tenants-shard-232`
+- `tenants-shard-233`
+- `tenants-shard-234`
+- `tenants-shard-235`
+- `tenants-shard-236`
+- `tenants-shard-237`
+- `tenants-shard-238`
+- `tenants-shard-239`
+- `tenants-shard-240`
+- `tenants-shard-241`
+- `tenants-shard-242`
+- `tenants-shard-243`
+- `tenants-shard-244`
+- `tenants-shard-245`
+- `tenants-shard-246`
+- `tenants-shard-247`
+- `tenants-shard-248`
+- `tenants-shard-249`
+- `tenants-shard-250`
+- `tenants-shard-251`
+- `tenants-shard-252`
+- `tenants-shard-253`
+- `tenants-shard-254`
+- `tenants-shard-255`
+- `tenants-shard-256`
+
+</details>
+
+**Skipped** (1):
+
+- `tenants-shard-legacy` — no plan for this PR
+
+Each database runs as its own apply and posts its own progress comments and Check Run below this comment. If a new commit lands on the PR mid-dispatch, the remaining databases are not started and a halt notice is posted.
 
 </details>
 
@@ -7657,8 +7941,9 @@ schemabot apply -e production
 
 #### Keyspace `cdb_resolute_sharded`
 
-**`mutes`**: 🔄 Row copy in progress
-  └ shards: ◐ -40 45% · ⏳ 40-80 · ⏳ 80-c0 · ⏳ c0-
+**`mutes`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62% (1 of 4 shards)
+- Rows: 914,707 / 1,466,232 across 1 of 4 shards · ETA: ≥ 3m 15s
+  └ shards: ◐ -40 62% · ⏳ 40-80 · ⏳ 80-c0 · ⏳ c0-
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
@@ -7758,7 +8043,8 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 #### Keyspace `cdb_resolute_lookup`
 
-**`outcomes_lookup`**: 🔄 Row copy in progress
+**`outcomes_lookup`**: 🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 27%
+- Rows: 540,211 / 2,000,780 · ETA: 8m 0s
 
 #### Keyspace `cdb_resolute_sharded`
 

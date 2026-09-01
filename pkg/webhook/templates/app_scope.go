@@ -3,6 +3,8 @@ package templates
 import (
 	"fmt"
 	"strings"
+
+	"github.com/block/schemabot/pkg/glyph"
 )
 
 // RenderInvalidAppFlag renders the usage comment posted when `--app` is
@@ -60,7 +62,7 @@ type AppScopedExpansionErrorData struct {
 func RenderAppScopedExpansionError(data AppScopedExpansionErrorData) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, "⛔ App-Scoped Command Rejected", data.Environment)
+	writeEnvironmentTitle(&sb, glyph.Refused+" App-Scoped Command Rejected", data.Environment)
 	fmt.Fprintf(&sb, "**App**: `%s`\n", data.App)
 	if data.RequestedBy != "" {
 		fmt.Fprintf(&sb, "**Requested by**: @%s\n", data.RequestedBy)
@@ -128,6 +130,24 @@ func RenderAppScopedApplyNotAuthorized(data AppScopedNotAuthorizedData) string {
 	return offerSupportChannel(sb.String())
 }
 
+// maxInlineDatabaseList is the largest database list rendered as inline
+// bullets; longer lists collapse into a details block so a fleet-sized
+// expansion does not dominate the PR timeline.
+const maxInlineDatabaseList = 10
+
+// writeDatabaseList writes the bullets produced by writeItems, collapsing
+// them into a details block titled summary when the list is longer than
+// maxInlineDatabaseList.
+func writeDatabaseList(sb *strings.Builder, count int, summary string, writeItems func()) {
+	if count <= maxInlineDatabaseList {
+		writeItems()
+		return
+	}
+	fmt.Fprintf(sb, "<details>\n<summary>%s</summary>\n\n", summary)
+	writeItems()
+	sb.WriteString("\n</details>\n")
+}
+
 // AppScopedDispatchHaltedData carries the mid-dispatch halt of an app-scoped
 // command: a new commit landed on the PR after some databases already started,
 // so the remaining databases were not started at the now-superseded commit.
@@ -150,7 +170,7 @@ type AppScopedDispatchHaltedData struct {
 func RenderAppScopedDispatchHalted(data AppScopedDispatchHaltedData) string {
 	var sb strings.Builder
 
-	writeEnvironmentTitle(&sb, "⚠️ App-Scoped Dispatch Halted", data.Environment)
+	writeEnvironmentTitle(&sb, glyph.Attention+" App-Scoped Dispatch Halted", data.Environment)
 	fmt.Fprintf(&sb, "**App**: `%s`\n\n", data.App)
 	fmt.Fprintf(&sb, "A new commit landed on this PR while `schemabot %s --app %s` was dispatching: the command started from `%s`, but the PR head is now `%s`.\n\n",
 		data.CommandName, data.App, data.PinnedSHA, data.CurrentSHA)
@@ -159,9 +179,12 @@ func RenderAppScopedDispatchHalted(data AppScopedDispatchHaltedData) string {
 		subject = "this database was"
 	}
 	fmt.Fprintf(&sb, "To keep every database on the same commit, %s **not** started:\n\n", subject)
-	for _, db := range data.NotStarted {
-		fmt.Fprintf(&sb, "- `%s`\n", db)
-	}
+	writeDatabaseList(&sb, len(data.NotStarted),
+		fmt.Sprintf("Show all %d databases", len(data.NotStarted)), func() {
+			for _, db := range data.NotStarted {
+				fmt.Fprintf(&sb, "- `%s`\n", db)
+			}
+		})
 	fmt.Fprintf(&sb, "\nDatabases dispatched before the halt continue at `%s` and report in their own comments. Review the new commit, then run `schemabot %s -e %s --app %s` again to apply the current head everywhere.\n",
 		data.PinnedSHA, data.CommandName, data.Environment, data.App)
 
@@ -183,6 +206,9 @@ type AppScopedDispatchData struct {
 	Environment string
 	CommandName string
 	RequestedBy string
+	// PinnedSHA is the PR head the dispatch pinned; every database applies
+	// this commit. Empty omits the commit line.
+	PinnedSHA string
 	// Databases are the expanded databases the command will run against, in
 	// name order.
 	Databases []string
@@ -201,19 +227,28 @@ func RenderAppScopedDispatch(data AppScopedDispatchData) string {
 	if data.RequestedBy != "" {
 		fmt.Fprintf(&sb, "**Requested by**: @%s\n", data.RequestedBy)
 	}
+	if data.PinnedSHA != "" {
+		fmt.Fprintf(&sb, "**Commit**: `%s` — every database applies this commit\n", data.PinnedSHA)
+	}
 	sb.WriteString("\n")
-	fmt.Fprintf(&sb, "`schemabot %s --app %s` expands to **%d** %s:\n\n",
-		data.CommandName, data.App, len(data.Databases), pluralize("database", len(data.Databases)))
-	for _, db := range data.Databases {
-		fmt.Fprintf(&sb, "- `%s`\n", db)
-	}
+	fmt.Fprintf(&sb, "`schemabot %s -e %s --app %s` is applying to **%d** %s, one at a time in name order:\n\n",
+		data.CommandName, data.Environment, data.App, len(data.Databases), pluralize("database", len(data.Databases)))
+	writeDatabaseList(&sb, len(data.Databases),
+		fmt.Sprintf("Show all %d databases", len(data.Databases)), func() {
+			for _, db := range data.Databases {
+				fmt.Fprintf(&sb, "- `%s`\n", db)
+			}
+		})
 	if len(data.Skipped) > 0 {
-		sb.WriteString("\n**Skipped**:\n")
-		for _, skipped := range data.Skipped {
-			fmt.Fprintf(&sb, "- `%s` — %s\n", skipped.Database, skipped.Reason)
-		}
+		fmt.Fprintf(&sb, "\n**Skipped** (%d):\n\n", len(data.Skipped))
+		writeDatabaseList(&sb, len(data.Skipped),
+			fmt.Sprintf("Show all %d skipped databases", len(data.Skipped)), func() {
+				for _, skipped := range data.Skipped {
+					fmt.Fprintf(&sb, "- `%s` — %s\n", skipped.Database, skipped.Reason)
+				}
+			})
 	}
-	sb.WriteString("\nEach database runs as its own apply with its own progress comment and check.\n")
+	sb.WriteString("\nEach database runs as its own apply and posts its own progress comments and Check Run below this comment. If a new commit lands on the PR mid-dispatch, the remaining databases are not started and a halt notice is posted.\n")
 
 	return sb.String()
 }

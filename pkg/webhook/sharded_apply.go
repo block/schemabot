@@ -363,9 +363,15 @@ func shardStatusesByKeyspace(groups []shardWorkGroup, qualifyIdentity bool, rele
 // siblings copy.
 func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map[int64][]*storage.Task) map[string][]templates.ShardedTableStatus {
 	type keyspaceTable struct{ namespace, table string }
-	seen := make(map[keyspaceTable]struct{})
+	type tableRollup struct {
+		shards          []templates.ShardProgressData
+		rowsCopied      int64
+		rowsTotal       int64
+		etaSeconds      int64
+		shardsReporting int
+	}
 	var order []keyspaceTable
-	shardsByTable := make(map[keyspaceTable][]templates.ShardProgressData)
+	rollups := make(map[keyspaceTable]*tableRollup)
 	for _, op := range ops {
 		ns, shard, table, ok := parseShardOperationKey(op.OperationKey)
 		if !ok {
@@ -373,51 +379,87 @@ func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map
 			continue
 		}
 		key := keyspaceTable{namespace: ns, table: table}
-		if _, dup := seen[key]; !dup {
-			seen[key] = struct{}{}
+		r := rollups[key]
+		if r == nil {
+			r = &tableRollup{}
+			rollups[key] = r
 			order = append(order, key)
 		}
-		status, percent := shardTaskStatus(op, tasksByOp[op.ID])
-		shardsByTable[key] = append(shardsByTable[key], templates.ShardProgressData{
+		sp := shardTaskProgress(op, tasksByOp[op.ID])
+		r.shards = append(r.shards, templates.ShardProgressData{
 			Shard:           shard,
-			Status:          status,
-			PercentComplete: percent,
+			Status:          sp.status,
+			PercentComplete: sp.percent,
 		})
+		// Rows sum across the shards that have reported; the ETA is the slowest
+		// reporting shard's. A shard counts as reporting only once it carries a
+		// row total, and all of its figures are gated on that together — the
+		// numerator, denominator, ETA, and coverage count always describe the
+		// same set of shards, so a shard with copied rows but no total yet
+		// cannot inflate the fraction's numerator alone. Shards whose dispatch
+		// wave has not started contribute nothing, and the renderer discloses
+		// the coverage instead of presenting a wave's figures as the table's.
+		if sp.rowsTotal > 0 {
+			r.shardsReporting++
+			r.rowsCopied += sp.rowsCopied
+			r.rowsTotal += sp.rowsTotal
+			if sp.etaSeconds > r.etaSeconds {
+				r.etaSeconds = sp.etaSeconds
+			}
+		}
 	}
 	out := make(map[string][]templates.ShardedTableStatus, len(order))
 	for _, key := range order {
-		shards := shardsByTable[key]
+		r := rollups[key]
 		out[key.namespace] = append(out[key.namespace], templates.ShardedTableStatus{
-			Table:  key.table,
-			Status: aggregateTableStatus(shards),
-			Shards: shards,
+			Table:           key.table,
+			Status:          aggregateTableStatus(r.shards),
+			RowsCopied:      r.rowsCopied,
+			RowsTotal:       r.rowsTotal,
+			ETASeconds:      r.etaSeconds,
+			ShardsReporting: r.shardsReporting,
+			Shards:          r.shards,
 		})
 	}
 	return out
 }
 
-// shardTaskStatus resolves one (shard, table) operation's display status and
-// copy percent from its most attention-worthy task — the task is where the
+// shardProgress is one (shard, table) operation's display projection: the
+// state and copy figures of its most attention-worthy task.
+type shardProgress struct {
+	status     string
+	percent    int
+	rowsCopied int64
+	rowsTotal  int64
+	etaSeconds int64
+}
+
+// shardTaskProgress resolves one (shard, table) operation's display status and
+// copy figures from its most attention-worthy task — the task is where the
 // engine reports live shard state. The operation state stands in when the
 // operation has no tasks yet (dispatch creates them when its wave starts) or a
 // task has not reported state; it normalizes into the same vocabulary.
-func shardTaskStatus(op *storage.ApplyOperation, tasks []*storage.Task) (string, int) {
-	best := ""
-	percent := 0
+func shardTaskProgress(op *storage.ApplyOperation, tasks []*storage.Task) shardProgress {
+	best := shardProgress{}
 	for _, t := range tasks {
 		status := t.State
 		if status == "" {
 			status = op.State
 		}
-		if best == "" || taskStateRank(status) > taskStateRank(best) {
-			best = status
-			percent = t.ProgressPercent
+		if best.status == "" || taskStateRank(status) > taskStateRank(best.status) {
+			best = shardProgress{
+				status:     status,
+				percent:    t.ProgressPercent,
+				rowsCopied: t.RowsCopied,
+				rowsTotal:  t.RowsTotal,
+				etaSeconds: int64(t.ETASeconds),
+			}
 		}
 	}
-	if best == "" {
-		return op.State, 0
+	if best.status == "" {
+		return shardProgress{status: op.State}
 	}
-	return best, percent
+	return best
 }
 
 // aggregateTableStatus reduces a table's per-shard states to the one an
