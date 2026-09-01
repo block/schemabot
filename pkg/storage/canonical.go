@@ -10,10 +10,11 @@ import "strings"
 // before matching or persisting. Folding is lowercase-only; accent folding is
 // deliberately excluded because identity strings are ASCII in practice.
 //
-// Deliberately not folded here: lock owner strings ("org/repo#42") are the
-// ownership predicate on lock acquire, release, and intent verification, but
-// the repository they are derived from is folded at ingress, so owners are
-// canonical by construction rather than re-folded at this boundary.
+// Lock owner strings are the ownership predicate on lock acquire, release,
+// and intent verification and must match byte-exactly. GitHub-origin owners
+// ("org/repo#42") are canonical by construction from the folded repository;
+// the lock API folds a caller-supplied owner ("cli:user@host") with this
+// function at acquire and release.
 // Deployment names are identity keys too, but they are operator-controlled
 // configuration that doubles as routing and schema-directory path components,
 // so config validation rejects non-canonical spellings instead of silently
