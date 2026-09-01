@@ -1834,6 +1834,11 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 
 func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, err error, startRequested bool) error {
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
+	// A cancelled drive is why the resume returned, so the error describes the
+	// driver rather than the schema change it was reattaching to.
+	if c.driveCancelled(ctx, apply, "while resuming the apply") {
+		return nil
+	}
 	if c.shouldRetryEngineError(err) {
 		logger.Warn("engine apply failed during recovery, pausing apply for operator retry",
 			"error", err)
