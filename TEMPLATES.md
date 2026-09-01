@@ -3378,7 +3378,7 @@ No schema change was started for any database.
 
 Usage: `schemabot apply -e <environment> --app <app>`
 
-The `--app` flag requires an application identifier (lowercase alphanumeric with hyphens) that matches the `app` field on the target databases.
+The `--app` flag requires an application identifier (lowercase alphanumeric with interior hyphens, e.g. `billing-service`) that matches the `app` field on the target databases.
 <!-- schemabot:offer-support-channel -->
 
 </details>
