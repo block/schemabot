@@ -20,13 +20,10 @@ import (
 // folded. The parity test against the embedded schema files keeps the map in
 // lockstep with the schema.
 //
-// Lock owner strings ("org/repo#42") are folded here even though the write
-// boundaries never re-fold them: new owners are canonical by construction
-// (derived from the folded repository), but owners stored by earlier
-// releases can embed the unfolded spelling, which the folded lookup can
-// never match again. CLI lock owners ("cli:user@host") fold with them; a
-// caller whose spelling differs only by case can release its lock through
-// force-release.
+// Lock owner strings fold with the rest: GitHub-origin owners
+// ("org/repo#42") are canonical by construction from the folded repository,
+// and the lock API folds a caller-supplied owner ("cli:user@host") at
+// acquire and release, so the byte-exact owner match holds across the fold.
 //
 // Deliberately absent: lease owners and observer owners are pod identities,
 // not row-identity keys; plan identifiers, apply identifiers, SHAs, GitHub
@@ -53,9 +50,16 @@ const postgresErrUniqueViolation = "23505"
 // drift, but PostgreSQL compares bytes: rows written by releases that did
 // not fold identity strings at the write boundaries are invisible to the
 // folded lookups — locks that cannot be released, checks that duplicate
-// instead of updating. Run the fold once when upgrading a PostgreSQL storage
-// database to a release that folds identity strings; it only rewrites rows
-// whose spelling is not already canonical, so rerunning it is safe.
+// instead of updating. Run the fold once, after every writer — server and
+// workers — runs a release that folds identity strings at the write
+// boundaries: a writer still on an earlier release keeps writing unfolded
+// spellings, reintroducing the rows the fold just cured and creating the
+// duplicates it exists to prevent. It only rewrites rows whose spelling is
+// not already canonical, so rerunning it is safe.
+//
+// Each rewritten row is row-locked until its table's fold commits, during
+// which lookups and FOR UPDATE SKIP LOCKED claims skip those rows — run the
+// fold with the server quiesced, not under live traffic.
 //
 // The fold rewrites spelling only, so updated_at timestamps are left
 // untouched — lease-expiry and staleness heuristics keep their meaning.
@@ -90,8 +94,11 @@ func CanonicalizePostgresIdentityKeys(ctx context.Context, db *sql.DB, logger *s
 	sort.Strings(foldTables)
 
 	folded := int64(0)
+	processed := 0
+	skipped := 0
 	for _, table := range foldTables {
 		if missingSet[table] {
+			skipped++
 			logger.Warn("storage table does not exist; its identity keys were not folded — rerun the canonicalization after the release that creates it bootstraps",
 				"table", table)
 			continue
@@ -105,6 +112,7 @@ func CanonicalizePostgresIdentityKeys(ctx context.Context, db *sql.DB, logger *s
 			}
 			return fmt.Errorf("fold identity keys on storage table %q: %w", table, err)
 		}
+		processed++
 		folded += rows
 		if rows > 0 {
 			logger.Info("folded stored identity keys to canonical lowercase",
@@ -115,7 +123,7 @@ func CanonicalizePostgresIdentityKeys(ctx context.Context, db *sql.DB, logger *s
 		}
 	}
 	logger.Info("identity key canonicalization summary",
-		"tables", len(foldTables), "rows_folded", folded)
+		"tables_folded", processed, "tables_skipped_missing", skipped, "rows_folded", folded)
 	return nil
 }
 

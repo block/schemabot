@@ -45,3 +45,57 @@ func TestPostgresIdentityKeyColumns_MatchEmbeddedSchema(t *testing.T) {
 		}
 	}
 }
+
+// The converse direction: every schema column whose name marks it as an
+// identity string must have a fold-map entry, or a deliberate exclusion with
+// a rationale. Without this direction, a new table or column that needs
+// folding would be silently omitted — its rows never folded — while the
+// canonicalization still reports success.
+func TestPostgresIdentityKeyColumns_CoverEmbeddedSchema(t *testing.T) {
+	// The column names under which identity strings are stored anywhere in
+	// the storage schema. Pod identities use distinct names (lease_owner,
+	// observer_owner) and never appear here.
+	identityColumnNames := map[string]bool{
+		"database_name":     true,
+		"database_type":     true,
+		"deployment":        true,
+		"environment":       true,
+		"environment_scope": true,
+		"owner":             true,
+		"repository":        true,
+	}
+	// table.column entries carrying an identity-shaped name that are
+	// deliberately not folded; the value states why.
+	excluded := map[string]string{}
+
+	tables, files, err := readEmbeddedPostgresSchemaFiles()
+	require.NoError(t, err)
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+
+	for _, table := range tables {
+		statements, err := parser.Split(files[table])
+		require.NoError(t, err)
+		require.NotEmpty(t, statements, "schema file for table %q has no statements", table)
+		columns, err := parser.CreateTableColumns(statements[0])
+		require.NoError(t, err)
+
+		mapped := make(map[string]bool, len(postgresIdentityKeyColumns[table]))
+		for _, column := range postgresIdentityKeyColumns[table] {
+			mapped[column] = true
+		}
+		for _, column := range columns {
+			if !identityColumnNames[column] {
+				continue
+			}
+			key := table + "." + column
+			if rationale, ok := excluded[key]; ok {
+				assert.False(t, mapped[column],
+					"%s is excluded (%s) but also mapped; drop one", key, rationale)
+				continue
+			}
+			assert.True(t, mapped[column],
+				"schema column %s holds an identity string but has no fold-map entry; map it, or exclude it here with a rationale", key)
+		}
+	}
+}

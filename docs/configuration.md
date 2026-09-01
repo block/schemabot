@@ -360,19 +360,30 @@ in-flight applies before upgrading. Rows written by earlier versions may
 carry mixed-case identity values — repository names, database names,
 environments, deployments, and lock owner values such as `Org/Repo#42`; on
 PostgreSQL, the folded lookups cannot match those rows again, so locks cannot
-be reacquired or released and checks duplicate instead of updating. After
-upgrading, fold the stored rows once with
+be reacquired or released and checks duplicate instead of updating. Once
+every writer — server and workers — runs the folding release (a writer still
+on an earlier release would keep writing mixed-case rows, reintroducing the
+rows the fold cures), fold the stored rows once with
 
 ```bash
 schemabot storage canonicalize-identity-keys --config /etc/schemabot/config.yaml
 ```
 
-The fold only rewrites rows whose spelling is not already canonical, so
-rerunning it is safe. When two rows differ only by case (for example locks on
-`Foo` and `foo` of the same database type), the fold refuses rather than
-collapse them, naming the violated unique index; delete or repair the
-duplicate rows by hand, then rerun. Force-release remains the fallback for
-any lock stranded before the fold runs.
+Run it inside the maintenance window with the server quiesced — the command
+connects to storage itself and works while the server is down. The fold
+row-locks every row it rewrites until its table's fold commits; under live
+traffic, lock lookups and `FOR UPDATE SKIP LOCKED` claims would skip those
+rows for the duration. The rewrite is one-way — original spellings are not
+recorded anywhere — so the command prompts before touching rows; pass
+`--auto-approve` (`-y`) for scripted maintenance windows. It only rewrites
+rows whose spelling is not already canonical, so rerunning it is safe.
+
+Each table folds in its own transaction. When two rows differ only by case
+(for example locks on `Foo` and `foo` of the same database type), that
+table's fold refuses rather than collapse them, naming the violated unique
+index — tables already folded stay folded. Delete or repair the duplicate
+rows by hand, then rerun to fold the rest. Force-release remains the
+fallback for any lock stranded before the fold runs.
 
 ## Hybrid Mode
 

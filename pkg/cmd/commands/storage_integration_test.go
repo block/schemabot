@@ -98,7 +98,7 @@ func TestCanonicalizeIdentityKeysCmd_DSNFlag(t *testing.T) {
 		 VALUES ('MyDB', 'MySQL', 'Org/Repo', 42, 'Org/Repo#42')`)
 	require.NoError(t, err)
 
-	cmd := &CanonicalizeIdentityKeysCmd{DSN: dsn}
+	cmd := &CanonicalizeIdentityKeysCmd{DSN: dsn, AutoApprove: true}
 	require.NoError(t, cmd.Run(t.Context(), &Globals{Version: "test"}))
 
 	var databaseName, databaseType, repository, owner string

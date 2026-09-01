@@ -100,6 +100,22 @@ func TestResolveStorageDSN_WhitespaceDirectDSN(t *testing.T) {
 	require.ErrorContains(t, err, "storage DSN not configured")
 }
 
+func TestResolveStorageDSN_RejectsNonPostgresDirectDSN(t *testing.T) {
+	_, _, err := resolveStorageDSN("user:pass@tcp(storage-host:3306)/schemabot", "", "the identity key canonicalization")
+	require.ErrorContains(t, err, "not a PostgreSQL DSN")
+	require.ErrorContains(t, err, `the identity key canonicalization only applies to "postgres" storage`)
+	assert.NotContains(t, err.Error(), "pass", "the error must not echo DSN credentials")
+}
+
+func TestResolveStorageDSN_RejectsNonPostgresStorageDialectForCanonicalization(t *testing.T) {
+	path := writeStorageTestConfig(t, `
+storage:
+  dsn: user:pass@tcp(storage-host:3306)/schemabot
+`)
+	_, _, err := resolveStorageDSN("", path, "the identity key canonicalization")
+	require.ErrorContains(t, err, `the identity key canonicalization only applies to "postgres" storage`)
+}
+
 func TestResolveStorageDSN_ReportsEnvironmentSource(t *testing.T) {
 	path := writeStorageTestConfig(t, `
 storage:

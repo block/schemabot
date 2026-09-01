@@ -19,6 +19,7 @@ type capturingLockStore struct {
 	acquired        *storage.Lock
 	releaseDatabase string
 	releaseType     string
+	releaseOwner    string
 	getDatabase     string
 	getType         string
 }
@@ -28,9 +29,10 @@ func (s *capturingLockStore) Acquire(_ context.Context, lock *storage.Lock) erro
 	return nil
 }
 
-func (s *capturingLockStore) Release(_ context.Context, database, dbType, _ string) error {
+func (s *capturingLockStore) Release(_ context.Context, database, dbType, owner string) error {
 	s.releaseDatabase = database
 	s.releaseType = dbType
+	s.releaseOwner = owner
 	return nil
 }
 
@@ -65,7 +67,8 @@ func TestLockHandlersCanonicalizeIdentityKeys(t *testing.T) {
 				assert.Equal(t, "testdb", store.acquired.DatabaseName)
 				assert.Equal(t, "mysql", store.acquired.DatabaseType)
 				assert.Equal(t, "org/repo", store.acquired.Repository)
-				assert.Equal(t, "Org/Repo#42", store.acquired.Owner)
+				assert.Equal(t, "org/repo#42", store.acquired.Owner,
+					"the owner is a byte-exact match token at release; it must fold at acquire so a differently-cased release still matches")
 			},
 		},
 		{
@@ -76,6 +79,8 @@ func TestLockHandlersCanonicalizeIdentityKeys(t *testing.T) {
 			assertCall: func(t *testing.T, store *capturingLockStore) {
 				assert.Equal(t, "testdb", store.releaseDatabase)
 				assert.Equal(t, "mysql", store.releaseType)
+				assert.Equal(t, "org/repo#42", store.releaseOwner,
+					"the owner must fold at release to match the folded spelling stored at acquire")
 			},
 		},
 		{
