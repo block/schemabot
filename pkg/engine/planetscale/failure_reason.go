@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/block/schemabot/pkg/engine"
 )
@@ -52,9 +53,10 @@ var vitessFailureReasons = map[int]string{
 }
 
 // MySQL error codes occupy 1000-1999 for the server, 2000-2999 for the client,
-// and 3000 up for codes added since. Bounding the accepted range keeps a
-// four-digit number that happens to sit after the word "error" from being
-// reported as a code.
+// and 3000 up for codes added since. The bound is only a plausibility filter —
+// it rejects numbers outside that range, but an in-range number after the
+// right label still parses. Separating codes from data is the label
+// requirement's and the scan region's job.
 const (
 	minMySQLErrorCode = 1000
 	maxMySQLErrorCode = 4999
@@ -66,14 +68,34 @@ const (
 // a four-digit value inside the quoted statement.
 var vitessErrorCodePattern = regexp.MustCompile(`(?i)\b(?:errno|error)[ :=]+([0-9]{4})\b`)
 
+// vitessQuotedStatementMarker separates the target's reason from the failed
+// statement it quotes after it. Codes sit in the reason; what follows the
+// marker is customer row data, where a labelled number is just a value.
+const vitessQuotedStatementMarker = "during query:"
+
+// codeScanRegion returns the part of the message where a labelled number can
+// be trusted as an error code: everything before the quoted statement. The
+// marker is an input-side dependency of the kind the package comment
+// describes — if Vitess rewords it, the scan covers the whole message again,
+// which is less precise but degrades only toward the generic sentence's
+// territory, never toward rendering target text.
+func codeScanRegion(msg string) string {
+	if before, _, ok := strings.Cut(msg, vitessQuotedStatementMarker); ok {
+		return before
+	}
+	return msg
+}
+
 // vitessErrorCode extracts the error code to look up. Vitess wraps a tablet's
-// error in one of its own, so a message often carries two codes — a generic
+// error in one of its own, so the reason often carries two codes — a generic
 // outer one and the specific inner one that says what actually went wrong.
 // Preferring a code this package recognizes picks the informative one without
-// depending on where in the message it sits.
+// depending on where in the reason it sits. The scan stays inside the reason
+// region: prefer-known must never let a value quoted from the customer's own
+// rows outrank the genuine code in front of it.
 func vitessErrorCode(msg string) (int, bool) {
 	first := 0
-	for _, m := range vitessErrorCodePattern.FindAllStringSubmatch(msg, -1) {
+	for _, m := range vitessErrorCodePattern.FindAllStringSubmatch(codeScanRegion(msg), -1) {
 		code, err := strconv.Atoi(m[1])
 		if err != nil || code < minMySQLErrorCode || code > maxMySQLErrorCode {
 			continue

@@ -71,6 +71,22 @@ func TestVitessFailureReason(t *testing.T) {
 	t.Run("out-of-range numbers are not codes", func(t *testing.T) {
 		assert.Equal(t, genericVitessFailure, vitessFailureReason("error 9999 and errno 0042"))
 	})
+
+	// Prefer-known picks the informative code out of the reason, but a labelled
+	// number inside the quoted statement is a customer value, not a code. An
+	// unmapped genuine failure must fall back to the generic sentence rather
+	// than adopt whatever the row data happens to say.
+	t.Run("a mapped code quoted in row data cannot outrank the genuine code", func(t *testing.T) {
+		msg := "Duplicate column name 'x' (errno 1060) during query: " +
+			"insert into `t` (`note`) values ('error 1062 seen in prod')"
+		assert.Equal(t, genericVitessFailure+" (error 1060)", vitessFailureReason(msg))
+	})
+
+	t.Run("a mapped code in the reason wins whatever the row data says", func(t *testing.T) {
+		msg := "Duplicate entry 'a' for key 'k' (errno 1062) during query: " +
+			"insert into `t` values ('errno 1048')"
+		assert.Equal(t, vitessFailureReasons[1062]+" (error 1062)", vitessFailureReason(msg))
+	})
 }
 
 // The property that has to survive a target that changes its wording: whatever
@@ -83,6 +99,7 @@ func FuzzVitessFailureReason(f *testing.F) {
 	f.Add("")
 	f.Add("Error 1105 (HY000): vttablet: rpc error: code = Unknown desc = Column 'x' cannot be null (errno 1048)")
 	f.Add("errno 1062 | during query: insert into `t` values ('a\nb')")
+	f.Add("Duplicate column name 'x' (errno 1060) during query: insert into `t` (`note`) values ('error 1062 seen in prod')")
 	f.Add("ERROR=3819 check constraint 'c' is violated.")
 
 	authored := authoredReasons()
