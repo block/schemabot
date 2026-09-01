@@ -1050,6 +1050,27 @@ func (o ControlOperation) Valid() bool {
 	return false
 }
 
+// retiredControlOperations are operations a previous release recognized that
+// this release removed. Durable rows and data-plane reports naming them can
+// survive an upgrade; no driver services them anymore, so consumers skip them
+// quietly and the terminal sweep settles their leftover pending rows. Remove
+// an entry once no deployment still holds rows for it.
+var retiredControlOperations = []ControlOperation{"volume"}
+
+// Retired reports whether the operation was recognized by a previous release
+// and removed since. A retired operation read from storage or off the wire is
+// leftover pre-upgrade state, not a sign of a newer peer speaking an unknown
+// operation.
+func (o ControlOperation) Retired() bool {
+	return slices.Contains(retiredControlOperations, o)
+}
+
+// RetiredControlOperations returns the retired operations, for the terminal
+// sweep that settles their leftover pending rows.
+func RetiredControlOperations() []ControlOperation {
+	return slices.Clone(retiredControlOperations)
+}
+
 // mirroredControlRequestMetadataKey marks a control request row this plane never
 // queued: the row exists only because another plane reported the operation
 // rejected, as happens for an operation this plane only proxies, where the

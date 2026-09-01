@@ -29,6 +29,9 @@ func TestCompletePendingRequestsForTerminalApply(t *testing.T) {
 		storage.ControlOperationRevert,
 		storage.ControlOperationSkipRevert,
 		storage.ControlOperationCancel,
+		// A pending row for a retired operation, written by a previous release;
+		// no driver services it, so the sweep is its only settlement path.
+		storage.ControlOperation("volume"),
 	}
 	requests := make([]*storage.ApplyControlRequest, 0, len(sweptOps))
 	for _, op := range sweptOps {

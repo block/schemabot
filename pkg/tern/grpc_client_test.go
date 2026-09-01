@@ -3054,6 +3054,36 @@ func TestGRPCClient_ProcessPendingCancelControlRequestCompletesWholeApply(t *tes
 	assert.Nil(t, cancelReq)
 }
 
+// A data plane still on a release that recognized a since-retired control
+// operation reports its settled requests on every progress poll for the life
+// of the drive. There is nothing to mirror for an operation this release
+// removed, so the entry is skipped at debug level — warning would recur on
+// every poll of a pre-upgrade apply — and no rejection row is recorded.
+func TestGRPCClient_MirrorSkipsRetiredControlOperations(t *testing.T) {
+	var records []capturedLog
+	controlRequests := &testControlRequestStore{}
+	client := &GRPCClient{
+		logger:  slog.New(captureHandler{records: &records}),
+		storage: &mockStorage{controlRequests: controlRequests},
+	}
+	apply := &storage.Apply{
+		ID: 7, ApplyIdentifier: "apply-retired-mirror",
+		Database: "testdb", Environment: "staging",
+	}
+
+	client.mirrorRemoteControlRejections(t.Context(), apply, "remote-apply", []*ternv1.SettledControlRequest{{
+		Operation:    "volume",
+		Status:       string(storage.ControlRequestFailed),
+		ErrorMessage: "the engine rejected the volume change",
+	}})
+
+	require.Len(t, records, 1, "the skip must be visible in logs, exactly once per report")
+	assert.Equal(t, slog.LevelDebug, records[0].level,
+		"a retired operation recurs on every poll; it must not warn")
+	assert.Contains(t, records[0].msg, "retired operation")
+	assert.Empty(t, controlRequests.requests, "a retired operation records no rejection row")
+}
+
 // A cancel that reconciles a terminal remote ends the drive, so the regular
 // poll loop never runs again. A control command the data plane settled after
 // the last regular poll — here a revert its engine refused — reaches the

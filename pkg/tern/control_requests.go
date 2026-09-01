@@ -60,6 +60,10 @@ func completePendingRequestsForTerminalApply(ctx context.Context, store storage.
 		storage.ControlOperationRevert,
 		storage.ControlOperationSkipRevert,
 	}
+	// A pending request for a retired operation can only be a row written by a
+	// previous release; no driver services it anymore, so this sweep is its
+	// only settlement path.
+	ops = append(ops, storage.RetiredControlOperations()...)
 	if !state.IsState(apply.State, state.Apply.Stopped) {
 		ops = append(ops, storage.ControlOperationCancel)
 	}

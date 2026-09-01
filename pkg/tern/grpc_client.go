@@ -1930,6 +1930,15 @@ func (c *GRPCClient) mirrorRemoteControlRejections(ctx context.Context, apply *s
 			continue
 		}
 		operation := storage.ControlOperation(entry.Operation)
+		if operation.Retired() {
+			// A data plane on a previous release reports its settled retired
+			// requests on every poll until the apply finishes; there is nothing
+			// left to mirror for an operation this release removed, and the
+			// entry recurs for the life of the drive, so it logs at debug.
+			logger.Debug("data plane reported a settled control request for a retired operation; nothing to mirror",
+				append(apply.MutableLogAttrs(), "operation", entry.Operation, "status", entry.Status)...)
+			continue
+		}
 		if !operation.Valid() {
 			logger.Warn("data plane reported a settled control request for an unrecognized operation; it will not reach the operator",
 				append(apply.MutableLogAttrs(), "operation", entry.Operation, "status", entry.Status)...)
