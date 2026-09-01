@@ -195,8 +195,8 @@ func alterUsersEmailWithRows(rows int64) []engine.TableChange {
 }
 
 // A sharded plan's namespace view reports the whole table's size: per-shard
-// row estimates are summed, the largest single shard is kept (the
-// write-blocking blast radius of a shard-at-a-time apply), and the shard span
+// row estimates are summed, the largest single shard is kept (the biggest
+// chunk a shard-at-a-time apply works through at once), and the shard span
 // is counted. The per-shard rows keep each shard's own estimate.
 func TestPlanAggregatesShardTableSizes(t *testing.T) {
 	store := &fakePlanStore{
