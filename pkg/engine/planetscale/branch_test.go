@@ -97,6 +97,51 @@ func TestDiffKeyspace_DetectsSchemaChanges(t *testing.T) {
 	})
 }
 
+// Vitess will not accept a foreign key, so a plan that offered to apply one
+// would be offering a guaranteed failure — and the author would learn that only
+// after the apply had run. The plan refuses it up front instead. Dropping a
+// foreign key is still applicable: that is how a legacy constraint gets removed.
+func TestDiffKeyspace_RefusesForeignKeys(t *testing.T) {
+	e := &Engine{
+		linter: lint.New(),
+		logger: slog.New(slog.NewTextHandler(os.Stdout, nil)),
+	}
+	usersTable := "CREATE TABLE `users` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+
+	t.Run("a new table declaring a foreign key is refused", func(t *testing.T) {
+		currentSchema := map[string][]table.TableSchema{"myapp": {{Name: "users", Schema: usersTable}}}
+		desired := &schema.Namespace{
+			Files: map[string]string{
+				"users.sql":  usersTable + ";",
+				"orders.sql": "CREATE TABLE `orders` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `user_id` bigint NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_user` (`user_id`),\n  CONSTRAINT `fk_orders_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+			},
+		}
+
+		changes, _, _, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
+		require.NoError(t, err)
+		require.Len(t, changes, 1)
+		assert.Equal(t, "orders", changes[0].Table)
+		assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
+		assert.Equal(t, foreignKeyRefusalReason, changes[0].ModeReason)
+	})
+
+	t.Run("an unrelated change to a table that has one is applicable", func(t *testing.T) {
+		ordersWithFK := "CREATE TABLE `orders` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `user_id` bigint NOT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_user` (`user_id`),\n  CONSTRAINT `fk_orders_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+		currentSchema := map[string][]table.TableSchema{"myapp": {{Name: "orders", Schema: ordersWithFK}}}
+		desired := &schema.Namespace{
+			Files: map[string]string{
+				"orders.sql": "CREATE TABLE `orders` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `user_id` bigint NOT NULL,\n  `note` varchar(255) DEFAULT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_user` (`user_id`),\n  CONSTRAINT `fk_orders_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+			},
+		}
+
+		changes, _, _, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
+		require.NoError(t, err)
+		require.Len(t, changes, 1)
+		assert.Contains(t, changes[0].DDL, "note")
+		assert.Empty(t, changes[0].ExecutionMode, "adding a column is not the constraint Vitess refuses")
+	})
+}
+
 // vschemaFetchStubClient serves a fixed response for keyspace VSchema reads so
 // tests can drive the VSchema half of diffKeyspace without a live API.
 type vschemaFetchStubClient struct {
