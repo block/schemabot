@@ -1232,9 +1232,6 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 		} else {
 			sb.WriteString("Recovering after restart. Cutover will be available once recovery completes.\n")
 		}
-	case state.Apply.CuttingOver:
-		sb.WriteString("\n---\n\n")
-		sb.WriteString("Cutover in progress — typically completes within seconds.\n")
 	case state.Apply.Running, state.Apply.RunningDegraded,
 		state.Apply.CatchingUp, state.Apply.Checksumming, state.Apply.PostChecksum:
 		if hasRetryingTable(data.Tables) {
