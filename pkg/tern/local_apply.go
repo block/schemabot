@@ -917,10 +917,11 @@ func (c *LocalClient) runApplyExecution(ctx context.Context, apply *storage.Appl
 
 // deriveOverallState determines the overall state from a list of tasks.
 // Priority order:
-//  1. Active work: CUTTING_OVER, then the least-advanced active phase
-//     (RUNNING, CATCHING_UP, CHECKSUMMING, POST_CHECKSUM — the post-copy
-//     phases surfacing only once every table has started), then
-//     WAITING_FOR_CUTOVER once nothing is still working
+//  1. Active work, least-advanced phase first: RUNNING, then CATCHING_UP,
+//     CHECKSUMMING, POST_CHECKSUM (the post-copy phases surfacing only once
+//     every table has started), then CUTTING_OVER once it is the least
+//     advanced work left, then WAITING_FOR_CUTOVER once nothing is still
+//     working
 //  2. FAILED - at least one task failed (CANCELLED tasks also indicate failure)
 //  3. FAILED_RETRYABLE - operator recovery may retry failed task work
 //  4. PENDING - more work queued
@@ -965,20 +966,23 @@ func deriveOverallState(tasks []*storage.Task) string {
 		}
 	}
 
-	// Active work, mirroring state.DeriveApplyState: once any table starts
-	// its cutover the apply is transitioning; otherwise surface the
+	// Active work, mirroring state.DeriveApplyState: surface the
 	// least-advanced active phase — while any table still copies rows the
 	// apply is running, the post-copy phases surface only once every table
-	// has started and is draining or verifying, and waiting_for_cutover only
-	// when nothing is still working. A queued table still has its whole copy
-	// ahead of it, so naming a sibling's post-copy phase would overstate
-	// progress.
+	// has started and is draining or verifying, a cutover only once it is
+	// the least advanced work left, and waiting_for_cutover only when
+	// nothing is still working. A cutover is the last step of a table's
+	// work, and a drive cuts tables over as each finishes — sequentially,
+	// rolling, or across concurrent shards — so naming a sibling's cutover
+	// while an earlier phase is still active would overstate progress and
+	// force the derived state to fall back once that cutover completes.
+	// Resolving least-advanced-first keeps the derived state monotone
+	// across the whole drive. A parked WAITING_FOR_CUTOVER sibling does not
+	// hold a cutover back: it is waiting on a command, not working.
 	switch {
-	case hasCuttingOver:
-		return state.Task.CuttingOver
 	case hasRunning:
 		return state.Task.Running
-	case hasPending && (hasCatchingUp || hasChecksumming || hasPostChecksum):
+	case hasPending && (hasCatchingUp || hasChecksumming || hasPostChecksum || hasCuttingOver):
 		return state.Task.Running
 	case hasCatchingUp:
 		return state.Task.CatchingUp
@@ -986,6 +990,8 @@ func deriveOverallState(tasks []*storage.Task) string {
 		return state.Task.Checksumming
 	case hasPostChecksum:
 		return state.Task.PostChecksum
+	case hasCuttingOver:
+		return state.Task.CuttingOver
 	case hasWaitingForCutover:
 		return state.Task.WaitingForCutover
 	}

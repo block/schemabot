@@ -896,7 +896,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 	if apply.StartedAt == nil && !state.IsState(remoteState, state.Apply.Pending) {
 		apply.StartedAt = &now
 	}
-	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, false)
+	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, progress.Tables, false)
 	apply.UpdatedAt = now
 	if remoteProgressIsTerminal(progress.State, progress.Tables) {
 		if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now, scope); err != nil {
@@ -1008,7 +1008,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 	}
 	now := time.Now()
 	priorState, priorStartedAt, priorUpdatedAt := apply.State, apply.StartedAt, apply.UpdatedAt
-	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, false)
+	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, progress.Tables, false)
 	apply.UpdatedAt = now
 	// A stopped remote is not a cancel outcome: the data plane accepts Cancel
 	// for stopped applies and its own driver consumes the durable request, so
@@ -1164,7 +1164,7 @@ func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context,
 	if apply.StartedAt == nil && !state.IsState(remoteState, state.Apply.Pending) {
 		apply.StartedAt = &now
 	}
-	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, false)
+	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, progress.Tables, false)
 	apply.ErrorMessage = remoteProgressErrorMessage(apply.State, progress.ErrorMessage, apply.ErrorMessage)
 	apply.UpdatedAt = now
 	if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now, scope); err != nil {
@@ -1244,7 +1244,7 @@ func (c *GRPCClient) completeRemoteCancelFromTerminalProgress(ctx context.Contex
 	if apply.StartedAt == nil && !state.IsState(remoteState, state.Apply.Pending) {
 		apply.StartedAt = &now
 	}
-	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, false)
+	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, progress.Tables, false)
 	apply.ErrorMessage = remoteProgressErrorMessage(apply.State, progress.ErrorMessage, apply.ErrorMessage)
 	apply.UpdatedAt = now
 	if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now, scope); err != nil {
@@ -4146,7 +4146,12 @@ func storedTaskResolvedForTerminalRemoteApply(remoteApplyState, storedTaskState 
 // progress into task state first, then derives apply state from stored tasks.
 // gRPC mode receives an apply state directly from the remote data plane, so the
 // control plane needs the same no-backward policy at the apply row boundary.
-func applyStateFromRemoteProgress(storedApplyState, remoteApplyState string, allowStoppedStoredApply bool) string {
+//
+// remoteTasks is the same report's per-table progress. It backs the one case
+// where the no-backward rank yields to the remote: a stored cutting_over that
+// the report contradicts with a table still in an earlier active phase (see
+// storedCutoverContradictedByEarlierActiveWork).
+func applyStateFromRemoteProgress(storedApplyState, remoteApplyState string, remoteTasks []*ternv1.TableProgress, allowStoppedStoredApply bool) string {
 	if remoteApplyState == "" {
 		return storedApplyState
 	}
@@ -4179,10 +4184,40 @@ func applyStateFromRemoteProgress(storedApplyState, remoteApplyState string, all
 	if state.IsState(storedApplyState, state.Apply.FailedRetryable) {
 		return storedApplyState
 	}
+	if storedCutoverContradictedByEarlierActiveWork(storedApplyState, remoteTasks) {
+		return remoteApplyState
+	}
 	if applyProgressRank(remoteApplyState) < applyProgressRank(storedApplyState) {
 		return storedApplyState
 	}
 	return remoteApplyState
+}
+
+// storedCutoverContradictedByEarlierActiveWork reports whether the stored
+// apply state says cutting_over while the remote report still shows a table
+// in an earlier active phase — queued, copying, or verifying. A cutover
+// surfaces at the apply level only when it is the least advanced work left,
+// so this pairing never describes a live drive: the stored value is a sample
+// of one table's cutover that the drive has since moved past, and the report
+// carrying the earlier-phase table is the corrected state — it wins over the
+// no-backward rank instead of being discarded as a regression. A parked
+// WAITING_FOR_CUTOVER table is not a contradiction: a cutover legitimately
+// proceeds while a sibling waits at the barrier for its own command.
+func storedCutoverContradictedByEarlierActiveWork(storedApplyState string, remoteTasks []*ternv1.TableProgress) bool {
+	if !state.IsState(storedApplyState, state.Apply.CuttingOver) {
+		return false
+	}
+	for _, remoteTask := range remoteTasks {
+		if remoteTask == nil {
+			continue
+		}
+		if state.IsState(state.NormalizeTaskStatus(remoteTask.Status),
+			state.Task.Pending, state.Task.Running,
+			state.Task.CatchingUp, state.Task.Checksumming, state.Task.PostChecksum) {
+			return true
+		}
+	}
+	return false
 }
 
 func applyProgressRank(applyState string) int {
@@ -4399,7 +4434,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				}
 				continue
 			}
-			newState = applyStateFromRemoteProgress(apply.State, remoteApplyState, allowStoppedAfterStart)
+			newState = applyStateFromRemoteProgress(apply.State, remoteApplyState, resp.Tables, allowStoppedAfterStart)
 			if !state.IsState(newState, remoteApplyState) {
 				logger.Debug("keeping stored gRPC apply state because remote progress reported earlier state",
 					append(apply.MutableLogAttrs(), "remote_state", remoteApplyState)...)
