@@ -78,22 +78,88 @@ func TestPostgresCreateTableColumns_EmbeddedFiles(t *testing.T) {
 	}
 }
 
-func TestPostgresAddColumnRequiresManualBackfill(t *testing.T) {
+// The manual-remediation gate must name every problem across every table in
+// one error, so an operator fixes them all in one pass instead of one per
+// startup attempt. An all-automatic drift set passes the gate untouched.
+func TestPostgresManualRemediation(t *testing.T) {
 	t.Parallel()
 
+	tables := []string{"applies", "settings"}
+	automatic := postgresSchemaDrift{
+		"applies": {{operation: "add_column", object: "caller", ddl: "ALTER TABLE applies ADD COLUMN caller text"}},
+	}
+	require.NoError(t, postgresManualRemediation(tables, automatic))
+
+	mixed := postgresSchemaDrift{
+		"applies": {
+			{operation: "add_column", object: "caller", ddl: "ALTER TABLE applies ADD COLUMN caller text"},
+			{operation: "add_column", object: "lock_id", manualReason: "definition is NOT NULL without a DEFAULT; add it manually or ship the column with a DEFAULT"},
+		},
+		"settings": {
+			{operation: "add_column", object: "setting_value", manualReason: "definition is NOT NULL without a DEFAULT; add it manually or ship the column with a DEFAULT"},
+		},
+	}
+	err := postgresManualRemediation(tables, mixed)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `storage table "applies" is missing column "lock_id"`)
+	assert.Contains(t, err.Error(), `storage table "settings" is missing column "setting_value"`)
+	assert.Contains(t, err.Error(), "add it manually or ship the column with a DEFAULT")
+}
+
+// The expectations parser fails closed on schema-file statements the additive
+// convergence cannot create or verify — an unnamed index or a non-index
+// trailing statement — so a schema file can never silently stop being the
+// source of truth for the live schema.
+func TestPostgresExpectationsFor_RejectsUntrackableStatements(t *testing.T) {
+	t.Parallel()
+
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+
 	tests := []struct {
-		name      string
-		statement string
-		want      bool
+		name string
+		file string
+		want string
 	}{
-		{name: "not null without default", statement: "ALTER TABLE settings ADD COLUMN setting_value text NOT NULL", want: true},
-		{name: "not null with default", statement: "ALTER TABLE applies ADD COLUMN caller varchar(255) DEFAULT '' NOT NULL"},
-		{name: "nullable", statement: "ALTER TABLE applies ADD COLUMN expected_operation_keys jsonb"},
+		{
+			name: "unnamed index",
+			file: "CREATE TABLE settings (id bigint);\nCREATE INDEX ON settings (id);",
+			want: "cannot track",
+		},
+		{
+			name: "non-index trailing statement",
+			file: "CREATE TABLE settings (id bigint);\nCOMMENT ON TABLE settings IS 'x';",
+			want: "cannot track",
+		},
+		{
+			name: "index on another table",
+			file: "CREATE TABLE settings (id bigint);\nCREATE INDEX idx_other ON other (id);",
+			want: `declares index "idx_other" on table "other"`,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			assert.Equal(t, tt.want, postgresAddColumnRequiresManualBackfill(tt.statement))
+			_, err := postgresExpectationsFor(parser, "settings", tt.file)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.want)
 		})
+	}
+}
+
+// Every embedded PostgreSQL schema file must parse into trackable
+// expectations: a CREATE TABLE followed only by named CREATE INDEX statements
+// on the file's own table.
+func TestPostgresExpectationsFor_EmbeddedFiles(t *testing.T) {
+	t.Parallel()
+
+	tables, files, err := readEmbeddedPostgresSchemaFiles()
+	require.NoError(t, err)
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+	for _, table := range tables {
+		expected, err := postgresExpectationsFor(parser, table, files[table])
+		require.NoError(t, err, "table %s", table)
+		assert.NotEmpty(t, expected.columns, "table %s", table)
 	}
 }

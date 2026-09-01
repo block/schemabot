@@ -253,6 +253,92 @@ func TestSynthesizePostgresAddColumn(t *testing.T) {
 	})
 }
 
+// The manual-remediation classifier reads the column's parsed constraints,
+// so it must stay correct where a text scan goes wrong: generated and
+// identity columns converge automatically even when declared NOT NULL,
+// quoted identifiers cannot mask a missing DEFAULT, and a function-call
+// DEFAULT fails closed because its volatility cannot be proven from the
+// statement alone.
+func TestPostgresAddColumnManualReason(t *testing.T) {
+	tests := []struct {
+		name       string
+		createDDL  string
+		columnName string
+		wantReason string
+	}{
+		{
+			name:       "not null without default",
+			createDDL:  "CREATE TABLE settings (id bigint, setting_value text NOT NULL)",
+			columnName: "setting_value",
+			wantReason: "NOT NULL without a DEFAULT",
+		},
+		{
+			name:       "not null with constant default",
+			createDDL:  "CREATE TABLE applies (id bigint, caller varchar(255) DEFAULT '' NOT NULL)",
+			columnName: "caller",
+		},
+		{
+			name:       "nullable",
+			createDDL:  "CREATE TABLE applies (id bigint, expected_operation_keys jsonb)",
+			columnName: "expected_operation_keys",
+		},
+		{
+			name:       "generated stored not null",
+			createDDL:  "CREATE TABLE metrics (a bigint, doubled bigint GENERATED ALWAYS AS (a * 2) STORED NOT NULL)",
+			columnName: "doubled",
+		},
+		{
+			name:       "identity not null",
+			createDDL:  "CREATE TABLE metrics (a bigint, seq bigint GENERATED ALWAYS AS IDENTITY NOT NULL)",
+			columnName: "seq",
+		},
+		{
+			name:       "quoted identifier containing default",
+			createDDL:  `CREATE TABLE odd (id bigint, " default " text NOT NULL)`,
+			columnName: " default ",
+			wantReason: "NOT NULL without a DEFAULT",
+		},
+		{
+			name:       "sql value function default",
+			createDDL:  "CREATE TABLE applies (id bigint, created_at timestamp DEFAULT CURRENT_TIMESTAMP NOT NULL)",
+			columnName: "created_at",
+		},
+		{
+			name:       "typecast constant default",
+			createDDL:  "CREATE TABLE applies (id bigint, options jsonb DEFAULT '{}'::jsonb NOT NULL)",
+			columnName: "options",
+		},
+		{
+			name:       "volatile function default",
+			createDDL:  "CREATE TABLE applies (id bigint, external_id uuid DEFAULT gen_random_uuid() NOT NULL)",
+			columnName: "external_id",
+			wantReason: "volatility cannot be proven",
+		},
+		{
+			name:       "nullable volatile function default",
+			createDDL:  "CREATE TABLE applies (id bigint, external_id uuid DEFAULT gen_random_uuid())",
+			columnName: "external_id",
+			wantReason: "volatility cannot be proven",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reason, err := PostgresAddColumnManualReason(tc.createDDL, tc.columnName)
+			require.NoError(t, err)
+			if tc.wantReason == "" {
+				assert.Empty(t, reason)
+			} else {
+				assert.Contains(t, reason, tc.wantReason)
+			}
+		})
+	}
+
+	t.Run("column not found", func(t *testing.T) {
+		_, err := PostgresAddColumnManualReason("CREATE TABLE users (id bigint)", "email")
+		require.ErrorContains(t, err, `column "email" not found`)
+	})
+}
+
 func TestSynthesizePostgresAddColumn_EmbeddedSchema(t *testing.T) {
 	files, err := fs.Glob(schema.PostgresFS, "postgres/*.sql")
 	require.NoError(t, err)

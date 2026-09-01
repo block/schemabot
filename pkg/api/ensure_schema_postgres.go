@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,7 +29,10 @@ import (
 //
 // Concurrency-safe across pods: discovers drift without a lock, acquires the
 // PostgreSQL advisory lock only when needed, then re-discovers under the lock.
-// Each table's changes execute in one transaction.
+// A change that needs manual remediation aborts the whole convergence before
+// any DDL executes. Each transaction bounds its lock wait with lock_timeout,
+// and index builds run in their own transactions so no table lock is held
+// across a build.
 func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Locker) error {
 	ctx, cancel := context.WithTimeout(context.Background(), EnsureSchemaTimeout)
 	defer cancel()
@@ -79,9 +83,22 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Lock
 		logger.Info("storage schema up-to-date", "database", database)
 		return nil
 	}
+	// Log what the fast-path scan found before parking on the lock, so the
+	// last pre-lock line names the work this pod is waiting to do.
+	for _, table := range tables {
+		for _, change := range drift[table] {
+			logger.Info("schema change detected (pre-lock)",
+				"table", table,
+				"operation", change.operation,
+				"object", change.object,
+				"ddl", change.ddl,
+			)
+		}
+	}
 	logger.Info("storage schema drift detected (pre-lock); acquiring EnsureSchema advisory lock to converge it",
 		"database", database,
-		"change_count", len(drift),
+		"change_count", drift.changeCount(),
+		"table_count", len(drift),
 	)
 
 	lockConn, err := acquirePostgresEnsureSchemaLock(ctx, dsn, logger, locker)
@@ -104,10 +121,18 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Lock
 		return nil
 	}
 
+	// Gate on manual remediation across the whole drift set before touching
+	// any table, so a change that cannot run automatically never leaves the
+	// schema half-converged.
+	if err := postgresManualRemediation(tables, drift); err != nil {
+		return err
+	}
+
 	applyStart := time.Now()
 	for _, table := range tables {
 		changes := drift[table]
 		if len(changes) == 0 {
+			logger.Debug("storage table already converged", "table", table)
 			continue
 		}
 		if err := applyPostgresTableChanges(ctx, db, table, changes, logger); err != nil {
@@ -116,7 +141,8 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Lock
 	}
 	logger.Info("storage schema applied successfully",
 		"database", database,
-		"change_count", len(drift),
+		"change_count", drift.changeCount(),
+		"table_count", len(drift),
 		"duration", time.Since(applyStart),
 	)
 	if err := verifyAndLogPostgresSchemaShape(ctx, db, tables, files, logger, database, schemaName); err != nil {
@@ -129,10 +155,79 @@ type postgresSchemaChange struct {
 	operation string
 	object    string
 	ddl       string
-	manual    bool
+	// manualReason is non-empty when the change cannot run automatically and
+	// names why plus the remediation. Any non-empty reason aborts convergence
+	// before any DDL executes.
+	manualReason string
 }
 
 type postgresSchemaDrift map[string][]postgresSchemaChange
+
+// changeCount returns the total number of planned changes across all tables.
+func (d postgresSchemaDrift) changeCount() int {
+	total := 0
+	for _, changes := range d {
+		total += len(changes)
+	}
+	return total
+}
+
+// postgresIndexExpectation is one standalone CREATE INDEX statement's
+// expectation: an index under this name must exist, and must be unique when
+// unique is set. Indexes are matched by name only — column composition is
+// not compared, so a same-named index over different columns reads as
+// converged.
+type postgresIndexExpectation struct {
+	name   string
+	unique bool
+	ddl    string
+}
+
+// postgresTableExpectations is the shape one embedded schema file declares
+// for its table: the CREATE TABLE statement followed by named standalone
+// CREATE INDEX statements.
+type postgresTableExpectations struct {
+	createTable string
+	columns     []string
+	indexes     []postgresIndexExpectation
+}
+
+// postgresExpectationsFor parses one table's embedded schema file into the
+// expectations the drift scan and the shape verification both consume. A
+// trailing statement that is not a named standalone CREATE INDEX on the
+// file's own table fails closed: the additive convergence could neither
+// create nor verify it, so a schema file carrying one would silently stop
+// being the source of truth for the live schema.
+func postgresExpectationsFor(parser ddl.StatementParser, table, file string) (postgresTableExpectations, error) {
+	statements, err := parser.Split(file)
+	if err != nil {
+		return postgresTableExpectations{}, fmt.Errorf("split schema file for table %q: %w", table, err)
+	}
+	if len(statements) == 0 {
+		return postgresTableExpectations{}, fmt.Errorf("schema file for table %q has no statements", table)
+	}
+	columns, err := parser.CreateTableColumns(statements[0])
+	if err != nil {
+		return postgresTableExpectations{}, fmt.Errorf("extract expected columns for table %q: %w", table, err)
+	}
+	expectations := postgresTableExpectations{createTable: statements[0], columns: columns}
+	for _, statement := range statements[1:] {
+		indexName, indexTable, unique, err := parser.CreateIndex(statement)
+		if err != nil {
+			return postgresTableExpectations{}, fmt.Errorf("extract expected indexes for table %q: %w", table, err)
+		}
+		if indexName == "" {
+			return postgresTableExpectations{}, fmt.Errorf(
+				"schema file for table %q contains a statement the additive convergence cannot track: %q; only named standalone CREATE INDEX statements may follow CREATE TABLE",
+				table, statement)
+		}
+		if indexTable != table {
+			return postgresTableExpectations{}, fmt.Errorf("schema file for table %q declares index %q on table %q", table, indexName, indexTable)
+		}
+		expectations.indexes = append(expectations.indexes, postgresIndexExpectation{name: indexName, unique: unique, ddl: statement})
+	}
+	return expectations, nil
+}
 
 func postgresSchemaDriftFor(ctx context.Context, db *sql.DB, tables []string, files map[string]string) (postgresSchemaDrift, error) {
 	missingTables, err := missingPostgresTables(ctx, db, tables)
@@ -150,39 +245,36 @@ func postgresSchemaDriftFor(ctx context.Context, db *sql.DB, tables []string, fi
 	}
 	drift := make(postgresSchemaDrift)
 	for _, table := range tables {
-		statements, err := parser.Split(files[table])
+		expected, err := postgresExpectationsFor(parser, table, files[table])
 		if err != nil {
-			return nil, fmt.Errorf("split schema file for table %q: %w", table, err)
-		}
-		if len(statements) == 0 {
-			return nil, fmt.Errorf("schema file for table %q has no statements", table)
+			return nil, err
 		}
 		if missingTable[table] {
 			drift[table] = []postgresSchemaChange{{operation: "create_table", object: table, ddl: files[table]}}
 			continue
 		}
 
-		expectedColumns, err := parser.CreateTableColumns(statements[0])
-		if err != nil {
-			return nil, fmt.Errorf("extract expected columns for table %q: %w", table, err)
-		}
 		existingColumns, err := postgresTableColumns(ctx, db, table)
 		if err != nil {
 			return nil, err
 		}
-		for _, column := range expectedColumns {
+		for _, column := range expected.columns {
 			if existingColumns[column] {
 				continue
 			}
-			statement, err := ddl.SynthesizePostgresAddColumn(statements[0], column)
+			statement, err := ddl.SynthesizePostgresAddColumn(expected.createTable, column)
 			if err != nil {
 				return nil, fmt.Errorf("synthesize ADD COLUMN for %q.%q: %w", table, column, err)
 			}
+			manualReason, err := ddl.PostgresAddColumnManualReason(expected.createTable, column)
+			if err != nil {
+				return nil, fmt.Errorf("classify ADD COLUMN safety for %q.%q: %w", table, column, err)
+			}
 			drift[table] = append(drift[table], postgresSchemaChange{
-				operation: "add_column",
-				object:    column,
-				ddl:       statement,
-				manual:    postgresAddColumnRequiresManualBackfill(statement),
+				operation:    "add_column",
+				object:       column,
+				ddl:          statement,
+				manualReason: manualReason,
 			})
 		}
 
@@ -190,38 +282,41 @@ func postgresSchemaDriftFor(ctx context.Context, db *sql.DB, tables []string, fi
 		if err != nil {
 			return nil, err
 		}
-		for _, statement := range statements[1:] {
-			indexName, indexTable, unique, err := parser.CreateIndex(statement)
-			if err != nil {
-				return nil, fmt.Errorf("extract expected indexes for table %q: %w", table, err)
-			}
-			if indexName == "" {
-				continue
-			}
-			if indexTable != table {
-				return nil, fmt.Errorf("schema file for table %q declares index %q on table %q", table, indexName, indexTable)
-			}
-			existingUnique, present := existingIndexes[indexName]
-			if present && (!unique || existingUnique) {
+		for _, index := range expected.indexes {
+			existingUnique, present := existingIndexes[index.name]
+			if present && (!index.unique || existingUnique) {
 				continue
 			}
 			// A non-unique live index cannot satisfy a unique expectation. CREATE
 			// INDEX would collide by name, so fail closed rather than altering it.
 			if present {
-				return nil, fmt.Errorf("storage table %q has non-unique index %q where the embedded schema requires a unique index; replace it manually", table, indexName)
+				return nil, fmt.Errorf("storage table %q has non-unique index %q where the embedded schema requires a unique index; replace it manually", table, index.name)
 			}
-			drift[table] = append(drift[table], postgresSchemaChange{operation: "create_index", object: indexName, ddl: statement})
+			drift[table] = append(drift[table], postgresSchemaChange{operation: "create_index", object: index.name, ddl: index.ddl})
 		}
 	}
 	return drift, nil
 }
 
-// SynthesizePostgresAddColumn returns canonical deparsed SQL, making these
-// clause checks insensitive to formatting in the embedded schema file. The
-// statement has already passed PostgreSQL's real parser before this guard.
-func postgresAddColumnRequiresManualBackfill(statement string) bool {
-	upper := strings.ToUpper(statement)
-	return strings.Contains(upper, " NOT NULL") && !strings.Contains(upper, " DEFAULT ")
+// postgresManualRemediation returns an error naming every planned change that
+// needs manual remediation, or nil when all planned changes can run
+// automatically. It scans the whole drift set so the gate fires before any
+// table's DDL executes — an operator sees every problem at once rather than
+// one per crashloop restart.
+func postgresManualRemediation(tables []string, drift postgresSchemaDrift) error {
+	var problems []string
+	for _, table := range tables {
+		for _, change := range drift[table] {
+			if change.manualReason == "" {
+				continue
+			}
+			problems = append(problems, fmt.Sprintf("storage table %q is missing column %q whose %s", table, change.object, change.manualReason))
+		}
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	return errors.New(strings.Join(problems, "; "))
 }
 
 func verifyAndLogPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []string, files map[string]string, logger *slog.Logger, database, schemaName string) error {
@@ -240,22 +335,16 @@ func verifyAndLogPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []s
 
 // verifyPostgresSchemaShape checks the additive convergence result. Columns
 // remain presence-only; type, length, and nullability drift are not detected.
+// Indexes are matched by name and uniqueness only, not column composition.
 func verifyPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []string, files map[string]string, logger *slog.Logger) error {
 	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
 	if err != nil {
 		return fmt.Errorf("select PostgreSQL statement parser: %w", err)
 	}
 	for _, table := range tables {
-		statements, err := parser.Split(files[table])
+		expected, err := postgresExpectationsFor(parser, table, files[table])
 		if err != nil {
-			return fmt.Errorf("split schema file for table %q: %w", table, err)
-		}
-		if len(statements) == 0 {
-			return fmt.Errorf("schema file for table %q has no statements", table)
-		}
-		expected, err := parser.CreateTableColumns(statements[0])
-		if err != nil {
-			return fmt.Errorf("extract expected columns for table %q: %w", table, err)
+			return err
 		}
 		existing, err := postgresTableColumns(ctx, db, table)
 		if err != nil {
@@ -263,7 +352,7 @@ func verifyPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []string,
 		}
 
 		var missing []string
-		for _, column := range expected {
+		for _, column := range expected.columns {
 			if !existing[column] {
 				missing = append(missing, column)
 			}
@@ -272,45 +361,23 @@ func verifyPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []string,
 			return fmt.Errorf("storage table %q is missing expected columns: %s", table, strings.Join(missing, ", "))
 		}
 
-		expectedUnique := make([]string, 0)
-		expectedNonUnique := make([]string, 0)
-		for _, statement := range statements[1:] {
-			indexName, indexTable, unique, err := parser.CreateIndex(statement)
-			if err != nil {
-				return fmt.Errorf("extract expected indexes for table %q: %w", table, err)
-			}
-			if indexName == "" {
-				// Not a standalone CREATE INDEX statement, so it declares no
-				// index expectation.
-				continue
-			}
-			if indexTable != table {
-				return fmt.Errorf("schema file for table %q declares index %q on table %q", table, indexName, indexTable)
-			}
-			if unique {
-				expectedUnique = append(expectedUnique, indexName)
-			} else {
-				expectedNonUnique = append(expectedNonUnique, indexName)
-			}
-		}
 		existingIndexes, err := postgresTableIndexes(ctx, db, table)
 		if err != nil {
 			return err
 		}
-		missing = nil
-		for _, indexName := range expectedUnique {
-			if !existingIndexes[indexName] {
-				missing = append(missing, indexName)
+		var missingUnique, missingNonUnique []string
+		for _, index := range expected.indexes {
+			switch {
+			case index.unique && !existingIndexes[index.name]:
+				missingUnique = append(missingUnique, index.name)
+			case !index.unique:
+				if _, present := existingIndexes[index.name]; !present {
+					missingNonUnique = append(missingNonUnique, index.name)
+				}
 			}
 		}
-		if len(missing) > 0 {
-			return fmt.Errorf("storage table %q is missing expected unique indexes: %s", table, strings.Join(missing, ", "))
-		}
-		var missingNonUnique []string
-		for _, indexName := range expectedNonUnique {
-			if _, present := existingIndexes[indexName]; !present {
-				missingNonUnique = append(missingNonUnique, indexName)
-			}
+		if len(missingUnique) > 0 {
+			return fmt.Errorf("storage table %q is missing expected unique indexes: %s", table, strings.Join(missingUnique, ", "))
 		}
 		if len(missingNonUnique) > 0 {
 			logger.Warn("storage table is missing non-unique indexes after additive convergence",
@@ -440,15 +507,53 @@ func missingPostgresTables(ctx context.Context, db *sql.DB, want []string) ([]st
 	return missing, nil
 }
 
-// applyPostgresTableChanges executes one table's additive changes atomically.
-// A CREATE TABLE change contains its complete embedded schema file, including
-// indexes; pgx's simple query protocol executes that multi-statement string.
+// postgresDDLLockTimeout bounds how long a convergence DDL statement waits
+// for its table lock. Without it, one long-running reader queues the ALTER
+// TABLE's AccessExclusiveLock request indefinitely, and every later reader
+// queues behind that request — a table-wide stall. With it, the statement
+// fails, the transaction rolls back, and the startup attempt retries or
+// fails visibly instead.
+const postgresDDLLockTimeout = 10 * time.Second
+
+// applyPostgresTableChanges executes one table's additive changes. A CREATE
+// TABLE change contains its complete embedded schema file, including indexes,
+// executed as one transaction; pgx's simple query protocol executes that
+// multi-statement string. For an existing table, column changes share one
+// transaction — each is metadata-only after the manual-remediation gate — and
+// each index builds in its own transaction, so the ALTER TABLE's brief
+// AccessExclusiveLock is never held across an index build and writes proceed
+// between builds. Cross-transaction atomicity is unnecessary: a startup
+// killed between transactions leaves additive drift the next run re-discovers
+// and converges.
 func applyPostgresTableChanges(ctx context.Context, db *sql.DB, table string, changes []postgresSchemaChange, logger *slog.Logger) error {
+	if changes[0].operation == "create_table" {
+		return execPostgresChanges(ctx, db, table, changes, logger)
+	}
+	var columnChanges []postgresSchemaChange
+	var indexChanges []postgresSchemaChange
 	for _, change := range changes {
-		if change.manual {
-			return fmt.Errorf("storage table %q is missing column %q whose definition is NOT NULL without a DEFAULT; add it manually or ship the column with a DEFAULT", table, change.object)
+		if change.operation == "create_index" {
+			indexChanges = append(indexChanges, change)
+		} else {
+			columnChanges = append(columnChanges, change)
 		}
 	}
+	if len(columnChanges) > 0 {
+		if err := execPostgresChanges(ctx, db, table, columnChanges, logger); err != nil {
+			return err
+		}
+	}
+	for _, index := range indexChanges {
+		if err := execPostgresChanges(ctx, db, table, []postgresSchemaChange{index}, logger); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// execPostgresChanges executes one batch of changes in a single transaction
+// with a bounded lock wait.
+func execPostgresChanges(ctx context.Context, db *sql.DB, table string, changes []postgresSchemaChange, logger *slog.Logger) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
@@ -461,6 +566,10 @@ func applyPostgresTableChanges(ctx context.Context, db *sql.DB, table string, ch
 		}
 	}()
 
+	if _, err := tx.ExecContext(ctx, "SELECT set_config('lock_timeout', $1, true)",
+		strconv.FormatInt(postgresDDLLockTimeout.Milliseconds(), 10)); err != nil {
+		return fmt.Errorf("set lock_timeout for table %q: %w", table, err)
+	}
 	for _, change := range changes {
 		logger.Info("schema change",
 			"table", table,

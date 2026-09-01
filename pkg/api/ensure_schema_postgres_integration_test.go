@@ -155,6 +155,51 @@ func TestEnsureSchemaPostgres_RejectsMissingNotNullColumnWithoutDefault(t *testi
 	require.ErrorContains(t, err, "add it manually or ship the column with a DEFAULT")
 }
 
+// A change that needs manual remediation aborts the whole convergence before
+// any DDL executes: automatic drift on another table must stay untouched
+// rather than being half-applied ahead of the failure, so a crashloop never
+// repeats a partial convergence.
+func TestEnsureSchemaPostgres_ManualRemediationBlocksAllDDL(t *testing.T) {
+	ctx := t.Context()
+	dsn, db := startPostgresStorage(t)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	// "applies" sorts before "settings": without the whole-set gate its
+	// automatic change would commit before the settings failure surfaced.
+	_, err := db.ExecContext(ctx, "ALTER TABLE applies DROP COLUMN caller")
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "ALTER TABLE settings DROP COLUMN setting_value")
+	require.NoError(t, err)
+
+	err = EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres))
+	require.ErrorContains(t, err, `storage table "settings" is missing column "setting_value"`)
+
+	columns, err := postgresTableColumns(ctx, db, "applies")
+	require.NoError(t, err)
+	assert.False(t, columns["caller"], "no DDL may run when any change needs manual remediation")
+}
+
+// A live non-unique index under a name the embedded schema requires to be
+// unique cannot be converged automatically — CREATE UNIQUE INDEX would
+// collide by name — so startup fails closed with a manual remediation rather
+// than silently accepting the weaker index.
+func TestEnsureSchemaPostgres_RejectsNonUniqueIndexWhereUniqueRequired(t *testing.T) {
+	ctx := t.Context()
+	dsn, db := startPostgresStorage(t)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	_, err := db.ExecContext(ctx, "DROP INDEX idx_settings_setting_key")
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "CREATE INDEX idx_settings_setting_key ON settings (setting_key)")
+	require.NoError(t, err)
+
+	err = EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres))
+	require.ErrorContains(t, err, `storage table "settings" has non-unique index "idx_settings_setting_key" where the embedded schema requires a unique index`)
+	require.ErrorContains(t, err, "replace it manually")
+}
+
 // A storage database missing a subset of tables converges back to the full
 // schema: the bootstrapper creates only the missing tables and leaves the
 // existing ones — and their data — untouched.
