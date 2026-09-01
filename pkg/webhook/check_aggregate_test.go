@@ -453,3 +453,25 @@ func TestAnyInProgressOnCommit(t *testing.T) {
 	checks = append(checks, &storage.Check{HeadSHA: "current", DatabaseName: "billing", Status: checkStatusInProgress})
 	assert.True(t, anyInProgressOnCommit(checks, "current"))
 }
+
+func TestAnyInProgressOnAnyCommit(t *testing.T) {
+	settled := []*storage.Check{
+		{HeadSHA: "previous", DatabaseName: "orders", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
+		{HeadSHA: "current", DatabaseName: "users", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
+	}
+	assert.False(t, anyInProgressOnAnyCommit(settled), "no apply is left anywhere to record results for the current commit")
+
+	assert.True(t, anyInProgressOnAnyCommit(append(settled,
+		&storage.Check{HeadSHA: "previous", DatabaseName: "billing", Status: checkStatusInProgress})),
+		"work on a superseded commit is still work that will settle and re-fold")
+}
+
+// The placeholder summary names the command that records results for the
+// commit the aggregate is published on, scoped to the environment whose gate is
+// held open. The global aggregate spans every environment, so it names the
+// unscoped plan instead of picking one arbitrarily.
+func TestAwaitingCurrentCommitSummary(t *testing.T) {
+	assert.Contains(t, awaitingCurrentCommitSummary("staging"), "`schemabot plan -e staging`")
+	assert.Contains(t, awaitingCurrentCommitSummary(aggregateSentinel), "`schemabot plan`")
+	assert.NotContains(t, awaitingCurrentCommitSummary(aggregateSentinel), "-e")
+}

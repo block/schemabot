@@ -385,6 +385,18 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 			"environment", environment, "head_sha", headSHA, "stale_rows", staleCount)
 		if status == checkStatusInProgress && !anyInProgressOnCommit(dbChecks, headSHA) {
 			title = awaitingCurrentCommitTitle
+			summary = awaitingCurrentCommitSummary(environment) + summary
+			if !anyInProgressOnAnyCommit(dbChecks) {
+				metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+					Operation:   "aggregate_awaiting_current_commit",
+					Repository:  repo,
+					Environment: environment,
+					Status:      "blocked",
+				})
+				h.logger.Warn("aggregate gate will keep blocking merge: it is held open by rows recorded for another commit and no apply is running on any commit, so only a plan on the current commit re-opens it",
+					"repo", repo, "pr", pr, "check_name", checkName,
+					"environment", environment, "head_sha", headSHA, "stale_rows", staleCount)
+			}
 		}
 	}
 

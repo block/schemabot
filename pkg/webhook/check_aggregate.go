@@ -200,8 +200,22 @@ func hasBlockingCheckForEnvironment(checks []*storage.Check, environment string)
 // awaitingCurrentCommitTitle is the aggregate title shown when only results
 // recorded for another commit hold the aggregate open — nothing is running for
 // the commit the Check Run is published on, and the current commit's own plan
-// or apply results are still pending.
-const awaitingCurrentCommitTitle = "Awaiting results for the latest commit"
+// or apply results are still pending. It names the exit rather than reporting
+// progress: from the PR there is no way to tell this state apart from an apply
+// that is genuinely still running, and the two need opposite responses.
+const awaitingCurrentCommitTitle = "Waiting for a plan on the latest commit"
+
+// awaitingCurrentCommitSummary leads the aggregate summary with the command
+// that records results for the current commit. A plan is the one action that
+// re-keys a row pinned to a superseded commit, so an operator looking at a
+// gate held open by one needs it spelled out.
+func awaitingCurrentCommitSummary(environment string) string {
+	command := "schemabot plan"
+	if environment != aggregateSentinel {
+		command = fmt.Sprintf("schemabot plan -e %s", environment)
+	}
+	return fmt.Sprintf("No results are recorded for this commit yet. Post `%s` to record them.\n\n", command)
+}
 
 // normalizeStaleContributions returns the fold contributions for headSHA.
 // A row stored for a different commit contributes a blocking in-progress
@@ -230,6 +244,19 @@ func normalizeStaleContributions(checks []*storage.Check, headSHA string) (contr
 func anyInProgressOnCommit(checks []*storage.Check, headSHA string) bool {
 	for _, c := range checks {
 		if c.HeadSHA == headSHA && c.Status == checkStatusInProgress {
+			return true
+		}
+	}
+	return false
+}
+
+// anyInProgressOnAnyCommit reports whether any check is in progress on any
+// commit. A stale-row placeholder published while this is false is a gate no
+// running work will re-open: the row holding it open is pinned to a superseded
+// commit, and no apply is left anywhere to record results for the current one.
+func anyInProgressOnAnyCommit(checks []*storage.Check) bool {
+	for _, c := range checks {
+		if c.Status == checkStatusInProgress {
 			return true
 		}
 	}
