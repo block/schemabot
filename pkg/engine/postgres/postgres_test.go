@@ -412,11 +412,6 @@ func TestLifecycleControlsDeclineAsUnsupported(t *testing.T) {
 			assert.Nil(t, result)
 			return err
 		}},
-		{"volume", func(t *testing.T) error {
-			result, err := eng.Volume(t.Context(), &engine.VolumeRequest{})
-			assert.Nil(t, result)
-			return err
-		}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

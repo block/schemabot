@@ -96,8 +96,8 @@ per table with a per-shard breakdown (`ShardProgress`), and an overall state
 that is `completed` only when every shard is complete and `failed` if any shard
 fails.
 
-`Stop`, `Start`, and `Cutover` apply across all shards of the change. `Volume`,
-`Revert`, and `SkipRevert` are not supported for strata, matching MySQL/Spirit.
+`Stop`, `Start`, and `Cutover` apply across all shards of the change. `Revert`
+and `SkipRevert` are not supported for strata, matching MySQL/Spirit.
 
 ## Onboarding
 
@@ -124,7 +124,6 @@ that target from the topology.
 
 - Phased/canary wave sequencing. The `ApplyRequest.target_shards` proto field is
   reserved as the hook, but it is not yet sent or honored.
-- `Volume`, `Revert`, and `SkipRevert` for strata (unsupported, as for
-  MySQL/Spirit).
+- `Revert` and `SkipRevert` for strata (unsupported, as for MySQL/Spirit).
 - In-process (local-mode) execution. Strata runs remotely today; local mode
   could be added later.

@@ -95,10 +95,6 @@ func PreviewCLIOutput(previewType PreviewType) {
 		previewStopCommandOutput()
 	case PreviewStartCommand:
 		previewStartCommandOutput()
-	case PreviewVolumeBar:
-		previewVolumeBarOutput()
-	case PreviewVolumeMode:
-		previewVolumeModeOutput()
 	case PreviewStatusList:
 		previewStatusListOutput()
 	case PreviewStatusDeployment:
@@ -317,10 +313,6 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAccepted())
 	case PreviewCommentCutoverActive:
 		fmt.Print(webhooktemplates.PreviewCommentCutoverCommandAlreadyInProgress())
-	case PreviewCommentVolumeAccepted:
-		fmt.Print(webhooktemplates.PreviewCommentVolumeCommandAccepted())
-	case PreviewCommentVolumeInvalid:
-		fmt.Print(webhooktemplates.PreviewCommentVolumeInvalidLevel())
 	case PreviewCommentAppScopedDispatch:
 		fmt.Print(webhooktemplates.PreviewCommentAppScopedDispatch())
 	case PreviewCommentAppScopedHalted:

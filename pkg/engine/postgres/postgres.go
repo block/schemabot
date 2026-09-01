@@ -489,12 +489,6 @@ func (e *Engine) SkipRevert(ctx context.Context, req *engine.ControlRequest) (*e
 	return nil, engine.NewUnsupportedOperationError("skip-revert is not supported for PostgreSQL schema changes: changes commit directly with no revert window")
 }
 
-// Volume declines: PostgreSQL schema changes run statement phases with no
-// tunable row copy to retune.
-func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine.VolumeResult, error) {
-	return nil, engine.NewUnsupportedOperationError("volume is not supported for PostgreSQL schema changes: there is no tunable row copy")
-}
-
 // Compile-time check that Engine implements engine.Engine.
 var _ engine.Engine = (*Engine)(nil)
 

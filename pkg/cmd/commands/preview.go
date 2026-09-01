@@ -60,9 +60,6 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 	// Stop/Start command types
 	case templates.PreviewStopCommand, templates.PreviewStartCommand:
 		templates.PreviewCLIOutput(previewType)
-	// Volume control types
-	case templates.PreviewVolumeMode, templates.PreviewVolumeBar:
-		templates.PreviewCLIOutput(previewType)
 	// Status types
 	case templates.PreviewStatusList, templates.PreviewStatusDeployment, templates.PreviewStatusHistory,
 		templates.PreviewPlansList, templates.PreviewPullSchema, templates.PreviewPullSchemaDetailed,
@@ -130,7 +127,6 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentDatabaseNotConfigured,
 		templates.PreviewCommentStartAccepted, templates.PreviewCommentStartPending,
 		templates.PreviewCommentCutoverAccepted, templates.PreviewCommentCutoverActive,
-		templates.PreviewCommentVolumeAccepted, templates.PreviewCommentVolumeInvalid,
 		templates.PreviewCommentAppScopedDispatch, templates.PreviewCommentAppScopedHalted,
 		templates.PreviewCommentAppScopedNotAuthorized,
 		templates.PreviewCommentAppScopedRejected, templates.PreviewCommentAppFlagInvalid,
@@ -227,10 +223,6 @@ Apply Watch Mode:
 Stop/Start Commands:
   stop_command          Output when user runs 'schemabot stop'
   start_command         Output when user runs 'schemabot start'
-
-Volume Control:
-  volume_bar            Volume bar at different levels
-  volume_mode           Volume adjustment mode (press 'v' during apply)
 
 Status:
   status_list           List of active schema changes
@@ -340,8 +332,6 @@ Apply Command Comments (GitHub PR apply commands):
   comment_start_pending         Start already pending
   comment_cutover_accepted      Cutover request accepted
   comment_cutover_active        Cutover already in progress
-  comment_volume_accepted       Volume request accepted
-  comment_volume_invalid        Volume command with a missing or invalid level
 
 App-Scoped Command Comments (--app expansion):
   comment_app_scoped_dispatch       App expansion summary (targeted + skipped databases)

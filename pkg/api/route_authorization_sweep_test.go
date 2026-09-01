@@ -101,7 +101,6 @@ func TestMutatingRoutesDenyScopedOperatorByDefault(t *testing.T) {
 		"POST /api/cancel":            controlBody,
 		"POST /api/start":             controlBody,
 		"POST /api/release":           controlBody,
-		"POST /api/volume":            controlBody,
 		"POST /api/revert":            controlBody,
 		"POST /api/skip-revert":       controlBody,
 		"POST /api/rollback/plan":     controlBody,

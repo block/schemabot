@@ -14,9 +14,8 @@ import (
 // TestControlRequests runs the behavioral parity suite for
 // storage.ControlRequestStore: the durable pending-request lifecycle
 // (request/complete/fail), convergence of concurrent requests on one row, the
-// release latch, volume-level metadata round-trips, the settled-request audit
-// read, remote-failure mirroring, and the apply-lease guard on pending
-// resolution.
+// release latch, the settled-request audit read, remote-failure mirroring, and
+// the apply-lease guard on pending resolution.
 func TestControlRequests(t *testing.T, h Harness) {
 	// createControlRequestApply creates a stopped apply — the state an
 	// operator's start request targets — and returns its ID.
@@ -368,102 +367,6 @@ func TestControlRequests(t *testing.T, h Harness) {
 		assert.False(t, failed.ReleasesPausedRollout())
 	})
 
-	// VolumeRequestLifecycleRoundTripsLevel verifies a volume control request
-	// carries its desired level in the row's metadata so the driving instance
-	// can retune the engine from storage alone. The level survives the full
-	// request/pending/complete lifecycle, and re-requesting after resolution
-	// resets the row with the new level — a completed adjustment never pins
-	// the payload of a later one.
-	t.Run("VolumeRequestLifecycleRoundTripsLevel", func(t *testing.T) {
-		ctx := t.Context()
-		store := h.NewStorage(t)
-
-		applyID := createControlRequestApply(t, store, "control_volume_db", "apply_control_volume")
-		firstMetadata, err := storage.EncodeVolumeControlRequestMetadata(3)
-		require.NoError(t, err)
-		first, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
-			ApplyID:     applyID,
-			Operation:   storage.ControlOperationVolume,
-			Status:      storage.ControlRequestPending,
-			RequestedBy: "operator-a",
-			Metadata:    firstMetadata,
-		})
-		require.NoError(t, err)
-		require.False(t, alreadyPending)
-
-		pending, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationVolume)
-		require.NoError(t, err)
-		require.NotNil(t, pending)
-		level, err := storage.DecodeVolumeControlRequestMetadata(pending.Metadata)
-		require.NoError(t, err)
-		assert.Equal(t, int32(3), level)
-
-		require.NoError(t, store.ControlRequests().CompletePending(ctx, applyID, storage.ControlOperationVolume))
-		pending, err = store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationVolume)
-		require.NoError(t, err)
-		assert.Nil(t, pending)
-		completed, err := store.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationVolume)
-		require.NoError(t, err)
-		require.NotNil(t, completed)
-		assert.Equal(t, storage.ControlRequestCompleted, completed.Status)
-
-		secondMetadata, err := storage.EncodeVolumeControlRequestMetadata(9)
-		require.NoError(t, err)
-		second, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
-			ApplyID:     applyID,
-			Operation:   storage.ControlOperationVolume,
-			Status:      storage.ControlRequestPending,
-			RequestedBy: "operator-b",
-			Metadata:    secondMetadata,
-		})
-		require.NoError(t, err)
-		require.False(t, alreadyPending)
-		assert.Equal(t, first.ID, second.ID)
-		assert.Equal(t, storage.ControlRequestPending, second.Status)
-		level, err = storage.DecodeVolumeControlRequestMetadata(second.Metadata)
-		require.NoError(t, err)
-		assert.Equal(t, int32(9), level)
-	})
-
-	// VolumeRequestPendingKeepsOriginalLevel verifies a pending volume
-	// request is immutable: a second request returns the existing row and its
-	// original level untouched. The tern layer relies on this to reject a
-	// different-level request instead of silently changing the level the
-	// driver is about to read, apply, and complete.
-	t.Run("VolumeRequestPendingKeepsOriginalLevel", func(t *testing.T) {
-		ctx := t.Context()
-		store := h.NewStorage(t)
-
-		applyID := createControlRequestApply(t, store, "control_volume_pending_db", "apply_control_volume_pending")
-		firstMetadata, err := storage.EncodeVolumeControlRequestMetadata(5)
-		require.NoError(t, err)
-		first, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
-			ApplyID:     applyID,
-			Operation:   storage.ControlOperationVolume,
-			Status:      storage.ControlRequestPending,
-			RequestedBy: "operator-a",
-			Metadata:    firstMetadata,
-		})
-		require.NoError(t, err)
-		require.False(t, alreadyPending)
-
-		secondMetadata, err := storage.EncodeVolumeControlRequestMetadata(11)
-		require.NoError(t, err)
-		second, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
-			ApplyID:     applyID,
-			Operation:   storage.ControlOperationVolume,
-			Status:      storage.ControlRequestPending,
-			RequestedBy: "operator-b",
-			Metadata:    secondMetadata,
-		})
-		require.NoError(t, err)
-		require.True(t, alreadyPending)
-		assert.Equal(t, first.ID, second.ID)
-		level, err := storage.DecodeVolumeControlRequestMetadata(second.Metadata)
-		require.NoError(t, err)
-		assert.Equal(t, int32(5), level, "a pending volume request must keep the level it was queued with")
-	})
-
 	// ListSettled verifies the audit read over resolved requests: an apply
 	// with no settled requests returns an empty result, only completed and
 	// failed rows are included — a pending request is live work, not audit
@@ -521,23 +424,23 @@ func TestControlRequests(t *testing.T, h Harness) {
 		applyID := createControlRequestApply(t, store, "control_mirror_create_db", "apply_control_mirror_create")
 		changed, err := store.ControlRequests().RecordRemoteFailure(ctx, &storage.ApplyControlRequest{
 			ApplyID:      applyID,
-			Operation:    storage.ControlOperationVolume,
+			Operation:    storage.ControlOperationCutover,
 			RequestedBy:  storage.ForwardingControlRequestCaller,
-			ErrorMessage: "remote volume rejected",
+			ErrorMessage: "remote cutover rejected",
 		})
 		require.NoError(t, err)
 		assert.True(t, changed, "a first-seen rejection must be recorded")
 
-		row, err := store.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationVolume)
+		row, err := store.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationCutover)
 		require.NoError(t, err)
 		require.NotNil(t, row)
 		assert.Equal(t, storage.ControlRequestFailed, row.Status)
-		assert.Equal(t, "remote volume rejected", row.ErrorMessage)
+		assert.Equal(t, "remote cutover rejected", row.ErrorMessage)
 		assert.Equal(t, storage.ForwardingControlRequestCaller, row.RequestedBy)
 		assert.True(t, row.IsMirroredRemoteRejection(), "a mirror-created row carries the mirrored-rejection marker")
 		assert.NotNil(t, row.CompletedAt)
 
-		pending, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationVolume)
+		pending, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationCutover)
 		require.NoError(t, err)
 		assert.Nil(t, pending, "a mirrored rejection is settled, never pending")
 	})
@@ -627,9 +530,9 @@ func TestControlRequests(t *testing.T, h Harness) {
 		applyID := createControlRequestApply(t, store, "control_mirror_idempotent_db", "apply_control_mirror_idempotent")
 		report := &storage.ApplyControlRequest{
 			ApplyID:      applyID,
-			Operation:    storage.ControlOperationVolume,
+			Operation:    storage.ControlOperationCutover,
 			RequestedBy:  storage.ForwardingControlRequestCaller,
-			ErrorMessage: "remote volume rejected",
+			ErrorMessage: "remote cutover rejected",
 		}
 		changed, err := store.ControlRequests().RecordRemoteFailure(ctx, report)
 		require.NoError(t, err)
@@ -641,17 +544,17 @@ func TestControlRequests(t *testing.T, h Harness) {
 
 		changed, err = store.ControlRequests().RecordRemoteFailure(ctx, &storage.ApplyControlRequest{
 			ApplyID:      applyID,
-			Operation:    storage.ControlOperationVolume,
+			Operation:    storage.ControlOperationCutover,
 			RequestedBy:  storage.ForwardingControlRequestCaller,
-			ErrorMessage: "remote volume rejected for a new reason",
+			ErrorMessage: "remote cutover rejected for a new reason",
 		})
 		require.NoError(t, err)
 		assert.True(t, changed, "a rejection with a different error is a distinct failure")
 
-		row, err := store.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationVolume)
+		row, err := store.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationCutover)
 		require.NoError(t, err)
 		require.NotNil(t, row)
-		assert.Equal(t, "remote volume rejected for a new reason", row.ErrorMessage)
+		assert.Equal(t, "remote cutover rejected for a new reason", row.ErrorMessage)
 	})
 
 	// ClearRemoteFailure_ClearsMirroredRejection verifies the mirror retires
@@ -665,24 +568,24 @@ func TestControlRequests(t *testing.T, h Harness) {
 		applyID := createControlRequestApply(t, store, "control_mirror_clear_db", "apply_control_mirror_clear")
 		changed, err := store.ControlRequests().RecordRemoteFailure(ctx, &storage.ApplyControlRequest{
 			ApplyID:      applyID,
-			Operation:    storage.ControlOperationVolume,
+			Operation:    storage.ControlOperationCutover,
 			RequestedBy:  storage.ForwardingControlRequestCaller,
-			ErrorMessage: "remote volume rejected",
+			ErrorMessage: "remote cutover rejected",
 		})
 		require.NoError(t, err)
 		require.True(t, changed)
 
-		cleared, err := store.ControlRequests().ClearRemoteFailure(ctx, applyID, storage.ControlOperationVolume)
+		cleared, err := store.ControlRequests().ClearRemoteFailure(ctx, applyID, storage.ControlOperationCutover)
 		require.NoError(t, err)
 		assert.True(t, cleared)
 
-		row, err := store.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationVolume)
+		row, err := store.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationCutover)
 		require.NoError(t, err)
 		require.NotNil(t, row)
 		assert.Equal(t, storage.ControlRequestCompleted, row.Status)
 		assert.Empty(t, row.ErrorMessage)
 
-		cleared, err = store.ControlRequests().ClearRemoteFailure(ctx, applyID, storage.ControlOperationVolume)
+		cleared, err = store.ControlRequests().ClearRemoteFailure(ctx, applyID, storage.ControlOperationCutover)
 		require.NoError(t, err)
 		assert.False(t, cleared, "an already-cleared rejection has nothing left to clear")
 	})

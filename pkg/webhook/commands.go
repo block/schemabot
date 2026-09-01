@@ -3,9 +3,9 @@ package webhook
 import (
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
 
@@ -49,13 +49,6 @@ type CommandSpec struct {
 
 	// SupportsForce means `--force` is recognized.
 	SupportsForce bool
-
-	// SupportsVolumeLevel means `-v <level>` / `--volume <level>` is recognized.
-	// The parser extracts the numeric level into CommandResult.VolumeLevel and
-	// flags a present-but-unparseable value via VolumeLevelError; range
-	// validation stays with the dispatcher so the rejection comment can cite
-	// the valid range.
-	SupportsVolumeLevel bool
 }
 
 // commandSpecs is the registry of all SchemaBot commands. Order does not
@@ -79,7 +72,6 @@ var commandSpecs = []CommandSpec{
 	{Name: action.Revert, RequiresEnv: true, HasApplyID: true},
 	{Name: action.SkipRevert, RequiresEnv: true, HasApplyID: true},
 	{Name: action.Cutover, RequiresEnv: true, HasApplyID: true},
-	{Name: action.Volume, RequiresEnv: true, HasApplyID: true, SupportsVolumeLevel: true},
 	{Name: action.Rollback, RequiresEnv: true, HasApplyID: true},
 	{Name: action.RollbackConfirm, RequiresEnv: true, SupportsDeferCutover: true},
 }
@@ -134,7 +126,6 @@ type CommandParser struct {
 	allowUnsafeRegex     *regexp.Regexp
 	forceRegex           *regexp.Regexp
 	autoConfirmRegex     *regexp.Regexp
-	volumeFlagRegex      *regexp.Regexp
 }
 
 // NewCommandParser creates a new command parser.
@@ -157,7 +148,6 @@ func NewCommandParser() *CommandParser {
 		allowUnsafeRegex:     regexp.MustCompile(`(?i)--allow-unsafe\b`),
 		forceRegex:           regexp.MustCompile(`(?i)--force\b`),
 		autoConfirmRegex:     regexp.MustCompile(`(?i)(?:^|\s)(?:--yes|-y)(?:\s|$)`),
-		volumeFlagRegex:      regexp.MustCompile(`(?i)(?:^|\s)(?:--volume|-v)(?:[ \t]+([^\s]+))?(?:\s|$)`),
 	}
 }
 
@@ -192,17 +182,10 @@ type CommandResult struct {
 	DeferCutover bool
 	AllowUnsafe  bool
 	Force        bool
-	// VolumeLevel is the numeric level from `-v` / `--volume` on commands whose
-	// spec opts into SupportsVolumeLevel. Zero means the flag was absent.
-	VolumeLevel int32
-	// VolumeLevelError is true when `-v` / `--volume` is present without a
-	// numeric value, so the dispatcher can post a usage comment instead of
-	// treating the command as flagless.
-	VolumeLevelError bool
-	Found            bool
-	IsHelp           bool
-	IsMention        bool
-	MissingEnv       bool
+	Found        bool
+	IsHelp       bool
+	IsMention    bool
+	MissingEnv   bool
 	// EnvironmentError is true when `-e` is present but its value is not a
 	// valid environment name (for example a flag glued onto the value:
 	// `-e production--allow-unsafe`). The dispatcher posts a usage comment;
@@ -257,24 +240,6 @@ func (p *CommandParser) firstDirectiveLine(body string) (string, bool) {
 		}
 	}
 	return "", false
-}
-
-// extractVolumeLevel returns the numeric level from `-v` / `--volume` and
-// whether the flag was present but unusable (missing value or non-numeric).
-// An absent flag returns (0, false); range validation is the dispatcher's job.
-func (p *CommandParser) extractVolumeLevel(body string) (int32, bool) {
-	match := p.volumeFlagRegex.FindStringSubmatch(body)
-	if len(match) == 0 {
-		return 0, false
-	}
-	if len(match) < 2 || match[1] == "" {
-		return 0, true
-	}
-	level, err := strconv.ParseInt(match[1], 10, 32)
-	if err != nil {
-		return 0, true
-	}
-	return int32(level), false
 }
 
 // extractApp returns the application identifier from `--app` and whether the
@@ -342,7 +307,7 @@ func (p *CommandParser) applySpec(spec CommandSpec, body, tenant string, tenantE
 	}
 	if spec.SupportsDB {
 		if m := p.databaseRegex.FindStringSubmatch(body); len(m) >= 2 {
-			result.Database = m[1]
+			result.Database = storage.CanonicalKey(m[1])
 		}
 	}
 	if spec.SupportsApp {
@@ -360,16 +325,12 @@ func (p *CommandParser) applySpec(spec CommandSpec, body, tenant string, tenantE
 	if spec.SupportsForce {
 		result.Force = p.forceRegex.MatchString(body)
 	}
-	if spec.SupportsVolumeLevel {
-		result.VolumeLevel, result.VolumeLevelError = p.extractVolumeLevel(body)
-	}
-
 	// The -e capture takes the whole token (any non-flag word) and validity is
 	// checked separately: a malformed value like `production--allow-unsafe`
 	// must be rejected as a whole, never reinterpreted as an environment plus
 	// a glued-on flag.
 	if m := p.environmentRegex.FindStringSubmatch(body); len(m) >= 2 {
-		env := strings.ToLower(m[1])
+		env := storage.CanonicalKey(m[1])
 		if p.environmentNameRegex.MatchString(env) {
 			result.Environment = env
 		} else {

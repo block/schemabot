@@ -3342,37 +3342,6 @@ func TestLocalClient_Start_NoStoppedMigration(t *testing.T) {
 	assert.Contains(t, err.Error(), "no stopped schema change")
 }
 
-func TestLocalClient_Volume_NoActiveSchemaChange(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
-	container, dsn := setupMySQLContainer(t)
-	_ = container              // container is managed by TestMain
-	setupStorageSchema(t, dsn) // need storage tables
-
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	stor := createStorage(t, dsn)
-
-	client, err := NewLocalClient(LocalConfig{
-		Database:  "testdb",
-		Type:      "mysql",
-		TargetDSN: dsn,
-	}, stor, logger)
-	require.NoError(t, err, "failed to create client")
-	defer utils.CloseAndLog(client)
-
-	ctx := t.Context()
-	// Volume requires an active schema change - returns error when none exists
-	_, err = client.Volume(ctx, &ternv1.VolumeRequest{
-		Environment: localClientTestEnvironment,
-		Volume:      5,
-	})
-	require.Error(t, err, "expected Volume() to return error when no active schema change")
-	// Error should mention no active schema change
-	assert.Contains(t, err.Error(), "no active schema change")
-}
-
 func TestLocalClient_Revert_NoActiveMigration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")

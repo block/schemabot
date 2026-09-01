@@ -403,7 +403,7 @@ func IsTerminalApplyState(s string) bool {
 // sibling deployment failed), or one of the post-copy phases (catching_up,
 // checksumming, post_checksum) where the engine is still actively working the
 // change. Control gates that mean "the apply is actively running" — cutover
-// readiness, start reconciliation, stop/volume eligibility — must use this so
+// readiness, start reconciliation, stop eligibility — must use this so
 // a degraded rollout or a table draining its changeset is not mistaken for a
 // non-running apply.
 // This is narrower than "active" (non-terminal): pending, waiting_for_cutover,

@@ -206,17 +206,6 @@ func (s *Server) Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.S
 	return resp, nil
 }
 
-func (s *Server) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error) {
-	if err := requireApplyID(req.ApplyId); err != nil {
-		return nil, err
-	}
-	resp, err := s.client.Volume(ctx, req)
-	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-	return resp, nil
-}
-
 func (s *Server) Revert(ctx context.Context, req *ternv1.RevertRequest) (*ternv1.RevertResponse, error) {
 	if err := requireApplyID(req.ApplyId); err != nil {
 		return nil, err
