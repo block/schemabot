@@ -116,9 +116,13 @@ func (postgresStatementParser) CreateTableColumns(stmt string) ([]string, error)
 	return columns, nil
 }
 
-// SynthesizePostgresAddColumn builds an ALTER TABLE statement from a column
-// declaration in exactly one PostgreSQL CREATE TABLE statement.
-func SynthesizePostgresAddColumn(createTableDDL, columnName string) (string, error) {
+// SynthesizeAddColumn implements StatementParser. It grafts the column's
+// ColumnDef parse node — type and column-level constraints intact — from the
+// CREATE TABLE tree into a fresh ALTER TABLE ... ADD COLUMN tree and deparses
+// it, so the output is libpg_query's normalized rendering rather than a
+// textual slice of the input. Table-level constraints are separate TableElts
+// nodes, not part of the ColumnDef, and are not carried.
+func (postgresStatementParser) SynthesizeAddColumn(createTableDDL, columnName string) (string, error) {
 	result, err := pgquery.Parse(createTableDDL)
 	if err != nil {
 		return "", fmt.Errorf("parse CREATE TABLE %q: %w", statementPreview(createTableDDL), err)
