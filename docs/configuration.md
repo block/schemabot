@@ -792,7 +792,15 @@ on the storage dialect:
   ```
 
   Without it, every webhook claim sorts the full claimable inbox before
-  taking one row, which slows claiming as delivery history grows.
+  taking one row, which slows claiming as delivery history grows. On MySQL
+  the same index arrives as a startup `ALTER` under the budget described in
+  the MySQL bullet above, and `webhook_events` grows with total delivery
+  history and has no retention sweep, so pre-create it there before rolling
+  out:
+
+  ```sql
+  ALTER TABLE `webhook_events` ADD INDEX `idx_created_id` (`created_at`, `id`);
+  ```
 
 The rest of this section describes the MySQL flow.
 
