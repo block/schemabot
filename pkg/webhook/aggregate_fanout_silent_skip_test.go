@@ -575,41 +575,6 @@ func TestRollbackMissingApplyIDDefersToLeader(t *testing.T) {
 	})
 }
 
-// A volume command with a missing or invalid -v level is a usage error every
-// deployment can detect from the comment text alone, so on an unscoped fan-out
-// participants defer the reply to the leader, which posts it exactly once.
-func TestVolumeInvalidLevelDefersToLeader(t *testing.T) {
-	invalidLevel := func(tenant string) CommandResult {
-		return CommandResult{Action: action.Volume, ApplyID: "apply_a1b2c3", Environment: "staging", VolumeLevelError: true, Tenant: tenant}
-	}
-
-	t.Run("participant stays silent on the unscoped usage error", func(t *testing.T) {
-		h, _, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
-
-		h.handleVolumeCommand("octocat/hello-world", 1, 12345, "hubot", invalidLevel(""))
-
-		assert.Empty(t, comments, "a participant must defer the invalid-volume-level reply to the leader")
-	})
-
-	t.Run("leader posts the usage error once", func(t *testing.T) {
-		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
-
-		h.handleVolumeCommand("octocat/hello-world", 1, 12345, "hubot", invalidLevel(""))
-
-		body := requireComment(t, comments, "invalid-volume-level comment")
-		assert.Contains(t, body, "Missing or Invalid Volume Level")
-	})
-
-	t.Run("tenant-scoped command gets the usage error from the addressee", func(t *testing.T) {
-		h, _, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
-
-		h.handleVolumeCommand("octocat/hello-world", 1, 12345, "hubot", invalidLevel("tenant-b"))
-
-		body := requireComment(t, comments, "invalid-volume-level comment")
-		assert.Contains(t, body, "Missing or Invalid Volume Level")
-	})
-}
-
 // On an aggregate repo, an -e value this deployment does not recognize may be
 // a perfectly valid environment served by a sibling deployment — a
 // participant's config holds only its own slice of the fleet's environments.

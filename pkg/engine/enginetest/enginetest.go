@@ -147,7 +147,6 @@ var engineMethodExclusions = map[string]string{
 	"Cutover":    "the suite exercises cutover only indirectly through engine-specific fixtures, so it cannot pin the method directly",
 	"Revert":     "revert semantics are engine-specific; each engine's own tests pin them",
 	"SkipRevert": "revert-window semantics are engine-specific; each engine's own tests pin them",
-	"Volume":     "throttle semantics are engine-specific; each engine's own tests pin them",
 }
 
 // Run executes the engine contract suite against the harness. Every

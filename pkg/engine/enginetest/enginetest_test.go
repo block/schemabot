@@ -308,7 +308,3 @@ func (f fakeEngine) SkipRevert(context.Context, *engine.ControlRequest) (*engine
 	f.recorder.record("SkipRevert")
 	return nil, nil
 }
-func (f fakeEngine) Volume(context.Context, *engine.VolumeRequest) (*engine.VolumeResult, error) {
-	f.recorder.record("Volume")
-	return nil, nil
-}

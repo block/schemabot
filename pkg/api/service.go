@@ -699,11 +699,6 @@ func (s *Service) HandleStart(w http.ResponseWriter, r *http.Request) {
 	s.handleStart(w, r)
 }
 
-// HandleVolume is the HTTP handler for POST /api/volume.
-func (s *Service) HandleVolume(w http.ResponseWriter, r *http.Request) {
-	s.handleVolume(w, r)
-}
-
 // HandleRevert is the HTTP handler for POST /api/revert.
 func (s *Service) HandleRevert(w http.ResponseWriter, r *http.Request) {
 	s.handleRevert(w, r)
@@ -776,7 +771,6 @@ func (s *Service) apiRoutes() []apiRoute {
 		{"POST /api/cancel", s.handleCancel},
 		{"POST /api/start", s.handleStart},
 		{"POST /api/release", s.handleRelease},
-		{"POST /api/volume", s.handleVolume},
 		{"POST /api/revert", s.handleRevert},
 		{"POST /api/skip-revert", s.handleSkipRevert},
 		{"POST /api/rollback/plan", s.handleRollbackPlan},

@@ -45,6 +45,13 @@ func controlRejectionSection(ctx context.Context, stor storage.Storage, logger i
 		if req.Status != storage.ControlRequestFailed {
 			continue
 		}
+		if req.Operation.Retired() {
+			// A rejection recorded by a previous release for an operation this
+			// release removed: the notice would tell the operator to re-issue a
+			// command that no longer exists, and nothing can ever clear it. The
+			// row stays in storage; it just no longer renders.
+			continue
+		}
 		rejections = append(rejections, templates.ControlRejectionData{
 			Operation:   string(req.Operation),
 			Message:     req.ErrorMessage,

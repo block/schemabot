@@ -16,6 +16,5 @@ func TestRenderHelpCommentListsControlCommands(t *testing.T) {
 	assert.Contains(t, rendered, "`schemabot cancel <apply-id> -e <env>`")
 	assert.Contains(t, rendered, "`schemabot start <apply-id> -e <env>`")
 	assert.Contains(t, rendered, "`schemabot cutover <apply-id> -e <env>`")
-	assert.Contains(t, rendered, "`schemabot volume <apply-id> -e <env> -v <level>`")
-	assert.Contains(t, rendered, "Adjust schema change speed (1=slowest, 11=fastest)")
+	assert.Contains(t, rendered, "Complete a deferred cutover")
 }

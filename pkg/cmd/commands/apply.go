@@ -285,7 +285,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 // Three modes are available:
 //
 //   - interactive (default): Full-screen TUI with progress bars, spinners, and
-//     keyboard controls (stop, volume, cutover). Requires a TTY. Provides a
+//     keyboard controls (stop, cutover). Requires a TTY. Provides a
 //     rich, real-time view of progress. Best when a human is watching — local
 //     development, production operations, etc.
 //

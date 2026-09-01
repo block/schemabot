@@ -1352,7 +1352,7 @@ type ControlRequestStore interface {
 	// for use when that plane later reports the same operation succeeded. It
 	// only touches a failed row the mirror itself created: rows this plane
 	// queued are cleared by their own request lifecycle, and a row with no
-	// lifecycle here — a pure proxy operation such as volume — would otherwise
+	// lifecycle here — an operation this plane only proxies — would otherwise
 	// keep warning about a command the operator has since re-issued
 	// successfully. It reports whether the stored row changed.
 	ClearRemoteFailure(ctx context.Context, applyID int64, operation ControlOperation) (bool, error)
