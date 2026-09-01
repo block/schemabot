@@ -5,10 +5,12 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -182,6 +184,75 @@ func TestFailedShard(t *testing.T) {
 		again, ok := failedShard(reversed)
 		require.True(t, ok)
 		assert.Equal(t, "first", again.Message)
+	})
+}
+
+// A shard can stop while the deploy request is still working — Vitess retries
+// it — and reporting that as the apply's failure would tell a pull request its
+// change failed while the change is still running.
+func TestAdoptedFailureReason(t *testing.T) {
+	failed := vitessMigrationRow{
+		Keyspace: "commerce", Shard: "-80", Table: "orders",
+		Status: state.Vitess.Failed, Message: notNullFailure,
+	}
+	wantReason := vitessFailureReasons[1048] + " (error 1048)"
+
+	tests := []struct {
+		name        string
+		engineState engine.State
+		row         vitessMigrationRow
+		shardFailed bool
+		want        string
+	}{
+		{
+			name:        "deploy request failed and a shard reported why",
+			engineState: engine.StateFailed,
+			row:         failed, shardFailed: true,
+			want: wantReason,
+		},
+		{
+			name:        "shard stopped while the change is still running",
+			engineState: engine.StateRunning,
+			row:         failed, shardFailed: true,
+			want: "",
+		},
+		{
+			name:        "shard stopped and the change went on to complete",
+			engineState: engine.StateCompleted,
+			row:         failed, shardFailed: true,
+			want: "",
+		},
+		{
+			name:        "deploy request failed with no shard to explain it",
+			engineState: engine.StateFailed,
+			shardFailed: false,
+			want:        "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, adoptedFailureReason(tt.engineState, tt.row, tt.shardFailed))
+		})
+	}
+}
+
+// The reason points an operator at this log, so the log has to carry the
+// target's words — bounded, because the statement quoted after them is as wide
+// as the table.
+func TestClampTargetMessage(t *testing.T) {
+	t.Run("keeps a message whole", func(t *testing.T) {
+		assert.Equal(t, notNullFailure, clampTargetMessage(notNullFailure))
+	})
+
+	t.Run("bounds a message a wide table made enormous", func(t *testing.T) {
+		got := clampTargetMessage(strings.Repeat("x", maxLoggedTargetMessageLen*3))
+		assert.True(t, strings.HasSuffix(got, "… (truncated)"))
+		assert.Len(t, []rune(got), maxLoggedTargetMessageLen+len([]rune("… (truncated)")))
+	})
+
+	t.Run("does not split a rune", func(t *testing.T) {
+		got := clampTargetMessage(strings.Repeat("é", maxLoggedTargetMessageLen*2))
+		assert.True(t, utf8.ValidString(got))
 	})
 }
 

@@ -169,21 +169,21 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		// The deploy request reports that the schema change failed but never why.
 		// The shard rows carry the reason, so attach it to the failure the drive
 		// is about to record; without it the pull request and the CLI show a
-		// state and nothing an operator can act on. Only a failed deploy request
-		// adopts it, so a shard message during a live change never becomes an
-		// apply-level error.
-		if engineState == engine.StateFailed && shardFailed {
-			result.ErrorMessage = vitessFailureReason(failed.Message)
-			// The target's own words are the triage detail and stay server-side:
-			// they quote the statement that failed, which is a customer row.
+		// state and nothing an operator can act on.
+		if reason := adoptedFailureReason(engineState, failed, shardFailed); reason != "" {
+			result.ErrorMessage = reason
+			// The target's own words are the triage detail and stay server-side.
+			// The rendered reason names this log, so it carries them at the
+			// severity of the failure rather than behind a debug level an
+			// operator would have to turn on after the fact.
 			e.logger.Warn("schema change failed on the target",
 				"database", req.Database,
 				"deploy_request", meta.DeployRequestID,
 				"keyspace", failed.Keyspace,
 				"shard", failed.Shard,
 				"table", failed.Table,
-				"reason", result.ErrorMessage,
-				"target_message", failed.Message,
+				"reason", reason,
+				"target_message", clampTargetMessage(failed.Message),
 			)
 		}
 		if len(tables) > 0 {
