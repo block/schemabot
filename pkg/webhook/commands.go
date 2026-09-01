@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
 
@@ -303,7 +304,7 @@ func (p *CommandParser) applySpec(spec CommandSpec, body, tenant string, tenantE
 	}
 	if spec.SupportsDB {
 		if m := p.databaseRegex.FindStringSubmatch(body); len(m) >= 2 {
-			result.Database = m[1]
+			result.Database = storage.CanonicalKey(m[1])
 		}
 	}
 	if spec.SupportsSkipRevert {
@@ -327,7 +328,7 @@ func (p *CommandParser) applySpec(spec CommandSpec, body, tenant string, tenantE
 	// must be rejected as a whole, never reinterpreted as an environment plus
 	// a glued-on flag.
 	if m := p.environmentRegex.FindStringSubmatch(body); len(m) >= 2 {
-		env := strings.ToLower(m[1])
+		env := storage.CanonicalKey(m[1])
 		if p.environmentNameRegex.MatchString(env) {
 			result.Environment = env
 		} else {
