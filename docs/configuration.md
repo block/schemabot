@@ -731,7 +731,13 @@ on the storage dialect:
 
 - **MySQL** diffs the embedded schema files against the live database and
   applies whatever DDL is needed (via Spirit) — new tables, new columns, and
-  index changes all converge automatically.
+  index changes all converge automatically. That convergence is bounded by a
+  hard five-minute startup budget, and an index added to an existing table
+  runs as Spirit online DDL — a table copy, not an in-place build — so its
+  cost grows with the table's row count. On a deployment whose storage
+  tables carry a long history, create a newly declared index by hand before
+  rolling out: the startup diff then finds nothing to do, instead of copying
+  the table inside the budget on every pod.
 - **PostgreSQL** creates missing tables and verifies that existing tables
   contain every column and standalone unique index declared by the embedded
   schema. Missing objects fail startup with the affected table and objects
@@ -763,7 +769,22 @@ on the storage dialect:
   ```
 
   Without it, every driver claim sorts the full claimable set before taking
-  one row, which slows claiming as apply history grows.
+  one row, which slows claiming as apply history grows. And one bootstrapped
+  before refused applies started naming the schema change holding the
+  database needs:
+
+  ```sql
+  CREATE INDEX idx_apply_operations_external_id ON apply_operations (external_id);
+  ```
+
+  Without it, resolving the holding change behind a refused apply scans the
+  full operation history for one remote identifier. On PostgreSQL the lookup
+  is an optimization, never load-bearing: the refusal still reads correctly,
+  it just gets slower to record as apply history grows. On MySQL the same
+  index is not optional — `EnsureSchema` applies it as a startup `ALTER`
+  under the budget described in the MySQL bullet above, and `apply_operations`
+  grows with total apply history, so large deployments should pre-create it
+  there too.
 
 The rest of this section describes the MySQL flow.
 

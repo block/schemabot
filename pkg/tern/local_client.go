@@ -2632,9 +2632,13 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 				return adopted, nil
 			}
 		}
+		// The conflict travels as structured facts beside the error text. The
+		// text is the engine's own and stays for the logs; a caller that must
+		// tell an operator why the database is busy renders the conflict.
 		return &ternv1.ApplyResponse{
 			Accepted:     false,
 			ErrorMessage: conflictErr.Error(),
+			Conflict:     blocking.conflict(),
 		}, nil
 	}
 

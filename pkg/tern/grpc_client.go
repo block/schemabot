@@ -2259,10 +2259,8 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 			return fmt.Errorf("dispatch %s apply_operation %d (apply %s): %w", kind, op.ID, apply.ApplyIdentifier, err)
 		}
 		if resp == nil || !resp.Accepted || resp.ApplyId == "" {
-			errMsg := fmt.Sprintf("remote %s apply was not accepted", kind)
-			if resp != nil && resp.ErrorMessage != "" {
-				errMsg = resp.ErrorMessage
-			}
+			holderApplyID := c.resolveConflictHolderApplyID(ctx, apply, resp.GetConflict())
+			errMsg := remoteApplyRejectionMessage(resp, holderApplyID, fmt.Sprintf("remote %s apply was not accepted", kind))
 			if markErr := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); markErr != nil {
 				return fmt.Errorf("mark %s apply_operation %d failed: %w", kind, op.ID, markErr)
 			}
@@ -3093,10 +3091,8 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		return fmt.Errorf("apply queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
 	}
 	if !resp.Accepted {
-		errMsg := resp.ErrorMessage
-		if errMsg == "" {
-			errMsg = "remote apply was not accepted"
-		}
+		holderApplyID := c.resolveConflictHolderApplyID(ctx, apply, resp.GetConflict())
+		errMsg := remoteApplyRejectionMessage(resp, holderApplyID, "remote apply was not accepted")
 		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, errMsg, false, scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after rejection: %w", apply.ApplyIdentifier, markErr)
 		}

@@ -614,6 +614,43 @@ message ApplyRequest {
   repeated string generation_operation_keys = 12;
 }
 
+// ApplyConflict names the active work that refused an apply, in the terms a
+// caller needs to explain the refusal on its own surfaces.
+//
+// error_message is the engine's own prose and is not safe to render: it can
+// carry dial failures, hostnames, and driver internals into a public pull
+// request. These fields are the sanitized alternative — facts the engine
+// derived rather than text it caught — so a caller can tell an operator what
+// holds the database without leaking what went wrong underneath.
+//
+// The engine's own identifiers are never rendered. They resolve only inside the
+// engine, so an operator who pastes one into the control-plane CLI is refused.
+// holder_external_id crosses for the opposite purpose: it is the key a caller
+// joins against its own record of what it dispatched, so it can name the
+// holding change by an identifier that resolves on the operator's side.
+message ApplyConflict {
+  // The table the blocking work is changing. Empty for a multi-table atomic
+  // change, which holds the database without naming a single table.
+  string table = 1;
+  // The shard held, for sharded engines. Empty when the whole database is held.
+  string shard = 2;
+  // The canonical state of the schema change holding the database, which is
+  // what decides whether an operator must act or can wait.
+  string blocking_state = 3;
+  // The pull request that owns the holding change, when one does.
+  string repository = 4;
+  int32 pull_request = 5;
+  // Who started the holding change (e.g. "cli:user@host"). Set when no pull
+  // request owns it.
+  string caller = 6;
+  // The engine's identifier for the holding change, for lookup only. A caller
+  // that dispatched the holding change recorded this identifier against its own
+  // apply, so it can resolve the handle an operator can actually use. A caller
+  // that finds no match did not start this work and has no handle to offer —
+  // this field is never the one rendered.
+  string holder_external_id = 7;
+}
+
 // ApplyResponse indicates whether the apply was accepted.
 message ApplyResponse {
   bool accepted = 1;
@@ -628,6 +665,10 @@ message ApplyResponse {
   // response without the caller's key must not be treated as that
   // operation's dispatch.
   string operation_key = 5;
+  // Set when the apply was refused because other work already holds the
+  // database, so the caller can render the refusal instead of the engine's
+  // unsafe error text. Absent for every other rejection.
+  ApplyConflict conflict = 6;
 }
 
 // ProgressRequest requests detailed progress for an active schema change.

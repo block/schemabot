@@ -520,6 +520,59 @@ func (s *applyOperationStore) SaveExternalOperationID(ctx context.Context, opera
 	return s.checkUpdatedOrExists(ctx, result, operationID, guard, false)
 }
 
+// ApplyIdentifierForRemoteApply returns the identifier of the apply this control
+// plane dispatched as externalID, or "" when it dispatched no such thing.
+//
+// An empty externalID correlates to nothing by definition, and is answered
+// without a query so that stays true however the column spells "none". The
+// answer happens to be the same today, since an unrecorded id is stored as NULL
+// and NULL matches nothing; making it a property of the method instead means a
+// caller with no identifier can never be correlated to every operation that has
+// none, which would name an unrelated schema change as the one to go look at.
+//
+// Distinct parents are counted rather than taking the first row: sibling
+// operations of one deployment share a remote apply, so many rows for one
+// parent is the normal shape, but two parents for one remote apply means the
+// one-remote-apply-per-deployment invariant has already been violated. Naming
+// either one would send an operator to the wrong schema change, so the store
+// reports the ambiguity instead.
+func (s *applyOperationStore) ApplyIdentifierForRemoteApply(ctx context.Context, externalID string) (string, error) {
+	if externalID == "" {
+		return "", nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT a.apply_identifier
+		FROM apply_operations o
+		JOIN applies a ON a.id = o.apply_id
+		WHERE o.external_id = ?
+	`, externalID)
+	if err != nil {
+		return "", fmt.Errorf("query apply identifier for remote apply %q: %w", externalID, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	var identifiers []string
+	for rows.Next() {
+		var identifier string
+		if err := rows.Scan(&identifier); err != nil {
+			return "", fmt.Errorf("scan apply identifier for remote apply %q: %w", externalID, err)
+		}
+		identifiers = append(identifiers, identifier)
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("iterate apply identifiers for remote apply %q: %w", externalID, err)
+	}
+	switch len(identifiers) {
+	case 0:
+		return "", nil
+	case 1:
+		return identifiers[0], nil
+	default:
+		return "", fmt.Errorf("remote apply %q correlates to %d applies (%s): %w",
+			externalID, len(identifiers), strings.Join(identifiers, ", "), storage.ErrRemoteApplyDeploymentIDConflict)
+	}
+}
+
 // SaveExternalID stores the remote data plane's apply_id on the operation row.
 // It refuses empty IDs so callers do not convert a missing remote field into an
 // apparent successful correlation.

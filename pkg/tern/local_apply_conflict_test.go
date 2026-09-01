@@ -576,7 +576,7 @@ func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 				table:          "xfers",
 				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.Stopped},
 			},
-			want: []string{"table xfers", "task-holding", "apply-holding", "stopped", "started or cancelled"},
+			want: []string{"table xfers", "task-holding", "stopped", "started or cancelled"},
 		},
 		{
 			name: "a running apply releases its database on its own, unless it parks for cutover",
@@ -586,7 +586,7 @@ func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.Running},
 			},
 			want: []string{
-				"table xfers", "task-holding", "apply-holding", "running",
+				"table xfers", "task-holding", "running",
 				"releases the database when it finishes", "unless it parks for cutover",
 			},
 		},
@@ -597,7 +597,7 @@ func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 				table:          "xfers",
 				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.CatchingUp},
 			},
-			want: []string{"apply-holding", "releases the database when it finishes"},
+			want: []string{"releases the database when it finishes"},
 		},
 		{
 			name: "a sharded change names the shard, since only that shard is held",
@@ -607,7 +607,7 @@ func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 				shard:          "-40",
 				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.Running},
 			},
-			want: []string{"table xfers shard -40", "task-holding", "apply-holding"},
+			want: []string{"table xfers shard -40", "task-holding"},
 		},
 		{
 			name: "a multi-table atomic change records no table, so the task names it",
@@ -615,7 +615,7 @@ func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 				taskIdentifier: "task-holding",
 				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.Running},
 			},
-			want: []string{"task task-holding is held by apply apply-holding"},
+			want: []string{"task task-holding is held by a schema change"},
 		},
 		{
 			name: "a sharded multi-table change still names the shard it holds",
@@ -624,7 +624,7 @@ func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 				shard:          "-40",
 				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.Running},
 			},
-			want: []string{"shard -40 (task task-holding)", "apply-holding"},
+			want: []string{"shard -40 (task task-holding)"},
 		},
 		{
 			name: "a retryable failure rests holding its database, so a decision is owed",
@@ -633,7 +633,7 @@ func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 				table:          "xfers",
 				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.FailedRetryable},
 			},
-			want: []string{"table xfers", "task-holding", "apply-holding", "failed_retryable", "retried or cancelled"},
+			want: []string{"table xfers", "task-holding", "failed_retryable", "retried or cancelled"},
 		},
 		{
 			name: "an apply parked at the cutover barrier holds its database until cut over",
@@ -642,7 +642,7 @@ func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 				table:          "xfers",
 				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.WaitingForCutover},
 			},
-			want: []string{"table xfers", "task-holding", "apply-holding", "waiting_for_cutover", "cut over or cancelled"},
+			want: []string{"table xfers", "task-holding", "waiting_for_cutover", "cut over or cancelled"},
 		},
 		{
 			name: "an apply in its revert window rests holding its database, so a decision is owed",
@@ -652,7 +652,7 @@ func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.RevertWindow},
 			},
 			want: []string{
-				"table xfers", "task-holding", "apply-holding", "revert_window",
+				"table xfers", "task-holding", "revert_window",
 				"reverted or skip-reverted",
 			},
 		},
@@ -663,7 +663,7 @@ func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 				table:          "xfers",
 				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.Reverting},
 			},
-			want: []string{"apply-holding", "reverting", "releases the database when the revert finishes"},
+			want: []string{"reverting", "releases the database when the revert finishes"},
 		},
 		{
 			name: "finalizing skip-revert finishes on its own too",
@@ -672,7 +672,7 @@ func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
 				table:          "xfers",
 				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.SkippingRevert},
 			},
-			want: []string{"apply-holding", "skipping_revert", "releases the database when the revert finishes"},
+			want: []string{"skipping_revert", "releases the database when the revert finishes"},
 		},
 		{
 			name: "an apply that could not be loaded still reports what it blocks on",
@@ -706,7 +706,7 @@ func TestBlockingTaskComposesTheWholeRefusal(t *testing.T) {
 		apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.Stopped},
 	}
 	assert.Equal(t,
-		"table xfers shard -40 (task task-holding) is held by apply apply-holding (stopped); "+
+		"table xfers shard -40 (task task-holding) is held by a schema change (stopped); "+
 			"it holds the database until it is started or cancelled",
 		held.describe())
 
@@ -715,8 +715,50 @@ func TestBlockingTaskComposesTheWholeRefusal(t *testing.T) {
 		table:          "xfers",
 	}
 	assert.Equal(t,
-		"table xfers (task task-holding) is held by an apply that could not be loaded",
+		"table xfers (task task-holding) is held by a schema change that could not be loaded",
 		unloadable.describe())
+}
+
+// The engine's apply identifier resolves only inside the engine: an operator who
+// pastes it into the control-plane CLI is refused. The refusal names the pull
+// request that owns the holding change instead, which is a handle on both sides.
+func TestBlockingTaskNamesTheHolderNotTheEngineIdentifier(t *testing.T) {
+	byPR := blockingTask{
+		taskIdentifier: "task-holding",
+		table:          "xfers",
+		apply: &storage.Apply{
+			ApplyIdentifier: "apply-holding",
+			State:           state.Apply.Stopped,
+			Repository:      "acme/payments",
+			PullRequest:     4821,
+			Caller:          "webhook:acme/payments#4821",
+		},
+	}
+	described := byPR.describe()
+	assert.Contains(t, described, "is held by a schema change (stopped) on acme/payments#4821")
+	assert.NotContains(t, described, "apply-holding",
+		"the engine's identifier does not resolve on the control plane, so it must not be offered as the handle")
+
+	// A change with no pull request is named by whoever started it.
+	byCaller := blockingTask{
+		taskIdentifier: "task-holding",
+		table:          "xfers",
+		apply: &storage.Apply{
+			ApplyIdentifier: "apply-holding",
+			State:           state.Apply.Running,
+			Caller:          "cli:dana@laptop",
+		},
+	}
+	assert.Contains(t, byCaller.describe(), "is held by a schema change (running) started by cli:dana@laptop")
+
+	// Provenance the dispatch never recorded leaves the work and the state to
+	// describe the conflict on their own.
+	anonymous := blockingTask{
+		taskIdentifier: "task-holding",
+		table:          "xfers",
+		apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.Stopped},
+	}
+	assert.Contains(t, anonymous.describe(), "is held by a schema change (stopped);")
 }
 
 // A state whose next move is not certain gets no resolution line rather than a
@@ -727,8 +769,51 @@ func TestBlockingTaskOffersNoResolutionForAnUncertainState(t *testing.T) {
 		apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.CuttingOver},
 	}
 
-	assert.Empty(t, blocking.resolution(), "cutting over has no operator action to offer")
+	assert.Empty(t, state.Hold(blocking.apply.State), "cutting over has no operator action to offer")
 	assert.Contains(t, blocking.describe(), state.Apply.CuttingOver, "the state is still named")
+}
+
+// The structured conflict is what a caller renders instead of the engine's own
+// error text, so it must carry every fact that refusal turns on. The holding
+// apply's engine identifier travels with them as a correlation key: a caller
+// that dispatched this work recorded that identifier against its own apply, and
+// resolving it is how the refusal names a handle an operator can use instead of
+// one the control-plane CLI refuses. The engine's own prose still names none.
+func TestBlockingTaskConflictCarriesTheFactsAndTheCorrelationKey(t *testing.T) {
+	blocking := blockingTask{
+		taskIdentifier: "task-holding",
+		table:          "xfers",
+		shard:          "-40",
+		apply: &storage.Apply{
+			ApplyIdentifier: "apply-holding",
+			State:           "STATE_STOPPED",
+			Repository:      "acme/payments",
+			PullRequest:     4821,
+			Caller:          "webhook:acme/payments#4821",
+		},
+	}
+
+	conflict := blocking.conflict()
+	require.NotNil(t, conflict)
+	assert.Equal(t, "xfers", conflict.Table)
+	assert.Equal(t, "-40", conflict.Shard)
+	assert.Equal(t, state.Apply.Stopped, conflict.BlockingState,
+		"the proto-formatted state is normalized so a caller can key on it directly")
+	assert.Equal(t, "acme/payments", conflict.Repository)
+	assert.Equal(t, int32(4821), conflict.PullRequest)
+	assert.Equal(t, "webhook:acme/payments#4821", conflict.Caller)
+	assert.Equal(t, "apply-holding", conflict.HolderExternalId,
+		"the caller needs the engine's identifier to find its own record of this work")
+	assert.NotContains(t, blocking.describe(), "apply-holding",
+		"the engine's identifier is a lookup key, never something the engine renders")
+
+	// Nothing to report when no task blocks.
+	assert.Nil(t, blockingTask{}.conflict())
+
+	// A task whose apply could not be loaded still blocks — the check fails
+	// closed — but nothing about the holder is proven, so there is nothing to
+	// render beyond the sanitized error the caller already has.
+	assert.Nil(t, blockingTask{taskIdentifier: "task-holding", table: "xfers"}.conflict())
 }
 
 // Every other resting state clears by starting, retrying, or cutting over — or
@@ -746,7 +831,7 @@ func TestBlockingTaskOffersNoCancelInsideTheRevertWindow(t *testing.T) {
 				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: applyState},
 			}
 
-			assert.NotEmpty(t, blocking.resolution(), "the revert phase names what clears the database")
+			assert.NotEmpty(t, state.Hold(applyState), "the revert phase names what clears the database")
 			assert.NotContains(t, blocking.describe(), "cancel",
 				"cancel is rejected once a change has cut over, so the refusal must not offer it")
 		})
