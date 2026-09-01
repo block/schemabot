@@ -377,12 +377,40 @@ type KeyspaceChangeData struct {
 	// keyspace's only work, which keeps such a plan from reading as having no
 	// changes.
 	Finalize bool
+	// TableSizes carries plan-time size estimates for the existing tables this
+	// keyspace's changes touch, rendered above the DDL so an operator sees the
+	// scale of each table before reading the statements. Tables being created
+	// have no size and are omitted; an entry without a row estimate renders an
+	// explicit "unavailable" so absence is never silent.
+	TableSizes []TableSizeData
 
 	// Shards carries this keyspace's per-shard changes for a sharded plan. When
 	// set, the DDL is rendered per shard-group ("what applies where") instead of
 	// the single Statements block — so a keyspace whose shards diverge is shown
 	// faithfully. Empty for a non-sharded keyspace.
 	Shards []KeyspaceShardChange
+}
+
+// TableSizeData is one existing table's plan-time size estimate for display.
+// Row values are approximate — sourced from engine statistics that may be
+// stale — and are rendered as such.
+type TableSizeData struct {
+	Table string
+	// EstimatedRows is the table's approximate row count, summed across shards
+	// for a sharded target. Nil renders as explicitly unavailable.
+	EstimatedRows *int64
+	// ShardCount is the number of shards the change spans. Zero when the
+	// target is not sharded or the topology is unknown, which omits the shard
+	// clause entirely.
+	ShardCount int
+	// LargestShardRows is the approximate row count of the largest single
+	// shard — the write-blocking blast radius of a shard-at-a-time apply.
+	// Rendered only when the change spans more than one shard.
+	LargestShardRows *int64
+	// EstimatedBytes is the table's approximate on-disk footprint (data plus
+	// indexes), summed across shards for a sharded target. Nil omits the byte
+	// clause.
+	EstimatedBytes *int64
 }
 
 // KeyspaceShardChange is one shard's planned statements within a keyspace.
@@ -764,6 +792,10 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 		writeExemptTables(sb, data.ExemptTables)
 		return
 	}
+
+	// Size context precedes the summary: how big the tables the plan will
+	// copy, rebuild, or scan are, then what the plan does.
+	writeTableSizesSection(sb, data)
 
 	fmt.Fprintf(sb, "📋 **Plan**: %s\n\n", planSummaryText(data.Changes, data.DatabaseType, data.IsMySQL, totalStatements))
 
@@ -1202,6 +1234,68 @@ func countPlanDDLBlocks(changes []KeyspaceChangeData) int {
 		}
 	}
 	return count
+}
+
+// writeTableSizesSection renders the plan's table-size info section: one line
+// per table the plan will copy, rebuild, or scan (the comment builder
+// attaches sizes only to statements whose cost scales with table size),
+// across every keyspace, placed above the plan summary. A plan of only
+// metadata-only statements renders no section at all. Table names carry
+// their keyspace when the plan spans more than one keyspace with sizes, so a
+// shared table name stays unambiguous.
+func writeTableSizesSection(sb *strings.Builder, data PlanCommentData) {
+	keyspacesWithSizes := 0
+	for _, ks := range data.Changes {
+		if len(ks.TableSizes) > 0 {
+			keyspacesWithSizes++
+		}
+	}
+	if keyspacesWithSizes == 0 {
+		return
+	}
+	qualify := keyspacesWithSizes > 1
+	sb.WriteString("📊 **Table sizes**:\n")
+	for _, ks := range data.Changes {
+		for _, ts := range ks.TableSizes {
+			name := ts.Table
+			if qualify {
+				name = ks.Keyspace + "." + ts.Table
+			}
+			fmt.Fprintf(sb, "- `%s`: %s\n", name, formatTableSize(ts))
+		}
+	}
+	sb.WriteString("\n")
+}
+
+// formatTableSize renders one table's size clause: the estimated rows and
+// bytes, the shard span for sharded targets, and the largest single shard when
+// the change spans several. An engine that reports only one of the two
+// estimates (PlanetScale's metrics report bytes alone) renders the one it has.
+// A table with neither is stated explicitly — operators must never mistake a
+// failed size probe for a small table.
+func formatTableSize(ts TableSizeData) string {
+	if ts.EstimatedRows == nil && ts.EstimatedBytes == nil {
+		if ts.ShardCount > 0 {
+			return fmt.Sprintf("size estimate unavailable · %d %s", ts.ShardCount, pluralize("shard", ts.ShardCount))
+		}
+		return "size estimate unavailable"
+	}
+	var size string
+	switch {
+	case ts.EstimatedBytes == nil:
+		size = ui.FormatApproxRows(*ts.EstimatedRows) + " rows"
+	case ts.EstimatedRows == nil:
+		size = ui.FormatApproxBytes(*ts.EstimatedBytes)
+	default:
+		size = ui.FormatApproxRows(*ts.EstimatedRows) + " rows · " + ui.FormatApproxBytes(*ts.EstimatedBytes)
+	}
+	if ts.ShardCount > 0 {
+		size += fmt.Sprintf(" across %d %s", ts.ShardCount, pluralize("shard", ts.ShardCount))
+		if ts.ShardCount > 1 && ts.LargestShardRows != nil {
+			size += fmt.Sprintf(" (largest shard %s rows)", ui.FormatApproxRows(*ts.LargestShardRows))
+		}
+	}
+	return size
 }
 
 // writePlanDDLBlocks writes one fenced SQL block per statement, in plan

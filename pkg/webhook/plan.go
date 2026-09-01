@@ -10,9 +10,11 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/ddl"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/routing"
+	schemapkg "github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -954,6 +956,30 @@ func planCommentDatabaseFlag(requestedDatabase, resolvedDatabase string, isAutoP
 	return ""
 }
 
+// statementCostScalesWithSize reports whether a plan statement's execution
+// cost grows with the table — an index build, a table copy or rebuild, or a
+// full-table validation scan — using the real parser for the database's
+// dialect. Table sizes are display-only context, so a statement that cannot
+// be parsed logs a warning and renders without a size line rather than
+// failing the comment.
+func statementCostScalesWithSize(schemaResult *ghclient.SchemaRequestResult, stmt string) bool {
+	parser, err := ddl.ParserForDialect(schemapkg.DialectForDatabaseType(schemaResult.Type))
+	if err != nil {
+		slog.Warn("no statement parser for dialect; plan comment omits the table-size line",
+			"repo", schemaResult.Repository, "database", schemaResult.Database,
+			"database_type", schemaResult.Type, "error", err)
+		return false
+	}
+	scales, err := parser.CostScalesWithTableSize(stmt)
+	if err != nil {
+		slog.Warn("failed to inspect plan statement for table-size-scaling cost; plan comment omits the table-size line",
+			"repo", schemaResult.Repository, "database", schemaResult.Database,
+			"database_type", schemaResult.Type, "error", err)
+		return false
+	}
+	return scales
+}
+
 // buildPlanCommentData converts plan results into template data.
 func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, tenant, requestedBy, agentHint string) templates.PlanCommentData {
 	data := templates.PlanCommentData{
@@ -1026,6 +1052,20 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		}
 		for _, t := range sc.TableChanges {
 			ksData.Statements = append(ksData.Statements, t.DDL)
+			// Table sizes are shown only for statements whose cost scales
+			// with the table's size — index builds, copies/rebuilds, and
+			// validation scans. Metadata-only statements carrying a size line
+			// would be noise on the plan.
+			if !statementCostScalesWithSize(schema, t.DDL) {
+				continue
+			}
+			ksData.TableSizes = append(ksData.TableSizes, templates.TableSizeData{
+				Table:            t.TableName,
+				EstimatedRows:    t.EstimatedRows,
+				ShardCount:       t.ShardCount,
+				LargestShardRows: t.LargestShardRows,
+				EstimatedBytes:   t.EstimatedBytes,
+			})
 		}
 		setNamespaceWork(&ksData, sc)
 		data.Changes = append(data.Changes, ksData)

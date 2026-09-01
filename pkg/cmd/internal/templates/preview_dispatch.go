@@ -140,6 +140,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentPlanExemptTables())
 	case PreviewCommentPlanIgnoreTables:
 		fmt.Print(webhooktemplates.PreviewCommentPlanIgnoreTables())
+	case PreviewCommentPlanColumnOnlyAlter:
+		fmt.Print(webhooktemplates.PreviewCommentPlanColumnOnlyAlter())
 	case PreviewCommentPlanBlocked:
 		fmt.Print(webhooktemplates.PreviewCommentPlanBlocked())
 	case PreviewCommentPlanBlockedPostgres:
@@ -182,6 +184,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhooktemplates.PreviewCommentMultiEnvPlanLint())
 	case PreviewCommentVitessPlan:
 		fmt.Print(webhooktemplates.PreviewCommentVitessPlan())
+	case PreviewCommentVitessPlanBytesOnlySizes:
+		fmt.Print(webhooktemplates.PreviewCommentVitessPlanBytesOnlySizes())
 	case PreviewCommentVitessPlanVSchemaRemoval:
 		fmt.Print(webhooktemplates.PreviewCommentVitessPlanVSchemaRemoval())
 	case PreviewCommentVitessApplyPlan:
