@@ -1290,6 +1290,7 @@ var knownRecoveredPanicOperations = map[string]bool{
 	"summary_reconciliation": true,
 	"observer_poll":          true,
 	"grpc_handler":           true,
+	"webhook_command":        true,
 }
 
 // RecordRecoveredPanic increments the recovered-panic counter for a background
