@@ -357,6 +357,27 @@ type TableChange struct {
 	// *can* run but the operator must acknowledge.
 	ExecutionMode string
 	ModeReason    string // Engine's reason for any non-empty ExecutionMode verdict
+
+	// EstimatedRows is the approximate number of rows in the table at plan
+	// time, for display only. Sourced from engine statistics, which may be
+	// stale — never an exact count and never a gate input. An engine that
+	// aggregates a sharded target itself reports the sum across shards; an
+	// engine that emits one SchemaChange per shard reports each shard's own
+	// estimate and the core sums them into the namespace-level view. Nil when
+	// no estimate is available (e.g. the table is being created, or statistics
+	// could not be read).
+	EstimatedRows *int64
+	// EstimatedBytes is the table's approximate on-disk footprint (data plus
+	// indexes) at plan time, for display only. Same sourcing, aggregation, and
+	// nil semantics as EstimatedRows.
+	EstimatedBytes *int64
+	// ShardCount is the number of shards this table change spans. Zero when
+	// the target is not sharded or the shard topology is unknown.
+	ShardCount int
+	// LargestShardRows is the approximate row count of the largest single
+	// shard — the write-blocking blast radius of a shard-at-a-time apply. Nil
+	// when the target is not sharded or no estimate is available.
+	LargestShardRows *int64
 }
 
 // Execution-mode verdicts recorded on a planned table change. The verdict

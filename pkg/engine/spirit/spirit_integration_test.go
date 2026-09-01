@@ -2306,3 +2306,74 @@ func TestNewSpiritMigrationRunSettings(t *testing.T) {
 	assert.Equal(t, 6*time.Hour, m.ChecksumYieldTimeout)
 	assert.False(t, m.EnableExperimentalAutoscaling, "autoscaling override disables it")
 }
+
+// A plan that touches existing tables reports each table's approximate row
+// count, so the plan comment can show the scale of what the change touches.
+// Estimates are display-only and best-effort: a table being created does not
+// exist yet and gets none.
+func TestEngine_Plan_TableRowEstimates(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE `sized_items` (\n"+
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n"+
+		"  `name` varchar(255) NOT NULL,\n"+
+		"  PRIMARY KEY (`id`)\n"+
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err, "create table")
+
+	// Seed rows and refresh statistics so information_schema reports a
+	// meaningful estimate.
+	var values strings.Builder
+	for i := range 1200 {
+		if i > 0 {
+			values.WriteString(",")
+		}
+		fmt.Fprintf(&values, "('name-%d')", i)
+	}
+	_, err = db.ExecContext(t.Context(), "INSERT INTO `sized_items` (`name`) VALUES "+values.String())
+	require.NoError(t, err, "seed rows")
+	_, err = db.ExecContext(t.Context(), "ANALYZE TABLE `sized_items`")
+	require.NoError(t, err, "analyze table")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"sized_items.sql": "CREATE TABLE `sized_items` (\n" +
+				"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+				"  `name` varchar(255) NOT NULL,\n" +
+				"  `quantity` int DEFAULT NULL,\n" +
+				"  PRIMARY KEY (`id`)\n" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			"sized_gadgets.sql": "CREATE TABLE `sized_gadgets` (\n" +
+				"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+				"  PRIMARY KEY (`id`)\n" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+		}),
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "Plan()")
+	require.False(t, result.NoChanges)
+
+	byTable := make(map[string]engine.TableChange)
+	for _, tc := range result.FlatTableChanges() {
+		byTable[tc.Table] = tc
+	}
+
+	altered, ok := byTable["sized_items"]
+	require.True(t, ok, "expected an ALTER for sized_items, got: %v", result.FlatDDL())
+	require.NotNil(t, altered.EstimatedRows, "an existing table carries a row estimate")
+	// TABLE_ROWS is an estimate; allow statistics slop around the seeded count.
+	assert.InDelta(t, 1200, float64(*altered.EstimatedRows), 300)
+	require.NotNil(t, altered.EstimatedBytes, "an existing table carries a byte estimate")
+	assert.Positive(t, *altered.EstimatedBytes, "data plus index bytes of a seeded table")
+	assert.Zero(t, altered.ShardCount, "a single MySQL target is not sharded")
+	assert.Nil(t, altered.LargestShardRows)
+
+	created, ok := byTable["sized_gadgets"]
+	require.True(t, ok, "expected a CREATE for sized_gadgets, got: %v", result.FlatDDL())
+	assert.Nil(t, created.EstimatedRows, "a table being created has no estimate")
+	assert.Nil(t, created.EstimatedBytes, "a table being created has no byte estimate")
+}

@@ -1548,6 +1548,7 @@ func (c *LocalClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*t
 func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (changes []*ternv1.SchemaChange, violations []*ternv1.LintViolation, shards []*ternv1.ShardPlan) {
 	protoByNS := make(map[string]*ternv1.SchemaChange)
 	protoTableSeen := make(map[string]map[string]bool)
+	sizeAgg := c.aggregateShardTableSizes(result.Changes)
 	for _, sc := range result.Changes {
 		ns := c.planNamespace(sc.Namespace)
 		protoSC := protoByNS[ns]
@@ -1580,7 +1581,18 @@ func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (chang
 				continue
 			}
 			protoTableSeen[ns][t.Table] = true
-			protoSC.TableChanges = append(protoSC.TableChanges, protoTableChangeFromEngine(t, ns))
+			ptc := protoTableChangeFromEngine(t, ns)
+			// The kept entry is the first shard's change; give it the
+			// cross-shard size aggregates so the namespace view reports the
+			// whole table, not one shard.
+			if a := sizeAgg[ns][t.Table]; a != nil {
+				shardCount, estimatedRows, largestShardRows, estimatedBytes := a.sizes()
+				ptc.ShardCount = int32(shardCount)
+				ptc.EstimatedRows = estimatedRows
+				ptc.LargestShardRows = largestShardRows
+				ptc.EstimatedBytes = estimatedBytes
+			}
+			protoSC.TableChanges = append(protoSC.TableChanges, ptc)
 		}
 		// A SchemaChange with an empty shard targets the whole namespace
 		// (non-sharded engines) and contributes no shard rows.
@@ -1975,6 +1987,7 @@ func (c *LocalClient) namespacesFromEngineChanges(changes []engine.SchemaChange,
 	namespaces := make(map[string]*storage.NamespacePlanData)
 	seenTable := make(map[string]map[string]bool)
 	var allShardPlans []storage.ShardPlan
+	sizeAgg := c.aggregateShardTableSizes(changes)
 	for _, sc := range changes {
 		ns := c.planNamespace(sc.Namespace)
 		nsData := namespaces[ns]
@@ -1991,7 +2004,11 @@ func (c *LocalClient) namespacesFromEngineChanges(changes []engine.SchemaChange,
 				continue
 			}
 			seenTable[ns][tc.Table] = true
-			nsData.Tables = append(nsData.Tables, storageTableChangeFromEngine(tc, ""))
+			stc := storageTableChangeFromEngine(tc, "")
+			if a := sizeAgg[ns][tc.Table]; a != nil {
+				stc.ShardCount, stc.EstimatedRows, stc.LargestShardRows, stc.EstimatedBytes = a.sizes()
+			}
+			nsData.Tables = append(nsData.Tables, stc)
 		}
 		// Record each changing shard's own changes so apply-create can rebuild
 		// per-shard operation groups with per-shard DDL (a keyspace whose shards

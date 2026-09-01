@@ -14,6 +14,7 @@ package spirit
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"slices"
@@ -569,6 +570,16 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		currentByTable[ts.Name] = ts.Schema
 	}
 
+	// Best-effort per-table row estimates for plan display. Sizes are
+	// informational — a failed read must not fail the plan, so log the miss
+	// and render the plan without them.
+	sizeEstimates, err := e.fetchTableSizeEstimates(ctx, req.Credentials.DSN)
+	if err != nil {
+		e.logger.Warn("table size estimates unavailable; the plan will omit table sizes",
+			"database", database, "error", err)
+		sizeEstimates = nil
+	}
+
 	// Convert PlannedChanges to engine types
 	var lintViolations []engine.LintViolation
 	changes := make([]engine.TableChange, 0, len(plan.Changes))
@@ -581,6 +592,14 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 			Table:     pc.TableName,
 			Operation: stmtType,
 			DDL:       pc.Statement,
+		}
+
+		// Attach the plan-time row estimate when statistics reported one. A
+		// table being created does not exist yet and gets no estimate.
+		if est, ok := sizeEstimates[pc.TableName]; ok {
+			estRows, estBytes := est.rows, est.bytes
+			change.EstimatedRows = &estRows
+			change.EstimatedBytes = &estBytes
 		}
 
 		// Error-severity violations mark the change as unsafe
@@ -1053,4 +1072,55 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, _ string) ([]table
 		return nil, fmt.Errorf("load schema: %w", err)
 	}
 	return tables, nil
+}
+
+// tableSizeEstimate is one table's approximate plan-time size read from
+// information_schema statistics: row count and on-disk footprint (data plus
+// indexes). Display only; statistics may be stale.
+type tableSizeEstimate struct {
+	rows  int64
+	bytes int64
+}
+
+// fetchTableSizeEstimates reads every base table's approximate row count and
+// on-disk footprint from information_schema on the given DSN. Estimates are
+// display-only plan context: the caller treats a failure as "no sizes" rather
+// than failing the plan.
+func (e *Engine) fetchTableSizeEstimates(ctx context.Context, dsn string) (map[string]tableSizeEstimate, error) {
+	db, err := mysqlconn.Open(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open database: %w", err)
+	}
+	defer utils.CloseAndLog(db)
+
+	if err := db.PingContext(ctx); err != nil {
+		return nil, fmt.Errorf("ping database: %w", err)
+	}
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT table_name, table_rows, data_length + index_length
+		FROM information_schema.tables
+		WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'`)
+	if err != nil {
+		return nil, fmt.Errorf("query table size estimates: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	estimates := make(map[string]tableSizeEstimate)
+	for rows.Next() {
+		var name string
+		var tableRows, tableBytes sql.NullInt64
+		if err := rows.Scan(&name, &tableRows, &tableBytes); err != nil {
+			return nil, fmt.Errorf("scan table size estimate: %w", err)
+		}
+		if !tableRows.Valid || !tableBytes.Valid {
+			// NULL statistics (e.g. a view): no estimate to report.
+			continue
+		}
+		estimates[name] = tableSizeEstimate{rows: tableRows.Int64, bytes: tableBytes.Int64}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate table size estimates: %w", err)
+	}
+	return estimates, nil
 }

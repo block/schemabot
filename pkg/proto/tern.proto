@@ -463,6 +463,24 @@ message TableChange {
   // that materializes the plan from a dispatch request runs the same
   // apply-time safety gates as one reading its own stored plan.
   map<string, string> metadata = 9;
+  // Approximate number of rows in the table at plan time, for display only.
+  // Sourced from engine statistics (e.g. information_schema TABLE_ROWS), which
+  // may be stale — never treat it as an exact count or use it as a gate input.
+  // For sharded targets this is the sum across shards. Unset when no estimate
+  // is available (e.g. the table is being created, or statistics could not be
+  // read).
+  optional int64 estimated_rows = 10;
+  // Number of shards this table change spans. Zero when the target is not
+  // sharded or the shard topology is unknown.
+  int32 shard_count = 11;
+  // Approximate row count of the largest single shard — the write-blocking
+  // blast radius of a shard-at-a-time apply. Unset when the target is not
+  // sharded or no estimate is available. Approximate like estimated_rows.
+  optional int64 largest_shard_rows = 12;
+  // Approximate on-disk footprint of the table (data plus indexes), summed
+  // across shards for sharded targets. Unset when no estimate was available.
+  // Approximate like estimated_rows.
+  optional int64 estimated_bytes = 13;
 }
 
 // SchemaChange is a namespace-level bundle. A PlanResponse must include at most
