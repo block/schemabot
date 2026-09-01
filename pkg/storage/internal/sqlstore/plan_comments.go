@@ -107,11 +107,15 @@ func (s *planCommentStore) MarkMinimized(ctx context.Context, id int64) error {
 	return nil
 }
 
+// canonicalizePlanCommentIdentity folds the identity keys that appear in this
+// store's SQL predicates. EnvironmentScope is deliberately not folded: no
+// query filters on it, and its consumers compare it in Go against values built
+// fresh from configured environment names, so folding only the stored side
+// would break those comparisons.
 func canonicalizePlanCommentIdentity(comment *storage.PlanComment) {
 	comment.Repository = storage.CanonicalKey(comment.Repository)
 	comment.DatabaseName = storage.CanonicalKey(comment.DatabaseName)
 	comment.DatabaseType = storage.CanonicalKey(comment.DatabaseType)
-	comment.EnvironmentScope = storage.CanonicalKey(comment.EnvironmentScope)
 }
 
 // scanPlanComment scans plan comment data from any scanner (Row or Rows).

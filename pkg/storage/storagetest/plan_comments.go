@@ -49,7 +49,9 @@ func TestPlanComments(t *testing.T, h Harness) {
 		assert.Equal(t, "mixedcase/sample-repo", inserted.Repository)
 		assert.Equal(t, "ordersdb", inserted.DatabaseName)
 		assert.Equal(t, "mysql", inserted.DatabaseType)
-		assert.Equal(t, "production,staging", inserted.EnvironmentScope)
+		// EnvironmentScope is not a query predicate and is compared in Go against
+		// a scope built from configured environment names, so it is stored as given.
+		assert.Equal(t, "Production,Staging", inserted.EnvironmentScope)
 
 		comments, err := store.PlanComments().ListUnminimizedForSlot(ctx, "MIXEDCASE/SAMPLE-REPO", 42, "ORDERSDB", "MYSQL")
 		require.NoError(t, err)

@@ -27,14 +27,14 @@ type webhookEventStore struct {
 }
 
 func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEvent) (bool, error) {
-	event.Repository = storage.CanonicalKey(event.Repository)
-
 	if event.DeliveryID == "" {
 		return false, fmt.Errorf("webhook delivery ID is required")
 	}
 	if event.Event == "" {
 		return false, fmt.Errorf("webhook event type is required")
 	}
+	event.Repository = storage.CanonicalKey(event.Repository)
+
 	provider := event.Provider
 	if provider == "" {
 		provider = storage.WebhookProviderGitHub

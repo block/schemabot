@@ -276,7 +276,10 @@ type SettingsStore interface {
 // primitive behind fast webhook acknowledgement: handlers can persist a delivery
 // before returning 2xx, and drivers can claim/retry the stored event after the
 // HTTP request has finished.
-// Create canonicalizes the provided event's repository in place before persisting.
+// Create canonicalizes the provided event's repository in place before
+// persisting. The coalescing reads (HasCoveringSuccessor, SupersedeIfCovered)
+// fold the repository only inside their SQL predicates and leave the caller's
+// event untouched.
 type WebhookEventStore interface {
 	// Create records a webhook delivery in the pending state. Returns
 	// inserted=false when provider + delivery GUID already exists, so callers
@@ -1084,7 +1087,10 @@ const SummaryClaimStaleAfter = 2 * time.Minute
 // for comments actually posted; minimized_at is set only after the GitHub
 // minimize call succeeded, so an unminimized row is always retried by the next
 // supersede.
-// Insert canonicalizes the provided comment's repository, environment scope, database, and database type in place before persisting.
+// Insert canonicalizes the provided comment's repository, database, and
+// database type in place before persisting. EnvironmentScope is stored as
+// given: no query predicate filters on it, and its consumers compare it in Go
+// against a scope built from the configured environment names.
 type PlanCommentStore interface {
 	// Insert stores a newly posted plan comment and sets comment.ID.
 	Insert(ctx context.Context, comment *PlanComment) error
