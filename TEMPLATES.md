@@ -3008,13 +3008,13 @@ Verify the database name, or run the command against the SchemaBot instance that
 <summary><a name="appscoped-apply-dispatch-summary"></a><strong>App-scoped Apply: Dispatch Summary</strong></summary>
 
 
-## App-Scoped Apply — Staging
+## Schema Change Status — Staging
 
-**App**: `billing-service`
-**Requested by**: @jackjackbits
-**Commit**: `abcdef1234567890abcdef1234567890abcdef12` — every database applies this commit
+**App**: `billing-service` | **Commit**: `abcdef1234567890abcdef1234567890abcdef12`
 
-`schemabot apply -e staging --app billing-service` is applying to **2** databases, one at a time in name order:
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Applying to **2** databases, one at a time in name order
 
 - `billing-invoices`
 - `billing-ledger`
@@ -3024,7 +3024,7 @@ Verify the database name, or run the command against the SchemaBot instance that
 - `billing-archive` — environment `staging` is not configured
 - `billing-reports` — no plan for this PR
 
-Each database runs as its own apply and posts its own progress comments and Check Run below this comment. If a new commit lands on the PR mid-dispatch, the remaining databases are not started and a halt notice is posted.
+Every database applies the pinned commit and runs as its own apply, posting its own progress comment and Check Run below. If a new commit lands on the PR mid-dispatch, the remaining databases are not started and a halt notice is posted.
 
 </details>
 
@@ -3032,13 +3032,13 @@ Each database runs as its own apply and posts its own progress comments and Chec
 <summary><a name="appscoped-apply-dispatch-summary-large-fleet"></a><strong>App-scoped Apply: Dispatch Summary (Large Fleet)</strong></summary>
 
 
-## App-Scoped Apply — Production
+## Schema Change Status — Production
 
-**App**: `tenants`
-**Requested by**: @jackjackbits
-**Commit**: `abcdef1234567890abcdef1234567890abcdef12` — every database applies this commit
+**App**: `tenants` | **Commit**: `abcdef1234567890abcdef1234567890abcdef12`
 
-`schemabot apply -e production --app tenants` is applying to **256** databases, one at a time in name order:
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: Applying to **256** databases, one at a time in name order
 
 <details>
 <summary>Show all 256 databases</summary>
@@ -3306,7 +3306,7 @@ Each database runs as its own apply and posts its own progress comments and Chec
 
 - `tenants-shard-legacy` — no plan for this PR
 
-Each database runs as its own apply and posts its own progress comments and Check Run below this comment. If a new commit lands on the PR mid-dispatch, the remaining databases are not started and a halt notice is posted.
+Every database applies the pinned commit and runs as its own apply, posting its own progress comment and Check Run below. If a new commit lands on the PR mid-dispatch, the remaining databases are not started and a halt notice is posted.
 
 </details>
 
