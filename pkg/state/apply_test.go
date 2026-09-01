@@ -140,12 +140,15 @@ func TestDeriveApplyState_PostCopyPhases(t *testing.T) {
 		{[]string{"COMPLETED", "post_checksum"}, Apply.PostChecksum},
 		// A table already cutting over outranks a sibling's drain.
 		{[]string{"CUTTING_OVER", "post_checksum"}, Apply.CuttingOver},
-		// A queued sibling keeps a cutover from surfacing the same way: a
-		// sequential or rolling drive cuts tables over as each finishes, so
-		// the apply stays Running until the last queued table has begun.
+		// A sibling that is still queued or still copying keeps a cutover from
+		// surfacing the same way: a drive cuts tables over as each finishes —
+		// sequentially, rolling, or across concurrent shards — so the apply
+		// stays Running until every table has finished its copy.
 		{[]string{"CUTTING_OVER", "PENDING"}, Apply.Running},
 		{[]string{"COMPLETED", "CUTTING_OVER", "PENDING"}, Apply.Running},
 		{[]string{"CUTTING_OVER", "RUNNING", "PENDING"}, Apply.Running},
+		{[]string{"CUTTING_OVER", "RUNNING"}, Apply.Running},
+		{[]string{"COMPLETED", "CUTTING_OVER", "RUNNING"}, Apply.Running},
 		// Pending tasks with no active sibling stay Pending, not Running.
 		{[]string{"PENDING", "PENDING"}, Apply.Pending},
 	}
@@ -177,8 +180,8 @@ func TestDeriveApplyState_WaitingAndCompleted(t *testing.T) {
 	assert.Equal(t, Apply.WaitingForCutover, DeriveApplyState(states))
 }
 
-// A cutover surfaces at the apply level only once no table is still queued;
-// the queued-sibling cases live in TestDeriveApplyState_PostCopyPhases.
+// A cutover surfaces at the apply level only once no table is still queued or
+// copying; those sibling cases live in TestDeriveApplyState_PostCopyPhases.
 func TestDeriveApplyState_CuttingOver(t *testing.T) {
 	testCases := [][]string{
 		{"CUTTING_OVER"},

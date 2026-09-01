@@ -91,7 +91,7 @@ var Apply = struct {
 //  4. Any task REVERTED → Apply REVERTED
 //  5. All tasks COMPLETED → Apply COMPLETED
 //  6. Any task RECOVERING → Apply RECOVERING
-//  7. Any task CUTTING_OVER, no task still PENDING → Apply CUTTING_OVER
+//  7. Any task CUTTING_OVER, no task still PENDING or RUNNING → Apply CUTTING_OVER
 //  8. All non-completed tasks WAITING_FOR_CUTOVER → Apply WAITING_FOR_CUTOVER
 //  9. All non-completed tasks WAITING_FOR_DEPLOY → Apply WAITING_FOR_DEPLOY
 //  10. Any task REVERT_WINDOW → Apply REVERT_WINDOW
@@ -107,13 +107,13 @@ var Apply = struct {
 // only once every table has started: while any table is still copying rows —
 // or still queued with its whole copy ahead of it — the apply is Running.
 // Once every table has at least begun and the active ones are draining or
-// verifying, the apply names that phase. The cutover gate (7) waits for the
-// queue the same way: a sequential or rolling drive cuts tables over as each
-// finishes, so a table cutting over ahead of queued siblings keeps the apply
-// Running rather than announcing a cutover most tables have not reached.
-// This keeps the derived state monotone across a multi-table drive — it
-// never has to fall back from cutting_over to running when the next table
-// starts copying.
+// verifying, the apply names that phase. The cutover gate (7) follows the
+// same rule: a drive cuts tables over as each finishes — sequentially,
+// rolling, or across concurrent shards — so a table cutting over ahead of
+// siblings that are still queued or still copying keeps the apply Running
+// rather than announcing a cutover most tables have not reached. This keeps
+// the derived state monotone across a multi-table drive — it never has to
+// fall back from cutting_over to running while another table copies.
 //
 // taskStates should be the State field from each Task. Empty slice returns PENDING.
 func DeriveApplyState(taskStates []string) string {
@@ -152,7 +152,7 @@ func DeriveApplyState(taskStates []string) string {
 	if counts[Apply.Recovering] > 0 {
 		return Apply.Recovering
 	}
-	if counts[Apply.CuttingOver] > 0 && counts[Apply.Pending] == 0 {
+	if counts[Apply.CuttingOver] > 0 && counts[Apply.Pending] == 0 && counts[Apply.Running] == 0 {
 		return Apply.CuttingOver
 	}
 	waitingOrCompleted := counts[Apply.WaitingForCutover] + counts[Apply.Completed]

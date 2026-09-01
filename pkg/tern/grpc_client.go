@@ -4149,8 +4149,8 @@ func storedTaskResolvedForTerminalRemoteApply(remoteApplyState, storedTaskState 
 //
 // remoteTasks is the same report's per-table progress. It backs the one case
 // where the no-backward rank yields to the remote: a stored cutting_over that
-// the report contradicts with still-queued tables (see
-// storedCutoverContradictedByQueuedWork).
+// the report contradicts with tables that still have copy work ahead (see
+// storedCutoverContradictedByRemainingCopyWork).
 func applyStateFromRemoteProgress(storedApplyState, remoteApplyState string, remoteTasks []*ternv1.TableProgress, allowStoppedStoredApply bool) string {
 	if remoteApplyState == "" {
 		return storedApplyState
@@ -4184,7 +4184,7 @@ func applyStateFromRemoteProgress(storedApplyState, remoteApplyState string, rem
 	if state.IsState(storedApplyState, state.Apply.FailedRetryable) {
 		return storedApplyState
 	}
-	if storedCutoverContradictedByQueuedWork(storedApplyState, remoteTasks) {
+	if storedCutoverContradictedByRemainingCopyWork(storedApplyState, remoteTasks) {
 		return remoteApplyState
 	}
 	if applyProgressRank(remoteApplyState) < applyProgressRank(storedApplyState) {
@@ -4193,14 +4193,16 @@ func applyStateFromRemoteProgress(storedApplyState, remoteApplyState string, rem
 	return remoteApplyState
 }
 
-// storedCutoverContradictedByQueuedWork reports whether the stored apply state
-// says cutting_over while the remote report still shows queued tables. A
-// cutover surfaces at the apply level only once no table is queued, so this
-// pairing never describes a live drive: the stored value is a sample of one
-// table's cutover that the queue has since moved past, and the report carrying
-// the queued tables is the corrected state — it wins over the no-backward rank
-// instead of being discarded as a regression.
-func storedCutoverContradictedByQueuedWork(storedApplyState string, remoteTasks []*ternv1.TableProgress) bool {
+// storedCutoverContradictedByRemainingCopyWork reports whether the stored
+// apply state says cutting_over while the remote report still shows tables
+// with copy work ahead of them — queued tables whose copy has not started, or
+// running tables mid-copy. A cutover surfaces at the apply level only once
+// every table has finished copying, so this pairing never describes a live
+// drive: the stored value is a sample of one table's cutover that the drive
+// has since moved past, and the report carrying the unfinished tables is the
+// corrected state — it wins over the no-backward rank instead of being
+// discarded as a regression.
+func storedCutoverContradictedByRemainingCopyWork(storedApplyState string, remoteTasks []*ternv1.TableProgress) bool {
 	if !state.IsState(storedApplyState, state.Apply.CuttingOver) {
 		return false
 	}
@@ -4208,7 +4210,7 @@ func storedCutoverContradictedByQueuedWork(storedApplyState string, remoteTasks 
 		if remoteTask == nil {
 			continue
 		}
-		if state.IsState(state.NormalizeTaskStatus(remoteTask.Status), state.Task.Pending) {
+		if state.IsState(state.NormalizeTaskStatus(remoteTask.Status), state.Task.Pending, state.Task.Running) {
 			return true
 		}
 	}

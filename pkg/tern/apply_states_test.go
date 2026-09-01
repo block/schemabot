@@ -296,7 +296,16 @@ func TestDeriveOverallState(t *testing.T) {
 			wantState: state.Task.Running,
 		},
 		{
-			name: "cutover surfaces once no table is still queued",
+			name: "a concurrent drive stays running while a table cuts over ahead of a copying sibling",
+			tasks: []*storage.Task{
+				{State: state.Task.Completed},
+				{State: state.Task.CuttingOver},
+				{State: state.Task.Running},
+			},
+			wantState: state.Task.Running,
+		},
+		{
+			name: "cutover surfaces once no table is still queued or copying",
 			tasks: []*storage.Task{
 				{State: state.Task.Completed},
 				{State: state.Task.CuttingOver},

@@ -5119,7 +5119,17 @@ func TestApplyStateFromRemoteProgress(t *testing.T) {
 			expected: state.Apply.Running,
 		},
 		{
-			name:        "a stored cutting_over holds against a running report once no table is queued",
+			name:        "a report with a still-copying table corrects a stored cutting_over to running",
+			storedState: state.Apply.CuttingOver,
+			remoteState: state.Apply.Running,
+			remoteTasks: []*ternv1.TableProgress{
+				{TableName: "users", Status: state.Task.Completed},
+				{TableName: "orders", Status: state.Task.Running},
+			},
+			expected: state.Apply.Running,
+		},
+		{
+			name:        "a stored cutting_over holds against a running report once every table finished copying",
 			storedState: state.Apply.CuttingOver,
 			remoteState: state.Apply.Running,
 			remoteTasks: []*ternv1.TableProgress{
