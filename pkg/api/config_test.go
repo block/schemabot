@@ -763,6 +763,217 @@ func TestServerConfig_Validate(t *testing.T) {
 	}
 }
 
+func TestServerConfig_ValidateIdentifiers(t *testing.T) {
+	validConfig := func() ServerConfig {
+		return ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"orders": {
+					Type: storage.DatabaseTypeMySQL,
+					Environments: map[string]EnvironmentConfig{
+						"staging": {Target: "orders-staging", Deployment: "primary"},
+					},
+				},
+			},
+			TernDeployments: TernConfig{
+				"primary": {"staging": "localhost:9090"},
+			},
+		}
+	}
+
+	tests := []struct {
+		name      string
+		mutate    func(*ServerConfig)
+		wantError string
+	}{
+		{
+			name: "database name",
+			mutate: func(cfg *ServerConfig) {
+				cfg.Databases["Orders"] = cfg.Databases["orders"]
+				delete(cfg.Databases, "orders")
+			},
+			wantError: `database name "Orders" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "environment name",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				database.Environments["Staging"] = database.Environments["staging"]
+				delete(database.Environments, "staging")
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment name "Staging" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "deployment name",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				environment := database.Environments["staging"]
+				environment.Deployment = "Primary"
+				database.Environments["staging"] = environment
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment "staging" deployment name "Primary" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "top-level environment order",
+			mutate: func(cfg *ServerConfig) {
+				cfg.EnvironmentOrder = []string{"Staging"}
+			},
+			wantError: `environment_order environment name "Staging" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "top-level allowed environments",
+			mutate: func(cfg *ServerConfig) {
+				cfg.AllowedEnvironments = []string{"Staging"}
+			},
+			wantError: `allowed_environments environment name "Staging" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "per-database environment order",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				database.EnvironmentOrder = []string{"Staging"}
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment_order environment name "Staging" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "per-database deployment order",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				environment := database.Environments["staging"]
+				environment.DeploymentOrder = []string{"Primary"}
+				database.Environments["staging"] = environment
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment "staging" deployment_order deployment name "Primary" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "deployments map key",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				environment := database.Environments["staging"]
+				environment.Target = ""
+				environment.Deployment = ""
+				environment.Deployments = map[string]DeploymentTarget{"Primary": {Target: "orders-staging"}}
+				database.Environments["staging"] = environment
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment "staging" deployment name "Primary" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "tern deployments map key",
+			mutate: func(cfg *ServerConfig) {
+				cfg.TernDeployments["Primary"] = cfg.TernDeployments["primary"]
+			},
+			wantError: `tern_deployments deployment name "Primary" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "tern deployments environment key",
+			mutate: func(cfg *ServerConfig) {
+				cfg.TernDeployments["primary"]["Staging"] = "localhost:9090"
+			},
+			wantError: `deployment "primary" environment name "Staging" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "empty database name",
+			mutate: func(cfg *ServerConfig) {
+				cfg.Databases[""] = cfg.Databases["orders"]
+				delete(cfg.Databases, "orders")
+			},
+			wantError: `database name "" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "empty environment order entry",
+			mutate: func(cfg *ServerConfig) {
+				cfg.EnvironmentOrder = []string{""}
+			},
+			wantError: `environment_order environment name "" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "empty deployments map key",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				environment := database.Environments["staging"]
+				environment.Target = ""
+				environment.Deployment = ""
+				environment.Deployments = map[string]DeploymentTarget{"": {Target: "orders-staging"}}
+				database.Environments["staging"] = environment
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment "staging" deployment name "" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "empty tern deployments name",
+			mutate: func(cfg *ServerConfig) {
+				cfg.TernDeployments[""] = cfg.TernDeployments["primary"]
+			},
+			wantError: `tern_deployments deployment name "" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "accented database name",
+			mutate: func(cfg *ServerConfig) {
+				cfg.Databases["café"] = cfg.Databases["orders"]
+				delete(cfg.Databases, "orders")
+			},
+			wantError: `database name "café" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "leading whitespace",
+			mutate: func(cfg *ServerConfig) {
+				cfg.EnvironmentOrder = []string{" staging"}
+			},
+			wantError: `environment_order environment name " staging" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "trailing whitespace",
+			mutate: func(cfg *ServerConfig) {
+				cfg.AllowedEnvironments = []string{"staging "}
+			},
+			wantError: `allowed_environments environment name "staging " must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "interior space",
+			mutate: func(cfg *ServerConfig) {
+				cfg.EnvironmentOrder = []string{"pre production"}
+			},
+			wantError: `environment_order environment name "pre production" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "repository key",
+			mutate: func(cfg *ServerConfig) {
+				cfg.Repos = map[string]RepoConfig{"Org/Repo.Name": {}}
+			},
+			wantError: `repos repository key "Org/Repo.Name" must be canonical`,
+		},
+		{
+			name: "allowed repository",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				database.AllowedRepos = []string{"Org/Repo.Name"}
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" allowed_repos repository "Org/Repo.Name" must be canonical`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			tt.mutate(&cfg)
+			err := cfg.Validate()
+			require.EqualError(t, err, tt.wantError)
+		})
+	}
+
+	t.Run("valid identifiers with digits hyphens and underscores", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Databases["orders_2-prod"] = cfg.Databases["orders"]
+		delete(cfg.Databases, "orders")
+		require.NoError(t, cfg.Validate())
+	})
+}
+
 // A required_checks entry that names SchemaBot's own aggregate Check Run would
 // be silently unenforced: SchemaBot checks are excluded from the passing-checks
 // gate, so the gate would treat the named check as always satisfied. Config
@@ -1755,8 +1966,8 @@ func TestServerConfig_ResolveDatabaseTargets_DeploymentOrder(t *testing.T) {
 // validateDeploymentOrder must report an empty deployments map key with the
 // same clear error used elsewhere, rather than the confusing
 // "missing deployment \"\"" that fell out of the permutation check. This guards
-// the Validate() path, which calls validateDeploymentOrder before its own
-// empty-key check.
+// the Validate() path, which calls validateDeploymentOrder before the
+// identifier validation rejects the empty key.
 func TestValidateDeploymentOrder_EmptyMapKey(t *testing.T) {
 	err := validateDeploymentOrder(
 		map[string]DeploymentTarget{

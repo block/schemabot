@@ -549,7 +549,14 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 		engineTableProgress = c.snapshotEngineProgress(ctx, eng, stopCreds)
 	}
 
-	stoppedCount, skippedCount, applyID := c.markTasksWithState(ctx, tasks, targetApplyID, engineTableProgress, terminalState)
+	stoppedCount, skippedCount, applyID, err := c.markTasksWithState(ctx, tasks, targetApplyID, engineTableProgress, terminalState)
+	if err != nil {
+		// Fail the stop rather than settling the apply on top of task rows that
+		// never moved. An operator re-issuing a stop is a recoverable outcome;
+		// an apply recorded as stopped while its tasks still read as active work
+		// holds the database with nothing left able to act on it.
+		return nil, fmt.Errorf("stop schema change on database %s: %w", c.config.Database, err)
+	}
 
 	if applyID > 0 && stoppedCount > 0 {
 		eventMsg := fmt.Sprintf("Stop requested: %d tasks stopped, %d skipped", stoppedCount, skippedCount)
@@ -668,7 +675,12 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 	}
 	c.cancelApplyHandle(applyCancel)
 
-	cancelledCount, skippedCount, applyID := c.markTasksWithState(ctx, tasks, targetApplyID, nil, state.Task.Cancelled)
+	cancelledCount, skippedCount, applyID, err := c.markTasksWithState(ctx, tasks, targetApplyID, nil, state.Task.Cancelled)
+	if err != nil {
+		// Same reasoning as the stop: an apply recorded as cancelled over task
+		// rows that never moved detaches the apply from its own tasks.
+		return nil, fmt.Errorf("cancel schema change on database %s: %w", c.config.Database, err)
+	}
 	if applyID > 0 && cancelledCount > 0 {
 		if err := c.markApplyCancelled(ctx, applyID); err != nil {
 			return nil, err
@@ -1573,11 +1585,22 @@ func (c *LocalClient) snapshotEngineProgress(ctx context.Context, eng engine.Eng
 	return nil
 }
 
-// markTasksStopped sets all non-terminal targeted tasks to STOPPED, preserving engine progress.
-// Returns (stopped count, skipped count, apply ID for logging).
-func (c *LocalClient) markTasksWithState(ctx context.Context, tasks []*storage.Task, targetApplyID int64, engineProgress map[string]*engine.TableProgress, newState string) (int64, int64, int64) {
+// markTasksWithState settles all non-terminal targeted tasks into newState,
+// preserving engine progress. Returns the marked count, the skipped count, an
+// apply ID for logging, and an error joining every refused write.
+//
+// The counts are landed writes, not attempts: they become the operator-facing
+// "N tasks stopped" event and response, and they gate the apply-level write
+// that follows. A refused task write is returned as an error rather than
+// counted, because the apply lease and the operation lease are separate — a
+// stop can hold the first while a peer has taken the second, and marking the
+// apply settled on top of task rows that never moved detaches the apply from
+// its own tasks. Every task is still attempted, so an operator retrying the
+// command has only the refused ones left to write.
+func (c *LocalClient) markTasksWithState(ctx context.Context, tasks []*storage.Task, targetApplyID int64, engineProgress map[string]*engine.TableProgress, newState string) (int64, int64, int64, error) {
 	var stoppedCount, skippedCount int64
 	var applyID int64
+	var refused []error
 
 	for _, task := range tasks {
 		if targetApplyID > 0 && task.ApplyID != targetApplyID {
@@ -1603,13 +1626,22 @@ func (c *LocalClient) markTasksWithState(ctx context.Context, tasks []*storage.T
 			task.ChecksumRowsTotal = et.ChecksumRowsTotal
 		}
 
-		c.transitionTaskState(ctx, task, task.ApplyID, newState,
-			fmt.Sprintf("Task %s %s", task.TaskIdentifier, newState))
+		if err := c.persistTaskStateTransition(ctx, task, task.ApplyID, newState,
+			fmt.Sprintf("Task %s %s", task.TaskIdentifier, newState)); err != nil {
+			c.logger.Error("failed to settle task during control operation; the task keeps its previous state",
+				append(task.LogAttrs(), "target_state", newState, "error", err)...)
+			refused = append(refused, err)
+			continue
+		}
 
 		stoppedCount++
 	}
 
-	return stoppedCount, skippedCount, applyID
+	if len(refused) > 0 {
+		return stoppedCount, skippedCount, applyID, fmt.Errorf("failed to settle %d of %d tasks to %s: %w",
+			len(refused), int64(len(refused))+stoppedCount, newState, errors.Join(refused...))
+	}
+	return stoppedCount, skippedCount, applyID, nil
 }
 
 // firstFailedTaskError returns an apply-level failure reason derived from task

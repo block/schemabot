@@ -68,7 +68,7 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "drop column",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\""},
 			},
 			want:   "the dropped column",
 			wantOK: true,
@@ -76,7 +76,7 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "multiple drop columns",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`; Unsafe operation detected: DROP COLUMN `legacy_code`"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\"; Unsafe operation detected: \"DROP COLUMN `legacy_code`\""},
 			},
 			want:   "any dropped columns",
 			wantOK: true,
@@ -84,7 +84,7 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "drop table",
 			changes: []UnsafeChangeData{
-				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+				{Table: "archived_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
 			},
 			want:   "the dropped table",
 			wantOK: true,
@@ -92,8 +92,8 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "multiple drop tables",
 			changes: []UnsafeChangeData{
-				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
-				{Table: "legacy_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+				{Table: "archived_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
+				{Table: "legacy_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
 			},
 			want:   "any dropped tables",
 			wantOK: true,
@@ -101,8 +101,8 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "drop column and table",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`"},
-				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\""},
+				{Table: "archived_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
 			},
 			want:   "the dropped table and column",
 			wantOK: true,
@@ -110,8 +110,8 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "multiple drop columns and one drop table",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`; Unsafe operation detected: DROP COLUMN `legacy_code`"},
-				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\"; Unsafe operation detected: \"DROP COLUMN `legacy_code`\""},
+				{Table: "archived_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
 			},
 			want:   "the dropped table and any dropped columns",
 			wantOK: true,
@@ -119,9 +119,9 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "multiple drop tables and one drop column",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`"},
-				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
-				{Table: "legacy_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\""},
+				{Table: "archived_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
+				{Table: "legacy_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
 			},
 			want:   "any dropped tables and the dropped column",
 			wantOK: true,
@@ -129,9 +129,9 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "multiple drop columns and tables",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`; Unsafe operation detected: DROP COLUMN `legacy_code`"},
-				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
-				{Table: "legacy_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\"; Unsafe operation detected: \"DROP COLUMN `legacy_code`\""},
+				{Table: "archived_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
+				{Table: "legacy_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
 			},
 			want:   "any dropped tables or columns",
 			wantOK: true,
@@ -139,7 +139,7 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "other unsafe change",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: MODIFY COLUMN"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"MODIFY COLUMN\""},
 			},
 			wantOK: false,
 		},
@@ -351,7 +351,7 @@ func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 		{
 			name: "drop index",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP INDEX `idx_customers_email`"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\""},
 			},
 			wantActionTarget:    "an index",
 			wantInvisibleTarget: "the dropped index",
@@ -361,7 +361,7 @@ func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 		{
 			name: "multiple drop indexes",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP INDEX `idx_customers_email`; Unsafe operation detected: DROP INDEX `idx_customers_phone`"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\"; Unsafe operation detected: \"DROP INDEX `idx_customers_phone`\""},
 			},
 			wantActionTarget:    "indexes",
 			wantInvisibleTarget: "any dropped indexes",
@@ -371,7 +371,7 @@ func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 		{
 			name: "drop index with drop column",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`; Unsafe operation detected: DROP INDEX `idx_customers_email`"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\"; Unsafe operation detected: \"DROP INDEX `idx_customers_email`\""},
 			},
 			wantActionTarget:    "an index",
 			wantInvisibleTarget: "the dropped index",
@@ -381,7 +381,7 @@ func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 		{
 			name: "other unsafe change",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: MODIFY COLUMN"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"MODIFY COLUMN\""},
 			},
 			wantOK: false,
 		},
@@ -415,7 +415,7 @@ func TestRenderUnsafeChangesBlockedIncludesDropIndexGuidance(t *testing.T) {
 		},
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`; Unsafe operation detected: DROP INDEX `idx_customers_email`"},
+			{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\"; Unsafe operation detected: \"DROP INDEX `idx_customers_email`\""},
 		},
 	})
 
@@ -440,7 +440,7 @@ func TestRenderUnsafeChangesBlockedUsesPluralMySQLDropIndexGuidance(t *testing.T
 		},
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "customers", Reason: "Unsafe operation detected: DROP INDEX `idx_customers_email`; Unsafe operation detected: DROP INDEX `idx_customers_phone`"},
+			{Table: "customers", Reason: "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\"; Unsafe operation detected: \"DROP INDEX `idx_customers_phone`\""},
 		},
 	})
 
@@ -463,7 +463,7 @@ func TestRenderUnsafeChangesBlockedDoesNotMentionInvisibleIndexesForVitess(t *te
 		},
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "customers", Reason: "Unsafe operation detected: DROP INDEX `idx_customers_email`"},
+			{Table: "customers", Reason: "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\""},
 		},
 	})
 
