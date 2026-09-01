@@ -100,9 +100,17 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 			"database", req.Database, "error", err)
 		shardCounts = nil
 	}
-	if req.Credentials == nil || req.Credentials.DSN == "" {
-		e.logger.Info("no vtgate DSN in credentials; the plan will omit table row estimates",
-			"database", req.Database)
+	// Per-table storage bytes for plan display, from the branch table metrics
+	// API — one call covers every keyspace on the branch. Best effort like the
+	// shard counts, and budget-bound: sizes are display-only, so a slow or
+	// failed metrics read logs and the plan proceeds without byte estimates.
+	metricsCtx, cancelMetrics := context.WithTimeout(ctx, engine.TableSizeProbeTimeout)
+	tableBytes, err := client.BranchTableMetrics(metricsCtx, org, req.Database, branch)
+	cancelMetrics()
+	if err != nil {
+		e.logger.Warn("branch table metrics unavailable; the plan will omit table byte estimates",
+			"organization", org, "database", req.Database, "branch", branch, "error", err)
+		tableBytes = nil
 	}
 
 	// Diff and lint per keyspace in parallel using Spirit's PlanChanges.
@@ -128,7 +136,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 			}
 
 			if len(tableChanges) > 0 {
-				e.attachTableSizes(gCtx, req.Credentials, ks, shardCounts[ks], tableChanges)
+				attachTableSizes(shardCounts[ks], tableBytes, tableChanges)
 			}
 
 			sc := engine.SchemaChange{
