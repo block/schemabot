@@ -33,6 +33,8 @@ func (s *webhookEventStore) Create(ctx context.Context, event *storage.WebhookEv
 	if event.Event == "" {
 		return false, fmt.Errorf("webhook event type is required")
 	}
+	event.Repository = storage.CanonicalKey(event.Repository)
+
 	provider := event.Provider
 	if provider == "" {
 		provider = storage.WebhookProviderGitHub
@@ -182,6 +184,7 @@ func webhookClaimableArgs() []any {
 }
 
 func (s *webhookEventStore) HasEventForHead(ctx context.Context, provider, repository string, pullRequest int, headSHA string) (bool, error) {
+	repository = storage.CanonicalKey(repository)
 	if provider == "" {
 		provider = storage.WebhookProviderGitHub
 	}
@@ -267,21 +270,23 @@ func (s *webhookEventStore) coveringSuccessorQuery(provider string, event *stora
 // the live PR is worth a GitHub call at all — the common no-successor claim
 // stays storage-only.
 func (s *webhookEventStore) HasCoveringSuccessor(ctx context.Context, event *storage.WebhookEvent) (bool, error) {
-	if event.Repository == "" || event.PullRequest == 0 {
+	queryEvent := *event
+	queryEvent.Repository = storage.CanonicalKey(queryEvent.Repository)
+	if queryEvent.Repository == "" || queryEvent.PullRequest == 0 {
 		return false, fmt.Errorf("check covering successor for webhook event %d: repository and pull request are required for coalescing", event.ID)
 	}
 	provider := event.Provider
 	if provider == "" {
 		provider = storage.WebhookProviderGitHub
 	}
-	query, args := s.coveringSuccessorQuery(provider, event)
+	query, args := s.coveringSuccessorQuery(provider, &queryEvent)
 	var one int
 	err := s.db.QueryRowContext(ctx, query, args...).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("check covering successor for webhook event %d (repo=%s, pr=%d): %w", event.ID, event.Repository, event.PullRequest, err)
+		return false, fmt.Errorf("check covering successor for webhook event %d (repo=%s, pr=%d): %w", event.ID, queryEvent.Repository, event.PullRequest, err)
 	}
 	return true, nil
 }
@@ -311,10 +316,11 @@ func (s *webhookEventStore) HasCoveringSuccessor(ctx context.Context, event *sto
 // terminally failed / superseded rows never run — none of those may justify
 // discarding older work.
 func (s *webhookEventStore) SupersedeIfCovered(ctx context.Context, event *storage.WebhookEvent) (bool, error) {
+	repository := storage.CanonicalKey(event.Repository)
 	if event.LeaseToken == "" {
 		return false, fmt.Errorf("webhook event lease token is required")
 	}
-	if event.Repository == "" || event.PullRequest == 0 {
+	if repository == "" || event.PullRequest == 0 {
 		return false, fmt.Errorf("supersede webhook event %d: repository and pull request are required for coalescing", event.ID)
 	}
 	provider := event.Provider
@@ -322,7 +328,9 @@ func (s *webhookEventStore) SupersedeIfCovered(ctx context.Context, event *stora
 		provider = storage.WebhookProviderGitHub
 	}
 	autoPlanIn := placeholders(len(storage.AutoPlanPullRequestActions))
-	successorQuery, successorArgs := s.coveringSuccessorQuery(provider, event)
+	queryEvent := *event
+	queryEvent.Repository = repository
+	successorQuery, successorArgs := s.coveringSuccessorQuery(provider, &queryEvent)
 	args := []any{storage.WebhookEventSuperseded, event.ID, event.LeaseToken, storage.WebhookEventProcessing}
 	args = append(args, stringArgs(storage.AutoPlanPullRequestActions)...)
 	args = append(args, successorArgs...)
@@ -336,7 +344,7 @@ func (s *webhookEventStore) SupersedeIfCovered(ctx context.Context, event *stora
 			)
 	`, args...)
 	if err != nil {
-		return false, fmt.Errorf("supersede webhook event %d (repo=%s, pr=%d): %w", event.ID, event.Repository, event.PullRequest, err)
+		return false, fmt.Errorf("supersede webhook event %d (repo=%s, pr=%d): %w", event.ID, repository, event.PullRequest, err)
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
