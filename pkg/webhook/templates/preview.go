@@ -936,8 +936,8 @@ func samplePlanChanges() []KeyspaceChangeData {
 // statements in samplePlanChanges, in the message format Spirit's linters emit.
 func sampleLintWarnings() []LintViolationData {
 	return []LintViolationData{
-		{Message: `Column "created_at" uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.`, Table: "users", LinterName: "has_timestamp"},
-		{Message: `Index 'idx_category' on columns (category) is redundant - covered by index 'idx_category_price' on columns (category, price)`, Table: "products", LinterName: "redundant_indexes"},
+		{Message: `Column "created_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.`, Table: "users", LinterName: "has_timestamp"},
+		{Message: `Index "idx_category" on column "category" is redundant - covered by index "idx_category_price" on columns ("category", "price")`, Table: "products", LinterName: "redundant_indexes"},
 	}
 }
 
@@ -963,16 +963,16 @@ func PreviewCommentPlanManyLintWarnings() string {
 			},
 		},
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "orders", Reason: "Index 'idx_legacy_status' should be made invisible before dropping to ensure it's not needed"},
-			{Table: "order_events", Reason: "Index 'idx_events_archived' should be made invisible before dropping to ensure it's not needed"},
+			{Table: "orders", Reason: `Index "idx_legacy_status" should be made invisible before dropping to ensure it's not needed`},
+			{Table: "order_events", Reason: `Index "idx_events_archived" should be made invisible before dropping to ensure it's not needed`},
 		},
 		LintViolations: []LintViolationData{
 			{Message: `Primary key column "order_ref" has type "varchar"`, Table: "orders", LinterName: "pk_type"},
-			{Message: `Index "idx_status_created" has DATETIME column "created_at" in position 3 of 5. DATETIME columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.`, Table: "order_events", LinterName: "datetime_index_position"},
-			{Message: `Index "idx_region_created" has DATETIME column "created_at" in position 4 of 5. DATETIME columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.`, Table: "order_events", LinterName: "datetime_index_position"},
+			{Message: `Index "idx_status_created" has "DATETIME" column "created_at" in position 3 of 5. "DATETIME" columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.`, Table: "order_events", LinterName: "datetime_index_position"},
+			{Message: `Index "idx_region_created" has "DATETIME" column "created_at" in position 4 of 5. "DATETIME" columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.`, Table: "order_events", LinterName: "datetime_index_position"},
 			{Message: `Primary key column "event_id" has type "mediumint"`, Table: "order_events", LinterName: "pk_type"},
-			{Message: `Index 'idx_status_created' on columns (status, region, created_at, event_id, order_pk) has a redundant PRIMARY KEY suffix (order_pk) - a leading prefix of the PRIMARY KEY appearing at the end of the index. InnoDB automatically appends the full PK columns (order_pk, event_id) to secondary indexes, so spelling out part of the PK at the end of the index is redundant.`, Table: "order_events", LinterName: "redundant_indexes"},
-			{Message: `Column "event_id" in table "order_events" has type "mediumint(9)" but 2 other table(s) use type "int(11)" (e.g. shipments, invoices)`, Table: "order_events", LinterName: "column_type_consistency"},
+			{Message: `Index "idx_status_created" on columns ("status", "region", "created_at", "event_id", "order_pk") has a redundant PRIMARY KEY suffix "order_pk" — a leading prefix of the PRIMARY KEY appearing at the end of the index. InnoDB automatically appends the full PK columns ("order_pk", "event_id") to secondary indexes, so spelling out part of the PK at the end of the index is redundant.`, Table: "order_events", LinterName: "redundant_indexes"},
+			{Message: `Column "event_id" in table "order_events" has type "mediumint(9)" but 2 other table(s) use type "int(11)" (e.g. shipments, invoices)`, Table: "order_events", LinterName: "type_pedantic"},
 		},
 	})
 }
@@ -1029,7 +1029,7 @@ func PreviewCommentDropColumnBlocked() string {
 		UnsafeChanges: []UnsafeChangeData{
 			{
 				Table:  "customers",
-				Reason: "Unsafe operation detected: DROP COLUMN `nickname`",
+				Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\"",
 			},
 		},
 	})
@@ -1059,7 +1059,7 @@ func PreviewCommentDropIndexBlocked() string {
 		UnsafeChanges: []UnsafeChangeData{
 			{
 				Table:  "customers",
-				Reason: "Unsafe operation detected: DROP INDEX `idx_customers_email`",
+				Reason: "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\"",
 			},
 		},
 	})
@@ -1089,7 +1089,7 @@ func PreviewCommentLintErrorsBlocked() string {
 		},
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "orders", Reason: `[ERROR] primary_key: Primary key column "id" has type "int"; [WARNING] has_timestamp: Column "created_at" uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.`},
+			{Table: "orders", Reason: `[ERROR] primary_key: Primary key column "id" has type "int"; [WARNING] has_timestamp: Column "created_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.`},
 			{Table: "users", Reason: `[ERROR] rename_column: Column rename detected in table "users": "email" to "email_address". Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled`},
 		},
 	})
