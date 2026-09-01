@@ -8,6 +8,54 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestFormatApproxRows(t *testing.T) {
+	tests := []struct {
+		n    int64
+		want string
+	}{
+		{0, "~0"},
+		{842, "~842"},
+		{1_000, "~1k"},
+		{15_249, "~15.2k"},
+		{999_949, "~999.9k"},
+		{999_950, "~1M"},
+		{1_000_000, "~1M"},
+		{2_340_000, "~2.3M"},
+		{48_200_000, "~48.2M"},
+		{999_950_000, "~1B"},
+		{5_100_000_000, "~5.1B"},
+		{999_950_000_000, "~1T"},
+		{5_100_000_000_000, "~5.1T"},
+		{-5, "~0"},
+	}
+	for _, tt := range tests {
+		assert.Equal(t, tt.want, FormatApproxRows(tt.n), "n=%d", tt.n)
+	}
+}
+
+func TestFormatApproxBytes(t *testing.T) {
+	tests := []struct {
+		b    int64
+		want string
+	}{
+		{0, "~0 B"},
+		{812, "~812 B"},
+		{1_000, "~1 KB"},
+		{112_640, "~112.6 KB"},
+		{999_949_999, "~999.9 MB"},
+		{999_950_000, "~1 GB"},
+		{1_130_000_000, "~1.1 GB"},
+		{23_400_000_000, "~23.4 GB"},
+		{999_950_000_000, "~1 TB"},
+		{48_000_000_000_000, "~48 TB"},
+		{999_950_000_000_000, "~1 PB"},
+		{-5, "~0 B"},
+	}
+	for _, tt := range tests {
+		assert.Equal(t, tt.want, FormatApproxBytes(tt.b), "b=%d", tt.b)
+	}
+}
+
 func TestTableStatePriority(t *testing.T) {
 	tests := []struct {
 		state    string
@@ -205,7 +253,7 @@ func TestCodeQuoteIdentifiers(t *testing.T) {
 
 // A byte count reads as a magnitude: bytes below a kibibyte, and one decimal
 // place with a binary unit above it, so a table's footprint is scannable.
-func TestFormatBytes(t *testing.T) {
+func TestFormatBytesBinary(t *testing.T) {
 	tests := []struct {
 		name   string
 		input  int64
@@ -224,7 +272,7 @@ func TestFormatBytes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.expect, FormatBytes(tt.input))
+			assert.Equal(t, tt.expect, FormatBytesBinary(tt.input))
 		})
 	}
 }

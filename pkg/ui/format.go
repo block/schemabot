@@ -28,11 +28,14 @@ func FormatNumber(n int64) string {
 	return string(result)
 }
 
-// FormatBytes formats a byte count with binary units, one decimal place above
-// the byte range. Storage engines report sizes in bytes, and an operator
-// reading a table's footprint wants the magnitude, not the digits.
+// FormatBytesBinary formats a byte count with binary units (KiB/MiB), one
+// decimal place above the byte range. Storage engines report sizes in bytes,
+// and an operator reading a table's footprint wants the magnitude, not the
+// digits. Use this for a measured allocation figure; use FormatApproxBytes for
+// an estimate, which renders decimal units — the two disagree by 7% at a
+// gibibyte and diverge further up the scale.
 // Example: 1536 → "1.5 KiB", 1048576 → "1.0 MiB"
-func FormatBytes(b int64) string {
+func FormatBytesBinary(b int64) string {
 	const unit = 1024
 	if b < unit {
 		return fmt.Sprintf("%d B", b)
@@ -45,6 +48,64 @@ func FormatBytes(b int64) string {
 		}
 	}
 	return fmt.Sprintf("%.1f EiB", value/unit)
+}
+
+// FormatApproxRows renders an approximate row-count estimate compactly with a
+// leading tilde: 842 → "~842", 15_200 → "~15.2k", 2_340_000 → "~2.3M",
+// 5_100_000_000 → "~5.1B". Row estimates come from engine statistics and are
+// never exact, so the tilde is part of the format. Each unit's threshold sits
+// where the one-decimal rendering would round to 1000 of the smaller unit, so
+// a value rolls over to "~1M" rather than rendering as "~1000k".
+func FormatApproxRows(n int64) string {
+	if n < 0 {
+		n = 0
+	}
+	switch {
+	case n >= 999_950_000_000:
+		return "~" + trimTrailingZero(float64(n)/1e12) + "T"
+	case n >= 999_950_000:
+		return "~" + trimTrailingZero(float64(n)/1e9) + "B"
+	case n >= 999_950:
+		return "~" + trimTrailingZero(float64(n)/1e6) + "M"
+	case n >= 1_000:
+		return "~" + trimTrailingZero(float64(n)/1e3) + "k"
+	default:
+		return fmt.Sprintf("~%d", n)
+	}
+}
+
+// trimTrailingZero renders a scaled magnitude with one decimal, dropping a
+// trailing ".0" so round values stay short ("2.3", "12").
+func trimTrailingZero(v float64) string {
+	return strings.TrimSuffix(fmt.Sprintf("%.1f", v), ".0")
+}
+
+// FormatApproxBytes renders an approximate byte-size estimate compactly with a
+// leading tilde and decimal units: 812 → "~812 B", 48_200_000_000 → "~48.2 GB".
+// Byte estimates come from engine statistics and are never exact, so the tilde
+// is part of the format. Decimal units (not binary) because the value is an
+// order-of-magnitude signal, not an allocation figure — a measured allocation
+// belongs in FormatBytesBinary instead. Each unit's threshold
+// sits where the one-decimal rendering would round to 1000 of the smaller
+// unit, so a value rolls over to "~1 GB" rather than rendering as "~1000 MB".
+func FormatApproxBytes(b int64) string {
+	if b < 0 {
+		b = 0
+	}
+	switch {
+	case b >= 999_950_000_000_000:
+		return "~" + trimTrailingZero(float64(b)/1e15) + " PB"
+	case b >= 999_950_000_000:
+		return "~" + trimTrailingZero(float64(b)/1e12) + " TB"
+	case b >= 999_950_000:
+		return "~" + trimTrailingZero(float64(b)/1e9) + " GB"
+	case b >= 999_950:
+		return "~" + trimTrailingZero(float64(b)/1e6) + " MB"
+	case b >= 1_000:
+		return "~" + trimTrailingZero(float64(b)/1e3) + " KB"
+	default:
+		return fmt.Sprintf("~%d B", b)
+	}
 }
 
 // VSchemaStatusLabel maps an engine's vschema_status display value to a human

@@ -1,6 +1,10 @@
 package templates
 
-import "github.com/block/schemabot/pkg/webhook/action"
+import (
+	"fmt"
+
+	"github.com/block/schemabot/pkg/webhook/action"
+)
 
 // PreviewCommentAppScopedDispatch renders a sample app-scoped expansion
 // summary: the databases the command targets plus the app databases skipped
@@ -11,10 +15,32 @@ func PreviewCommentAppScopedDispatch() string {
 		Environment: "staging",
 		CommandName: action.Apply,
 		RequestedBy: previewRequestedBy,
+		PinnedSHA:   previewHeadSHA,
 		Databases:   []string{"billing-invoices", "billing-ledger"},
 		Skipped: []AppScopedSkippedDatabase{
 			{Database: "billing-archive", Reason: "environment `staging` is not configured"},
 			{Database: "billing-reports", Reason: "no plan for this PR"},
+		},
+	})
+}
+
+// PreviewCommentAppScopedDispatchLarge renders the expansion summary for a
+// fleet-sized app, where the database list collapses into a details block
+// instead of dominating the PR timeline.
+func PreviewCommentAppScopedDispatchLarge() string {
+	databases := make([]string, 0, 256)
+	for i := 1; i <= 256; i++ {
+		databases = append(databases, fmt.Sprintf("tenants-shard-%03d", i))
+	}
+	return RenderAppScopedDispatch(AppScopedDispatchData{
+		App:         "tenants",
+		Environment: "production",
+		CommandName: action.Apply,
+		RequestedBy: previewRequestedBy,
+		PinnedSHA:   previewHeadSHA,
+		Databases:   databases,
+		Skipped: []AppScopedSkippedDatabase{
+			{Database: "tenants-shard-legacy", Reason: "no plan for this PR"},
 		},
 	})
 }

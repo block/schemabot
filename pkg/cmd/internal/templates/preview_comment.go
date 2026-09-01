@@ -260,6 +260,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"ACTOR AUTHORIZATION: DATABASE NOT CONFIGURED", func() { fmt.Print(webhooktemplates.PreviewCommentPRCommandDatabaseNotConfigured()) }},
 		// App-scoped commands: --app expands to every database in the app
 		{"APP-SCOPED APPLY: DISPATCH SUMMARY", func() { fmt.Print(webhooktemplates.PreviewCommentAppScopedDispatch()) }},
+		{"APP-SCOPED APPLY: DISPATCH SUMMARY (LARGE FLEET)", func() { fmt.Print(webhooktemplates.PreviewCommentAppScopedDispatchLarge()) }},
 		{"APP-SCOPED APPLY: DISPATCH HALTED (HEAD ADVANCED)", func() { fmt.Print(webhooktemplates.PreviewCommentAppScopedDispatchHalted()) }},
 		{"APP-SCOPED APPLY: ACTOR NOT AUTHORIZED", func() { fmt.Print(webhooktemplates.PreviewCommentAppScopedNotAuthorized()) }},
 		{"APP-SCOPED APPLY: REJECTED", func() { fmt.Print(webhooktemplates.PreviewCommentAppScopedRejected()) }},
