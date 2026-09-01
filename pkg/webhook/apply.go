@@ -33,7 +33,6 @@ func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, display 
 		VSchemaChanges:   display.VSchema,
 		DeployRequestURL: display.DeployRequestURL,
 		RevertExpiresAt:  display.RevertExpiresAt,
-		Volume:           apply.GetOptions().Volume,
 		Tenant:           tenant,
 		Rollback:         apply.IsRollback(),
 		DeferCutover:     apply.GetOptions().DeferCutover,

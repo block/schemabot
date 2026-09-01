@@ -859,14 +859,6 @@ func TestEngine_SkipRevert_NotSupported(t *testing.T) {
 	require.Error(t, err, "expected error for skip revert")
 }
 
-func TestEngine_Volume_NoActiveSchemaChange(t *testing.T) {
-	eng := New(Config{})
-
-	_, err := eng.Volume(t.Context(), &engine.VolumeRequest{Volume: 5})
-	require.Error(t, err, "expected error when no active schema change")
-	assert.Contains(t, err.Error(), "no active schema change")
-}
-
 func TestNew_Defaults(t *testing.T) {
 	eng := New(Config{})
 
@@ -1179,9 +1171,7 @@ func TestEngine_Progress_NamespaceFromApplyChanges(t *testing.T) {
 // poll observing a runner in teardown (Spirit status "close") reports the
 // tracked state instead of inferring terminal success. Terminal outcomes are
 // recorded before the runner is closed, so a closing runner alongside a
-// non-terminal tracked state means the apply is still in flight — for
-// example the stopped runner that stays registered while a volume change
-// restarts the schema change.
+// non-terminal tracked state means the apply is still in flight.
 func TestEngine_Progress_ClosedRunnerIsNotCompletion(t *testing.T) {
 	host, username, password, database, err := parseDSN(sharedDSN)
 	require.NoError(t, err, "parseDSN")
@@ -1203,21 +1193,6 @@ func TestEngine_Progress_ClosedRunnerIsNotCompletion(t *testing.T) {
 			tables:   []string{"progress_close"},
 			state:    engine.StateRunning,
 			runners:  []*spiritmigration.Runner{runner},
-		}
-
-		result, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
-		require.NoError(t, err, "Progress()")
-		assert.Equal(t, engine.StateRunning, result.State)
-	})
-
-	t.Run("volume restart reports running", func(t *testing.T) {
-		eng := New(Config{})
-		eng.runningSchemaChange = &runningSchemaChange{
-			database:                database,
-			tables:                  []string{"progress_close"},
-			state:                   engine.StateStopped,
-			volumeRestartInProgress: true,
-			runners:                 []*spiritmigration.Runner{runner},
 		}
 
 		result, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
@@ -2003,189 +1978,6 @@ func TestEngine_Plan_ConnectionError(t *testing.T) {
 	assert.Error(t, err, "expected error for invalid DSN")
 }
 
-// TestEngine_Volume_PreservesProgress verifies that changing volume preserves
-// copy progress. Volume changes force a checkpoint before stopping, then resume
-// from that checkpoint with the updated copy settings.
-func TestEngine_Volume_PreservesProgress(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping long-running integration test in short mode")
-	}
-
-	dsn, db := setupTestMySQL(t)
-	cleanupTables(t, db)
-
-	// Create a table with enough data that Spirit takes time to copy.
-	// Use a smaller VARCHAR so expanding it forces a table copy.
-	_, err := db.ExecContext(t.Context(), `CREATE TABLE volume_test (
-		id INT PRIMARY KEY AUTO_INCREMENT,
-		name VARCHAR(50) NOT NULL
-	)`)
-	require.NoError(t, err, "create table")
-
-	t.Log("Inserting test data...")
-	seedTableRows(t, db, "volume_test")
-
-	var rowCount int
-	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM volume_test").Scan(&rowCount), "count rows")
-	t.Logf("Created table with %d rows", rowCount)
-
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	eng := New(Config{
-		Logger:  logger,
-		Threads: 1, // Start slow
-	})
-
-	ctx := t.Context()
-
-	// Start the apply with DDL directly
-	// Use a DDL that forces a full table copy (not instant DDL)
-	// Changing VARCHAR(50) to VARCHAR(100) requires a table copy
-	applyResult, err := eng.Apply(ctx, &engine.ApplyRequest{
-		Database: "testdb",
-		Changes: []engine.SchemaChange{{
-			Namespace:    "testdb",
-			TableChanges: []engine.TableChange{{Table: "volume_test", DDL: "ALTER TABLE `volume_test` MODIFY COLUMN `name` varchar(100) NOT NULL"}},
-		}},
-		Credentials: &engine.Credentials{
-			DSN: dsn,
-		},
-	})
-	require.NoError(t, err, "Apply()")
-	defer eng.Drain()
-	require.True(t, applyResult.Accepted, "Apply not accepted: %s", applyResult.Message)
-	t.Log("Schema change started")
-
-	// Wait for enough copy progress that a restart from the beginning would be observable.
-	// Volume forces a checkpoint before stopping, so this does not depend on Spirit's
-	// periodic checkpoint cadence.
-	var progressBefore int64
-	for attempts := range 100 {
-		time.Sleep(100 * time.Millisecond)
-
-		progressResult, err := eng.Progress(ctx, &engine.ProgressRequest{})
-		if err != nil {
-			t.Logf("Progress before volume change unavailable: %v", err)
-			continue
-		}
-
-		if len(progressResult.Tables) > 0 {
-			progressBefore = progressResult.Tables[0].RowsCopied
-			t.Logf("Progress check %d: state=%v, rows_copied=%d/%d",
-				attempts, progressResult.State, progressBefore, progressResult.Tables[0].RowsTotal)
-
-			// Wait until there is substantial progress to preserve across the volume change.
-			if progressBefore >= 2000 {
-				break
-			}
-		}
-
-		// Check if schema change completed (small table might finish fast)
-		if progressResult.State == engine.StateCompleted {
-			t.Skip("Schema change completed before we could test volume change")
-		}
-	}
-
-	if progressBefore < 100 {
-		t.Skipf("Spirit didn't make enough progress to test volume change (only %d rows)", progressBefore)
-	}
-
-	t.Logf("Progress before volume change: %d rows copied", progressBefore)
-
-	// Change volume - this triggers Stop + Start
-	// Note: Volume 5+ has chunk times >5s which Spirit doesn't support,
-	// so we use volume 3 (2 threads, 2s chunks)
-	volumeResult, err := eng.Volume(ctx, &engine.VolumeRequest{
-		Database: "testdb",
-		Volume:   3, // Change from 1 thread to 2 threads
-		Credentials: &engine.Credentials{
-			DSN: dsn,
-		},
-	})
-	require.NoError(t, err, "Volume()")
-	t.Logf("Volume changed: %d -> %d", volumeResult.PreviousVolume, volumeResult.NewVolume)
-
-	// Give Spirit time to resume and make progress
-	time.Sleep(500 * time.Millisecond)
-
-	// Check progress after volume change.
-	//
-	// A volume change is a Stop (force checkpoint) + Start (resume with new
-	// settings). Start returns after the resume goroutine is scheduled, not after
-	// the new Spirit runner has completed setup and exposed checkpoint-backed
-	// per-table progress. A progress poll in that restart window can observe
-	// SchemaBot's zero-valued fallback row before Spirit table progress is
-	// available. Ignore those setup-window samples, then assert on the first real
-	// table progress sample so a genuine restart from the beginning still fails.
-	minExpected := progressBefore * 50 / 100
-	var progressAfter int64
-	var stateAfter engine.State
-	var sawResumedTableProgress bool
-	for range 100 {
-		time.Sleep(100 * time.Millisecond)
-
-		progressResult, err := eng.Progress(ctx, &engine.ProgressRequest{})
-		if err != nil {
-			t.Logf("Progress after volume change unavailable: %v", err)
-			continue
-		}
-
-		stateAfter = progressResult.State
-		// Completed is a success — the copy finished without restarting from scratch.
-		if stateAfter == engine.StateCompleted {
-			t.Logf("Schema change completed after volume change")
-			break
-		}
-		// A volume change resumes the copy; it must never drive the apply to a
-		// terminal failure/cancelled/reverted state. Fail fast on that regression
-		// instead of waiting out the poll window and mis-reporting it as a reset.
-		if stateAfter.IsTerminal() {
-			t.Fatalf("volume change drove the apply to terminal state %v (expected running or completed)", stateAfter)
-		}
-
-		if len(progressResult.Tables) == 0 {
-			t.Logf("Progress after volume change has no table progress yet: state=%v", progressResult.State)
-			continue
-		}
-		tableProgress := progressResult.Tables[0]
-		t.Logf("Progress after volume change: state=%v, rows_copied=%d/%d",
-			progressResult.State, tableProgress.RowsCopied, tableProgress.RowsTotal)
-		// During the resume window the new runner can publish a table row with a
-		// known RowsTotal while RowsCopied is momentarily 0, before the checkpoint
-		// is re-applied. Skip those samples and wait for the first checkpoint-backed
-		// one. A genuine restart from the beginning is still caught: it re-copies
-		// from 0 and its first non-zero sample lands far below minExpected, and if it
-		// never republishes progress the timeout guard below fails the test.
-		if tableProgress.RowsTotal == 0 || tableProgress.RowsCopied == 0 {
-			t.Logf("Progress after volume change is still in runner setup: state=%v, rows_copied=%d/%d",
-				progressResult.State, tableProgress.RowsCopied, tableProgress.RowsTotal)
-			continue
-		}
-
-		progressAfter = tableProgress.RowsCopied
-		sawResumedTableProgress = true
-		break
-	}
-
-	// The key assertion: progress should NOT have reset to 0. If the schema
-	// change completed, rows_copied may be 0 (Spirit clears progress on
-	// completion) — that's fine, it means it finished successfully.
-	if stateAfter != engine.StateCompleted {
-		if !sawResumedTableProgress {
-			t.Fatalf("volume change did not report checkpoint-backed table progress before timeout; last state=%v", stateAfter)
-		}
-		assert.GreaterOrEqual(t, progressAfter, minExpected,
-			"Progress reset after volume change! Before: %d, After: %d (expected at least %d)",
-			progressBefore, progressAfter, minExpected)
-	}
-	t.Logf("Progress after volume change (before=%d, after=%d, state=%v)", progressBefore, progressAfter, stateAfter)
-
-	// Schema change cleanup happens automatically when the test ends and the container is stopped.
-}
-
-// When an operator stops a schema change, the engine cancels the execution
-// context. A CREATE/DROP-only change must treat that cancellation as a stop:
-// the stored state stays Stopped and the pending CREATE/DROP statements never
-// run, so the change can be resumed rather than wedged in Failed.
 func TestEngine_ExecuteMigration_CancelledContextKeepsStoppedState(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)

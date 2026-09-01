@@ -39,18 +39,8 @@ func TestLocalClient_ControlRequestsRecordTheOperatorWhoIssuedThem(t *testing.T)
 	ctx := t.Context()
 	stor := createStorage(t, dsn)
 	defer utils.CloseAndLog(stor)
-	client, _ := newVolumeControlClient(t, dsn, stor)
+	client := newControlRequestClient(t, dsn, stor)
 	apply := dispatchQueuedApplyWithOptions(t, stor, client, nil)
-
-	resp, err := client.Volume(ctx, &ternv1.VolumeRequest{
-		ApplyId:     apply.ApplyIdentifier,
-		Environment: apply.Environment,
-		Volume:      5,
-		Caller:      "cli:armand",
-	})
-	require.NoError(t, err)
-	require.True(t, resp.Accepted, "the volume request must be queued: %s", resp.ErrorMessage)
-	requireControlRequestRequester(t, stor, apply.ID, storage.ControlOperationVolume, "cli:armand")
 
 	cutover, err := client.Cutover(ctx, &ternv1.CutoverRequest{
 		ApplyId:     apply.ApplyIdentifier,
@@ -80,15 +70,14 @@ func TestLocalClient_ControlRequestWithoutACallerNamesTheForwardingPath(t *testi
 	ctx := t.Context()
 	stor := createStorage(t, dsn)
 	defer utils.CloseAndLog(stor)
-	client, _ := newVolumeControlClient(t, dsn, stor)
+	client := newControlRequestClient(t, dsn, stor)
 	apply := dispatchQueuedApplyWithOptions(t, stor, client, nil)
 
-	resp, err := client.Volume(ctx, &ternv1.VolumeRequest{
+	resp, err := client.Cutover(ctx, &ternv1.CutoverRequest{
 		ApplyId:     apply.ApplyIdentifier,
 		Environment: apply.Environment,
-		Volume:      5,
 	})
 	require.NoError(t, err)
-	require.True(t, resp.Accepted, "the volume request must be queued: %s", resp.ErrorMessage)
-	requireControlRequestRequester(t, stor, apply.ID, storage.ControlOperationVolume, storage.ForwardingControlRequestCaller)
+	require.True(t, resp.Accepted, "the cutover request must be queued: %s", resp.ErrorMessage)
+	requireControlRequestRequester(t, stor, apply.ID, storage.ControlOperationCutover, storage.ForwardingControlRequestCaller)
 }

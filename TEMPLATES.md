@@ -1501,7 +1501,6 @@ schemabot apply -e staging --allow-unsafe
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
 | `schemabot release <apply-id> -e <env>` | Release a paused rollout to proceed |
 | `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
-| `schemabot volume <apply-id> -e <env> -v <level>` | Adjust schema change speed (1=slowest, 11=fastest) |
 | `schemabot rollback <apply-id> -e <env> [-t <tenant>]` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env> [-t <tenant>]` | Execute a rollback |
 
@@ -1533,7 +1532,6 @@ That command wasn't recognized. Available commands:
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
 | `schemabot release <apply-id> -e <env>` | Release a paused rollout to proceed |
 | `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
-| `schemabot volume <apply-id> -e <env> -v <level>` | Adjust schema change speed (1=slowest, 11=fastest) |
 | `schemabot rollback <apply-id> -e <env> [-t <tenant>]` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env> [-t <tenant>]` | Execute a rollback |
 
@@ -1827,7 +1825,6 @@ That command wasn't recognized. Available commands:
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
 | `schemabot release <apply-id> -e <env>` | Release a paused rollout to proceed |
 | `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
-| `schemabot volume <apply-id> -e <env> -v <level>` | Adjust schema change speed (1=slowest, 11=fastest) |
 | `schemabot rollback <apply-id> -e <env> [-t <tenant>]` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env> [-t <tenant>]` | Execute a rollback |
 
@@ -3018,37 +3015,6 @@ Verify the database name, or run the command against the SchemaBot instance that
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 **Status**: In Progress
-
-**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 48%
-
-```sql
-ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-```
-- Rows: 3,500,000 / 7,200,000 · ETA: 5m 30s
-
-
----
-
-To stop this schema change:
-```
-schemabot stop apply-a1b2c3d4e5f6 -e staging
-```
-
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
-
-</details>
-
-<details>
-<summary><a name="single-table-running-volume-tuned"></a><strong>Single Table: Running (Volume Tuned)</strong></summary>
-
-
-## Schema Change Status — Staging
-
-**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
-
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-**Status**: In Progress | Volume: 8/11
 
 **`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 48%
 
@@ -4467,85 +4433,6 @@ Cutover is already in progress. SchemaBot will keep reporting progress from the 
 </details>
 
 <details>
-<summary><a name="volume-command-accepted"></a><strong>Volume Command Accepted</strong></summary>
-
-
-## Volume Request Accepted
-
-**Apply**: `apply-a1b2c3d4e5f67890`
-**Environment**: `staging`
-**Requested by**: @alice
-
-Volume change to 8 requested. SchemaBot will adjust the speed of this schema change shortly; once the new level takes effect, a fresh progress comment will track the schema change at the new volume.
-
-</details>
-
-<details>
-<summary><a name="volume-command-invalid-level"></a><strong>Volume Command Invalid Level</strong></summary>
-
-
-## Missing or Invalid Volume Level
-
-Usage: `schemabot volume <apply-id> -e <environment> -v <level>`
-
-The `-v` flag is required and must be a number between 1 (slowest) and 11 (fastest).
-<!-- schemabot:offer-support-channel -->
-
-</details>
-
-<details>
-<summary><a name="volume-command-missing-apply-id"></a><strong>Volume Command Missing Apply ID</strong></summary>
-
-
-## Missing Apply ID
-
-Usage: `schemabot volume <apply-id> -e <environment> -v <1-11>`
-
-Use `schemabot status -e <environment>` to find the apply ID.
-<!-- schemabot:offer-support-channel -->
-
-</details>
-
-<details>
-<summary><a name="volume-changed-superseded-progress-comment"></a><strong>Volume Changed: Superseded Progress Comment</strong></summary>
-
-
-⏩ Volume changed to **8/11** — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
-
-<details>
-<summary>Progress before the volume change</summary>
-
-## Schema Change Status — Staging
-
-**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
-
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-**Status**: In Progress | Volume: 3/11
-
-**`users`**: 🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 32%
-
-```sql
-ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-```
-- Rows: 2,300,000 / 7,200,000 · ETA: 13m 0s
-
-
----
-
-To stop this schema change:
-```
-schemabot stop apply-a1b2c3d4e5f6 -e staging
-```
-
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
-
-
-</details>
-
-</details>
-
-<details>
 <summary><a name="resumed-superseded-progress-comment"></a><strong>Resumed: Superseded Progress Comment</strong></summary>
 
 
@@ -5524,7 +5411,6 @@ Sequential mode: First complete, second running
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Running              │
-│  Volume:    3/11                 │
 │  Started:   Jan 15 14:18:00 UTC  │
 │  Duration:  12m                  │
 └──────────────────────────────────┘
@@ -6662,7 +6548,7 @@ Apply watch mode: Running with footer controls
      ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
-ESC detach • s stop • v volume
+ESC detach • s stop
 
 ```
 </details>
@@ -6788,51 +6674,7 @@ Resuming from checkpoint...
      ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
-ESC detach • s stop • v volume
-
-```
-</details>
-
-<details>
-<summary><a name="volume-mode"></a><strong>Volume Mode</strong></summary>
-
-```
-
-Volume mode: Interactive volume adjustment
-(Press 'v' during apply to enter volume mode)
-
-```
-</details>
-
-<details>
-<summary><a name="in-volume-mode-default-4"></a><strong>In Volume Mode (Default 4):</strong></summary>
-
-```
-
-Volume: ████░░░░░░░ 4/11
-↑↓ adjust • 1-9 direct • ESC done
-
-```
-</details>
-
-<details>
-<summary><a name="after-adjusting-to-8"></a><strong>After Adjusting To 8:</strong></summary>
-
-```
-
-Volume: ████████░░░ 8/11
-↑↓ adjust • 1-9 direct • ESC done
-
-```
-</details>
-
-<details>
-<summary><a name="after-adjusting-to-2"></a><strong>After Adjusting To 2:</strong></summary>
-
-```
-
-Volume: ██░░░░░░░░░ 2/11
-↑↓ adjust • 1-9 direct • ESC done
+ESC detach • s stop
 
 ```
 </details>
@@ -8096,7 +7938,6 @@ Sequential mode: First complete, second running
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Running              │
-│  Volume:    3/11                 │
 │  Started:   Jan 15 14:18:00 UTC  │
 │  Duration:  12m                  │
 └──────────────────────────────────┘
@@ -8550,7 +8391,7 @@ The following unsafe changes will be applied:
        • ℹ️ More rows than initially estimated, copying is still active and will continue
 
 
-ESC detach • s stop • v volume
+ESC detach • s stop
 ```
 
 

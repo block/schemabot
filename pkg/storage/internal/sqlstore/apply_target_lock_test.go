@@ -3,8 +3,16 @@ package sqlstore
 import (
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestApplyTargetLockName_CanonicalComponents(t *testing.T) {
+	lowercase := applyTargetLockName("orders_db", "mysql", "staging")
+	mixedCase := applyTargetLockName("Orders_DB", "MySQL", "Staging")
+
+	assert.Equal(t, lowercase, mixedCase)
+}
 
 // TestAcquireApplyTargetLockConn_NilLockerFailsClosed verifies an apply
 // target without an advisory-lock implementation is rejected before any

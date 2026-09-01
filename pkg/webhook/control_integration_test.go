@@ -774,164 +774,6 @@ func TestE2ECutoverCommandRejectsPendingStop(t *testing.T) {
 	assertReactionEventually(t, reactions)
 }
 
-// TestE2EVolumeCommandQueuesDurableRequest verifies that a PR comment volume
-// command queues a durable volume control request carrying the requested level,
-// and that the acknowledgement comment states the queued semantics — the driver
-// applies the level at its next progress check — rather than claiming the new
-// level is already in effect.
-func TestE2EVolumeCommandQueuesDurableRequest(t *testing.T) {
-	ctx := t.Context()
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
-	require.NoError(t, err)
-	require.NoError(t, schemabotDB.PingContext(ctx))
-
-	store := mysqlstore.New(schemabotDB)
-	applyIdentifier := "apply_ecafe123"
-	database := "volume_pr_comments_db"
-	cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
-	t.Cleanup(func() {
-		cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
-		utils.CloseAndLog(schemabotDB)
-	})
-	applyID := createStopCommandApply(t, store, applyIdentifier, database)
-
-	client, mux := setupGitHubServer(t)
-	comments := make(chan string, 10)
-	reactions := make(chan string, 10)
-	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Body string `json:"body"`
-		}
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
-		comments <- body.Body
-		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
-	})
-	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Content string `json:"content"`
-		}
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
-		reactions <- body.Content
-		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
-	})
-
-	service := apiServiceForStopCommandTest(t, store, database)
-	localClient, err := tern.NewLocalClient(tern.LocalConfig{
-		Database:  database,
-		Type:      storage.DatabaseTypeMySQL,
-		TargetDSN: e2eTargetDSN,
-	}, store, testLogger())
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		utils.CloseAndLog(localClient)
-	})
-	service.RegisterTernClient(database, "staging", localClient)
-	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
-		logger:    testLogger(),
-	}
-
-	postVolumeCommand(t, h, applyIdentifier, "alice", "8")
-	comment := readComment(t, comments)
-	assert.Contains(t, comment, "Volume Request Accepted")
-	assert.Contains(t, comment, "`"+applyIdentifier+"`")
-	assert.Contains(t, comment, "@alice")
-	assert.Contains(t, comment, "Volume change to 8 requested. SchemaBot will adjust the speed of this schema change shortly")
-
-	controlReq, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationVolume)
-	require.NoError(t, err)
-	require.NotNil(t, controlReq)
-	assert.Equal(t, storage.ControlRequestPending, controlReq.Status)
-	level, err := storage.DecodeVolumeControlRequestMetadata(controlReq.Metadata)
-	require.NoError(t, err)
-	assert.Equal(t, int32(8), level)
-
-	logs, err := store.ApplyLogs().List(ctx, storage.ApplyLogFilter{ApplyID: applyID, Limit: 20})
-	require.NoError(t, err)
-	assert.True(t, applyLogContains(logs, "Volume change to 8 queued; the driver applies it at its next progress check (caller: github:alice@octocat/hello-world#1)"))
-	assertReactionEventually(t, reactions)
-}
-
-// TestE2EVolumeCommandRejectsTerminalApply verifies that a volume command
-// against a terminal apply posts the rejection comment carrying the queue's
-// SchemaBot-authored error message and records no durable volume request —
-// there is no driver left to apply the level.
-func TestE2EVolumeCommandRejectsTerminalApply(t *testing.T) {
-	ctx := t.Context()
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
-	require.NoError(t, err)
-	require.NoError(t, schemabotDB.PingContext(ctx))
-
-	store := mysqlstore.New(schemabotDB)
-	applyIdentifier := "apply_ecafe456"
-	database := "volume_pr_comments_completed_db"
-	cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
-	t.Cleanup(func() {
-		cleanupStopCommandTestRows(t, schemabotDB, applyIdentifier, database)
-		utils.CloseAndLog(schemabotDB)
-	})
-
-	applyID := createStopCommandApply(t, store, applyIdentifier, database)
-	storedApply, err := store.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
-	require.NoError(t, err)
-	require.NotNil(t, storedApply)
-	storedApply.State = state.Apply.Completed
-	storedApply.UpdatedAt = time.Now().UTC()
-	require.NoError(t, store.Applies().Update(ctx, storedApply))
-
-	client, mux := setupGitHubServer(t)
-	comments := make(chan string, 10)
-	reactions := make(chan string, 10)
-	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Body string `json:"body"`
-		}
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
-		comments <- body.Body
-		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
-	})
-	mux.HandleFunc("POST /repos/octocat/hello-world/issues/comments/42/reactions", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Content string `json:"content"`
-		}
-		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
-		reactions <- body.Content
-		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
-	})
-
-	service := apiServiceForStopCommandTest(t, store, database)
-	localClient, err := tern.NewLocalClient(tern.LocalConfig{
-		Database:  database,
-		Type:      storage.DatabaseTypeMySQL,
-		TargetDSN: e2eTargetDSN,
-	}, store, testLogger())
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		utils.CloseAndLog(localClient)
-	})
-	service.RegisterTernClient(database, "staging", localClient)
-	h := &Handler{
-		service:   service,
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: ghclient.NewInstallationClient(client, testLogger())}),
-		logger:    testLogger(),
-	}
-
-	postVolumeCommand(t, h, applyIdentifier, "alice", "8")
-	comment := readComment(t, comments)
-	assert.Contains(t, comment, "Volume Failed")
-	assert.Contains(t, comment, "volume can only be adjusted while it is running")
-
-	pendingVolume, err := store.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationVolume)
-	require.NoError(t, err)
-	assert.Nil(t, pendingVolume)
-	assertReactionEventually(t, reactions)
-}
-
 func apiServiceForStopCommandTest(t *testing.T, store storage.Storage, database string) *api.Service {
 	t.Helper()
 	return api.New(store, &api.ServerConfig{
@@ -1067,19 +909,6 @@ func postCutoverCommand(t *testing.T, h *Handler, applyIdentifier, user string) 
 	assert.Contains(t, rr.Body.String(), "cutover started")
 }
 
-func postVolumeCommand(t *testing.T, h *Handler, applyIdentifier, user, level string) {
-	t.Helper()
-	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment:   "schemabot volume " + applyIdentifier + " -e staging -v " + level,
-		userLogin: user,
-		isPR:      true,
-	}, nil)
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
-	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Body.String(), "volume started")
-}
-
 func postSkipRevertCommand(t *testing.T, h *Handler, applyIdentifier, user string) {
 	t.Helper()
 	req := buildWebhookRequest(t, webhookPayloadOpts{
@@ -1183,10 +1012,6 @@ func (c *stopCommandTernClient) Cancel(context.Context, *ternv1.CancelRequest) (
 }
 
 func (c *stopCommandTernClient) Start(context.Context, *ternv1.StartRequest) (*ternv1.StartResponse, error) {
-	return nil, nil
-}
-
-func (c *stopCommandTernClient) Volume(context.Context, *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error) {
 	return nil, nil
 }
 

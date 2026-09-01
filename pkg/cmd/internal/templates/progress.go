@@ -14,7 +14,6 @@ import (
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
-	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -65,19 +64,6 @@ func FormatKeyspaceHeader(ns string) string {
 // nowFunc returns the current time. Overridden in previews for deterministic output.
 var nowFunc = time.Now
 
-// volumeBoxRow returns the detail-box row for an operator-set volume level.
-// The level only matters while the engine is actively working (copying,
-// draining, or verifying — volume stays adjustable through the post-copy
-// phases); on other states (stopped, waiting for cutover, terminal) it
-// carries no signal, and zero means the operator never set one, so the box
-// stays quiet.
-func volumeBoxRow(volume int, applyState string) (BoxRow, bool) {
-	if volume <= 0 || !state.IsRunningApplyState(applyState) {
-		return BoxRow{}, false
-	}
-	return BoxRow{"Volume", fmt.Sprintf("%d/%d", volume, storage.MaxVolume)}, true
-}
-
 // WriteProgress writes the schema change progress to stdout.
 func WriteProgress(data ProgressData) {
 	// No active schema change
@@ -115,9 +101,6 @@ func WriteProgress(data ProgressData) {
 		rows = append(rows, BoxRow{"Environment", data.Environment})
 	}
 	rows = append(rows, BoxRow{"State", displayState})
-	if row, ok := volumeBoxRow(data.Volume, data.State); ok {
-		rows = append(rows, row)
-	}
 	rows = append(rows, callerAndSourceBoxRows(data.Caller, data.PullRequestURL)...)
 	if len(data.Options) > 0 {
 		var opts []string
@@ -952,7 +935,6 @@ type ActiveApplyData struct {
 	StartedAt           string
 	CompletedAt         string
 	UpdatedAt           string
-	Volume              int
 }
 
 // StatusListData contains data for rendering the status list.

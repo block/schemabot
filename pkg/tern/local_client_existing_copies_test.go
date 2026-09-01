@@ -72,11 +72,6 @@ func (e *copiesByNamespaceEngine) SkipRevert(context.Context, *engine.ControlReq
 	return e.control("skip-revert")
 }
 
-func (e *copiesByNamespaceEngine) Volume(context.Context, *engine.VolumeRequest) (*engine.VolumeResult, error) {
-	e.t.Fatal("the plan path must not set volume")
-	return nil, nil
-}
-
 // TestPlanMySQLNamespacesKeepsEveryNamespacesExistingCopies verifies a
 // multi-namespace MySQL plan carries the copy disclosure from every namespace
 // that holds unfinished work, not just the first. Each namespace is planned

@@ -472,7 +472,6 @@ var knownPRCommandActorAuthCommands = map[string]bool{
 	"stop":             true,
 	"cancel":           true,
 	"start":            true,
-	"volume":           true,
 	"revert":           true,
 	"skip_revert":      true,
 }
@@ -532,7 +531,6 @@ var knownDirectWriteAuthOperations = map[string]bool{
 	"start":              true,
 	"cutover":            true,
 	"cancel":             true,
-	"volume":             true,
 	"release":            true,
 	"revert":             true,
 	"skip_revert":        true,
@@ -755,7 +753,6 @@ var knownControlOperations = map[string]bool{
 	"stop":          true,
 	"cancel":        true,
 	"start":         true,
-	"volume":        true,
 	"revert":        true,
 	"skip_revert":   true,
 	"release":       true,
@@ -763,7 +760,7 @@ var knownControlOperations = map[string]bool{
 }
 
 // RecordControlOperation increments the control operations counter.
-// Operation should be one of: cutover, stop, start, volume, revert, skip_revert, release, rollback_plan.
+// Operation should be one of: cutover, stop, start, revert, skip_revert, release, rollback_plan.
 // Status should be "success" or "error".
 func RecordControlOperation(ctx context.Context, operation, database, deployment, environment, status string) {
 	if !knownControlOperations[operation] {

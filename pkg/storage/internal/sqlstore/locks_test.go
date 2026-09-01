@@ -89,7 +89,7 @@ func TestLockStore_Acquire_RefreshSameOwnerValueAlreadyMatches(t *testing.T) {
 		require.NoError(t, db.Close())
 	})
 	require.NoError(t, db.PingContext(ctx))
-	store := &lockStore{db: newRebindDB(db, MySQLDialect{}), classifier: NewMySQLErrorClassifier()}
+	store := &lockStore{db: newRebindDB(db, MySQLDialect{}), dialect: MySQLDialect{}, classifier: NewMySQLErrorClassifier()}
 
 	require.NoError(t, store.Acquire(ctx, &storage.Lock{
 		DatabaseName:  "testdb",
@@ -150,7 +150,7 @@ func TestLockStore_Acquire_RefreshSameOwnerValueAlreadyMatches(t *testing.T) {
 func TestLockStore_Acquire_RefreshOwnerNoLongerMatches(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
-	store := &lockStore{db: newRebindDB(testDB, MySQLDialect{}), classifier: NewMySQLErrorClassifier()}
+	store := &lockStore{db: newRebindDB(testDB, MySQLDialect{}), dialect: MySQLDialect{}, classifier: NewMySQLErrorClassifier()}
 
 	require.NoError(t, store.Acquire(ctx, &storage.Lock{
 		DatabaseName:  "testdb",
@@ -280,7 +280,7 @@ func TestLockStore_UpdateSameSecondSucceeds(t *testing.T) {
 	_, err = db.ExecContext(ctx, "SET TIMESTAMP = 1700000000")
 	require.NoError(t, err)
 
-	store := &lockStore{db: newRebindDB(db, MySQLDialect{}), classifier: NewMySQLErrorClassifier()}
+	store := &lockStore{db: newRebindDB(db, MySQLDialect{}), dialect: MySQLDialect{}, classifier: NewMySQLErrorClassifier()}
 
 	// Acquire seeds the row via the locks table's DEFAULT CURRENT_TIMESTAMP,
 	// which resolves to the frozen NOW().

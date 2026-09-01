@@ -644,8 +644,6 @@ func TestWebhookControlCommandMissingApplyID(t *testing.T) {
 		{name: "cancel", comment: "schemabot cancel -e staging", action: "cancel"},
 		{name: "start", comment: "schemabot start -e staging", action: "start"},
 		{name: "cutover", comment: "schemabot cutover -e staging", action: "cutover"},
-		{name: "volume", comment: "schemabot volume -e staging -v 8", action: "volume"},
-		{name: "volume without level", comment: "schemabot volume -e staging", action: "volume"},
 	}
 
 	for _, tt := range tests {
@@ -669,48 +667,6 @@ func TestWebhookControlCommandMissingApplyID(t *testing.T) {
 				assert.Contains(t, body, "schemabot "+tt.action+" <apply-id> -e <environment>")
 			case <-time.After(2 * time.Second):
 				t.Fatal("timed out waiting for missing apply ID comment")
-			}
-		})
-	}
-}
-
-// TestWebhookVolumeCommandInvalidLevel verifies that a volume command with a
-// missing, non-numeric, or out-of-range -v level posts a usage comment naming
-// the valid range and exact syntax instead of silently dropping the command.
-func TestWebhookVolumeCommandInvalidLevel(t *testing.T) {
-	tests := []struct {
-		name    string
-		comment string
-	}{
-		{name: "missing -v flag", comment: "schemabot volume apply_abc123 -e staging"},
-		{name: "-v without value", comment: "schemabot volume apply_abc123 -e staging -v"},
-		{name: "non-numeric level", comment: "schemabot volume apply_abc123 -e staging -v fast"},
-		{name: "level below range", comment: "schemabot volume apply_abc123 -e staging -v 0"},
-		{name: "level above range", comment: "schemabot volume apply_abc123 -e staging -v 12"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			h, comments, _ := newTestHandler(t)
-
-			req := buildWebhookRequest(t, webhookPayloadOpts{
-				comment: tt.comment,
-				isPR:    true,
-			}, nil)
-
-			rr := httptest.NewRecorder()
-			h.ServeHTTP(rr, req)
-
-			require.Equal(t, http.StatusOK, rr.Code)
-			assert.Contains(t, rr.Body.String(), "volume started")
-
-			select {
-			case body := <-comments:
-				assert.Contains(t, body, "Missing or Invalid Volume Level")
-				assert.Contains(t, body, "schemabot volume <apply-id> -e <environment> -v <level>")
-				assert.Contains(t, body, "between 1 (slowest) and 11 (fastest)")
-			case <-time.After(2 * time.Second):
-				t.Fatal("timed out waiting for invalid volume level comment")
 			}
 		})
 	}
