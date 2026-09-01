@@ -185,3 +185,130 @@ func TestPlanPreservesUnsafeMetadataInStoredPlanAndResponse(t *testing.T) {
 	assert.True(t, resp.Shards[0].Changes[0].IsUnsafe)
 	assert.Equal(t, "DROP TABLE removes all data", resp.Shards[0].Changes[0].UnsafeReason)
 }
+
+func alterUsersEmailWithRows(rows int64) []engine.TableChange {
+	tc := alterUsersEmail()
+	tc[0].EstimatedRows = &rows
+	bytes := rows * 100
+	tc[0].EstimatedBytes = &bytes
+	return tc
+}
+
+// A sharded plan's namespace view reports the whole table's size: per-shard
+// row estimates are summed, the largest single shard is kept (the
+// write-blocking blast radius of a shard-at-a-time apply), and the shard span
+// is counted. The per-shard rows keep each shard's own estimate.
+func TestPlanAggregatesShardTableSizes(t *testing.T) {
+	store := &fakePlanStore{
+		getFn:    func(string) (*storage.Plan, error) { return nil, nil },
+		createID: 10,
+	}
+	result := &engine.PlanResult{
+		PlanID: "plan_sized",
+		Changes: []engine.SchemaChange{
+			{Namespace: "resolute", Shard: engine.Shard{Name: "-80"}, TableChanges: alterUsersEmailWithRows(100)},
+			{Namespace: "resolute", Shard: engine.Shard{Name: "80-"}, TableChanges: alterUsersEmailWithRows(250)},
+		},
+	}
+	c := shardPlanTestClient(t, store, result)
+
+	resp, err := c.Plan(t.Context(), &ternv1.PlanRequest{Database: "commerce"})
+	require.NoError(t, err)
+
+	require.NotNil(t, store.created)
+	require.Len(t, store.created.Namespaces["resolute"].Tables, 1)
+	stored := store.created.Namespaces["resolute"].Tables[0]
+	require.NotNil(t, stored.EstimatedRows)
+	assert.Equal(t, int64(350), *stored.EstimatedRows)
+	assert.Equal(t, 2, stored.ShardCount)
+	require.NotNil(t, stored.LargestShardRows)
+	assert.Equal(t, int64(250), *stored.LargestShardRows)
+	require.NotNil(t, stored.EstimatedBytes)
+	assert.Equal(t, int64(35_000), *stored.EstimatedBytes)
+
+	// Per-shard rows keep each shard's own estimate, unaggregated.
+	shards := store.created.Namespaces["resolute"].Shards
+	require.Len(t, shards, 2)
+	require.NotNil(t, shards[0].Changes[0].EstimatedRows)
+	assert.Equal(t, int64(100), *shards[0].Changes[0].EstimatedRows)
+	assert.Zero(t, shards[0].Changes[0].ShardCount)
+
+	// The proto response carries the same namespace-level aggregates.
+	require.Len(t, resp.Changes, 1)
+	require.Len(t, resp.Changes[0].TableChanges, 1)
+	protoChange := resp.Changes[0].TableChanges[0]
+	require.NotNil(t, protoChange.EstimatedRows)
+	assert.Equal(t, int64(350), *protoChange.EstimatedRows)
+	assert.Equal(t, int32(2), protoChange.ShardCount)
+	require.NotNil(t, protoChange.LargestShardRows)
+	assert.Equal(t, int64(250), *protoChange.LargestShardRows)
+	require.NotNil(t, protoChange.EstimatedBytes)
+	assert.Equal(t, int64(35_000), *protoChange.EstimatedBytes)
+}
+
+// When any shard lacks an estimate, the namespace row totals are omitted
+// rather than understating the table's size — the shard count still reports
+// the span.
+func TestPlanShardTableSizesOmittedWhenAnyShardMissing(t *testing.T) {
+	store := &fakePlanStore{
+		getFn:    func(string) (*storage.Plan, error) { return nil, nil },
+		createID: 11,
+	}
+	result := &engine.PlanResult{
+		PlanID: "plan_partial_sizes",
+		Changes: []engine.SchemaChange{
+			{Namespace: "resolute", Shard: engine.Shard{Name: "-80"}, TableChanges: alterUsersEmailWithRows(100)},
+			{Namespace: "resolute", Shard: engine.Shard{Name: "80-"}, TableChanges: alterUsersEmail()},
+		},
+	}
+	c := shardPlanTestClient(t, store, result)
+
+	resp, err := c.Plan(t.Context(), &ternv1.PlanRequest{Database: "commerce"})
+	require.NoError(t, err)
+
+	require.NotNil(t, store.created)
+	stored := store.created.Namespaces["resolute"].Tables[0]
+	assert.Nil(t, stored.EstimatedRows)
+	assert.Nil(t, stored.LargestShardRows)
+	assert.Equal(t, 2, stored.ShardCount)
+
+	protoChange := resp.Changes[0].TableChanges[0]
+	assert.Nil(t, protoChange.EstimatedRows)
+	assert.Nil(t, protoChange.LargestShardRows)
+	assert.Equal(t, int32(2), protoChange.ShardCount)
+}
+
+// An engine that aggregates a sharded target itself emits unsharded changes;
+// its own size values pass through the namespace view untouched.
+func TestPlanUnshardedTableSizesPassThrough(t *testing.T) {
+	store := &fakePlanStore{
+		getFn:    func(string) (*storage.Plan, error) { return nil, nil },
+		createID: 12,
+	}
+	rows, largest := int64(48_200_000), int64(24_600_000)
+	tc := alterUsersEmail()
+	tc[0].EstimatedRows = &rows
+	tc[0].ShardCount = 2
+	tc[0].LargestShardRows = &largest
+	result := &engine.PlanResult{
+		PlanID:  "plan_self_aggregated",
+		Changes: []engine.SchemaChange{{Namespace: "resolute", TableChanges: tc}},
+	}
+	c := shardPlanTestClient(t, store, result)
+
+	resp, err := c.Plan(t.Context(), &ternv1.PlanRequest{Database: "commerce"})
+	require.NoError(t, err)
+
+	require.NotNil(t, store.created)
+	stored := store.created.Namespaces["resolute"].Tables[0]
+	require.NotNil(t, stored.EstimatedRows)
+	assert.Equal(t, rows, *stored.EstimatedRows)
+	assert.Equal(t, 2, stored.ShardCount)
+	require.NotNil(t, stored.LargestShardRows)
+	assert.Equal(t, largest, *stored.LargestShardRows)
+
+	protoChange := resp.Changes[0].TableChanges[0]
+	require.NotNil(t, protoChange.EstimatedRows)
+	assert.Equal(t, rows, *protoChange.EstimatedRows)
+	assert.Equal(t, int32(2), protoChange.ShardCount)
+}
