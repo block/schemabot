@@ -79,7 +79,8 @@ func setupGitHubServer(t *testing.T) (*gh.Client, *http.ServeMux) {
 // prWebhookPayloadOpts configures how buildPRWebhookRequest constructs the payload.
 type prWebhookPayloadOpts struct {
 	action    string // "opened", "synchronize", "reopened", "closed", etc.
-	merged    bool   // for "closed": whether the PR merged or was closed without merging
+	repo      string
+	merged    bool // for "closed": whether the PR merged or was closed without merging
 	beforeSHA string
 	headSHA   string
 	headRef   string
@@ -108,6 +109,9 @@ func buildPRWebhookRequest(t *testing.T, opts prWebhookPayloadOpts, secret []byt
 	if opts.headRef == "" {
 		opts.headRef = "feature-branch"
 	}
+	if opts.repo == "" {
+		opts.repo = "octocat/hello-world"
+	}
 
 	payload := map[string]any{
 		"action": opts.action,
@@ -123,7 +127,7 @@ func buildPRWebhookRequest(t *testing.T, opts prWebhookPayloadOpts, secret []byt
 			},
 		},
 		"repository": map[string]any{
-			"full_name": "octocat/hello-world",
+			"full_name": opts.repo,
 		},
 		"installation": map[string]any{
 			"id": 12345,
@@ -210,6 +214,7 @@ func buildCheckRunWebhookRequest(t *testing.T, opts checkRunWebhookPayloadOpts, 
 // webhookPayloadOpts configures how buildWebhookRequest constructs the payload.
 type webhookPayloadOpts struct {
 	comment   string
+	repo      string
 	userType  string // "User" or "Bot"
 	userLogin string
 	isPR      bool // whether the issue has a pull_request field
@@ -225,6 +230,9 @@ func buildWebhookRequest(t *testing.T, opts webhookPayloadOpts, secret []byte) *
 	if opts.userType == "" {
 		opts.userType = "User"
 	}
+	if opts.repo == "" {
+		opts.repo = "octocat/hello-world"
+	}
 
 	payload := map[string]any{
 		"action": "created",
@@ -237,7 +245,7 @@ func buildWebhookRequest(t *testing.T, opts webhookPayloadOpts, secret []byte) *
 			},
 		},
 		"repository": map[string]any{
-			"full_name": "octocat/hello-world",
+			"full_name": opts.repo,
 		},
 		"installation": map[string]any{
 			"id": 12345,

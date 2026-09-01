@@ -240,6 +240,36 @@ func TestDurablePullRequestWebhookQueuesAndAcks(t *testing.T) {
 	}
 }
 
+func TestDurablePullRequestWebhookCanonicalizesRepository(t *testing.T) {
+	events := newRecordingWebhookEventStore()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{
+		Repos: map[string]api.RepoConfig{"mixedcase/sample-repo": {}},
+	}, nil, logger)
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action: "opened", repo: "MixedCase/Sample-Repo", headSHA: "MixedCaseSHA", headRef: "MixedCaseBranch",
+	}, nil)
+	req.Header.Set(headerDeliveryID, "mixed-case-pull-request")
+	rr := httptest.NewRecorder()
+
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.JSONEq(t, `{"message":"auto-plan queued"}`, rr.Body.String())
+	event, err := events.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "mixed-case-pull-request")
+	require.NoError(t, err)
+	require.NotNil(t, event)
+	assert.Equal(t, "mixedcase/sample-repo", event.Repository)
+	assert.Equal(t, "mixedcase/sample-repo#1", fmt.Sprintf("%s#%d", event.Repository, event.PullRequest))
+	assert.Equal(t, "MixedCaseSHA", event.HeadSHA)
+
+	var payload pullRequestPayload
+	require.NoError(t, json.Unmarshal(event.Payload, &payload))
+	assert.Equal(t, "MixedCaseBranch", payload.PullRequest.Head.Ref)
+}
+
 func TestDurablePullRequestWebhookDeduplicatesDelivery(t *testing.T) {
 	events := newRecordingWebhookEventStore()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
