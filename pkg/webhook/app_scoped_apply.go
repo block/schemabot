@@ -185,6 +185,7 @@ func (h *Handler) appScopedApplyCore(parent context.Context, repo string, pr int
 		Environment: environment,
 		CommandName: commandName,
 		RequestedBy: requestedBy,
+		PinnedSHA:   pinnedSHA,
 		Databases:   expansion.databases,
 		Skipped:     expansion.skipped,
 	}))

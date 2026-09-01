@@ -271,9 +271,10 @@ func TestAppScopedApplyDispatchSummaryListsTargetsAndSkips(t *testing.T) {
 	body := requireComment(t, comments, "dispatch summary")
 	assert.Contains(t, body, "App-Scoped Apply")
 	assert.Contains(t, body, "**App**: `tenants`")
-	assert.Contains(t, body, "expands to **1** database")
+	assert.Contains(t, body, "is applying to **1** database")
+	assert.Contains(t, body, "**Commit**: `abc123`")
 	assert.Contains(t, body, "- `tenants-shard-01`")
-	assert.Contains(t, body, "**Skipped**:")
+	assert.Contains(t, body, "**Skipped** (2):")
 	assert.Contains(t, body, "- `tenants-shard-02` — environment `staging` is not configured")
 	assert.Contains(t, body, "- `tenants-shard-03` — no plan for this PR")
 }
