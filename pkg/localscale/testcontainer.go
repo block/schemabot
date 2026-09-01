@@ -523,22 +523,24 @@ type mappedPortLookup func(ctx context.Context, port string) (network.Port, erro
 
 // resolveProxyPort returns the host port Docker mapped to container proxy port p,
 // retrying transient lookup failures (e.g., Docker inspect under load) until
-// proxyPortLookupTimeout elapses. Every proxy port is declared in the container's
-// exposed ports, so a lookup that never resolves is an error rather than a port
-// to skip.
+// proxyPortLookupTimeout elapses. The timeout bounds each lookup call as well as
+// the retry loop, so a hung Docker inspect cannot stall past the deadline. Every
+// proxy port is declared in the container's exposed ports, so a lookup that never
+// resolves is an error rather than a port to skip.
 func resolveProxyPort(ctx context.Context, p int, lookup mappedPortLookup) (int, error) {
-	deadline := time.Now().Add(proxyPortLookupTimeout)
+	lookupCtx, cancel := context.WithTimeout(ctx, proxyPortLookupTimeout)
+	defer cancel()
 	for {
-		mapped, err := lookup(ctx, strconv.Itoa(p))
+		mapped, err := lookup(lookupCtx, strconv.Itoa(p))
 		if err == nil {
 			return int(mapped.Num()), nil
 		}
-		if time.Now().After(deadline) {
-			return 0, fmt.Errorf("resolve host port for proxy port %d after retrying for %s: %w", p, proxyPortLookupTimeout, err)
+		if ctx.Err() != nil {
+			return 0, fmt.Errorf("resolve host port for proxy port %d: %w", p, ctx.Err())
 		}
 		select {
-		case <-ctx.Done():
-			return 0, fmt.Errorf("resolve host port for proxy port %d: %w", p, ctx.Err())
+		case <-lookupCtx.Done():
+			return 0, fmt.Errorf("resolve host port for proxy port %d after retrying for %s: %w", p, proxyPortLookupTimeout, err)
 		case <-time.After(proxyPortLookupInterval):
 		}
 	}

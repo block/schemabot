@@ -3,6 +3,7 @@ package localscale
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -101,6 +102,25 @@ func TestResolveProxyPortFailsWhenPortStaysUnmapped(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "proxy port 19101")
 	assert.ErrorIs(t, err, lookupErr)
+}
+
+func TestResolveProxyPortCancelsHungLookup(t *testing.T) {
+	oldTimeout := proxyPortLookupTimeout
+	proxyPortLookupTimeout = 250 * time.Millisecond
+	t.Cleanup(func() {
+		proxyPortLookupTimeout = oldTimeout
+	})
+
+	lookup := func(ctx context.Context, port string) (network.Port, error) {
+		<-ctx.Done()
+		return network.Port{}, fmt.Errorf("inspect: %w", ctx.Err())
+	}
+
+	_, err := resolveProxyPort(t.Context(), 19101, lookup)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "proxy port 19101")
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
 func TestResolveProxyPortHonorsContextCancellation(t *testing.T) {
