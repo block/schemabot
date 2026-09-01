@@ -1,9 +1,13 @@
 package localscale
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
@@ -108,6 +112,110 @@ func (s *Server) handleGetBranchSchema(w http.ResponseWriter, r *http.Request) e
 	}
 
 	s.writeJSON(w, map[string]any{"data": schemas})
+	return nil
+}
+
+// handleBranchTableMetrics serves the branch table metrics endpoint, which the
+// PlanetScale SDK does not wrap: GET .../branches/{branch}/metrics/tables. The
+// response is one flat JSON object keyed by table name — every keyspace on the
+// branch in a single call — each entry carrying that table's storage_bytes.
+// Bytes are computed from the backing cluster's table statistics (data plus
+// index length), so seeded tables report a real, non-zero footprint and the
+// figure is the whole-branch total: summed across a keyspace's shards on main,
+// and read from the branch databases on other branches.
+func (s *Server) handleBranchTableMetrics(w http.ResponseWriter, r *http.Request) error {
+	org := r.PathValue("org")
+	database := r.PathValue("db")
+	branch := r.PathValue("branch")
+	s.logger.Debug("branch table metrics", "org", org, "database", database, "branch", branch)
+
+	backend, err := s.backendFor(org, database)
+	if err != nil {
+		return newHTTPError(http.StatusNotFound, "%v", err)
+	}
+
+	resp, err := backend.vtctld.GetKeyspaces(r.Context(), &vtctldatapb.GetKeyspacesRequest{})
+	if err != nil {
+		return newHTTPError(http.StatusInternalServerError, "list keyspaces: %v", err)
+	}
+
+	totals := make(map[string]int64)
+	for _, ks := range resp.Keyspaces {
+		if branch == "main" {
+			err := s.forEachShard(r.Context(), backend, ks.Name, func(conn *sql.Conn) error {
+				return accumulateTableStorageBytes(r.Context(), conn, totals)
+			})
+			if err != nil {
+				return newHTTPError(http.StatusInternalServerError, "table metrics for keyspace %s: %v", ks.Name, err)
+			}
+			continue
+		}
+
+		branchDB, err := s.openBranchDB(r.Context(), branch, ks.Name)
+		if err != nil {
+			return newHTTPError(http.StatusNotFound, "branch database not found: %v", err)
+		}
+		accErr := accumulateTableStorageBytes(r.Context(), branchDB, totals)
+		utils.CloseAndLog(branchDB)
+		if accErr != nil {
+			return newHTTPError(http.StatusInternalServerError, "table metrics for branch %s keyspace %s: %v", branch, ks.Name, accErr)
+		}
+	}
+
+	type tableMetricsJSON struct {
+		StorageBytes int64 `json:"storage_bytes"`
+	}
+	payload := make(map[string]tableMetricsJSON, len(totals))
+	for name, storageBytes := range totals {
+		payload[name] = tableMetricsJSON{StorageBytes: storageBytes}
+	}
+	s.writeJSON(w, payload)
+	return nil
+}
+
+// rowQuerier abstracts the query surface shared by *sql.DB and *sql.Conn so
+// table statistics can be read from a shard-targeted connection or a branch
+// database pool alike.
+type rowQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// accumulateTableStorageBytes adds each user table's data-plus-index footprint
+// from SHOW TABLE STATUS into totals, keyed by table name. Adding lets callers
+// sum one table's footprint across shards. Underscore-prefixed tables (Vitess
+// internals and online DDL artifacts) are excluded, matching the schema
+// handlers' table filtering.
+func accumulateTableStorageBytes(ctx context.Context, q rowQuerier, totals map[string]int64) error {
+	rows, err := q.QueryContext(ctx, "SHOW TABLE STATUS")
+	if err != nil {
+		return fmt.Errorf("show table status: %w", err)
+	}
+	statuses, err := scanDynamicRows(rows)
+	utils.CloseAndLog(rows)
+	if err != nil {
+		return fmt.Errorf("scan table status: %w", err)
+	}
+	for _, st := range statuses {
+		name := st["Name"]
+		if strings.HasPrefix(name, "_") {
+			continue
+		}
+		var storageBytes int64
+		for _, col := range []string{"Data_length", "Index_length"} {
+			v, ok := st[col]
+			if !ok || v == "" {
+				// NULL statistics (views, or a storage engine that reports
+				// none) contribute nothing to the footprint.
+				continue
+			}
+			n, parseErr := strconv.ParseInt(v, 10, 64)
+			if parseErr != nil {
+				return fmt.Errorf("parse %s for table %s: %w", col, name, parseErr)
+			}
+			storageBytes += n
+		}
+		totals[name] += storageBytes
+	}
 	return nil
 }
 
