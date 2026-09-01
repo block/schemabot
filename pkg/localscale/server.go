@@ -1368,6 +1368,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/organizations/{org}/databases/{db}/branches/{branch}/vschema", s.handleError(s.handleGetBranchVSchema))
 	mux.HandleFunc("GET /v1/organizations/{org}/databases/{db}/branches/{branch}/keyspaces/{keyspace}/vschema", s.handleError(s.handleGetKeyspaceVSchema))
 	mux.HandleFunc("PATCH /v1/organizations/{org}/databases/{db}/branches/{branch}/keyspaces/{keyspace}/vschema", s.handleError(s.handleUpdateKeyspaceVSchema))
+	mux.HandleFunc("GET /v1/organizations/{org}/databases/{db}/branches/{branch}/metrics/tables", s.handleError(s.handleBranchTableMetrics))
 
 	// Branch endpoints
 	mux.HandleFunc("GET /v1/organizations/{org}/databases/{db}/branches/{branch}", s.handleError(s.handleGetBranch))
