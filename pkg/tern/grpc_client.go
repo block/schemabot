@@ -148,6 +148,10 @@ type GRPCClient struct {
 	observerMu      sync.RWMutex
 	observers       map[int64]ProgressObserver
 	pendingObserver ProgressObserver
+	// observerPollInterval overrides the observer notification cadence; zero
+	// selects the production default. Tests set a short interval so poll-loop
+	// behavior is observable without real-time waits.
+	observerPollInterval time.Duration
 
 	// controlSendGate throttles retransmission of pending stop/cancel control
 	// requests to the data plane (see remoteControlResendInterval).
@@ -403,6 +407,22 @@ func (c *GRPCClient) clearObserver(applyID int64) {
 	delete(c.observers, applyID)
 }
 
+// clearObserverIfCurrent removes the observer for applyID only if obs is still
+// the registered one, and reports whether it removed it. SetObserver treats an
+// existing registration as proof that a poller is already running, so a poller
+// that is about to exit must not blindly delete the map entry — a newer
+// observer may have replaced its own between reads, and deleting that
+// replacement would leave it registered-looking but never polled.
+func (c *GRPCClient) clearObserverIfCurrent(applyID int64, obs ProgressObserver) bool {
+	c.observerMu.Lock()
+	defer c.observerMu.Unlock()
+	if c.observers[applyID] != obs {
+		return false
+	}
+	delete(c.observers, applyID)
+	return true
+}
+
 // logApplyEvent appends a control-plane apply log entry for gRPC applies. The
 // remote Tern service writes its own local logs, but operators read SchemaBot's
 // control-plane apply history from SchemaBot storage.
@@ -499,7 +519,11 @@ func (c *GRPCClient) pollAndNotifyObserver(applyID int64) {
 // until the apply reaches a terminal state, the observer is cleared, or the
 // apply row disappears.
 func (c *GRPCClient) notifyObserverUntilTerminal(applyID int64) {
-	ticker := time.NewTicker(5 * time.Second)
+	interval := c.observerPollInterval
+	if interval == 0 {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	// Captured from the first successful load so a later transient load failure
@@ -519,6 +543,23 @@ func (c *GRPCClient) notifyObserverUntilTerminal(applyID int64) {
 			// Observer was cleared — apply reached terminal state and
 			// OnTerminal already ran. Stop polling.
 			return
+		}
+
+		// An observer that permanently lost its apply lease to a newer owner
+		// will never publish again — the new owner's observer carries the
+		// apply from here — so ticking it further is pure storage load and log
+		// noise. Clear it and stop, but only while it is still the registered
+		// observer: if a newer registration already replaced it, leave the
+		// replacement in place and drive it on the next tick.
+		if sup, ok := obs.(supersededObserver); ok && sup.Superseded() {
+			if c.clearObserverIfCurrent(applyID, obs) {
+				c.baseLogger().Info("observer poll: observer superseded by a newer apply owner; stopping poll",
+					identArgs()...)
+				return
+			}
+			c.baseLogger().Info("observer poll: superseded observer already replaced by a newer registration; continuing with the replacement",
+				identArgs()...)
+			continue
 		}
 
 		// Load failures here are transient — the ticker retries on the next
