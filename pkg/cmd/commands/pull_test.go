@@ -81,3 +81,91 @@ func TestPullCmdOutputDefaultsToPretty(t *testing.T) {
 	_, err = parser.Parse([]string{"pull", "-d", "boardgames", "-e", "staging", "-o", "yaml"})
 	require.Error(t, err, "only pretty and json are valid output formats")
 }
+
+// The --table filter matches the way the databases --name filter does: a
+// case-insensitive substring, so a prefix selects a whole table family and an
+// exact name selects one table. Matching tables keep their catalog entries and
+// lint findings, non-matching namespaces drop out entirely, namespace-scoped
+// artifacts are omitted, and the table count reflects the selection.
+func TestFilterPullSchemaTablesKeepsSubstringMatches(t *testing.T) {
+	resp := &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Type:        "mysql",
+		Environment: "production",
+		TableCount:  3,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {
+				Tables: map[string]string{
+					"users":         "CREATE TABLE `users` (`id` bigint NOT NULL);",
+					"user_settings": "CREATE TABLE `user_settings` (`id` bigint NOT NULL);",
+					"payments":      "CREATE TABLE `payments` (`id` bigint NOT NULL);",
+				},
+				Artifacts: map[string]string{"vschema": "{}"},
+				TableCatalog: map[string]*apitypes.TableCatalog{
+					"users":    {Name: "users"},
+					"payments": {Name: "payments"},
+				},
+				Lint: []*apitypes.LintViolationResponse{
+					{Table: "users", Message: "violation on users"},
+					{Table: "payments", Message: "violation on payments"},
+				},
+			},
+			"billing": {
+				Tables: map[string]string{"invoices": "CREATE TABLE `invoices` (`id` bigint NOT NULL);"},
+			},
+		},
+	}
+
+	require.NoError(t, filterPullSchemaTables(resp, "USER"))
+
+	require.Contains(t, resp.Namespaces, "orders")
+	assert.NotContains(t, resp.Namespaces, "billing", "a namespace with no matching table must drop out")
+	ns := resp.Namespaces["orders"]
+	assert.Equal(t, map[string]string{
+		"users":         "CREATE TABLE `users` (`id` bigint NOT NULL);",
+		"user_settings": "CREATE TABLE `user_settings` (`id` bigint NOT NULL);",
+	}, ns.Tables)
+	assert.Nil(t, ns.Artifacts, "namespace-scoped artifacts must be omitted from a table-filtered pull")
+	assert.Equal(t, map[string]*apitypes.TableCatalog{"users": {Name: "users"}}, ns.TableCatalog)
+	require.Len(t, ns.Lint, 1)
+	assert.Equal(t, "users", ns.Lint[0].Table)
+	assert.Equal(t, int32(2), resp.TableCount)
+}
+
+// A filtered pull that requested lint keeps the explicit empty audit when the
+// selected tables are clean, so "no violations" stays distinguishable from
+// lint not being requested.
+func TestFilterPullSchemaTablesPreservesExplicitCleanLint(t *testing.T) {
+	resp := &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Environment: "production",
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {
+				Tables: map[string]string{
+					"users":    "CREATE TABLE `users` (`id` bigint NOT NULL);",
+					"payments": "CREATE TABLE `payments` (`id` bigint NOT NULL);",
+				},
+				Lint: []*apitypes.LintViolationResponse{{Table: "payments", Message: "violation on payments"}},
+			},
+		},
+	}
+
+	require.NoError(t, filterPullSchemaTables(resp, "users"))
+
+	ns := resp.Namespaces["orders"]
+	require.NotNil(t, ns.Lint, "a requested lint audit must stay explicit after filtering")
+	assert.Empty(t, ns.Lint)
+}
+
+// A filter that matches nothing is an error naming the filter, the database,
+// and the environment, and lists the available tables so a typo is a
+// one-round-trip fix rather than an empty-but-successful pull.
+func TestFilterPullSchemaTablesErrorsWhenNothingMatches(t *testing.T) {
+	resp := validPullSchemaResponse()
+
+	err := filterPullSchemaTables(resp, "odres")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `no table matching "odres" in database orders environment production`)
+	assert.Contains(t, err.Error(), "available tables: users")
+}
