@@ -569,6 +569,14 @@ func (s *Service) operatorDriver(ctx context.Context, driverID int, stop <-chan 
 // claim or projection machinery itself and leaves no apply marked failed —
 // that work is retried on a later tick.
 func (s *Service) driveTick(ctx context.Context, driverID int) {
+	// The driver's select can pick a ready ticker over an equally ready
+	// ctx.Done(), so a tick can start after the operator has already been told
+	// to stop. Every claim it made would fail against the cancelled context and
+	// report a failure the successor driver is about to retry.
+	if ctx.Err() != nil {
+		s.logger.Debug("operator: skipping the claim ladder; the operator is shutting down", "driver", driverID)
+		return
+	}
 	err := panicsafe.Call(func() error {
 		s.recoverApplies(ctx, driverID)
 		return nil
@@ -591,6 +599,26 @@ func (s *Service) driveTick(ctx context.Context, driverID int) {
 	metrics.RecordRecoveredPanic(ctx, "operator_tick")
 }
 
+// logClaimFailure reports a failed claim or maintenance pass, separating the
+// two ways a rung of the ladder fails. A pass cut short by shutdown is a
+// routine deploy: the driver context is cancelled between polls, so whichever
+// rung was mid-query reports it and the rungs behind it report the same
+// cancellation moments later, while a successor driver reclaims all of it. Like
+// the reaper's sweeps, that ending may not tick the claim-failure counter
+// operators alert on, and there is no operator action it could name. Every
+// other failure keeps its own reason and stays an error.
+//
+// The shutdown test is the driver context rather than the error, so a
+// cancellation that did not come from shutdown still reports as a real failure.
+func (s *Service) logClaimFailure(ctx context.Context, msg, reason string, attrs ...any) {
+	if ctx.Err() != nil {
+		s.logger.Debug(msg+"; the operator is shutting down and a successor driver will retry the claim", attrs...)
+		return
+	}
+	s.logger.Error(msg, attrs...)
+	metrics.RecordOperatorClaimFailure(ctx, reason)
+}
+
 // expireRetryableApplies runs the retryable-apply expiry maintenance pass,
 // terminalizing failed_retryable applies that have exhausted their attempts or
 // freshness window. It is best-effort: a storage error is logged and recorded
@@ -598,8 +626,8 @@ func (s *Service) driveTick(ctx context.Context, driverID int) {
 func (s *Service) expireRetryableApplies(ctx context.Context, driverID int) {
 	expired, err := s.storage.Applies().ExpireRetryable(ctx)
 	if err != nil {
-		s.logger.Error("operator: failed to expire retryable applies", "driver", driverID, "error", err)
-		metrics.RecordOperatorClaimFailure(ctx, "expire_retryable_error")
+		s.logClaimFailure(ctx, "operator: failed to expire retryable applies", "expire_retryable_error",
+			"driver", driverID, "error", err)
 		return
 	}
 	for _, expiration := range expired {
@@ -716,8 +744,8 @@ func (s *Service) recoverApplies(ctx context.Context, driverID int) {
 func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner string) {
 	op, err := s.storage.ApplyOperations().FindNextApplyOperation(ctx, owner)
 	if err != nil {
-		s.logger.Error("operator: failed to claim apply_operation", "driver", driverID, "lease_owner", owner, "error", err)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_storage_error")
+		s.logClaimFailure(ctx, "operator: failed to claim apply_operation", "operation_storage_error",
+			"driver", driverID, "lease_owner", owner, "error", err)
 		return
 	}
 	if op == nil {
@@ -750,10 +778,9 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 	// lease, and the parent applies.state is moved solely by the projection CAS.
 	ops, err := s.storage.ApplyOperations().ListByApply(ctx, op.ApplyID)
 	if err != nil {
-		s.logger.Error("operator: failed to list operations for claimed apply; operation will not be driven",
+		s.logClaimFailure(ctx, "operator: failed to list operations for claimed apply; operation will not be driven", "operation_set_list_error",
 			append(op.LogAttrs(),
 				"driver", driverID, "lease_owner", owner, "error", err)...)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_set_list_error")
 		return
 	}
 	if !operationSetContainsID(ops, op.ID) {
@@ -776,10 +803,9 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 	// then be refused against the terminal apply.
 	apply, err := s.storage.Applies().Get(ctx, op.ApplyID)
 	if err != nil {
-		s.logger.Error("operator: failed to load parent apply for the drive-mode decision; operation will not be driven",
+		s.logClaimFailure(ctx, "operator: failed to load parent apply for the drive-mode decision; operation will not be driven", "operation_parent_load_error",
 			append(op.LogAttrs(),
 				"driver", driverID, "lease_owner", owner, "error", err)...)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_load_error")
 		return
 	}
 	if apply == nil {
@@ -802,10 +828,9 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 	}
 	hasTasks, err := s.claimedOperationHasTasks(ctx, op)
 	if err != nil {
-		s.logger.Error("operator: failed to inspect claimed operation tasks; operation will not be driven",
+		s.logClaimFailure(ctx, "operator: failed to inspect claimed operation tasks; operation will not be driven", "operation_task_inspect_error",
 			append(op.LogAttrs(),
 				"driver", driverID, "lease_owner", owner, "error", err)...)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_task_inspect_error")
 		return
 	}
 	if !hasTasks {
@@ -854,12 +879,11 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 	// operation lease alone does not authorize parent-apply writes.
 	apply, err := s.storage.Applies().ClaimApplyByID(ctx, op.ApplyID, owner)
 	if err != nil {
-		s.logger.Error("operator: failed to claim parent apply for operation",
+		s.logClaimFailure(ctx, "operator: failed to claim parent apply for operation", "operation_parent_claim_error",
 			append(op.LogAttrs(),
 				"driver", driverID,
 				"lease_owner", owner,
 				"error", err)...)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_claim_error")
 		return
 	}
 	if apply == nil {
@@ -1050,10 +1074,9 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 
 	apply, err := s.storage.Applies().Get(operationLeaseCtx, op.ApplyID)
 	if err != nil {
-		s.logger.Error("operator: failed to load parent apply for operation drive; operation will not be driven",
+		s.logClaimFailure(ctx, "operator: failed to load parent apply for operation drive; operation will not be driven", "operation_parent_load_error",
 			append(op.LogAttrs(),
 				"driver", driverID, "error", err)...)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_load_error")
 		return
 	}
 	if apply == nil {
@@ -1216,8 +1239,8 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 func (s *Service) recoverApplyOperationCutover(ctx context.Context, driverID int, owner string) bool {
 	op, err := s.storage.ApplyOperations().FindNextApplyOperationCutover(ctx, owner)
 	if err != nil {
-		s.logger.Error("operator: failed to claim apply_operation cutover", "driver", driverID, "lease_owner", owner, "error", err)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_cutover_storage_error")
+		s.logClaimFailure(ctx, "operator: failed to claim apply_operation cutover", "operation_cutover_storage_error",
+			"driver", driverID, "lease_owner", owner, "error", err)
 		return true
 	}
 	if op == nil {
@@ -1243,10 +1266,9 @@ func (s *Service) recoverApplyOperationCutover(ctx context.Context, driverID int
 	// driving rather than trusting the claim alone.
 	ops, err := s.storage.ApplyOperations().ListByApply(ctx, op.ApplyID)
 	if err != nil {
-		s.logger.Error("operator: failed to list operations for claimed cutover; operation will not be driven",
+		s.logClaimFailure(ctx, "operator: failed to list operations for claimed cutover; operation will not be driven", "operation_cutover_set_list_error",
 			append(op.LogAttrs(),
 				"driver", driverID, "lease_owner", owner, "error", err)...)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_cutover_set_list_error")
 		return true
 	}
 	if len(ops) <= 1 || !operationSetContainsID(ops, op.ID) {
@@ -1284,9 +1306,8 @@ func (s *Service) recoverApplyOperationCutover(ctx context.Context, driverID int
 func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, owner string) bool {
 	apply, err := s.storage.Applies().FindNextApplyForStopReconciliation(ctx, owner)
 	if err != nil {
-		s.logger.Error("operator: failed to claim apply for stop reconciliation",
+		s.logClaimFailure(ctx, "operator: failed to claim apply for stop reconciliation", "stop_reconciliation_claim_error",
 			"driver", driverID, "lease_owner", owner, "error", err)
-		metrics.RecordOperatorClaimFailure(ctx, "stop_reconciliation_claim_error")
 		return false
 	}
 	if apply == nil {
@@ -1402,9 +1423,8 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 func (s *Service) recoverApplyOperationProjection(ctx context.Context, driverID int, owner string) bool {
 	apply, err := s.storage.Applies().FindNextApplyForOperationProjection(ctx, owner)
 	if err != nil {
-		s.logger.Error("operator: failed to claim apply for operation projection",
+		s.logClaimFailure(ctx, "operator: failed to claim apply for operation projection", "operation_projection_claim_error",
 			"driver", driverID, "lease_owner", owner, "error", err)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_projection_claim_error")
 		return true
 	}
 	if apply == nil {
@@ -1574,11 +1594,10 @@ func (s *Service) completePendingRequestForResolvedApply(ctx context.Context, dr
 func (s *Service) reconcileUnclaimableParent(ctx context.Context, driverID int, op *storage.ApplyOperation, opLease storage.OperationLease) {
 	parent, err := s.storage.Applies().Get(ctx, op.ApplyID)
 	if err != nil {
-		s.logger.Error("operator: failed to load unclaimable parent apply; operation will be retried once its lease goes stale",
+		s.logClaimFailure(ctx, "operator: failed to load unclaimable parent apply; operation will be retried once its lease goes stale", "operation_parent_load_error",
 			append(op.LogAttrs(),
 				"driver", driverID,
 				"error", err)...)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_load_error")
 		return
 	}
 	if parent == nil {
@@ -1595,13 +1614,12 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, driverID int, 
 	metrics.RecordOperatorClaimFailure(ctx, "operation_parent_not_claimable")
 	released, err := s.storage.ApplyOperations().ReleaseClaim(ctx, opLease)
 	if err != nil {
-		s.logger.Error("operator: parent apply not claimable and operation lease release failed; operation will be retried once its lease goes stale",
+		s.logClaimFailure(ctx, "operator: parent apply not claimable and operation lease release failed; operation will be retried once its lease goes stale", "operation_lease_release_error",
 			append(parent.LogAttrs(),
 				"driver", driverID,
 				"apply_operation_id", op.ID,
 				"operation_deployment", op.Deployment,
 				"error", err)...)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_lease_release_error")
 		return
 	}
 	if !released {

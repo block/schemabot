@@ -232,14 +232,25 @@ func TestResumeClaimedApply_DriveLogsCarryApplyIdentity(t *testing.T) {
 		"mutable state must not be frozen into the bound drive logger")
 }
 
-// expiringApplyStore returns a fixed set of retryable-apply expirations so the
-// expiry maintenance pass can be exercised without a database.
+// expiringApplyStore serves the expiry maintenance pass a fixed outcome — a set
+// of retryable-apply expirations, or a storage failure — so the pass can be
+// exercised without a database. It counts its calls so a test can tell whether
+// the claim ladder reached its first rung at all.
 type expiringApplyStore struct {
 	storage.ApplyStore
 	expirations []*storage.RetryableApplyExpiration
+	expireErr   error
+	calls       int
 }
 
-func (s *expiringApplyStore) ExpireRetryable(context.Context) ([]*storage.RetryableApplyExpiration, error) {
+func (s *expiringApplyStore) ExpireRetryable(ctx context.Context) ([]*storage.RetryableApplyExpiration, error) {
+	s.calls++
+	if s.expireErr != nil {
+		return nil, s.expireErr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return s.expirations, nil
 }
 
