@@ -217,11 +217,20 @@ run_severityglyphs() {
         tag_flag="-tags=$build_tags"
     fi
 
+    # Fail closed: if go list can't resolve the staged packages, the analyzer
+    # can't vouch for them, so block the commit rather than silently skipping.
+    local listed
+    if ! listed=$(go list $tag_flag "${patterns[@]}"); then
+        echo "severityglyphs: go list failed for staged packages; commit blocked until it resolves."
+        exit 1
+    fi
+
     # `grep -v` exits non-zero (and would trip `set -e`) when every package
     # is filtered out, so suppress that exit and skip the run instead.
     local packages
-    packages=$(go list $tag_flag "${patterns[@]}" 2>/dev/null | grep -v '/pkg/glyph$' | grep -v '/pkg/analyzers/severityglyphs' | grep -v '/testdata/' || true)
+    packages=$(echo "$listed" | grep -v '/pkg/glyph$' | grep -v '/pkg/analyzers/severityglyphs' | grep -v '/testdata/' || true)
     if [ -z "$packages" ]; then
+        echo "severityglyphs: all staged packages are excluded from the check; skipping."
         return 0
     fi
 

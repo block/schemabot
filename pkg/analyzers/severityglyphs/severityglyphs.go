@@ -49,7 +49,7 @@ var severityGlyphs = []struct {
 // drifts.
 var Analyzer = &analysis.Analyzer{
 	Name:     "severityglyphs",
-	Doc:      "flags severity glyph literals (🚨 ⛔ ❌ ⚠️ ℹ️) outside pkg/glyph; use the named pkg/glyph constants",
+	Doc:      "flags severity glyph literals (🚨 ⛔ ❌ ⚠️ ℹ️) in non-test files; use the named pkg/glyph constants (callers exclude pkg/glyph itself from the package set)",
 	Requires: []*analysis.Analyzer{inspect.Analyzer},
 	Run:      run,
 }
