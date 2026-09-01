@@ -12,7 +12,7 @@ require (
 	github.com/block/pg-sprite v0.2.0
 	github.com/block/spirit v0.16.1-0.20260830151448-a967b34edf91
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0
-	github.com/charmbracelet/bubbles v1.0.0
+	github.com/charmbracelet/bubbles/v2 v2.2.1
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/coreos/go-oidc/v3 v3.18.0
