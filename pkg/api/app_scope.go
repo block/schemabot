@@ -20,15 +20,17 @@ func validateDatabaseApp(database string, dbConfig DatabaseConfig) error {
 	if app == "" {
 		return nil
 	}
-	if len(app) > maxAppNameChars {
-		return fmt.Errorf("databases.%s.app value %q exceeds %d characters", database, app, maxAppNameChars)
-	}
 	for _, r := range app {
 		switch {
 		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-':
 		default:
 			return fmt.Errorf("databases.%s.app value %q must be lowercase alphanumeric with hyphens", database, app)
 		}
+	}
+	// The charset above is all ASCII, so at this point bytes and characters
+	// agree and len(app) counts what the error message promises.
+	if len(app) > maxAppNameChars {
+		return fmt.Errorf("databases.%s.app value %q exceeds %d characters", database, app, maxAppNameChars)
 	}
 	if app[0] == '-' || app[len(app)-1] == '-' {
 		return fmt.Errorf("databases.%s.app value %q must start and end with a letter or digit", database, app)
