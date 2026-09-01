@@ -30,9 +30,9 @@ import (
 // Concurrency-safe across pods: discovers drift without a lock, acquires the
 // PostgreSQL advisory lock only when needed, then re-discovers under the lock.
 // A change that needs manual remediation aborts the whole convergence before
-// any DDL executes. Each transaction bounds its lock wait with lock_timeout,
-// and index builds run in their own transactions so no table lock is held
-// across a build.
+// any DDL executes. Each transaction bounds its lock wait with lock_timeout.
+// Plain CREATE INDEX holds a SHARE lock for the full build, blocking writes;
+// EnsureSchemaTimeout is the build's only duration ceiling.
 func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Locker) error {
 	ctx, cancel := context.WithTimeout(context.Background(), EnsureSchemaTimeout)
 	defer cancel()
@@ -320,7 +320,7 @@ func postgresManualRemediation(tables []string, drift postgresSchemaDrift) error
 }
 
 func verifyAndLogPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []string, files map[string]string, logger *slog.Logger, database, schemaName string) error {
-	if err := verifyPostgresSchemaShape(ctx, db, tables, files, logger); err != nil {
+	if err := verifyPostgresSchemaShape(ctx, db, tables, files); err != nil {
 		logger.Error("PostgreSQL storage schema shape check failed",
 			"dialect", schema.DialectPostgres,
 			"database", database,
@@ -336,7 +336,7 @@ func verifyAndLogPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []s
 // verifyPostgresSchemaShape checks the additive convergence result. Columns
 // remain presence-only; type, length, and nullability drift are not detected.
 // Indexes are matched by name and uniqueness only, not column composition.
-func verifyPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []string, files map[string]string, logger *slog.Logger) error {
+func verifyPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []string, files map[string]string) error {
 	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
 	if err != nil {
 		return fmt.Errorf("select PostgreSQL statement parser: %w", err)
@@ -365,26 +365,14 @@ func verifyPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []string,
 		if err != nil {
 			return err
 		}
-		var missingUnique, missingNonUnique []string
+		var missingUnique []string
 		for _, index := range expected.indexes {
-			switch {
-			case index.unique && !existingIndexes[index.name]:
+			if index.unique && !existingIndexes[index.name] {
 				missingUnique = append(missingUnique, index.name)
-			case !index.unique:
-				if _, present := existingIndexes[index.name]; !present {
-					missingNonUnique = append(missingNonUnique, index.name)
-				}
 			}
 		}
 		if len(missingUnique) > 0 {
 			return fmt.Errorf("storage table %q is missing expected unique indexes: %s", table, strings.Join(missingUnique, ", "))
-		}
-		if len(missingNonUnique) > 0 {
-			logger.Warn("storage table is missing non-unique indexes after additive convergence",
-				"dialect", schema.DialectPostgres,
-				"table", table,
-				"indexes", strings.Join(missingNonUnique, ", "),
-			)
 		}
 	}
 	return nil
@@ -520,11 +508,13 @@ const postgresDDLLockTimeout = 10 * time.Second
 // executed as one transaction; pgx's simple query protocol executes that
 // multi-statement string. For an existing table, column changes share one
 // transaction — each is metadata-only after the manual-remediation gate — and
-// each index builds in its own transaction, so the ALTER TABLE's brief
-// AccessExclusiveLock is never held across an index build and writes proceed
-// between builds. Cross-transaction atomicity is unnecessary: a startup
-// killed between transactions leaves additive drift the next run re-discovers
-// and converges.
+// each index builds in its own transaction. Plain CREATE INDEX holds a SHARE
+// lock for the full build and blocks writes; lock_timeout bounds only the wait
+// to acquire that lock, while EnsureSchemaTimeout bounds the build itself.
+// CREATE INDEX CONCURRENTLY cannot run inside these transactions, so the write
+// block is the accepted cost. Cross-transaction atomicity is unnecessary: a
+// startup killed between transactions leaves additive drift the next run
+// re-discovers and converges.
 func applyPostgresTableChanges(ctx context.Context, db *sql.DB, table string, changes []postgresSchemaChange, logger *slog.Logger) error {
 	if changes[0].operation == "create_table" {
 		return execPostgresChanges(ctx, db, table, changes, logger)

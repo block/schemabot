@@ -709,10 +709,12 @@ on the storage dialect:
 - **PostgreSQL** automatically creates missing tables, columns, and standalone
   indexes. It discovers drift before taking the bootstrap advisory lock, then
   re-checks and applies each table's changes transactionally under that lock.
-  A missing `NOT NULL` column without a `DEFAULT` fails startup with instructions
-  to add it manually or ship a default, because adding it safely may require a
-  deliberate backfill. Startup also fails when additive DDL cannot be parsed or
-  executed, or when re-verification finds unresolved drift.
+  A missing `NOT NULL` column without a `DEFAULT`, a generated or identity
+  column, or a column with a constraint shape not explicitly classified as
+  safe fails startup with instructions for manual remediation. Generated and
+  identity columns rewrite the populated table under an exclusive lock.
+  Startup also fails when additive DDL cannot be parsed or executed, or when
+  re-verification finds unresolved drift.
 
   Convergence is additive-only: extra columns and indexes remain in place for
   binary rollback, and `allow_destructive_schema_changes` has no effect because

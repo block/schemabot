@@ -253,12 +253,10 @@ func TestSynthesizePostgresAddColumn(t *testing.T) {
 	})
 }
 
-// The manual-remediation classifier reads the column's parsed constraints,
-// so it must stay correct where a text scan goes wrong: generated and
-// identity columns converge automatically even when declared NOT NULL,
-// quoted identifiers cannot mask a missing DEFAULT, and a function-call
-// DEFAULT fails closed because its volatility cannot be proven from the
-// statement alone.
+// The manual-remediation classifier reads the column's parsed constraints.
+// Generated, identity, and unrecognized constraint shapes fail closed, quoted
+// identifiers cannot mask a missing DEFAULT, and a function-call DEFAULT fails
+// closed because its volatility cannot be proven from the statement alone.
 func TestPostgresAddColumnManualReason(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -286,11 +284,29 @@ func TestPostgresAddColumnManualReason(t *testing.T) {
 			name:       "generated stored not null",
 			createDDL:  "CREATE TABLE metrics (a bigint, doubled bigint GENERATED ALWAYS AS (a * 2) STORED NOT NULL)",
 			columnName: "doubled",
+			wantReason: "generated or identity, which rewrites the whole table under an exclusive lock",
 		},
 		{
 			name:       "identity not null",
 			createDDL:  "CREATE TABLE metrics (a bigint, seq bigint GENERATED ALWAYS AS IDENTITY NOT NULL)",
 			columnName: "seq",
+			wantReason: "generated or identity, which rewrites the whole table under an exclusive lock",
+		},
+		{
+			name:       "primary key",
+			createDDL:  "CREATE TABLE metrics (a bigint, seq bigint PRIMARY KEY)",
+			columnName: "seq",
+			wantReason: "constraint CONSTR_PRIMARY",
+		},
+		{
+			name:       "nullable unique",
+			createDDL:  "CREATE TABLE metrics (a bigint, external_id bigint UNIQUE)",
+			columnName: "external_id",
+		},
+		{
+			name:       "nullable references",
+			createDDL:  "CREATE TABLE metrics (a bigint, parent_id bigint REFERENCES parents (id))",
+			columnName: "parent_id",
 		},
 		{
 			name:       "quoted identifier containing default",

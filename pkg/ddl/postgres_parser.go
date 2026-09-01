@@ -171,8 +171,8 @@ func SynthesizePostgresAddColumn(createTableDDL, columnName string) (string, err
 // or "" when the synthesized ADD COLUMN is safe to run automatically. The
 // decision reads the column's parsed constraint list:
 //
-//   - Generated and identity columns are safe: PostgreSQL computes values for
-//     existing rows itself, so no backfill is needed.
+//   - Generated and identity columns rewrite the whole table under an
+//     exclusive lock while PostgreSQL computes values for existing rows.
 //   - NOT NULL without a DEFAULT needs a backfill — the server would reject
 //     the ADD COLUMN outright on a populated table.
 //   - A DEFAULT whose expression is not provably non-volatile (a constant,
@@ -180,6 +180,7 @@ func SynthesizePostgresAddColumn(createTableDDL, columnName string) (string, err
 //     CURRENT_TIMESTAMP) fails closed: the parse tree cannot see function
 //     volatility, and a volatile default rewrites the whole table under an
 //     exclusive lock.
+//   - Constraint shapes not explicitly known to be safe fail closed.
 func PostgresAddColumnManualReason(createTableDDL, columnName string) (string, error) {
 	_, _, columnNode, err := postgresCreateTableColumn(createTableDDL, columnName)
 	if err != nil {
@@ -197,7 +198,11 @@ func PostgresAddColumnManualReason(createTableDDL, columnName string) (string, e
 			hasDefault = true
 			constantDefault = postgresNonVolatileExpression(constraint.GetRawExpr())
 		case pgproto.ConstrType_CONSTR_GENERATED, pgproto.ConstrType_CONSTR_IDENTITY:
-			return "", nil
+			return "definition is generated or identity, which rewrites the whole table under an exclusive lock; add it manually", nil
+		case pgproto.ConstrType_CONSTR_NULL, pgproto.ConstrType_CONSTR_UNIQUE, pgproto.ConstrType_CONSTR_FOREIGN:
+			// These constraints are safe on a nullable new column.
+		default:
+			return fmt.Sprintf("definition has constraint %s, which is not safe for automatic convergence; add it manually", constraint.GetContype().String()), nil
 		}
 	}
 	if hasDefault && !constantDefault {
