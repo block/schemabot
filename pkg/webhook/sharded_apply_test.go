@@ -605,6 +605,38 @@ func TestBuildShardedApplyData_TableRollupFromTasks(t *testing.T) {
 	assert.Equal(t, 2, table.ShardsReporting, "the taskless shard is not counted as reporting")
 }
 
+// A shard reporting copied rows without a row total has no denominator to
+// aggregate against, so none of its figures count: the table's fraction stays
+// consistent (numerator, denominator, ETA, and coverage all describe the same
+// reporting shards) instead of copied rows inflating the numerator alone.
+func TestBuildShardedApplyData_CopiedRowsWithoutTotalNotAggregated(t *testing.T) {
+	mk := func(id int64, key, opState string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, ApplyID: 1, Deployment: "cake", OperationKey: key, State: opState, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt}
+	}
+	ops := []*storage.ApplyOperation{
+		mk(1, "cdb_resolute_sharded/-40/mutes", state.ApplyOperation.Running),
+		mk(2, "cdb_resolute_sharded/40-/mutes", state.ApplyOperation.Running),
+	}
+	opID1, opID2 := int64(1), int64(2)
+	tasks := []*storage.Task{
+		{ID: 1, ApplyID: 1, ApplyOperationID: &opID1, Shard: "-40", Namespace: "cdb_resolute_sharded", TableName: "mutes",
+			State: state.Task.Running, ProgressPercent: 37, RowsCopied: 185000, RowsTotal: 500000, ETASeconds: 240},
+		{ID: 2, ApplyID: 1, ApplyOperationID: &opID2, Shard: "40-", Namespace: "cdb_resolute_sharded", TableName: "mutes",
+			State: state.Task.Running, RowsCopied: 90000, ETASeconds: 900},
+	}
+	apply := &storage.Apply{ApplyIdentifier: "apply-x", Database: "cdb_resolute", Environment: "staging", State: state.Apply.Running}
+
+	data := buildShardedApplyData(apply, ops, false, tasks, nil, "")
+
+	require.Len(t, data.Keyspaces, 1)
+	require.Len(t, data.Keyspaces[0].Tables, 1)
+	table := data.Keyspaces[0].Tables[0]
+	assert.Equal(t, int64(185000), table.RowsCopied, "copied rows without a total stay out of the numerator")
+	assert.Equal(t, int64(500000), table.RowsTotal)
+	assert.Equal(t, int64(240), table.ETASeconds, "an ETA without a total does not set the table's floor")
+	assert.Equal(t, 1, table.ShardsReporting, "a shard without a row total is not reporting")
+}
+
 // A shard whose table failed makes the whole table read failed, and each
 // keyspace's tables keep resolved order even when their operations interleave
 // with another keyspace's.

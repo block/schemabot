@@ -392,17 +392,20 @@ func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map
 			PercentComplete: sp.percent,
 		})
 		// Rows sum across the shards that have reported; the ETA is the slowest
-		// reporting shard's. Shards whose dispatch wave has not started
-		// contribute nothing yet, so the reporting count travels with the sums
-		// and the renderer discloses the coverage instead of presenting a
-		// wave's figures as the whole table's.
+		// reporting shard's. A shard counts as reporting only once it carries a
+		// row total, and all of its figures are gated on that together — the
+		// numerator, denominator, ETA, and coverage count always describe the
+		// same set of shards, so a shard with copied rows but no total yet
+		// cannot inflate the fraction's numerator alone. Shards whose dispatch
+		// wave has not started contribute nothing, and the renderer discloses
+		// the coverage instead of presenting a wave's figures as the table's.
 		if sp.rowsTotal > 0 {
 			r.shardsReporting++
-		}
-		r.rowsCopied += sp.rowsCopied
-		r.rowsTotal += sp.rowsTotal
-		if sp.etaSeconds > r.etaSeconds {
-			r.etaSeconds = sp.etaSeconds
+			r.rowsCopied += sp.rowsCopied
+			r.rowsTotal += sp.rowsTotal
+			if sp.etaSeconds > r.etaSeconds {
+				r.etaSeconds = sp.etaSeconds
+			}
 		}
 	}
 	out := make(map[string][]templates.ShardedTableStatus, len(order))

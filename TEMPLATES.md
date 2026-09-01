@@ -7691,7 +7691,7 @@ schemabot apply -e production
 
 #### Keyspace `cdb_resolute_sharded`
 
-**`mutes`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62%
+**`mutes`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62% (1 of 4 shards)
 - Rows: 914,707 / 1,466,232 across 1 of 4 shards · ETA: ≥ 3m 15s
   └ shards: ◐ -40 62% · ⏳ 40-80 · ⏳ 80-c0 · ⏳ c0-
 
