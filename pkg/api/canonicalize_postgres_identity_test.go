@@ -66,7 +66,9 @@ func TestPostgresIdentityKeyColumns_CoverEmbeddedSchema(t *testing.T) {
 	}
 	// table.column entries carrying an identity-shaped name that are
 	// deliberately not folded; the value states why.
-	excluded := map[string]string{}
+	excluded := map[string]string{
+		"plan_comments.environment_scope": "not a query predicate; the store persists it as given and consumers compare it in Go against a scope built from configured environment names",
+	}
 
 	tables, files, err := readEmbeddedPostgresSchemaFiles()
 	require.NoError(t, err)

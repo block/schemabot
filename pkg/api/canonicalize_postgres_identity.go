@@ -28,13 +28,20 @@ import (
 // Deliberately absent: lease owners and observer owners are pod identities,
 // not row-identity keys; plan identifiers, apply identifiers, SHAs, GitHub
 // node IDs, and delivery IDs are opaque or case-significant values.
+// plan_comments.environment_scope is never a query predicate and the store
+// persists it as given: its consumers compare it in Go against a scope built
+// from the configured environment names, so folding stored rows alone would
+// break that comparison.
+//
+// Folding in SQL with lower() and in Go with storage.CanonicalKey agree
+// because identity strings are ASCII, the documented scope of the fold.
 var postgresIdentityKeyColumns = map[string][]string{
 	"applies":            {"database_name", "database_type", "deployment", "environment", "repository"},
 	"apply_operations":   {"deployment"},
 	"apply_target_locks": {"database_name", "database_type", "deployment", "environment"},
 	"checks":             {"database_name", "database_type", "environment", "repository"},
 	"locks":              {"database_name", "database_type", "owner", "repository"},
-	"plan_comments":      {"database_name", "database_type", "environment_scope", "repository"},
+	"plan_comments":      {"database_name", "database_type", "repository"},
 	"plans":              {"database_name", "database_type", "deployment", "environment", "repository"},
 	"tasks":              {"database_name", "database_type", "environment", "repository"},
 	"webhook_events":     {"repository"},
