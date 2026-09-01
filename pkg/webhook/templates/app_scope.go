@@ -13,7 +13,7 @@ import (
 func RenderInvalidAppFlag(command string) string {
 	return offerSupportChannel("## Missing or Invalid App\n\n" +
 		fmt.Sprintf("Usage: `schemabot %s -e <environment> --app <app>`\n\n", command) +
-		"The `--app` flag requires an application identifier (lowercase alphanumeric with hyphens) that matches the `app` field on the target databases.")
+		"The `--app` flag requires an application identifier (lowercase alphanumeric with interior hyphens, e.g. `billing-service`) that matches the `app` field on the target databases.")
 }
 
 // RenderUnsupportedAppFlag renders the message posted when `--app` is supplied
