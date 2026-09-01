@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/moby/moby/api/types/network"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
@@ -22,9 +24,15 @@ const (
 	defaultProxyPortStart      = 19100
 	defaultProxyPortEnd        = 19150
 	defaultAdminRequestTimeout = 10 * time.Second
+
+	defaultProxyPortLookupTimeout = 10 * time.Second
+	proxyPortLookupInterval       = 100 * time.Millisecond
 )
 
-var localScaleAdminRequestTimeout = defaultAdminRequestTimeout
+var (
+	localScaleAdminRequestTimeout = defaultAdminRequestTimeout
+	proxyPortLookupTimeout        = defaultProxyPortLookupTimeout
+)
 
 // LocalScaleContainer wraps a testcontainers.Container with LocalScale-specific helpers.
 type LocalScaleContainer struct {
@@ -191,19 +199,20 @@ func RunContainer(ctx context.Context, cfg ContainerConfig, opts ...testcontaine
 	}
 	baseURL := fmt.Sprintf("http://%s:%s", host, apiPort.Port())
 
-	// Register proxy port mappings so the password API returns correct external ports.
+	// Register proxy port mappings so the password API returns correct external
+	// ports. Every proxy port is exposed above, so each lookup must resolve — a
+	// dropped entry would make the password API advertise the container-internal
+	// port for that branch proxy, which is unreachable from the host.
 	portMap := make(map[int]int)
 	for p := cfg.ProxyPortStart; p <= cfg.ProxyPortEnd; p++ {
-		mapped, err := ctr.MappedPort(ctx, fmt.Sprintf("%d", p))
+		hostPort, err := resolveProxyPort(ctx, p, ctr.MappedPort)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("build proxy port map: %w", err)
 		}
-		portMap[p] = int(mapped.Num())
+		portMap[p] = hostPort
 	}
-	if len(portMap) > 0 {
-		if err := postProxyPortMap(ctx, baseURL, portMap); err != nil {
-			return nil, fmt.Errorf("register proxy port map: %w", err)
-		}
+	if err := postProxyPortMap(ctx, baseURL, portMap); err != nil {
+		return nil, fmt.Errorf("register proxy port map: %w", err)
 	}
 
 	success = true
@@ -506,6 +515,33 @@ func localScaleAdminContext(ctx context.Context) (context.Context, context.Cance
 
 func elapsed(start time.Time) time.Duration {
 	return time.Since(start).Round(time.Millisecond)
+}
+
+// mappedPortLookup resolves the host port Docker mapped to an exposed container
+// port. It matches the signature of testcontainers.Container.MappedPort.
+type mappedPortLookup func(ctx context.Context, port string) (network.Port, error)
+
+// resolveProxyPort returns the host port Docker mapped to container proxy port p,
+// retrying transient lookup failures (e.g., Docker inspect under load) until
+// proxyPortLookupTimeout elapses. Every proxy port is declared in the container's
+// exposed ports, so a lookup that never resolves is an error rather than a port
+// to skip.
+func resolveProxyPort(ctx context.Context, p int, lookup mappedPortLookup) (int, error) {
+	deadline := time.Now().Add(proxyPortLookupTimeout)
+	for {
+		mapped, err := lookup(ctx, strconv.Itoa(p))
+		if err == nil {
+			return int(mapped.Num()), nil
+		}
+		if time.Now().After(deadline) {
+			return 0, fmt.Errorf("resolve host port for proxy port %d after retrying for %s: %w", p, proxyPortLookupTimeout, err)
+		}
+		select {
+		case <-ctx.Done():
+			return 0, fmt.Errorf("resolve host port for proxy port %d: %w", p, ctx.Err())
+		case <-time.After(proxyPortLookupInterval):
+		}
+	}
 }
 
 // postProxyPortMap sends the internal->external port mapping to the LocalScale admin endpoint.
