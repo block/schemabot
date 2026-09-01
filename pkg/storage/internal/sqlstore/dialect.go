@@ -53,6 +53,12 @@ type Dialect interface {
 	// placed immediately after a table name or alias; dialects without index-hint
 	// syntax return an empty string.
 	IndexHint(index string) string
+	// BinaryEquals returns a predicate that is true only when column's stored
+	// value equals the single bound placeholder byte-for-byte. Opaque identity
+	// values such as lock owners compare byte-wise by contract, so dialects
+	// whose default column collation folds case or accents must force a binary
+	// comparison rather than inherit the column's collation.
+	BinaryEquals(column string) string
 	// JoinedUpdate returns an UPDATE that changes target rows selected through a
 	// join. Aliases qualify join and predicate expressions, while assignments to
 	// target columns must be unqualified so the statement is valid across
@@ -252,6 +258,13 @@ func (MySQLDialect) IndexHint(index string) string {
 	return " FORCE INDEX (`" + strings.ReplaceAll(index, "`", "``") + "`)"
 }
 
+// BinaryEquals compares under the binary collation: the schema's table default
+// is accent- and case-insensitive utf8mb4_0900_ai_ci, under which
+// differently-spelled opaque values would match.
+func (MySQLDialect) BinaryEquals(column string) string {
+	return column + " COLLATE utf8mb4_0900_bin = ?"
+}
+
 // JoinedUpdate builds a MySQL multi-table UPDATE statement.
 func (MySQLDialect) JoinedUpdate(targetTable, targetAlias, joinTable, joinAlias, joinCondition string, assignments []JoinedUpdateAssignment, predicate string) string {
 	if len(assignments) == 0 {
@@ -444,6 +457,12 @@ func (PostgresDialect) JSONBooleanIsTrue(expression string, path []string) strin
 // IndexHint returns an empty string: PostgreSQL has no index-hint syntax and
 // relies on the planner to choose the access path.
 func (PostgresDialect) IndexHint(string) string { return "" }
+
+// BinaryEquals returns plain equality: PostgreSQL's deterministic collations
+// already compare equality byte-for-byte.
+func (PostgresDialect) BinaryEquals(column string) string {
+	return column + " = ?"
+}
 
 // JoinedUpdate builds a PostgreSQL UPDATE … FROM statement. The join condition
 // moves into the WHERE clause alongside the residual predicate; SET
