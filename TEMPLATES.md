@@ -1766,7 +1766,7 @@ If SchemaBot should manage them, ask a SchemaBot operator to add the directory t
 
 ### Error
 
-> Failed to prepare the schema change request. Internal SchemaBot error — retry (error reference `ab12cd34`).
+> Failed to prepare the schema change request. Internal SchemaBot error. Retry (error reference `ab12cd34`).
 <!-- schemabot:offer-support-channel -->
 
 </details>
@@ -1783,7 +1783,7 @@ If SchemaBot should manage them, ask a SchemaBot operator to add the directory t
 
 ### Error
 
-> Failed to prepare the schema change request. Internal SchemaBot error — retry (error reference `ab12cd34`).
+> Failed to prepare the schema change request. Internal SchemaBot error. Retry (error reference `ab12cd34`).
 <!-- schemabot:offer-support-channel -->
 
 </details>
@@ -2781,7 +2781,7 @@ If the plan finds changes, apply `staging` and wait for the SchemaBot check to s
 
 ## ❌ Apply Blocked
 
-Could not verify staging status: failed to query check runs. Internal SchemaBot error — retry (error reference `ab12cd34`).
+Could not verify staging status: failed to query check runs. Internal SchemaBot error. Retry (error reference `ab12cd34`).
 <!-- schemabot:offer-support-channel -->
 
 </details>
@@ -2881,7 +2881,7 @@ Schema changes require approval from an authorized reviewer before applying.
 
 ### Error
 
-> Review gate check failed. Internal SchemaBot error — retry (error reference `ab12cd34`). If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
+> Review gate check failed. Internal SchemaBot error. Retry (error reference `ab12cd34`). If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
 <!-- schemabot:offer-support-channel -->
 
 </details>
