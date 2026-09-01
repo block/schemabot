@@ -230,8 +230,6 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 	c.transitionTaskState(ctx, task, 0, state.Task.Running, "")
 	logger.Info("task running", "task_id", task.TaskIdentifier, "table", task.TableName)
 
-	c.convergeTaskVolumeToStoredLevel(ctx, apply, task, taskCreds, result.ResumeState)
-
 	// Poll to completion. Thread the engine's returned resume state into the
 	// poll: a sharded engine (Strata) identifies the operation to report on from
 	// ResumeState.Metadata and errors without it, so Progress must carry what
@@ -554,20 +552,6 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 					"task_id", task.TaskIdentifier, "error", err)
 				return taskAbort
 			}
-			// A volume failure never aborts the drive: the copy continues at
-			// its current volume and a still-pending request is retried at the
-			// next tick. A lost lease is the exception — this owner must stop
-			// driving.
-			if err := c.processPendingVolumeControlRequest(ctx, apply, eng, creds, resumeState); err != nil {
-				if errors.Is(err, storage.ErrApplyLeaseLost) {
-					logger.Warn("pending volume request processing lost the apply lease; current apply owner will exit for operator retry",
-						"task_id", task.TaskIdentifier, "error", err)
-					return taskAbort
-				}
-				logger.Warn("pending volume request processing failed; the drive continues and retries at the next progress tick",
-					"task_id", task.TaskIdentifier, "error", err)
-			}
-
 			// Re-fetch task state from storage to detect external changes (e.g., Stop).
 			// This also guards against a race where a new apply starts and the engine's
 			// runningSchemaChange no longer corresponds to this task.

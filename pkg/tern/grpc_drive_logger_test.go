@@ -58,24 +58,6 @@ func TestDriveEndingHeartbeatFailure_LogsCarryApplyIdentity(t *testing.T) {
 	assert.Equal(t, hbErr, line.attrs["error"])
 }
 
-// An out-of-range remote volume level is rejected and logged through the
-// identity-bound drive logger, so the warning carries the apply identity and
-// the offending remote level an operator needs to triage the data plane.
-func TestMirrorRemoteVolume_OutOfRangeLogCarriesApplyIdentity(t *testing.T) {
-	apply := driveLoggerTestApply(state.Apply.Running)
-	apply.Options = storage.MarshalApplyOptions(storage.ApplyOptions{Volume: 3})
-	var records []capturedLog
-	logger := slog.New(captureHandler{records: &records}).With(apply.IdentityLogAttrs()...)
-
-	assert.False(t, mirrorRemoteVolume(logger, apply, 12))
-	assert.Equal(t, 3, apply.GetOptions().Volume)
-
-	line := requireCapturedLog(t, records,
-		"remote progress reported an out-of-range volume level; keeping the stored level")
-	assertLogCarriesApplyIdentity(t, line)
-	assert.Equal(t, int64(12), line.attrs["remote_volume"])
-}
-
 // A retransmitted control request logs through the identity-bound drive
 // logger: a fresh request re-sends at info, and one pending past the stale
 // threshold escalates to warn — both carrying the apply identity and the

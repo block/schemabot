@@ -195,13 +195,6 @@ type grpcSimpleResponse struct {
 	ErrorMessage string `json:"error_message,omitempty"`
 }
 
-type grpcVolumeResponse struct {
-	Accepted       bool   `json:"accepted"`
-	ErrorMessage   string `json:"error_message,omitempty"`
-	PreviousVolume int32  `json:"previous_volume"`
-	NewVolume      int32  `json:"new_volume"`
-}
-
 func grpcPlan(t *testing.T, database, env string, schemaFiles map[string]string) grpcPlanResponse {
 	t.Helper()
 

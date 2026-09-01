@@ -198,7 +198,7 @@ type Config struct {
 // the remote-deployment outage monitor, which must observe an outage promptly
 // rather than ride it out.
 //
-// State-changing RPCs (Apply, Cutover, Stop, Cancel, Start, Volume, Revert,
+// State-changing RPCs (Apply, Cutover, Stop, Cancel, Start, Revert,
 // SkipRevert) are intentionally not retried here: re-sending them could
 // duplicate work or advance an apply twice, and the operator's durable
 // queue already owns redelivery for dispatch failures.
@@ -1431,10 +1431,6 @@ func (c *GRPCClient) Start(ctx context.Context, req *ternv1.StartRequest) (*tern
 	return c.client.Start(ctx, req)
 }
 
-func (c *GRPCClient) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error) {
-	return c.client.Volume(ctx, req)
-}
-
 func (c *GRPCClient) Revert(ctx context.Context, req *ternv1.RevertRequest) (*ternv1.RevertResponse, error) {
 	return c.client.Revert(ctx, req)
 }
@@ -1902,35 +1898,6 @@ func (c *GRPCClient) mirrorRemoteDisplayMetadata(ctx context.Context, apply *sto
 	return blob
 }
 
-// mirrorRemoteVolume copies the volume level the data plane reports on a
-// progress response onto the in-memory apply options, so the poll's regular
-// parent-apply persistence records it. Volume changes are applied by the
-// data-plane driver against its own apply row, and the control plane only
-// learns the resulting level from progress responses — the PR comment and the
-// control-plane progress API both read the level from the control-plane apply
-// options. Returns true when the stored level changed so the caller can log
-// the transition. The logger is expected to carry the apply's identity
-// attributes already bound.
-func mirrorRemoteVolume(logger *slog.Logger, apply *storage.Apply, remoteVolume int32) bool {
-	if remoteVolume == 0 {
-		// The data plane reports 0 when no volume level was ever set on the
-		// apply; there is nothing to mirror.
-		return false
-	}
-	if remoteVolume < storage.MinVolume || remoteVolume > storage.MaxVolume {
-		logger.Warn("remote progress reported an out-of-range volume level; keeping the stored level",
-			append(apply.MutableLogAttrs(), "remote_volume", remoteVolume)...)
-		return false
-	}
-	opts := apply.GetOptions()
-	if opts.Volume == int(remoteVolume) {
-		return false
-	}
-	opts.Volume = int(remoteVolume)
-	apply.SetOptions(opts)
-	return true
-}
-
 // mirrorRemoteControlRejections records, on the control plane, the control
 // requests the data plane accepted and then failed. Accepting a control RPC
 // only means the request was queued: the engine call happens later on the data
@@ -1963,6 +1930,15 @@ func (c *GRPCClient) mirrorRemoteControlRejections(ctx context.Context, apply *s
 			continue
 		}
 		operation := storage.ControlOperation(entry.Operation)
+		if operation.Retired() {
+			// A data plane on a previous release reports its settled retired
+			// requests on every poll until the apply finishes; there is nothing
+			// left to mirror for an operation this release removed, and the
+			// entry recurs for the life of the drive, so it logs at debug.
+			logger.Debug("data plane reported a settled control request for a retired operation; nothing to mirror",
+				append(apply.MutableLogAttrs(), "operation", entry.Operation, "status", entry.Status)...)
+			continue
+		}
 		if !operation.Valid() {
 			logger.Warn("data plane reported a settled control request for an unrecognized operation; it will not reach the operator",
 				append(apply.MutableLogAttrs(), "operation", entry.Operation, "status", entry.Status)...)
@@ -2015,11 +1991,10 @@ func (c *GRPCClient) mirrorRemoteControlRejections(ctx context.Context, apply *s
 }
 
 // retireMirroredControlRejection clears a rejection this plane mirrored once the
-// data plane reports the same operation succeeded. It matters for an operation
-// this plane only proxies — volume, whose request lives entirely in the data
-// plane — because the mirrored row is the sole record here and no local request
-// lifecycle will ever reset it: without this the operator re-issues the command,
-// it works, and the PR keeps warning that it did not.
+// data plane reports the same operation succeeded. The mirrored row is this
+// plane's only record of that failure, so nothing else resets it: without this
+// the operator re-issues the command, it works, and the PR keeps warning that
+// it did not.
 func (c *GRPCClient) retireMirroredControlRejection(
 	ctx context.Context,
 	apply *storage.Apply,
@@ -4436,10 +4411,6 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			apply.State = newState
 			apply.ErrorMessage = remoteProgressErrorMessage(apply.State, resp.ErrorMessage, apply.ErrorMessage)
 			apply.UpdatedAt = now
-			if mirrorRemoteVolume(logger, apply, resp.Volume) {
-				logger.Info("mirrored remote volume level onto control-plane apply options",
-					append(apply.MutableLogAttrs(), "volume", resp.Volume)...)
-			}
 			c.mirrorRemoteControlRejections(ctx, apply, remoteID, resp.SettledControlRequests)
 
 			if remoteProgressIsTerminal(resp.State, resp.Tables) {

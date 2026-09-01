@@ -94,7 +94,7 @@ func TestPlansListHandler(t *testing.T) {
 	mux := newPlansTestServer(t, store)
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet,
-		"/api/plans?limit=1&database=orders&environment=staging&repository=org/repo&pull_request=42&last=24h", nil)
+		"/api/plans?limit=1&database=OrDeRs&environment=StAgInG&repository=Org/Repo&pull_request=42&last=24h", nil)
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 

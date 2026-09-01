@@ -14,7 +14,7 @@ option go_package = "github.com/block/schemabot/pkg/proto/ternv1";
 // rather than silently returning "unimplemented".
 //
 // Lifecycle: Plan -> Apply -> [Progress] -> [Cutover] -> [Revert|SkipRevert]
-// Control:   Stop, Start, Volume (can be called during Apply execution)
+// Control:   Stop, Start (can be called during Apply execution)
 //
 // State machine (per apply):
 //   pending -> running -> waiting_for_cutover -> cutting_over -> completed
@@ -216,25 +216,6 @@ service Tern {
       body: "*"
     };
   }
-
-  // Volume adjusts the schema change speed/concurrency while running.
-  //
-  // Scale: 1 (conservative, minimal database load) to 11 (aggressive, maximum
-  // throughput). Affects chunk size, lock hold time, and throttle parameters.
-  //
-  // Can be called multiple times during a running schema change. The engine
-  // is stopped and restarted internally to apply the new settings.
-  //
-  // Preconditions:
-  //   - Active schema change must exist for the database.
-  //   - Volume must be 1-11 inclusive.
-  rpc Volume(VolumeRequest) returns (VolumeResponse) {
-    option (google.api.http) = {
-      post: "/v1/volume"
-      body: "*"
-    };
-  }
-
 }
 
 // Engine represents the schema change engine type.
@@ -734,8 +715,8 @@ message TableProgress {
 // queued, so the plane that accepted it learns here whether the operation
 // actually took effect.
 message SettledControlRequest {
-  // The control operation: "stop", "start", "cutover", "cancel", "volume",
-  // "revert", or "skip_revert".
+  // The control operation: "stop", "start", "cutover", "cancel", "revert", or
+  // "skip_revert".
   string operation = 1;
   // Terminal status of the request: "completed" or "failed".
   string status = 2;
@@ -757,7 +738,11 @@ message ProgressResponse {
   repeated TableProgress tables = 6;
   string started_at = 7;
   string completed_at = 8;
-  int32 volume = 9;
+  // Field 9 carried the operator-set volume level before the volume control
+  // operation was removed. Reserved so a future field cannot reuse the number
+  // while an embedded pre-removal data plane still emits it.
+  reserved 9;
+  reserved "volume";
   map<string, string> metadata = 10;
   // Control requests on this apply that have reached a terminal status.
   repeated SettledControlRequest settled_control_requests = 11;
@@ -887,29 +872,4 @@ message StartResponse {
   int64 started_count = 3;
   // Number of tasks skipped (not in stopped state).
   int64 skipped_count = 4;
-}
-
-// VolumeRequest modifies the schema change speed/concurrency.
-message VolumeRequest {
-  // Apply ID for the schema change to adjust.
-  string apply_id = 1;
-  // Environment: "staging" or "production".
-  string environment = 2;
-  // Volume level 1-11 (1=conservative, 11=aggressive).
-  int32 volume = 3;
-  // Caller identifies the operator who issued the command, as resolved by the
-  // plane that accepted it. The plane that records the durable control request
-  // may not be the one the operator talked to, and the request is what names
-  // the requester in the PR notice and the apply log.
-  string caller = 4;
-}
-
-// VolumeResponse indicates whether the volume change was accepted.
-message VolumeResponse {
-  bool accepted = 1;
-  string error_message = 2;
-  // Previous volume level.
-  int32 previous_volume = 3;
-  // New volume level.
-  int32 new_volume = 4;
 }

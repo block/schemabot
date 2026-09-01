@@ -358,11 +358,6 @@ type releaseResponseWrapper struct{ r *apitypes.ReleaseResponse }
 func (w releaseResponseWrapper) IsAccepted() bool        { return w.r.Accepted }
 func (w releaseResponseWrapper) GetErrorMessage() string { return w.r.ErrorMessage }
 
-type volumeResponseWrapper struct{ r *apitypes.VolumeResponse }
-
-func (w volumeResponseWrapper) IsAccepted() bool        { return w.r.Accepted }
-func (w volumeResponseWrapper) GetErrorMessage() string { return w.r.ErrorMessage }
-
 // checkAccepted checks that an API response has accepted=true.
 // Returns a formatted error using the operation name if not accepted.
 func checkAccepted(result acceptedResponse, operation string) error {

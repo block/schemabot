@@ -112,7 +112,6 @@ func activeApplyDataFromResponse(a *apitypes.ActiveApplyResponse) templates.Acti
 		StartedAt:           a.StartedAt,
 		CompletedAt:         a.CompletedAt,
 		UpdatedAt:           a.UpdatedAt,
-		Volume:              a.Volume,
 	}
 }
 
