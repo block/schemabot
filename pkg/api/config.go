@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -32,6 +33,8 @@ import (
 // DefaultGitHubCheckName is the base GitHub Check Run name used when a
 // deployment does not configure a custom name.
 const DefaultGitHubCheckName = "SchemaBot"
+
+var configIdentifierPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 
 // ServerConfig holds the server-side SchemaBot configuration.
 // This is loaded from a YAML file specified by SCHEMABOT_CONFIG_FILE.
@@ -1353,10 +1356,10 @@ func (c *ServerConfig) Validate() error {
 		return fmt.Errorf("databases or target_resolver is required")
 	}
 
-	if err := validateLowercaseIdentifiers("environment_order environment name", c.EnvironmentOrder); err != nil {
+	if err := validateIdentifiers("environment_order environment name", c.EnvironmentOrder); err != nil {
 		return err
 	}
-	if err := validateLowercaseIdentifiers("allowed_environments environment name", c.AllowedEnvironments); err != nil {
+	if err := validateIdentifiers("allowed_environments environment name", c.AllowedEnvironments); err != nil {
 		return err
 	}
 	if err := validateUniqueNames("environment_order", c.EnvironmentOrder); err != nil {
@@ -1401,11 +1404,16 @@ func (c *ServerConfig) Validate() error {
 	// Validate Databases if present. An environment is either local mode
 	// (direct DSN) or gRPC mode (server-side target + deployment).
 	for name, dbConfig := range c.Databases {
-		if err := validateLowercaseIdentifier("database name", name); err != nil {
+		if err := validateIdentifier("database name", name); err != nil {
 			return err
 		}
-		if err := validateLowercaseIdentifiers(fmt.Sprintf("database %q environment_order environment name", name), dbConfig.EnvironmentOrder); err != nil {
+		if err := validateIdentifiers(fmt.Sprintf("database %q environment_order environment name", name), dbConfig.EnvironmentOrder); err != nil {
 			return err
+		}
+		for _, repo := range dbConfig.AllowedRepos {
+			if repo != storage.CanonicalKey(repo) {
+				return fmt.Errorf("database %q allowed_repos repository %q must be canonical", name, repo)
+			}
 		}
 		if dbConfig.Type == "" {
 			return fmt.Errorf("database %q missing type", name)
@@ -1428,15 +1436,15 @@ func (c *ServerConfig) Validate() error {
 			return err
 		}
 		for env, envConfig := range dbConfig.Environments {
-			if err := validateLowercaseIdentifier(fmt.Sprintf("database %q environment name", name), env); err != nil {
+			if err := validateIdentifier(fmt.Sprintf("database %q environment name", name), env); err != nil {
 				return err
 			}
 			if envConfig.Deployment != "" {
-				if err := validateLowercaseIdentifier(fmt.Sprintf("database %q environment %q deployment name", name, env), envConfig.Deployment); err != nil {
+				if err := validateIdentifier(fmt.Sprintf("database %q environment %q deployment name", name, env), envConfig.Deployment); err != nil {
 					return err
 				}
 			}
-			if err := validateLowercaseIdentifiers(fmt.Sprintf("database %q environment %q deployment_order deployment name", name, env), envConfig.DeploymentOrder); err != nil {
+			if err := validateIdentifiers(fmt.Sprintf("database %q environment %q deployment_order deployment name", name, env), envConfig.DeploymentOrder); err != nil {
 				return err
 			}
 			if err := envConfig.validateRevertWindowDuration(fmt.Sprintf("database %q environment %q", name, env)); err != nil {
@@ -1491,7 +1499,7 @@ func (c *ServerConfig) Validate() error {
 					}
 				}
 				for deployment, dt := range envConfig.Deployments {
-					if err := validateLowercaseIdentifier(fmt.Sprintf("database %q environment %q deployment name", name, env), deployment); err != nil {
+					if err := validateIdentifier(fmt.Sprintf("database %q environment %q deployment name", name, env), deployment); err != nil {
 						return err
 					}
 					if dt.Target == "" {
@@ -1528,6 +1536,9 @@ func (c *ServerConfig) Validate() error {
 	}
 
 	for repo, repoConfig := range c.Repos {
+		if repo != storage.CanonicalKey(repo) {
+			return fmt.Errorf("repos repository key %q must be canonical", repo)
+		}
 		if err := validateAggregateConfig(repo, repoConfig.Aggregate); err != nil {
 			return err
 		}
@@ -1542,14 +1553,14 @@ func (c *ServerConfig) Validate() error {
 
 	// Validate TernDeployments if present (gRPC mode)
 	for name, endpoints := range c.TernDeployments {
-		if err := validateLowercaseIdentifier("tern_deployments deployment name", name); err != nil {
+		if err := validateIdentifier("tern_deployments deployment name", name); err != nil {
 			return err
 		}
 		if len(endpoints) == 0 {
 			return fmt.Errorf("deployment %q has no environments configured", name)
 		}
 		for env, addr := range endpoints {
-			if err := validateLowercaseIdentifier(fmt.Sprintf("deployment %q environment name", name), env); err != nil {
+			if err := validateIdentifier(fmt.Sprintf("deployment %q environment name", name), env); err != nil {
 				return err
 			}
 			if addr == "" {
@@ -1572,19 +1583,19 @@ func (c *ServerConfig) Validate() error {
 	return nil
 }
 
-func validateLowercaseIdentifier(field, value string) error {
-	if value == "" {
-		return fmt.Errorf("%s must not be empty", field)
-	}
-	if value != storage.CanonicalKey(value) {
-		return fmt.Errorf("%s %q must be lowercase", field, value)
+func validateIdentifier(field, value string) error {
+	// Restrict identity keys to portable ASCII. Case folding alone permits
+	// accents that MySQL may fold but PostgreSQL preserves, as well as spaces
+	// and other bytes that cannot be canonical identity keys.
+	if !configIdentifierPattern.MatchString(value) {
+		return fmt.Errorf("%s %q must match %s", field, value, configIdentifierPattern)
 	}
 	return nil
 }
 
-func validateLowercaseIdentifiers(field string, values []string) error {
+func validateIdentifiers(field string, values []string) error {
 	for _, value := range values {
-		if err := validateLowercaseIdentifier(field, value); err != nil {
+		if err := validateIdentifier(field, value); err != nil {
 			return err
 		}
 	}

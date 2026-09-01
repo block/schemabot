@@ -714,7 +714,7 @@ func TestServerConfig_Validate(t *testing.T) {
 	}
 }
 
-func TestServerConfig_ValidateIdentifierCase(t *testing.T) {
+func TestServerConfig_ValidateIdentifiers(t *testing.T) {
 	validConfig := func() ServerConfig {
 		return ServerConfig{
 			Databases: map[string]DatabaseConfig{
@@ -742,7 +742,7 @@ func TestServerConfig_ValidateIdentifierCase(t *testing.T) {
 				cfg.Databases["Orders"] = cfg.Databases["orders"]
 				delete(cfg.Databases, "orders")
 			},
-			wantError: `database name "Orders" must be lowercase`,
+			wantError: `database name "Orders" must match ^[a-z0-9][a-z0-9_-]*$`,
 		},
 		{
 			name: "environment name",
@@ -752,7 +752,7 @@ func TestServerConfig_ValidateIdentifierCase(t *testing.T) {
 				delete(database.Environments, "staging")
 				cfg.Databases["orders"] = database
 			},
-			wantError: `database "orders" environment name "Staging" must be lowercase`,
+			wantError: `database "orders" environment name "Staging" must match ^[a-z0-9][a-z0-9_-]*$`,
 		},
 		{
 			name: "deployment name",
@@ -763,21 +763,21 @@ func TestServerConfig_ValidateIdentifierCase(t *testing.T) {
 				database.Environments["staging"] = environment
 				cfg.Databases["orders"] = database
 			},
-			wantError: `database "orders" environment "staging" deployment name "Primary" must be lowercase`,
+			wantError: `database "orders" environment "staging" deployment name "Primary" must match ^[a-z0-9][a-z0-9_-]*$`,
 		},
 		{
 			name: "top-level environment order",
 			mutate: func(cfg *ServerConfig) {
 				cfg.EnvironmentOrder = []string{"Staging"}
 			},
-			wantError: `environment_order environment name "Staging" must be lowercase`,
+			wantError: `environment_order environment name "Staging" must match ^[a-z0-9][a-z0-9_-]*$`,
 		},
 		{
 			name: "top-level allowed environments",
 			mutate: func(cfg *ServerConfig) {
 				cfg.AllowedEnvironments = []string{"Staging"}
 			},
-			wantError: `allowed_environments environment name "Staging" must be lowercase`,
+			wantError: `allowed_environments environment name "Staging" must match ^[a-z0-9][a-z0-9_-]*$`,
 		},
 		{
 			name: "per-database environment order",
@@ -786,7 +786,7 @@ func TestServerConfig_ValidateIdentifierCase(t *testing.T) {
 				database.EnvironmentOrder = []string{"Staging"}
 				cfg.Databases["orders"] = database
 			},
-			wantError: `database "orders" environment_order environment name "Staging" must be lowercase`,
+			wantError: `database "orders" environment_order environment name "Staging" must match ^[a-z0-9][a-z0-9_-]*$`,
 		},
 		{
 			name: "per-database deployment order",
@@ -797,7 +797,7 @@ func TestServerConfig_ValidateIdentifierCase(t *testing.T) {
 				database.Environments["staging"] = environment
 				cfg.Databases["orders"] = database
 			},
-			wantError: `database "orders" environment "staging" deployment_order deployment name "Primary" must be lowercase`,
+			wantError: `database "orders" environment "staging" deployment_order deployment name "Primary" must match ^[a-z0-9][a-z0-9_-]*$`,
 		},
 		{
 			name: "deployments map key",
@@ -810,21 +810,21 @@ func TestServerConfig_ValidateIdentifierCase(t *testing.T) {
 				database.Environments["staging"] = environment
 				cfg.Databases["orders"] = database
 			},
-			wantError: `database "orders" environment "staging" deployment name "Primary" must be lowercase`,
+			wantError: `database "orders" environment "staging" deployment name "Primary" must match ^[a-z0-9][a-z0-9_-]*$`,
 		},
 		{
 			name: "tern deployments map key",
 			mutate: func(cfg *ServerConfig) {
 				cfg.TernDeployments["Primary"] = cfg.TernDeployments["primary"]
 			},
-			wantError: `tern_deployments deployment name "Primary" must be lowercase`,
+			wantError: `tern_deployments deployment name "Primary" must match ^[a-z0-9][a-z0-9_-]*$`,
 		},
 		{
 			name: "tern deployments environment key",
 			mutate: func(cfg *ServerConfig) {
 				cfg.TernDeployments["primary"]["Staging"] = "localhost:9090"
 			},
-			wantError: `deployment "primary" environment name "Staging" must be lowercase`,
+			wantError: `deployment "primary" environment name "Staging" must match ^[a-z0-9][a-z0-9_-]*$`,
 		},
 		{
 			name: "empty database name",
@@ -832,14 +832,14 @@ func TestServerConfig_ValidateIdentifierCase(t *testing.T) {
 				cfg.Databases[""] = cfg.Databases["orders"]
 				delete(cfg.Databases, "orders")
 			},
-			wantError: `database name must not be empty`,
+			wantError: `database name "" must match ^[a-z0-9][a-z0-9_-]*$`,
 		},
 		{
 			name: "empty environment order entry",
 			mutate: func(cfg *ServerConfig) {
 				cfg.EnvironmentOrder = []string{""}
 			},
-			wantError: `environment_order environment name must not be empty`,
+			wantError: `environment_order environment name "" must match ^[a-z0-9][a-z0-9_-]*$`,
 		},
 		{
 			name: "empty deployments map key",
@@ -852,14 +852,59 @@ func TestServerConfig_ValidateIdentifierCase(t *testing.T) {
 				database.Environments["staging"] = environment
 				cfg.Databases["orders"] = database
 			},
-			wantError: `database "orders" environment "staging" deployment name must not be empty`,
+			wantError: `database "orders" environment "staging" deployment name "" must match ^[a-z0-9][a-z0-9_-]*$`,
 		},
 		{
 			name: "empty tern deployments name",
 			mutate: func(cfg *ServerConfig) {
 				cfg.TernDeployments[""] = cfg.TernDeployments["primary"]
 			},
-			wantError: `tern_deployments deployment name must not be empty`,
+			wantError: `tern_deployments deployment name "" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "accented database name",
+			mutate: func(cfg *ServerConfig) {
+				cfg.Databases["café"] = cfg.Databases["orders"]
+				delete(cfg.Databases, "orders")
+			},
+			wantError: `database name "café" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "leading whitespace",
+			mutate: func(cfg *ServerConfig) {
+				cfg.EnvironmentOrder = []string{" staging"}
+			},
+			wantError: `environment_order environment name " staging" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "trailing whitespace",
+			mutate: func(cfg *ServerConfig) {
+				cfg.AllowedEnvironments = []string{"staging "}
+			},
+			wantError: `allowed_environments environment name "staging " must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "interior space",
+			mutate: func(cfg *ServerConfig) {
+				cfg.EnvironmentOrder = []string{"pre production"}
+			},
+			wantError: `environment_order environment name "pre production" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "repository key",
+			mutate: func(cfg *ServerConfig) {
+				cfg.Repos = map[string]RepoConfig{"Org/Repo.Name": {}}
+			},
+			wantError: `repos repository key "Org/Repo.Name" must be canonical`,
+		},
+		{
+			name: "allowed repository",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				database.AllowedRepos = []string{"Org/Repo.Name"}
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" allowed_repos repository "Org/Repo.Name" must be canonical`,
 		},
 	}
 
@@ -872,8 +917,10 @@ func TestServerConfig_ValidateIdentifierCase(t *testing.T) {
 		})
 	}
 
-	t.Run("lowercase identifiers", func(t *testing.T) {
+	t.Run("valid identifiers with digits hyphens and underscores", func(t *testing.T) {
 		cfg := validConfig()
+		cfg.Databases["orders_2-prod"] = cfg.Databases["orders"]
+		delete(cfg.Databases, "orders")
 		require.NoError(t, cfg.Validate())
 	})
 }

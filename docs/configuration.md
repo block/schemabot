@@ -355,6 +355,12 @@ consumer repository's `schemabot.yaml` `database:` value, and the schema
 directory in lockstep. Renaming while an apply is in flight is unsafe; drain
 all in-flight applies first.
 
+When upgrading to a release that folds repository identity at ingress, drain
+in-flight applies before upgrading. Lock rows written by earlier versions may
+have mixed-case owner values such as `Org/Repo#42`; on PostgreSQL, the folded
+owner cannot reacquire or release those locks. Use force-release for any locks
+stranded during the upgrade.
+
 ## Hybrid Mode
 
 Both modes can be used simultaneously. Each database environment in the `databases` section chooses one route: local mode with `dsn`, or gRPC mode with `target` and `deployment`. This is useful when some databases are co-located with SchemaBot and others are in remote environments.
