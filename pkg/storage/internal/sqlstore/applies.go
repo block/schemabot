@@ -229,6 +229,10 @@ func (w *applyWriteTx) commit() error {
 }
 
 func applyTargetLockName(database, dbType, environment string) string {
+	// Fold every component so caller spelling cannot change the derived lock name.
+	database = storage.CanonicalKey(database)
+	dbType = storage.CanonicalKey(dbType)
+	environment = storage.CanonicalKey(environment)
 	sum := sha256.Sum256([]byte(database + "\x00" + dbType + "\x00" + environment))
 	return "schemabot_apply_" + hex.EncodeToString(sum[:16])
 }

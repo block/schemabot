@@ -22,9 +22,9 @@ func TestLocks(t *testing.T, h Harness) {
 		lock := &storage.Lock{
 			DatabaseName:  "Orders_DB",
 			DatabaseType:  "MySQL",
-			Repository:    "MixedCase/Sample-Repo",
-			PullRequest:   123,
-			Owner:         "MixedCase/Sample-Repo#123",
+			Repository:    "Org/Repo",
+			PullRequest:   42,
+			Owner:         "Org/Repo#42",
 			PendingPlanID: "plan-1",
 		}
 		require.NoError(t, store.Locks().Acquire(ctx, lock))
@@ -34,25 +34,26 @@ func TestLocks(t *testing.T, h Harness) {
 		require.NotNil(t, stored)
 		assert.Equal(t, "orders_db", stored.DatabaseName)
 		assert.Equal(t, "mysql", stored.DatabaseType)
-		assert.Equal(t, "mixedcase/sample-repo", stored.Repository)
-		assert.Equal(t, "MixedCase/Sample-Repo#123", stored.Owner)
+		assert.Equal(t, "org/repo", stored.Repository)
+		assert.Equal(t, "Org/Repo#42", stored.Owner)
 
-		locks, err := store.Locks().GetByPR(ctx, "MIXEDCASE/SAMPLE-REPO", 123)
+		locks, err := store.Locks().GetByPR(ctx, "ORG/REPO", 42)
 		require.NoError(t, err)
 		require.Len(t, locks, 1)
 
 		require.NoError(t, store.Locks().Acquire(ctx, &storage.Lock{
 			DatabaseName: "orders_db", DatabaseType: "mysql",
-			Repository: "mixedcase/sample-repo", PullRequest: 123,
-			Owner: "MixedCase/Sample-Repo#123",
+			Repository: "org/repo", PullRequest: 42,
+			Owner: "Org/Repo#42",
 		}))
 		require.ErrorIs(t, store.Locks().Acquire(ctx, &storage.Lock{
 			DatabaseName: "ORDERS_DB", DatabaseType: "MYSQL",
-			Repository: "MIXEDCASE/SAMPLE-REPO", PullRequest: 123,
-			Owner: "different-owner",
+			Repository: "ORG/REPO", PullRequest: 42,
+			Owner: "org/repo#42",
 		}), storage.ErrLockHeld)
+		require.ErrorIs(t, store.Locks().Release(ctx, "ORDERS_DB", "MYSQL", "org/repo#42"), storage.ErrLockNotOwned)
 
-		released, err := store.Locks().ReleaseIfPendingPlanID(ctx, "ORDERS_DB", "MYSQL", "MixedCase/Sample-Repo#123", "plan-1")
+		released, err := store.Locks().ReleaseIfPendingPlanID(ctx, "ORDERS_DB", "MYSQL", "Org/Repo#42", "plan-1")
 		require.NoError(t, err)
 		assert.True(t, released)
 	})
