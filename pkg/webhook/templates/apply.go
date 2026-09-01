@@ -81,6 +81,8 @@ type ShardProgressData struct {
 	Shard           string
 	Status          string // canonical lowercase shard/task state
 	PercentComplete int
+	RowsCopied      int64
+	RowsTotal       int64
 }
 
 // ApplyStatusCommentData contains all data needed to render an apply status PR comment.
@@ -779,7 +781,8 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		// show how far the verify has progressed once Spirit reports a total.
 		if table.ChecksumRowsTotal > 0 {
 			pct := ui.ClampPercent(int(table.ChecksumRowsChecked * 100 / table.ChecksumRowsTotal))
-			fmt.Fprintf(sb, "**`%s`**: %s \U0001f50d Checksumming to verify data (%d%%)%s\n", table.TableName, ui.ProgressBarRowCopy(pct), pct, throttledSuffix(table))
+			fmt.Fprintf(sb, "**`%s`**: %s \U0001f50d Checksumming to verify data (%s)%s\n", table.TableName, ui.ProgressBarRowCopy(pct),
+				ui.FormatRowCopyPercent(pct, table.ChecksumRowsChecked, table.ChecksumRowsTotal), throttledSuffix(table))
 			writeDDLLine(sb, dialect, table.DDL)
 			fmt.Fprintf(sb, "- Rows verified: %s / %s\n",
 				ui.FormatNumber(ui.ClampRows(table.ChecksumRowsChecked, table.ChecksumRowsTotal)), ui.FormatNumber(table.ChecksumRowsTotal))
@@ -920,8 +923,9 @@ func renderShardSummary(sb *strings.Builder, table TableProgressData) {
 	if len(table.Shards) <= shardNamesInlineLimit {
 		parts := make([]string, 0, len(table.Shards))
 		for _, sh := range table.Shards {
-			if isCopyingShardStatus(sh.Status) && sh.PercentComplete > 0 {
-				parts = append(parts, fmt.Sprintf("%s %s %d%%", shardGlyph(sh.Status), sh.Shard, sh.PercentComplete))
+			if isCopyingShardStatus(sh.Status) && (sh.PercentComplete > 0 || sh.RowsCopied > 0) {
+				parts = append(parts, fmt.Sprintf("%s %s %s", shardGlyph(sh.Status), sh.Shard,
+					ui.FormatRowCopyPercent(sh.PercentComplete, sh.RowsCopied, sh.RowsTotal)))
 				continue
 			}
 			part := fmt.Sprintf("%s %s", shardGlyph(sh.Status), sh.Shard)
@@ -937,8 +941,8 @@ func renderShardSummary(sb *strings.Builder, table TableProgressData) {
 	}
 
 	var complete, copying, ready, failed, queued, other int
-	slowestShard := ""
-	slowestPct := -1
+	slowestShard, slowestText := "", ""
+	slowestFraction := -1.0
 	for _, sh := range table.Shards {
 		// Shards parked at the cutover barrier count through the shared
 		// readiness predicate, keeping the shard buckets consistent with the
@@ -957,9 +961,10 @@ func renderShardSummary(sb *strings.Builder, table TableProgressData) {
 		default:
 			if isCopyingShardStatus(sh.Status) {
 				copying++
-				if slowestPct < 0 || sh.PercentComplete < slowestPct {
-					slowestPct = sh.PercentComplete
+				if frac := ui.RowCopyFraction(sh.PercentComplete, sh.RowsCopied, sh.RowsTotal); slowestFraction < 0 || frac < slowestFraction {
+					slowestFraction = frac
 					slowestShard = sh.Shard
+					slowestText = ui.FormatRowCopyPercent(sh.PercentComplete, sh.RowsCopied, sh.RowsTotal)
 				}
 			} else {
 				other++
@@ -986,8 +991,8 @@ func renderShardSummary(sb *strings.Builder, table TableProgressData) {
 		buckets = append(buckets, fmt.Sprintf("%d …", other))
 	}
 	line := fmt.Sprintf("  └ %d shards: %s", len(table.Shards), strings.Join(buckets, " · "))
-	if slowestShard != "" && slowestPct >= 0 {
-		line += fmt.Sprintf(" · slowest %s %d%%", slowestShard, slowestPct)
+	if slowestShard != "" && slowestFraction >= 0 {
+		line += fmt.Sprintf(" · slowest %s %s", slowestShard, slowestText)
 	}
 	sb.WriteString(line + "\n")
 }
@@ -1114,15 +1119,15 @@ func recoveringIsCopyingRows(table TableProgressData) bool {
 // percent as display text, so the recovery summary never overstates how far
 // the slowest table has come.
 func recoveringCopyPercent(tables []TableProgressData) (string, bool) {
-	percent := 100
+	fraction := 0.0
 	text := ""
 	found := false
 	for _, table := range tables {
 		if state.NormalizeTaskStatus(table.Status) != state.Task.Recovering || !recoveringIsCopyingRows(table) {
 			continue
 		}
-		if pct := ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied); !found || pct < percent {
-			percent = pct
+		if frac := ui.RowCopyFraction(table.PercentComplete, table.RowsCopied, table.RowsTotal); !found || frac < fraction {
+			fraction = frac
 			text = ui.FormatRowCopyPercent(table.PercentComplete, table.RowsCopied, table.RowsTotal)
 		}
 		found = true

@@ -827,7 +827,7 @@ func (e *logEmitter) emitTableStateChange(tbl *apitypes.TableProgressResponse, t
 		kvs := tableKVs(recoveringLogMessage(tbl), tbl, ts)
 		if tbl.RowsTotal > 0 && tbl.PercentComplete < 100 {
 			kvs = append(kvs,
-				"progress", fmt.Sprintf("%d%%", min(int(tbl.PercentComplete), 100)),
+				"progress", ui.FormatRowCopyPercent(int(tbl.PercentComplete), tbl.RowsCopied, tbl.RowsTotal),
 				"rows", fmt.Sprintf("%s/%s", ui.FormatNumber(ui.ClampRows(tbl.RowsCopied, tbl.RowsTotal)), ui.FormatNumber(tbl.RowsTotal)),
 			)
 			if tbl.ETASeconds > 0 {
@@ -842,8 +842,8 @@ func (e *logEmitter) emitTableStateChange(tbl *apitypes.TableProgressResponse, t
 		e.emit(kvs...)
 	case state.Apply.Stopped:
 		kvs := tableKVs("Table stopped", tbl, ts)
-		if tbl.PercentComplete > 0 {
-			kvs = append(kvs, "progress", fmt.Sprintf("%d%%", min(int(tbl.PercentComplete), 100)))
+		if tbl.PercentComplete > 0 || tbl.RowsCopied > 0 {
+			kvs = append(kvs, "progress", ui.FormatRowCopyPercent(int(tbl.PercentComplete), tbl.RowsCopied, tbl.RowsTotal))
 		}
 		e.emit(kvs...)
 	default:
@@ -874,9 +874,8 @@ func (e *logEmitter) emitProgressHeartbeat(tbl *apitypes.TableProgressResponse, 
 			"rows_copied", fmt.Sprintf("%s so far", ui.FormatNumber(tbl.RowsCopied)),
 		)
 	} else {
-		pct := ui.ClampPercent(int(tbl.PercentComplete))
 		kvs = append(kvs,
-			"progress", fmt.Sprintf("%d%%", pct),
+			"progress", ui.FormatRowCopyPercent(int(tbl.PercentComplete), tbl.RowsCopied, tbl.RowsTotal),
 			"rows", fmt.Sprintf("%s/%s", ui.FormatNumber(ui.ClampRows(tbl.RowsCopied, tbl.RowsTotal)), ui.FormatNumber(tbl.RowsTotal)),
 		)
 		if tbl.ETASeconds > 0 {

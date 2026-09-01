@@ -136,23 +136,32 @@ func TestRowCopyDisplayPercent(t *testing.T) {
 	assert.Equal(t, 100, RowCopyDisplayPercent(145, 42))
 }
 
-func TestFormatRowCopyPercent(t *testing.T) {
-	// Whole percents render as integers; nothing copied renders as 0%.
-	assert.Equal(t, "0%", FormatRowCopyPercent(0, 0, 1_000_000))
-	assert.Equal(t, "45%", FormatRowCopyPercent(45, 450_000, 1_000_000))
-	assert.Equal(t, "100%", FormatRowCopyPercent(100, 1_000_000, 1_000_000))
-	assert.Equal(t, "100%", FormatRowCopyPercent(145, 42, 1_000_000))
+func TestRowCopyFraction(t *testing.T) {
+	assert.InDelta(t, 45.37, RowCopyFraction(45, 453_700, 1_000_000), 0.0001)
+	assert.InDelta(t, 100, RowCopyFraction(99, 1_100_000, 1_000_000), 0.0001)
+	assert.InDelta(t, 45, RowCopyFraction(45, 0, 0), 0.0001)
+	assert.InDelta(t, 100, RowCopyFraction(145, 0, 0), 0.0001)
+}
 
-	// Begun but sub-1%: the true fraction, computed from the row counts.
+func TestFormatRowCopyPercent(t *testing.T) {
+	// Row counts are the source of truth: the percent is recomputed from them
+	// at two-decimal precision, whatever the whole-number percent says.
+	assert.Equal(t, "45.00%", FormatRowCopyPercent(45, 450_000, 1_000_000))
+	assert.Equal(t, "45.37%", FormatRowCopyPercent(45, 453_700, 1_000_000))
 	assert.Equal(t, "0.03%", FormatRowCopyPercent(0, 13_186_540, 43_234_523_345))
 	assert.Equal(t, "0.19%", FormatRowCopyPercent(0, 3_000, 1_604_159))
+	assert.Equal(t, "100.00%", FormatRowCopyPercent(100, 1_000_000, 1_000_000))
 
-	// Clamped away from 0.00% (copying has begun) and away from 1.00% (the
-	// whole-number percent still says 0).
+	// Floored at 0.01% once copying has begun, and capped at 100% when the
+	// copied count overshoots the estimated total.
 	assert.Equal(t, "0.01%", FormatRowCopyPercent(0, 1, 1_000_000))
-	assert.Equal(t, "0.99%", FormatRowCopyPercent(0, 9_999, 1_000_000))
+	assert.Equal(t, "100.00%", FormatRowCopyPercent(99, 1_100_000, 1_000_000))
 
-	// No row total to compute a fraction from.
+	// Without row counts, the engine's whole-number percent renders clamped;
+	// a copy that has begun with no total falls back to "<1%".
+	assert.Equal(t, "0%", FormatRowCopyPercent(0, 0, 1_000_000))
+	assert.Equal(t, "45%", FormatRowCopyPercent(45, 0, 0))
+	assert.Equal(t, "100%", FormatRowCopyPercent(145, 0, 0))
 	assert.Equal(t, "<1%", FormatRowCopyPercent(0, 42, 0))
 }
 
