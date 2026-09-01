@@ -513,6 +513,9 @@ type PlanStore interface {
 
 // ApplyStore manages schema change execution state.
 // Applies are created when Apply() is called and updated during execution.
+// Methods accepting *Apply canonicalize repository, database, database type,
+// and environment in place before persisting; Update rewrites these fields on
+// the struct even though its SQL statement writes only state and progress.
 type ApplyStore interface {
 	// Create stores a new apply and returns its ID.
 	// Returns ErrActiveApplyExists if another active apply already exists for
@@ -839,6 +842,9 @@ type RetryableApplyExpiration struct {
 // TaskStore manages schema change tasks (individual DDLs within an apply).
 // Each task represents one table operation. For multi-table changes,
 // one apply contains multiple tasks.
+// Create and UpsertShardProgress canonicalize repository, database, database
+// type, and environment in place before persisting. Update leaves those
+// identity fields untouched: its SQL statement writes only state and progress.
 type TaskStore interface {
 	// Create stores a new task and returns its ID.
 	Create(ctx context.Context, task *Task) (int64, error)
