@@ -154,9 +154,9 @@ func (tidbStatementParser) CreateIndex(string) (string, string, bool, error) {
 // provably metadata-only: index-backed constraint adds build an index, FOREIGN
 // KEY and CHECK adds validate every row, and column type changes, charset
 // conversions, and table-option rebuilds copy the table. Clause shapes MySQL
-// executes on metadata alone — plain column adds and drops, renames, default
-// changes, constraint and index drops, visibility toggles, partition
-// management, and comment-only option changes — report false.
+// executes on metadata alone — plain column adds, renames, default changes,
+// constraint and index drops, visibility toggles, partition drops and
+// truncations, and comment-only option changes — report false.
 func (tidbStatementParser) CostScalesWithTableSize(stmt string) (bool, error) {
 	p := parser.New()
 	stmtNodes, _, err := p.Parse(stmt, "", "")
@@ -189,11 +189,19 @@ func (tidbStatementParser) CostScalesWithTableSize(stmt string) (bool, error) {
 // hiding it on an expensive change.
 func alterSpecScalesWithTableSize(spec *ast.AlterTableSpec) bool {
 	switch spec.Tp { //nolint:exhaustive
-	case ast.AlterTableDropColumn, ast.AlterTableRenameColumn, ast.AlterTableRenameTable,
+	case ast.AlterTableRenameColumn, ast.AlterTableRenameTable,
 		ast.AlterTableRenameIndex, ast.AlterTableAlterColumn, ast.AlterTableDropIndex,
 		ast.AlterTableDropForeignKey, ast.AlterTableDropCheck, ast.AlterTableIndexInvisible,
-		ast.AlterTableDropPartition, ast.AlterTableTruncatePartition, ast.AlterTableAddPartitions:
+		ast.AlterTableDropPartition, ast.AlterTableTruncatePartition:
 		return false
+	case ast.AlterTableAddPartitions:
+		// ADD PARTITION is two operations sharing one clause type, and the
+		// statement shows which: with partition definitions
+		// (ADD PARTITION (PARTITION p ...), the RANGE/LIST form) it attaches
+		// a new empty partition on metadata alone, while without them
+		// (ADD PARTITION PARTITIONS n, the HASH/KEY form) it changes the
+		// partition count and redistributes every existing row.
+		return len(spec.PartDefinitions) == 0
 	case ast.AlterTableAddColumns:
 		// A plain column add is metadata-only, but an inline PRIMARY KEY or
 		// UNIQUE builds an index and a STORED generated column is computed
@@ -225,6 +233,10 @@ func alterSpecScalesWithTableSize(spec *ast.AlterTableSpec) bool {
 		// adds validate every existing row; MODIFY/CHANGE COLUMN can rebuild
 		// (a VARCHAR widening that crosses the length-byte boundary copies the
 		// table, and that boundary isn't visible from the statement alone).
+		// DROP COLUMN lands here too: it is instant only on MySQL 8.0.29+,
+		// only while the table's instant-change row-header budget lasts, not
+		// on ROW_FORMAT=COMPRESSED, and not without rebuilding any index on
+		// the column — none of which the statement shows.
 		return true
 	}
 }
