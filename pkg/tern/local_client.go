@@ -1542,9 +1542,13 @@ func (c *LocalClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*t
 // violations, and per-shard membership. It has no storage side effects, so both
 // the persisting Plan path and the non-persisting PlanDiff path produce
 // identical change sets for the same engine result. A sharded engine emits one
-// SchemaChange per (namespace, shard); the namespace view collapses them
-// (deduping repeated tables) while per-shard membership travels separately on
-// the response's Shards.
+// SchemaChange per (namespace, shard), so the same table repeats across a
+// keyspace's shards; the namespace view collapses those repeats while per-shard
+// membership travels separately on the response's Shards. A non-sharded
+// engine's change list is an ordered statement sequence in which one table may
+// legitimately appear more than once (a table's CREATE TABLE followed by its
+// index builds), so it passes through intact — deduping it would silently drop
+// planned statements.
 func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (changes []*ternv1.SchemaChange, violations []*ternv1.LintViolation, shards []*ternv1.ShardPlan) {
 	protoByNS := make(map[string]*ternv1.SchemaChange)
 	protoTableSeen := make(map[string]map[string]bool)
@@ -1575,11 +1579,14 @@ func (c *LocalClient) planResultToProtoChanges(result *engine.PlanResult) (chang
 				}
 			}
 		}
+		sharded := strings.TrimSpace(sc.Shard.Name) != ""
 		for _, t := range sc.TableChanges {
-			if protoTableSeen[ns][t.Table] {
-				continue
+			if sharded {
+				if protoTableSeen[ns][t.Table] {
+					continue
+				}
+				protoTableSeen[ns][t.Table] = true
 			}
-			protoTableSeen[ns][t.Table] = true
 			protoSC.TableChanges = append(protoSC.TableChanges, protoTableChangeFromEngine(t, ns))
 		}
 		// A SchemaChange with an empty shard targets the whole namespace
@@ -1985,12 +1992,20 @@ func (c *LocalClient) namespacesFromEngineChanges(changes []engine.SchemaChange,
 		}
 		// A plan is keyed by (namespace, shard), so a sharded engine emits one
 		// SchemaChange per shard and the same table repeats across a keyspace's
-		// shards. The stored plan keeps namespace-level tables, so dedupe by table.
+		// shards; the stored plan keeps namespace-level tables, so those
+		// repeats dedupe by table. A non-sharded engine's change list is an
+		// ordered statement sequence in which one table may legitimately
+		// appear more than once (a table's CREATE TABLE followed by its index
+		// builds), so it is stored intact — deduping it would silently drop
+		// statements the apply must execute.
+		sharded := strings.TrimSpace(sc.Shard.Name) != ""
 		for _, tc := range sc.TableChanges {
-			if seenTable[ns][tc.Table] {
-				continue
+			if sharded {
+				if seenTable[ns][tc.Table] {
+					continue
+				}
+				seenTable[ns][tc.Table] = true
 			}
-			seenTable[ns][tc.Table] = true
 			nsData.Tables = append(nsData.Tables, storageTableChangeFromEngine(tc, ""))
 		}
 		// Record each changing shard's own changes so apply-create can rebuild

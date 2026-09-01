@@ -72,6 +72,47 @@ func TestPostgresConfigFixturePlansAndAppliesNativeSafeChange(t *testing.T) {
 	assert.True(t, postgresColumnExists(t, db, "users", "email"))
 }
 
+// A PostgreSQL plan whose desired state adds a column and an index to one
+// table is an ordered multi-statement sequence for that table: every
+// statement must survive into both the plan response the operator reviews
+// and the stored plan the apply executes — a table appearing more than once
+// is legal, and dropping its later statements would silently under-apply the
+// reviewed change.
+func TestPostgresConfigFixtureKeepsAllStatementsForOneTable(t *testing.T) {
+	fixture := loadPostgresConfigFixture(t, "postgres")
+	fixture.schema = "CREATE TABLE users (\n    id bigint PRIMARY KEY,\n    email text\n);\nCREATE INDEX idx_users_email ON users (email);\n"
+	dsn, db := testutil.StartPostgres(t, fixture.config.Database)
+	createFixtureUsersTable(t, db)
+
+	svc := setupE2EServiceOpts(t, fixture.config.Database, e2eServiceOpts{
+		databaseType: string(fixture.config.Type),
+		targetDSN:    dsn,
+	})
+	plan, err := svc.ExecutePlan(t.Context(), fixture.planRequest())
+	require.NoError(t, err)
+	require.Len(t, plan.Changes, 1)
+	require.Len(t, plan.Changes[0].TableChanges, 2)
+	alter := plan.Changes[0].TableChanges[0]
+	index := plan.Changes[0].TableChanges[1]
+	assert.Equal(t, "users", alter.TableName)
+	assert.Contains(t, alter.DDL, "ADD COLUMN")
+	assert.Equal(t, "users", index.TableName)
+	assert.Contains(t, index.DDL, "CREATE")
+	assert.Contains(t, index.DDL, "INDEX")
+	assert.Contains(t, index.DDL, "idx_users_email")
+
+	stored, err := svc.Storage().Plans().Get(t.Context(), plan.PlanID)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	storedChanges := stored.FlatDDLChanges()
+	require.Len(t, storedChanges, 2)
+	assert.Contains(t, storedChanges[0].DDL, "ADD COLUMN")
+	assert.Contains(t, storedChanges[1].DDL, "idx_users_email")
+	for _, tc := range storedChanges {
+		assert.Equal(t, "users", tc.Table)
+	}
+}
+
 // A repository config selecting PostgreSQL surfaces a statement outside the
 // optimistic native-safe slice as a typed blocked plan, and the apply gate
 // refuses to queue it when an apply is attempted anyway.
