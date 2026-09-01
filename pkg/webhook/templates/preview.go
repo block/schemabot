@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -2450,7 +2451,10 @@ func PreviewCommentSummaryFailed() string {
 	tables[1].PercentComplete = 30
 	tables[2].Status = state.Task.Cancelled
 	data := sampleSummaryData(state.Apply.Failed, tables)
-	data.ErrorMessage = "table users failed: schema change failed: unsafe warning: Field 'name' doesn't have a default value"
+	// The engine reports a failure as a reason SchemaBot wrote, keyed off the
+	// target's error code. The target's own words — which quote the row that
+	// could not be copied — stay in the server logs.
+	data.ErrorMessage = mysqlerr.ReasonFromText("(errno 1364)")
 	return RenderApplySummaryComment(data) +
 		RenderRecentFailureLogs(sampleFailureLogEntries("users", "unsafe warning: Field 'name' doesn't have a default value"), GitHubIssueCommentMaxChars, false)
 }

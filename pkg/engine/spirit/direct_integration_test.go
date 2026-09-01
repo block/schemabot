@@ -573,9 +573,11 @@ func TestEngine_ExecuteAlterPhase_BusyTableFailsFast(t *testing.T) {
 	eng.mu.Unlock()
 
 	assert.Equal(t, engine.StateFailed, finalState)
-	assert.Contains(t, errorMessage, `table "direct_busy" is busy`)
+	assert.Contains(t, errorMessage, `Table "direct_busy" is busy`)
 	assert.Contains(t, errorMessage, fmt.Sprintf("could not acquire the metadata lock within %ds", lockWaitSeconds))
-	assert.Contains(t, errorMessage, "retry when long-running transactions on the table have finished")
+	assert.Contains(t, errorMessage, "Retry when long-running transactions on the table have finished")
+	assert.NotContains(t, errorMessage, "Lock wait timeout exceeded",
+		"the driver's own words are for the server log, not the pull request")
 
 	require.NoError(t, holder.Rollback(), "release the metadata lock")
 	assert.Equal(t, []string{"id"}, pkColumns(t, database, "direct_busy"), "the target is untouched")

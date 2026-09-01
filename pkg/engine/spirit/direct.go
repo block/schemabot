@@ -338,7 +338,7 @@ func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB,
 			// apply fails with a fixed line and the cause stays in the logs.
 			logger.Error("routing failed: cannot read the target's current table definition",
 				"database", database, "table", table, "error", err)
-			return alterRouting{}, fmt.Errorf("cannot read the current definition of table %q on the target; see server logs", table)
+			return alterRouting{}, engine.OperatorErrorf(err, "SchemaBot could not read the current definition of table %q on the target; see the server logs for the reason.", table)
 		}
 		reason, refused, err := check.StatementRefusal(ctx, stmt, currentCreateTable, logger)
 		if err != nil {
@@ -358,10 +358,13 @@ func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB,
 		decision := e.resolveRefusedMode(ctx, target, policy, database, table, reason)
 		if decision.mode != engine.ExecutionModeDirect {
 			metrics.RecordDirectExecution(ctx, database, decision.outcome)
+			// A refusal reason is SchemaBot's own account of why the statement
+			// cannot run, built from the plan's table names and this database's
+			// configured bounds — the same text the plan preview already shows.
 			if !policy.Enabled {
-				return alterRouting{}, fmt.Errorf("statement on table %q is not supported by the schema-change engine and direct execution is not enabled for this database: %s", table, reason)
+				return alterRouting{}, engine.OperatorErrorf(nil, "Statement on table %q is not supported by the schema-change engine and direct execution is not enabled for this database: %s", table, reason)
 			}
-			return alterRouting{}, fmt.Errorf("statement on table %q cannot run directly: %s", table, decision.modeReason)
+			return alterRouting{}, engine.OperatorErrorf(nil, "Statement on table %q cannot run directly: %s", table, decision.modeReason)
 		}
 		routing.direct = append(routing.direct, directRouted{stmt: stmt, table: table, reason: reason, rows: decision.rows})
 	}
@@ -425,8 +428,12 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 			if isLockWaitTimeout(err) {
 				logger.Error("direct execution failed: statement could not acquire the table's metadata lock within the bounded wait",
 					"database", database, "table", ds.table, "lock_wait_timeout_seconds", lockWaitSeconds, "error", err)
-				e.setSchemaChangeFailed(fmt.Errorf("table %q is busy: could not acquire the metadata lock within %ds; retry when long-running transactions on the table have finished: %w",
-					ds.table, lockWaitSeconds, err))
+				// The table name comes from the plan and the timeout from this
+				// deployment's own configuration, so this sentence is safe to
+				// show on the pull request that asked for the change.
+				e.setSchemaChangeFailed(engine.OperatorErrorf(err,
+					"Table %q is busy: the change could not acquire the metadata lock within %ds. Retry when long-running transactions on the table have finished.",
+					ds.table, lockWaitSeconds))
 				return false
 			}
 			logger.Error("direct execution failed",
