@@ -738,6 +738,11 @@ message ProgressResponse {
   repeated TableProgress tables = 6;
   string started_at = 7;
   string completed_at = 8;
+  // Field 9 carried the operator-set volume level before the volume control
+  // operation was removed. Reserved so a future field cannot reuse the number
+  // while an embedded pre-removal data plane still emits it.
+  reserved 9;
+  reserved "volume";
   map<string, string> metadata = 10;
   // Control requests on this apply that have reached a terminal status.
   repeated SettledControlRequest settled_control_requests = 11;
