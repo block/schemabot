@@ -116,6 +116,31 @@ func (postgresStatementParser) CreateTableColumns(stmt string) ([]string, error)
 	return columns, nil
 }
 
+// postgresCreateTableColumn parses exactly one PostgreSQL CREATE TABLE
+// statement and returns its parse result, the CREATE TABLE node, and the
+// declaration node of the named column.
+func postgresCreateTableColumn(createTableDDL, columnName string) (*pgproto.ParseResult, *pgproto.Node_CreateStmt, *pgproto.Node, error) {
+	result, err := pgquery.Parse(createTableDDL)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("parse CREATE TABLE %q: %w", statementPreview(createTableDDL), err)
+	}
+	stmts := result.GetStmts()
+	if len(stmts) != 1 {
+		return nil, nil, nil, fmt.Errorf("expected one CREATE TABLE statement, got %d", len(stmts))
+	}
+	createNode, ok := stmts[0].GetStmt().GetNode().(*pgproto.Node_CreateStmt)
+	if !ok {
+		return nil, nil, nil, fmt.Errorf("expected CREATE TABLE statement")
+	}
+	for _, element := range createNode.CreateStmt.GetTableElts() {
+		column, ok := element.GetNode().(*pgproto.Node_ColumnDef)
+		if ok && column.ColumnDef.GetColname() == columnName {
+			return result, createNode, element, nil
+		}
+	}
+	return nil, nil, nil, fmt.Errorf("column %q not found in CREATE TABLE statement", columnName)
+}
+
 // SynthesizeAddColumn implements StatementParser. It grafts the column's
 // ColumnDef parse node — type and column-level constraints intact — from the
 // CREATE TABLE tree into a fresh ALTER TABLE ... ADD COLUMN tree and deparses
@@ -123,29 +148,9 @@ func (postgresStatementParser) CreateTableColumns(stmt string) ([]string, error)
 // textual slice of the input. Table-level constraints are separate TableElts
 // nodes, not part of the ColumnDef, and are not carried.
 func (postgresStatementParser) SynthesizeAddColumn(createTableDDL, columnName string) (string, error) {
-	result, err := pgquery.Parse(createTableDDL)
+	result, createNode, columnNode, err := postgresCreateTableColumn(createTableDDL, columnName)
 	if err != nil {
-		return "", fmt.Errorf("parse CREATE TABLE %q: %w", statementPreview(createTableDDL), err)
-	}
-	stmts := result.GetStmts()
-	if len(stmts) != 1 {
-		return "", fmt.Errorf("expected one CREATE TABLE statement, got %d", len(stmts))
-	}
-	createNode, ok := stmts[0].GetStmt().GetNode().(*pgproto.Node_CreateStmt)
-	if !ok {
-		return "", fmt.Errorf("expected CREATE TABLE statement")
-	}
-
-	var columnNode *pgproto.Node
-	for _, element := range createNode.CreateStmt.GetTableElts() {
-		column, ok := element.GetNode().(*pgproto.Node_ColumnDef)
-		if ok && column.ColumnDef.GetColname() == columnName {
-			columnNode = element
-			break
-		}
-	}
-	if columnNode == nil {
-		return "", fmt.Errorf("column %q not found in CREATE TABLE statement", columnName)
+		return "", err
 	}
 
 	result.Stmts = []*pgproto.RawStmt{{
@@ -163,6 +168,74 @@ func (postgresStatementParser) SynthesizeAddColumn(createTableDDL, columnName st
 		return "", fmt.Errorf("deparse ADD COLUMN for %q: %w", columnName, err)
 	}
 	return ddl, nil
+}
+
+// PostgresAddColumnManualReason reports why adding the named column from a
+// CREATE TABLE declaration to a populated table needs manual remediation,
+// or "" when the synthesized ADD COLUMN is safe to run automatically. The
+// decision reads the column's parsed constraint list:
+//
+//   - Generated and identity columns rewrite the whole table under an
+//     exclusive lock while PostgreSQL computes values for existing rows.
+//   - NOT NULL without a DEFAULT needs a backfill — the server would reject
+//     the ADD COLUMN outright on a populated table.
+//   - A DEFAULT whose expression is not provably non-volatile (a constant,
+//     a cast of a constant, or a SQL value function such as
+//     CURRENT_TIMESTAMP) fails closed: the parse tree cannot see function
+//     volatility, and a volatile default rewrites the whole table under an
+//     exclusive lock.
+//   - Constraint shapes not explicitly known to be safe fail closed.
+func PostgresAddColumnManualReason(createTableDDL, columnName string) (string, error) {
+	_, _, columnNode, err := postgresCreateTableColumn(createTableDDL, columnName)
+	if err != nil {
+		return "", err
+	}
+	column := columnNode.GetColumnDef()
+
+	var notNull, hasDefault, constantDefault bool
+	for _, node := range column.GetConstraints() {
+		constraint := node.GetConstraint()
+		switch constraint.GetContype() {
+		case pgproto.ConstrType_CONSTR_NOTNULL:
+			notNull = true
+		case pgproto.ConstrType_CONSTR_DEFAULT:
+			hasDefault = true
+			constantDefault = postgresNonVolatileExpression(constraint.GetRawExpr())
+		case pgproto.ConstrType_CONSTR_GENERATED, pgproto.ConstrType_CONSTR_IDENTITY:
+			return "definition is generated or identity, which rewrites the whole table under an exclusive lock; add it manually", nil
+		case pgproto.ConstrType_CONSTR_NULL, pgproto.ConstrType_CONSTR_UNIQUE, pgproto.ConstrType_CONSTR_FOREIGN:
+			// These constraints are safe on a nullable new column.
+		default:
+			return fmt.Sprintf("definition has constraint %s, which is not safe for automatic convergence; add it manually", constraint.GetContype().String()), nil
+		}
+	}
+	if hasDefault && !constantDefault {
+		return "definition has a DEFAULT expression whose volatility cannot be proven from the statement alone, and a volatile default rewrites the whole table under an exclusive lock; add it manually or ship the column with a constant DEFAULT", nil
+	}
+	if notNull && !hasDefault {
+		return "definition is NOT NULL without a DEFAULT; add it manually or ship the column with a DEFAULT", nil
+	}
+	return "", nil
+}
+
+// postgresNonVolatileExpression reports whether a DEFAULT expression is
+// provably non-volatile from its parse tree: a constant, a cast whose
+// argument is itself provably non-volatile, or a SQL value function
+// (CURRENT_TIMESTAMP and friends, which PostgreSQL defines as STABLE).
+// Function calls report false — the parse tree carries no volatility
+// information, so even a stable function like now() cannot be proven safe
+// without catalog access.
+func postgresNonVolatileExpression(expr *pgproto.Node) bool {
+	switch x := expr.GetNode().(type) {
+	case *pgproto.Node_AConst:
+		return true
+	case *pgproto.Node_TypeCast:
+		return postgresNonVolatileExpression(x.TypeCast.GetArg())
+	case *pgproto.Node_SqlvalueFunction:
+		return true
+	default:
+		return false
+	}
 }
 
 // CreateIndex implements StatementParser using the parsed IndexStmt. Any

@@ -762,23 +762,34 @@ on the storage dialect:
   tables carry a long history, create a newly declared index by hand before
   rolling out: the startup diff then finds nothing to do, instead of copying
   the table inside the budget on every pod.
-- **PostgreSQL** creates missing tables and verifies that existing tables
-  contain every column and standalone unique index declared by the embedded
-  schema. Missing objects fail startup with the affected table and objects
-  identified; extra columns are tolerated, and a missing non-unique index is
-  tolerated with a startup warning naming it. Column verification is
-  presence-only: type, length, and nullability drift
-  is outside its scope and is not detected. Existing tables are never altered,
-  and `allow_destructive_schema_changes` has no effect because this flow never
-  produces destructive DDL. Apply column changes to already-bootstrapped
-  PostgreSQL databases before deploying schema files that expect them.
+- **PostgreSQL** automatically creates missing tables, columns, and standalone
+  indexes. It discovers drift before taking the bootstrap advisory lock, then
+  re-checks and applies each table's changes transactionally under that lock.
+  A missing `NOT NULL` column without a `DEFAULT`, a generated or identity
+  column, or a column with a constraint shape not explicitly classified as
+  safe fails startup with instructions for manual remediation. Generated and
+  identity columns rewrite the populated table under an exclusive lock.
+  Startup also fails when additive DDL cannot be parsed or executed, or when
+  re-verification finds unresolved drift.
 
-  Non-unique indexes work the same way, and the consequence is quieter: an
-  index added to an embedded schema file reaches newly created databases only,
-  so an already-bootstrapped database keeps answering the queries that index
-  was added for — correctly, but without it, and startup warns about the gap
-  on every deploy until it is closed. Create those by hand. A database
-  bootstrapped before `idx_plans_created_at` was added to `plans` needs:
+  Convergence is additive-only: extra columns and indexes remain in place for
+  binary rollback, and `allow_destructive_schema_changes` has no effect because
+  this flow never produces destructive DDL. Column verification remains
+  presence-only, so type, length, and nullability drift is outside its scope and
+  is not detected.
+
+  Indexes added to an embedded schema file after a database was bootstrapped
+  converge on the next startup as plain `CREATE INDEX` statements, each in
+  its own transaction under the bootstrap advisory lock. A plain
+  `CREATE INDEX` holds a `SHARE` lock on the table for the full build and
+  blocks writes to it, and the startup budget is the build's only duration
+  ceiling, so on a deployment whose storage tables carry a long history,
+  pre-create the index by hand before rolling out — the startup diff then
+  finds it present and skips the build. The indexes below are the ones a
+  long-lived database is most likely to be missing.
+
+  A database bootstrapped before `idx_plans_created_at` was added to `plans`
+  needs:
 
   ```sql
   CREATE INDEX idx_plans_created_at ON plans (created_at);
@@ -793,7 +804,7 @@ on the storage dialect:
   ```
 
   Without it, every driver claim sorts the full claimable set before taking
-  one row, which slows claiming as apply history grows. And one bootstrapped
+  one row, which slows claiming as apply history grows. One bootstrapped
   before refused applies started naming the schema change holding the
   database needs:
 
