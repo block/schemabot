@@ -431,10 +431,13 @@ func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.
 	prInfo, err := ghInstClient.FetchPullRequestNoCache(ctx, a.Repository, a.PullRequest)
 	if err != nil {
 		// The outcome still has to land somewhere, and the apply's own commit is
-		// the only one left in hand. It is not the run GitHub gates on once the
-		// head has moved, so say so: an operator reading a stale aggregate needs
-		// to know the publish went to another commit.
-		h.logger.Warn("aggregate check published on the apply's commit and no re-plan considered: could not read the PR head after a terminal apply",
+		// the only one left in hand. Name the commit the refresh targets: it is
+		// not the run GitHub gates on once the head has moved, and an operator
+		// reading a stale aggregate needs to know where the outcome was sent.
+		// Whether it lands there is the fold's own decision — its head-currency
+		// check drops a publish aimed at a commit that is no longer the head, and
+		// logs that reason itself.
+		h.logger.Warn("terminal apply's aggregate refresh targets the apply's commit and no re-plan is considered: could not read the PR head",
 			append(checkFields(), "check_head_sha", checkRecord.HeadSHA, "error", err)...)
 		h.updateAggregateCheck(ctx, ghInstClient, a.Repository, a.PullRequest, checkRecord.HeadSHA)
 		return
