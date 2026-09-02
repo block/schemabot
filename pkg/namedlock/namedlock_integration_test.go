@@ -5,18 +5,15 @@ package namedlock
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"log"
 	"os"
 	"testing"
 	"time"
 
-	"github.com/moby/moby/api/types/network"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/block/schemabot/pkg/testutil"
 
@@ -40,25 +37,8 @@ func TestMain(m *testing.M) {
 // wait-strategy timeout), and the nil-safe TerminateContainer makes the
 // deferred call a no-op when no container exists at all.
 func run(ctx context.Context, m *testing.M) int {
-	// The MySQL entrypoint runs a throwaway init server that also logs
-	// "ready for connections" and binds nothing on TCP, so log- and
-	// port-based waits can be satisfied before the final server accepts
-	// clients. Gate readiness on a real query through the mapped port
-	// instead — the same handshake the tests themselves perform.
-	req := testcontainers.ContainerRequest{
-		Image:        "mysql:8.4",
-		ExposedPorts: []string{"3306/tcp"},
-		Env: map[string]string{
-			"MYSQL_ROOT_PASSWORD": "testpassword",
-			"MYSQL_DATABASE":      "testdb",
-		},
-		WaitingFor: wait.ForSQL("3306/tcp", "mysql", func(host string, port network.Port) string {
-			return fmt.Sprintf("root:testpassword@tcp(%s:%s)/testdb", host, port.Port())
-		}).WithStartupTimeout(30 * time.Second),
-	}
-
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: req,
+		ContainerRequest: testutil.MySQLContainerRequest("mysql:8.4", "testdb"),
 		Started:          true,
 	})
 	defer func() {
@@ -71,17 +51,11 @@ func run(ctx context.Context, m *testing.M) int {
 		return 1
 	}
 
-	host, err := testutil.ContainerHost(ctx, container)
+	mysqlDSN, err = testutil.MySQLDSN(ctx, container, "testdb", "parseTime=true")
 	if err != nil {
-		log.Printf("get container host: %v", err)
+		log.Printf("build mysql dsn: %v", err)
 		return 1
 	}
-	port, err := testutil.ContainerPort(ctx, container, "3306")
-	if err != nil {
-		log.Printf("get container port: %v", err)
-		return 1
-	}
-	mysqlDSN = fmt.Sprintf("root:testpassword@tcp(%s:%d)/testdb?parseTime=true", host, port)
 
 	pgContainer, err := postgres.Run(ctx,
 		"postgres:16",
