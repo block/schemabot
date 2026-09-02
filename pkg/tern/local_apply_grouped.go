@@ -1251,6 +1251,28 @@ func (c *LocalClient) logAtomicProgress(ctx context.Context, apply *storage.Appl
 	ps.lastProgressLog = now
 }
 
+// enginePoll is one grouped progress poll, decoded once for the whole apply:
+// the engine's report, the apply-wide task state the poll mapped to, the
+// instant classification its resume metadata carried, and the tick's clock.
+// Both halves of the projection read the same value, so a task can never be
+// refreshed against one poll and advanced against another.
+type enginePoll struct {
+	result   *engine.ProgressResult
+	newState string
+	// instantFromMetadata is the engine's own instant classification, decoded
+	// from the poll's resume metadata. It stands in for the per-table report an
+	// instant DDL never produces, having copied no rows.
+	instantFromMetadata bool
+	now                 time.Time
+}
+
+// retryableFailure reports whether the state this poll claims is a failure the
+// drive will retry, which leaves the task short of a finished outcome: no
+// completion stamp, and no finished progress bar.
+func (p enginePoll) retryableFailure() bool {
+	return state.IsState(p.newState, state.Task.FailedRetryable)
+}
+
 // syncAtomicTaskProgress projects one grouped progress poll onto every task of
 // the apply. A poll carries two separable things, and each task takes them
 // through a separate helper: the fields the operator sees, which a poll may
@@ -1264,21 +1286,20 @@ func (c *LocalClient) logAtomicProgress(ctx context.Context, apply *storage.Appl
 // deferred cutovers and revert windows, where nothing changes tick to tick.
 func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.Logger, tasks []*storage.Task, result *engine.ProgressResult, newState string, now time.Time) {
 	tableProgress := indexEngineTableProgress(result.Tables)
-	retryableFailure := state.IsState(newState, state.Task.FailedRetryable)
-	instantFromMetadata := false
+	poll := enginePoll{result: result, newState: newState, now: now}
 	if result.ResumeState != nil && result.ResumeState.Metadata != "" {
 		if meta, err := decodePSMetadataForStorage(result.ResumeState.Metadata); err == nil && meta != nil {
-			instantFromMetadata = meta.IsInstant
+			poll.instantFromMetadata = meta.IsInstant
 		}
 	}
 
 	for _, task := range tasks {
-		if retryableFailure && state.IsTerminalTaskState(task.State) {
+		if poll.retryableFailure() && state.IsTerminalTaskState(task.State) {
 			continue
 		}
 		tp, _ := tableProgress.ForTask(task)
-		c.refreshTaskDisplayFromEngine(ctx, logger, task, tp, result, instantFromMetadata, retryableFailure, now)
-		c.advanceTaskFromEngineProgress(ctx, task, newState, tp, result, retryableFailure, now)
+		c.refreshTaskDisplayFromEngine(ctx, logger, task, tp, poll)
+		c.advanceTaskFromEngineProgress(ctx, task, tp, poll)
 	}
 }
 
@@ -1291,24 +1312,37 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.L
 // (shard != "") that only the per-shard renderer loads; the task state machine
 // never reads them.
 //
-// Those shard rows are the only write made here. The task's own refreshed
-// fields ride out on the persisted write advanceTaskFromEngineProgress makes,
-// which is why the refresh runs first: a transition rolled back by a storage
-// failure keeps the display fields the caller refreshed before it.
-func (c *LocalClient) refreshTaskDisplayFromEngine(ctx context.Context, logger *slog.Logger, task *storage.Task, tp *engine.TableProgress, result *engine.ProgressResult, instantFromMetadata, retryableFailure bool, now time.Time) {
-	if tp != nil {
+// Those shard rows are the only write made here: the task's own refreshed
+// fields are mutated in memory and reach storage on the write
+// advanceTaskFromEngineProgress makes, which is why the refresh runs first — a
+// transition rolled back by a storage failure keeps the display fields the
+// caller refreshed before it. A caller that refreshes the display and then
+// declines the advance still owes the task a persisted write. The operator
+// reads tasks.updated_at as the drive's liveness signal
+// (ApplyDriveStallAfter), so a tick that ends without one reads as a drive
+// that stopped making progress, however fresh the fields left in memory are.
+func (c *LocalClient) refreshTaskDisplayFromEngine(ctx context.Context, logger *slog.Logger, task *storage.Task, tp *engine.TableProgress, poll enginePoll) {
+	switch {
+	case tp != nil:
 		applyEngineTableDisplayFields(task, tp)
 		// Persist the per-shard breakdown as per-shard tasks so the renderer
 		// can show per-shard state from storage. No-op outside the lease-held
 		// operator drive (read-path callers carry no operation lease).
-		c.writeShardProgress(ctx, logger, task, tp, now)
-		return
-	}
-	if instantFromMetadata {
+		c.writeShardProgress(ctx, logger, task, tp, poll.now)
+	case poll.instantFromMetadata:
+		// An instant DDL copies no rows, so no per-table report arrives to
+		// fill the bar: any terminal outcome it reaches other than a retryable
+		// failure leaves the change made, and the bar full.
 		task.IsInstant = true
-		if result.State.IsTerminal() && !retryableFailure {
+		if poll.result.State.IsTerminal() && !poll.retryableFailure() {
 			task.ProgressPercent = 100
 		}
+	}
+	// A completed poll ends the bar at 100 whatever the table's last sample
+	// read: row counts are estimates, and a finished copy can land a fraction
+	// short of its own total.
+	if poll.result.State == engine.StateCompleted {
+		task.ProgressPercent = 100
 	}
 }
 
@@ -1321,7 +1355,11 @@ func (c *LocalClient) refreshTaskDisplayFromEngine(ctx context.Context, logger *
 // schema itself — can keep showing live engine progress without letting the
 // poll re-open what was settled. taskStateWithNoBackwardProgress remains the
 // policy for whether the claim is allowed to move the stored state.
-func (c *LocalClient) advanceTaskFromEngineProgress(ctx context.Context, task *storage.Task, newState string, tp *engine.TableProgress, result *engine.ProgressResult, retryableFailure bool, now time.Time) {
+//
+// This is also where the tick reaches storage, for the task's stamps and for
+// the display fields the refresh left in memory.
+func (c *LocalClient) advanceTaskFromEngineProgress(ctx context.Context, task *storage.Task, tp *engine.TableProgress, poll enginePoll) {
+	retryableFailure := poll.retryableFailure()
 	if tp != nil {
 		if tp.StartedAt != nil && task.StartedAt == nil {
 			task.StartedAt = tp.StartedAt
@@ -1330,21 +1368,18 @@ func (c *LocalClient) advanceTaskFromEngineProgress(ctx context.Context, task *s
 			task.CompletedAt = tp.CompletedAt
 		}
 	}
-	if task.StartedAt == nil && newState != state.Task.Pending {
-		task.StartedAt = &now
+	if task.StartedAt == nil && poll.newState != state.Task.Pending {
+		task.StartedAt = &poll.now
 	}
-	if result.State.IsTerminal() && !retryableFailure && task.CompletedAt == nil {
-		task.CompletedAt = &now
+	if poll.result.State.IsTerminal() && !retryableFailure && task.CompletedAt == nil {
+		task.CompletedAt = &poll.now
 	}
-	if result.State == engine.StateFailed && task.ErrorMessage == "" {
-		if msg := progressFailureMessage(result); msg != "" {
+	if poll.result.State == engine.StateFailed && task.ErrorMessage == "" {
+		if msg := progressFailureMessage(poll.result); msg != "" {
 			task.ErrorMessage = msg
 		}
 	}
-	if result.State == engine.StateCompleted {
-		task.ProgressPercent = 100
-	}
-	c.transitionTaskState(ctx, task, 0, taskStateWithNoBackwardProgress(task.State, engineTaskStateClaim(newState, tp)), "")
+	c.transitionTaskState(ctx, task, 0, taskStateWithNoBackwardProgress(task.State, engineTaskStateClaim(poll.newState, tp)), "")
 }
 
 // engineTaskStateClaim is the state a progress poll claims for one task: the

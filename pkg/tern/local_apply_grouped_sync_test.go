@@ -101,6 +101,35 @@ func TestSyncAtomicTaskProgress_RefusedStateClaimStillRefreshesDisplay(t *testin
 	assert.EqualValues(t, 13, checksumming.ProgressPercent)
 }
 
+// Row counts are estimates, so an engine can report a completed schema change
+// whose final per-table sample still reads a fraction short of its own total.
+// The operator sees a finished bar on a finished change: the completed poll
+// ends the percentage at 100 whatever the last sample carried.
+func TestSyncAtomicTaskProgress_CompletedPollFinishesTheBar(t *testing.T) {
+	copied := &storage.Task{
+		ID: 1, ApplyID: 1, TaskIdentifier: "task-1",
+		Database: "appdb", DatabaseType: storage.DatabaseTypeMySQL,
+		TableName: "mutes", State: state.Task.Running,
+	}
+	taskStore := &stateRecordingTaskStore{
+		exactProgressTaskStore: &exactProgressTaskStore{tasks: []*storage.Task{copied}},
+	}
+	result := &engine.ProgressResult{
+		State: engine.StateCompleted,
+		Tables: []engine.TableProgress{
+			{Table: "mutes", State: spiritstatus.CopyRows.String(), RowsCopied: 8_912, RowsTotal: 9_000, Progress: 99},
+		},
+	}
+	client := groupedSyncClient(taskStore)
+
+	client.syncAtomicTaskProgress(t.Context(), slog.Default(), []*storage.Task{copied}, result, state.Task.Completed, time.Now())
+
+	assert.EqualValues(t, 100, copied.ProgressPercent, "a completed poll finishes the bar even when the last table sample fell short")
+	assert.EqualValues(t, 8_912, copied.RowsCopied, "the row counters keep what the engine reported")
+	assert.Equal(t, state.Task.Completed, copied.State)
+	assert.NotNil(t, copied.CompletedAt)
+}
+
 // A table the engine did not report on still belongs to the apply, so its task
 // takes the apply-wide state and keeps whatever progress the last report left
 // behind. An absent snapshot degrades the display and nothing else.
