@@ -424,8 +424,43 @@ func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.
 			checkFields()...)
 		return
 	}
-	h.updateAggregateCheck(ctx, ghInstClient, a.Repository, a.PullRequest, checkRecord.HeadSHA)
-	h.replanAfterCheckOwnershipRelease(ctx, ghInstClient, a, checkRecord)
+	// The stored row names the commit the apply started on, and the terminal
+	// write above re-pins it there. Both decisions left — which commit carries
+	// the outcome, and whether a re-plan is owed — turn on where the PR is now,
+	// so read the head uncached rather than trusting the row.
+	prInfo, err := ghInstClient.FetchPullRequestNoCache(ctx, a.Repository, a.PullRequest)
+	if err != nil {
+		// The outcome still has to land somewhere, and the apply's own commit is
+		// the only one left in hand. It is not the run GitHub gates on once the
+		// head has moved, so say so: an operator reading a stale aggregate needs
+		// to know the publish went to another commit.
+		h.logger.Warn("aggregate check published on the apply's commit and no re-plan considered: could not read the PR head after a terminal apply",
+			append(checkFields(), "check_head_sha", checkRecord.HeadSHA, "error", err)...)
+		h.updateAggregateCheck(ctx, ghInstClient, a.Repository, a.PullRequest, checkRecord.HeadSHA)
+		return
+	}
+
+	h.updateAggregateCheck(ctx, ghInstClient, a.Repository, a.PullRequest, aggregatePublishSHA(checkRecord, prInfo))
+	h.replanAfterCheckOwnershipRelease(a, checkRecord, prInfo)
+}
+
+// aggregatePublishSHA picks the commit a terminal apply's aggregate is
+// published on.
+//
+// The stored row names the commit the apply started on. Publishing there once
+// the PR head has moved puts the outcome on a Check Run GitHub no longer
+// displays or gates, leaving the run an operator is actually looking at showing
+// whatever it last said. It matters most for an apply that ends owing a
+// reconciliation: no re-plan follows that one by design, so the publish is the
+// only chance to state the block on the commit the PR is gated on.
+//
+// The stored commit stays the fallback for a head GitHub did not report, since
+// an outcome on a stale commit still beats no outcome at all.
+func aggregatePublishSHA(check *storage.Check, prInfo *github.PullRequestInfo) string {
+	if prInfo.HeadSHA == "" {
+		return check.HeadSHA
+	}
+	return prInfo.HeadSHA
 }
 
 // replanAfterCheckOwnershipRelease re-plans a PR whose head moved while an
@@ -444,7 +479,10 @@ func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.
 // completed task history keeps the row claimed — is deliberately left alone: an
 // operator owes that target a reconciliation and a clean plan must not replace
 // the block.
-func (h *Handler) replanAfterCheckOwnershipRelease(ctx context.Context, client *github.InstallationClient, a *storage.Apply, check *storage.Check) {
+//
+// prInfo is the caller's uncached read of the PR, shared with the commit the
+// aggregate was just published on so both decisions see one head.
+func (h *Handler) replanAfterCheckOwnershipRelease(a *storage.Apply, check *storage.Check, prInfo *github.PullRequestInfo) {
 	logFields := []any{
 		"apply_id", a.ApplyIdentifier,
 		"repo", a.Repository,
@@ -453,17 +491,10 @@ func (h *Handler) replanAfterCheckOwnershipRelease(ctx context.Context, client *
 		"database_type", a.DatabaseType,
 		"environment", a.Environment,
 		"check_head_sha", check.HeadSHA,
+		"head_sha", prInfo.HeadSHA,
+		"check_apply_id", check.ApplyID,
+		"pr_state", prInfo.State,
 	}
-
-	// The cached PR head is what a plan running during the apply would have
-	// read; this decision needs the head as it stands now.
-	prInfo, err := client.FetchPullRequestNoCache(ctx, a.Repository, a.PullRequest)
-	if err != nil {
-		h.logger.Warn("check will keep blocking the PR: could not read the PR to decide whether a re-plan is owed after a terminal apply released its check",
-			append(logFields, "error", err)...)
-		return
-	}
-	logFields = append(logFields, "head_sha", prInfo.HeadSHA, "check_apply_id", check.ApplyID, "pr_state", prInfo.State)
 	if !replanOwedAfterOwnershipRelease(check, prInfo) {
 		h.logger.Debug("no re-plan after terminal apply: the stored check is still apply-owned, already covers the PR head, or the PR is closed",
 			logFields...)
