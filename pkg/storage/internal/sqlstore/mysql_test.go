@@ -8,17 +8,17 @@ import (
 	"fmt"
 	"os"
 	"testing"
-	"time"
 
 	"github.com/block/spirit/pkg/utils"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
 )
+
+const testDatabaseName = "schemabot_test"
 
 var (
 	testDB             *sql.DB
@@ -35,38 +35,32 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	host, err := testutil.ContainerHost(ctx, container)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to get container host: %v\n", err)
-		os.Exit(1)
-	}
-
-	port, err := testutil.ContainerPort(ctx, container, "3306")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to get container port: %v\n", err)
-		os.Exit(1)
-	}
-
 	// testDSN sets clientFoundRows=true so RowsAffected reflects matched rows.
 	// testDSNChangedRows omits it to mirror production, where RowsAffected
 	// reflects changed rows: a matched row whose values are unchanged reports
 	// zero affected rows. Storage paths that infer existence or ownership from
 	// RowsAffected must be correct under the changed-rows connection.
-	testDSN = fmt.Sprintf("root:testpassword@tcp(%s:%d)/schemabot_test?parseTime=true&clientFoundRows=true&multiStatements=true", host, port)
-	testDSNChangedRows = fmt.Sprintf("root:testpassword@tcp(%s:%d)/schemabot_test?parseTime=true&multiStatements=true", host, port)
+	testDSN, err = testutil.MySQLDSN(ctx, container, testDatabaseName,
+		"parseTime=true", "clientFoundRows=true", "multiStatements=true")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to build MySQL DSN: %v\n", err)
+		os.Exit(1)
+	}
+	testDSNChangedRows, err = testutil.MySQLDSN(ctx, container, testDatabaseName,
+		"parseTime=true", "multiStatements=true")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to build MySQL changed-rows DSN: %v\n", err)
+		os.Exit(1)
+	}
 
 	testDB, err = sql.Open("mysql", testDSN)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to connect to MySQL: %v\n", err)
 		os.Exit(1)
 	}
-
-	// Wait for MySQL to be ready to accept connections
-	for range 30 {
-		if err := testDB.PingContext(ctx); err == nil {
-			break
-		}
-		time.Sleep(time.Second)
+	if err := testDB.PingContext(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to ping MySQL: %v\n", err)
+		os.Exit(1)
 	}
 
 	// Apply schema by executing embedded SQL files directly
@@ -103,21 +97,8 @@ func applyTestSchema(db *sql.DB) error {
 }
 
 func startMySQLContainer(ctx context.Context) (testcontainers.Container, error) {
-	req := testcontainers.ContainerRequest{
-		Image:        "mysql:8.0",
-		ExposedPorts: []string{"3306/tcp"},
-		Env: map[string]string{
-			"MYSQL_ROOT_PASSWORD": "testpassword",
-			"MYSQL_DATABASE":      "schemabot_test",
-		},
-		WaitingFor: wait.ForAll(
-			wait.ForLog("ready for connections").WithOccurrence(2).WithStartupTimeout(120*time.Second),
-			wait.ForListeningPort("3306/tcp"),
-		),
-	}
-
 	return testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: req,
+		ContainerRequest: testutil.MySQLContainerRequest("mysql:8.0", testDatabaseName),
 		Started:          true,
 	})
 }

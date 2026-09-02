@@ -16,7 +16,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/testutil"
@@ -29,57 +28,17 @@ var sharedDSN string
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 
-	req := testcontainers.ContainerRequest{
-		Image:        "mysql:8.0",
-		ExposedPorts: []string{"3306/tcp"},
-		Env: map[string]string{
-			"MYSQL_ROOT_PASSWORD": "testpassword",
-			"MYSQL_DATABASE":      "testdb",
-		},
-		WaitingFor: wait.ForAll(
-			wait.ForLog("ready for connections").WithOccurrence(2).WithStartupTimeout(30*time.Second),
-			wait.ForListeningPort("3306/tcp"),
-		),
-	}
-
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: req,
+		ContainerRequest: testutil.MySQLContainerRequest("mysql:8.0", "testdb"),
 		Started:          true,
 	})
 	if err != nil {
 		log.Fatalf("start mysql container: %v", err)
 	}
 
-	host, err := testutil.ContainerHost(ctx, container)
+	sharedDSN, err = testutil.MySQLDSN(ctx, container, "testdb", "parseTime=true")
 	if err != nil {
-		log.Fatalf("get container host: %v", err)
-	}
-	port, err := testutil.ContainerPort(ctx, container, "3306")
-	if err != nil {
-		log.Fatalf("get container port: %v", err)
-	}
-	sharedDSN = fmt.Sprintf("root:testpassword@tcp(%s:%d)/testdb?parseTime=true", host, port)
-
-	var db *sql.DB
-	for range 30 {
-		db, err = sql.Open("mysql", sharedDSN)
-		if err != nil {
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
-		if err = db.PingContext(ctx); err == nil {
-			if err := db.Close(); err != nil {
-				log.Fatalf("close mysql readiness connection: %v", err)
-			}
-			break
-		}
-		if closeErr := db.Close(); closeErr != nil {
-			log.Printf("close mysql readiness connection: %v", closeErr)
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	if err != nil {
-		log.Fatalf("connect to mysql: %v", err)
+		log.Fatalf("build mysql dsn: %v", err)
 	}
 
 	code := m.Run()
