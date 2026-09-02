@@ -23,7 +23,6 @@ import (
 	"net"
 	"regexp"
 	"strconv"
-	"strings"
 
 	"github.com/go-sql-driver/mysql"
 )
@@ -56,6 +55,7 @@ var reasons = map[int]string{
 	3819: "Existing rows violate a check constraint. Correct the data before applying a change that adds the constraint.",
 	1451: "A foreign key constraint blocked the change: child rows still reference a row it would remove.",
 	1452: "A foreign key constraint blocked the change: a row references a parent row that does not exist.",
+	1824: "A foreign key in this change references a table the target could not open. Create the referenced table before applying the change that points at it.",
 	1050: "The table already exists on the target.",
 	1146: "The table does not exist on the target.",
 	1091: "The column, index, or constraint does not exist on the target.",
@@ -91,18 +91,20 @@ var codePattern = regexp.MustCompile(`(?i)\b(?:errno|error)[ :=]+([0-9]{4})\b`)
 
 // quotedStatementMarker separates a target's reason from the failed statement
 // it quotes after it. Codes sit in the reason; what follows the marker is
-// customer row data, where a labelled number is just a value.
-const quotedStatementMarker = "during query:"
+// customer row data, where a labelled number is just a value. Matching without
+// regard to case costs nothing and keeps a target that capitalizes the marker
+// from putting row data back inside the scan.
+var quotedStatementMarker = regexp.MustCompile(`(?i)during query:`)
 
 // codeScanRegion returns the part of a message where a labelled number can be
 // trusted as an error code: everything before the quoted statement. The marker
 // is an input-side dependency of the kind the package comment describes — if a
-// target rewords it, the scan covers the whole message again, which is less
-// precise but degrades only toward the generic sentence's territory, never
-// toward rendering target text.
+// target rewords it the scan covers the whole message again, which cannot
+// render target text but can let a labelled number quoted from a row outrank
+// the genuine code, so the match is kept as forgiving as the shape allows.
 func codeScanRegion(msg string) string {
-	if before, _, ok := strings.Cut(msg, quotedStatementMarker); ok {
-		return before
+	if loc := quotedStatementMarker.FindStringIndex(msg); loc != nil {
+		return msg[:loc[0]]
 	}
 	return msg
 }

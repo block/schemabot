@@ -606,10 +606,20 @@ func TestEngine_RouteAlterStatements_UnreadableTableBlocked(t *testing.T) {
 		[]string{"ALTER TABLE `direct_missing` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)"},
 		directPolicy{Enabled: true, MaxTableRows: 100000})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "cannot read the current definition of table \"direct_missing\"")
-	assert.Contains(t, err.Error(), "see server logs")
-	assert.NotContains(t, err.Error(), "SHOW CREATE TABLE", "the raw query and driver error belong in the logs")
-	assert.NotContains(t, err.Error(), "Error 1146", "the raw query and driver error belong in the logs")
+
+	// What reaches the pull request is the marked operator message, and it
+	// carries none of the target's answer.
+	operatorMsg, marked := engine.OperatorMessageOf(err)
+	require.True(t, marked, "the routing failure is not safe to render: %v", err)
+	assert.Contains(t, operatorMsg, "could not read the current definition of table \"direct_missing\"")
+	assert.Contains(t, operatorMsg, "see the server logs")
+	assert.NotContains(t, operatorMsg, "SHOW CREATE TABLE", "the raw query and driver error belong in the logs")
+	assert.NotContains(t, operatorMsg, "Error 1146", "the raw query and driver error belong in the logs")
+
+	// The error itself keeps the cause, because the logs are where an operator
+	// goes to find out which query failed and what the target said.
+	assert.Contains(t, err.Error(), "SHOW CREATE TABLE")
+	assert.Contains(t, err.Error(), "Error 1146")
 }
 
 // A refused statement whose table size cannot be estimated is blocked: an
