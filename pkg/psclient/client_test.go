@@ -140,6 +140,48 @@ func TestCreateDeployRequestSendsServiceToken(t *testing.T) {
 	assert.Equal(t, "token-name:token-value", auth)
 }
 
+// tableMetricsServer serves the branch table metrics endpoint with a canned
+// response body.
+func tableMetricsServer(t *testing.T, body string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "/v1/organizations/block/databases/orders/branches/main/metrics/tables", r.URL.Path)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// The branch table metrics endpoint answers with one object keyed by table
+// name, each entry carrying the table's storage bytes for the whole branch.
+// The client flattens that into a table→bytes map.
+func TestBranchTableMetricsReadsStorageBytes(t *testing.T) {
+	body := `{"accounts":{"storage_bytes":14319353856},"accounts_seq":{"storage_bytes":114688}}`
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", tableMetricsServer(t, body).URL)
+	require.NoError(t, err)
+
+	metrics, err := client.BranchTableMetrics(t.Context(), "block", "orders", "main")
+
+	require.NoError(t, err)
+	assert.Equal(t, map[string]int64{
+		"accounts":     14_319_353_856,
+		"accounts_seq": 114_688,
+	}, metrics)
+}
+
+func TestBranchTableMetricsRefusesWithoutBaseURL(t *testing.T) {
+	client, err := NewPSClient("token-name", "token-value")
+	require.NoError(t, err)
+	client.(*psClientWrapper).baseURL = ""
+
+	_, err = client.BranchTableMetrics(t.Context(), "block", "orders", "main")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no PlanetScale API base URL")
+	assert.Contains(t, err.Error(), "orders")
+}
+
 // autoCutoverServer serves the deploy-request read endpoint with a fixed body.
 func autoCutoverServer(t *testing.T, body string) *httptest.Server {
 	t.Helper()

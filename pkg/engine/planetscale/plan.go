@@ -91,6 +91,20 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, fmt.Errorf("fetch current schema: %w", err)
 	}
 
+	// Keyspace shard counts for plan display, from the PlanetScale API. Best
+	// effort and budget-bound like every size probe: sizes are informational,
+	// so a slow or failed lookup logs and the plan proceeds with the counts
+	// unknown rather than failing.
+	countsCtx, cancelCounts := context.WithTimeout(ctx, engine.TableSizeProbeTimeout)
+	shardCounts, err := e.fetchKeyspaceShardCounts(countsCtx, client, org, req.Database, branch)
+	cancelCounts()
+	if err != nil {
+		e.logger.Warn("keyspace shard counts unavailable; the plan will omit them",
+			"database", req.Database, "error", err)
+		shardCounts = nil
+	}
+	tableBytes := e.fetchBranchTableBytes(ctx, client, org, req.Database, branch, shardCounts)
+
 	// Diff and lint per keyspace in parallel using Spirit's PlanChanges.
 	type keyspaceResult struct {
 		change     engine.SchemaChange
@@ -112,6 +126,8 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 			if diffErr != nil {
 				return diffErr
 			}
+
+			attachTableSizes(shardCounts[ks], tableBytes, tableChanges)
 
 			sc := engine.SchemaChange{
 				Namespace:    ks,
