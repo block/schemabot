@@ -92,26 +92,18 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	}
 
 	// Keyspace shard counts for plan display, from the PlanetScale API. Best
-	// effort: sizes are informational, so a lookup failure logs and the plan
-	// proceeds with the counts unknown rather than failing.
-	shardCounts, err := e.fetchKeyspaceShardCounts(ctx, client, org, req.Database, branch)
+	// effort and budget-bound like every size probe: sizes are informational,
+	// so a slow or failed lookup logs and the plan proceeds with the counts
+	// unknown rather than failing.
+	countsCtx, cancelCounts := context.WithTimeout(ctx, engine.TableSizeProbeTimeout)
+	shardCounts, err := e.fetchKeyspaceShardCounts(countsCtx, client, org, req.Database, branch)
+	cancelCounts()
 	if err != nil {
 		e.logger.Warn("keyspace shard counts unavailable; the plan will omit them",
 			"database", req.Database, "error", err)
 		shardCounts = nil
 	}
-	// Per-table storage bytes for plan display, from the branch table metrics
-	// API — one call covers every keyspace on the branch. Best effort like the
-	// shard counts, and budget-bound: sizes are display-only, so a slow or
-	// failed metrics read logs and the plan proceeds without byte estimates.
-	metricsCtx, cancelMetrics := context.WithTimeout(ctx, engine.TableSizeProbeTimeout)
-	tableBytes, err := client.BranchTableMetrics(metricsCtx, org, req.Database, branch)
-	cancelMetrics()
-	if err != nil {
-		e.logger.Warn("branch table metrics unavailable; the plan will omit table byte estimates",
-			"organization", org, "database", req.Database, "branch", branch, "error", err)
-		tableBytes = nil
-	}
+	tableBytes := e.fetchBranchTableBytes(ctx, client, org, req.Database, branch, shardCounts)
 
 	// Diff and lint per keyspace in parallel using Spirit's PlanChanges.
 	type keyspaceResult struct {
@@ -135,9 +127,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 				return diffErr
 			}
 
-			if len(tableChanges) > 0 {
-				attachTableSizes(shardCounts[ks], tableBytes, tableChanges)
-			}
+			attachTableSizes(shardCounts[ks], tableBytes, tableChanges)
 
 			sc := engine.SchemaChange{
 				Namespace:    ks,

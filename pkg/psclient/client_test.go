@@ -140,7 +140,6 @@ func TestCreateDeployRequestSendsServiceToken(t *testing.T) {
 	assert.Equal(t, "token-name:token-value", auth)
 }
 
-// autoCutoverServer serves the deploy-request read endpoint with a fixed body.
 // tableMetricsServer serves the branch table metrics endpoint with a canned
 // response body.
 func tableMetricsServer(t *testing.T, body string) *httptest.Server {
@@ -183,6 +182,7 @@ func TestBranchTableMetricsRefusesWithoutBaseURL(t *testing.T) {
 	assert.Contains(t, err.Error(), "orders")
 }
 
+// autoCutoverServer serves the deploy-request read endpoint with a fixed body.
 func autoCutoverServer(t *testing.T, body string) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

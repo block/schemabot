@@ -399,13 +399,15 @@ type TableChange struct {
 	// indexes) at plan time, for display only. Same sourcing, aggregation, and
 	// nil semantics as EstimatedRows.
 	EstimatedBytes *int64
-	// ShardCount is the number of shards this table change spans. Zero when
-	// the target is not sharded or the shard topology is unknown.
+	// ShardCount is the number of shards this table change spans. Zero means
+	// there is no shard count to render: the target is not sharded, or its
+	// shard topology could not be read. The two are indistinguishable here, so
+	// a renderer must omit the shard count on zero rather than assert the
+	// table is unsharded.
 	ShardCount int
 	// LargestShardRows is the approximate row count of the largest single
-	// shard — the biggest chunk a shard-at-a-time apply works through at once.
-	// Nil
-	// when the target is not sharded or no estimate is available.
+	// shard, the biggest chunk a shard-at-a-time apply works through at once.
+	// Nil when the target is not sharded or no estimate is available.
 	LargestShardRows *int64
 }
 
