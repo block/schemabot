@@ -128,58 +128,112 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check,
 			return err
 		}
 
-		// Preserve in-progress apply-owned state regardless of the plan's head SHA.
-		// Once an apply has started, the stored row is authoritative until the apply
-		// completes (CompleteForApply, MarkActionRequiredForApply) or an explicit
-		// recovery path releases it. A plan result — even from a newer PR commit that
-		// diffs cleanly against the mid-apply database — must not take ownership or
-		// convert the row into a passing check.
-		//
-		// A not-evaluated write additionally preserves the full gating state of an
-		// existing review-time drift block: it may refresh the head SHA and check
-		// run id so the current-head aggregate stays aligned, but it must not clear
-		// the block's conclusion, blocking reason, or summary. Only a write that
-		// re-ran the rollup (clean or blocked) rewrites those columns.
-		// Every CASE predicate reads the stored blocking_reason: preservation
-		// keys on the existing block, never on the incoming write. MySQL
-		// evaluates SET assignments left to right and later expressions see
-		// already-assigned values, while PostgreSQL evaluates every right-hand
-		// side against the old row — so blocking_reason is assigned after every
-		// CASE that reads it, keeping both dialects reading the stored value.
-		if drift == storage.PlanDriftNotEvaluated {
-			result, err := s.db.ExecContext(ctx, `
-				UPDATE checks
-				SET head_sha = ?,
-				    check_run_id = ?,
-				    apply_id     = CASE WHEN COALESCE(blocking_reason, '') = ? THEN apply_id     ELSE NULL END,
-				    has_changes  = CASE WHEN COALESCE(blocking_reason, '') = ? THEN has_changes  ELSE ?    END,
-				    status       = CASE WHEN COALESCE(blocking_reason, '') = ? THEN status       ELSE ?    END,
-				    conclusion   = CASE WHEN COALESCE(blocking_reason, '') = ? THEN conclusion   ELSE ?    END,
-				    error_message   = CASE WHEN COALESCE(blocking_reason, '') = ? THEN error_message   ELSE ? END,
-				    change_summary  = CASE WHEN COALESCE(blocking_reason, '') = ? THEN change_summary  ELSE ? END,
-				    blocking_reason = CASE WHEN COALESCE(blocking_reason, '') = ? THEN blocking_reason ELSE ? END,
-				    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
-				WHERE repository = ? AND pull_request = ?
-				  AND environment = ? AND database_type = ? AND database_name = ?
-				  AND NOT (status = ? AND apply_id IS NOT NULL)
-			`, check.HeadSHA, checkRunID,
-				storage.ReviewTimeDeploymentDriftBlockingReason,
-				storage.ReviewTimeDeploymentDriftBlockingReason, check.HasChanges,
-				storage.ReviewTimeDeploymentDriftBlockingReason, check.Status,
-				storage.ReviewTimeDeploymentDriftBlockingReason, check.Conclusion,
-				storage.ReviewTimeDeploymentDriftBlockingReason, check.ErrorMessage,
-				storage.ReviewTimeDeploymentDriftBlockingReason, nullString(check.ChangeSummary),
-				storage.ReviewTimeDeploymentDriftBlockingReason, check.BlockingReason,
-				check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
-				checkStatusInProgress)
-			if err != nil {
-				return err
-			}
-			stored, err = s.planWriteLanded(ctx, check, result)
-			return err
-		}
+		stored, err = s.writePlanResultUnlessApplyOwned(ctx, check, drift, checkRunID)
+		return err
+	})
+	return stored, err
+}
 
-		result, err := s.db.ExecContext(ctx, `
+// writePlanResultUnlessApplyOwned writes a plan result over existing check
+// state and reports whether it landed, refusing the write while an in-progress
+// apply owns the row.
+//
+// The ownership read and the write share one transaction, with the row held
+// under FOR UPDATE. That is what makes the answer trustworthy, because the
+// UPDATE's own row count cannot supply it: stored rows carry whole-second
+// timestamps, so a repeated plan rewriting a row with the values it already
+// holds reports no changed rows on MySQL's default row-count semantics despite
+// having matched. Asking afterwards, outside the write, answers a question
+// about a later moment — an apply that terminates in between turns a refusal
+// into a reported success, silencing the refusal precisely when applies are
+// ending and it is most worth counting.
+//
+// Holding the row also makes the ownership check the single decision point, so
+// the UPDATEs below carry no guard clause of their own.
+//
+// Returns storage.ErrCheckNotFound when the row is gone, which ownership cannot
+// account for: apply-owned rows are retained, so a target a refusal protects
+// still exists.
+func (s *checkStore) writePlanResultUnlessApplyOwned(ctx context.Context, check *storage.Check, drift storage.PlanDriftState, checkRunID any) (bool, error) {
+	target := fmt.Sprintf("%s#%d %s/%s/%s",
+		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return false, fmt.Errorf("begin plan check result write for %s: %w", target, err)
+	}
+	defer rollbackTx(ctx, tx, "upsert plan check result")
+
+	var status string
+	var applyID sql.NullInt64
+	err = tx.QueryRowContext(ctx, `
+		SELECT status, apply_id
+		FROM checks
+		WHERE repository = ? AND pull_request = ?
+		  AND environment = ? AND database_type = ? AND database_name = ?
+		FOR UPDATE
+	`, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName).Scan(&status, &applyID)
+	if errors.Is(err, sql.ErrNoRows) {
+		// The row existed for the duplicate-key insert and was deleted before this
+		// read — the PR closed and its check state was cleaned up mid-plan. No
+		// apply owns a row that is gone, so this is not a refusal: report it as
+		// its own outcome rather than as a check an apply is holding.
+		return false, fmt.Errorf("check state for %s was deleted while its plan result was being written: %w", target, storage.ErrCheckNotFound)
+	}
+	if err != nil {
+		return false, fmt.Errorf("read check ownership for plan result on %s: %w", target, err)
+	}
+
+	// Preserve in-progress apply-owned state regardless of the plan's head SHA.
+	// Once an apply has started, the stored row is authoritative until the apply
+	// completes (CompleteForApply, MarkActionRequiredForApply) or an explicit
+	// recovery path releases it. A plan result — even from a newer PR commit that
+	// diffs cleanly against the mid-apply database — must not take ownership or
+	// convert the row into a passing check.
+	if status == checkStatusInProgress && applyID.Valid {
+		if err := tx.Commit(); err != nil {
+			return false, fmt.Errorf("commit apply-owned plan check result read for %s: %w", target, err)
+		}
+		return false, nil
+	}
+
+	// A not-evaluated write preserves the full gating state of an existing
+	// review-time drift block: it may refresh the head SHA and check run id so the
+	// current-head aggregate stays aligned, but it must not clear the block's
+	// conclusion, blocking reason, or summary. Only a write that re-ran the rollup
+	// (clean or blocked) rewrites those columns.
+	// Every CASE predicate reads the stored blocking_reason: preservation
+	// keys on the existing block, never on the incoming write. MySQL
+	// evaluates SET assignments left to right and later expressions see
+	// already-assigned values, while PostgreSQL evaluates every right-hand
+	// side against the old row — so blocking_reason is assigned after every
+	// CASE that reads it, keeping both dialects reading the stored value.
+	if drift == storage.PlanDriftNotEvaluated {
+		_, err = tx.ExecContext(ctx, `
+			UPDATE checks
+			SET head_sha = ?,
+			    check_run_id = ?,
+			    apply_id     = CASE WHEN COALESCE(blocking_reason, '') = ? THEN apply_id     ELSE NULL END,
+			    has_changes  = CASE WHEN COALESCE(blocking_reason, '') = ? THEN has_changes  ELSE ?    END,
+			    status       = CASE WHEN COALESCE(blocking_reason, '') = ? THEN status       ELSE ?    END,
+			    conclusion   = CASE WHEN COALESCE(blocking_reason, '') = ? THEN conclusion   ELSE ?    END,
+			    error_message   = CASE WHEN COALESCE(blocking_reason, '') = ? THEN error_message   ELSE ? END,
+			    change_summary  = CASE WHEN COALESCE(blocking_reason, '') = ? THEN change_summary  ELSE ? END,
+			    blocking_reason = CASE WHEN COALESCE(blocking_reason, '') = ? THEN blocking_reason ELSE ? END,
+			    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
+			WHERE repository = ? AND pull_request = ?
+			  AND environment = ? AND database_type = ? AND database_name = ?
+		`, check.HeadSHA, checkRunID,
+			storage.ReviewTimeDeploymentDriftBlockingReason,
+			storage.ReviewTimeDeploymentDriftBlockingReason, check.HasChanges,
+			storage.ReviewTimeDeploymentDriftBlockingReason, check.Status,
+			storage.ReviewTimeDeploymentDriftBlockingReason, check.Conclusion,
+			storage.ReviewTimeDeploymentDriftBlockingReason, check.ErrorMessage,
+			storage.ReviewTimeDeploymentDriftBlockingReason, nullString(check.ChangeSummary),
+			storage.ReviewTimeDeploymentDriftBlockingReason, check.BlockingReason,
+			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+	} else {
+		_, err = tx.ExecContext(ctx, `
 			UPDATE checks
 			SET head_sha = ?,
 			    check_run_id = ?,
@@ -193,62 +247,16 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check,
 			    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
 			WHERE repository = ? AND pull_request = ?
 			  AND environment = ? AND database_type = ? AND database_name = ?
-			  AND NOT (status = ? AND apply_id IS NOT NULL)
 		`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, nullString(check.ChangeSummary),
-			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
-			checkStatusInProgress)
-		if err != nil {
-			return err
-		}
-		stored, err = s.planWriteLanded(ctx, check, result)
-		return err
-	})
-	return stored, err
-}
-
-// planWriteLanded reports whether a guarded plan-result UPDATE actually wrote
-// the row.
-//
-// A non-zero affected count is decisive. Zero is not: stored rows carry
-// whole-second timestamps, so an UPDATE that rewrites a row with the values it
-// already holds reports no changed rows on MySQL's default row-count semantics
-// even though it matched. Re-reading the row and asking the guard's own
-// question — is this row still in-progress apply-owned? — separates the write
-// the guard refused from the write that was a no-op, so a repeated plan is
-// never reported to callers as refused.
-//
-// Returns storage.ErrCheckNotFound when the row is gone, which the guard cannot
-// account for: it retains apply-owned rows, so a target it refused still exists.
-func (s *checkStore) planWriteLanded(ctx context.Context, check *storage.Check, result sql.Result) (bool, error) {
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	if rows > 0 {
-		return true, nil
-	}
-
-	var status string
-	var applyID sql.NullInt64
-	err = s.db.QueryRowContext(ctx, `
-		SELECT status, apply_id
-		FROM checks
-		WHERE repository = ? AND pull_request = ?
-		  AND environment = ? AND database_type = ? AND database_name = ?
-	`, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName).Scan(&status, &applyID)
-	if errors.Is(err, sql.ErrNoRows) {
-		// The row existed for the duplicate-key insert and was deleted before this
-		// read — the PR closed and its check state was cleaned up mid-plan. No
-		// apply owns a row that is gone, so this is not the guard refusing: report
-		// it as its own outcome rather than as a check an apply is holding.
-		return false, fmt.Errorf("check state for %s#%d %s/%s/%s was deleted while its plan result was being written: %w",
-			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName, storage.ErrCheckNotFound)
+			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
 	}
 	if err != nil {
-		return false, fmt.Errorf("read check ownership after zero-row plan write for %s#%d %s/%s/%s: %w",
-			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName, err)
+		return false, fmt.Errorf("write plan check result for %s: %w", target, err)
 	}
-	return status != checkStatusInProgress || !applyID.Valid, nil
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit plan check result for %s: %w", target, err)
+	}
+	return true, nil
 }
 
 // RecoverApplyOwnedCheckWithNoOpPlan updates same-head apply-owned stored check
