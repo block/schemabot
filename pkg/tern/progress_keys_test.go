@@ -108,18 +108,52 @@ func TestStatementIndexForTaskFallsBackToTableEntry(t *testing.T) {
 	assert.Equal(t, 60, tp.Progress)
 }
 
-func TestStatementIndexForTaskFallsBackToTableWhenStatementUnmatched(t *testing.T) {
+// An engine that runs a table's statements as one change reports the combined
+// text as the entry's DDL, which matches no single task's statement. With one
+// entry on the table there is nothing else that entry could describe, so every
+// task on the table resolves to it.
+func TestStatementIndexForTaskFallsBackToSoleTableEntryWhenStatementUnmatched(t *testing.T) {
 	progress := indexEngineTableProgress([]engine.TableProgress{
-		{Namespace: "app", Table: "users", DDL: "ALTER TABLE users ADD COLUMN email text", Progress: 90},
+		{
+			Namespace: "app",
+			Table:     "users",
+			DDL:       "ALTER TABLE users ADD COLUMN email text; ALTER TABLE users ADD COLUMN name text",
+			Progress:  90,
+		},
+	})
+
+	for _, statement := range []string{
+		"ALTER TABLE users ADD COLUMN email text",
+		"ALTER TABLE users ADD COLUMN name text",
+	} {
+		tp, ok := progress.ForTask(&storage.Task{Namespace: "app", TableName: "users", DDL: statement})
+		require.True(t, ok, statement)
+		assert.Equal(t, 90, tp.Progress, statement)
+	}
+}
+
+// Once a table has several entries, a task whose statement matches none of
+// them is a miss: handing back a sibling statement's entry would report that
+// sibling's progress and terminal state as this task's.
+func TestStatementIndexForTaskMissesWhenStatementUnmatchedAmongSeveralEntries(t *testing.T) {
+	progress := IndexProtoTableProgress([]*ternv1.TableProgress{
+		{Namespace: "app", TableName: "users", Ddl: "CREATE TABLE public.users (id bigint PRIMARY KEY)", Status: "completed"},
+		{Namespace: "app", TableName: "users", Ddl: "CREATE INDEX users_email_idx ON public.users (email)", Status: "running"},
 	})
 
 	tp, ok := progress.ForTask(&storage.Task{
 		Namespace: "app",
 		TableName: "users",
-		DDL:       "ALTER TABLE users ADD COLUMN name text",
+		DDL:       "CREATE INDEX users_name_idx ON public.users (name)",
 	})
+	require.False(t, ok)
+	require.Nil(t, tp)
+
+	// A task without a statement asks about the table as a whole and still
+	// resolves to the table's entry.
+	tp, ok = progress.ForTask(&storage.Task{Namespace: "app", TableName: "users"})
 	require.True(t, ok)
-	assert.Equal(t, 90, tp.Progress)
+	assert.Equal(t, "running", tp.Status)
 }
 
 func TestStatementIndexTreatsWhitespaceOnlyDDLAsTableEntry(t *testing.T) {

@@ -334,6 +334,12 @@ func (sc SchemaChange) ShardName() string {
 // repeats across a keyspace's shards; a non-sharded change lists each
 // statement once, and a table may legitimately appear more than once when its
 // change is a multi-statement sequence.
+//
+// An engine that fans a change out to its shards behind one endpoint reports
+// a whole-namespace change like a single-node engine does, so any repeated
+// table in it is a statement sequence, never a per-shard repeat. Per-shard
+// changes come from callers that scope a change to one shard — a shard-scoped
+// dispatch, or a task that recorded the shard it ran on.
 func (sc SchemaChange) Sharded() bool {
 	return sc.ShardName() != ""
 }

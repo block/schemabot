@@ -24,20 +24,33 @@ func progressStatementKey(namespace, table, ddl string) string {
 //
 // A task is one statement, and a table can carry several statements in one
 // apply, so an entry that names its DDL is matched by that same statement on
-// that (namespace, table). An entry without DDL describes the table as a whole
-// and matches every statement on it. The two planes mint task identifiers
-// independently, so the statement text is the only identity that travels
-// between them intact.
+// that (namespace, table). The two planes mint task identifiers independently,
+// so the statement text is the only identity that travels between them intact.
+//
+// A lookup that names a statement but finds no entry for it falls back to the
+// table's entry only while that entry is unambiguous: a table with a single
+// entry can only be describing this statement's work — whether the entry
+// omits its DDL, or an engine that runs a table's statements as one change
+// reports the combined text. Once a table has several entries, a statement
+// that matches none of them is unaccounted for, and the lookup reports a miss
+// rather than hand back a sibling statement's progress.
 type StatementIndex[T any] struct {
 	byStatement map[string]*T
-	byTable     map[string]*T
+	byTable     map[string]tableEntries[T]
+}
+
+// tableEntries is the last entry recorded for a table and how many entries the
+// table has received in total.
+type tableEntries[T any] struct {
+	last  *T
+	count int
 }
 
 // NewStatementIndex returns an empty index sized for about size entries.
 func NewStatementIndex[T any](size int) StatementIndex[T] {
 	return StatementIndex[T]{
 		byStatement: make(map[string]*T, size),
-		byTable:     make(map[string]*T, size),
+		byTable:     make(map[string]tableEntries[T], size),
 	}
 }
 
@@ -47,23 +60,34 @@ func (ix StatementIndex[T]) Add(namespace, table, ddl string, entry *T) {
 	if strings.TrimSpace(ddl) != "" {
 		ix.byStatement[progressStatementKey(namespace, table, ddl)] = entry
 	}
-	ix.byTable[progressTableKey(namespace, table)] = entry
+	tableKey := progressTableKey(namespace, table)
+	ix.byTable[tableKey] = tableEntries[T]{last: entry, count: ix.byTable[tableKey].count + 1}
 }
 
 // Lookup returns the entry for the statement on the table when ddl is not
-// blank and one was added for it, otherwise the entry for the table.
+// blank and one was added for it. Otherwise it returns the table's entry when
+// the table has exactly one, or when ddl is blank and the caller is asking
+// about the table as a whole. A statement that matches none of a table's
+// several entries is a miss.
 func (ix StatementIndex[T]) Lookup(namespace, table, ddl string) (*T, bool) {
-	if strings.TrimSpace(ddl) != "" {
+	hasStatement := strings.TrimSpace(ddl) != ""
+	if hasStatement {
 		if entry, ok := ix.byStatement[progressStatementKey(namespace, table, ddl)]; ok {
 			return entry, true
 		}
 	}
-	entry, ok := ix.byTable[progressTableKey(namespace, table)]
-	return entry, ok
+	entries, ok := ix.byTable[progressTableKey(namespace, table)]
+	if !ok {
+		return nil, false
+	}
+	if hasStatement && entries.count > 1 {
+		return nil, false
+	}
+	return entries.last, true
 }
 
 // ForTask returns the entry describing the task: its own statement's entry
-// when one was recorded, otherwise the entry for its table.
+// when one was recorded, otherwise the table's entry while it is unambiguous.
 func (ix StatementIndex[T]) ForTask(task *storage.Task) (*T, bool) {
 	return ix.Lookup(task.Namespace, task.TableName, task.DDL)
 }
