@@ -27,6 +27,7 @@ func TestNew_Integration(t *testing.T) {
 		mysql.WithDatabase("schemabot_test"),
 		mysql.WithUsername("root"),
 		mysql.WithPassword("test"),
+		testutil.MySQLTmpfsDatadir(),
 	)
 	require.NoError(t, err, "failed to start mysql")
 	t.Cleanup(func() {

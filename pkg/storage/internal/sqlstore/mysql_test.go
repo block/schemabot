@@ -58,8 +58,8 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "Failed to connect to MySQL: %v\n", err)
 		os.Exit(1)
 	}
-	if err := testDB.PingContext(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to ping MySQL: %v\n", err)
+	if err := testutil.PingMySQL(ctx, testDB); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to reach MySQL: %v\n", err)
 		os.Exit(1)
 	}
 

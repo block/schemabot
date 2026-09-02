@@ -85,7 +85,6 @@ import (
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
@@ -115,30 +114,20 @@ func TestMain(m *testing.M) {
 		log.Fatalf("Failed to start target MySQL: %v", err)
 	}
 
-	host, err := testutil.ContainerHost(ctx, targetContainer)
+	e2eTargetDSN, err = testutil.MySQLDSN(ctx, targetContainer, "target_test", "parseTime=true")
 	if err != nil {
-		log.Fatalf("Failed to get target host: %v", err)
+		log.Fatalf("Failed to build target DSN: %v", err)
 	}
-	port, err := testutil.ContainerPort(ctx, targetContainer, "3306")
-	if err != nil {
-		log.Fatalf("Failed to get target port: %v", err)
-	}
-	e2eTargetDSN = fmt.Sprintf("root:testpassword@tcp(%s:%d)/target_test?parseTime=true", host, port)
 
 	sbContainer, err := startE2EMySQLContainer(ctx, "webhook-schemabot-mysql", "schemabot_test", &schema.MySQLFS)
 	if err != nil {
 		log.Fatalf("Failed to start SchemaBot MySQL: %v", err)
 	}
 
-	sbHost, err := testutil.ContainerHost(ctx, sbContainer)
+	e2eSchemabotDSN, err = testutil.MySQLDSN(ctx, sbContainer, "schemabot_test", "parseTime=true")
 	if err != nil {
-		log.Fatalf("Failed to get schemabot host: %v", err)
+		log.Fatalf("Failed to build SchemaBot storage DSN: %v", err)
 	}
-	sbPort, err := testutil.ContainerPort(ctx, sbContainer, "3306")
-	if err != nil {
-		log.Fatalf("Failed to get schemabot port: %v", err)
-	}
-	e2eSchemabotDSN = fmt.Sprintf("root:testpassword@tcp(%s:%d)/schemabot_test?parseTime=true", sbHost, sbPort)
 
 	code := m.Run()
 
@@ -1087,19 +1076,8 @@ func setupE2EServiceMultiEnv(t *testing.T, appDBName string) *api.Service {
 }
 
 func startE2EMySQLContainer(ctx context.Context, baseName, dbName string, schemaFS *embed.FS) (testcontainers.Container, error) {
-	req := testcontainers.ContainerRequest{
-		Name:         e2eContainerName(baseName),
-		Image:        "mysql:8.0",
-		ExposedPorts: []string{"3306/tcp"},
-		Env: map[string]string{
-			"MYSQL_ROOT_PASSWORD": "testpassword",
-			"MYSQL_DATABASE":      dbName,
-		},
-		WaitingFor: wait.ForAll(
-			wait.ForLog("ready for connections").WithOccurrence(2).WithStartupTimeout(60*time.Second),
-			wait.ForListeningPort("3306/tcp"),
-		),
-	}
+	req := testutil.MySQLContainerRequest("mysql:8.0", dbName)
+	req.Name = e2eContainerName(baseName)
 
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: req,
@@ -1111,17 +1089,11 @@ func startE2EMySQLContainer(ctx context.Context, baseName, dbName string, schema
 	}
 
 	if schemaFS != nil {
-		host, err := testutil.ContainerHost(ctx, container)
+		dsn, err := testutil.MySQLDSN(ctx, container, dbName, "parseTime=true", "multiStatements=true")
 		if err != nil {
 			_ = container.Terminate(ctx)
-			return nil, fmt.Errorf("get container host: %w", err)
+			return nil, fmt.Errorf("build mysql dsn: %w", err)
 		}
-		port, err := testutil.ContainerPort(ctx, container, "3306")
-		if err != nil {
-			_ = container.Terminate(ctx)
-			return nil, fmt.Errorf("get container port: %w", err)
-		}
-		dsn := fmt.Sprintf("root:testpassword@tcp(%s:%d)/%s?parseTime=true&multiStatements=true", host, port, dbName)
 		db, err := sql.Open("mysql", dsn)
 		if err != nil {
 			_ = container.Terminate(ctx)
@@ -1129,17 +1101,9 @@ func startE2EMySQLContainer(ctx context.Context, baseName, dbName string, schema
 		}
 		defer func() { _ = db.Close() }()
 
-		// Wait for MySQL to be ready to accept connections
-		var pingErr error
-		for range 30 {
-			if pingErr = db.PingContext(ctx); pingErr == nil {
-				break
-			}
-			time.Sleep(500 * time.Millisecond)
-		}
-		if pingErr != nil {
+		if err := testutil.PingMySQL(ctx, db); err != nil {
 			_ = container.Terminate(ctx)
-			return nil, fmt.Errorf("MySQL not ready after 15s: %w", pingErr)
+			return nil, err
 		}
 
 		if err := applyEmbeddedSchema(db, *schemaFS); err != nil {
