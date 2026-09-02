@@ -28,3 +28,4 @@ CREATE INDEX idx_apply_operations_deployment_state ON apply_operations (deployme
 CREATE INDEX idx_apply_operations_state_created_id ON apply_operations (state, created_at, id);
 CREATE INDEX idx_apply_operations_apply_created_id ON apply_operations (apply_id, created_at, id);
 CREATE INDEX idx_apply_operations_created_id ON apply_operations (created_at, id);
+CREATE INDEX idx_apply_operations_external_id ON apply_operations (external_id);

@@ -85,7 +85,7 @@ func NewWithDependencies(deps Dependencies) *Storage {
 	}
 	return &Storage{
 		db:              rdb,
-		locks:           &lockStore{db: rdb, classifier: deps.Classifier},
+		locks:           &lockStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
 		plans:           &planStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier},
 		applies:         &applyStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier},
 		tasks:           &taskStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker},

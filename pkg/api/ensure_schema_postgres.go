@@ -262,7 +262,7 @@ func postgresSchemaDriftFor(ctx context.Context, db *sql.DB, tables []string, fi
 			if existingColumns[column] {
 				continue
 			}
-			statement, err := ddl.SynthesizePostgresAddColumn(expected.createTable, column)
+			statement, err := parser.SynthesizeAddColumn(expected.createTable, column)
 			if err != nil {
 				return nil, fmt.Errorf("synthesize ADD COLUMN for %q.%q: %w", table, column, err)
 			}

@@ -204,6 +204,27 @@ func TestCheckSuiteWebhookQueuesWithGrace(t *testing.T) {
 	assert.WithinDuration(t, before.Add(defaultCheckSuiteRecoveryGrace), *row.RetryAfter, 10*time.Second)
 }
 
+func TestCheckSuiteWebhookCanonicalizesRepository(t *testing.T) {
+	store := newRecordingWebhookEventStore()
+	h := newCheckSuiteIngressHandler(t, store, map[string]api.RepoConfig{"mixedcase/sample-repo": {}})
+
+	req := buildCheckSuiteWebhookRequest(t, "requested", "MixedCaseSHA", "MixedCaseBranch", 7)
+	body, err := io.ReadAll(req.Body)
+	require.NoError(t, err)
+	req.Body = io.NopCloser(strings.NewReader(strings.ReplaceAll(string(body), "octocat/hello-world", "MixedCase/Sample-Repo")))
+	req.Header.Set(headerDeliveryID, "mixed-case-check-suite")
+	rr := httptest.NewRecorder()
+
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "mixed-case-check-suite")
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, "mixedcase/sample-repo", row.Repository)
+	assert.Equal(t, "MixedCaseSHA", row.HeadSHA)
+}
+
 // Only "requested" carries recovery work: "rerequested" re-plans through
 // check_run.rerequested and "completed" is pure noise, so neither may occupy
 // an inbox row.
@@ -426,6 +447,27 @@ func TestDurableCheckSuiteSynthesizesMissingCoverage(t *testing.T) {
 	assert.Equal(t, 7, row.PullRequest)
 	assert.Equal(t, "suite-sha", row.HeadSHA)
 	assert.Equal(t, "12345", row.TenantID)
+}
+
+// A durable row is normalized before config and GitHub routing so replayed
+// rows from any producer use the same repository identity as ingress rows.
+func TestDurableCheckSuiteCanonicalizesStoredRepository(t *testing.T) {
+	store := newRecordingWebhookEventStore()
+	h, mux := newCheckSuiteProcessHandler(t, store, map[string]api.RepoConfig{"octocat/hello-world": {}})
+	mux.HandleFunc("/repos/octocat/hello-world/pulls/7", func(w http.ResponseWriter, _ *http.Request) {
+		writeSinglePR(t, w, 7, "open", "suite-sha")
+	})
+	event := durableCheckSuiteEvent(t, "suite-sha", 7)
+	event.Repository = "OctoCat/Hello-World"
+
+	retry, err := h.processDurableCheckSuite(t.Context(), event)
+
+	require.NoError(t, err)
+	require.False(t, retry)
+	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "suite-sha"))
+	require.NoError(t, err)
+	require.NotNil(t, row)
+	assert.Equal(t, "octocat/hello-world", row.Repository)
 }
 
 // Every payload PR still open at the suite head gets its own PR-scoped

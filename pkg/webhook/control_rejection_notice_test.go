@@ -32,16 +32,30 @@ func TestStatusCommentSurfacesRejectedControlCommands(t *testing.T) {
 
 	t.Run("a failed control request is named with its reason", func(t *testing.T) {
 		body := observer(&storage.ApplyControlRequest{
-			Operation:    storage.ControlOperationVolume,
+			Operation:    storage.ControlOperationRevert,
 			Status:       storage.ControlRequestFailed,
 			RequestedBy:  "octocat",
-			ErrorMessage: "throttle deploy request 42 failed: 404 Not Found",
+			ErrorMessage: "deploy request is outside its revert window",
 		}).formatStatusComment(apply, nil)
 
 		assert.Contains(t, body, "Command not applied")
-		assert.Contains(t, body, "`volume` was accepted but did not take effect")
+		assert.Contains(t, body, "`revert` was accepted but did not take effect")
 		assert.Contains(t, body, "requested by `octocat`")
-		assert.Contains(t, body, "404 Not Found")
+		assert.Contains(t, body, "outside its revert window")
+	})
+
+	// A rejection recorded by a previous release for a retired operation names
+	// a command the operator can no longer issue: the notice's "re-issue the
+	// command" remedy is impossible, so nothing could ever clear it.
+	t.Run("a rejection for a retired operation adds no notice", func(t *testing.T) {
+		body := observer(&storage.ApplyControlRequest{
+			Operation:    storage.ControlOperation("volume"),
+			Status:       storage.ControlRequestFailed,
+			RequestedBy:  "octocat",
+			ErrorMessage: "the engine rejected the volume change",
+		}).formatStatusComment(apply, nil)
+
+		assert.NotContains(t, body, "Command not applied")
 	})
 
 	t.Run("a completed control request adds no notice", func(t *testing.T) {
@@ -57,19 +71,20 @@ func TestStatusCommentSurfacesRejectedControlCommands(t *testing.T) {
 		assert.NotContains(t, observer().formatStatusComment(apply, nil), "Command not applied")
 	})
 
-	// Volume is proxied entirely through SchemaBot's own forwarding path, so its
-	// stored request never names a person. Crediting the command to the internal
+	// A command that reached this plane without an operator identity — an
+	// internal resume, or a plane that predates the caller field — records
+	// SchemaBot's own forwarding caller. Crediting the command to that internal
 	// caller would tell the operator someone else issued it.
 	t.Run("a request that names no operator is not attributed", func(t *testing.T) {
 		body := observer(&storage.ApplyControlRequest{
-			Operation:    storage.ControlOperationVolume,
+			Operation:    storage.ControlOperationStart,
 			Status:       storage.ControlRequestFailed,
 			RequestedBy:  storage.ForwardingControlRequestCaller,
-			ErrorMessage: "engine does not support volume changes",
+			ErrorMessage: "no stopped schema change to resume",
 		}).formatStatusComment(apply, nil)
 
-		assert.Contains(t, body, "`volume` was accepted but did not take effect")
-		assert.Contains(t, body, "engine does not support volume changes")
+		assert.Contains(t, body, "`start` was accepted but did not take effect")
+		assert.Contains(t, body, "no stopped schema change to resume")
 		assert.NotContains(t, body, "requested by")
 	})
 

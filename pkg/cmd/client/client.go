@@ -412,16 +412,6 @@ func CallReleaseAPI(endpoint, environment, applyID string) (*apitypes.ReleaseRes
 	return callControlAPI[apitypes.ReleaseResponse](endpoint, "/api/release", environment, applyID)
 }
 
-// CallVolumeAPI calls the volume API and returns the typed result.
-func CallVolumeAPI(endpoint, environment, applyID string, volume int) (*apitypes.VolumeResponse, error) {
-	req := apitypes.VolumeRequest{Environment: environment, Volume: int32(volume), ApplyID: applyID}
-	var result apitypes.VolumeResponse
-	if err := doPostInto(endpoint, "/api/volume", req, &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
-}
-
 // CallRevertAPI calls the revert API and returns the typed result.
 func CallRevertAPI(endpoint, environment, applyID string) (*apitypes.ControlResponse, error) {
 	return callControlAPI[apitypes.ControlResponse](endpoint, "/api/revert", environment, applyID)

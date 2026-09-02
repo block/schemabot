@@ -26,6 +26,22 @@ import (
 	"github.com/block/schemabot/pkg/vschema"
 )
 
+// foreignKeyRefusalReason is the plan-time disclosure for a statement that
+// declares a foreign key. The engine rejects it outright, so the statement is a
+// guaranteed failure rather than a risk for the author to weigh, and a plan that
+// offered to apply it would be offering a wait that can only end in an error.
+// The wording matches the refusal the MySQL engine already reports for the same
+// constraint, so one operator-facing vocabulary covers both.
+//
+// This is the only rejection this engine's plan predicts. Every other statement
+// it will not accept is rejected when the DDL runs on the branch, before any
+// data is copied: the apply fails, but it fails against a throwaway branch and
+// never leaves a table half-changed. Predicting this one is worth the special
+// case because the rejection is deterministic and the statement is common;
+// predicting the rest would mean reimplementing the engine's own DDL acceptance
+// rules, and getting that wrong would refuse changes that work.
+const foreignKeyRefusalReason = "foreign key constraints are not supported"
+
 // verifyBranchMatchesDesiredWithRetry retries verifyBranchMatchesDesired up to
 // 90s to handle PlanetScale VSchema API staleness. DDL schema is fetched via
 // MySQL (real-time) and fails fast on mismatch. Only VSchema errors are
@@ -244,6 +260,25 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 				msgs[i] = v.Message
 			}
 			change.UnsafeReason = strings.Join(msgs, "; ")
+		}
+		// Only a CREATE TABLE or an ALTER TABLE can declare a foreign key.
+		// Gating on the type keeps the verdict — an informational field — off
+		// the statement types the refusal check's own parser rejects outright.
+		// The classifier and the check parse with the same parser, so a
+		// statement classified as either type parses for both; what remains is
+		// the check's own post-parse analysis, and an error there fails the
+		// plan rather than guessing, matching the MySQL engine's refusal gate.
+		if stmtType == ddl.StatementCreateTable || stmtType == ddl.StatementAlterTable {
+			declaresFK, fkErr := ddl.DeclaresForeignKey(pc.Statement)
+			if fkErr != nil {
+				return nil, false, "", fmt.Errorf("foreign key check for table %s in keyspace %s: %w", pc.TableName, ks, fkErr)
+			}
+			if declaresFK {
+				change.ExecutionMode = engine.ExecutionModeBlocked
+				change.ModeReason = foreignKeyRefusalReason
+				e.logger.Info("plan contains a statement Vitess will refuse at apply time",
+					"keyspace", ks, "table", pc.TableName, "reason", change.ModeReason)
+			}
 		}
 		tableChanges = append(tableChanges, change)
 	}

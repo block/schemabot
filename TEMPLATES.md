@@ -43,8 +43,8 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
 💡 **Lint Warnings**: 2 advisory findings
-- `users`: Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
-- `products`: Index `idx_category` on columns (category) is redundant - covered by index `idx_category_price` on columns (category, price)
+- `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+- `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -130,10 +130,10 @@ ALTER TABLE `order_events` DROP INDEX `idx_events_archived`;
 - Primary key column `order_ref` has type `varchar`
 
 **`order_events`**
-- Index `idx_status_created` has DATETIME column `created_at` in position 3 of 5. DATETIME columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.
-- Index `idx_region_created` has DATETIME column `created_at` in position 4 of 5. DATETIME columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.
+- Index `idx_status_created` has `DATETIME` column `created_at` in position 3 of 5. `DATETIME` columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.
+- Index `idx_region_created` has `DATETIME` column `created_at` in position 4 of 5. `DATETIME` columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.
 - Primary key column `event_id` has type `mediumint`
-- Index `idx_status_created` on columns (status, region, created_at, event_id, order_pk) has a redundant PRIMARY KEY suffix (order_pk) - a leading prefix of the PRIMARY KEY appearing at the end of the index. InnoDB automatically appends the full PK columns (order_pk, event_id) to secondary indexes, so spelling out part of the PK at the end of the index is redundant.
+- Index `idx_status_created` on columns (`status`, `region`, `created_at`, `event_id`, `order_pk`) has a redundant PRIMARY KEY suffix `order_pk` — a leading prefix of the PRIMARY KEY appearing at the end of the index. InnoDB automatically appends the full PK columns (`order_pk`, `event_id`) to secondary indexes, so spelling out part of the PK at the end of the index is redundant.
 - Column `event_id` in table `order_events` has type `mediumint(9)` but 2 other table(s) use type `int(11)` (e.g. shipments, invoices)
 
 </details>
@@ -255,8 +255,8 @@ DROP TABLE `reconcile_state`;
 A plan diffs this PR's schema files against the live database, so what another PR applied before merging reads here as something to remove. If that is not what you intend, merge that PR, or bring this PR's schema files up to date with it, then re-plan.
 
 ⚠️ **Issues**: 2 unsafe changes detected
-- `orders`: DROP COLUMN discards the column's data
-- `reconcile_state`: DROP TABLE removes all data
+1. `orders`: DROP COLUMN discards the column's data
+2. `reconcile_state`: DROP TABLE removes all data
 
 **Destructive drop guidance:**
 
@@ -812,8 +812,8 @@ schemabot apply -e staging
 ```
 
 ⚠️ **Issues**: 2 unsafe changes detected
-- `commerce_sharded/vschema.json`: lookup vindex `customers_email_lookup` is removed: Vitess immediately stops maintaining its rows in backing table `customers_email_lookup`, queries routed through it can fail or scatter, and the lookup data goes stale
-- `commerce_sharded/vschema.json`: table `customers` no longer uses vindex `customers_email_lookup`: routing for queries on its columns changes immediately and lookup rows stop being maintained
+1. `commerce_sharded/vschema.json`: lookup vindex `customers_email_lookup` is removed: Vitess immediately stops maintaining its rows in backing table `customers_email_lookup`, queries routed through it can fail or scatter, and the lookup data goes stale
+2. `commerce_sharded/vschema.json`: table `customers` no longer uses vindex `customers_email_lookup`: routing for queries on its columns changes immediately and lookup rows stop being maintained
 
 📋 **Plan**: **1** vschema update
 
@@ -1215,8 +1215,8 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 </details>
 
 💡 **Lint Warnings**: 2 advisory findings
-- `users`: Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
-- `products`: Index `idx_category` on columns (category) is redundant - covered by index `idx_category_price` on columns (category, price)
+- `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+- `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -1404,7 +1404,7 @@ ALTER TABLE `customers` DROP COLUMN `nickname`;
 ---
 
 **⛔ Apply rejected**: 1 unsafe change detected
-- `customers`: Unsafe operation detected: DROP COLUMN `nickname`
+1. `customers`: Unsafe operation detected: `` DROP COLUMN `nickname` ``
 
 **Destructive drop guidance:**
 
@@ -1437,7 +1437,7 @@ ALTER TABLE `customers` DROP INDEX `idx_customers_email`;
 ---
 
 **⛔ Apply rejected**: 1 unsafe change detected
-- `customers`: Unsafe operation detected: DROP INDEX `idx_customers_email`
+1. `customers`: Unsafe operation detected: `` DROP INDEX `idx_customers_email` ``
 
 **Destructive drop guidance:**
 
@@ -1472,10 +1472,9 @@ ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
 ---
 
 **⛔ Apply rejected**: 3 unsafe changes detected
-- `orders`:
-  - Primary key column `id` has type `int`
-  - Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
-- `users`: Column rename detected in table `users`: `email` to `email_address`. Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled
+1. `orders`: Primary key column `id` has type `int`
+2. `orders`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+3. `users`: Column rename detected in table `users`: `email` to `email_address`. Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled
 
 **🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
 ```
@@ -1502,7 +1501,6 @@ schemabot apply -e staging --allow-unsafe
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
 | `schemabot release <apply-id> -e <env>` | Release a paused rollout to proceed |
 | `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
-| `schemabot volume <apply-id> -e <env> -v <level>` | Adjust schema change speed (1=slowest, 11=fastest) |
 | `schemabot rollback <apply-id> -e <env> [-t <tenant>]` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env> [-t <tenant>]` | Execute a rollback |
 
@@ -1534,7 +1532,6 @@ That command wasn't recognized. Available commands:
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
 | `schemabot release <apply-id> -e <env>` | Release a paused rollout to proceed |
 | `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
-| `schemabot volume <apply-id> -e <env> -v <level>` | Adjust schema change speed (1=slowest, 11=fastest) |
 | `schemabot rollback <apply-id> -e <env> [-t <tenant>]` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env> [-t <tenant>]` | Execute a rollback |
 
@@ -1627,8 +1624,8 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
 💡 **Lint Warnings**: 2 advisory findings
-- `users`: Column `created_at` uses TIMESTAMP which overflows on 2038-01-19. Consider using DATETIME instead.
-- `products`: Index `idx_category` on columns (category) is redundant - covered by index `idx_category_price` on columns (category, price)
+- `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+- `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -1828,7 +1825,6 @@ That command wasn't recognized. Available commands:
 | `schemabot start <apply-id> -e <env>` | Resume a stopped deployment |
 | `schemabot release <apply-id> -e <env>` | Release a paused rollout to proceed |
 | `schemabot cutover <apply-id> -e <env>` | Complete a deferred cutover |
-| `schemabot volume <apply-id> -e <env> -v <level>` | Adjust schema change speed (1=slowest, 11=fastest) |
 | `schemabot rollback <apply-id> -e <env> [-t <tenant>]` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env> [-t <tenant>]` | Execute a rollback |
 
@@ -3020,38 +3016,7 @@ Verify the database name, or run the command against the SchemaBot instance that
 
 **Status**: In Progress
 
-**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 48%
-
-```sql
-ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-```
-- Rows: 3,500,000 / 7,200,000 · ETA: 5m 30s
-
-
----
-
-To stop this schema change:
-```
-schemabot stop apply-a1b2c3d4e5f6 -e staging
-```
-
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
-
-</details>
-
-<details>
-<summary><a name="single-table-running-volume-tuned"></a><strong>Single Table: Running (Volume Tuned)</strong></summary>
-
-
-## Schema Change Status — Staging
-
-**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
-
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-**Status**: In Progress | Volume: 8/11
-
-**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 48%
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 48.61%
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
@@ -3134,7 +3099,7 @@ schemabot apply -e staging
 
 **Status**: Stopped
 
-**`users`**: 🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 39%
+**`users`**: 🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 39.34%
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
@@ -3209,11 +3174,11 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Status**: In Progress
 
-📊 1 running (22%) · 2 queued
+📊 1 running (21.92%) · 2 queued
 
 **Schema `testapp`**
 
-**`orders`**: 🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 22%
+**`orders`**: 🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 21.92%
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
@@ -3256,11 +3221,11 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Status**: In Progress
 
-📊 1/3 complete · 1 running (62%) · 1 queued
+📊 1/3 complete · 1 running (62.38%) · 1 queued
 
 **Schema `testapp`**
 
-**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62%
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62.38%
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
@@ -3351,11 +3316,11 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Status**: In Progress
 
-📊 1/3 complete · 1 running (62%) · 1 queued
+📊 1/3 complete · 1 running (62.38%) · 1 queued
 
 **Schema `testapp`**
 
-**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62% (throttled)
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62.38% (throttled)
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
@@ -3450,7 +3415,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Schema `testapp`**
 
-**`users`**: 🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 🔍 Checksumming to verify data (21%)
+**`users`**: 🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 🔍 Checksumming to verify data (21.92%)
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
@@ -3540,11 +3505,11 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Status**: In Progress
 
-📊 2/3 complete · 1 running (17%)
+📊 2/3 complete · 1 running (16.67%)
 
 **Schema `testapp`**
 
-**`products`**: 🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 17%
+**`products`**: 🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 16.67%
 
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
@@ -3589,7 +3554,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Schema `commerce`**
 
-**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62%
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62.38%
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
@@ -3623,7 +3588,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Schema `commerce`**
 
-**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 70%
+**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 70.00%
 
 ```sql
 ALTER TABLE `orders` ADD COLUMN `region` varchar(32);
@@ -4043,7 +4008,7 @@ schemabot apply -e staging
 
 **Schema `testapp`**
 
-**`users`**: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 72%
+**`users`**: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 72.00%
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
@@ -4260,10 +4225,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
----
-
-Cutover in progress — typically completes within seconds.
-
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
 </details>
@@ -4468,85 +4429,6 @@ Cutover is already in progress. SchemaBot will keep reporting progress from the 
 </details>
 
 <details>
-<summary><a name="volume-command-accepted"></a><strong>Volume Command Accepted</strong></summary>
-
-
-## Volume Request Accepted
-
-**Apply**: `apply-a1b2c3d4e5f67890`
-**Environment**: `staging`
-**Requested by**: @alice
-
-Volume change to 8 requested. SchemaBot will adjust the speed of this schema change shortly; once the new level takes effect, a fresh progress comment will track the schema change at the new volume.
-
-</details>
-
-<details>
-<summary><a name="volume-command-invalid-level"></a><strong>Volume Command Invalid Level</strong></summary>
-
-
-## Missing or Invalid Volume Level
-
-Usage: `schemabot volume <apply-id> -e <environment> -v <level>`
-
-The `-v` flag is required and must be a number between 1 (slowest) and 11 (fastest).
-<!-- schemabot:offer-support-channel -->
-
-</details>
-
-<details>
-<summary><a name="volume-command-missing-apply-id"></a><strong>Volume Command Missing Apply ID</strong></summary>
-
-
-## Missing Apply ID
-
-Usage: `schemabot volume <apply-id> -e <environment> -v <1-11>`
-
-Use `schemabot status -e <environment>` to find the apply ID.
-<!-- schemabot:offer-support-channel -->
-
-</details>
-
-<details>
-<summary><a name="volume-changed-superseded-progress-comment"></a><strong>Volume Changed: Superseded Progress Comment</strong></summary>
-
-
-⏩ Volume changed to **8/11** — progress continues in [a new progress comment](https://github.com/acme/testapp/pull/42#issuecomment-2222222222).
-
-<details>
-<summary>Progress before the volume change</summary>
-
-## Schema Change Status — Staging
-
-**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
-
-*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
-
-**Status**: In Progress | Volume: 3/11
-
-**`users`**: 🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 32%
-
-```sql
-ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-```
-- Rows: 2,300,000 / 7,200,000 · ETA: 13m 0s
-
-
----
-
-To stop this schema change:
-```
-schemabot stop apply-a1b2c3d4e5f6 -e staging
-```
-
-_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
-
-
-</details>
-
-</details>
-
-<details>
 <summary><a name="resumed-superseded-progress-comment"></a><strong>Resumed: Superseded Progress Comment</strong></summary>
 
 
@@ -4563,7 +4445,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Status**: Stopped
 
-**`users`**: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 32%
+**`users`**: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 31.94%
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
@@ -4723,7 +4605,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Status**: Stopped
 
-**`users`**: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 32%
+**`users`**: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 31.94%
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
@@ -4793,7 +4675,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 1 of 3 tables completed before failure.
 
-**`users`** — Failed at 30%
+**`users`** — Failed at 30.00%
 ```sql
 ALTER TABLE `users`
     DROP COLUMN `full_name`,
@@ -4851,7 +4733,7 @@ schemabot apply -e staging
 
 1 of 2 tables completed before stop.
 
-**`users`** — Stopped at 72%
+**`users`** — Stopped at 72.00%
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
@@ -5249,7 +5131,7 @@ ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
 
 **Schema `testapp`**
 
-**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 45%
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 45.00%
 
 ```sql
 ALTER TABLE `users` DROP INDEX `idx_email`;
@@ -5311,7 +5193,7 @@ Single table progress (default):
 
   ── testapp ──
 
-     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 48%
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 48.61%
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
        • Rows: 3,500,000 / 7,200,000 · ETA: 5m 30s
 
@@ -5387,7 +5269,7 @@ The new apply will only process tables that haven't completed.
 
   ── testapp ──
 
-     ~ users: 🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 39%
+     ~ users: 🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 39.34%
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
        • Rows: 156,342 / 397,453
 
@@ -5501,7 +5383,7 @@ Sequential mode: First table running, others queued
 └──────────────────────────────────┘
 
 
-     ~ users: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35%
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.00%
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
        • Rows: 875,000 / 2,500,000 · ETA: 8m 30s
 
@@ -5525,13 +5407,12 @@ Sequential mode: First complete, second running
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Running              │
-│  Volume:    3/11                 │
 │  Started:   Jan 15 14:18:00 UTC  │
 │  Duration:  12m                  │
 └──────────────────────────────────┘
 
 
-     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60%
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00%
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
        • Rows: 3,000,000 / 5,000,000 · ETA: 12m 15s
 
@@ -5589,7 +5470,7 @@ Sequential mode: First complete, second paused by the engine's throttler
 └──────────────────────────────────┘
 
 
-     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62% (throttled)
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62.00% (throttled)
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
        • Rows: 3,100,000 / 5,000,000
        • ℹ️ Throttled: commit-latency 112.4ms >= 100ms · backing off while database writes commit slowly
@@ -5619,7 +5500,7 @@ Sequential mode: First complete, second checksumming
 └──────────────────────────────────┘
 
 
-     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 🔍 Checksumming to verify data (60%)
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 🔍 Checksumming to verify data (60.00%)
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
        • Rows verified: 3,000,000 / 5,000,000
 
@@ -5677,7 +5558,7 @@ Sequential mode: First two complete, third running
 └──────────────────────────────────┘
 
 
-     ~ products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 80%
+     ~ products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 80.00%
        ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
        • Rows: 160,000 / 200,000 · ETA: 2m 45s
 
@@ -5801,7 +5682,7 @@ Sequential mode: User stopped mid-apply
 └──────────────────────────────────┘
 
 
-     ~ orders: 🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 42%
+     ~ orders: 🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 42.06%
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
        • Rows: 112,045 / 266,383
 
@@ -6154,7 +6035,7 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 
   ── myapp_sharded ──
 
-     ~ orders: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 🚫 Cancelled at 30%
+     ~ orders: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 🚫 Cancelled at 30.00%
        ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
 
        • Shards: 2 (2 cancelled)
@@ -6182,7 +6063,7 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 
   ── commerce_sharded ──
 
-     ~ transactions: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜ 57%
+     ~ transactions: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜ 57.21%
        ALTER TABLE `transactions` ADD COLUMN `region_id` int;
        • Rows: 110,573,340 / 193,280,000 · ETA: 4m 40s
        • Shards: 256 (30 waiting for cutover, 226 copying)
@@ -6190,11 +6071,11 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
            ● 01-02: waiting for cutover
            ● 02-03: waiting for cutover
            ... 27 more waiting for cutover
-           ◉ ff-: 10% (101,000/1,010,000 rows) ETA 4m 40s
-           ◉ fe-ff: 10% (100,800/1,008,000 rows) ETA 4m 40s
-           ◉ fd-fe: 11% (110,660/1,006,000 rows) ETA 4m 38s
-           ◉ fc-fd: 11% (110,440/1,004,000 rows) ETA 4m 38s
-           ◉ fb-fc: 12% (120,240/1,002,000 rows) ETA 4m 36s
+           ◉ ff-: 10.00% (101,000/1,010,000 rows) ETA 4m 40s
+           ◉ fe-ff: 10.00% (100,800/1,008,000 rows) ETA 4m 40s
+           ◉ fd-fe: 11.00% (110,660/1,006,000 rows) ETA 4m 38s
+           ◉ fc-fd: 11.00% (110,440/1,004,000 rows) ETA 4m 38s
+           ◉ fb-fc: 12.00% (120,240/1,002,000 rows) ETA 4m 36s
            ... 221 more copying shards
 
 ```
@@ -6218,7 +6099,7 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 
   ── commerce_sharded ──
 
-     ~ transactions: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜ 67%
+     ~ transactions: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜ 67.89%
        ALTER TABLE `transactions` ADD COLUMN `region_id` int;
        • Rows: 29,435,000 / 43,360,000 · ETA: 2m 37s
        • Shards: 32 (12 waiting for cutover, 20 copying)
@@ -6226,11 +6107,11 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
            ● 08-10: waiting for cutover
            ● 10-18: waiting for cutover
            ... 9 more waiting for cutover
-           ◉ f8-: 23% (347,300/1,510,000 rows) ETA 2m 37s
-           ◉ f0-f8: 26% (390,000/1,500,000 rows) ETA 2m 34s
-           ◉ e8-f0: 29% (432,100/1,490,000 rows) ETA 2m 31s
-           ◉ e0-e8: 32% (473,600/1,480,000 rows) ETA 2m 28s
-           ◉ d8-e0: 35% (514,500/1,470,000 rows) ETA 2m 25s
+           ◉ f8-: 23.00% (347,300/1,510,000 rows) ETA 2m 37s
+           ◉ f0-f8: 26.00% (390,000/1,500,000 rows) ETA 2m 34s
+           ◉ e8-f0: 29.00% (432,100/1,490,000 rows) ETA 2m 31s
+           ◉ e0-e8: 32.00% (473,600/1,480,000 rows) ETA 2m 28s
+           ◉ d8-e0: 35.00% (514,500/1,470,000 rows) ETA 2m 25s
            ... 15 more copying shards
 
   ── commerce_001 ──
@@ -6396,12 +6277,12 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
 
   ── myapp_sharded ──
 
-     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 70%
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 70.00%
        ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
        • Rows: 2,800,000 / 4,000,000 · ETA: 2m 0s
        • Shards: 2 (2 copying)
-           ◉ -80: 95% (2,000,000/2,100,000 rows) ETA 10s
-           ◉ 80-: 42% (800,000/1,900,000 rows) ETA 2m 0s
+           ◉ -80: 95.24% (2,000,000/2,100,000 rows) ETA 10s
+           ◉ 80-: 42.11% (800,000/1,900,000 rows) ETA 2m 0s
 
 ```
 </details>
@@ -6653,7 +6534,7 @@ Apply watch mode: Running with footer controls
 
   ── testapp ──
 
-     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62%
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62.38%
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
        • Rows: 914,707 / 1,466,232 · ETA: 3m 15s
 
@@ -6663,7 +6544,7 @@ Apply watch mode: Running with footer controls
      ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
-ESC detach • s stop • v volume
+ESC detach • s stop
 
 ```
 </details>
@@ -6731,7 +6612,7 @@ Checkpoint saved. Use 'schemabot start -e staging apply-a1b2c3d4e5f67890' to res
 
   ── testapp ──
 
-     ~ users: 🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 39%
+     ~ users: 🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 39.34%
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
        • Rows: 156,342 / 397,453
 
@@ -6779,7 +6660,7 @@ Resuming from checkpoint...
 
   ── testapp ──
 
-     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 40%
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 39.75%
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
        • Rows: 158,000 / 397,453 · ETA: 8m 0s
 
@@ -6789,51 +6670,7 @@ Resuming from checkpoint...
      ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 
-ESC detach • s stop • v volume
-
-```
-</details>
-
-<details>
-<summary><a name="volume-mode"></a><strong>Volume Mode</strong></summary>
-
-```
-
-Volume mode: Interactive volume adjustment
-(Press 'v' during apply to enter volume mode)
-
-```
-</details>
-
-<details>
-<summary><a name="in-volume-mode-default-4"></a><strong>In Volume Mode (Default 4):</strong></summary>
-
-```
-
-Volume: ████░░░░░░░ 4/11
-↑↓ adjust • 1-9 direct • ESC done
-
-```
-</details>
-
-<details>
-<summary><a name="after-adjusting-to-8"></a><strong>After Adjusting To 8:</strong></summary>
-
-```
-
-Volume: ████████░░░ 8/11
-↑↓ adjust • 1-9 direct • ESC done
-
-```
-</details>
-
-<details>
-<summary><a name="after-adjusting-to-2"></a><strong>After Adjusting To 2:</strong></summary>
-
-```
-
-Volume: ██░░░░░░░░░ 2/11
-↑↓ adjust • 1-9 direct • ESC done
+ESC detach • s stop
 
 ```
 </details>
@@ -6991,11 +6828,11 @@ SchemaBot triggers cutover automatically — no action needed.
 
 **Status**: In Progress
 
-📊 1/3 complete · 1 running (62%) · 1 queued
+📊 1/3 complete · 1 running (62.38%) · 1 queued
 
 **Schema `testapp`**
 
-**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62%
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62.38%
 
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
@@ -7657,7 +7494,7 @@ ALTER TABLE `mutes`
 ```
 
 ⚠️ **Issues**: 1 unsafe change detected
-- `mutes` (shard `40-80`): DROP COLUMN removes data and is irreversible
+1. `mutes` (shard `40-80`): DROP COLUMN removes data and is irreversible
 
 **Destructive drop guidance:**
 
@@ -7691,8 +7528,9 @@ schemabot apply -e production
 
 #### Keyspace `cdb_resolute_sharded`
 
-**`mutes`**: 🔄 Row copy in progress
-  └ shards: ◐ -40 45% · ⏳ 40-80 · ⏳ 80-c0 · ⏳ c0-
+**`mutes`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62% (1 of 4 shards)
+- Rows: 914,707 / 1,466,232 across 1 of 4 shards · ETA: ≥ 3m 15s
+  └ shards: ◐ -40 62% · ⏳ 40-80 · ⏳ 80-c0 · ⏳ c0-
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
@@ -7792,7 +7630,8 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 #### Keyspace `cdb_resolute_lookup`
 
-**`outcomes_lookup`**: 🔄 Row copy in progress
+**`outcomes_lookup`**: 🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 27%
+- Rows: 540,211 / 2,000,780 · ETA: 8m 0s
 
 #### Keyspace `cdb_resolute_sharded`
 
@@ -7906,8 +7745,8 @@ schemabot apply -e production
 | --- | --- |
 | `-40` | ✅ completed |
 | `40-80` | ✅ completed |
-| `80-c0` | ⛔ cancelled |
-| `c0-` | ⛔ cancelled |
+| `80-c0` | 🚫 cancelled |
+| `c0-` | 🚫 cancelled |
 
 ---
 
@@ -7942,7 +7781,7 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 
 🔄 eu-west — running table copy (orders-eu-west)
 
-     ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35%
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.00%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
        • Rows: 42,000 / 120,000 · ETA: 4m 0s
 
@@ -8073,7 +7912,7 @@ Sequential mode: First table running, others queued
 └──────────────────────────────────┘
 
 
-     ~ users: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35%
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.00%
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
        • Rows: 875,000 / 2,500,000 · ETA: 8m 30s
 
@@ -8097,13 +7936,12 @@ Sequential mode: First complete, second running
 ┌──────────────────────────────────┐
 │  Apply ID:  apply-a1b2c3d4e5f6   │
 │  State:     Running              │
-│  Volume:    3/11                 │
 │  Started:   Jan 15 14:18:00 UTC  │
 │  Duration:  12m                  │
 └──────────────────────────────────┘
 
 
-     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60%
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00%
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
        • Rows: 3,000,000 / 5,000,000 · ETA: 12m 15s
 
@@ -8132,7 +7970,7 @@ Sequential mode: First two complete, third running
 └──────────────────────────────────┘
 
 
-     ~ products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 80%
+     ~ products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 80.00%
        ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;
        • Rows: 160,000 / 200,000 · ETA: 2m 45s
 
@@ -8256,7 +8094,7 @@ Sequential mode: User stopped mid-apply
 └──────────────────────────────────┘
 
 
-     ~ orders: 🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 42%
+     ~ orders: 🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 42.06%
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
        • Rows: 112,045 / 266,383
 
@@ -8288,15 +8126,15 @@ Atomic mode (--defer-cutover): All tables copy rows, then cutover together
 └──────────────────────────────────┘
 
 
-     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 72%
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 72.00%
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
        • Rows: 1,800,000 / 2,500,000 · ETA: 3m 15s
 
-     ~ products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 45%
+     ~ products: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 45.00%
        ALTER TABLE `products` ADD INDEX `idx_category`(`category`);
        • Rows: 450,000 / 1,000,000 · ETA: 6m 20s
 
-     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜ 89%
+     ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜ 88.89%
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
        • Rows: 6,400,000 / 7,200,000 · ETA: 1m 45s
 
@@ -8412,15 +8250,15 @@ Defer cutover: Stopped by user (s)
 └──────────────────────────────────┘
 
 
-     ~ orders: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 72%
+     ~ orders: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 72.00%
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
        • Rows: 1,800,000 / 2,500,000
 
-     ~ products: 🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 45%
+     ~ products: 🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 45.00%
        ALTER TABLE `products` ADD INDEX `idx_category`(`category`);
        • Rows: 450,000 / 1,000,000
 
-     ~ users: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜ ⏹️ Stopped at 89%
+     ~ users: 🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧🟧⬜⬜⬜ ⏹️ Stopped at 88.89%
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
        • Rows: 6,400,000 / 7,200,000
 
@@ -8478,7 +8316,6 @@ Defer cutover: Cutting over in progress
      ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Cutting over...
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-Cutover in progress. This typically completes within seconds.
 Tables are being renamed atomically...
 ```
 </details>
@@ -8508,12 +8345,11 @@ Lint violations: Non-blocking warnings during plan/apply
 
 Unsafe blocked: Destructive changes require --allow-unsafe
 
-⛔ Apply blocked: 3 unsafe change(s) detected
-  • users: DROP COLUMN email
-  • orders: DROP TABLE
-  • products:
-      - MODIFY COLUMN price_cents: INT → SMALLINT (potential data loss)
-      - DROP INDEX idx_category
+⛔ Apply blocked: 4 unsafe change(s) detected
+  1. users: DROP COLUMN email
+  2. orders: DROP TABLE
+  3. products: MODIFY COLUMN price_cents: INT → SMALLINT (potential data loss)
+  4. products: DROP INDEX idx_category
 
 🚨 To proceed with these destructive changes, re-run with --allow-unsafe:
 
@@ -8534,8 +8370,8 @@ Unsafe allowed: Proceeding with --allow-unsafe flag
 🚨 Unsafe Changes (--allow-unsafe enabled)
 
 The following unsafe changes will be applied:
-  • users: DROP COLUMN email
-  • orders: DROP TABLE
+  1. users: DROP COLUMN email
+  2. orders: DROP TABLE
 
 ```
 </details>
@@ -8552,7 +8388,7 @@ The following unsafe changes will be applied:
        • ℹ️ More rows than initially estimated, copying is still active and will continue
 
 
-ESC detach • s stop • v volume
+ESC detach • s stop
 ```
 
 
@@ -8576,7 +8412,7 @@ Environment: production
   External operation ID: remote-op-eu-west-001
   External apply ID: remote-apply-eu-west-001
 
-     ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35%
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.42%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
        • Rows: 42,500 / 120,000 · ETA: 4m 0s
 

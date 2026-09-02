@@ -68,7 +68,7 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "drop column",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\""},
 			},
 			want:   "the dropped column",
 			wantOK: true,
@@ -76,7 +76,7 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "multiple drop columns",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`; Unsafe operation detected: DROP COLUMN `legacy_code`"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\"; Unsafe operation detected: \"DROP COLUMN `legacy_code`\""},
 			},
 			want:   "any dropped columns",
 			wantOK: true,
@@ -84,7 +84,7 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "drop table",
 			changes: []UnsafeChangeData{
-				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+				{Table: "archived_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
 			},
 			want:   "the dropped table",
 			wantOK: true,
@@ -92,8 +92,8 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "multiple drop tables",
 			changes: []UnsafeChangeData{
-				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
-				{Table: "legacy_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+				{Table: "archived_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
+				{Table: "legacy_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
 			},
 			want:   "any dropped tables",
 			wantOK: true,
@@ -101,8 +101,8 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "drop column and table",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`"},
-				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\""},
+				{Table: "archived_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
 			},
 			want:   "the dropped table and column",
 			wantOK: true,
@@ -110,8 +110,8 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "multiple drop columns and one drop table",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`; Unsafe operation detected: DROP COLUMN `legacy_code`"},
-				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\"; Unsafe operation detected: \"DROP COLUMN `legacy_code`\""},
+				{Table: "archived_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
 			},
 			want:   "the dropped table and any dropped columns",
 			wantOK: true,
@@ -119,9 +119,9 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "multiple drop tables and one drop column",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`"},
-				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
-				{Table: "legacy_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\""},
+				{Table: "archived_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
+				{Table: "legacy_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
 			},
 			want:   "any dropped tables and the dropped column",
 			wantOK: true,
@@ -129,9 +129,9 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "multiple drop columns and tables",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`; Unsafe operation detected: DROP COLUMN `legacy_code`"},
-				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
-				{Table: "legacy_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\"; Unsafe operation detected: \"DROP COLUMN `legacy_code`\""},
+				{Table: "archived_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
+				{Table: "legacy_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
 			},
 			want:   "any dropped tables or columns",
 			wantOK: true,
@@ -139,7 +139,7 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "other unsafe change",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: MODIFY COLUMN"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"MODIFY COLUMN\""},
 			},
 			wantOK: false,
 		},
@@ -255,7 +255,7 @@ func TestRenderApplyStatusComment_Checksumming(t *testing.T) {
 
 	assert.Contains(t, result, "## Schema Change Status", "apply stays in progress; checksumming is table-level")
 	assert.Contains(t, result, "**`orders`**")
-	assert.Contains(t, result, "🔍 Checksumming to verify data (21%)")
+	assert.Contains(t, result, "🔍 Checksumming to verify data (21.92%)")
 	assert.Contains(t, result, "Rows verified: 321,450 / 1,466,232")
 	assert.Contains(t, result, "1 checksumming")
 }
@@ -284,7 +284,7 @@ func TestRenderApplyStatusComment_Throttled(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "45% (throttled)",
+	assert.Contains(t, result, "45.00% (throttled)",
 		"the annotation lands on the header line next to the percent")
 	assert.Contains(t, result, "- ℹ️ _Throttled: redo-aware 4 > 3 · backing off while the database's active threads exceed its budget ([docs](https://github.com/block/schemabot/blob/main/docs/throttle.md))_",
 		"the reason renders as a tooltip bullet with its tip and the doc link")
@@ -301,7 +301,7 @@ func TestRenderApplyStatusComment_Throttled(t *testing.T) {
 
 	data.Tables[0].ThrottleReason = ""
 	noReason := RenderApplyStatusComment(data)
-	assert.Contains(t, noReason, "45% (throttled)")
+	assert.Contains(t, noReason, "45.00% (throttled)")
 	assert.NotContains(t, noReason, "ℹ️ Throttled", "no tooltip without a reason")
 
 	data.Tables[0].Throttled = false
@@ -335,7 +335,7 @@ func TestRenderApplyStatusComment_ThrottledChecksumming(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "🔍 Checksumming to verify data (21%) (throttled)")
+	assert.Contains(t, result, "🔍 Checksumming to verify data (21.92%) (throttled)")
 	assert.Contains(t, result, "- ℹ️ _Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget ([docs](https://github.com/block/schemabot/blob/main/docs/throttle.md))_")
 }
 
@@ -351,7 +351,7 @@ func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 		{
 			name: "drop index",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP INDEX `idx_customers_email`"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\""},
 			},
 			wantActionTarget:    "an index",
 			wantInvisibleTarget: "the dropped index",
@@ -361,7 +361,7 @@ func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 		{
 			name: "multiple drop indexes",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP INDEX `idx_customers_email`; Unsafe operation detected: DROP INDEX `idx_customers_phone`"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\"; Unsafe operation detected: \"DROP INDEX `idx_customers_phone`\""},
 			},
 			wantActionTarget:    "indexes",
 			wantInvisibleTarget: "any dropped indexes",
@@ -371,7 +371,7 @@ func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 		{
 			name: "drop index with drop column",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`; Unsafe operation detected: DROP INDEX `idx_customers_email`"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\"; Unsafe operation detected: \"DROP INDEX `idx_customers_email`\""},
 			},
 			wantActionTarget:    "an index",
 			wantInvisibleTarget: "the dropped index",
@@ -381,7 +381,7 @@ func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 		{
 			name: "other unsafe change",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: MODIFY COLUMN"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"MODIFY COLUMN\""},
 			},
 			wantOK: false,
 		},
@@ -415,7 +415,7 @@ func TestRenderUnsafeChangesBlockedIncludesDropIndexGuidance(t *testing.T) {
 		},
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`; Unsafe operation detected: DROP INDEX `idx_customers_email`"},
+			{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\"; Unsafe operation detected: \"DROP INDEX `idx_customers_email`\""},
 		},
 	})
 
@@ -440,7 +440,7 @@ func TestRenderUnsafeChangesBlockedUsesPluralMySQLDropIndexGuidance(t *testing.T
 		},
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "customers", Reason: "Unsafe operation detected: DROP INDEX `idx_customers_email`; Unsafe operation detected: DROP INDEX `idx_customers_phone`"},
+			{Table: "customers", Reason: "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\"; Unsafe operation detected: \"DROP INDEX `idx_customers_phone`\""},
 		},
 	})
 
@@ -463,7 +463,7 @@ func TestRenderUnsafeChangesBlockedDoesNotMentionInvisibleIndexesForVitess(t *te
 		},
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "customers", Reason: "Unsafe operation detected: DROP INDEX `idx_customers_email`"},
+			{Table: "customers", Reason: "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\""},
 		},
 	})
 
@@ -498,7 +498,7 @@ func TestRenderApplyStatusComment_Running(t *testing.T) {
 	assert.NotContains(t, result, "**Last updated**")
 	// Progress summary
 	assert.Contains(t, result, "📊 1/3 complete")
-	assert.Contains(t, result, "1 running (45%)")
+	assert.Contains(t, result, "1 running (45.00%)")
 	assert.Contains(t, result, "1 queued")
 	assert.Contains(t, result, "**`users`**")
 
@@ -508,49 +508,13 @@ func TestRenderApplyStatusComment_Running(t *testing.T) {
 	assert.Contains(t, result, "🟩") // green bar for completed
 
 	assert.Contains(t, result, "**`users`**")
-	assert.Contains(t, result, "45%")
+	assert.Contains(t, result, "45.00%")
 	assert.Contains(t, result, "🟦") // blue bar for running
 	assert.Contains(t, result, "45,000 / 100,000")
 	assert.Contains(t, result, "ETA: 3m 15s")
 
 	assert.Contains(t, result, "**`products`**")
 	assert.Contains(t, result, "Queued")
-}
-
-// TestRenderApplyStatusComment_Volume verifies that a running apply with a
-// volume level set on its stored options shows the level compactly on the
-// Status line, and that an apply without a level (engine default) renders no
-// volume text at all.
-func TestRenderApplyStatusComment_Volume(t *testing.T) {
-	newData := func(applyState, tableStatus string, volume int) ApplyStatusCommentData {
-		return ApplyStatusCommentData{
-			Database:    "testapp",
-			Environment: "staging",
-			RequestedBy: "aparajon",
-			State:       applyState,
-			Engine:      "Spirit",
-			Volume:      volume,
-			Tables: []TableProgressData{
-				{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: tableStatus, RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45},
-			},
-		}
-	}
-
-	t.Run("running apply with volume shows level on the status line", func(t *testing.T) {
-		result := RenderApplyStatusComment(newData("running", "running", 8))
-		assert.Contains(t, result, "**Status**: In Progress | Volume: 8/11")
-	})
-
-	t.Run("running apply without volume renders no volume text", func(t *testing.T) {
-		result := RenderApplyStatusComment(newData("running", "running", 0))
-		assert.Contains(t, result, "**Status**: In Progress")
-		assert.NotContains(t, result, "Volume")
-	})
-
-	t.Run("stopped apply with volume renders no volume text", func(t *testing.T) {
-		result := RenderApplyStatusComment(newData("stopped", "stopped", 8))
-		assert.NotContains(t, result, "Volume")
-	})
 }
 
 // A Vitess/PlanetScale apply labels its namespace group "Keyspace" (not "Schema"),
@@ -793,7 +757,12 @@ func TestRenderApplyStatusComment_DeployRequestLink(t *testing.T) {
 	assert.NotContains(t, RenderApplyStatusComment(base), "Deploy request:")
 }
 
-func TestRenderApplyStatusComment_RowCopyDisplaysOnePercentAfterCopyStarts(t *testing.T) {
+// A copy that has begun but not yet reached 1% shows the true fraction
+// computed from the row counts — in the running summary and on the table's
+// progress line — so early progress on a huge table reads as the small
+// fraction it is instead of a rounded-up 1%. The bar still lights its first
+// segment so the copy reads as started.
+func TestRenderApplyStatusComment_SubPercentRowCopyShowsFraction(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:    "testapp",
 		Environment: "staging",
@@ -808,8 +777,8 @@ func TestRenderApplyStatusComment_RowCopyDisplaysOnePercentAfterCopyStarts(t *te
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "1 running (1%)")
-	assert.Contains(t, result, "**`orders`**: "+ui.ProgressBarRowCopy(1)+" 1%")
+	assert.Contains(t, result, "1 running (0.19%)")
+	assert.Contains(t, result, "**`orders`**: "+ui.ProgressBarRowCopy(1)+" 0.19%")
 	assert.Contains(t, result, "Rows: 3,000 / 1,604,159")
 	assert.NotContains(t, result, " 0%")
 }
@@ -1339,7 +1308,7 @@ func TestRenderApplyStatusComment_Stopped(t *testing.T) {
 	assert.Contains(t, result, "## Schema Change Status — Staging")
 	assert.Contains(t, result, "**Status**: Stopped")
 	assert.Contains(t, result, "🟧") // orange bar for stopped
-	assert.Contains(t, result, "⏹️ Stopped at 72%")
+	assert.Contains(t, result, "⏹️ Stopped at 72.00%")
 	assert.Contains(t, result, "72,000 / 100,000")
 	// Progress summary
 	assert.Contains(t, result, "📊 1/2 complete")
@@ -1485,9 +1454,9 @@ func TestRenderApplyStatusComment_RecoveringCopyingRows(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "Row copy in progress (42%)")
+	assert.Contains(t, result, "Row copy in progress (42.00%)")
 	assert.Contains(t, result, "Rows: 420 / 1,000 · ETA: 2m")
-	assert.Contains(t, result, "Row copy is in progress (42%)")
+	assert.Contains(t, result, "Row copy is in progress (42.00%)")
 	assert.Contains(t, result, "progress returns to the normal row-copy view")
 	assert.Contains(t, result, "Recovering after restart")
 	assert.NotContains(t, result, "Cutover will be available once recovery completes")
@@ -1701,7 +1670,7 @@ func TestPreviewCommentApplyProgress(t *testing.T) {
 	assert.Contains(t, result, "**`orders`**")
 	assert.Contains(t, result, "**`users`**")
 	assert.Contains(t, result, "**`products`**")
-	assert.Contains(t, result, "62%")
+	assert.Contains(t, result, "62.38%")
 	assert.Contains(t, result, "Queued")
 }
 
@@ -1738,7 +1707,7 @@ func TestPreviewCommentApplyStopped(t *testing.T) {
 
 	assert.Contains(t, result, "Schema Change Status")
 	assert.Contains(t, result, "**Status**: Stopped")
-	assert.Contains(t, result, "Stopped at 72%")
+	assert.Contains(t, result, "Stopped at 72.00%")
 	assert.Contains(t, result, "schemabot start")
 }
 
@@ -1804,7 +1773,7 @@ func TestPreviewCommentSummaryFailed(t *testing.T) {
 	assert.Contains(t, result, "1 of 3 tables completed before failure.")
 	// Single namespace — no header, but table entries present
 	assert.NotContains(t, result, "### ")
-	assert.Contains(t, result, "**`users`** — Failed at 30%")
+	assert.Contains(t, result, "**`users`** — Failed at 30.00%")
 	assert.Contains(t, result, "**`orders`** — Completed", "on a failed apply, the reader must be able to tell which tables made it")
 	assert.Contains(t, result, "**`products`** — Cancelled")
 }
@@ -1816,7 +1785,7 @@ func TestPreviewCommentSummaryStopped(t *testing.T) {
 	assert.Contains(t, result, "1 of 2 tables completed before stop.")
 	// Single namespace — no header
 	assert.NotContains(t, result, "### ")
-	assert.Contains(t, result, "**`users`** — Stopped at 72%")
+	assert.Contains(t, result, "**`users`** — Stopped at 72.00%")
 	assert.Contains(t, result, "**`orders`** — Completed", "on a stopped apply, the reader must be able to tell which tables made it")
 	// A stopped change is resumable.
 	assert.Contains(t, result, "schemabot start")

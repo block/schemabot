@@ -45,7 +45,7 @@ const (
 	PreviewCommentApplyFlowAll PreviewType = "comment_apply_flow_all" // PR: apply plan, started, progress, completed, etc.
 	PreviewCLIPlanAll          PreviewType = "cli_plan_all"           // CLI: plan, progress states, status
 	PreviewCLILockingAll       PreviewType = "cli_locking_all"        // CLI: lock acquired, conflict, released, list
-	PreviewCLIApplyAll         PreviewType = "cli_apply_all"          // CLI: apply watch, stop/start, volume
+	PreviewCLIApplyAll         PreviewType = "cli_apply_all"          // CLI: apply watch, stop/start
 
 	// Apply watch mode previews
 	PreviewApplyWatch    PreviewType = "apply_watch"    // Running with footer controls
@@ -76,10 +76,6 @@ const (
 	// Stop/Start command output previews
 	PreviewStopCommand  PreviewType = "stop_command"  // Output when user runs 'schemabot stop'
 	PreviewStartCommand PreviewType = "start_command" // Output when user runs 'schemabot start'
-
-	// Volume control previews
-	PreviewVolumeBar  PreviewType = "volume_bar"  // Volume bar at different levels
-	PreviewVolumeMode PreviewType = "volume_mode" // Volume adjustment mode
 
 	// Status previews
 	PreviewStatusList         PreviewType = "status_list"          // List of active schema changes
@@ -214,6 +210,4 @@ const (
 	PreviewCommentStartPending          PreviewType = "comment_start_pending"                // Start command when start is already pending
 	PreviewCommentCutoverAccepted       PreviewType = "comment_cutover_accepted"             // Cutover command accepted
 	PreviewCommentCutoverActive         PreviewType = "comment_cutover_active"               // Cutover command when cutover is already in progress
-	PreviewCommentVolumeAccepted        PreviewType = "comment_volume_accepted"              // Volume command accepted
-	PreviewCommentVolumeInvalid         PreviewType = "comment_volume_invalid"               // Volume command with a missing or invalid level
 )

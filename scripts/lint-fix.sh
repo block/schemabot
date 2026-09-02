@@ -202,4 +202,51 @@ if [ -n "$PKG_FILES" ]; then
     fi
 fi
 
+# Run severityglyphs analyzer on staged packages to flag severity glyph
+# literals that should reference the pkg/glyph constants instead. The analyzer
+# skips test files itself (rendered-output assertions deliberately pin literal
+# glyphs); pkg/glyph (the vocabulary's home) and the analyzer's own glyph
+# table are excluded here. Mirrors the closeandlog build-tag matrix.
+run_severityglyphs() {
+    local build_tags="$1"
+    shift
+    local patterns=("$@")
+    local tag_flag=""
+
+    if [ -n "$build_tags" ]; then
+        tag_flag="-tags=$build_tags"
+    fi
+
+    # Fail closed: if go list can't resolve the staged packages, the analyzer
+    # can't vouch for them, so block the commit rather than silently skipping.
+    local listed
+    if ! listed=$(go list $tag_flag "${patterns[@]}"); then
+        echo "severityglyphs: go list failed for staged packages; commit blocked until it resolves."
+        exit 1
+    fi
+
+    # `grep -v` exits non-zero (and would trip `set -e`) when every package
+    # is filtered out, so suppress that exit and skip the run instead.
+    local packages
+    packages=$(echo "$listed" | grep -v '/pkg/glyph$' | grep -v '/pkg/analyzers/severityglyphs' | grep -v '/testdata/' || true)
+    if [ -z "$packages" ]; then
+        echo "severityglyphs: all staged packages are excluded from the check; skipping."
+        return 0
+    fi
+
+    if ! go run ./cmd/severityglyphs-check $tag_flag $packages 2>&1; then
+        echo ""
+        echo "severityglyphs: use the pkg/glyph constants (glyph.Escalation, glyph.Refused,"
+        echo "glyph.Failed, glyph.Attention, glyph.Info) instead of literal severity glyphs."
+        exit 1
+    fi
+}
+
+if [ -n "$PKG_FILES" ]; then
+    SEVERITYGLYPHS_PKGS=$(echo "$PKG_FILES" | xargs -n1 dirname | sort -u | sed 's|^|./|' | sed 's|$|/...|')
+    echo "Running severityglyphs analyzer..."
+    run_severityglyphs "" $SEVERITYGLYPHS_PKGS
+    run_severityglyphs "integration" $SEVERITYGLYPHS_PKGS
+fi
+
 echo "All lint checks passed!"

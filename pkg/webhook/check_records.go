@@ -119,21 +119,42 @@ func (h *Handler) storeManualPlanCheckRecord(ctx context.Context, client *ghclie
 // drift fails the check closed ahead of the plan's own outcome: a deployment
 // whose live schema no longer matches the reviewed plan (or that could not be
 // confirmed to match) must block the PR even when the primary's diff is clean or
-// empty. A primary plan that reported errors or a PostgreSQL refusal likewise
+// empty. A primary plan that reported errors or a final engine refusal likewise
 // fails. Destructive changes remain action-required: the apply path requires
 // the separate --allow-unsafe acknowledgement before they can proceed.
-func planCheckConclusion(hasChanges, hasPlanErrors, hasPostgresRefusal, driftBlocked bool) string {
+func planCheckConclusion(hasChanges, hasPlanErrors, hasFinalRefusal, driftBlocked bool) string {
 	switch {
 	case driftBlocked:
 		return checkConclusionFailure
 	case hasPlanErrors:
 		return checkConclusionFailure
-	case hasPostgresRefusal:
+	case hasFinalRefusal:
 		return checkConclusionFailure
 	case hasChanges:
 		return checkConclusionActionRequired
 	default:
 		return checkConclusionSuccess
+	}
+}
+
+// planRefusalFailsCheck reports whether a plan's engine-blocked changes are
+// final enough to fail the check rather than leave the PR at action-required.
+//
+// A refusal is final when it is a property of the statement rather than of live
+// target state, so no re-plan can lift it and no apply the operator runs can
+// satisfy it: PostgreSQL blocks a change it has no authoritative classifier
+// verdict for, and Vitess refuses constructs it cannot execute at all. The
+// MySQL engine also marks a refused statement blocked, but there the verdict
+// previews a direct-execution routing decision that apply time re-resolves
+// against live policy and table size, so a plan blocked at review can still
+// apply cleanly later. Those stay action-required and the apply path does the
+// rejecting.
+func planRefusalFailsCheck(databaseType string, planResp *apitypes.PlanResponse) bool {
+	switch databaseType {
+	case storage.DatabaseTypePostgres, storage.DatabaseTypeVitess:
+		return planResp.HasBlockedChanges()
+	default:
+		return false
 	}
 }
 
@@ -180,8 +201,7 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 	hasChanges := planResp.HasChanges()
 	driftBlocked := drift.blocks()
 
-	hasPostgresRefusal := schema.Type == storage.DatabaseTypePostgres && planResp.HasBlockedChanges()
-	conclusion := planCheckConclusion(hasChanges, len(planResp.Errors) > 0, hasPostgresRefusal, driftBlocked)
+	conclusion := planCheckConclusion(hasChanges, len(planResp.Errors) > 0, planRefusalFailsCheck(schema.Type, planResp), driftBlocked)
 
 	// Review-time drift is a first-class blocking reason, not an overload of the
 	// plan facts: HasChanges stays "the reviewed primary plan has changes", and

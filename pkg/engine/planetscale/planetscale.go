@@ -32,7 +32,6 @@
 //	Cutover  → Complete the deploy request (maps to vtctldclient OnlineDDL complete)
 //	Revert   → Revert the deploy request during the revert window
 //	SkipRevert → Close the revert window, making changes permanent
-//	Volume   → Throttle/unthrottle the deploy request (maps to vtctldclient OnlineDDL throttle/unthrottle)
 //
 // # Deploy Request States
 //
@@ -295,7 +294,7 @@
 //
 // Throttling:
 //
-//	user_throttle_ratio       User-set throttle ratio (0.0-1.0). Maps to Volume.
+//	user_throttle_ratio       User-set throttle ratio (0.0-1.0).
 //	                          0.85 means 85% throttled.
 //	last_throttled_timestamp  When last throttled on this shard.
 //	component_throttled       Which component caused throttling (e.g. "vplayer").

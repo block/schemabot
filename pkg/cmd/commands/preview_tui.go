@@ -128,7 +128,6 @@ func previewTUIStatic(scenario tuiPreviewScenario) {
 	model.tables = msg.tables
 	model.operations = msg.operations
 	model.errorMsg = msg.errorMsg
-	model.currentVolume = msg.volume
 	model.initialized = true
 
 	fmt.Print(model.View())

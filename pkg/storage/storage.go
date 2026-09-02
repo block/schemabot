@@ -112,6 +112,7 @@ type Storage interface {
 // Locks prevent concurrent schema changes to the same database.
 // Lock key is database:type (not per-environment) to block concurrent changes
 // across environments and PRs.
+// Methods accepting a *Lock canonicalize its repository, database name, and database type in place before persisting.
 type LockStore interface {
 	// Acquire attempts to acquire a lock. Returns ErrLockHeld if already held by another owner.
 	// If the same owner already holds the lock, this is a no-op (idempotent).
@@ -150,6 +151,7 @@ type LockStore interface {
 // CheckStore manages SchemaBot's stored check state.
 // Per-database rows track internal status for a PR/environment/database.
 // Aggregate rows store the GitHub check_run_id for the visible GitHub Check Run.
+// Methods accepting a *Check canonicalize its repository, database name, database type, and environment in place before persisting.
 type CheckStore interface {
 	// Upsert creates or updates stored check state.
 	Upsert(ctx context.Context, check *Check) error
@@ -274,6 +276,10 @@ type SettingsStore interface {
 // primitive behind fast webhook acknowledgement: handlers can persist a delivery
 // before returning 2xx, and drivers can claim/retry the stored event after the
 // HTTP request has finished.
+// Create canonicalizes the provided event's repository in place before
+// persisting. The coalescing reads (HasCoveringSuccessor, SupersedeIfCovered)
+// fold the repository only inside their SQL predicates and leave the caller's
+// event untouched.
 type WebhookEventStore interface {
 	// Create records a webhook delivery in the pending state. Returns
 	// inserted=false when provider + delivery GUID already exists, so callers
@@ -475,6 +481,7 @@ type ListPlansOptions struct {
 // PlanStore manages schema change plans.
 // Plans are created by Plan() and stored for Apply() and staleness detection.
 // Both GRPCClient and LocalClient are stateless - SchemaBot owns plan storage.
+// Create canonicalizes the provided plan's repository, environment, database, and database type in place before persisting.
 type PlanStore interface {
 	// Create stores a new plan and returns its ID. Returns error if plan_identifier already exists.
 	Create(ctx context.Context, plan *Plan) (int64, error)
@@ -511,6 +518,9 @@ type PlanStore interface {
 
 // ApplyStore manages schema change execution state.
 // Applies are created when Apply() is called and updated during execution.
+// Methods accepting *Apply canonicalize repository, database, database type,
+// and environment in place before persisting; Update rewrites these fields on
+// the struct even though its SQL statement writes only state and progress.
 type ApplyStore interface {
 	// Create stores a new apply and returns its ID.
 	// Returns ErrActiveApplyExists if another active apply already exists for
@@ -837,6 +847,9 @@ type RetryableApplyExpiration struct {
 // TaskStore manages schema change tasks (individual DDLs within an apply).
 // Each task represents one table operation. For multi-table changes,
 // one apply contains multiple tasks.
+// Create and UpsertShardProgress canonicalize repository, database, database
+// type, and environment in place before persisting. Update leaves those
+// identity fields untouched: its SQL statement writes only state and progress.
 type TaskStore interface {
 	// Create stores a new task and returns its ID.
 	Create(ctx context.Context, task *Task) (int64, error)
@@ -1080,6 +1093,10 @@ const SummaryClaimStaleAfter = 2 * time.Minute
 // for comments actually posted; minimized_at is set only after the GitHub
 // minimize call succeeded, so an unminimized row is always retried by the next
 // supersede.
+// Insert canonicalizes the provided comment's repository, database, and
+// database type in place before persisting. EnvironmentScope is stored as
+// given: no query predicate filters on it, and its consumers compare it in Go
+// against a scope built from the configured environment names.
 type PlanCommentStore interface {
 	// Insert stores a newly posted plan comment and sets comment.ID.
 	Insert(ctx context.Context, comment *PlanComment) error
@@ -1162,6 +1179,22 @@ type ApplyOperationStore interface {
 	// them from recording divergent ids. Divergence returns an error wrapping
 	// ErrRemoteApplyDeploymentIDConflict.
 	SaveExternalID(ctx context.Context, applyID, operationID int64, externalID string) error
+
+	// ApplyIdentifierForRemoteApply returns the identifier of the apply this
+	// control plane dispatched as the given remote apply, or "" when it
+	// dispatched no such thing. It answers the question an operator asks about
+	// someone else's work: the data plane names the change holding a database by
+	// its own identifier, which resolves nowhere the operator can reach, and this
+	// turns that into the handle their CLI accepts.
+	//
+	// A remote apply this control plane did not start is the ordinary empty
+	// answer, not an error — another control plane or a direct engine run owns
+	// it, and there is no handle to offer. The correlation is read from the
+	// operation rows because a multi-operation apply has no single authoritative
+	// remote identifier; every operation carrying one remote apply id belongs to
+	// the same parent, so more than one parent matching means the correlation
+	// itself is broken and the store refuses to guess.
+	ApplyIdentifierForRemoteApply(ctx context.Context, externalID string) (string, error)
 
 	// SaveEngineResumeState stores opaque engine resume state on the operation.
 	SaveEngineResumeState(ctx context.Context, operationID int64, resumeState *EngineResumeState) error
@@ -1350,7 +1383,7 @@ type ControlRequestStore interface {
 	// for use when that plane later reports the same operation succeeded. It
 	// only touches a failed row the mirror itself created: rows this plane
 	// queued are cleared by their own request lifecycle, and a row with no
-	// lifecycle here — a pure proxy operation such as volume — would otherwise
+	// lifecycle here — an operation this plane only proxies — would otherwise
 	// keep warning about a command the operator has since re-issued
 	// successfully. It reports whether the stored row changed.
 	ClearRemoteFailure(ctx context.Context, applyID int64, operation ControlOperation) (bool, error)

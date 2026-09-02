@@ -52,7 +52,7 @@ SchemaBot handles the full lifecycle:
 - **Plan** — diff desired vs current schema → compute DDL
 - **Apply** — execute DDL online using [Spirit](https://github.com/block/spirit) (MySQL), [PlanetScale deploy requests](https://planetscale.com/docs/vitess/schema-changes/deploy-requests) (Vitess), or [pg-sprite](https://github.com/block/pg-sprite) (PostgreSQL)
 - **Progress** — track row copy progress, ETA, per-table/per-shard status
-- **Control** — `stop` (pause), `start` (resume), `volume` (adjust speed), `cutover` (trigger table swap), `revert` (roll back)
+- **Control** — `stop` (pause), `start` (resume), `cutover` (trigger table swap), `revert` (roll back)
 
 Simple changes (e.g., adding a column) use instant DDL and complete in milliseconds. Operations that require a row copy (e.g., adding an index) run online without blocking reads or writes.
 
@@ -80,7 +80,9 @@ See [docs/configuration.md](./docs/configuration.md) for setup instructions (loc
 
 ## Docs
 
-General design docs are in the [docs](./docs/) folder.
+General design docs are in the [docs](./docs/) folder. The PostgreSQL support
+envelope — what plans, what applies, and how each refusal is reported — is in
+[docs/postgresql.md](./docs/postgresql.md).
 
 ## Releases
 

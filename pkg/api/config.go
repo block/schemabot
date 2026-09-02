@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -32,6 +33,8 @@ import (
 // DefaultGitHubCheckName is the base GitHub Check Run name used when a
 // deployment does not configure a custom name.
 const DefaultGitHubCheckName = "SchemaBot"
+
+var configIdentifierPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 
 // ServerConfig holds the server-side SchemaBot configuration.
 // This is loaded from a YAML file specified by SCHEMABOT_CONFIG_FILE.
@@ -59,12 +62,16 @@ type ServerConfig struct {
 	// Every entry in Repos MUST set GitHubApp to one of the keys in this map.
 	Apps map[string]GitHubAppConfig `yaml:"apps,omitempty"`
 
-	// TernDeployments maps deployment names to Tern gRPC endpoints per environment.
-	// Use "default" for single-deployment setups.
+	// TernDeployments maps lowercase deployment names to Tern gRPC endpoints
+	// per lowercase environment name. These names are storage identity keys
+	// compared byte-wise across storage dialects. Use "default" for
+	// single-deployment setups.
 	TernDeployments TernConfig `yaml:"tern_deployments"`
 
 	// Databases contains registered database configurations per environment.
-	// Key format: "database_name" with nested environment configs.
+	// Map keys are lowercase database names used as storage identity keys and
+	// schema-directory routing keys. Identity keys are compared byte-wise across
+	// storage dialects and are validated rather than rewritten.
 	Databases map[string]DatabaseConfig `yaml:"databases"`
 
 	// TargetResolver configures how a data-plane server (serve --grpc) resolves
@@ -839,7 +846,16 @@ type DatabaseConfig struct {
 	// Type is the database type: "mysql", "vitess", or "strata".
 	Type string `yaml:"type"`
 
-	// Environments contains per-environment configuration.
+	// App optionally names the application this database belongs to. Databases
+	// sharing an app value form one application and can be targeted together by
+	// app-scoped PR comment commands (`--app <name>`), which expand to every
+	// database declaring that app. Values are lowercase alphanumeric with
+	// interior hyphens (e.g. "billing-service").
+	App string `yaml:"app,omitempty"`
+
+	// Environments contains per-environment configuration. Map keys are
+	// lowercase environment names used as storage identity keys and compared
+	// byte-wise across storage dialects.
 	Environments map[string]EnvironmentConfig `yaml:"environments"`
 
 	// EnvironmentOrder optionally overrides the server-wide environment_order
@@ -942,14 +958,16 @@ type EnvironmentConfig struct {
 	// Mutually exclusive with Deployments.
 	Target string `yaml:"target,omitempty"`
 
-	// Deployment is the Tern deployment key for gRPC mode.
+	// Deployment is the lowercase Tern deployment key for gRPC mode. Deployment
+	// names are storage identity keys compared byte-wise across storage dialects.
 	// Mutually exclusive with Deployments.
 	Deployment string `yaml:"deployment,omitempty"`
 
-	// Deployments maps a Tern deployment key to its per-deployment target
+	// Deployments maps a lowercase Tern deployment key to its per-deployment target
 	// for multi-deployment environments. Each key MUST also appear in the
 	// top-level tern_deployments map. Mutually exclusive with the scalar
-	// Target/Deployment fields above.
+	// Target/Deployment fields above. Deployment names are storage identity keys
+	// compared byte-wise across storage dialects.
 	//
 	// Example:
 	//   deployments:
@@ -1193,7 +1211,7 @@ type RepoConfig struct {
 // RepoAdmins returns the repository-scoped admin principals configured for
 // repo. A repository with no config entry has no repo admins.
 func (c *ServerConfig) RepoAdmins(repo string) (teams, users []string) {
-	repoConfig, ok := c.Repos[repo]
+	repoConfig, ok := c.Repos[storage.CanonicalKey(repo)]
 	if !ok {
 		return nil, nil
 	}
@@ -1328,11 +1346,44 @@ func LoadServerConfigFromFile(path string) (*ServerConfig, error) {
 		return nil, fmt.Errorf("parse config file: %w", err)
 	}
 
+	if err := config.canonicalizeRepositories(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
 	return &config, nil
+}
+
+func (c *ServerConfig) canonicalizeRepositories() error {
+	repoNames := make([]string, 0, len(c.Repos))
+	for repo := range c.Repos {
+		repoNames = append(repoNames, repo)
+	}
+	slices.Sort(repoNames)
+
+	canonicalRepos := make(map[string]RepoConfig, len(c.Repos))
+	originalNames := make(map[string]string, len(c.Repos))
+	for _, repo := range repoNames {
+		canonical := storage.CanonicalKey(repo)
+		if original, ok := originalNames[canonical]; ok {
+			return fmt.Errorf("repos contains keys %q and %q that canonicalize to %q", original, repo, canonical)
+		}
+		canonicalRepos[canonical] = c.Repos[repo]
+		originalNames[canonical] = repo
+	}
+	if c.Repos != nil {
+		c.Repos = canonicalRepos
+	}
+
+	for database, dbConfig := range c.Databases {
+		for i, repo := range dbConfig.AllowedRepos {
+			dbConfig.AllowedRepos[i] = storage.CanonicalKey(repo)
+		}
+		c.Databases[database] = dbConfig
+	}
+	return nil
 }
 
 // Validate checks the configuration for required fields and consistency.
@@ -1345,6 +1396,12 @@ func (c *ServerConfig) Validate() error {
 		return fmt.Errorf("databases or target_resolver is required")
 	}
 
+	if err := validateIdentifiers("environment_order environment name", c.EnvironmentOrder); err != nil {
+		return err
+	}
+	if err := validateIdentifiers("allowed_environments environment name", c.AllowedEnvironments); err != nil {
+		return err
+	}
 	if err := validateUniqueNames("environment_order", c.EnvironmentOrder); err != nil {
 		return err
 	}
@@ -1387,6 +1444,17 @@ func (c *ServerConfig) Validate() error {
 	// Validate Databases if present. An environment is either local mode
 	// (direct DSN) or gRPC mode (server-side target + deployment).
 	for name, dbConfig := range c.Databases {
+		if err := validateIdentifier("database name", name); err != nil {
+			return err
+		}
+		if err := validateIdentifiers(fmt.Sprintf("database %q environment_order environment name", name), dbConfig.EnvironmentOrder); err != nil {
+			return err
+		}
+		for _, repo := range dbConfig.AllowedRepos {
+			if repo != storage.CanonicalKey(repo) {
+				return fmt.Errorf("database %q allowed_repos repository %q must be canonical", name, repo)
+			}
+		}
 		if dbConfig.Type == "" {
 			return fmt.Errorf("database %q missing type", name)
 		}
@@ -1394,6 +1462,9 @@ func (c *ServerConfig) Validate() error {
 			return err
 		}
 		if err := validateDatabaseActorAuthorization(name, dbConfig); err != nil {
+			return err
+		}
+		if err := validateDatabaseApp(name, dbConfig); err != nil {
 			return err
 		}
 		switch dbConfig.Type {
@@ -1408,6 +1479,17 @@ func (c *ServerConfig) Validate() error {
 			return err
 		}
 		for env, envConfig := range dbConfig.Environments {
+			if err := validateIdentifier(fmt.Sprintf("database %q environment name", name), env); err != nil {
+				return err
+			}
+			if envConfig.Deployment != "" {
+				if err := validateIdentifier(fmt.Sprintf("database %q environment %q deployment name", name, env), envConfig.Deployment); err != nil {
+					return err
+				}
+			}
+			if err := validateIdentifiers(fmt.Sprintf("database %q environment %q deployment_order deployment name", name, env), envConfig.DeploymentOrder); err != nil {
+				return err
+			}
 			if err := envConfig.validateRevertWindowDuration(fmt.Sprintf("database %q environment %q", name, env)); err != nil {
 				return err
 			}
@@ -1460,8 +1542,8 @@ func (c *ServerConfig) Validate() error {
 					}
 				}
 				for deployment, dt := range envConfig.Deployments {
-					if deployment == "" {
-						return fmt.Errorf("database %q environment %q has a deployments map entry with an empty key", name, env)
+					if err := validateIdentifier(fmt.Sprintf("database %q environment %q deployment name", name, env), deployment); err != nil {
+						return err
 					}
 					if dt.Target == "" {
 						return fmt.Errorf("database %q environment %q deployment %q missing target", name, env, deployment)
@@ -1497,6 +1579,9 @@ func (c *ServerConfig) Validate() error {
 	}
 
 	for repo, repoConfig := range c.Repos {
+		if repo != storage.CanonicalKey(repo) {
+			return fmt.Errorf("repos repository key %q must be canonical", repo)
+		}
 		if err := validateAggregateConfig(repo, repoConfig.Aggregate); err != nil {
 			return err
 		}
@@ -1511,10 +1596,16 @@ func (c *ServerConfig) Validate() error {
 
 	// Validate TernDeployments if present (gRPC mode)
 	for name, endpoints := range c.TernDeployments {
+		if err := validateIdentifier("tern_deployments deployment name", name); err != nil {
+			return err
+		}
 		if len(endpoints) == 0 {
 			return fmt.Errorf("deployment %q has no environments configured", name)
 		}
 		for env, addr := range endpoints {
+			if err := validateIdentifier(fmt.Sprintf("deployment %q environment name", name), env); err != nil {
+				return err
+			}
 			if addr == "" {
 				return fmt.Errorf("deployment %q environment %q has empty address", name, env)
 			}
@@ -1532,6 +1623,25 @@ func (c *ServerConfig) Validate() error {
 		return fmt.Errorf("auth config: %w", err)
 	}
 
+	return nil
+}
+
+func validateIdentifier(field, value string) error {
+	// Restrict identity keys to portable ASCII. Case folding alone permits
+	// accents that MySQL may fold but PostgreSQL preserves, as well as spaces
+	// and other bytes that cannot be canonical identity keys.
+	if !configIdentifierPattern.MatchString(value) {
+		return fmt.Errorf("%s %q must match %s", field, value, configIdentifierPattern)
+	}
+	return nil
+}
+
+func validateIdentifiers(field string, values []string) error {
+	for _, value := range values {
+		if err := validateIdentifier(field, value); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -2282,7 +2392,7 @@ func (c *ServerConfig) IsRepoAllowed(repo string) bool {
 	if c == nil || len(c.Repos) == 0 {
 		return true
 	}
-	_, ok := c.Repos[repo]
+	_, ok := c.Repos[storage.CanonicalKey(repo)]
 	return ok
 }
 
@@ -2293,7 +2403,7 @@ func (c *ServerConfig) AreChecksEnabled(repo string) bool {
 	if c == nil || len(c.Repos) == 0 {
 		return true
 	}
-	repoConfig, ok := c.Repos[repo]
+	repoConfig, ok := c.Repos[storage.CanonicalKey(repo)]
 	if !ok || repoConfig.EnableChecks == nil {
 		return true
 	}
@@ -2344,7 +2454,7 @@ func (c *ServerConfig) ResolveGitHubAppForRepo(repo string) (ResolvedGitHubApp, 
 		return ResolvedGitHubApp{}, fmt.Errorf("server config is nil")
 	}
 	if len(c.Apps) > 0 {
-		repoConfig, ok := c.Repos[repo]
+		repoConfig, ok := c.Repos[storage.CanonicalKey(repo)]
 		if !ok {
 			return ResolvedGitHubApp{}, fmt.Errorf("repository %q: %w", repo, ErrRepoNotConfigured)
 		}
@@ -2615,7 +2725,7 @@ func (c *ServerConfig) GitHubCheckNameBaseForRepo(repo string) string {
 		return DefaultGitHubCheckName
 	}
 	if len(c.Apps) > 0 {
-		repoConfig, ok := c.Repos[repo]
+		repoConfig, ok := c.Repos[storage.CanonicalKey(repo)]
 		if !ok {
 			return DefaultGitHubCheckName
 		}
@@ -2637,7 +2747,7 @@ func (c *ServerConfig) PromotionCheckNameBaseForRepo(repo string) string {
 		return DefaultGitHubCheckName
 	}
 	if len(c.Apps) > 0 {
-		repoConfig, ok := c.Repos[repo]
+		repoConfig, ok := c.Repos[storage.CanonicalKey(repo)]
 		if !ok {
 			return DefaultGitHubCheckName
 		}
