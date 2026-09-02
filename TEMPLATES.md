@@ -8377,6 +8377,56 @@ The following unsafe changes will be applied:
 </details>
 
 
+## Rate Limits (CLI + API)
+
+<details>
+<summary><a name="pull-refused-caller-budget-spent"></a><strong>Pull Refused: Caller Budget Spent</strong></summary>
+
+```
+
+Pull failed
+  Database: orders
+  Environment: production
+  API status: HTTP 429
+  Error code: rate_limited
+  Error: too many pull requests from this caller; retry in 1s
+
+```
+</details>
+
+<details>
+<summary><a name="pull-refused-target-budget-spent"></a><strong>Pull Refused: Target Budget Spent</strong></summary>
+
+```
+
+Pull failed
+  Database: orders
+  Environment: production
+  API status: HTTP 429
+  Error code: rate_limited
+  Error: too many pull requests for this database and environment; retry in 1s
+
+```
+</details>
+
+<details>
+<summary><a name="api-response-service-callers"></a><strong>API Response (Service Callers)</strong></summary>
+
+```
+
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/json
+Retry-After: 1
+
+{
+  "error": "too many pull requests for this database and environment; retry in 1s",
+  "error_code": "rate_limited",
+  "retry_after_seconds": 1
+}
+```
+</details>
+
+
 ## Interactive TUI (CLI)
 
 ```

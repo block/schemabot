@@ -86,6 +86,12 @@ const (
 	PreviewPullSchemaDetailed PreviewType = "pull_schema_detailed" // Pulled live schema with the detailed catalog's estimates
 	PreviewPullVitessSchema   PreviewType = "pull_schema_vitess"   // Multi-keyspace Vitess pull with VSchema artifacts
 
+	// Rate limit previews (pull refused for exceeding a request budget)
+	PreviewPullRateLimitedCaller   PreviewType = "pull_rate_limited_caller"   // CLI: caller spent its own request budget
+	PreviewPullRateLimitedTarget   PreviewType = "pull_rate_limited_target"   // CLI: the target database is absorbing every client's reads
+	PreviewPullRateLimitedResponse PreviewType = "pull_rate_limited_response" // API: the 429 a service caller reads off the wire
+	PreviewRateLimitAll            PreviewType = "rate_limit_all"             // Show all rate limit previews
+
 	// Lint and unsafe previews
 	PreviewLintViolations PreviewType = "lint_violations" // Lint violations output
 	PreviewUnsafeBlocked  PreviewType = "unsafe_blocked"  // Unsafe changes blocked

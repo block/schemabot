@@ -5,6 +5,8 @@ package apitypes
 
 import (
 	"encoding/json"
+	"fmt"
+	"math"
 	"strings"
 	"time"
 )
@@ -112,6 +114,32 @@ type ErrorResponse struct {
 	// header in the body because the CLI's HTTP client reads error bodies and
 	// not response headers.
 	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
+}
+
+// The reasons a pull is refused for exceeding a request budget. Each names the
+// budget that ran out, so a client reading only the message can tell whether it
+// is being limited for its own request rate or for the load every client is
+// putting on one database.
+const (
+	PullRateLimitCallerReason = "too many pull requests from this caller"
+	PullRateLimitTargetReason = "too many pull requests for this database and environment"
+)
+
+// NewRateLimitedResponse builds the body of a 429 refusal from the budget that
+// ran out and how long the caller must wait.
+//
+// The wait is rounded up to whole seconds, the only unit Retry-After can
+// express, and is never reported as less than one: "retry in 0s" reads as an
+// invitation to retry immediately, which is exactly what the budget is
+// refusing. The same rounded value goes in the message and in the field, so a
+// client that reads either sees one delay.
+func NewRateLimitedResponse(reason string, retryAfter time.Duration) ErrorResponse {
+	seconds := max(int(math.Ceil(retryAfter.Seconds())), 1)
+	return ErrorResponse{
+		Error:             fmt.Sprintf("%s; retry in %ds", reason, seconds),
+		ErrorCode:         ErrCodeRateLimited,
+		RetryAfterSeconds: seconds,
+	}
 }
 
 type WebhookRedriveRequest struct {

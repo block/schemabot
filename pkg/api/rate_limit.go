@@ -1,7 +1,6 @@
 package api
 
 import (
-	"math"
 	"net/http"
 	"strconv"
 	"time"
@@ -80,7 +79,7 @@ func (s *Service) checkPullRateLimit(w http.ResponseWriter, r *http.Request, dat
 			"environment", environment,
 			"retry_after", retryAfter,
 		)
-		s.writeRateLimited(w, retryAfter, "too many pull requests from this caller")
+		s.writeRateLimited(w, retryAfter, apitypes.PullRateLimitCallerReason)
 		return false
 	}
 	metrics.RecordRateLimitDecision(ctx, pullRateLimitEndpoint, rateLimitScopeCaller, rateLimitDecisionAllow, environment)
@@ -93,7 +92,7 @@ func (s *Service) checkPullRateLimit(w http.ResponseWriter, r *http.Request, dat
 			"environment", environment,
 			"retry_after", retryAfter,
 		)
-		s.writeRateLimited(w, retryAfter, "too many pull requests for this database and environment")
+		s.writeRateLimited(w, retryAfter, apitypes.PullRateLimitTargetReason)
 		return false
 	}
 	metrics.RecordRateLimitDecision(ctx, pullRateLimitEndpoint, rateLimitScopeTarget, rateLimitDecisionAllow, environment)
@@ -105,25 +104,10 @@ func (s *Service) checkPullRateLimit(w http.ResponseWriter, r *http.Request, dat
 // the standard Retry-After header and in the response body. The body repeats it
 // because the CLI's HTTP client reads error bodies and not response headers, so
 // a header-only hint would be invisible to the client most likely to be
-// limited.
-func (s *Service) writeRateLimited(w http.ResponseWriter, retryAfter time.Duration, message string) {
-	seconds := retryAfterSeconds(retryAfter)
-	w.Header().Set("Retry-After", strconv.Itoa(seconds))
-	s.writeJSON(w, http.StatusTooManyRequests, apitypes.ErrorResponse{
-		Error:             message + "; retry in " + strconv.Itoa(seconds) + "s",
-		ErrorCode:         apitypes.ErrCodeRateLimited,
-		RetryAfterSeconds: seconds,
-	})
-}
-
-// retryAfterSeconds rounds a wait up to whole seconds, the only unit
-// Retry-After can express, and never returns less than 1: a "retry after 0
-// seconds" reads as an invitation to retry immediately, which is what the
-// limit is refusing.
-func retryAfterSeconds(retryAfter time.Duration) int {
-	seconds := int(math.Ceil(retryAfter.Seconds()))
-	if seconds < 1 {
-		return 1
-	}
-	return seconds
+// limited. Both come from the same rounded value the response body carries, so
+// the header and the message can never disagree.
+func (s *Service) writeRateLimited(w http.ResponseWriter, retryAfter time.Duration, reason string) {
+	body := apitypes.NewRateLimitedResponse(reason, retryAfter)
+	w.Header().Set("Retry-After", strconv.Itoa(body.RetryAfterSeconds))
+	s.writeJSON(w, http.StatusTooManyRequests, body)
 }

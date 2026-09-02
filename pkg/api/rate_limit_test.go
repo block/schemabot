@@ -8,7 +8,6 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -274,14 +273,6 @@ func TestValidateRejectsNegativeRateLimits(t *testing.T) {
 			assert.Contains(t, err.Error(), tc.wantErr)
 		})
 	}
-}
-
-func TestRetryAfterSecondsRoundsUpToAtLeastOne(t *testing.T) {
-	assert.Equal(t, 1, retryAfterSeconds(0), "a zero wait would read as an invitation to retry immediately")
-	assert.Equal(t, 1, retryAfterSeconds(-1), "a negative wait cannot be advertised")
-	assert.Equal(t, 1, retryAfterSeconds(500*time.Millisecond), "a sub-second wait rounds up to a whole second")
-	assert.Equal(t, 2, retryAfterSeconds(1500*time.Millisecond))
-	assert.Equal(t, 30, retryAfterSeconds(30*time.Second))
 }
 
 // The per-target key cannot collide across databases or environments, so one

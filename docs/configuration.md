@@ -505,7 +505,26 @@ Each request must have budget in both lanes:
 A refused request carries `error_code: rate_limited`, a `Retry-After` header,
 and the same delay as `retry_after_seconds` in the response body. The code is
 retryable: a client should wait the advertised delay and retry rather than
-treating the response as a failure.
+treating the response as a failure. The message names the budget that ran out,
+so a caller well inside its own budget can tell it is being limited for the
+load on one database:
+
+```http
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/json
+Retry-After: 1
+
+{
+  "error": "too many pull requests for this database and environment; retry in 1s",
+  "error_code": "rate_limited",
+  "retry_after_seconds": 1
+}
+```
+
+The delay is always at least one second, since a client told to retry in zero
+seconds would retry immediately, which is what the budget is refusing. See
+[Rate Limits](../TEMPLATES.md#pull-refused-caller-budget-spent) in TEMPLATES.md
+for how a refusal renders at the terminal.
 
 A malformed request is rejected before any budget is spent. A well-formed
 request naming a database this server does not route does spend budget, because
