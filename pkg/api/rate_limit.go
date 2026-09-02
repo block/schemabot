@@ -67,12 +67,23 @@ func callerRateLimitKey(r *http.Request) string {
 // map: a target the request names but this server does not route still gets a
 // bucket, so a client cycling through invented database names can only mint as
 // many as its own budget admits before the limiter's idle sweep reclaims them.
+//
+// The environment recorded on the metric is clamped to a configured one. The
+// budget itself is keyed on the environment the request named, whatever that
+// is — an unroutable request still spends budget — but an arbitrary caller
+// string must never reach a metric attribute and mint a series per value.
+// Logs carry the unclamped name, which is what an operator needs to see.
 func (s *Service) checkPullRateLimit(w http.ResponseWriter, r *http.Request, database, environment string) bool {
+	if !s.pullRateLimitEnforced() {
+		return true
+	}
+
 	ctx := r.Context()
+	metricEnvironment := s.config.metricEnvironmentAttribute(environment)
 
 	caller := callerRateLimitKey(r)
 	if allowed, retryAfter := s.pullPerCallerLimiter.Allow(caller); !allowed {
-		metrics.RecordRateLimitDecision(ctx, pullRateLimitEndpoint, rateLimitScopeCaller, rateLimitDecisionLimit, environment)
+		metrics.RecordRateLimitDecision(ctx, pullRateLimitEndpoint, rateLimitScopeCaller, rateLimitDecisionLimit, metricEnvironment)
 		s.logger.Warn("pull schema rejected because the caller exceeded its request budget",
 			"caller", caller,
 			"database", database,
@@ -82,10 +93,10 @@ func (s *Service) checkPullRateLimit(w http.ResponseWriter, r *http.Request, dat
 		s.writeRateLimited(w, retryAfter, apitypes.PullRateLimitCallerReason)
 		return false
 	}
-	metrics.RecordRateLimitDecision(ctx, pullRateLimitEndpoint, rateLimitScopeCaller, rateLimitDecisionAllow, environment)
+	metrics.RecordRateLimitDecision(ctx, pullRateLimitEndpoint, rateLimitScopeCaller, rateLimitDecisionAllow, metricEnvironment)
 
 	if allowed, retryAfter := s.pullPerTargetLimiter.Allow(targetRateLimitKey(database, environment)); !allowed {
-		metrics.RecordRateLimitDecision(ctx, pullRateLimitEndpoint, rateLimitScopeTarget, rateLimitDecisionLimit, environment)
+		metrics.RecordRateLimitDecision(ctx, pullRateLimitEndpoint, rateLimitScopeTarget, rateLimitDecisionLimit, metricEnvironment)
 		s.logger.Warn("pull schema rejected because the target exceeded its request budget",
 			"caller", caller,
 			"database", database,
@@ -95,9 +106,17 @@ func (s *Service) checkPullRateLimit(w http.ResponseWriter, r *http.Request, dat
 		s.writeRateLimited(w, retryAfter, apitypes.PullRateLimitTargetReason)
 		return false
 	}
-	metrics.RecordRateLimitDecision(ctx, pullRateLimitEndpoint, rateLimitScopeTarget, rateLimitDecisionAllow, environment)
+	metrics.RecordRateLimitDecision(ctx, pullRateLimitEndpoint, rateLimitScopeTarget, rateLimitDecisionAllow, metricEnvironment)
 
 	return true
+}
+
+// pullRateLimitEnforced reports whether either lane can refuse a request.
+// Rate limiting being off is a configuration decision, logged once at startup,
+// so a disabled server returns here without recording a decision it never
+// made: an "allow" per pull would otherwise imply a budget was consulted.
+func (s *Service) pullRateLimitEnforced() bool {
+	return s.pullPerCallerLimiter != nil || s.pullPerTargetLimiter != nil
 }
 
 // writeRateLimited writes a 429 carrying how long the caller must wait, both as

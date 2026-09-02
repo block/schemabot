@@ -432,6 +432,13 @@ per client per database. Every limited request logs both alongside the
 advertised retry delay, so a spike on this counter is triaged from the WARN
 logs, not by slicing the metric.
 
+`environment` arrives in the request body, so it is clamped to a configured
+environment before it is recorded and appears as `unconfigured` otherwise. A
+budget is still keyed on the environment the request named — an unroutable
+request spends budget like any other — so a rising `unconfigured` share means
+clients are asking for environments this server does not serve. The unclamped
+name is in the log.
+
 Budgets are enforced per server process, so a fleet-wide `limit` rate is the sum
 across replicas and the effective ceiling is `replicas ×` the configured rate.
 See [Rate Limits](../../docs/configuration.md#rate-limits) for the config.

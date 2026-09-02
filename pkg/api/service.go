@@ -312,16 +312,30 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 
 // buildRateLimiters (re)builds the endpoint limiters from the current config
 // and clock. Both limiters are left nil when the endpoint's rate limiting is
-// disabled: a nil limiter admits every request, so the disabled path costs
-// nothing per request and needs no branch at the call site.
+// disabled, which the request path reads as "not enforced" and returns on
+// before it spends or records anything.
+//
+// Enforcement being off is worth one line at startup: an unbounded pull
+// endpoint is a deliberate choice, and an operator watching a target absorb
+// traffic should be able to tell from the server's own logs whether a budget
+// was ever in play.
 func (s *Service) buildRateLimiters() {
 	if s.config == nil || !s.config.PullRateLimitEnabled() {
 		s.pullPerCallerLimiter = nil
 		s.pullPerTargetLimiter = nil
+		s.logger.Info("pull endpoint rate limiting is disabled; pull requests will not be bounded by a request budget")
 		return
 	}
-	s.pullPerCallerLimiter = ratelimit.New(s.config.PullPerCallerRateLimit(), s.clock)
-	s.pullPerTargetLimiter = ratelimit.New(s.config.PullPerTargetRateLimit(), s.clock)
+	perCaller := s.config.PullPerCallerRateLimit()
+	perTarget := s.config.PullPerTargetRateLimit()
+	s.pullPerCallerLimiter = ratelimit.New(perCaller, s.clock)
+	s.pullPerTargetLimiter = ratelimit.New(perTarget, s.clock)
+	s.logger.Info("pull endpoint rate limiting is enabled",
+		"per_caller_requests_per_minute", perCaller.RequestsPerMinute,
+		"per_caller_burst", perCaller.Burst,
+		"per_target_requests_per_minute", perTarget.RequestsPerMinute,
+		"per_target_burst", perTarget.Burst,
+	)
 }
 
 // RegisterEngine registers an Engine implementation for a database type this

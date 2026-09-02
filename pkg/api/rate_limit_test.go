@@ -11,6 +11,10 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/auth"
@@ -64,6 +68,13 @@ func newRateLimitedPullService(t *testing.T, limits EndpointRateLimitConfig) (*S
 // caller leaves the request unauthenticated.
 func pullAs(t *testing.T, svc *Service, caller, database string) *httptest.ResponseRecorder {
 	t.Helper()
+	return pullAsInEnvironment(t, svc, caller, database, "production")
+}
+
+// pullAsInEnvironment is pullAs for a request naming an environment other than
+// the configured one, the shape a caller can invent freely.
+func pullAsInEnvironment(t *testing.T, svc *Service, caller, database, environment string) *httptest.ResponseRecorder {
+	t.Helper()
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
 
@@ -71,7 +82,7 @@ func pullAs(t *testing.T, svc *Service, caller, database string) *httptest.Respo
 	if caller != "" {
 		ctx = auth.WithUser(ctx, &auth.User{Subject: caller})
 	}
-	body := `{"database":"` + database + `","environment":"production","type":"mysql"}`
+	body := `{"database":"` + database + `","environment":"` + environment + `","type":"mysql"}`
 	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/api/pull", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -281,4 +292,55 @@ func TestTargetRateLimitKeyIsUnambiguous(t *testing.T) {
 	assert.NotEqual(t, targetRateLimitKey("orders", "production"), targetRateLimitKey("orders-production", ""))
 	assert.NotEqual(t, targetRateLimitKey("orders", "staging"), targetRateLimitKey("orders", "production"))
 	assert.Equal(t, targetRateLimitKey("orders", "production"), targetRateLimitKey("orders", "production"))
+}
+
+// The environment on a pull comes from the request body, so a caller can
+// invent one. The budget is still keyed on the name the request used, but the
+// decision metric records only configured environments: an arbitrary string
+// must never mint a time series per value.
+func TestPullRateLimitMetricClampsCallerSuppliedEnvironment(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prevMP := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		require.NoError(t, mp.Shutdown(t.Context()))
+	})
+
+	svc, _ := newRateLimitedPullService(t, EndpointRateLimitConfig{
+		PerCaller: RateLimitBudgetConfig{RequestsPerMinute: 60, Burst: 1},
+		PerTarget: RateLimitBudgetConfig{RequestsPerMinute: 6000, Burst: 100},
+	})
+
+	// Two requests naming environments that exist nowhere in the config: the
+	// first spends the caller's burst, the second is refused, so both an allow
+	// and a limit decision are recorded for an unconfigured environment.
+	pullAsInEnvironment(t, svc, "operator@example.com", "orders", "invented-one")
+	w := pullAsInEnvironment(t, svc, "operator@example.com", "orders", "invented-two")
+	require.Equal(t, http.StatusTooManyRequests, w.Code, w.Body.String())
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+
+	environments := make(map[string]int)
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "schemabot.rate_limit_decisions.total" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok, "the decision counter should be an int64 sum")
+			for _, dp := range sum.DataPoints {
+				environment, found := dp.Attributes.Value(attribute.Key("environment"))
+				require.True(t, found, "every decision carries an environment attribute")
+				environments[environment.Emit()]++
+			}
+		}
+	}
+
+	require.NotEmpty(t, environments, "the pulls should have recorded rate limit decisions")
+	for environment := range environments {
+		assert.Equal(t, "unconfigured", environment, "a caller-supplied environment must be clamped before it reaches a metric")
+	}
 }
