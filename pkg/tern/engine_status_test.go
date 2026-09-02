@@ -78,7 +78,7 @@ func reporterTestTask() *storage.Task {
 
 const unrecognizedStatusMetric = "schemabot.engine.unrecognized_task_status_total"
 
-const unrecognizedStatusWarn = "engine reported a task status with no state mapping; the work renders as Running until a mapping is added in pkg/state"
+const unrecognizedStatusWarn = "engine or data plane reported a task status with no state mapping; the work renders as Running until a mapping is added in pkg/state"
 
 // An engine status with no task-state mapping fails open to Running, so the
 // fallback must be observable: every sighting counts on the unrecognized

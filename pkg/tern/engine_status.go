@@ -69,7 +69,7 @@ func (r *unrecognizedStatusReporter) observe(ctx context.Context, logger *slog.L
 	if shard != "" {
 		attrs = append(attrs, "shard", shard)
 	}
-	logger.WarnContext(ctx, "engine reported a task status with no state mapping; the work renders as Running until a mapping is added in pkg/state",
+	logger.WarnContext(ctx, "engine or data plane reported a task status with no state mapping; the work renders as Running until a mapping is added in pkg/state",
 		append(attrs, "raw_status", status)...)
 }
 

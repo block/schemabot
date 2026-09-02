@@ -969,7 +969,7 @@ func RecordPlanetScaleUnclassifiedCancelRejection(ctx context.Context, database,
 // alertable on a bounded set of dimensions.
 func RecordUnrecognizedEngineTaskStatus(ctx context.Context, database, databaseType, engineName, environment string) {
 	addCounter(ctx, "schemabot.engine.unrecognized_task_status_total",
-		"Total engine-reported task statuses with no task-state mapping, rendered as Running by the fail-open default", "{status}",
+		"Total engine- or data-plane-reported task statuses with no task-state mapping, rendered as Running by the fail-open default", "{status}",
 		attribute.String("database", database),
 		attribute.String("database_type", databaseType),
 		attribute.String("engine", engineName),
