@@ -613,6 +613,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 			var tp *engine.TableProgress
 			if len(result.Tables) > 0 {
 				tp = &result.Tables[0]
+				c.unrecognizedStatuses.observeTaskStatus(ctx, logger, task, tp.State)
 			}
 			engineTaskState := engineTaskStateClaim(taskStateFromProgressResult(result), tp)
 

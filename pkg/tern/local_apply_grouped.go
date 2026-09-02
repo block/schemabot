@@ -1437,6 +1437,9 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.L
 			continue
 		}
 		tp, _ := tableProgress.ForTask(task)
+		if tp != nil {
+			c.unrecognizedStatuses.observeTaskStatus(ctx, logger, task, tp.State)
+		}
 		c.refreshTaskDisplayFromEngine(ctx, logger, task, tp, poll)
 		c.advanceTaskFromEngineProgress(ctx, task, tp, poll)
 	}
@@ -1595,6 +1598,7 @@ func (c *LocalClient) writeShardProgress(ctx context.Context, logger *slog.Logge
 		operationID = *table.ApplyOperationID
 	}
 	for _, sh := range tp.Shards {
+		c.unrecognizedStatuses.observeShardStatus(ctx, logger, table, sh.Shard, sh.State)
 		shardTask := &storage.Task{
 			TaskIdentifier:   engine.NewTaskID(),
 			ApplyID:          table.ApplyID,

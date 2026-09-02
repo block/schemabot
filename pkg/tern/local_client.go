@@ -199,6 +199,10 @@ type LocalClient struct {
 	psClientFunc      func(tokenName, tokenValue string) (psclient.PSClient, error)
 	logger            *slog.Logger
 
+	// unrecognizedStatuses reports engine statuses with no task-state mapping
+	// at the drive's ingest points. Zero value is ready.
+	unrecognizedStatuses unrecognizedStatusReporter
+
 	// heartbeatInterval controls how often the apply heartbeat updates updated_at.
 	// Defaults to 10s. Tests may lower this to verify heartbeat behavior.
 	heartbeatInterval time.Duration
