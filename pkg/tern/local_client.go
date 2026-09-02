@@ -1071,15 +1071,24 @@ func (c *LocalClient) pullNamespaceCatalog(ctx context.Context, db *sql.DB, name
 	if err := c.loadForeignKeyCatalog(ctx, db, physical, pulledTables, catalog.tables); err != nil {
 		return nil, err
 	}
-	if err := c.loadTableEstimates(ctx, db, physical, pulledTables, catalog.tables); err != nil {
-		return nil, err
-	}
 	return catalog, nil
 }
 
+// loadTableCatalog reads each pulled table's kind and comment together with its
+// engine-maintained row-count and on-disk-size estimates. The estimates are
+// approximations: NULL for views, and served from the data dictionary's cached
+// table statistics, so they lag the live table until those statistics are
+// refreshed.
+//
+// The estimate columns are what make this read more than the kind and comment
+// alone would. information_schema_stats_expiry governs how long the cached
+// statistics are reused; the first read after they expire makes the server
+// refresh them per table. Kind and comment come from the data dictionary and
+// are cheap either way, so they ride along on this query rather than paying for
+// a second traversal of the view.
 func (c *LocalClient) loadTableCatalog(ctx context.Context, db *sql.DB, physicalSchema string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
 	rows, err := db.QueryContext(ctx, `
-		SELECT table_name, table_type, table_comment
+		SELECT table_name, table_type, table_comment, table_rows, data_length, index_length
 		FROM information_schema.tables
 		WHERE table_schema = ?
 		ORDER BY table_name`, physicalSchema)
@@ -1090,52 +1099,22 @@ func (c *LocalClient) loadTableCatalog(ctx context.Context, db *sql.DB, physical
 
 	for rows.Next() {
 		var tableName, tableType, tableComment string
-		if err := rows.Scan(&tableName, &tableType, &tableComment); err != nil {
+		var tableRows, dataLength, indexLength sql.NullInt64
+		if err := rows.Scan(&tableName, &tableType, &tableComment, &tableRows, &dataLength, &indexLength); err != nil {
 			return fmt.Errorf("scan table catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 		}
 		if _, ok := pulledTables[tableName]; ok {
 			catalog[tableName] = &ternv1.TableCatalog{
-				Name:    tableName,
-				Kind:    normalizedTableKind(tableType),
-				Comment: tableComment,
+				Name:              tableName,
+				Kind:              normalizedTableKind(tableType),
+				Comment:           tableComment,
+				EstimatedRowCount: tableRows.Int64,
+				DataSizeBytes:     dataLength.Int64 + indexLength.Int64,
 			}
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterate table catalog for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
-	}
-	return nil
-}
-
-// loadTableEstimates populates engine-maintained row-count and on-disk-size
-// estimates from information_schema.tables. These are approximations (NULL for
-// views, stale until statistics are refreshed) and are only loaded at DETAILED
-// catalog detail.
-func (c *LocalClient) loadTableEstimates(ctx context.Context, db *sql.DB, physicalSchema string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
-	rows, err := db.QueryContext(ctx, `
-		SELECT table_name, table_rows, data_length, index_length
-		FROM information_schema.tables
-		WHERE table_schema = ?
-		ORDER BY table_name`, physicalSchema)
-	if err != nil {
-		return fmt.Errorf("load table estimates for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
-	}
-	defer utils.CloseAndLog(rows)
-
-	for rows.Next() {
-		var tableName string
-		var tableRows, dataLength, indexLength sql.NullInt64
-		if err := rows.Scan(&tableName, &tableRows, &dataLength, &indexLength); err != nil {
-			return fmt.Errorf("scan table estimates for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
-		}
-		if _, ok := pulledTables[tableName]; ok {
-			tableCatalog := ensurePulledTableCatalog(catalog, tableName)
-			tableCatalog.EstimatedRowCount = tableRows.Int64
-			tableCatalog.DataSizeBytes = dataLength.Int64 + indexLength.Int64
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate table estimates for database %s physical schema %s: %w", c.config.Database, physicalSchema, err)
 	}
 	return nil
 }
