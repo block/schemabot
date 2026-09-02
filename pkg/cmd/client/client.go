@@ -22,6 +22,7 @@ import (
 	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // ResolveEndpoint returns the endpoint to use, checking in order:
@@ -462,7 +463,29 @@ func GenerateCLIOwner() string {
 		hostname = h
 	}
 
-	return caller.FormatCLI(username, hostname)
+	return cliOwner(username, hostname)
+}
+
+// cliOwner renders a CLI owner in the canonical spelling the lock API stores.
+// The lock API folds every caller-supplied owner before persisting or matching
+// it, so the CLI must fold the same value: an operator whose hostname or
+// username carries uppercase characters would otherwise compare unequal to
+// their own stored lock, and the pre-apply lock check would report the
+// database as locked by someone else.
+//
+// The same string is also the caller attribution on CLI-driven requests, which
+// the server does not fold. The hostname half is free — hostnames are
+// case-insensitive — and an authenticated server records the verified subject
+// in place of the claimed username, so nothing of the identity is lost there.
+// A server running without API auth records the claimed username lowercased:
+// a cosmetic loss on a display-only field, in exchange for an ownership
+// predicate that agrees with the one the lock is stored under.
+//
+// The fold belongs here rather than in caller.FormatCLI because the server
+// renders verified subjects through that same formatter, and a verified
+// identity must reach storage in the spelling its provider issued.
+func cliOwner(username, hostname string) string {
+	return storage.CanonicalKey(caller.FormatCLI(username, hostname))
 }
 
 // AcquireLock attempts to acquire a lock on a database.

@@ -14,7 +14,8 @@ import "strings"
 // and intent verification and must match byte-exactly. GitHub-origin owners
 // ("org/repo#42") are canonical by construction from the folded repository;
 // the lock API folds a caller-supplied owner ("cli:user@host") with this
-// function at acquire and release.
+// function at acquire and release, and the CLI generates its owner already
+// folded so its own ownership checks compare against the stored spelling.
 // Deployment names are identity keys too, but they are operator-controlled
 // configuration that doubles as routing and schema-directory path components,
 // so config validation rejects non-canonical spellings instead of silently
