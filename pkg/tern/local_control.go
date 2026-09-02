@@ -1610,6 +1610,9 @@ func (c *LocalClient) wrapFailedEngineStop(task *storage.Task, stopErr error) er
 // landed must reconcile to its completed outcome, never settle as stopped or
 // cancelled.
 // The revert states keep the engine actively unwinding the change.
+//
+// A nil result is uncertainty of the same kind and counts as live, so a caller
+// that reaches the cleared branch always holds a result it can report.
 func engineProgressShowsLiveWork(eng engine.Engine, progress *engine.ProgressResult) bool {
 	if progress == nil {
 		return true
