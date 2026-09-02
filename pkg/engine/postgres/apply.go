@@ -29,10 +29,22 @@ const (
 	// Server-side statement/lock timeouts bound queries once a session is
 	// healthy, but they cannot unwedge a hung dial or a black-holed
 	// connection — the ceiling guarantees the drive always reaches a
-	// terminal progress state. Generously above the worst legitimate run
-	// (retry attempts x statement limit plus backoffs) so it only fires on
-	// genuine hangs.
+	// terminal progress state. Above the worst legitimate run on either
+	// execution path — generously above the retry path's (retry attempts x
+	// statement limit plus backoffs), and above the concurrent index
+	// budget with enough headroom for session setup and the post-failure
+	// catalog verdict — so it only fires on genuine hangs.
 	optimisticApplyCeiling = 5 * time.Minute
+
+	// concurrentIndexBudget bounds one CREATE INDEX CONCURRENTLY build.
+	// Concurrent builds get their own budget instead of the per-statement
+	// limit: their snapshot waits are lock waits by implementation, so the
+	// executor runs them with lock_timeout disabled under one overall
+	// statement deadline. Deliberately below the apply ceiling so the
+	// server-side deadline fires before the client-side ceiling cancels
+	// the session — exhaustion then surfaces as the typed budget verdict
+	// rather than an ambiguous external cancellation.
+	concurrentIndexBudget = 4 * time.Minute
 )
 
 type nativeApply struct {
@@ -130,6 +142,28 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		return
 	}
 
+	var invalidErr *executor.InvalidIndexError
+	if errors.As(err, &invalidErr) {
+		// An invalid index — pre-existing or a build's own unrecovered
+		// leftover — is operational: an operator clears it and a retry can
+		// succeed. Checked before the refusal and budget arms because the
+		// verdict wraps the build failure that produced it (a budget-
+		// cancelled build leaves its own invalid index), and that inner
+		// cause must not be read as the outcome — the index the operator
+		// clears is. The detail is built from the typed identifiers and
+		// verdict code, never the wrapped build or cleanup errors, which
+		// may carry raw server text; the full cause lands in the server
+		// log below it.
+		logger.Error("PostgreSQL concurrent index build left or found an invalid index",
+			"namespace", change.namespace, "table", change.table,
+			"index_schema", invalidErr.Schema, "index", invalidErr.Index, "error", err)
+		result := progressResult(engine.StateFailed, "failed", started, change,
+			invalidIndexDetail(invalidErr))
+		result.Retryable = true
+		e.publishProgress(key, result, logger)
+		return
+	}
+
 	if r := classifyRefusal(err, change.table); r != nil {
 		// The taxonomy's reason survives in the operator-facing detail; no
 		// metadata carries it because nothing downstream consumes one yet.
@@ -158,6 +192,30 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	// a retry futile — the drive must not cancel the apply's remaining work.
 	result.Retryable = true
 	e.publishProgress(key, result, logger)
+}
+
+// invalidIndexDetail renders the operator-facing next step for an
+// invalid-index verdict, matching pg-sprite's own ownership standard: a drop
+// is named only when the entry is proven this build's own leftover. A
+// pre-existing invalid entry may be another actor's still-running build, and
+// an unproven verdict may sit on a healthy index — both get investigation
+// steps, never a statement to run. Only the typed identifiers are
+// interpolated, never the wrapped build or cleanup errors, which may carry
+// raw server text.
+func invalidIndexDetail(invalidErr *executor.InvalidIndexError) string {
+	name := fmt.Sprintf("%q.%q", invalidErr.Schema, invalidErr.Index)
+	var advice string
+	switch invalidErr.Code() {
+	case executor.CodeInvalidIndexOwnLeftover:
+		advice = fmt.Sprintf("this build left its own invalid index %s on the target; drop the invalid index, then retry", name)
+	case executor.CodeInvalidIndexPreexisting:
+		advice = fmt.Sprintf("an invalid index %s already occupies the name on the target and may be another actor's build still in progress; check pg_stat_activity before any recovery, then retry", name)
+	default:
+		// CodeInvalidIndexUnproven and any future verdict fail safe with
+		// investigation steps: the index under the name may be healthy.
+		advice = fmt.Sprintf("index %s may be invalid but its catalog state could not be verified; inspect pg_index.indisvalid on the target before any recovery, then retry", name)
+	}
+	return sanitizeReasonText(advice)
 }
 
 // refusal is a typed apply outcome that retrying cannot fix: the schema
@@ -205,9 +263,26 @@ func refusalForCause(err error, table string) *refusal {
 		}
 		return &refusal{reason: "insufficient-privileges", detail: detail}
 	}
+	// An invalid-index verdict is operational even when the build failure it
+	// wraps would classify as a refusal on its own — a budget-cancelled
+	// concurrent build leaves its own invalid index, and the index the
+	// operator clears is the outcome, not the inner budget exhaustion.
+	// Declined before the budget arm so the nested cause can never shadow
+	// the verdict.
+	var invalidErr *executor.InvalidIndexError
+	if errors.As(err, &invalidErr) {
+		return nil
+	}
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
 		return &refusal{reason: "not-native-safe-budget-exceeded", detail: budgetErr.Error()}
+	}
+	var partitionErr *preflight.UnsupportedPartitionedParentError
+	if errors.As(err, &partitionErr) {
+		// The typed error's message is a fixed English sentence with no
+		// interpolated identifiers or server text — a deliberate pg-sprite
+		// property — so rendering it verbatim is safe by construction.
+		return &refusal{reason: "unsupported-partitioned-parent", detail: partitionErr.Error()}
 	}
 	var sizeErr *preflight.SizeError
 	if errors.As(err, &sizeErr) {
@@ -327,6 +402,32 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	table, err := preflight.CheckTable(ctx, pool, change.namespace, change.table, tableSizeLimit)
 	if err != nil {
 		return fmt.Errorf("preflight PostgreSQL table %q: %w", change.table, err)
+	}
+	if table.Partitioned() {
+		// The partition admission policy runs here, in the session window
+		// that executes, not only at plan time: a table partitioned after
+		// planning must get the typed refusal, never a raw server error
+		// mid-statement. Server major matters to the policy (NOT VALID
+		// foreign keys), so it is read from the same target.
+		facts, err := preflight.LookupTargetFacts(ctx, pool, change.namespace, change.table)
+		if err != nil {
+			return fmt.Errorf("look up PostgreSQL target facts for table %q: %w", change.table, err)
+		}
+		if err := preflight.CheckPartitionSupport(table, facts.ServerMajor(), []string{change.sql}); err != nil {
+			return fmt.Errorf("admit statement for partitioned PostgreSQL table %q: %w", change.table, err)
+		}
+	}
+	if statement.Kind() == pgstatement.KindCreateIndex && statement.Concurrent() {
+		// A concurrent build cannot run inside a transaction block, so it
+		// must not reach the transactional optimistic executor: pg-sprite's
+		// dedicated index-build executor runs it under the CONCURRENTLY
+		// budget policy and returns a catalog-verified verdict — including
+		// the invalid-index recovery a failed build needs.
+		if _, err := executor.BuildIndexConcurrently(ctx, pool, change.sql,
+			executor.ConcurrentBudget{Overall: concurrentIndexBudget}); err != nil {
+			return fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", change.table, err)
+		}
+		return nil
 	}
 	if err := executor.ExecuteNative(ctx, pool, table, statement, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
