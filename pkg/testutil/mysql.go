@@ -22,6 +22,12 @@ const mysqlPort = "3306"
 // mysqlStartupTimeout bounds the wait for a test MySQL container to accept
 // queries. A container that has not become usable by then is a failed setup
 // rather than one worth waiting longer on.
+//
+// The budget assumes the in-memory data directory below. Building a fresh one
+// on a contended disk does not reliably finish inside it, so a change that
+// puts the directory back on the block device has to revisit this number
+// too -- otherwise setup starts failing again, and does it before any test
+// runs, which reports the whole package as failed.
 const mysqlStartupTimeout = 30 * time.Second
 
 // mysqlLookupTimeout bounds the Docker API lookups MySQLDSN needs. Its callers
@@ -35,6 +41,13 @@ const mysqlLookupTimeout = 30 * time.Second
 // room above what the heaviest package's tables, redo log and binary logs
 // reach, so a test that writes without bound fails on its own data directory
 // instead of pressuring the host.
+//
+// The cap is per container, and a tmpfs with no container memory limit is
+// charged onward to the host, so what a CI runner must hold is this times the
+// number of package binaries live at once -- which Go's package parallelism
+// governs, not anything here. Raising that parallelism, or adding another
+// MySQL-starting package to a shard already running several, is a reason to
+// revisit this rather than inherit it.
 const mysqlDatadirSize = "2g"
 
 // MySQLContainerRequest returns the request for a throwaway MySQL container
