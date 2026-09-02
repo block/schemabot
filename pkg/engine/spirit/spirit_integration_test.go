@@ -2313,6 +2313,7 @@ func TestNewSpiritMigrationRunSettings(t *testing.T) {
 // exist yet and gets none.
 func TestEngine_Plan_TableRowEstimates(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
 
 	_, err := db.ExecContext(t.Context(), "CREATE TABLE `sized_items` (\n"+
 		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n"+

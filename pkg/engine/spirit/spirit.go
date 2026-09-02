@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	spiritlint "github.com/block/spirit/pkg/lint"
 	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/statement"
@@ -570,12 +571,13 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		currentByTable[ts.Name] = ts.Schema
 	}
 
-	// Best-effort per-table row estimates for plan display. Sizes are
-	// informational — a failed or slow read must not fail or stall the plan,
-	// so the probe runs under its own budget, and a miss logs and renders the
-	// plan without sizes.
+	// Best-effort per-table row estimates for plan display, read only for the
+	// tables this plan touches so a database with many unrelated tables does
+	// not pay for them. Sizes are informational — a failed or slow read must
+	// not fail or stall the plan, so the probe runs under its own budget, and
+	// a miss logs and renders the plan without sizes.
 	probeCtx, cancelProbe := context.WithTimeout(ctx, engine.TableSizeProbeTimeout)
-	sizeEstimates, err := e.fetchTableSizeEstimates(probeCtx, req.Credentials.DSN)
+	sizeEstimates, err := e.fetchTableSizeEstimates(probeCtx, req.Credentials.DSN, plannedTableNames(plan.Changes))
 	cancelProbe()
 	if err != nil {
 		e.logger.Warn("table size estimates unavailable; the plan will omit table sizes",
@@ -1085,11 +1087,33 @@ type tableSizeEstimate struct {
 	bytes int64
 }
 
-// fetchTableSizeEstimates reads every base table's approximate row count and
-// on-disk footprint from information_schema on the given DSN. Estimates are
-// display-only plan context: the caller treats a failure as "no sizes" rather
-// than failing the plan.
-func (e *Engine) fetchTableSizeEstimates(ctx context.Context, dsn string) (map[string]tableSizeEstimate, error) {
+// plannedTableNames returns the distinct tables a plan touches, in first-seen
+// order. A plan can carry several statements for one table (a partition-type
+// change needs its own REMOVE PARTITIONING statement), so the names are
+// deduplicated before they become query parameters.
+func plannedTableNames(changes []spiritlint.PlannedChange) []string {
+	seen := make(map[string]bool, len(changes))
+	names := make([]string, 0, len(changes))
+	for _, pc := range changes {
+		if pc.TableName == "" || seen[pc.TableName] {
+			continue
+		}
+		seen[pc.TableName] = true
+		names = append(names, pc.TableName)
+	}
+	return names
+}
+
+// fetchTableSizeEstimates reads the approximate row count and on-disk
+// footprint of the named base tables from information_schema on the given DSN.
+// The read is scoped to the planned tables so the cost does not scale with the
+// size of the schema. Estimates are display-only plan context: the caller
+// treats a failure as "no sizes" rather than failing the plan.
+func (e *Engine) fetchTableSizeEstimates(ctx context.Context, dsn string, tables []string) (map[string]tableSizeEstimate, error) {
+	if len(tables) == 0 {
+		return nil, nil
+	}
+
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
@@ -1100,12 +1124,19 @@ func (e *Engine) fetchTableSizeEstimates(ctx context.Context, dsn string) (map[s
 		return nil, fmt.Errorf("ping database: %w", err)
 	}
 
-	rows, err := db.QueryContext(ctx, `
+	args := make([]any, 0, len(tables))
+	for _, name := range tables {
+		args = append(args, name)
+	}
+	query := `
 		SELECT table_name, table_rows, data_length + index_length
 		FROM information_schema.tables
-		WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'`)
+		WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE'
+		  AND table_name IN (?` + strings.Repeat(", ?", len(tables)-1) + `)`
+
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("query table size estimates: %w", err)
+		return nil, fmt.Errorf("query size estimates for tables %v: %w", tables, err)
 	}
 	defer utils.CloseAndLog(rows)
 
