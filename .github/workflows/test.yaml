@@ -170,10 +170,11 @@ jobs:
           # onto their own runner so the long tail keeps headroom under the job
           # budget.
           - shard: tern-webhook
-          # The single heaviest per-package binary (~4 min alone), which starts
-          # many MySQL testcontainers. Running it beside other container-heavy
-          # binaries contends on the shared Docker daemon and stretches it
-          # toward go test's own timeout, so it gets an uncontended runner.
+          # The largest per-package binary: hundreds of storage-backed tests
+          # over a shared MySQL testcontainer plus per-test PostgreSQL
+          # testcontainers. Running it beside other container-heavy binaries
+          # contends on the shared Docker daemon and stretches it toward go
+          # test's own timeout, so it gets an uncontended runner.
           - shard: pkg/api
           # Every other integration-tagged package: tests that live beside the
           # code they cover, spread across ./pkg, ./cmd and ./e2e. A newly
