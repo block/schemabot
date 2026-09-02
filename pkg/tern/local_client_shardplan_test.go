@@ -186,6 +186,34 @@ func TestPlanPreservesUnsafeMetadataInStoredPlanAndResponse(t *testing.T) {
 	assert.Equal(t, "DROP TABLE removes all data", resp.Shards[0].Changes[0].UnsafeReason)
 }
 
+// repartitionUsersWithRows returns the two statements a partition-type change
+// needs against one table, both carrying the same shard-level estimate.
+func repartitionUsersWithRows(rows int64) []engine.TableChange {
+	bytes := rows * 100
+	changes := make([]engine.TableChange, 0, 2)
+	for _, statement := range []string{
+		"ALTER TABLE `users` REMOVE PARTITIONING",
+		"ALTER TABLE `users` PARTITION BY KEY(`id`) PARTITIONS 4",
+	} {
+		changes = append(changes, engine.TableChange{
+			Table:          "users",
+			Operation:      ddl.StatementAlterTable,
+			DDL:            statement,
+			EstimatedRows:  &rows,
+			EstimatedBytes: &bytes,
+		})
+	}
+	return changes
+}
+
+// alterUsersEmailWithBytes models a statistics source that reports storage
+// bytes but no row counts.
+func alterUsersEmailWithBytes(bytes int64) []engine.TableChange {
+	tc := alterUsersEmail()
+	tc[0].EstimatedBytes = &bytes
+	return tc
+}
+
 func alterUsersEmailWithRows(rows int64) []engine.TableChange {
 	tc := alterUsersEmail()
 	tc[0].EstimatedRows = &rows
@@ -270,12 +298,90 @@ func TestPlanShardTableSizesOmittedWhenAnyShardMissing(t *testing.T) {
 	stored := store.created.Namespaces["resolute"].Tables[0]
 	assert.Nil(t, stored.EstimatedRows)
 	assert.Nil(t, stored.LargestShardRows)
+	assert.Nil(t, stored.EstimatedBytes)
 	assert.Equal(t, 2, stored.ShardCount)
 
 	protoChange := resp.Changes[0].TableChanges[0]
 	assert.Nil(t, protoChange.EstimatedRows)
 	assert.Nil(t, protoChange.LargestShardRows)
+	assert.Nil(t, protoChange.EstimatedBytes)
 	assert.Equal(t, int32(2), protoChange.ShardCount)
+}
+
+// A shard that plans several statements against one table (a partition-type
+// change needs its own REMOVE PARTITIONING statement) contributes to the
+// namespace totals once: the shard count is a count of shards, and the row and
+// byte sums are not multiplied by statement count.
+func TestPlanShardTableSizesCountShardsNotStatements(t *testing.T) {
+	store := &fakePlanStore{
+		getFn:    func(string) (*storage.Plan, error) { return nil, nil },
+		createID: 13,
+	}
+	result := &engine.PlanResult{
+		PlanID: "plan_repeated_statements",
+		Changes: []engine.SchemaChange{
+			{Namespace: "resolute", Shard: engine.Shard{Name: "-80"}, TableChanges: repartitionUsersWithRows(100)},
+			{Namespace: "resolute", Shard: engine.Shard{Name: "80-"}, TableChanges: repartitionUsersWithRows(250)},
+		},
+	}
+	c := shardPlanTestClient(t, store, result)
+
+	resp, err := c.Plan(t.Context(), &ternv1.PlanRequest{Database: "commerce"})
+	require.NoError(t, err)
+
+	require.NotNil(t, store.created)
+	require.Len(t, store.created.Namespaces["resolute"].Tables, 1)
+	stored := store.created.Namespaces["resolute"].Tables[0]
+	assert.Equal(t, 2, stored.ShardCount)
+	require.NotNil(t, stored.EstimatedRows)
+	assert.Equal(t, int64(350), *stored.EstimatedRows)
+	require.NotNil(t, stored.LargestShardRows)
+	assert.Equal(t, int64(250), *stored.LargestShardRows)
+	require.NotNil(t, stored.EstimatedBytes)
+	assert.Equal(t, int64(35_000), *stored.EstimatedBytes)
+
+	protoChange := resp.Changes[0].TableChanges[0]
+	assert.Equal(t, int32(2), protoChange.ShardCount)
+	require.NotNil(t, protoChange.EstimatedRows)
+	assert.Equal(t, int64(350), *protoChange.EstimatedRows)
+	require.NotNil(t, protoChange.EstimatedBytes)
+	assert.Equal(t, int64(35_000), *protoChange.EstimatedBytes)
+}
+
+// An engine whose statistics source reports bytes but no row counts still gets
+// a byte total: the row and byte totals are independently all-or-nothing, so
+// absent row estimates do not suppress the bytes the source did report.
+func TestPlanShardTableSizesKeepBytesWithoutRows(t *testing.T) {
+	store := &fakePlanStore{
+		getFn:    func(string) (*storage.Plan, error) { return nil, nil },
+		createID: 14,
+	}
+	result := &engine.PlanResult{
+		PlanID: "plan_bytes_only",
+		Changes: []engine.SchemaChange{
+			{Namespace: "resolute", Shard: engine.Shard{Name: "-80"}, TableChanges: alterUsersEmailWithBytes(6_000)},
+			{Namespace: "resolute", Shard: engine.Shard{Name: "80-"}, TableChanges: alterUsersEmailWithBytes(4_000)},
+		},
+	}
+	c := shardPlanTestClient(t, store, result)
+
+	resp, err := c.Plan(t.Context(), &ternv1.PlanRequest{Database: "commerce"})
+	require.NoError(t, err)
+
+	require.NotNil(t, store.created)
+	stored := store.created.Namespaces["resolute"].Tables[0]
+	assert.Equal(t, 2, stored.ShardCount)
+	require.NotNil(t, stored.EstimatedBytes)
+	assert.Equal(t, int64(10_000), *stored.EstimatedBytes)
+	assert.Nil(t, stored.EstimatedRows)
+	assert.Nil(t, stored.LargestShardRows)
+
+	protoChange := resp.Changes[0].TableChanges[0]
+	assert.Equal(t, int32(2), protoChange.ShardCount)
+	require.NotNil(t, protoChange.EstimatedBytes)
+	assert.Equal(t, int64(10_000), *protoChange.EstimatedBytes)
+	assert.Nil(t, protoChange.EstimatedRows)
+	assert.Nil(t, protoChange.LargestShardRows)
 }
 
 // An engine that aggregates a sharded target itself emits unsharded changes;
