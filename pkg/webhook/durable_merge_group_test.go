@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -74,6 +75,31 @@ func TestDurableMergeGroupWebhookQueuesAndAcks(t *testing.T) {
 		t.Fatal("durable request path should not create a GitHub client")
 	default:
 	}
+}
+
+func TestDurableMergeGroupWebhookCanonicalizesRepository(t *testing.T) {
+	events := newRecordingWebhookEventStore()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{
+		Repos: map[string]api.RepoConfig{"mixedcase/sample-repo": {}},
+	}, nil, logger)
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+
+	req := buildMergeGroupWebhookRequest(t, "checks_requested", "MixedCaseSHA", nil)
+	body, err := io.ReadAll(req.Body)
+	require.NoError(t, err)
+	req.Body = io.NopCloser(strings.NewReader(strings.ReplaceAll(string(body), "octocat/hello-world", "MixedCase/Sample-Repo")))
+	req.Header.Set(headerDeliveryID, "mixed-case-merge-group")
+	rr := httptest.NewRecorder()
+
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	event, err := events.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "mixed-case-merge-group")
+	require.NoError(t, err)
+	require.NotNil(t, event)
+	assert.Equal(t, "mixedcase/sample-repo", event.Repository)
+	assert.Equal(t, "MixedCaseSHA", event.HeadSHA)
 }
 
 // A webhook redelivery reuses the delivery GUID, so the inbox deduplicates it to

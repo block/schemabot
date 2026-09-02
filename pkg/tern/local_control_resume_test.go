@@ -36,9 +36,9 @@ func TestReplanShardTableDDLKeysPerNamespaceAndShard(t *testing.T) {
 	got := replanShardTableDDL(result)
 
 	require.Len(t, got, 3, "same table across shards and keyspaces must produce three distinct keys")
-	assert.Equal(t, ddlA, got[shardTableKey{namespace: "ks1", shard: "-80", table: "mutes"}])
-	assert.Equal(t, ddlB, got[shardTableKey{namespace: "ks1", shard: "80-", table: "mutes"}])
-	assert.Equal(t, ddlC, got[shardTableKey{namespace: "ks2", shard: "-80", table: "mutes"}], "the same shard+table in another keyspace is not conflated")
+	assert.Equal(t, []string{ddlA}, got[shardTableKey{namespace: "ks1", shard: "-80", table: "mutes"}])
+	assert.Equal(t, []string{ddlB}, got[shardTableKey{namespace: "ks1", shard: "80-", table: "mutes"}])
+	assert.Equal(t, []string{ddlC}, got[shardTableKey{namespace: "ks2", shard: "-80", table: "mutes"}], "the same shard+table in another keyspace is not conflated")
 }
 
 // For a non-sharded engine the shard name is empty, so keying degrades to
@@ -54,7 +54,29 @@ func TestReplanShardTableDDLNonShardedDegradesToTable(t *testing.T) {
 	got := replanShardTableDDL(result)
 
 	require.Len(t, got, 1)
-	assert.Equal(t, ddl, got[shardTableKey{namespace: "commerce", table: "mutes"}])
+	assert.Equal(t, []string{ddl}, got[shardTableKey{namespace: "commerce", table: "mutes"}])
+}
+
+// A table can carry several statements in one plan, each its own task. The
+// re-plan index must keep every statement for the table, in plan order, so each
+// task can be matched against its own statement rather than the table's last.
+func TestReplanShardTableDDLKeepsEveryStatementForATable(t *testing.T) {
+	createDDL := "CREATE TABLE public.users (id bigint PRIMARY KEY)"
+	indexDDL := "CREATE INDEX users_email_idx ON public.users (email)"
+	result := &engine.PlanResult{
+		Changes: []engine.SchemaChange{{
+			Namespace: "app",
+			TableChanges: []engine.TableChange{
+				{Table: "users", DDL: createDDL},
+				{Table: "users", DDL: indexDDL},
+			},
+		}},
+	}
+
+	got := replanShardTableDDL(result)
+
+	require.Len(t, got, 1)
+	assert.Equal(t, []string{createDDL, indexDDL}, got[shardTableKey{namespace: "app", table: "users"}])
 }
 
 // On resume, replanAndFilterTasks recomputes each deployment's delta against its
@@ -77,39 +99,79 @@ func TestVerifyReplannedTaskDDL(t *testing.T) {
 
 	t.Run("matching re-plan passes", func(t *testing.T) {
 		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-		err := c.verifyReplannedTaskDDL(tk, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		ddl, err := c.verifyReplannedTaskDDL(tk, []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"})
 		require.NoError(t, err)
+		assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ddl)
 	})
 
 	t.Run("incidental formatting differences pass", func(t *testing.T) {
 		// Unquoted identifiers and extra whitespace canonicalize to the same form
 		// as the reviewed DDL, so they are not drift.
 		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-		err := c.verifyReplannedTaskDDL(tk, "ALTER TABLE   users   ADD COLUMN email varchar(255)")
+		ddl, err := c.verifyReplannedTaskDDL(tk, []string{"ALTER TABLE   users   ADD COLUMN email varchar(255)"})
 		require.NoError(t, err)
+		assert.Equal(t, "ALTER TABLE   users   ADD COLUMN email varchar(255)", ddl, "the re-planned text is what the task will run")
 	})
 
 	t.Run("divergent re-plan fails closed", func(t *testing.T) {
 		// The deployment drifted: the re-plan would apply a different column type
 		// than the one reviewed. This unreviewed DDL must be refused.
 		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-		err := c.verifyReplannedTaskDDL(tk, "ALTER TABLE `users` ADD COLUMN `email` varchar(100)")
+		_, err := c.verifyReplannedTaskDDL(tk, []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(100)"})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "drifted from the reviewed plan")
 		assert.Contains(t, err.Error(), "commerce[-80].users/alter")
+	})
+
+	t.Run("the task's statement is matched among the table's several statements", func(t *testing.T) {
+		// Three statements remain for the table; this task's is the middle
+		// one, in different formatting. It must resolve to its own statement,
+		// not the table's first or last.
+		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		ddl, err := c.verifyReplannedTaskDDL(tk, []string{
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+			"ALTER TABLE users ADD COLUMN email varchar(255)",
+			"ALTER TABLE `users` ADD INDEX (`email`)",
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "ALTER TABLE users ADD COLUMN email varchar(255)", ddl)
+	})
+
+	t.Run("no match among several statements fails closed naming the ambiguity", func(t *testing.T) {
+		// The table still has pending statements but none is this task's. That
+		// is either this statement having already landed or drift; the resume
+		// cannot tell, so it refuses without calling it drift.
+		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		_, err := c.verifyReplannedTaskDDL(tk, []string{
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+			"ALTER TABLE `users` ADD INDEX (`name`)",
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "re-plan has 2 pending statements for commerce[-80].users/alter")
+		assert.Contains(t, err.Error(), "task_abc123")
+		assert.Contains(t, err.Error(), "cannot tell a statement that already landed from drift")
+		assert.NotContains(t, err.Error(), "drifted from the reviewed plan")
+	})
+
+	t.Run("no re-planned statements is an error", func(t *testing.T) {
+		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		_, err := c.verifyReplannedTaskDDL(tk, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "re-plan emitted no statements")
 	})
 
 	t.Run("empty reviewed DDL is left to the caller", func(t *testing.T) {
 		// Only legacy synthetic VSchema tasks carry no reviewed DDL; they have no
 		// reference to compare against and are handled downstream, not here.
 		tk := task("")
-		err := c.verifyReplannedTaskDDL(tk, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		ddl, err := c.verifyReplannedTaskDDL(tk, []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"})
 		require.NoError(t, err)
+		assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ddl)
 	})
 
 	t.Run("unparseable re-planned DDL fails closed", func(t *testing.T) {
 		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-		err := c.verifyReplannedTaskDDL(tk, "this is not valid sql")
+		_, err := c.verifyReplannedTaskDDL(tk, []string{"this is not valid sql"})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "re-planned DDL for task task_abc123")
 	})
@@ -168,11 +230,12 @@ func TestTableStillNeedsChange_ReturnsReplannedDDL(t *testing.T) {
 		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
 	}
 
-	ddl, needsChange, err := c.tableStillNeedsChange(t.Context(), apply, plan, task)
+	replanned, needsChange, err := c.tableStillNeedsChange(t.Context(), apply, plan, task)
 	require.NoError(t, err)
 	assert.True(t, needsChange)
-	assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ddl)
-	require.NoError(t, c.verifyReplannedTaskDDL(task, ddl), "matching re-plan is not drift")
+	assert.Equal(t, []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"}, replanned)
+	_, err = c.verifyReplannedTaskDDL(task, replanned)
+	require.NoError(t, err, "matching re-plan is not drift")
 }
 
 // When the table has dropped out of the re-plan diff (its cutover completed) the
@@ -203,10 +266,10 @@ func TestTableStillNeedsChange_TableAbsentReportsDone(t *testing.T) {
 		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
 	}
 
-	ddl, needsChange, err := c.tableStillNeedsChange(t.Context(), apply, plan, task)
+	replanned, needsChange, err := c.tableStillNeedsChange(t.Context(), apply, plan, task)
 	require.NoError(t, err)
 	assert.False(t, needsChange)
-	assert.Empty(t, ddl)
+	assert.Empty(t, replanned)
 }
 
 // If live drifts between resume entry and a later per-task apply, the re-plan the
@@ -237,10 +300,10 @@ func TestTableStillNeedsChange_DriftFailsClosed(t *testing.T) {
 		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
 	}
 
-	ddl, needsChange, err := c.tableStillNeedsChange(t.Context(), apply, plan, task)
+	replanned, needsChange, err := c.tableStillNeedsChange(t.Context(), apply, plan, task)
 	require.NoError(t, err)
 	require.True(t, needsChange)
-	err = c.verifyReplannedTaskDDL(task, ddl)
+	_, err = c.verifyReplannedTaskDDL(task, replanned)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "drifted from the reviewed plan")
 	assert.Contains(t, err.Error(), "testapp.users/alter")

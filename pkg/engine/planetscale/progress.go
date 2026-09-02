@@ -160,12 +160,32 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	hasVtgateDSN := req.Credentials.DSN != ""
 	hasMigrationContext := req.ResumeState != nil && req.ResumeState.MigrationContext != ""
 	if hasVtgateDSN && hasMigrationContext {
-		tables, overallProgress := e.queryVitessMigrations(ctx, client, req.Database, req.Credentials, req.ResumeState.MigrationContext)
+		tables, overallProgress, failed, shardFailed := e.queryVitessMigrations(ctx, client, req.Database, req.Credentials, req.ResumeState.MigrationContext)
 		e.logger.Debug("vitess migrations queried",
 			"database", req.Database,
 			"table_count", len(tables),
 			"overall_progress", overallProgress,
 		)
+		// The deploy request reports that the schema change failed but never why.
+		// The shard rows carry the reason, so attach it to the failure the drive
+		// is about to record; without it the pull request and the CLI show a
+		// state and nothing an operator can act on.
+		if reason := adoptedFailureReason(engineState, failed, shardFailed); reason != "" {
+			result.ErrorMessage = reason
+			// The target's own words are the triage detail and stay server-side.
+			// The rendered reason names this log, so it carries them at the
+			// severity of the failure rather than behind a debug level an
+			// operator would have to turn on after the fact.
+			e.logger.Warn("schema change failed on the target",
+				"database", req.Database,
+				"deploy_request", meta.DeployRequestID,
+				"keyspace", failed.Keyspace,
+				"shard", failed.Shard,
+				"table", failed.Table,
+				"reason", reason,
+				"target_message", clampTargetMessage(failed.Message),
+			)
+		}
 		if len(tables) > 0 {
 			result.Tables = tables
 			if overallProgress > 0 {
@@ -541,11 +561,18 @@ type vitessMigrationRow struct {
 	RequestedAt      *time.Time
 	StartedAt        *time.Time
 	CompletedAt      *time.Time
+	// Message is Vitess's own account of what happened to this shard. On a
+	// failed shard it carries the reason the schema change stopped, which is
+	// the only place that reason exists: the deploy request reports a state
+	// and no cause.
+	Message string
 }
 
 // queryVitessMigrations queries SHOW VITESS_MIGRATIONS across all keyspaces via vtgate
-// and aggregates per-shard results into per-table TableProgress entries.
-func (e *Engine) queryVitessMigrations(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials, migrationContext string) ([]engine.TableProgress, int) {
+// and aggregates per-shard results into per-table TableProgress entries. The
+// last two returns are the shard whose failure the apply should report and
+// whether there was one.
+func (e *Engine) queryVitessMigrations(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials, migrationContext string) ([]engine.TableProgress, int, vitessMigrationRow, bool) {
 	branch := mainBranch(creds)
 	keyspaces, err := client.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{
 		Organization: credOrg(creds),
@@ -554,7 +581,7 @@ func (e *Engine) queryVitessMigrations(ctx context.Context, client psclient.PSCl
 	})
 	if err != nil {
 		e.logger.Warn("queryVitessMigrations: failed to list keyspaces", "error", err)
-		return nil, 0
+		return nil, 0, vitessMigrationRow{}, false
 	}
 
 	var allRows []vitessMigrationRow
@@ -568,10 +595,40 @@ func (e *Engine) queryVitessMigrations(ctx context.Context, client psclient.PSCl
 	}
 
 	if len(allRows) == 0 {
-		return nil, 0
+		return nil, 0, vitessMigrationRow{}, false
 	}
 
-	return aggregateShardProgress(allRows)
+	tables, overallProgress := aggregateShardProgress(allRows)
+	failed, shardFailed := failedShard(allRows)
+	return tables, overallProgress, failed, shardFailed
+}
+
+// failedShard returns the shard whose failure the apply should report, or false
+// when no shard failed or Vitess recorded nothing about the one that did.
+// Shards that fail together almost always fail for the same reason, so the
+// first failure in a stable ordering is representative, and ordering by
+// keyspace, table and shard keeps successive polls reporting the same one
+// rather than alternating between them.
+func failedShard(rows []vitessMigrationRow) (vitessMigrationRow, bool) {
+	failed := make([]vitessMigrationRow, 0, len(rows))
+	for _, r := range rows {
+		if r.Status == state.Vitess.Failed && strings.TrimSpace(r.Message) != "" {
+			failed = append(failed, r)
+		}
+	}
+	if len(failed) == 0 {
+		return vitessMigrationRow{}, false
+	}
+	sort.Slice(failed, func(i, j int) bool {
+		if failed[i].Keyspace != failed[j].Keyspace {
+			return failed[i].Keyspace < failed[j].Keyspace
+		}
+		if failed[i].Table != failed[j].Table {
+			return failed[i].Table < failed[j].Table
+		}
+		return shardLess(failed[i].Shard, failed[j].Shard)
+	})
+	return failed[0], true
 }
 
 // showVitessMigrationsForKeyspace connects to vtgate and runs
@@ -642,6 +699,7 @@ func (e *Engine) showVitessMigrationsForKeyspace(ctx context.Context, dsn, keysp
 			ReadyToComplete:  colMap["ready_to_complete"] == "1",
 			DDLAction:        colMap["ddl_action"],
 			IsImmediate:      colMap["is_immediate_operation"] == "1",
+			Message:          colMap["message"],
 		}
 		if v, err := parseProgressPercent(colMap["progress"]); err != nil {
 			e.logger.Debug("parse vitess_migrations field", "field", "progress", "value", colMap["progress"], "error", err)

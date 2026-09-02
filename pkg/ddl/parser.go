@@ -47,6 +47,24 @@ type StatementParser interface {
 	// name without an error.
 	CreateIndex(stmt string) (indexName, tableName string, unique bool, err error)
 
+	// SynthesizeAddColumn builds an ALTER TABLE ... ADD COLUMN statement for
+	// the named column of exactly one CREATE TABLE statement, carrying the
+	// column's declaration verbatim at the parse-tree level: its type and all
+	// column-level constraints. Table-level constraints (PRIMARY KEY (...),
+	// UNIQUE (...), CHECK (...)) are not part of a column declaration and are
+	// not carried. The result is the parser's normalized rendering of the
+	// synthesized statement, not a textual slice of the input DDL.
+	//
+	// The seam is faithful by design and judges nothing: a NOT NULL column
+	// without a DEFAULT synthesizes exactly as declared even though PostgreSQL
+	// rejects that ALTER on a populated table. Whether the synthesized
+	// statement can be applied is the caller's decision.
+	//
+	// columnName is matched against the parser-folded column name — the
+	// values CreateTableColumns returns — so an unquoted "Email" in the DDL
+	// is found as "email", and only a quoted identifier keeps its case.
+	SynthesizeAddColumn(createTableDDL, columnName string) (string, error)
+
 	// CostScalesWithTableSize reports whether exactly one DDL statement's
 	// execution cost grows with the size of an existing table: an index
 	// build, a table copy or rebuild, or a full-table scan to validate a
@@ -147,6 +165,13 @@ func (tidbStatementParser) CreateTableColumns(stmt string) ([]string, error) {
 // currently needed only by the PostgreSQL storage bootstrapper.
 func (tidbStatementParser) CreateIndex(string) (string, string, bool, error) {
 	return "", "", false, fmt.Errorf("CREATE INDEX inspection is not supported by the MySQL statement parser")
+}
+
+// SynthesizeAddColumn implements StatementParser. This synthesis operation is
+// currently needed only by the PostgreSQL storage bootstrapper; the MySQL
+// bootstrapper diffs schemas with Spirit instead.
+func (tidbStatementParser) SynthesizeAddColumn(string, string) (string, error) {
+	return "", fmt.Errorf("ADD COLUMN synthesis is not supported by the MySQL statement parser")
 }
 
 // CostScalesWithTableSize implements StatementParser. A standalone CREATE

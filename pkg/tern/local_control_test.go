@@ -1718,7 +1718,7 @@ func TestLocalClient_ControlOperationCountsOnlyLandedTaskWrites(t *testing.T) {
 	}
 
 	marked, skipped, applyID, err := client.markTasksWithState(t.Context(),
-		[]*storage.Task{landing, refused, alreadyDone}, apply.ID, nil, state.Task.Stopped)
+		[]*storage.Task{landing, refused, alreadyDone}, apply.ID, StatementIndex[engine.TableProgress]{}, state.Task.Stopped)
 
 	require.Error(t, err, "a refused task write must be reported, not absorbed into the count")
 	assert.Contains(t, err.Error(), "failed to settle 1 of 2 tasks",

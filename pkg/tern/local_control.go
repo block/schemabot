@@ -541,7 +541,7 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 	// For Vitess/PlanetScale, stopping means cancelling the deploy request —
 	// this is permanent (not resumable). Use "cancelled" instead of "stopped".
 	terminalState := state.Task.Stopped
-	var engineTableProgress map[string]*engine.TableProgress
+	var engineTableProgress StatementIndex[engine.TableProgress]
 	if stopTerminatesChange(c.config.Type) {
 		terminalState = state.Task.Cancelled
 	} else {
@@ -675,7 +675,7 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 	}
 	c.cancelApplyHandle(applyCancel)
 
-	cancelledCount, skippedCount, applyID, err := c.markTasksWithState(ctx, tasks, targetApplyID, nil, state.Task.Cancelled)
+	cancelledCount, skippedCount, applyID, err := c.markTasksWithState(ctx, tasks, targetApplyID, StatementIndex[engine.TableProgress]{}, state.Task.Cancelled)
 	if err != nil {
 		// Same reasoning as the stop: an apply recorded as cancelled over task
 		// rows that never moved detaches the apply from its own tasks.
@@ -1561,14 +1561,15 @@ func engineProgressShowsLiveWork(eng engine.Engine, progress *engine.ProgressRes
 }
 
 // snapshotEngineProgress captures per-table progress from the engine after stopping.
-func (c *LocalClient) snapshotEngineProgress(ctx context.Context, eng engine.Engine, creds *engine.Credentials) map[string]*engine.TableProgress {
+func (c *LocalClient) snapshotEngineProgress(ctx context.Context, eng engine.Engine, creds *engine.Credentials) StatementIndex[engine.TableProgress] {
+	var none StatementIndex[engine.TableProgress]
 	if eng == nil {
 		c.logger.Error("snapshotEngineProgress: engine is nil")
-		return nil
+		return none
 	}
 	if creds == nil {
 		c.logger.Debug("skipping engine progress snapshot because no live engine work was stopped", "database", c.config.Database, "type", c.config.Type)
-		return nil
+		return none
 	}
 	progress, err := eng.Progress(ctx, &engine.ProgressRequest{
 		Database:    c.config.Database,
@@ -1577,12 +1578,12 @@ func (c *LocalClient) snapshotEngineProgress(ctx context.Context, eng engine.Eng
 	if err != nil {
 		c.logger.Warn("failed to snapshot engine progress after stop",
 			"database", c.config.Database, "type", c.config.Type, "error", err)
-		return nil
+		return none
 	}
 	if progress != nil {
 		return indexEngineTableProgress(progress.Tables)
 	}
-	return nil
+	return none
 }
 
 // markTasksWithState settles all non-terminal targeted tasks into newState,
@@ -1597,7 +1598,7 @@ func (c *LocalClient) snapshotEngineProgress(ctx context.Context, eng engine.Eng
 // apply settled on top of task rows that never moved detaches the apply from
 // its own tasks. Every task is still attempted, so an operator retrying the
 // command has only the refused ones left to write.
-func (c *LocalClient) markTasksWithState(ctx context.Context, tasks []*storage.Task, targetApplyID int64, engineProgress map[string]*engine.TableProgress, newState string) (int64, int64, int64, error) {
+func (c *LocalClient) markTasksWithState(ctx context.Context, tasks []*storage.Task, targetApplyID int64, engineProgress StatementIndex[engine.TableProgress], newState string) (int64, int64, int64, error) {
 	var stoppedCount, skippedCount int64
 	var applyID int64
 	var refused []error
@@ -1617,7 +1618,7 @@ func (c *LocalClient) markTasksWithState(ctx context.Context, tasks []*storage.T
 		// Mark as STOPPED — even if Spirit reports per-table IsComplete.
 		// IsComplete means "row copy done", NOT "cutover done". The re-plan
 		// during Start() will detect which tables truly completed.
-		if et, ok := engineProgressForTask(engineProgress, task); ok {
+		if et, ok := engineProgress.ForTask(task); ok {
 			task.RowsCopied = et.RowsCopied
 			task.RowsTotal = et.RowsTotal
 			task.ProgressPercent = et.Progress

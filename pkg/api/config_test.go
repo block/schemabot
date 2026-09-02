@@ -176,6 +176,55 @@ repos:
 	assert.False(t, cfg.AreChecksEnabled("org/repo"))
 }
 
+func TestLoadServerConfigFromFileCanonicalizesRepositories(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := `
+databases:
+  testapp:
+    type: mysql
+    allowed_repos:
+      - MixedCase/Sample-Repo
+    environments:
+      staging:
+        target: testapp-staging
+        deployment: default
+tern_deployments:
+  default:
+    staging: tern-staging:9090
+repos:
+  MixedCase/Sample-Repo: {}
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(content), 0644))
+
+	cfg, err := LoadServerConfigFromFile(configPath)
+	require.NoError(t, err)
+	assert.Contains(t, cfg.Repos, "mixedcase/sample-repo")
+	assert.NotContains(t, cfg.Repos, "MixedCase/Sample-Repo")
+	assert.Equal(t, []string{"mixedcase/sample-repo"}, cfg.Databases["testapp"].AllowedRepos)
+}
+
+func TestLoadServerConfigFromFileRejectsCanonicalRepositoryCollision(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := `
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        target: testapp-staging
+        deployment: default
+repos:
+  MixedCase/Sample-Repo: {}
+  mixedcase/sample-repo: {}
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(content), 0644))
+
+	_, err := LoadServerConfigFromFile(configPath)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, `"MixedCase/Sample-Repo"`)
+	assert.ErrorContains(t, err, `"mixedcase/sample-repo"`)
+}
+
 func TestLoadServerConfigFromFile_DSNFrom(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")
@@ -2970,6 +3019,8 @@ func TestServerConfig_IsRepoAllowed(t *testing.T) {
 			},
 		}
 		assert.True(t, cfg.IsRepoAllowed("org/allowed-repo"))
+		assert.True(t, cfg.IsRepoAllowed("ORG/ALLOWED-REPO"))
+		assert.True(t, cfg.IsRepoAllowed("Org/Allowed-Repo"))
 	})
 
 	t.Run("populated repos rejects unlisted repo", func(t *testing.T) {

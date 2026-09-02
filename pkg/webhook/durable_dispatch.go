@@ -675,7 +675,7 @@ func (h *Handler) processDurablePullRequest(ctx context.Context, event *storage.
 // delivery under the delivery lease. runPRCloseCleanup is idempotent, so a
 // retry after a partial cleanup reconciles rather than double-acts.
 func (h *Handler) processDurablePullRequestClosed(ctx context.Context, event *storage.WebhookEvent, payload pullRequestPayload) (retry bool, err error) {
-	repo := payload.Repository.FullName
+	repo := storage.CanonicalKey(payload.Repository.FullName)
 	pr := payload.PullRequest.Number
 	if repo == "" || pr == 0 {
 		return false, fmt.Errorf("durable pull_request closed delivery %s missing repo or PR", event.DeliveryID)
@@ -700,7 +700,7 @@ func (h *Handler) processDurablePullRequestAutoPlan(ctx context.Context, event *
 		return false, err
 	}
 
-	repo := payload.Repository.FullName
+	repo := storage.CanonicalKey(payload.Repository.FullName)
 	pr := payload.PullRequest.Number
 	headSHA := payload.PullRequest.Head.SHA
 	if repo == "" || pr == 0 || headSHA == "" {
@@ -792,7 +792,7 @@ func (h *Handler) processDurableCheckRun(ctx context.Context, event *storage.Web
 // participant convergence returns no error and is handed to the in-memory
 // re-fold budget through the shared follow-up, exactly as the wrapper does.
 func (h *Handler) processDurableCheckRunCompleted(ctx context.Context, event *storage.WebhookEvent, payload checkRunPayload) (retry bool, err error) {
-	repo := payload.Repository.FullName
+	repo := storage.CanonicalKey(payload.Repository.FullName)
 	if h.service == nil || !h.service.Config().IsAggregateLeaderForRepo(repo) {
 		h.logger.Info("durable check_run completion ignored because deployment is not the aggregate leader",
 			"delivery_id", event.DeliveryID, "repo", repo, "pr", event.PullRequest,
@@ -877,7 +877,7 @@ func (h *Handler) processDurableCheckRunCompleted(ctx context.Context, event *st
 // delivery. A GitHub failure verifying the head keeps the delivery retryable
 // rather than completing it, so a transient outage cannot drop the re-plan.
 func (h *Handler) processDurableCheckRunRerequest(ctx context.Context, event *storage.WebhookEvent, payload checkRunPayload) (retry bool, err error) {
-	repo := payload.Repository.FullName
+	repo := storage.CanonicalKey(payload.Repository.FullName)
 	pr, ok := checkRunPullRequestNumber(payload)
 	if !ok {
 		h.logger.Info("durable check_run rerequest ignored without pull request",
@@ -970,7 +970,7 @@ func (h *Handler) enqueueDurablePullRequest(ctx context.Context, payload pullReq
 		DeliveryID:  deliveryID,
 		Event:       "pull_request",
 		Action:      payload.Action,
-		Repository:  payload.Repository.FullName,
+		Repository:  storage.CanonicalKey(payload.Repository.FullName),
 		PullRequest: payload.PullRequest.Number,
 		HeadSHA:     payload.PullRequest.Head.SHA,
 		TenantID:    strconv.FormatInt(installationID, 10),
@@ -984,7 +984,7 @@ func (h *Handler) enqueueDurableCheckRun(ctx context.Context, payload checkRunPa
 		DeliveryID:  deliveryID,
 		Event:       "check_run",
 		Action:      payload.Action,
-		Repository:  payload.Repository.FullName,
+		Repository:  storage.CanonicalKey(payload.Repository.FullName),
 		PullRequest: pr,
 		HeadSHA:     payload.CheckRun.HeadSHA,
 		TenantID:    strconv.FormatInt(installationID, 10),

@@ -124,12 +124,12 @@ func (c *LocalClient) driftMultisetFromPlanResult(result *engine.PlanResult, sha
 	}
 	ms := driftChangeMultiset{}
 	for _, sc := range result.Changes {
-		shard := sc.Shard.Name
+		shard := sc.ShardName()
 		if shardScoped {
 			if shard != targetShard {
 				continue
 			}
-		} else if shard != "" {
+		} else if sc.Sharded() {
 			continue
 		}
 		ns := c.planNamespace(sc.Namespace)

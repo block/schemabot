@@ -50,6 +50,7 @@ func (h *Handler) handleMergeGroup(ctx context.Context, metricApp string, w http
 		h.writeError(w, http.StatusBadRequest, "invalid merge_group payload")
 		return
 	}
+	payload.Repository.FullName = storage.CanonicalKey(payload.Repository.FullName)
 
 	// GitHub sends "checks_requested" when a PR joins the queue and "destroyed"
 	// when it leaves. Only checks_requested needs a check run on the new SHA.
@@ -183,7 +184,7 @@ func (h *Handler) enqueueDurableMergeGroup(ctx context.Context, payload mergeGro
 		DeliveryID: deliveryID,
 		Event:      "merge_group",
 		Action:     payload.Action,
-		Repository: payload.Repository.FullName,
+		Repository: storage.CanonicalKey(payload.Repository.FullName),
 		HeadSHA:    payload.MergeGroup.HeadSHA,
 		TenantID:   strconv.FormatInt(installationID, 10),
 		Payload:    body,
@@ -209,7 +210,7 @@ func (h *Handler) processDurableMergeGroup(ctx context.Context, event *storage.W
 		return false, nil
 	}
 
-	repo := payload.Repository.FullName
+	repo := storage.CanonicalKey(payload.Repository.FullName)
 	headSHA := payload.MergeGroup.HeadSHA
 	if repo == "" || headSHA == "" {
 		return false, fmt.Errorf("durable merge_group delivery %s missing repo or head SHA", event.DeliveryID)

@@ -122,12 +122,6 @@ func engineName(e ternv1.Engine) string {
 	}
 }
 
-const progressTableKeySep = "\x00"
-
-func progressTableKey(namespace, table string) string {
-	return namespace + progressTableKeySep + table
-}
-
 // applyHasMultipleOperations reports whether an apply fanned out to more than
 // one deployment operation. A multi-operation apply has no single data-plane
 // apply id — each operation carries its own — and its aggregate state is
@@ -468,12 +462,12 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	// doesn't carry task timestamps, but storage has them from engine
 	// progress polling (e.g., SHOW VITESS_MIGRATIONS started_timestamp).
 	if tasks, err := s.storage.Tasks().GetByApplyID(r.Context(), apply.ID); err == nil {
-		taskByTable := make(map[string]*storage.Task, len(tasks))
+		taskIndex := tern.NewStatementIndex[storage.Task](len(tasks))
 		for _, t := range tasks {
-			taskByTable[progressTableKey(t.Namespace, t.TableName)] = t
+			taskIndex.Add(t.Namespace, t.TableName, t.DDL, t)
 		}
 		for _, tpr := range httpResp.Tables {
-			task, ok := taskByTable[progressTableKey(tpr.Keyspace, tpr.TableName)]
+			task, ok := taskIndex.Lookup(tpr.Keyspace, tpr.TableName, tpr.DDL)
 			if ok {
 				if task.StartedAt != nil && tpr.StartedAt == "" {
 					tpr.StartedAt = task.StartedAt.Format(time.RFC3339)
@@ -1223,12 +1217,7 @@ func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, t
 		return fmt.Errorf("progress RPC: %w", err)
 	}
 
-	// Build namespace/table → proto progress lookup. Vitess applies commonly
-	// include the same table name in multiple keyspaces.
-	tableProgress := make(map[string]*ternv1.TableProgress, len(resp.Tables))
-	for _, tp := range resp.Tables {
-		tableProgress[progressTableKey(tp.Namespace, tp.TableName)] = tp
-	}
+	tableProgress := tern.IndexProtoTableProgress(resp.Tables)
 
 	now := time.Now()
 	var synced int
@@ -1236,7 +1225,7 @@ func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, t
 		if state.IsTerminalTaskState(task.State) {
 			continue
 		}
-		tp, ok := tableProgress[progressTableKey(task.Namespace, task.TableName)]
+		tp, ok := tableProgress.ForTask(task)
 		if !ok {
 			s.logger.Error("task has no matching table in Tern progress response",
 				append(apply.LogAttrs(),
