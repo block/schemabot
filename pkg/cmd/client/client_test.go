@@ -13,6 +13,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/caller"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 func TestCallPullSchemaAPI(t *testing.T) {
@@ -359,4 +361,26 @@ func TestCallPlanAPI_SendsGroupedExecution(t *testing.T) {
 	_, _, err = CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, nil, false)
 	require.NoError(t, err)
 	assert.False(t, gotReq.GroupedExecution, "a caller that has not chosen leaves the plan on the ungrouped default")
+}
+
+// A CLI owner is the ownership token the lock API matches byte-exactly against
+// the folded spelling it stored at acquire. An operator on a host whose name
+// carries uppercase characters must still recognize their own lock, so the
+// owner is generated already folded.
+func TestGenerateCLIOwnerIsCanonical(t *testing.T) {
+	t.Run("uppercase hostname and username fold", func(t *testing.T) {
+		owner := cliOwner("JDoe", "MacBook.local")
+		assert.Equal(t, "cli:jdoe@macbook.local", owner)
+		assert.Equal(t, storage.CanonicalKey(owner), owner, "owner matches the spelling the lock API stores")
+
+		user, host, ok := caller.SplitCLI(owner)
+		require.True(t, ok, "folding keeps the owner CLI-shaped")
+		assert.Equal(t, "jdoe", user)
+		assert.Equal(t, "macbook.local", host)
+	})
+
+	t.Run("generated owner is already folded", func(t *testing.T) {
+		owner := GenerateCLIOwner()
+		assert.Equal(t, storage.CanonicalKey(owner), owner)
+	})
 }
