@@ -12,9 +12,12 @@
   - [Deployment Order](#deployment-order)
 - [Environment Order](#environment-order)
   - [Per-Database Environment Order](#per-database-environment-order)
+  - [Renaming identifiers](#renaming-identifiers)
 - [Hybrid Mode](#hybrid-mode)
 - [Drivers](#drivers)
 - [Metrics](#metrics)
+  - [Per-apply driver cap](#per-apply-driver-cap)
+- [Rate Limits](#rate-limits)
 - [Pending Drops](#pending-drops)
 - [Direct Execution](#direct-execution)
 - [Storage Dialect](#storage-dialect)
@@ -453,6 +456,69 @@ The cap applies only to *starting* new operations — a first start, a resume af
 **The cap is a steady-state bound, not a hard admission limit.** Each claim evaluates the count independently, so drivers polling in the same instant can all read the same pre-claim value and admit together — a pod restart or rolling deploy, where every driver's first poll lands at once, is the shape that produces it. The transient ceiling is the number of drivers claiming in that window; once those leases commit, the next claim counts them and the cap binds again. Size against the steady-state number, and do not treat the cap as a guarantee that an apply can never briefly exceed it.
 
 A multi-shard apply started with a manual `--defer-cutover` keeps its drivers while it waits: unlike the automatic barrier park, a manually deferred operation holds its claim and keeps heartbeating, so it stays counted. Cutting over such an apply therefore takes one `cutover` per capped batch rather than one for the whole fan-out, and shards that have not yet advanced are still subject to the manual-inaction timeout.
+
+## Rate Limits
+
+`POST /api/pull` reads a database's live schema. Per namespace, that opens a
+connection to the target, issues one `SHOW CREATE TABLE` per table, and (at
+detailed catalog detail) runs several `information_schema` scans that walk every
+table's metadata. A client in a loop, an automated onboarding sweep, or a
+service polling for schema inventory can therefore load the control plane and
+the target database at once, so the endpoint enforces a request budget and
+refuses anything over it with `429 Too Many Requests`.
+
+Rate limiting is **on by default** with the budgets below. They are sized so
+that no legitimate use reaches them while a runaway still trips them by orders
+of magnitude: a client stuck retrying issues hundreds of requests a second, not
+two. The point is to stop a runaway, not to pace normal work.
+
+```yaml
+rate_limits:
+  pull:
+    enabled: true              # default: true
+    per_caller:
+      requests_per_minute: 600 # default: 600
+      burst: 120               # default: 120
+    per_target:
+      requests_per_minute: 120 # default: 120
+      burst: 30                # default: 30
+```
+
+The two lanes are not sized alike, because they bound different amounts of
+work. The control plane does little per pull: decode, resolve the route, forward
+one RPC per namespace, marshal the response. The target does the real work, and
+it scales with the schema rather than with the request, so the per-caller lane
+is generous and the per-target lane is the conservative one.
+
+Each request must have budget in both lanes:
+
+- `per_caller` is keyed on the authenticated caller, which is the operator's
+  identity for a request through the forward-auth proxy lane and the SPIFFE ID
+  for a service caller through the gateway lane. It keeps one runaway client
+  from consuming the server's capacity. When API auth is disabled every request
+  arrives as the same anonymous caller, so this budget then applies to all
+  traffic together.
+- `per_target` is keyed on the database and environment being read, across all
+  callers. It protects the target database, whose load does not care how many
+  distinct clients produced it.
+
+A refused request carries `error_code: rate_limited`, a `Retry-After` header,
+and the same delay as `retry_after_seconds` in the response body. The code is
+retryable: a client should wait the advertised delay and retry rather than
+treating the response as a failure.
+
+A malformed request is rejected before any budget is spent. A well-formed
+request naming a database this server does not route does spend budget, because
+resolving the route is server-side work and a client looping on an unknown
+database is exactly the runaway the budget exists to bound.
+
+Omit a field to keep its default. Values must not be negative, which fails
+validation at startup rather than silently admitting everything; to turn
+enforcement off, set `enabled: false`.
+
+Budgets are enforced per server process, so a deployment running N replicas
+admits up to N times the configured rate overall. Size the numbers as a
+per-replica ceiling.
 
 ## Pending Drops
 

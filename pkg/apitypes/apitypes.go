@@ -84,6 +84,7 @@ const (
 	ErrCodeActiveApplyExists    = "active_apply_exists"    // Another active apply already exists for the target
 	ErrCodeSourcePolicyDenied   = "source_policy_denied"   // Source repo/path is not authorized for the database
 	ErrCodeLockNotOwned         = "lock_not_owned"         // Lock release denied because the caller is not the owner
+	ErrCodeRateLimited          = "rate_limited"           // Caller or target exceeded its request budget; retry after the advertised delay
 )
 
 var retryableErrorCodes = map[string]bool{
@@ -91,6 +92,7 @@ var retryableErrorCodes = map[string]bool{
 	ErrCodeStorageError:         true,
 	ErrCodeEngineUnavailable:    true,
 	ErrCodeStateSyncFailed:      true,
+	ErrCodeRateLimited:          true,
 }
 
 // IsRetryableErrorCode reports whether the given API error code represents a
@@ -104,6 +106,12 @@ func IsRetryableErrorCode(code string) bool {
 type ErrorResponse struct {
 	Error     string `json:"error"`
 	ErrorCode string `json:"error_code"`
+
+	// RetryAfterSeconds is how long the client should wait before retrying,
+	// set only on responses that carry a Retry-After header. It repeats the
+	// header in the body because the CLI's HTTP client reads error bodies and
+	// not response headers.
+	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
 }
 
 type WebhookRedriveRequest struct {
