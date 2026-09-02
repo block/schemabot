@@ -18,7 +18,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/testutil"
@@ -200,37 +199,17 @@ func startEnsureSchemaContainer(t *testing.T, ctx context.Context) (testcontaine
 	t.Helper()
 
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: testcontainers.ContainerRequest{
-			Image:        "mysql:8.0",
-			ExposedPorts: []string{"3306/tcp"},
-			Env: map[string]string{
-				"MYSQL_ROOT_PASSWORD": "testpassword",
-				"MYSQL_DATABASE":      "schemabot",
-			},
-			WaitingFor: wait.ForAll(
-				wait.ForLog("ready for connections").WithOccurrence(2).WithStartupTimeout(120*time.Second),
-				wait.ForListeningPort("3306/tcp"),
-			),
-		},
-		Started: true,
+		ContainerRequest: testutil.MySQLContainerRequest("mysql:8.0", "schemabot"),
+		Started:          true,
 	})
 	require.NoError(t, err, "Failed to start MySQL container")
 
-	host, err := testutil.ContainerHost(ctx, container)
-	require.NoError(t, err, "Failed to get container host")
-
-	port, err := testutil.ContainerPort(ctx, container, "3306")
-	require.NoError(t, err, "Failed to get container port")
-
-	dsn := fmt.Sprintf("root:testpassword@tcp(%s:%d)/schemabot?parseTime=true", host, port)
+	dsn, err := testutil.MySQLDSN(ctx, container, "schemabot", "parseTime=true")
+	require.NoError(t, err, "Failed to build MySQL DSN")
 
 	db, err := sql.Open("mysql", dsn)
 	require.NoError(t, err, "Failed to connect to MySQL")
-
-	// Wait for MySQL to be ready
-	require.Eventually(t, func() bool {
-		return db.PingContext(ctx) == nil
-	}, 30*time.Second, time.Second, "MySQL did not become ready")
+	require.NoError(t, db.PingContext(ctx), "Failed to ping MySQL")
 
 	return container, dsn, db
 }

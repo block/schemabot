@@ -3,6 +3,7 @@ package testutil
 import (
 	"context"
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 
@@ -50,18 +51,39 @@ const mysqlLookupTimeout = 30 * time.Second
 // revisit this rather than inherit it.
 const mysqlDatadirSize = "2g"
 
-// MySQLContainerRequest returns the request for a throwaway MySQL container
-// serving the named database, for the caller to start and terminate.
-//
-// The data directory is mounted on tmpfs. The entrypoint builds a fresh data
-// directory before the real server binds TCP, and that work is dominated by
-// fsyncs of the system tablespaces and the redo log. Several integration
-// packages each start their own MySQL and share one CI runner's disk, so when
-// the device is saturated initialization stretches far past the readiness
+// mysqlDatadir is where the MySQL images keep their data directory.
+const mysqlDatadir = "/var/lib/mysql"
+
+// mysqlDatadirTmpfs is the mount that holds the data directory in memory. The
+// entrypoint builds a fresh one before the final server binds TCP, and that
+// work is dominated by fsyncs of the system tablespaces and the redo log.
+// Integration packages that each start their own MySQL share one CI runner's
+// disk, so on a saturated device initialization stretches past the readiness
 // budget and the package fails during setup, before any test runs. Nothing in
 // the directory outlives the container, so holding it in memory costs nothing
-// and takes both that initialization and the tests' own writes out of the
-// contention.
+// and takes both that initialization and the tests' own writes off the device.
+func mysqlDatadirTmpfs() map[string]string {
+	return map[string]string{mysqlDatadir: "rw,size=" + mysqlDatadirSize}
+}
+
+// MySQLTmpfsDatadir holds a MySQL container's data directory in memory, for
+// containers built through the testcontainers MySQL module rather than through
+// MySQLContainerRequest. The module's own readiness gate is already accurate --
+// it waits on the line carrying the real port, which the throwaway init server
+// does not emit -- so this adds the mount and leaves the gate alone.
+func MySQLTmpfsDatadir() testcontainers.CustomizeRequestOption {
+	return func(req *testcontainers.GenericContainerRequest) error {
+		if req.Tmpfs == nil {
+			req.Tmpfs = map[string]string{}
+		}
+		maps.Copy(req.Tmpfs, mysqlDatadirTmpfs())
+		return nil
+	}
+}
+
+// MySQLContainerRequest returns the request for a throwaway MySQL container
+// serving the named database, for the caller to start and terminate. The data
+// directory is held in memory, as described on mysqlDatadirTmpfs.
 //
 // Readiness is gated on a real query through the mapped port, the same
 // handshake the tests themselves perform. The MySQL entrypoint runs a
@@ -76,7 +98,7 @@ func MySQLContainerRequest(image, database string) testcontainers.ContainerReque
 			"MYSQL_ROOT_PASSWORD": mysqlRootPassword,
 			"MYSQL_DATABASE":      database,
 		},
-		Tmpfs: map[string]string{"/var/lib/mysql": "rw,size=" + mysqlDatadirSize},
+		Tmpfs: mysqlDatadirTmpfs(),
 		WaitingFor: wait.ForSQL(mysqlPort+"/tcp", "mysql", func(host string, port network.Port) string {
 			return fmt.Sprintf("root:%s@tcp(%s:%s)/%s", mysqlRootPassword, host, port.Port(), database)
 		}).WithStartupTimeout(mysqlStartupTimeout),

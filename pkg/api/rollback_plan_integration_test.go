@@ -31,6 +31,7 @@ func TestExecuteRollbackPlanForApplyUsesRequestedApplyOriginalFiles(t *testing.T
 		mysql.WithDatabase("schemabot_test"),
 		mysql.WithUsername("root"),
 		mysql.WithPassword("test"),
+		testutil.MySQLTmpfsDatadir(),
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() {
