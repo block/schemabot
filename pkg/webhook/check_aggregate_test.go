@@ -342,6 +342,36 @@ func TestAggregateSummary_StoppedApplies(t *testing.T) {
 	})
 }
 
+// Resolving stopped applies costs a storage read, and only an in-progress
+// apply-owned row can be held open by one. Folds run on every webhook event, so
+// a fold with no such row must not pay for a set it would never consult.
+func TestAnyApplyOwnedInProgress(t *testing.T) {
+	t.Run("in-progress row owned by an apply", func(t *testing.T) {
+		assert.True(t, anyApplyOwnedInProgress([]*storage.Check{
+			{Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
+			{Status: checkStatusInProgress, ApplyID: 7},
+		}))
+	})
+
+	// A plan-only row waiting on results has no apply to be stopped.
+	t.Run("in-progress row no apply owns", func(t *testing.T) {
+		assert.False(t, anyApplyOwnedInProgress([]*storage.Check{
+			{Status: checkStatusInProgress},
+		}))
+	})
+
+	// An apply that has finished cannot be stopped, whatever the row remembers.
+	t.Run("completed row that still names an apply", func(t *testing.T) {
+		assert.False(t, anyApplyOwnedInProgress([]*storage.Check{
+			{Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired, ApplyID: 7},
+		}))
+	})
+
+	t.Run("no contributions", func(t *testing.T) {
+		assert.False(t, anyApplyOwnedInProgress(nil))
+	})
+}
+
 // Participant gating is the key information, so the Tenant deployments section
 // must survive even when the leader has so many per-database checks that the
 // Database section truncates.
