@@ -1,6 +1,7 @@
 package spirit
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -54,6 +55,19 @@ func TestFailureReason(t *testing.T) {
 		got := failureReason(err)
 		assert.Equal(t, mysqlerr.Unreachable, got)
 		assert.NotContains(t, got, "10.4.2.19")
+	})
+
+	// The engine bounds its own steps — a chunk, a checksum, a cutover unlock —
+	// on contexts it derives itself, so one of those budgets running out reaches
+	// here while the change's own context is still live. That is a change that
+	// ran, so it must not be reported as a target that could not be reached.
+	t.Run("an engine deadline is not reported as a connection problem", func(t *testing.T) {
+		err := fmt.Errorf("run Spirit: %w",
+			fmt.Errorf("fix chunk: %w", context.DeadlineExceeded))
+
+		got := failureReason(err)
+		assert.Equal(t, mysqlerr.Timeout, got)
+		assert.NotEqual(t, mysqlerr.Unreachable, got)
 	})
 
 	// The gate is closed by default: a failure path added later renders as the

@@ -1,6 +1,8 @@
 package mysqlerr
 
 import (
+	"context"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io"
@@ -134,9 +136,38 @@ func TestReason(t *testing.T) {
 		assert.NotContains(t, got, "dial")
 	})
 
+	// A connection that existed and broke is a different thing to tell an
+	// operator than one that was never established: the change ran, so there is
+	// a partial copy on the target to account for.
 	t.Run("a connection lost mid-change says so", func(t *testing.T) {
-		assert.Equal(t, Unreachable, Reason(fmt.Errorf("read result: %w", io.EOF)))
-		assert.Equal(t, Unreachable, Reason(fmt.Errorf("exec: %w", mysql.ErrInvalidConn)))
+		assert.Equal(t, ConnectionLost, Reason(fmt.Errorf("read result: %w", io.EOF)))
+		assert.Equal(t, ConnectionLost, Reason(fmt.Errorf("exec: %w", mysql.ErrInvalidConn)))
+		assert.Equal(t, ConnectionLost, Reason(fmt.Errorf("copy chunk: %w", driver.ErrBadConn)))
+	})
+
+	// An exceeded deadline satisfies net.Error, and a context that fires while a
+	// query is in flight also invalidates that connection. Either would report a
+	// target that could not be reached — so an engine-internal chunk or checksum
+	// budget running out would send an operator after a connection that was
+	// working the whole time.
+	t.Run("an exceeded deadline is not reported as a connection problem", func(t *testing.T) {
+		got := Reason(fmt.Errorf("fix chunk: %w", context.DeadlineExceeded))
+		assert.Equal(t, Timeout, got)
+		assert.NotEqual(t, Unreachable, got)
+		assert.NotEqual(t, ConnectionLost, got)
+	})
+
+	// A deadline that kills a query in flight surfaces both the context error
+	// and the broken connection it was using. The deadline is the cause.
+	t.Run("a deadline that also breaks the connection reports the deadline", func(t *testing.T) {
+		err := fmt.Errorf("copy rows: %w", fmt.Errorf("%w: %w", context.DeadlineExceeded, mysql.ErrInvalidConn))
+		assert.Equal(t, Timeout, Reason(err))
+	})
+
+	// A cancelled change carries its outcome in its state, so the reason has
+	// nothing to add beyond where to read the cause.
+	t.Run("a cancelled change falls back", func(t *testing.T) {
+		assert.Equal(t, Generic, Reason(fmt.Errorf("run: %w", context.Canceled)))
 	})
 
 	t.Run("an error with nothing to key on falls back", func(t *testing.T) {
@@ -196,6 +227,27 @@ func FuzzReason(f *testing.F) {
 		require.True(t, authored[sentence],
 			"rendered a sentence this package did not write: %q (from %q/%d)", got, msg, code)
 	})
+}
+
+// The four sentences a failure with no usable code can reach each send an
+// operator somewhere different: a partial copy to account for, a connection
+// that never opened, a budget that ran out, or the logs. Collapsing any two of
+// them would report one of those as another.
+func TestCauseSentencesAreDistinctAndAuthored(t *testing.T) {
+	authored := Authored()
+	seen := map[string]string{}
+	for name, sentence := range map[string]string{
+		"Generic":        Generic,
+		"Unreachable":    Unreachable,
+		"ConnectionLost": ConnectionLost,
+		"Timeout":        Timeout,
+	} {
+		assert.True(t, authored[sentence], "%s is not in Authored()", name)
+		if prior, dup := seen[sentence]; dup {
+			t.Errorf("%s and %s render the same sentence: %q", prior, name, sentence)
+		}
+		seen[sentence] = name
+	}
 }
 
 // Every sentence has to survive being dropped into a table cell in a pull

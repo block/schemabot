@@ -16,6 +16,7 @@
 package mysqlerr
 
 import (
+	"context"
 	"database/sql/driver"
 	"errors"
 	"fmt"
@@ -36,6 +37,18 @@ const Generic = "The schema change failed on the target; see the server logs for
 // apart from Generic because the two send an operator to different places: one
 // is a schema change that ran and stopped, the other never got to run.
 const Unreachable = "SchemaBot could not reach the target database; see the server logs for the connection error."
+
+// ConnectionLost is what a change that reached the target and then lost it
+// reports. It is kept apart from Unreachable because the two leave the target
+// in different states: a change that never connected did nothing to it, while
+// one cut off partway through has a copy in progress to account for.
+const ConnectionLost = "The connection to the target was lost while the schema change was running; see the server logs for the connection error."
+
+// Timeout is what an exceeded deadline reports. The target was reached and the
+// change was running, so it is neither Unreachable nor a failure the target
+// described — the budget that ran out is SchemaBot's or the engine's, and the
+// log names which one.
+const Timeout = "The schema change ran out of time before it finished; see the server logs for the step that timed out."
 
 // reasons maps a MySQL error code to SchemaBot's account of what it means for a
 // schema change and what to do next. Row-copy failures dominate: the DDL is
@@ -117,6 +130,24 @@ func Reason(err error) string {
 	if errors.As(err, &mysqlErr) {
 		return render(int(mysqlErr.Number))
 	}
+	// Context errors are classified ahead of the connection probes below,
+	// because both probes would otherwise claim them. An exceeded deadline
+	// satisfies net.Error on its own, and a context that fires while a query is
+	// in flight also invalidates the connection carrying it — so a copy that
+	// blew an engine-internal chunk or checksum budget would report a target
+	// SchemaBot could not reach, sending an operator after a connection that
+	// was never the problem.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return Timeout
+	}
+	// A cancelled change is reported by its state rather than by a reason, so
+	// there is nothing to say about the cause beyond where to read it.
+	if errors.Is(err, context.Canceled) {
+		return Generic
+	}
+	if connectionLost(err) {
+		return ConnectionLost
+	}
 	if unreachable(err) {
 		return Unreachable
 	}
@@ -134,13 +165,21 @@ func ReasonFromText(msg string) string {
 	return render(code)
 }
 
-// unreachable reports whether the target was never reached, as opposed to
-// reached and unable to run the change. These arrive as network and driver
-// errors rather than as a MySQL error with a code.
+// connectionLost reports whether a connection existed and then broke, as
+// opposed to never being established. The driver reports a connection it can no
+// longer use through these sentinels rather than as a MySQL error with a code —
+// a target restart or a failover mid-copy arrives here.
+func connectionLost(err error) bool {
+	return errors.Is(err, driver.ErrBadConn) ||
+		errors.Is(err, mysql.ErrInvalidConn) ||
+		errors.Is(err, io.EOF)
+}
+
+// unreachable reports whether the target was never reached at all. A dial or
+// name-resolution failure arrives as a net.Error; once a connection exists, a
+// break in it arrives as one of connectionLost's sentinels instead, so this is
+// checked after those.
 func unreachable(err error) bool {
-	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, mysql.ErrInvalidConn) || errors.Is(err, io.EOF) {
-		return true
-	}
 	var netErr net.Error
 	return errors.As(err, &netErr)
 }
@@ -188,7 +227,12 @@ func render(code int) string {
 // Authored returns every sentence this package can render, so a test can assert
 // that a rendered reason is one of them.
 func Authored() map[string]bool {
-	all := map[string]bool{Generic: true, Unreachable: true}
+	all := map[string]bool{
+		Generic:        true,
+		Unreachable:    true,
+		ConnectionLost: true,
+		Timeout:        true,
+	}
 	for _, reason := range reasons {
 		all[reason] = true
 	}
