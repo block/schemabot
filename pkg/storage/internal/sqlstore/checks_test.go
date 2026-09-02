@@ -67,6 +67,36 @@ func TestCheckStore_MarkStalePlanSuccessfulLeavesInProgressApplyBlockingUnderCha
 	assert.Equal(t, int64(42), stored.ApplyID)
 }
 
+// A plan result whose target row is deleted mid-write — the PR closed and its
+// check state was cleaned up — is reported as its own outcome, not as the
+// ownership guard refusing: the guard retains apply-owned rows, so a target it
+// refused still exists. The race is driven directly here because the storage
+// interface offers no way to delete the row between a write's own statements.
+func TestCheckStore_PlanWriteOnDeletedRowReportsCheckNotFound(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := newChangedRowsStore(t)
+
+	check := &storage.Check{
+		Repository: "org/repo", PullRequest: 123, HeadSHA: "newsha",
+		Environment: "staging", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "testdb",
+		Status: "completed", Conclusion: "success",
+	}
+
+	// An update against the now-absent row yields the same zero-row result the
+	// guarded plan write leaves behind once the row is gone.
+	result, err := store.checks.db.ExecContext(ctx, `
+		UPDATE checks SET head_sha = ?
+		WHERE repository = ? AND pull_request = ?
+		  AND environment = ? AND database_type = ? AND database_name = ?
+	`, check.HeadSHA, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+	require.NoError(t, err)
+
+	landed, err := store.checks.planWriteLanded(ctx, check, result)
+	require.ErrorIs(t, err, storage.ErrCheckNotFound)
+	assert.False(t, landed)
+}
+
 func newChangedRowsStore(t *testing.T) *Storage {
 	t.Helper()
 	db, err := sql.Open("mysql", testDSNChangedRows)

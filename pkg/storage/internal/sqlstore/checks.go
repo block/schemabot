@@ -216,6 +216,9 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check,
 // question — is this row still in-progress apply-owned? — separates the write
 // the guard refused from the write that was a no-op, so a repeated plan is
 // never reported to callers as refused.
+//
+// Returns storage.ErrCheckNotFound when the row is gone, which the guard cannot
+// account for: it retains apply-owned rows, so a target it refused still exists.
 func (s *checkStore) planWriteLanded(ctx context.Context, check *storage.Check, result sql.Result) (bool, error) {
 	rows, err := result.RowsAffected()
 	if err != nil {
@@ -234,11 +237,12 @@ func (s *checkStore) planWriteLanded(ctx context.Context, check *storage.Check, 
 		  AND environment = ? AND database_type = ? AND database_name = ?
 	`, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName).Scan(&status, &applyID)
 	if errors.Is(err, sql.ErrNoRows) {
-		// The row was deleted between the duplicate-key insert and this read, so
-		// no apply owns the target and the guard is not what stopped the write.
-		// The plan result is gone either way; report it as not landed so the
-		// caller surfaces a check that will not converge on its own.
-		return false, nil
+		// The row existed for the duplicate-key insert and was deleted before this
+		// read — the PR closed and its check state was cleaned up mid-plan. No
+		// apply owns a row that is gone, so this is not the guard refusing: report
+		// it as its own outcome rather than as a check an apply is holding.
+		return false, fmt.Errorf("check state for %s#%d %s/%s/%s was deleted while its plan result was being written: %w",
+			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName, storage.ErrCheckNotFound)
 	}
 	if err != nil {
 		return false, fmt.Errorf("read check ownership after zero-row plan write for %s#%d %s/%s/%s: %w",

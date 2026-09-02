@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -228,6 +229,27 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 		ChangeSummary:  changeSummary,
 	}
 	stored, err := h.service.Storage().Checks().UpsertPlanResult(ctx, check, drift.planDriftState())
+	if errors.Is(err, storage.ErrCheckNotFound) {
+		// The PR closed and its check state was cleaned up while this plan ran.
+		// There is no gate left for the result to land on, so the plan itself is
+		// not failed by it.
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "plan_check_recorded",
+			Repository:   repo,
+			Database:     schema.Database,
+			DatabaseType: schema.Type,
+			Environment:  environment,
+			Status:       "target_missing",
+		})
+		h.logger.Info("plan check result discarded: the PR's check state was deleted while the plan ran, so there is no check for it to update",
+			"repo", repo,
+			"pr", pr,
+			"head_sha", headSHA,
+			"environment", environment,
+			"database_type", schema.Type,
+			"database", schema.Database)
+		return headSHA, check, nil
+	}
 	if err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:    "plan_check_recorded",
@@ -242,9 +264,10 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 	if !stored {
 		// The guard preserving in-progress apply-owned state refused this write.
 		// That is correct while the apply runs, but it leaves the stored row on
-		// the apply's commit: until a plan lands for the current head, the
-		// aggregate holds this row as blocking (see normalizeStaleContributions)
-		// and the PR stays gated on a check no other path will refresh.
+		// the apply's commit, which the aggregate holds as blocking whenever the
+		// PR head has moved past it (see normalizeStaleContributions). Releasing
+		// it takes a write from a path the guard admits — the manual same-head
+		// no-op recovery below, or a plan that runs once the apply is terminal.
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:    "plan_check_recorded",
 			Repository:   repo,
@@ -253,7 +276,7 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 			Environment:  environment,
 			Status:       "refused",
 		})
-		h.logger.Warn("plan check result not stored: an in-flight apply owns this check; the check will keep blocking the PR until a plan runs after the apply releases it",
+		h.logger.Warn("plan check result not stored: an in-flight apply owns this check, so the stored row still names the apply's commit and the aggregate holds it as blocking",
 			"repo", repo,
 			"pr", pr,
 			"head_sha", headSHA,
