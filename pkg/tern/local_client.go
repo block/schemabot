@@ -1076,14 +1076,16 @@ func (c *LocalClient) pullNamespaceCatalog(ctx context.Context, db *sql.DB, name
 
 // loadTableCatalog reads each pulled table's kind and comment together with its
 // engine-maintained row-count and on-disk-size estimates. The estimates are
-// approximations (NULL for views, stale until statistics are refreshed).
+// approximations: NULL for views, and served from the data dictionary's cached
+// table statistics, so they lag the live table until those statistics are
+// refreshed.
 //
-// Selecting table_rows / data_length / index_length makes this the most
-// expensive query a pull issues: it forces InnoDB to open every table's
-// tablespace metadata, and on a server with innodb_stats_on_metadata=ON it
-// recalculates statistics per table. Both halves are keyed by table_name over
-// the same rows, so they are read in a single scan of information_schema.tables
-// rather than two.
+// The estimate columns are what make this read more than the kind and comment
+// alone would. information_schema_stats_expiry governs how long the cached
+// statistics are reused; the first read after they expire makes the server
+// refresh them per table. Kind and comment come from the data dictionary and
+// are cheap either way, so they ride along on this query rather than paying for
+// a second traversal of the view.
 func (c *LocalClient) loadTableCatalog(ctx context.Context, db *sql.DB, physicalSchema string, pulledTables map[string]string, catalog map[string]*ternv1.TableCatalog) error {
 	rows, err := db.QueryContext(ctx, `
 		SELECT table_name, table_type, table_comment, table_rows, data_length, index_length
