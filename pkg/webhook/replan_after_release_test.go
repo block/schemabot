@@ -54,3 +54,44 @@ func TestReplanOwedAfterOwnershipRelease(t *testing.T) {
 func openPRAt(headSHA string) *github.PullRequestInfo {
 	return &github.PullRequestInfo{HeadSHA: headSHA, State: "open"}
 }
+
+// A terminal apply's aggregate belongs on the commit the PR is gated on. The
+// stored row names the commit the apply started on, so publishing from the row
+// puts the outcome on a Check Run GitHub no longer displays whenever the head
+// moved while the apply ran.
+func TestAggregatePublishSHA(t *testing.T) {
+	t.Run("head moved while the apply ran", func(t *testing.T) {
+		check := &storage.Check{HeadSHA: "apply-sha"}
+		assert.Equal(t, "newer-sha", aggregatePublishSHA(check, openPRAt("newer-sha")))
+	})
+
+	t.Run("head never moved", func(t *testing.T) {
+		check := &storage.Check{HeadSHA: "same-sha"}
+		assert.Equal(t, "same-sha", aggregatePublishSHA(check, openPRAt("same-sha")))
+	})
+
+	// An outcome on the apply's commit still beats no outcome at all.
+	t.Run("head GitHub did not report falls back to the stored commit", func(t *testing.T) {
+		check := &storage.Check{HeadSHA: "apply-sha"}
+		assert.Equal(t, "apply-sha", aggregatePublishSHA(check, openPRAt("")))
+	})
+
+	// A cancelled apply keeps its check claimed so an operator reconciles the
+	// target, which suppresses the re-plan. The publish is then the only write
+	// left, so it has to reach the head even though no plan will follow it.
+	t.Run("reconciliation-owed apply still publishes on the head", func(t *testing.T) {
+		check := &storage.Check{HeadSHA: "apply-sha", ApplyID: 42}
+		prInfo := openPRAt("newer-sha")
+		assert.Equal(t, "newer-sha", aggregatePublishSHA(check, prInfo))
+		assert.False(t, replanOwedAfterOwnershipRelease(check, prInfo),
+			"retained ownership must still suppress the re-plan")
+	})
+
+	// A merged PR's head is a real commit that can still carry the outcome, and
+	// a half-applied target is exactly what someone reading it needs to see.
+	t.Run("closed PR publishes on the head", func(t *testing.T) {
+		check := &storage.Check{HeadSHA: "apply-sha"}
+		closed := &github.PullRequestInfo{HeadSHA: "newer-sha", State: "closed", Merged: true}
+		assert.Equal(t, "newer-sha", aggregatePublishSHA(check, closed))
+	})
+}
