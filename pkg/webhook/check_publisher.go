@@ -9,6 +9,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
@@ -306,6 +307,33 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 	return aggregateFoldClearParticipantRefoldBudget, nil
 }
 
+// stoppedAppliesForPR resolves which of a PR's applies are stopped, so the fold
+// can name a paused apply rather than report it as work in progress.
+//
+// A lookup failure returns no set rather than an error: the aggregate's status
+// and conclusion do not depend on it, so failing the whole fold would trade a
+// less precise title for a check that does not get published at all. The title
+// falls back to the state-agnostic wording and the error is logged.
+func (h *Handler) stoppedAppliesForPR(ctx context.Context, repo string, pr int) stoppedApplyIDs {
+	applies, err := h.service.Storage().Applies().GetByPR(ctx, repo, pr)
+	if err != nil {
+		h.logger.Warn("aggregate title will not distinguish stopped applies; failed to load the PR's applies",
+			"repo", repo, "pr", pr, "error", err)
+		return nil
+	}
+	var stopped stoppedApplyIDs
+	for _, a := range applies {
+		if !state.IsState(a.State, state.Apply.Stopped) {
+			continue
+		}
+		if stopped == nil {
+			stopped = stoppedApplyIDs{}
+		}
+		stopped[a.ID] = true
+	}
+	return stopped
+}
+
 // prFilePaths extracts the changed-file paths from a PR file listing for
 // expected-participant matching.
 func prFilePaths(files []ghclient.PRFile) []string {
@@ -378,7 +406,7 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 
 	contributions, staleCount := normalizeStaleContributions(dbChecks, headSHA)
 	conclusion, status := computeAggregate(contributions)
-	title, summary := aggregateSummary(contributions, conclusion)
+	title, summary := aggregateSummary(contributions, conclusion, h.stoppedAppliesForPR(ctx, repo, pr))
 	if staleCount > 0 {
 		h.logger.Info("aggregate fold holds rows recorded for another commit as blocking until results land for the current commit",
 			"repo", repo, "pr", pr, "check_name", checkName,

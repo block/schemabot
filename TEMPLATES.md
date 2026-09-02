@@ -2114,6 +2114,20 @@ Plan failed
 SchemaBot cannot determine whether this PR contains managed schema changes: the PR changes more files than GitHub will report for a single pull request, so the changed-file list SchemaBot reads is incomplete. SchemaBot fails this check closed rather than planning from a partial diff, and retrying the check returns the same incomplete list. Split this PR so GitHub reports the full changed-file list — if it carries schema changes, move them into their own smaller PR and SchemaBot will plan them there.
 </details>
 
+
+## Aggregate Check — Stopped Apply Holds the PR
+
+<details>
+<summary><strong>Aggregate Check — Stopped Apply Holds the PR</strong></summary>
+
+1 apply stopped
+
+| Database | Type | Change | Status |
+|----------|------|--------|--------|
+| `orders` | mysql | 1 alter | Stopped |
+
+</details>
+
 ## Locking
 
 ### PR Comments

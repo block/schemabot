@@ -226,6 +226,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhook.PreviewAggregateSummary())
 	case PreviewAggregateCheckFileCapBlocked:
 		fmt.Print(webhook.PreviewAggregateCheckFileCapBlocked())
+	case PreviewAggregateCheckStopped:
+		fmt.Print(webhook.PreviewAggregateCheckStopped())
 	case PreviewCLIMultiDeployInProgress:
 		previewCLIMultiDeploymentApplyInProgress()
 	case PreviewCLIMultiDeployFailed:

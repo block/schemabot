@@ -92,16 +92,21 @@ func (s *checkStore) Upsert(ctx context.Context, check *storage.Check) error {
 // drift block: the block depends on live deployment state, not PR content, so
 // only a write that re-ran the rollup and found the deployments clean may clear
 // it. See storage.PlanDriftState.
-func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check, drift storage.PlanDriftState) error {
+func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check, drift storage.PlanDriftState) (bool, error) {
 	canonicalizeCheck(check)
 	var checkRunID any
 	if check.CheckRunID != 0 {
 		checkRunID = check.CheckRunID
 	}
 
+	stored := false
 	op := fmt.Sprintf("upsert plan check result for %s#%d %s/%s/%s",
 		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
-	return withLockRetry(ctx, s.classifier, op, func() error {
+	err := withLockRetry(ctx, s.classifier, op, func() error {
+		// A lock retry re-runs the whole write, so the previous attempt's
+		// outcome must not leak into this one.
+		stored = false
+
 		_, err := s.db.ExecContext(ctx, `
 			INSERT INTO checks (
 				repository, pull_request, head_sha,
@@ -116,6 +121,7 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check,
 		// storage failure; duplicate key means the row exists and needs the
 		// guarded update below.
 		if err == nil {
+			stored = true
 			return nil
 		}
 		if !s.classifier.IsDuplicateKey(err) {
@@ -141,7 +147,7 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check,
 		// side against the old row — so blocking_reason is assigned after every
 		// CASE that reads it, keeping both dialects reading the stored value.
 		if drift == storage.PlanDriftNotEvaluated {
-			_, err = s.db.ExecContext(ctx, `
+			result, err := s.db.ExecContext(ctx, `
 				UPDATE checks
 				SET head_sha = ?,
 				    check_run_id = ?,
@@ -166,10 +172,14 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check,
 				storage.ReviewTimeDeploymentDriftBlockingReason, check.BlockingReason,
 				check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
 				checkStatusInProgress)
+			if err != nil {
+				return err
+			}
+			stored, err = s.planWriteLanded(ctx, check, result)
 			return err
 		}
 
-		_, err = s.db.ExecContext(ctx, `
+		result, err := s.db.ExecContext(ctx, `
 			UPDATE checks
 			SET head_sha = ?,
 			    check_run_id = ?,
@@ -187,8 +197,54 @@ func (s *checkStore) UpsertPlanResult(ctx context.Context, check *storage.Check,
 		`, check.HeadSHA, checkRunID, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, nullString(check.ChangeSummary),
 			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
 			checkStatusInProgress)
+		if err != nil {
+			return err
+		}
+		stored, err = s.planWriteLanded(ctx, check, result)
 		return err
 	})
+	return stored, err
+}
+
+// planWriteLanded reports whether a guarded plan-result UPDATE actually wrote
+// the row.
+//
+// A non-zero affected count is decisive. Zero is not: stored rows carry
+// whole-second timestamps, so an UPDATE that rewrites a row with the values it
+// already holds reports no changed rows on MySQL's default row-count semantics
+// even though it matched. Re-reading the row and asking the guard's own
+// question — is this row still in-progress apply-owned? — separates the write
+// the guard refused from the write that was a no-op, so a repeated plan is
+// never reported to callers as refused.
+func (s *checkStore) planWriteLanded(ctx context.Context, check *storage.Check, result sql.Result) (bool, error) {
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if rows > 0 {
+		return true, nil
+	}
+
+	var status string
+	var applyID sql.NullInt64
+	err = s.db.QueryRowContext(ctx, `
+		SELECT status, apply_id
+		FROM checks
+		WHERE repository = ? AND pull_request = ?
+		  AND environment = ? AND database_type = ? AND database_name = ?
+	`, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName).Scan(&status, &applyID)
+	if errors.Is(err, sql.ErrNoRows) {
+		// The row was deleted between the duplicate-key insert and this read, so
+		// no apply owns the target and the guard is not what stopped the write.
+		// The plan result is gone either way; report it as not landed so the
+		// caller surfaces a check that will not converge on its own.
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read check ownership after zero-row plan write for %s#%d %s/%s/%s: %w",
+			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName, err)
+	}
+	return status != checkStatusInProgress || !applyID.Valid, nil
 }
 
 // RecoverApplyOwnedCheckWithNoOpPlan updates same-head apply-owned stored check

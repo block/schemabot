@@ -227,7 +227,8 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 		BlockingReason: blockingReason,
 		ChangeSummary:  changeSummary,
 	}
-	if err := h.service.Storage().Checks().UpsertPlanResult(ctx, check, drift.planDriftState()); err != nil {
+	stored, err := h.service.Storage().Checks().UpsertPlanResult(ctx, check, drift.planDriftState())
+	if err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:    "plan_check_recorded",
 			Repository:   repo,
@@ -237,6 +238,29 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 			Status:       "error",
 		})
 		return headSHA, nil, fmt.Errorf("store check state: %w", err)
+	}
+	if !stored {
+		// The guard preserving in-progress apply-owned state refused this write.
+		// That is correct while the apply runs, but it leaves the stored row on
+		// the apply's commit: until a plan lands for the current head, the
+		// aggregate holds this row as blocking (see normalizeStaleContributions)
+		// and the PR stays gated on a check no other path will refresh.
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "plan_check_recorded",
+			Repository:   repo,
+			Database:     schema.Database,
+			DatabaseType: schema.Type,
+			Environment:  environment,
+			Status:       "refused",
+		})
+		h.logger.Warn("plan check result not stored: an in-flight apply owns this check; the check will keep blocking the PR until a plan runs after the apply releases it",
+			"repo", repo,
+			"pr", pr,
+			"head_sha", headSHA,
+			"environment", environment,
+			"database_type", schema.Type,
+			"database", schema.Database)
+		return headSHA, check, nil
 	}
 
 	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
