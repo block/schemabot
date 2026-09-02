@@ -259,3 +259,75 @@ func TestNamespacesFromEngineChangesWithoutVSchemaWork(t *testing.T) {
 	assert.Nil(t, nsData.Metadata)
 	assert.Empty(t, nsData.Artifacts)
 }
+
+// nonShardedMultiStatementChange is a non-sharded engine change whose table
+// appears in three ordered statements — its CREATE TABLE followed by two index
+// builds — the shape a PostgreSQL greenfield table plans as.
+func nonShardedMultiStatementChange() engine.SchemaChange {
+	return engine.SchemaChange{
+		Namespace: "payments",
+		TableChanges: []engine.TableChange{
+			{
+				Table:     "users",
+				DDL:       `CREATE TABLE "users" ("id" bigint PRIMARY KEY, "email" text, "org" text)`,
+				Operation: ddl.StatementCreateTable,
+			},
+			{
+				Table:     "users",
+				DDL:       `CREATE UNIQUE INDEX "users_email_idx" ON "users" ("email")`,
+				Operation: ddl.StatementCreateIndex,
+			},
+			{
+				Table:     "users",
+				DDL:       `CREATE INDEX "users_org_idx" ON "users" ("org")`,
+				Operation: ddl.StatementCreateIndex,
+			},
+		},
+	}
+}
+
+// TestNamespacesFromEngineChangesKeepsNonShardedStatementOrder verifies the
+// stored plan keeps every statement of a non-sharded change even when one
+// table appears more than once: a table's CREATE TABLE and each of its index
+// builds must all survive into the plan the apply executes, in plan order.
+func TestNamespacesFromEngineChangesKeepsNonShardedStatementOrder(t *testing.T) {
+	client := planNamespacesTestClient()
+
+	namespaces, shardPlans := client.namespacesFromEngineChanges(
+		[]engine.SchemaChange{nonShardedMultiStatementChange()}, schema.SchemaFiles{})
+
+	assert.Empty(t, shardPlans)
+	require.Contains(t, namespaces, "payments")
+	tables := namespaces["payments"].Tables
+	require.Len(t, tables, 3)
+	assert.Contains(t, tables[0].DDL, "CREATE TABLE")
+	assert.Contains(t, tables[1].DDL, `"users_email_idx"`)
+	assert.Contains(t, tables[2].DDL, `"users_org_idx"`)
+	for _, tc := range tables {
+		assert.Equal(t, "users", tc.Table)
+	}
+}
+
+// TestPlanResultToProtoChangesKeepsNonShardedStatementOrder verifies the plan
+// response carries every statement of a non-sharded change even when one table
+// appears more than once, so the plan an operator reviews shows the same
+// ordered statement list the apply will execute.
+func TestPlanResultToProtoChangesKeepsNonShardedStatementOrder(t *testing.T) {
+	client := planNamespacesTestClient()
+
+	changes, violations, shards := client.planResultToProtoChanges(&engine.PlanResult{
+		Changes: []engine.SchemaChange{nonShardedMultiStatementChange()},
+	})
+
+	assert.Empty(t, violations)
+	assert.Empty(t, shards)
+	require.Len(t, changes, 1)
+	tableChanges := changes[0].TableChanges
+	require.Len(t, tableChanges, 3)
+	assert.Contains(t, tableChanges[0].Ddl, "CREATE TABLE")
+	assert.Contains(t, tableChanges[1].Ddl, `"users_email_idx"`)
+	assert.Contains(t, tableChanges[2].Ddl, `"users_org_idx"`)
+	for _, tc := range tableChanges {
+		assert.Equal(t, "users", tc.TableName)
+	}
+}

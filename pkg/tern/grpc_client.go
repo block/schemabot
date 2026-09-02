@@ -3849,10 +3849,10 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 	now time.Time,
 ) error {
 	logger := c.applyLogger(storedApply)
-	remoteTaskIndex := indexProtoTableProgress(remoteTasks)
+	remoteTaskIndex := IndexProtoTableProgress(remoteTasks)
 	missingProgressTasks := 0
 	for _, storedTask := range storedTasks {
-		remoteTask, ok := protoProgressForTask(remoteTaskIndex, storedTask)
+		remoteTask, ok := remoteTaskIndex.ForTask(storedTask)
 		if !ok {
 			missingProgressTasks++
 			continue

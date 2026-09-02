@@ -1272,7 +1272,7 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.L
 			continue
 		}
 		engineTaskState := newState
-		if tp, ok := engineProgressForTask(tableProgress, task); ok {
+		if tp, ok := tableProgress.ForTask(task); ok {
 			task.RowsCopied = tp.RowsCopied
 			task.RowsTotal = tp.RowsTotal
 			task.ProgressPercent = tp.Progress

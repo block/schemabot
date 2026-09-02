@@ -291,3 +291,25 @@ func TestHaltEngineForShutdownReportsTheHaltResult(t *testing.T) {
 		assert.Contains(t, err.Error(), "runner still copying")
 	})
 }
+
+func TestSchemaChange_Sharded(t *testing.T) {
+	tests := []struct {
+		name      string
+		shard     string
+		sharded   bool
+		shardName string
+	}{
+		{name: "named shard", shard: "-80", sharded: true, shardName: "-80"},
+		{name: "named shard with surrounding whitespace", shard: " 80- \n", sharded: true, shardName: "80-"},
+		{name: "empty shard", shard: "", sharded: false, shardName: ""},
+		{name: "whitespace-only shard", shard: " \t\n", sharded: false, shardName: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sc := SchemaChange{Namespace: "payments", Shard: Shard{Name: tt.shard}}
+			assert.Equal(t, tt.sharded, sc.Sharded())
+			assert.Equal(t, tt.shardName, sc.ShardName())
+		})
+	}
+}

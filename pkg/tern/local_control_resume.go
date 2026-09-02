@@ -426,7 +426,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 		// between re-plan (which reads schema) and Spirit's cutover (which renames
 		// the shadow table). If Spirit completed the cutover after the re-plan read
 		// the schema, the table already has the desired changes.
-		replannedDDL, needsChange, err := c.tableStillNeedsChange(ctx, apply, plan, task)
+		replanned, needsChange, err := c.tableStillNeedsChange(ctx, apply, plan, task)
 		if err != nil {
 			logger.Warn("could not verify table schema state, proceeding with apply",
 				"task_id", task.TaskIdentifier, "table", task.TableName, "error", err)
@@ -450,11 +450,11 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 				return
 			}
 			continue
-		} else if err := c.verifyReplannedTaskDDL(task, replannedDDL); err != nil {
-			// Live schema drifted since resume began: the DDL this shard now
-			// needs no longer matches what was reviewed. Fail closed rather than
-			// apply unreviewed DDL.
-			logger.Error("resume aborting task: live schema drifted from the reviewed plan",
+		} else if _, err := c.verifyReplannedTaskDDL(task, replanned); err != nil {
+			// The statements this shard now needs no longer include what this
+			// task was reviewed with. Fail closed rather than apply unreviewed
+			// DDL.
+			logger.Error("resume aborting task: the re-plan no longer includes the task's reviewed DDL",
 				"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "error", err)
 			c.markTaskFailed(ctx, task, err.Error())
 			failedTask = task
@@ -499,17 +499,20 @@ type shardTableKey struct {
 }
 
 // replanShardTableDDL indexes a re-plan's table changes by
-// (namespace, shard, table) -> DDL so the resume/recovery path reconciles each
-// task against its own namespace and shard. A sharded engine emits one
-// SchemaChange per (namespace, shard) and the same table repeats across them, so
-// keying by table name alone would conflate tasks: another shard's (or another
-// keyspace's) remaining diff could keep this task active, or update it with the
-// wrong DDL.
-func replanShardTableDDL(result *engine.PlanResult) map[shardTableKey]string {
-	out := make(map[shardTableKey]string)
+// (namespace, shard, table) -> the DDL statements still pending for that table,
+// in plan order, so the resume/recovery path reconciles each task against its
+// own namespace and shard. A sharded engine emits one SchemaChange per
+// (namespace, shard) and the same table repeats across them, so keying by table
+// name alone would conflate tasks: another shard's (or another keyspace's)
+// remaining diff could keep this task active, or update it with the wrong DDL.
+// Within one (namespace, shard) a table can carry several statements, each its
+// own task, so every statement is kept for the task to be matched against.
+func replanShardTableDDL(result *engine.PlanResult) map[shardTableKey][]string {
+	out := make(map[shardTableKey][]string)
 	for _, sc := range result.Changes {
 		for _, tc := range sc.TableChanges {
-			out[shardTableKey{namespace: sc.Namespace, shard: sc.Shard.Name, table: tc.Table}] = tc.DDL
+			key := shardTableKey{namespace: sc.Namespace, shard: sc.ShardName(), table: tc.Table}
+			out[key] = append(out[key], tc.DDL)
 		}
 	}
 	return out
@@ -519,15 +522,15 @@ func replanShardTableDDL(result *engine.PlanResult) map[shardTableKey]string {
 // this task's table still needs a change on its (namespace, shard). Returns
 // false if it already has the desired schema (e.g., Spirit's cutover completed
 // during the stop sequence). When the table still needs changes, it also returns
-// the DDL the re-plan would now apply so the caller can confirm it still matches
-// the reviewed DDL before applying it.
-func (c *LocalClient) tableStillNeedsChange(ctx context.Context, apply *storage.Apply, plan *storage.Plan, task *storage.Task) (string, bool, error) {
+// the statements the re-plan would now apply to it so the caller can confirm the
+// task's own statement is still among them before applying it.
+func (c *LocalClient) tableStillNeedsChange(ctx context.Context, apply *storage.Apply, plan *storage.Plan, task *storage.Task) ([]string, bool, error) {
 	result, err := c.planWithEngine(ctx, &ternv1.PlanRequest{}, apply.Database, plan.SchemaFiles)
 	if err != nil {
-		return "", false, fmt.Errorf("re-plan check failed: %w", err)
+		return nil, false, fmt.Errorf("re-plan check failed: %w", err)
 	}
-	ddl, stillNeeded := replanShardTableDDL(result)[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
-	return ddl, stillNeeded, nil
+	statements, stillNeeded := replanShardTableDDL(result)[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
+	return statements, stillNeeded, nil
 }
 
 // replanResult holds the result of replanAndFilterTasks.
@@ -584,7 +587,7 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 			activeTasks = append(activeTasks, task)
 			continue
 		}
-		ddl, stillNeeded := replanDDL[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
+		replanned, stillNeeded := replanDDL[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
 		if !stillNeeded {
 			// The re-plan diffs the reviewed target (plan.SchemaFiles) against
 			// this shard's live schema. A table dropping out of that diff means
@@ -609,7 +612,8 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 			// reviewed with: the re-plan recomputes the delta against live
 			// schema, so on a drifted deployment it can produce unreviewed DDL
 			// that overwriting task.DDL would silently apply.
-			if err := c.verifyReplannedTaskDDL(task, ddl); err != nil {
+			ddl, err := c.verifyReplannedTaskDDL(task, replanned)
+			if err != nil {
 				return nil, err
 			}
 			task.DDL = ddl
@@ -640,33 +644,51 @@ func applyInRevertPhase(apply *storage.Apply) bool {
 	return state.IsState(apply.State, state.Apply.RevertWindow, state.Apply.Reverting, state.Apply.SkippingRevert)
 }
 
-// verifyReplannedTaskDDL fails closed when the DDL a resume re-plan would now
-// apply for a task differs from the DDL the task was reviewed with. The resume
-// re-plan recomputes each deployment's own delta against its live schema; on a
+// verifyReplannedTaskDDL returns, from the statements a resume re-plan would
+// now apply to the task's table, the one this task will run, and fails closed
+// when none of them is the DDL the task was reviewed with. The resume re-plan
+// recomputes each deployment's own delta against its live schema; on a
 // deployment whose schema has drifted, that recomputed delta is DDL no human
 // reviewed, and overwriting task.DDL with it would apply it silently. Comparing
 // canonical forms tolerates incidental formatting differences so only a real
-// semantic divergence trips the guard. A task with no reviewed DDL carries no
-// reference to compare against (only the legacy synthetic VSchema tasks, which
-// the engine-change builder already skips), so it is left to existing handling.
-func (c *LocalClient) verifyReplannedTaskDDL(task *storage.Task, replannedDDL string) error {
+// semantic divergence trips the guard.
+//
+// A table can carry several statements, each its own task, so the task's
+// statement is matched among all of the table's re-planned statements. When the
+// table has several and none matches, the resume cannot tell whether this
+// task's statement already landed (leaving only its siblings in the diff) or
+// the deployment drifted; every remaining statement is unreviewed for this task
+// either way, so it is refused with that ambiguity named rather than reported
+// as drift.
+//
+// A task with no reviewed DDL carries no reference to compare against (only the
+// legacy synthetic VSchema tasks, which the engine-change builder already
+// skips), so it is left to existing handling with the table's last statement.
+func (c *LocalClient) verifyReplannedTaskDDL(task *storage.Task, replanned []string) (string, error) {
+	if len(replanned) == 0 {
+		return "", fmt.Errorf("task %s: re-plan emitted no statements for its table", task.TaskIdentifier)
+	}
 	if task.DDL == "" {
-		return nil
+		return replanned[len(replanned)-1], nil
 	}
 	parser, err := c.statementParser()
 	if err != nil {
-		return fmt.Errorf("task %s: %w", task.TaskIdentifier, err)
+		return "", fmt.Errorf("task %s: %w", task.TaskIdentifier, err)
 	}
 	reviewedCanon, err := canonicalDDLForDrift(parser, task.DDL)
 	if err != nil {
-		return fmt.Errorf("reviewed DDL for task %s: %w", task.TaskIdentifier, err)
+		return "", fmt.Errorf("reviewed DDL for task %s: %w", task.TaskIdentifier, err)
 	}
-	replannedCanon, err := canonicalDDLForDrift(parser, replannedDDL)
-	if err != nil {
-		return fmt.Errorf("re-planned DDL for task %s: %w", task.TaskIdentifier, err)
-	}
-	if reviewedCanon == replannedCanon {
-		return nil
+	replannedCanon := make([]string, 0, len(replanned))
+	for _, ddl := range replanned {
+		canon, err := canonicalDDLForDrift(parser, ddl)
+		if err != nil {
+			return "", fmt.Errorf("re-planned DDL for task %s: %w", task.TaskIdentifier, err)
+		}
+		if canon == reviewedCanon {
+			return ddl, nil
+		}
+		replannedCanon = append(replannedCanon, canon)
 	}
 	loc := formatDriftLocation(driftChangeKey{
 		namespace: task.Namespace,
@@ -674,8 +696,12 @@ func (c *LocalClient) verifyReplannedTaskDDL(task *storage.Task, replannedDDL st
 		table:     task.TableName,
 		operation: task.DDLAction,
 	})
-	return fmt.Errorf("local schema has drifted from the reviewed plan; resume would apply unreviewed DDL for %s: reviewed %q, re-planned %q",
-		loc, reviewedCanon, replannedCanon)
+	if len(replannedCanon) > 1 {
+		return "", fmt.Errorf("re-plan has %d pending statements for %s and none is the reviewed DDL of task %s; resume cannot tell a statement that already landed from drift, so it refuses to apply unreviewed DDL: reviewed %q, re-planned %q",
+			len(replannedCanon), loc, task.TaskIdentifier, reviewedCanon, replannedCanon)
+	}
+	return "", fmt.Errorf("local schema has drifted from the reviewed plan; resume would apply unreviewed DDL for %s: reviewed %q, re-planned %q",
+		loc, reviewedCanon, replannedCanon[0])
 }
 
 // prepareRetryableTasksForResume queues only the task work that previously
