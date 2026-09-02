@@ -145,7 +145,7 @@ func TestAggregateSummary(t *testing.T) {
 		{DatabaseName: "users", DatabaseType: "vitess", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired, ChangeSummary: "1 drop · 2 vschema updates"},
 	}
 
-	title, summary := aggregateSummary(checks, checkConclusionActionRequired)
+	title, summary := aggregateSummary(checks, checkConclusionActionRequired, nil)
 
 	assert.Contains(t, title, "1 apply pending")
 	// The rows span staging and production, so the global aggregate table adds an
@@ -172,7 +172,7 @@ func TestRenderDatabaseSection_EnvironmentColumn(t *testing.T) {
 			{DatabaseName: "orders", DatabaseType: "mysql", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true, ChangeSummary: "2 creates"},
 			{DatabaseName: "users", DatabaseType: "vitess", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true, ChangeSummary: "1 alter"},
 		}
-		section := renderDatabaseSection(checks, maxCheckRunTextLength)
+		section := renderDatabaseSection(checks, maxCheckRunTextLength, nil)
 		assert.Contains(t, section, "| Database | Type | Change | Status |")
 		assert.NotContains(t, section, "Environment")
 	})
@@ -182,7 +182,7 @@ func TestRenderDatabaseSection_EnvironmentColumn(t *testing.T) {
 			{DatabaseName: "orders", DatabaseType: "mysql", Environment: "staging", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true, ChangeSummary: "2 creates"},
 			{DatabaseName: "orders", DatabaseType: "mysql", Environment: "production", Status: checkStatusInProgress, ChangeSummary: "2 creates"},
 		}
-		section := renderDatabaseSection(checks, maxCheckRunTextLength)
+		section := renderDatabaseSection(checks, maxCheckRunTextLength, nil)
 		assert.Contains(t, section, "| Database | Environment | Type | Change | Status |")
 		assert.Contains(t, section, "| `orders` | staging | mysql |")
 		assert.Contains(t, section, "| `orders` | production | mysql |")
@@ -199,7 +199,7 @@ func TestAggregateSummary_WithParticipants(t *testing.T) {
 		{DatabaseType: aggregateSentinel, DatabaseName: "tenant-c", Environment: "production", Status: checkStatusInProgress},
 	}
 
-	_, summary := aggregateSummary(checks, checkConclusionActionRequired)
+	_, summary := aggregateSummary(checks, checkConclusionActionRequired, nil)
 
 	dbSection, tenantSection, found := strings.Cut(summary, "**Tenant deployments**")
 	require.True(t, found, "summary has a Tenant deployments section")
@@ -239,7 +239,7 @@ func TestAggregateSummary_TenantApplyTitles(t *testing.T) {
 			tenantPending("tenant-b"),
 			tenantPending("tenant-c"),
 		}
-		title, _ := aggregateSummary(checks, checkConclusionActionRequired)
+		title, _ := aggregateSummary(checks, checkConclusionActionRequired, nil)
 		assert.Equal(t, "3 tenant applies pending", title)
 	})
 
@@ -248,7 +248,7 @@ func TestAggregateSummary_TenantApplyTitles(t *testing.T) {
 			tenantPending("tenant-a"),
 			{DatabaseType: aggregateSentinel, DatabaseName: "tenant-b", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
 		}
-		title, _ := aggregateSummary(checks, checkConclusionActionRequired)
+		title, _ := aggregateSummary(checks, checkConclusionActionRequired, nil)
 		assert.Equal(t, "1 tenant apply pending", title)
 	})
 
@@ -257,7 +257,7 @@ func TestAggregateSummary_TenantApplyTitles(t *testing.T) {
 			{DatabaseName: "orders", DatabaseType: "mysql", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired, ChangeSummary: "1 alter"},
 			tenantPending("tenant-a"),
 		}
-		title, _ := aggregateSummary(checks, checkConclusionActionRequired)
+		title, _ := aggregateSummary(checks, checkConclusionActionRequired, nil)
 		assert.Equal(t, "2 applies pending (1 tenant)", title)
 	})
 
@@ -271,7 +271,7 @@ func TestAggregateSummary_TenantApplyTitles(t *testing.T) {
 			tenantPending("tenant-a"),
 			unresolvedRow,
 		}
-		title, _ := aggregateSummary(checks, checkConclusionActionRequired)
+		title, _ := aggregateSummary(checks, checkConclusionActionRequired, nil)
 		assert.Equal(t, "1 apply pending, 1 participant has not reported", title)
 	})
 
@@ -286,8 +286,89 @@ func TestAggregateSummary_TenantApplyTitles(t *testing.T) {
 			unresolvedB,
 			unresolvedC,
 		}
-		title, _ := aggregateSummary(checks, checkConclusionActionRequired)
+		title, _ := aggregateSummary(checks, checkConclusionActionRequired, nil)
 		assert.Equal(t, "2 applies pending, 2 participants have not reported", title)
+	})
+}
+
+// A stopped apply keeps its check in progress so merge stays blocked, but the
+// PR is waiting on an operator to start or cancel it — not on work. The title
+// has to say which, or a reader watches for progress that will never arrive.
+func TestAggregateSummary_StoppedApplies(t *testing.T) {
+	running := &storage.Check{
+		DatabaseName: "orders", DatabaseType: "mysql", Environment: "production",
+		ApplyID: 11, Status: checkStatusInProgress, HasChanges: true,
+	}
+	stoppedOrders := &storage.Check{
+		DatabaseName: "orders", DatabaseType: "mysql", Environment: "production",
+		ApplyID: 22, Status: checkStatusInProgress, HasChanges: true,
+	}
+	stoppedLedger := &storage.Check{
+		DatabaseName: "ledger", DatabaseType: "mysql", Environment: "production",
+		ApplyID: 33, Status: checkStatusInProgress, HasChanges: true,
+	}
+	stopped := stoppedApplyIDs{22: true, 33: true}
+
+	t.Run("the only in-flight apply is stopped", func(t *testing.T) {
+		title, _ := aggregateSummary([]*storage.Check{stoppedOrders}, "", stopped)
+		assert.Equal(t, "1 apply stopped", title)
+	})
+
+	t.Run("every in-flight apply is stopped", func(t *testing.T) {
+		title, _ := aggregateSummary([]*storage.Check{stoppedOrders, stoppedLedger}, "", stopped)
+		assert.Equal(t, "2 applies stopped", title)
+	})
+
+	t.Run("a stopped apply alongside one still running", func(t *testing.T) {
+		title, _ := aggregateSummary([]*storage.Check{running, stoppedLedger}, "", stopped)
+		assert.Equal(t, "Apply in progress (1 stopped)", title)
+	})
+
+	t.Run("the table row agrees with the title", func(t *testing.T) {
+		_, summary := aggregateSummary([]*storage.Check{running, stoppedLedger}, "", stopped)
+		assert.Contains(t, summary, "| `ledger` | mysql | — | Stopped |")
+		assert.Contains(t, summary, "| `orders` | mysql | — | In progress |")
+	})
+
+	t.Run("nothing stopped keeps the state-agnostic title", func(t *testing.T) {
+		title, _ := aggregateSummary([]*storage.Check{running}, "", stopped)
+		assert.Equal(t, "Apply in progress", title)
+	})
+
+	// An unresolvable set (a storage read failed) must not change the title.
+	t.Run("unknown apply states keep the state-agnostic title", func(t *testing.T) {
+		title, _ := aggregateSummary([]*storage.Check{stoppedOrders, stoppedLedger}, "", nil)
+		assert.Equal(t, "Apply in progress", title)
+	})
+}
+
+// Resolving stopped applies costs a storage read, and only an in-progress
+// apply-owned row can be held open by one. Folds run on every webhook event, so
+// a fold with no such row must not pay for a set it would never consult.
+func TestAnyApplyOwnedInProgress(t *testing.T) {
+	t.Run("in-progress row owned by an apply", func(t *testing.T) {
+		assert.True(t, anyApplyOwnedInProgress([]*storage.Check{
+			{Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
+			{Status: checkStatusInProgress, ApplyID: 7},
+		}))
+	})
+
+	// A plan-only row waiting on results has no apply to be stopped.
+	t.Run("in-progress row no apply owns", func(t *testing.T) {
+		assert.False(t, anyApplyOwnedInProgress([]*storage.Check{
+			{Status: checkStatusInProgress},
+		}))
+	})
+
+	// An apply that has finished cannot be stopped, whatever the row remembers.
+	t.Run("completed row that still names an apply", func(t *testing.T) {
+		assert.False(t, anyApplyOwnedInProgress([]*storage.Check{
+			{Status: checkStatusCompleted, Conclusion: checkConclusionActionRequired, ApplyID: 7},
+		}))
+	})
+
+	t.Run("no contributions", func(t *testing.T) {
+		assert.False(t, anyApplyOwnedInProgress(nil))
 	})
 }
 
@@ -307,7 +388,7 @@ func TestAggregateSummary_TenantSectionSurvivesDatabaseTruncation(t *testing.T) 
 		Status: checkStatusInProgress,
 	})
 
-	_, summary := aggregateSummary(checks, checkStatusInProgress)
+	_, summary := aggregateSummary(checks, checkStatusInProgress, nil)
 
 	assert.Less(t, len(summary), maxCheckRunTextLength, "summary stays under the Check Run limit")
 	assert.Contains(t, summary, "more check(s)", "the Database section truncates")
@@ -321,7 +402,7 @@ func TestAggregateSummary_AllSuccess(t *testing.T) {
 		{DatabaseName: "orders", Environment: "production", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess, HasChanges: true},
 	}
 
-	title, _ := aggregateSummary(checks, checkConclusionSuccess)
+	title, _ := aggregateSummary(checks, checkConclusionSuccess, nil)
 	assert.Equal(t, "All applies complete", title)
 }
 
@@ -331,7 +412,7 @@ func TestAggregateSummary_AllUpToDate(t *testing.T) {
 		{DatabaseName: "users", DatabaseType: "mysql", Environment: "staging", Status: checkStatusCompleted, Conclusion: checkConclusionSuccess},
 	}
 
-	title, summary := aggregateSummary(checks, checkConclusionSuccess)
+	title, summary := aggregateSummary(checks, checkConclusionSuccess, nil)
 
 	assert.Equal(t, "Schema up to date", title)
 	assert.Contains(t, summary, "| Database | Type | Change | Status |")

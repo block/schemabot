@@ -67,6 +67,56 @@ func TestCheckStore_MarkStalePlanSuccessfulLeavesInProgressApplyBlockingUnderCha
 	assert.Equal(t, int64(42), stored.ApplyID)
 }
 
+// A plan result whose target row is deleted mid-write — the PR closed and its
+// check state was cleaned up — is reported as its own outcome, not as a
+// refusal: apply-owned rows are retained, so a target a refusal protects still
+// exists. The write is driven directly because reaching this outcome through
+// the storage interface needs the row to vanish between the duplicate-key
+// insert and the ownership read, which the interface cannot arrange.
+func TestCheckStore_PlanWriteOnDeletedRowReportsCheckNotFound(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := newChangedRowsStore(t)
+
+	check := &storage.Check{
+		Repository: "org/repo", PullRequest: 123, HeadSHA: "newsha",
+		Environment: "staging", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "testdb",
+		Status: "completed", Conclusion: "success",
+	}
+
+	landed, err := store.checks.writePlanResultUnlessApplyOwned(ctx, check, storage.PlanDriftNotEvaluated, nil)
+	require.ErrorIs(t, err, storage.ErrCheckNotFound)
+	assert.False(t, landed)
+}
+
+// A repeated plan writes the values the row already holds, which reports no
+// changed rows under MySQL's default row-count semantics. The write matched and
+// landed, so the outcome must not be taken from that count.
+func TestCheckStore_RepeatedPlanResultLandsUnderChangedRows(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := newChangedRowsStore(t)
+
+	require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+		Repository: "org/repo", PullRequest: 123, HeadSHA: "oldsha",
+		Environment: "staging", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "testdb",
+		HasChanges: true, Status: "completed", Conclusion: "action_required",
+	}))
+
+	result := &storage.Check{
+		Repository: "org/repo", PullRequest: 123, HeadSHA: "newsha",
+		Environment: "staging", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "testdb",
+		HasChanges: true, Status: "completed", Conclusion: "action_required",
+	}
+	stored, err := store.Checks().UpsertPlanResult(ctx, result, storage.PlanDriftClean)
+	require.NoError(t, err)
+	assert.True(t, stored)
+
+	stored, err = store.Checks().UpsertPlanResult(ctx, result, storage.PlanDriftClean)
+	require.NoError(t, err)
+	assert.True(t, stored, "a plan rewriting the values the row already holds still landed")
+}
+
 func newChangedRowsStore(t *testing.T) *Storage {
 	t.Helper()
 	db, err := sql.Open("mysql", testDSNChangedRows)
