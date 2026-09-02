@@ -153,9 +153,9 @@ func startMySQLContainer(ctx context.Context, baseName, dbName string, schemaFS 
 		}
 		defer func() { _ = db.Close() }()
 
-		if err := db.PingContext(ctx); err != nil {
+		if err := testutil.PingMySQL(ctx, db); err != nil {
 			_ = container.Terminate(ctx)
-			return nil, fmt.Errorf("ping mysql: %w", err)
+			return nil, err
 		}
 
 		if err := applySchemaFS(ctx, db, *schemaFS); err != nil {
@@ -232,8 +232,8 @@ func startTernGRPC(ctx context.Context, targetDSN, storageDSN string) (grpcAddre
 		return "", fmt.Errorf("open target db: %w", err)
 	}
 	defer utils.CloseAndLog(targetDB)
-	if err := targetDB.PingContext(ctx); err != nil {
-		return "", fmt.Errorf("ping target db: %w", err)
+	if err := testutil.PingMySQL(ctx, targetDB); err != nil {
+		return "", fmt.Errorf("reach target db: %w", err)
 	}
 	if _, err := targetDB.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", quoteIdentifier(databaseName))); err != nil {
 		return "", fmt.Errorf("create target database %s: %w", databaseName, err)

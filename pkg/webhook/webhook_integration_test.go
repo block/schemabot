@@ -1101,9 +1101,9 @@ func startE2EMySQLContainer(ctx context.Context, baseName, dbName string, schema
 		}
 		defer func() { _ = db.Close() }()
 
-		if err := db.PingContext(ctx); err != nil {
+		if err := testutil.PingMySQL(ctx, db); err != nil {
 			_ = container.Terminate(ctx)
-			return nil, fmt.Errorf("ping mysql: %w", err)
+			return nil, err
 		}
 
 		if err := applyEmbeddedSchema(db, *schemaFS); err != nil {

@@ -55,7 +55,7 @@ func setupCleanerTest(t *testing.T) *sql.DB {
 	db, err := sql.Open("mysql", sharedDSN)
 	require.NoError(t, err, "connect to mysql")
 	t.Cleanup(func() { utils.CloseAndLog(db) })
-	require.NoError(t, db.PingContext(t.Context()), "ping mysql")
+	require.NoError(t, testutil.PingMySQL(t.Context(), db), "reach mysql")
 
 	_, err = db.ExecContext(t.Context(), fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", Database))
 	require.NoError(t, err, "reset quarantine database")

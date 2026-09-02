@@ -2,6 +2,7 @@ package testutil
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"maps"
 	"strings"
@@ -31,11 +32,13 @@ const mysqlPort = "3306"
 // runs, which reports the whole package as failed.
 const mysqlStartupTimeout = 30 * time.Second
 
-// mysqlLookupTimeout bounds the Docker API lookups MySQLDSN needs. Its callers
-// run in TestMain, which has no *testing.T to hang a deadline on and so passes
-// a background context; a daemon that stops answering would otherwise wedge
-// package setup with nothing to read. Reaching it fails the setup instead.
-const mysqlLookupTimeout = 30 * time.Second
+// mysqlSetupTimeout bounds the individual setup steps this file performs once
+// a container has started: the Docker API lookups MySQLDSN needs, and the
+// readiness ping PingMySQL runs. Their callers run in TestMain, which has no
+// *testing.T to hang a deadline on and so passes a background context; a
+// daemon or a dial that stops answering would otherwise wedge package setup
+// with nothing to read. Reaching it fails the setup instead.
+const mysqlSetupTimeout = 30 * time.Second
 
 // mysqlDatadirSize caps the in-memory data directory. It is a ceiling, not a
 // reservation: the tmpfs occupies only what MySQL has written. Sized to leave
@@ -105,15 +108,35 @@ func MySQLContainerRequest(image, database string) testcontainers.ContainerReque
 	}
 }
 
-// MySQLDSN returns the DSN addressing the named database on a started MySQL
-// test container, with params appended to the query string. A caller that
-// brings its own deadline keeps it; one that does not gets mysqlLookupTimeout.
-func MySQLDSN(ctx context.Context, c testcontainers.Container, database string, params ...string) (string, error) {
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, mysqlLookupTimeout)
-		defer cancel()
+// boundSetup caps a setup step at mysqlSetupTimeout. A caller that brings its
+// own deadline keeps it, so a test's context still governs the step.
+func boundSetup(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return context.WithCancel(ctx)
 	}
+	return context.WithTimeout(ctx, mysqlSetupTimeout)
+}
+
+// PingMySQL verifies that a pool opened against a started test container
+// reaches the server. Go's SQL driver dials lazily, so this is the first call
+// that exercises the DSN. The wait is bounded as described on
+// mysqlSetupTimeout.
+func PingMySQL(ctx context.Context, db *sql.DB) error {
+	ctx, cancel := boundSetup(ctx)
+	defer cancel()
+
+	if err := db.PingContext(ctx); err != nil {
+		return fmt.Errorf("ping mysql: %w", err)
+	}
+	return nil
+}
+
+// MySQLDSN returns the DSN addressing the named database on a started MySQL
+// test container, with params appended to the query string. The lookups it
+// needs are bounded as described on mysqlSetupTimeout.
+func MySQLDSN(ctx context.Context, c testcontainers.Container, database string, params ...string) (string, error) {
+	ctx, cancel := boundSetup(ctx)
+	defer cancel()
 
 	host, err := ContainerHost(ctx, c)
 	if err != nil {

@@ -121,7 +121,7 @@ func openTerminableLockConn(t *testing.T, driverName, dsn string) (*sql.Conn, fu
 	t.Helper()
 	db, err := sql.Open(driverName, dsn)
 	require.NoError(t, err)
-	require.NoError(t, db.PingContext(t.Context()))
+	require.NoError(t, testutil.PingMySQL(t.Context(), db))
 	conn, err := db.Conn(t.Context())
 	require.NoError(t, err)
 	t.Cleanup(func() {

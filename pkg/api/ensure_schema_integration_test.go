@@ -209,7 +209,7 @@ func startEnsureSchemaContainer(t *testing.T, ctx context.Context) (testcontaine
 
 	db, err := sql.Open("mysql", dsn)
 	require.NoError(t, err, "Failed to connect to MySQL")
-	require.NoError(t, db.PingContext(ctx), "Failed to ping MySQL")
+	require.NoError(t, testutil.PingMySQL(ctx, db), "Failed to reach MySQL")
 
 	return container, dsn, db
 }
