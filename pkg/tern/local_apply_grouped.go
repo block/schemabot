@@ -1464,9 +1464,9 @@ func (c *LocalClient) refreshTaskDisplayFromEngine(ctx context.Context, logger *
 	switch {
 	case tp != nil:
 		applyEngineTableDisplayFields(task, tp)
-		// Persist the per-shard breakdown as per-shard tasks so the renderer
-		// can show per-shard state from storage. No-op outside the lease-held
-		// operator drive (read-path callers carry no operation lease).
+		// Persist the per-shard breakdown as per-shard tasks so the read path
+		// serves per-shard state out of tasks storage rather than re-querying
+		// the engine. Only a driver writes it, under the lease its claim holds.
 		c.writeShardProgress(ctx, logger, task, tp, poll.now)
 	case poll.instantFromMetadata:
 		// An instant DDL copies no rows, so no per-table report arrives to
