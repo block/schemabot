@@ -471,9 +471,19 @@ func GenerateCLIOwner() string {
 // it, so the CLI must fold the same value: an operator whose hostname or
 // username carries uppercase characters would otherwise compare unequal to
 // their own stored lock, and the pre-apply lock check would report the
-// database as locked by someone else. Folding is free for attribution too —
-// hostnames are case-insensitive, and an authenticated request has its
-// username replaced by the verified subject server-side.
+// database as locked by someone else.
+//
+// The same string is also the caller attribution on CLI-driven requests, which
+// the server does not fold. The hostname half is free — hostnames are
+// case-insensitive — and an authenticated server records the verified subject
+// in place of the claimed username, so nothing of the identity is lost there.
+// A server running without API auth records the claimed username lowercased:
+// a cosmetic loss on a display-only field, in exchange for an ownership
+// predicate that agrees with the one the lock is stored under.
+//
+// The fold belongs here rather than in caller.FormatCLI because the server
+// renders verified subjects through that same formatter, and a verified
+// identity must reach storage in the spelling its provider issued.
 func cliOwner(username, hostname string) string {
 	return storage.CanonicalKey(caller.FormatCLI(username, hostname))
 }
