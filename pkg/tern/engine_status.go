@@ -12,9 +12,11 @@ import (
 )
 
 // maxObservedStatusLen bounds an engine-controlled status string before it is
-// used as a structured log value and a metric attribute, so a pathological
-// engine response cannot flood telemetry or explode metric cardinality. Real
-// statuses are short single tokens.
+// used as a structured log value, so a pathological engine response cannot
+// flood the log with one enormous line. Real statuses are short single tokens.
+//
+// This bounds the size of each value, not how many distinct ones there are.
+// Nothing keyed on the status may assume a small set of them.
 const maxObservedStatusLen = 128
 
 // unrecognizedStatusReporter surfaces engine- and data-plane-reported task
@@ -27,9 +29,12 @@ const maxObservedStatusLen = 128
 // statuses record nothing, so observing on every poll tick is cheap.
 //
 // The zero value is ready to use. The warn-dedupe set is keyed by task (or
-// shard) and status, so one missing mapping grows it by the number of
-// affected tasks — bounded by the tasks this client drives, so it is
-// deliberately left unbounded.
+// shard) and status, so it grows with tasks times distinct statuses and is
+// never evicted: entries accumulate over the process lifetime, not just over
+// the tasks being driven now. It is left unbounded because the gate in front
+// of it is what limits growth — nothing is recorded at all while every status
+// maps, so the set only grows during a mapping gap, which a mapping added to
+// pkg/state closes.
 type unrecognizedStatusReporter struct {
 	mu     sync.Mutex
 	warned map[string]struct{}
@@ -53,8 +58,8 @@ func (r *unrecognizedStatusReporter) observe(ctx context.Context, logger *slog.L
 	if state.RecognizedTaskStatus(raw) {
 		return
 	}
+	metrics.RecordUnrecognizedEngineTaskStatus(ctx, task.Database, task.DatabaseType, task.Engine, task.Environment)
 	status := clampObservedStatus(raw)
-	metrics.RecordUnrecognizedEngineTaskStatus(ctx, task.Database, task.DatabaseType, task.Engine, task.Environment, status)
 	if !r.firstSighting(task.TaskIdentifier + "\x00" + shard + "\x00" + status) {
 		// The counter above recorded the sighting; only the warn is deduped so
 		// a poll loop cannot emit one line per tick for the same status.
@@ -83,10 +88,9 @@ func (r *unrecognizedStatusReporter) firstSighting(key string) bool {
 }
 
 // clampObservedStatus collapses whitespace runs (including newlines) to single
-// spaces and clamps the length, keeping an engine-controlled status safe to
-// use as a structured log value and a bounded metric attribute. An
-// empty-after-collapse status becomes a visible placeholder so the sighting
-// is still attributable.
+// spaces and clamps the length, keeping an engine-controlled status safe to use
+// as a structured log value. An empty-after-collapse status becomes a visible
+// placeholder so the sighting is still attributable.
 func clampObservedStatus(raw string) string {
 	collapsed := strings.Join(strings.Fields(raw), " ")
 	if collapsed == "" {

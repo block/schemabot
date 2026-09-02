@@ -102,7 +102,6 @@ func TestUnrecognizedStatusReporter_WarnsOnceAndCountsEverySighting(t *testing.T
 	assert.Equal(t, "mysql", counterAttr(t, points[0], "database_type"))
 	assert.Equal(t, "spirit", counterAttr(t, points[0], "engine"))
 	assert.Equal(t, "staging", counterAttr(t, points[0], "environment"))
-	assert.Equal(t, "someNewEngineState", counterAttr(t, points[0], "status"))
 
 	warns := capturedLogsWithMessage(records, unrecognizedStatusWarn)
 	require.Len(t, warns, 1)
@@ -120,6 +119,39 @@ func TestUnrecognizedStatusReporter_WarnsOnceAndCountsEverySighting(t *testing.T
 	warns = capturedLogsWithMessage(records, unrecognizedStatusWarn)
 	require.Len(t, warns, 2)
 	assert.Equal(t, "anotherNewEngineState", warns[1].attrs["raw_status"])
+}
+
+// A status is engine-controlled text with no bound on how many distinct values
+// it can take — one carrying a host name, an identifier, or an error tail is a
+// fresh value every sighting. The counter therefore keys only on dimensions
+// drawn from bounded sets, so a mapping gap raises a rate on one series rather
+// than minting series at poll frequency, at exactly the moment an operator is
+// already dealing with an incident. The warn keeps the statuses distinguishable
+// for triage.
+func TestUnrecognizedStatusReporter_DistinctStatusesShareOneSeries(t *testing.T) {
+	reader := newTernMetricsReader(t)
+	var records []capturedLog
+	logger := slog.New(captureHandler{records: &records})
+	task := reporterTestTask()
+	var reporter unrecognizedStatusReporter
+
+	for _, status := range []string{
+		"failed: connection to host-abc-123 refused",
+		"failed: connection to host-def-456 refused",
+		"failed: connection to host-ghi-789 refused",
+	} {
+		reporter.observeTaskStatus(t.Context(), logger, task, status)
+	}
+
+	points := collectCounterPoints(t, reader, unrecognizedStatusMetric)
+	require.Len(t, points, 1, "statuses that differ only in variable text must not each mint a series")
+	assert.Equal(t, int64(3), points[0].Value, "every sighting still counts")
+	_, hasStatus := points[0].Attributes.Value(attribute.Key("status"))
+	assert.False(t, hasStatus, "the unbounded status must not be a counter attribute")
+
+	warns := capturedLogsWithMessage(records, unrecognizedStatusWarn)
+	require.Len(t, warns, 3, "the warn keeps each distinct status triageable")
+	assert.Equal(t, "failed: connection to host-abc-123 refused", warns[0].attrs["raw_status"])
 }
 
 // Each shard of a table task is its own unit of engine work, so two shards
@@ -161,10 +193,10 @@ func TestUnrecognizedStatusReporter_RecognizedStatusRecordsNothing(t *testing.T)
 	assert.Empty(t, capturedLogsWithMessage(records, unrecognizedStatusWarn))
 }
 
-// The raw status is engine-controlled text bound for structured logs and a
-// metric attribute, so it is collapsed and clamped before use: whitespace
-// runs (including newlines) become single spaces, over-long values are cut
-// with a visible marker, and an empty status stays attributable.
+// The raw status is engine-controlled text bound for a structured log value,
+// so it is collapsed and clamped before use: whitespace runs (including
+// newlines) become single spaces, over-long values are cut with a visible
+// marker, and an empty status stays attributable.
 func TestClampObservedStatus(t *testing.T) {
 	assert.Equal(t, "phase one two", clampObservedStatus("phase\none\r\n  two"))
 	assert.Equal(t, "(empty)", clampObservedStatus("   \n "))
@@ -232,7 +264,7 @@ func TestSyncStoredTasksFromRemoteTasks_ReportsUnrecognizedRemoteStatus(t *testi
 		points := collectCounterPoints(t, reader, unrecognizedStatusMetric)
 		require.Len(t, points, 1)
 		assert.Equal(t, int64(1), points[0].Value)
-		assert.Equal(t, "someNewDataPlaneState", counterAttr(t, points[0], "status"))
+		assert.Equal(t, "orders_db", counterAttr(t, points[0], "database"))
 	})
 
 	t.Run("recognized remote status records nothing", func(t *testing.T) {
