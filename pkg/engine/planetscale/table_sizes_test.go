@@ -2,6 +2,7 @@ package planetscale
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"testing"
 
@@ -26,16 +27,84 @@ func (c *keyspaceListingClient) ListKeyspaces(context.Context, *ps.ListKeyspaces
 	return c.keyspaces, c.err
 }
 
+// Every keyspace on the branch is reported so the caller can tell a
+// single-keyspace branch from a multi-keyspace one, but only a sharded
+// keyspace carries a count: an unsharded keyspace the API reports as one shard
+// maps to zero, the value that renders no shard count.
 func TestFetchKeyspaceShardCounts(t *testing.T) {
 	e := New(slog.Default())
 	client := &keyspaceListingClient{keyspaces: []*ps.Keyspace{
-		{Name: "commerce", Shards: 1},
-		{Name: "commerce_sharded", Shards: 4},
+		{Name: "commerce", Shards: 1, Sharded: false},
+		{Name: "commerce_sharded", Shards: 4, Sharded: true},
 	}}
 
 	counts, err := e.fetchKeyspaceShardCounts(t.Context(), client, "org", "db", "main")
 	require.NoError(t, err)
-	assert.Equal(t, map[string]int{"commerce": 1, "commerce_sharded": 4}, counts)
+	assert.Equal(t, map[string]int{"commerce": 0, "commerce_sharded": 4}, counts)
+}
+
+// tableMetricsClient fakes ListKeyspaces and BranchTableMetrics, recording
+// whether the metrics endpoint was called.
+type tableMetricsClient struct {
+	psclient.PSClient
+	metrics map[string]int64
+	err     error
+	called  bool
+}
+
+func (c *tableMetricsClient) BranchTableMetrics(context.Context, string, string, string) (map[string]int64, error) {
+	c.called = true
+	return c.metrics, c.err
+}
+
+// The branch table metrics endpoint keys its bytes by bare table name with no
+// keyspace, so those bytes are only attributable on a single-keyspace branch.
+// Anything else — several keyspaces, or a topology that could not be read —
+// omits byte estimates rather than attributing one keyspace's bytes to
+// another's identically named table.
+func TestFetchBranchTableBytes(t *testing.T) {
+	metrics := map[string]int64{"customers": 14_319_353_856}
+
+	t.Run("single keyspace branch reads the metrics", func(t *testing.T) {
+		client := &tableMetricsClient{metrics: metrics}
+		e := New(slog.Default())
+
+		got := e.fetchBranchTableBytes(t.Context(), client, "org", "db", "main", map[string]int{"commerce": 0})
+
+		assert.True(t, client.called)
+		assert.Equal(t, metrics, got)
+	})
+
+	t.Run("multi keyspace branch omits the metrics", func(t *testing.T) {
+		client := &tableMetricsClient{metrics: metrics}
+		e := New(slog.Default())
+
+		got := e.fetchBranchTableBytes(t.Context(), client, "org", "db", "main",
+			map[string]int{"commerce": 0, "commerce_sharded": 4})
+
+		assert.False(t, client.called, "the metrics endpoint must not be called when its keys cannot be attributed")
+		assert.Nil(t, got)
+	})
+
+	t.Run("unknown topology omits the metrics", func(t *testing.T) {
+		client := &tableMetricsClient{metrics: metrics}
+		e := New(slog.Default())
+
+		got := e.fetchBranchTableBytes(t.Context(), client, "org", "db", "main", nil)
+
+		assert.False(t, client.called)
+		assert.Nil(t, got)
+	})
+
+	t.Run("metrics failure leaves the plan without bytes", func(t *testing.T) {
+		client := &tableMetricsClient{err: errors.New("metrics endpoint unavailable")}
+		e := New(slog.Default())
+
+		got := e.fetchBranchTableBytes(t.Context(), client, "org", "db", "main", map[string]int{"commerce": 0})
+
+		assert.True(t, client.called)
+		assert.Nil(t, got)
+	})
 }
 
 // A table present in the branch metrics carries its storage bytes alongside
