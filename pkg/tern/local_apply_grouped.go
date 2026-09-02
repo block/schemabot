@@ -1196,8 +1196,7 @@ func (c *LocalClient) settleLostEngineWorkForTasks(ctx context.Context, apply *s
 		return settled, fmt.Errorf("verify target schema for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	for _, task := range unverified {
-		_, needsChange := replanDDL[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
-		c.settleLostVerifiedTask(ctx, apply, task, needsChange, engineState)
+		c.settleLostVerifiedTask(ctx, apply, task, replanVerdictForTask(replanDDL, task), engineState)
 		settled.add(task)
 	}
 	return settled, nil
@@ -1412,7 +1411,9 @@ func (p enginePoll) retryableFailure() bool {
 // liveness signal (ApplyDriveStallAfter) and cancels a drive whose rows stop
 // advancing, so the write must stay unconditional — including through parked
 // states such as deferred cutovers and revert windows, where nothing changes
-// tick to tick.
+// tick to tick. A task the poll does not speak for is one already settled from
+// a more authoritative source earlier in the tick, and it took its persisted
+// write from that settlement.
 func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.Logger, tasks []*storage.Task, result *engine.ProgressResult, newState string, now time.Time, settled settledTaskSet) {
 	tableProgress := indexEngineTableProgress(result.Tables)
 	poll := enginePoll{result: result, newState: newState, now: now}

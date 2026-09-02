@@ -94,7 +94,7 @@ func TestSyncAtomicTaskProgress_RefusedStateClaimStillRefreshesDisplay(t *testin
 	}
 	client := groupedSyncClient(taskStore)
 
-	client.syncAtomicTaskProgress(t.Context(), slog.Default(), []*storage.Task{checksumming}, result, state.Task.Running, time.Now())
+	client.syncAtomicTaskProgress(t.Context(), slog.Default(), []*storage.Task{checksumming}, result, state.Task.Running, time.Now(), settledTaskSet{})
 
 	assert.Equal(t, state.Task.Checksumming, checksumming.State, "a poll claiming an earlier phase never rewinds the stored state")
 	assert.EqualValues(t, 120, checksumming.RowsCopied, "the display takes the poll's counters even when its state claim is refused")
@@ -122,7 +122,7 @@ func TestSyncAtomicTaskProgress_CompletedPollFinishesTheBar(t *testing.T) {
 	}
 	client := groupedSyncClient(taskStore)
 
-	client.syncAtomicTaskProgress(t.Context(), slog.Default(), []*storage.Task{copied}, result, state.Task.Completed, time.Now())
+	client.syncAtomicTaskProgress(t.Context(), slog.Default(), []*storage.Task{copied}, result, state.Task.Completed, time.Now(), settledTaskSet{})
 
 	assert.EqualValues(t, 100, copied.ProgressPercent, "a completed poll finishes the bar even when the last table sample fell short")
 	assert.EqualValues(t, 8_912, copied.RowsCopied, "the row counters keep what the engine reported")

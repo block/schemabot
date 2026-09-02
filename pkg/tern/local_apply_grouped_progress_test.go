@@ -311,3 +311,68 @@ func TestPollForCompletionAtomic_LostEngineWorkSettlesRevertPhaseTasksWhenVerifi
 	assert.Contains(t, forward.ErrorMessage, "could not be verified")
 	assert.Equal(t, 0, eng.planCalls, "a failed plan read settles nothing by re-plan; the engine is never consulted")
 }
+
+// A shard-scoped dispatch tags its tasks with the shard they ran on, while
+// re-planning the reviewed schema set describes whole namespaces. A converged
+// whole-namespace re-plan therefore never mentions a shard, and reading its
+// silence as proof would report a shard's change as made on evidence that
+// never covered that shard. Those tasks rest retryable for a fresh claim to
+// re-drive instead.
+func TestPollForCompletionAtomic_LostEngineWorkNeverCompletesShardTasksOnWholeNamespaceReplan(t *testing.T) {
+	eng := &lostWorkEngine{
+		phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+			{State: engine.StatePending},
+		}},
+		// What every engine's re-plan of the reviewed schema set reports: whole
+		// namespaces, no shard dimension.
+		planResult: &engine.PlanResult{NoChanges: true},
+	}
+	client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetReached)
+	tasks[0].Shard = "-80"
+	tasks[1].Shard = "80-"
+
+	client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false)
+
+	assert.Equal(t, state.Apply.FailedRetryable, apply.State, "an unattributable shard settles the apply retryable, never completed")
+	assert.Nil(t, apply.CompletedAt, "a retryable apply carries no completion timestamp")
+	for _, task := range tasks {
+		assert.Equal(t, state.Task.FailedRetryable, task.State, "shard %s", task.Shard)
+		assert.Nil(t, task.CompletedAt, "shard %s", task.Shard)
+		assert.NotEqual(t, 100, task.ProgressPercent, "an unsettled shard never renders a finished bar (shard %s)", task.Shard)
+		assert.Contains(t, task.ErrorMessage, task.Shard, "the reason names the shard the target could not be verified for")
+	}
+}
+
+// The guard is on what the re-plan covered, not on the task carrying a shard:
+// a re-plan that does describe a namespace one shard at a time settles that
+// shard's tasks the same way a whole-namespace plan settles namespace-wide
+// ones. The table the shard still needs rests retryable, and its sibling on
+// the same shard completes.
+func TestPollForCompletionAtomic_LostEngineWorkSettlesShardTasksOnPerShardReplan(t *testing.T) {
+	eng := &lostWorkEngine{
+		phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+			{State: engine.StatePending},
+		}},
+		planResult: &engine.PlanResult{Changes: []engine.SchemaChange{{
+			Namespace: "appdb",
+			Shard:     engine.Shard{Name: "-80"},
+			TableChanges: []engine.TableChange{{
+				Table: "orders",
+				DDL:   "ALTER TABLE `orders` ADD COLUMN `note` VARCHAR(255)",
+			}},
+		}}},
+	}
+	client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetReached)
+	orders, payments := tasks[0], tasks[1]
+	orders.Shard = "-80"
+	payments.Shard = "-80"
+
+	client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false)
+
+	assert.Equal(t, state.Apply.FailedRetryable, apply.State, "the shard still needing a change pauses the apply for retry")
+	assert.Equal(t, state.Task.FailedRetryable, orders.State, "the table this shard still needs is retryable")
+	assert.Contains(t, orders.ErrorMessage, "still needs the change")
+	assert.Equal(t, state.Task.Completed, payments.State, "a shard-keyed re-plan settles the table whose change landed on that shard")
+	require.NotNil(t, payments.CompletedAt)
+	assert.Equal(t, 100, payments.ProgressPercent)
+}

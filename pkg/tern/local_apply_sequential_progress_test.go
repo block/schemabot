@@ -331,6 +331,9 @@ func TestPollTaskToCompletion_LostEngineWorkTargetConverged(t *testing.T) {
 		planResult: &engine.PlanResult{NoChanges: true},
 	}
 	client, apply, task, _ := lostWorkPollFixture(eng, lostWorkTrustBudgetReached)
+	// A whole-namespace task, which is the scope a re-plan of the reviewed
+	// schema set speaks for and therefore the scope its silence can settle.
+	task.Shard = ""
 
 	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
 
@@ -372,6 +375,32 @@ func TestPollTaskToCompletion_LostEngineWorkTargetNotConverged(t *testing.T) {
 	assert.Contains(t, task.ErrorMessage, "orders")
 	assert.Contains(t, task.ErrorMessage, "still needs the change")
 	assert.Nil(t, task.CompletedAt, "a retryable task carries no completion timestamp")
+}
+
+// Re-planning the reviewed schema set describes whole namespaces, so its
+// silence about a table says nothing about any one shard of it. A task tagged
+// with the shard it ran on — the shape a shard-scoped dispatch creates — is
+// therefore never completed from that silence: it rests retryable for a fresh
+// claim, because reporting a shard's change as made is the one direction a
+// schema read must not be guessed in.
+func TestPollTaskToCompletion_LostEngineWorkNeverCompletesAShardTaskOnWholeNamespaceReplan(t *testing.T) {
+	eng := &lostWorkEngine{
+		phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+			{State: engine.StatePending},
+		}},
+		// A converged whole-namespace re-plan: no engine's plan of the reviewed
+		// schema set carries a shard, so nothing here speaks for shard -40.
+		planResult: &engine.PlanResult{NoChanges: true},
+	}
+	client, apply, task, _ := lostWorkPollFixture(eng, lostWorkTrustBudgetReached)
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskFailed, action)
+	assert.Equal(t, state.Task.FailedRetryable, task.State, "an unattributable shard rests retryable, never completed")
+	assert.Nil(t, task.CompletedAt, "a retryable task carries no completion timestamp")
+	assert.NotEqual(t, 100, task.ProgressPercent, "an unsettled shard never renders a finished bar")
+	assert.Contains(t, task.ErrorMessage, "-40", "the reason names the shard the target could not be verified for")
 }
 
 // When the engine reports no active schema change and the target plan cannot
@@ -728,6 +757,9 @@ func TestPollTaskToCompletion_SynchronousEngineNeedsNoTrustBudget(t *testing.T) 
 	}
 	// No budget override: the engine's own declaration decides the budget.
 	client, apply, task, _ := lostWorkPollFixture(eng, 0)
+	// The subject here is the budget, so the task takes the whole-namespace
+	// scope a converged re-plan can settle.
+	task.Shard = ""
 
 	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
 
