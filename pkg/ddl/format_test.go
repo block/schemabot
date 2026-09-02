@@ -275,6 +275,40 @@ func TestCanonicalize(t *testing.T) {
 			input:    "DROP TABLE users",
 			expected: "DROP TABLE `users`",
 		},
+		// Canonicalization is a spelling of the statement, not a judgement
+		// about it: it quotes identifiers, uppercases keywords and collapses
+		// whitespace, and otherwise reprints the parse tree as written. An
+		// expression therefore keeps whatever parentheses it arrived with,
+		// including ones a user would call redundant — whether two spellings
+		// mean the same table is decided when the schemas are diffed, not
+		// here. What these pin is that the reprint stays faithful: a plan
+		// comment must never show a generated column or DEFAULT expression
+		// that differs from the one being applied.
+		{
+			name:     "generated column keeps its expression",
+			input:    "CREATE TABLE t (a INT, b INT AS (a * 2) STORED)",
+			expected: "CREATE TABLE `t` (`a` INT,`b` INT GENERATED ALWAYS AS(`a`*2) STORED)",
+		},
+		{
+			name:     "generated column keeps redundant parentheses",
+			input:    "CREATE TABLE t (a INT, b INT GENERATED ALWAYS AS ((a * 2)) VIRTUAL)",
+			expected: "CREATE TABLE `t` (`a` INT,`b` INT GENERATED ALWAYS AS((`a`*2)) VIRTUAL)",
+		},
+		{
+			name:     "parenthesized DEFAULT expression stays an expression",
+			input:    "CREATE TABLE t (a INT DEFAULT (1 + 2))",
+			expected: "CREATE TABLE `t` (`a` INT DEFAULT (1+2))",
+		},
+		{
+			name:     "nested parentheses in a DEFAULT expression are preserved",
+			input:    "CREATE TABLE t (a INT DEFAULT ((1 + 2)))",
+			expected: "CREATE TABLE `t` (`a` INT DEFAULT ((1+2)))",
+		},
+		{
+			name:     "function call in a DEFAULT expression keeps its call syntax",
+			input:    "CREATE TABLE t (a CHAR(36) DEFAULT (uuid()))",
+			expected: "CREATE TABLE `t` (`a` CHAR(36) DEFAULT (UUID()))",
+		},
 		{
 			name:     "invalid SQL returns original",
 			input:    "not valid sql",
