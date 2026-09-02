@@ -24,6 +24,12 @@ const mysqlPort = "3306"
 // rather than one worth waiting longer on.
 const mysqlStartupTimeout = 30 * time.Second
 
+// mysqlLookupTimeout bounds the Docker API lookups MySQLDSN needs. Its callers
+// run in TestMain, which has no *testing.T to hang a deadline on and so passes
+// a background context; a daemon that stops answering would otherwise wedge
+// package setup with nothing to read. Reaching it fails the setup instead.
+const mysqlLookupTimeout = 30 * time.Second
+
 // mysqlDatadirSize caps the in-memory data directory. It is a ceiling, not a
 // reservation: the tmpfs occupies only what MySQL has written. Sized to leave
 // room above what the heaviest package's tables, redo log and binary logs
@@ -65,8 +71,15 @@ func MySQLContainerRequest(image, database string) testcontainers.ContainerReque
 }
 
 // MySQLDSN returns the DSN addressing the named database on a started MySQL
-// test container, with params appended to the query string.
+// test container, with params appended to the query string. A caller that
+// brings its own deadline keeps it; one that does not gets mysqlLookupTimeout.
 func MySQLDSN(ctx context.Context, c testcontainers.Container, database string, params ...string) (string, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, mysqlLookupTimeout)
+		defer cancel()
+	}
+
 	host, err := ContainerHost(ctx, c)
 	if err != nil {
 		return "", fmt.Errorf("get mysql container host: %w", err)
