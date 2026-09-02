@@ -99,6 +99,11 @@ var retryableErrorCodes = map[string]bool{
 
 // IsRetryableErrorCode reports whether the given API error code represents a
 // transient failure that clients should retry with backoff.
+//
+// A code says whether to retry but never when. When the whole response is in
+// hand, prefer ErrorResponse.RetryAfter, which answers both together: some
+// refusals carry a delay the server expects a client to observe, and retrying
+// on the code alone ignores it.
 func IsRetryableErrorCode(code string) bool {
 	return retryableErrorCodes[code]
 }
@@ -116,6 +121,22 @@ type ErrorResponse struct {
 	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
 }
 
+// RetryAfter reports whether a client should retry this error and how long it
+// must wait before doing so.
+//
+// The two answers belong together. A retryable code on its own invites a
+// client to retry at whatever cadence it likes, which for a refusal that
+// carries a delay turns one bounded rejection into sustained rejected traffic
+// against the very thing the delay is protecting. A zero delay means the code
+// is retryable with no wait the server can name, and the client picks its own
+// backoff.
+func (e ErrorResponse) RetryAfter() (retry bool, after time.Duration) {
+	if !IsRetryableErrorCode(e.ErrorCode) {
+		return false, 0
+	}
+	return true, time.Duration(e.RetryAfterSeconds) * time.Second
+}
+
 // The reasons a pull is refused for exceeding a request budget. Each names the
 // budget that ran out, so a client reading only the message can tell whether it
 // is being limited for its own request rate or for the load every client is
@@ -123,6 +144,14 @@ type ErrorResponse struct {
 const (
 	PullRateLimitCallerReason = "too many pull requests from this caller"
 	PullRateLimitTargetReason = "too many pull requests for this database and environment"
+
+	// PullRateLimitSharedReason replaces the per-caller reason on a server that
+	// does not authenticate callers. There every request arrives as the same
+	// anonymous subject, so the budget that ran out belongs to all clients at
+	// once: a refused operator has not made the requests being counted, and a
+	// message blaming "this caller" would send them looking for a fault in
+	// their own tooling instead of at the server's auth configuration.
+	PullRateLimitSharedReason = "too many pull requests; this server does not authenticate callers, so every client shares one request budget"
 )
 
 // NewRateLimitedResponse builds the body of a 429 refusal from the budget that

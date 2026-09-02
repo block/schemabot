@@ -20,6 +20,14 @@ func previewPullRateLimitedCallerOutput() {
 	WriteSchemaPullFailure(rateLimitedPullFailure(apitypes.PullRateLimitCallerReason))
 }
 
+// previewPullRateLimitedSharedOutput shows the same caller-lane refusal on a
+// server that does not authenticate callers, where the budget is shared by
+// every client. The message says so rather than blaming the operator in front
+// of it, who may have made only one of the requests being counted.
+func previewPullRateLimitedSharedOutput() {
+	WriteSchemaPullFailure(rateLimitedPullFailure(apitypes.PullRateLimitSharedReason))
+}
+
 // previewPullRateLimitedTargetOutput shows a pull refused because the database
 // it names is already absorbing every client's reads. The caller may be well
 // inside its own budget, so the message names the other budget rather than
@@ -73,6 +81,7 @@ func previewRateLimitAllOutput() {
 		fn   func()
 	}{
 		{"PULL REFUSED: CALLER BUDGET SPENT", previewPullRateLimitedCallerOutput},
+		{"PULL REFUSED: SHARED BUDGET SPENT (AUTH DISABLED)", previewPullRateLimitedSharedOutput},
 		{"PULL REFUSED: TARGET BUDGET SPENT", previewPullRateLimitedTargetOutput},
 		{"API RESPONSE (SERVICE CALLERS)", previewPullRateLimitedResponseOutput},
 	}

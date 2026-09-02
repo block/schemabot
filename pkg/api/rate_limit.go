@@ -90,7 +90,7 @@ func (s *Service) checkPullRateLimit(w http.ResponseWriter, r *http.Request, dat
 			"environment", environment,
 			"retry_after", retryAfter,
 		)
-		s.writeRateLimited(w, retryAfter, apitypes.PullRateLimitCallerReason)
+		s.writeRateLimited(w, retryAfter, s.pullCallerRateLimitReason())
 		return false
 	}
 	metrics.RecordRateLimitDecision(ctx, pullRateLimitEndpoint, rateLimitScopeCaller, rateLimitDecisionAllow, metricEnvironment)
@@ -109,6 +109,19 @@ func (s *Service) checkPullRateLimit(w http.ResponseWriter, r *http.Request, dat
 	metrics.RecordRateLimitDecision(ctx, pullRateLimitEndpoint, rateLimitScopeTarget, rateLimitDecisionAllow, metricEnvironment)
 
 	return true
+}
+
+// pullCallerRateLimitReason names the budget a caller-lane refusal ran out of.
+// It reads the auth configuration rather than the request's own identity
+// because the two cases differ in what the operator has to fix: on an
+// authenticated server the caller really did spend its own budget, while on an
+// unauthenticated one the budget is shared by every client and the request
+// being refused may have contributed almost nothing to it.
+func (s *Service) pullCallerRateLimitReason() string {
+	if s.config.Auth.Enabled() {
+		return apitypes.PullRateLimitCallerReason
+	}
+	return apitypes.PullRateLimitSharedReason
 }
 
 // pullRateLimitEnforced reports whether either lane can refuse a request.

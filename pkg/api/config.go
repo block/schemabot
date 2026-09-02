@@ -1861,6 +1861,18 @@ type ForwardAuthSettings struct {
 	OperatorEnvironments []string `yaml:"operator_environments,omitempty"`
 }
 
+// Enabled reports whether the API authenticates its callers. With
+// authentication off, every request arrives as the same anonymous subject, so
+// any decision made per caller is really being made for all of them at once.
+func (a *AuthConfig) Enabled() bool {
+	switch a.Type {
+	case "", "none":
+		return false
+	default:
+		return true
+	}
+}
+
 // Validate checks the auth configuration. Unknown types are rejected so a
 // typo fails closed at startup rather than silently disabling auth.
 func (a *AuthConfig) Validate() error {

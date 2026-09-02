@@ -420,3 +420,26 @@ func TestPullRateLimitReasonsNameTheirBudget(t *testing.T) {
 	assert.Contains(t, PullRateLimitCallerReason, "caller")
 	assert.Contains(t, PullRateLimitTargetReason, "database and environment")
 }
+
+// A retryable refusal answers both questions at once: whether to retry, and
+// how long to wait first. Retrying on the code alone would ignore a delay the
+// server expects a client to observe.
+func TestErrorResponseRetryAfterPairsTheCodeWithTheDelay(t *testing.T) {
+	limited := NewRateLimitedResponse(PullRateLimitCallerReason, 3*time.Second)
+	retry, after := limited.RetryAfter()
+	assert.True(t, retry)
+	assert.Equal(t, 3*time.Second, after)
+
+	// A retryable code with no advertised delay leaves the backoff to the
+	// client rather than implying it may retry immediately in a tight loop.
+	retryable := ErrorResponse{ErrorCode: ErrCodeEngineErrorRetryable}
+	retry, after = retryable.RetryAfter()
+	assert.True(t, retry)
+	assert.Zero(t, after)
+
+	// A permanent failure is never retryable, whatever delay it carries.
+	permanent := ErrorResponse{ErrorCode: ErrCodeNotFound, RetryAfterSeconds: 30}
+	retry, after = permanent.RetryAfter()
+	assert.False(t, retry)
+	assert.Zero(t, after)
+}

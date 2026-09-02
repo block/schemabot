@@ -26,8 +26,16 @@ import (
 // newRateLimitedPullService configures two MySQL databases on one production
 // deployment with the given pull budgets, and a data plane that answers every
 // pull successfully, so a test can tell an admitted request (200) from a
-// limited one (429).
+// limited one (429). Callers are authenticated, the configuration under which
+// each one carries an identity of its own.
 func newRateLimitedPullService(t *testing.T, limits EndpointRateLimitConfig) (*Service, *mockTernClient) {
+	t.Helper()
+	return newRateLimitedPullServiceWithAuth(t, limits, AuthConfig{Type: "forward_auth"})
+}
+
+// newRateLimitedPullServiceWithAuth is newRateLimitedPullService with the auth
+// configuration named, for tests that turn on what a refused caller is told.
+func newRateLimitedPullServiceWithAuth(t *testing.T, limits EndpointRateLimitConfig, authCfg AuthConfig) (*Service, *mockTernClient) {
 	t.Helper()
 	client := &mockTernClient{
 		pullSchemaResp: &ternv1.PullSchemaResponse{
@@ -59,6 +67,7 @@ func newRateLimitedPullService(t *testing.T, limits EndpointRateLimitConfig) (*S
 			"primary": {"production": "tern.example.com:80"},
 		},
 		RateLimits: RateLimitsConfig{Pull: limits},
+		Auth:       authCfg,
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	return New(&mockStorage{}, cfg, map[string]tern.Client{"primary/production": client}, logger), client
@@ -116,6 +125,27 @@ func TestPullRateLimitRefusesExhaustedCallerWith429(t *testing.T) {
 	assert.True(t, apitypes.IsRetryableErrorCode(resp.ErrorCode), "a rate limit is retryable after the advertised delay")
 
 	assert.Len(t, client.pullSchemaReqs, pullsBefore, "a limited request must not reach the data plane")
+}
+
+// A server that does not authenticate callers has no identities to tell them
+// apart, so every client charges the same per-caller bucket. The refusal says
+// so rather than blaming the operator reading it, who may have made only one of
+// the requests that spent the budget, and who would otherwise go looking for a
+// runaway loop in their own tooling instead of at the server's auth setting.
+func TestPullRateLimitNamesTheSharedBudgetWhenCallersAreNotAuthenticated(t *testing.T) {
+	svc, _ := newRateLimitedPullServiceWithAuth(t, EndpointRateLimitConfig{
+		PerCaller: RateLimitBudgetConfig{RequestsPerMinute: 60, Burst: 1},
+	}, AuthConfig{})
+
+	require.Equal(t, http.StatusOK, pullAs(t, svc, "", "orders").Code)
+
+	w := pullAs(t, svc, "", "payments")
+	require.Equal(t, http.StatusTooManyRequests, w.Code, w.Body.String())
+
+	var resp apitypes.ErrorResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.Contains(t, resp.Error, "this server does not authenticate callers")
+	assert.NotContains(t, resp.Error, "from this caller")
 }
 
 // The per-caller budget isolates callers: one client in a retry loop must not

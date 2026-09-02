@@ -111,6 +111,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		previewPullVitessSchemaOutput()
 	case PreviewPullRateLimitedCaller:
 		previewPullRateLimitedCallerOutput()
+	case PreviewPullRateLimitedShared:
+		previewPullRateLimitedSharedOutput()
 	case PreviewPullRateLimitedTarget:
 		previewPullRateLimitedTargetOutput()
 	case PreviewPullRateLimitedResponse:

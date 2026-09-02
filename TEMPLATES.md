@@ -8395,6 +8395,21 @@ Pull failed
 </details>
 
 <details>
+<summary><a name="pull-refused-shared-budget-spent-auth-disabled"></a><strong>Pull Refused: Shared Budget Spent (Auth Disabled)</strong></summary>
+
+```
+
+Pull failed
+  Database: orders
+  Environment: production
+  API status: HTTP 429
+  Error code: rate_limited
+  Error: too many pull requests; this server does not authenticate callers, so every client shares one request budget; retry in 1s
+
+```
+</details>
+
+<details>
 <summary><a name="pull-refused-target-budget-spent"></a><strong>Pull Refused: Target Budget Spent</strong></summary>
 
 ```

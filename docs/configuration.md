@@ -497,7 +497,8 @@ Each request must have budget in both lanes:
   for a service caller through the gateway lane. It keeps one runaway client
   from consuming the server's capacity. When API auth is disabled every request
   arrives as the same anonymous caller, so this budget then applies to all
-  traffic together.
+  traffic together, and a refusal in this lane says so rather than naming the
+  caller in front of it.
 - `per_target` is keyed on the database and environment being read, across all
   callers. It protects the target database, whose load does not care how many
   distinct clients produced it.

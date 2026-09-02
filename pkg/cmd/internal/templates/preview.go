@@ -88,6 +88,7 @@ const (
 
 	// Rate limit previews (pull refused for exceeding a request budget)
 	PreviewPullRateLimitedCaller   PreviewType = "pull_rate_limited_caller"   // CLI: caller spent its own request budget
+	PreviewPullRateLimitedShared   PreviewType = "pull_rate_limited_shared"   // CLI: budget shared by every client because auth is disabled
 	PreviewPullRateLimitedTarget   PreviewType = "pull_rate_limited_target"   // CLI: the target database is absorbing every client's reads
 	PreviewPullRateLimitedResponse PreviewType = "pull_rate_limited_response" // API: the 429 a service caller reads off the wire
 	PreviewRateLimitAll            PreviewType = "rate_limit_all"             // Show all rate limit previews

@@ -66,7 +66,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewPullVitessSchema:
 		templates.PreviewCLIOutput(previewType)
 	// Rate limit types
-	case templates.PreviewPullRateLimitedCaller, templates.PreviewPullRateLimitedTarget,
+	case templates.PreviewPullRateLimitedCaller, templates.PreviewPullRateLimitedShared,
+		templates.PreviewPullRateLimitedTarget,
 		templates.PreviewPullRateLimitedResponse, templates.PreviewRateLimitAll:
 		templates.PreviewCLIOutput(previewType)
 	// Lint and unsafe types
@@ -235,6 +236,7 @@ Status:
 
 Rate Limits:
   pull_rate_limited_caller    Pull refused: caller spent its own request budget
+  pull_rate_limited_shared    Pull refused: budget shared by every client because auth is disabled
   pull_rate_limited_target    Pull refused: target database is absorbing every client's reads
   pull_rate_limited_response  The 429 a service caller reads off the wire
   rate_limit_all              Show all rate limit previews

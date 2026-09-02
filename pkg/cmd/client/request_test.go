@@ -4,9 +4,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/apitypes"
 )
 
 // captureAuthServer returns a test server that records the Authorization header
@@ -100,6 +103,41 @@ func TestDoPostIntoErrorStatusReturnsAPIError(t *testing.T) {
 	assert.Equal(t, http.StatusConflict, apiErr.Status)
 	assert.Equal(t, "conflict", apiErr.ErrorCode)
 	assert.Contains(t, apiErr.Message, "not in its revert window")
+}
+
+// A refused request carries both facts a client automating against the API
+// needs: that the refusal is transient, and the wait the server expects it to
+// observe before trying again.
+func TestDoPostIntoCarriesTheServersRetryDelay(t *testing.T) {
+	srv := controlStatusServer(t, http.StatusTooManyRequests, `{"error": "too many pull requests for this database and environment; retry in 4s", "error_code": "rate_limited", "retry_after_seconds": 4}`)
+
+	var result struct{}
+	err := doPostInto(srv.URL, "/api/pull", map[string]string{"database": "orders"}, &result)
+
+	var apiErr *APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, http.StatusTooManyRequests, apiErr.Status)
+	assert.Equal(t, apitypes.ErrCodeRateLimited, apiErr.ErrorCode)
+	assert.Equal(t, 4, apiErr.RetryAfterSeconds)
+
+	retry, after := apiErr.RetryAfter()
+	assert.True(t, retry)
+	assert.Equal(t, 4*time.Second, after)
+}
+
+// A permanent refusal reports no retry, so a client reading only RetryAfter
+// never schedules one against an error that will never succeed.
+func TestDoPostIntoReportsNoRetryForPermanentErrors(t *testing.T) {
+	srv := controlStatusServer(t, http.StatusConflict, `{"error": "schema change is not in its revert window", "error_code": "conflict"}`)
+
+	var result struct{}
+	err := doPostInto(srv.URL, "/api/skip-revert", map[string]string{"apply_id": "apply-abc"}, &result)
+
+	var apiErr *APIError
+	require.ErrorAs(t, err, &apiErr)
+	retry, after := apiErr.RetryAfter()
+	assert.False(t, retry)
+	assert.Zero(t, after)
 }
 
 func TestAuthTokenAttachedAsBearer(t *testing.T) {
