@@ -1334,7 +1334,11 @@ CREATE TABLE orders (
 	// 1824. What the operator reads is SchemaBot's account of that code, not
 	// the target's — the target names the referenced table in words that also
 	// quote the statement, and this message is rendered on a pull request.
-	assert.Equal(t, mysqlerr.ReasonFromText("(errno 1824)"), errorMessage)
+	//
+	// The reason is asserted as a substring because the apply layer prefixes
+	// the failing table, and which of the two the poll catches depends on when
+	// it lands relative to the task being recorded.
+	assert.Contains(t, errorMessage, mysqlerr.ReasonFromText("(errno 1824)"))
 	assert.NotContains(t, errorMessage, "Failed to open",
 		"the target's own wording must not reach the pull request")
 	t.Logf("Correctly captured MySQL error: %s", errorMessage)
