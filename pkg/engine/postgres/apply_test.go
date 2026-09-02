@@ -177,13 +177,15 @@ func TestRefusalForOutcomeTotalOverExecutorCodes(t *testing.T) {
 	}
 }
 
-// TestConcurrentIndexBudgetFitsUnderApplyCeiling pins the ordering the two
-// bounds depend on: the server-side index budget must expire before the
-// client-side ceiling cancels the session, so an exhausted build surfaces as
-// the typed budget verdict — and its invalid-index catalog check still gets
-// to run — rather than as an ambiguous external cancellation.
-func TestConcurrentIndexBudgetFitsUnderApplyCeiling(t *testing.T) {
-	assert.Less(t, concurrentIndexBudget, optimisticApplyCeiling)
+// TestConcurrentIndexBudgetLeavesHeadroomUnderApplyCeiling pins the gap the
+// two bounds depend on: the server-side index budget must expire with at
+// least the named headroom to spare before the client-side ceiling cancels
+// the session, so an exhausted build surfaces as the typed budget verdict —
+// and its invalid-index catalog check still gets to run inside the ceiling —
+// rather than as an ambiguous external cancellation. Retuning either bound
+// without keeping the headroom fails here instead of in an apply.
+func TestConcurrentIndexBudgetLeavesHeadroomUnderApplyCeiling(t *testing.T) {
+	assert.GreaterOrEqual(t, optimisticApplyCeiling-concurrentIndexBudget, concurrentIndexHeadroom)
 }
 
 // TestInvalidIndexDetailMatchesVerdictOwnership pins the advice ladder to
