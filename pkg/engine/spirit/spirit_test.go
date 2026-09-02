@@ -312,3 +312,20 @@ func TestRegistersWorkSynchronously(t *testing.T) {
 	assert.True(t, engine.RegistersWorkSynchronously(eng),
 		"the package helper resolves Spirit's declaration")
 }
+
+// An engine that tracks no schema change — a fresh process whose predecessor
+// held the work, or one that has released its last outcome — must answer a
+// progress poll with pending and no error. Control resolution probes exactly
+// such an engine to decide whether work it can no longer reach is still live,
+// and pending is the only answer that lets a stop or cancel settle durably.
+// Any other state, or an error, reads as unresolved work and keeps the control
+// request retrying against an engine that will never run it.
+func TestIdleEngineReportsPending(t *testing.T) {
+	eng := New(Config{})
+
+	result := pollProgress(t, eng)
+
+	assert.Equal(t, engine.StatePending, result.State,
+		"an engine tracking no schema change reports the idle sentinel control resolution reads")
+	assert.Equal(t, "No active schema change", result.Message)
+}
