@@ -1046,3 +1046,44 @@ func TestRenderUnsafeChangesBlocked_PreservesTenantInRetryCommand(t *testing.T) 
 	assert.Contains(t, rendered, "**Tenant**: `alpha`")
 	assert.Contains(t, rendered, "schemabot apply -e staging --tenant alpha --allow-unsafe")
 }
+
+// Per-table size estimates on the namespace-level plan changes are threaded
+// into the keyspace's TableSizes for rendering, but only for statements whose
+// cost scales with the table: an index add and a column widening carry size
+// lines, while a metadata-only column add and a table being created (no size
+// to report) are omitted.
+func TestBuildPlanCommentData_TableSizes(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "cdb_resolute", Type: "strata"}
+	rows, largest, bytes := int64(48_200_000), int64(13_100_000), int64(23_400_000_000)
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "cdb_resolute_sharded",
+			TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "widgets", DDL: "CREATE TABLE `widgets` (`id` bigint unsigned NOT NULL, PRIMARY KEY (`id`))", ChangeType: "create"},
+				{TableName: "audits", DDL: "ALTER TABLE `audits` ADD COLUMN `reason` varchar(255)", ChangeType: "alter",
+					EstimatedRows: &rows, ShardCount: 4, LargestShardRows: &largest, EstimatedBytes: &bytes},
+				{TableName: "mutes", DDL: "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)", ChangeType: "alter",
+					EstimatedRows: &rows, ShardCount: 4, LargestShardRows: &largest, EstimatedBytes: &bytes},
+				{TableName: "outcomes", DDL: "ALTER TABLE `outcomes` MODIFY COLUMN `note` varchar(500)", ChangeType: "alter",
+					EstimatedRows: &rows, ShardCount: 4, LargestShardRows: &largest, EstimatedBytes: &bytes},
+			},
+		}},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+
+	require.Len(t, data.Changes, 1)
+	assert.Len(t, data.Changes[0].Statements, 4, "all statements still render as DDL")
+	require.Len(t, data.Changes[0].TableSizes, 2,
+		"the index add and the widening carry size lines; the created table and the metadata-only column add are omitted")
+	size := data.Changes[0].TableSizes[0]
+	assert.Equal(t, "mutes", size.Table)
+	require.NotNil(t, size.EstimatedRows)
+	assert.Equal(t, rows, *size.EstimatedRows)
+	assert.Equal(t, 4, size.ShardCount)
+	require.NotNil(t, size.LargestShardRows)
+	assert.Equal(t, largest, *size.LargestShardRows)
+	require.NotNil(t, size.EstimatedBytes)
+	assert.Equal(t, bytes, *size.EstimatedBytes)
+	assert.Equal(t, "outcomes", data.Changes[0].TableSizes[1].Table)
+}

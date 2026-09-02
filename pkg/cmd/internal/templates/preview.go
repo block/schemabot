@@ -112,6 +112,7 @@ const (
 	// Comment template previews (GitHub PR comments)
 	PreviewCommentPlan                         PreviewType = "comment_plan"                            // Plan comment with DDL changes + lint violations
 	PreviewCommentPlanIgnoredNamespaces        PreviewType = "comment_plan_ignored_namespaces"         // Plan with namespaces withheld by ignore_namespaces
+	PreviewCommentPlanColumnOnlyAlter          PreviewType = "comment_plan_column_only_alter"          // Plan whose alter is metadata-only, so no table-size section renders
 	PreviewCommentPlanBlocked                  PreviewType = "comment_plan_blocked"                    // Plan with a statement the engine refuses (blocked verdict)
 	PreviewCommentPlanDirect                   PreviewType = "comment_plan_direct"                     // Locked plan with a statement routed to direct execution (direct verdict)
 	PreviewCommentPlanCopyDiscarded            PreviewType = "comment_plan_copy_discarded"             // Plan whose apply would throw away an unfinished copy on the target
@@ -132,6 +133,7 @@ const (
 	PreviewCommentMultiEnvDiff                 PreviewType = "comment_multi_env_diff"                  // Multi-env plan (different per env)
 	PreviewCommentMultiEnvLint                 PreviewType = "comment_multi_env_lint"                  // Multi-env plan with lint violations
 	PreviewCommentVitessPlan                   PreviewType = "comment_vitess_plan"                     // Vitess plan with keyspaces + VSchema
+	PreviewCommentVitessPlanBytesOnlySizes     PreviewType = "comment_vitess_plan_bytes_only_sizes"    // Vitess plan whose size context is storage bytes with no row counts
 	PreviewCommentVitessPlanVSchemaRemoval     PreviewType = "comment_vitess_plan_vschema_removal"     // Vitess plan with unsafe VSchema removals
 	PreviewCommentVitessApplyPlan              PreviewType = "comment_vitess_apply_plan"               // Locked Vitess apply-plan with options
 	PreviewCommentMySQLMultiSchema             PreviewType = "comment_mysql_multi_schema"              // MySQL plan with multiple schema names

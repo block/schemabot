@@ -40,6 +40,7 @@ func previewCommentAllOutput() {
 		fn   func()
 	}{
 		{"PLAN COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentPlan()) }},
+		{"PLAN COMMENT (COLUMN-ONLY ALTER, NO TABLE SIZES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanColumnOnlyAlter()) }},
 		{"PLAN COMMENT (IGNORED NAMESPACES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoredNamespaces()) }},
 		{"PLAN COMMENT (MANY LINT WARNINGS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyLintWarnings()) }},
 		{"PLAN COMMENT (ENGINE-BLOCKED CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBlocked()) }},
@@ -144,6 +145,7 @@ func previewCommentPlanAllOutput() {
 		fn   func()
 	}{
 		{"MYSQL PLAN", func() { fmt.Print(webhooktemplates.PreviewCommentPlan()) }},
+		{"MYSQL PLAN (COLUMN-ONLY ALTER, NO TABLE SIZES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanColumnOnlyAlter()) }},
 		{"MYSQL PLAN (IGNORED NAMESPACES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoredNamespaces()) }},
 		{"MYSQL PLAN (MANY LINT WARNINGS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyLintWarnings()) }},
 		{"MYSQL PLAN (ENGINE-BLOCKED CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBlocked()) }},
@@ -172,6 +174,7 @@ func previewCommentPlanAllOutput() {
 		{"RECONCILIATION REQUIRED (IN PROGRESS)", func() { fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationInProgress()) }},
 		{"RECONCILIATION REQUIRED (COMPLETED)", func() { fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationCompleted()) }},
 		{"VITESS PLAN", func() { fmt.Print(webhooktemplates.PreviewCommentVitessPlan()) }},
+		{"VITESS PLAN (BYTES-ONLY TABLE SIZES)", func() { fmt.Print(webhooktemplates.PreviewCommentVitessPlanBytesOnlySizes()) }},
 		{"VITESS PLAN: VSCHEMA REMOVAL (UNSAFE)", func() { fmt.Print(webhooktemplates.PreviewCommentVitessPlanVSchemaRemoval()) }},
 		{"POSTGRES PLAN", func() { fmt.Print(webhooktemplates.PreviewCommentPostgresPlan()) }},
 		{"SCHEMA CHANGE APPLY (LOCKED + OPTIONS)", func() { fmt.Print(webhooktemplates.PreviewCommentVitessApplyPlan()) }},

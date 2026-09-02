@@ -46,7 +46,36 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 - `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 - `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
 
+📊 **Table sizes**:
+- `products`: ~2.3M rows · ~1.1 GB
+
 📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-columnonly-alter-no-table-sizes"></a><strong>MySQL Plan (Column-only Alter, No Table Sizes)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `products` ADD COLUMN `discount_cents` bigint;
+```
+
+📋 **Plan**: **1** table to alter
 
 
 ---
@@ -92,6 +121,9 @@ CREATE TABLE `orders` (
 
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
+
+📊 **Table sizes**:
+- `products`: ~2.3M rows · ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -543,6 +575,9 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+📊 **Table sizes**:
+- `products`: ~2.3M rows · ~1.1 GB
+
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 
@@ -755,9 +790,44 @@ CREATE TABLE `addresses` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+
+ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier`(`loyalty_tier`);
 ```
 
-📋 **Plan**: **2** tables to create, **2** vschema updates
+📊 **Table sizes**:
+- `customers`: ~48.2M rows · ~23.4 GB across 2 shards (largest shard ~24.6M rows)
+
+📋 **Plan**: **2** tables to create, **1** table to alter, **2** vschema updates
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="vitess-plan-bytesonly-table-sizes"></a><strong>Vitess Plan (Bytes-only Table Sizes)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `commerce` | **Type**: `Vitess`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+#### Keyspace: `commerce_sharded`
+```sql
+ALTER TABLE `addresses` ADD INDEX `idx_region`(`region`);
+```
+
+📊 **Table sizes**:
+- `addresses`: ~48 GB across 4 shards
+
+📋 **Plan**: **1** table to alter
 
 
 ---
@@ -938,9 +1008,14 @@ CREATE TABLE `addresses` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+
+ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier`(`loyalty_tier`);
 ```
 
-📋 **Plan**: **2** tables to create, **2** vschema updates
+📊 **Table sizes**:
+- `customers`: ~48.2M rows · ~23.4 GB across 2 shards (largest shard ~24.6M rows)
+
+📋 **Plan**: **2** tables to create, **1** table to alter, **2** vschema updates
 
 
 **Options**: ⏸️ Defer Cutover | ⏩ Skip Revert
@@ -1036,6 +1111,9 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 </details>
 
+📊 **Table sizes**:
+- `products`: ~2.3M rows · ~1.1 GB
+
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 ---
@@ -1098,6 +1176,9 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 </details>
 
+📊 **Table sizes**:
+- `products`: ~2.3M rows · ~1.1 GB
+
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 ---
@@ -1150,6 +1231,9 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
 </details>
+
+📊 **Table sizes**:
+- `products`: ~2.3M rows · ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -1218,6 +1302,9 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 - `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 - `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
 
+📊 **Table sizes**:
+- `products`: ~2.3M rows · ~1.1 GB
+
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 ---
@@ -1270,6 +1357,9 @@ CREATE TABLE `orders` (
 
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
+
+📊 **Table sizes**:
+- `products`: ~2.3M rows · ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -1324,6 +1414,9 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+📊 **Table sizes**:
+- `products`: ~2.3M rows · ~1.1 GB
+
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 
@@ -1372,6 +1465,9 @@ CREATE TABLE `orders` (
 
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
+
+📊 **Table sizes**:
+- `products`: ~2.3M rows · ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -1626,6 +1722,9 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 💡 **Lint Warnings**: 2 advisory findings
 - `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 - `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
+
+📊 **Table sizes**:
+- `products`: ~2.3M rows · ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -2343,6 +2442,9 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+📊 **Table sizes**:
+- `products`: ~2.3M rows · ~1.1 GB
+
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 
@@ -2388,6 +2490,9 @@ CREATE TABLE `orders` (
 
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
+
+📊 **Table sizes**:
+- `products`: ~2.3M rows · ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -2436,6 +2541,9 @@ CREATE TABLE `orders` (
 
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
+
+📊 **Table sizes**:
+- `products`: ~2.3M rows · ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -2532,9 +2640,14 @@ CREATE TABLE `addresses` (
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
   COLLATE utf8mb4_0900_ai_ci;
+
+ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier`(`loyalty_tier`);
 ```
 
-📋 **Plan**: **2** tables to create, **2** vschema updates
+📊 **Table sizes**:
+- `customers`: ~48.2M rows · ~23.4 GB across 2 shards (largest shard ~24.6M rows)
+
+📋 **Plan**: **2** tables to create, **1** table to alter, **2** vschema updates
 
 
 **Options**: ⏸️ Defer Cutover | ⏩ Skip Revert
@@ -7385,6 +7498,9 @@ ALTER TABLE `mutes`
     ADD COLUMN `reason` varchar(255);
 ```
 
+📊 **Table sizes**:
+- `mutes`: ~48.2M rows across 4 shards (largest shard ~13.1M rows)
+
 📋 **Plan**: **1** table to alter
 
 
@@ -7453,6 +7569,9 @@ _Already applied — no change._
 ```sql
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ```
+
+📊 **Table sizes**:
+- `mutes`: size estimate unavailable · 3 shards
 
 📋 **Plan**: 1 DDL statement
 
