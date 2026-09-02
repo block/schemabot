@@ -431,20 +431,38 @@ func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.
 	prInfo, err := ghInstClient.FetchPullRequestNoCache(ctx, a.Repository, a.PullRequest)
 	if err != nil {
 		// The outcome still has to land somewhere, and the apply's own commit is
-		// the only one left in hand. Name the commit the refresh targets: it is
-		// not the run GitHub gates on once the head has moved, and an operator
-		// reading a stale aggregate needs to know where the outcome was sent.
-		// Whether it lands there is the fold's own decision — its head-currency
-		// check drops a publish aimed at a commit that is no longer the head, and
-		// logs that reason itself.
+		// the only one left in hand. The fold makes its own read and publishes
+		// there only while that commit is still the head; if it has moved, the
+		// fold skips and this outcome is not recorded on any commit the PR is
+		// gated on. Name the target so an operator can tell the two apart.
 		h.logger.Warn("terminal apply's aggregate refresh targets the apply's commit and no re-plan is considered: could not read the PR head",
 			append(checkFields(), "check_head_sha", checkRecord.HeadSHA, "error", err)...)
 		h.updateAggregateCheck(ctx, ghInstClient, a.Repository, a.PullRequest, checkRecord.HeadSHA)
 		return
 	}
 
-	h.updateAggregateCheck(ctx, ghInstClient, a.Repository, a.PullRequest, aggregatePublishSHA(checkRecord, prInfo))
+	h.updateAggregateCheck(publishHeadCtx(ctx, a, prInfo), ghInstClient, a.Repository, a.PullRequest, aggregatePublishSHA(checkRecord, prInfo))
 	h.replanAfterCheckOwnershipRelease(a, checkRecord, prInfo)
+}
+
+// publishHeadCtx scopes the aggregate publish to the head the caller already
+// read, so the fold's own currency check is answered by that read instead of a
+// second one.
+//
+// Two independent reads of a mutable head can disagree, and the fold treats a
+// disagreement as a stale write: it skips the publish and arms a re-fold. That
+// re-fold only runs on an aggregate leader, so on every other repo a terminal
+// outcome caught in the gap is not published anywhere — it is dropped, with a
+// debug line as the only trace. One read closes the gap and costs one round
+// trip instead of two.
+//
+// A head GitHub did not report seeds nothing: an empty head cannot answer the
+// currency check, so the fold reads for itself as it otherwise would.
+func publishHeadCtx(ctx context.Context, a *storage.Apply, prInfo *github.PullRequestInfo) context.Context {
+	if prInfo.HeadSHA == "" {
+		return ctx
+	}
+	return github.WithPRInfo(ctx, a.Repository, a.PullRequest, prInfo)
 }
 
 // aggregatePublishSHA picks the commit a terminal apply's aggregate is
@@ -457,8 +475,11 @@ func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.
 // reconciliation: no re-plan follows that one by design, so the publish is the
 // only chance to state the block on the commit the PR is gated on.
 //
-// The stored commit stays the fallback for a head GitHub did not report, since
-// an outcome on a stale commit still beats no outcome at all.
+// The stored commit stays the fallback for a head GitHub did not report,
+// because an empty SHA is one the fold rejects outright rather than compares.
+// It buys a publish only while the stored commit is still the head; past that
+// the fold skips, so the fallback avoids an error rather than guaranteeing an
+// outcome.
 func aggregatePublishSHA(check *storage.Check, prInfo *github.PullRequestInfo) string {
 	if prInfo.HeadSHA == "" {
 		return check.HeadSHA

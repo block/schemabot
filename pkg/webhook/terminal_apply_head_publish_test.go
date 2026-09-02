@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"sync/atomic"
 	"testing"
 
 	gh "github.com/google/go-github/v86/github"
@@ -25,9 +26,15 @@ import (
 )
 
 // An apply runs on one commit while the PR moves to another, and the terminal
-// outcome must land on the commit the PR is gated on: a Check Run published on
-// the apply's commit is one GitHub no longer displays, so an operator reading
-// the PR would keep seeing whatever the aggregate last said. The PR here is
+// outcome must reach the commit the PR is gated on. Publishing on the apply's
+// commit does not merely put the outcome on a run GitHub no longer displays:
+// the fold refuses a write aimed at a commit that is not the head and arms a
+// re-fold instead, and that re-fold runs only on an aggregate leader. This
+// deployment is not one, so an outcome aimed at the wrong commit is published
+// nowhere at all.
+//
+// The PR head is read once and answers both the commit to publish on and the
+// fold's own currency check, so the PR is fetched exactly once. The PR here is
 // closed so no re-plan follows the publish, isolating the commit the terminal
 // refresh chooses on its own.
 func TestRefreshChecksForTerminalApplyPublishesOnPRHead(t *testing.T) {
@@ -60,7 +67,9 @@ func TestRefreshChecksForTerminalApplyPublishesOnPRHead(t *testing.T) {
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
+	var prFetches atomic.Int64
 	mux.HandleFunc("GET /repos/"+repo+"/pulls/21", func(w http.ResponseWriter, _ *http.Request) {
+		prFetches.Add(1)
 		_ = json.NewEncoder(w).Encode(gh.PullRequest{
 			Head:  &gh.PullRequestBranch{Ref: new("feature-branch"), SHA: new(headSHA)},
 			Base:  &gh.PullRequestBranch{Ref: new("main"), SHA: new("base456")},
@@ -79,7 +88,10 @@ func TestRefreshChecksForTerminalApplyPublishesOnPRHead(t *testing.T) {
 
 	st := mysqlstore.New(db)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	svc := api.New(st, &api.ServerConfig{}, nil, logger)
+	cfg := &api.ServerConfig{}
+	require.False(t, cfg.IsAggregateLeaderForRepo(repo),
+		"the publish must reach the head without a re-fold, which only a leader arms")
+	svc := api.New(st, cfg, nil, logger)
 
 	ghc := gh.NewClient(nil)
 	ghc.BaseURL, err = url.Parse(server.URL + "/")
@@ -128,4 +140,7 @@ func TestRefreshChecksForTerminalApplyPublishesOnPRHead(t *testing.T) {
 	default:
 		t.Fatal("terminal refresh published no aggregate Check Run")
 	}
+
+	assert.Equal(t, int64(1), prFetches.Load(),
+		"one read of the head answers both the publish target and the fold's currency check")
 }
