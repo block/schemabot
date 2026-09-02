@@ -16,6 +16,57 @@ import (
 // create/get/update lifecycle, claimability and lease rotation, stale-lease
 // recovery, lease-guarded writes, and concurrent claim exclusion.
 func TestApplies(t *testing.T, h Harness) {
+	t.Run("IdentityKeys_AreCaseInsensitive", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "mixedcase_db", storage.DatabaseTypeMySQL)
+		apply := &storage.Apply{
+			ApplyIdentifier: "apply_mixed_case",
+			LockID:          lock.ID,
+			Database:        "MixedCase_DB",
+			DatabaseType:    "MySQL",
+			Repository:      "MixedCase/Sample-Repo",
+			PullRequest:     812,
+			Environment:     "StAgInG",
+			Deployment:      "Primary-Region",
+			State:           state.Apply.Completed,
+		}
+		id, err := store.Applies().Create(ctx, apply)
+		require.NoError(t, err)
+		require.Equal(t, "mixedcase_db", apply.Database)
+		require.Equal(t, "mysql", apply.DatabaseType)
+		require.Equal(t, "mixedcase/sample-repo", apply.Repository)
+		require.Equal(t, "staging", apply.Environment)
+
+		byDatabase, err := store.Applies().GetByDatabase(ctx, "MIXEDCASE_DB", "MYSQL", "STAGING")
+		require.NoError(t, err)
+		require.Len(t, byDatabase, 1)
+		assert.Equal(t, id, byDatabase[0].ID)
+		assert.Equal(t, "mixedcase_db", byDatabase[0].Database)
+		assert.Equal(t, "mysql", byDatabase[0].DatabaseType)
+		assert.Equal(t, "mixedcase/sample-repo", byDatabase[0].Repository)
+		assert.Equal(t, "staging", byDatabase[0].Environment)
+		assert.Equal(t, "Primary-Region", byDatabase[0].Deployment)
+
+		byPR, err := store.Applies().GetByPR(ctx, "MIXEDCASE/SAMPLE-REPO", 812)
+		require.NoError(t, err)
+		require.Len(t, byPR, 1)
+		assert.Equal(t, id, byPR[0].ID)
+
+		recent, err := store.Applies().GetRecent(ctx, storage.RecentAppliesFilter{Limit: 10, Environment: "STAGING"})
+		require.NoError(t, err)
+		require.Len(t, recent, 1)
+		assert.Equal(t, id, recent[0].ID)
+		counts, err := store.Applies().CountRecentByState(ctx, storage.RecentAppliesFilter{Environment: "sTaGiNg"})
+		require.NoError(t, err)
+		assert.Equal(t, map[string]int{state.Apply.Completed: 1}, counts)
+
+		require.NoError(t, store.Applies().DeleteByPR(ctx, "mixedCASE/sample-REPO", 812))
+		deleted, err := store.Applies().Get(ctx, id)
+		require.NoError(t, err)
+		assert.Nil(t, deleted)
+	})
+
 	t.Run("Create_Get_Update", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)

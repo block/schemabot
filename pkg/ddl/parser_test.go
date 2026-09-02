@@ -46,6 +46,10 @@ func (f fakeStatementParser) CreateIndex(string) (string, string, bool, error) {
 	return "", "", false, nil
 }
 
+func (f fakeStatementParser) SynthesizeAddColumn(string, string) (string, error) {
+	return "", nil
+}
+
 func (f fakeStatementParser) CostScalesWithTableSize(string) (bool, error) {
 	return false, nil
 }

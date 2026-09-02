@@ -1211,7 +1211,7 @@ type RepoConfig struct {
 // RepoAdmins returns the repository-scoped admin principals configured for
 // repo. A repository with no config entry has no repo admins.
 func (c *ServerConfig) RepoAdmins(repo string) (teams, users []string) {
-	repoConfig, ok := c.Repos[repo]
+	repoConfig, ok := c.Repos[storage.CanonicalKey(repo)]
 	if !ok {
 		return nil, nil
 	}
@@ -1346,11 +1346,44 @@ func LoadServerConfigFromFile(path string) (*ServerConfig, error) {
 		return nil, fmt.Errorf("parse config file: %w", err)
 	}
 
+	if err := config.canonicalizeRepositories(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
 	return &config, nil
+}
+
+func (c *ServerConfig) canonicalizeRepositories() error {
+	repoNames := make([]string, 0, len(c.Repos))
+	for repo := range c.Repos {
+		repoNames = append(repoNames, repo)
+	}
+	slices.Sort(repoNames)
+
+	canonicalRepos := make(map[string]RepoConfig, len(c.Repos))
+	originalNames := make(map[string]string, len(c.Repos))
+	for _, repo := range repoNames {
+		canonical := storage.CanonicalKey(repo)
+		if original, ok := originalNames[canonical]; ok {
+			return fmt.Errorf("repos contains keys %q and %q that canonicalize to %q", original, repo, canonical)
+		}
+		canonicalRepos[canonical] = c.Repos[repo]
+		originalNames[canonical] = repo
+	}
+	if c.Repos != nil {
+		c.Repos = canonicalRepos
+	}
+
+	for database, dbConfig := range c.Databases {
+		for i, repo := range dbConfig.AllowedRepos {
+			dbConfig.AllowedRepos[i] = storage.CanonicalKey(repo)
+		}
+		c.Databases[database] = dbConfig
+	}
+	return nil
 }
 
 // Validate checks the configuration for required fields and consistency.
@@ -2359,7 +2392,7 @@ func (c *ServerConfig) IsRepoAllowed(repo string) bool {
 	if c == nil || len(c.Repos) == 0 {
 		return true
 	}
-	_, ok := c.Repos[repo]
+	_, ok := c.Repos[storage.CanonicalKey(repo)]
 	return ok
 }
 
@@ -2370,7 +2403,7 @@ func (c *ServerConfig) AreChecksEnabled(repo string) bool {
 	if c == nil || len(c.Repos) == 0 {
 		return true
 	}
-	repoConfig, ok := c.Repos[repo]
+	repoConfig, ok := c.Repos[storage.CanonicalKey(repo)]
 	if !ok || repoConfig.EnableChecks == nil {
 		return true
 	}
@@ -2421,7 +2454,7 @@ func (c *ServerConfig) ResolveGitHubAppForRepo(repo string) (ResolvedGitHubApp, 
 		return ResolvedGitHubApp{}, fmt.Errorf("server config is nil")
 	}
 	if len(c.Apps) > 0 {
-		repoConfig, ok := c.Repos[repo]
+		repoConfig, ok := c.Repos[storage.CanonicalKey(repo)]
 		if !ok {
 			return ResolvedGitHubApp{}, fmt.Errorf("repository %q: %w", repo, ErrRepoNotConfigured)
 		}
@@ -2692,7 +2725,7 @@ func (c *ServerConfig) GitHubCheckNameBaseForRepo(repo string) string {
 		return DefaultGitHubCheckName
 	}
 	if len(c.Apps) > 0 {
-		repoConfig, ok := c.Repos[repo]
+		repoConfig, ok := c.Repos[storage.CanonicalKey(repo)]
 		if !ok {
 			return DefaultGitHubCheckName
 		}
@@ -2714,7 +2747,7 @@ func (c *ServerConfig) PromotionCheckNameBaseForRepo(repo string) string {
 		return DefaultGitHubCheckName
 	}
 	if len(c.Apps) > 0 {
-		repoConfig, ok := c.Repos[repo]
+		repoConfig, ok := c.Repos[storage.CanonicalKey(repo)]
 		if !ok {
 			return DefaultGitHubCheckName
 		}

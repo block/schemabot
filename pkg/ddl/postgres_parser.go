@@ -116,6 +116,55 @@ func (postgresStatementParser) CreateTableColumns(stmt string) ([]string, error)
 	return columns, nil
 }
 
+// SynthesizeAddColumn implements StatementParser. It grafts the column's
+// ColumnDef parse node — type and column-level constraints intact — from the
+// CREATE TABLE tree into a fresh ALTER TABLE ... ADD COLUMN tree and deparses
+// it, so the output is libpg_query's normalized rendering rather than a
+// textual slice of the input. Table-level constraints are separate TableElts
+// nodes, not part of the ColumnDef, and are not carried.
+func (postgresStatementParser) SynthesizeAddColumn(createTableDDL, columnName string) (string, error) {
+	result, err := pgquery.Parse(createTableDDL)
+	if err != nil {
+		return "", fmt.Errorf("parse CREATE TABLE %q: %w", statementPreview(createTableDDL), err)
+	}
+	stmts := result.GetStmts()
+	if len(stmts) != 1 {
+		return "", fmt.Errorf("expected one CREATE TABLE statement, got %d", len(stmts))
+	}
+	createNode, ok := stmts[0].GetStmt().GetNode().(*pgproto.Node_CreateStmt)
+	if !ok {
+		return "", fmt.Errorf("expected CREATE TABLE statement")
+	}
+
+	var columnNode *pgproto.Node
+	for _, element := range createNode.CreateStmt.GetTableElts() {
+		column, ok := element.GetNode().(*pgproto.Node_ColumnDef)
+		if ok && column.ColumnDef.GetColname() == columnName {
+			columnNode = element
+			break
+		}
+	}
+	if columnNode == nil {
+		return "", fmt.Errorf("column %q not found in CREATE TABLE statement", columnName)
+	}
+
+	result.Stmts = []*pgproto.RawStmt{{
+		Stmt: &pgproto.Node{Node: &pgproto.Node_AlterTableStmt{AlterTableStmt: &pgproto.AlterTableStmt{
+			Relation: createNode.CreateStmt.GetRelation(),
+			Cmds: []*pgproto.Node{{Node: &pgproto.Node_AlterTableCmd{AlterTableCmd: &pgproto.AlterTableCmd{
+				Subtype: pgproto.AlterTableType_AT_AddColumn,
+				Def:     columnNode,
+			}}}},
+			Objtype: pgproto.ObjectType_OBJECT_TABLE,
+		}}},
+	}}
+	ddl, err := pgquery.Deparse(result)
+	if err != nil {
+		return "", fmt.Errorf("deparse ADD COLUMN for %q: %w", columnName, err)
+	}
+	return ddl, nil
+}
+
 // CreateIndex implements StatementParser using the parsed IndexStmt. Any
 // standalone CREATE INDEX statement reports its index and table names, with
 // unique carrying the UNIQUE declaration; other parsed statement types return
