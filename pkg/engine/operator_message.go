@@ -39,8 +39,14 @@ func (e *OperatorMessage) Unwrap() error { return e.Err }
 //
 // The format string and its arguments must be SchemaBot's own words and
 // identifiers an operator already has — a table name from the plan, a
-// configured timeout. Never format an error, a driver message, or a value read
-// off the target into it; wrap those as cause instead.
+// configured timeout. Never format a driver message, a target's error, or a
+// value read off the target into it; wrap those as cause instead.
+//
+// A sentence a library authored about the requested change may be interpolated,
+// but only after reading what that library actually puts in it. The bar is the
+// same one this type exists to hold: it must carry nothing beyond the statement
+// the pull request already shows. Text that reaches the library from the target
+// does not qualify, however the library words it.
 func OperatorErrorf(cause error, format string, args ...any) error {
 	return &OperatorMessage{Message: fmt.Sprintf(format, args...), Err: cause}
 }
