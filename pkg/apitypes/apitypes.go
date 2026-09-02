@@ -5,6 +5,8 @@ package apitypes
 
 import (
 	"encoding/json"
+	"fmt"
+	"math"
 	"strings"
 	"time"
 )
@@ -84,6 +86,7 @@ const (
 	ErrCodeActiveApplyExists    = "active_apply_exists"    // Another active apply already exists for the target
 	ErrCodeSourcePolicyDenied   = "source_policy_denied"   // Source repo/path is not authorized for the database
 	ErrCodeLockNotOwned         = "lock_not_owned"         // Lock release denied because the caller is not the owner
+	ErrCodeRateLimited          = "rate_limited"           // Caller or target exceeded its request budget; retry after the advertised delay
 )
 
 var retryableErrorCodes = map[string]bool{
@@ -91,10 +94,16 @@ var retryableErrorCodes = map[string]bool{
 	ErrCodeStorageError:         true,
 	ErrCodeEngineUnavailable:    true,
 	ErrCodeStateSyncFailed:      true,
+	ErrCodeRateLimited:          true,
 }
 
 // IsRetryableErrorCode reports whether the given API error code represents a
 // transient failure that clients should retry with backoff.
+//
+// A code says whether to retry but never when. When the whole response is in
+// hand, prefer ErrorResponse.RetryAfter, which answers both together: some
+// refusals carry a delay the server expects a client to observe, and retrying
+// on the code alone ignores it.
 func IsRetryableErrorCode(code string) bool {
 	return retryableErrorCodes[code]
 }
@@ -104,6 +113,62 @@ func IsRetryableErrorCode(code string) bool {
 type ErrorResponse struct {
 	Error     string `json:"error"`
 	ErrorCode string `json:"error_code"`
+
+	// RetryAfterSeconds is how long the client should wait before retrying,
+	// set only on responses that carry a Retry-After header. It repeats the
+	// header in the body because the CLI's HTTP client reads error bodies and
+	// not response headers.
+	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
+}
+
+// RetryAfter reports whether a client should retry this error and how long it
+// must wait before doing so.
+//
+// The two answers belong together. A retryable code on its own invites a
+// client to retry at whatever cadence it likes, which for a refusal that
+// carries a delay turns one bounded rejection into sustained rejected traffic
+// against the very thing the delay is protecting. A zero delay means the code
+// is retryable with no wait the server can name, and the client picks its own
+// backoff.
+func (e ErrorResponse) RetryAfter() (retry bool, after time.Duration) {
+	if !IsRetryableErrorCode(e.ErrorCode) {
+		return false, 0
+	}
+	return true, time.Duration(e.RetryAfterSeconds) * time.Second
+}
+
+// The reasons a pull is refused for exceeding a request budget. Each names the
+// budget that ran out, so a client reading only the message can tell whether it
+// is being limited for its own request rate or for the load every client is
+// putting on one database.
+const (
+	PullRateLimitCallerReason = "too many pull requests from this caller"
+	PullRateLimitTargetReason = "too many pull requests for this database and environment"
+
+	// PullRateLimitSharedReason replaces the per-caller reason on a server that
+	// does not authenticate callers. There every request arrives as the same
+	// anonymous subject, so the budget that ran out belongs to all clients at
+	// once: a refused operator has not made the requests being counted, and a
+	// message blaming "this caller" would send them looking for a fault in
+	// their own tooling instead of at the server's auth configuration.
+	PullRateLimitSharedReason = "too many pull requests; this server does not authenticate callers, so every client shares one request budget"
+)
+
+// NewRateLimitedResponse builds the body of a 429 refusal from the budget that
+// ran out and how long the caller must wait.
+//
+// The wait is rounded up to whole seconds, the only unit Retry-After can
+// express, and is never reported as less than one: "retry in 0s" reads as an
+// invitation to retry immediately, which is exactly what the budget is
+// refusing. The same rounded value goes in the message and in the field, so a
+// client that reads either sees one delay.
+func NewRateLimitedResponse(reason string, retryAfter time.Duration) ErrorResponse {
+	seconds := max(int(math.Ceil(retryAfter.Seconds())), 1)
+	return ErrorResponse{
+		Error:             fmt.Sprintf("%s; retry in %ds", reason, seconds),
+		ErrorCode:         ErrCodeRateLimited,
+		RetryAfterSeconds: seconds,
+	}
 }
 
 type WebhookRedriveRequest struct {

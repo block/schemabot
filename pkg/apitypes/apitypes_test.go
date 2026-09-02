@@ -1,7 +1,9 @@
 package apitypes
 
 import (
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -384,4 +386,60 @@ func TestPlanResponseDiscardedCopiesCountsUnknownDisposition(t *testing.T) {
 func TestPlanResponseDiscardedCopiesEmpty(t *testing.T) {
 	assert.Empty(t, (&PlanResponse{}).DiscardedCopies())
 	assert.Empty(t, (*PlanResponse)(nil).DiscardedCopies())
+}
+
+// A refused request always advertises a wait a client can act on: whole
+// seconds, never zero, and the same value in the message and the field.
+func TestNewRateLimitedResponseAdvertisesAWholeSecondWait(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		retryAfter time.Duration
+		want       int
+	}{
+		{"zero rounds up", 0, 1},
+		{"negative rounds up", -time.Second, 1},
+		{"sub-second rounds up", 500 * time.Millisecond, 1},
+		{"partial second rounds up", 1500 * time.Millisecond, 2},
+		{"whole seconds are kept", 30 * time.Second, 30},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := NewRateLimitedResponse(PullRateLimitTargetReason, tc.retryAfter)
+
+			assert.Equal(t, tc.want, resp.RetryAfterSeconds)
+			assert.Equal(t, ErrCodeRateLimited, resp.ErrorCode)
+			assert.True(t, IsRetryableErrorCode(resp.ErrorCode), "a limited caller should retry rather than fail the command")
+			assert.Equal(t, fmt.Sprintf("%s; retry in %ds", PullRateLimitTargetReason, tc.want), resp.Error)
+		})
+	}
+}
+
+// The two reasons name the budget that ran out, so a limited client can tell
+// whether its own request rate or the load on one database refused it.
+func TestPullRateLimitReasonsNameTheirBudget(t *testing.T) {
+	assert.NotEqual(t, PullRateLimitCallerReason, PullRateLimitTargetReason)
+	assert.Contains(t, PullRateLimitCallerReason, "caller")
+	assert.Contains(t, PullRateLimitTargetReason, "database and environment")
+}
+
+// A retryable refusal answers both questions at once: whether to retry, and
+// how long to wait first. Retrying on the code alone would ignore a delay the
+// server expects a client to observe.
+func TestErrorResponseRetryAfterPairsTheCodeWithTheDelay(t *testing.T) {
+	limited := NewRateLimitedResponse(PullRateLimitCallerReason, 3*time.Second)
+	retry, after := limited.RetryAfter()
+	assert.True(t, retry)
+	assert.Equal(t, 3*time.Second, after)
+
+	// A retryable code with no advertised delay leaves the backoff to the
+	// client rather than implying it may retry immediately in a tight loop.
+	retryable := ErrorResponse{ErrorCode: ErrCodeEngineErrorRetryable}
+	retry, after = retryable.RetryAfter()
+	assert.True(t, retry)
+	assert.Zero(t, after)
+
+	// A permanent failure is never retryable, whatever delay it carries.
+	permanent := ErrorResponse{ErrorCode: ErrCodeNotFound, RetryAfterSeconds: 30}
+	retry, after = permanent.RetryAfter()
+	assert.False(t, retry)
+	assert.Zero(t, after)
 }

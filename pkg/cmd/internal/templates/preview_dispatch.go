@@ -109,6 +109,16 @@ func PreviewCLIOutput(previewType PreviewType) {
 		previewPullSchemaDetailedOutput()
 	case PreviewPullVitessSchema:
 		previewPullVitessSchemaOutput()
+	case PreviewPullRateLimitedCaller:
+		previewPullRateLimitedCallerOutput()
+	case PreviewPullRateLimitedShared:
+		previewPullRateLimitedSharedOutput()
+	case PreviewPullRateLimitedTarget:
+		previewPullRateLimitedTargetOutput()
+	case PreviewPullRateLimitedResponse:
+		previewPullRateLimitedResponseOutput()
+	case PreviewRateLimitAll:
+		previewRateLimitAllOutput()
 	case PreviewLintViolations:
 		previewLintViolationsOutput()
 	case PreviewUnsafeBlocked:

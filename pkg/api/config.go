@@ -22,6 +22,7 @@ import (
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/pendingdrops"
+	"github.com/block/schemabot/pkg/ratelimit"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/secrets"
@@ -210,6 +211,51 @@ type ServerConfig struct {
 	// Postgres configures process-wide behavior for every PostgreSQL database
 	// this server drives directly.
 	Postgres PostgresConfig `yaml:"postgres,omitempty"`
+
+	// RateLimits bounds how fast callers may spend the API's expensive read
+	// endpoints. It is on by default with budgets well above what an
+	// interactive operator or a well-behaved service reaches; see
+	// RateLimitsConfig for the shape and defaults.
+	RateLimits RateLimitsConfig `yaml:"rate_limits,omitempty"`
+}
+
+// RateLimitsConfig groups the per-endpoint request budgets.
+type RateLimitsConfig struct {
+	// Pull bounds POST /api/pull, which reads a database's live schema. One
+	// pull fans out to a catalog read per namespace on the target, so an
+	// unbounded caller loads the control plane and the database together.
+	Pull EndpointRateLimitConfig `yaml:"pull,omitempty"`
+}
+
+// EndpointRateLimitConfig is one endpoint's budget. Each lane is enforced
+// independently: a request must have budget in both to be served.
+type EndpointRateLimitConfig struct {
+	// Enabled controls enforcement for this endpoint. Defaults to true when
+	// not configured (nil = enabled); set false to admit every request, which
+	// is the escape hatch for a deployment whose legitimate traffic does not
+	// fit the budgets.
+	Enabled *bool `yaml:"enabled"`
+
+	// PerCaller bounds a single authenticated caller, keyed by its subject
+	// (an operator's identity, or a service caller's SPIFFE ID). This is what
+	// keeps one runaway client from consuming the control plane's capacity.
+	PerCaller RateLimitBudgetConfig `yaml:"per_caller,omitempty"`
+
+	// PerTarget bounds a single database and environment, across all callers.
+	// This is what protects the target database itself, whose load does not
+	// care how many distinct clients produced it.
+	PerTarget RateLimitBudgetConfig `yaml:"per_target,omitempty"`
+}
+
+// RateLimitBudgetConfig is a single token bucket's budget. A zero field takes
+// the endpoint's default; a negative field is a configuration error.
+type RateLimitBudgetConfig struct {
+	// RequestsPerMinute is the sustained rate one key may spend.
+	RequestsPerMinute int `yaml:"requests_per_minute,omitempty"`
+
+	// Burst is how many requests one key may spend at once before the
+	// sustained rate takes over.
+	Burst int `yaml:"burst,omitempty"`
 }
 
 // PendingDropsConfig configures the pending drops quarantine for MySQL/Spirit
@@ -285,6 +331,88 @@ func (c *ServerConfig) PendingDropsRetention() (time.Duration, error) {
 		return 0, fmt.Errorf("pending_drops.retention must be positive, got %q", c.PendingDrops.Retention)
 	}
 	return d, nil
+}
+
+// Default pull budgets, sized to what a pull actually costs.
+//
+// The two lanes bound very different amounts of work, so they are not sized
+// alike. The control plane does little per pull: decode, resolve the route,
+// forward one RPC per namespace, marshal the response. The target does the real
+// work, and it scales with the schema rather than with the request: a
+// connection opened and torn down per namespace, one SHOW CREATE TABLE per
+// table, and at DETAILED detail a handful of information_schema scans that walk
+// every table's metadata. A five-table database costs almost nothing; a
+// thousand-table one costs a thousand round trips. So the per-caller lane is
+// generous and the per-target lane is the conservative one.
+//
+// Both are set where no legitimate use reaches them while a loop still trips
+// them by orders of magnitude: a client stuck retrying issues hundreds of
+// requests a second, not two. The point is to stop a runaway, not to pace work.
+//
+// Because a request count is a proxy for a cost that varies by ~100x across the
+// fleet, a deployment whose targets carry unusually large schemas should lower
+// per_target rather than raise it: the same request rate buys far more
+// introspection there.
+const (
+	defaultPullPerCallerRequestsPerMinute = 600
+	defaultPullPerCallerBurst             = 120
+	defaultPullPerTargetRequestsPerMinute = 120
+	defaultPullPerTargetBurst             = 30
+)
+
+// PullRateLimitEnabled reports whether the pull endpoint enforces its request
+// budgets. Defaults to true when not configured.
+func (c *ServerConfig) PullRateLimitEnabled() bool {
+	return c.RateLimits.Pull.Enabled == nil || *c.RateLimits.Pull.Enabled
+}
+
+// PullPerCallerRateLimit returns the per-caller budget for the pull endpoint,
+// with unset fields filled from the defaults.
+func (c *ServerConfig) PullPerCallerRateLimit() ratelimit.Config {
+	return c.RateLimits.Pull.PerCaller.resolve(defaultPullPerCallerRequestsPerMinute, defaultPullPerCallerBurst)
+}
+
+// PullPerTargetRateLimit returns the per-target budget for the pull endpoint,
+// with unset fields filled from the defaults.
+func (c *ServerConfig) PullPerTargetRateLimit() ratelimit.Config {
+	return c.RateLimits.Pull.PerTarget.resolve(defaultPullPerTargetRequestsPerMinute, defaultPullPerTargetBurst)
+}
+
+// resolve fills unset fields from the given defaults. Validate rejects
+// negative values, so by the time a budget is resolved a zero means "unset".
+func (b RateLimitBudgetConfig) resolve(defaultRPM, defaultBurst int) ratelimit.Config {
+	cfg := ratelimit.Config{RequestsPerMinute: b.RequestsPerMinute, Burst: b.Burst}
+	if cfg.RequestsPerMinute == 0 {
+		cfg.RequestsPerMinute = defaultRPM
+	}
+	if cfg.Burst == 0 {
+		cfg.Burst = defaultBurst
+	}
+	return cfg
+}
+
+// validateRateLimits rejects budgets that cannot be honored. A negative value
+// is a typo, not a way to disable enforcement: the limiter would treat it as
+// disabled and silently admit everything, which is the opposite of what
+// someone editing a rate limit downward intends. Disable with
+// rate_limits.<endpoint>.enabled: false instead.
+func validateRateLimits(cfg RateLimitsConfig) error {
+	lanes := []struct {
+		name   string
+		budget RateLimitBudgetConfig
+	}{
+		{"rate_limits.pull.per_caller", cfg.Pull.PerCaller},
+		{"rate_limits.pull.per_target", cfg.Pull.PerTarget},
+	}
+	for _, lane := range lanes {
+		if lane.budget.RequestsPerMinute < 0 {
+			return fmt.Errorf("%s.requests_per_minute must not be negative, got %d (omit it for the default, or set enabled: false to disable)", lane.name, lane.budget.RequestsPerMinute)
+		}
+		if lane.budget.Burst < 0 {
+			return fmt.Errorf("%s.burst must not be negative, got %d (omit it for the default, or set enabled: false to disable)", lane.name, lane.budget.Burst)
+		}
+	}
+	return nil
 }
 
 // SpiritConfig overrides the Spirit engine's default run settings. Each field
@@ -1440,6 +1568,9 @@ func (c *ServerConfig) Validate() error {
 			return err
 		}
 	}
+	if err := validateRateLimits(c.RateLimits); err != nil {
+		return err
+	}
 
 	// Validate Databases if present. An environment is either local mode
 	// (direct DSN) or gRPC mode (server-side target + deployment).
@@ -1728,6 +1859,18 @@ type ForwardAuthSettings struct {
 	// the code-enforced guard keeping scoped writes out of the environments
 	// not named here.
 	OperatorEnvironments []string `yaml:"operator_environments,omitempty"`
+}
+
+// Enabled reports whether the API authenticates its callers. With
+// authentication off, every request arrives as the same anonymous subject, so
+// any decision made per caller is really being made for all of them at once.
+func (a *AuthConfig) Enabled() bool {
+	switch a.Type {
+	case "", "none":
+		return false
+	default:
+		return true
+	}
 }
 
 // Validate checks the auth configuration. Unknown types are rejected so a

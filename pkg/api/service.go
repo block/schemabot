@@ -16,6 +16,7 @@ import (
 
 	"github.com/block/schemabot/pkg/clock"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/ratelimit"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage"
@@ -136,6 +137,13 @@ type Service struct {
 	// nil when no GitHub webhook runtime exists.
 	checkRunBackfiller CheckRunBackfiller
 	clock              clock.Clock
+
+	// pullPerCallerLimiter and pullPerTargetLimiter bound POST /api/pull. Both
+	// are nil when the endpoint's rate limiting is disabled, which a nil
+	// limiter reads as "admit everything". They are built from the config in
+	// New and rebuilt by SetClock, so a test's fake clock drives them too.
+	pullPerCallerLimiter *ratelimit.Limiter
+	pullPerTargetLimiter *ratelimit.Limiter
 
 	// engineFactories holds engine implementations for database types this build
 	// does not provide natively, registered by an embedding service via
@@ -283,7 +291,7 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 	if ternClients == nil {
 		ternClients = make(map[string]tern.Client)
 	}
-	return &Service{
+	s := &Service{
 		storage:              st,
 		config:               config,
 		ternClients:          ternClients,
@@ -298,6 +306,36 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 		heldClaims:           make(map[int64]heldClaim),
 		heldOperationClaims:  make(map[int64]heldOperationClaim),
 	}
+	s.buildRateLimiters()
+	return s
+}
+
+// buildRateLimiters (re)builds the endpoint limiters from the current config
+// and clock. Both limiters are left nil when the endpoint's rate limiting is
+// disabled, which the request path reads as "not enforced" and returns on
+// before it spends or records anything.
+//
+// Enforcement being off is worth one line at startup: an unbounded pull
+// endpoint is a deliberate choice, and an operator watching a target absorb
+// traffic should be able to tell from the server's own logs whether a budget
+// was ever in play.
+func (s *Service) buildRateLimiters() {
+	if s.config == nil || !s.config.PullRateLimitEnabled() {
+		s.pullPerCallerLimiter = nil
+		s.pullPerTargetLimiter = nil
+		s.logger.Info("pull endpoint rate limiting is disabled; pull requests will not be bounded by a request budget")
+		return
+	}
+	perCaller := s.config.PullPerCallerRateLimit()
+	perTarget := s.config.PullPerTargetRateLimit()
+	s.pullPerCallerLimiter = ratelimit.New(perCaller, s.clock)
+	s.pullPerTargetLimiter = ratelimit.New(perTarget, s.clock)
+	s.logger.Info("pull endpoint rate limiting is enabled",
+		"per_caller_requests_per_minute", perCaller.RequestsPerMinute,
+		"per_caller_burst", perCaller.Burst,
+		"per_target_requests_per_minute", perTarget.RequestsPerMinute,
+		"per_target_burst", perTarget.Burst,
+	)
 }
 
 // RegisterEngine registers an Engine implementation for a database type this
@@ -342,6 +380,12 @@ func (s *Service) RegisterEngine(databaseType string, factory tern.EngineFactory
 // Production callers should leave the default clock.Real{} in place; tests
 // use clock.NewFake to make timing observable. A nil or typed-nil c is
 // coalesced to clock.Real{} via clock.Default.
+//
+// The endpoint rate limiters are rebuilt on the new clock, which also discards
+// whatever budget they had already spent. That is intentional: swapping the
+// time source out from under a running token bucket would leave it refilling
+// against a clock that no longer moves the way it did when the tokens were
+// taken.
 func (s *Service) SetClock(c clock.Clock) error {
 	s.operatorMu.Lock()
 	defer s.operatorMu.Unlock()
@@ -349,6 +393,7 @@ func (s *Service) SetClock(c clock.Clock) error {
 		return fmt.Errorf("cannot change clock while operator is running")
 	}
 	s.clock = clock.Default(c)
+	s.buildRateLimiters()
 	return nil
 }
 

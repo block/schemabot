@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"golang.org/x/net/html"
+
+	"github.com/block/schemabot/pkg/apitypes"
 )
 
 // authTransport injects a Bearer token on outbound requests when one is
@@ -88,10 +90,22 @@ type APIError struct {
 	Status    int    // HTTP status code (e.g., 404, 500)
 	ErrorCode string // Error code from API response (e.g., "not_found", "storage_error")
 	Message   string
+
+	// RetryAfterSeconds is the delay the server asked the client to wait, set
+	// only on responses that advertise one. Read it through RetryAfter rather
+	// than on its own, so a retry is never scheduled without it.
+	RetryAfterSeconds int
 }
 
 func (e *APIError) Error() string {
 	return e.Message
+}
+
+// RetryAfter reports whether this request should be retried and how long to
+// wait first, so a caller automating against the API gets both facts from one
+// call instead of retrying on the code and ignoring the delay.
+func (e *APIError) RetryAfter() (retry bool, after time.Duration) {
+	return apitypes.ErrorResponse{ErrorCode: e.ErrorCode, RetryAfterSeconds: e.RetryAfterSeconds}.RetryAfter()
 }
 
 // IsNotFound reports whether the error is a 404 from the API.
@@ -266,17 +280,18 @@ func stripHTMLTags(s string) string {
 }
 
 // parseAPIError builds an APIError from a non-200 HTTP response, extracting
-// the error_code if present in the JSON body.
+// the error_code and any advertised retry delay from the JSON body. The delay
+// is read from the body rather than the Retry-After header because this client
+// keeps error bodies and discards responses.
 func parseAPIError(statusCode int, body []byte) *APIError {
 	apiErr := &APIError{
 		Status:  statusCode,
 		Message: FormatAPIError(statusCode, body),
 	}
-	var resp struct {
-		ErrorCode string `json:"error_code"`
-	}
-	if json.Unmarshal(body, &resp) == nil && resp.ErrorCode != "" {
+	var resp apitypes.ErrorResponse
+	if json.Unmarshal(body, &resp) == nil {
 		apiErr.ErrorCode = resp.ErrorCode
+		apiErr.RetryAfterSeconds = resp.RetryAfterSeconds
 	}
 	return apiErr
 }
