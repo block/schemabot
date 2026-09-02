@@ -518,6 +518,79 @@ func replanShardTableDDL(result *engine.PlanResult) map[shardTableKey][]string {
 	return out
 }
 
+// replanTargetSchema re-plans the reviewed schema set against the live target
+// and indexes the remaining changes by (namespace, shard, table), so callers
+// can look up whether each task's table still needs its change.
+//
+// The plan it returns is all-or-nothing: an engine that cannot read one of the
+// target's namespaces fails the whole plan rather than returning the rest, so
+// a table's absence from the result means the target has the reviewed schema
+// and never means the target could not be asked. Callers that read absence as
+// "the change already landed" depend on that, and on the key space this plan
+// speaks in — see replanVerdictForTask, which is how a task should be judged
+// against it.
+func (c *LocalClient) replanTargetSchema(ctx context.Context, apply *storage.Apply, plan *storage.Plan) (map[shardTableKey][]string, error) {
+	result, err := c.planWithEngine(ctx, &ternv1.PlanRequest{}, apply.Database, plan.SchemaFiles)
+	if err != nil {
+		return nil, fmt.Errorf("re-plan check failed: %w", err)
+	}
+	return replanShardTableDDL(result), nil
+}
+
+// replanVerdict is what a re-plan of the reviewed schema set says about one
+// task whose engine work has gone quiet.
+type replanVerdict int
+
+const (
+	// replanNeedsChange: the target still needs this task's change, so the
+	// work is genuinely gone.
+	replanNeedsChange replanVerdict = iota
+	// replanChangeLanded: the target already has the reviewed schema for this
+	// task, so the work finished and only its outcome was lost.
+	replanChangeLanded
+	// replanCannotAttribute: the re-plan does not speak for this task's scope,
+	// so its silence is not evidence either way.
+	replanCannotAttribute
+)
+
+// replanVerdictForTask judges one task against a target re-plan.
+//
+// A table still in the re-plan needs its change. A table absent from it is
+// where the caller has to be careful: absence only means "already applied"
+// when the re-plan actually covers the scope the task ran in. Re-planning the
+// reviewed schema set describes whole namespaces — no engine's Plan emits a
+// per-shard change, because an engine that fans a change out to its shards
+// behind one endpoint reports the namespace as a unit — while a shard-scoped
+// dispatch tags its tasks with the shard they ran on. Such a task can never
+// match a whole-namespace key, so reading its absence as success would
+// complete a shard's change on evidence that never mentioned the shard. It is
+// unattributable instead, and the caller rests it retryable.
+//
+// The check is on what the re-plan demonstrably covered rather than on the
+// engine, so a plan that does key by shard settles its shard-tagged tasks
+// normally.
+func replanVerdictForTask(replanDDL map[shardTableKey][]string, task *storage.Task) replanVerdict {
+	if _, needsChange := replanDDL[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]; needsChange {
+		return replanNeedsChange
+	}
+	if task.Shard != "" && !replanCoversShards(replanDDL, task.Namespace) {
+		return replanCannotAttribute
+	}
+	return replanChangeLanded
+}
+
+// replanCoversShards reports whether a re-plan described the namespace one
+// shard at a time, which is what makes a shard-tagged table's absence from it
+// meaningful.
+func replanCoversShards(replanDDL map[shardTableKey][]string, namespace string) bool {
+	for key := range replanDDL {
+		if key.namespace == namespace && key.shard != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // tableStillNeedsChange re-plans the full schema set and then looks up whether
 // this task's table still needs a change on its (namespace, shard). Returns
 // false if it already has the desired schema (e.g., Spirit's cutover completed
@@ -525,11 +598,11 @@ func replanShardTableDDL(result *engine.PlanResult) map[shardTableKey][]string {
 // the statements the re-plan would now apply to it so the caller can confirm the
 // task's own statement is still among them before applying it.
 func (c *LocalClient) tableStillNeedsChange(ctx context.Context, apply *storage.Apply, plan *storage.Plan, task *storage.Task) ([]string, bool, error) {
-	result, err := c.planWithEngine(ctx, &ternv1.PlanRequest{}, apply.Database, plan.SchemaFiles)
+	replanDDL, err := c.replanTargetSchema(ctx, apply, plan)
 	if err != nil {
-		return nil, false, fmt.Errorf("re-plan check failed: %w", err)
+		return nil, false, err
 	}
-	statements, stillNeeded := replanShardTableDDL(result)[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
+	statements, stillNeeded := replanDDL[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
 	return statements, stillNeeded, nil
 }
 
