@@ -55,12 +55,6 @@ type PSClient interface {
 	// models auto_cutover on the create request but on neither response, so this
 	// uses raw HTTP via baseURL; it returns an error if baseURL is not set.
 	DeployRequestAutoCutover(ctx context.Context, org, database string, number uint64) (bool, error)
-
-	// BranchTableMetrics reports each table's storage footprint in bytes on a
-	// branch, keyed by table name. The endpoint reports bytes only — no row
-	// counts and no per-shard breakdown. The SDK does not wrap it, so this
-	// uses raw HTTP via baseURL; it returns an error if baseURL is not set.
-	BranchTableMetrics(ctx context.Context, org, database, branch string) (map[string]int64, error)
 }
 
 // psClientWrapper wraps the real PlanetScale client to implement PSClient.
@@ -294,31 +288,6 @@ func (w *psClientWrapper) DeployRequestAutoCutover(ctx context.Context, org, dat
 		return false, fmt.Errorf("read auto_cutover for %s/%s deploy request #%d: %w", org, database, number, ErrAutoCutoverNotReported)
 	}
 	return *payload.Deployment.AutoCutover, nil
-}
-
-// BranchTableMetrics reads the branch table metrics endpoint, which the SDK
-// does not wrap. The response is one object keyed by table name, each entry
-// carrying that table's storage_bytes figure for the whole branch.
-func (w *psClientWrapper) BranchTableMetrics(ctx context.Context, org, database, branch string) (map[string]int64, error) {
-	if w.baseURL == "" {
-		return nil, fmt.Errorf("read table metrics for %s/%s branch %s: no PlanetScale API base URL", org, database, branch)
-	}
-	path := fmt.Sprintf("/v1/organizations/%s/databases/%s/branches/%s/metrics/tables", org, database, branch)
-	respBody, err := w.doRawJSON(ctx, http.MethodGet, path, nil)
-	if err != nil {
-		return nil, fmt.Errorf("read table metrics for %s/%s branch %s: %w", org, database, branch, err)
-	}
-	var payload map[string]struct {
-		StorageBytes int64 `json:"storage_bytes"`
-	}
-	if err := json.Unmarshal(respBody, &payload); err != nil {
-		return nil, fmt.Errorf("decode table metrics for %s/%s branch %s: %w", org, database, branch, err)
-	}
-	metrics := make(map[string]int64, len(payload))
-	for table, m := range payload {
-		metrics[table] = m.StorageBytes
-	}
-	return metrics, nil
 }
 
 // doRawJSON sends a JSON request to an endpoint the SDK does not cover and
