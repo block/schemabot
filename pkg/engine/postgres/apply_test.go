@@ -86,7 +86,15 @@ func TestClassifyRefusal(t *testing.T) {
 			name:       "create collision is a refusal whoever took the name first",
 			err:        fmt.Errorf("execute: %w", executor.ErrCreateCollision),
 			wantReason: "create-collision",
-			wantDetail: []string{"already taken on the target", "re-plan"},
+			wantDetail: []string{"relation already occupies a name", "table, or one of its index names", "re-plan"},
+		},
+		{
+			name: "create collision identifies the failed sequence step",
+			err: fmt.Errorf("execute: %w", &executor.SequenceStepError{
+				Step: 2, Total: 3, Err: executor.ErrCreateCollision,
+			}),
+			wantReason: "create-collision",
+			wantDetail: []string{"relation already occupies a name", "step 2 of 3 failed", "CREATE TABLE committed", "re-plan"},
 		},
 		{
 			name:       "invariant violation fails closed as a refusal",
@@ -161,6 +169,21 @@ func TestClassifyRefusal(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCommittedCreatePrefixDetail pins the retry boundary for create sets: a
+// first-step failure has changed nothing and may be retried, while any later
+// failure leaves the CREATE TABLE committed and requires a fresh plan.
+func TestCommittedCreatePrefixDetail(t *testing.T) {
+	first := &executor.SequenceStepError{Step: 1, Total: 3, Err: errors.New("server failure")}
+	detail, committed := committedCreatePrefixDetail(first, "users")
+	assert.False(t, committed)
+	assert.Empty(t, detail)
+
+	later := &executor.SequenceStepError{Step: 2, Total: 3, Err: errors.New("server failure")}
+	detail, committed = committedCreatePrefixDetail(later, "users")
+	assert.True(t, committed)
+	assert.Equal(t, `step 2 of 3 failed after the CREATE TABLE for "users" committed; re-plan against the current schema`, detail)
 }
 
 // TestRefusalForOutcomeTotalOverExecutorCodes pins the classifier to
@@ -423,7 +446,7 @@ func TestValidateOptimisticApplyRefusesMixedCreateScript(t *testing.T) {
 
 	_, err := validateOptimisticApply(req)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "must be a CREATE TABLE followed only by CREATE INDEX")
+	assert.Equal(t, `apply PostgreSQL table "widgets": planned DDL is not one statement or a valid greenfield create set`, err.Error())
 }
 
 // The apply pool inherits the CA bundle the acceptance path resolved; a

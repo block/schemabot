@@ -238,7 +238,7 @@ func isGreenfieldCreateSet(report pgplan.Report, verdicts []string) bool {
 	if !isGreenfieldTable(report) {
 		return false
 	}
-	if len(report.Statements) == 0 || len(verdicts) != len(report.Statements) {
+	if len(report.Statements) == 0 {
 		return false
 	}
 	for i, statement := range report.Statements {
@@ -262,23 +262,23 @@ func isGreenfieldTable(report pgplan.Report) bool {
 func greenfieldCreateSet(report pgplan.Report, parser ddl.StatementParser) (engine.TableChange, preflight.Tier, error) {
 	statements := make([]string, len(report.Statements))
 	for i, statement := range report.Statements {
-		operation, table, err := parser.Classify(statement.SQL)
-		if err != nil {
-			return engine.TableChange{}, 0, fmt.Errorf("classify greenfield statement %d for table %q: %w", i+1, report.Table, err)
-		}
-		expected := ddl.StatementCreateIndex
-		if i == 0 {
-			expected = ddl.StatementCreateTable
-		}
-		if operation != expected {
-			return engine.TableChange{}, 0, fmt.Errorf("greenfield statement %d for table %q is %s, expected %s", i+1, report.Table, operation, expected)
-		}
-		if table != report.Table {
-			return engine.TableChange{}, 0, fmt.Errorf("greenfield statement %d targets table %q, expected %q", i+1, table, report.Table)
-		}
+		// pg-sprite may render ExecSQL with CONCURRENTLY, which ExecuteCreate
+		// refuses for a table born in the run; canonical SQL is deliberate
+		// regardless of renderer behavior.
 		statements[i] = statement.SQL
 	}
-	tier, err := preflight.RequiredTier(statements)
+	createSet, err := ddl.CreateSetStatements(parser, strings.Join(statements, ";\n"))
+	if err != nil {
+		return engine.TableChange{}, 0, fmt.Errorf("validate greenfield create set for table %q: %w", report.Table, err)
+	}
+	_, table, err := parser.Classify(createSet[0])
+	if err != nil {
+		return engine.TableChange{}, 0, fmt.Errorf("classify greenfield CREATE TABLE for table %q: %w", report.Table, err)
+	}
+	if table != report.Table {
+		return engine.TableChange{}, 0, fmt.Errorf("greenfield create set targets table %q, expected planner table %q", table, report.Table)
+	}
+	tier, err := preflight.RequiredTier(createSet)
 	if err != nil {
 		return engine.TableChange{}, 0, fmt.Errorf("derive privilege tier for greenfield table %q: %w", report.Table, err)
 	}
@@ -288,7 +288,7 @@ func greenfieldCreateSet(report pgplan.Report, parser ddl.StatementParser) (engi
 	return engine.TableChange{
 		Table:     report.Table,
 		Operation: ddl.StatementCreateTable,
-		DDL:       strings.Join(statements, ";\n"),
+		DDL:       strings.Join(createSet, ";\n"),
 	}, tier, nil
 }
 
@@ -316,7 +316,7 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 	if hasExecutableChanges(changes) && report.Table == "" {
 		return nil, fmt.Errorf("plan report carries executable steps but names no target table")
 	}
-	if report.TableExists != nil && !*report.TableExists {
+	if isGreenfieldTable(report) {
 		// A privilege probe against a table that provably does not exist can
 		// only answer "table not found" — a dead end for the operator. Only
 		// the CREATE TABLE step's off-ladder tier states facts an absent
@@ -377,7 +377,7 @@ func blockOversizedTable(ctx context.Context, pool *pgxpool.Pool, report pgplan.
 	if report.Table == "" {
 		return nil, fmt.Errorf("plan report carries executable steps but names no target table")
 	}
-	if report.TableExists != nil && !*report.TableExists {
+	if isGreenfieldTable(report) {
 		return changes, nil
 	}
 	_, err := preflight.CheckTable(ctx, pool, report.Schema, report.Table, tableSizeLimit)

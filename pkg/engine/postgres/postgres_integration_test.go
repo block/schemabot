@@ -293,7 +293,7 @@ func TestEngineApplyCreateSetDuplicateNameRefusal(t *testing.T) {
 	progress := awaitPostgresProgress(t, eng, "widgets")
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "refused", progress.Metadata["phase"])
-	assert.Contains(t, progress.ErrorMessage, "claims the same relation name twice")
+	assert.Equal(t, `the create set for "widgets" claims the same relation name twice (a CREATE INDEX name repeats the table's implicit constraint-index name or another index); fix the schema file and re-plan`, progress.ErrorMessage)
 }
 
 // TestEngineApplyCreateCollisionRefusal proves a CREATE TABLE whose name is
@@ -313,7 +313,7 @@ func TestEngineApplyCreateCollisionRefusal(t *testing.T) {
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "refused", progress.Metadata["phase"])
 	assert.False(t, progress.Retryable, "a collision refusal is permanent until a re-plan; the drive must not offer a retry")
-	assert.Contains(t, progress.ErrorMessage, "re-plan")
+	assert.Equal(t, `a relation already occupies a name the create set for "widgets" claims (the table, or one of its index names); re-plan against the current schema`, progress.ErrorMessage)
 }
 
 // TestEngineApplyCreateIfNotExistsRefusal proves a CREATE TABLE carrying
