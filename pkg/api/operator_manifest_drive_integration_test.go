@@ -35,7 +35,7 @@ func TestOperatorManifestKeyedApplyWaitsForLateSiblings(t *testing.T) {
 	)
 
 	ctx := t.Context()
-	db := startMatrixContainer(t, ctx)
+	db := openMatrixStorage(t)
 	stor := mysqlstore.New(db)
 	resetMatrixTables(t, ctx, db)
 

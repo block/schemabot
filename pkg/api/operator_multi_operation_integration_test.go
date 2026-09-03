@@ -12,18 +12,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/block/spirit/pkg/utils"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/mysql"
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
-	"github.com/block/schemabot/pkg/testutil"
 )
 
 // TestOperatorMultiOperationMatrix proves the DORMANT multi-deployment fan-out
@@ -51,7 +47,7 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 	}
 
 	ctx := t.Context()
-	db := startMatrixContainer(t, ctx)
+	db := openMatrixStorage(t)
 	stor := mysqlstore.New(db)
 
 	t.Run("RollingHaltCompletesInOrder", func(t *testing.T) {
@@ -408,33 +404,14 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 
 // --- harness ------------------------------------------------------------
 
-func startMatrixContainer(t *testing.T, ctx context.Context) *sql.DB {
+// openMatrixStorage gives the test a schema-bootstrapped storage database on
+// the shared MySQL server and a handle the test owns. The matrix services built
+// over this handle (newMatrixService) are never closed, so the test's cleanup
+// is the handle's only closer; a harness that starts closing its service must
+// open the handle itself instead.
+func openMatrixStorage(t *testing.T) *sql.DB {
 	t.Helper()
-	container, err := mysql.Run(ctx,
-		"mysql:8.0",
-		mysql.WithDatabase("schemabot_test"),
-		mysql.WithUsername("root"),
-		mysql.WithPassword("test"),
-		testutil.MySQLTmpfsDatadir(),
-	)
-	require.NoError(t, err, "failed to start mysql")
-	t.Cleanup(func() {
-		if err := testcontainers.TerminateContainer(container); err != nil {
-			t.Logf("failed to terminate container: %v", err)
-		}
-	})
-
-	dsn, err := testutil.ContainerConnectionString(ctx, container, "parseTime=true")
-	require.NoError(t, err, "failed to get connection string")
-
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	require.NoError(t, EnsureSchema(dsn, logger), "failed to ensure schema")
-
-	db, err := sql.Open("mysql", dsn)
-	require.NoError(t, err, "failed to open database")
-	require.NoError(t, db.PingContext(ctx), "failed to ping database")
-	t.Cleanup(func() { utils.CloseAndLog(db) })
-	return db
+	return openStorageDB(t, newStorageDatabaseWithSchema(t).DSN)
 }
 
 // resetMatrixTables clears the rows the matrix touches so each subtest shares one
