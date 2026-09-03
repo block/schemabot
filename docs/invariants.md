@@ -171,11 +171,11 @@ target size cap and by lock and statement budgets. A change that would require a
 rewrite is blocked at plan time rather than routed to something less safe, which keeps the
 boundary honest but leaves that whole class of change unsupported.
 
-The rest of the gap follows from that one. Because nothing long-running is in flight, there is
-nothing to pause, so stop, cancel, start, cutover, revert, and skip-revert are all unsupported on
-a PostgreSQL target. RV-5's recovery window is absent for a separate reason: the pending-drops
-quarantine is a Spirit mechanism. A multi-statement plan is also not atomic, since each statement
-commits in its own transaction, so a mid-plan failure leaves earlier statements applied.
+Part of the gap follows from that one. Because nothing long-running is in flight, there is nothing
+to pause, so stop, cancel, start, and cutover are all unsupported on a PostgreSQL target. RV-5's
+recovery window is absent for a separate reason: the pending-drops quarantine is a Spirit
+mechanism. A multi-statement plan is also not atomic, since each statement commits in its own
+transaction, so a mid-plan failure leaves earlier statements applied.
 
 Worth being precise about what still holds inside that gap, because it is the difference between
 an unfinished engine and an unsafe one. A control request against a PostgreSQL target is still
