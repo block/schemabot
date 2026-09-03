@@ -6,6 +6,8 @@
 
 GitOps for database schemas. Define your desired schema in SQL files, open a PR, and SchemaBot plans and executes your schema changes safely.
 
+**GA** means the engine upholds every runtime safety invariant in [docs/invariants.md](./docs/invariants.md). **Early alpha** means it does not yet, and that document names the specific gaps.
+
 ## Schema Changes via Pull Request
 
 Open a PR with schema changes and SchemaBot handles the rest — plan, apply, and verify across environments:
@@ -80,9 +82,15 @@ See [docs/configuration.md](./docs/configuration.md) for setup instructions (loc
 
 ## Docs
 
-General design docs are in the [docs](./docs/) folder. The PostgreSQL support
-envelope — what plans, what applies, and how each refusal is reported — is in
-[docs/postgresql.md](./docs/postgresql.md).
+General design docs are in the [docs](./docs/) folder. Two are worth reading before you
+put SchemaBot in front of a database you care about:
+
+- [docs/invariants.md](./docs/invariants.md) is the registry of runtime safety invariants:
+  what must never be false while SchemaBot is running, why each rule matters, where it is
+  enforced, and what these guarantees deliberately do not cover. It opens with what happens
+  when GitHub is down.
+- [docs/postgresql.md](./docs/postgresql.md) is the PostgreSQL support envelope: what plans,
+  what applies, and how each refusal is reported.
 
 ## Releases
 

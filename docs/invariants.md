@@ -6,7 +6,9 @@
 
 - [Does SchemaBot depend on GitHub?](#does-schemabot-depend-on-github)
 - [The two shapes, and what "data plane" means](#the-two-shapes-and-what-data-plane-means)
+- [What GA and early alpha mean](#what-ga-and-early-alpha-mean)
 - [Three principles](#three-principles)
+- [What these invariants do not promise](#what-these-invariants-do-not-promise)
 - [Availability and blast radius (AV)](#availability-and-blast-radius-av)
   - [AV-1: Schema changes run without GitHub](#av-1-schema-changes-run-without-github)
   - [AV-2: Outages degrade, never destroy](#av-2-outages-degrade-never-destroy)
@@ -97,13 +99,8 @@ except where an entry says otherwise. Several do say otherwise, because engines 
 differ: a PlanetScale deploy request lives server-side while a Spirit run does not, and the
 entries that turn on that (CO-3, CO-8, RV-5) name the difference rather than paper over it.
 
-Engine support is not uniform either, and this document does not imply that it is. MySQL via
-Spirit and Vitess via PlanetScale are what Block runs in production. PostgreSQL target support
-is early alpha with a deliberately narrow set of supported changes, and a change outside that
-boundary has its plan blocked rather than routed to something less safe; see
-[postgresql.md](postgresql.md) for the boundary. That is separate from PostgreSQL as a dialect
-of SchemaBot's *own* storage, which is fully supported and is what AV-9 and the cross-dialect
-parity rule are about.
+Engine support is not uniform either, and this document does not imply that it is. What the
+maturity levels on the README mean is spelled out below.
 
 ## Does SchemaBot depend on GitHub?
 
@@ -143,6 +140,35 @@ is talking about the gRPC shape, where the two are separate processes that can b
 unreachable and separately versioned. [release.md](release.md) covers the deploy ordering that
 follows from that split.
 
+## What GA and early alpha mean
+
+The engine badges in the [README](../README.md) are defined by this document. An engine is **GA**
+when it upholds every invariant here. **Early alpha** means it does not yet, and that the gaps
+are specific and written down rather than left for you to find.
+
+MySQL via Spirit and Vitess via PlanetScale are GA, and are what Block runs in production.
+PostgreSQL is early alpha, and its gaps concentrate in the control family: a PostgreSQL target
+does not support stop, cancel, start, cutover, revert, or skip-revert, because each statement
+runs as its own transaction that either commits or fails and there is no in-flight copy to pause.
+RV-5's recovery window is likewise absent, since the pending-drops quarantine is a Spirit
+mechanism.
+
+Worth being precise about what still holds inside that gap, because it is the difference between
+an unfinished engine and an unsafe one. A control request against a PostgreSQL target is still
+recorded durably before it is acknowledged (CO-1), and still resolves to an explicit terminal
+outcome (CO-2), specifically a typed unsupported-operation decline rather than a silent drop, a
+false success, or an unbounded retry. The changes PostgreSQL cannot yet apply safely are blocked
+at plan time rather than routed to something less safe. [postgresql.md](postgresql.md) has the
+full boundary.
+
+Stating maturity this way is deliberate. "Early alpha" names a finite set of missing invariants
+rather than a vague confidence level, and closing the distance to GA is a reviewable list rather
+than a judgement call.
+
+Separately, PostgreSQL as a dialect of SchemaBot's *own* storage is fully supported, and is what
+AV-9 and the cross-dialect parity rule are about. The two are easy to confuse and are unrelated:
+one is a database SchemaBot changes, the other is a database SchemaBot runs on.
+
 ## Three principles
 
 These generate most of what follows:
@@ -161,6 +187,42 @@ Each invariant carries an ID (`AV-*` availability, `MG-*` merge gate, `ST-*` sta
 integrity, `AZ-*` routing and authorization). When you change code near one of these, the
 invariant is the review bar: a PR that weakens one must say so explicitly and update this
 document.
+
+## What these invariants do not promise
+
+A registry of guarantees is only useful next to its boundary, so here is what is deliberately
+outside it.
+
+**They do not promise your schema change is correct.** Validation catches classes of danger, not
+intent. Nothing here knows that the column you are dropping is the one your service reads on
+every request, and an approved destructive change runs as approved. RV-3 makes a drop require
+explicit consent; it does not make the consent right.
+
+**They do not promise your database is unaffected.** An online schema change copies data and
+consumes capacity on the target while it runs. SchemaBot's job is to make that work observable,
+interruptible, and correct in its bookkeeping, not to make it free.
+
+**They do not promise the change is reversible.** Only RV-5's narrow and largely opt-in recovery
+window exists, and it covers dropped tables rather than data generally. SchemaBot is not a backup
+system and does not behave as one.
+
+**They do not promise liveness.** Fail-closed is a real trade, not a free one: an ambiguous gate
+blocks a merge, and an apply whose outcome cannot be established keeps blocking until an operator
+reconciles it. These invariants spend workflow availability to buy correctness. That is the right
+trade in front of a tier-0 database, and it does mean SchemaBot will sometimes stop and wait for
+a human on purpose.
+
+**They are not a security boundary against your own operators.** The AZ family constrains what a
+request can reach and who can authorize an apply. It does not defend against someone who is
+legitimately allowed to change your schema and chooses badly.
+
+**They do not extend beneath the engine.** These are invariants of SchemaBot's orchestration.
+Spirit, Vitess, and PostgreSQL each have their own correctness properties and their own bugs, and
+this document does not restate or guarantee them.
+
+Finally, the absence of an entry is not the opposite of a guarantee. This registry pins what is
+enforced; behavior that is not listed is unpinned rather than known-unsafe, and if you are relying
+on something that is not here, it is worth asking for an entry.
 
 ## Availability and blast radius (AV)
 
