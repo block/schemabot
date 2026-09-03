@@ -99,11 +99,12 @@ table's change at all, so a real schema's harder changes get blocked rather than
 to fall back to a copy is what makes the engine's envelope the whole schema rather than the easy
 part of it.
 
-**The core control operations: `stop`, `start`, `cutover`, and `cancel`.** A copy is long-running
-by nature, which means an operator will eventually need to pause one, hold one short of cutover,
-or abandon one, and the moment they need it is usually the moment the database is already in
-trouble. An engine that can start a copy but not manage one in flight hands the operator a
-process they can only wait out.
+**The core control operations: `stop`, `start`, `cutover`, and `cancel`.** A copy can run for
+hours, so an operator has to be able to act on one that is already in flight: `stop` to take the
+load off the database and `start` to resume once it recovers, `cutover` to decide when the swap
+happens rather than let it happen on its own, and `cancel` to abandon the change outright. An
+engine that can begin a copy but not act on one leaves the operator with a process they can only
+wait out.
 
 `revert` and `skip-revert` are deliberately **not** on that list. They depend on the old table
 still existing after cutover, which is a property of where the change runs rather than of how
