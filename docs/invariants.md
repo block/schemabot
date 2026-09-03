@@ -162,19 +162,27 @@ when it upholds every invariant here. **Early alpha** means it does not yet, and
 are specific and written down rather than left for you to find.
 
 MySQL via Spirit and Vitess via PlanetScale are GA, and are what Block runs in production.
-PostgreSQL is early alpha, and its gaps concentrate in the control family: a PostgreSQL target
-does not support stop, cancel, start, cutover, revert, or skip-revert, because each statement
-runs as its own transaction that either commits or fails and there is no in-flight copy to pause.
-RV-5's recovery window is likewise absent, since the pending-drops quarantine is a Spirit
-mechanism.
+
+PostgreSQL is early alpha, and one missing capability accounts for most of the distance: there is
+no copy-and-swap. On MySQL, a change that cannot be done in place is executed by copying the
+table, backfilling it, and swapping it in, which is what makes a large table changeable at all.
+PostgreSQL has no equivalent path yet, so it executes only native in-place DDL, bounded by a
+target size cap and by lock and statement budgets. A change that would require a copy or a
+rewrite is blocked at plan time rather than routed to something less safe, which keeps the
+boundary honest but leaves that whole class of change unsupported.
+
+The rest of the gap follows from that one. Because nothing long-running is in flight, there is
+nothing to pause, so stop, cancel, start, cutover, revert, and skip-revert are all unsupported on
+a PostgreSQL target. RV-5's recovery window is absent for a separate reason: the pending-drops
+quarantine is a Spirit mechanism. A multi-statement plan is also not atomic, since each statement
+commits in its own transaction, so a mid-plan failure leaves earlier statements applied.
 
 Worth being precise about what still holds inside that gap, because it is the difference between
 an unfinished engine and an unsafe one. A control request against a PostgreSQL target is still
 recorded durably before it is acknowledged (CO-1), and still resolves to an explicit terminal
 outcome (CO-2), specifically a typed unsupported-operation decline rather than a silent drop, a
-false success, or an unbounded retry. The changes PostgreSQL cannot yet apply safely are blocked
-at plan time rather than routed to something less safe. [postgresql.md](postgresql.md) has the
-full boundary.
+false success, or an unbounded retry. The engine is narrower than the MySQL and Vitess ones, and
+it is narrow in ways it tells you about. [postgresql.md](postgresql.md) has the full boundary.
 
 Stating maturity this way is deliberate. "Early alpha" names a finite set of missing invariants
 rather than a vague confidence level, and closing the distance to GA is a reviewable list rather
