@@ -271,6 +271,8 @@ refuses to start otherwise.
 
 A database that lives on more than one target replaces the scalar `target` with a `targets` list. Each entry is one target the environment addresses, and rollout follows the listed order.
 
+> **MySQL only.** `targets` is rejected at startup on any other database type. Addressing N targets has to be represented on every operator-facing surface — the plan comment, progress, the terminal summary — and that presentation is built per engine, so the feature is enabled per engine as the work lands.
+
 > **Config surface only in this release.** `targets` resolves to one rollout member per target, but the plan and apply paths still treat every member of an environment the way they treat deployments.
 
 ```yaml
@@ -300,6 +302,7 @@ A `targets` list can also sit inside a `deployments` map entry, for a database w
 
 Rules:
 
+- `targets` requires `type: mysql`. Configuring it on a `vitess`, `strata`, or `postgres` database fails validation at startup.
 - `targets` is mutually exclusive with `target` at the same level, and with a local `dsn` / `dsn_from`.
 - The list MUST contain at least one entry, and no entry may be empty.
 - One deployment may not list the same target twice. A rollout member is identified by its deployment and target together, so the same target under two different deployments is two distinct members and is allowed.
