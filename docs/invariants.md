@@ -15,6 +15,7 @@
   - [MG-8 — Check trust is by App identity, never by name](#mg-8-check-trust-is-by-app-identity-never-by-name)
   - [MG-9 — GitHub being down never invents state](#mg-9-github-being-down-never-invents-state)
   - [MG-10 — A blocked aggregate converges without an external event](#mg-10-a-blocked-aggregate-converges-without-an-external-event)
+  - [MG-11 — A terminal outcome lands on the commit the PR is gated on](#mg-11-a-terminal-outcome-lands-on-the-commit-the-pr-is-gated-on)
 - [Apply state machine (ST)](#apply-state-machine-st)
   - [ST-1 — A finished apply stays finished](#st-1-a-finished-apply-stays-finished)
   - [ST-2 — Recovery from permanent failure is a fresh plan and apply](#st-2-recovery-from-permanent-failure-is-a-fresh-plan-and-apply)
@@ -44,6 +45,7 @@
   - [CO-7 — ID namespaces are never conflated](#co-7-id-namespaces-are-never-conflated)
   - [CO-8 — Stop terminality is engine truth, told truthfully](#co-8-stop-terminality-is-engine-truth-told-truthfully)
   - [CO-9 — Control operations are stateless](#co-9-control-operations-are-stateless)
+  - [CO-10 — A retired operation settles; it is never mistaken for a newer peer's](#co-10-a-retired-operation-settles-it-is-never-mistaken-for-a-newer-peers)
 - [Recovery (RC)](#recovery-rc)
   - [RC-1 — Nothing is orphaned](#rc-1-nothing-is-orphaned)
   - [RC-2 — Settled applies stop changing](#rc-2-settled-applies-stop-changing)
@@ -56,7 +58,7 @@
   - [RV-3 — Consent is explicit, specific, and re-checked](#rv-3-consent-is-explicit-specific-and-re-checked)
   - [RV-4 — Engine refusals are known at plan time and gate the apply](#rv-4-engine-refusals-are-known-at-plan-time-and-gate-the-apply)
   - [RV-5 — A dropped table stays recoverable](#rv-5-a-dropped-table-stays-recoverable)
-  - [RV-6 — Every statement parses, or it is an error](#rv-6-every-statement-parses-or-it-is-an-error)
+  - [RV-6 — Every statement parses under its own dialect, or it is an error](#rv-6-every-statement-parses-under-its-own-dialect-or-it-is-an-error)
   - [RV-7 — Rollback needs the originals](#rv-7-rollback-needs-the-originals)
   - [RV-8 — The plan sees the whole schema, or nothing](#rv-8-the-plan-sees-the-whole-schema-or-nothing)
 - [Routing and authorization (AZ)](#routing-and-authorization-az)
@@ -74,6 +76,7 @@
   - [AV-6 — An old binary never destroys newer state](#av-6-an-old-binary-never-destroys-newer-state)
   - [AV-7 — An acknowledged delivery is a promise](#av-7-an-acknowledged-delivery-is-a-promise)
   - [AV-8 — Untrusted text never reaches operator surfaces raw](#av-8-untrusted-text-never-reaches-operator-surfaces-raw)
+  - [AV-9 — SchemaBot never destroys its own storage to start](#av-9-schemabot-never-destroys-its-own-storage-to-start)
 - [Structural enforcement](#structural-enforcement)
 - [Engineering rules live in AGENTS.md](#engineering-rules-live-in-agentsmd)
 
@@ -85,6 +88,9 @@ how the system is built and [apply-lifecycle.md](apply-lifecycle.md) explains ho
 and dies; this document states what must never be false at runtime, why each rule matters, and
 where it is enforced. Every invariant here is enforced in shipped code — this is a registry of
 existing behavior, not a wishlist.
+
+Every invariant binds every engine SchemaBot drives and every SQL dialect it parses. Where an
+entry names one, it is naming where the rule is enforced, not narrowing who it binds.
 
 Three principles generate most of what follows:
 
@@ -142,8 +148,15 @@ taken while an apply is mutating the database never becomes the merge-gating sou
 A plan result never overwrites an `in_progress` check row that carries an `apply_id`, and
 apply/rollback completion updates the row only if it still holds that `apply_id` and no newer
 apply exists for the same PR, environment, and database. *Breaks if violated:* a concurrent
-plan or a stale driver flips a gate that live work owns. *Enforced:* `apply_id` ownership
-markers on `checks` rows with conditional completion writes; ownership misses are counted.
+plan or a stale driver flips a gate that live work owns.
+
+The refusal is decided, never inferred: ownership is read and the write made in a single
+transaction with the row held, because a row count cannot answer the question. A plan rewriting
+a row with the values it already holds changes nothing and so reports nothing changed, and
+reading ownership after the write answers about a later moment than the one the write was
+authorized under — either would report a refusal that never happened, or hide one that did.
+*Enforced:* `apply_id` ownership markers on `checks` rows, with the ownership read and the
+conditional write in one transaction under a row lock; refusals are counted.
 
 ### MG-6 — Started applies keep blocking after the change disappears
 
@@ -183,6 +196,17 @@ Aggregates blocked on unresolved or stale state are re-evaluated by SchemaBot it
 waiting for a lucky comment or push — except blocks that no retry can lift (untrusted App,
 misconfigured check name), which block immediately and permanently. *Enforced:* stale-check
 reconciliation and aggregate re-evaluation in `pkg/webhook`.
+
+### MG-11 — A terminal outcome lands on the commit the PR is gated on
+
+When an apply settles, its aggregate is published on the PR's current head — not on the commit
+the apply started on, which the stored row still names. GitHub gates on runs attached to the
+head, and the publish path refuses a write aimed at any other commit, so an outcome addressed
+to the apply's own commit is not merely hidden: it is written nowhere. The head is resolved
+once and answers both the publish target and that refusal check, so a push landing between two
+reads cannot silently turn the outcome into a no-op. *Breaks if violated:* a half-changed
+target with nothing on the gating commit saying so. *Enforced:* head-resolved publishing on the
+terminal check refresh in `pkg/webhook`.
 
 ## Apply state machine (ST)
 
@@ -327,7 +351,7 @@ Operations section of [AGENTS.md](../AGENTS.md).
 
 ### CO-1 — Durable before acknowledged
 
-An accepted control request (stop, start, cutover, cancel, volume, revert, skip-revert) is
+An accepted control request (start, stop, cancel, cutover, revert, skip-revert, release) is
 recorded in `apply_control_requests` before SchemaBot reports acceptance; drivers consume it
 from storage. A pod restart, lease handover, or webhook redelivery never loses an acknowledged
 command; in-memory flags are per-drive optimizations, never the source of truth. *Enforced:*
@@ -368,12 +392,12 @@ still doing to the database underneath. *Enforced:* revert-phase gates in the co
 
 ### CO-6 — Commands act only where they have an effect
 
-A control operation is rejected up front when nothing can service it — a volume change on an
-apply that is finished or has no row copy running, a second cutover while one is already in
-flight — instead of being queued for a consumer that will never come. And its effect is scoped
-to the one change it targets: an incident-time tuning or one operation's completion never
-bleeds onto sibling operations or future applies. *Enforced:* queue-time eligibility gates;
-operation-scoped request rows.
+A control operation is rejected up front when nothing can service it — a release against a
+rollout that is not paused, a second cutover while one is already in flight — instead of being
+queued for a consumer that will never come. And its effect is scoped to the one change it
+targets: an incident-time tuning or one operation's completion never bleeds onto sibling
+operations or future applies. *Enforced:* queue-time eligibility gates; operation-scoped
+request rows.
 
 ### CO-7 — ID namespaces are never conflated
 
@@ -397,6 +421,16 @@ state — storage rows, or marker tables on the target database itself — never
 a specific process's in-memory engine. A cutover request landing on a pod that is not driving
 the apply still works. *Enforced:* design rule in [architecture.md](architecture.md); the
 cutover sentinel table on the target database.
+
+### CO-10 — A retired operation settles; it is never mistaken for a newer peer's
+
+An operation an earlier release accepted and this one removed stays *known*, as retired. Its
+durable rows and the data-plane reports naming it outlive the upgrade, no driver services it
+anymore, and the terminal sweep settles whatever it left pending — so a command retired
+mid-flight resolves (CO-2) instead of pending forever against a consumer that no longer exists.
+Reading that same string as an operation from a newer peer would be a different judgement about
+a different situation, and would leave the row waiting. *Enforced:* the retired-operation
+registry in `pkg/storage`, consulted by the terminal sweep in `pkg/tern`.
 
 ## Recovery (RC)
 
@@ -482,12 +516,17 @@ tables before purging them. *Enforced:* the pending-drops lifecycle
 ([pending-drops.md](pending-drops.md)) on Spirit; the table lifecycle native to Vitess online
 DDL on PlanetScale.
 
-### RV-6 — Every statement parses, or it is an error
+### RV-6 — Every statement parses under its own dialect, or it is an error
 
-All SQL SchemaBot processes must parse with the TiDB parser — no string-splitting fallback, no
-silently skipped statements — and a classifier refuses ambiguity (a compound statement never
-classifies as its first verb) rather than letting a destructive statement ride past
-classification-based gating. *Enforced:* the `pkg/ddl` / Spirit `statement` boundary.
+All SQL SchemaBot processes must parse with the real parser for the target's dialect — the TiDB
+parser for the MySQL family, libpg_query for PostgreSQL — with no string-splitting fallback and
+no silently skipped statements. The parser is resolved from the target rather than defaulted:
+reading one dialect's DDL under another's grammar is the same class of failure as not parsing
+it at all, because a statement that misparses can also misclassify, and classification is what
+destructive gating reads. A classifier refuses ambiguity (a compound statement never classifies
+as its first verb) rather than letting a destructive statement ride past that gate. *Enforced:*
+dialect resolution at the `pkg/ddl` parser seam; the Spirit `statement` and libpg_query
+boundaries.
 
 ### RV-7 — Rollback needs the originals
 
@@ -587,8 +626,10 @@ observation outage only proves the control plane cannot see, not that the change
 
 A panic is contained to the unit of work that caused it, converted into a permanent (not
 retryable) failure — retrying would feed the poisoned input straight back — and made loud with
-a log, a durable apply-log entry, and a metric. One bad row must never crash-loop the fleet.
-*Enforced:* recover boundaries around drives and webhook work units.
+a log, a durable apply-log entry, and a metric. One bad row must never crash-loop the fleet,
+and one bad RPC must never take the server process down with it. The panic value stays
+server-side: a caller gets a fixed internal error, never the panic text or a stack. *Enforced:*
+recover boundaries around drives, webhook work units, and gRPC unary and stream handlers.
 
 ### AV-6 — An old binary never destroys newer state
 
@@ -613,6 +654,19 @@ check markdown — surfaces show a fixed sanitized line while the raw error goes
 with triage identifiers — and inbound payloads are size-bounded before decode. *Enforced:*
 sanitized rendering helpers in `pkg/webhook`; request body limits.
 
+### AV-9 — SchemaBot never destroys its own storage to start
+
+The startup schema bootstrap converges SchemaBot's own storage additively, and decides before
+it writes. On MySQL a destructive statement — a `DROP TABLE`, or an `ALTER TABLE` carrying a
+`DROP COLUMN` — is refused unless destructive storage changes are explicitly allowed, and a
+statement whose destructive clauses cannot be partitioned out is refused *whole*: refusing the
+whole statement runs strictly less than any split of it, so the fallback can never widen what
+the bootstrap executes. Startup continues on the safe remainder. On PostgreSQL the convergence
+is additive-only and gates on the entire drift set before touching anything, so a change
+needing manual remediation aborts the pass rather than leaving storage half-converged.
+*Breaks if violated:* the first pod of a rolling deploy drops state the rest of the fleet is
+still reading. *Enforced:* the per-dialect bootstrappers in `pkg/api`.
+
 ## Structural enforcement
 
 The strongest invariants are enforced by structure, so regressions fail CI instead of review:
@@ -626,6 +680,10 @@ The strongest invariants are enforced by structure, so regressions fail CI inste
   a case documents an explicit skip, never a silent opt-out (CO-3, CO-8).
 - **Claim parity** — the states the claim query accepts are pinned by tests, so a state added
   to one copy of a safety-critical condition cannot silently diverge from another (OW-6).
+- **Cross-dialect schema parity** — the embedded per-dialect storage schemas are pinned against
+  each other by tests: a table file present for one dialect and not the other, or an index that
+  differs in table, ordered columns, or uniqueness, fails CI. A guard whose correctness rests on
+  a unique index therefore cannot hold on one dialect and quietly not on the other (MG-5, AV-9).
 
 New invariants should aspire to this tier: when adding one, prefer a completeness test over the
 relevant registry to a hand-maintained list.
@@ -637,3 +695,9 @@ never swallow; no silent branch cases; wrap errors with identifiers; logs answer
 question; name compound predicates; one owner closes a handle; tests prove documented
 behavior — belong in [AGENTS.md](../AGENTS.md), not here. This document holds invariants about
 the **running system**; that one holds invariants about **how we write and review the code**.
+
+That file's *Runtime Invariants* section is the other half of this one: it says how to use this
+registry when writing and reviewing a change — find the entries a change touches, cite them by
+ID, and declare whether the change upholds, extends, establishes, or weakens each. A change may
+weaken an invariant, deliberately and in the open; what it may never do is leave an entry here
+describing behavior the code no longer has.
