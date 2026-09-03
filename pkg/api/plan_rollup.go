@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -21,6 +22,11 @@ const (
 	// DeploymentErrored means the deployment's diff could not be computed or
 	// compared. It must be treated as blocking, never as agreement.
 	DeploymentErrored
+	// DeploymentPlanned means the member was planned against its own live
+	// schema and was never compared to the reviewed plan, because its
+	// environment's members are not expected to hold the same schema. Its
+	// changes are its own and do not block.
+	DeploymentPlanned
 )
 
 func (c DeploymentClassification) String() string {
@@ -31,8 +37,38 @@ func (c DeploymentClassification) String() string {
 		return "diverged"
 	case DeploymentErrored:
 		return "errored"
+	case DeploymentPlanned:
+		return "planned"
 	default:
 		return fmt.Sprintf("unknown(%d)", int(c))
+	}
+}
+
+// MemberPlanning is how the rollout members of one database/environment relate
+// to each other, which decides whether a difference between them is drift.
+type MemberPlanning int
+
+const (
+	// PlanMirrored means the members are expected to hold the same schema, so
+	// each is compared to the reviewed plan and any difference is drift that
+	// blocks the review. This is the default: an environment opts out of it, and
+	// never into it, so a config that does not say otherwise keeps blocking.
+	PlanMirrored MemberPlanning = iota
+	// PlanIndependent means each member is planned against its own live schema,
+	// so a difference between members is ordinary rather than drift. Members are
+	// still individually required to be plannable — an error on any of them
+	// blocks the review.
+	PlanIndependent
+)
+
+func (p MemberPlanning) String() string {
+	switch p {
+	case PlanMirrored:
+		return "mirrored"
+	case PlanIndependent:
+		return "independent"
+	default:
+		return fmt.Sprintf("unknown(%d)", int(p))
 	}
 }
 
@@ -58,32 +94,46 @@ type PlanRollup struct {
 	Clean   bool
 }
 
-// RollupDeploymentDiffs classifies each deployment's review-time diff against the
-// reviewed primary plan and reports whether the rollup is clean.
+// RollupDeploymentDiffs classifies each rollout member's review-time diff
+// against the reviewed primary plan and reports whether the rollup is clean.
 //
-// expectedDeployments is the configured deployment set in rollout order, primary
-// first — the same order PlanDeploymentDiffs produces. The diffs must match it
-// positionally: this turns the producer's structural convention (primary first,
-// one entry per configured deployment) into an enforced contract, so a
-// reordered, short, or otherwise mismatched result is rejected rather than
-// letting a missing or misidentified deployment silently pass the gate.
+// expectedMembers is the configured member set in rollout order, primary first
+// — the same order PlanDeploymentDiffs produces. The diffs must match it
+// positionally on both deployment and target: this turns the producer's
+// structural convention (primary first, one entry per configured member) into
+// an enforced contract, so a reordered, short, or otherwise mismatched result
+// is rejected rather than letting a missing or misidentified member silently
+// pass the gate. Matching on the deployment alone would not be enough, because
+// one deployment can address several targets and they would be
+// indistinguishable.
 //
-// The primary (index 0) is the reviewed baseline and classifies Match against
-// itself; every other deployment is compared to it with tern.CompareChangeSets.
-// The result fails closed: a contract mismatch, a primary baseline that errored
-// or is otherwise unusable, or any deployment that errored or diverged makes the
-// rollup not Clean.
-func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedDeployments []string) (PlanRollup, error) {
-	if len(expectedDeployments) == 0 {
-		return PlanRollup{}, fmt.Errorf("no expected deployments to roll up")
+// planning decides what a difference between members means. Under
+// PlanMirrored the primary (index 0) is the reviewed baseline and classifies
+// Match against itself, every other member is compared to it with
+// tern.CompareChangeSets, and a difference is drift that blocks. Under
+// PlanIndependent no member is compared to another: each was planned against
+// its own live schema, so every member that produced a usable diff classifies
+// Planned.
+//
+// The result fails closed under either planning: a contract mismatch, or any
+// member that errored, makes the rollup not Clean. Under PlanMirrored a
+// diverged member, or a primary baseline that is unusable, also blocks.
+func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing.ExecutionTarget, planning MemberPlanning) (PlanRollup, error) {
+	if len(expectedMembers) == 0 {
+		return PlanRollup{}, fmt.Errorf("no expected rollout members to roll up")
 	}
-	if len(diffs) != len(expectedDeployments) {
-		return PlanRollup{}, fmt.Errorf("expected %d deployment diffs in rollout order, got %d", len(expectedDeployments), len(diffs))
+	if len(diffs) != len(expectedMembers) {
+		return PlanRollup{}, fmt.Errorf("expected %d member diffs in rollout order, got %d", len(expectedMembers), len(diffs))
 	}
-	for i, name := range expectedDeployments {
-		if diffs[i].Deployment != name {
-			return PlanRollup{}, fmt.Errorf("deployment diff %d is %q, expected %q; diffs must be in rollout order with the primary first and every configured deployment present", i, diffs[i].Deployment, name)
+	for i, member := range expectedMembers {
+		got := routing.ExecutionTarget{Deployment: diffs[i].Deployment, Target: diffs[i].Target}
+		if got.Deployment != member.Deployment || got.Target != member.Target {
+			return PlanRollup{}, fmt.Errorf("member diff %d is %q, expected %q; diffs must be in rollout order with the primary first and every configured member present", i, got.MemberID(), member.MemberID())
 		}
+	}
+
+	if planning == PlanIndependent {
+		return rollupIndependentMembers(diffs), nil
 	}
 
 	baseline := tern.ChangeSet{Changes: diffs[0].Changes, Shards: diffs[0].Shards}
@@ -171,4 +221,40 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedDeployments []str
 	}
 
 	return PlanRollup{Entries: entries, Clean: clean}, nil
+}
+
+// rollupIndependentMembers classifies members that were each planned against
+// their own live schema. No member is compared to another, so a difference
+// between them is never drift. What still blocks is a member that could not be
+// planned at all: a producer error, or change content that will not parse under
+// the member's own grammar. Content is checked by comparing a member's change
+// set to itself, which is provably empty when the content is well-formed, so the
+// check surfaces malformed content without ever false-diverging a real plan.
+func rollupIndependentMembers(diffs []DeploymentPlanDiff) PlanRollup {
+	entries := make([]DeploymentRollupEntry, len(diffs))
+	clean := true
+	for i, d := range diffs {
+		entry := DeploymentRollupEntry{
+			DatabaseType: d.DatabaseType,
+			Deployment:   d.Deployment,
+			Target:       d.Target,
+		}
+		switch {
+		case d.Err != nil:
+			entry.Class = DeploymentErrored
+			entry.Err = d.Err
+			clean = false
+		default:
+			own := tern.ChangeSet{Changes: d.Changes, Shards: d.Shards}
+			if _, err := tern.CompareChangeSets(schema.DialectForDatabaseType(d.DatabaseType), own, own); err != nil {
+				entry.Class = DeploymentErrored
+				entry.Err = fmt.Errorf("member plan is not usable: %w", err)
+				clean = false
+			} else {
+				entry.Class = DeploymentPlanned
+			}
+		}
+		entries[i] = entry
+	}
+	return PlanRollup{Entries: entries, Clean: clean}
 }

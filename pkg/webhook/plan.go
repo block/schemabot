@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -136,7 +137,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 	// Roll up every deployment's diff against the reviewed plan so drift on a
 	// non-primary deployment fails the check closed at review time.
-	drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp.Deployment, repo, pr)
+	drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, routing.ExecutionTarget{Deployment: planResp.Deployment, Target: planResp.Target}, repo, pr)
 
 	// Build plan comment data
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint())
@@ -424,7 +425,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 
 		// Roll up every deployment's diff against the reviewed plan so drift on a
 		// non-primary deployment fails the check closed at review time.
-		drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp.Deployment, repo, pr)
+		drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, routing.ExecutionTarget{Deployment: planResp.Deployment, Target: planResp.Target}, repo, pr)
 
 		// Store per-database check record per environment
 		var recoveredApplyOwnedCheckState bool

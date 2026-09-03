@@ -4753,6 +4753,60 @@ func TestServerConfig_ResolveDatabaseTargets_MultiTarget(t *testing.T) {
 	})
 }
 
+// TestServerConfig_MemberPlanningFor covers which environments plan their
+// members independently. Spelling any routing as a targets list means the
+// members are distinct targets with no expectation of matching; every other
+// shape, including every shape that predates the targets spelling, stays
+// mirrored so a difference between members keeps blocking the review.
+func TestServerConfig_MemberPlanningFor(t *testing.T) {
+	cfg := ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"scalar":       {Deployment: "payments-a", Target: "payments-001"},
+					"local":        {DSN: "root@tcp(localhost)/payments"},
+					"mirrored":     {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}, "payments-b": {Target: "payments"}}},
+					"targets":      {Deployment: "payments-a", Targets: []string{"payments-001", "payments-002"}},
+					"map-targets":  {Deployments: map[string]DeploymentTarget{"payments-a": {Targets: []string{"payments-001", "payments-002"}}}},
+					"mixed-shapes": {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments-001"}, "payments-b": {Targets: []string{"payments-002"}}}},
+				},
+			},
+		},
+	}
+
+	cases := []struct {
+		environment string
+		want        MemberPlanning
+	}{
+		{"scalar", PlanMirrored},
+		{"local", PlanMirrored},
+		{"mirrored", PlanMirrored},
+		{"targets", PlanIndependent},
+		{"map-targets", PlanIndependent},
+		{"mixed-shapes", PlanIndependent},
+	}
+	for _, tc := range cases {
+		t.Run(tc.environment, func(t *testing.T) {
+			got, err := cfg.MemberPlanningFor("payments", tc.environment)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+
+	t.Run("unknown database errors", func(t *testing.T) {
+		_, err := cfg.MemberPlanningFor("missing", "scalar")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not configured")
+	})
+
+	t.Run("unknown environment errors", func(t *testing.T) {
+		_, err := cfg.MemberPlanningFor("payments", "missing")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "missing")
+	})
+}
+
 // TestServerConfig_MultiTargetIsMySQLOnly covers the engine gate on the targets
 // spelling. A targets list makes an environment address several distinct
 // targets, which only MySQL drives today, so configuring it on another engine

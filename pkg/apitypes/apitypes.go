@@ -520,12 +520,15 @@ type PlanResponse struct {
 	Database     string `json:"database,omitempty"`
 	DatabaseType string `json:"database_type,omitempty"`
 	Environment  string `json:"environment,omitempty"`
-	// Deployment is the primary deployment this plan was created against
-	// (rollout index 0 at plan time). The review-time drift rollup carries it
-	// forward so it can verify the plan's baseline still maps to the primary at
-	// rollup time, rather than trusting that current config re-resolves the same
-	// primary.
+	// Deployment and Target together identify the primary rollout member this
+	// plan was created against (rollout index 0 at plan time). The review-time
+	// drift rollup carries both forward so it can verify the plan's baseline
+	// still maps to the primary at rollup time, rather than trusting that
+	// current config re-resolves the same primary. The deployment alone is not
+	// sufficient: one deployment can address several targets, so a member is
+	// identified by the pair.
 	Deployment  string                   `json:"deployment,omitempty"`
+	Target      string                   `json:"target,omitempty"`
 	Engine      string                   `json:"engine"`
 	Changes     []*SchemaChangeResponse  `json:"changes"`
 	LintResults []*LintViolationResponse `json:"lint_violations"`
