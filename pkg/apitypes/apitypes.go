@@ -1091,7 +1091,12 @@ type TableProgressResponse struct {
 	DDL       string `json:"ddl"`
 	// Deployment attributes this table/task to a deployment in a multi-deployment apply.
 	// Empty for single-deployment applies.
-	Deployment      string `json:"deployment,omitempty"`
+	Deployment string `json:"deployment,omitempty"`
+	// Target attributes this table/task to a target within that deployment. One
+	// deployment can address several targets, each running its own copy of the
+	// change, so the deployment alone does not say which member's progress this
+	// row reports.
+	Target          string `json:"target,omitempty"`
 	Keyspace        string `json:"keyspace,omitempty"`
 	ChangeType      string `json:"change_type,omitempty"` // create, alter, drop
 	Status          string `json:"status"`

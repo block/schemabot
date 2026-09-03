@@ -23,9 +23,9 @@ func TestWriteProgressMultiDeploymentRendersAggregateAndSections(t *testing.T) {
 				{Deployment: "region-c", Target: "orders-c", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 			},
 			Tables: []TableProgress{
-				{Deployment: "region-a", TableName: "users_a", ChangeType: "alter", DDL: "ALTER TABLE `users_a` ADD COLUMN `region` varchar(20)", Status: state.Task.Completed},
-				{Deployment: "region-b", TableName: "users_b", ChangeType: "alter", DDL: "ALTER TABLE `users_b` ADD COLUMN `region` varchar(20)", Status: state.Task.Failed},
-				{Deployment: "region-c", TableName: "users_c", ChangeType: "alter", DDL: "ALTER TABLE `users_c` ADD COLUMN `region` varchar(20)", Status: state.Task.Running},
+				{Deployment: "region-a", Target: "orders-a", TableName: "users_a", ChangeType: "alter", DDL: "ALTER TABLE `users_a` ADD COLUMN `region` varchar(20)", Status: state.Task.Completed},
+				{Deployment: "region-b", Target: "orders-b", TableName: "users_b", ChangeType: "alter", DDL: "ALTER TABLE `users_b` ADD COLUMN `region` varchar(20)", Status: state.Task.Failed},
+				{Deployment: "region-c", Target: "orders-c", TableName: "users_c", ChangeType: "alter", DDL: "ALTER TABLE `users_c` ADD COLUMN `region` varchar(20)", Status: state.Task.Running},
 			},
 		})
 	})
@@ -91,8 +91,8 @@ func TestWriteProgressMultiDeploymentContinueFailureShowsRunningDegraded(t *test
 				{Deployment: "region-b", Target: "orders-b", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureContinue},
 			},
 			Tables: []TableProgress{
-				{Deployment: "region-a", TableName: "users_a", ChangeType: "alter", DDL: "ALTER TABLE `users_a` ADD COLUMN `region` varchar(20)", Status: state.Task.Failed},
-				{Deployment: "region-b", TableName: "users_b", ChangeType: "alter", DDL: "ALTER TABLE `users_b` ADD COLUMN `region` varchar(20)", Status: state.Task.Running},
+				{Deployment: "region-a", Target: "orders-a", TableName: "users_a", ChangeType: "alter", DDL: "ALTER TABLE `users_a` ADD COLUMN `region` varchar(20)", Status: state.Task.Failed},
+				{Deployment: "region-b", Target: "orders-b", TableName: "users_b", ChangeType: "alter", DDL: "ALTER TABLE `users_b` ADD COLUMN `region` varchar(20)", Status: state.Task.Running},
 			},
 		})
 	})
@@ -190,4 +190,39 @@ func TestWriteProgressMultiTargetSectionsNameEachMember(t *testing.T) {
 	// trailing parenthetical.
 	assert.NotContains(t, output, "primary/testapp-001 — completed (testapp-001)")
 	assert.NotContains(t, output, "primary/testapp-002 — running table copy (testapp-002)")
+}
+
+// Two targets of one deployment each run their own copy of the change against
+// their own schema. Each member's section shows only the tables its own target
+// copied and only its own data-plane identifiers — nothing is read off the
+// sibling member it shares a deployment with.
+func TestWriteProgressMultiTargetSectionsAreMemberScoped(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteProgress(ProgressData{
+			ApplyID:     "apply-multi-target",
+			Environment: "staging",
+			State:       state.Apply.Running,
+			Operations: []ProgressOperation{
+				{Deployment: "primary", Target: "testapp-001", ExternalID: "remote-apply-001", ExternalOperationID: "remote-op-001", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+				{Deployment: "primary", Target: "testapp-002", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+			},
+			Tables: []TableProgress{
+				{Deployment: "primary", Target: "testapp-001", TableName: "users_001", ChangeType: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `region` varchar(20)", Status: state.Task.Completed},
+				{Deployment: "primary", Target: "testapp-002", TableName: "users_002", ChangeType: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `region` varchar(20)", Status: state.Task.Running},
+			},
+		})
+	})
+
+	// The dispatched member's identifiers stay with it: the other member runs a
+	// separate data-plane apply, so it inherits neither.
+	assert.Equal(t, 1, strings.Count(output, "External apply ID: remote-apply-001"),
+		"a sibling target must not inherit another member's external apply ID")
+	assert.Equal(t, 1, strings.Count(output, "External operation ID: remote-op-001"))
+
+	// Each member lists only the tables its own target copied.
+	assertLess(t, output, "primary/testapp-001", "users_001")
+	assertLess(t, output, "users_001", "primary/testapp-002")
+	assertLess(t, output, "primary/testapp-002", "users_002")
+	assert.Equal(t, 1, strings.Count(output, "users_001"))
+	assert.Equal(t, 1, strings.Count(output, "users_002"))
 }

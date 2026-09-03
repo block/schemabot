@@ -7789,22 +7789,9 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 
 🟢 us-east — ready for cutover — next in order (orders-us-east)
 
-     ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
-
-
 🔄 eu-west — running table copy (orders-eu-west)
 
-     ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.00%
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
-       • Rows: 42,000 / 120,000 · ETA: 4m 0s
-
-
 ⏳ ap-south — waiting for eu-west (orders-ap-south)
-
-     ~ orders: ⏳ Queued
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
-
 
 
 ```
@@ -7832,22 +7819,10 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 
 ✅ us-east — completed (orders-us-east)
 
-     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
-
-
 ❌ eu-west — failed (orders-eu-west)
   duplicate key name 'idx_orders_source'
 
-     ~ orders: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
-       ALTER TABLE `orders` ADD INDEX `idx_orders_source`(`source`);
-
-
 ⏸️ ap-south — halted — eu-west failed (orders-ap-south)
-
-     ~ orders: 🚫 Cancelled (not started)
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
-
 
 
 ```
@@ -7871,21 +7846,9 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 
 ✅ us-east — completed (orders-us-east)
 
-     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
-
-
 ✅ eu-west — completed (orders-eu-west)
 
-     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
-
-
 ✅ ap-south — completed (orders-ap-south)
-
-     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
-
 
 ```
 </details>
@@ -8483,24 +8446,11 @@ Environment: production
   External operation ID: remote-op-us-east-001
   External apply ID: remote-apply-us-east-001
 
-     ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
-
-
 🔄 eu-west — running table copy (orders-eu-west)
   External operation ID: remote-op-eu-west-001
   External apply ID: remote-apply-eu-west-001
 
-     ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.42%
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
-       • Rows: 42,500 / 120,000 · ETA: 4m 0s
-
-
 ⏳ ap-south — waiting for eu-west (orders-ap-south)
-
-     ~ orders: ⏳ Queued
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
-
 
 ESC to detach
 ```

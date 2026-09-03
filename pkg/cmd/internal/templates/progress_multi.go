@@ -137,7 +137,7 @@ func writeDeploymentProgressSection(deployment presentation.Deployment, op Progr
 		fmt.Printf("  %s%s%s\n", ANSIRed, deployment.Error, ANSIReset)
 	}
 
-	tables := activeTablesForDeployment(data.Tables, deployment.Deployment)
+	tables := activeTablesForMember(data.Tables, deployment.Deployment, deployment.Target)
 	if len(tables) > 0 && !state.IsSetupPhase(data.State) {
 		sortActiveTables(tables)
 		if hasTableNamespaces(tables) {
@@ -152,29 +152,47 @@ func writeDeploymentProgressSection(deployment presentation.Deployment, op Progr
 	fmt.Println()
 }
 
+// deploymentTarget reports the one target every operation of op's deployment
+// addresses, and whether there is exactly one. It is what decides when an
+// operation that has not recorded its own routing may inherit a sibling's: a
+// deployment addressing several targets runs a separate data-plane apply per
+// target, so nothing about one member can be read off another.
+func deploymentTarget(op ProgressOperation, ops []ProgressOperation) (target string, single bool) {
+	for _, sibling := range ops {
+		if sibling.Deployment != op.Deployment || sibling.Target == "" {
+			continue
+		}
+		if target != "" && target != sibling.Target {
+			return "", false
+		}
+		target = sibling.Target
+	}
+	return target, true
+}
+
 // sectionTarget resolves the target shown in a section header: the section's
-// own operation when set, falling back to any same-deployment sibling — the
-// target is deployment-level routing, identical across a keyed apply's
-// operations.
+// own operation when set, otherwise its deployment's when the deployment
+// addresses a single one. A deployment addressing several shows no target
+// rather than another member's.
 func sectionTarget(op ProgressOperation, ops []ProgressOperation) string {
 	if op.Target != "" {
 		return op.Target
 	}
-	for _, sibling := range ops {
-		if sibling.Deployment == op.Deployment && sibling.Target != "" {
-			return sibling.Target
-		}
-	}
-	return ""
+	target, _ := deploymentTarget(op, ops)
+	return target
 }
 
 // sectionExternalID resolves the external apply ID shown in a section: the
-// section's own operation when set, falling back to any same-deployment
-// sibling — a keyed apply's operations share one data-plane apply, so a
-// not-yet-dispatched operation still shows the deployment's shared ID.
+// section's own operation when set, falling back to a sibling's — a keyed
+// apply's operations share one data-plane apply, so an operation that has not
+// dispatched yet still shows it. The fallback applies only while the deployment
+// addresses a single target, so it never shows one member the ID of another.
 func sectionExternalID(op ProgressOperation, ops []ProgressOperation) string {
 	if op.ExternalID != "" {
 		return op.ExternalID
+	}
+	if _, single := deploymentTarget(op, ops); !single {
+		return ""
 	}
 	for _, sibling := range ops {
 		if sibling.Deployment == op.Deployment && sibling.ExternalID != "" {
@@ -184,10 +202,14 @@ func sectionExternalID(op ProgressOperation, ops []ProgressOperation) string {
 	return ""
 }
 
-func activeTablesForDeployment(tables []TableProgress, deployment string) []TableProgress {
+// activeTablesForMember selects the tables copied by one rollout member. Both
+// halves of the routing pair are matched: two targets of one deployment each
+// copy the same tables, and matching the deployment alone would list both
+// members' copies under each of them.
+func activeTablesForMember(tables []TableProgress, deployment, target string) []TableProgress {
 	activeTables := make([]TableProgress, 0, len(tables))
 	for _, table := range tables {
-		if table.Deployment == deployment && table.TableName != "" {
+		if table.Deployment == deployment && table.Target == target && table.TableName != "" {
 			activeTables = append(activeTables, table)
 		}
 	}
