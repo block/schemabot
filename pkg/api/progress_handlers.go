@@ -17,6 +17,7 @@ import (
 	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/ddl"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
@@ -246,7 +247,7 @@ func progressOperationResponseFromStorage(op *storage.ApplyOperation) *apitypes.
 	return resp
 }
 
-func (s *Service) progressOperationsForApply(ctx context.Context, apply *storage.Apply) ([]*apitypes.ProgressOperationResponse, map[int64]string, []*storage.ApplyOperation, error) {
+func (s *Service) progressOperationsForApply(ctx context.Context, apply *storage.Apply) ([]*apitypes.ProgressOperationResponse, map[int64]routing.ExecutionTarget, []*storage.ApplyOperation, error) {
 	if apply == nil {
 		return nil, nil, nil, fmt.Errorf("apply is required")
 	}
@@ -254,8 +255,8 @@ func (s *Service) progressOperationsForApply(ctx context.Context, apply *storage
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("list apply operations for apply %d (%s): %w", apply.ID, apply.ApplyIdentifier, err)
 	}
-	responses, deploymentByOperationID := progressOperationsFromRows(ops)
-	return responses, deploymentByOperationID, ops, nil
+	responses, memberByOperationID := progressOperationsFromRows(ops)
+	return responses, memberByOperationID, ops, nil
 }
 
 // resolveReleaseLatch best-effort reports whether a paused rollout has been
@@ -274,26 +275,28 @@ func (s *Service) resolveReleaseLatch(ctx context.Context, apply *storage.Apply,
 }
 
 // progressOperationsFromRows projects already-fetched operation rows into the
-// API response shape and the operation-id→deployment map. Keeping the
+// API response shape and the operation-id→member map. Keeping the
 // transformation separate from the storage read lets a single ListByApply
-// result feed both multi-operation detection and per-deployment enrichment on
-// the polled progress path.
-func progressOperationsFromRows(ops []*storage.ApplyOperation) ([]*apitypes.ProgressOperationResponse, map[int64]string) {
+// result feed both multi-operation detection and per-member enrichment on the
+// polled progress path. The map carries the whole routing pair rather than the
+// deployment alone, because a deployment can address several targets and a task
+// attributed to the deployment would not say which of them ran it.
+func progressOperationsFromRows(ops []*storage.ApplyOperation) ([]*apitypes.ProgressOperationResponse, map[int64]routing.ExecutionTarget) {
 	responses := make([]*apitypes.ProgressOperationResponse, 0, len(ops))
-	deploymentByOperationID := make(map[int64]string, len(ops))
+	memberByOperationID := make(map[int64]routing.ExecutionTarget, len(ops))
 	for _, op := range ops {
 		responses = append(responses, progressOperationResponseFromStorage(op))
-		deploymentByOperationID[op.ID] = op.Deployment
+		memberByOperationID[op.ID] = routing.ExecutionTarget{Deployment: op.Deployment, Target: op.Target}
 	}
-	return responses, deploymentByOperationID
+	return responses, memberByOperationID
 }
 
-func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *storage.Apply) ([]*apitypes.ProgressOperationResponse, map[int64]string, bool) {
+func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *storage.Apply) ([]*apitypes.ProgressOperationResponse, map[int64]routing.ExecutionTarget, bool) {
 	if apply == nil {
 		s.logger.Warn("progress response will omit per-deployment operations: apply is nil")
 		return nil, nil, false
 	}
-	operations, deploymentByOperationID, ops, err := s.progressOperationsForApply(ctx, apply)
+	operations, memberByOperationID, ops, err := s.progressOperationsForApply(ctx, apply)
 	if err != nil {
 		// Operation rows are observability enrichment, not an apply safety gate.
 		// Serve progress without the enrichment and log the storage uncertainty.
@@ -302,7 +305,7 @@ func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *stora
 				"error", err)...)
 		return nil, nil, false
 	}
-	return operations, deploymentByOperationID, s.resolveReleaseLatch(ctx, apply, ops)
+	return operations, memberByOperationID, s.resolveReleaseLatch(ctx, apply, ops)
 }
 
 // handleProgressByApplyID handles GET /api/progress/apply/{apply_id} requests.
@@ -504,7 +507,7 @@ func setRevertSkippedMetadata(resp *apitypes.ProgressResponse, apply *storage.Ap
 // resume state persisted on the apply's operation. Best-effort: a value already
 // set by the caller is never overwritten, and applies that predate resume-state
 // persistence simply render without these fields.
-func (s *Service) overlayStoredDisplayMetadata(ctx context.Context, resp *apitypes.ProgressResponse, apply *storage.Apply, operationIDs map[int64]string) {
+func (s *Service) overlayStoredDisplayMetadata(ctx context.Context, resp *apitypes.ProgressResponse, apply *storage.Apply, operationIDs map[int64]routing.ExecutionTarget) {
 	if apply == nil || apply.Engine != storage.EnginePlanetScale {
 		return
 	}
@@ -1157,10 +1160,10 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	}
 	overlayApplyOptions(httpResp, apply)
 	setRevertSkippedMetadata(httpResp, apply)
-	operations, deploymentByOperationID, released := s.bestEffortProgressOperations(ctx, apply)
+	operations, memberByOperationID, released := s.bestEffortProgressOperations(ctx, apply)
 	httpResp.Operations = operations
 	httpResp.Released = released
-	s.overlayStoredDisplayMetadata(ctx, httpResp, apply, deploymentByOperationID)
+	s.overlayStoredDisplayMetadata(ctx, httpResp, apply, memberByOperationID)
 
 	for _, task := range tasks {
 		tpr := &apitypes.TableProgressResponse{
@@ -1180,8 +1183,9 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 			TaskID:              task.TaskIdentifier,
 		}
 		if task.ApplyOperationID != nil {
-			if deployment, ok := deploymentByOperationID[*task.ApplyOperationID]; ok {
-				tpr.Deployment = deployment
+			if member, ok := memberByOperationID[*task.ApplyOperationID]; ok {
+				tpr.Deployment = member.Deployment
+				tpr.Target = member.Target
 			}
 		}
 		if task.StartedAt != nil {
