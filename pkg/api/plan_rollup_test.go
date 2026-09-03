@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/routing"
 )
 
 func rollupAlterUsers(ddl string) *ternv1.SchemaChange {
@@ -23,22 +24,38 @@ func rollupAlterUsers(ddl string) *ternv1.SchemaChange {
 }
 
 func rollupDeployment(name string, changes ...*ternv1.SchemaChange) DeploymentPlanDiff {
+	return rollupMember(name, name, changes...)
+}
+
+// rollupMember builds a diff for one rollout member, for cases where the
+// deployment and target differ.
+func rollupMember(deployment, target string, changes ...*ternv1.SchemaChange) DeploymentPlanDiff {
 	return DeploymentPlanDiff{
 		DatabaseType: "vitess",
-		Deployment:   name,
-		Target:       name,
+		Deployment:   deployment,
+		Target:       target,
 		Changes:      changes,
 	}
 }
 
-// rollupNames returns the deployment names of diffs in order, the expected
-// deployment contract PlanDeploymentDiffs would produce for them.
-func rollupNames(diffs []DeploymentPlanDiff) []string {
-	names := make([]string, len(diffs))
+// rollupMembers returns the rollout members of diffs in order, the expected
+// member contract PlanDeploymentDiffs would produce for them.
+func rollupMembers(diffs []DeploymentPlanDiff) []routing.ExecutionTarget {
+	members := make([]routing.ExecutionTarget, len(diffs))
 	for i, d := range diffs {
-		names[i] = d.Deployment
+		members[i] = routing.ExecutionTarget{Deployment: d.Deployment, Target: d.Target}
 	}
-	return names
+	return members
+}
+
+// rollupMemberList builds an expected member set from "deployment/target"
+// pairs, for contract cases that deliberately disagree with the diffs.
+func rollupMemberList(pairs ...[2]string) []routing.ExecutionTarget {
+	members := make([]routing.ExecutionTarget, len(pairs))
+	for i, p := range pairs {
+		members[i] = routing.ExecutionTarget{Deployment: p[0], Target: p[1]}
+	}
+	return members
 }
 
 // When every deployment would plan exactly the reviewed changes, the rollup is
@@ -50,7 +67,7 @@ func TestRollupDeploymentDiffs_AllMatchIsClean(t *testing.T) {
 		rollupDeployment("au", rollupAlterUsers(change)),
 		rollupDeployment("us", rollupAlterUsers(change)),
 	}
-	rollup, err := RollupDeploymentDiffs(diffs, rollupNames(diffs))
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
 	require.NoError(t, err)
 	assert.True(t, rollup.Clean)
 	require.Len(t, rollup.Entries, 3)
@@ -66,7 +83,7 @@ func TestRollupDeploymentDiffs_DivergenceBlocks(t *testing.T) {
 		rollupDeployment("eu", rollupAlterUsers("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")),
 		rollupDeployment("au", rollupAlterUsers("ALTER TABLE `users` ADD COLUMN `phone` varchar(255)")),
 	}
-	rollup, err := RollupDeploymentDiffs(diffs, rollupNames(diffs))
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
 	require.NoError(t, err)
 	assert.False(t, rollup.Clean)
 	assert.Equal(t, DeploymentMatch, rollup.Entries[0].Class)
@@ -84,7 +101,7 @@ func TestRollupDeploymentDiffs_ProducerErrorBlocks(t *testing.T) {
 		rollupDeployment("eu", rollupAlterUsers(change)),
 		errored,
 	}
-	rollup, err := RollupDeploymentDiffs(diffs, rollupNames(diffs))
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
 	require.NoError(t, err)
 	assert.False(t, rollup.Clean)
 	assert.Equal(t, DeploymentMatch, rollup.Entries[0].Class)
@@ -99,7 +116,7 @@ func TestRollupDeploymentDiffs_ComparisonErrorBlocks(t *testing.T) {
 		rollupDeployment("eu", rollupAlterUsers("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")),
 		rollupDeployment("au", rollupAlterUsers("not valid sql")),
 	}
-	rollup, err := RollupDeploymentDiffs(diffs, rollupNames(diffs))
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
 	require.NoError(t, err)
 	assert.False(t, rollup.Clean)
 	assert.Equal(t, DeploymentErrored, rollup.Entries[1].Class)
@@ -115,7 +132,7 @@ func TestRollupDeploymentDiffs_UnusablePrimaryBlocksAll(t *testing.T) {
 		primary,
 		rollupDeployment("au", rollupAlterUsers("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")),
 	}
-	rollup, err := RollupDeploymentDiffs(diffs, rollupNames(diffs))
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
 	require.NoError(t, err)
 	assert.False(t, rollup.Clean)
 	assert.Equal(t, DeploymentErrored, rollup.Entries[0].Class)
@@ -135,7 +152,7 @@ func TestRollupDeploymentDiffs_SingleDeploymentClean(t *testing.T) {
 	diffs := []DeploymentPlanDiff{
 		rollupDeployment("eu", rollupAlterUsers("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")),
 	}
-	rollup, err := RollupDeploymentDiffs(diffs, rollupNames(diffs))
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
 	require.NoError(t, err)
 	assert.True(t, rollup.Clean)
 	require.Len(t, rollup.Entries, 1)
@@ -149,7 +166,7 @@ func TestRollupDeploymentDiffs_MalformedSingleDeploymentBaselineBlocks(t *testin
 	diffs := []DeploymentPlanDiff{
 		rollupDeployment("eu", rollupAlterUsers("not valid sql")),
 	}
-	rollup, err := RollupDeploymentDiffs(diffs, rollupNames(diffs))
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
 	require.NoError(t, err)
 	assert.False(t, rollup.Clean)
 	require.Len(t, rollup.Entries, 1)
@@ -183,7 +200,7 @@ func TestRollupDeploymentDiffs_PostgresDialectClean(t *testing.T) {
 		rollupPostgresDeployment("eu", change()),
 		rollupPostgresDeployment("us", change()),
 	}
-	rollup, err := RollupDeploymentDiffs(diffs, rollupNames(diffs))
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
 	require.NoError(t, err)
 	assert.True(t, rollup.Clean)
 	require.Len(t, rollup.Entries, 2)
@@ -199,7 +216,7 @@ func TestRollupDeploymentDiffs_UnregisteredPrimaryDialectBlocks(t *testing.T) {
 	primary := rollupDeployment("eu", rollupAlterUsers("ALTER TABLE `users` ADD COLUMN `email` varchar(255)"))
 	primary.DatabaseType = "oracle"
 	diffs := []DeploymentPlanDiff{primary}
-	rollup, err := RollupDeploymentDiffs(diffs, rollupNames(diffs))
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
 	require.NoError(t, err)
 	assert.False(t, rollup.Clean)
 	require.Len(t, rollup.Entries, 1)
@@ -219,7 +236,7 @@ func TestRollupDeploymentDiffs_MySQLFamilyTypesShareDialect(t *testing.T) {
 		rollupDeployment("eu", rollupAlterUsers(change)),
 		mysqlDeployment,
 	}
-	rollup, err := RollupDeploymentDiffs(diffs, rollupNames(diffs))
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
 	require.NoError(t, err)
 	assert.True(t, rollup.Clean)
 	require.Len(t, rollup.Entries, 2)
@@ -236,7 +253,7 @@ func TestRollupDeploymentDiffs_MixedDialectBlocks(t *testing.T) {
 		rollupDeployment("eu", rollupAlterUsers("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")),
 		rollupPostgresDeployment("us", rollupAlterUsers("ALTER TABLE users ADD COLUMN email varchar(255)")),
 	}
-	rollup, err := RollupDeploymentDiffs(diffs, rollupNames(diffs))
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
 	require.NoError(t, err)
 	assert.False(t, rollup.Clean)
 	assert.Equal(t, DeploymentMatch, rollup.Entries[0].Class)
@@ -256,15 +273,42 @@ func TestRollupDeploymentDiffs_ContractMismatchErrors(t *testing.T) {
 	}
 
 	t.Run("wrong primary", func(t *testing.T) {
-		_, err := RollupDeploymentDiffs(diffs, []string{"au", "eu"})
+		_, err := RollupDeploymentDiffs(diffs, rollupMemberList([2]string{"au", "au"}, [2]string{"eu", "eu"}))
 		require.Error(t, err)
 	})
-	t.Run("missing deployment", func(t *testing.T) {
-		_, err := RollupDeploymentDiffs(diffs, []string{"eu", "au", "us"})
+	t.Run("missing member", func(t *testing.T) {
+		_, err := RollupDeploymentDiffs(diffs, rollupMemberList([2]string{"eu", "eu"}, [2]string{"au", "au"}, [2]string{"us", "us"}))
 		require.Error(t, err)
 	})
 	t.Run("extra diff", func(t *testing.T) {
-		_, err := RollupDeploymentDiffs(diffs, []string{"eu"})
+		_, err := RollupDeploymentDiffs(diffs, rollupMemberList([2]string{"eu", "eu"}))
 		require.Error(t, err)
+	})
+}
+
+// Members of one deployment are distinguished by their target, so a result
+// carrying the right deployments against the wrong targets is a contract
+// mismatch rather than a silent pass. Without the target half of the member
+// identity these two entries would be indistinguishable.
+func TestRollupDeploymentDiffs_SameDeploymentDifferentTargets(t *testing.T) {
+	change := "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
+	diffs := []DeploymentPlanDiff{
+		rollupMember("cake", "orders-001", rollupAlterUsers(change)),
+		rollupMember("cake", "orders-002", rollupAlterUsers(change)),
+	}
+
+	t.Run("matching members roll up clean", func(t *testing.T) {
+		rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs))
+		require.NoError(t, err)
+		assert.True(t, rollup.Clean)
+		require.Len(t, rollup.Entries, 2)
+		assert.Equal(t, "orders-001", rollup.Entries[0].Target)
+		assert.Equal(t, "orders-002", rollup.Entries[1].Target)
+	})
+
+	t.Run("swapped targets are a contract mismatch", func(t *testing.T) {
+		_, err := RollupDeploymentDiffs(diffs, rollupMemberList([2]string{"cake", "orders-002"}, [2]string{"cake", "orders-001"}))
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "cake/orders-001")
 	})
 }
