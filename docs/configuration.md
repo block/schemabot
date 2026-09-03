@@ -8,7 +8,7 @@
   - [Building DSNs from separate secrets](#building-dsns-from-separate-secrets)
   - [PostgreSQL `dsn_from` targets](#postgresql-dsn_from-targets)
 - [gRPC Mode](#grpc-mode)
-- [Multi-Deployment Environment (preview)](#multi-deployment-environment-preview)
+- [Multi-Deployment Environments](#multi-deployment-environments)
   - [Deployment Order](#deployment-order)
 - [Environment Order](#environment-order)
   - [Per-Database Environment Order](#per-database-environment-order)
@@ -215,11 +215,11 @@ In gRPC mode, `target` is an opaque identifier understood by the remote Tern ser
 
 The example above is a single SchemaBot deployment that owns both environments. In environment-isolated deployments, each SchemaBot config should contain only the targets for the environments that instance owns. Use `allowed_environments` to scope each instance.
 
-## Multi-Deployment Environment (preview)
+## Multi-Deployment Environments
 
-A single environment will eventually be able to fan out to multiple Tern deployments by replacing the scalar `target` / `deployment` pair with a `deployments` map. Each entry's key is a Tern deployment name (which MUST also exist as a key in `tern_deployments`), and each value carries the per-deployment `target`.
+A single environment can fan out to multiple Tern deployments by replacing the scalar `target` / `deployment` pair with a `deployments` map. Each entry's key is a Tern deployment name (which MUST also exist as a key in `tern_deployments`), and each value carries the per-deployment `target`.
 
-> **Not yet enabled in this release.** The config shape and resolver API are landed, but the plan/apply orchestration path still consumes a single deployment per `(database, environment)`. To prevent silent failures, `Validate()` currently rejects any `deployments` map with more than one entry. A single-entry map is accepted and behaves identically to the scalar `target` / `deployment` shape.
+> **Apply fans out across every deployment; review compares them against one plan.** `Validate()` accepts a `deployments` map with any number of entries, and `ResolveDatabaseTargets` returns one execution target per entry in rollout order. An apply resolves that whole set and creates one `apply_operations` row per deployment. The driver claims each row and sequences the rollout along `deployment_order` under the environment's `cutover_policy` and `on_failure` policies, control requests (stop, cutover, cancel) are recorded durably and consumed per operation, and progress, PR comments, and CLI output render per deployment. Review works differently by design: the plan reviewers see, and the plan SchemaBot persists and later applies from, is computed against the primary deployment only (the first entry in rollout order). The remaining deployments are diffed against that reviewed plan at review time with a non-persisting diff, and the plan check fails closed if any of them diverges or cannot be diffed. A multi-deployment environment is therefore gated on every deployment agreeing with one reviewed plan, not on one reviewed plan per deployment.
 
 ```yaml
 storage:
@@ -253,11 +253,11 @@ tern_deployments:
 
 Rules:
 
-- `deployments` is mutually exclusive with the scalar `target` / `deployment` fields and with a local `dsn` / `dsn_from`.
+- `deployments` is mutually exclusive with the scalar `target` / `deployment` fields and with a local `dsn` / `dsn_from`. Fan-out is a gRPC-mode shape: every key must resolve through `tern_deployments`, so an environment that executes against a local DSN cannot fan out.
 - The map MUST contain at least one entry, each entry MUST set a non-empty `target`, and each map key MUST resolve through `tern_deployments` with an endpoint configured for this environment.
 - Keys under `deployments:` must be lowercase; the server refuses to start otherwise.
-- Until the orchestration path is wired, the map MUST contain exactly one entry; multi-entry maps are rejected at config load.
-- Single-deployment environments should continue to use the scalar `target` / `deployment` shape.
+- A single-entry map is accepted and behaves identically to the scalar `target` / `deployment` shape. Single-deployment environments should continue to use the scalar shape.
+- `cutover_policy` and `on_failure` are only valid alongside a `deployments` map. `cutover_policy` accepts `rolling` (the default), `barrier`, or `parallel`; `on_failure` accepts `halt` (the default), `continue`, or `pause`. Both values are captured on every operation row when the apply is created, so the policy in force at that moment travels with the rollout.
 
 ### Deployment Order
 
