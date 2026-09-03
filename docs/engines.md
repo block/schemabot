@@ -6,6 +6,7 @@
 
 - [Capability matrix](#capability-matrix)
 - [Why the differences exist](#why-the-differences-exist)
+- [What GA asks of an engine](#what-ga-asks-of-an-engine)
 - [Load management](#load-management)
 - [Dropped tables](#dropped-tables)
 - [Reading further](#reading-further)
@@ -31,17 +32,18 @@ that holds; this page is a description of the present, not a contract.
 
 | | Spirit (MySQL) | PlanetScale (Vitess) | pg-sprite (PostgreSQL) |
 |---|---|---|---|
-| **Execution model** | copy and swap | deploy request, server-side | in-place DDL only |
-| **Changes needing a copy or rewrite** | yes | yes | blocked at plan time |
+| **Instant or in-place DDL** | yes, attempted first | yes, attempted first | yes, the only mode |
+| **Copy and swap** | yes, the fallback | yes, the fallback | no |
+| **Changes needing a copy or rewrite** | executed online | executed online | blocked at plan time |
 | **`stop` / `start`** | yes | yes | declined |
 | **`cutover`** | yes | yes | declined |
 | **Deferred cutover** | yes | no | no |
 | **`cancel`** | yes | yes | declined |
 | **`revert` / `skip-revert`** | no | yes | declined |
-| **Load-aware throttling** | yes, reported live | yes, managed by Vitess | no, bounded instead |
+| **Load-aware throttling** | automatic, on live target signals | manual, configured on the cluster | none, statements bounded instead |
 | **Adaptive pacing** | yes | no | no |
-| **Drop recovery window** | opt-in quarantine | native table lifecycle | none |
-| **Progress authority** | instance-local | externally authoritative | instance-local |
+| **Dropped-table recovery** | opt-in quarantine, expires | inside the revert window, expires | none |
+| **Who reports progress** | the process running the change | the cluster, so any instance can read it | the process running the change |
 
 "Declined" means the operation resolves to a typed, terminal unsupported-operation error rather
 than hanging, silently dropping, or reporting a success that did not happen. The request is still
@@ -50,42 +52,76 @@ recorded durably before it is acknowledged. That distinction is the subject of C
 
 ## Why the differences exist
 
-Almost everything in that table follows from the execution model, so it is worth reading the
-first row before the rest.
+Almost everything below the first three rows follows from them, so they are worth reading first.
 
-**Copy and swap** builds a new table, backfills it, keeps it in sync, and swaps it in. This is
-what makes a large table changeable without a long lock, and it is why the change is a
-long-running process with phases you can act on: there is something in flight to pause, to pace,
-and to cut over deliberately.
+**Instant and in-place DDL** is the cheap path, and both MySQL-family engines take it when they
+can. Some changes are metadata-only: adding a column at the end of a table does not have to touch
+the rows. Spirit asserts `ALGORITHM=INSTANT` and then a known-safe `ALGORITHM=INPLACE` before it
+considers doing anything heavier, and Vitess performs the same analysis for a deploy request. When
+that succeeds the change is over in milliseconds, and none of the control operations below are
+reachable, because there is nothing in flight to control.
 
-**A deploy request** is also a copy underneath, but it lives on the server rather than in the
-process watching it. It therefore survives the watcher restarting, which is why its progress is
-authoritative no matter which instance answers, and why it can offer a revert window after
-cutover: the old table is still there, under the provider's control.
+**Copy and swap** is the fallback when the cheap path is not available. It builds a new table,
+backfills it, keeps it in sync with ongoing writes, and swaps it in. That is what makes a large
+table changeable without a long lock, and it is why such a change is a long-running process with
+phases you can act on: there is something in flight to pause, to pace, and to cut over
+deliberately. Every control operation in the table exists because of it.
 
-**In-place DDL** has no copy at all. Each statement runs as its own transaction that either
-commits or fails. There is nothing to pause, nothing to cut over, and no window in which the
-previous state still exists, which is why the whole control family is declined rather than
+Where the copy runs is the second-order difference, and it decides who can answer questions about
+it. A Spirit copy runs inside the SchemaBot process driving the apply, so that process is the only
+thing that knows how far along it is; if it dies, the replacement resumes from a checkpoint. A
+deploy request runs on the cluster instead. It survives the process watching it, and any instance
+can ask the cluster where it has got to and get the same answer. That is also why only Vitess has
+a revert window: after cutover the old table is still there, held by the cluster, until the window
+expires.
+
+**pg-sprite has no copy at all.** Each statement runs as its own transaction that either commits
+or fails. There is nothing to pause, nothing to cut over, and no window in which the previous
+state still exists, which is why the whole control family is declined rather than
 half-implemented. Protection comes from refusing the work instead: a change that would require a
 copy or a rewrite is blocked at plan time, and what does run is bounded by lock and statement
 budgets rather than paced.
 
+## What GA asks of an engine
+
+[invariants.md](invariants.md) defines **GA** as an engine that upholds every invariant in the
+registry. Read off the matrix above, that comes down to two things.
+
+**Copy and swap.** An engine limited to what the database will do in place cannot execute a large
+table's change at all, so a real schema's harder changes get blocked rather than run. Being able
+to fall back to a copy is what makes the engine's envelope the whole schema rather than the easy
+part of it.
+
+**The core control operations: `stop`, `start`, `cutover`, and `cancel`.** A copy is long-running
+by nature, which means an operator will eventually need to pause one, hold one short of cutover,
+or abandon one, and the moment they need it is usually the moment the database is already in
+trouble. An engine that can start a copy but not manage one in flight hands the operator a
+process they can only wait out.
+
+`revert` and `skip-revert` are deliberately **not** on that list. They depend on the old table
+still existing after cutover, which is a property of where the change runs rather than of how
+complete the engine is, and the MySQL engine is GA without them. Everything else in the matrix
+is a difference rather than a gap: adaptive pacing, deferred cutover, and a drop quarantine each
+make an engine better on its own axis, and an engine missing one is not thereby below the bar.
+
 ## Load management
 
-The engines that copy do not run flat out. They watch the target and back off when it is under
-pressure, but the mechanisms and their defaults are the engine's, configured there rather than in
-SchemaBot.
+Only a copy has a rate to manage, so throttling is a property of the two engines that copy and the
+third bounds its statements instead. In every case the mechanism belongs to the engine rather than
+to SchemaBot.
 
-**Spirit** throttles on live signals from the target and reports both the fact and the reason
-back through progress, so a throttled change is visible in the PR comment and the CLI rather than
-just slow. On Aurora it additionally uses signals that are continuous rather than a binary stop or
-go, which lets the copier steer on them: it sizes its own chunks and write concurrency against how
-the target is responding, backing off under load and taking more headroom when there is some. Not
-every signal is suitable for this. Replication lag deliberately is not, because lag is a budget to
-stay within rather than a gauge to optimize against, and steering on it would park replicas behind.
+**Spirit** does it automatically. It watches live signals from the target, backs off when they say
+the database is under pressure, and reports both the fact and the reason back through progress, so
+a throttled change shows up as throttled in the PR comment and the CLI rather than just as slow.
+On Aurora it additionally uses signals that are continuous rather than a binary stop or go, which
+lets the copier steer on them: it sizes its own chunks and write concurrency against how the target
+is responding, backing off under load and taking more headroom when there is some. Not every signal
+is suitable for that. Replication lag deliberately is not, because lag is a budget to stay within
+rather than a gauge to optimize against, and steering on it would park replicas behind.
 
-**PlanetScale** throttling is handled by Vitess on the server side, on the same lag-based
-mechanism that governs the rest of the cluster's background work.
+**PlanetScale** does not. Throttling there is a cluster-level setting an operator configures ahead
+of time, and it governs the deploy request the same way it governs the cluster's other background
+work. SchemaBot does not adjust it, and there is nothing per-apply to tune.
 
 **pg-sprite** does not throttle, because there is no long-running copy whose rate could be
 adjusted. A statement is bounded instead: it gets a lock budget and a statement budget with
@@ -99,18 +135,21 @@ change will contend for, and the protection you actually get is the engine's, no
 ## Dropped tables
 
 A `DROP TABLE` requires explicit approval on every engine, which is the part that always holds
-(RV-3). Whether the data survives the drop is engine-specific:
+(RV-3). Whether the data outlives the drop, and for how long, is engine-specific:
 
 - **Spirit** can quarantine the table instead of dropping it, renaming it into a holding area
-  with a timestamp so it can be recovered until it ages out. This is **opt-in and off unless
-  enabled** in server config, so an unconfigured deployment executes the drop and the data is
-  gone. See [pending-drops.md](pending-drops.md).
-- **PlanetScale** rides Vitess's native table lifecycle, which holds dropped tables before
-  purging them.
+  with a timestamp. This is **opt-in and off unless enabled** in server config, so an
+  unconfigured deployment executes the drop and the data is gone immediately. Where it is
+  enabled, the table is held until it ages out and is then dropped for real. See
+  [pending-drops.md](pending-drops.md).
+- **PlanetScale** has no separate mechanism for this. A dropped table is recoverable because the
+  drop is revertible like any other deploy request, so the recovery window is the revert window,
+  and it ends the same way: once the window expires the table is purged.
 - **pg-sprite** has no equivalent. A dropped table is dropped.
 
-Nothing here is a backup system. The consent gate is the protection to rely on; the recovery
-window is a second chance where it happens to exist.
+So on two of the three there is a window, and on all three the window closes. Nothing here is a
+backup system. The consent gate is the protection to rely on; the window is a second chance to
+notice, not a place to store data.
 
 ## Reading further
 

@@ -174,6 +174,11 @@ and still resolves to an explicit terminal outcome (CO-2), specifically a typed
 unsupported-operation decline rather than a silent drop, a false success, or an unbounded retry.
 That is the difference between an unfinished engine and an unsafe one.
 
+Cashed out in engine capabilities, the bar is copy and swap plus the core control operations
+(`stop`, `start`, `cutover`, `cancel`); `revert` and `skip-revert` are not part of it, because
+they depend on where the change runs rather than on how complete the engine is.
+[engines.md](engines.md) works through why, and is the per-engine picture generally.
+
 Where an engine's envelope is still moving, its own doc is the authority on where the boundary
 currently sits rather than this one. [postgresql.md](postgresql.md) is that doc for PostgreSQL,
 and is worth reading before pointing SchemaBot at a PostgreSQL database.
