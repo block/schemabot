@@ -49,6 +49,20 @@ func TestEnginePullSchema(t *testing.T) {
 	assert.Contains(t, response.Namespaces["app"].Tables["accounts"], "accounts_balance_idx")
 }
 
+// TestEnginePullSchemaRejectsMissingSchema proves a request for a schema that
+// does not exist fails instead of producing an empty baseline that a typo
+// could be mistaken for a schema with no tables.
+func TestEnginePullSchemaRejectsMissingSchema(t *testing.T) {
+	dsn, _ := testutil.StartPostgres(t, "pull_missing_test")
+
+	eng := NewForTarget(0, "pull_missing_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "missing"})
+
+	require.Error(t, err)
+	assert.Nil(t, response)
+	assert.Contains(t, err.Error(), `schema "missing" does not exist`)
+}
+
 // TestEnginePullSchemaAggregatesUnrenderableTables proves a pull never returns
 // a partial baseline and identifies every table that needs manual resolution.
 func TestEnginePullSchemaAggregatesUnrenderableTables(t *testing.T) {

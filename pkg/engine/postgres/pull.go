@@ -8,7 +8,6 @@ import (
 	"github.com/block/pg-sprite/pkg/dbconn"
 	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/block/schemabot/pkg/postgresconn"
@@ -20,6 +19,8 @@ const listPostgresSchemas = `
 SELECT nspname
 FROM pg_namespace
 ORDER BY nspname`
+
+const postgresSchemaExists = `SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)`
 
 const listPostgresTables = `
 SELECT c.relname
@@ -111,6 +112,13 @@ func pullNamespaces(ctx context.Context, pool *pgxpool.Pool, requested string) (
 		if schema.IsReservedPullNamespaceForDialect(schema.DialectPostgres, requested) {
 			return nil, fmt.Errorf("schema %q is reserved and cannot be pulled", requested)
 		}
+		var exists bool
+		if err := pool.QueryRow(ctx, postgresSchemaExists, requested).Scan(&exists); err != nil {
+			return nil, fmt.Errorf("check PostgreSQL schema %q exists: %w", requested, err)
+		}
+		if !exists {
+			return nil, fmt.Errorf("schema %q does not exist", requested)
+		}
 		return []string{requested}, nil
 	}
 	rows, err := pool.Query(ctx, listPostgresSchemas)
@@ -137,7 +145,7 @@ func pullNamespaces(ctx context.Context, pool *pgxpool.Pool, requested string) (
 func pullTables(ctx context.Context, pool *pgxpool.Pool, namespace string) ([]string, error) {
 	rows, err := pool.Query(ctx, listPostgresTables, namespace)
 	if err != nil {
-		return nil, fmt.Errorf("query PostgreSQL tables in schema %s: %w", pgx.Identifier{namespace}.Sanitize(), err)
+		return nil, fmt.Errorf("query PostgreSQL tables in schema %q: %w", namespace, err)
 	}
 	defer rows.Close()
 	var tables []string
