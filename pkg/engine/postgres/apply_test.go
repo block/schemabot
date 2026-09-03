@@ -396,6 +396,36 @@ func TestValidateOptimisticApplyRefusesNonNativeShape(t *testing.T) {
 	assert.Contains(t, err.Error(), "does not execute this statement shape yet")
 }
 
+func TestValidateOptimisticApplyAcceptsCreateSet(t *testing.T) {
+	req := &engine.ApplyRequest{
+		Database: "app",
+		Changes: []engine.SchemaChange{{Namespace: "public", TableChanges: []engine.TableChange{{
+			Table: "widgets",
+			DDL:   "CREATE TABLE public.widgets (id bigint PRIMARY KEY, name text);\nCREATE UNIQUE INDEX widgets_name_key ON public.widgets (name)",
+		}}}},
+		Credentials: &engine.Credentials{DSN: "postgres://localhost/app"},
+	}
+
+	change, err := validateOptimisticApply(req)
+	require.NoError(t, err)
+	assert.Equal(t, req.Changes[0].TableChanges[0].DDL, change.sql)
+}
+
+func TestValidateOptimisticApplyRefusesMixedCreateScript(t *testing.T) {
+	req := &engine.ApplyRequest{
+		Database: "app",
+		Changes: []engine.SchemaChange{{Namespace: "public", TableChanges: []engine.TableChange{{
+			Table: "widgets",
+			DDL:   "CREATE TABLE public.widgets (id bigint PRIMARY KEY);\nALTER TABLE public.widgets ADD COLUMN name text",
+		}}}},
+		Credentials: &engine.Credentials{DSN: "postgres://localhost/app"},
+	}
+
+	_, err := validateOptimisticApply(req)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must be a CREATE TABLE followed only by CREATE INDEX")
+}
+
 // The apply pool inherits the CA bundle the acceptance path resolved; a
 // bundle that disappears between acceptance and execution fails the pool
 // build closed, before any statement is attempted.

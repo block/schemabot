@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -235,6 +236,64 @@ func TestEngineApplyCreateTable(t *testing.T) {
 		WHERE table_schema = 'public' AND table_name = 'widgets' AND column_name = 'name')`).Scan(&exists)
 	require.NoError(t, err)
 	assert.True(t, exists)
+}
+
+// TestEngineApplyGreenfieldCreateSet proves a new table and its declared indexes
+// execute as one unit before the table can carry traffic, then converge cleanly.
+func TestEngineApplyGreenfieldCreateSet(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "create_set_test")
+	desired := "CREATE TABLE widgets (id bigint PRIMARY KEY, name text); CREATE UNIQUE INDEX widgets_name_key ON widgets (name); CREATE INDEX widgets_id_idx ON widgets (id);"
+	planRequest := &engine.PlanRequest{
+		Database:    "create_set_test",
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{"widgets.sql": desired}}},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	eng := New()
+	plan, err := eng.Plan(t.Context(), planRequest)
+	require.NoError(t, err)
+	require.Len(t, plan.Changes, 1)
+	require.Len(t, plan.Changes[0].TableChanges, 1)
+	change := plan.Changes[0].TableChanges[0]
+	assert.Empty(t, change.ExecutionMode)
+	assert.Contains(t, change.DDL, ";\nCREATE UNIQUE INDEX widgets_name_key")
+	assert.Contains(t, change.DDL, ";\nCREATE INDEX widgets_id_idx")
+
+	result, err := eng.Apply(t.Context(), applyRequest(dsn, "widgets", change.DDL))
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	progress := awaitPostgresProgress(t, eng, "widgets")
+	assert.Equal(t, engine.StateCompleted, progress.State)
+
+	rows, err := db.QueryContext(t.Context(), "SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND tablename = 'widgets' ORDER BY indexname")
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rows)
+	var indexes []string
+	for rows.Next() {
+		var index string
+		require.NoError(t, rows.Scan(&index))
+		indexes = append(indexes, index)
+	}
+	require.NoError(t, rows.Err())
+	assert.Equal(t, []string{"widgets_id_idx", "widgets_name_key", "widgets_pkey"}, indexes)
+
+	converged, err := eng.Plan(t.Context(), planRequest)
+	require.NoError(t, err)
+	assert.True(t, converged.NoChanges)
+}
+
+// TestEngineApplyCreateSetDuplicateNameRefusal proves name ownership across the
+// table and index declarations is validated before any object is created.
+func TestEngineApplyCreateSetDuplicateNameRefusal(t *testing.T) {
+	dsn, _ := testutil.StartPostgres(t, "duplicate_create_name_test")
+	eng := New()
+	_, err := eng.Apply(t.Context(), applyRequest(dsn, "widgets",
+		"CREATE TABLE public.widgets (id int PRIMARY KEY);\nCREATE INDEX widgets_pkey ON public.widgets (id)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "widgets")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.Contains(t, progress.ErrorMessage, "claims the same relation name twice")
 }
 
 // TestEngineApplyCreateCollisionRefusal proves a CREATE TABLE whose name is

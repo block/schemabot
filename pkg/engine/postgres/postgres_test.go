@@ -124,8 +124,10 @@ func TestTableChangesMapsDestructiveSafety(t *testing.T) {
 func TestTableChangesRendersOrderedExecutionSteps(t *testing.T) {
 	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
 	require.NoError(t, err)
+	exists := true
 	report := pgplan.NewReport(pgplan.SourceDiff)
 	report.Table = "users"
+	report.TableExists = &exists
 	report.Statements = []pgplan.Statement{{
 		SQL:         "ALTER TABLE public.users ADD COLUMN email text",
 		Route:       planner.RouteNative,
@@ -150,6 +152,53 @@ func TestTableChangesRendersOrderedExecutionSteps(t *testing.T) {
 	assert.Equal(t, preflight.TierAlterInPlace, tiers[0],
 		"an in-place ALTER needs only owner membership, never the index tier's schema CREATE")
 	assert.Equal(t, preflight.TierIndexBuild, tiers[1])
+}
+
+func TestTableChangesCollapsesGreenfieldCreateSet(t *testing.T) {
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+	exists := false
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "widgets"
+	report.TableExists = &exists
+	report.Statements = []pgplan.Statement{
+		{SQL: "CREATE TABLE public.widgets (id bigint PRIMARY KEY, name text)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionExecute, ExecSQL: []string{"CREATE TABLE public.widgets (id bigint PRIMARY KEY, name text)"}},
+		{SQL: "CREATE UNIQUE INDEX widgets_name_key ON public.widgets (name)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionExecute, ExecSQL: []string{"CREATE UNIQUE INDEX CONCURRENTLY widgets_name_key ON public.widgets (name)"}},
+		{SQL: "CREATE INDEX widgets_id_idx ON public.widgets (id)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionExecute, ExecSQL: []string{"CREATE INDEX CONCURRENTLY widgets_id_idx ON public.widgets (id)"}},
+	}
+
+	changes, tiers, err := tableChanges(report, parser)
+	require.NoError(t, err)
+	require.Len(t, changes, 1)
+	assert.Equal(t, "CREATE TABLE public.widgets (id bigint PRIMARY KEY, name text);\nCREATE UNIQUE INDEX widgets_name_key ON public.widgets (name);\nCREATE INDEX widgets_id_idx ON public.widgets (id)", changes[0].DDL)
+	assert.Equal(t, "widgets", changes[0].Table)
+	assert.Equal(t, ddl.StatementCreateTable, changes[0].Operation)
+	assert.False(t, changes[0].IsUnsafe)
+	assert.Empty(t, changes[0].ExecutionMode)
+	require.Equal(t, []preflight.Tier{preflight.TierCreateTable}, tiers)
+}
+
+func TestTableChangesKeepsGreenfieldVerdictsPerStatement(t *testing.T) {
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+	exists := false
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "widgets"
+	report.TableExists = &exists
+	report.Statements = []pgplan.Statement{
+		{SQL: "CREATE TABLE public.widgets (id bigint PRIMARY KEY, name text)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionExecute, ExecSQL: []string{"CREATE TABLE public.widgets (id bigint PRIMARY KEY, name text)"}},
+		{SQL: "CREATE INDEX widgets_name_idx ON public.widgets (name)", Route: planner.RouteCopyAndSwap, Backend: router.BackendCopyAndSwap, Disposition: router.DispositionUnavailable},
+		{SQL: "CREATE INDEX widgets_id_idx ON public.widgets (id)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionExecute, ExecSQL: []string{"CREATE INDEX CONCURRENTLY widgets_id_idx ON public.widgets (id)"}},
+	}
+
+	changes, tiers, err := tableChanges(report, parser)
+	require.NoError(t, err)
+	require.Len(t, changes, 3)
+	blockAbsentTableDependents(changes, tiers, report.Table)
+	assert.Empty(t, changes[0].ExecutionMode)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[2].ExecutionMode)
+	assert.Contains(t, changes[2].ModeReason, "depends on the statement that creates it")
 }
 
 func TestTableChangesMixedVerdictsFailClosedPerStatement(t *testing.T) {

@@ -8,6 +8,7 @@ import (
 	"maps"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -17,7 +18,9 @@ import (
 	"github.com/block/pg-sprite/pkg/preflight"
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/schema"
 )
 
 const (
@@ -125,10 +128,26 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	// The same tier derivation runs again inside the background apply; this
 	// synchronous check exists so a statement shape the native-safe path
 	// cannot execute is refused at acceptance, before any work is queued.
-	if _, err := preflight.RequiredTier([]string{tc.DDL}); err != nil {
+	statements, err := postgresCreateSetStatements(tc.DDL)
+	if err != nil {
+		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: %w", tc.Table, err)
+	}
+	if _, err := preflight.RequiredTier(statements); err != nil {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: SchemaBot's PostgreSQL support does not execute this statement shape yet", tc.Table)
 	}
 	return nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL}, nil
+}
+
+func postgresCreateSetStatements(script string) ([]string, error) {
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	if err != nil {
+		return nil, fmt.Errorf("select PostgreSQL statement parser: %w", err)
+	}
+	statements, err := ddl.CreateSetStatements(parser, script)
+	if err != nil {
+		return nil, fmt.Errorf("admit PostgreSQL DDL script: %w", err)
+	}
+	return statements, nil
 }
 
 func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change nativeApply, key string, started time.Time, logger *slog.Logger) {
@@ -382,7 +401,11 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	}
 	defer pool.Close()
 
-	tier, err := preflight.RequiredTier([]string{change.sql})
+	statements, err := postgresCreateSetStatements(change.sql)
+	if err != nil {
+		return fmt.Errorf("parse planned PostgreSQL DDL for table %q: %w", change.table, err)
+	}
+	tier, err := preflight.RequiredTier(statements)
 	if err != nil {
 		return fmt.Errorf("derive privilege tier for table %q: %w", change.table, err)
 	}
@@ -390,9 +413,12 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		// The off-ladder create tier has its own preflight sequence: the
 		// ladder checks below state facts about an existing table, and a
 		// greenfield target has none.
-		return executeCreate(ctx, pool, change)
+		return executeCreate(ctx, pool, change, statements)
 	}
-	statement, err := pgstatement.ParseOne(change.sql)
+	if len(statements) != 1 {
+		return fmt.Errorf("execute PostgreSQL table %q: privilege tier %s requires exactly one statement, got %d", change.table, tier, len(statements))
+	}
+	statement, err := pgstatement.ParseOne(statements[0])
 	if err != nil {
 		return fmt.Errorf("parse planned PostgreSQL statement for table %q: %w", change.table, err)
 	}
@@ -437,22 +463,26 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	return nil
 }
 
-// executeCreate runs one greenfield CREATE TABLE through pg-sprite's create
-// path: parse the desired shape, prove the role can create in the schema,
+// executeCreate runs a greenfield create set through pg-sprite's create path:
+// parse the table and its declared indexes, prove the role can create in the schema,
 // prove the name is free, then execute — both proofs minted here, in the
 // session that executes, because absence or privilege at plan time proves
 // nothing about apply time. The table size gate deliberately does not run:
 // it bounds rewrites of existing data, and a table that does not exist yet
 // has none.
-func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply) error {
-	// The planned statement arrives schema-qualified; the desired-schema
+func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, statements []string) error {
+	// The planned statements arrive schema-qualified; the desired-schema
 	// contract wants the unqualified form and the executor pins the schema
 	// from the absence proof instead.
-	unqualified, err := pgstatement.Qualify(change.sql, "")
-	if err != nil {
-		return fmt.Errorf("render planned CREATE TABLE for table %q in unqualified form: %w", change.table, err)
+	unqualified := make([]string, len(statements))
+	for i, statement := range statements {
+		var err error
+		unqualified[i], err = pgstatement.Qualify(statement, "")
+		if err != nil {
+			return fmt.Errorf("render planned create statement %d for table %q in unqualified form: %w", i+1, change.table, err)
+		}
 	}
-	desired, err := pgstatement.ParseDesired(unqualified)
+	desired, err := pgstatement.ParseDesired(strings.Join(unqualified, ";\n"))
 	if err != nil {
 		return fmt.Errorf("parse planned CREATE TABLE for table %q: %w", change.table, err)
 	}
@@ -525,6 +555,7 @@ func progressResult(state engine.State, phase string, started time.Time, change 
 		ErrorMessage: detail,
 		Metadata: map[string]string{
 			"phase": phase, "elapsed": time.Since(started).Round(time.Millisecond).String(),
+			// A create set is one apply unit: the table and its indexes become visible together.
 			"step": "1", "steps_total": "1",
 		},
 		Tables: []engine.TableProgress{{
