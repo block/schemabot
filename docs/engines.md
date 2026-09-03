@@ -43,7 +43,7 @@ engines gain features. If the two ever disagree, invariants.md is the one that h
 | **`cutover`, including deferring it** | yes | yes | planned |
 | **`cancel`** | yes | yes | planned |
 | **`revert` / `skip-revert`** | no | yes | not planned |
-| **Load-aware throttling** | automatic, on live target signals | no, a configured threshold that admits or rejects | planned; statements bounded meanwhile |
+| **Throttling** | automatic, on live target signals | a configured threshold that admits or rejects | planned; statements bounded meanwhile |
 | **Adaptive pacing** | yes | no | not applicable, no copy to pace |
 | **Dropped-table recovery** | opt-in quarantine, expires | inside the revert window, expires | not applicable, a drop is blocked at plan time |
 | **Who reports progress** | the process running the change | the cluster, so any instance can read it | the process running the change |
