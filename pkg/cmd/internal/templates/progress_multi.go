@@ -138,7 +138,7 @@ func writeDeploymentProgressSection(deployment presentation.Deployment, op Progr
 		fmt.Printf("  %s%s%s\n", ANSIRed, deployment.Error, ANSIReset)
 	}
 
-	tables := activeTablesForDeployment(data.Tables, deployment.Deployment)
+	tables := activeTablesForMember(data.Tables, deployment.Deployment, deployment.Target)
 	if len(tables) > 0 && !state.IsSetupPhase(data.State) {
 		sortActiveTables(tables)
 		if hasTableNamespaces(tables) {
@@ -159,7 +159,8 @@ func sectionTarget(op ProgressOperation, ops []ProgressOperation) string {
 	if op.Target != "" {
 		return op.Target
 	}
-	return sharedAcrossDeployment(op, ops, func(o ProgressOperation) string { return o.Target })
+	target, _ := sharedAcrossDeployment(op, ops, func(o ProgressOperation) string { return o.Target })
+	return target
 }
 
 // SectionExternalID resolves the external apply ID shown for a rollout member:
@@ -167,15 +168,27 @@ func sectionTarget(op ProgressOperation, ops []ProgressOperation) string {
 // shares. It is exported because the progress renderer and the watch TUI both
 // label a member with it, and a member must not be told two different apply IDs
 // depending on which surface an operator is reading.
+//
+// The fallback is gated on the deployment addressing a single target, not on
+// the IDs themselves agreeing. A deployment addressing several targets runs a
+// separate data-plane apply per member, so the first member to dispatch is the
+// only one carrying an ID at all: agreement among the IDs present would be
+// vacuously true and would hand that ID to every member still waiting.
 func SectionExternalID(op ProgressOperation, ops []ProgressOperation) string {
 	if op.ExternalID != "" {
 		return op.ExternalID
 	}
-	return sharedAcrossDeployment(op, ops, func(o ProgressOperation) string { return o.ExternalID })
+	if _, single := sharedAcrossDeployment(op, ops, func(o ProgressOperation) string { return o.Target }); !single {
+		return ""
+	}
+	externalID, _ := sharedAcrossDeployment(op, ops, func(o ProgressOperation) string { return o.ExternalID })
+	return externalID
 }
 
 // sharedAcrossDeployment returns the value every operation of op's deployment
-// agrees on, and "" when they carry more than one.
+// agrees on, and reports whether they agree. Operations carrying no value at
+// all agree with anything: a value none of them has recorded yet is not a
+// disagreement.
 //
 // A keyed apply runs several operations of one deployment against one target
 // and through one data-plane apply, so an operation that has not dispatched yet
@@ -184,8 +197,7 @@ func SectionExternalID(op ProgressOperation, ops []ProgressOperation) string {
 // target's apply, telling an operator to go look at a member they are not
 // watching. Showing nothing is the honest answer, and it resolves on the next
 // poll once the operation dispatches and carries its own.
-func sharedAcrossDeployment(op ProgressOperation, ops []ProgressOperation, valueOf func(ProgressOperation) string) string {
-	shared := ""
+func sharedAcrossDeployment(op ProgressOperation, ops []ProgressOperation, valueOf func(ProgressOperation) string) (shared string, agreed bool) {
 	for _, sibling := range ops {
 		if sibling.Deployment != op.Deployment {
 			continue
@@ -195,17 +207,21 @@ func sharedAcrossDeployment(op ProgressOperation, ops []ProgressOperation, value
 			continue
 		}
 		if shared != "" && shared != value {
-			return ""
+			return "", false
 		}
 		shared = value
 	}
-	return shared
+	return shared, true
 }
 
-func activeTablesForDeployment(tables []TableProgress, deployment string) []TableProgress {
+// activeTablesForMember selects the tables copied by one rollout member. Both
+// halves of the routing pair are matched: two targets of one deployment each
+// copy the same tables, and matching the deployment alone would list both
+// members' copies under each of them.
+func activeTablesForMember(tables []TableProgress, deployment, target string) []TableProgress {
 	activeTables := make([]TableProgress, 0, len(tables))
 	for _, table := range tables {
-		if table.Deployment == deployment && table.TableName != "" {
+		if table.Deployment == deployment && table.Target == target && table.TableName != "" {
 			activeTables = append(activeTables, table)
 		}
 	}

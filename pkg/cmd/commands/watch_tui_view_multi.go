@@ -110,7 +110,7 @@ func (m WatchModel) writeDeploymentSection(b *strings.Builder, deployment presen
 		fmt.Fprintf(b, "  %s\n", errStyle.Render(deployment.Error))
 	}
 
-	tables := tablesForDeployment(m.tables, deployment.Deployment)
+	tables := tablesForMember(m.tables, deployment.Deployment, deployment.Target)
 	if len(tables) > 0 && !state.IsSetupPhase(m.state) {
 		sortTablesByProgress(tables)
 		m.renderTables(b, tables)
@@ -118,14 +118,18 @@ func (m WatchModel) writeDeploymentSection(b *strings.Builder, deployment presen
 	b.WriteString("\n")
 }
 
-func tablesForDeployment(tables []templates.TableProgress, deployment string) []templates.TableProgress {
-	deploymentTables := make([]templates.TableProgress, 0, len(tables))
+// tablesForMember selects the tables copied by one rollout member. Both halves
+// of the routing pair are matched: two targets of one deployment each copy the
+// same tables, and matching the deployment alone would list both members'
+// copies under each of them.
+func tablesForMember(tables []templates.TableProgress, deployment, target string) []templates.TableProgress {
+	memberTables := make([]templates.TableProgress, 0, len(tables))
 	for _, table := range tables {
-		if table.Deployment == deployment && table.TableName != "" {
-			deploymentTables = append(deploymentTables, table)
+		if table.Deployment == deployment && table.Target == target && table.TableName != "" {
+			memberTables = append(memberTables, table)
 		}
 	}
-	return deploymentTables
+	return memberTables
 }
 
 func (m WatchModel) writeMultiDeploymentFooter(b *strings.Builder, model presentation.Apply) {
