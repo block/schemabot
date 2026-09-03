@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -58,31 +59,35 @@ type PlanRollup struct {
 	Clean   bool
 }
 
-// RollupDeploymentDiffs classifies each deployment's review-time diff against the
-// reviewed primary plan and reports whether the rollup is clean.
+// RollupDeploymentDiffs classifies each rollout member's review-time diff
+// against the reviewed primary plan and reports whether the rollup is clean.
 //
-// expectedDeployments is the configured deployment set in rollout order, primary
-// first — the same order PlanDeploymentDiffs produces. The diffs must match it
-// positionally: this turns the producer's structural convention (primary first,
-// one entry per configured deployment) into an enforced contract, so a
-// reordered, short, or otherwise mismatched result is rejected rather than
-// letting a missing or misidentified deployment silently pass the gate.
+// expectedMembers is the configured member set in rollout order, primary first
+// — the same order PlanDeploymentDiffs produces. The diffs must match it
+// positionally on both deployment and target: this turns the producer's
+// structural convention (primary first, one entry per configured member) into
+// an enforced contract, so a reordered, short, or otherwise mismatched result
+// is rejected rather than letting a missing or misidentified member silently
+// pass the gate. Matching on the deployment alone would not be enough, because
+// one deployment can address several targets and they would be
+// indistinguishable.
 //
 // The primary (index 0) is the reviewed baseline and classifies Match against
-// itself; every other deployment is compared to it with tern.CompareChangeSets.
+// itself; every other member is compared to it with tern.CompareChangeSets.
 // The result fails closed: a contract mismatch, a primary baseline that errored
-// or is otherwise unusable, or any deployment that errored or diverged makes the
+// or is otherwise unusable, or any member that errored or diverged makes the
 // rollup not Clean.
-func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedDeployments []string) (PlanRollup, error) {
-	if len(expectedDeployments) == 0 {
-		return PlanRollup{}, fmt.Errorf("no expected deployments to roll up")
+func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing.ExecutionTarget) (PlanRollup, error) {
+	if len(expectedMembers) == 0 {
+		return PlanRollup{}, fmt.Errorf("no expected rollout members to roll up")
 	}
-	if len(diffs) != len(expectedDeployments) {
-		return PlanRollup{}, fmt.Errorf("expected %d deployment diffs in rollout order, got %d", len(expectedDeployments), len(diffs))
+	if len(diffs) != len(expectedMembers) {
+		return PlanRollup{}, fmt.Errorf("expected %d member diffs in rollout order, got %d", len(expectedMembers), len(diffs))
 	}
-	for i, name := range expectedDeployments {
-		if diffs[i].Deployment != name {
-			return PlanRollup{}, fmt.Errorf("deployment diff %d is %q, expected %q; diffs must be in rollout order with the primary first and every configured deployment present", i, diffs[i].Deployment, name)
+	for i, member := range expectedMembers {
+		got := routing.ExecutionTarget{Deployment: diffs[i].Deployment, Target: diffs[i].Target}
+		if got.Deployment != member.Deployment || got.Target != member.Target {
+			return PlanRollup{}, fmt.Errorf("member diff %d is %q, expected %q; diffs must be in rollout order with the primary first and every configured member present", i, got.MemberID(), member.MemberID())
 		}
 	}
 

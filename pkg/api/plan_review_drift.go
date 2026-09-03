@@ -7,6 +7,7 @@ import (
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/tern"
 )
 
@@ -17,33 +18,28 @@ import (
 // primaryPlan is the just-reviewed primary plan proto, reused as the rollup's
 // baseline so the comparison is against exactly what the user reviewed rather
 // than a fresh read of the primary's live schema (which could have drifted and
-// tripped a spurious primary-vs-primary mismatch). primaryDeployment is the
-// deployment that plan was created against; the producer fails closed if it no
-// longer maps to rollout index 0 at rollup time.
+// tripped a spurious primary-vs-primary mismatch). primaryMember is the
+// deployment and target that plan was created against; the producer fails
+// closed if that pair no longer maps to rollout index 0 at rollup time.
 //
-// The database/environment is resolved once here to the configured deployment
-// set in rollout order, then shared with the producer. The resolved order is
-// also passed to RollupDeploymentDiffs as the expected set so the rollup can
-// enforce that the producer returned one diff per deployment in that order — a
-// missing, extra, or reordered result fails closed rather than being mistaken
-// for agreement. The returned rollup is Clean only when every deployment
-// matches.
-func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse, primaryDeployment string) (PlanRollup, error) {
+// The database/environment is resolved once here to the configured member set
+// in rollout order, then shared with the producer. The resolved order is also
+// passed to RollupDeploymentDiffs as the expected set so the rollup can enforce
+// that the producer returned one diff per member in that order — a missing,
+// extra, or reordered result fails closed rather than being mistaken for
+// agreement. The returned rollup is Clean only when every member matches.
+func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse, primaryMember routing.ExecutionTarget) (PlanRollup, error) {
 	targets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
 	if err != nil {
 		return PlanRollup{}, fmt.Errorf("resolve deployment targets for %s/%s: %w", req.Database, req.Environment, err)
 	}
-	expectedDeployments := make([]string, len(targets))
-	for i, t := range targets {
-		expectedDeployments[i] = t.Deployment
-	}
 
-	diffs, err := s.PlanDeploymentDiffs(ctx, req, primaryPlan, primaryDeployment, targets)
+	diffs, err := s.PlanDeploymentDiffs(ctx, req, primaryPlan, primaryMember, targets)
 	if err != nil {
 		return PlanRollup{}, fmt.Errorf("plan deployment diffs for %s/%s: %w", req.Database, req.Environment, err)
 	}
 
-	rollup, err := RollupDeploymentDiffs(diffs, expectedDeployments)
+	rollup, err := RollupDeploymentDiffs(diffs, targets)
 	if err != nil {
 		return PlanRollup{}, fmt.Errorf("roll up deployment diffs for %s/%s: %w", req.Database, req.Environment, err)
 	}
