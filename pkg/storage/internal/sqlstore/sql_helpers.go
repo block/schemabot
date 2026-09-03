@@ -33,6 +33,16 @@ func nullString(s string) sql.NullString {
 	return sql.NullString{String: s, Valid: true}
 }
 
+// nullInt64 returns a sql.NullInt64 for a row reference held as an int64, where
+// zero means "no reference" and must be stored as NULL rather than as a row ID
+// of 0 that no row can have.
+func nullInt64(v int64) sql.NullInt64 {
+	if v == 0 {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: v, Valid: true}
+}
+
 // nullInt64Ptr returns a sql.NullInt64 for a *int64 value.
 func nullInt64Ptr(v *int64) sql.NullInt64 {
 	if v == nil {

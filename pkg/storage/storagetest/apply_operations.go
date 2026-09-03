@@ -455,6 +455,52 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.NotEmpty(t, claims[0].LeaseToken)
 	})
 
+	// PlanIDRoundTrip verifies which plan each member of an apply executes. A
+	// member planned together with its siblings stores no plan of its own and
+	// resolves to the apply's plan, while a member planned against its own live
+	// schema carries that plan on its row and keeps it across a claim.
+	t.Run("PlanIDRoundTrip", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_plan_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_plan", 910)
+
+		sharedID := createOperation(t, store, apply.ID, "region-a", "schema")
+		ownID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-b", OperationKey: "schema", PlanID: 911,
+		})
+		require.NoError(t, err)
+
+		shared, err := store.ApplyOperations().Get(ctx, sharedID)
+		require.NoError(t, err)
+		require.NotNil(t, shared)
+		assert.Zero(t, shared.PlanID, "a member planned with its siblings stores no plan of its own")
+		sharedPlan, err := storage.PlanIDForOperation(apply, shared)
+		require.NoError(t, err)
+		assert.Equal(t, int64(910), sharedPlan)
+
+		own, err := store.ApplyOperations().Get(ctx, ownID)
+		require.NoError(t, err)
+		require.NotNil(t, own)
+		assert.Equal(t, int64(911), own.PlanID)
+		ownPlan, err := storage.PlanIDForOperation(apply, own)
+		require.NoError(t, err)
+		assert.Equal(t, int64(911), ownPlan)
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		assert.Equal(t, sharedID, claimed.ID)
+		assert.Zero(t, claimed.PlanID)
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, sharedID))
+
+		claimed, err = store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+		require.NoError(t, err)
+		require.NotNil(t, claimed)
+		assert.Equal(t, ownID, claimed.ID)
+		assert.Equal(t, int64(911), claimed.PlanID, "a member's own plan survives the claim")
+	})
+
 	t.Run("FindNextApplyOperation_DBError", func(t *testing.T) {
 		store := h.NewUnreachableStorage(t)
 		_, err := store.ApplyOperations().FindNextApplyOperation(t.Context(), "driver")
