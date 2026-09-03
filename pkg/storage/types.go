@@ -352,10 +352,10 @@ func PlanIDForOperation(apply *Apply, op *ApplyOperation) (int64, error) {
 		return op.PlanID, nil
 	}
 	if apply == nil {
-		return 0, fmt.Errorf("resolve plan for operation %d: operation has no plan and its apply was not loaded", op.ID)
+		return 0, fmt.Errorf("resolve plan for operation on deployment %q (operation key %q): operation has no plan and its apply was not loaded", op.Deployment, op.OperationKey)
 	}
 	if apply.PlanID == 0 {
-		return 0, fmt.Errorf("resolve plan for operation %d: neither the operation nor apply %s names a plan", op.ID, apply.ApplyIdentifier)
+		return 0, fmt.Errorf("resolve plan for operation on deployment %q (operation key %q): neither the operation nor apply %s names a plan", op.Deployment, op.OperationKey, apply.ApplyIdentifier)
 	}
 	return apply.PlanID, nil
 }

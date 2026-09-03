@@ -1516,11 +1516,13 @@ func (c EnvironmentConfig) validateMultiTargetSupport(context, databaseType stri
 // exactly the member list validation checked.
 //
 // An entry names either a single target or a targets list, never both: the two
-// spellings would otherwise disagree about how many members the entry has. An
-// entry that names neither returns an empty list without an error, leaving the
-// caller to report the missing target in its own terms.
+// spellings would otherwise disagree about how many members the entry has. Both
+// spellings being present is what conflicts, so an explicitly empty targets list
+// alongside a target is reported as the conflict it is rather than as an empty
+// list. An entry that names neither returns an empty list without an error,
+// leaving the caller to report the missing target in its own terms.
 func resolveTargetList(what, target string, targets []string) ([]string, error) {
-	if target != "" && len(targets) > 0 {
+	if target != "" && targets != nil {
 		return nil, fmt.Errorf("%s cannot configure both target and targets", what)
 	}
 	if targets == nil {
