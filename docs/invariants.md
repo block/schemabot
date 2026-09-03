@@ -266,30 +266,42 @@ is down, a data plane never needs a GitHub App, and the observer side effects th
 (PR comments, progress edits) are best-effort: a failure is logged and never blocks or fails the
 change. *Enforced:* the comment observer (`pkg/webhook/comment_observer.go`); a data plane's
 config carries no GitHub credentials (`deploy/local/config/grpc-tern.yaml` is a working example).
+
 ### AV-2: Outages degrade, never destroy
 
-A storage outage degrades the control plane only. In-flight schema changes keep running, because
-the safety mechanisms that protect the target database (throttling, lock timeouts, checksums) live
-in the engine rather than in the drive loop, and uncertainty is never converted into a verdict. A
-terminal outcome that cannot be persisted leaves the row non-terminal and claimable, to be
-re-derived on the next claim rather than fabricated. *Enforced:* per-failure-class handling in the
-drive loop (`pkg/api/operator.go`), modelled in
+Every apply involves two databases with separate credentials and separate failure modes: the
+target, where your schema change runs, and SchemaBot's own storage, which holds its bookkeeping.
+This entry is about storage going down, and a storage outage does not reach the target.
+
+A schema change already running keeps running, because nothing it needs is in storage. The engine
+drives it against the target, the state it would resume from is on the target as well, and the
+protections that matter to the database (throttling, lock timeouts, checksums) are the engine's.
+What degrades is SchemaBot's supervision of it: progress reporting goes dark and control commands
+cannot be delivered, though they cannot be submitted either, since the API needs the same storage.
+Supervision reattaches to the still-running change once storage returns.
+
+Uncertainty is never converted into a verdict. A terminal outcome that cannot be persisted leaves
+the row non-terminal and claimable, to be re-derived on the next claim rather than fabricated.
+*Enforced:* per-failure-class handling in the drive loop (`pkg/api/operator.go`), modelled in
 [storage-outage-behavior.md](storage-outage-behavior.md).
+
 ### AV-3: Liveness is process-only
 
 Storage reachability belongs on readiness, never liveness. Restarting an instance cannot fix an
 unreachable database, and it aborts in-flight local drives on top of the outage. Boot retries
 storage inside the startup budget, re-resolving credentials each attempt. *Enforced:* the `/livez`
 and `/health` probe wiring (`pkg/api/service.go`, `pkg/serve/serve.go`).
+
 ### AV-4: A transient failure never fails the work
 
-A storage or transport blip is not a schema-change failure. An error writing a progress update is
+A storage or transport blip is not a schema change failure. An error writing a progress update is
 logged and the drive continues. An error reading something safety-gating ends this drive attempt
 and leaves the row claimable for another. Repeated errors observing remote progress mark the apply
 `failed_retryable` and never trigger a remote stop, because an observation outage only proves the
 control plane cannot see, not that the change is unhealthy. *Enforced:* failure-class handling in
 the drive loop (`pkg/api/operator.go`) and the remote progress error limit
 (`pkg/tern/grpc_client.go`).
+
 ### AV-5: Panics are contained and permanent
 
 A panic is contained to the unit of work that caused it, converted into a permanent rather than
@@ -300,6 +312,7 @@ caller gets a fixed internal error, never the panic text or a stack. *Enforced:*
 boundary in `pkg/panicsafe/panicsafe.go`, applied around webhook work units
 (`pkg/webhook/handler.go`, `pkg/webhook/durable_dispatch.go`) and local drives
 (`pkg/tern/local_apply.go`).
+
 ### AV-6: Mixed versions are survivable by contract, not by guesswork
 
 During a rolling deploy the two planes run different versions, and when a data plane belongs to
@@ -318,6 +331,7 @@ operator's typo rather than a peer on a different release, and ignoring it would
 ([release.md](release.md)); strict decoding on the HTTP API handlers
 (`pkg/api/control_handlers.go`, `pkg/api/plan_handlers.go`) and on config load
 (`pkg/api/config.go`).
+
 ### AV-7: An acknowledged delivery is a promise
 
 A webhook delivery acknowledged with 200 is durable work. It is recorded in the event inbox before
@@ -327,6 +341,7 @@ terminated visibly rather than retried forever or dropped in silence. *Enforced:
 webhook inbox: dispatch and reconciliation in `pkg/webhook/durable_dispatch.go` and
 `pkg/webhook/durable_reconcile.go`, backed by the `webhook_events` table
 (`pkg/storage/internal/sqlstore/webhook_events.go`).
+
 ### AV-8: Untrusted text never reaches operator surfaces raw
 
 Error text SchemaBot did not author (dial failures, DSN fragments, hostnames, engine output) is
@@ -348,6 +363,7 @@ before decode. *Enforced:* the comment and table-cell sanitizers in
 (`pkg/webhook/templates/errors.go`); the Check Run summary sanitizer and its markup escaper
 (`pkg/webhook/check_publisher.go`); the drift summary clamp (`pkg/webhook/plan_drift.go`); the
 request body limit (`pkg/webhook/handler.go`).
+
 ### AV-9: SchemaBot never destroys its own storage to start
 
 The startup schema bootstrap converges SchemaBot's own storage additively, and decides before it
@@ -373,6 +389,7 @@ Config-discovery failure, stored-check-state read failure, head-SHA ambiguity, o
 apply must surface as a blocking or absent check, never a passing one. *Breaks if violated:* a PR
 merges while its schema state is unknown. *Enforced:* every check-state write and aggregate
 publish path (`pkg/webhook/check_publisher.go`, `pkg/webhook/check_aggregate.go`).
+
 ### MG-2: Absence never passes
 
 The aggregate check is created on every PR head commit. A PR that touches no managed schema files
@@ -383,18 +400,21 @@ it, that reads as blocking, never as not-applicable. A gate must not be removabl
 change it guards. *Enforced:* aggregate creation on head-commit events
 (`pkg/webhook/check_suite.go`, `pkg/webhook/pull_request.go`); required-check and
 environment-ordering gates (`pkg/webhook/apply_gating.go`, `pkg/webhook/check_prior_env.go`).
+
 ### MG-3: The rollup is conservative
 
 The aggregate check reports the worst result among its per-database checks: one `in_progress`
 blocks, one `failure` fails, one `action_required` demands action, and the aggregate passes only
 when every database passes. A conclusion SchemaBot does not recognize blocks. *Enforced:* the
 aggregate rollup (`pkg/webhook/check_aggregate.go`).
+
 ### MG-4: A check belongs to exactly one commit
 
 Work from an older head SHA never satisfies branch protection for a newer head, and a plan taken
 while an apply is mutating the database never becomes the merge-gating source of truth.
 *Enforced:* per-SHA check rows (`pkg/webhook/check_records.go`); stale-webhook and mid-apply plan
 guards (`pkg/webhook/plan.go`).
+
 ### MG-5: Apply-owned check rows are released only by their owner
 
 A plan result never overwrites an `in_progress` check row that carries an `apply_id`, and
@@ -411,6 +431,7 @@ report a refusal that never happened, or hide one that did. *Enforced:* `apply_i
 markers on `checks` rows, with the ownership read and the conditional write in one transaction
 under a row lock (`pkg/storage/internal/sqlstore/checks.go`,
 `pkg/webhook/apply_check_records.go`); refusals are counted.
+
 ### MG-6: Started applies keep blocking after the change disappears
 
 A later commit that removes the schema change must not make the aggregate pass by cleanup alone:
@@ -418,12 +439,14 @@ the check stays blocked (`schema_removed_after_apply_started`) until the apply s
 operator reconciles the target. Closing and reopening the PR does not wash this state away.
 *Enforced:* stale-cleanup guards (`pkg/webhook/check_records.go`); close and reopen handlers
 release nothing they cannot read (`pkg/webhook/pull_request.go`).
+
 ### MG-7: A completed rollback never shows green
 
 Rollback completion moves the check to `action_required` without ever passing through `success`.
 The rollback reverted the PR's change, so the live database no longer matches the PR. Only a fresh
 plan finding no diff may turn the gate green. *Enforced:* rollback-aware terminal check writes
 (`pkg/webhook/check_publisher.go`).
+
 ### MG-8: Check trust is by App identity, never by name
 
 Only Check Runs created by this deployment's GitHub App (or explicitly trusted App slugs) satisfy
@@ -432,6 +455,7 @@ environment's passing check only proves the ordering was respected. It never aut
 the later deployment still plans, lints, and decides for itself. *Enforced:* App-identity filters
 on every check read (`pkg/webhook/check_run.go`, `pkg/webhook/check_runs.go`); cross-deployment
 trust model in [check-runs.md](check-runs.md).
+
 ### MG-9: GitHub being down never invents state
 
 When GitHub is unreachable, SchemaBot publishes a failing aggregate if it can still verify the
@@ -439,6 +463,7 @@ head commit, and publishes nothing at all if it cannot. It never invents a check
 `schemabot unlock` and CLI success never satisfy branch protection by themselves. *Enforced:*
 GitHub-unavailable branches in the check publish path (`pkg/webhook/check_publisher.go`); unlock
 and CLI flows do not write passing checks.
+
 ### MG-10: A blocked aggregate converges without an external event
 
 Aggregates blocked on unresolved or stale state are re-evaluated by SchemaBot itself, not left
@@ -446,6 +471,7 @@ waiting for a lucky comment or push. The exception is a block that no retry can 
 App, misconfigured check name), which blocks immediately and permanently. *Enforced:* stale-check
 reconciliation (`pkg/webhook/check_records.go`) and aggregate re-evaluation
 (`pkg/webhook/check_aggregate.go`, `pkg/webhook/checks_backfill.go`).
+
 ### MG-11: A terminal outcome lands on the commit the PR is gated on
 
 When an apply settles, its aggregate is published on the PR's current head, not on the commit the
@@ -475,11 +501,13 @@ the claim query rather than general re-entry: no other terminal state is claimab
 reaches an active state by any other route. *Enforced:* the terminal guard in the storage apply
 update path, and the named state arms of the single claim query
 (`pkg/storage/internal/sqlstore/applies.go`).
+
 ### ST-2: Recovery from permanent failure is a fresh plan and apply
 
 There is no revival path from `failed`. Plans are diffs, so a fresh plan and apply never re-runs
 already-landed work, whereas a revival path would re-run stored DDL against a database that may
 have drifted since. *Enforced:* absence. Storage exposes no failed-to-active transition (ST-1).
+
 ### ST-3: Apply state flows upward, never downward
 
 A driver writes only the operation row it has claimed; the parent apply's state is derived from
@@ -487,29 +515,34 @@ its operations' tasks using a fixed priority order, never written directly by a 
 violated:* one deployment's driver overwrites the verdict of another's. *Enforced:*
 `DeriveApplyState()` (`pkg/state/apply.go`) and the rollout projection in `pkg/tern`; lease-scoped
 writes cannot touch the parent row.
+
 ### ST-4: Stored task state never moves backward
 
 A stale engine poll can never rewind stored task state: terminal stored tasks stay terminal,
 control-owned states (`stopped`, `failed_retryable`) are never overwritten by active engine polls,
 and active states advance strictly forward through the lifecycle. *Enforced:* forward-only
 reconciliation in the progress poller (`pkg/tern/observer.go`).
+
 ### ST-5: Unknown engine states are visible and blocking
 
 A raw engine state SchemaBot does not recognize normalizes to `running`, so unfamiliar in-flight
 work stays visible and keeps blocking. Engine-specific strings never leak into SchemaBot state or
 UI. *Enforced:* the `NormalizeTaskStatus` default branch (`pkg/state/task.go`).
+
 ### ST-6: Engine truth is scoped
 
 Engine-reported terminal states are trusted; an engine reporting "no active schema change" is not
 proof of completion and marks the task failed rather than done. `stopped` and `cancelled` are
 SchemaBot-owned states an engine can never report. *Enforced:* the engine trust model in the
 progress sync (`pkg/tern/state_converters.go`, [pkg/state/README.md](../pkg/state/README.md)).
+
 ### ST-7: Stop checkpoints conservatively
 
 On stop, every non-terminal task goes `stopped` whatever its engine sub-state says. A task is
 never promoted to `completed` on partial engine progress, and the stop snapshot is taken only
 after the engine's own stop returns. *Enforced:* stop handling in `pkg/tern/local_control.go` and
 `pkg/tern/stop_terminality.go`.
+
 ### ST-8: Every state has a recovery story
 
 Every apply state is registered with metadata (label, terminal classification), and every
@@ -517,6 +550,7 @@ non-terminal state an apply can sit in is either re-claimable once its driver's 
 stale or covered by its own named recovery path. A state added without a recovery path is a CI
 failure, not a production orphan. *Enforced:* the state metadata registry and a reflection-driven
 completeness test over it (`pkg/state/metadata.go`).
+
 ### ST-9: The retry budget is bounded and never re-runs finished work
 
 `failed_retryable` is active, not terminal: recovery re-drives it automatically. Only
@@ -525,6 +559,7 @@ settles to permanent `failed` when the attempt budget is spent or the recovery w
 *Enforced:* retry preparation and expiry (`pkg/api/operator.go`,
 `pkg/storage/internal/sqlstore/retry.go`); budget semantics in
 [apply-lifecycle.md](apply-lifecycle.md).
+
 ### ST-10: Rollouts respect order and fail closed on policy
 
 Multi-deployment rollouts claim operations in `deployment_order`, and a failed earlier deployment
@@ -545,6 +580,7 @@ every drive including the very first: the process that accepted the request gets
 claims the apply like any other driver. The wake signal sent after enqueueing only makes a driver
 check for claimable work sooner; it never hands work to a process directly. *Enforced:* the
 operator claim path (`pkg/api/operator.go`, `pkg/storage/internal/sqlstore/applies.go`).
+
 ### OW-2: Lease-scoped writes must hold the current token
 
 Apply and task updates, heartbeats, apply logs, and recovered observer side effects all carry the
@@ -552,6 +588,7 @@ lease token; when another driver has claimed the row and rotated the token, the 
 writes fail with an ownership error and it exits rather than posting stale comments or overwriting
 newer state. *Enforced:* a token check on every lease-scoped storage write
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/apply_operations.go`).
+
 ### OW-3: A driver yields no later than a peer may reclaim
 
 The heartbeat loop and the claim query read the same staleness window, so a driver that cannot
@@ -559,6 +596,7 @@ heartbeat stops driving at or before the moment a peer could consider the row ab
 it. The same schema change can never be driven by two instances at once. *Enforced:* one shared
 staleness constant used by both the heartbeat loop (`pkg/api/operator.go`) and the claim query
 (`pkg/storage/internal/sqlstore/applies.go`).
+
 ### OW-4: Lease loss is proven, never inferred
 
 A driver self-fences only after a successful read proves the token changed; a connection error or
@@ -566,6 +604,7 @@ transient storage failure is retried, never misread as displacement. *Breaks if 
 storage blip aborts a healthy multi-hour copy. *Enforced:* the split-brain fences in the drive
 loop (`pkg/api/operator.go`), modelled in
 [storage-outage-behavior.md](storage-outage-behavior.md).
+
 ### OW-5: One active apply per deployment
 
 The unit of exclusion is the physical deployment: an apply reserves every deployment in its
@@ -582,6 +621,7 @@ transaction that decides. It does not depend on a user-facing database lock bein
 callers and `--no-lock` flows are equally bound. *Enforced:* the exclusivity check in the storage
 apply create and activate paths, under the apply target lock
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/locks.go`).
+
 ### OW-6: There is one way to claim work
 
 Exactly one claim query and one lease-rotation path exist, with no side doors. Eligibility rules
@@ -591,6 +631,7 @@ already in motion, and discovering only then that it should not have been claime
 *Enforced:* the single operation-claim query
 (`pkg/storage/internal/sqlstore/apply_operations.go`); tests pin its state arms against
 divergence.
+
 ### OW-7: Ownership uncertainty fails closed
 
 A driver refuses work it cannot prove it owns, and work outside the databases its engine client
@@ -613,6 +654,7 @@ from storage. A restart, lease handover, or webhook redelivery never loses an ac
 command. In-memory flags are per-drive optimizations, never the source of truth. *Enforced:* the
 durable request path (`pkg/storage/internal/sqlstore/control_requests.go`), written by the API and
 webhook control entry points (`pkg/api/control_handlers.go`, `pkg/webhook/control.go`).
+
 ### CO-2: Every command resolves; none wedges
 
 A control request resolves to an explicit durable outcome: applied, superseded, or failed. A
@@ -621,6 +663,7 @@ rather than being retried forever, and polling windows are bounded with visible 
 *Breaks if violated:* an apply loops on a doomed command while holding its database lock.
 *Enforced:* request completion and bounded-retry rules in the drive loop (`pkg/api/operator.go`,
 `pkg/tern/control_requests.go`).
+
 ### CO-3: Engine terminal truth outranks a queued command
 
 When the engine's own record shows the change already settled, the drive adopts that outcome
@@ -630,6 +673,7 @@ authoritative record of the change (PlanetScale, where the deploy request lives 
 consulted this way; for all others the question fails closed. And only settled outcomes are
 adopted, never a remote state still in motion. *Enforced:* terminal-truth preflights on the
 control paths (`pkg/tern/local_control.go`, `pkg/tern/grpc_control_resend.go`).
+
 ### CO-4: Stop wins
 
 Stop is the highest-priority intent. Once accepted, no actor may knowingly advance the apply
@@ -638,12 +682,14 @@ rejected while a stop pends, and contradictory intents are rejected at acceptanc
 resolved by drive ordering. *Enforced:* pending-stop checks in pollers and the cutover paths
 (`pkg/tern/cutover_barrier.go`, `pkg/tern/local_control.go`); conflict rejection at request intake
 (`pkg/api/control_handlers.go`).
+
 ### CO-5: The revert phase owns the outcome
 
 Once an apply is `reverting` or `skipping_revert`, stop, cancel, and cutover are refused for the
 whole phase, because storage must never settle on a state that contradicts what the engine is
 still doing to the database underneath. *Enforced:* revert-phase gates in the control paths
 (`pkg/tern/local_control.go`).
+
 ### CO-6: Commands act only where they have an effect
 
 A control operation is rejected up front when nothing can service it, rather than being queued for
@@ -652,6 +698,7 @@ cutover while one is already in flight are both refused at intake. Its effect is
 the one change it targets: an incident-time tuning, or one operation's completion, never bleeds
 onto sibling operations or future applies. *Enforced:* queue-time eligibility gates and
 operation-scoped request rows (`pkg/storage/internal/sqlstore/control_requests.go`).
+
 ### CO-7: ID namespaces are never conflated
 
 Data-plane RPCs identify work by the operation's `external_id`, while every user-facing surface
@@ -660,12 +707,14 @@ to a data plane is a routing bug, and the internal numeric row ID appears on no 
 *Enforced:* the remote apply ID invariant
 ([grpc-control-edge-cases.md](grpc-control-edge-cases.md)); ID resolution at the API boundary
 (`pkg/api/control_handlers.go`).
+
 ### CO-8: Stop terminality is engine truth, told truthfully
 
 A Spirit stop is a resumable pause; a PlanetScale stop cancels the deploy request permanently. The
 distinction is derived from the engine, not inferred at render time, and every operator surface
 says which one happened. *Enforced:* the stop-terminality policy helper and its renderings
 (`pkg/tern/stop_terminality.go`).
+
 ### CO-9: Control operations are stateless
 
 Any instance can serve any control operation, because controls act by writing shared durable
@@ -673,6 +722,7 @@ state: storage rows, or marker tables on the target database itself. They never 
 specific process's in-memory engine. A cutover request landing on an instance that is not driving
 the apply still works. *Enforced:* design rule in [architecture.md](architecture.md); the cutover
 sentinel table on the target database (`pkg/tern/cutover_barrier.go`).
+
 ### CO-10: A retired operation settles; it is never mistaken for a newer peer's
 
 An operation an earlier release accepted and this one removed stays *known*, as retired. Its
@@ -695,23 +745,27 @@ reaper marks that row with the parent's outcome, but only once the parent is set
 and never while the parent is `stopped` or `failed_retryable`, since those may still resume.
 *Enforced:* bidirectional reconciliation in the operator (`pkg/api/operator.go`) and the
 stranded-operation reaper (`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/reaper.go`).
+
 ### RC-2: Settled applies stop changing
 
 No claim, reaper, or recovery path touches an apply whose verdict is recorded. An apply that
 finished last week does not have its rows change today. *Enforced:* settled-state exclusions in
 every claim and sweep query (`pkg/storage/internal/sqlstore/applies.go`), with ST-1 as the
 backstop under all of them.
+
 ### RC-3: Loading nothing is not owning nothing
 
 A loader returning zero rows because of an error is never conflated with an apply that genuinely
 owns zero rows: the first blocks and surfaces, only the second may complete as a no-op. *Breaks if
 violated:* completion reports success for DDL that never ran. *Enforced:* separated error and
 empty handling on recovery load paths (`pkg/api/operator.go`).
+
 ### RC-4: Self-healing needs proof
 
 Automatic cleanup acts only where the record provably carries no engine work, as with a `pending`
 task, which has no checkpoint by construction. Anything uncertain keeps blocking for an operator.
 *Enforced:* narrow eligibility conditions on every self-heal path (`pkg/api/reaper.go`).
+
 ### RC-5: Terminal notifications fire exactly once
 
 The terminal summary (PR comment, check completion) is authorized by an atomic first-writer-wins
@@ -738,6 +792,7 @@ compares it immediately before each per-task engine apply. Drift fails closed, i
 cannot parse, and recomputed deltas are never applied silently. *Enforced:* pre-apply change-set
 comparison (`pkg/tern/change_set_compare.go`), applied on the review-drift and rollup paths
 (`pkg/api/plan_review_drift.go`, `pkg/api/plan_rollup.go`, `pkg/webhook/plan_drift.go`).
+
 ### RV-2: Stale plans never apply
 
 An apply is rejected when the plan's base is no longer the branch's live base. Freshness is
@@ -745,6 +800,7 @@ mandatory, is checked at apply time against the current base, and cannot be waiv
 `--allow-unsafe`. Plan comments are suppressed as duplicates only when SchemaBot can prove it is
 not preserving a stale plan. *Enforced:* the plan-freshness gate on both apply entry points
 (`pkg/webhook/plan_freshness.go`).
+
 ### RV-3: Consent is explicit, specific, and re-checked
 
 Unsafe changes (error-severity lint findings such as drops and column narrowing) block without
@@ -754,6 +810,7 @@ consequences disclosed to them. The re-plan that runs just before execution re-c
 verdict, so a plan that changed after the confirmation stops rather than running something the
 operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,
 `pkg/webhook/apply_gating.go`).
+
 ### RV-4: Engine refusals are known at plan time and gate the apply
 
 Whether the engine will refuse a statement, or route it to direct execution (a MySQL and Spirit
@@ -763,6 +820,7 @@ direct execution's table-size bound, a table whose size cannot be measured is bl
 estimate is trusted only in the blocking direction: an estimate alone never approves. *Enforced:*
 plan-time execution verdicts and apply-time verdict gates (`pkg/engine`); the direct-execution
 size bound ([direct-execution.md](direct-execution.md)).
+
 ### RV-5: A drop is never silent, and where a recovery window exists it is honored
 
 What always holds is consent: a `DROP TABLE` is an error-severity lint finding and cannot run
@@ -782,6 +840,7 @@ serialized per target under an advisory lock.
 lint gate on drops; the pending-drops lifecycle ([pending-drops.md](pending-drops.md)) on Spirit,
 gated on `PendingDropsEnabled()` (`pkg/api/config.go`); the table lifecycle native to Vitess
 online DDL on PlanetScale.
+
 ### RV-6: Every statement parses under its own dialect, or it is an error
 
 All SQL SchemaBot processes must parse with the real parser for the target's dialect, meaning the
@@ -792,11 +851,13 @@ at all, because a statement that misparses can also misclassify, and classificat
 destructive gating reads. A classifier refuses ambiguity, so a compound statement never classifies
 as its first verb and rides past that gate. *Enforced:* dialect resolution at the parser seam
 (`pkg/ddl/parser.go`); the Spirit `statement` and libpg_query boundaries.
+
 ### RV-7: Rollback needs the originals
 
 Rollback requires the original schema files captured at apply time. If artifact capture failed,
 rollback is refused rather than reconstructed. *Enforced:* rollback preconditions on stored
 artifacts (`pkg/storage/internal/sqlstore/plans.go`).
+
 ### RV-8: The plan sees the whole schema, or nothing
 
 Schema discovery fails closed on any partial view. A GitHub directory listing at the API's entry
@@ -815,6 +876,7 @@ and reused by the apply, and request decoding rejects client-supplied routing fi
 source (repo plus path) is authorized against server config at plan time and re-checked before
 apply, and missing config fails closed. *Enforced:* server-side routing
 (`pkg/tern/target_router.go`) and source policy (`pkg/webhook/schema_source_policy.go`).
+
 ### AZ-2: Authorization fails closed at every tier
 
 An API route not classified as a read is treated as a write. Planning counts as a write, since it
@@ -822,6 +884,7 @@ stages a change. A target that cannot be resolved never authorizes. A configured
 never match any request is a startup error rather than silent dead config. And a new mutating
 endpoint cannot ship without a test proving it denies unauthorized callers. *Enforced:* route
 classification with a structural sweep test over the route table (`pkg/api/service.go`).
+
 ### AZ-3: Identity comes from a verified lane
 
 Forwarded identity headers are trusted only from explicitly listed proxies, a gateway-verified
@@ -829,12 +892,14 @@ service caller never reaches the write tier by self-asserting user headers, and 
 control action is attributed to the verified caller rather than to any client-supplied caller
 string. *Enforced:* the trust-anchor config, which refuses to start without one, and
 identity-precedence rules in the auth layer (`pkg/auth`).
+
 ### AZ-4: Applying takes an authorized actor
 
 A PR apply requires an actor authorized for the target (configured operators, admin teams, repo
 admins, or CODEOWNERS, per config), evaluated per database. The change's author cannot satisfy
 their own review requirement. *Enforced:* the review gate and actor authorization
 (`pkg/webhook/review_gate.go`, `pkg/webhook/actor_authorization.go`).
+
 ### AZ-5: Commands never guess
 
 An unscoped PR command resolves to exactly one unambiguous database or is rejected with guidance,
