@@ -38,9 +38,8 @@ that holds; this page is a description of the present, not a contract.
 
 | | Spirit (MySQL) | PlanetScale (Vitess) | pg-sprite (PostgreSQL) |
 |---|---|---|---|
-| **Instant or in-place DDL** | yes, attempted first | yes, attempted first | yes, the only mode |
-| **Copy and swap** | yes, the fallback | yes, the fallback | no |
-| **Changes needing a copy or rewrite** | executed online | executed online | blocked at plan time |
+| **Instant DDL preferred** | yes, attempted first | yes, attempted first | not applicable, runs native DDL |
+| **Online DDL (copy and swap)** | yes, when instant is not possible | yes, when instant is not possible | no, those changes are blocked at plan time |
 | **`stop` / `start`** | yes | yes | declined |
 | **`cutover`** | yes | yes | declined |
 | **Deferred cutover** | yes | no | no |
@@ -58,20 +57,22 @@ recorded durably before it is acknowledged. That distinction is the subject of C
 
 ## Why the differences exist
 
-Almost everything below the first three rows follows from them, so they are worth reading first.
+Almost everything below the first two rows follows from them, so they are worth reading first.
 
-**Instant and in-place DDL** is the cheap path, and both MySQL-family engines take it when they
-can. Some changes are metadata-only: adding a column at the end of a table does not have to touch
-the rows. Spirit asserts `ALGORITHM=INSTANT` and then a known-safe `ALGORITHM=INPLACE` before it
-considers doing anything heavier, and Vitess performs the same analysis for a deploy request. When
-that succeeds the change is over in milliseconds, and none of the control operations below are
-reachable, because there is nothing in flight to control.
+**Instant DDL** is the cheap path, and both MySQL-family engines try it before anything else. Some
+changes are metadata-only: adding a column at the end of a table does not have to touch the rows,
+so MySQL can make the change without rewriting them. Spirit asks the server to run the statement
+with `ALGORITHM=INSTANT` and lets the server decide whether it can, rather than keeping its own
+list of qualifying operations, because eligibility moves with the MySQL minor version and can even
+depend on the table. Vitess makes the same attempt for a deploy request. When it succeeds the
+change is over in milliseconds, and none of the control operations below are reachable, because
+there is nothing in flight to control.
 
-**Copy and swap** is the fallback when the cheap path is not available. It builds a new table,
-backfills it, keeps it in sync with ongoing writes, and swaps it in. That is what makes a large
-table changeable without a long lock, and it is why such a change is a long-running process with
-phases you can act on: there is something in flight to pause, to pace, and to cut over
-deliberately. Every control operation in the table exists because of it.
+**Online DDL, or copy and swap,** is what happens when the cheap path is not available. It builds
+a new table, backfills it, keeps it in sync with ongoing writes, and swaps it in. That is what
+makes a large table changeable without a long lock, and it is why such a change is a long-running
+process with phases you can act on: there is something in flight to pause, to pace, and to cut
+over deliberately. Every control operation in the table exists because of it.
 
 Where the copy runs is the second-order difference, and it decides who can answer questions about
 it. A Spirit copy runs inside the SchemaBot process driving the apply, so that process is the only
@@ -93,7 +94,7 @@ budgets rather than paced.
 [invariants.md](invariants.md) defines **GA** as an engine that upholds every invariant in the
 registry. Read off the matrix above, that comes down to two things.
 
-**Copy and swap.** An engine limited to what the database will do in place cannot execute a large
+**Online DDL.** An engine limited to what the database will do natively cannot execute a large
 table's change at all, so a real schema's harder changes get blocked rather than run. Being able
 to fall back to a copy is what makes the engine's envelope the whole schema rather than the easy
 part of it.

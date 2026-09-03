@@ -224,8 +224,8 @@ explicit consent; it does not make the consent right.
 consumes capacity on the target while it runs. Where the engine copies, that is actively managed
 rather than ignored: the copier watches the target, backs off under pressure, and on a continuous
 signal paces itself against the headroom it has. How much of that you get is an engine property,
-not a SchemaBot one, and an engine that executes in place has no copy to pace at all and bounds
-its statements instead. [engines.md](engines.md) has the per-engine picture. What holds either way
+not a SchemaBot one, and an engine that runs native DDL has no copy to pace at all and bounds its
+statements instead. [engines.md](engines.md) has the per-engine picture. What holds either way
 is that the protection is the engine's, configured there rather than here, and capacity you are
 already using is capacity the change will contend for. SchemaBot's job is to make the work
 observable, interruptible, and correct in its bookkeeping, not to make it free.
