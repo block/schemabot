@@ -174,11 +174,14 @@ and still resolves to an explicit terminal outcome (CO-2), specifically a typed
 unsupported-operation decline rather than a silent drop, a false success, or an unbounded retry.
 That is the difference between an unfinished engine and an unsafe one.
 
-Cashed out in engine capabilities, the bar is copy and swap plus the core control operations
-(`stop`, `start`, `cutover`, `cancel`); `revert` and `skip-revert` are not part of it, because
-they depend on whether the engine keeps the pre-cutover table rather than on how complete the
-engine is.
-[engines.md](engines.md) works through why, and is the per-engine picture generally.
+Cashed out in engine capabilities, the bar is copy and swap plus a real lever over a change that
+is already in flight: taking the load off the database, choosing when the swap happens
+(`cutover`), and abandoning the change (`cancel`). Which verbs deliver that varies, so the bar is
+the ability rather than a fixed list. Spirit pauses and resumes; Vitess has no pause, and there a
+`stop` ends the change like a `cancel` does. `revert` and `skip-revert` are outside the bar
+entirely, because they depend on whether the engine keeps the pre-cutover table rather than on how
+complete the engine is. [engines.md](engines.md) works through why, and is the per-engine picture
+generally.
 
 Where an engine's envelope is still moving, its own doc is the authority on where the boundary
 currently sits rather than this one. [postgresql.md](postgresql.md) is that doc for PostgreSQL,
@@ -775,10 +778,17 @@ to a data plane is a routing bug, and the internal numeric row ID appears on no 
 
 ### CO-8: Stop terminality is engine truth, told truthfully
 
-A Spirit stop is a resumable pause; a PlanetScale stop cancels the deploy request permanently. The
-distinction is derived from the engine, not inferred at render time, and every operator surface
-says which one happened. *Enforced:* the stop-terminality policy helper and its renderings
-(`pkg/tern/stop_terminality.go`).
+`stop` does not mean the same thing on every engine, and an operator must never have to guess
+which one they got. On Spirit a stop is a pause: the copy checkpoints, the apply settles as
+`stopped`, and `start` resumes it. On Vitess there is no pause. A stop cancels the deploy request,
+the apply settles as `cancelled`, and nothing brings it back.
+
+That reading is decided in one place from the target's database type, rather than inferred
+wherever a result is rendered, and it is keyed on the database type specifically so a change that
+never reached a data plane settles the same way, with no engine instance anywhere to ask. Every
+operator surface then names the outcome that actually happened. *Breaks if violated:* an operator
+reads `stopped`, waits to resume, and the change is already dead. *Enforced:* the single
+stop-terminality decision and its renderings (`pkg/tern/stop_terminality.go`).
 
 ### CO-9: Control operations are stateless
 
@@ -790,12 +800,21 @@ sentinel table on the target database (`pkg/tern/cutover_barrier.go`).
 
 ### CO-10: A retired operation settles; it is never mistaken for a newer peer's
 
-An operation an earlier release accepted and this one removed stays *known*, as retired. Its
-durable rows and the reports naming it outlive the upgrade, no driver services it anymore, and the
-terminal sweep settles whatever it left pending. A command retired mid-flight therefore resolves
-(CO-2) instead of pending forever against a consumer that no longer exists. Reading that same
-string as an operation from a newer peer would be a different judgement about a different
-situation, and would leave the row waiting. *Enforced:* the retired-operation set
+When a release removes a control operation, the rows an earlier release wrote for it are still in
+storage and reports naming it can still arrive from a data plane. So a running build meets
+operation names it does not implement, and it has to tell two situations apart.
+
+One is an operation that used to exist and was removed. Nothing will ever service it, so its
+leftover pending rows have to be settled or they pend forever, which is exactly the wedge CO-2
+forbids. The other is an operation from a *newer* peer mid-rollout, which this build has no
+business judging and should leave alone. On the wire both look identical: a string this build does
+not implement.
+
+They are told apart by name rather than by guessing. A removed operation stays *known*, as
+retired, on an explicit list; no driver services it, and the sweep that settles a terminal apply's
+mooted requests settles the retired ones too, which is their only settlement path. Anything not on
+that list is treated as a newer peer's and left alone. An entry comes off the list once no
+deployment still holds rows naming it. *Enforced:* the retired-operation list
 (`RetiredControlOperations()` in `pkg/storage/types.go`), consulted by the terminal sweep
 (`pkg/tern/control_requests.go`).
 

@@ -58,7 +58,7 @@ SchemaBot handles the full lifecycle:
 
 Simple changes (e.g., adding a column) use instant DDL and complete in milliseconds. Operations that require a row copy (e.g., adding an index) run online without blocking reads or writes.
 
-Not every engine supports every feature. `revert`, automatic throttling, and drop recovery all vary, and [docs/engines.md](./docs/engines.md) is the capability matrix showing which engine does what and why.
+Not every engine supports every feature, and some share a verb without sharing its meaning: pausing and resuming a running change, `revert`, automatic throttling, and drop recovery all vary by engine. [docs/engines.md](./docs/engines.md) is the capability matrix showing which engine does what and why.
 
 ## Quick Start
 

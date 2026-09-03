@@ -39,7 +39,7 @@ engines gain features. If the two ever disagree, invariants.md is the one that h
 | **Instant DDL preferred** | yes, attempted first | yes, attempted first | not applicable, a MySQL concept |
 | **Online DDL (copy and swap)** | yes, when instant is not possible | yes, when instant is not possible | planned; those changes are blocked at plan time meanwhile |
 | **Escape hatch for refused statements** | direct execution: opt-in, size-bounded, separately confirmed | none, excluded by design | none, native execution is already the only path |
-| **`stop` / `start`** | yes | yes | planned |
+| **`stop` / `start` as pause and resume** | yes | no, a stop cancels the deploy request permanently | planned |
 | **`cutover`, including deferring it** | yes | yes | planned |
 | **`cancel`** | yes | yes | planned |
 | **`revert` / `skip-revert`** | no | yes | not planned |
@@ -80,6 +80,17 @@ Where that copy runs decides who can report on it. A Spirit copy runs inside the
 driving the apply, so only that process knows how far along it is, and if it dies its replacement
 picks up from a checkpoint. A deploy request runs on the cluster instead. It outlives the process
 watching it, and any instance can ask the cluster for its progress and get the same answer.
+
+**A stop does not mean the same thing on both engines.** On Spirit it is a pause: the copy
+checkpoints, the apply settles as stopped, and `start` resumes it from that checkpoint. On Vitess
+there is no pause at all. A stop cancels the deploy request, the apply settles as cancelled, and
+nothing brings it back. The two are told apart at the source rather than at render time, so every
+operator surface names which one happened and a cancelled change never reads as merely paused.
+That is CO-8 in [invariants.md](invariants.md).
+
+`start` on Vitess is a different operation from Spirit's resume, not a partial version of it. It
+launches a deploy request that was created and deliberately left undeployed, which is how a change
+waits for an operator before it begins rather than after it has already run.
 
 The revert window is a separate decision and does not follow from where the copy ran. Both engines
 reach cutover holding two tables: the new one, about to take traffic, and the original, renamed
@@ -129,12 +140,16 @@ registry. In terms of the matrix above, that comes down to two things.
 table at all, so the harder half of a real schema gets blocked instead of applied. Falling back to
 a copy is what lets an engine handle a whole schema rather than the easy parts of one.
 
-**The core control operations: `stop`, `start`, `cutover`, and `cancel`.** A copy can run for
-hours, so an operator needs to be able to act on one that is already in flight: `stop` to take the
-load off the database and `start` to resume when it recovers, `cutover` to choose when the swap
-happens instead of letting it happen on its own, and `cancel` to abandon the change. An engine
-that can begin a copy but not act on one leaves the operator with a process they can only wait
-out.
+**A lever over a change that is already in flight.** A copy can run for hours, and an engine that
+can begin one but not act on one leaves the operator with a process they can only wait out. At
+minimum they must be able to take the load off the database, choose when the swap happens
+(`cutover`), and abandon the change (`cancel`).
+
+Which verbs deliver that varies, and the bar is the ability rather than a particular verb. Spirit
+pauses and resumes. Vitess has no pause: there, taking the load off means ending the change, and
+`stop` and `cancel` both do that. What GA requires is that the lever exists and that the operator
+is told plainly which outcome they got, never that every engine implements the same four verbs the
+same way.
 
 `revert` and `skip-revert` are deliberately **not** on the list. They depend on the engine keeping
 the pre-cutover table, which is a choice about retention rather than a measure of maturity. The
