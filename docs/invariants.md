@@ -45,7 +45,7 @@
 - [Ownership and leases (OW)](#ownership-and-leases-ow)
   - [OW-1: Every drive runs under a claim](#ow-1-every-drive-runs-under-a-claim)
   - [OW-2: Lease-scoped writes must hold the current token](#ow-2-lease-scoped-writes-must-hold-the-current-token)
-  - [OW-3: A driver yields no later than a peer may reclaim](#ow-3-a-driver-yields-no-later-than-a-peer-may-reclaim)
+  - [OW-3: A driver stops before a peer may reclaim](#ow-3-a-driver-stops-before-a-peer-may-reclaim)
   - [OW-4: Lease loss is proven, never inferred](#ow-4-lease-loss-is-proven-never-inferred)
   - [OW-5: One active apply per deployment](#ow-5-one-active-apply-per-deployment)
   - [OW-6: There is one way to claim work](#ow-6-there-is-one-way-to-claim-work)
@@ -633,21 +633,42 @@ writes fail with an ownership error and it exits rather than posting stale comme
 newer state. *Enforced:* a token check on every lease-scoped storage write
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/apply_operations.go`).
 
-### OW-3: A driver yields no later than a peer may reclaim
+### OW-3: A driver stops before a peer may reclaim
 
-The heartbeat loop and the claim query read the same staleness window, so a driver that cannot
-heartbeat stops driving at or before the moment a peer could consider the row abandoned and claim
-it. The same schema change can never be driven by two instances at once. *Enforced:* one shared
-staleness constant used by both the heartbeat loop (`pkg/api/operator.go`) and the claim query
-(`pkg/storage/internal/sqlstore/applies.go`).
+A driver keeps its claim alive by refreshing a heartbeat on the row it holds. One staleness window
+decides what happens when those refreshes stop, and both sides of a handover measure against it:
+
+- A peer treats a row whose heartbeat is older than the window as abandoned, and may claim it.
+- A driver whose own heartbeat writes have been failing for that same span presumes a peer has
+  already done so. It stops driving and stops writing apply state.
+
+The two deadlines are the same deadline, which is the whole point. If the driver's bound were the
+larger of the two, there would be a stretch in which a peer had legitimately claimed the work while
+the original driver was still running it.
+
+Storage writes are lease-guarded either way (OW-2), so a displaced driver cannot corrupt state
+whatever it believes about itself. What the shared window bounds is the thing no lease guard can
+reach: how long two processes can be running the same engine work against the same database at
+once. Giving up on a timer is also the one place a driver acts without proof, so it is deliberately
+the fallback; a driver that can still reach storage learns it was displaced by reading the token
+instead (OW-4). *Enforced:* one staleness constant (`ApplyLeaseStaleAfter` in
+`pkg/storage/storage.go`) read by both the heartbeat loop (`pkg/api/operator.go`) and every claim
+query (`pkg/storage/internal/sqlstore/applies.go`).
 
 ### OW-4: Lease loss is proven, never inferred
 
-A driver self-fences only after a successful read proves the token changed; a connection error or
-transient storage failure is retried, never misread as displacement. *Breaks if violated:* a
-storage blip aborts a healthy multi-hour copy. *Enforced:* the split-brain fences in the drive
-loop (`pkg/api/operator.go`), modelled in
-[storage-outage-behavior.md](storage-outage-behavior.md).
+A driver stops driving an apply only when a successful read shows that another driver now holds the
+lease. It never concludes that from a failed write: a connection error or a storage blip says
+nothing about who owns the work, so those are retried instead.
+
+The asymmetry is deliberate, because the two mistakes are not equally bad. Reading a blip as
+displacement throws away a healthy copy that may be hours in. Missing a real displacement is
+already covered from the other side, since a driver out of touch for the full staleness window
+stops on its own (OW-3) rather than needing to guess from one failed write.
+
+*Breaks if violated:* a storage blip aborts a healthy multi-hour copy. *Enforced:* the ownership
+checks in the drive loop, which stop the drive on a proven token change and retry everything else
+(`pkg/api/operator.go`), modelled in [storage-outage-behavior.md](storage-outage-behavior.md).
 
 ### OW-5: One active apply per deployment
 
