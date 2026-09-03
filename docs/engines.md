@@ -40,19 +40,20 @@ that holds; this page is a description of the present, not a contract.
 |---|---|---|---|
 | **Instant DDL preferred** | yes, attempted first | yes, attempted first | not applicable, runs native DDL |
 | **Online DDL (copy and swap)** | yes, when instant is not possible | yes, when instant is not possible | no, those changes are blocked at plan time |
-| **`stop` / `start`** | yes | yes | declined |
-| **`cutover`** | yes | yes | declined |
-| **Deferred cutover** | yes | no | no |
-| **`cancel`** | yes | yes | declined |
-| **`revert` / `skip-revert`** | no | yes | declined |
+| **Direct execution (native DDL)** | opt-in, size-bounded, separately confirmed | excluded by design | not available |
+| **`stop` / `start`** | yes | yes | planned |
+| **`cutover`, including deferring it** | yes | yes | planned |
+| **`cancel`** | yes | yes | planned |
+| **`revert` / `skip-revert`** | no | yes | planned |
 | **Load-aware throttling** | automatic, on live target signals | manual, configured on the cluster | none, statements bounded instead |
 | **Adaptive pacing** | yes | no | no |
 | **Dropped-table recovery** | opt-in quarantine, expires | inside the revert window, expires | none |
 | **Who reports progress** | the process running the change | the cluster, so any instance can read it | the process running the change |
 
-"Declined" means the operation resolves to a typed, terminal unsupported-operation error rather
-than hanging, silently dropping, or reporting a success that did not happen. The request is still
-recorded durably before it is acknowledged. That distinction is the subject of CO-1 and CO-2 in
+"Planned" means the engine does not implement the operation yet. Asking for one today is safe
+rather than surprising: the request is recorded durably before it is acknowledged, and it then
+resolves to a typed, terminal unsupported-operation decline rather than hanging, being silently
+dropped, or reporting a success that did not happen. That is CO-1 and CO-2 in
 [invariants.md](invariants.md), and it is what makes a narrower engine still a safe one.
 
 ## Why the differences exist
@@ -82,6 +83,18 @@ can ask the cluster where it has got to and get the same answer. That is also wh
 a revert window: after cutover the old table is still there, held by the cluster, until the window
 expires.
 
+**Direct execution** is a third path, and it is deliberately awkward to reach. A few statements
+the MySQL engine will never run through a copy: dropping a primary key or adding a foreign key
+cannot survive one. By default those block the apply. Under a policy an operator enables per
+environment, they can instead run verbatim as native DDL, restricted to tables under a configured
+row count and gated on a second confirmation step in the PR. What runs then is not an online
+change: it is synchronous, it blocks writes to the table for its whole duration, it is neither
+throttled nor checkpointed, and it cannot be reverted. The policy exists to bound those
+consequences, and what it replaces is someone running the same statement by hand against the
+target with no plan, no audit trail, and no bound at all. Vitess is excluded from it by design,
+because raw DDL against vtgate would bypass exactly the machinery that engine is there to use.
+[direct-execution.md](direct-execution.md) covers the gate in full.
+
 **pg-sprite has no copy at all.** Each statement runs as its own transaction that either commits
 or fails. There is nothing to pause, nothing to cut over, and no window in which the previous
 state still exists, which is why the whole control family is declined rather than
@@ -108,9 +121,13 @@ wait out.
 
 `revert` and `skip-revert` are deliberately **not** on that list. They depend on the old table
 still existing after cutover, which is a property of where the change runs rather than of how
-complete the engine is, and the MySQL engine is GA without them. Everything else in the matrix
-is a difference rather than a gap: adaptive pacing, deferred cutover, and a drop quarantine each
-make an engine better on its own axis, and an engine missing one is not thereby below the bar.
+complete the engine is, and the MySQL engine is GA without them.
+
+Everything else in the matrix is a difference rather than a gap. Adaptive pacing and a drop
+quarantine each make an engine better on its own axis, and an engine missing one is not thereby
+below the bar. Direct execution is not a maturity signal in either direction:
+it is an opt-in escape hatch for statements no copy can execute, and the engine that does not
+offer it does not offer it on purpose.
 
 ## Load management
 
