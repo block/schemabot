@@ -264,6 +264,23 @@ func TestFindAllConfigsForPRDiscoversChangedConfigFile(t *testing.T) {
 	assert.Equal(t, "apps/widgets/schema", configs[0].SchemaDir)
 }
 
+// TestFetchConfigCanonicalizesIdentityKeys covers a consumer repository whose
+// schemabot.yaml spells the database and dialect in mixed case. The parsed
+// config must carry the canonical (lowercase) identity so it matches the
+// server's config key and the identity stored on every row, and the dialect
+// must still pass type validation.
+func TestFetchConfigCanonicalizesIdentityKeys(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/schema/schemabot.yaml", "database: Payments\ntype: Postgres\n")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	config, err := ic.FetchConfig(t.Context(), "octocat/hello-world", "schema/schemabot.yaml", "abc123")
+
+	require.NoError(t, err)
+	assert.Equal(t, "payments", config.Database)
+	assert.Equal(t, DatabaseTypePostgres, config.Type)
+}
+
 // TestFindConfigsForPRFilesProbesEachDirectoryOnce exercises discovery for a
 // PR that touches many schema files under shared directory trees — the shape
 // of an onboarding PR that adds a declarative schema root while deleting a

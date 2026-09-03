@@ -38,6 +38,22 @@ func TestLoadCLIConfig_WithoutEnvironments(t *testing.T) {
 	assert.Equal(t, "mysql", cfg.Type)
 }
 
+// TestLoadCLIConfig_CanonicalizesIdentityKeys covers a schemabot.yaml that
+// spells the database and dialect in mixed case: the CLI must name the same
+// canonical identity the server stores so plan, lock, and apply requests
+// address the configured database rather than an unknown one.
+func TestLoadCLIConfig_CanonicalizesIdentityKeys(t *testing.T) {
+	dir := t.TempDir()
+	content := "database: Payments\ntype: Postgres\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte(content), 0644))
+
+	cfg, err := LoadCLIConfig(dir)
+	require.NoError(t, err)
+
+	assert.Equal(t, "payments", cfg.Database)
+	assert.Equal(t, "postgres", cfg.Type)
+}
+
 func TestLoadCLIConfig_RejectsDeployment(t *testing.T) {
 	dir := t.TempDir()
 	content := "database: mydb\ntype: mysql\ndeployment: us-west\n"

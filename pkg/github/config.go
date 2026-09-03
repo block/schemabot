@@ -11,6 +11,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // DatabaseType represents the type of database backend.
@@ -25,6 +26,11 @@ const (
 
 // SchemabotConfig represents the schemabot.yaml configuration file.
 // The presence of this file in a directory indicates that directory contains schema files.
+//
+// Database and Type are row-identity keys: FetchConfig folds them with
+// storage.CanonicalKey so a consumer repository's spelling always matches the
+// canonical server config key and the identity stored on every row, whatever
+// case the file was written in.
 type SchemabotConfig struct {
 	Database string       `yaml:"database" json:"database"`
 	Name     string       `yaml:"name" json:"name"`
@@ -102,6 +108,8 @@ func (ic *InstallationClient) FetchConfig(ctx context.Context, repo, configPath,
 	if err := decoder.Decode(&config); err != nil {
 		return nil, fmt.Errorf("invalid schemabot.yaml at %s: %w", configPath, err)
 	}
+	config.Database = storage.CanonicalKey(config.Database)
+	config.Type = DatabaseType(storage.CanonicalKey(string(config.Type)))
 
 	if config.Database == "" {
 		return nil, fmt.Errorf("invalid schemabot.yaml at %s: database is required", configPath)
