@@ -104,42 +104,87 @@ func ParserForDialect(dialect schema.Dialect) (StatementParser, error) {
 	}
 }
 
-// CreateSetStatements splits a DDL script with the parser and admits it only
-// when it is a single statement, or a greenfield create set: one CREATE TABLE
-// followed by CREATE INDEX statements on that same table. Single statements
-// are returned without classification so callers retain their existing rules.
-func CreateSetStatements(p StatementParser, script string) ([]string, error) {
+// CreateSet is a parsed greenfield create set, or a single statement of any
+// type. Statements preserves the parser's statement order.
+type CreateSet struct {
+	Statements []string
+	Type       StatementType
+	Table      string
+}
+
+// ParseCreateSet splits and classifies a DDL script, admitting either one
+// statement or a greenfield create set: one CREATE TABLE followed only by
+// CREATE INDEX statements on that same table. Multi-statement create sets are
+// currently a PostgreSQL-parser capability. The MySQL parser does not split
+// multi-statement scripts, so they are refused.
+func ParseCreateSet(p StatementParser, script string) (CreateSet, error) {
 	statements, err := p.Split(script)
 	if err != nil {
-		return nil, fmt.Errorf("split DDL script: %w", err)
+		return CreateSet{}, fmt.Errorf("split DDL script: %w", err)
 	}
 	if len(statements) == 0 {
-		return nil, fmt.Errorf("DDL script contains no statements")
-	}
-	if len(statements) == 1 {
-		return statements, nil
+		return CreateSet{}, fmt.Errorf("DDL script contains no statements")
 	}
 
 	firstType, table, err := p.Classify(statements[0])
-	if err != nil {
-		return nil, fmt.Errorf("classify statement 1 in multi-statement DDL script: %w", err)
+	if err != nil && len(statements) == 1 {
+		return CreateSet{}, fmt.Errorf("multi-statement DDL scripts are not supported for this dialect: %w", err)
 	}
+	if err != nil {
+		return CreateSet{}, fmt.Errorf("split result does not contain individual statements; multi-statement DDL scripts are not supported for this dialect: %w", err)
+	}
+	result := CreateSet{Statements: statements, Type: firstType, Table: table}
+	if len(statements) == 1 {
+		return result, nil
+	}
+
 	if firstType != StatementCreateTable {
-		return nil, fmt.Errorf("statement 1 is %s; a multi-statement DDL script must start with CREATE TABLE", firstType)
+		return CreateSet{}, fmt.Errorf("statement 1 is %s; a multi-statement DDL script must start with CREATE TABLE", firstType)
+	}
+	createTarget, err := createSetRelation(p, statements[0], table)
+	if err != nil {
+		return CreateSet{}, fmt.Errorf("identify CREATE TABLE target: %w", err)
 	}
 	for i, stmt := range statements[1:] {
 		stmtType, indexTable, err := p.Classify(stmt)
 		if err != nil {
-			return nil, fmt.Errorf("classify statement %d in multi-statement DDL script: %w", i+2, err)
+			return CreateSet{}, fmt.Errorf("classify statement %d in multi-statement DDL script: %w", i+2, err)
 		}
 		if stmtType != StatementCreateIndex {
-			return nil, fmt.Errorf("statement %d is %s; a multi-statement DDL script must be a CREATE TABLE followed only by CREATE INDEX statements on that table", i+2, stmtType)
+			return CreateSet{}, fmt.Errorf("statement %d is %s; a multi-statement DDL script must be a CREATE TABLE followed only by CREATE INDEX statements on that table", i+2, stmtType)
 		}
-		if indexTable != table {
-			return nil, fmt.Errorf("statement %d creates an index on table %q, not CREATE TABLE target %q", i+2, indexTable, table)
+		indexTarget, err := createSetRelation(p, stmt, indexTable)
+		if err != nil {
+			return CreateSet{}, fmt.Errorf("identify statement %d index target: %w", i+2, err)
+		}
+		if indexTarget != createTarget {
+			return CreateSet{}, fmt.Errorf("statement %d creates an index on table %q, not CREATE TABLE target %q", i+2, indexTarget, createTarget)
 		}
 	}
-	return statements, nil
+	return result, nil
+}
+
+type createSetRelationParser interface {
+	createSetRelation(stmt string) (string, error)
+}
+
+func createSetRelation(p StatementParser, stmt, classifiedTable string) (string, error) {
+	if relationParser, ok := p.(createSetRelationParser); ok {
+		return relationParser.createSetRelation(stmt)
+	}
+	return classifiedTable, nil
+}
+
+// CreateSetStatements has the same admission rules as ParseCreateSet. It is
+// retained for callers that need only the split statements. Multi-statement
+// create sets are a PostgreSQL-parser capability; the MySQL parser refuses
+// them because its Split implementation does not separate the statements.
+func CreateSetStatements(p StatementParser, script string) ([]string, error) {
+	createSet, err := ParseCreateSet(p, script)
+	if err != nil {
+		return nil, err
+	}
+	return createSet.Statements, nil
 }
 
 // tidbStatementParser implements StatementParser over the TiDB parser via

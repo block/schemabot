@@ -77,6 +77,24 @@ func TestMaterializedTableChangeOperation(t *testing.T) {
 		assert.Equal(t, "create", op)
 	})
 
+	t.Run("MySQL single-statement fallbacks retain their operations", func(t *testing.T) {
+		parser, err := ddl.ParserForDialect(schema.DialectMySQL)
+		require.NoError(t, err)
+
+		tests := []struct {
+			ddl    string
+			wantOp string
+		}{
+			{ddl: "TRUNCATE TABLE `t`", wantOp: "truncate"},
+			{ddl: "CREATE INDEX `i` ON `t` (`v`)", wantOp: "create_index"},
+		}
+		for _, tc := range tests {
+			op, err := materializedTableChangeOperation(parser, &ternv1.TableChange{TableName: "t", Ddl: tc.ddl})
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantOp, op)
+		}
+	})
+
 	t.Run("proto change type is authoritative", func(t *testing.T) {
 		op, err := materializedTableChangeOperation(nil, &ternv1.TableChange{
 			TableName:  "t",

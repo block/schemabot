@@ -195,23 +195,27 @@ func (c *LocalClient) statementParser() (ddl.StatementParser, error) {
 // drift — Classify errors reject it first. Classify also rejects
 // multi-statement input; the one multi-statement shape drift admits is a
 // greenfield create set (a CREATE TABLE followed by CREATE INDEX statements on
-// that table), canonicalized statement by statement so each spelling of the
-// same set compares equal.
+// that table), canonicalized statement by statement so equivalent spellings
+// in the same order compare equal.
 func canonicalDDLForDrift(p ddl.StatementParser, raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return "", fmt.Errorf("empty DDL")
 	}
-	if _, _, err := p.Classify(raw); err == nil {
-		return canonicalDriftStatement(p, raw)
+	if stmtType, _, err := p.Classify(raw); err == nil {
+		return canonicalDriftStatement(p, raw, stmtType)
 	}
-	statements, err := ddl.CreateSetStatements(p, raw)
+	createSet, err := ddl.ParseCreateSet(p, raw)
 	if err != nil {
 		return "", fmt.Errorf("DDL rejected by the statement parser: %w", err)
 	}
-	canonical := make([]string, 0, len(statements))
-	for _, statement := range statements {
-		c, err := canonicalDriftStatement(p, statement)
+	canonical := make([]string, 0, len(createSet.Statements))
+	for i, statement := range createSet.Statements {
+		stmtType := createSet.Type
+		if i > 0 {
+			stmtType = ddl.StatementCreateIndex
+		}
+		c, err := canonicalDriftStatement(p, statement, stmtType)
 		if err != nil {
 			return "", err
 		}
@@ -225,11 +229,7 @@ func canonicalDDLForDrift(p ddl.StatementParser, raw string) (string, error) {
 // remedies: DML (e.g. INSERT) has no place in a schema change and should be
 // removed from it, while a statement outside the shared DDL vocabulary is SQL
 // the comparison has no name for and cannot verify.
-func canonicalDriftStatement(p ddl.StatementParser, statement string) (string, error) {
-	stmtType, _, err := p.Classify(statement)
-	if err != nil {
-		return "", fmt.Errorf("DDL rejected by the statement parser: %w", err)
-	}
+func canonicalDriftStatement(p ddl.StatementParser, statement string, stmtType ddl.StatementType) (string, error) {
 	if stmtType == ddl.StatementUnknown {
 		return "", fmt.Errorf("statement classified outside the shared DDL vocabulary; drift cannot verify it")
 	}

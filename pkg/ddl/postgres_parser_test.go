@@ -122,6 +122,27 @@ func TestCreateSetStatements(t *testing.T) {
 			wantErrMsg: `statement 2 creates an index on table "other", not CREATE TABLE target "t"`,
 		},
 		{
+			name:   "schema-qualified targets match",
+			parser: postgresParser,
+			script: "CREATE TABLE a.t (id bigint); CREATE INDEX t_id_idx ON a.t (id);",
+			want: []string{
+				"CREATE TABLE a.t (id bigint)",
+				"CREATE INDEX t_id_idx ON a.t (id)",
+			},
+		},
+		{
+			name:       "schema-qualified targets differ",
+			parser:     postgresParser,
+			script:     "CREATE TABLE a.t (id bigint); CREATE INDEX t_id_idx ON b.t (id);",
+			wantErrMsg: `statement 2 creates an index on table "b.t", not CREATE TABLE target "a.t"`,
+		},
+		{
+			name:       "qualified and unqualified targets differ",
+			parser:     postgresParser,
+			script:     "CREATE TABLE a.t (id bigint); CREATE INDEX t_id_idx ON t (id);",
+			wantErrMsg: `statement 2 creates an index on table "t", not CREATE TABLE target "a.t"`,
+		},
+		{
 			name:       "alter follows create table",
 			parser:     postgresParser,
 			script:     "CREATE TABLE t (id bigint); ALTER TABLE t ADD COLUMN v text;",
@@ -140,6 +161,12 @@ func TestCreateSetStatements(t *testing.T) {
 			wantErrMsg: "statement 1 is CREATE INDEX",
 		},
 		{
+			name:       "DML follows create table",
+			parser:     postgresParser,
+			script:     "CREATE TABLE t (id bigint); INSERT INTO t (id) VALUES (1);",
+			wantErrMsg: "statement 2 is INSERT",
+		},
+		{
 			name:       "empty",
 			parser:     postgresParser,
 			script:     "  ",
@@ -150,6 +177,12 @@ func TestCreateSetStatements(t *testing.T) {
 			parser: mysqlParser,
 			script: "  ALTER TABLE `t` ADD COLUMN `v` varchar(20)  ",
 			want:   []string{"ALTER TABLE `t` ADD COLUMN `v` varchar(20)"},
+		},
+		{
+			name:       "MySQL multi-statement create set is unsupported",
+			parser:     mysqlParser,
+			script:     "CREATE TABLE `t` (`id` bigint); CREATE INDEX `t_id_idx` ON `t` (`id`)",
+			wantErrMsg: "multi-statement DDL scripts are not supported for this dialect",
 		},
 	}
 
@@ -165,6 +198,14 @@ func TestCreateSetStatements(t *testing.T) {
 			assert.Equal(t, tc.want, got)
 		})
 	}
+
+	t.Run("returns the first statement classification", func(t *testing.T) {
+		got, err := ParseCreateSet(postgresParser, "CREATE TABLE a.t (id bigint); CREATE INDEX t_id_idx ON a.t (id)")
+		require.NoError(t, err)
+		assert.Equal(t, StatementCreateTable, got.Type)
+		assert.Equal(t, "t", got.Table)
+		assert.Len(t, got.Statements, 2)
+	})
 }
 
 func TestPostgresParserClassify(t *testing.T) {

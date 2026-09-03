@@ -1,9 +1,12 @@
 package templates
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/block/schemabot/pkg/schema"
 )
 
 // A PostgreSQL plan classifies and renders its DDL under the PostgreSQL
@@ -36,4 +39,13 @@ func TestRenderPlanComment_PostgresDialect(t *testing.T) {
 	assert.Contains(t, out, "ALTER TABLE users\n    ADD COLUMN a int,\n    ADD COLUMN b text;")
 	assert.NotContains(t, out, "`sessions`", "identifiers must not gain MySQL backtick quoting")
 	assert.NotContains(t, out, "`users`", "identifiers must not gain MySQL backtick quoting")
+}
+
+func TestWritePlanDDLBlock_PostgresCreateSet(t *testing.T) {
+	var out strings.Builder
+	writePlanDDLBlock(&out, []string{
+		"CREATE TABLE t (id bigint, v text); CREATE INDEX t_v_idx ON t (v)",
+	}, schema.DialectPostgres)
+
+	assert.Equal(t, "```sql\nCREATE TABLE t (\n    id bigint,\n    v text\n);\nCREATE INDEX t_v_idx ON t USING btree (v);\n```\n\n", out.String())
 }
