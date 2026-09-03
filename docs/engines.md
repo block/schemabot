@@ -165,7 +165,8 @@ copy is checked against, and the check either admits the work or rejects it. A d
 under it is held off and then runs at full speed again, where Spirit would slow down and speed up.
 The threshold belongs to the cluster, an operator sets it ahead of time, and it governs a deploy
 request the same way it governs the cluster's other background work. SchemaBot does not adjust it,
-and there is nothing to tune per apply.
+and there is nothing to tune per apply. PlanetScale documents the controls in
+[Throttling deploy requests](https://planetscale.com/docs/vitess/schema-changes/throttling-deploy-requests).
 
 **pg-sprite does not throttle yet.** It is planned. Until it lands, each statement gets a lock
 budget and a statement budget, with bounded retries when it hits contention, and a statement that
