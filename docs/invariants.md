@@ -92,8 +92,18 @@ dies. This document states what must never be false at runtime, why each rule ma
 it is enforced. Every invariant here is enforced in shipped code, so this is a registry of
 existing behavior rather than a wishlist.
 
-Every invariant binds every engine SchemaBot drives and every SQL dialect it parses. Where an
-entry names one, it is naming where the rule is enforced, not narrowing who it binds.
+These are invariants of SchemaBot's own machinery, so they hold across engines and dialects
+except where an entry says otherwise. Several do say otherwise, because engines genuinely
+differ: a PlanetScale deploy request lives server-side while a Spirit run does not, and the
+entries that turn on that (CO-3, CO-8, RV-5) name the difference rather than paper over it.
+
+Engine support is not uniform either, and this document does not imply that it is. MySQL via
+Spirit and Vitess via PlanetScale are what Block runs in production. PostgreSQL target support
+is early alpha with a deliberately narrow set of supported changes, and a change outside that
+boundary has its plan blocked rather than routed to something less safe; see
+[postgresql.md](postgresql.md) for the boundary. That is separate from PostgreSQL as a dialect
+of SchemaBot's *own* storage, which is fully supported and is what AV-9 and the cross-dialect
+parity rule are about.
 
 ## Does SchemaBot depend on GitHub?
 
