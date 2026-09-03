@@ -405,7 +405,10 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 // --- harness ------------------------------------------------------------
 
 // openMatrixStorage gives the test a schema-bootstrapped storage database on
-// the shared MySQL server and a handle the test owns.
+// the shared MySQL server and a handle the test owns. The matrix services built
+// over this handle (newMatrixService) are never closed, so the test's cleanup
+// is the handle's only closer; a harness that starts closing its service must
+// open the handle itself instead.
 func openMatrixStorage(t *testing.T) *sql.DB {
 	t.Helper()
 	return openStorageDB(t, newStorageDatabaseWithSchema(t).DSN)

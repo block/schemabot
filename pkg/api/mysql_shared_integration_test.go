@@ -9,8 +9,10 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/block/spirit/pkg/utils"
 	mysqldriver "github.com/go-sql-driver/mysql"
@@ -21,27 +23,66 @@ import (
 	"github.com/block/schemabot/pkg/testutil"
 )
 
-// sharedMySQLDSN points at the single MySQL server that every integration test
-// in this package shares. Booting a MySQL container costs seconds; a test that
-// needs MySQL storage carves out its own database on the shared server with
-// newStorageDatabase instead, which costs a CREATE DATABASE.
-var sharedMySQLDSN string
+// sharedMySQL is the single MySQL server every MySQL-backed integration test in
+// this package shares. Booting a MySQL container costs seconds, so the server
+// starts on first use — a run that selects only unit or PostgreSQL tests never
+// pays for it — and a test that needs MySQL storage carves out its own database
+// on it with newStorageDatabase, which costs a CREATE DATABASE. TestMain
+// terminates the server once the package finishes.
+var sharedMySQL struct {
+	once      sync.Once
+	container *mysql.MySQLContainer
+	dsn       string
+	err       error
+}
 
 // storageDatabaseSeq numbers the per-test databases so each test works in a
 // database no other test has touched.
 var storageDatabaseSeq atomic.Int64
 
+// storageSetupTimeout bounds each administrative statement newStorageDatabase
+// runs against the shared server, so an unreachable server fails the test with
+// a named cause instead of hanging until the binary timeout.
+const storageSetupTimeout = 30 * time.Second
+
 func TestMain(m *testing.M) {
 	os.Exit(runWithSharedMySQL(m))
 }
 
-// runWithSharedMySQL boots the shared MySQL server, runs the package tests
-// against it, and returns the process exit code. The container is terminated
-// on every exit path — including a failed readiness check — so an aborted run
-// never leaves a server behind on the host.
+// runWithSharedMySQL runs the package tests and then terminates the shared
+// MySQL server if any test started it. TerminateContainer is nil-safe, so the
+// deferred call is a no-op when no test needed MySQL, and it also reaps a
+// container that startSharedMySQL handed back alongside an error.
 func runWithSharedMySQL(m *testing.M) int {
-	ctx := context.Background()
+	defer func() {
+		if err := testcontainers.TerminateContainer(sharedMySQL.container); err != nil {
+			log.Printf("terminate shared mysql container: %v", err)
+		}
+	}()
+	return m.Run()
+}
 
+// sharedMySQLDSN returns the root DSN of the shared server, booting it on the
+// first call. A boot failure is recorded and reported to every later caller,
+// so each MySQL-backed test fails with the same cause rather than retrying a
+// Docker daemon that already refused.
+func sharedMySQLDSN(t *testing.T) string {
+	t.Helper()
+	sharedMySQL.once.Do(func() {
+		// The booting test's context only bounds the start and readiness
+		// calls; the running container is not tied to it, so the server
+		// outlives that test for the rest of the package.
+		sharedMySQL.container, sharedMySQL.dsn, sharedMySQL.err = startSharedMySQL(t.Context())
+	})
+	require.NoError(t, sharedMySQL.err, "shared mysql server")
+	return sharedMySQL.dsn
+}
+
+// startSharedMySQL boots the shared server and confirms it answers through the
+// mapped port. The container is returned even when err is set: a failed start
+// can still hand back a running container (for example on a wait-strategy
+// timeout), and runWithSharedMySQL terminates whatever came back.
+func startSharedMySQL(ctx context.Context) (*mysql.MySQLContainer, string, error) {
 	container, err := mysql.Run(ctx,
 		"mysql:8.0",
 		mysql.WithDatabase("schemabot_test"),
@@ -50,32 +91,22 @@ func runWithSharedMySQL(m *testing.M) int {
 		testutil.MySQLTmpfsDatadir(),
 	)
 	if err != nil {
-		log.Printf("start shared mysql container: %v", err)
-		return 1
+		return container, "", fmt.Errorf("start shared mysql container: %w", err)
 	}
-	defer func() {
-		if err := testcontainers.TerminateContainer(container); err != nil {
-			log.Printf("terminate shared mysql container: %v", err)
-		}
-	}()
 
-	sharedMySQLDSN, err = testutil.ContainerConnectionString(ctx, container, "parseTime=true")
+	dsn, err := testutil.ContainerConnectionString(ctx, container, "parseTime=true")
 	if err != nil {
-		log.Printf("shared mysql connection string: %v", err)
-		return 1
+		return container, "", fmt.Errorf("shared mysql connection string: %w", err)
 	}
-	if err := pingSharedMySQL(ctx); err != nil {
-		log.Printf("shared mysql readiness: %v", err)
-		return 1
+	if err := pingMySQL(ctx, dsn); err != nil {
+		return container, "", fmt.Errorf("shared mysql readiness: %w", err)
 	}
-
-	return m.Run()
+	return container, dsn, nil
 }
 
-// pingSharedMySQL confirms the shared server answers through the mapped port
-// before any test opens a pool against it.
-func pingSharedMySQL(ctx context.Context) error {
-	db, err := sql.Open("mysql", sharedMySQLDSN)
+// pingMySQL opens a throwaway pool on dsn and runs the bounded readiness ping.
+func pingMySQL(ctx context.Context, dsn string) error {
+	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return fmt.Errorf("open shared mysql: %w", err)
 	}
@@ -95,19 +126,29 @@ type storageDatabase struct {
 // calling test. The database is left in place when the test finishes: dropping
 // it could block behind connections the test leaked, and the whole server is
 // discarded with the container once the package finishes.
+//
+// The database isolates tables and nothing else. Three things remain
+// server-wide and are shared with every other test in the package: advisory
+// lock names (EnsureSchema serializes on one fixed name), the
+// pendingdrops.Database quarantine schema (its table names carry no source
+// database), and information_schema.PROCESSLIST. The package's MySQL-backed
+// tests run sequentially because of this; do not add t.Parallel to one without
+// first scoping whatever it touches on that list.
 func newStorageDatabase(t *testing.T) storageDatabase {
 	t.Helper()
-	ctx := t.Context()
+	ctx, cancel := context.WithTimeout(t.Context(), storageSetupTimeout)
+	defer cancel()
 
+	rootDSN := sharedMySQLDSN(t)
 	name := fmt.Sprintf("api_test_%d", storageDatabaseSeq.Add(1))
 
-	admin, err := sql.Open("mysql", sharedMySQLDSN)
+	admin, err := sql.Open("mysql", rootDSN)
 	require.NoError(t, err, "open shared mysql")
 	defer utils.CloseAndLog(admin)
 	_, err = admin.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE `%s`", name))
 	require.NoError(t, err, "create database %s", name)
 
-	cfg, err := mysqldriver.ParseDSN(sharedMySQLDSN)
+	cfg, err := mysqldriver.ParseDSN(rootDSN)
 	require.NoError(t, err, "parse shared mysql DSN")
 	cfg.DBName = name
 
@@ -125,15 +166,16 @@ func newStorageDatabaseWithSchema(t *testing.T) storageDatabase {
 	return sdb
 }
 
-// openStorageDB opens and pings a handle on dsn that the test owns: it is
-// closed when the test finishes. Tests that hand the handle to a component
-// which closes it itself (a Service built over mysqlstore.New) must open their
-// own handle instead so the handle has a single owner.
+// openStorageDB opens a handle on dsn that the test owns — it is closed when
+// the test finishes — and confirms it answers with the bounded readiness ping.
+// Tests that hand the handle to a component which closes it itself (a Service
+// built over mysqlstore.New that the test later closes) must open their own
+// handle instead so the handle has a single owner.
 func openStorageDB(t *testing.T, dsn string) *sql.DB {
 	t.Helper()
 	db, err := sql.Open("mysql", dsn)
 	require.NoError(t, err, "open storage database")
 	t.Cleanup(func() { utils.CloseAndLog(db) })
-	require.NoError(t, db.PingContext(t.Context()), "ping storage database")
+	require.NoError(t, testutil.PingMySQL(t.Context(), db), "ping storage database")
 	return db
 }

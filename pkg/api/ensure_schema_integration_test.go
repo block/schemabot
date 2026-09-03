@@ -122,12 +122,9 @@ func assertEnsureSchemaDoesNotCleanSpiritTablesWhileWaitingForLock(
 	_, err = db.ExecContext(ctx, fmt.Sprintf("CREATE TABLE `%s` (id INT PRIMARY KEY)", shadowTable))
 	require.NoError(t, err)
 
-	errs := make(chan error, 1)
-	go func() {
-		errs <- EnsureSchema(sdb.DSN, logger)
-	}()
+	errs := startEnsureSchema(t, sdb.DSN, logger)
 
-	waitForEnsureSchemaLockWaiter(t, db)
+	waitForEnsureSchemaLockWaiter(t, db, sdb.Name)
 	assert.True(t, testutil.TableExists(t, db, sdb.Name, shadowTable),
 		"Spirit shadow table should not be cleaned while another pod holds the EnsureSchema lock")
 
@@ -137,7 +134,7 @@ func assertEnsureSchemaDoesNotCleanSpiritTablesWhileWaitingForLock(
 	select {
 	case err := <-errs:
 		require.NoError(t, err)
-	case <-time.After(30 * time.Second):
+	case <-time.After(ensureSchemaFinishDeadline):
 		t.Fatal("timed out waiting for EnsureSchema to finish after releasing lock")
 	}
 
@@ -154,35 +151,66 @@ func TestEnsureSchema_ConcurrentPods(t *testing.T) {
 	// Simulate two pods starting simultaneously, both calling EnsureSchema.
 	// The advisory lock should serialize them — both should succeed without
 	// colliding on Spirit's shadow tables.
-	errs := make(chan error, 2)
-	for range 2 {
-		go func() {
-			errs <- EnsureSchema(dsn, logger)
-		}()
-	}
+	podA := startEnsureSchema(t, dsn, logger)
+	podB := startEnsureSchema(t, dsn, logger)
 
-	for range 2 {
-		require.NoError(t, <-errs, "concurrent EnsureSchema failed")
-	}
+	// Collect both outcomes before asserting so a failure in one pod never
+	// leaves the other running past the end of the test.
+	errA, errB := <-podA, <-podB
+	require.NoError(t, errA, "concurrent EnsureSchema failed")
+	require.NoError(t, errB, "concurrent EnsureSchema failed")
 
 	// Verify tables exist after concurrent execution.
 	assert.True(t, testutil.TableExists(t, db, sdb.Name, "tasks"),
 		"tasks table should exist after concurrent EnsureSchema")
 }
 
-func waitForEnsureSchemaLockWaiter(t *testing.T, db *sql.DB) {
+// ensureSchemaFinishDeadline bounds how long a test waits for a background
+// EnsureSchema to return once nothing is holding it back.
+const ensureSchemaFinishDeadline = 30 * time.Second
+
+// startEnsureSchema runs EnsureSchema in the background and returns the channel
+// its result arrives on. The advisory lock EnsureSchema takes is server-wide,
+// so the test always waits for the goroutine to finish before it ends: a
+// straggler left running after a failed assertion would hold the lock against
+// every later test in the package and stall them until it completed.
+func startEnsureSchema(t *testing.T, dsn string, logger *slog.Logger) <-chan error {
+	t.Helper()
+	errs := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		errs <- EnsureSchema(dsn, logger)
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-done:
+		case <-time.After(ensureSchemaFinishDeadline):
+			t.Error("background EnsureSchema still running at test end; it holds the ensure-schema lock against later tests")
+		}
+	})
+	return errs
+}
+
+// waitForEnsureSchemaLockWaiter blocks until a session connected to database
+// is waiting on an advisory lock. The database predicate matters: PROCESSLIST
+// is server-wide, so without it a waiter from any other test on the shared
+// server would satisfy the check.
+func waitForEnsureSchemaLockWaiter(t *testing.T, db *sql.DB, database string) {
 	t.Helper()
 	var count int
 	require.Eventually(t, func() bool {
 		err := db.QueryRowContext(t.Context(),
 			`SELECT COUNT(*) FROM information_schema.PROCESSLIST
 			 WHERE ID <> CONNECTION_ID()
+			   AND DB = ?
 			   AND INFO LIKE '%GET_LOCK%'`,
+			database,
 		).Scan(&count)
 		require.NoError(t, err)
 		return count > 0
 	}, 10*time.Second, 100*time.Millisecond,
-		"expected EnsureSchema to wait for the advisory lock, waiter count: %d", count)
+		"expected EnsureSchema to wait for the advisory lock in %s, waiter count: %d", database, count)
 }
 
 // openEnsureSchemaDatabase gives the test an empty database on the shared
