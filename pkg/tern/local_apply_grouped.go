@@ -568,14 +568,18 @@ func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *stor
 // pollForCompletionAtomic polls the engine for progress in atomic mode (all tasks share state).
 func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, options map[string]string, releaseAtCutoverBarrier bool) {
 	eng := c.getEngine()
-	ticker := time.NewTicker(defaultTaskPollInterval)
+	ticker := time.NewTicker(c.taskPollInterval())
 	defer ticker.Stop()
 
 	// Seed revertSkipped from the durable signal so a driver that picks this apply
 	// up after a restart treats skip-revert as already accepted: it won't re-attempt
 	// SkipRevert, and it keeps surfacing skipping_revert while finalization is in
 	// flight rather than falling back to revert_window.
-	ps := &atomicPollState{lastProgressLog: time.Now(), revertSkipped: apply.RevertSkippedAt != nil}
+	ps := &atomicPollState{
+		lastProgressLog: time.Now(),
+		revertSkipped:   apply.RevertSkippedAt != nil,
+		lostWork:        lostEngineWorkTracker{budget: c.lostEngineWorkPendingBudget(eng)},
+	}
 
 	for {
 		select {
@@ -671,6 +675,45 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		}
 		return false
 	}
+	now := time.Now()
+	newState := taskStateFromProgressResult(result)
+
+	settled := settledTaskSet{}
+	if engineReportsLostApplyWork(newState, tasks) {
+		pendingFor, exhausted := ps.lostWork.observePending(now)
+		if exhausted {
+			var settleErr error
+			if settled, settleErr = c.settleLostEngineWorkForTasks(ctx, apply, tasks, result.State); settleErr != nil {
+				// Neither the engine nor the target has answered what happened
+				// to the work, so count the failed verification against the
+				// same bounded error budget as a failed poll — this must never
+				// become an unbounded loop. Return before the reset below so
+				// the healthy poll that carried the pending report cannot
+				// clear the count.
+				ps.consecutiveErrors++
+				logger.Warn("engine reports no active schema change for an in-flight apply and target verification failed; the drive re-verifies at the next poll",
+					append(apply.MutableLogAttrs(), "engine_state", result.State, "consecutive_errors", ps.consecutiveErrors, "error", settleErr)...)
+				if ps.consecutiveErrors >= maxConsecutiveProgressPollErrors {
+					c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("engine reports no active schema change for an in-flight apply and the target could not be verified; %d consecutive errors across progress polls and target verification; see server logs", ps.consecutiveErrors))
+					return true
+				}
+				return false
+			}
+			// The settled tasks are terminal or resting now, and the progress
+			// sync below leaves them out, so the tick falls through and the
+			// apply-state derivation quiesces the apply from the settled task
+			// states.
+		} else {
+			// Inside the budget the engine is still trusted: it may be
+			// serving a stale snapshot after a restart, or reporting
+			// pending for real work it has not begun executing yet.
+			logger.Debug("engine reports no active schema change for an in-flight apply; still inside the trust budget",
+				append(apply.MutableLogAttrs(), "engine_state", result.State, "pending_for", pendingFor.Round(time.Second))...)
+		}
+	} else {
+		ps.lostWork.reset()
+	}
+
 	ps.consecutiveErrors = 0
 	c.logEngineResumeOnce(ctx, logger, apply, result.ResumedFromCheckpoint, &ps.resumeEventLogged)
 
@@ -705,9 +748,6 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		}
 	}
 
-	now := time.Now()
-	newState := taskStateFromProgressResult(result)
-
 	// Log state transitions and track when waiting states are entered (for timeouts)
 	if newState != ps.lastTaskState {
 		msg := fmt.Sprintf("State changed to %s", newState)
@@ -739,7 +779,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	c.logAtomicProgress(ctx, apply, result, ps, now)
 
 	// Update all tasks with engine progress
-	c.syncAtomicTaskProgress(ctx, logger, tasks, result, newState, now)
+	c.syncAtomicTaskProgress(ctx, logger, tasks, result, newState, now, settled)
 	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		logger.Warn("pending stop request processing failed after progress sync; current apply owner will exit for operator retry",
 			"error", err)
@@ -1088,6 +1128,93 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	return false
 }
 
+// engineReportsLostApplyWork reports whether a grouped progress poll came back
+// with no active schema change (a state that maps to pending) while durable
+// storage says at least one of the apply's tasks is in flight. A grouped apply
+// is a single engine operation, so the engine-vs-storage divergence is
+// detected at the apply level and one trust budget covers all of its tasks;
+// the per-task stored states still decide which tasks a settlement touches.
+// Like the sequential detection, this shape is ambiguous on its own — the
+// caller treats it as the start of a timed trust budget, not as evidence (see
+// engineReportsLostWork).
+func engineReportsLostApplyWork(engineTaskState string, tasks []*storage.Task) bool {
+	for _, task := range tasks {
+		if engineReportsLostWork(task.State, engineTaskState) {
+			return true
+		}
+	}
+	return false
+}
+
+// settleLostEngineWorkForTasks resolves a grouped apply's in-flight tasks after
+// the engine has stopped reporting on them, by verifying the target schema
+// directly — the grouped counterpart of settleLostEngineWork. The engine says
+// no schema change is active while durable storage says the apply's work is in
+// flight, and that divergence outlasted the tolerated staleness window, so
+// engine progress can never terminalize these tasks and the target itself is
+// the only remaining authority.
+//
+// Revert-phase tasks rest retryable without a target read — a schema read
+// cannot settle a revert — so they settle even when the re-plan below fails.
+// Every other in-flight task settles from one shared re-plan of the reviewed
+// schema set: completed when its (namespace, shard, table) no longer needs a
+// change, retryable when it still does. Tasks already at rest or terminal are
+// left untouched, so a settlement retried after a verification error never
+// re-settles what an earlier pass already decided. A verification error is
+// returned for the caller's consecutive-error budget to count.
+//
+// Returns the tasks it settled, so the caller can keep the same tick's engine
+// report from claiming a state for work the target already answered for.
+func (c *LocalClient) settleLostEngineWorkForTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, engineState engine.State) (settledTaskSet, error) {
+	settled := settledTaskSet{}
+	var unverified []*storage.Task
+	for _, task := range tasks {
+		if !state.IsInFlightTaskState(task.State) {
+			c.logger.Debug("leaving task out of lost-work settlement; its stored state has no active engine work",
+				append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "engine_state", engineState)...)
+			continue
+		}
+		if taskInRevertPhase(task) {
+			c.settleLostRevertPhaseTask(ctx, apply, task, engineState)
+			settled.add(task)
+			continue
+		}
+		unverified = append(unverified, task)
+	}
+	if len(unverified) == 0 {
+		return settled, nil
+	}
+	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+	if err != nil {
+		return settled, fmt.Errorf("load plan for apply %s to verify target schema: %w", apply.ApplyIdentifier, err)
+	}
+	if plan == nil {
+		return settled, fmt.Errorf("plan not found for apply %s while verifying target schema", apply.ApplyIdentifier)
+	}
+	replanDDL, err := c.replanTargetSchema(ctx, apply, plan)
+	if err != nil {
+		return settled, fmt.Errorf("verify target schema for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	for _, task := range unverified {
+		c.settleLostVerifiedTask(ctx, apply, task, replanVerdictForTask(replanDDL, task), engineState)
+		settled.add(task)
+	}
+	return settled, nil
+}
+
+// settledTaskSet holds the tasks a drive resolved from a more authoritative
+// source than the engine during a single tick — here, the live target schema.
+// Their state is decided and persisted, so the same tick's engine report is no
+// longer entitled to claim one for them.
+type settledTaskSet map[*storage.Task]struct{}
+
+func (s settledTaskSet) add(task *storage.Task) { s[task] = struct{}{} }
+
+func (s settledTaskSet) contains(task *storage.Task) bool {
+	_, ok := s[task]
+	return ok
+}
+
 // autoTriggerCutover fires the engine cutover for a drive that is not
 // deferring cutover, pacing the operator-visible signal around the backend's
 // staging window: the trigger event is recorded once per drive so retries do
@@ -1251,76 +1378,183 @@ func (c *LocalClient) logAtomicProgress(ctx context.Context, apply *storage.Appl
 	ps.lastProgressLog = now
 }
 
-// syncAtomicTaskProgress updates all tasks with engine state and per-table
-// progress. Every task ends its tick with a persisted write, even when no
-// field moved: the operator reads tasks.updated_at as the drive's liveness
-// signal (ApplyDriveStallAfter) and cancels a drive whose rows stop advancing,
-// so the write must stay unconditional — including through parked states such
-// as deferred cutovers and revert windows, where nothing changes tick to tick.
-func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.Logger, tasks []*storage.Task, result *engine.ProgressResult, newState string, now time.Time) {
+// enginePoll is one grouped progress poll, decoded once for the whole apply:
+// the engine's report, the apply-wide task state the poll mapped to, the
+// instant classification its resume metadata carried, and the tick's clock.
+// Both halves of the projection read the same value, so a task can never be
+// refreshed against one poll and advanced against another.
+type enginePoll struct {
+	result   *engine.ProgressResult
+	newState string
+	// instantFromMetadata is the engine's own instant classification, decoded
+	// from the poll's resume metadata. It stands in for the per-table report an
+	// instant DDL never produces, having copied no rows.
+	instantFromMetadata bool
+	now                 time.Time
+}
+
+// retryableFailure reports whether the state this poll claims is a failure the
+// drive will retry, which leaves the task short of a finished outcome: no
+// completion stamp, and no finished progress bar.
+func (p enginePoll) retryableFailure() bool {
+	return state.IsState(p.newState, state.Task.FailedRetryable)
+}
+
+// syncAtomicTaskProgress projects one grouped progress poll onto every task of
+// the apply. A poll carries two separable things, and each task takes them
+// through a separate helper: the fields the operator sees, which a poll may
+// always refresh, and the state the poll claims for the task, which is a
+// correctness decision.
+//
+// Every task the poll speaks for ends its tick with a persisted write, even
+// when no field moved: the operator reads tasks.updated_at as the drive's
+// liveness signal (ApplyDriveStallAfter) and cancels a drive whose rows stop
+// advancing, so the write must stay unconditional — including through parked
+// states such as deferred cutovers and revert windows, where nothing changes
+// tick to tick. A task the poll does not speak for is one already settled from
+// a more authoritative source earlier in the tick, and it took its persisted
+// write from that settlement.
+func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.Logger, tasks []*storage.Task, result *engine.ProgressResult, newState string, now time.Time, settled settledTaskSet) {
 	tableProgress := indexEngineTableProgress(result.Tables)
-	retryableFailure := state.IsState(newState, state.Task.FailedRetryable)
-	instantFromMetadata := false
+	poll := enginePoll{result: result, newState: newState, now: now}
 	if result.ResumeState != nil && result.ResumeState.Metadata != "" {
 		if meta, err := decodePSMetadataForStorage(result.ResumeState.Metadata); err == nil && meta != nil {
-			instantFromMetadata = meta.IsInstant
+			poll.instantFromMetadata = meta.IsInstant
 		}
 	}
 
 	for _, task := range tasks {
-		if retryableFailure && state.IsTerminalTaskState(task.State) {
+		if poll.retryableFailure() && state.IsTerminalTaskState(task.State) {
 			continue
 		}
-		engineTaskState := newState
-		if tp, ok := tableProgress.ForTask(task); ok {
-			task.RowsCopied = tp.RowsCopied
-			task.RowsTotal = tp.RowsTotal
-			task.ProgressPercent = tp.Progress
-			task.ETASeconds = int(tp.ETASeconds)
-			task.ChecksumRowsChecked = tp.ChecksumRowsChecked
-			task.ChecksumRowsTotal = tp.ChecksumRowsTotal
-			task.Throttled = tp.Throttled
-			task.ThrottleReason = tp.ThrottleReason
-			task.IsInstant = tp.IsInstant
-			if tp.StartedAt != nil && task.StartedAt == nil {
-				task.StartedAt = tp.StartedAt
-			}
-			if tp.CompletedAt != nil && !retryableFailure && task.CompletedAt == nil {
-				task.CompletedAt = tp.CompletedAt
-			}
-			// A generic running apply refines into the table's post-copy phase
-			// when the engine reports one, so a table catching up on accumulated
-			// changes, checksumming, or cutting over is stored — and rendered —
-			// as that phase rather than as a serene fully-copied bar.
-			if phase, isPhase := tablePhaseTaskState(tp.State); isPhase && state.IsState(newState, state.Task.Running) {
-				engineTaskState = phase
-			}
-			// Persist the per-shard breakdown as per-shard tasks so the renderer
-			// can show per-shard state from storage. No-op outside the lease-held
-			// operator drive (read-path callers carry no operation lease).
-			c.writeShardProgress(ctx, logger, task, tp, now)
-		} else if instantFromMetadata {
-			task.IsInstant = true
-			if result.State.IsTerminal() && !retryableFailure {
-				task.ProgressPercent = 100
-			}
+		if settled.contains(task) {
+			// The target schema answered for this task earlier in the tick and
+			// settlement persisted the result. The poll that sent the drive to
+			// the target reports no active schema change, so it carries neither
+			// progress to display nor a state this task may take.
+			logger.Debug("leaving settled task out of the engine progress projection",
+				append(task.LogAttrs(), "engine_state", result.State)...)
+			continue
 		}
-		if task.StartedAt == nil && newState != state.Task.Pending {
-			task.StartedAt = &now
+		tp, _ := tableProgress.ForTask(task)
+		if tp != nil {
+			c.unrecognizedStatuses.observeTaskStatus(ctx, logger, task, tp.State)
 		}
-		if result.State.IsTerminal() && !retryableFailure && task.CompletedAt == nil {
-			task.CompletedAt = &now
-		}
-		if result.State == engine.StateFailed && task.ErrorMessage == "" {
-			if msg := progressFailureMessage(result); msg != "" {
-				task.ErrorMessage = msg
-			}
-		}
-		if result.State == engine.StateCompleted {
+		c.refreshTaskDisplayFromEngine(ctx, logger, task, tp, poll)
+		c.advanceTaskFromEngineProgress(ctx, task, tp, poll)
+	}
+}
+
+// refreshTaskDisplayFromEngine projects a progress poll onto the fields the
+// operator sees: row counts, percentage, ETA, checksum progress, throttle
+// state, instant classification, and the per-shard breakdown. None of them
+// decides what state a task is in, so this is always safe to run — a stale or
+// absent engine snapshot degrades the display and nothing else. The per-shard
+// breakdown does carry a state per shard, but it lands on rows of its own
+// (shard != "") that only the per-shard renderer loads; the task state machine
+// never reads them.
+//
+// Those shard rows are the only write made here: the task's own refreshed
+// fields are mutated in memory and reach storage on the write
+// advanceTaskFromEngineProgress makes, which is why the refresh runs first — a
+// transition rolled back by a storage failure keeps the display fields the
+// caller refreshed before it. A caller that refreshes the display and then
+// declines the advance still owes the task a persisted write. The operator
+// reads tasks.updated_at as the drive's liveness signal
+// (ApplyDriveStallAfter), so a tick that ends without one reads as a drive
+// that stopped making progress, however fresh the fields left in memory are.
+func (c *LocalClient) refreshTaskDisplayFromEngine(ctx context.Context, logger *slog.Logger, task *storage.Task, tp *engine.TableProgress, poll enginePoll) {
+	switch {
+	case tp != nil:
+		applyEngineTableDisplayFields(task, tp)
+		// Persist the per-shard breakdown as per-shard tasks so the read path
+		// serves per-shard state out of tasks storage rather than re-querying
+		// the engine. Only a driver writes it, under the lease its claim holds.
+		c.writeShardProgress(ctx, logger, task, tp, poll.now)
+	case poll.instantFromMetadata:
+		// An instant DDL copies no rows, so no per-table report arrives to
+		// fill the bar: any terminal outcome it reaches other than a retryable
+		// failure leaves the change made, and the bar full.
+		task.IsInstant = true
+		if poll.result.State.IsTerminal() && !poll.retryableFailure() {
 			task.ProgressPercent = 100
 		}
-		c.transitionTaskState(ctx, task, 0, taskStateWithNoBackwardProgress(task.State, engineTaskState), "")
 	}
+	// A completed poll ends the bar at 100 whatever the table's last sample
+	// read: row counts are estimates, and a finished copy can land a fraction
+	// short of its own total.
+	if poll.result.State == engine.StateCompleted {
+		task.ProgressPercent = 100
+	}
+}
+
+// advanceTaskFromEngineProgress applies the part of a progress poll that is a
+// correctness decision: the state the poll claims for the task, and the
+// start/completion/error stamps that belong to that outcome.
+//
+// It is separate from the display refresh so a drive that has already settled a
+// task from a more authoritative source — a durable record, or the target
+// schema itself — can keep showing live engine progress without letting the
+// poll re-open what was settled. taskStateWithNoBackwardProgress remains the
+// policy for whether the claim is allowed to move the stored state.
+//
+// This is also where the tick reaches storage, for the task's stamps and for
+// the display fields the refresh left in memory.
+func (c *LocalClient) advanceTaskFromEngineProgress(ctx context.Context, task *storage.Task, tp *engine.TableProgress, poll enginePoll) {
+	retryableFailure := poll.retryableFailure()
+	if tp != nil {
+		if tp.StartedAt != nil && task.StartedAt == nil {
+			task.StartedAt = tp.StartedAt
+		}
+		if tp.CompletedAt != nil && !retryableFailure && task.CompletedAt == nil {
+			task.CompletedAt = tp.CompletedAt
+		}
+	}
+	if task.StartedAt == nil && poll.newState != state.Task.Pending {
+		task.StartedAt = &poll.now
+	}
+	if poll.result.State.IsTerminal() && !retryableFailure && task.CompletedAt == nil {
+		task.CompletedAt = &poll.now
+	}
+	if poll.result.State == engine.StateFailed && task.ErrorMessage == "" {
+		if msg := progressFailureMessage(poll.result); msg != "" {
+			task.ErrorMessage = msg
+		}
+	}
+	c.transitionTaskState(ctx, task, 0, taskStateWithNoBackwardProgress(task.State, engineTaskStateClaim(poll.newState, tp)), "")
+}
+
+// engineTaskStateClaim is the state a progress poll claims for one task: the
+// apply-wide state the poll mapped to, refined into the table's own post-copy
+// phase when the engine reported one. A table catching up on accumulated
+// changes, checksumming, or cutting over is then stored — and rendered — as
+// that phase rather than as a serene fully-copied bar.
+//
+// It is only a claim. Whether the stored state may move to it is decided by
+// taskStateWithNoBackwardProgress.
+func engineTaskStateClaim(newState string, tp *engine.TableProgress) string {
+	if tp == nil {
+		return newState
+	}
+	if phase, isPhase := tablePhaseTaskState(tp.State); isPhase && state.IsState(newState, state.Task.Running) {
+		return phase
+	}
+	return newState
+}
+
+// applyEngineTableDisplayFields copies a poll's per-table progress onto the
+// task's display fields. Shared by the grouped and sequential drives so both
+// render from the same projection of an engine report.
+func applyEngineTableDisplayFields(task *storage.Task, tp *engine.TableProgress) {
+	task.RowsCopied = tp.RowsCopied
+	task.RowsTotal = tp.RowsTotal
+	task.ProgressPercent = tp.Progress
+	task.ETASeconds = int(tp.ETASeconds)
+	task.ChecksumRowsChecked = tp.ChecksumRowsChecked
+	task.ChecksumRowsTotal = tp.ChecksumRowsTotal
+	task.Throttled = tp.Throttled
+	task.ThrottleReason = tp.ThrottleReason
+	task.IsInstant = tp.IsInstant
 }
 
 // tablePhaseTaskState maps a per-table engine state to the refined task state
@@ -1364,6 +1598,7 @@ func (c *LocalClient) writeShardProgress(ctx context.Context, logger *slog.Logge
 		operationID = *table.ApplyOperationID
 	}
 	for _, sh := range tp.Shards {
+		c.unrecognizedStatuses.observeShardStatus(ctx, logger, table, sh.Shard, sh.State)
 		shardTask := &storage.Task{
 			TaskIdentifier:   engine.NewTaskID(),
 			ApplyID:          table.ApplyID,

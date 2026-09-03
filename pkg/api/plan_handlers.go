@@ -172,6 +172,16 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Spend the request's budget once the request is well-formed and before it
+	// reaches a target, so a malformed request costs nothing while every
+	// request that could load a database is counted. A request naming a
+	// database this server does not route still spends budget: route
+	// resolution is server-side work, and a client looping on an unknown
+	// database is exactly the runaway the budget exists to bound.
+	if !s.checkPullRateLimit(w, r, req.Database, req.Environment) {
+		return
+	}
+
 	resp, err := s.ExecutePullSchema(r.Context(), req)
 	if err != nil {
 		var typeMismatchErr *databaseTypeMismatchError

@@ -7,6 +7,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -261,7 +262,7 @@ func computeAggregate(checks []*storage.Check) (conclusion, status string) {
 }
 
 // aggregateSummary builds a human-readable title and markdown summary for the aggregate check.
-func aggregateSummary(checks []*storage.Check, conclusion string) (title, summary string) {
+func aggregateSummary(checks []*storage.Check, conclusion string, stopped stoppedApplyIDs) (title, summary string) {
 	switch conclusion {
 	case checkConclusionSuccess:
 		if allChecksAreUpToDate(checks) {
@@ -269,10 +270,10 @@ func aggregateSummary(checks []*storage.Check, conclusion string) (title, summar
 		} else {
 			title = "All applies complete"
 		}
-		summary = buildAggregateTable(checks)
+		summary = buildAggregateTable(checks, stopped)
 	case checkConclusionFailure:
 		title = "Apply failed"
-		summary = buildAggregateTable(checks)
+		summary = buildAggregateTable(checks, stopped)
 	case checkConclusionActionRequired:
 		pending := 0
 		unresolved := 0
@@ -329,21 +330,26 @@ func aggregateSummary(checks []*storage.Check, conclusion string) (title, summar
 		default:
 			title = fmt.Sprintf("%d applies pending", pending)
 		}
-		summary = buildAggregateTable(checks)
+		summary = buildAggregateTable(checks, stopped)
 	default:
 		// in_progress — conclusion is empty
 		inProgress := 0
 		waiting := 0
+		paused := 0
 		for _, c := range checks {
 			if c.Status != checkStatusInProgress {
 				continue
 			}
 			inProgress++
-			if isUnresolvedParticipantCheck(c) {
+			switch {
+			case isUnresolvedParticipantCheck(c):
 				waiting++
+			case stopped.holds(c):
+				paused++
 			}
 		}
-		if inProgress > 0 && waiting == inProgress {
+		switch {
+		case inProgress > 0 && waiting == inProgress:
 			// Nothing is applying; the fold is waiting for participant Check
 			// Runs a scheduled re-fold will re-read shortly.
 			if waiting == 1 {
@@ -351,12 +357,36 @@ func aggregateSummary(checks []*storage.Check, conclusion string) (title, summar
 			} else {
 				title = fmt.Sprintf("Waiting for %d participant deployments to report", waiting)
 			}
-		} else {
+		case inProgress > 0 && paused == inProgress:
+			// Every row holding the aggregate open is a stopped apply, so the
+			// PR is waiting on an operator to start or cancel, not on work.
+			if paused == 1 {
+				title = "1 apply stopped"
+			} else {
+				title = fmt.Sprintf("%d applies stopped", paused)
+			}
+		case paused > 0:
+			title = fmt.Sprintf("Apply in progress (%d stopped)", paused)
+		default:
 			title = "Apply in progress"
 		}
-		summary = buildAggregateTable(checks)
+		summary = buildAggregateTable(checks, stopped)
 	}
 	return title, summary
+}
+
+// stoppedApplyIDs is the set of applies resting in the stopped state, so the
+// fold can tell a check held open by a paused apply from one held open by work
+// still running. The distinction is the operator's next move: a stopped apply
+// holds its database until someone starts or cancels it, and calling that
+// "Apply in progress" sends the reader off to watch progress that will never
+// arrive. Resolved per fold rather than stored on the row, so a resume needs no
+// second write to undo it. A nil set reads as "nothing is stopped".
+type stoppedApplyIDs map[int64]bool
+
+// holds reports whether the apply that owns this check is stopped.
+func (s stoppedApplyIDs) holds(c *storage.Check) bool {
+	return c.ApplyID != 0 && s[c.ApplyID]
 }
 
 // isUnresolvedParticipantCheck reports whether a synthesized participant row
@@ -383,7 +413,7 @@ func isParticipantCheck(c *storage.Check) bool {
 // so the Tenant deployments section is rendered first and its size reserved: it
 // is never dropped, even when many per-database rows would otherwise fill the
 // Check Run text limit — those rows truncate instead.
-func buildAggregateTable(checks []*storage.Check) string {
+func buildAggregateTable(checks []*storage.Check, stopped stoppedApplyIDs) string {
 	var dbChecks, participantChecks []*storage.Check
 	for _, c := range checks {
 		if isParticipantCheck(c) {
@@ -394,7 +424,7 @@ func buildAggregateTable(checks []*storage.Check) string {
 	}
 
 	tenantSection := renderParticipantSection(participantChecks)
-	dbSection := renderDatabaseSection(dbChecks, maxCheckRunTextLength-1000-len(tenantSection))
+	dbSection := renderDatabaseSection(dbChecks, maxCheckRunTextLength-1000-len(tenantSection), stopped)
 
 	var sb strings.Builder
 	sb.WriteString(dbSection)
@@ -425,7 +455,7 @@ func changeSummaryLabel(c *storage.Check) string {
 // environments into one table, so an Environment column is added when the rows
 // span more than one environment — otherwise staging and production rows for the
 // same database would be indistinguishable.
-func renderDatabaseSection(dbChecks []*storage.Check, budget int) string {
+func renderDatabaseSection(dbChecks []*storage.Check, budget int, stopped stoppedApplyIDs) string {
 	if len(dbChecks) == 0 {
 		return ""
 	}
@@ -441,9 +471,9 @@ func renderDatabaseSection(dbChecks []*storage.Check, budget int) string {
 	for i, c := range dbChecks {
 		var row string
 		if showEnv {
-			row = fmt.Sprintf("| `%s` | %s | %s | %s | %s |\n", c.DatabaseName, c.Environment, c.DatabaseType, changeSummaryLabel(c), checkStatusLabel(c))
+			row = fmt.Sprintf("| `%s` | %s | %s | %s | %s |\n", c.DatabaseName, c.Environment, c.DatabaseType, changeSummaryLabel(c), checkStatusLabel(c, stopped))
 		} else {
-			row = fmt.Sprintf("| `%s` | %s | %s | %s |\n", c.DatabaseName, c.DatabaseType, changeSummaryLabel(c), checkStatusLabel(c))
+			row = fmt.Sprintf("| `%s` | %s | %s | %s |\n", c.DatabaseName, c.DatabaseType, changeSummaryLabel(c), checkStatusLabel(c, stopped))
 		}
 		if sb.Len()+len(row) > budget {
 			fmt.Fprintf(&sb, "\n... and %d more check(s)\n", len(dbChecks)-i)
@@ -479,7 +509,7 @@ func renderParticipantSection(participantChecks []*storage.Check) string {
 	sb.WriteString("| Tenant | Status |\n")
 	sb.WriteString("|--------|--------|\n")
 	for i, c := range participantChecks {
-		row := fmt.Sprintf("| `%s` | %s |\n", c.DatabaseName, checkStatusLabel(c))
+		row := fmt.Sprintf("| `%s` | %s |\n", c.DatabaseName, checkStatusLabel(c, nil))
 		if sb.Len()+len(row) > maxCheckRunTextLength-1000 {
 			fmt.Fprintf(&sb, "\n... and %d more tenant(s)\n", len(participantChecks)-i)
 			break
@@ -501,9 +531,14 @@ func allChecksAreUpToDate(checks []*storage.Check) bool {
 	return true
 }
 
-func checkStatusLabel(c *storage.Check) string {
+func checkStatusLabel(c *storage.Check, stopped stoppedApplyIDs) string {
 	if c.Status == checkStatusCompleted && c.Conclusion == checkConclusionSuccess && !c.HasChanges {
 		return "Up to date"
+	}
+	// A stopped apply's check is still in progress so merge stays blocked; the
+	// row says which so the table agrees with the title.
+	if c.Status == checkStatusInProgress && stopped.holds(c) {
+		return state.Label(state.Apply.Stopped)
 	}
 	if isUnresolvedParticipantCheck(c) {
 		if c.Status == checkStatusInProgress {

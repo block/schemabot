@@ -286,10 +286,70 @@ func TestProgressIsKeyedToTheRequestingApply(t *testing.T) {
 	assert.Equal(t, engine.StatePending, anonymous.State)
 }
 
-// TestStaleApplyCannotOverwriteTrackedProgress proves a background writer
-// from a superseded apply cannot replace the tracked apply's state: once a
-// newer apply claims the engine, the stale terminal write is discarded.
-func TestStaleApplyCannotOverwriteTrackedProgress(t *testing.T) {
+// TestConcurrentAppliesEachAnswerForTheirOwnWork proves accepting a second
+// apply on the same target leaves the first one's progress intact. One engine
+// serves a target for its whole lifetime, and a running apply's driver reading
+// pending would take it as evidence its work was lost and settle the apply
+// against the target schema while the statement is still executing.
+func TestConcurrentAppliesEachAnswerForTheirOwnWork(t *testing.T) {
+	eng := New()
+	changeA := nativeApply{namespace: "public", table: "t_a", sql: "ALTER TABLE public.t_a ADD COLUMN a text"}
+	changeB := nativeApply{namespace: "public", table: "t_b", sql: "ALTER TABLE public.t_b ADD COLUMN b text"}
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), changeA, ""))
+	eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), changeB, ""))
+
+	first, err := eng.Progress(t.Context(), &engine.ProgressRequest{
+		ResumeState: &engine.ResumeState{MigrationContext: "task-a"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, engine.StateRunning, first.State)
+	require.Len(t, first.Tables, 1)
+	assert.Equal(t, "t_a", first.Tables[0].Table)
+
+	second, err := eng.Progress(t.Context(), &engine.ProgressRequest{
+		ResumeState: &engine.ResumeState{MigrationContext: "task-b"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, engine.StateRunning, second.State)
+	require.Len(t, second.Tables, 1)
+	assert.Equal(t, "t_b", second.Tables[0].Table)
+}
+
+// TestClaimProgressRetiresSettledApplies proves accepting an apply retires the
+// entries that already reached a terminal state, so a long-lived engine does
+// not accumulate one entry per apply it has ever served, while entries for
+// applies that are still running survive untouched.
+func TestClaimProgressRetiresSettledApplies(t *testing.T) {
+	eng := New()
+	settled := nativeApply{namespace: "public", table: "t_settled", sql: "ALTER TABLE public.t_settled ADD COLUMN a text"}
+	running := nativeApply{namespace: "public", table: "t_running", sql: "ALTER TABLE public.t_running ADD COLUMN b text"}
+	fresh := nativeApply{namespace: "public", table: "t_fresh", sql: "ALTER TABLE public.t_fresh ADD COLUMN c text"}
+	eng.claimProgress("task-settled", progressResult(engine.StateCompleted, "completed", time.Now(), settled, ""))
+	eng.claimProgress("task-running", progressResult(engine.StateRunning, "preflight", time.Now(), running, ""))
+
+	eng.claimProgress("task-fresh", progressResult(engine.StateRunning, "preflight", time.Now(), fresh, ""))
+
+	retired, err := eng.Progress(t.Context(), &engine.ProgressRequest{
+		ResumeState: &engine.ResumeState{MigrationContext: "task-settled"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, engine.StatePending, retired.State)
+	assert.Equal(t, "No active schema change", retired.Message)
+
+	survivor, err := eng.Progress(t.Context(), &engine.ProgressRequest{
+		ResumeState: &engine.ResumeState{MigrationContext: "task-running"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, engine.StateRunning, survivor.State)
+	require.Len(t, survivor.Tables, 1)
+	assert.Equal(t, "t_running", survivor.Tables[0].Table)
+}
+
+// TestUntrackedApplyProgressIsDiscarded proves a background writer whose apply
+// the engine has stopped tracking cannot resurrect an entry or disturb the
+// applies still being tracked. Drain is what stops tracking a running apply,
+// and it means the drive that accepted the work has given it up.
+func TestUntrackedApplyProgressIsDiscarded(t *testing.T) {
 	eng := New()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	changeB := nativeApply{namespace: "public", table: "t_b", sql: "ALTER TABLE public.t_b ADD COLUMN b text"}
@@ -297,6 +357,13 @@ func TestStaleApplyCannotOverwriteTrackedProgress(t *testing.T) {
 
 	changeA := nativeApply{namespace: "public", table: "t_a", sql: "ALTER TABLE public.t_a ADD COLUMN a text"}
 	eng.publishProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), changeA, ""), logger)
+
+	discarded, err := eng.Progress(t.Context(), &engine.ProgressRequest{
+		ResumeState: &engine.ResumeState{MigrationContext: "task-a"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, engine.StatePending, discarded.State)
+	assert.Equal(t, "No active schema change", discarded.Message)
 
 	tracked, err := eng.Progress(t.Context(), &engine.ProgressRequest{
 		ResumeState: &engine.ResumeState{MigrationContext: "task-b"},
@@ -307,22 +374,26 @@ func TestStaleApplyCannotOverwriteTrackedProgress(t *testing.T) {
 	assert.Equal(t, "t_b", tracked.Tables[0].Table)
 }
 
-// TestDrainClearsTrackedSchemaChange proves a drain leaves the engine idle:
-// resume paths drain precisely so the next poll reads the idle sentinel
-// instead of the previous change's terminal snapshot.
-func TestDrainClearsTrackedSchemaChange(t *testing.T) {
+// TestDrainStopsTrackingEverySchemaChange proves a drain leaves the engine
+// idle for every apply it was serving: resume paths drain precisely so the next
+// poll reads the idle sentinel instead of a previous change's snapshot.
+func TestDrainStopsTrackingEverySchemaChange(t *testing.T) {
 	eng := New()
-	change := nativeApply{namespace: "public", table: "t_a", sql: "ALTER TABLE public.t_a ADD COLUMN a text"}
-	eng.claimProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), change, ""))
+	changeA := nativeApply{namespace: "public", table: "t_a", sql: "ALTER TABLE public.t_a ADD COLUMN a text"}
+	changeB := nativeApply{namespace: "public", table: "t_b", sql: "ALTER TABLE public.t_b ADD COLUMN b text"}
+	eng.claimProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), changeA, ""))
+	eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), changeB, ""))
 
 	eng.Drain()
 
-	progress, err := eng.Progress(t.Context(), &engine.ProgressRequest{
-		ResumeState: &engine.ResumeState{MigrationContext: "task-a"},
-	})
-	require.NoError(t, err)
-	assert.Equal(t, engine.StatePending, progress.State)
-	assert.Equal(t, "No active schema change", progress.Message)
+	for _, key := range []string{"task-a", "task-b"} {
+		progress, err := eng.Progress(t.Context(), &engine.ProgressRequest{
+			ResumeState: &engine.ResumeState{MigrationContext: key},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, engine.StatePending, progress.State, "apply %q must read the idle sentinel after a drain", key)
+		assert.Equal(t, "No active schema change", progress.Message)
+	}
 }
 
 // TestValidateOptimisticApplyRefusesNonNativeShape proves acceptance-time

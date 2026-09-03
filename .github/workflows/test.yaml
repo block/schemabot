@@ -170,10 +170,13 @@ jobs:
           # onto their own runner so the long tail keeps headroom under the job
           # budget.
           - shard: tern-webhook
-          # The single heaviest per-package binary (~4 min alone), which starts
-          # many MySQL testcontainers. Running it beside other container-heavy
-          # binaries contends on the shared Docker daemon and stretches it
-          # toward go test's own timeout, so it gets an uncontended runner.
+          # The service package: its storage-backed tests share one MySQL
+          # testcontainer and start a PostgreSQL testcontainer each, on top of
+          # a large body of unit tests in the same binary. Running it beside
+          # other container-heavy binaries contends on the shared Docker
+          # daemon, so it keeps an uncontended runner; fold it back into
+          # per-package once its wall clock has settled well below the other
+          # shards' for a stretch of main runs.
           - shard: pkg/api
           # Every other integration-tagged package: tests that live beside the
           # code they cover, spread across ./pkg, ./cmd and ./e2e. A newly
@@ -676,6 +679,9 @@ jobs:
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
         with:
           driver: docker
+          # The e2e scripts build images through `minikube docker-env`, which
+          # only yields a usable Docker daemon under the docker runtime.
+          container-runtime: docker
           cpus: 2
           memory: 2048
       # The script builds the schemabot image into minikube's docker daemon
@@ -727,6 +733,9 @@ jobs:
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
         with:
           driver: docker
+          # The e2e scripts build images through `minikube docker-env`, which
+          # only yields a usable Docker daemon under the docker runtime.
+          container-runtime: docker
           cpus: 2
           memory: 4096
       # The script builds both the schemabot and etre images into minikube's
@@ -792,6 +801,9 @@ jobs:
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
         with:
           driver: docker
+          # The e2e scripts build images through `minikube docker-env`, which
+          # only yields a usable Docker daemon under the docker runtime.
+          container-runtime: docker
           cpus: 2
           memory: 6144
       # The script builds the schemabot, etre, and localscale images into

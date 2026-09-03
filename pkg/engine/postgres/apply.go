@@ -491,12 +491,14 @@ func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply) 
 }
 
 // Progress reports phase, elapsed time, and statement position for the apply
-// the caller identifies via ResumeState.MigrationContext. A caller asking
-// about an apply the engine is not tracking gets the idle sentinel: one
-// engine is shared for the lifetime of a target, so answering with whichever
-// apply wrote last would report another schema change's state — including a
-// terminal one — for work that is still in flight. Rich server progress is
-// intentionally absent until the PostgreSQL executor exposes it.
+// the caller identifies via ResumeState.MigrationContext. Every accepted apply
+// is tracked under its own identity, so a caller always reads its own schema
+// change's state and never a sibling's — one engine is shared for the lifetime
+// of a target, and answering with whichever apply wrote last would report
+// another schema change's state, including a terminal one, for work that is
+// still in flight. A caller asking about an apply the engine is not tracking
+// gets the idle sentinel. Rich server progress is intentionally absent until
+// the PostgreSQL executor exposes it.
 func (e *Engine) Progress(_ context.Context, req *engine.ProgressRequest) (*engine.ProgressResult, error) {
 	var key string
 	if req != nil {
@@ -504,15 +506,16 @@ func (e *Engine) Progress(_ context.Context, req *engine.ProgressRequest) (*engi
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.progress == nil || key != e.progressKey {
+	tracked := e.progress[key]
+	if tracked == nil {
 		// The exact idle message is a cross-engine contract: stale-task
 		// recovery compares against it verbatim to auto-resolve work
 		// abandoned by a crashed server.
 		return &engine.ProgressResult{State: engine.StatePending, Message: "No active schema change"}, nil
 	}
-	result := *e.progress
-	result.Metadata = cloneMetadata(e.progress.Metadata)
-	result.Tables = cloneTables(e.progress.Tables)
+	result := *tracked
+	result.Metadata = cloneMetadata(tracked.Metadata)
+	result.Tables = cloneTables(tracked.Tables)
 	if len(result.Tables) > 0 && result.Tables[0].StartedAt != nil && !result.State.IsTerminal() {
 		result.Metadata["elapsed"] = time.Since(*result.Tables[0].StartedAt).Round(time.Millisecond).String()
 	}
@@ -555,29 +558,46 @@ func progressResult(state engine.State, phase string, started time.Time, change 
 	return result
 }
 
-// claimProgress records an accepted apply as the engine's tracked schema
-// change. Only Apply calls this: acceptance is the moment the engine's
-// single progress slot changes hands.
+// claimProgress starts tracking an accepted apply. Only Apply calls this:
+// acceptance is the moment the engine becomes answerable for a schema change's
+// progress.
+//
+// Accepting an apply also retires the entries that already reached a terminal
+// state. A terminal entry is kept only so the driver polling that apply can
+// read its outcome, and a driver that has accepted another apply on this target
+// has moved past it; anything still polling a retired identity reads the idle
+// sentinel and settles against the target schema, which is authoritative.
+// Entries for applies that are still running are never retired, so an
+// in-flight change always answers for itself no matter how many siblings the
+// engine accepts.
 func (e *Engine) claimProgress(key string, result *engine.ProgressResult) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.progressKey = key
-	e.progress = result
+	if e.progress == nil {
+		e.progress = make(map[string]*engine.ProgressResult)
+	}
+	for tracked, progress := range e.progress {
+		if tracked != key && progress.State.IsTerminal() {
+			delete(e.progress, tracked)
+		}
+	}
+	e.progress[key] = result
 }
 
-// publishProgress stores a background apply's progress unless a newer apply
-// has claimed the engine since. A stale writer must never overwrite the
-// tracked apply's state, so the dropped write is logged and discarded — the
-// superseded apply's poller reads the idle sentinel instead.
+// publishProgress stores a background apply's progress unless the engine has
+// stopped tracking that apply. Drain is the only writer that stops tracking a
+// running apply, and it means the drive that accepted the work has given it up,
+// so the write is logged and discarded rather than resurrecting an entry no
+// poller is waiting for.
 func (e *Engine) publishProgress(key string, result *engine.ProgressResult, logger *slog.Logger) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if key != e.progressKey {
-		logger.Warn("PostgreSQL apply progress discarded: a newer apply claimed the engine",
-			"task_id", key, "state", result.State, "tracked_task_id", e.progressKey)
+	if _, tracked := e.progress[key]; !tracked {
+		logger.Warn("PostgreSQL apply progress discarded: the engine no longer tracks this schema change",
+			"task_id", key, "state", result.State)
 		return
 	}
-	e.progress = result
+	e.progress[key] = result
 }
 
 func cloneMetadata(metadata map[string]string) map[string]string {

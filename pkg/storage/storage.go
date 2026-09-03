@@ -168,7 +168,17 @@ type CheckStore interface {
 	// (PlanDriftClean) or set one (PlanDriftBlocked); a write from a path that
 	// did not evaluate drift (PlanDriftNotEvaluated, e.g. an apply-time plan)
 	// must preserve any existing drift block rather than silently clearing it.
-	UpsertPlanResult(ctx context.Context, check *Check, drift PlanDriftState) error
+	//
+	// Returns stored=false only when the ownership guard refused the write. The
+	// refusal is a correct outcome, not an error, but it leaves the stored row
+	// on the apply's commit: callers must surface it, because a plan whose
+	// result never landed cannot converge the PR's checks on its own.
+	//
+	// A write whose target row no longer exists — the PR closed and its check
+	// state was cleaned up while the plan ran — returns ErrCheckNotFound rather
+	// than a refusal, so callers never report a vanished gate as one an apply
+	// is holding.
+	UpsertPlanResult(ctx context.Context, check *Check, drift PlanDriftState) (stored bool, err error)
 
 	// RecoverApplyOwnedCheckWithNoOpPlan updates same-head apply-owned stored check state
 	// from in_progress to a successful no-op plan result. Returns true when recovery occurred.

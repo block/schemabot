@@ -14,15 +14,12 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/mysql"
 
 	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
-	"github.com/block/schemabot/pkg/testutil"
 )
 
 // A data-plane host queues control-plane-authorized dispatches through
@@ -35,24 +32,8 @@ import (
 func TestEnqueueAuthorizedApplyQueuesDurableApplyAgainstStorage(t *testing.T) {
 	ctx := t.Context()
 
-	container, err := mysql.Run(ctx,
-		"mysql:8.0",
-		mysql.WithDatabase("schemabot_test"),
-		mysql.WithUsername("root"),
-		mysql.WithPassword("test"),
-	)
-	require.NoError(t, err, "failed to start mysql")
-	t.Cleanup(func() {
-		if err := testcontainers.TerminateContainer(container); err != nil {
-			t.Logf("failed to terminate container: %v", err)
-		}
-	})
-
-	dsn, err := testutil.ContainerConnectionString(ctx, container, "parseTime=true")
-	require.NoError(t, err, "failed to get connection string")
-
+	dsn := newStorageDatabaseWithSchema(t).DSN
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	require.NoError(t, EnsureSchema(dsn, logger), "failed to ensure schema")
 
 	db, err := sql.Open("mysql", dsn)
 	require.NoError(t, err, "failed to open database")
@@ -166,24 +147,8 @@ func TestEnqueueAuthorizedApplyQueuesDurableApplyAgainstStorage(t *testing.T) {
 func TestEnqueueAuthorizedApplyRecordsAuthenticatedCaller(t *testing.T) {
 	ctx := t.Context()
 
-	container, err := mysql.Run(ctx,
-		"mysql:8.4",
-		mysql.WithDatabase("schemabot_test"),
-		mysql.WithUsername("root"),
-		mysql.WithPassword("test"),
-	)
-	require.NoError(t, err, "failed to start mysql")
-	t.Cleanup(func() {
-		if err := testcontainers.TerminateContainer(container); err != nil {
-			t.Logf("failed to terminate container: %v", err)
-		}
-	})
-
-	dsn, err := testutil.ContainerConnectionString(ctx, container, "parseTime=true")
-	require.NoError(t, err, "failed to get connection string")
-
+	dsn := newStorageDatabaseWithSchema(t).DSN
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	require.NoError(t, EnsureSchema(dsn, logger), "failed to ensure schema")
 
 	db, err := sql.Open("mysql", dsn)
 	require.NoError(t, err, "failed to open database")

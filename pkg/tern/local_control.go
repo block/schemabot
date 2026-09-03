@@ -1423,11 +1423,14 @@ func (c *LocalClient) stopEngineForTasks(ctx context.Context, eng engine.Engine,
 		if err != nil {
 			return nil, fmt.Errorf("build stop request for task %s: %w", task.TaskIdentifier, err)
 		}
-		if _, err := eng.Stop(ctx, req); err != nil {
-			if c.config.Type == storage.DatabaseTypeVitess {
-				return nil, fmt.Errorf("cancel deploy request for task %s: %w", task.TaskIdentifier, err)
+		if _, stopErr := eng.Stop(ctx, req); stopErr != nil {
+			if err := c.resolveFailedEngineStop(ctx, eng, task, creds, req.ResumeState, stopErr); err != nil {
+				return nil, err
 			}
-			return nil, fmt.Errorf("stop local engine for task %s: %w", task.TaskIdentifier, err)
+			// The engine tracks nothing for this task, so there is no live
+			// progress to snapshot: returning no stop credentials keeps the
+			// persisted checkpoint progress on the task rows.
+			return nil, nil
 		}
 		return creds, nil
 	}
@@ -1520,11 +1523,74 @@ func (c *LocalClient) resolveFailedEngineCancel(ctx context.Context, eng engine.
 	return nil
 }
 
+// resolveFailedEngineStop decides whether a failed engine stop may still
+// complete durably. A stop that cannot reach any running work has nothing left
+// to pause — the persisted checkpoint is already the resume point a stop
+// exists to preserve — so completing it records the tasks and apply as
+// stopped, the resumable state a later start resumes from. Surfacing such an
+// error instead would abort the drive, leave the durable stop request pending,
+// and re-run the same failing stop on every claim.
+//
+// The engine's own report decides: a progress probe scoped to the task shows
+// whether live work remains. Nothing running resolves to nil so the caller
+// proceeds to record the stop; live work — or any uncertainty about it (a
+// failed probe) — surfaces the original stop error unchanged, because a
+// stopped record over an engine still executing would let the change keep
+// running unwatched. Typed rejections with their own resolution paths also
+// surface unchanged: an already-completed rejection has the caller reconcile
+// stored state to the completed outcome, and an unsupported-operation decline
+// resolves the durable request without recording a stop.
+func (c *LocalClient) resolveFailedEngineStop(ctx context.Context, eng engine.Engine, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, stopErr error) error {
+	if engine.IsAlreadyCompleted(stopErr) {
+		return c.wrapFailedEngineStop(task, stopErr)
+	}
+	// An unsupported-operation decline means the engine refuses stop for its
+	// database type while the schema change keeps executing; it surfaces so the
+	// pending-request decline path resolves the request terminally without
+	// touching the running change.
+	if engine.IsUnsupportedOperation(stopErr) {
+		return c.wrapFailedEngineStop(task, stopErr)
+	}
+	progress, probeErr := eng.Progress(ctx, &engine.ProgressRequest{
+		Database:    c.config.Database,
+		Credentials: creds,
+		ResumeState: resumeState,
+	})
+	if probeErr != nil {
+		c.logger.Warn("engine stop failed and the live-work probe also failed; the stop error surfaces and the drive will retry rather than record a stop over unknown engine state",
+			append(task.LogAttrs(), "probe_error", probeErr, "error", stopErr)...)
+		return c.wrapFailedEngineStop(task, stopErr)
+	}
+	if engineProgressShowsLiveWork(eng, progress) {
+		engineState := ""
+		if progress != nil {
+			engineState = string(progress.State)
+		}
+		c.logger.Warn("engine stop failed while the engine still has live work; the stop error surfaces so the work is never recorded stopped while it keeps running",
+			append(task.LogAttrs(), "engine_state", engineState, "error", stopErr)...)
+		return c.wrapFailedEngineStop(task, stopErr)
+	}
+	c.logger.Warn("engine stop failed but the engine has no live work for the task; the durable stop proceeds and records the tasks stopped for a later resume",
+		append(task.LogAttrs(), "engine_state", string(progress.State), "error", stopErr)...)
+	return nil
+}
+
+// wrapFailedEngineStop names, in the surfaced error, the engine operation a
+// stop performs on this database type: on Vitess targets stop cancels the
+// provider deploy request, everywhere else it stops the local engine's work.
+func (c *LocalClient) wrapFailedEngineStop(task *storage.Task, stopErr error) error {
+	if c.config.Type == storage.DatabaseTypeVitess {
+		return fmt.Errorf("cancel deploy request for task %s: %w", task.TaskIdentifier, stopErr)
+	}
+	return fmt.Errorf("stop local engine for task %s: %w", task.TaskIdentifier, stopErr)
+}
+
 // engineProgressShowsLiveWork reports whether a progress probe shows engine
-// work that a cancel must still terminate before storage may record the
-// schema change as cancelled. It reads the engine's own report, unlike
-// hasLiveEngineWork, which reads the stored task state's expectation.
-// Uncertainty counts as live work — only an affirmative nothing-left-to-cancel
+// work that a stop or cancel must still terminate before storage may record
+// the schema change as stopped or cancelled. It reads the engine's own
+// report, unlike hasLiveEngineWork, which reads the stored task state's
+// expectation.
+// Uncertainty counts as live work — only an affirmative nothing-left-to-settle
 // answer clears the probe, and what qualifies depends on who owns the engine's
 // truth:
 //
@@ -1532,17 +1598,21 @@ func (c *LocalClient) resolveFailedEngineCancel(ctx context.Context, eng engine.
 //     provider's record of the change, so only a provider answer that closed
 //     the change clears the probe: cancelled, or failed with no retry path.
 //     Pending from such an engine is an open change the provider can still
-//     run, and a retryable failure remains runnable — both keep the cancel
-//     error surfacing so the change is never recorded cancelled while the
-//     provider can still land it.
+//     run, and a retryable failure remains runnable — both keep the control
+//     error surfacing so the change is never recorded stopped or cancelled
+//     while the provider can still land it.
 //   - Any other engine executes in this process, so pending — the idle
 //     sentinel — is the only answer proving nothing is left. A state the
 //     engine still tracks, terminal or not, means engine-owned work (such as
-//     target cleanup) remains that only a retried cancel finishes.
+//     target cleanup) remains that only a retried stop or cancel finishes.
 //
 // Completed deliberately counts as live for every engine: a change that
-// landed must reconcile to its completed outcome, never settle as cancelled.
+// landed must reconcile to its completed outcome, never settle as stopped or
+// cancelled.
 // The revert states keep the engine actively unwinding the change.
+//
+// A nil result is uncertainty of the same kind and counts as live, so a caller
+// that reaches the cleared branch always holds a result it can report.
 func engineProgressShowsLiveWork(eng engine.Engine, progress *engine.ProgressResult) bool {
 	if progress == nil {
 		return true

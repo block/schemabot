@@ -19,11 +19,9 @@ import (
 	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/moby/moby/api/types/network"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/pendingdrops"
@@ -74,27 +72,9 @@ func waitForCopyProgress(t *testing.T, eng *Engine, wantRowsCopied int64) int64 
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 
-	// Start shared MySQL container. The MySQL entrypoint runs a throwaway
-	// init server that also logs "ready for connections" and binds nothing
-	// on TCP, so log- and port-based waits can be satisfied before the
-	// final server accepts clients. Gate readiness on a real query through
-	// the mapped port instead — the same handshake the tests themselves
-	// perform.
-	req := testcontainers.ContainerRequest{
-		Image:        "mysql:8.0",
-		ExposedPorts: []string{"3306/tcp"},
-		Env: map[string]string{
-			"MYSQL_ROOT_PASSWORD": "testpassword",
-			"MYSQL_DATABASE":      "testdb",
-		},
-		WaitingFor: wait.ForSQL("3306/tcp", "mysql", func(host string, port network.Port) string {
-			return fmt.Sprintf("root:testpassword@tcp(%s:%s)/testdb", host, port.Port())
-		}).WithStartupTimeout(30 * time.Second),
-	}
-
 	var err error
 	sharedContainer, err = testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: req,
+		ContainerRequest: testutil.MySQLContainerRequest("mysql:8.0", testDatabase),
 		Started:          true,
 		Reuse:            os.Getenv("DEBUG") != "",
 	})
@@ -102,15 +82,10 @@ func TestMain(m *testing.M) {
 		log.Fatalf("start mysql container: %v", err)
 	}
 
-	host, err := testutil.ContainerHost(ctx, sharedContainer)
+	sharedDSN, err = testutil.MySQLDSN(ctx, sharedContainer, testDatabase, "parseTime=true", "multiStatements=true")
 	if err != nil {
-		log.Fatalf("get container host: %v", err)
+		log.Fatalf("build mysql dsn: %v", err)
 	}
-	port, err := testutil.ContainerPort(ctx, sharedContainer, "3306")
-	if err != nil {
-		log.Fatalf("get container port: %v", err)
-	}
-	sharedDSN = fmt.Sprintf("root:testpassword@tcp(%s:%d)/testdb?parseTime=true&multiStatements=true", host, port)
 
 	code := m.Run()
 

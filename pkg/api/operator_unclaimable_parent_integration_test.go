@@ -28,7 +28,7 @@ func TestOperator_UnclaimableParentReleasesOperationLease(t *testing.T) {
 	}
 
 	ctx := t.Context()
-	db := startMatrixContainer(t, ctx)
+	db := openMatrixStorage(t)
 	stor := mysqlstore.New(db)
 
 	seed := seedGroupedApply(t, ctx, stor, multiOpSeed{

@@ -445,12 +445,12 @@ func (s *recordingCheckStore) Upsert(ctx context.Context, check *storage.Check) 
 	return err
 }
 
-func (s *recordingCheckStore) UpsertPlanResult(ctx context.Context, check *storage.Check, drift storage.PlanDriftState) error {
-	err := s.CheckStore.UpsertPlanResult(ctx, check, drift)
-	if err == nil {
+func (s *recordingCheckStore) UpsertPlanResult(ctx context.Context, check *storage.Check, drift storage.PlanDriftState) (bool, error) {
+	stored, err := s.CheckStore.UpsertPlanResult(ctx, check, drift)
+	if err == nil && stored {
 		s.record("upsert_plan_result", check.DatabaseName, check.Status, check.Conclusion)
 	}
-	return err
+	return stored, err
 }
 
 func (s *recordingCheckStore) RecoverApplyOwnedCheckWithNoOpPlan(ctx context.Context, check *storage.Check) (bool, error) {

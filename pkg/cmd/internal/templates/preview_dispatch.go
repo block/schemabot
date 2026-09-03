@@ -109,6 +109,16 @@ func PreviewCLIOutput(previewType PreviewType) {
 		previewPullSchemaDetailedOutput()
 	case PreviewPullVitessSchema:
 		previewPullVitessSchemaOutput()
+	case PreviewPullRateLimitedCaller:
+		previewPullRateLimitedCallerOutput()
+	case PreviewPullRateLimitedShared:
+		previewPullRateLimitedSharedOutput()
+	case PreviewPullRateLimitedTarget:
+		previewPullRateLimitedTargetOutput()
+	case PreviewPullRateLimitedResponse:
+		previewPullRateLimitedResponseOutput()
+	case PreviewRateLimitAll:
+		previewRateLimitAllOutput()
 	case PreviewLintViolations:
 		previewLintViolationsOutput()
 	case PreviewUnsafeBlocked:
@@ -226,6 +236,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		fmt.Print(webhook.PreviewAggregateSummary())
 	case PreviewAggregateCheckFileCapBlocked:
 		fmt.Print(webhook.PreviewAggregateCheckFileCapBlocked())
+	case PreviewAggregateCheckStopped:
+		fmt.Print(webhook.PreviewAggregateCheckStopped())
 	case PreviewCLIMultiDeployInProgress:
 		previewCLIMultiDeploymentApplyInProgress()
 	case PreviewCLIMultiDeployFailed:

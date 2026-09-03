@@ -2114,6 +2114,20 @@ Plan failed
 SchemaBot cannot determine whether this PR contains managed schema changes: the PR changes more files than GitHub will report for a single pull request, so the changed-file list SchemaBot reads is incomplete. SchemaBot fails this check closed rather than planning from a partial diff, and retrying the check returns the same incomplete list. Split this PR so GitHub reports the full changed-file list — if it carries schema changes, move them into their own smaller PR and SchemaBot will plan them there.
 </details>
 
+
+## Aggregate Check — Stopped Apply Holds the PR
+
+<details>
+<summary><strong>Aggregate Check — Stopped Apply Holds the PR</strong></summary>
+
+1 apply stopped
+
+| Database | Type | Change | Status |
+|----------|------|--------|--------|
+| `orders` | mysql | 1 alter | Stopped |
+
+</details>
+
 ## Locking
 
 ### PR Comments
@@ -8373,6 +8387,71 @@ The following unsafe changes will be applied:
   1. users: DROP COLUMN email
   2. orders: DROP TABLE
 
+```
+</details>
+
+
+## Rate Limits (CLI + API)
+
+<details>
+<summary><a name="pull-refused-caller-budget-spent"></a><strong>Pull Refused: Caller Budget Spent</strong></summary>
+
+```
+
+Pull failed
+  Database: orders
+  Environment: production
+  API status: HTTP 429
+  Error code: rate_limited
+  Error: too many pull requests from this caller; retry in 1s
+
+```
+</details>
+
+<details>
+<summary><a name="pull-refused-shared-budget-spent-auth-disabled"></a><strong>Pull Refused: Shared Budget Spent (Auth Disabled)</strong></summary>
+
+```
+
+Pull failed
+  Database: orders
+  Environment: production
+  API status: HTTP 429
+  Error code: rate_limited
+  Error: too many pull requests; this server does not authenticate callers, so every client shares one request budget; retry in 1s
+
+```
+</details>
+
+<details>
+<summary><a name="pull-refused-target-budget-spent"></a><strong>Pull Refused: Target Budget Spent</strong></summary>
+
+```
+
+Pull failed
+  Database: orders
+  Environment: production
+  API status: HTTP 429
+  Error code: rate_limited
+  Error: too many pull requests for this database and environment; retry in 1s
+
+```
+</details>
+
+<details>
+<summary><a name="api-response-service-callers"></a><strong>API Response (Service Callers)</strong></summary>
+
+```
+
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/json
+Retry-After: 1
+
+{
+  "error": "too many pull requests for this database and environment; retry in 1s",
+  "error_code": "rate_limited",
+  "retry_after_seconds": 1
+}
 ```
 </details>
 

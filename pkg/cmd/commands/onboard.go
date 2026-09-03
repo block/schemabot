@@ -484,15 +484,16 @@ func outputSchemaPullRequestError(operation, database, environment string, err e
 		return false
 	}
 
-	fmt.Printf("%s%s failed%s\n", templates.ANSIRed, operation, templates.ANSIReset)
-	fmt.Printf("  Database: %s\n", database)
-	fmt.Printf("  Environment: %s\n", environment)
-	if apiErr != nil {
-		fmt.Printf("  API status: HTTP %d\n", apiErr.Status)
-		if apiErr.ErrorCode != "" {
-			fmt.Printf("  Error code: %s\n", apiErr.ErrorCode)
-		}
+	failure := templates.SchemaPullFailure{
+		Operation:   operation,
+		Database:    database,
+		Environment: environment,
+		Message:     err.Error(),
 	}
-	fmt.Printf("  Error: %s\n", err.Error())
+	if apiErr != nil {
+		failure.Status = apiErr.Status
+		failure.ErrorCode = apiErr.ErrorCode
+	}
+	templates.WriteSchemaPullFailure(failure)
 	return true
 }

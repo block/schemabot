@@ -65,6 +65,11 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewPlansList, templates.PreviewPullSchema, templates.PreviewPullSchemaDetailed,
 		templates.PreviewPullVitessSchema:
 		templates.PreviewCLIOutput(previewType)
+	// Rate limit types
+	case templates.PreviewPullRateLimitedCaller, templates.PreviewPullRateLimitedShared,
+		templates.PreviewPullRateLimitedTarget,
+		templates.PreviewPullRateLimitedResponse, templates.PreviewRateLimitAll:
+		templates.PreviewCLIOutput(previewType)
 	// Lint and unsafe types
 	case templates.PreviewLintViolations, templates.PreviewUnsafeBlocked,
 		templates.PreviewUnsafeAllowed, templates.PreviewLintAll:
@@ -105,7 +110,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCLIMultiDeployInProgress, templates.PreviewCLIMultiDeployFailed,
 		templates.PreviewCLIMultiDeployCompleted, templates.PreviewCLIMultiDeployAll,
 		templates.PreviewCommentShardedAll, templates.PreviewAggregateCheckSummary,
-		templates.PreviewAggregateCheckFileCapBlocked,
+		templates.PreviewAggregateCheckFileCapBlocked, templates.PreviewAggregateCheckStopped,
 		templates.PreviewCommentSingleProgress, templates.PreviewCommentSingleComplete,
 		templates.PreviewCommentSingleFailed, templates.PreviewCommentSingleStopped,
 		templates.PreviewCommentSummaryCompleted, templates.PreviewCommentSummaryFailed,
@@ -228,6 +233,13 @@ Status:
   pull_schema           Pulled live schema rendered as readable SQL
   pull_schema_detailed  Pulled live schema with the detailed catalog's estimates
   pull_schema_vitess    Multi-keyspace Vitess pull with VSchema artifacts
+
+Rate Limits:
+  pull_rate_limited_caller    Pull refused: caller spent its own request budget
+  pull_rate_limited_shared    Pull refused: budget shared by every client because auth is disabled
+  pull_rate_limited_target    Pull refused: target database is absorbing every client's reads
+  pull_rate_limited_response  The 429 a service caller reads off the wire
+  rate_limit_all              Show all rate limit previews
 
 Lint and Unsafe:
   lint_violations         Lint violations output

@@ -48,6 +48,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.remote_apply_deployment_id_conflict_total` | Counter | database, environment, deployment | Remote dispatch results refused fail-closed because the deployment already correlates to a different remote apply id — see [Remote Apply Attaches](#remote-apply-attaches) |
 | `schemabot.lock_operations_total` | Counter | operation, database, environment, status | Lock acquire/release operations |
 | `schemabot.direct_write_authorization.total` | Counter | operation, database, environment, status, reason | Per-database direct-write (CLI/API) authorization decisions at the handler layer |
+| `schemabot.rate_limit_decisions.total` | Counter | endpoint, scope, environment, decision | API request-budget decisions on rate-limited endpoints. `scope` is which budget was consulted (`caller` or `target`) and `decision` is `allow` or `limit`, so the limited rate has a denominator and a client approaching its budget is visible before it is turned away. The caller identity and target database are deliberately absent (hundreds of each); a limited request logs both — see [Rate Limits](#rate-limits) |
 | `schemabot.operator.resumed_total` | Counter | database, environment, previous_state | Applies resumed by the operator |
 | `schemabot.operator.resume_failures_total` | Counter | database, environment, reason | Operator resume attempts that failed |
 | `schemabot.operator.claim_failures_total` | Counter | environment, reason | Operator claim attempts that failed |
@@ -55,6 +56,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.operator.stuck_pending_applies` | Gauge | environment | Pending applies past the stuck threshold that a driver should have claimed (sampled; capped at 500, so a value of 500 means "at least 500") |
 | `schemabot.operator.stuck_pending_scan_failures` | Counter | environment | Failed stuck-pending apply scans (liveness signal for the gauge above) |
 | `schemabot.operator.stranded_operations_reaped_total` | Counter | database, deployment, environment, parent_state | Pending apply operations the reaper settled from an already-settled parent apply. `deployment` is the reaped operation's own. A one-time burst is the historical backlog draining; a climbing rate means a producer is terminalizing parents without settling their children |
+| `schemabot.engine.unrecognized_task_status_total` | Counter | database, database_type, engine, environment | Engine- or data-plane-reported task statuses with no task-state mapping. The fail-open default renders the affected work as Running, so any sustained rate means an engine or data-plane version introduced a status SchemaBot cannot classify — add an explicit mapping in `pkg/state`. The status itself is not an attribute: it is engine-controlled text with no bound on distinct values, and this counter fires only during a mapping gap. The paired drive warn carries the raw status with the task identifiers |
 | `schemabot.storage_schema.destructive_refusals_total` | Counter | table, operation, scope, environment | Destructive storage-schema DDL statements the startup bootstrap (`EnsureSchema`) refused to execute. `scope` says whether the safe clauses of the statement still ran. A nonzero rate means a starting binary's embedded schema no longer declares a table or column that exists in the storage database — expected briefly from older pods during a rolling deploy or rollback. `environment` is always `unknown`: the bootstrap precedes any schema-change environment |
 | `schemabot.drop_table.already_absent_total` | Counter | database, environment | DROP TABLE targets that were already absent when the apply reached them |
 | `schemabot.pending_drops.tables_moved_total` | Counter | database, environment | Dropped tables quarantined into the pending drops database |
@@ -408,6 +410,39 @@ cardinality bounded. `database` and `environment` use the `unknown` sentinel
 when the operation has no such dimension (admin-only operations have no single
 target database; lock operations have no environment) or when the request
 failed before the target resolved.
+
+### Rate Limits
+
+`schemabot.rate_limit_decisions.total` tracks the request-budget decisions made
+by the API's rate-limited endpoints (today `POST /api/pull`). Both outcomes are
+counted, so `decision=limit` has a denominator and a client approaching its
+budget shows up as a rising share of one endpoint's traffic before any request
+is actually refused.
+
+`scope` says which of the two budgets was consulted, and they answer different
+questions:
+
+| Scope | Keyed on | A sustained `limit` rate means |
+|---|---|---|
+| `caller` | The authenticated subject (an operator's identity, or a service caller's SPIFFE ID) | One client is looping. Find it in the paired WARN log's `caller` attribute before raising the budget. |
+| `target` | The database and environment being read | A database is absorbing more schema reads than the budget allows, from any number of clients. Check whether the reads are legitimate before raising it. |
+
+The caller identity and target database are deliberately not metric
+attributes — there are hundreds of each, and the counter would carry a series
+per client per database. Every limited request logs both alongside the
+advertised retry delay, so a spike on this counter is triaged from the WARN
+logs, not by slicing the metric.
+
+`environment` arrives in the request body, so it is clamped to a configured
+environment before it is recorded and appears as `unconfigured` otherwise. A
+budget is still keyed on the environment the request named — an unroutable
+request spends budget like any other — so a rising `unconfigured` share means
+clients are asking for environments this server does not serve. The unclamped
+name is in the log.
+
+Budgets are enforced per server process, so a fleet-wide `limit` rate is the sum
+across replicas and the effective ceiling is `replicas ×` the configured rate.
+See [Rate Limits](../../docs/configuration.md#rate-limits) for the config.
 
 ## HTTP Server Metrics
 

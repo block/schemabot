@@ -50,6 +50,7 @@ func TestMain(m *testing.M) {
 		mysql.WithDatabase("testdb"),
 		mysql.WithUsername("root"),
 		mysql.WithPassword("test"),
+		testutil.MySQLTmpfsDatadir(),
 	)
 	if err != nil {
 		log.Fatalf("failed to start MySQL container: %v", err)

@@ -613,6 +613,27 @@ func RecordAuthDecision(ctx context.Context, tier, decision, reason string) {
 	)
 }
 
+// RecordRateLimitDecision increments the counter for request-budget decisions
+// on the API's rate-limited endpoints. Both outcomes are counted, so the
+// limited rate has a denominator and an operator can see a client approaching
+// its budget before it is turned away.
+//
+// Labels are deliberately fixed sets: endpoint is the route, scope is which
+// budget was consulted (the caller's or the target's), decision is allow/limit,
+// and environment is the target environment of the request. The caller identity
+// and the target database are the useful triage details but there are hundreds
+// of each, so they belong in the log line that accompanies a limited request,
+// not in metric attributes.
+func RecordRateLimitDecision(ctx context.Context, endpoint, scope, decision, environment string) {
+	addCounter(ctx, "schemabot.rate_limit_decisions.total",
+		"Total API request-budget decisions on rate-limited endpoints", "{decision}",
+		attribute.String("endpoint", endpoint),
+		attribute.String("scope", scope),
+		attribute.String("decision", decision),
+		EnvironmentAttribute(environment),
+	)
+}
+
 // knownCheckOwnershipOperations limits metric cardinality to expected check
 // ownership miss paths.
 var knownCheckOwnershipOperations = map[string]bool{
@@ -927,6 +948,32 @@ func RecordPlanetScaleUnclassifiedCancelRejection(ctx context.Context, database,
 		"Total PlanetScale cancel rejections observed in a deployment state with no explicit classification", "{rejection}",
 		attribute.String("database", database),
 		attribute.String("deployment_state", deploymentState),
+	)
+}
+
+// RecordUnrecognizedEngineTaskStatus counts engine- or data-plane-reported
+// task statuses that have no mapping in pkg/state. An unknown status
+// normalizes to Running so the work stays visible and blocking, but that
+// fallback is a guess: every surface renders the affected work as Running
+// regardless of what the engine is actually doing. A sustained rate here means
+// an engine or data-plane version introduced a status SchemaBot cannot
+// classify — add an explicit mapping in pkg/state.
+//
+// Which status went unmapped is deliberately not an attribute. The value is
+// engine-controlled text, so a status carrying variable data — a host name, an
+// identifier, an error tail — would mint a series per sighting, and this
+// counter fires only when there is a mapping gap: exactly the moment a
+// cardinality explosion would land on top of an incident. The paired drive
+// warn carries the raw status alongside the task identifiers, deduped per task
+// and status, so triage reads the status from the log while the counter stays
+// alertable on a bounded set of dimensions.
+func RecordUnrecognizedEngineTaskStatus(ctx context.Context, database, databaseType, engineName, environment string) {
+	addCounter(ctx, "schemabot.engine.unrecognized_task_status_total",
+		"Total engine- or data-plane-reported task statuses with no task-state mapping, rendered as Running by the fail-open default", "{status}",
+		attribute.String("database", database),
+		attribute.String("database_type", databaseType),
+		attribute.String("engine", engineName),
+		EnvironmentAttribute(environment),
 	)
 }
 
