@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/json"
+	"fmt"
 	"slices"
 	"sort"
 	"strings"
@@ -315,6 +316,48 @@ const (
 // against it to distinguish drive tasks from reflected per-shard progress rows.
 func ShardOperationKey(namespace, shard, table string) string {
 	return namespace + "/" + shard + "/" + table
+}
+
+// TargetOperationKey builds the operation key for one target's work when a
+// single apply addresses several targets. The target leads the key because it
+// is the coarsest scope: an apply's members are its targets, and any narrower
+// division of one target's work hangs off it.
+//
+// scopedKey is the narrower key within that target, or empty for work that
+// covers the whole target. Passing a ShardOperationKey composes the two, so a
+// sharded target yields one key per (target, namespace, shard, table):
+//
+//	TargetOperationKey("orders-002", "")                                 -> "orders-002"
+//	TargetOperationKey("orders-002", ShardOperationKey("main", "-80", "t")) -> "orders-002/main/-80/t"
+func TargetOperationKey(target, scopedKey string) string {
+	if scopedKey == "" {
+		return target
+	}
+	return target + "/" + scopedKey
+}
+
+// PlanIDForOperation resolves which plan an operation executes: its own when it
+// has one, and its parent apply's otherwise. Members of one apply share the
+// apply's plan when they are planned together, and carry their own plan when
+// each was planned against its own live schema.
+//
+// An operation with no plan on either row is not executable — a dispatch would
+// have no DDL to run — so that case is an error rather than a zero return the
+// caller might mistake for a valid plan.
+func PlanIDForOperation(apply *Apply, op *ApplyOperation) (int64, error) {
+	if op == nil {
+		return 0, fmt.Errorf("resolve plan for operation: no operation")
+	}
+	if op.PlanID != 0 {
+		return op.PlanID, nil
+	}
+	if apply == nil {
+		return 0, fmt.Errorf("resolve plan for operation %d: operation has no plan and its apply was not loaded", op.ID)
+	}
+	if apply.PlanID == 0 {
+		return 0, fmt.Errorf("resolve plan for operation %d: neither the operation nor apply %s names a plan", op.ID, apply.ApplyIdentifier)
+	}
+	return apply.PlanID, nil
 }
 
 // EngineForType returns the engine name for a database type.
@@ -845,6 +888,17 @@ type ApplyOperation struct {
 	// ApplyID points to applies.id. Unique together with Deployment and
 	// OperationKey.
 	ApplyID int64
+
+	// PlanID points to the plans.id this operation executes, when the operation
+	// has a plan of its own. Zero means the operation executes its parent
+	// apply's plan; resolve it with PlanIDForOperation rather than reading this
+	// field directly, so the fallback is applied consistently.
+	//
+	// An operation carries its own plan when the members of one apply do not
+	// share a single desired-vs-live diff — each member is planned against its
+	// own live schema, so each gets its own persisted plan row. Members that do
+	// share the parent's plan leave this zero.
+	PlanID int64
 
 	// Deployment is the Tern deployment name this child row targets
 	// (e.g. "region-a", "payments-eu"). Drawn from the resolved
