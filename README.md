@@ -6,7 +6,7 @@
 
 GitOps for database schemas. Define your desired schema in SQL files, open a PR, and SchemaBot plans and executes your schema changes safely.
 
-**GA** means the engine upholds every runtime safety invariant in [docs/invariants.md](./docs/invariants.md). **Early alpha** means it does not yet, and that document names the specific gaps.
+**GA** means the engine upholds every runtime safety invariant in [docs/invariants.md](./docs/invariants.md). **Early alpha** means it does not yet, and that document names the specific gaps. See [docs/engines.md](./docs/engines.md) for what each engine can actually do: how it executes a change, which control operations it supports, and how it manages load.
 
 ## Schema Changes via Pull Request
 
@@ -57,6 +57,8 @@ SchemaBot handles the full lifecycle:
 - **Control** — `stop` (pause), `start` (resume), `cutover` (trigger table swap), `revert` (roll back)
 
 Simple changes (e.g., adding a column) use instant DDL and complete in milliseconds. Operations that require a row copy (e.g., adding an index) run online without blocking reads or writes.
+
+Not every engine supports every feature. `revert`, deferred cutover, automatic throttling, and drop recovery all vary, and [docs/engines.md](./docs/engines.md) is the capability matrix showing which engine does what and why.
 
 ## Quick Start
 
