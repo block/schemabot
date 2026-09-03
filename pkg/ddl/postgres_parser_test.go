@@ -380,6 +380,9 @@ func clearParseLocations(m protoreflect.Message) {
 // Generated, identity, and unrecognized constraint shapes fail closed, quoted
 // identifiers cannot mask a missing DEFAULT, and a function-call DEFAULT fails
 // closed because its volatility cannot be proven from the statement alone.
+// UNIQUE builds an index over the whole table so it is never automatic;
+// REFERENCES is metadata-only until a DEFAULT makes the server validate every
+// existing row.
 func TestPostgresAddColumnManualReason(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -425,11 +428,24 @@ func TestPostgresAddColumnManualReason(t *testing.T) {
 			name:       "nullable unique",
 			createDDL:  "CREATE TABLE metrics (a bigint, external_id bigint UNIQUE)",
 			columnName: "external_id",
+			wantReason: "UNIQUE, which builds a unique index over the whole table",
 		},
 		{
 			name:       "nullable references",
 			createDDL:  "CREATE TABLE metrics (a bigint, parent_id bigint REFERENCES parents (id))",
 			columnName: "parent_id",
+		},
+		{
+			name:       "references with default",
+			createDDL:  "CREATE TABLE metrics (a bigint, parent_id bigint DEFAULT 1 REFERENCES parents (id))",
+			columnName: "parent_id",
+			wantReason: "FOREIGN KEY with a DEFAULT, which validates every existing row",
+		},
+		{
+			name:       "not null references with default",
+			createDDL:  "CREATE TABLE metrics (a bigint, parent_id bigint NOT NULL DEFAULT 1 REFERENCES parents (id))",
+			columnName: "parent_id",
+			wantReason: "FOREIGN KEY with a DEFAULT, which validates every existing row",
 		},
 		{
 			name:       "quoted identifier containing default",

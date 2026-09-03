@@ -851,12 +851,28 @@ on the storage dialect:
 - **PostgreSQL** automatically creates missing tables, columns, and standalone
   indexes. It discovers drift before taking the bootstrap advisory lock, then
   re-checks and applies each table's changes transactionally under that lock.
-  A missing `NOT NULL` column without a `DEFAULT`, a generated or identity
-  column, or a column with a constraint shape not explicitly classified as
-  safe fails startup with instructions for manual remediation. Generated and
-  identity columns rewrite the populated table under an exclusive lock.
-  Startup also fails when additive DDL cannot be parsed or executed, or when
-  re-verification finds unresolved drift.
+  A missing column converges automatically only when the `ADD COLUMN` is
+  metadata-only. A missing `NOT NULL` column without a `DEFAULT`, a generated
+  or identity column, a `UNIQUE` column, a `REFERENCES` column with a
+  `DEFAULT`, or a column with a constraint shape not explicitly classified as
+  safe fails startup with instructions for manual remediation: generated and
+  identity columns rewrite the populated table, `UNIQUE` builds a unique
+  index over it, and a foreign key with a `DEFAULT` validates every existing
+  row against the referenced table — all under an exclusive lock whose hold
+  time the startup lock timeout does not bound. Startup also fails when
+  additive DDL cannot be parsed or executed, or when re-verification finds
+  unresolved drift.
+
+  A live index only counts as present when PostgreSQL reports it valid. A
+  `CREATE INDEX CONCURRENTLY` that fails part-way — a unique build that hits
+  duplicate keys, a cancelled session — leaves an invalid index under the
+  expected name that the planner never uses. Startup fails closed naming that
+  index rather than reading it as converged or colliding with it on a fresh
+  `CREATE INDEX`; drop it so the next startup recreates it, or
+  `REINDEX INDEX CONCURRENTLY` it by hand. A non-unique index under a name
+  the embedded schema requires to be unique fails startup the same way. Every
+  such problem across every table is named in the one startup error, and no
+  DDL runs until all of them are resolved.
 
   Convergence is additive-only: extra columns and indexes remain in place for
   binary rollback, and `allow_destructive_schema_changes` has no effect because

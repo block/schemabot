@@ -172,18 +172,27 @@ func (postgresStatementParser) SynthesizeAddColumn(createTableDDL, columnName st
 
 // PostgresAddColumnManualReason reports why adding the named column from a
 // CREATE TABLE declaration to a populated table needs manual remediation,
-// or "" when the synthesized ADD COLUMN is safe to run automatically. The
-// decision reads the column's parsed constraint list:
+// or "" when the synthesized ADD COLUMN is metadata-only and safe to run
+// automatically. The bar is cost, not acceptance: a shape is safe only when
+// the ALTER TABLE touches no existing row and builds nothing proportional to
+// the table, because it runs under ACCESS EXCLUSIVE and a lock timeout bounds
+// only the wait to acquire that lock, never the work done while holding it.
+// The decision reads the column's parsed constraint list:
 //
-//   - Generated and identity columns rewrite the whole table under an
-//     exclusive lock while PostgreSQL computes values for existing rows.
+//   - Generated and identity columns rewrite the whole table while
+//     PostgreSQL computes values for existing rows.
 //   - NOT NULL without a DEFAULT needs a backfill — the server would reject
 //     the ADD COLUMN outright on a populated table.
 //   - A DEFAULT whose expression is not provably non-volatile (a constant,
 //     a cast of a constant, or a SQL value function such as
 //     CURRENT_TIMESTAMP) fails closed: the parse tree cannot see function
-//     volatility, and a volatile default rewrites the whole table under an
-//     exclusive lock.
+//     volatility, and a volatile default rewrites the whole table.
+//   - UNIQUE builds a unique index over every existing row inside the same
+//     ALTER TABLE, even though the new column is NULL in all of them.
+//   - REFERENCES is metadata-only while the column has no DEFAULT — the
+//     server skips validation because every existing row reads NULL. With a
+//     DEFAULT, the server validates every existing row against the referenced
+//     table.
 //   - Constraint shapes not explicitly known to be safe fail closed.
 func PostgresAddColumnManualReason(createTableDDL, columnName string) (string, error) {
 	_, _, columnNode, err := postgresCreateTableColumn(createTableDDL, columnName)
@@ -192,7 +201,7 @@ func PostgresAddColumnManualReason(createTableDDL, columnName string) (string, e
 	}
 	column := columnNode.GetColumnDef()
 
-	var notNull, hasDefault, constantDefault bool
+	var notNull, hasDefault, constantDefault, foreignKey bool
 	for _, node := range column.GetConstraints() {
 		constraint := node.GetConstraint()
 		switch constraint.GetContype() {
@@ -203,14 +212,21 @@ func PostgresAddColumnManualReason(createTableDDL, columnName string) (string, e
 			constantDefault = postgresNonVolatileExpression(constraint.GetRawExpr())
 		case pgproto.ConstrType_CONSTR_GENERATED, pgproto.ConstrType_CONSTR_IDENTITY:
 			return "definition is generated or identity, which rewrites the whole table under an exclusive lock; add it manually", nil
-		case pgproto.ConstrType_CONSTR_NULL, pgproto.ConstrType_CONSTR_UNIQUE, pgproto.ConstrType_CONSTR_FOREIGN:
-			// These constraints are safe on a nullable new column.
+		case pgproto.ConstrType_CONSTR_UNIQUE:
+			return "definition is UNIQUE, which builds a unique index over the whole table under an exclusive lock; add it manually or ship the index as a standalone CREATE INDEX", nil
+		case pgproto.ConstrType_CONSTR_FOREIGN:
+			foreignKey = true
+		case pgproto.ConstrType_CONSTR_NULL:
+			// Explicit NULL is the default nullability; nothing to do.
 		default:
 			return fmt.Sprintf("definition has constraint %s, which is not safe for automatic convergence; add it manually", constraint.GetContype().String()), nil
 		}
 	}
 	if hasDefault && !constantDefault {
 		return "definition has a DEFAULT expression whose volatility cannot be proven from the statement alone, and a volatile default rewrites the whole table under an exclusive lock; add it manually or ship the column with a constant DEFAULT", nil
+	}
+	if foreignKey && hasDefault {
+		return "definition is a FOREIGN KEY with a DEFAULT, which validates every existing row against the referenced table under an exclusive lock; add it manually or ship the column without a DEFAULT", nil
 	}
 	if notNull && !hasDefault {
 		return "definition is NOT NULL without a DEFAULT; add it manually or ship the column with a DEFAULT", nil

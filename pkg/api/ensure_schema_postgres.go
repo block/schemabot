@@ -283,19 +283,45 @@ func postgresSchemaDriftFor(ctx context.Context, db *sql.DB, tables []string, fi
 			return nil, err
 		}
 		for _, index := range expected.indexes {
-			existingUnique, present := existingIndexes[index.name]
-			if present && (!index.unique || existingUnique) {
+			live, present := existingIndexes[index.name]
+			if !present {
+				drift[table] = append(drift[table], postgresSchemaChange{operation: "create_index", object: index.name, ddl: index.ddl})
 				continue
 			}
-			// A non-unique live index cannot satisfy a unique expectation. CREATE
-			// INDEX would collide by name, so fail closed rather than altering it.
-			if present {
-				return nil, fmt.Errorf("storage table %q has non-unique index %q where the embedded schema requires a unique index; replace it manually", table, index.name)
+			manualReason := postgresLiveIndexManualReason(index, live)
+			if manualReason == "" {
+				continue
 			}
-			drift[table] = append(drift[table], postgresSchemaChange{operation: "create_index", object: index.name, ddl: index.ddl})
+			// The live index occupies the expected name, so CREATE INDEX would
+			// collide rather than repair it. Carry the change as manual so the
+			// gate reports it alongside every other problem before any DDL runs.
+			drift[table] = append(drift[table], postgresSchemaChange{
+				operation:    "create_index",
+				object:       index.name,
+				ddl:          index.ddl,
+				manualReason: manualReason,
+			})
 		}
 	}
 	return drift, nil
+}
+
+// postgresLiveIndexManualReason reports why the live index under an expected
+// index's name cannot satisfy that expectation, or "" when it does. A live
+// index satisfies a non-unique expectation under either uniqueness, since a
+// unique index answers the same reads. Only a valid index counts: PostgreSQL
+// leaves an invalid index behind when CREATE INDEX CONCURRENTLY fails, the
+// planner never uses one, and it may not cover every existing row, so its
+// presence says nothing about the reads or the uniqueness the embedded schema
+// relies on.
+func postgresLiveIndexManualReason(expected postgresIndexExpectation, live postgresLiveIndex) string {
+	if !live.valid {
+		return "live index is invalid — a CREATE INDEX CONCURRENTLY that did not complete leaves an unusable index under the expected name; DROP INDEX it so startup recreates it, or REINDEX INDEX CONCURRENTLY it manually"
+	}
+	if expected.unique && !live.unique {
+		return "live index is non-unique where the embedded schema requires a unique index; replace it manually"
+	}
+	return ""
 }
 
 // postgresManualRemediation returns an error naming every planned change that
@@ -310,13 +336,28 @@ func postgresManualRemediation(tables []string, drift postgresSchemaDrift) error
 			if change.manualReason == "" {
 				continue
 			}
-			problems = append(problems, fmt.Sprintf("storage table %q is missing column %q whose %s", table, change.object, change.manualReason))
+			problems = append(problems, postgresManualProblem(table, change))
 		}
 	}
 	if len(problems) == 0 {
 		return nil
 	}
 	return errors.New(strings.Join(problems, "; "))
+}
+
+// postgresManualProblem phrases one manual change for the operator: the
+// table, the object, and the situation the reason describes. An operation the
+// drift scan does not classify still surfaces, so a new change kind can never
+// slip past the gate unnamed.
+func postgresManualProblem(table string, change postgresSchemaChange) string {
+	switch change.operation {
+	case "add_column":
+		return fmt.Sprintf("storage table %q is missing column %q whose %s", table, change.object, change.manualReason)
+	case "create_index":
+		return fmt.Sprintf("storage table %q has index %q whose %s", table, change.object, change.manualReason)
+	default:
+		return fmt.Sprintf("storage table %q needs %s of %q which requires manual remediation: %s", table, change.operation, change.object, change.manualReason)
+	}
 }
 
 func verifyAndLogPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []string, files map[string]string, logger *slog.Logger, database, schemaName string) error {
@@ -335,7 +376,8 @@ func verifyAndLogPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []s
 
 // verifyPostgresSchemaShape checks the additive convergence result. Columns
 // remain presence-only; type, length, and nullability drift are not detected.
-// Indexes are matched by name and uniqueness only, not column composition.
+// Indexes are matched by name, validity, and uniqueness only, not column
+// composition.
 func verifyPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []string, files map[string]string) error {
 	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
 	if err != nil {
@@ -365,14 +407,15 @@ func verifyPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []string,
 		if err != nil {
 			return err
 		}
-		var missingUnique []string
+		var unsatisfied []string
 		for _, index := range expected.indexes {
-			if index.unique && !existingIndexes[index.name] {
-				missingUnique = append(missingUnique, index.name)
+			live, present := existingIndexes[index.name]
+			if !present || postgresLiveIndexManualReason(index, live) != "" {
+				unsatisfied = append(unsatisfied, index.name)
 			}
 		}
-		if len(missingUnique) > 0 {
-			return fmt.Errorf("storage table %q is missing expected unique indexes: %s", table, strings.Join(missingUnique, ", "))
+		if len(unsatisfied) > 0 {
+			return fmt.Errorf("storage table %q is missing expected valid indexes: %s", table, strings.Join(unsatisfied, ", "))
 		}
 	}
 	return nil
@@ -400,13 +443,22 @@ func postgresTableColumns(ctx context.Context, db *sql.DB, table string) (map[st
 	return existing, nil
 }
 
-// postgresTableIndexes returns the table's live indexes as a name→uniqueness
-// map. A unique expectation requires its name to map to true; a non-unique
-// expectation is satisfied by presence under either uniqueness, since a
-// unique index answers the same reads.
-func postgresTableIndexes(ctx context.Context, db *sql.DB, table string) (map[string]bool, error) {
+// postgresLiveIndex is what the catalog reports about one live index: whether
+// it enforces uniqueness and whether PostgreSQL considers it usable. An index
+// left invalid by a failed CREATE INDEX CONCURRENTLY still occupies its name
+// in pg_index and is still maintained on writes, but the planner never
+// consults it and it may not cover every existing row.
+type postgresLiveIndex struct {
+	unique bool
+	valid  bool
+}
+
+// postgresTableIndexes returns the table's live indexes keyed by name.
+// postgresLiveIndexManualReason decides whether a live index satisfies an
+// expectation; this only reports what the catalog holds.
+func postgresTableIndexes(ctx context.Context, db *sql.DB, table string) (map[string]postgresLiveIndex, error) {
 	rows, err := db.QueryContext(ctx, `
-		SELECT index_class.relname, index_info.indisunique
+		SELECT index_class.relname, index_info.indisunique, index_info.indisvalid
 		FROM pg_index AS index_info
 		JOIN pg_class AS table_class ON table_class.oid = index_info.indrelid
 		JOIN pg_namespace AS table_namespace ON table_namespace.oid = table_class.relnamespace
@@ -418,14 +470,14 @@ func postgresTableIndexes(ctx context.Context, db *sql.DB, table string) (map[st
 	}
 	defer utils.CloseAndLog(rows)
 
-	existing := make(map[string]bool)
+	existing := make(map[string]postgresLiveIndex)
 	for rows.Next() {
 		var indexName string
-		var unique bool
-		if err := rows.Scan(&indexName, &unique); err != nil {
+		var live postgresLiveIndex
+		if err := rows.Scan(&indexName, &live.unique, &live.valid); err != nil {
 			return nil, fmt.Errorf("scan index for table %q: %w", table, err)
 		}
-		existing[indexName] = unique
+		existing[indexName] = live
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate indexes for table %q: %w", table, err)

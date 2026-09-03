@@ -136,7 +136,7 @@ func TestEnsureSchemaPostgres_ConvergesMissingUniqueIndex(t *testing.T) {
 	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
 	indexes, err := postgresTableIndexes(ctx, db, "settings")
 	require.NoError(t, err)
-	assert.True(t, indexes["idx_settings_setting_key"])
+	assert.Equal(t, postgresLiveIndex{unique: true, valid: true}, indexes["idx_settings_setting_key"])
 }
 
 // Startup refuses automatic convergence when the desired missing column is
@@ -183,7 +183,9 @@ func TestEnsureSchemaPostgres_ManualRemediationBlocksAllDDL(t *testing.T) {
 // A live non-unique index under a name the embedded schema requires to be
 // unique cannot be converged automatically — CREATE UNIQUE INDEX would
 // collide by name — so startup fails closed with a manual remediation rather
-// than silently accepting the weaker index.
+// than silently accepting the weaker index. The problem goes through the same
+// whole-set gate as column remediation: automatic drift elsewhere stays
+// untouched, and every manual problem is named in the one error.
 func TestEnsureSchemaPostgres_RejectsNonUniqueIndexWhereUniqueRequired(t *testing.T) {
 	ctx := t.Context()
 	dsn, db := startPostgresStorage(t)
@@ -194,10 +196,53 @@ func TestEnsureSchemaPostgres_RejectsNonUniqueIndexWhereUniqueRequired(t *testin
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx, "CREATE INDEX idx_settings_setting_key ON settings (setting_key)")
 	require.NoError(t, err)
+	// "apply_logs" sorts before "settings": without the whole-set gate its
+	// automatic index change would commit before the settings failure surfaced.
+	_, err = db.ExecContext(ctx, "DROP INDEX idx_apply_logs_level")
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "ALTER TABLE settings DROP COLUMN setting_value")
+	require.NoError(t, err)
 
 	err = EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres))
-	require.ErrorContains(t, err, `storage table "settings" has non-unique index "idx_settings_setting_key" where the embedded schema requires a unique index`)
+	require.ErrorContains(t, err, `storage table "settings" has index "idx_settings_setting_key" whose live index is non-unique where the embedded schema requires a unique index`)
 	require.ErrorContains(t, err, "replace it manually")
+	require.ErrorContains(t, err, `storage table "settings" is missing column "setting_value"`)
+
+	indexes, err := postgresTableIndexes(ctx, db, "apply_logs")
+	require.NoError(t, err)
+	assert.NotContains(t, indexes, "idx_apply_logs_level", "no DDL may run when any change needs manual remediation")
+}
+
+// A CREATE INDEX CONCURRENTLY that fails part-way leaves an invalid index
+// under the expected name. PostgreSQL never uses it for reads and it may not
+// cover every row, so startup must not read it as converged: it fails closed
+// naming the index and the remediation, and does not attempt a CREATE INDEX
+// that would only collide with the invalid one.
+func TestEnsureSchemaPostgres_RejectsInvalidIndex(t *testing.T) {
+	ctx := t.Context()
+	dsn, db := startPostgresStorage(t)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	_, err := db.ExecContext(ctx, "DROP INDEX idx_settings_setting_key")
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "INSERT INTO settings (setting_key, setting_value) VALUES ('dup', 'a'), ('dup', 'b')")
+	require.NoError(t, err)
+	// Duplicate keys make the concurrent unique build fail after the index has
+	// been catalogued, which is exactly how an invalid index arises in practice.
+	_, err = db.ExecContext(ctx, "CREATE UNIQUE INDEX CONCURRENTLY idx_settings_setting_key ON settings (setting_key)")
+	require.Error(t, err)
+	indexes, err := postgresTableIndexes(ctx, db, "settings")
+	require.NoError(t, err)
+	require.Equal(t, postgresLiveIndex{unique: true, valid: false}, indexes["idx_settings_setting_key"])
+
+	err = EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres))
+	require.ErrorContains(t, err, `storage table "settings" has index "idx_settings_setting_key" whose live index is invalid`)
+	require.ErrorContains(t, err, "DROP INDEX it so startup recreates it")
+
+	indexes, err = postgresTableIndexes(ctx, db, "settings")
+	require.NoError(t, err)
+	assert.Equal(t, postgresLiveIndex{unique: true, valid: false}, indexes["idx_settings_setting_key"], "startup must leave the invalid index for the operator")
 }
 
 // A storage database missing a subset of tables converges back to the full
