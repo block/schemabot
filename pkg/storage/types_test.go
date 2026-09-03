@@ -358,3 +358,68 @@ func TestGroupsEngineExecution(t *testing.T) {
 		})
 	}
 }
+
+// TestTargetOperationKey covers the operation keys an apply that addresses
+// several targets stamps on its members: one key per target for whole-target
+// work, and a target-led composition when a target's work is further divided by
+// shard so no two members of the same apply can collide on a key.
+func TestTargetOperationKey(t *testing.T) {
+	cases := []struct {
+		name      string
+		target    string
+		scopedKey string
+		want      string
+	}{
+		{"whole-target work keys on the target alone", "orders-002", "", "orders-002"},
+		{"shard work hangs off its target", "orders-002", ShardOperationKey("main", "-80", "customers"), "orders-002/main/-80/customers"},
+		{"the same shard on another target is a distinct key", "orders-003", ShardOperationKey("main", "-80", "customers"), "orders-003/main/-80/customers"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, TargetOperationKey(tc.target, tc.scopedKey))
+		})
+	}
+}
+
+// TestPlanIDForOperation covers which plan a member executes: members planned
+// together share their apply's plan, a member planned against its own live
+// schema carries its own, and a member with neither is not executable and must
+// error rather than resolve to a plan ID no row can have.
+func TestPlanIDForOperation(t *testing.T) {
+	apply := &Apply{ApplyIdentifier: "apply-1", PlanID: 7}
+
+	t.Run("member without its own plan executes the apply's", func(t *testing.T) {
+		planID, err := PlanIDForOperation(apply, &ApplyOperation{ID: 1})
+		require.NoError(t, err)
+		assert.Equal(t, int64(7), planID)
+	})
+
+	t.Run("member with its own plan executes that one", func(t *testing.T) {
+		planID, err := PlanIDForOperation(apply, &ApplyOperation{ID: 2, PlanID: 42})
+		require.NoError(t, err)
+		assert.Equal(t, int64(42), planID)
+	})
+
+	t.Run("an unloaded apply cannot supply the fallback", func(t *testing.T) {
+		_, err := PlanIDForOperation(nil, &ApplyOperation{ID: 3})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "was not loaded")
+	})
+
+	t.Run("an unloaded apply is irrelevant once the member has its own plan", func(t *testing.T) {
+		planID, err := PlanIDForOperation(nil, &ApplyOperation{ID: 4, PlanID: 42})
+		require.NoError(t, err)
+		assert.Equal(t, int64(42), planID)
+	})
+
+	t.Run("no plan on either row is an error", func(t *testing.T) {
+		_, err := PlanIDForOperation(&Apply{ApplyIdentifier: "apply-2"}, &ApplyOperation{ID: 5})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "apply-2")
+	})
+
+	t.Run("no operation is an error", func(t *testing.T) {
+		_, err := PlanIDForOperation(apply, nil)
+		require.Error(t, err)
+	})
+}

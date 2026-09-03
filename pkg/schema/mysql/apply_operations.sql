@@ -1,6 +1,7 @@
 CREATE TABLE `apply_operations` (
   `id` bigint unsigned NOT NULL AUTO_INCREMENT,
   `apply_id` bigint unsigned NOT NULL,
+  `plan_id` bigint unsigned DEFAULT NULL,
   `deployment` varchar(255) NOT NULL,
   `operation_key` varchar(255) NOT NULL DEFAULT '',
   `operation_kind` varchar(32) NOT NULL DEFAULT 'work',
