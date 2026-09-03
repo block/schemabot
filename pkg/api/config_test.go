@@ -2247,6 +2247,109 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			},
 			tern: baseTern,
 		},
+		{
+			name: "environment targets list is accepted",
+			envConfig: EnvironmentConfig{
+				Deployment: "payments-a",
+				Targets:    []string{"payments-001", "payments-002"},
+			},
+			tern: baseTern,
+		},
+		{
+			name: "environment target and targets together are rejected",
+			envConfig: EnvironmentConfig{
+				Deployment: "payments-a",
+				Target:     "payments-001",
+				Targets:    []string{"payments-001", "payments-002"},
+			},
+			tern:       baseTern,
+			wantErrSub: "cannot configure both target and targets",
+		},
+		{
+			name: "empty environment targets list is rejected",
+			envConfig: EnvironmentConfig{
+				Deployment: "payments-a",
+				Targets:    []string{},
+			},
+			tern:       baseTern,
+			wantErrSub: "targets list is empty",
+		},
+		{
+			name: "empty entry in environment targets is rejected",
+			envConfig: EnvironmentConfig{
+				Deployment: "payments-a",
+				Targets:    []string{"payments-001", ""},
+			},
+			tern:       baseTern,
+			wantErrSub: "targets entry 1 is empty",
+		},
+		{
+			name: "repeated environment target is rejected",
+			envConfig: EnvironmentConfig{
+				Deployment: "payments-a",
+				Targets:    []string{"payments-001", "payments-001"},
+			},
+			tern:       baseTern,
+			wantErrSub: `lists target "payments-001" more than once`,
+		},
+		{
+			name: "environment targets without a deployment is rejected",
+			envConfig: EnvironmentConfig{
+				Targets: []string{"payments-001", "payments-002"},
+			},
+			tern:       baseTern,
+			wantErrSub: "missing deployment",
+		},
+		{
+			name: "local DSN together with targets is rejected",
+			envConfig: EnvironmentConfig{
+				DSN:        "root@tcp(localhost)/payments",
+				Deployment: "payments-a",
+				Targets:    []string{"payments-001"},
+			},
+			tern:       baseTern,
+			wantErrSub: "cannot configure both local DSN and target/deployment(s)",
+		},
+		{
+			name: "deployment targets list is accepted",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Targets: []string{"payments-001", "payments-002"}},
+					"payments-b": {Target: "payments-003"},
+				},
+			},
+			tern: baseTern,
+		},
+		{
+			name: "deployment target and targets together are rejected",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Target: "payments-001", Targets: []string{"payments-002"}},
+				},
+			},
+			tern:       baseTern,
+			wantErrSub: `deployment "payments-a" cannot configure both target and targets`,
+		},
+		{
+			name: "repeated target within one deployment is rejected",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Targets: []string{"payments-001", "payments-001"}},
+				},
+			},
+			tern:       baseTern,
+			wantErrSub: `deployment "payments-a" lists target "payments-001" more than once`,
+		},
+		{
+			name: "the same target under different deployments is accepted",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Targets: []string{"payments-001", "payments-002"}},
+					"payments-b": {Targets: []string{"payments-001", "payments-002"}},
+				},
+			},
+			tern: baseTern,
+		},
 	}
 
 	for _, tc := range cases {
@@ -4557,5 +4660,85 @@ postgres:
 		_, err := LoadServerConfigFromFile(path)
 		require.ErrorContains(t, err, "parse config file")
 		require.ErrorContains(t, err, "cannot unmarshal")
+	})
+}
+
+// TestServerConfig_ResolveDatabaseTargets_MultiTarget covers an environment
+// that addresses several targets. A rollout member is a deployment and a target
+// together, so resolution returns one member per target — under a single
+// deployment, under each deployment of a deployments map, and in an order that
+// walks the deployments outermost so a rollout finishes one deployment before
+// moving to the next.
+func TestServerConfig_ResolveDatabaseTargets_MultiTarget(t *testing.T) {
+	cfg := ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"scalar": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"production": {
+						Deployment: "payments-a",
+						Targets:    []string{"payments-002", "payments-001"},
+					},
+				},
+			},
+			"mapped": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"production": {
+						Deployments: map[string]DeploymentTarget{
+							"payments-b": {Targets: []string{"payments-003", "payments-004"}},
+							"payments-a": {Target: "payments-001"},
+						},
+						DeploymentOrder: []string{"payments-a", "payments-b"},
+					},
+				},
+			},
+			"broken": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"production": {
+						Deployment: "payments-a",
+						Target:     "payments-001",
+						Targets:    []string{"payments-002"},
+					},
+				},
+			},
+		},
+		TernDeployments: TernConfig{
+			"payments-a": {"production": "tern-a:9090"},
+			"payments-b": {"production": "tern-b:9090"},
+		},
+	}
+
+	t.Run("one deployment fans out to one member per target in listed order", func(t *testing.T) {
+		got, err := cfg.ResolveDatabaseTargets("scalar", "production")
+		require.NoError(t, err)
+		assert.Equal(t, []routing.ExecutionTarget{
+			{DatabaseType: "mysql", Deployment: "payments-a", Target: "payments-002"},
+			{DatabaseType: "mysql", Deployment: "payments-a", Target: "payments-001"},
+		}, got, "targets resolve in the order they are listed, not sorted")
+	})
+
+	t.Run("a deployments map fans out deployments outermost", func(t *testing.T) {
+		got, err := cfg.ResolveDatabaseTargets("mapped", "production")
+		require.NoError(t, err)
+		assert.Equal(t, []routing.ExecutionTarget{
+			{DatabaseType: "mysql", Deployment: "payments-a", Target: "payments-001"},
+			{DatabaseType: "mysql", Deployment: "payments-b", Target: "payments-003"},
+			{DatabaseType: "mysql", Deployment: "payments-b", Target: "payments-004"},
+		}, got)
+	})
+
+	t.Run("the primary is the first member, not the first deployment", func(t *testing.T) {
+		primary, err := cfg.ResolvePrimaryDatabaseTarget("scalar", "production")
+		require.NoError(t, err)
+		assert.Equal(t, "payments-a", primary.Deployment)
+		assert.Equal(t, "payments-002", primary.Target)
+	})
+
+	t.Run("target and targets together fail closed at resolution too", func(t *testing.T) {
+		_, err := cfg.ResolveDatabaseTargets("broken", "production")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "cannot configure both target and targets")
 	})
 }

@@ -1083,8 +1083,25 @@ type EnvironmentConfig struct {
 	DSNFrom *DSNFromConfig `yaml:"dsn_from,omitempty"`
 
 	// Target is the opaque Tern-facing target identifier for gRPC mode.
-	// Mutually exclusive with Deployments.
+	// Mutually exclusive with Targets and with Deployments.
 	Target string `yaml:"target,omitempty"`
+
+	// Targets lists the Tern-facing target identifiers this environment
+	// addresses through a single deployment, for a database that lives on more
+	// than one target. Rollout follows the listed order. Mutually exclusive with
+	// Target and with Deployments.
+	//
+	// Targets and Deployments both fan an environment out across several
+	// members, and a member is identified by its deployment and target together
+	// either way. They differ in what the fan-out means: the deployments of one
+	// environment are meant to hold the same schema, so a difference between
+	// them is drift to surface; the targets of one environment are each planned
+	// on their own, so a difference between them is ordinary and is converged.
+	//
+	// Example:
+	//   deployment: region-a
+	//   targets: [orders-001, orders-002]
+	Targets []string `yaml:"targets,omitempty"`
 
 	// Deployment is the lowercase Tern deployment key for gRPC mode. Deployment
 	// names are storage identity keys compared byte-wise across storage dialects.
@@ -1444,7 +1461,53 @@ func (c *ServerConfig) SchemaDirHintsForRepo(repo string) (dirs []string, exhaus
 // the top-level tern_deployments map).
 type DeploymentTarget struct {
 	// Target is the opaque Tern-facing target identifier for this deployment.
+	// Mutually exclusive with Targets.
 	Target string `yaml:"target"`
+
+	// Targets lists the Tern-facing target identifiers this deployment
+	// addresses, for a deployment that reaches more than one. Rollout follows
+	// the listed order. Mutually exclusive with Target.
+	//
+	// Example:
+	//   deployments:
+	//     region-a:
+	//       targets: [orders-001, orders-002]
+	Targets []string `yaml:"targets,omitempty"`
+}
+
+// resolveTargetList returns the ordered target list for one routing entry —
+// either an environment's scalar routing or one entry of its deployments map.
+// Validation and routing both call it, so a config that validates resolves to
+// exactly the member list validation checked.
+//
+// An entry names either a single target or a targets list, never both: the two
+// spellings would otherwise disagree about how many members the entry has. An
+// entry that names neither returns an empty list without an error, leaving the
+// caller to report the missing target in its own terms.
+func resolveTargetList(what, target string, targets []string) ([]string, error) {
+	if target != "" && len(targets) > 0 {
+		return nil, fmt.Errorf("%s cannot configure both target and targets", what)
+	}
+	if targets == nil {
+		if target == "" {
+			return nil, nil
+		}
+		return []string{target}, nil
+	}
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("%s targets list is empty", what)
+	}
+	seen := make(map[string]bool, len(targets))
+	for i, t := range targets {
+		if t == "" {
+			return nil, fmt.Errorf("%s targets entry %d is empty", what, i)
+		}
+		if seen[t] {
+			return nil, fmt.Errorf("%s lists target %q more than once; a rollout member is identified by its deployment and target together, so one deployment cannot address the same target twice", what, t)
+		}
+		seen[t] = true
+	}
+	return targets, nil
 }
 
 var defaultEnvironmentOrder = []string{"staging", "production"}
@@ -1628,7 +1691,7 @@ func (c *ServerConfig) Validate() error {
 				return err
 			}
 			hasDSN := envConfig.HasLocalDSN()
-			hasScalarRouting := envConfig.Target != "" || envConfig.Deployment != ""
+			hasScalarRouting := envConfig.Target != "" || envConfig.Targets != nil || envConfig.Deployment != ""
 			hasMapRouting := envConfig.Deployments != nil
 			if len(envConfig.DeploymentOrder) > 0 && !hasMapRouting {
 				return fmt.Errorf("database %q environment %q sets deployment_order without a deployments map", name, env)
@@ -1676,7 +1739,11 @@ func (c *ServerConfig) Validate() error {
 					if err := validateIdentifier(fmt.Sprintf("database %q environment %q deployment name", name, env), deployment); err != nil {
 						return err
 					}
-					if dt.Target == "" {
+					targets, err := resolveTargetList(fmt.Sprintf("database %q environment %q deployment %q", name, env, deployment), dt.Target, dt.Targets)
+					if err != nil {
+						return err
+					}
+					if len(targets) == 0 {
 						return fmt.Errorf("database %q environment %q deployment %q missing target", name, env, deployment)
 					}
 					endpoints, ok := c.TernDeployments[deployment]
@@ -1690,10 +1757,15 @@ func (c *ServerConfig) Validate() error {
 				continue
 			case !hasScalarRouting:
 				return fmt.Errorf("database %q environment %q missing local DSN or target/deployment(s)", name, env)
-			case envConfig.Target == "":
-				return fmt.Errorf("database %q environment %q missing target", name, env)
 			case envConfig.Deployment == "":
 				return fmt.Errorf("database %q environment %q missing deployment", name, env)
+			}
+			scalarTargets, err := resolveTargetList(fmt.Sprintf("database %q environment %q", name, env), envConfig.Target, envConfig.Targets)
+			if err != nil {
+				return err
+			}
+			if len(scalarTargets) == 0 {
+				return fmt.Errorf("database %q environment %q missing target", name, env)
 			}
 			endpoints, ok := c.TernDeployments[envConfig.Deployment]
 			if !ok {
@@ -2503,29 +2575,43 @@ func (c *ServerConfig) ResolveDatabaseTargets(database, environment string) ([]r
 		out := make([]routing.ExecutionTarget, 0, len(deployments))
 		for _, deployment := range deployments {
 			dt := envConfig.Deployments[deployment]
-			if dt.Target == "" {
+			targets, err := resolveTargetList(fmt.Sprintf("database %q environment %q deployment %q", database, environment, deployment), dt.Target, dt.Targets)
+			if err != nil {
+				return nil, err
+			}
+			if len(targets) == 0 {
 				return nil, fmt.Errorf("database %q environment %q deployment %q missing target", database, environment, deployment)
 			}
-			out = append(out, routing.ExecutionTarget{
-				DatabaseType: dbConfig.Type,
-				Deployment:   deployment,
-				Target:       dt.Target,
-			})
+			for _, target := range targets {
+				out = append(out, routing.ExecutionTarget{
+					DatabaseType: dbConfig.Type,
+					Deployment:   deployment,
+					Target:       target,
+				})
+			}
 		}
 		return out, nil
 	}
 
-	if envConfig.Target == "" {
+	targets, err := resolveTargetList(fmt.Sprintf("database %q environment %q", database, environment), envConfig.Target, envConfig.Targets)
+	if err != nil {
+		return nil, err
+	}
+	if len(targets) == 0 {
 		return nil, fmt.Errorf("database %q environment %q missing server-side target", database, environment)
 	}
 	if envConfig.Deployment == "" {
 		return nil, fmt.Errorf("database %q environment %q missing server-side deployment", database, environment)
 	}
-	return []routing.ExecutionTarget{{
-		DatabaseType: dbConfig.Type,
-		Deployment:   envConfig.Deployment,
-		Target:       envConfig.Target,
-	}}, nil
+	out := make([]routing.ExecutionTarget, 0, len(targets))
+	for _, target := range targets {
+		out = append(out, routing.ExecutionTarget{
+			DatabaseType: dbConfig.Type,
+			Deployment:   envConfig.Deployment,
+			Target:       target,
+		})
+	}
+	return out, nil
 }
 
 // IsRepoAllowed returns whether the given repository is permitted to use SchemaBot.

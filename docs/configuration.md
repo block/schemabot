@@ -10,6 +10,7 @@
 - [gRPC Mode](#grpc-mode)
 - [Multi-Deployment Environment (preview)](#multi-deployment-environment-preview)
   - [Deployment Order](#deployment-order)
+- [Multi-Target Environment (preview)](#multi-target-environment-preview)
 - [Environment Order](#environment-order)
   - [Per-Database Environment Order](#per-database-environment-order)
   - [Renaming identifiers](#renaming-identifiers)
@@ -265,6 +266,46 @@ Rules:
 
 Every deployment name in `deployment_order` must be lowercase; the server
 refuses to start otherwise.
+
+## Multi-Target Environment (preview)
+
+A database that lives on more than one target replaces the scalar `target` with a `targets` list. Each entry is one target the environment addresses, and rollout follows the listed order.
+
+> **Config surface only in this release.** `targets` resolves to one rollout member per target, but the plan and apply paths still treat every member of an environment the way they treat deployments.
+
+```yaml
+databases:
+  payments:
+    type: mysql
+    environments:
+      production:
+        deployment: payments-a
+        targets:
+          - payments-001
+          - payments-002
+```
+
+A `targets` list can also sit inside a `deployments` map entry, for a database whose targets are spread across several deployments:
+
+```yaml
+      production:
+        deployments:
+          payments-a:
+            targets:
+              - payments-001
+              - payments-002
+          payments-b:
+            target: payments-003
+```
+
+Rules:
+
+- `targets` is mutually exclusive with `target` at the same level, and with a local `dsn` / `dsn_from`.
+- The list MUST contain at least one entry, and no entry may be empty.
+- One deployment may not list the same target twice. A rollout member is identified by its deployment and target together, so the same target under two different deployments is two distinct members and is allowed.
+- Members resolve deployments outermost: every target of the first deployment, then every target of the next.
+
+`targets` and `deployments` both fan an environment out across several members, but they mean different things. The deployments of one environment are expected to hold the same schema, so a difference between them is drift to surface. The targets of one environment are each planned on their own, so a difference between them is ordinary.
 
 ## Environment Order
 
