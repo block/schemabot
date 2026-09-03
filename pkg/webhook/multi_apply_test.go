@@ -122,10 +122,10 @@ func TestBuildMultiApplyData_RoutesTasksByOperation(t *testing.T) {
 	}
 	data := buildMultiApplyData(runningApply(), ops, false, tasks, nil, nil, "")
 
-	require.Len(t, data.Details["eu"].Tables, 1)
-	assert.Equal(t, "customers", data.Details["eu"].Tables[0].TableName)
-	require.Len(t, data.Details["us"].Tables, 1)
-	assert.Equal(t, "orders", data.Details["us"].Tables[0].TableName)
+	require.Len(t, data.Details[0].Tables, 1)
+	assert.Equal(t, "customers", data.Details[0].Tables[0].TableName)
+	require.Len(t, data.Details[1].Tables, 1)
+	assert.Equal(t, "orders", data.Details[1].Tables[0].TableName)
 }
 
 // Per-shard rows are scoped to their owning deployment: when two deployments
@@ -152,12 +152,12 @@ func TestBuildMultiApplyData_ScopesShardsByOperation(t *testing.T) {
 
 	data := buildMultiApplyData(runningApply(), ops, false, tasks, nil, shardsByTable, "")
 
-	require.Len(t, data.Details["eu"].Tables, 1)
-	require.Len(t, data.Details["eu"].Tables[0].Shards, 1)
-	assert.Equal(t, "-80", data.Details["eu"].Tables[0].Shards[0].Shard)
-	require.Len(t, data.Details["us"].Tables, 1)
-	require.Len(t, data.Details["us"].Tables[0].Shards, 1)
-	assert.Equal(t, "80-", data.Details["us"].Tables[0].Shards[0].Shard)
+	require.Len(t, data.Details[0].Tables, 1)
+	require.Len(t, data.Details[0].Tables[0].Shards, 1)
+	assert.Equal(t, "-80", data.Details[0].Tables[0].Shards[0].Shard)
+	require.Len(t, data.Details[1].Tables, 1)
+	require.Len(t, data.Details[1].Tables[0].Shards, 1)
+	assert.Equal(t, "80-", data.Details[1].Tables[0].Shards[0].Shard)
 }
 
 // The per-deployment section reflects the operation's own state and error, not
