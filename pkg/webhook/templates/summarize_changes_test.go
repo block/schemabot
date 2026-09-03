@@ -60,6 +60,17 @@ func TestSummarizeChanges(t *testing.T) {
 		assert.Zero(t, drops)
 	})
 
+	t.Run("does not count a MySQL create index as a table change", func(t *testing.T) {
+		changes := []KeyspaceChangeData{{
+			Keyspace:   "orders",
+			Statements: []string{"CREATE INDEX `i` ON `t` (`v`)"},
+		}}
+		creates, alters, drops := countStatementTypes(changes, "mysql")
+		assert.Zero(t, creates)
+		assert.Zero(t, alters)
+		assert.Zero(t, drops)
+	})
+
 	t.Run("appends vschema updates for non-MySQL", func(t *testing.T) {
 		data := PlanCommentData{
 			DatabaseType: "vitess",
