@@ -22,6 +22,12 @@ drives them to a conclusion, but the work against your database is done by an **
 | PlanetScale | Vitess | [PlanetScale deploy requests](https://planetscale.com/docs/vitess/schema-changes/deploy-requests) |
 | pg-sprite | PostgreSQL | [pg-sprite](https://github.com/block/pg-sprite) |
 
+A PlanetScale deploy request is [Vitess Online DDL](https://vitess.io/docs/user-guides/schema-changes/managed-online-schema-changes/)
+underneath, wrapped in PlanetScale's API and branching model. That is worth knowing, because it
+means the capabilities in the Vitess column below are Vitess's own: the copy, the cutover, the
+revert window, and the throttler all belong to the cluster rather than to PlanetScale's control
+surface over it.
+
 Engines differ, and this document is where those differences are written down. It is the moving
 half of the documentation on purpose: [invariants.md](invariants.md) states what must never be
 false regardless of engine and is meant to be stable, while what any given engine can currently
