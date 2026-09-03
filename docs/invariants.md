@@ -157,32 +157,24 @@ versioned. [release.md](release.md) covers the deploy ordering that follows from
 
 ## What GA and early alpha mean
 
-The engine badges in the [README](../README.md) are defined by this document. An engine is **GA**
-when it upholds every invariant here. **Early alpha** means it does not yet, and that the gaps
-are specific and written down rather than left for you to find.
+This document defines what the engine badges in the [README](../README.md) mean. The badges carry
+the current assignment, which moves as engines mature; the definition is here and does not move.
 
-MySQL via Spirit and Vitess via PlanetScale are GA, and are what Block runs in production.
+An engine is **GA** when it upholds every invariant in this registry. **Early alpha** means it
+does not yet, and that the gaps are specific and written down rather than left for you to find.
 
-PostgreSQL is early alpha, and one missing capability accounts for most of the distance: there is
-no copy-and-swap. On MySQL, a change that cannot be done in place is executed by copying the
-table, backfilling it, and swapping it in, which is what makes a large table changeable at all.
-PostgreSQL has no equivalent path yet, so it executes only native in-place DDL, bounded by a
-target size cap and by lock and statement budgets. A change that would require a copy or a
-rewrite is blocked at plan time rather than routed to something less safe, which keeps the
-boundary honest but leaves that whole class of change unsupported.
+The distinction to hold onto is that an engine below GA is **narrower, not looser**. Fewer classes
+of change can be executed, and fewer operations are available against one that is running, but the
+behavior at the edge of that envelope is the same as everywhere else in this document. A change
+the engine cannot execute safely is blocked at plan time rather than routed to something less
+safe. An operation it does not support is still recorded durably before it is acknowledged (CO-1)
+and still resolves to an explicit terminal outcome (CO-2), specifically a typed
+unsupported-operation decline rather than a silent drop, a false success, or an unbounded retry.
+That is the difference between an unfinished engine and an unsafe one.
 
-Part of the gap follows from that one. Because nothing long-running is in flight, there is nothing
-to pause, so stop, cancel, start, and cutover are all unsupported on a PostgreSQL target. RV-5's
-recovery window is absent for a separate reason: the pending-drops quarantine is a Spirit
-mechanism. A multi-statement plan is also not atomic, since each statement commits in its own
-transaction, so a mid-plan failure leaves earlier statements applied.
-
-Worth being precise about what still holds inside that gap, because it is the difference between
-an unfinished engine and an unsafe one. A control request against a PostgreSQL target is still
-recorded durably before it is acknowledged (CO-1), and still resolves to an explicit terminal
-outcome (CO-2), specifically a typed unsupported-operation decline rather than a silent drop, a
-false success, or an unbounded retry. The engine is narrower than the MySQL and Vitess ones, and
-it is narrow in ways it tells you about. [postgresql.md](postgresql.md) has the full boundary.
+Where an engine's envelope is still moving, its own doc is the authority on where the boundary
+currently sits rather than this one. [postgresql.md](postgresql.md) is that doc for PostgreSQL,
+and is worth reading before pointing SchemaBot at a PostgreSQL database.
 
 Stating maturity this way is deliberate. "Early alpha" names a finite set of missing invariants
 rather than a vague confidence level, and closing the distance to GA is a reviewable list rather
