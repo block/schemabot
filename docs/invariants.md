@@ -313,10 +313,21 @@ webhook inbox: dispatch in `pkg/webhook`, backed by the `webhook_events` table.
 
 ### AV-8: Untrusted text never reaches operator surfaces raw
 
-Raw error strings (dial failures, DSN fragments, hostnames) are never rendered into PR or check
-markdown. Those surfaces show a fixed sanitized line while the raw error goes to server logs
-with triage identifiers, and inbound payloads are size-bounded before decode. *Enforced:*
-sanitized rendering helpers in `pkg/webhook`; request body limits.
+Error text SchemaBot did not author (dial failures, DSN fragments, hostnames, engine output) is
+never rendered into PR or check markdown as it arrived. Before reaching either surface it has
+control and bidi-format characters stripped, connection details redacted, and its length clamped,
+and it is escaped so it cannot inject markup or break out of the structure holding it. A message
+that sanitizes to nothing falls back to a fixed line rather than publishing an empty summary.
+Text bound for a table cell is additionally flattened to one line with the cell separator
+neutralized, so it cannot break the layout around it.
+
+Sanitizing is a property of the rendering boundary rather than of each call site, which is what
+makes it hold: the callers that pass an error through to a comment do not individually decide to
+be careful. The unredacted error goes to the server log next to the repo, PR, environment,
+database, and command, so nothing is lost for triage. Inbound webhook payloads are size-bounded
+before decode. *Enforced:* the comment and table-cell sanitizers in `pkg/webhook/templates`,
+applied by the error renderers themselves; the Check Run summary sanitizer and its markup escaper
+in `pkg/webhook`; the drift summary clamp; the request body limit on the webhook handler.
 
 ### AV-9: SchemaBot never destroys its own storage to start
 
