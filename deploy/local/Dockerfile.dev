@@ -1,5 +1,12 @@
 FROM alpine:3.19
-RUN apk add --no-cache ca-certificates
+# The Alpine CDN intermittently answers "temporary error (try again later)" and a
+# single failed fetch takes the whole e2e job with it; retry with backoff instead.
+RUN for attempt in 1 2 3 4 5; do \
+        apk add --no-cache ca-certificates && break; \
+        [ "$attempt" -lt 5 ] || exit 1; \
+        echo "apk add failed (attempt ${attempt}/5); retrying" >&2; \
+        sleep $((attempt * 5)); \
+    done
 COPY schemabot-dev /schemabot
 ENTRYPOINT ["/schemabot"]
 CMD ["serve"]
