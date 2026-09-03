@@ -12,6 +12,7 @@ import (
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -441,4 +442,20 @@ func TestRegistersWorkSynchronously(t *testing.T) {
 func TestNewWithTableSizeLimitTreatsZeroAsUnset(t *testing.T) {
 	assert.Equal(t, DefaultNativeSafeTableSizeLimitBytes, NewWithTableSizeLimit(0).TableSizeLimit())
 	assert.Equal(t, int64(42), NewWithTableSizeLimit(42).TableSizeLimit())
+}
+
+func TestPullNamespacesRejectsReservedSchema(t *testing.T) {
+	_, err := pullNamespaces(t.Context(), nil, "pg_catalog")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `schema "pg_catalog" is reserved and cannot be pulled`)
+}
+
+func TestPullSchemaRequiresConfiguredCredentials(t *testing.T) {
+	_, err := New().PullSchema(t.Context(), nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "request is required")
+
+	_, err = New().PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "orders"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "DSN credentials are required")
 }

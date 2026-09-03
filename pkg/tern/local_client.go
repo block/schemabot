@@ -333,7 +333,10 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 			Settings:            spiritSettings,
 		}),
 		planetscaleEngine: psEngine,
-		postgresEngine:    postgres.NewWithTableSizeLimit(cfg.PostgresNativeSafeTableSizeLimitBytes),
+		postgresEngine: postgres.NewForTarget(cfg.PostgresNativeSafeTableSizeLimitBytes, cfg.Database, &engine.Credentials{
+			DSN:      cfg.TargetDSN,
+			Metadata: maps.Clone(cfg.Metadata),
+		}),
 		customEngine:      customEngine,
 		psClientFunc:      psClientFunc,
 		logger:            logger,

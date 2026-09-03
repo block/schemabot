@@ -4038,9 +4038,9 @@ func TestLocalClient_PullSchemaEngineWithoutCapabilityUnsupported(t *testing.T) 
 	assert.Contains(t, err.Error(), "engine does not support schema pull")
 }
 
-// The built-in PostgreSQL engine has no pull path, so a postgres client
-// reports pull as unsupported rather than attempting a MySQL-shaped pull.
-func TestLocalClient_PullSchemaPostgresUnsupported(t *testing.T) {
+// A PostgreSQL pull reaches the built-in engine rather than the MySQL-shaped
+// pull path or the unsupported-capability fallback.
+func TestLocalClient_PullSchemaPostgresReachesEngine(t *testing.T) {
 	client, err := NewLocalClient(LocalConfig{
 		Database:  "orders",
 		Type:      storage.DatabaseTypePostgres,
@@ -4050,7 +4050,9 @@ func TestLocalClient_PullSchemaPostgresUnsupported(t *testing.T) {
 
 	_, err = client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "orders"})
 
-	require.ErrorIs(t, err, ErrPullSchemaUnsupportedType)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrPullSchemaUnsupportedType)
+	assert.Contains(t, err.Error(), "PostgreSQL database")
 }
 
 // A request whose type disagrees with the client's configured type is a

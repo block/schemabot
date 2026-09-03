@@ -7,15 +7,66 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/pg-sprite/pkg/statement"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
 )
 
 const postgresApplyDeadline = 10 * time.Second
+
+// TestEnginePullSchema exports every ordinary table in a requested schema as
+// an independently parseable declarative file, including constraints and
+// secondary indexes.
+func TestEnginePullSchema(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.accounts (id bigint PRIMARY KEY, balance bigint NOT NULL CHECK (balance >= 0));
+		CREATE INDEX accounts_balance_idx ON app.accounts (balance);
+		CREATE TABLE app.events (id bigint PRIMARY KEY, message text NOT NULL)`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, "pull_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database: "pull_test", Type: "postgres", Environment: "test", Namespace: "app",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), response.TableCount)
+	require.Len(t, response.Namespaces, 1)
+	require.Len(t, response.Namespaces["app"].Tables, 2)
+	for _, table := range []string{"accounts", "events"} {
+		ddl := response.Namespaces["app"].Tables[table]
+		parsed, parseErr := statement.ParseDesired(ddl)
+		require.NoError(t, parseErr)
+		assert.Equal(t, table, parsed.Table())
+	}
+	assert.Contains(t, response.Namespaces["app"].Tables["accounts"], "CHECK")
+	assert.Contains(t, response.Namespaces["app"].Tables["accounts"], "accounts_balance_idx")
+}
+
+// TestEnginePullSchemaAggregatesUnrenderableTables proves a pull never returns
+// a partial baseline and identifies every table that needs manual resolution.
+func TestEnginePullSchemaAggregatesUnrenderableTables(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_refusal_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE UNLOGGED TABLE app.audit_log (id bigint PRIMARY KEY);
+		CREATE UNLOGGED TABLE app.delivery_log (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, "pull_refusal_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
+
+	require.Error(t, err)
+	assert.Nil(t, response)
+	assert.Contains(t, err.Error(), `schema "app" table "audit_log"`)
+	assert.Contains(t, err.Error(), `schema "app" table "delivery_log"`)
+}
 
 // TestEnginePlanCreateTable proves a greenfield CREATE TABLE derived from
 // desired state plans as an executable change: the role's schema CREATE
