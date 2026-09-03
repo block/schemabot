@@ -10,6 +10,7 @@ import (
 	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
@@ -176,25 +177,49 @@ type PlanCommentData struct {
 // per-deployment breakdown when some deployment diverged from — or could not be
 // confirmed against — the reviewed plan.
 type DeploymentDriftData struct {
-	// Deployments is every configured deployment in rollout order, primary first.
+	// Deployments is every configured rollout member in rollout order, primary
+	// first.
 	Deployments []DeploymentDriftEntry
-	// Clean is true only when every deployment matches the reviewed plan.
+	// Clean means every member passed its contract: under mirrored members, that
+	// they all match the reviewed plan; under independent members, that they all
+	// produced a plan of their own.
 	Clean bool
 	// Computed is false when the rollup itself could not be evaluated; the check
 	// still fails closed, and the preview says the deployments are unverified.
 	Computed bool
+	// Independent reports that each member holds its own schema and was planned
+	// against it. Members are then not expected to match each other, so a clean
+	// rollup means every target was planned rather than that they agree — which
+	// is the opposite of what the mirrored wording says.
+	Independent bool
 }
 
-// DeploymentDriftEntry is one deployment's classification against the reviewed
-// primary plan.
+// DeploymentDriftEntry is one rollout member's classification against the
+// reviewed primary plan.
 type DeploymentDriftEntry struct {
 	Deployment string
-	Primary    bool
-	// Class is "match", "diverged", or "errored".
+	// Target is the member's target within its deployment. One deployment can
+	// address several targets, so the deployment name alone does not always name
+	// the member.
+	Target  string
+	Primary bool
+	// Class is "match", "planned", "diverged", or "errored".
 	Class string
-	// Detail is a short human explanation for a diverged or errored deployment;
-	// empty for a match.
+	// Detail is a short human explanation for a diverged or errored member;
+	// empty for a member that passed.
 	Detail string
+}
+
+// driftMemberNames renders each rollup entry the way an operator addresses it,
+// index-parallel to the entries. The naming rule is shared with every other
+// member-facing surface, so a deployment that addresses several targets is named
+// the same way in the plan comment, the check summary, and the progress comment.
+func driftMemberNames(entries []DeploymentDriftEntry) []string {
+	members := make([]routing.ExecutionTarget, len(entries))
+	for i, e := range entries {
+		members[i] = routing.ExecutionTarget{Deployment: e.Deployment, Target: e.Target}
+	}
+	return routing.DisplayNames(members)
 }
 
 // applyingWithoutConfirmation reports whether this comment announces an apply
@@ -953,25 +978,48 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 		return
 	}
 
+	names := driftMemberNames(drift.Deployments)
 	if drift.Clean {
+		if drift.Independent {
+			fmt.Fprintf(sb, "✅ **Planned separately for all %d targets** (%s) — each target holds its own schema, so their plans are not expected to match.\n\n",
+				len(drift.Deployments), strings.Join(names, ", "))
+			return
+		}
 		fmt.Fprintf(sb, "✅ **Same plan on all %d deployments** (%s).\n\n",
-			len(drift.Deployments), joinDeploymentNames(drift.Deployments))
+			len(drift.Deployments), strings.Join(names, ", "))
 		return
 	}
 
-	sb.WriteString(glyph.Attention + " **Deployment drift detected** — some deployments no longer match the reviewed plan, so the plan check is failing closed:\n\n")
-	for _, d := range drift.Deployments {
-		name := "`" + d.Deployment + "`"
+	// A member that could not be planned blocks under either contract, but only
+	// mirrored members can be *out of agreement* with each other. Calling an
+	// independent environment's failure "drift" would tell an operator to go
+	// reconcile targets that are supposed to differ.
+	if drift.Independent {
+		sb.WriteString(glyph.Attention + " **Some targets could not be planned** — every target must have a plan before an apply can run, so the plan check is failing closed:\n\n")
+	} else {
+		sb.WriteString(glyph.Attention + " **Deployment drift detected** — some deployments no longer match the reviewed plan, so the plan check is failing closed:\n\n")
+	}
+	for i, d := range drift.Deployments {
+		name := "`" + names[i] + "`"
 		if d.Primary {
 			name += " (primary)"
 		}
 		switch d.Class {
 		case "match":
 			fmt.Fprintf(sb, "- %s ✅ matches the reviewed plan\n", name)
+		case "planned":
+			fmt.Fprintf(sb, "- %s ✅ planned against its own schema\n", name)
 		case "diverged":
 			fmt.Fprintf(sb, "- %s "+glyph.Attention+" diverged%s\n", name, driftDetailSuffix(d.Detail))
 		default:
-			fmt.Fprintf(sb, "- %s "+glyph.Failed+" could not verify%s\n", name, driftDetailSuffix(d.Detail))
+			// An errored member means different things under the two contracts:
+			// a mirrored member's diff could not be confirmed against the
+			// reviewed plan, while an independent member has no plan at all.
+			reason := "could not verify"
+			if drift.Independent {
+				reason = "could not plan"
+			}
+			fmt.Fprintf(sb, "- %s "+glyph.Failed+" %s%s\n", name, reason, driftDetailSuffix(d.Detail))
 		}
 	}
 	sb.WriteString("\n")
@@ -984,15 +1032,6 @@ func driftDetailSuffix(detail string) string {
 		return ""
 	}
 	return " — " + detail
-}
-
-// joinDeploymentNames lists deployment names for the uniform drift line.
-func joinDeploymentNames(deployments []DeploymentDriftEntry) string {
-	names := make([]string, len(deployments))
-	for i, d := range deployments {
-		names[i] = d.Deployment
-	}
-	return strings.Join(names, ", ")
 }
 
 // writeBlockedChanges writes the section for statements the engine refuses,

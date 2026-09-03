@@ -62,8 +62,8 @@ func TestMultiDeploymentApplyDetailHintsCarryTenant(t *testing.T) {
 		ApplyID:     "apply-123",
 		Environment: "production",
 		Tenant:      "acme",
-		Details: map[string]ApplyStatusCommentData{
-			"eu": {ApplyID: "apply-123", Environment: "production", State: state.Apply.Stopped, Tenant: "acme"},
+		Details: []*ApplyStatusCommentData{
+			{ApplyID: "apply-123", Environment: "production", State: state.Apply.Stopped, Tenant: "acme"},
 		},
 	}
 
