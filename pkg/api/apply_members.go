@@ -45,6 +45,16 @@ func (m applyMember) MemberID() string {
 // safe fallback: the apply's plan describes a different target's schema, so
 // substituting it would run DDL that was never planned for this member.
 func (s *Service) resolveApplyMembers(ctx context.Context, plan *storage.Plan, environment string, targets []routing.ExecutionTarget) ([]applyMember, error) {
+	// A single member is the plan's own primary, so it runs the apply's plan
+	// under either contract and there is no sibling whose plan could be
+	// substituted for it. Deciding the contract first would make apply creation
+	// depend on database config that the trusted control-plane enqueue path is
+	// not required to have — the same reason the caller falls back to the plan's
+	// stored target when config does not resolve the environment.
+	if len(targets) == 1 {
+		return []applyMember{{Target: targets[0], Plan: plan}}, nil
+	}
+
 	planning, err := s.config.MemberPlanningFor(plan.Database, environment)
 	if err != nil {
 		// A database/environment the config no longer resolves cannot be shown to
