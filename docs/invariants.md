@@ -317,7 +317,9 @@ Error text SchemaBot did not author (dial failures, DSN fragments, hostnames, en
 never rendered into PR or check markdown as it arrived. Before reaching either surface it has
 control and bidi-format characters stripped, connection details redacted, and its length clamped,
 and it is escaped so it cannot inject markup or break out of the structure holding it. A message
-that sanitizes to nothing falls back to a fixed line rather than publishing an empty summary.
+that sanitizes away to nothing is never published as an empty one: a Check Run summary falls back
+to a fixed line, since a Check Run has to carry some summary, while a comment simply omits the
+error block rather than rendering an empty quote.
 Text bound for a table cell is additionally flattened to one line with the cell separator
 neutralized, so it cannot break the layout around it.
 
