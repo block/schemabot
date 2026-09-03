@@ -92,6 +92,26 @@ func TestResolveApplyMembers_MirroredMembersShareTheApplyPlan(t *testing.T) {
 	}
 }
 
+// The trusted control-plane enqueue path creates applies on servers that hold
+// no database config, and apply creation falls back to the plan's own stored
+// target there. That single member is the plan's own primary, so it runs the
+// apply's plan without consulting config for a contract that could not change
+// the outcome.
+func TestResolveApplyMembers_SingleMemberNeedsNoDatabaseConfig(t *testing.T) {
+	plans := &listingPlanStore{listErr: errors.New("List must not be called for a single member")}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithPlanLookup{plans: plans}, &ServerConfig{}, map[string]tern.Client{}, logger)
+	plan := primaryPlanRow("testapp-001")
+
+	members, err := svc.resolveApplyMembers(t.Context(), plan, "production", []routing.ExecutionTarget{
+		{DatabaseType: plan.DatabaseType, Deployment: plan.Deployment, Target: plan.Target},
+	})
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	assert.Equal(t, "eu/testapp-001", members[0].MemberID())
+	assert.Same(t, plan, members[0].Plan)
+}
+
 // Each target of a multi-target environment runs the plan stored for that
 // target in the same review round, matched on the head SHA the apply's plan was
 // created for.
