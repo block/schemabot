@@ -34,12 +34,17 @@ func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, pr
 		return PlanRollup{}, fmt.Errorf("resolve deployment targets for %s/%s: %w", req.Database, req.Environment, err)
 	}
 
+	planning, err := s.config.MemberPlanningFor(req.Database, req.Environment)
+	if err != nil {
+		return PlanRollup{}, fmt.Errorf("resolve member planning for %s/%s: %w", req.Database, req.Environment, err)
+	}
+
 	diffs, err := s.PlanDeploymentDiffs(ctx, req, primaryPlan, primaryMember, targets)
 	if err != nil {
 		return PlanRollup{}, fmt.Errorf("plan deployment diffs for %s/%s: %w", req.Database, req.Environment, err)
 	}
 
-	rollup, err := RollupDeploymentDiffs(diffs, targets)
+	rollup, err := RollupDeploymentDiffs(diffs, targets, planning)
 	if err != nil {
 		return PlanRollup{}, fmt.Errorf("roll up deployment diffs for %s/%s: %w", req.Database, req.Environment, err)
 	}
@@ -77,6 +82,7 @@ func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, pr
 				"environment", req.Environment,
 				"deployment", entry.Deployment,
 				"target", entry.Target,
+				"member_planning", planning.String(),
 				"error", entry.Err)
 		}
 	}

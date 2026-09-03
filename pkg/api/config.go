@@ -2528,6 +2528,42 @@ func validateDeploymentOrder(deployments map[string]DeploymentTarget, order []st
 	return nil
 }
 
+// MemberPlanningFor reports how the rollout members of a database/environment
+// relate to each other, which decides whether a difference between them is
+// drift that blocks a review.
+//
+// An environment plans its members independently when it spells any of its
+// routing as a targets list — at the environment level or inside a deployments
+// map entry. Every other shape is mirrored, so an environment that predates the
+// targets spelling, or does not use it, keeps blocking on drift.
+//
+// The choice is per environment rather than per member: an environment whose
+// members are distinct targets has no pair of members that should be expected
+// to match, so extending independent planning to the whole environment does not
+// silence a comparison that would otherwise have been meaningful.
+func (c *ServerConfig) MemberPlanningFor(database, environment string) (MemberPlanning, error) {
+	if c == nil {
+		return PlanMirrored, fmt.Errorf("server config is nil")
+	}
+	dbConfig := c.Database(database)
+	if dbConfig == nil {
+		return PlanMirrored, &DatabaseNotConfiguredError{Database: database}
+	}
+	envConfig, ok := dbConfig.Environments[environment]
+	if !ok {
+		return PlanMirrored, &EnvironmentNotConfiguredError{Database: database, Environment: environment}
+	}
+	if envConfig.Targets != nil {
+		return PlanIndependent, nil
+	}
+	for _, dt := range envConfig.Deployments {
+		if dt.Targets != nil {
+			return PlanIndependent, nil
+		}
+	}
+	return PlanMirrored, nil
+}
+
 // ResolveTargets implements routing.Resolver using this server's static
 // configuration.
 func (c *ServerConfig) ResolveTargets(_ context.Context, req routing.Request) ([]routing.ExecutionTarget, error) {
