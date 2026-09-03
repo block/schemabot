@@ -859,6 +859,25 @@ type storedPlanRoute struct {
 }
 
 func (s *Service) storePlanResponse(ctx context.Context, req PlanRequest, resp *ternv1.PlanResponse, route storedPlanRoute) error {
+	return s.storePlan(ctx, req, resp.PlanId, resp.Changes, resp.Shards, route)
+}
+
+// storePlan writes one plan row for a single rollout member: the changes and
+// shards that member would run, stamped with the member's own route and the
+// request's PR context. It is the one place a plan row is built, so the primary
+// member's reviewed plan and a non-primary member's independently produced plan
+// are stored identically and are indistinguishable to everything downstream.
+//
+// planIdentifier is the plan's external identifier — minted by the planner for
+// the primary, minted here for a member whose plan came from the non-persisting
+// diff RPC.
+//
+// An identifier that is already stored is not an error: a re-plan of unchanged
+// content re-stores the same plan, and the row already there is that plan.
+func (s *Service) storePlan(ctx context.Context, req PlanRequest, planIdentifier string, changes []*ternv1.SchemaChange, shards []*ternv1.ShardPlan, route storedPlanRoute) error {
+	if planIdentifier == "" {
+		return fmt.Errorf("store plan for database %s deployment %q target %q: plan has no identifier", req.Database, route.Deployment, route.Target)
+	}
 	prInt := 0
 	if req.PullRequest != nil {
 		prInt = int(*req.PullRequest)
@@ -871,16 +890,16 @@ func (s *Service) storePlanResponse(ctx context.Context, req PlanRequest, resp *
 	if req.HeadSHA != nil {
 		headSHA = *req.HeadSHA
 	}
-	namespaces, err := protoChangesToNamespaces(resp.Changes, req.SchemaFiles)
+	namespaces, err := protoChangesToNamespaces(changes, req.SchemaFiles)
 	if err != nil {
 		return fmt.Errorf("convert plan namespaces: %w", err)
 	}
-	shards, err := protoShardPlansToStorage(resp.Shards)
+	storedShards, err := protoShardPlansToStorage(shards)
 	if err != nil {
 		return fmt.Errorf("convert plan shards: %w", err)
 	}
 	storedPlan := &storage.Plan{
-		PlanIdentifier: resp.PlanId,
+		PlanIdentifier: planIdentifier,
 		Database:       req.Database,
 		DatabaseType:   route.DatabaseType,
 		Deployment:     route.Deployment,
@@ -891,12 +910,12 @@ func (s *Service) storePlanResponse(ctx context.Context, req PlanRequest, resp *
 		Environment:    req.Environment,
 		SchemaFiles:    protoToSchemaFiles(req.SchemaFiles),
 		Namespaces:     namespaces,
-		Shards:         shards,
+		Shards:         storedShards,
 		HeadSHA:        headSHA,
 		CreatedAt:      time.Now(),
 	}
 	if _, err := s.storage.Plans().Create(ctx, storedPlan); err != nil && !errors.Is(err, storage.ErrPlanIDExists) {
-		return fmt.Errorf("store plan: %w", err)
+		return fmt.Errorf("store plan %s: %w", planIdentifier, err)
 	}
 	return nil
 }
