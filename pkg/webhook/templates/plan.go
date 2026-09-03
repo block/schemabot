@@ -721,7 +721,13 @@ func countStatementTypes(changes []KeyspaceChangeData, databaseType string) (cre
 	}
 	for _, ks := range changes {
 		for _, stmt := range ks.Statements {
-			stmtType, _, err := parser.Classify(stmt)
+			statements, err := ddl.CreateSetStatements(parser, stmt)
+			if err != nil {
+				slog.Warn("plan summary could not classify a statement; it is left out of the create/alter/drop counts",
+					"database_type", databaseType, "keyspace", ks.Keyspace, "error", err)
+				continue
+			}
+			stmtType, _, err := parser.Classify(statements[0])
 			if err != nil {
 				slog.Warn("plan summary could not classify a statement; it is left out of the create/alter/drop counts",
 					"database_type", databaseType, "keyspace", ks.Keyspace, "error", err)

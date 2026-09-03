@@ -44,6 +44,22 @@ func TestSummarizeChanges(t *testing.T) {
 		assert.Equal(t, "1 create, 1 alter", SummarizeChanges(data))
 	})
 
+	t.Run("counts a PostgreSQL create set as one create", func(t *testing.T) {
+		data := PlanCommentData{
+			DatabaseType: "postgres",
+			Changes: []KeyspaceChangeData{{
+				Keyspace: "orders",
+				Statements: []string{
+					"CREATE TABLE t (id bigint, v text); CREATE INDEX t_v_idx ON t (v)",
+				},
+			}},
+		}
+		creates, alters, drops := countStatementTypes(data.Changes, data.DatabaseType)
+		assert.Equal(t, 1, creates)
+		assert.Zero(t, alters)
+		assert.Zero(t, drops)
+	})
+
 	t.Run("appends vschema updates for non-MySQL", func(t *testing.T) {
 		data := PlanCommentData{
 			DatabaseType: "vitess",

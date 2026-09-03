@@ -188,22 +188,45 @@ func (c *LocalClient) statementParser() (ddl.StatementParser, error) {
 	return p, nil
 }
 
-// canonicalDDLForDrift normalizes a single DDL statement for comparison and
-// fails closed if it cannot be parsed, carries more than one statement, or is
-// not actually DDL. The parser's Canonicalize returns the input unchanged on a
-// parse failure, so such input would otherwise compare by raw text and could
-// mask drift — Classify errors reject it first. Classify also rejects
-// multi-statement input. Of what classifies cleanly, two rejection causes get
-// distinct messages because they call for different remedies: DML (e.g.
-// INSERT) has no place in a schema change and should be removed from it, while
-// a statement outside the shared DDL vocabulary is SQL the comparison has no
-// name for and cannot verify.
+// canonicalDDLForDrift normalizes a DDL statement, or a greenfield create set,
+// for comparison and fails closed if it cannot be parsed or is not actually
+// DDL. The parser's Canonicalize returns the input unchanged on a parse
+// failure, so such input would otherwise compare by raw text and could mask
+// drift — Classify errors reject it first. Classify also rejects
+// multi-statement input; the one multi-statement shape drift admits is a
+// greenfield create set (a CREATE TABLE followed by CREATE INDEX statements on
+// that table), canonicalized statement by statement so each spelling of the
+// same set compares equal.
 func canonicalDDLForDrift(p ddl.StatementParser, raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return "", fmt.Errorf("empty DDL")
 	}
-	stmtType, _, err := p.Classify(raw)
+	if _, _, err := p.Classify(raw); err == nil {
+		return canonicalDriftStatement(p, raw)
+	}
+	statements, err := ddl.CreateSetStatements(p, raw)
+	if err != nil {
+		return "", fmt.Errorf("DDL rejected by the statement parser: %w", err)
+	}
+	canonical := make([]string, 0, len(statements))
+	for _, statement := range statements {
+		c, err := canonicalDriftStatement(p, statement)
+		if err != nil {
+			return "", err
+		}
+		canonical = append(canonical, c)
+	}
+	return strings.Join(canonical, ";\n"), nil
+}
+
+// canonicalDriftStatement canonicalizes one statement that must be DDL. Two
+// rejection causes get distinct messages because they call for different
+// remedies: DML (e.g. INSERT) has no place in a schema change and should be
+// removed from it, while a statement outside the shared DDL vocabulary is SQL
+// the comparison has no name for and cannot verify.
+func canonicalDriftStatement(p ddl.StatementParser, statement string) (string, error) {
+	stmtType, _, err := p.Classify(statement)
 	if err != nil {
 		return "", fmt.Errorf("DDL rejected by the statement parser: %w", err)
 	}
@@ -213,7 +236,7 @@ func canonicalDDLForDrift(p ddl.StatementParser, raw string) (string, error) {
 	if !stmtType.IsDDL() {
 		return "", fmt.Errorf("expected a DDL statement, got %s", stmtType)
 	}
-	return p.Canonicalize(raw), nil
+	return p.Canonicalize(statement), nil
 }
 
 // diffDriftMultisets returns the changes each side of a comparison holds that

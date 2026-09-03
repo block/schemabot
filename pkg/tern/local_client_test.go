@@ -51,6 +51,19 @@ func TestMaterializedTableChangeOperation(t *testing.T) {
 		assert.Equal(t, "create", op)
 	})
 
+	t.Run("Postgres create set fallback", func(t *testing.T) {
+		parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+		require.NoError(t, err)
+
+		op, err := materializedTableChangeOperation(parser, &ternv1.TableChange{
+			TableName: "t",
+			Ddl:       "CREATE TABLE t (id bigint, v text); CREATE INDEX t_v_idx ON t (v)",
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, ddl.StatementTypeToOp(ddl.StatementCreateTable), op)
+	})
+
 	t.Run("MySQL fallback", func(t *testing.T) {
 		parser, err := ddl.ParserForDialect(schema.DialectMySQL)
 		require.NoError(t, err)

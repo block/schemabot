@@ -104,6 +104,44 @@ func ParserForDialect(dialect schema.Dialect) (StatementParser, error) {
 	}
 }
 
+// CreateSetStatements splits a DDL script with the parser and admits it only
+// when it is a single statement, or a greenfield create set: one CREATE TABLE
+// followed by CREATE INDEX statements on that same table. Single statements
+// are returned without classification so callers retain their existing rules.
+func CreateSetStatements(p StatementParser, script string) ([]string, error) {
+	statements, err := p.Split(script)
+	if err != nil {
+		return nil, fmt.Errorf("split DDL script: %w", err)
+	}
+	if len(statements) == 0 {
+		return nil, fmt.Errorf("DDL script contains no statements")
+	}
+	if len(statements) == 1 {
+		return statements, nil
+	}
+
+	firstType, table, err := p.Classify(statements[0])
+	if err != nil {
+		return nil, fmt.Errorf("classify statement 1 in multi-statement DDL script: %w", err)
+	}
+	if firstType != StatementCreateTable {
+		return nil, fmt.Errorf("statement 1 is %s; a multi-statement DDL script must start with CREATE TABLE", firstType)
+	}
+	for i, stmt := range statements[1:] {
+		stmtType, indexTable, err := p.Classify(stmt)
+		if err != nil {
+			return nil, fmt.Errorf("classify statement %d in multi-statement DDL script: %w", i+2, err)
+		}
+		if stmtType != StatementCreateIndex {
+			return nil, fmt.Errorf("statement %d is %s; a multi-statement DDL script must be a CREATE TABLE followed only by CREATE INDEX statements on that table", i+2, stmtType)
+		}
+		if indexTable != table {
+			return nil, fmt.Errorf("statement %d creates an index on table %q, not CREATE TABLE target %q", i+2, indexTable, table)
+		}
+	}
+	return statements, nil
+}
+
 // tidbStatementParser implements StatementParser over the TiDB parser via
 // Spirit's statement package — the behavior pkg/ddl has always had.
 type tidbStatementParser struct{}

@@ -3,6 +3,7 @@ package tern
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -332,6 +333,28 @@ func TestCanonicalDDLForDrift_PostgresDialect(t *testing.T) {
 		compact, err := canonicalDDLForDrift(parser, "CREATE TABLE users (id uuid PRIMARY KEY, seq bigint GENERATED ALWAYS AS IDENTITY, created_at timestamptz NOT NULL DEFAULT now())")
 		require.NoError(t, err)
 		assert.Equal(t, compact, spaced, "formatting-only differences canonicalize to the same form")
+	})
+
+	t.Run("greenfield create set is canonicalized statement by statement", func(t *testing.T) {
+		spaced, err := canonicalDDLForDrift(parser, `CREATE TABLE  users (id bigint, email text);
+			CREATE INDEX users_email_idx ON users (email);
+			CREATE UNIQUE INDEX users_id_idx ON users (id);`)
+		require.NoError(t, err)
+		compact, err := canonicalDDLForDrift(parser, "create table users(id bigint,email text); create index users_email_idx on users using btree(email); create unique index users_id_idx on users using btree(id)")
+		require.NoError(t, err)
+
+		assert.Equal(t, compact, spaced)
+		assert.Equal(t, strings.Join([]string{
+			parser.Canonicalize("CREATE TABLE users (id bigint, email text)"),
+			parser.Canonicalize("CREATE INDEX users_email_idx ON users (email)"),
+			parser.Canonicalize("CREATE UNIQUE INDEX users_id_idx ON users (id)"),
+		}, ";\n"), spaced)
+	})
+
+	t.Run("greenfield create set rejects ALTER TABLE", func(t *testing.T) {
+		_, err := canonicalDDLForDrift(parser, "CREATE TABLE users (id bigint); ALTER TABLE users ADD COLUMN email text")
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "statement 2 is ALTER TABLE")
 	})
 
 	t.Run("CREATE INDEX CONCURRENTLY is canonicalized", func(t *testing.T) {

@@ -2120,7 +2120,11 @@ func materializedTableChangeOperation(parser ddl.StatementParser, ch *ternv1.Tab
 	if strings.TrimSpace(ch.Ddl) == "" {
 		return "", fmt.Errorf("table change for %q has an unrecognized change type and no DDL to classify", ch.TableName)
 	}
-	statementType, _, err := parser.Classify(ch.Ddl)
+	statements, err := ddl.CreateSetStatements(parser, ch.Ddl)
+	if err != nil {
+		return "", fmt.Errorf("split DDL for table %q: %w", ch.TableName, err)
+	}
+	statementType, _, err := parser.Classify(statements[0])
 	if err != nil {
 		return "", fmt.Errorf("classify DDL for table %q: %w", ch.TableName, err)
 	}
