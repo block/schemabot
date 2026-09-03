@@ -230,3 +230,60 @@ func TestWritePullSchema_StylesOutputOnInteractiveTerminals(t *testing.T) {
 	assert.NotContains(t, plain, "\033[", "piped output carries no ANSI escapes")
 	assert.Contains(t, plain, "{\n  \"sharded\": true\n}\n")
 }
+
+// A pull of an environment whose targets each hold their own schema reports how
+// every other target differs from the primary, whose schema is the DDL printed
+// below. A converged target says so rather than being omitted, so "they agree"
+// is distinguishable from "not checked". The whole section renders as "--"
+// comments, so a redirected pull stays valid SQL.
+func TestWritePullSchema_RendersPerTargetDivergence(t *testing.T) {
+	setColors(t, false)
+	out := captureStdout(t, func() {
+		WritePullSchema(&apitypes.PullSchemaResponse{
+			Database:    "orders-db",
+			Type:        "mysql",
+			Environment: "production",
+			TableCount:  1,
+			Namespaces: map[string]*apitypes.PulledNamespace{
+				"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			},
+			Targets: []*apitypes.TargetDivergence{
+				{Deployment: "eu", Target: "orders-002", TableCount: 2, DivergedTables: []apitypes.DivergedTable{
+					{Namespace: "orders", Table: "audits", Difference: apitypes.DivergenceOnlyOnTarget},
+					{Namespace: "orders", Table: "users", Difference: apitypes.DivergenceDiffers},
+				}},
+				{Deployment: "eu", Target: "orders-003", TableCount: 1},
+			},
+		})
+	})
+
+	assert.Contains(t, out, "-- Target `orders-002` — 2 tables differ from the primary target")
+	assert.Contains(t, out, "--   orders.audits: extra")
+	assert.Contains(t, out, "--   orders.users: differs")
+	assert.Contains(t, out, "-- Target `orders-003` — same schema as the primary target")
+	for line := range strings.SplitSeq(out, "\n") {
+		if strings.Contains(line, "orders-002") || strings.Contains(line, "orders-003") || strings.Contains(line, "orders.audits") {
+			assert.True(t, strings.HasPrefix(strings.TrimSpace(line), "--"),
+				"divergence line %q must be a SQL comment", line)
+		}
+	}
+}
+
+// An environment whose targets are expected to hold the same schema carries no
+// divergence, and a pull of it renders exactly as it always did.
+func TestWritePullSchema_NoDivergenceSectionWithoutTargets(t *testing.T) {
+	setColors(t, false)
+	out := captureStdout(t, func() {
+		WritePullSchema(&apitypes.PullSchemaResponse{
+			Database:    "orders-db",
+			Type:        "mysql",
+			Environment: "production",
+			TableCount:  1,
+			Namespaces: map[string]*apitypes.PulledNamespace{
+				"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			},
+		})
+	})
+
+	assert.NotContains(t, out, "-- Target ")
+}
