@@ -38,23 +38,24 @@ that holds; this page is a description of the present, not a contract.
 
 | | Spirit (MySQL) | PlanetScale (Vitess) | pg-sprite (PostgreSQL) |
 |---|---|---|---|
-| **Instant DDL preferred** | yes, attempted first | yes, attempted first | not applicable, runs native DDL |
+| **Instant DDL preferred** | yes, attempted first | yes, attempted first | not applicable, a MySQL concept |
 | **Online DDL (copy and swap)** | yes, when instant is not possible | yes, when instant is not possible | no, those changes are blocked at plan time |
-| **Direct execution (native DDL)** | opt-in, size-bounded, separately confirmed | excluded by design | not available |
+| **Escape hatch for refused statements** | direct execution: opt-in, size-bounded, separately confirmed | none, excluded by design | none, native execution is already the only path |
 | **`stop` / `start`** | yes | yes | planned |
 | **`cutover`, including deferring it** | yes | yes | planned |
 | **`cancel`** | yes | yes | planned |
-| **`revert` / `skip-revert`** | no | yes | planned |
-| **Load-aware throttling** | automatic, on live target signals | manual, configured on the cluster | none, statements bounded instead |
-| **Adaptive pacing** | yes | no | no |
-| **Dropped-table recovery** | opt-in quarantine, expires | inside the revert window, expires | none |
+| **`revert` / `skip-revert`** | no | yes | not planned |
+| **Load-aware throttling** | automatic, on live target signals | no, a configured threshold that admits or rejects | planned; statements bounded meanwhile |
+| **Adaptive pacing** | yes | no | not applicable, no copy to pace |
+| **Dropped-table recovery** | opt-in quarantine, expires | inside the revert window, expires | not applicable, a drop is blocked at plan time |
 | **Who reports progress** | the process running the change | the cluster, so any instance can read it | the process running the change |
 
-"Planned" means the engine does not implement the operation yet. Asking for one today is safe
-rather than surprising: the request is recorded durably before it is acknowledged, and it then
-resolves to a typed, terminal unsupported-operation decline rather than hanging, being silently
-dropped, or reporting a success that did not happen. That is CO-1 and CO-2 in
-[invariants.md](invariants.md), and it is what makes a narrower engine still a safe one.
+"Planned" means the engine does not implement the operation yet but is expected to. "Not planned"
+means the same thing without that intent. Either way, asking for one today is safe rather than
+surprising: the request is recorded durably before it is acknowledged, and it then resolves to a
+typed, terminal unsupported-operation decline rather than hanging, being silently dropped, or
+reporting a success that did not happen. That is CO-1 and CO-2 in [invariants.md](invariants.md),
+and it is what makes a narrower engine still a safe one.
 
 ## Why the differences exist
 
@@ -95,12 +96,17 @@ target with no plan, no audit trail, and no bound at all. Vitess is excluded fro
 because raw DDL against vtgate would bypass exactly the machinery that engine is there to use.
 [direct-execution.md](direct-execution.md) covers the gate in full.
 
-**pg-sprite has no copy at all.** Each statement runs as its own transaction that either commits
-or fails. There is nothing to pause, nothing to cut over, and no window in which the previous
-state still exists, which is why the whole control family is declined rather than
-half-implemented. Protection comes from refusing the work instead: a change that would require a
-copy or a rewrite is blocked at plan time, and what does run is bounded by lock and statement
-budgets rather than paced.
+**pg-sprite has no copy at all.** Each statement runs as its own PostgreSQL transaction that
+either commits or fails. There is nothing to pause and nothing to cut over, which is why those
+operations are absent rather than half-implemented, and no window in which the previous state
+still exists, which is why `revert` is not merely unbuilt but has nothing to revert to.
+
+Protection comes from narrowing what runs instead, at several points. A change needing a copy or
+a rewrite is blocked at plan time. Only a small set of statement shapes is admitted at all, which
+is why a `DROP TABLE` never reaches the target. A change to a table above a configured size
+ceiling is refused. What does run carries a lock budget and a statement budget rather than a pace.
+[postgresql.md](postgresql.md) walks the whole boundary, and is worth reading before pointing
+SchemaBot at a PostgreSQL database.
 
 ## What GA asks of an engine
 
@@ -144,14 +150,18 @@ is responding, backing off under load and taking more headroom when there is som
 is suitable for that. Replication lag deliberately is not, because lag is a budget to stay within
 rather than a gauge to optimize against, and steering on it would park replicas behind.
 
-**PlanetScale** does not. Throttling there is a cluster-level setting an operator configures ahead
-of time, and it governs the deploy request the same way it governs the cluster's other background
-work. SchemaBot does not adjust it, and there is nothing per-apply to tune.
+**PlanetScale** does not, and the difference is not just that its throttle is configured by hand
+ahead of time rather than derived per apply. It is a different kind of mechanism: a threshold the
+copy is checked against, which admits the work or rejects it, rather than a signal the copy paces
+itself against. Under it a deploy request is held off and then resumes at full rate, where Spirit
+slows down and speeds up. The threshold is the cluster's, set by an operator, and it governs the
+deploy request the same way it governs the cluster's other background work; SchemaBot does not
+adjust it and there is nothing per-apply to tune.
 
-**pg-sprite** does not throttle, because there is no long-running copy whose rate could be
-adjusted. A statement is bounded instead: it gets a lock budget and a statement budget with
-bounded retries for contention, and a statement that exceeds its budget is not allowed to
-continue.
+**pg-sprite** does not throttle yet. It is planned, and until it lands the protection is a bound
+rather than a rate: each statement gets a lock budget and a statement budget with bounded retries
+for contention, and one that exceeds its budget is not allowed to continue. That is a cruder
+instrument than a throttle, which is part of why the changes it will run are kept small.
 
 None of this is a guarantee about your workload. Capacity you are already using is capacity the
 change will contend for, and the protection you actually get is the engine's, not SchemaBot's.
@@ -159,8 +169,8 @@ change will contend for, and the protection you actually get is the engine's, no
 
 ## Dropped tables
 
-A `DROP TABLE` requires explicit approval on every engine, which is the part that always holds
-(RV-3). Whether the data outlives the drop, and for how long, is engine-specific:
+Where a `DROP TABLE` can run at all, it requires explicit approval, which is the part that always
+holds (RV-3). Whether the data outlives the drop, and for how long, is engine-specific:
 
 - **Spirit** can quarantine the table instead of dropping it, renaming it into a holding area
   with a timestamp. This is **opt-in and off unless enabled** in server config, so an
@@ -170,9 +180,11 @@ A `DROP TABLE` requires explicit approval on every engine, which is the part tha
 - **PlanetScale** has no separate mechanism for this. A dropped table is recoverable because the
   drop is revertible like any other deploy request, so the recovery window is the revert window,
   and it ends the same way: once the window expires the table is purged.
-- **pg-sprite** has no equivalent. A dropped table is dropped.
+- **pg-sprite** does not execute drops at all. `DROP TABLE` is outside the set of statement shapes
+  it admits, so the plan is blocked and the table is still there. That is a narrower envelope
+  rather than a safety feature, and it will stop being true when the shape is admitted.
 
-So on two of the three there is a window, and on all three the window closes. Nothing here is a
+So there is a window on two of the engines, and on both of them it closes. Nothing here is a
 backup system. The consent gate is the protection to rely on; the window is a second chance to
 notice, not a place to store data.
 
