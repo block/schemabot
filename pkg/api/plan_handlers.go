@@ -859,8 +859,7 @@ type storedPlanRoute struct {
 }
 
 func (s *Service) storePlanResponse(ctx context.Context, req PlanRequest, resp *ternv1.PlanResponse, route storedPlanRoute) error {
-	_, err := s.storePlan(ctx, req, resp.PlanId, resp.Changes, resp.Shards, route)
-	return err
+	return s.storePlan(ctx, req, resp.PlanId, resp.Changes, resp.Shards, route)
 }
 
 // storePlan writes one plan row for a single rollout member: the changes and
@@ -871,15 +870,13 @@ func (s *Service) storePlanResponse(ctx context.Context, req PlanRequest, resp *
 //
 // planIdentifier is the plan's external identifier — minted by the planner for
 // the primary, minted here for a member whose plan came from the non-persisting
-// diff RPC. The stored row's ID is returned so a caller can point an apply
-// operation at exactly this plan.
+// diff RPC.
 //
-// An identifier that already exists is not an error: a re-plan of unchanged
-// content re-stores the same plan, and the existing row is the same plan. The
-// existing row is reloaded so its ID is still returned.
-func (s *Service) storePlan(ctx context.Context, req PlanRequest, planIdentifier string, changes []*ternv1.SchemaChange, shards []*ternv1.ShardPlan, route storedPlanRoute) (int64, error) {
+// An identifier that is already stored is not an error: a re-plan of unchanged
+// content re-stores the same plan, and the row already there is that plan.
+func (s *Service) storePlan(ctx context.Context, req PlanRequest, planIdentifier string, changes []*ternv1.SchemaChange, shards []*ternv1.ShardPlan, route storedPlanRoute) error {
 	if planIdentifier == "" {
-		return 0, fmt.Errorf("store plan for database %s deployment %q target %q: plan has no identifier", req.Database, route.Deployment, route.Target)
+		return fmt.Errorf("store plan for database %s deployment %q target %q: plan has no identifier", req.Database, route.Deployment, route.Target)
 	}
 	prInt := 0
 	if req.PullRequest != nil {
@@ -895,11 +892,11 @@ func (s *Service) storePlan(ctx context.Context, req PlanRequest, planIdentifier
 	}
 	namespaces, err := protoChangesToNamespaces(changes, req.SchemaFiles)
 	if err != nil {
-		return 0, fmt.Errorf("convert plan namespaces: %w", err)
+		return fmt.Errorf("convert plan namespaces: %w", err)
 	}
 	storedShards, err := protoShardPlansToStorage(shards)
 	if err != nil {
-		return 0, fmt.Errorf("convert plan shards: %w", err)
+		return fmt.Errorf("convert plan shards: %w", err)
 	}
 	storedPlan := &storage.Plan{
 		PlanIdentifier: planIdentifier,
@@ -917,21 +914,10 @@ func (s *Service) storePlan(ctx context.Context, req PlanRequest, planIdentifier
 		HeadSHA:        headSHA,
 		CreatedAt:      time.Now(),
 	}
-	id, err := s.storage.Plans().Create(ctx, storedPlan)
-	if err == nil {
-		return id, nil
+	if _, err := s.storage.Plans().Create(ctx, storedPlan); err != nil && !errors.Is(err, storage.ErrPlanIDExists) {
+		return fmt.Errorf("store plan %s: %w", planIdentifier, err)
 	}
-	if !errors.Is(err, storage.ErrPlanIDExists) {
-		return 0, fmt.Errorf("store plan %s: %w", planIdentifier, err)
-	}
-	existing, getErr := s.storage.Plans().Get(ctx, planIdentifier)
-	if getErr != nil {
-		return 0, fmt.Errorf("reload already-stored plan %s: %w", planIdentifier, getErr)
-	}
-	if existing == nil {
-		return 0, fmt.Errorf("plan %s was reported as already stored but could not be read back", planIdentifier)
-	}
-	return existing.ID, nil
+	return nil
 }
 
 // handleApply handles POST /api/apply requests.
