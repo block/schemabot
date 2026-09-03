@@ -4796,3 +4796,84 @@ func TestServerConfig_MemberPlanningFor(t *testing.T) {
 		assert.Contains(t, err.Error(), "missing")
 	})
 }
+
+// TestServerConfig_MultiTargetIsMySQLOnly covers the engine gate on the targets
+// spelling. A targets list makes an environment address several distinct
+// targets, which only MySQL drives today, so configuring it on another engine
+// fails validation rather than being silently collapsed to one target. A
+// deployments map with several single-target entries is not multi-target and
+// stays available on every engine.
+func TestServerConfig_MultiTargetIsMySQLOnly(t *testing.T) {
+	configFor := func(dbType string, env EnvironmentConfig) ServerConfig {
+		return ServerConfig{
+			TernDeployments: TernConfig{
+				"payments-a": {"production": "localhost:9090"},
+				"payments-b": {"production": "localhost:9091"},
+			},
+			Databases: map[string]DatabaseConfig{
+				"payments": {
+					Type:         dbType,
+					Environments: map[string]EnvironmentConfig{"production": env},
+				},
+			},
+		}
+	}
+	envTargets := EnvironmentConfig{Deployment: "payments-a", Targets: []string{"payments-001", "payments-002"}}
+	mapTargets := EnvironmentConfig{Deployments: map[string]DeploymentTarget{
+		"payments-a": {Targets: []string{"payments-001", "payments-002"}},
+	}}
+	mirrored := EnvironmentConfig{Deployments: map[string]DeploymentTarget{
+		"payments-a": {Target: "payments"},
+		"payments-b": {Target: "payments"},
+	}}
+
+	cases := []struct {
+		name    string
+		dbType  string
+		env     EnvironmentConfig
+		wantErr string
+	}{
+		{name: "mysql env targets", dbType: storage.DatabaseTypeMySQL, env: envTargets},
+		{name: "mysql deployments targets", dbType: storage.DatabaseTypeMySQL, env: mapTargets},
+		{name: "vitess env targets", dbType: storage.DatabaseTypeVitess, env: envTargets, wantErr: `configures targets, which is only supported for mysql databases (type is "vitess")`},
+		{name: "postgres env targets", dbType: storage.DatabaseTypePostgres, env: envTargets, wantErr: `configures targets, which is only supported for mysql databases (type is "postgres")`},
+		{name: "strata deployments targets", dbType: storage.DatabaseTypeStrata, env: mapTargets, wantErr: `configures targets, which is only supported for mysql databases (type is "strata")`},
+		{name: "vitess mirrored deployments", dbType: storage.DatabaseTypeVitess, env: mirrored},
+		{name: "postgres mirrored deployments", dbType: storage.DatabaseTypePostgres, env: mirrored},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := configFor(tc.dbType, tc.env)
+			err := cfg.Validate()
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+func TestEnvironmentConfig_UsesTargetsList(t *testing.T) {
+	cases := []struct {
+		name string
+		env  EnvironmentConfig
+		want bool
+	}{
+		{name: "single target", env: EnvironmentConfig{Deployment: "a", Target: "payments"}},
+		{name: "local dsn", env: EnvironmentConfig{DSN: "root@tcp(localhost)/payments"}},
+		{name: "deployments map of single targets", env: EnvironmentConfig{Deployments: map[string]DeploymentTarget{
+			"a": {Target: "payments"}, "b": {Target: "payments"},
+		}}},
+		{name: "environment targets", env: EnvironmentConfig{Deployment: "a", Targets: []string{"payments-001"}}, want: true},
+		{name: "deployments entry targets", env: EnvironmentConfig{Deployments: map[string]DeploymentTarget{
+			"a": {Target: "payments-001"}, "b": {Targets: []string{"payments-002"}},
+		}}, want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, tc.env.UsesTargetsList())
+		})
+	}
+}

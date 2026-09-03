@@ -1475,6 +1475,41 @@ type DeploymentTarget struct {
 	Targets []string `yaml:"targets,omitempty"`
 }
 
+// UsesTargetsList reports whether an environment spells any of its routing as a
+// targets list — at the environment level, or inside one entry of its
+// deployments map. That spelling is what makes an environment multi-target:
+// several distinct targets under one deployment, each holding its own schema.
+//
+// A deployments map whose entries each name a single target is not multi-target
+// however many entries it has: those members are expected to hold the same
+// schema as each other.
+func (c EnvironmentConfig) UsesTargetsList() bool {
+	if c.Targets != nil {
+		return true
+	}
+	for _, dt := range c.Deployments {
+		if dt.Targets != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// validateMultiTargetSupport rejects a targets list on a database whose engine
+// cannot drive several targets from one database entry. Multi-target work is
+// planned and applied per target, which not every engine supports yet, and a
+// config that looks like it addresses several targets must never be silently
+// collapsed to one.
+func (c EnvironmentConfig) validateMultiTargetSupport(context, databaseType string) error {
+	if !c.UsesTargetsList() {
+		return nil
+	}
+	if !schema.SupportsFeature(databaseType, schema.FeatureMultiTarget) {
+		return fmt.Errorf("%s configures targets, which is only supported for %s databases (type is %q)", context, storage.DatabaseTypeMySQL, databaseType)
+	}
+	return nil
+}
+
 // resolveTargetList returns the ordered target list for one routing entry —
 // either an environment's scalar routing or one entry of its deployments map.
 // Validation and routing both call it, so a config that validates resolves to
@@ -1688,6 +1723,9 @@ func (c *ServerConfig) Validate() error {
 				return err
 			}
 			if err := envConfig.validateDirectExecution(fmt.Sprintf("database %q environment %q", name, env), dbConfig.Type); err != nil {
+				return err
+			}
+			if err := envConfig.validateMultiTargetSupport(fmt.Sprintf("database %q environment %q", name, env), dbConfig.Type); err != nil {
 				return err
 			}
 			hasDSN := envConfig.HasLocalDSN()
@@ -2553,13 +2591,8 @@ func (c *ServerConfig) MemberPlanningFor(database, environment string) (MemberPl
 	if !ok {
 		return PlanMirrored, &EnvironmentNotConfiguredError{Database: database, Environment: environment}
 	}
-	if envConfig.Targets != nil {
+	if envConfig.UsesTargetsList() {
 		return PlanIndependent, nil
-	}
-	for _, dt := range envConfig.Deployments {
-		if dt.Targets != nil {
-			return PlanIndependent, nil
-		}
 	}
 	return PlanMirrored, nil
 }
