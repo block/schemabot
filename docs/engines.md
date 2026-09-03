@@ -80,9 +80,15 @@ Where the copy runs is the second-order difference, and it decides who can answe
 it. A Spirit copy runs inside the SchemaBot process driving the apply, so that process is the only
 thing that knows how far along it is; if it dies, the replacement resumes from a checkpoint. A
 deploy request runs on the cluster instead. It survives the process watching it, and any instance
-can ask the cluster where it has got to and get the same answer. That is also why only Vitess has
-a revert window: after cutover the old table is still there, held by the cluster, until the window
-expires.
+can ask the cluster where it has got to and get the same answer.
+
+The revert window is a separate decision and does not follow from that one. Both engines reach
+cutover holding two tables: the new one about to take traffic, and the original, renamed aside.
+Spirit drops the original as soon as the swap lands, so by the time the apply reports success
+there is nothing left to go back to. Vitess keeps it for a bounded period and offers an operation
+that swaps it back, which is what the revert window is, and what `skip-revert` gives up early.
+That is a retention policy paired with a supported operation, not a consequence of where the
+change ran.
 
 **Direct execution** is a third path, and it is deliberately awkward to reach. A few statements
 the MySQL engine will never run through a copy: dropping a primary key or adding a foreign key
@@ -125,9 +131,9 @@ happens rather than let it happen on its own, and `cancel` to abandon the change
 engine that can begin a copy but not act on one leaves the operator with a process they can only
 wait out.
 
-`revert` and `skip-revert` are deliberately **not** on that list. They depend on the old table
-still existing after cutover, which is a property of where the change runs rather than of how
-complete the engine is, and the MySQL engine is GA without them.
+`revert` and `skip-revert` are deliberately **not** on that list. They depend on the engine
+keeping the pre-cutover table around afterwards, which is a retention policy rather than a measure
+of how complete the engine is, and the MySQL engine is GA without them.
 
 Everything else in the matrix is a difference rather than a gap. Adaptive pacing and a drop
 quarantine each make an engine better on its own axis, and an engine missing one is not thereby

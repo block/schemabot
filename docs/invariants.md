@@ -176,7 +176,8 @@ That is the difference between an unfinished engine and an unsafe one.
 
 Cashed out in engine capabilities, the bar is copy and swap plus the core control operations
 (`stop`, `start`, `cutover`, `cancel`); `revert` and `skip-revert` are not part of it, because
-they depend on where the change runs rather than on how complete the engine is.
+they depend on whether the engine keeps the pre-cutover table rather than on how complete the
+engine is.
 [engines.md](engines.md) works through why, and is the per-engine picture generally.
 
 Where an engine's envelope is still moving, its own doc is the authority on where the boundary
