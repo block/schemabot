@@ -106,8 +106,10 @@ PlanetScale deploy request lives on PlanetScale's side and outlives the process 
 while a Spirit run does not, and the entries that turn on that (CO-3, CO-8, RV-5) name the
 difference rather than paper over it.
 
-Engine support is not uniform either, and this document does not imply that it is. What the
-maturity levels on the README mean is spelled out below.
+Engine support is not uniform either, and this document does not imply that it is.
+[engines.md](engines.md) is the capability matrix: what each engine can currently do, and why
+the differences follow from how it executes. What the maturity levels on the README mean is
+spelled out below.
 
 ## Does SchemaBot depend on GitHub?
 
@@ -214,21 +216,20 @@ every request, and an approved destructive change runs as approved. RV-3 makes a
 explicit consent; it does not make the consent right.
 
 **They do not promise your database is unaffected.** An online schema change copies data and
-consumes capacity on the target while it runs. That is actively managed rather than ignored: the
-copier sizes its own work against how the target is responding, and the engines throttle on live
-load signals, backing off when the database is under pressure. Where a signal is continuous
-rather than a simple stop or go, it can be steered on instead of merely stopped on, so the change
-can also speed up while there is headroom to use.
+consumes capacity on the target while it runs. Where the engine copies, that is actively managed
+rather than ignored: the copier watches the target, backs off under pressure, and on a continuous
+signal paces itself against the headroom it has. How much of that you get is an engine property,
+not a SchemaBot one, and an engine that executes in place has no copy to pace at all and bounds
+its statements instead. [engines.md](engines.md) has the per-engine picture. What holds either way
+is that the protection is the engine's, configured there rather than here, and capacity you are
+already using is capacity the change will contend for. SchemaBot's job is to make the work
+observable, interruptible, and correct in its bookkeeping, not to make it free.
 
-What that does not add up to is a guarantee. The protection is the engine's rather than
-SchemaBot's, so it varies by engine and is governed by the engine's own configuration rather than
-by anything in this registry, and capacity you are already using is capacity the copy will
-contend for. SchemaBot's job is to make the work observable, interruptible, and correct in its
-bookkeeping, not to make it free.
-
-**They do not promise the change is reversible.** Only RV-5's narrow and largely opt-in recovery
-window exists, and it covers dropped tables rather than data generally. SchemaBot is not a backup
-system and does not behave as one.
+**They do not promise the change is reversible.** Where a recovery window exists at all it is
+RV-5's, it covers dropped tables rather than data generally, and whether you have one depends on
+the engine and on how it is configured; on at least one it is off unless someone turned it on. See
+[engines.md](engines.md) for which is which. SchemaBot is not a backup system and does not behave
+as one.
 
 **They do not promise liveness.** Fail-closed is a real trade, not a free one: an ambiguous gate
 blocks a merge, and an apply whose outcome cannot be established keeps blocking until an operator

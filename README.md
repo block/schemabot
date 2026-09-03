@@ -82,13 +82,16 @@ See [docs/configuration.md](./docs/configuration.md) for setup instructions (loc
 
 ## Docs
 
-General design docs are in the [docs](./docs/) folder. Two are worth reading before you
+General design docs are in the [docs](./docs/) folder. Three are worth reading before you
 put SchemaBot in front of a database you care about:
 
 - [docs/invariants.md](./docs/invariants.md) is the registry of runtime safety invariants:
   what must never be false while SchemaBot is running, why each rule matters, where it is
   enforced, and what these guarantees deliberately do not cover. It opens with what happens
   when GitHub is down.
+- [docs/engines.md](./docs/engines.md) is the engine capability matrix: how each engine
+  executes a change, which control operations it supports, how it manages load, and why the
+  differences exist.
 - [docs/postgresql.md](./docs/postgresql.md) is the PostgreSQL support envelope: what plans,
   what applies, and how each refusal is reported.
 
