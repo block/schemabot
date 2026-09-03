@@ -49,6 +49,14 @@ func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, pr
 		return PlanRollup{}, fmt.Errorf("roll up deployment diffs for %s/%s: %w", req.Database, req.Environment, err)
 	}
 
+	// Members planned on their own each need a plan row of their own, since an
+	// apply has no single plan that covers them. Storing them here, before the
+	// rollup is reported, keeps "the review says this member is fine" and "this
+	// member has a plan to run" from being separately true.
+	if err := s.persistMemberPlans(ctx, req, planning, diffs, &rollup); err != nil {
+		return PlanRollup{}, fmt.Errorf("persist member plans for %s/%s: %w", req.Database, req.Environment, err)
+	}
+
 	// Include repo/pr/head SHA so an operator can tell which PR is blocked from
 	// the drift warn log alone.
 	var pr int32
