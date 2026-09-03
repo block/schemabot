@@ -54,7 +54,7 @@ func (s *Service) persistMemberPlans(ctx context.Context, req PlanRequest, plann
 			Deployment:   entry.Deployment,
 			Target:       entry.Target,
 		}
-		if _, err := s.storePlan(ctx, req, planIdentifier, diffs[i].Changes, diffs[i].Shards, route); err != nil {
+		if err := s.storePlan(ctx, req, planIdentifier, diffs[i].Changes, diffs[i].Shards, route); err != nil {
 			s.logger.Error("failed to store a rollout member's plan; the member will block the review because an apply would have no plan to run for it",
 				"repository", req.Repository,
 				"database", req.Database,
