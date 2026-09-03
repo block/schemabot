@@ -2268,6 +2268,16 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			wantErrSub: "cannot configure both target and targets",
 		},
 		{
+			name: "environment target and an empty targets list are rejected as a conflict",
+			envConfig: EnvironmentConfig{
+				Deployment: "payments-a",
+				Target:     "payments-001",
+				Targets:    []string{},
+			},
+			tern:       baseTern,
+			wantErrSub: "cannot configure both target and targets",
+		},
+		{
 			name: "empty environment targets list is rejected",
 			envConfig: EnvironmentConfig{
 				Deployment: "payments-a",
