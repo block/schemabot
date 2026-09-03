@@ -185,7 +185,26 @@ func TestRefusalForOutcomeTotalOverExecutorCodes(t *testing.T) {
 // rather than as an ambiguous external cancellation. Retuning either bound
 // without keeping the headroom fails here instead of in an apply.
 func TestConcurrentIndexBudgetLeavesHeadroomUnderApplyCeiling(t *testing.T) {
+	// A zero headroom would let the two bounds coincide and race, so the
+	// strict ordering is pinned on its own as well as through the gap.
+	require.Positive(t, concurrentIndexHeadroom)
+	assert.Less(t, concurrentIndexBudget, optimisticApplyCeiling)
 	assert.GreaterOrEqual(t, optimisticApplyCeiling-concurrentIndexBudget, concurrentIndexHeadroom)
+}
+
+// TestRetryPathFitsUnderApplyCeiling pins the other execution path against
+// the same ceiling: every attempt the default retry policy allows, each at
+// its full statement limit, plus the longest backoff between them, must
+// finish before the ceiling cancels the session — otherwise a lock-contended
+// native statement would surface as an external cancellation instead of the
+// typed budget verdict. The policy comes from pg-sprite, so a dependency
+// bump that widens it fails here instead of in an apply.
+func TestRetryPathFitsUnderApplyCeiling(t *testing.T) {
+	policy := executor.DefaultRetryPolicy()
+	require.Positive(t, policy.MaxAttempts)
+	attempts := time.Duration(policy.MaxAttempts)
+	worstCase := attempts*optimisticStatementLimit + (attempts-1)*policy.MaxBackoff
+	assert.Less(t, worstCase, optimisticApplyCeiling)
 }
 
 // TestInvalidIndexDetailMatchesVerdictOwnership pins the advice ladder to

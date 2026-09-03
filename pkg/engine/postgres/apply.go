@@ -49,12 +49,13 @@ const (
 	// concurrentIndexHeadroom is the least the apply ceiling must exceed
 	// the concurrent index budget by. The ceiling wraps the whole apply,
 	// so the gap has to absorb everything that shares the ceiling with the
-	// build: pool acquisition, the preflight table read, the partition
-	// admission facts lookup, and — after the budget has already expired —
-	// the catalog verdict that names an invalid leftover index. If the
-	// ceiling fires first the verdict has no live context to run in and
-	// the failure degrades to an external cancellation that names no
-	// index, which is the outcome the verdict exists to prevent.
+	// build — pool dial, the privilege check, the preflight table read, the
+	// partition admission facts lookup, and the rest of the session setup
+	// executeOptimistic runs before the build — and, after the budget has
+	// already expired, the catalog verdict that names an invalid leftover
+	// index. If the ceiling fires first the verdict has no live context to
+	// run in and the failure degrades to an external cancellation that
+	// names no index, which is the outcome the verdict exists to prevent.
 	concurrentIndexHeadroom = time.Minute
 )
 
@@ -443,9 +444,9 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	// Every other statement — including a blocking CREATE INDEX — runs
 	// exactly as reviewed, under the per-statement and lock limits.
 	// SchemaBot executes the DDL the plan surfaced and never rewrites it
-	// into its concurrent form: the choice between a blocking and a
-	// concurrent build belongs to the author at plan time, where the plan
-	// spells out the cost, not to the apply.
+	// into its concurrent form: the plan surfaces the statement as
+	// authored and the apply executes it unchanged, so the choice between
+	// a blocking and a concurrent build stays with the author.
 	if err := executor.ExecuteNative(ctx, pool, table, statement, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
 	}, executor.DefaultRetryPolicy()); err != nil {
