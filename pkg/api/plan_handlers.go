@@ -28,7 +28,6 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
-	"github.com/block/schemabot/pkg/tern"
 )
 
 const applyOperationKeyMaxLen = 255
@@ -280,79 +279,22 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		return nil, err
 	}
 
-	client, err := s.TernClient(resolvedTarget.Deployment, req.Environment)
+	merged, err := s.pullTargetSchema(ctx, req, resolvedTarget, namespaces, catalogDetail)
 	if err != nil {
 		span.RecordError(err)
-		span.SetStatus(otelcodes.Error, "tern client")
-		return nil, fmt.Errorf("database %q (%s): %w", req.Database, req.Environment, err)
+		span.SetStatus(otelcodes.Error, "pull schema failed")
+		return nil, err
 	}
 
-	isRemoteTarget := client.IsRemote()
-	s.logger.Info("ExecutePullSchema: calling PullSchema",
-		"database", req.Database,
-		"type", resolvedTarget.DatabaseType,
-		"deployment", resolvedTarget.Deployment,
-		"target", resolvedTarget.Target,
-		"environment", req.Environment,
-		"pull_call_count", len(namespaces),
-		"explicit_namespace_count", len(req.Namespaces),
-		"is_remote", isRemoteTarget,
-	)
-
-	merged := &ternv1.PullSchemaResponse{
-		Database:    req.Database,
-		Type:        resolvedTarget.DatabaseType,
-		Environment: req.Environment,
-		Namespaces:  make(map[string]*ternv1.PulledNamespace),
-	}
-	for _, namespace := range namespaces {
-		resp, pullErr := client.PullSchema(ctx, &ternv1.PullSchemaRequest{
-			Database:      req.Database,
-			Type:          resolvedTarget.DatabaseType,
-			Target:        resolvedTarget.Target,
-			Environment:   req.Environment,
-			Namespace:     namespace,
-			CatalogDetail: catalogDetail,
-		})
-		if pullErr != nil {
-			span.RecordError(pullErr)
-			span.SetStatus(otelcodes.Error, "pull schema failed")
-			s.logger.Error("ExecutePullSchema: routing client PullSchema failed",
-				"database", req.Database,
-				"type", resolvedTarget.DatabaseType,
-				"deployment", resolvedTarget.Deployment,
-				"target", resolvedTarget.Target,
-				"environment", req.Environment,
-				"namespace", namespace,
-				"endpoint", client.Endpoint(),
-				"is_remote", isRemoteTarget,
-				"error", pullErr,
-			)
-			if isRemoteTarget && grpcstatus.Code(pullErr) == grpccodes.Unavailable {
-				return nil, &RemoteDeploymentUnavailableError{
-					Deployment: resolvedTarget.Deployment,
-					Target:     resolvedTarget.Target,
-					Err:        pullErr,
-				}
-			}
-			// Whether pull is supported is the data plane's answer — it
-			// depends on which engine backs the deployment — so the 501 is
-			// derived from the pull attempt instead of gating on database
-			// type. One sentinel check covers both routes: the local client
-			// returns ErrPullSchemaUnsupportedType directly, and the gRPC
-			// client re-derives the same sentinel from the remote data
-			// plane's own unsupported verdict (infrastructure Unimplemented
-			// errors deliberately fall through as ordinary failures).
-			if errors.Is(pullErr, tern.ErrPullSchemaUnsupportedType) {
-				return nil, &unsupportedPullSchemaError{DatabaseType: resolvedTarget.DatabaseType}
-			}
-			return nil, pullErr
-		}
-		if err := mergePullSchemaResponse(merged, resp, namespace); err != nil {
-			span.RecordError(err)
-			span.SetStatus(otelcodes.Error, "merge pull schema response")
-			return nil, err
-		}
+	// An environment whose targets each hold their own schema has no single live
+	// schema, so the primary's is reported alongside how the others differ from
+	// it. Comparing here, rather than leaving it to the caller, keeps a pull from
+	// presenting one target's schema as the environment's.
+	divergences, err := s.pullMemberDivergence(ctx, req, resolvedTarget, merged, namespaces, catalogDetail)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "compare rollout members")
+		return nil, err
 	}
 
 	span.SetAttributes(attribute.Int("table_count", int(merged.TableCount)))
@@ -362,9 +304,11 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		"environment", merged.Environment,
 		"table_count", merged.TableCount,
 		"namespace_count", len(merged.Namespaces),
+		"compared_target_count", len(divergences),
 	)
 
 	httpResp := pullSchemaResponseFromProto(merged)
+	httpResp.Targets = divergences
 	if req.Lint {
 		if err := lintPulledNamespaces(httpResp); err != nil {
 			span.RecordError(err)

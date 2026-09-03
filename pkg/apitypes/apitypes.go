@@ -440,12 +440,46 @@ type PullSchemaRequest struct {
 }
 
 // PullSchemaResponse is the HTTP response body for POST /api/pull.
+//
+// Namespaces holds the primary target's live schema, which is the schema a
+// caller materializes. Targets is populated only for an environment whose
+// targets each hold their own schema, and describes how every other target
+// differs from the primary.
 type PullSchemaResponse struct {
 	Database    string                      `json:"database"`
 	Type        string                      `json:"type"`
 	Environment string                      `json:"environment"`
 	Namespaces  map[string]*PulledNamespace `json:"namespaces"`
 	TableCount  int32                       `json:"table_count"`
+	Targets     []*TargetDivergence         `json:"targets,omitempty"`
+}
+
+// Difference values for DivergedTable.
+const (
+	// DivergenceDiffers means both targets hold the table with different DDL.
+	DivergenceDiffers = "differs"
+	// DivergenceOnlyOnPrimary means only the primary target holds the table.
+	DivergenceOnlyOnPrimary = "only_on_primary"
+	// DivergenceOnlyOnTarget means only this target holds the table.
+	DivergenceOnlyOnTarget = "only_on_target"
+)
+
+// TargetDivergence reports how one non-primary target's live schema differs from
+// the primary's. An empty DivergedTables means the two targets hold the same
+// schema; it never means the comparison was skipped, since a target that could
+// not be pulled or compared fails the pull instead.
+type TargetDivergence struct {
+	Deployment     string          `json:"deployment"`
+	Target         string          `json:"target"`
+	TableCount     int32           `json:"table_count"`
+	DivergedTables []DivergedTable `json:"diverged_tables,omitempty"`
+}
+
+// DivergedTable names one table two targets do not agree on, and how.
+type DivergedTable struct {
+	Namespace  string `json:"namespace"`
+	Table      string `json:"table"`
+	Difference string `json:"difference"`
 }
 
 // DatabaseListResponse is the HTTP response body for GET /api/databases.

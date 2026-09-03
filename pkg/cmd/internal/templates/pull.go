@@ -30,6 +30,7 @@ func WritePullSchema(resp *apitypes.PullSchemaResponse) {
 	}
 	rows = append(rows, BoxRow{Label: "Tables", Value: strconv.Itoa(int(resp.TableCount))})
 	WriteBox(rows, "", nil)
+	writeTargetDivergence(resp.Targets)
 
 	for _, name := range sortedKeys(resp.Namespaces) {
 		ns := resp.Namespaces[name]
@@ -55,6 +56,52 @@ func WritePullSchema(resp *apitypes.PullSchemaResponse) {
 				body = colorizeJSON(body)
 			}
 			fmt.Println(body)
+		}
+	}
+}
+
+// divergenceLabels phrases each difference for a reader looking at the primary
+// target's schema: the DDL printed below is the primary's, so the wording says
+// what the other target has instead.
+var divergenceLabels = map[string]string{
+	apitypes.DivergenceDiffers:       "differs",
+	apitypes.DivergenceOnlyOnPrimary: "missing",
+	apitypes.DivergenceOnlyOnTarget:  "extra",
+}
+
+// writeTargetDivergence reports how each of an environment's other targets
+// differs from the primary, whose schema is the DDL printed below. It renders as
+// "--" comments like the rest of the pull output, so redirecting a multi-target
+// pull into a .sql file still produces valid SQL.
+//
+// A target with no diverged tables is still listed: "these two hold the same
+// schema" is the answer an operator is usually looking for, and omitting the
+// converged targets would leave it indistinguishable from not having checked.
+// An environment whose targets are expected to hold the same schema carries no
+// divergence at all and prints nothing.
+func writeTargetDivergence(targets []*apitypes.TargetDivergence) {
+	if len(targets) == 0 {
+		return
+	}
+	for _, target := range targets {
+		fmt.Println()
+		if len(target.DivergedTables) == 0 {
+			fmt.Println(annotation(fmt.Sprintf("-- Target %s — same schema as the primary target",
+				emphasis("`"+target.Target+"`"))))
+			continue
+		}
+		fmt.Println(annotation(fmt.Sprintf("-- Target %s — %d %s differ from the primary target",
+			emphasis("`"+target.Target+"`"),
+			len(target.DivergedTables),
+			ui.Pluralize("table", len(target.DivergedTables)))))
+		for _, table := range target.DivergedTables {
+			label, ok := divergenceLabels[table.Difference]
+			if !ok {
+				// A difference this client does not know how to phrase is still
+				// reported, since dropping it would understate the divergence.
+				label = table.Difference
+			}
+			fmt.Println(annotation(fmt.Sprintf("--   %s.%s: %s", table.Namespace, table.Table, label)))
 		}
 	}
 }
