@@ -82,7 +82,7 @@ MYSQL_DATA_PLANE_PORT="$(free_local_port 28000 4000)"
 
 if ! minikube status > /dev/null 2>&1; then
     echo "Starting minikube..."
-    minikube start --driver=docker --cpus=2 --memory=2048
+    minikube start --driver=docker --container-runtime=docker --cpus=2 --memory=2048
 fi
 
 # --- Build image ---
