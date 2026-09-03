@@ -214,8 +214,17 @@ every request, and an approved destructive change runs as approved. RV-3 makes a
 explicit consent; it does not make the consent right.
 
 **They do not promise your database is unaffected.** An online schema change copies data and
-consumes capacity on the target while it runs. SchemaBot's job is to make that work observable,
-interruptible, and correct in its bookkeeping, not to make it free.
+consumes capacity on the target while it runs. That is actively managed rather than ignored: the
+copier sizes its own work against how the target is responding, and the engines throttle on live
+load signals, backing off when the database is under pressure. Where a signal is continuous
+rather than a simple stop or go, it can be steered on instead of merely stopped on, so the change
+can also speed up while there is headroom to use.
+
+What that does not add up to is a guarantee. The protection is the engine's rather than
+SchemaBot's, so it varies by engine and is governed by the engine's own configuration rather than
+by anything in this registry, and capacity you are already using is capacity the copy will
+contend for. SchemaBot's job is to make the work observable, interruptible, and correct in its
+bookkeeping, not to make it free.
 
 **They do not promise the change is reversible.** Only RV-5's narrow and largely opt-in recovery
 window exists, and it covers dropped tables rather than data generally. SchemaBot is not a backup
