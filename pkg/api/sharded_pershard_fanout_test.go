@@ -18,6 +18,16 @@ func pershardTargets() []routing.ExecutionTarget {
 	return []routing.ExecutionTarget{{DatabaseType: storage.DatabaseTypeStrata, Deployment: "cdb-resolute", Target: "cdb-resolute"}}
 }
 
+// pershardMembers is the single rollout member these tests build operations
+// for, paired with the plan its work comes from.
+func pershardMembers(plan *storage.Plan) []applyMember {
+	members := make([]applyMember, 0, 1)
+	for _, target := range pershardTargets() {
+		members = append(members, applyMember{Target: target, Plan: plan})
+	}
+	return members
+}
+
 func pershardTestTime() time.Time { return time.Unix(1700000000, 0).UTC() }
 
 // operationKeys returns each group's operation key paired with its tasks' DDLs,
@@ -56,7 +66,7 @@ func TestBuildShardedApplyOperationGroupsUsesPerShardDDL(t *testing.T) {
 		},
 	}
 
-	groups, err := buildShardedApplyOperationGroups(plan, pershardTargets(), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	groups, err := buildShardedApplyOperationGroups(plan, pershardMembers(plan), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
 	require.NoError(t, err)
 
 	got := operationDDLByKey(groups)
@@ -86,7 +96,7 @@ func TestBuildShardedApplyOperationGroupsSkipsShardsWithoutChanges(t *testing.T)
 		},
 	}
 
-	groups, err := buildShardedApplyOperationGroups(plan, pershardTargets(), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	groups, err := buildShardedApplyOperationGroups(plan, pershardMembers(plan), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
 	require.NoError(t, err)
 
 	assert.Equal(t, map[string][]string{
@@ -130,7 +140,7 @@ func TestBuildShardedApplyOperationGroupsFailsClosedOnMalformedChange(t *testing
 			Changes: []storage.TableChange{{Namespace: pershardNamespace, Table: "", DDL: "ALTER TABLE `mutes` ADD INDEX (`x`)", Operation: "alter"}},
 		}},
 	}
-	_, err := buildShardedApplyOperationGroups(plan, pershardTargets(), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	_, err := buildShardedApplyOperationGroups(plan, pershardMembers(plan), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "empty table")
 }
@@ -169,7 +179,7 @@ func TestBuildApplyOperationGroupsVSchemaOnlyPlanBuildsFinalizer(t *testing.T) {
 		},
 	}
 
-	groups, shardedFanout, err := buildApplyOperationGroups(plan, nil, pershardTargets(), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	groups, shardedFanout, err := buildApplyOperationGroups(plan, nil, pershardMembers(plan), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
 	require.NoError(t, err)
 	assert.False(t, shardedFanout)
 	require.Len(t, groups, 1)
@@ -192,7 +202,7 @@ func TestBuildApplyOperationGroupsVSchemaOnlyPlanMultiNamespaceSingleFinalizer(t
 		},
 	}
 
-	groups, shardedFanout, err := buildApplyOperationGroups(plan, nil, pershardTargets(), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	groups, shardedFanout, err := buildApplyOperationGroups(plan, nil, pershardMembers(plan), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
 	require.NoError(t, err)
 	assert.False(t, shardedFanout)
 	require.Len(t, groups, 1)
@@ -217,7 +227,7 @@ func TestBuildApplyOperationGroupsTableDDLKeepsWorkShape(t *testing.T) {
 	taskChanges := plan.FlatDDLChanges()
 	require.Len(t, taskChanges, 1)
 
-	groups, shardedFanout, err := buildApplyOperationGroups(plan, taskChanges, pershardTargets(), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	groups, shardedFanout, err := buildApplyOperationGroups(plan, taskChanges, pershardMembers(plan), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
 	require.NoError(t, err)
 	assert.False(t, shardedFanout)
 	require.Len(t, groups, 1)
