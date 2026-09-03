@@ -679,6 +679,9 @@ jobs:
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
         with:
           driver: docker
+          # The e2e scripts build images through `minikube docker-env`, which
+          # only yields a usable Docker daemon under the docker runtime.
+          container-runtime: docker
           cpus: 2
           memory: 2048
       # The script builds the schemabot image into minikube's docker daemon
@@ -730,6 +733,9 @@ jobs:
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
         with:
           driver: docker
+          # The e2e scripts build images through `minikube docker-env`, which
+          # only yields a usable Docker daemon under the docker runtime.
+          container-runtime: docker
           cpus: 2
           memory: 4096
       # The script builds both the schemabot and etre images into minikube's
@@ -795,6 +801,9 @@ jobs:
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
         with:
           driver: docker
+          # The e2e scripts build images through `minikube docker-env`, which
+          # only yields a usable Docker daemon under the docker runtime.
+          container-runtime: docker
           cpus: 2
           memory: 6144
       # The script builds the schemabot, etre, and localscale images into
