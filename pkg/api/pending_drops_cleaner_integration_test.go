@@ -4,22 +4,17 @@ package api
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"io"
 	"log/slog"
 	"testing"
 	"time"
 
-	"github.com/block/spirit/pkg/utils"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/mysql"
 
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/storage"
-	"github.com/block/schemabot/pkg/testutil"
 )
 
 // pendingDropsEnabled opts these tests into the quarantine, which is off by
@@ -32,30 +27,11 @@ var pendingDropsEnabled = true
 func TestStartPendingDropsCleanerDropsExpiredTable(t *testing.T) {
 	ctx := t.Context()
 
-	container, err := mysql.Run(ctx,
-		"mysql:8.0",
-		mysql.WithDatabase("schemabot_test"),
-		mysql.WithUsername("root"),
-		mysql.WithPassword("test"),
-		testutil.MySQLTmpfsDatadir(),
-	)
-	require.NoError(t, err, "start mysql")
-	t.Cleanup(func() {
-		if err := testcontainers.TerminateContainer(container); err != nil {
-			t.Logf("terminate mysql container: %v", err)
-		}
-	})
-
-	dsn, err := testutil.ContainerConnectionString(ctx, container, "parseTime=true")
-	require.NoError(t, err, "container connection string")
-
-	db, err := sql.Open("mysql", dsn)
-	require.NoError(t, err, "open mysql")
-	defer utils.CloseAndLog(db)
-	require.NoError(t, db.PingContext(ctx), "ping mysql")
+	dsn := newStorageDatabase(t).DSN
+	db := openStorageDB(t, dsn)
 
 	expired := pendingdrops.TableName("schemabot_test", "scheduled_drop", time.Now().Add(-48*time.Hour))
-	_, err = db.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", pendingdrops.Database))
+	_, err := db.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS `%s`", pendingdrops.Database))
 	require.NoError(t, err, "create pending drops database")
 	_, err = db.ExecContext(ctx, fmt.Sprintf("CREATE TABLE `%s`.`%s` (id INT PRIMARY KEY)", pendingdrops.Database, expired))
 	require.NoError(t, err, "create expired quarantined table")

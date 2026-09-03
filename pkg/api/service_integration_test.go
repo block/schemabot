@@ -12,36 +12,15 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/mysql"
 
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
-	"github.com/block/schemabot/pkg/testutil"
 )
 
 func TestNew_Integration(t *testing.T) {
 	ctx := t.Context()
 
-	container, err := mysql.Run(ctx,
-		"mysql:8.0",
-		mysql.WithDatabase("schemabot_test"),
-		mysql.WithUsername("root"),
-		mysql.WithPassword("test"),
-		testutil.MySQLTmpfsDatadir(),
-	)
-	require.NoError(t, err, "failed to start mysql")
-	t.Cleanup(func() {
-		if err := testcontainers.TerminateContainer(container); err != nil {
-			t.Logf("failed to terminate container: %v", err)
-		}
-	})
-
-	dsn, err := testutil.ContainerConnectionString(ctx, container, "parseTime=true")
-	require.NoError(t, err, "failed to get connection string")
-
-	// Apply schema using EnsureSchema (same mechanism as production)
+	dsn := newStorageDatabaseWithSchema(t).DSN
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	require.NoError(t, EnsureSchema(dsn, logger), "failed to ensure schema")
 
 	t.Run("successful connection", func(t *testing.T) {
 		serverConfig := &ServerConfig{
