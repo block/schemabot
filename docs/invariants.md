@@ -383,6 +383,22 @@ reading. *Enforced:* the per-dialect bootstrappers (`pkg/api/ensure_schema.go`,
 The GitHub Check Run gate is the tier-0 safety feature: it is what stands between a schema PR
 and a merge that contradicts the live database. Full semantics: [check-runs.md](check-runs.md).
 
+Two different things get called a check, and the invariants below only make sense if you keep
+them apart.
+
+A **Check Run** is GitHub's object. It hangs off exactly one commit, it is what a reviewer sees
+on the PR, and it is the only thing branch protection reads. Branch protection looks at the runs
+on the PR's current head and nowhere else, so a Check Run on an earlier commit still exists but
+no longer gates anything.
+
+**Stored check state** is SchemaBot's own record of what that Check Run should say. It lives in
+SchemaBot's storage database as one row per target, keyed by repository, PR, environment,
+database type, and database. There is one row per target rather than one per commit, so the row
+also records which commit its result was computed against, alongside the ID of the Check Run it
+drives and, while an apply is running, that apply's ID as an ownership marker. SchemaBot decides
+from the row; GitHub gates on the run. Most of what follows is about keeping the two in
+agreement.
+
 ### MG-1: Uncertainty is never converted into a passing check
 
 Config-discovery failure, stored-check-state read failure, head-SHA ambiguity, or an in-flight
@@ -412,8 +428,10 @@ aggregate rollup (`pkg/webhook/check_aggregate.go`).
 
 Work from an older head SHA never satisfies branch protection for a newer head, and a plan taken
 while an apply is mutating the database never becomes the merge-gating source of truth.
-*Enforced:* per-SHA check rows (`pkg/webhook/check_records.go`); stale-webhook and mid-apply plan
-guards (`pkg/webhook/plan.go`).
+*Enforced:* the commit stamp each check row carries and the guard refusing a write whose commit is
+no longer the head (`pkg/webhook/check_records.go`); stale-webhook and mid-apply plan guards
+(`pkg/webhook/plan.go`). MG-11 is the other direction: making sure a real outcome does reach the
+gating commit.
 
 ### MG-5: Apply-owned check rows are released only by their owner
 
@@ -474,14 +492,25 @@ reconciliation (`pkg/webhook/check_records.go`) and aggregate re-evaluation
 
 ### MG-11: A terminal outcome lands on the commit the PR is gated on
 
-When an apply settles, its aggregate is published on the PR's current head, not on the commit the
-apply started on, which the stored row still names. GitHub gates on runs attached to the head, and
-the publish path refuses a write aimed at any other commit, so an outcome addressed to the apply's
-own commit is not merely hidden: it is written nowhere. The head is resolved once and answers both
-the publish target and that refusal check, so a push landing between two reads cannot quietly turn
-the outcome into a no-op. *Breaks if violated:* a half-changed target with nothing on the gating
-commit saying so. *Enforced:* head-resolved publishing on the terminal check refresh
-(`pkg/webhook/check_publisher.go`).
+When an apply settles, its outcome is published on the PR's current head, not on the commit its
+stored check state names. That row still names the commit the apply started on, which by the time
+a long apply finishes may be several pushes old, and a Check Run there gates nothing.
+
+Publishing to that older commit would not merely be invisible. MG-4 makes the publish path refuse
+any write aimed at a commit that is no longer the head, so an outcome addressed to the apply's own
+commit is dropped rather than written somewhere stale. The two rules are halves of one guarantee:
+MG-4 keeps old work from satisfying a newer gate, and this one keeps a real outcome from failing to
+reach the gate at all.
+
+That refusal is also why the head is read once, with the single read serving as both the publish
+target and the answer to the refusal check. Two reads of a moving head can disagree, and a push
+landing between them would address the outcome to a commit the check then rejects, turning it into
+a silent no-op. When the head cannot be read at all, the outcome is published on the apply's own
+commit and the fallback is logged with the target it used, so an outcome that got dropped is never
+mistaken for one that landed. *Breaks if violated:* a half-changed target with nothing on the
+gating commit saying so. *Enforced:* one uncached head read shared by the publish target and the
+currency check on the terminal check refresh (`pkg/webhook/handler.go`,
+`pkg/webhook/check_publisher.go`).
 
 ## Apply state machine (ST)
 
@@ -498,9 +527,24 @@ driver replaying stale progress.
 a database rather than done with it. It can be claimed to resume via `start`, and it can be
 claimed to deliver a pending `cancel`, which settles it to `cancelled`. Both are explicit arms of
 the claim query rather than general re-entry: no other terminal state is claimable, and nothing
-reaches an active state by any other route. *Enforced:* the terminal guard in the storage apply
-update path, and the named state arms of the single claim query
-(`pkg/storage/internal/sqlstore/applies.go`).
+reaches an active state by any other route.
+
+One marker overrides even that. When a later apply takes over a stopped apply's unfinished work,
+adopting or discarding the copy it left behind, the stopped apply is stamped with its successor's
+identifier. State alone cannot express this: the apply is still `stopped`, and once the successor
+settles nothing else tells it apart from a stopped apply nobody touched. Starting it would replay
+its statements against a target where that work has already happened, so a stamped apply can never
+be started. The stamp is write-once, because a second and different successor means the takeover
+is ambiguous, and it is never cleared, outliving the successor it names.
+
+That refusal holds at every surface that could begin the work again: the API rejects the start
+request and points at the successor, a claim to resume refuses and fails the pending start request
+with the reason, and the claim predicate excludes a stamped `failed_retryable` apply from automatic
+retry. No other claim path can reach a stamped apply, since work must have run before a successor
+can take it over, and an active apply cannot gain one at all. *Enforced:* the terminal guard in the
+storage apply update path, the named state arms of the single claim query, and the write-once
+supersession marker consulted by the start, resume, and retry paths
+(`pkg/storage/internal/sqlstore/applies.go`, `pkg/api/control_handlers.go`).
 
 ### ST-2: Recovery from permanent failure is a fresh plan and apply
 
