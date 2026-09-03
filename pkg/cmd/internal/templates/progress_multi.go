@@ -40,6 +40,7 @@ func progressOperationsForPresentation(ops []ProgressOperation, released bool) [
 	for _, op := range ops {
 		presentationOps = append(presentationOps, presentation.Operation{
 			Deployment:        op.Deployment,
+			Target:            op.Target,
 			State:             op.State,
 			Barrier:           op.CutoverPolicy == storage.CutoverPolicyBarrier,
 			Parallel:          op.CutoverPolicy == storage.CutoverPolicyParallel,
@@ -89,35 +90,37 @@ func writeMultiDeploymentFirstFailure(failure *presentation.Deployment) {
 		return
 	}
 	if failure.Error == "" {
-		fmt.Printf("\n  %s"+glyph.Failed+" First failure: %s%s\n", ANSIRed, failure.Deployment, ANSIReset)
+		fmt.Printf("\n  %s"+glyph.Failed+" First failure: %s%s\n", ANSIRed, failure.Name, ANSIReset)
 		return
 	}
-	fmt.Printf("\n  %s"+glyph.Failed+" First failure: %s — %s%s\n", ANSIRed, failure.Deployment, failure.Error, ANSIReset)
+	fmt.Printf("\n  %s"+glyph.Failed+" First failure: %s — %s%s\n", ANSIRed, failure.Name, failure.Error, ANSIReset)
 }
 
 func writeMultiDeploymentNextAction(next presentation.NextAction) {
 	switch next.Kind {
 	case presentation.NextActionCutover:
-		fmt.Printf("\n  Next: cut over %s\n", next.Deployment)
+		fmt.Printf("\n  Next: cut over %s\n", next.Name)
 	case presentation.NextActionResume:
 		fmt.Println("\n  Next: resume apply")
 	case presentation.NextActionReviewFailure:
-		if next.Deployment == "" {
+		if next.Name == "" {
 			fmt.Println("\n  Next: review failure")
 			return
 		}
-		fmt.Printf("\n  Next: review failure in %s\n", next.Deployment)
+		fmt.Printf("\n  Next: review failure in %s\n", next.Name)
 	case presentation.NextActionNone:
 	}
 }
 
 func writeDeploymentProgressSection(deployment presentation.Deployment, op ProgressOperation, data ProgressData) {
-	fmt.Printf("%s %s", deployment.Emoji, deployment.Deployment)
+	fmt.Printf("%s %s", deployment.Emoji, deployment.Name)
 	if op.OperationKey != "" {
 		fmt.Printf(" · %s", op.OperationKey)
 	}
 	fmt.Printf(" — %s", deployment.Label)
-	if target := sectionTarget(op, data.Operations); target != "" {
+	// A member whose name already carries its target does not repeat it in the
+	// trailing parenthetical.
+	if target := sectionTarget(op, data.Operations); target != "" && deployment.Name == deployment.Deployment {
 		fmt.Printf(" (%s)", target)
 	}
 	fmt.Println()

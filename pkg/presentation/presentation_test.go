@@ -328,7 +328,7 @@ func TestDerive_AggregateBarrierWorkedExample(t *testing.T) {
 	assert.Equal(t, StateWaiting, got.Deployments[3].Presentation)
 	assert.Equal(t, "waiting for us", got.Deployments[3].Label)
 
-	assert.Equal(t, NextAction{Kind: NextActionCutover, Deployment: "eu"}, got.NextAction)
+	assert.Equal(t, NextAction{Kind: NextActionCutover, Deployment: "eu", Name: "eu"}, got.NextAction)
 	assert.Equal(t, []StateCount{
 		{Label: "ready for cutover", Count: 1},
 		{Label: "running", Count: 1},
@@ -349,7 +349,7 @@ func TestDerive_AggregateFailedHaltExample(t *testing.T) {
 
 	assert.Equal(t, state.Apply.Failed, got.State)
 	assert.Equal(t, "failed", got.Label)
-	assert.Equal(t, NextAction{Kind: NextActionReviewFailure, Deployment: "us"}, got.NextAction)
+	assert.Equal(t, NextAction{Kind: NextActionReviewFailure, Deployment: "us", Name: "us"}, got.NextAction)
 	assert.Equal(t, StateHalted, got.Deployments[2].Presentation)
 	assert.Equal(t, "halted — us failed", got.Deployments[2].Label)
 	assert.Equal(t, StateHalted, got.Deployments[3].Presentation)
@@ -491,4 +491,69 @@ func TestDerive_FirstFailureExcludesRetrying(t *testing.T) {
 		rolling("us", so.FailedRetryable),
 	})
 	assert.Nil(t, got.FirstFailure)
+}
+
+// TestDerive_MultiTargetMemberNames: when one deployment addresses several
+// targets, every member of that deployment is named by the routing pair, so a
+// surface never labels two members identically. A sibling deployment that
+// addresses a single target keeps its plain name.
+func TestDerive_MultiTargetMemberNames(t *testing.T) {
+	got := Derive([]Operation{
+		{Deployment: "primary", Target: "testapp-001", State: so.Completed},
+		{Deployment: "primary", Target: "testapp-002", State: so.Running},
+		{Deployment: "eu-west", Target: "orders-eu", State: so.Pending},
+	})
+	require.Len(t, got.Deployments, 3)
+	assert.Equal(t, "primary/testapp-001", got.Deployments[0].Name)
+	assert.Equal(t, "primary/testapp-002", got.Deployments[1].Name)
+	assert.Equal(t, "eu-west", got.Deployments[2].Name)
+	// The routing pair travels alongside the name so a surface can still
+	// address the member it just labelled.
+	assert.Equal(t, "primary", got.Deployments[1].Deployment)
+	assert.Equal(t, "testapp-002", got.Deployments[1].Target)
+}
+
+// TestDerive_MultiTargetLabelsNameTheBlockingMember: a member held by an earlier
+// sibling names that sibling the same way the sibling's own section is named, so
+// an operator reading "halted — X failed" can find X.
+func TestDerive_MultiTargetLabelsNameTheBlockingMember(t *testing.T) {
+	got := Derive([]Operation{
+		{Deployment: "primary", Target: "testapp-001", State: so.Failed, Error: "lock wait timeout"},
+		{Deployment: "primary", Target: "testapp-002", State: so.Pending},
+	})
+	require.Len(t, got.Deployments, 2)
+	assert.Equal(t, StateHalted, got.Deployments[1].Presentation)
+	assert.Equal(t, "halted — primary/testapp-001 failed", got.Deployments[1].Label)
+	require.NotNil(t, got.FirstFailure)
+	assert.Equal(t, "primary/testapp-001", got.FirstFailure.Name)
+}
+
+// TestDerive_MultiTargetNextActionCarriesMemberIdentity: a cutover suggestion
+// names the member it applies to and carries the routing pair that addresses it,
+// so the two targets of one deployment produce distinguishable next actions.
+func TestDerive_MultiTargetNextActionCarriesMemberIdentity(t *testing.T) {
+	got := Derive([]Operation{
+		{Deployment: "primary", Target: "testapp-001", State: so.Completed},
+		{Deployment: "primary", Target: "testapp-002", State: so.WaitingForCutover},
+	})
+	assert.Equal(t, NextAction{
+		Kind:       NextActionCutover,
+		Deployment: "primary",
+		Target:     "testapp-002",
+		Name:       "primary/testapp-002",
+	}, got.NextAction)
+}
+
+// TestDerive_KeyedApplyStaysNamedByDeployment: several operations of one
+// deployment against the same target are a keyed apply, not separate members.
+// The target half would not tell them apart, so the plain deployment name is
+// kept and the operation key does the disambiguating on the surface.
+func TestDerive_KeyedApplyStaysNamedByDeployment(t *testing.T) {
+	got := Derive([]Operation{
+		{Deployment: "us-east", Target: "orders-us", State: so.Completed},
+		{Deployment: "us-east", Target: "orders-us", State: so.Running},
+	})
+	require.Len(t, got.Deployments, 2)
+	assert.Equal(t, "us-east", got.Deployments[0].Name)
+	assert.Equal(t, "us-east", got.Deployments[1].Name)
 }

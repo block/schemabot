@@ -163,3 +163,31 @@ func assertLess(t *testing.T, output, left, right string) {
 	assert.NotEqual(t, -1, rightIndex, "expected output to contain %q", right)
 	assert.Less(t, leftIndex, rightIndex, "expected %q before %q", left, right)
 }
+
+// One deployment can address several targets, each running its own copy of the
+// change. Every member is named by its routing pair so no two sections carry the
+// same heading, while a sibling deployment that addresses a single target keeps
+// its plain name.
+func TestWriteProgressMultiTargetSectionsNameEachMember(t *testing.T) {
+	output := captureStdout(t, func() {
+		WriteProgress(ProgressData{
+			ApplyID:     "apply-multi-target",
+			Environment: "staging",
+			State:       state.Apply.Running,
+			Operations: []ProgressOperation{
+				{Deployment: "primary", Target: "testapp-001", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+				{Deployment: "primary", Target: "testapp-002", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+				{Deployment: "eu-west", Target: "orders-eu", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+			},
+		})
+	})
+
+	assert.Contains(t, output, "✅ primary/testapp-001 — completed")
+	assert.Contains(t, output, "🔄 primary/testapp-002 — running table copy")
+	assert.Contains(t, output, "⏳ eu-west — waiting for primary/testapp-002 (orders-eu)")
+
+	// A name that already carries the target does not repeat it in the
+	// trailing parenthetical.
+	assert.NotContains(t, output, "primary/testapp-001 — completed (testapp-001)")
+	assert.NotContains(t, output, "primary/testapp-002 — running table copy (testapp-002)")
+}

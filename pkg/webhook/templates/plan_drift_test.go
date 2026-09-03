@@ -237,3 +237,64 @@ func TestAnyEnvHasDriftToShow(t *testing.T) {
 		})
 	}
 }
+
+// When one deployment addresses several targets, the deployment name alone
+// labels two different members identically. The plan comment names every member
+// of that deployment by its routing pair, while a sibling deployment that
+// addresses a single target keeps its plain name.
+func TestRenderPlanComment_DriftNamesMultiTargetMembers(t *testing.T) {
+	data := PlanCommentData{
+		Database: "testapp", Environment: "production", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}},
+		DeploymentDrift: &DeploymentDriftData{
+			Computed:    true,
+			Clean:       false,
+			Independent: true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "primary", Target: "testapp-001", Primary: true, Class: "planned"},
+				{Deployment: "primary", Target: "testapp-002", Class: "errored", Detail: "diff failed; see server logs"},
+				{Deployment: "eu-west", Target: "orders-eu", Class: "planned"},
+			},
+		},
+	}
+
+	out := RenderPlanComment(data)
+	assert.Contains(t, out, "Some targets could not be planned")
+	assert.Contains(t, out, "`primary/testapp-001` (primary)")
+	assert.Contains(t, out, "`primary/testapp-002`")
+	assert.Contains(t, out, "`eu-west`")
+	// An independent target has no plan of its own to compare, so its failure
+	// is reported as unplanned rather than unverified.
+	assert.Contains(t, out, "could not plan")
+	assert.NotContains(t, out, "could not verify")
+}
+
+// The uniform clean line names members the same way the per-member breakdown
+// does, so a reviewer sees one vocabulary for the rollout across both renderings.
+func TestRenderPlanComment_DriftCleanNamesMultiTargetMembers(t *testing.T) {
+	data := PlanCommentData{
+		Database: "testapp", Environment: "production", IsMySQL: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+		}},
+		DeploymentDrift: &DeploymentDriftData{
+			Computed:    true,
+			Clean:       true,
+			Independent: true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "primary", Target: "testapp-001", Primary: true, Class: "planned"},
+				{Deployment: "primary", Target: "testapp-002", Class: "planned"},
+				{Deployment: "eu-west", Target: "orders-eu", Class: "planned"},
+			},
+		},
+	}
+
+	out := RenderPlanComment(data)
+	assert.Contains(t, out, "Planned separately for all 3 targets")
+	assert.Contains(t, out, "primary/testapp-001, primary/testapp-002, eu-west")
+	assert.True(t, strings.Contains(out, "each target holds its own schema"))
+}

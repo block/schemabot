@@ -20,6 +20,7 @@ import (
 	"fmt"
 
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -31,6 +32,13 @@ import (
 type Operation struct {
 	// Deployment is the deployment name this operation targets.
 	Deployment string
+
+	// Target is the address this operation runs against within its deployment.
+	// One deployment can address several targets, in which case the deployment
+	// name alone labels two different rollout members identically — the
+	// derivation resolves an unambiguous name for each member from the two
+	// together (see routing.DisplayNames).
+	Target string
 
 	// State is the canonical operation state (state.ApplyOperation, == state.Apply).
 	State string
@@ -121,6 +129,17 @@ type Deployment struct {
 	// Deployment is the deployment name.
 	Deployment string
 
+	// Target is the address this member runs against within its deployment.
+	Target string
+
+	// Name is the operator-facing identity of this member: the deployment name
+	// on its own, or deployment/target when the deployment addresses several
+	// targets in this apply and the deployment name would not tell its members
+	// apart. Surfaces label a member with this rather than with Deployment, and
+	// labels that reference another member (waiting for, halted by) name it the
+	// same way.
+	Name string
+
 	// State is the raw operation state it was derived from.
 	State string
 
@@ -169,6 +188,11 @@ type NextAction struct {
 	Kind NextActionKind
 	// Deployment is the action's target, when the action is deployment-scoped.
 	Deployment string
+	// Target is that deployment's address, when the action is member-scoped.
+	Target string
+	// Name is the member's operator-facing identity (see Deployment.Name), for
+	// surfaces that render the action as prose.
+	Name string
 }
 
 // StateCount is one entry of the aggregate's per-status histogram.
@@ -235,9 +259,10 @@ func Derive(ops []Operation) Apply {
 		}
 	}
 
+	names := memberNames(ops)
 	deployments := make([]Deployment, len(ops))
 	for i := range ops {
-		deployments[i] = deriveDeployment(ops, i)
+		deployments[i] = deriveDeployment(ops, names, i)
 	}
 
 	aggState := state.DeriveRolloutApplyState(children)
@@ -267,11 +292,25 @@ func firstFailure(deps []Deployment) *Deployment {
 	return nil
 }
 
+// memberNames resolves the operator-facing name of every operation, so a label
+// that names a member — its own or an earlier sibling it is waiting on — always
+// identifies exactly one of them. The naming rule is shared with the plan
+// comment and the check summary.
+func memberNames(ops []Operation) []string {
+	members := make([]routing.ExecutionTarget, len(ops))
+	for i, op := range ops {
+		members[i] = routing.ExecutionTarget{Deployment: op.Deployment, Target: op.Target}
+	}
+	return routing.DisplayNames(members)
+}
+
 // deriveDeployment projects operation i, using its earlier siblings for the
-// ordering context that disambiguates pending and waiting_for_cutover.
-func deriveDeployment(ops []Operation, i int) Deployment {
+// ordering context that disambiguates pending and waiting_for_cutover. names is
+// index-parallel to ops, so a label that references sibling j names it exactly
+// as sibling j's own section is labelled.
+func deriveDeployment(ops []Operation, names []string, i int) Deployment {
 	op := ops[i]
-	d := Deployment{Deployment: op.Deployment, State: op.State, Error: op.Error}
+	d := Deployment{Deployment: op.Deployment, Target: op.Target, Name: names[i], State: op.State, Error: op.Error}
 
 	switch op.State {
 	case state.ApplyOperation.Completed:
@@ -293,9 +332,9 @@ func deriveDeployment(ops []Operation, i int) Deployment {
 	case state.ApplyOperation.Reverted:
 		d.set(StateReverted, "reverted", "↩️", false)
 	case state.ApplyOperation.Pending:
-		derivePending(&d, ops, i)
+		derivePending(&d, ops, names, i)
 	case state.ApplyOperation.WaitingForCutover:
-		deriveWaitingForCutover(&d, ops, i)
+		deriveWaitingForCutover(&d, ops, names, i)
 	default:
 		// Unknown / engine-specific transient state: show it verbatim and keep it
 		// open so an operator is never left without a status for a deployment.
@@ -307,7 +346,7 @@ func deriveDeployment(ops []Operation, i int) Deployment {
 // derivePending splits a pending operation into next-in-order, waiting-on, or
 // halted, mirroring the pending sibling gate in FindNextApplyOperation so the
 // label agrees with what the operator will claim next.
-func derivePending(d *Deployment, ops []Operation, i int) {
+func derivePending(d *Deployment, ops []Operation, names []string, i int) {
 	op := ops[i]
 	// Under parallel the copy phase has no earlier-sibling gate, so a pending
 	// operation is immediately claimable regardless of any earlier sibling — it
@@ -317,17 +356,17 @@ func derivePending(d *Deployment, ops []Operation, i int) {
 		d.set(StateQueuedNext, "queued — next in order", "⏳", false)
 		return
 	}
-	if h, paused := blockingSibling(ops, i); h != nil {
+	if h, paused := blockingSibling(ops, i); h >= 0 {
 		if paused {
-			d.set(StatePaused, fmt.Sprintf("paused — %s failed; release or stop", h.Deployment), "⏸️", true)
+			d.set(StatePaused, fmt.Sprintf("paused — %s failed; release or stop", names[h]), "⏸️", true)
 			return
 		}
-		d.set(StateHalted, fmt.Sprintf("halted — %s %s", h.Deployment, haltedReason(h.State)), "⏸️", true)
+		d.set(StateHalted, fmt.Sprintf("halted — %s %s", names[h], haltedReason(ops[h].State)), "⏸️", true)
 		return
 	}
 	for j := range i {
 		if blocksPending(ops[j].State, op.Barrier, op.continuesPastFailure()) {
-			d.set(StateWaiting, fmt.Sprintf("waiting for %s", ops[j].Deployment), "⏳", false)
+			d.set(StateWaiting, fmt.Sprintf("waiting for %s", names[j]), "⏳", false)
 			return
 		}
 	}
@@ -337,24 +376,27 @@ func derivePending(d *Deployment, ops []Operation, i int) {
 // deriveWaitingForCutover splits a copied-and-parked operation into ready-now or
 // ready-but-waiting-on-an-earlier-cutover. Cutover ordering is strict-complete
 // and independent of cutover_policy, which only relaxes copy start.
-func deriveWaitingForCutover(d *Deployment, ops []Operation, i int) {
+func deriveWaitingForCutover(d *Deployment, ops []Operation, names []string, i int) {
 	op := ops[i]
 	for j := range i {
 		if blocksCutover(ops[j].State, op.continuesPastFailure()) {
-			d.set(StateReadyForCutoverWaiting, fmt.Sprintf("ready for cutover — waiting for %s", ops[j].Deployment), "🟡", true)
+			d.set(StateReadyForCutoverWaiting, fmt.Sprintf("ready for cutover — waiting for %s", names[j]), "🟡", true)
 			return
 		}
 	}
 	d.set(StateReadyForCutoverNext, "ready for cutover — next in order", "🟢", true)
 }
 
-// blockingSibling returns the earliest earlier sibling that holds the rollout
-// for a pending operation, and whether the hold is a human-gated pause rather
-// than a halt. A terminal-failed sibling holds unless the policy continues past
-// it (continue, or a released pause); when it does hold under on_failure=pause
-// the hold is a pause (paused=true). A cancelled/reverted sibling always halts,
-// matching the predicate's lack of an exemption for them.
-func blockingSibling(ops []Operation, i int) (blocker *Operation, paused bool) {
+// blockingSibling returns the index of the earliest earlier sibling that holds
+// the rollout for a pending operation, or -1 when none does, and whether the
+// hold is a human-gated pause rather than a halt. A terminal-failed sibling
+// holds unless the policy continues past it (continue, or a released pause);
+// when it does hold under on_failure=pause the hold is a pause (paused=true). A
+// cancelled/reverted sibling always halts, matching the predicate's lack of an
+// exemption for them. The index, rather than the operation, is what the caller
+// needs: the label names the blocker by its resolved member name, which is only
+// addressable by position.
+func blockingSibling(ops []Operation, i int) (blocker int, paused bool) {
 	op := ops[i]
 	for j := range i {
 		switch ops[j].State {
@@ -362,12 +404,12 @@ func blockingSibling(ops []Operation, i int) (blocker *Operation, paused bool) {
 			if op.continuesPastFailure() {
 				continue
 			}
-			return &ops[j], op.pausesOnFailure()
+			return j, op.pausesOnFailure()
 		case state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted:
-			return &ops[j], false
+			return j, false
 		}
 	}
-	return nil, false
+	return -1, false
 }
 
 // blocksPending reports whether an earlier sibling in earlierState blocks a
@@ -488,7 +530,7 @@ func nextAction(aggState string, deps []Deployment) NextAction {
 	// even if an earlier deployment is sitting ready for cutover.
 	if aggState == state.Apply.Failed {
 		if d, ok := firstWithState(deps, state.ApplyOperation.Failed); ok {
-			return NextAction{Kind: NextActionReviewFailure, Deployment: d.Deployment}
+			return memberAction(NextActionReviewFailure, d)
 		}
 		return NextAction{Kind: NextActionReviewFailure}
 	}
@@ -502,9 +544,15 @@ func nextAction(aggState string, deps []Deployment) NextAction {
 	// up until every deployment has reached it). This covers both the
 	// waiting_for_cutover aggregate and the running-with-one-ready case.
 	if d, ok := firstWithPresentation(deps, StateReadyForCutoverNext); ok {
-		return NextAction{Kind: NextActionCutover, Deployment: d.Deployment}
+		return memberAction(NextActionCutover, d)
 	}
 	return NextAction{Kind: NextActionNone}
+}
+
+// memberAction scopes a next action to one rollout member, carrying both the
+// routing pair a surface needs to address it and the name it renders it under.
+func memberAction(kind NextActionKind, d Deployment) NextAction {
+	return NextAction{Kind: kind, Deployment: d.Deployment, Target: d.Target, Name: d.Name}
 }
 
 // summaryCategoryOrder is the stable display order for the aggregate histogram.
