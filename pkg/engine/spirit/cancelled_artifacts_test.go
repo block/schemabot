@@ -104,6 +104,58 @@ func TestMetadataArtifacts_AlwaysIncludesSchemaLevelTables(t *testing.T) {
 	assert.Empty(t, dataBearingArtifacts(nil))
 }
 
+// The shapes the release guard recognises must be the shapes Spirit's naming
+// actually produces. Restating them is what lets the guard drift: a suffix
+// Spirit renamed would leave the guard refusing every artifact carrying it,
+// turning a release into a failure rather than a wrong drop — safe, but broken.
+func TestArtifactNameShapes_MatchSpiritNaming(t *testing.T) {
+	const table = "orders"
+
+	assert.Equal(t, artifactPrefix+table+shadowTableSuffix, utils.NewTableName(table))
+	assert.Equal(t, artifactPrefix+table+cutoverOriginalSuffix, utils.OldTableName(table))
+	assert.Equal(t, artifactPrefix+table+perTableCheckpointSuffix, utils.CheckpointTableName(table))
+}
+
+// Nothing reaches a DROP or a RENAME unless it is shaped like an artifact name.
+// The guard stands between a name and the DDL, so a name that arrives there
+// without having been derived — a table name that skipped the derivation, an
+// operator-supplied string, a future path into this file — is refused rather
+// than executed. Truncation cannot defeat it: Spirit reserves room for the
+// suffix, so a derived name carries the shape at any table-name length.
+func TestVerifyReleasableArtifacts_RefusesAnythingNotAnArtifactName(t *testing.T) {
+	allowed := []string{
+		sharedCheckpointTable,
+		deferredCutoverSentinelTable,
+	}
+	for _, table := range []string{"orders", "_orders", strings.Repeat("a", 200)} {
+		allowed = append(allowed, dataBearingArtifacts([]string{table})...)
+		allowed = append(allowed, utils.CheckpointTableName(table))
+	}
+	assert.NoError(t, verifyReleasableArtifacts("shop", allowed),
+		"every name a release derives must pass its own guard")
+
+	refused := []string{
+		"orders",                  // the live table itself
+		"orders_new",              // an artifact's suffix without its prefix
+		"_orders",                 // an artifact's prefix without its suffix
+		"_spirit_sentinel_backup", // a name that only starts like a schema-level table
+		"users",
+		"*",
+		"",
+	}
+	for _, name := range refused {
+		err := verifyReleasableArtifacts("shop", []string{name})
+		require.Error(t, err, "release must refuse %q", name)
+		assert.Contains(t, err.Error(), "shop."+name,
+			"the refusal must name what it refused so an operator can see it")
+	}
+
+	// One bad name refuses the whole set: a release is checked before its first
+	// statement, so it cannot drop half its names and then discover the rest.
+	require.Error(t, verifyReleasableArtifacts("shop",
+		append(append([]string{}, allowed...), "orders")))
+}
+
 // Every name a release reclaims is derived from a table name, never passed
 // through, and no derivation returns the table it was given. That is what keeps
 // a release off the live table it was asked about, whatever that table is

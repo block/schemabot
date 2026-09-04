@@ -128,11 +128,60 @@ func (e *Engine) releaseArtifacts(ctx context.Context, db *sql.DB, database stri
 	return result, nil
 }
 
+// Artifact name shapes. Spirit derives an artifact name by wrapping a table
+// name in a leading underscore and one of these suffixes, reserving room for
+// the suffix before it truncates — so both survive for a table name of any
+// length, and a name carrying neither was not derived from a table name. A
+// test pins them against Spirit's naming helpers, since a shape restated here
+// that Spirit later stopped producing would refuse every release carrying it.
+const (
+	artifactPrefix           = "_"
+	shadowTableSuffix        = "_new"
+	cutoverOriginalSuffix    = "_old"
+	perTableCheckpointSuffix = "_chkpnt"
+)
+
+// verifyReleasableArtifacts refuses to release any name that is not a schema
+// change artifact's. Every name a release touches is derived from a table name
+// by the helpers above, or is one of the two schema-level tables, so a name
+// shaped like neither cannot have come from either — a table name that reached
+// the DDL unwrapped, say.
+//
+// It guards the two functions that execute the DDL rather than the entry point
+// that validates a request, because that is the last position from which a
+// name cannot yet have been dropped or renamed. A release that would touch
+// anything else does not run at all: the names are checked together, before the
+// first statement, so a bad name cannot be found half way through.
+func verifyReleasableArtifacts(database string, names []string) error {
+	for _, name := range names {
+		if isReleasableArtifactName(name) {
+			continue
+		}
+		return fmt.Errorf("refusing to release %s.%s: not a schema change artifact name", database, name)
+	}
+	return nil
+}
+
+func isReleasableArtifactName(name string) bool {
+	if name == sharedCheckpointTable || name == deferredCutoverSentinelTable {
+		return true
+	}
+	if !strings.HasPrefix(name, artifactPrefix) {
+		return false
+	}
+	return strings.HasSuffix(name, shadowTableSuffix) ||
+		strings.HasSuffix(name, cutoverOriginalSuffix) ||
+		strings.HasSuffix(name, perTableCheckpointSuffix)
+}
+
 // preserveArtifacts renames the given tables into the pending drops quarantine
 // so the rows they hold stay recoverable until retention expires.
 func preserveArtifacts(ctx context.Context, db *sql.DB, database string, names []string) ([]engine.PreservedArtifact, error) {
 	if len(names) == 0 {
 		return nil, nil
+	}
+	if err := verifyReleasableArtifacts(database, names); err != nil {
+		return nil, err
 	}
 
 	moves := make([]pendingdrops.TableMove, 0, len(names))
@@ -161,6 +210,10 @@ func preserveArtifacts(ctx context.Context, db *sql.DB, database string, names [
 // schema.table name so a release reads the same way whichever half disposed of
 // a given artifact.
 func discardArtifacts(ctx context.Context, db *sql.DB, database string, names []string) ([]string, error) {
+	if err := verifyReleasableArtifacts(database, names); err != nil {
+		return nil, err
+	}
+
 	discarded := make([]string, 0, len(names))
 	for _, name := range names {
 		if _, err := db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s.%s",

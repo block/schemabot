@@ -56,6 +56,26 @@ func quarantinedRowCount(t *testing.T, db *sql.DB, name string) int {
 	return count
 }
 
+// tablesIn returns every table in a schema, so a test can assert on what a
+// release changed by comparing the whole schema before and after rather than
+// probing the names it expected to be touched.
+func tablesIn(t *testing.T, db *sql.DB, schema string) []string {
+	t.Helper()
+	rows, err := db.QueryContext(t.Context(),
+		"SELECT table_name FROM information_schema.tables WHERE table_schema = ? ORDER BY table_name", schema)
+	require.NoError(t, err, "list tables in %s", schema)
+	defer utils.CloseAndLog(rows)
+
+	var tables []string
+	for rows.Next() {
+		var name string
+		require.NoError(t, rows.Scan(&name))
+		tables = append(tables, name)
+	}
+	require.NoError(t, rows.Err())
+	return tables
+}
+
 // quarantineDatabaseExists reports whether the quarantine database was created.
 func quarantineDatabaseExists(t *testing.T, db *sql.DB) bool {
 	t.Helper()
@@ -264,6 +284,137 @@ func TestEngine_ReleaseCancelledArtifacts_LeavesUnnamedTablesAlone(t *testing.T)
 	quarantined := listQuarantinedTables(t, db)
 	require.Len(t, quarantined, 1, "only the named table's copy is quarantined")
 	assert.Contains(t, quarantined[0], utils.NewTableName(named))
+}
+
+// A release leaves the schema exactly as it found it apart from the artifacts
+// of the table it was given. This asserts on the whole schema rather than the
+// names a release was expected to touch, so a release that reached something
+// nobody thought to check for fails here: near-misses of the artifact naming,
+// another table's artifacts, and a timestamped copy from a run that was told to
+// keep it all have to survive.
+func TestEngine_ReleaseCancelledArtifacts_ChangesNothingElseInTheSchema(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	const target = "orders"
+	decoys := []string{
+		target,
+		"customers",
+		utils.NewTableName("customers"),
+		utils.OldTableName("customers"),
+		utils.CheckpointTableName("customers"),
+		// Near-misses of the naming: an artifact's suffix without its prefix,
+		// its prefix without its suffix, a doubly-derived name, and a name that
+		// only begins like a schema-level table.
+		target + "_new",
+		"_" + target,
+		utils.NewTableName(utils.NewTableName(target)),
+		deferredCutoverSentinelTable + "_backup",
+		// A run told to keep the table it swapped out names it with a
+		// timestamp, which no derivation a release performs reproduces.
+		utils.OldTableNameWithTimestamp(target, "20260101_000000"),
+	}
+	reclaimed := []string{
+		utils.NewTableName(target),
+		utils.CheckpointTableName(target),
+		sharedCheckpointTable,
+		deferredCutoverSentinelTable,
+	}
+
+	releaseTestCleanup(t, db, append(append([]string{}, decoys...), reclaimed...)...)
+	for _, name := range append(append([]string{}, decoys...), reclaimed...) {
+		seedArtifact(t, db, name, 1)
+	}
+	before := tablesIn(t, db, "testdb")
+
+	eng := New(Config{})
+	_, err := eng.ReleaseCancelledArtifacts(t.Context(), &engine.ReleaseArtifactsRequest{
+		Database:    "testdb",
+		Tables:      []string{target},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "ReleaseCancelledArtifacts()")
+
+	assert.ElementsMatch(t, decoys, tablesIn(t, db, "testdb"),
+		"a release must change nothing in the schema but the artifacts of the table it was given")
+	assert.Len(t, before, len(decoys)+len(reclaimed), "every seeded table must have existed to begin with")
+}
+
+// A release refused for want of a table list must be refused before it reaches
+// the target, not part way through it. The schema-level artifacts are the ones
+// an empty list would otherwise reclaim, so they are the ones that prove the
+// refusal came first.
+func TestEngine_ReleaseCancelledArtifacts_RefusedReleaseTouchesNothing(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	releaseTestCleanup(t, db, sharedCheckpointTable, deferredCutoverSentinelTable)
+	seedArtifact(t, db, sharedCheckpointTable, 1)
+	seedArtifact(t, db, deferredCutoverSentinelTable, 1)
+	before := tablesIn(t, db, "testdb")
+
+	eng := New(Config{})
+	_, err := eng.ReleaseCancelledArtifacts(t.Context(), &engine.ReleaseArtifactsRequest{
+		Database:    "testdb",
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.ErrorContains(t, err, "tables are required")
+
+	assert.Equal(t, before, tablesIn(t, db, "testdb"),
+		"a refused release must leave the target as it found it")
+	assert.False(t, quarantineDatabaseExists(t, db),
+		"a refused release must not create the quarantine database")
+}
+
+// A release reaches only the schema it was pointed at. The schema-level
+// artifacts carry the same name in every schema, so an identically named copy
+// of one next door is what proves the release stayed where it belongs.
+func TestEngine_ReleaseCancelledArtifacts_StaysInItsOwnSchema(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	const neighbour = "neighbourdb"
+	cleanupCtx := context.WithoutCancel(t.Context())
+	t.Cleanup(func() {
+		_, err := db.ExecContext(cleanupCtx,
+			fmt.Sprintf("DROP DATABASE IF EXISTS %s", quoteIdentifier(neighbour)))
+		assert.NoError(t, err, "drop neighbouring database")
+	})
+	_, err := db.ExecContext(t.Context(),
+		fmt.Sprintf("CREATE DATABASE %s", quoteIdentifier(neighbour)))
+	require.NoError(t, err, "create neighbouring database")
+
+	const target = "orders"
+	for _, name := range []string{
+		utils.NewTableName(target), utils.CheckpointTableName(target),
+		sharedCheckpointTable, deferredCutoverSentinelTable,
+	} {
+		_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s.%s (id INT PRIMARY KEY)",
+			quoteIdentifier(neighbour), quoteIdentifier(name)))
+		require.NoError(t, err, "seed %s in the neighbouring database", name)
+	}
+	neighbourBefore := tablesIn(t, db, neighbour)
+
+	releaseTestCleanup(t, db, target, utils.NewTableName(target), deferredCutoverSentinelTable)
+	seedArtifact(t, db, target, 1)
+	seedArtifact(t, db, utils.NewTableName(target), 2)
+	seedArtifact(t, db, deferredCutoverSentinelTable, 1)
+
+	eng := New(Config{})
+	_, err = eng.ReleaseCancelledArtifacts(t.Context(), &engine.ReleaseArtifactsRequest{
+		Database:    "testdb",
+		Tables:      []string{target},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "ReleaseCancelledArtifacts()")
+
+	assert.Equal(t, neighbourBefore, tablesIn(t, db, neighbour),
+		"a release must not reach a schema it was not pointed at")
+	assert.False(t, tableExists(t, db, deferredCutoverSentinelTable),
+		"the target schema's own sentinel is reclaimed")
 }
 
 // A caller that names the same table twice reclaims its artifacts once. The
