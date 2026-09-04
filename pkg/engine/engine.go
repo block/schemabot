@@ -236,6 +236,11 @@ type ReleaseArtifactsRequest struct {
 // an operator where their copy went. Both are empty when the schema change left
 // nothing behind, which is the ordinary outcome for a cancel that arrives
 // before any copying started.
+//
+// Every table in either field is named in full, as schema.table, so an operator
+// reading one release can act on any line of it without having to supply the
+// schema from context — including the lines naming tables that left the schema
+// the release ran against.
 type ReleaseArtifactsResult struct {
 	// Preserved names each table whose data was kept, and where it was kept.
 	Preserved []PreservedArtifact

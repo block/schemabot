@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -107,12 +108,13 @@ func TestEngine_ReleaseCancelledArtifacts_PreCutoverPreservesCopy(t *testing.T) 
 	assert.Equal(t, 7, quarantinedRowCount(t, db, quarantined[0]), "the copied rows must survive")
 
 	assert.ElementsMatch(t, []string{
-		utils.CheckpointTableName(baseTable),
-		sharedCheckpointTable,
-		deferredCutoverSentinelTable,
+		"testdb." + utils.CheckpointTableName(baseTable),
+		"testdb." + sharedCheckpointTable,
+		"testdb." + deferredCutoverSentinelTable,
 	}, result.Discarded)
-	for _, name := range result.Discarded {
-		assert.False(t, tableExists(t, db, name), "metadata artifact should be dropped: %s", name)
+	for _, qualified := range result.Discarded {
+		name := strings.TrimPrefix(qualified, "testdb.")
+		assert.False(t, tableExists(t, db, name), "metadata artifact should be dropped: %s", qualified)
 	}
 }
 
@@ -182,8 +184,8 @@ func TestEngine_ReleaseCancelledArtifacts_QuarantineDisabledDropsCopy(t *testing
 	assert.False(t, tableExists(t, db, utils.NewTableName(baseTable)), "the shadow table must be dropped")
 	assert.Empty(t, result.Preserved, "nothing is preserved where the quarantine is off")
 	assert.ElementsMatch(t, []string{
-		utils.NewTableName(baseTable),
-		utils.CheckpointTableName(baseTable),
+		"testdb." + utils.NewTableName(baseTable),
+		"testdb." + utils.CheckpointTableName(baseTable),
 	}, result.Discarded)
 	assert.False(t, quarantineDatabaseExists(t, db),
 		"no quarantine database should be created when the quarantine is disabled")
@@ -241,7 +243,7 @@ func TestEngine_ReleaseCancelledArtifacts_RepeatedTableReleasedOnce(t *testing.T
 
 	require.Len(t, result.Preserved, 1, "the copy must be preserved exactly once")
 	assert.Equal(t, "testdb."+utils.NewTableName(baseTable), result.Preserved[0].Source)
-	assert.Equal(t, []string{utils.CheckpointTableName(baseTable)}, result.Discarded)
+	assert.Equal(t, []string{"testdb." + utils.CheckpointTableName(baseTable)}, result.Discarded)
 
 	assert.True(t, tableExists(t, db, baseTable), "the live table must be left alone")
 	assert.False(t, tableExists(t, db, utils.NewTableName(baseTable)), "the shadow table must leave the target")

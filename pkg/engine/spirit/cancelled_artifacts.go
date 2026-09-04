@@ -143,7 +143,9 @@ func preserveArtifacts(ctx context.Context, db *sql.DB, database string, names [
 	return preserved, nil
 }
 
-// discardArtifacts drops the given tables outright.
+// discardArtifacts drops the given tables outright, reporting each by its full
+// schema.table name so a release reads the same way whichever half disposed of
+// a given artifact.
 func discardArtifacts(ctx context.Context, db *sql.DB, database string, names []string) ([]string, error) {
 	discarded := make([]string, 0, len(names))
 	for _, name := range names {
@@ -151,7 +153,7 @@ func discardArtifacts(ctx context.Context, db *sql.DB, database string, names []
 			quoteIdentifier(database), quoteIdentifier(name))); err != nil {
 			return nil, fmt.Errorf("discard cancelled schema change artifact %s.%s: %w", database, name, err)
 		}
-		discarded = append(discarded, name)
+		discarded = append(discarded, database+"."+name)
 	}
 	return discarded, nil
 }
