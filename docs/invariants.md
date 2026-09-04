@@ -51,6 +51,7 @@
   - [OW-5: One active apply per deployment](#ow-5-one-active-apply-per-deployment)
   - [OW-6: There is one way to claim work](#ow-6-there-is-one-way-to-claim-work)
   - [OW-7: Ownership uncertainty fails closed](#ow-7-ownership-uncertainty-fails-closed)
+  - [OW-8: Only drivers and elected reapers write apply and task rows](#ow-8-only-drivers-and-elected-reapers-write-apply-and-task-rows)
 - [Control operations (CO)](#control-operations-co)
   - [CO-1: Durable before acknowledged](#co-1-durable-before-acknowledged)
   - [CO-2: Every command resolves; none wedges](#co-2-every-command-resolves-none-wedges)
@@ -631,10 +632,10 @@ A stale engine poll can never rewind stored task state: terminal stored tasks st
 control-owned states (`stopped`, `failed_retryable`) are never overwritten by active engine polls,
 and active states advance strictly forward through the lifecycle.
 
-The guard belongs to the drive loop, which is where stale polls come from. The one write that
-skips it is the read-path task reconciliation named in UX-3, which assigns task state raw. On a
-terminal apply that is harmless, since there is no forward progress left to undo; on a `resuming`
-apply it is a live gap, and UX-3 carries the detail. *Enforced:* the forward-only state resolution
+The guard belongs to the drive loop, which is where stale polls come from, and nothing else
+assigns task state. That is a consequence of OW-8: every writer of a task row is a driver or an
+elected reaper, so every write either goes through this resolution or is a reaper settling a row
+no driver is touching. *Enforced:* the forward-only state resolution
 the drive loop reconciles through (`taskStateWithNoBackwardProgress`,
 `pkg/tern/local_client.go`).
 
@@ -704,10 +705,10 @@ stale comments or overwriting newer state.
 
 The token is what a driver writes under, so a write made by something that is not driving has none
 to present and the predicate is empty. That is only safe where such a write cannot race a driver.
-The read-path task reconciliation named in UX-3 is the one write that is not a driver's, and it is
-not conditioned tightly enough to earn the exemption: it reaches a `resuming` apply, which a driver
-holds. Any new non-driver write needs a precondition that actually excludes a live driver.
-*Enforced:* a token
+The elected reaper is the sole non-driver writer (OW-8), and it earns that by writing only rows
+whose drive liveness signal has gone quiet for longer than the operator's whole recovery budget,
+re-asserted on the guarded write rather than trusted from the scan. Any new non-driver write needs
+a precondition that actually excludes a live driver. *Enforced:* a token
 check on every lease-scoped storage write
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/apply_operations.go`).
 
@@ -791,6 +792,30 @@ proceed releases its lease immediately rather than holding the row idle until th
 expires. And an instance never trusts its own in-memory engine state to answer questions about
 work it does not own. *Enforced:* scope checks and token-guarded claim release in the drive path
 (`pkg/api/operator.go`).
+
+### OW-8: Only drivers and elected reapers write apply and task rows
+
+Two classes of writer touch apply, apply-operation, and task rows: the driver holding that row's
+lease, and the elected reaper settling rows no driver is coming back for. Nothing else does, and a
+request goroutine serving a read never does.
+
+The reason is narrower than "reads and writes should not race", and survives the observation that
+a particular reader write would almost always have agreed with the driver. The guarantee OW-2
+provides is *stored apply and task state is what the lease-holder wrote*. A writer outside the
+lease system does not weaken that claim so much as make it uncheckable: with one such writer in
+the system, no row can be attributed by reading it, and every entry resting on lease ownership
+degrades to a statement about the common case. Readers are also the wrong shape for the work.
+They are unbounded and uncoordinated, they run on contexts that end when a client disconnects, and
+they present no token, so the storage lease predicate that protects every other write is empty.
+
+The pressure to break this comes from rows that genuinely need repair: a task left active under an
+apply that has already settled. That repair is real work, and it belongs to the reaper, which is
+elected, holds its own advisory lock, and proves the row is quiet before writing it (RC-2). A
+reader's job is to report what is stored, including when what is stored is a task that has
+outlived its apply's verdict (UX-3). *Enforced:* lease predicates on every apply and task write
+(`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/applies.go`) and a read
+path that builds progress from stored rows without writing them
+(`pkg/api/progress_handlers.go`).
 
 ## Control operations (CO)
 
@@ -971,21 +996,12 @@ per-shard rows and engine resume metadata on every tick, and terminalizing the a
 derive from what it wrote, computing the rollups that are not stored, such as a table's headline
 across its shards, at read time.
 
-There is one exception on the read path, and it is a reconciliation rather than a poll. When a
-control-plane read finds task rows still active and disagreeing with their apply's state, it asks
-that apply's data plane once for the truth and writes the answer back, after which the rows agree
-and later reads are served from storage. It exists for rows that are already wrong: a driver
-settled the apply elsewhere and left them behind, and no other path revisits them.
-
-That is the case it was built for, but it is not the only case it is reachable in, and the
-difference matters enough to state rather than round off. The read serves from storage for a
-terminal apply, and also for `resuming` — a state a driver writes as it claims the row, holding a
-lease. So this write can land while a driver is live, and it is the one reader write covered by
-neither the lease discipline below (OW-2) nor the monotonicity guard above (ST-4): it presents no
-token, so the storage lease predicate is empty, and it assigns task state raw. Two writers of the
-same engine truth make the practical divergence small, but nothing orders them. Closing this
-means gating the reconciliation on a settled apply, and until it is gated, treat UX-3, OW-2 and
-ST-4 as holding everywhere except here.
+There is no exception. A read that finds a task row still active under an apply that has settled
+reports it exactly as stored, because the two situations behind such a row cannot be told apart
+from a read: the task may be genuinely still running, since one failed sibling settles the apply
+while the rest keep going, or its driver may have gone away and left it behind. Repairing it
+belongs to a writer that can hold a lease (OW-8), and the reaper is what settles the rows that
+really are stranded (RC-1).
 
 That separation is what keeps a display problem a display problem. A stale percentage, a missing
 ETA, a rollup that reads oddly on a multi-table apply: none of it can move the state machine,
@@ -1090,13 +1106,24 @@ Its child rows are a different question, and RC-1 is the reason: a settled apply
 operation or task row that never reached a terminal state, and something has to close those out.
 The reaper does, and a settled parent is its *precondition* rather than something it avoids. It
 asserts that parent state in both the sweep's read and the guarded write, so the write re-verifies
-the parent it was chosen for rather than trusting a read that may be seconds old, and it waits for
-a quiescence window first, because the apply's own paths may still be writing child rows just
-after it terminalized. What stays fixed is the verdict: reconciling a stranded child to match it
-is not the same as changing it. *Enforced:* settled-state exclusions in every claim and sweep
-query (`pkg/storage/internal/sqlstore/applies.go`) and the reaper's parent gate
-(`strandedParentGate`, `pkg/storage/internal/sqlstore/apply_operations.go`), with ST-1 as the
-backstop under all of them.
+the parent it was chosen for rather than trusting a read that may be seconds old.
+
+A settled parent is not on its own a promise that its children stopped, which is why the parent
+state is a precondition and not the whole gate. Under a rollout, one deployment's failure can
+settle the apply while a sibling deployment is still driving, and a driver holding only an
+operation lease may not bump the parent row, so that row can read settled *and* quiet while work
+is live. No window on the parent detects that at any length. For task rows the sweep therefore
+measures the row a live drive actually writes: every drive tick mirrors its tasks unconditionally,
+so `tasks.updated_at` is the drive's liveness signal, and the window over it is the operator's
+whole recovery budget — its stall bound, plus a lease-staleness window for a cancelled drive's
+lease to become re-claimable, plus a poll interval for a peer to claim it. Cancelling a drive is
+recoverable and writing a verdict onto a row is not, so the reaper goes last. What stays fixed
+throughout is the verdict: reconciling a stranded child to match it is not the same as changing
+it. *Enforced:* settled-state exclusions in every claim and sweep query
+(`pkg/storage/internal/sqlstore/applies.go`), the operation sweep's parent gate
+(`strandedParentGate`, `pkg/storage/internal/sqlstore/apply_operations.go`), and the active-task
+sweep's task-liveness gate (`strandedActiveTaskGate`,
+`pkg/storage/internal/sqlstore/tasks.go`), with ST-1 as the backstop under all of them.
 
 ### RC-3: Loading nothing is not owning nothing
 
