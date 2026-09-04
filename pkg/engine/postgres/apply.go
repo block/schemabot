@@ -522,12 +522,15 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		}
 		return nil
 	}
-	// Every other statement — including a blocking CREATE INDEX — runs
-	// exactly as reviewed, under the per-statement and lock limits.
-	// SchemaBot executes the DDL the plan surfaced and never rewrites it
-	// into its concurrent form: the plan surfaces the statement as
-	// authored and the apply executes it unchanged, so the choice between
-	// a blocking and a concurrent build stays with the author.
+	// Every other statement — including a blocking CREATE INDEX, should a
+	// plan ever surface one — runs exactly as reviewed, under the
+	// per-statement and lock limits. The apply never rewrites a statement
+	// here: it executes the plan's ExecSQL unchanged. The choice between a
+	// blocking and a concurrent build is made upstream by pg-sprite's
+	// planner, whose safer-idiom rewrite substitutes the concurrent form
+	// for a plain CREATE INDEX before the reviewed plan is produced — so
+	// the concurrent branch above is the one a declarative index normally
+	// takes, and the plan the PR reviewed is what runs.
 	if err := executor.ExecuteNative(ctx, pool, table, statement, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
 	}, executor.DefaultRetryPolicy()); err != nil {
