@@ -967,12 +967,47 @@ type TaskStore interface {
 	// ErrStrandedTaskReaperBusy reports that another instance holds it. As with
 	// ReapStranded, the lock is an efficiency gate, not a safety one.
 	ReapStrandedRetryable(ctx context.Context, limit int) ([]*ReapedTask, error)
+
+	// ReapStrandedActive settles to their parent apply's recorded outcome the
+	// task rows still in an active state under a settled parent, returning what
+	// it reaped (at most limit rows, oldest first). A driver that records the
+	// parent's verdict and exits before closing its task rows leaves them
+	// describing work that will never resume: the verdict is final, so nothing
+	// revisits the children, and the row reads as live work forever. That is
+	// what makes a completed apply render a table still copying, and the only
+	// writer that may correct it is one holding a lease — which a reader is not.
+	//
+	// The row takes the parent's verdict rather than a decided one: every
+	// settled parent state is also a terminal task state, and a task whose own
+	// outcome was never recorded is never assumed to have succeeded, so under a
+	// failed parent it settles failed and carries the parent's explanation when
+	// it has none of its own. completed_at is stamped because every settled
+	// parent state is non-resumable.
+	//
+	// failed_retryable rows are excluded: they are ReapStrandedRetryable's, on a
+	// far longer window, because the parent's recovery path may still dispatch
+	// their retry. Only settled parents (completed, failed, cancelled, reverted)
+	// quiescent past the reaper's window qualify — stopped and failed_retryable
+	// parents are resumable, and their tasks belong to the resume path. Each
+	// write re-verifies both the row's state and the parent's, so a row a
+	// concurrent writer advanced is skipped rather than overwritten. The parent
+	// apply row is never touched.
+	//
+	// One instance reaps per pass, guarded by an advisory lock;
+	// ErrStrandedActiveTaskReaperBusy reports that another instance holds it. As
+	// with ReapStranded, the lock is an efficiency gate, not a safety one.
+	ReapStrandedActive(ctx context.Context, limit int) ([]*ReapedTask, error)
 }
 
 // ErrStrandedTaskReaperBusy reports that another instance holds the stranded
 // retryable-task reaper lock, so this pass did no work. It is an expected
 // outcome on every instance but one, not a failure.
 var ErrStrandedTaskReaperBusy = errors.New("another instance is reaping stranded retryable tasks")
+
+// ErrStrandedActiveTaskReaperBusy reports that another instance holds the
+// stranded active-task reaper lock, so this pass did no work. It is an expected
+// outcome on every instance but one, not a failure.
+var ErrStrandedActiveTaskReaperBusy = errors.New("another instance is reaping stranded active tasks")
 
 // ReapedTask records one failed_retryable task row hardened to failed under a
 // settled parent apply, carrying both rows so callers can log what the reaper

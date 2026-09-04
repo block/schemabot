@@ -791,6 +791,172 @@ func (s *taskStore) reapStrandedRetryableTask(ctx context.Context, task *storage
 	return true, nil
 }
 
+// strandedActiveTaskReaperLockName is the advisory lock that elects one
+// active-task reaper per pass. It is separate from the retryable-task reaper's
+// so the two never serialize: they select disjoint row sets on very different
+// quiescence windows, and the retryable sweep frees a blocked remote drive.
+const strandedActiveTaskReaperLockName = "schemabot_stranded_active_task_reaper"
+
+// strandedActiveTaskSweep identifies the active-task sweep to the shared
+// election wrapper.
+var strandedActiveTaskSweep = strandedSweep{
+	lockName: strandedActiveTaskReaperLockName,
+	busy:     storage.ErrStrandedActiveTaskReaperBusy,
+	subject:  "stranded active tasks",
+}
+
+// ReapStrandedActive elects one reaper per pass and reaps under the lock.
+// See storage.TaskStore for the contract.
+func (s *taskStore) ReapStrandedActive(ctx context.Context, limit int) ([]*storage.ReapedTask, error) {
+	return reapUnderElection(ctx, s.db, s.locker, strandedActiveTaskSweep,
+		func(ctx context.Context) ([]*storage.ReapedTask, error) {
+			return s.reapStrandedActive(ctx, limit)
+		})
+}
+
+// reapStrandedActive mirrors settled parents' outcomes onto their task rows that
+// are still in an active state, without electing a reaper. ReapStrandedActive is
+// the entry point that holds the lock; this is separate so the reaping itself
+// can be exercised on its own.
+//
+// A driver that settles an apply and exits before closing its task rows leaves
+// them describing work that will never resume: the parent's verdict is final, so
+// no path revisits the children. The row then reads as live work forever, which
+// is what makes a completed apply render a table still copying.
+//
+// failed_retryable is deliberately excluded. It is active by the task state
+// machine, but it belongs to the retryable sweep, which waits out a far longer
+// window because a retry may still be admitted against the parent. Reaping it
+// here would harden a retry promise the recovery path could still dispatch.
+//
+// Each row is settled by its own committed write, so a mid-pass failure returns
+// the settlements that already landed alongside the error: they are durable
+// whatever the caller does next, and dropping them would leave real state
+// changes with no log line and no count behind them.
+func (s *taskStore) reapStrandedActive(ctx context.Context, limit int) ([]*storage.ReapedTask, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("reap stranded active tasks: limit must be positive, got %d", limit)
+	}
+
+	parentGate, parentGateArgs := strandedParentGate(s.dialect, "tasks.apply_id", strandedParentQuiescence)
+
+	excluded := append(append([]string{}, state.TerminalTaskStates...), state.Task.FailedRetryable)
+	selectArgs := stringArgs(excluded)
+	selectArgs = append(selectArgs, parentGateArgs...)
+	selectArgs = append(selectArgs, limit)
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT %s
+		FROM tasks
+		WHERE state NOT IN (%s)
+			AND %s
+		ORDER BY created_at, id
+		LIMIT ?
+	`, taskColumns, placeholders(len(excluded)), parentGate), selectArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("query stranded active tasks: %w", err)
+	}
+	stranded, err := scanTasks(rows)
+	utils.CloseAndLog(rows)
+	if err != nil {
+		return nil, fmt.Errorf("scan stranded active tasks: %w", err)
+	}
+	if len(stranded) == 0 {
+		return nil, nil
+	}
+
+	applyIDs := make([]int64, 0, len(stranded))
+	for _, task := range stranded {
+		applyIDs = append(applyIDs, task.ApplyID)
+	}
+	parents, err := loadSettledParents(ctx, s.db, applyIDs, "stranded active tasks")
+	if err != nil {
+		return nil, err
+	}
+
+	reaped := make([]*storage.ReapedTask, 0, len(stranded))
+	for _, task := range stranded {
+		parent, ok := parents[task.ApplyID]
+		if !ok {
+			// The parent was deleted between the two reads (PR cleanup races the
+			// reaper). Its rows go with it, so there is nothing left to settle.
+			slog.WarnContext(ctx, "parent apply disappeared while reaping a stranded active task; the row is being deleted with it",
+				task.LogAttrs()...)
+			continue
+		}
+		settled, err := s.reapStrandedActiveTask(ctx, task, parent)
+		if err != nil {
+			return reaped, err
+		}
+		if !settled {
+			// The row left the state it was read in, or the parent left the
+			// settled set, between the read and the guarded write, so it belongs
+			// to whoever moved it.
+			slog.DebugContext(ctx, "stranded active task changed before it could be reaped; skipping",
+				task.LogAttrs()...)
+			continue
+		}
+		reaped = append(reaped, &storage.ReapedTask{Task: task, Parent: parent})
+	}
+	return reaped, nil
+}
+
+// reapStrandedActiveTask writes one task row from its settled parent, reporting
+// whether the guarded write landed. It takes the parent's verdict rather than
+// deciding one: every settled parent state is a terminal task state, and a task
+// whose outcome was never recorded is never assumed to have succeeded — under a
+// failed parent it settles failed, carrying the parent's explanation, exactly as
+// the operation reaper does.
+//
+// completed_at is stamped because every settled parent state is non-resumable.
+//
+// The write re-asserts both the row's state and the parent gate rather than
+// trusting the sweep's read, so it can never overwrite a row a driver moved
+// after the scan selected it.
+func (s *taskStore) reapStrandedActiveTask(ctx context.Context, task *storage.Task, parent *storage.Apply) (bool, error) {
+	taskState := state.NormalizeState(parent.State)
+	setClause := "state = ?, completed_at = COALESCE(completed_at, NOW())"
+	args := []any{taskState}
+	if state.IsState(parent.State, state.Apply.Failed) {
+		setClause = "state = ?, error_message = COALESCE(NULLIF(error_message, ''), ?), completed_at = COALESCE(completed_at, NOW())"
+		args = []any{taskState, nullString(parent.ErrorMessage)}
+	}
+	parentGate, parentGateArgs := strandedParentGate(s.dialect, "tasks.apply_id", strandedParentQuiescence)
+	args = append(args, task.ID, task.State)
+	args = append(args, parentGateArgs...)
+
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE tasks
+		SET `+setClause+`, updated_at = NOW()
+		WHERE id = ? AND state = ?
+			AND `+parentGate+`
+	`, args...)
+	if err != nil {
+		return false, fmt.Errorf("reap stranded active task %s (table %q) from %s parent apply: %w",
+			task.TaskIdentifier, task.TableName, parent.State, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read reaped rows for stranded active task %s (table %q): %w",
+			task.TaskIdentifier, task.TableName, err)
+	}
+	if changed == 0 {
+		return false, nil
+	}
+
+	// Mirror the write onto the returned row so a caller reporting the
+	// settlement reads what is now stored, not the pre-write values.
+	now := time.Now()
+	task.State = taskState
+	task.UpdatedAt = now
+	if task.CompletedAt == nil {
+		task.CompletedAt = &now
+	}
+	if state.IsState(parent.State, state.Apply.Failed) && task.ErrorMessage == "" {
+		task.ErrorMessage = parent.ErrorMessage
+	}
+	return true, nil
+}
+
 // scanTask scans a single task row, returning nil if not found.
 func scanTask(row *sql.Row) (*storage.Task, error) {
 	task, err := scanTaskInto(row)

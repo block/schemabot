@@ -659,6 +659,10 @@ func (s *capturingTaskStore) Create(_ context.Context, task *storage.Task) (int6
 	return int64(len(s.tasks)), nil
 }
 
+func (s *capturingTaskStore) ReapStrandedActive(context.Context, int) ([]*storage.ReapedTask, error) {
+	return nil, nil
+}
+
 func (s *capturingTaskStore) ReapStrandedRetryable(context.Context, int) ([]*storage.ReapedTask, error) {
 	return nil, nil
 }

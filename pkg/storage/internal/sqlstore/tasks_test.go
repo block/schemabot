@@ -1203,3 +1203,120 @@ func TestTaskStore_ReapStrandedRetryable_ElectsOneReaperPerPass(t *testing.T) {
 	require.Len(t, settled, 1, "the task reaper lock is released after each pass")
 	assert.Equal(t, next.TaskIdentifier, settled[0].Task.TaskIdentifier)
 }
+
+// A driver that records its apply's verdict and exits before closing its task
+// rows leaves them in an active state under a settled parent. Nothing revisits
+// them — the verdict is final — so the rows read as live work forever, which is
+// what makes a completed apply render a table still copying. The reaper settles
+// them to the parent's recorded outcome. Parents that are merely paused, and
+// live parents, keep their rows for the driver or resume path.
+func TestTaskStore_ReapStrandedActive_SettlesTasksUnderSettledParents(t *testing.T) {
+	const parentError = "target rejected the schema change"
+
+	tests := []struct {
+		name        string
+		parentState string
+		wantState   string
+		settles     bool
+	}{
+		{"completed parent settles its stranded task", state.Apply.Completed, state.Task.Completed, true},
+		{"failed parent settles its stranded task", state.Apply.Failed, state.Task.Failed, true},
+		{"cancelled parent settles its stranded task", state.Apply.Cancelled, state.Task.Cancelled, true},
+		{"reverted parent settles its stranded task", state.Apply.Reverted, state.Task.Reverted, true},
+		{"stopped parent keeps its task for the resume path", state.Apply.Stopped, state.Task.Running, false},
+		{"failed_retryable parent keeps its task for the retry path", state.Apply.FailedRetryable, state.Task.Running, false},
+		{"running parent keeps its task for its driver", state.Apply.Running, state.Task.Running, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := NewMySQL(testDB)
+
+			lock := createTestLock(t, store, "reap_active_db", "mysql")
+			parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_active_"+tt.parentState, 1, tt.parentState, "staging")
+			setApplyErrorMessage(t, parent.ID, parentError)
+			backdateApplyUpdatedAt(t, parent.ID, strandedParentQuiescence+time.Minute)
+
+			stranded := createRetryableReapTask(t, store, parent, "task_reap_active_users", "users", state.Task.Running, "")
+			// A failed_retryable sibling belongs to the retryable sweep, which
+			// waits out a far longer window because the parent's recovery path
+			// may still dispatch its retry. This sweep must not take it.
+			retryableSibling := createRetryableReapTask(t, store, parent, "task_reap_active_orders", "orders", state.Task.FailedRetryable, "copy failed")
+
+			settled, err := store.tasks.reapStrandedActive(ctx, 10)
+			require.NoError(t, err)
+
+			reloaded, err := store.Tasks().Get(ctx, stranded.TaskIdentifier)
+			require.NoError(t, err)
+			require.NotNil(t, reloaded)
+			assertTaskState(t, store, retryableSibling.TaskIdentifier, state.Task.FailedRetryable)
+
+			if !tt.settles {
+				assert.Empty(t, settled, "a %s parent may still write its task rows, so they are left alone", tt.parentState)
+				assert.Equal(t, tt.wantState, reloaded.State)
+				assert.Nil(t, reloaded.CompletedAt, "an untouched active task has no completion time")
+				return
+			}
+
+			require.Len(t, settled, 1, "the stranded task under a %s parent settles", tt.parentState)
+			assert.Equal(t, stranded.TaskIdentifier, settled[0].Task.TaskIdentifier)
+			assert.Equal(t, tt.wantState, settled[0].Task.State, "the returned row carries the state it was written to")
+			assert.Equal(t, parent.ApplyIdentifier, settled[0].Parent.ApplyIdentifier, "the parent travels with the settlement for triage logging")
+
+			assert.Equal(t, tt.wantState, reloaded.State, "the task takes the parent's recorded verdict")
+			assert.NotNil(t, reloaded.CompletedAt, "every settled parent state is non-resumable, so the row is stamped complete")
+			if tt.wantState == state.Task.Failed {
+				assert.Equal(t, parentError, reloaded.ErrorMessage, "a task with no explanation of its own inherits the parent's")
+			}
+
+			again, err := store.tasks.reapStrandedActive(ctx, 10)
+			require.NoError(t, err)
+			assert.Empty(t, again, "a settled row is no longer active, so a later sweep finds nothing to do")
+		})
+	}
+}
+
+// The guarded write re-verifies the row's state, so a task a driver advanced
+// between the sweep's scan and its write belongs to that driver, not the reaper.
+func TestTaskStore_ReapStrandedActive_SkipsRowThatLeftTheStateItWasReadIn(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_active_race_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_active_race", 1, state.Apply.Completed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedParentQuiescence+time.Minute)
+	task := createRetryableReapTask(t, store, parent, "task_reap_active_race", "users", state.Task.Running, "")
+
+	// Read the row as the sweep would, then let a driver move it before the
+	// guarded write runs.
+	task.State = state.Task.CuttingOver
+	require.NoError(t, store.Tasks().Update(ctx, task))
+	task.State = state.Task.Running
+
+	settled, err := store.tasks.reapStrandedActiveTask(ctx, task, parent)
+	require.NoError(t, err)
+	assert.False(t, settled, "the row moved after the scan, so it belongs to whoever moved it")
+	assertTaskState(t, store, task.TaskIdentifier, state.Task.CuttingOver)
+}
+
+// A parent settled only moments ago may still be writing its own task rows
+// through terminal derivation or stop reconciliation, so the reaper waits out a
+// quiescence window before treating a row underneath it as abandoned.
+func TestTaskStore_ReapStrandedActive_WaitsOutParentQuiescence(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_active_quiet_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_active_quiet", 1, state.Apply.Completed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedParentQuiescence-time.Minute)
+	task := createRetryableReapTask(t, store, parent, "task_reap_active_quiet", "users", state.Task.Running, "")
+
+	settled, err := store.tasks.reapStrandedActive(ctx, 10)
+	require.NoError(t, err)
+	assert.Empty(t, settled, "a parent that only just settled may still be writing its own task rows")
+	assertTaskState(t, store, task.TaskIdentifier, state.Task.Running)
+}

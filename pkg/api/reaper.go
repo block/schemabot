@@ -136,6 +136,7 @@ func (s *Service) runStrandedReaperPass(ctx context.Context) {
 	var sweeps sync.WaitGroup
 	sweeps.Go(func() { s.reapStrandedOperations(ctx) })
 	sweeps.Go(func() { s.reapStrandedRetryableTasks(ctx) })
+	sweeps.Go(func() { s.reapStrandedActiveTasks(ctx) })
 	sweeps.Wait()
 }
 
@@ -159,6 +160,11 @@ var (
 		busy:          storage.ErrStrandedTaskReaperBusy,
 		subject:       "stranded retryable tasks",
 		failureReason: "stranded_task_reaper_error",
+	}
+	strandedActiveTaskSweep = reapSweep{
+		busy:          storage.ErrStrandedActiveTaskReaperBusy,
+		subject:       "stranded active tasks",
+		failureReason: "stranded_active_task_reaper_error",
 	}
 )
 
@@ -230,4 +236,31 @@ func (s *Service) reapStrandedRetryableTasks(ctx context.Context) {
 	}
 
 	s.recordSweepOutcome(ctx, strandedRetryableTaskSweep, len(reaped), err)
+}
+
+// reapStrandedActiveTasks settles task rows left in an active state under a
+// settled parent apply, mirroring the parent's outcome onto them. These are the
+// rows that make a completed apply render a table still copying: their driver
+// recorded the verdict on the parent and exited without closing them, and a
+// reader cannot correct them because correcting them is a write.
+//
+// Settlements are logged, not counted, for the same reason as the retryable
+// sweep's: they are the rare residue of a driver that stopped mid-write, so a
+// rate would read zero for weeks.
+func (s *Service) reapStrandedActiveTasks(ctx context.Context) {
+	reaped, err := s.storage.Tasks().ReapStrandedActive(ctx, strandedReaperBatch)
+
+	// Report what landed before handling the error. A failed pass still returns
+	// the rows it settled before failing, and those writes are committed — an
+	// operator asking who changed a settled apply's task rows must find them.
+	for _, settled := range reaped {
+		parent, task := settled.Parent, settled.Task
+		s.logger.Info("operator: reaped a stranded active task to its parent apply's recorded outcome",
+			append(parent.LogAttrs(),
+				"task_id", task.TaskIdentifier,
+				"table", task.TableName,
+				"task_state", task.State)...)
+	}
+
+	s.recordSweepOutcome(ctx, strandedActiveTaskSweep, len(reaped), err)
 }
