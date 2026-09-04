@@ -295,11 +295,16 @@ func (tidbStatementParser) CostScalesWithTableSize(stmt string) (bool, error) {
 // allowlist: a clause shape this function doesn't recognize is assumed to
 // scale, so a new or exotic clause over-reports size context rather than
 // hiding it on an expensive change.
+//
+// DROP CONSTRAINT is metadata-only whichever constraint it names: MySQL
+// resolves it against the table's CHECK, FOREIGN KEY and UNIQUE constraints,
+// and dropping any of the three is a metadata change.
 func alterSpecScalesWithTableSize(spec *ast.AlterTableSpec) bool {
 	switch spec.Tp { //nolint:exhaustive
 	case ast.AlterTableRenameColumn, ast.AlterTableRenameTable,
 		ast.AlterTableRenameIndex, ast.AlterTableAlterColumn, ast.AlterTableDropIndex,
-		ast.AlterTableDropForeignKey, ast.AlterTableDropCheck, ast.AlterTableIndexInvisible,
+		ast.AlterTableDropForeignKey, ast.AlterTableDropCheck,
+		ast.AlterTableDropConstraint, ast.AlterTableIndexInvisible,
 		ast.AlterTableDropPartition, ast.AlterTableTruncatePartition:
 		return false
 	case ast.AlterTableAddPartitions:
