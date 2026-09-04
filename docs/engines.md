@@ -25,13 +25,18 @@ engine is what touches your tables.
 | pg-sprite | PostgreSQL | [pg-sprite](https://github.com/block/pg-sprite) |
 
 Engines are adapters rather than implementations. None of them reimplements online schema change;
-each one drives existing machinery and translates between it and the rest of SchemaBot. Where that
-machinery runs is itself a difference. Spirit and pg-sprite are libraries, so their work happens
-inside the SchemaBot process driving the apply. A PlanetScale deploy request is
+each one drives existing machinery and translates between it and the rest of SchemaBot. In every
+case the work itself lands in the target database: your MySQL, Vitess, or PostgreSQL server is what
+copies the rows and runs the DDL, whichever engine asked it to.
+
+What differs is where the thing driving that work runs. Spirit and pg-sprite are libraries, so the
+loop that issues statements and decides what happens next runs inside the SchemaBot process holding
+the apply. A PlanetScale deploy request is
 [Vitess Online DDL](https://vitess.io/docs/user-guides/schema-changes/managed-online-schema-changes/)
-wrapped in PlanetScale's API and branching model, so the copy, the cutover, the revert window, and
-the throttle are all Vitess features running on the cluster, and the engine is how SchemaBot asks
-for them. That distinction turns up several times in the table below.
+wrapped in PlanetScale's API and branching model, and Vitess drives it from inside the cluster, so
+SchemaBot submits the change and then watches it rather than running it. The copy, the cutover, the
+revert window, and the throttle are all Vitess features on that path. The difference comes up
+several times below.
 
 Engines differ, and this is where those differences are written down. It is the companion to
 [invariants.md](invariants.md), and the two answer different questions. That document says what
@@ -53,7 +58,7 @@ that holds.
 | **Throttling** | automatic, on live target signals | a threshold that admits or rejects, adjustable mid-flight | planned, on replica and slot lag; meanwhile a statement is cancelled at its budget rather than slowed |
 | **Adaptive pacing** | yes | no | not applicable, no copy to pace |
 | **Dropped-table recovery** | opt-in quarantine, expires | inside the revert window, expires | not applicable, a drop is blocked at plan time |
-| **Who reports progress** | the process running the change | the cluster, so any instance can read it | the process running the change |
+| **Who reports progress** | the process driving the change | the cluster, so any instance can read it | the process driving the change |
 
 A cell that says **planned** means the engine does not do this yet but is expected to. A plain
 **no** means it does not do this today.
@@ -99,10 +104,10 @@ what lets a large table change without a long lock, and it is why the change bec
 long-running process with phases: something is in flight, so there is something to pause, to slow
 down, and to cut over when you choose. Every control operation in the matrix exists because of it.
 
-Where that copy runs decides who can report on it. A Spirit copy runs inside the SchemaBot process
-driving the apply, so only that process knows how far along it is, and if it dies its replacement
-picks up from a checkpoint. A deploy request runs on the cluster instead. It outlives the process
-watching it, and any instance can ask the cluster for its progress and get the same answer.
+What drives the copy decides who can report on it. A Spirit copy is driven by the process holding
+the apply, so only that process knows how far along it is, and if it dies its replacement picks up
+from a checkpoint. A deploy request outlives the process that submitted it, and any instance can
+ask the cluster for its progress and get the same answer.
 
 **Pausing is an engine capability.** `stop` and `start` are ordinary control operations, no more
 tied to one database technology than `cancel` is. What varies is whether the engine behind them
