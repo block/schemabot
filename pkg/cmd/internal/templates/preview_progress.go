@@ -873,42 +873,6 @@ func previewFailedOutput() {
 	WriteProgress(data)
 }
 
-// previewUnsettledTaskOutput renders a settled apply whose table rows have not
-// all settled with it. The apply's verdict comes from the table that failed;
-// the other table is reported at the state its driver last persisted. That
-// table may genuinely still be copying, since one failure settles the apply
-// while its siblings run on, or its driver may have died and left the row for a
-// reaper to settle. Both look like this, and the reader cannot tell them apart,
-// which is why it reports what is stored instead of guessing.
-func previewUnsettledTaskOutput() {
-	startedAt := previewTime.Add(-8 * time.Minute).Format(time.RFC3339)
-	completedAt := previewTime.Add(-10 * time.Second).Format(time.RFC3339)
-	data := ProgressData{
-		State:        state.Apply.Failed,
-		Engine:       "Spirit",
-		ApplyID:      "apply-a1b2c3d4e5f6",
-		StartedAt:    startedAt,
-		CompletedAt:  completedAt,
-		ErrorMessage: "lock wait timeout exceeded; try restarting transaction",
-		Tables: []TableProgress{
-			{
-				TableName: "users", Namespace: "testapp",
-				DDL:    "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
-				Status: state.Task.Failed,
-			},
-			{
-				TableName: "orders", Namespace: "testapp",
-				DDL:             "ALTER TABLE `orders` ADD INDEX `idx_total_cents` (`total_cents`)",
-				Status:          state.Task.Running,
-				RowsCopied:      156342,
-				RowsTotal:       397453,
-				PercentComplete: 39,
-			},
-		},
-	}
-	WriteProgress(data)
-}
-
 func previewStoppedOutput() {
 	// Sample progress with stopped state (mid-apply stop)
 	startedAt := previewTime.Add(-3 * time.Minute).Format(time.RFC3339)

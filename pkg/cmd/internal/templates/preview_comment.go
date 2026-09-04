@@ -397,7 +397,6 @@ func previewCLIApplyAllOutput() {
 		{"MYSQL: SINGLE TABLE RUNNING", previewProgressOutput},
 		{"MYSQL: SINGLE TABLE COMPLETED", previewCompletedOutput},
 		{"MYSQL: SINGLE TABLE FAILED", previewFailedOutput},
-		{"MYSQL: SETTLED APPLY WITH AN UNSETTLED TABLE", previewUnsettledTaskOutput},
 		{"MYSQL: SINGLE TABLE STOPPED", previewStoppedOutput},
 		{"MYSQL: SINGLE TABLE WAITING FOR CUTOVER", previewWaitingForCutoverOutput},
 		{"MYSQL: SINGLE TABLE CUTTING OVER", previewCuttingOverOutput},
