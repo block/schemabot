@@ -275,6 +275,104 @@ func TestCanonicalize(t *testing.T) {
 			input:    "DROP TABLE users",
 			expected: "DROP TABLE `users`",
 		},
+		// Canonicalization is a spelling of the statement, not a judgement
+		// about it: it quotes identifiers, uppercases keywords and collapses
+		// whitespace, and otherwise reprints the parse tree as written. An
+		// expression therefore keeps whatever parentheses it arrived with,
+		// including ones a user would call redundant — whether two spellings
+		// mean the same table is decided when the schemas are diffed, not
+		// here.
+		//
+		// That spelling is worth pinning because it is load-bearing twice
+		// over. A plan comment must never show a generated column or DEFAULT
+		// expression that differs from the one being applied. And the drift
+		// guard uses the canonical form as a comparison key
+		// (canonicalDDLForDrift), holding a form produced at plan time
+		// against one recomputed at apply time — a gap that can span a
+		// deploy. A silent change to canonical spelling, a parser that begins
+		// folding redundant parentheses away say, would put every in-flight
+		// dispatch out of agreement with its own recomputation and fail
+		// closed on someone's schema change. Pinned here, that change fails
+		// in CI instead.
+		{
+			name:     "generated column keeps its expression",
+			input:    "CREATE TABLE t (a INT, b INT AS (a * 2) STORED)",
+			expected: "CREATE TABLE `t` (`a` INT,`b` INT GENERATED ALWAYS AS(`a`*2) STORED)",
+		},
+		{
+			name:     "generated column keeps redundant parentheses",
+			input:    "CREATE TABLE t (a INT, b INT GENERATED ALWAYS AS ((a * 2)) VIRTUAL)",
+			expected: "CREATE TABLE `t` (`a` INT,`b` INT GENERATED ALWAYS AS((`a`*2)) VIRTUAL)",
+		},
+		{
+			name:     "parenthesized DEFAULT expression stays an expression",
+			input:    "CREATE TABLE t (a INT DEFAULT (1 + 2))",
+			expected: "CREATE TABLE `t` (`a` INT DEFAULT (1+2))",
+		},
+		{
+			name:     "nested parentheses in a DEFAULT expression are preserved",
+			input:    "CREATE TABLE t (a INT DEFAULT ((1 + 2)))",
+			expected: "CREATE TABLE `t` (`a` INT DEFAULT ((1+2)))",
+		},
+		{
+			name:     "function call in a DEFAULT expression keeps its call syntax",
+			input:    "CREATE TABLE t (a CHAR(36) DEFAULT (uuid()))",
+			expected: "CREATE TABLE `t` (`a` CHAR(36) DEFAULT (UUID()))",
+		},
+		// The two statement kinds are spelled by different code. Canonicalize
+		// branches before the parser: an ALTER is reconstructed from Spirit's
+		// normalized Alter field, while CREATE and DROP go through TiDB's
+		// Restore. The cases above therefore pin only one of the two, and the
+		// ALTER path is the one carrying more risk — a schema change on an
+		// existing table is an ALTER, so it is the shape that dominates what
+		// the drift guard compares, and its spelling moves with the Spirit
+		// dependency rather than with anything in this repository.
+		{
+			name:     "ALTER adding a generated column spells out GENERATED ALWAYS",
+			input:    "ALTER TABLE t ADD COLUMN b INT AS (a * 2) STORED",
+			expected: "ALTER TABLE `t` ADD COLUMN `b` INT GENERATED ALWAYS AS(`a`*2) STORED",
+		},
+		{
+			name:     "ALTER keeps redundant parentheses in a generated column",
+			input:    "ALTER TABLE t ADD COLUMN b INT GENERATED ALWAYS AS ((a * 2)) VIRTUAL",
+			expected: "ALTER TABLE `t` ADD COLUMN `b` INT GENERATED ALWAYS AS((`a`*2)) VIRTUAL",
+		},
+		{
+			name:     "ALTER keeps a parenthesized DEFAULT expression",
+			input:    "ALTER TABLE t ADD COLUMN c INT DEFAULT ((1 + 2))",
+			expected: "ALTER TABLE `t` ADD COLUMN `c` INT DEFAULT ((1+2))",
+		},
+		{
+			name:     "ALTER modifying a generated column keeps its expression",
+			input:    "ALTER TABLE t MODIFY COLUMN b BIGINT AS (a * 2) STORED",
+			expected: "ALTER TABLE `t` MODIFY COLUMN `b` BIGINT GENERATED ALWAYS AS(`a`*2) STORED",
+		},
+		{
+			name:     "ALTER keeps an expression in every clause",
+			input:    "ALTER TABLE t ADD COLUMN b INT AS (a * 2) STORED, ADD COLUMN c INT DEFAULT (1 + 2)",
+			expected: "ALTER TABLE `t` ADD COLUMN `b` INT GENERATED ALWAYS AS(`a`*2) STORED, ADD COLUMN `c` INT DEFAULT (1+2)",
+		},
+		{
+			name:     "schema-qualified ALTER keeps its expression",
+			input:    "ALTER TABLE d.t ADD COLUMN b INT AS (a * 2) STORED",
+			expected: "ALTER TABLE `d`.`t` ADD COLUMN `b` INT GENERATED ALWAYS AS(`a`*2) STORED",
+		},
+		{
+			// DROP CONSTRAINT and DROP CHECK are not synonyms: MySQL resolves
+			// the first against the table's CHECK, FOREIGN KEY and UNIQUE
+			// constraints and the second against check constraints alone. The
+			// engine submits this canonical text rather than what the author
+			// wrote, so folding the two spellings together sends the server a
+			// statement it rejects.
+			name:     "ALTER dropping a named constraint keeps the CONSTRAINT spelling",
+			input:    "ALTER TABLE t DROP CONSTRAINT uq_name",
+			expected: "ALTER TABLE `t` DROP CONSTRAINT `uq_name`",
+		},
+		{
+			name:     "ALTER dropping a check constraint keeps the CHECK spelling",
+			input:    "ALTER TABLE t DROP CHECK chk_positive",
+			expected: "ALTER TABLE `t` DROP CHECK `chk_positive`",
+		},
 		{
 			name:     "invalid SQL returns original",
 			input:    "not valid sql",

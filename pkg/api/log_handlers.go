@@ -21,11 +21,11 @@ import (
 // GET /api/logs/{database}?environment=staging&limit=50
 // GET /api/logs/{database}?apply_id=apply_abc123&limit=50
 func (s *Service) handleLogs(w http.ResponseWriter, r *http.Request) {
-	database := r.PathValue("database")
-	environment := r.URL.Query().Get("environment")
+	database := storage.CanonicalKey(r.PathValue("database"))
+	environment := storage.CanonicalKey(r.URL.Query().Get("environment"))
 	applyID := r.URL.Query().Get("apply_id")
 	limitStr := r.URL.Query().Get("limit")
-	deployment := r.URL.Query().Get("deployment")
+	deployment := storage.CanonicalKey(r.URL.Query().Get("deployment"))
 
 	if database == "" {
 		s.writeError(w, http.StatusBadRequest, "database is required")
@@ -40,7 +40,7 @@ func (s *Service) handleLogs(w http.ResponseWriter, r *http.Request) {
 func (s *Service) handleLogsWithoutDatabase(w http.ResponseWriter, r *http.Request) {
 	applyID := r.URL.Query().Get("apply_id")
 	limitStr := r.URL.Query().Get("limit")
-	deployment := r.URL.Query().Get("deployment")
+	deployment := storage.CanonicalKey(r.URL.Query().Get("deployment"))
 
 	if applyID == "" {
 		s.writeError(w, http.StatusBadRequest, "apply_id is required")

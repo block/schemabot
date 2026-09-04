@@ -791,6 +791,248 @@ func (s *taskStore) reapStrandedRetryableTask(ctx context.Context, task *storage
 	return true, nil
 }
 
+// strandedActiveTaskReaperLockName is the advisory lock that elects one
+// active-task reaper per pass. It is separate from the retryable-task reaper's
+// so the two never serialize: they select disjoint row sets on very different
+// quiescence windows, and the retryable sweep frees a blocked remote drive.
+const strandedActiveTaskReaperLockName = "schemabot_stranded_active_task_reaper"
+
+// strandedActiveTaskQuiescence is how long a task row must have gone untouched
+// before the sweep settles it. It is measured on the task row, not the parent,
+// because the task row is the one a live drive writes: every tick mirrors its
+// tasks unconditionally, so tasks.updated_at is the drive's liveness signal.
+// The parent applies row is not a substitute — a drive holding only an
+// operation lease is forbidden from bumping it, so it can sit quiet while that
+// drive works.
+//
+// Three drive shapes make that unconditional write, and all three say so where
+// they make it: syncAtomicTaskProgress (local grouped drives),
+// pollTaskToCompletion (local sequential drives), and
+// syncStoredTasksFromRemoteTasks (gRPC drives against remote Tern). A change
+// that makes any of them write only on a field change breaks this window, which
+// is why they are named here rather than left to be rediscovered.
+//
+// The window covers the operator's whole recovery budget rather than just its
+// stall bound, because the two actions are not equally recoverable. The
+// operator crossing that bound cancels the run so a peer can reclaim the
+// operation and finish the work; the reaper crossing it writes a terminal
+// verdict the operator cannot undo. So the reaper waits for that recovery to
+// have played out and failed: the stall bound itself, plus a lease-staleness
+// window for the cancelled drive's lease to become re-claimable, plus a poll
+// interval for a peer to claim it. Half again the stall bound clears that
+// budget, so a drive the operator would have cancelled is always cancelled
+// first and the reaper cleans up after that path rather than racing it.
+//
+// One gap in the premise is narrowed here, not closed: the remote sync skips a
+// stored task the remote stopped reporting, so a row can miss ticks while its
+// drive is alive, and the operation watchdog reads the newest mirror across the
+// operation's tasks, so a mirroring sibling hides it from the cancel path. No
+// window length bounds that. What is left is a row the remote has gone silent
+// about for longer than the entire recovery budget, under a parent that has
+// already settled.
+//
+// All timestamps compared are database-side, so there is no clock skew to
+// absorb, and the guarded write re-asserts the window anyway: a drive that
+// mirrors the row before the write lands keeps it whatever the scan concluded.
+const strandedActiveTaskQuiescence = 3 * storage.ApplyDriveStallAfter / 2
+
+// strandedActiveParentQuiescence is how long the parent apply must have been
+// settled before the sweep considers its task rows. It is far shorter than the
+// operation reaper's window because it is no longer what makes the sweep safe:
+// the task-row window above is, and it is the only one that holds under fan-out.
+// What is left for the parent to prove is that its verdict is final and no
+// driver still holds it, which two lease-staleness windows establish — a lease
+// that has not been heartbeated that long is already re-claimable, so an apply
+// row quiet for twice that has no live driver by the claim path's own reckoning.
+const strandedActiveParentQuiescence = 2 * storage.ApplyLeaseStaleAfter
+
+// strandedActiveTaskGate renders the condition admitting only task rows no
+// drive has touched for strandedActiveTaskQuiescence. Both the sweep's SELECT
+// and its guarded per-row UPDATE assert it, so a drive that mirrors the row
+// between the two loses the write rather than having its progress overwritten.
+func strandedActiveTaskGate(d Dialect) string {
+	return "tasks.updated_at < " + d.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(strandedActiveTaskQuiescence.Microseconds())), IntervalMicrosecond)
+}
+
+// strandedActiveTaskSweep identifies the active-task sweep to the shared
+// election wrapper.
+var strandedActiveTaskSweep = strandedSweep{
+	lockName: strandedActiveTaskReaperLockName,
+	busy:     storage.ErrStrandedActiveTaskReaperBusy,
+	subject:  "stranded active tasks",
+}
+
+// ReapStrandedActive elects one reaper per pass and reaps under the lock.
+// See storage.TaskStore for the contract.
+func (s *taskStore) ReapStrandedActive(ctx context.Context, limit int) ([]*storage.ReapedTask, error) {
+	return reapUnderElection(ctx, s.db, s.locker, strandedActiveTaskSweep,
+		func(ctx context.Context) ([]*storage.ReapedTask, error) {
+			return s.reapStrandedActive(ctx, limit)
+		})
+}
+
+// reapStrandedActive mirrors settled parents' outcomes onto their task rows that
+// are still in an active state, without electing a reaper. ReapStrandedActive is
+// the entry point that holds the lock; this is separate so the reaping itself
+// can be exercised on its own.
+//
+// A driver that settles an apply and exits before closing its task rows leaves
+// them describing work that will never resume: the parent's verdict is final, so
+// no path revisits the children. The row then reads as live work forever, which
+// is what makes a completed apply render a table still copying.
+//
+// A settled parent alone is not enough to call a row stranded, and neither is a
+// quiescent one. Under a fan-out rollout a halt-policy deployment that fails
+// projects the apply to failed immediately, by design, while its sibling
+// deployments are still driving; and a sibling drive holding only an operation
+// lease is forbidden from bumping the parent applies row, so the parent can look
+// settled and quiescent while real work continues underneath it. No window on
+// the parent detects that, because the parent is not the row the live drive
+// touches.
+//
+// The task row is. Every drive tick mirrors its tasks unconditionally, which is
+// what makes tasks.updated_at the drive's liveness signal — the operator reads
+// it to cancel a stalled drive. So the sweep gates on the task's own quiescence
+// too: a row no drive has touched for longer than a stalled drive would survive
+// is stranded, whatever its siblings are doing.
+//
+// failed_retryable is deliberately excluded. It is active by the task state
+// machine, but it belongs to the retryable sweep, which waits out a far longer
+// window because a retry may still be admitted against the parent. Reaping it
+// here would harden a retry promise the recovery path could still dispatch.
+//
+// Each row is settled by its own committed write, so a mid-pass failure returns
+// the settlements that already landed alongside the error: they are durable
+// whatever the caller does next, and dropping them would leave real state
+// changes with no log line and no count behind them.
+func (s *taskStore) reapStrandedActive(ctx context.Context, limit int) ([]*storage.ReapedTask, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("reap stranded active tasks: limit must be positive, got %d", limit)
+	}
+
+	parentGate, parentGateArgs := strandedParentGate(s.dialect, "tasks.apply_id", strandedActiveParentQuiescence)
+
+	excluded := append(append([]string{}, state.TerminalTaskStates...), state.Task.FailedRetryable)
+	selectArgs := stringArgs(excluded)
+	selectArgs = append(selectArgs, parentGateArgs...)
+	selectArgs = append(selectArgs, limit)
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT %s
+		FROM tasks
+		WHERE state NOT IN (%s)
+			AND %s
+			AND %s
+		ORDER BY created_at, id
+		LIMIT ?
+	`, taskColumns, placeholders(len(excluded)), strandedActiveTaskGate(s.dialect), parentGate), selectArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("query stranded active tasks: %w", err)
+	}
+	stranded, err := scanTasks(rows)
+	utils.CloseAndLog(rows)
+	if err != nil {
+		return nil, fmt.Errorf("scan stranded active tasks: %w", err)
+	}
+	if len(stranded) == 0 {
+		return nil, nil
+	}
+
+	applyIDs := make([]int64, 0, len(stranded))
+	for _, task := range stranded {
+		applyIDs = append(applyIDs, task.ApplyID)
+	}
+	parents, err := loadSettledParents(ctx, s.db, applyIDs, "stranded active tasks")
+	if err != nil {
+		return nil, err
+	}
+
+	reaped := make([]*storage.ReapedTask, 0, len(stranded))
+	for _, task := range stranded {
+		parent, ok := parents[task.ApplyID]
+		if !ok {
+			// The parent was deleted between the two reads (PR cleanup races the
+			// reaper). Its rows go with it, so there is nothing left to settle.
+			slog.WarnContext(ctx, "parent apply disappeared while reaping a stranded active task; the row is being deleted with it",
+				task.LogAttrs()...)
+			continue
+		}
+		settled, err := s.reapStrandedActiveTask(ctx, task, parent)
+		if err != nil {
+			return reaped, err
+		}
+		if !settled {
+			// The row left the state it was read in, a drive mirrored it and
+			// refreshed its liveness, or the parent left the settled set, between
+			// the read and the guarded write. Any of the three means the row
+			// belongs to a live writer rather than to the sweep.
+			slog.DebugContext(ctx, "stranded active task changed before it could be reaped; skipping",
+				task.LogAttrs()...)
+			continue
+		}
+		reaped = append(reaped, &storage.ReapedTask{Task: task, Parent: parent})
+	}
+	return reaped, nil
+}
+
+// reapStrandedActiveTask writes one task row from its settled parent, reporting
+// whether the guarded write landed. It takes the parent's verdict rather than
+// deciding one: every settled parent state is a terminal task state, and a task
+// whose outcome was never recorded is never assumed to have succeeded — under a
+// failed parent it settles failed, carrying the parent's explanation, exactly as
+// the operation reaper does.
+//
+// completed_at is stamped because every settled parent state is non-resumable.
+//
+// The write re-asserts the row's state, its quiescence, and the parent gate
+// rather than trusting the sweep's read, so it can never overwrite a row a
+// driver moved — or merely mirrored — after the scan selected it.
+func (s *taskStore) reapStrandedActiveTask(ctx context.Context, task *storage.Task, parent *storage.Apply) (bool, error) {
+	taskState := state.NormalizeState(parent.State)
+	setClause := "state = ?, completed_at = COALESCE(completed_at, NOW())"
+	args := []any{taskState}
+	if state.IsState(parent.State, state.Apply.Failed) {
+		setClause = "state = ?, error_message = COALESCE(NULLIF(error_message, ''), ?), completed_at = COALESCE(completed_at, NOW())"
+		args = []any{taskState, nullString(parent.ErrorMessage)}
+	}
+	parentGate, parentGateArgs := strandedParentGate(s.dialect, "tasks.apply_id", strandedActiveParentQuiescence)
+	args = append(args, task.ID, task.State)
+	args = append(args, parentGateArgs...)
+
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE tasks
+		SET `+setClause+`, updated_at = NOW()
+		WHERE id = ? AND state = ?
+			AND `+strandedActiveTaskGate(s.dialect)+`
+			AND `+parentGate+`
+	`, args...)
+	if err != nil {
+		return false, fmt.Errorf("reap stranded active task %s (table %q) from %s parent apply: %w",
+			task.TaskIdentifier, task.TableName, parent.State, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read reaped rows for stranded active task %s (table %q): %w",
+			task.TaskIdentifier, task.TableName, err)
+	}
+	if changed == 0 {
+		return false, nil
+	}
+
+	// Mirror the write onto the returned row so a caller reporting the
+	// settlement reads what is now stored, not the pre-write values.
+	now := time.Now()
+	task.State = taskState
+	task.UpdatedAt = now
+	if task.CompletedAt == nil {
+		task.CompletedAt = &now
+	}
+	if state.IsState(parent.State, state.Apply.Failed) && task.ErrorMessage == "" {
+		task.ErrorMessage = parent.ErrorMessage
+	}
+	return true, nil
+}
+
 // scanTask scans a single task row, returning nil if not found.
 func scanTask(row *sql.Row) (*storage.Task, error) {
 	task, err := scanTaskInto(row)

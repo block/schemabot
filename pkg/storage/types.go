@@ -1416,11 +1416,14 @@ type ApplyComment struct {
 }
 
 // PlanComment tracks a plan comment posted on a PR so a newer plan comment for
-// the same database can minimize it on GitHub. Rows are written only when a
+// the same database can retire it on GitHub. Rows are written only when a
 // comment is actually posted — a plan whose comment was suppressed leaves no
-// row. The GitHub comment itself is never edited or deleted through this
-// record; minimizing collapses it in the PR timeline while keeping it
-// expandable as the record of what was shown.
+// row. Retirement takes one of two forms: a comment whose head an apply owns
+// is minimized (collapsed in the PR timeline but still expandable as the
+// record of what was planned for that apply), while a comment no apply ever
+// acted on is deleted from the timeline entirely. The row itself is never
+// deleted, so the identifiers of a deleted comment remain available for
+// triage.
 type PlanComment struct {
 	// ID is the unique identifier (BIGINT AUTO_INCREMENT).
 	ID int64
@@ -1453,9 +1456,16 @@ type PlanComment struct {
 	GitHubNodeID string
 
 	// MinimizedAt is set only after the GitHub minimize call succeeded. Nil
-	// means the comment is still expanded on the PR — including after a failed
+	// means the comment was not minimized — including after a failed
 	// minimize, so the next supersede retries it.
 	MinimizedAt *time.Time
+
+	// DeletedAt is set only after the GitHub delete call succeeded (or
+	// confirmed the comment already gone). Nil means the comment was not
+	// deleted — including after a failed delete, so the next supersede
+	// retries it. A row with both MinimizedAt and DeletedAt nil is still
+	// fully visible on the PR.
+	DeletedAt *time.Time
 
 	// CreatedAt is when the comment was posted.
 	CreatedAt time.Time

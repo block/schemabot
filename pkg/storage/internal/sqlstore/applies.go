@@ -149,13 +149,11 @@ func terminalApplyStates() []string {
 // rollout is over and nothing will claim its rows again. It is
 // terminalApplyStates minus stopped, which is terminal for claiming but
 // resumable — a stopped apply's rows belong to its resume path.
+//
+// Defined in pkg/state so the storage gate and every read-side consumer share
+// one definition of settled and cannot drift apart.
 func settledApplyStates() []string {
-	return []string{
-		state.Apply.Completed,
-		state.Apply.Failed,
-		state.Apply.Cancelled,
-		state.Apply.Reverted,
-	}
+	return state.SettledApplyStates
 }
 
 func isActiveApplyState(applyState string) bool {

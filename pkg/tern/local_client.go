@@ -333,7 +333,10 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 			Settings:            spiritSettings,
 		}),
 		planetscaleEngine: psEngine,
-		postgresEngine:    postgres.NewWithTableSizeLimit(cfg.PostgresNativeSafeTableSizeLimitBytes),
+		postgresEngine: postgres.NewForTarget(cfg.PostgresNativeSafeTableSizeLimitBytes, cfg.Database, &engine.Credentials{
+			DSN:      cfg.TargetDSN,
+			Metadata: maps.Clone(cfg.Metadata),
+		}),
 		customEngine:      customEngine,
 		psClientFunc:      psClientFunc,
 		logger:            logger,
@@ -2107,12 +2110,13 @@ func (c *LocalClient) namespacesFromApplyRequest(changes []*ternv1.TableChange, 
 // materializedTableChangeOperation recovers the storage operation for a
 // materialized table change. The proto change type is authoritative when it maps
 // to a known DDL action; otherwise the operation is classified from the request's
-// authoritative DDL with the target dialect's parser. DDL that classifies
+// authoritative DDL with the target dialect's parser. A single statement is
+// classified directly; otherwise only a valid greenfield create set is
+// admitted, and its operation comes from the first statement. DDL that classifies
 // outside the shared DDL vocabulary, or as DML, is rejected — never mapped to
-// an "unknown" action that would resume as a no-op. The two rejection causes
-// get distinct messages because they call for different remedies: DML has no
-// place in a schema change, while out-of-vocabulary SQL is a statement the
-// materialized plan has no name for.
+// an "unknown" action that would resume as a no-op. Classification, create-set
+// shape, and non-DDL rejection remain distinct because they call for different
+// remedies.
 func materializedTableChangeOperation(parser ddl.StatementParser, ch *ternv1.TableChange) (string, error) {
 	if op := protoChangeTypeToDDLAction(ch.ChangeType); op != "unknown" {
 		return op, nil
@@ -2120,9 +2124,13 @@ func materializedTableChangeOperation(parser ddl.StatementParser, ch *ternv1.Tab
 	if strings.TrimSpace(ch.Ddl) == "" {
 		return "", fmt.Errorf("table change for %q has an unrecognized change type and no DDL to classify", ch.TableName)
 	}
-	statementType, _, err := parser.Classify(ch.Ddl)
-	if err != nil {
-		return "", fmt.Errorf("classify DDL for table %q: %w", ch.TableName, err)
+	statementType, _, classifyErr := parser.Classify(ch.Ddl)
+	if classifyErr != nil {
+		createSet, err := ddl.ParseCreateSet(parser, ch.Ddl)
+		if err != nil {
+			return "", fmt.Errorf("parse DDL for table %q as a create set: %w", ch.TableName, err)
+		}
+		statementType = createSet.Type
 	}
 	if statementType == ddl.StatementUnknown {
 		return "", fmt.Errorf("DDL for table %q classified outside the shared DDL vocabulary; cannot recover an operation", ch.TableName)

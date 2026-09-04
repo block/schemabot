@@ -86,6 +86,128 @@ CREATE TABLE t (id INT);`
 	})
 }
 
+func TestCreateSetStatements(t *testing.T) {
+	postgresParser, err := ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+	mysqlParser, err := ParserForDialect(schema.DialectMySQL)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name       string
+		parser     StatementParser
+		script     string
+		want       []string
+		wantErrMsg string
+	}{
+		{
+			name:   "single Postgres statement",
+			parser: postgresParser,
+			script: "ALTER TABLE t ADD COLUMN v text;",
+			want:   []string{"ALTER TABLE t ADD COLUMN v text"},
+		},
+		{
+			name:   "Postgres create set",
+			parser: postgresParser,
+			script: "CREATE TABLE t (id bigint, v text); CREATE INDEX t_v_idx ON t (v); CREATE UNIQUE INDEX t_id_idx ON t (id);",
+			want: []string{
+				"CREATE TABLE t (id bigint, v text)",
+				"CREATE INDEX t_v_idx ON t (v)",
+				"CREATE UNIQUE INDEX t_id_idx ON t (id)",
+			},
+		},
+		{
+			name:       "index targets another table",
+			parser:     postgresParser,
+			script:     "CREATE TABLE t (id bigint); CREATE INDEX other_id_idx ON other (id);",
+			wantErrMsg: `statement 2 creates an index on table "other", not CREATE TABLE target "t"`,
+		},
+		{
+			name:   "schema-qualified targets match",
+			parser: postgresParser,
+			script: "CREATE TABLE a.t (id bigint); CREATE INDEX t_id_idx ON a.t (id);",
+			want: []string{
+				"CREATE TABLE a.t (id bigint)",
+				"CREATE INDEX t_id_idx ON a.t (id)",
+			},
+		},
+		{
+			name:       "schema-qualified targets differ",
+			parser:     postgresParser,
+			script:     "CREATE TABLE a.t (id bigint); CREATE INDEX t_id_idx ON b.t (id);",
+			wantErrMsg: `statement 2 creates an index on table "b.t", not CREATE TABLE target "a.t"`,
+		},
+		{
+			name:       "qualified and unqualified targets differ",
+			parser:     postgresParser,
+			script:     "CREATE TABLE a.t (id bigint); CREATE INDEX t_id_idx ON t (id);",
+			wantErrMsg: `statement 2 creates an index on table "t", not CREATE TABLE target "a.t"`,
+		},
+		{
+			name:       "alter follows create table",
+			parser:     postgresParser,
+			script:     "CREATE TABLE t (id bigint); ALTER TABLE t ADD COLUMN v text;",
+			wantErrMsg: "statement 2 is ALTER TABLE",
+		},
+		{
+			name:       "two create tables",
+			parser:     postgresParser,
+			script:     "CREATE TABLE t (id bigint); CREATE TABLE u (id bigint);",
+			wantErrMsg: "statement 2 is CREATE TABLE",
+		},
+		{
+			name:       "index first",
+			parser:     postgresParser,
+			script:     "CREATE INDEX t_id_idx ON t (id); CREATE INDEX t_v_idx ON t (v);",
+			wantErrMsg: "statement 1 is CREATE INDEX",
+		},
+		{
+			name:       "DML follows create table",
+			parser:     postgresParser,
+			script:     "CREATE TABLE t (id bigint); INSERT INTO t (id) VALUES (1);",
+			wantErrMsg: "statement 2 is INSERT",
+		},
+		{
+			name:       "empty",
+			parser:     postgresParser,
+			script:     "  ",
+			wantErrMsg: "DDL script contains no statements",
+		},
+		{
+			name:   "single MySQL statement is unchanged",
+			parser: mysqlParser,
+			script: "  ALTER TABLE `t` ADD COLUMN `v` varchar(20)  ",
+			want:   []string{"ALTER TABLE `t` ADD COLUMN `v` varchar(20)"},
+		},
+		{
+			name:       "MySQL multi-statement create set is unsupported",
+			parser:     mysqlParser,
+			script:     "CREATE TABLE `t` (`id` bigint); CREATE INDEX `t_id_idx` ON `t` (`id`)",
+			wantErrMsg: "multi-statement DDL scripts are not supported for this dialect",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := CreateSetStatements(tc.parser, tc.script)
+			if tc.wantErrMsg != "" {
+				require.ErrorContains(t, err, tc.wantErrMsg)
+				assert.Nil(t, got)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+
+	t.Run("returns the first statement classification", func(t *testing.T) {
+		got, err := ParseCreateSet(postgresParser, "CREATE TABLE a.t (id bigint); CREATE INDEX t_id_idx ON a.t (id)")
+		require.NoError(t, err)
+		assert.Equal(t, StatementCreateTable, got.Type)
+		assert.Equal(t, "t", got.Table)
+		assert.Len(t, got.Statements, 2)
+	})
+}
+
 func TestPostgresParserClassify(t *testing.T) {
 	p := postgresStatementParser{}
 
@@ -380,6 +502,9 @@ func clearParseLocations(m protoreflect.Message) {
 // Generated, identity, and unrecognized constraint shapes fail closed, quoted
 // identifiers cannot mask a missing DEFAULT, and a function-call DEFAULT fails
 // closed because its volatility cannot be proven from the statement alone.
+// UNIQUE builds an index over the whole table so it is never automatic;
+// REFERENCES is metadata-only until a DEFAULT makes the server validate every
+// existing row.
 func TestPostgresAddColumnManualReason(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -425,11 +550,24 @@ func TestPostgresAddColumnManualReason(t *testing.T) {
 			name:       "nullable unique",
 			createDDL:  "CREATE TABLE metrics (a bigint, external_id bigint UNIQUE)",
 			columnName: "external_id",
+			wantReason: "UNIQUE, which builds a unique index over the whole table",
 		},
 		{
 			name:       "nullable references",
 			createDDL:  "CREATE TABLE metrics (a bigint, parent_id bigint REFERENCES parents (id))",
 			columnName: "parent_id",
+		},
+		{
+			name:       "references with default",
+			createDDL:  "CREATE TABLE metrics (a bigint, parent_id bigint DEFAULT 1 REFERENCES parents (id))",
+			columnName: "parent_id",
+			wantReason: "FOREIGN KEY with a DEFAULT, which validates every existing row",
+		},
+		{
+			name:       "not null references with default",
+			createDDL:  "CREATE TABLE metrics (a bigint, parent_id bigint NOT NULL DEFAULT 1 REFERENCES parents (id))",
+			columnName: "parent_id",
+			wantReason: "FOREIGN KEY with a DEFAULT, which validates every existing row",
 		},
 		{
 			name:       "quoted identifier containing default",
@@ -565,6 +703,9 @@ func TestPostgresCostScalesWithTableSize(t *testing.T) {
 		{"add column with volatile default", `ALTER TABLE mutes ADD COLUMN token uuid DEFAULT gen_random_uuid()`, true},
 		{"add column with inline unique", `ALTER TABLE mutes ADD COLUMN slug varchar(64) UNIQUE`, true},
 		{"add generated column", `ALTER TABLE mutes ADD COLUMN total int GENERATED ALWAYS AS (a + b) STORED`, true},
+		{"add column references with default", `ALTER TABLE mutes ADD COLUMN parent_id bigint DEFAULT 1 REFERENCES parents (id)`, true},
+		{"add column with inline check", `ALTER TABLE mutes ADD COLUMN c int CHECK (c > 0)`, true},
+		{"add column references without default", `ALTER TABLE mutes ADD COLUMN parent_id bigint REFERENCES parents (id)`, false},
 		{"add foreign key not valid", `ALTER TABLE mutes ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users (id) NOT VALID`, false},
 		{"add check constraint not valid", `ALTER TABLE mutes ADD CONSTRAINT chk_positive CHECK (count > 0) NOT VALID`, false},
 		{"add column only", `ALTER TABLE mutes ADD COLUMN reason varchar(255)`, false},

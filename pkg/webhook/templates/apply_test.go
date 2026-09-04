@@ -1769,7 +1769,10 @@ func TestPreviewCommentSummaryFailed(t *testing.T) {
 	result := PreviewCommentSummaryFailed()
 
 	assert.Contains(t, result, "Schema Change Failed")
-	assert.Contains(t, result, "unsafe warning")
+	// The error line says what an operator should do about the failure, and
+	// names the code so they can search for it.
+	assert.Contains(t, result, "A row had no value for a column that has no default")
+	assert.Contains(t, result, "(error 1364)")
 	assert.Contains(t, result, "1 of 3 tables completed before failure.")
 	// Single namespace — no header, but table entries present
 	assert.NotContains(t, result, "### ")

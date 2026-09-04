@@ -511,10 +511,10 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			// The no-changes outcome supersedes older plan comments just as a
 			// new plan comment would: a prior head's comment still advertises
 			// pending DDL and an apply prompt that no longer match the branch.
-			h.logger.Info("auto-plan: no changes, errors, or drift detected; skipping comment and minimizing plan comments from prior heads",
+			h.logger.Info("auto-plan: no changes, errors, or drift detected; skipping comment and retiring plan comments from prior heads",
 				"repo", repo, "pr", pr, "database", multiEnvData.Database,
 				"database_type", multiEnvData.DatabaseType, "head_sha", multiEnvData.HeadSHA)
-			h.minimizeStalePlanComments(ctx, client, repo, pr,
+			h.retireStalePlanComments(ctx, client, repo, pr,
 				multiEnvData.Database, multiEnvData.DatabaseType, multiEnvData.HeadSHA)
 			return
 		}
