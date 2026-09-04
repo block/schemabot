@@ -70,15 +70,20 @@ stay put, where this page moves as engines gain features.
 A cell that says **planned** means the engine does not do this yet but is expected to. A plain
 **no** means it does not do this today.
 
-Either way, asking for something an engine does not support is safe rather than surprising. The
-request is recorded durably before it is acknowledged, and then fails with a typed, terminal
-"unsupported operation" error. It does not hang, get dropped silently, or report a success that
-did not happen. That behavior is CO-1 and CO-2 in [invariants.md](invariants.md), and it is what
-keeps a narrower engine a safe one.
+Either way, asking for something an engine does not support is safe rather than surprising, and it
+resolves one of two ways. When the answer is known before any work starts, the request is refused
+on the spot and nothing durable is recorded, so there is no pending command left against an engine
+that will never service it. When the engine is the one that declines, the request was already
+recorded durably before it was acknowledged, and the decline is a typed "unsupported operation"
+that settles it terminally rather than retrying against an answer that cannot change. Neither
+shape hangs, gets dropped silently, or reports a success that did not happen. That is CO-1 and
+CO-2 in [invariants.md](invariants.md), and it is what keeps a narrower engine a safe one.
 
-`stop` on Vitess is the one operation that resolves rather than declines: it is carried out as a
-`cancel`, which ends the change for good, and the apply settles as cancelled so the operator is
-never told it was paused. The next section covers why.
+`stop` on Vitess is the first shape, and it declines with a pointer rather than just a refusal: a
+deploy request cannot be paused, so the message names `cancel` as the operation that will take the
+load off the database, and says plainly that it is permanent. SchemaBot will not quietly carry out
+the stop as a cancel, because someone asking to pause has said they intend to resume. That is CO-8
+in [invariants.md](invariants.md), and the next section covers why the engine cannot pause.
 
 ## What the terms mean
 
@@ -88,10 +93,10 @@ Every row of the matrix, in a line each.
 |---|---|
 | **Instant DDL** | A change the database makes by editing metadata alone, without touching the rows. Done in milliseconds, with no copy and nothing to control while it runs. |
 | **Copy and swap** | Building a new version of the table, backfilling it, keeping it in step with ongoing writes, and swapping it in. Also called online DDL. It is what lets a large table change without a long lock. |
-| **Cutover** | The swap itself: the moment the new table starts taking traffic. |
+| **Cutover** | The swap: moving traffic from the original table to the new one. It is the shortest phase of a copy, but it is a phase and not an instant, and it is the part that takes a lock. |
 | **Deferred cutover** | Holding a finished copy at that point until an operator asks for the swap, instead of swapping as soon as the copy is ready. |
 | **Revert window** | A period after cutover in which the original table still exists, so the change can be undone. |
-| **Direct execution** | Running a statement as ordinary DDL against the database, with no copy. Quick, and it holds a lock for as long as it takes. |
+| **Direct execution** | Running a statement as ordinary DDL against the database, with no copy. Two separate bounds apply: a configured timeout caps how long it waits to acquire the lock, so a busy table fails fast instead of queueing behind an open transaction, and a table size limit in the policy is what bounds how long writes are blocked once it has the lock. |
 | **Throttling** | Holding the copy back while the database is under pressure. |
 | **Adaptive pacing** | Continuously adjusting how hard the copy pushes based on how the database is responding, rather than only starting and stopping it. |
 | **Quarantine** | Renaming a dropped table aside and keeping it for a while instead of dropping it outright. |
@@ -201,10 +206,12 @@ answer.
 `cancel` is. What varies is whether the engine behind them can suspend a change and pick it back
 up. Spirit can: a stop checkpoints the copy and settles the apply as stopped, and `start` resumes
 from that checkpoint. The PlanetScale engine cannot, because a deploy request runs or it ends. So
-there the way to take the load off a database is `cancel`, which ends the change for good. Asking
-for a stop gets you that cancel rather than a refusal, and the apply settles as cancelled, so what
-the operator is told always matches what happened. That is CO-8 in
-[invariants.md](invariants.md).
+there the way to take the load off a database is `cancel`, which ends the change for good.
+
+SchemaBot could quietly carry out a stop as that cancel, and it does not. Asking to pause says you
+mean to come back, and a cancel gives you nothing to come back to, so the stop is refused and the
+refusal names `cancel` and says it is permanent. The choice to end the change stays the
+operator's. That is CO-8 in [invariants.md](invariants.md).
 
 `start` follows stop. On the PlanetScale engine it exists only to launch a deploy request that was
 created and deliberately left undeployed, which is how a change waits for an operator before it
@@ -227,10 +234,15 @@ By default they block the apply. An operator can enable a policy, per environmen
 statements run as ordinary MySQL DDL instead. The policy covers only tables under a configured row
 count, and the PR asks for a second, explicit confirmation before anything runs.
 
-What runs then is not an online change. It is synchronous, it blocks writes to the table for as
-long as it takes, nothing throttles it, nothing checkpoints it, and it cannot be reverted. The
-policy exists to bound that, and what it replaces is worse: someone running the same statement by
-hand against the database, with no plan, no audit trail, and no size limit. Vitess is excluded by
+What runs then is not an online change. It is synchronous, it blocks writes to the table for its
+full duration, nothing throttles it, nothing checkpoints it, and it cannot be reverted. The row
+count in the policy is what bounds that outage, since how long the table is blocked scales with
+its size. The other bound is on the way in: native DDL queues on the table's metadata lock behind
+any open transaction that has touched it, and everything arriving after queues behind the DDL, so
+a statement that cannot take the lock quickly stalls all traffic to the table rather than just
+waiting. Direct statements run with a short lock acquisition timeout, so a busy table fails the
+apply fast instead. What the policy replaces is worse: someone running the same statement by hand
+against the database, with no plan, no audit trail, and no size limit. Vitess is excluded by
 design, because raw DDL sent to vtgate would bypass the online DDL machinery that engine exists to
 use. [direct-execution.md](direct-execution.md) covers the gate in full.
 

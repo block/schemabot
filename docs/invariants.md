@@ -59,7 +59,7 @@
   - [CO-5: The revert phase owns the outcome](#co-5-the-revert-phase-owns-the-outcome)
   - [CO-6: Commands act only where they have an effect](#co-6-commands-act-only-where-they-have-an-effect)
   - [CO-7: ID namespaces are never conflated](#co-7-id-namespaces-are-never-conflated)
-  - [CO-8: Stop terminality is engine truth, told truthfully](#co-8-stop-terminality-is-engine-truth-told-truthfully)
+  - [CO-8: A stop that cannot pause is refused, never quietly made permanent](#co-8-a-stop-that-cannot-pause-is-refused-never-quietly-made-permanent)
   - [CO-9: Control operations are stateless](#co-9-control-operations-are-stateless)
   - [CO-10: A retired operation settles; it is never mistaken for a newer peer's](#co-10-a-retired-operation-settles-it-is-never-mistaken-for-a-newer-peers)
 - [Operator surfaces (UX)](#operator-surfaces-ux)
@@ -179,7 +179,7 @@ because it is not a participant in them.
 
 A minority of entries do describe the boundary with the engine, and those are the ones an engine
 participates in: how its terminal truth is scoped and how it outranks a queued command (ST-6,
-CO-3), what a stop means on it and how that is reported (ST-7, CO-8), which refusals it must
+CO-3), whether it can pause at all and what a stop does when it cannot (ST-7, CO-8), which refusals it must
 surface at plan time so they gate the apply (RV-4), and whether a dropped table has a recovery
 window at all (RV-5). Engine-dependence cuts across the families rather than following them, so
 it is read per entry rather than per section.
@@ -810,19 +810,28 @@ to a data plane is a routing bug, and the internal numeric row ID appears on no 
 ([grpc-control-edge-cases.md](grpc-control-edge-cases.md)); ID resolution at the API boundary
 (`pkg/api/control_handlers.go`).
 
-### CO-8: Stop terminality is engine truth, told truthfully
+### CO-8: A stop that cannot pause is refused, never quietly made permanent
 
 Only Spirit can pause a change. A Spirit stop checkpoints the copy, the apply settles as
-`stopped`, and `start` resumes it from there. The PlanetScale engine has no pause, so a stop aimed
-at a Vitess target cancels the deploy request instead: the apply settles as `cancelled`, and nothing brings it
-back. An operator must never be told the first when they got the second.
+`stopped`, and `start` resumes it from there. A PlanetScale deploy request has no pause: it runs
+or it ends. The tempting shortcut is to honor a stop there by cancelling, since cancelling does
+take the load off the database. SchemaBot does not, because an operator asking to pause has said
+they intend to resume, and a cancel is permanent. The stop is refused instead, with a `400` naming
+`cancel` as the operation that does what the engine can actually do. Nothing durable is recorded,
+so there is no request left pending against an engine that will never service it.
 
-That reading is decided in one place from the target's database type, rather than inferred
-wherever a result is rendered, and it is keyed on the database type specifically so a change that
-never reached a data plane settles the same way, with no engine instance anywhere to ask. Every
-operator surface then names the outcome that actually happened. *Breaks if violated:* an operator
-reads `stopped`, waits to resume, and the change is already dead. *Enforced:* the single
-stop-terminality decision and its renderings (`pkg/tern/stop_terminality.go`).
+The refusal is decided before any work is attempted, and it is enforced twice: once in the service
+method both the CLI and the PR surface reach, and again in the data plane on the target's database
+type, so a stop arriving by any route meets the same answer.
+
+Where a stop against such an engine does exist in storage, written by an earlier release, settling
+it must still not report a pause. Those records terminalize to `cancelled`, decided in one place
+from the database type rather than inferred wherever a result is rendered, and keyed on the type
+specifically so an apply that never reached a data plane settles the same way with no engine
+instance anywhere to ask. *Breaks if violated:* an operator asks for a pause, is told the change is
+`stopped`, waits to resume, and it is already dead. *Enforced:* the engine refusal
+(`pkg/api/control_handlers.go`, `pkg/tern/local_control.go`) and the single stop-terminality
+decision behind it (`pkg/tern/stop_terminality.go`).
 
 ### CO-9: Control operations are stateless
 
