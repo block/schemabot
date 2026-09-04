@@ -141,7 +141,7 @@ The first two rows drive most of the rest of the table, so start there.
         |
         +-- metadata only? ----------> done in milliseconds, nothing to control
         |
-        +-- needs to rewrite rows? --> copy and swap, minutes to hours, controllable
+        +-- needs to rewrite rows? --> copy and swap, minutes to weeks, controllable
 ```
 
 ### The cheap native path
@@ -287,10 +287,11 @@ all.
 table at all, so the harder half of a real schema gets blocked instead of applied. Falling back to
 a copy is what lets an engine handle a whole schema rather than the easy parts of one.
 
-**A lever over a change that is already in flight.** A copy can run for hours, and an engine that
-can begin one but not act on one leaves the operator with a process they can only wait out. At
-minimum they must be able to take the load off the database, hold the change short of its swap and
-trigger that swap when they choose (deferred cutover), and abandon the change (`cancel`).
+**A lever over a change that is already in flight.** A copy on a large table can run for days or
+weeks, and an engine that can begin one but not act on one leaves the operator with a process they
+can only wait out. At minimum they must be able to take the load off the database, hold the change
+short of its swap and trigger that swap when they choose (deferred cutover), and abandon the
+change (`cancel`).
 
 Which verbs deliver that varies, and the bar is the ability rather than a particular verb. Spirit
 pauses and resumes; the PlanetScale engine cannot pause at all, so `cancel` is how a change gets

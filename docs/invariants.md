@@ -699,12 +699,13 @@ lease. It never concludes that from a failed write: a connection error or a stor
 nothing about who owns the work, so those are retried instead.
 
 The asymmetry is deliberate, because the two mistakes are not equally bad. Reading a blip as
-displacement throws away a healthy copy that may be hours in. Missing a real displacement is
+displacement throws away a healthy copy that may be days in. Missing a real displacement is
 already covered from the other side, since a driver out of touch for the full staleness window
 stops on its own (OW-3) rather than needing to guess from one failed write.
 
-*Breaks if violated:* a storage blip aborts a healthy multi-hour copy. *Enforced:* the ownership
-checks in the drive loop, which stop the drive on a proven token change and retry everything else
+*Breaks if violated:* a storage blip aborts a healthy copy that has been running for days.
+*Enforced:* the ownership checks in the drive loop, which stop the drive on a proven token change
+and retry everything else
 (`pkg/api/operator.go`), modelled in [storage-outage-behavior.md](storage-outage-behavior.md).
 
 ### OW-5: One active apply per deployment
