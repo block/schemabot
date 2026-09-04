@@ -872,14 +872,20 @@ on the storage dialect:
   A live index only counts as present when PostgreSQL reports it valid.
   PostgreSQL marks an index invalid both while a `CREATE INDEX CONCURRENTLY`
   is still building it and after one fails part-way — a unique build that
-  hits duplicate keys, a cancelled session — and the catalog does not
-  distinguish the two; in either case the planner never uses it. Startup
-  fails closed naming that index rather than reading it as converged or
-  colliding with it on a fresh `CREATE INDEX`. Before recovering, check
-  `pg_stat_progress_create_index` for a build still running on it; if one
-  is, let it finish. Otherwise remove the cause first — a unique build keeps
-  failing while duplicate keys remain — then drop the index so the next
-  startup recreates it, or `REINDEX INDEX CONCURRENTLY` it by hand. A
+  hits duplicate keys, a cancelled session — and in either case the planner
+  never uses it. Startup fails closed naming that index rather than reading
+  it as converged or colliding with it on a fresh `CREATE INDEX`, and reads
+  `pg_stat_progress_create_index` to say which situation it is. When a build
+  is in progress — the expected state while an operator pre-creates an index
+  ahead of a release — the error says so and asks for nothing; the pod
+  restarts on its backoff and starts cleanly once the build completes. When
+  no build is visible, the error treats the index as a failed build: remove
+  the cause first — a unique build keeps failing while duplicate keys
+  remain — then drop the index so the next startup recreates it, or
+  `REINDEX INDEX CONCURRENTLY` it by hand. That view only shows other roles'
+  sessions to a caller with `pg_read_all_stats`, so if the storage role
+  lacks it and the build runs under a different role, confirm from a
+  privileged session that no build is running before recovering. A
   non-unique index under a name the embedded schema requires to be unique
   fails startup the same way. Every such problem across every table is named
   in the one startup error, and no DDL runs until all of them are resolved.

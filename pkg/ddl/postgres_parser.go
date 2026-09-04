@@ -213,7 +213,7 @@ func PostgresAddColumnManualReason(createTableDDL, columnName string) (string, e
 		case pgproto.ConstrType_CONSTR_GENERATED, pgproto.ConstrType_CONSTR_IDENTITY:
 			return "definition is generated or identity, which rewrites the whole table under an exclusive lock; add it manually", nil
 		case pgproto.ConstrType_CONSTR_UNIQUE:
-			return "definition is UNIQUE, which builds a unique index over the whole table under an exclusive lock; add it manually or ship the index as a standalone CREATE INDEX", nil
+			return "definition is UNIQUE, which builds a unique index over the whole table under an exclusive lock; add it manually or ship the index as a standalone CREATE INDEX, which builds the same index under a SHARE lock that keeps reads flowing and within the startup timeout", nil
 		case pgproto.ConstrType_CONSTR_FOREIGN:
 			foreignKey = true
 		case pgproto.ConstrType_CONSTR_NULL:
@@ -344,17 +344,19 @@ func alterCmdScalesWithTableSize(cmd *pgproto.AlterTableCmd) bool {
 // addColumnScalesWithTableSize reports whether adding this column forces a
 // table rewrite or scan: an inline PRIMARY KEY or UNIQUE builds an index, a
 // generated or identity column is computed for every existing row, a
-// non-constant DEFAULT is evaluated per row, and a REFERENCES column with a
-// DEFAULT validates every existing row against the referenced table. A plain
-// column with no DEFAULT (or a constant one), including a nullable REFERENCES
-// column without one, is metadata-only.
+// non-constant DEFAULT is evaluated per row, an inline CHECK is validated
+// against every existing row even though the new column is NULL in all of
+// them, and a REFERENCES column with a DEFAULT validates every existing row
+// against the referenced table. A plain column with no DEFAULT (or a constant
+// one), including a nullable REFERENCES column without one, is metadata-only.
 func addColumnScalesWithTableSize(col *pgproto.ColumnDef) bool {
 	var foreignKey, hasDefault bool
 	for _, c := range col.GetConstraints() {
 		constraint := c.GetConstraint()
 		switch constraint.GetContype() {
 		case pgproto.ConstrType_CONSTR_PRIMARY, pgproto.ConstrType_CONSTR_UNIQUE,
-			pgproto.ConstrType_CONSTR_GENERATED, pgproto.ConstrType_CONSTR_IDENTITY:
+			pgproto.ConstrType_CONSTR_GENERATED, pgproto.ConstrType_CONSTR_IDENTITY,
+			pgproto.ConstrType_CONSTR_CHECK:
 			return true
 		case pgproto.ConstrType_CONSTR_DEFAULT:
 			hasDefault = true
@@ -364,8 +366,8 @@ func addColumnScalesWithTableSize(col *pgproto.ColumnDef) bool {
 		case pgproto.ConstrType_CONSTR_FOREIGN:
 			foreignKey = true
 		default:
-			// NOT NULL, NULL, CHECK, and the remaining shapes do not scan the
-			// table on their own when the column is new.
+			// NOT NULL, NULL, and the remaining shapes do not scan the table
+			// on their own when the column is new.
 		}
 	}
 	return foreignKey && hasDefault

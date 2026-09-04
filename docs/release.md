@@ -261,7 +261,9 @@ Diff the embedded schema files. On MySQL, additive changes need no action. On
 PostgreSQL, new tables, metadata-only columns, and standalone indexes land
 automatically. A new index builds as a plain `CREATE INDEX` under the startup
 budget, so on a deployment with a long history it belongs in the release notes
-with its statement so operators can pre-create it. A new column whose shape
+with its statement so operators can pre-create it — finish the `CREATE INDEX
+CONCURRENTLY` before rolling the release, since a pod that starts while the
+build is still running fails closed until it completes. A new column whose shape
 needs manual remediation — `NOT NULL` without a `DEFAULT`, generated or
 identity, `UNIQUE`, `REFERENCES` with a `DEFAULT` — fails startup until an
 operator creates it by hand, so it always belongs in the release notes with its

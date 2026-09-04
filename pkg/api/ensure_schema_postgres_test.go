@@ -111,7 +111,9 @@ func TestPostgresManualRemediation(t *testing.T) {
 // A live index satisfies an expectation only when PostgreSQL can use it: an
 // invalid index is reported regardless of uniqueness, a non-unique index
 // cannot stand in for a unique one, and a unique index answers a non-unique
-// expectation's reads.
+// expectation's reads. An invalid index still under construction is told
+// apart from one a failed build abandoned, since only the latter needs the
+// operator to act.
 func TestPostgresLiveIndexManualReason(t *testing.T) {
 	t.Parallel()
 
@@ -123,8 +125,15 @@ func TestPostgresLiveIndexManualReason(t *testing.T) {
 	assert.Empty(t, postgresLiveIndexManualReason(nonUnique, postgresLiveIndex{unique: true, valid: true}))
 
 	assert.Contains(t, postgresLiveIndexManualReason(unique, postgresLiveIndex{unique: false, valid: true}), "live state is non-unique")
-	assert.Contains(t, postgresLiveIndexManualReason(unique, postgresLiveIndex{unique: true, valid: false}), "live state is invalid")
-	assert.Contains(t, postgresLiveIndexManualReason(nonUnique, postgresLiveIndex{unique: false, valid: false}), "live state is invalid")
+	failedBuild := postgresLiveIndexManualReason(unique, postgresLiveIndex{unique: true, valid: false})
+	assert.Contains(t, failedBuild, "live state is invalid and no CREATE INDEX CONCURRENTLY is visible building it")
+	assert.Contains(t, failedBuild, "DROP INDEX it so startup recreates it")
+	assert.Contains(t, postgresLiveIndexManualReason(nonUnique, postgresLiveIndex{unique: false, valid: false}), "live state is invalid and no CREATE INDEX CONCURRENTLY is visible building it")
+
+	inFlight := postgresLiveIndexManualReason(unique, postgresLiveIndex{unique: true, valid: false, building: true})
+	assert.Contains(t, inFlight, "live state is invalid because a CREATE INDEX CONCURRENTLY is still building it")
+	assert.Contains(t, inFlight, "startup succeeds once that build completes")
+	assert.NotContains(t, inFlight, "DROP INDEX")
 }
 
 // The expectations parser fails closed on schema-file statements the additive
