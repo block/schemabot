@@ -6,6 +6,7 @@
 
 - [Schema pull](#schema-pull)
 - [Supported changes](#supported-changes)
+  - [Index builds](#index-builds)
   - [Greenfield tables](#greenfield-tables)
   - [Partitioned tables](#partitioned-tables)
 - [Blocked plans](#blocked-plans)
@@ -60,9 +61,9 @@ conditions:
 - pg-sprite classifies the statement for native execution.
 - The statement is a kind the shape check admits: an `ALTER TABLE` shape
   accepted by pg-sprite's privilege-tier check, a greenfield `CREATE TABLE`
-  (see [Greenfield tables](#greenfield-tables)), or a `CREATE INDEX` — with
-  the caveat that an admitted index build cannot complete at apply time (see
-  below). Statement kinds outside that set fail closed.
+  (see [Greenfield tables](#greenfield-tables)), or a `CREATE INDEX` (see
+  [Index builds](#index-builds)). Statement kinds outside that set fail
+  closed.
 - For a change to an existing table, the target is an ordinary or partitioned
   table and its measured on-disk size is no more than the configured
   native-apply ceiling (1 GiB by default; see
@@ -97,12 +98,25 @@ transaction, so a mid-plan failure leaves the earlier statements committed and
 the schema partially changed. Keep a PostgreSQL change to a single statement
 when a partially applied plan would be unsafe to leave in place.
 
-`CREATE INDEX` against an existing table passes planning but cannot complete on
-the current apply path. pg-sprite renders that build as `CREATE INDEX
-CONCURRENTLY`, which PostgreSQL refuses to run inside a transaction block, and
-the apply path runs it inside a transaction. Greenfield index builds are the
-exception: indexes declared with a new table run as plain, non-concurrent steps
-inside the create set and can complete.
+### Index builds
+
+A `CREATE INDEX` against an existing table plans as a native statement. The
+choice between a blocking and a concurrent build is pg-sprite's, not the
+author's: its planner constructs `CREATE INDEX CONCURRENTLY` as the safer form
+of a plain `CREATE INDEX`, and the plan surfaces that concurrent form for
+review. A statement already written with `CONCURRENTLY` surfaces as authored.
+The apply runs the reviewed build through pg-sprite's dedicated concurrent
+index-build executor — outside a transaction block, under a 4-minute overall
+budget instead of the per-statement lock and statement limits — and reports
+completion only once the catalog shows the index valid. A build that fails
+part-way leaves an invalid index; the stored failure names it and is retryable
+once an operator has cleared it. A concurrent build against a partitioned
+parent is refused permanently, because PostgreSQL cannot build parent-level
+indexes concurrently.
+
+Indexes declared together with a new table take a different path: they run as
+plain, non-concurrent steps inside the greenfield create set, because the table
+has no readers yet (see [Greenfield tables](#greenfield-tables)).
 
 ### Greenfield tables
 
@@ -149,10 +163,12 @@ statement shape is outside the `ALTER TABLE`, `CREATE TABLE`, and
 is defined by the pinned
 pg-sprite version, not by SchemaBot: when a pg-sprite upgrade widens the
 shapes its engine executes, SchemaBot's plan and apply gates widen with the
-pin, with no SchemaBot code change. That shape check admits `CREATE INDEX`.
-An index build against an existing table is not blocked at plan time even
-though it fails at apply time, while an index in a greenfield create set can
-complete as described above.
+pin, with no SchemaBot code change. That shape check admits `CREATE INDEX`,
+so an index build against an existing table is not blocked at plan time; it
+executes as described in [Index builds](#index-builds). It is blocked only
+when pg-sprite could not construct the concurrent form of a plain
+`CREATE INDEX`, since running the submitted form would falsify the plan's own
+verdict.
 
 The plan comment lists the table and SchemaBot's reason for the refusal. For a
 PostgreSQL plan, the plan Check Run concludes unsuccessfully, and an apply
@@ -183,6 +199,13 @@ change or that depend on the target:
   failure includes the provisioning `GRANT` derived by pg-sprite.
 - Exhausting the 30-second statement budget is a permanent native-safety
   refusal. Exhausting the lock budget is retryable after contention clears.
+- A concurrent index build runs under its own 4-minute budget. A build that
+  leaves an invalid index behind — including one cancelled by that budget — or
+  finds one already under the requested name fails as a retryable operational
+  failure naming the index and the recovery step; the invalid index, not the
+  cause that produced it, is the outcome an operator acts on. Only a budget
+  exhaustion that provably left nothing is a permanent refusal. A parent-level
+  index build on a partitioned table is refused permanently.
 - Other operational failures are recorded as retryable when no create-set
   prefix committed and expose a sanitized message; connection and server
   details remain in server logs. A create-set failure after the table commits
