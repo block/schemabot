@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -86,7 +87,24 @@ func TestClassifyRefusal(t *testing.T) {
 			name:       "create collision is a refusal whoever took the name first",
 			err:        fmt.Errorf("execute: %w", executor.ErrCreateCollision),
 			wantReason: "create-collision",
-			wantDetail: []string{"already taken on the target", "re-plan"},
+			wantDetail: []string{"relation already occupies a name", "table, or one of its index names", "re-plan"},
+		},
+		{
+			name: "create collision identifies the failed sequence step",
+			err: fmt.Errorf("execute: %w", &executor.SequenceStepError{
+				Step: 2, Total: 3, Err: executor.ErrCreateCollision,
+			}),
+			wantReason: "create-collision",
+			wantDetail: []string{"relation already occupies a name", "step 2 of 3 failed", `CREATE TABLE for "users" committed`, "re-plan"},
+		},
+		{
+			name: "single-statement refusal omits sequence position",
+			err: fmt.Errorf("execute: %w", &executor.SequenceStepError{
+				Step: 1, Total: 1, Err: executor.ErrCreateCollision,
+			}),
+			wantReason:    "create-collision",
+			wantDetail:    []string{"relation already occupies a name"},
+			wantNotDetail: []string{"step 1 of 1"},
 		},
 		{
 			name:       "invariant violation fails closed as a refusal",
@@ -159,8 +177,50 @@ func TestClassifyRefusal(t *testing.T) {
 			for _, notWant := range tt.wantNotDetail {
 				assert.NotContains(t, r.detail, notWant)
 			}
+			if strings.Contains(r.detail, "CREATE TABLE") {
+				assert.LessOrEqual(t, strings.Count(r.detail, "re-plan"), 1)
+			}
 		})
 	}
+}
+
+// TestCommittedCreatePrefixDetail pins the retry boundary for create sets: a
+// first-step failure has changed nothing and may be retried, while any later
+// failure leaves the CREATE TABLE committed and requires a fresh plan.
+func TestCommittedCreatePrefixDetail(t *testing.T) {
+	first := &executor.SequenceStepError{Step: 1, Total: 3, Err: errors.New("server failure")}
+	detail, committed := committedCreatePrefixDetail(first, "users")
+	assert.False(t, committed)
+	assert.Empty(t, detail)
+
+	later := &executor.SequenceStepError{Step: 2, Total: 3, Err: errors.New("server failure")}
+	detail, committed = committedCreatePrefixDetail(later, "users")
+	assert.True(t, committed)
+	assert.Equal(t, `step 2 of 3 failed after the CREATE TABLE for "users" committed; re-plan against the current schema`, detail)
+}
+
+func TestClassifyApplyFailureCommittedCreatePrefix(t *testing.T) {
+	err := &executor.SequenceStepError{Step: 2, Total: 3, Err: errors.New("server failure")}
+
+	failure := classifyApplyFailure(err, "users")
+
+	assert.False(t, failure.retryable)
+	assert.True(t, failure.committedPrefix)
+	assert.Contains(t, failure.detail, `CREATE TABLE for "users" committed`)
+	assert.Contains(t, failure.detail, "re-plan against the current schema")
+	assert.Equal(t, 1, strings.Count(failure.detail, "re-plan"))
+}
+
+func TestProgressResultReportsCreateSequenceLength(t *testing.T) {
+	result := progressResult(engine.StateRunning, "running", time.Now(), nativeApply{
+		namespace: "public",
+		table:     "widgets",
+		sql:       "CREATE TABLE public.widgets (id bigint PRIMARY KEY)",
+		steps:     3,
+	}, "")
+
+	assert.Equal(t, "1", result.Metadata["step"])
+	assert.Equal(t, "3", result.Metadata["steps_total"])
 }
 
 // TestRefusalForOutcomeTotalOverExecutorCodes pins the classifier to
@@ -415,6 +475,36 @@ func TestValidateOptimisticApplyRefusesNonNativeShape(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "does not execute this statement shape yet")
+}
+
+func TestValidateOptimisticApplyAcceptsCreateSet(t *testing.T) {
+	req := &engine.ApplyRequest{
+		Database: "app",
+		Changes: []engine.SchemaChange{{Namespace: "public", TableChanges: []engine.TableChange{{
+			Table: "widgets",
+			DDL:   "CREATE TABLE public.widgets (id bigint PRIMARY KEY, name text);\nCREATE UNIQUE INDEX widgets_name_key ON public.widgets (name)",
+		}}}},
+		Credentials: &engine.Credentials{DSN: "postgres://localhost/app"},
+	}
+
+	change, err := validateOptimisticApply(req)
+	require.NoError(t, err)
+	assert.Equal(t, req.Changes[0].TableChanges[0].DDL, change.sql)
+}
+
+func TestValidateOptimisticApplyRefusesMixedCreateScript(t *testing.T) {
+	req := &engine.ApplyRequest{
+		Database: "app",
+		Changes: []engine.SchemaChange{{Namespace: "public", TableChanges: []engine.TableChange{{
+			Table: "widgets",
+			DDL:   "CREATE TABLE public.widgets (id bigint PRIMARY KEY);\nALTER TABLE public.widgets ADD COLUMN name text",
+		}}}},
+		Credentials: &engine.Credentials{DSN: "postgres://localhost/app"},
+	}
+
+	_, err := validateOptimisticApply(req)
+	require.Error(t, err)
+	assert.Equal(t, `apply PostgreSQL table "widgets": planned DDL is not one statement or a valid greenfield create set`, err.Error())
 }
 
 // The apply pool inherits the CA bundle the acceptance path resolved; a
