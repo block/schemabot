@@ -43,7 +43,7 @@ engines gain features. If the two ever disagree, invariants.md is the one that h
 | **Deferred cutover** | yes | yes | planned |
 | **`cancel`** | yes | yes | planned |
 | **`revert` / `skip-revert`** | no | yes | no |
-| **Throttling** | automatic, on live target signals | a threshold that admits or rejects, adjustable mid-flight | planned; statements bounded meanwhile |
+| **Throttling** | automatic, on live target signals | a threshold that admits or rejects, adjustable mid-flight | planned, on replica and slot lag; meanwhile a statement is cancelled at its budget rather than slowed |
 | **Adaptive pacing** | yes | no | not applicable, no copy to pace |
 | **Dropped-table recovery** | opt-in quarantine, expires | inside the revert window, expires | not applicable, a drop is blocked at plan time |
 | **Who reports progress** | the process running the change | the cluster, so any instance can read it | the process running the change |
@@ -208,10 +208,13 @@ than through SchemaBot, which has no control operation for it; SchemaBot reads t
 throttle state and reports it, and never sets it. PlanetScale documents the controls in
 [Throttling deploy requests](https://planetscale.com/docs/vitess/schema-changes/throttling-deploy-requests).
 
-**pg-sprite does not throttle yet.** It is planned. Until it lands, each statement gets a lock
-budget and a statement budget, with bounded retries when it hits contention, and a statement that
-runs past its budget is stopped. That is a blunter instrument than a throttle, which is part of
-why the changes allowed through are kept small.
+**pg-sprite has nothing to pace yet.** A throttle governs a copy, and there is no copy. What
+stands in its place is the budget on each statement: a lock timeout and a statement timeout, with
+bounded retries when it hits contention. A statement that runs past its budget is cancelled and
+rolled back rather than slowed down, so a change that turns out to be expensive is stopped instead
+of allowed to drag on holding a lock. That is a harder edge than a throttle, and deliberately so
+while the only thing a PostgreSQL change can do is run to completion. Throttling arrives with the
+copy, watching read-replica lag and replication slot lag.
 
 None of this is a promise about your workload. Capacity you are already using is capacity the
 change will compete for, and the protection you get is the engine's, not SchemaBot's.
