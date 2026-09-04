@@ -224,6 +224,11 @@ func (s *staticApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
 func (s *staticApplyStore) SetRevertSkipped(context.Context, int64, time.Time) error {
 	return nil
 }
+
+// GetByDatabase compares its arguments byte-for-byte against the fixture rows,
+// modelling a store with no collation forgiveness of its own. A handler that
+// forwards a caller's spelling unfolded therefore misses the fixture, so a
+// mixed-case request only matches when the handler folds it first.
 func (s *staticApplyStore) GetByDatabase(_ context.Context, database, dbType, environment string) ([]*storage.Apply, error) {
 	if s.err != nil {
 		return nil, s.err
