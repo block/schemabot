@@ -313,6 +313,30 @@ Only a copy has a rate to manage. The two engines that copy handle it differentl
 bounds its statements instead. In every case the mechanism belongs to the engine, not to
 SchemaBot.
 
+The difference is the shape of the response, not how much of it there is. Put the same pressure on
+the database and each engine answers with a different curve:
+
+```
+                             pressure        pressure
+                              starts           eases
+                                 v               v
+   Spirit          ##############=======---------=======##############
+   (steers)                      eases down by degrees, then climbs back
+
+   PlanetScale     ##############                #####################
+   (threshold)                   held off entirely, then straight back to full
+
+   pg-sprite       ##############X
+   (budget)                      cancelled at its budget and rolled back
+
+   Time runs left to right. # is full speed, = and - are slower,
+   blank is held off, X is the change ending.
+```
+
+Spirit's curve has intermediate values; PlanetScale's has two; pg-sprite's has an end. That
+ordering is not a ranking. A threshold that admits or rejects is a real protection, and a hard
+budget is the right answer for a change that cannot be paced.
+
 **Spirit throttles automatically.** It watches live signals from the target database, backs off
 when they show pressure, and reports both the throttle and its reason through progress, so a
 throttled change reads as throttled in the PR comment and the CLI rather than just as slow. On
