@@ -57,7 +57,7 @@ that holds.
 | **`revert` / `skip-revert`** | no | yes | no |
 | **Throttling** | automatic, on live target signals | a threshold that admits or rejects, adjustable mid-flight | planned, on replica and slot lag; meanwhile a statement is cancelled at its budget rather than slowed |
 | **Adaptive pacing** | yes | no | not applicable, no copy to pace |
-| **Dropped-table recovery** | opt-in quarantine, expires | inside the revert window, expires | not applicable, a drop is blocked at plan time |
+| **Dropped-table recovery** | opt-in quarantine, expires | inside the revert window, expires | no |
 | **Who reports progress** | the process driving the change | the cluster, so any instance can read it | the process driving the change |
 
 A cell that says **planned** means the engine does not do this yet but is expected to. A plain
