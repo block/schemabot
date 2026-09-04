@@ -942,24 +942,52 @@ AV-8: guidance is written by SchemaBot, never assembled out of an untrusted erro
 ### UX-5: One vocabulary, one meaning, every surface
 
 The severity glyphs are a closed set with fixed meanings, and they mean the same thing wherever
-they appear. Escalation is destructive consent in effect. Refused is a request SchemaBot
-understood and will not perform, where retrying it unchanged refuses again. Failed is an attempt
-that stopped on its own and now needs triage. Attention is something to look at and act on before
-proceeding, with nothing refused yet, which is also where errors in the operator's own input
-belong, since fixing the input and retrying can succeed. Info requires nothing. The distinctions
-are the point: what separates Refused from Attention is whether retrying unchanged can work, which
-is exactly what an operator needs to know first.
+they appear:
 
-Where an operation sits in its lifecycle is a second, separate vocabulary, and the two do not
-borrow from each other, except that a state which is itself a severity takes its glyph from the
-severity set so the two cannot drift apart. Both are shared rather than reimplemented per surface:
-the codepoints are identical in the CLI and in a PR comment, and the multi-deployment rollup that
-decides what an apply is called is derived once from the operation rows and rendered by both. Only
-markup differs between surfaces, ANSI color against markdown emphasis, and colored output degrades
-to the same text byte for byte when it is not going to a terminal. *Enforced:* the vocabulary and
-its rules (`pkg/glyph`), the shared rollup (`pkg/presentation`), and a custom analyzer run in CI
-and pre-commit that fails a build on a severity glyph written as a literal anywhere outside its
-home package (`pkg/analyzers/severityglyphs`).
+| | Means |
+|---|---|
+| 🚨 | Destructive consent is in effect. `--allow-unsafe` was given and data will be destroyed. This is the last moment to stop. |
+| ⛔ | Refused. SchemaBot or the engine understood the request and will not perform it. Something has to change before a retry can succeed. |
+| ❌ | Failed. An attempt stopped on its own, and the operator's job is triage. |
+| ⚠️ | Attention. Something to look at and act on before proceeding, with nothing refused yet. |
+| ℹ️ | Information. Nothing is required of the operator. |
+
+The distinctions are the point. What separates Refused from Failed is who stopped the work, and
+what separates Refused from Attention is whether retrying unchanged could ever succeed, which is
+the first thing an operator needs to know. That second line is also why an error in the operator's
+own input carries Attention rather than Refused: fixing the input and retrying works, so it is not
+a refusal of the request. Refusal also attaches to the refusal itself and never to what was
+refused, so the same unsafe change carries Attention when it is disclosed at plan time and Refused
+only once an apply is actually declining to proceed.
+
+A progress bar is a second vocabulary, in the same spirit and read at a glance rather than word by
+word:
+
+| | Means |
+|---|---|
+| 🟦 | Copying rows. |
+| 🟨 | Waiting for cutover. |
+| 🟩 | Complete. |
+| 🟧 | Halted by an operator: stopped, cancelled, or reverted. |
+| 🟥 | Failed. |
+| ⬜ | Not done yet. |
+
+Orange against red carries the same distinction the severity set draws between Refused and Failed:
+whether a human stopped this or it broke. That is worth a color of its own, because the two look
+identical in a percentage and call for completely different reactions.
+
+Where an operation sits in its lifecycle is a third vocabulary. The three do not borrow from each
+other, except that a state which is itself a severity takes its glyph from the severity set so the
+two cannot drift apart. All of them are shared rather than reimplemented per surface: the
+codepoints are identical in the CLI and in a PR comment, the bar is built from emoji rather than
+terminal colors so it renders the same in both, and the multi-deployment rollup that decides what
+an apply is called is derived once from the operation rows and rendered by both. Only markup
+differs between surfaces, ANSI color against markdown emphasis, and colored output degrades to the
+same text byte for byte when it is not going to a terminal. *Enforced:* the severity vocabulary
+and its rules (`pkg/glyph`), the shared bar and its colors (`pkg/ui`), the shared rollup
+(`pkg/presentation`), and a custom analyzer run in CI and pre-commit that fails a build on a
+severity glyph written as a literal anywhere outside its home package
+(`pkg/analyzers/severityglyphs`).
 
 ## Recovery (RC)
 
