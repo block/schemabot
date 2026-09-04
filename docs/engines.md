@@ -62,7 +62,7 @@ stay put, where this page moves as engines gain features.
 | **Deferred cutover** | yes | yes | planned |
 | **`cancel`** | yes | yes | planned |
 | **`revert` / `skip-revert`** | no | yes | no |
-| **Throttling** | automatic, on live target signals | a threshold that admits or rejects, adjustable mid-flight | planned, on replica and slot lag; meanwhile a statement is cancelled at its budget rather than slowed |
+| **Throttling** | automatic, on live target signals | automatic, on live cluster signals; plus an operator-set rate on a running change | planned, on replica and slot lag; meanwhile a statement is cancelled at its budget rather than slowed |
 | **Adaptive pacing** | yes | no | planned |
 | **Dropped-table recovery** | opt-in quarantine, expires | inside the revert window, expires | no |
 | **Who reports progress** | the process driving the change | the cluster, so any instance can read it | the process driving the change |
@@ -309,33 +309,34 @@ hatch for statements no copy can run, and the engine that lacks it lacks it on p
 
 ## Load management
 
-Only a copy has a rate to manage. The two engines that copy handle it differently, and the third
-bounds its statements instead. In every case the mechanism belongs to the engine, not to
-SchemaBot.
+Only a copy has a rate to manage. The two engines that copy both watch live signals from the
+target and back off on their own; the third has no copy and bounds its statements instead. In
+every case the mechanism belongs to the engine, not to SchemaBot.
 
-The difference is the shape of the response, not how much of it there is. Put the same pressure on
-the database and each engine answers with a different curve:
+What differs between the two that copy is what backing off does. Put the same pressure on the
+database and each answers differently:
 
 ```
                              pressure        pressure
                               starts           eases
                                  v               v
    Spirit          ##############=======---------=======##############
-   (steers)                      eases down by degrees, then climbs back
+   (paces)                       slows its own copy down, then speeds it back up
 
-   PlanetScale     ##############                #####################
-   (threshold)                   held off entirely, then straight back to full
+   PlanetScale     ############## # # #   #  #  # # # # ##############
+   (gates)                       same speed, allowed through less often
 
    pg-sprite       ##############X
    (budget)                      cancelled at its budget and rolled back
 
-   Time runs left to right. # is full speed, = and - are slower,
-   blank is held off, X is the change ending.
+   Time runs left to right. # is copying, = and - are copying more
+   slowly, blank is waiting, X is the change ending.
 ```
 
-Spirit's curve has intermediate values; PlanetScale's has two; pg-sprite's has an end. That
-ordering is not a ranking. A threshold that admits or rejects is a real protection, and a hard
-budget is the right answer for a change that cannot be paced.
+Spirit changes the size of the work. Vitess keeps the work the same size and changes how often it
+is let through. Averaged over a minute the two look similar, which is the point: neither is the
+crude one. pg-sprite is the one that is genuinely different, because it has no copy to hold back
+and stops the change instead.
 
 **Spirit throttles automatically.** It watches live signals from the target database, backs off
 when they show pressure, and reports both the throttle and its reason through progress, so a
@@ -346,17 +347,25 @@ responding, easing off under load and taking more headroom when there is some. N
 suits that. Replication lag deliberately does not, because lag is a budget to stay inside rather
 than a dial to optimize, and steering on it would leave replicas permanently behind.
 
-**PlanetScale's throttle works differently, not just less automatically.** It is a threshold the
-copy is checked against, and the check either admits the work or rejects it. A deploy request
-under it is held off and then runs at full speed again, where Spirit would slow down and speed up.
-Part of that threshold belongs to the cluster and governs a deploy request the same way it governs
-the cluster's other background work.
+**Vitess gates rather than paces.** Its throttler also watches live signals: replication lag by
+default, and, where configured, running threads, load average, InnoDB history list length, or a
+custom query. Each is a threshold, and a metric over its threshold makes the throttler
+unsatisfied.
 
-A running deploy request also carries its own throttle ratio, and an operator can change it while
-the copy is in flight to hold the change back further or let it run. That is the lever to reach
-for when a deploy request is competing with live traffic. It is set through PlanetScale rather
-than through SchemaBot, which has no control operation for it; SchemaBot reads the resulting
-throttle state and reports it, and never sets it. PlanetScale documents the controls in
+The copy consults it constantly. VReplication asks before each batch, and an unsatisfied answer
+means that batch does not go: it waits a fraction of a second and asks again, over and over, until
+the answer comes back yes. So the copy is not slowed down so much as let through less often, and
+the rate an operator observes is the fraction of those checks that pass. It also asks as a
+declared background workload, which is what puts it behind production traffic and alongside the
+cluster's other background work rather than in competition with it.
+
+Sitting over that is a throttle ratio an operator can set on a running deploy request, and it
+works the way the gate does: the ratio is the probability that any given check is refused, so a
+ratio held at three quarters lets roughly one batch in four through. That is the lever to reach
+for when a deploy request is competing with live traffic, and unlike the signal thresholds it is a
+deliberate choice rather than a reaction. It is set through PlanetScale rather than through
+SchemaBot, which has no control operation for it; SchemaBot reads the resulting throttle state and
+reports it, and never sets it. PlanetScale documents the controls in
 [Throttling deploy requests](https://planetscale.com/docs/vitess/schema-changes/throttling-deploy-requests).
 
 **pg-sprite has nothing to pace yet.** A throttle governs a copy, and there is no copy. What
