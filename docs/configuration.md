@@ -9,6 +9,7 @@
   - [PostgreSQL `dsn_from` targets](#postgresql-dsn_from-targets)
 - [gRPC Mode](#grpc-mode)
 - [Multi-Deployment Environments](#multi-deployment-environments)
+  - [Review and the Primary Deployment](#review-and-the-primary-deployment)
   - [Deployment Order](#deployment-order)
 - [Environment Order](#environment-order)
   - [Per-Database Environment Order](#per-database-environment-order)
@@ -219,7 +220,9 @@ The example above is a single SchemaBot deployment that owns both environments. 
 
 A single environment can fan out to multiple Tern deployments by replacing the scalar `target` / `deployment` pair with a `deployments` map. Each entry's key is a Tern deployment name (which MUST also exist as a key in `tern_deployments`), and each value carries the per-deployment `target`.
 
-> **Apply fans out across every deployment; review compares them against one plan.** `Validate()` accepts a `deployments` map with any number of entries, and `ResolveDatabaseTargets` returns one execution target per entry in rollout order. An apply resolves that whole set and creates one `apply_operations` row per deployment. The driver claims each row and sequences the rollout along `deployment_order` under the environment's `cutover_policy` and `on_failure` policies, control requests (stop, cutover, cancel) are recorded durably and consumed per operation, and progress, PR comments, and CLI output render per deployment. Review works differently by design: the plan reviewers see, and the plan SchemaBot persists and later applies from, is computed against the primary deployment only (the first entry in rollout order). The remaining deployments are diffed against that reviewed plan at review time with a non-persisting diff, and the plan check fails closed if any of them diverges or cannot be diffed. A multi-deployment environment is therefore gated on every deployment agreeing with one reviewed plan, not on one reviewed plan per deployment.
+`Validate()` accepts a `deployments` map with any number of entries, and `ResolveDatabaseTargets` returns one execution target per entry in rollout order. An apply resolves that whole set and creates one `apply_operations` row per deployment. The driver claims each row and sequences the rollout along `deployment_order` under the environment's `cutover_policy` and `on_failure` policies. Control requests (stop, cutover, cancel) are recorded durably and consumed per operation, and progress, PR comments, and CLI output render per deployment.
+
+Review does not fan out the same way. See [Review and the Primary Deployment](#review-and-the-primary-deployment).
 
 ```yaml
 storage:
@@ -258,6 +261,14 @@ Rules:
 - Keys under `deployments:` must be lowercase; the server refuses to start otherwise.
 - A single-entry map is accepted and behaves identically to the scalar `target` / `deployment` shape. Single-deployment environments should continue to use the scalar shape.
 - `cutover_policy` and `on_failure` are only valid alongside a `deployments` map. `cutover_policy` accepts `rolling` (the default), `barrier`, or `parallel`; `on_failure` accepts `halt` (the default), `continue`, or `pause`. Both values are captured on every operation row when the apply is created, so the policy in force at that moment travels with the rollout.
+
+### Review and the Primary Deployment
+
+An apply fans out across every deployment. Review does not: the plan reviewers see, and the plan SchemaBot persists and later applies from, is computed against the **primary deployment** only, meaning the first entry in rollout order.
+
+The remaining deployments are diffed against that reviewed plan at review time, using a diff that is not persisted. The plan check fails closed on two distinct conditions: a deployment whose schema diverges from the reviewed plan, and a deployment that cannot be diffed at all. An unreachable deployment therefore blocks the merge rather than passing quietly.
+
+A multi-deployment environment is gated on every deployment agreeing with one reviewed plan, not on one reviewed plan per deployment.
 
 ### Deployment Order
 
