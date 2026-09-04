@@ -414,7 +414,12 @@ that no ability lives on only one of them. Nor is the CLI a way around a gate: a
 requires an authorized actor (AZ-4) and a verified identity (AZ-3), and reaching for the terminal
 changes who is asking, never what they are allowed to do. *Enforced:* the shared `Execute*`
 service methods behind both surfaces (`pkg/api/plan_handlers.go`, `pkg/api/control_handlers.go`),
-called by the comment-command dispatcher (`pkg/webhook`) and by the HTTP routes the CLI uses.
+called by the comment-command dispatcher (`pkg/webhook`) and by the HTTP routes the CLI uses; and
+`TestEveryPRCommandHasACLIEquivalent` (`pkg/cmd/command_parity_test.go`), which walks the
+registered comment commands and requires each one to have a CLI command of the same name or a
+justified exemption naming the CLI capability that covers it. That test mechanizes the spelling
+half only: a CLI command whose behavior drifted from its comment counterpart still passes, so the
+capability half above remains a convention.
 
 ## Merge gate (MG)
 
