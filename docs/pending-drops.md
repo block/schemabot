@@ -67,6 +67,23 @@ plan: DROP TABLE `users`   RENAME TABLE `app`.`users`
    period. Tables whose names do not carry a valid timestamp prefix are never
    auto-dropped, because their age is unknown.
 
+**Cancelling a schema change quarantines its copy too.** A cancelled change
+leaves a shadow table holding every row copied so far, and — if it had already
+cut over — the original table it swapped out. Both hold data the change may
+have spent days producing, so both go through the same quarantine as a table an
+operator deleted from a schema file, under the same retention. The metadata
+describing where the copy had got to (the checkpoint tables and the deferred
+cutover sentinel) is dropped outright, because a checkpoint whose shadow table
+is gone describes a copy that no longer exists.
+
+The operational consequence is the one below: **cancelling no longer frees disk
+immediately.** Before the quarantine, cancelling dropped the shadow table and
+returned its space. Now the copy survives until retention expires, and the
+quarantine rename is metadata-only — it does not release the tablespace. An
+operator cancelling a change *because the target is running out of disk* must
+drop the quarantined copy by hand to get the space back, exactly as they would
+to reclaim space from a quarantined `DROP TABLE`.
+
 ## Recovering a dropped table
 
 Within the retention period, restore a quarantined table by renaming it back:
@@ -155,5 +172,8 @@ querying `information_schema`.
   until an operator removes the referencing constraints. Plans that drop a
   parent table should drop the referencing tables or constraints in the same
   change.
-- **Disk space**: quarantined tables keep their data, so dropping a large table
-  does not free space until the retention period expires.
+- **Disk space**: quarantined tables keep their data, so neither dropping a
+  large table nor cancelling a schema change part-way through copying one frees
+  space until the retention period expires. The quarantine rename is
+  metadata-only and does not release the tablespace. Reclaiming the space
+  sooner means dropping the quarantined table by hand.
