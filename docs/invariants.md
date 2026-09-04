@@ -859,6 +859,9 @@ shown while it does it, which is a safety property too: a guarantee an operator 
 they cannot act on, and a surface that reads plausibly while being wrong is worse than one that
 says nothing.
 
+Which surface an operator is on is covered a family up, in AV-10: every command a PR comment
+accepts has a CLI equivalent, so none of what follows is reachable from only one of them.
+
 ### UX-1: An operator's command shows its effect at the bottom of the PR
 
 When a control command takes effect on an apply that is still running, the progress comment does
