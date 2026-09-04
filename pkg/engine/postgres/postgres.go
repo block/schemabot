@@ -282,14 +282,21 @@ func greenfieldCreateSet(report pgplan.Report, parser ddl.StatementParser) (engi
 	if err != nil {
 		return engine.TableChange{}, 0, fmt.Errorf("derive privilege tier for greenfield table %q: %w", report.Table, err)
 	}
-	if tier != preflight.TierCreateTable {
-		return engine.TableChange{}, 0, fmt.Errorf("greenfield table %q requires tier %s, expected %s", report.Table, tier, preflight.TierCreateTable)
+	if err := ensureGreenfieldCreateTier(report.Table, tier); err != nil {
+		return engine.TableChange{}, 0, err
 	}
 	return engine.TableChange{
 		Table:     report.Table,
 		Operation: ddl.StatementCreateTable,
 		DDL:       strings.Join(createSet, ";\n"),
 	}, tier, nil
+}
+
+func ensureGreenfieldCreateTier(table string, tier preflight.Tier) error {
+	if tier != preflight.TierCreateTable {
+		return fmt.Errorf("greenfield table %q requires tier %s, expected %s", table, tier, preflight.TierCreateTable)
+	}
+	return nil
 }
 
 // blockMissingPrivileges verifies the connected role holds the access each

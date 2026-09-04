@@ -66,6 +66,7 @@ type nativeApply struct {
 	namespace string
 	table     string
 	sql       string
+	steps     int
 }
 
 // targetConn carries one background apply's connection inputs: the raw DSN
@@ -147,7 +148,7 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	if _, err := preflight.RequiredTier(statements); err != nil {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: SchemaBot's PostgreSQL support does not execute this statement shape yet", tc.Table)
 	}
-	return nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL}, nil
+	return nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL, steps: len(statements)}, nil
 }
 
 // postgresCreateSetStatements parses one statement or a greenfield create set
@@ -204,33 +205,53 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		return
 	}
 
-	if detail, committed := committedCreatePrefixDetail(err, change.table); committed {
+	failure := classifyApplyFailure(err, change.table)
+	switch {
+	case failure.committedPrefix:
 		logger.Error("PostgreSQL create set failed after committing a prefix",
 			"namespace", change.namespace, "table", change.table, "error", err)
-		e.publishProgress(key, progressResult(engine.StateFailed, "failed", started, change, detail), logger)
-		return
+	case failure.lockBudget:
+		logger.Warn("PostgreSQL native-safe schema change lost its lock budget; the drive will retry",
+			"namespace", change.namespace, "table", change.table, "error", err)
+	default:
+		logger.Error("PostgreSQL native-safe schema change failed", "namespace", change.namespace, "table", change.table, "error", err)
 	}
+	result := progressResult(engine.StateFailed, "failed", started, change, failure.detail)
+	result.Retryable = failure.retryable
+	e.publishProgress(key, result, logger)
+}
 
+// applyFailure is the drive-facing disposition of an operational apply
+// failure: the operator detail and whether a retry can succeed. Refusals never
+// reach it — classifyRefusal consumes them first.
+type applyFailure struct {
+	detail          string
+	retryable       bool
+	committedPrefix bool
+	lockBudget      bool
+}
+
+// classifyApplyFailure decides retryability from the failure's shape, in the
+// order the shapes nest: a create sequence that failed after its CREATE TABLE
+// committed is never retryable, even when the failing step lost a lock budget
+// that would otherwise be retryable — the table exists, so a retry can only
+// collide. classifyRefusal already consumed the statement-budget cause, so a
+// budget exceeded here is the lock budget: the statement is native-safe and
+// merely lost a bounded race with concurrent lock holders, and marking it
+// blocked would falsely tell the operator retrying cannot succeed.
+func classifyApplyFailure(err error, table string) applyFailure {
+	if detail, committed := committedCreatePrefixDetail(err, table); committed {
+		return applyFailure{detail: detail, committedPrefix: true}
+	}
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) {
-		// classifyRefusal consumed the statement-budget cause, so the budget
-		// exceeded here is the lock budget: the statement itself is
-		// native-safe and merely lost a bounded race with concurrent lock
-		// holders. Surface the typed detail as a retryable failure — marking
-		// it blocked would falsely tell the operator retrying cannot succeed.
-		result := progressResult(engine.StateFailed, "failed", started, change,
-			budgetErr.Error()+"; retry once lock contention subsides")
-		result.Retryable = true
-		e.publishProgress(key, result, logger)
-		return
+		return applyFailure{
+			detail:     budgetErr.Error() + "; retry once lock contention subsides",
+			retryable:  true,
+			lockBudget: true,
+		}
 	}
-
-	logger.Error("PostgreSQL native-safe schema change failed", "namespace", change.namespace, "table", change.table, "error", err)
-	result := progressResult(engine.StateFailed, "failed", started, change, "PostgreSQL schema change failed; see server logs")
-	// Operational failures are retryable because refusals and create sequences
-	// with a committed prefix returned above.
-	result.Retryable = true
-	e.publishProgress(key, result, logger)
+	return applyFailure{detail: "PostgreSQL schema change failed; see server logs", retryable: true}
 }
 
 // invalidIndexDetail renders the operator-facing next step for an
@@ -281,14 +302,21 @@ func classifyRefusal(err error, table string) *refusal {
 	}
 	r.detail = sanitizeReasonText(r.detail)
 	var stepErr *executor.SequenceStepError
-	if errors.As(err, &stepErr) {
-		stepDetail := fmt.Sprintf("step %d of %d failed", stepErr.Step, stepErr.Total)
+	if errors.As(err, &stepErr) && stepErr.Total > 1 {
 		if stepErr.Step > 1 {
-			stepDetail += "; earlier steps including the CREATE TABLE committed, so re-plan against the current schema"
+			r.detail = strings.TrimSuffix(r.detail, "; re-plan against the current schema")
 		}
-		r.detail = sanitizeReasonText(r.detail + "; " + stepDetail)
+		r.detail = sanitizeReasonText(r.detail + "; " + sequenceStepDetail(stepErr, table))
 	}
 	return r
+}
+
+func sequenceStepDetail(stepErr *executor.SequenceStepError, table string) string {
+	detail := fmt.Sprintf("step %d of %d failed", stepErr.Step, stepErr.Total)
+	if stepErr.Step > 1 {
+		detail += fmt.Sprintf(" after the CREATE TABLE for %q committed; re-plan against the current schema", table)
+	}
+	return detail
 }
 
 // committedCreatePrefixDetail reports the non-retryable recovery action for a
@@ -298,7 +326,7 @@ func committedCreatePrefixDetail(err error, table string) (string, bool) {
 	if !errors.As(err, &stepErr) || stepErr.Step <= 1 {
 		return "", false
 	}
-	detail := fmt.Sprintf("step %d of %d failed after the CREATE TABLE for %q committed; re-plan against the current schema", stepErr.Step, stepErr.Total, table)
+	detail := sequenceStepDetail(stepErr, table)
 	return sanitizeReasonText(detail), true
 }
 
@@ -595,15 +623,21 @@ func progressResult(state engine.State, phase string, started time.Time, change 
 	if state == engine.StateCompleted {
 		progress = 100
 	}
+	steps := change.steps
+	if steps == 0 {
+		steps = 1
+	}
 	result := &engine.ProgressResult{
 		State: state, Progress: progress, Message: "PostgreSQL schema change " + phase,
 		ErrorMessage: detail,
 		Metadata: map[string]string{
 			"phase": phase, "elapsed": time.Since(started).Round(time.Millisecond).String(),
-			// ExecuteCreate commits each create-set step in its own bounded
-			// transaction; a failure leaves the committed prefix for the next
-			// plan to reconcile.
-			"step": "1", "steps_total": "1",
+			// Per-step position is deliberately not tracked yet: the apply
+			// publishes progress only at accept and at the terminal outcome,
+			// and nothing observes the executor's step transitions in
+			// between, so the position stays at the sequence's first step
+			// while the total reports the real create-set length.
+			"step": "1", "steps_total": strconv.Itoa(steps),
 		},
 		Tables: []engine.TableProgress{{
 			Namespace: change.namespace, Table: change.table, DDL: change.sql,

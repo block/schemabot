@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -94,7 +95,16 @@ func TestClassifyRefusal(t *testing.T) {
 				Step: 2, Total: 3, Err: executor.ErrCreateCollision,
 			}),
 			wantReason: "create-collision",
-			wantDetail: []string{"relation already occupies a name", "step 2 of 3 failed", "CREATE TABLE committed", "re-plan"},
+			wantDetail: []string{"relation already occupies a name", "step 2 of 3 failed", `CREATE TABLE for "users" committed`, "re-plan"},
+		},
+		{
+			name: "single-statement refusal omits sequence position",
+			err: fmt.Errorf("execute: %w", &executor.SequenceStepError{
+				Step: 1, Total: 1, Err: executor.ErrCreateCollision,
+			}),
+			wantReason:    "create-collision",
+			wantDetail:    []string{"relation already occupies a name"},
+			wantNotDetail: []string{"step 1 of 1"},
 		},
 		{
 			name:       "invariant violation fails closed as a refusal",
@@ -167,6 +177,9 @@ func TestClassifyRefusal(t *testing.T) {
 			for _, notWant := range tt.wantNotDetail {
 				assert.NotContains(t, r.detail, notWant)
 			}
+			if strings.Contains(r.detail, "CREATE TABLE") {
+				assert.LessOrEqual(t, strings.Count(r.detail, "re-plan"), 1)
+			}
 		})
 	}
 }
@@ -184,6 +197,30 @@ func TestCommittedCreatePrefixDetail(t *testing.T) {
 	detail, committed = committedCreatePrefixDetail(later, "users")
 	assert.True(t, committed)
 	assert.Equal(t, `step 2 of 3 failed after the CREATE TABLE for "users" committed; re-plan against the current schema`, detail)
+}
+
+func TestClassifyApplyFailureCommittedCreatePrefix(t *testing.T) {
+	err := &executor.SequenceStepError{Step: 2, Total: 3, Err: errors.New("server failure")}
+
+	failure := classifyApplyFailure(err, "users")
+
+	assert.False(t, failure.retryable)
+	assert.True(t, failure.committedPrefix)
+	assert.Contains(t, failure.detail, `CREATE TABLE for "users" committed`)
+	assert.Contains(t, failure.detail, "re-plan against the current schema")
+	assert.Equal(t, 1, strings.Count(failure.detail, "re-plan"))
+}
+
+func TestProgressResultReportsCreateSequenceLength(t *testing.T) {
+	result := progressResult(engine.StateRunning, "running", time.Now(), nativeApply{
+		namespace: "public",
+		table:     "widgets",
+		sql:       "CREATE TABLE public.widgets (id bigint PRIMARY KEY)",
+		steps:     3,
+	}, "")
+
+	assert.Equal(t, "1", result.Metadata["step"])
+	assert.Equal(t, "3", result.Metadata["steps_total"])
 }
 
 // TestRefusalForOutcomeTotalOverExecutorCodes pins the classifier to

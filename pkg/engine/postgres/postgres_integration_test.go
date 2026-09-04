@@ -316,6 +316,31 @@ func TestEngineApplyCreateCollisionRefusal(t *testing.T) {
 	assert.Equal(t, `a relation already occupies a name the create set for "widgets" claims (the table, or one of its index names); re-plan against the current schema`, progress.ErrorMessage)
 }
 
+// TestEngineApplyCreateSetCommittedPrefixNotRetryable proves a create set
+// that fails after its CREATE TABLE committed is published as a failure the
+// drive must not retry: the table now exists, so a retry can only land on a
+// collision refusal for a state the operator did not author. The second
+// statement fails on the server because its operator class does not accept
+// the column's type — a shape the desired-schema parse admits, so nothing
+// refuses it before the first step commits.
+func TestEngineApplyCreateSetCommittedPrefixNotRetryable(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "committed_prefix_test")
+
+	eng := New()
+	_, err := eng.Apply(t.Context(), applyRequest(dsn, "widgets",
+		"CREATE TABLE public.widgets (id bigint PRIMARY KEY, name integer);\nCREATE INDEX widgets_name_idx ON public.widgets (name text_pattern_ops)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "widgets")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "failed", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable, "the CREATE TABLE committed; a retry cannot succeed, so the drive must not offer one")
+	assert.Equal(t, `step 2 of 2 failed after the CREATE TABLE for "widgets" committed; re-plan against the current schema`, progress.ErrorMessage)
+
+	var exists bool
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT to_regclass('public.widgets') IS NOT NULL").Scan(&exists))
+	assert.True(t, exists, "the committed CREATE TABLE stays for the next plan to reconcile")
+}
+
 // TestEngineApplyCreateIfNotExistsRefusal proves a CREATE TABLE carrying
 // IF NOT EXISTS is a permanent refusal naming the clause: the native-safe
 // path cannot prove what the clause's silent no-op would mean, so the drive

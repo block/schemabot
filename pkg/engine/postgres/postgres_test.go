@@ -201,6 +201,57 @@ func TestTableChangesKeepsGreenfieldVerdictsPerStatement(t *testing.T) {
 	assert.Contains(t, changes[2].ModeReason, "depends on the statement that creates it")
 }
 
+func TestIsGreenfieldCreateSetRejectsUnsafeStatements(t *testing.T) {
+	exists := false
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "widgets"
+	report.TableExists = &exists
+	report.Statements = []pgplan.Statement{{SQL: "CREATE TABLE public.widgets (id bigint PRIMARY KEY)"}}
+
+	tests := []struct {
+		name     string
+		verdicts []string
+		mutate   func(*pgplan.Report)
+	}{
+		{name: "destructive verdict", verdicts: []string{"destructive statement"}},
+		{name: "destructive term", verdicts: []string{""}, mutate: func(report *pgplan.Report) {
+			report.Statements[0].Destructive = true
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			candidate := report
+			candidate.Statements = append([]pgplan.Statement(nil), report.Statements...)
+			if tt.mutate != nil {
+				tt.mutate(&candidate)
+			}
+			assert.False(t, isGreenfieldCreateSet(candidate, tt.verdicts))
+		})
+	}
+}
+
+func TestGreenfieldCreateSetRejectsNonCreateTier(t *testing.T) {
+	err := ensureGreenfieldCreateTier("widgets", preflight.TierIndexBuild)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "expected create a new table")
+}
+
+func TestGreenfieldCreateSetRejectsIndexForAnotherTable(t *testing.T) {
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "widgets"
+	report.Statements = []pgplan.Statement{
+		{SQL: "CREATE TABLE public.widgets (id bigint PRIMARY KEY)"},
+		{SQL: "CREATE INDEX gadgets_id_idx ON public.gadgets (id)"},
+	}
+
+	_, _, err = greenfieldCreateSet(report, parser)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `not CREATE TABLE target "public.widgets"`)
+}
+
 func TestTableChangesMixedVerdictsFailClosedPerStatement(t *testing.T) {
 	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
 	require.NoError(t, err)
