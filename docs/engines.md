@@ -42,8 +42,7 @@ Engines differ, and this is where those differences are written down. It is the 
 [invariants.md](invariants.md), and the two answer different questions. That document is about
 SchemaBot's orchestration, and most of it holds no matter which engine executes a change. Only a
 few of its entries reach the engine boundary at all, and it names which ones. It is also meant to
-stay put, where this page moves as engines gain features. Where the two touch the same ground and
-disagree, invariants.md is the one that holds.
+stay put, where this page moves as engines gain features.
 
 ## Capability matrix
 
