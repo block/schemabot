@@ -306,7 +306,7 @@ Defined in `pkg/cmd/internal/templates/progress.go`.
 | Color | Emoji | Meaning | Used when |
 |-------|-------|---------|-----------|
 | Blue  | `🟦`  | In progress | Engine actively working: copying rows, cutting over, recovering state |
-| Yellow | `🟨` | Waiting | Waiting for cutover (the operator holds the next move) |
+| Yellow | `🟨` | Not final | Waiting for cutover, revert window open, reverting, or retrying after a recoverable failure |
 | Green | `🟩`  | Complete | Table finished successfully |
 | Orange | `🟧` | Stopped | Stopped mid-progress (partially complete) |
 | Red   | `🟥`  | Failed | Table failed |

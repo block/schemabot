@@ -946,35 +946,38 @@ they appear:
 
 | | Means |
 |---|---|
-| 🚨 | Destructive consent is in effect. `--allow-unsafe` was given and data will be destroyed. This is the last moment to stop. |
-| ⛔ | Refused. SchemaBot or the engine understood the request and will not perform it. Something has to change before a retry can succeed. |
-| ❌ | Failed. An attempt stopped on its own, and the operator's job is triage. |
-| ⚠️ | Attention. Something to look at and act on before proceeding, with nothing refused yet. |
-| ℹ️ | Information. Nothing is required of the operator. |
+| 🚨 | `Escalation`. Destructive consent is in effect. `--allow-unsafe` was given and data will be destroyed. This is the last moment to stop. |
+| ⛔ | `Refused`. SchemaBot or the engine understood the request and will not perform it. Something has to change before a retry can succeed. |
+| ❌ | `Failed`. An attempt stopped on its own, and the operator's job is triage. |
+| ⚠️ | `Attention`. Something to look at and act on before proceeding, with nothing refused yet. |
+| ℹ️ | `Info`. Nothing is required of the operator. |
 
-The distinctions are the point. What separates Refused from Failed is who stopped the work, and
-what separates Refused from Attention is whether retrying unchanged could ever succeed, which is
-the first thing an operator needs to know. That second line is also why an error in the operator's
-own input carries Attention rather than Refused: fixing the input and retrying works, so it is not
-a refusal of the request. Refusal also attaches to the refusal itself and never to what was
-refused, so the same unsafe change carries Attention when it is disclosed at plan time and Refused
-only once an apply is actually declining to proceed.
+The distinctions are the point. What separates `Refused` from `Failed` is who stopped the work,
+and what separates `Refused` from `Attention` is whether retrying unchanged could ever succeed,
+which is the first thing an operator needs to know. That second line is also why an error in the
+operator's own input carries `Attention` rather than `Refused`: fixing the input and retrying
+works, so it is not a refusal of the request. Refusal also attaches to the refusal itself and
+never to what was refused, so the same unsafe change carries `Attention` when it is disclosed at
+plan time and `Refused` only once an apply is actually declining to proceed.
 
 A progress bar is a second vocabulary, in the same spirit and read at a glance rather than word by
-word:
+word. The fill color carries the meaning; the unfilled remainder of the bar is always ⬜.
 
 | | Means |
 |---|---|
-| 🟦 | Copying rows. |
-| 🟨 | Waiting for cutover. |
-| 🟩 | Complete. |
+| 🟦 | Progressing normally. Copying rows, cutting over, or recovering state. |
+| 🟨 | Not final. Holding at the cutover gate, inside the revert window, being reverted, or retrying after a recoverable failure. |
+| 🟩 | Complete and settled. |
 | 🟧 | Halted by an operator: stopped, cancelled, or reverted. |
 | 🟥 | Failed. |
-| ⬜ | Not done yet. |
 
-Orange against red carries the same distinction the severity set draws between Refused and Failed:
-whether a human stopped this or it broke. That is worth a color of its own, because the two look
-identical in a percentage and call for completely different reactions.
+Two of those distinctions do real work. Blue against yellow is whether the change is simply
+progressing or has reached a point where the normal path is suspended, reversible, or being
+undone, which is the difference between an apply that needs nothing from an operator and one that
+may. It is also why a revert window renders yellow with no checkmark: the change is applied but
+not final, and a checkmark reads as done, walk away. Orange against red carries the same
+distinction the severity set draws between `Refused` and `Failed`, whether a human stopped this
+or it broke. Those two look identical in a percentage and call for completely different reactions.
 
 Where an operation sits in its lifecycle is a third vocabulary. The three do not borrow from each
 other, except that a state which is itself a severity takes its glyph from the severity set so the
