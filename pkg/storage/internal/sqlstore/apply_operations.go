@@ -1861,6 +1861,38 @@ func strandedParentGate(d Dialect, correlation string, quiescence time.Duration)
 		)`, correlation, placeholders(len(parentStates)), quiescentBefore), args
 }
 
+// unleasedOperationGate renders the NOT EXISTS admitting only task rows whose
+// operation no driver currently holds.
+//
+// This is what makes a reaper and a driver mutually exclusive by the same
+// mechanism drivers are mutually exclusive with each other, rather than by a
+// timing argument. A driver takes an operation lease to work an operation and
+// heartbeats it for as long as it lives, and the claim path treats a lease
+// whose heartbeat is older than storage.ApplyLeaseStaleAfter as re-claimable.
+// Reading the lease the same way means a reaper writes a row only where a
+// driver would be allowed to take it, so the two writer classes can never hold
+// the same row at once.
+//
+// It matters most under fan-out, where a live sibling drive holds only an
+// operation lease: the parent apply can be settled and quiet while that drive
+// works, so no gate on the parent sees it, and the lease is the only signal
+// that does not depend on the drive having recently mirrored the row.
+//
+// A task with no operation is admitted. Nothing holds a lease over it, so there
+// is nothing here to exclude it by, and it is left to the caller's other gates.
+func unleasedOperationGate(d Dialect) string {
+	freshLeaseAfter := d.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+
+	return fmt.Sprintf(`NOT EXISTS (
+			SELECT 1
+			FROM apply_operations lease_holder
+			WHERE lease_holder.id = tasks.apply_operation_id
+				AND lease_holder.lease_owner <> ''
+				AND lease_holder.updated_at >= %s
+		)`, freshLeaseAfter)
+}
+
 // ReapStranded elects one reaper per pass and reaps under the lock. See
 // storage.ApplyOperationStore for the contract.
 func (s *applyOperationStore) ReapStranded(ctx context.Context, limit int) ([]*storage.ReapedOperation, error) {
