@@ -56,7 +56,7 @@ stay put, where this page moves as engines gain features.
 | **`cancel`** | yes | yes | planned |
 | **`revert` / `skip-revert`** | no | yes | no |
 | **Throttling** | automatic, on live target signals | a threshold that admits or rejects, adjustable mid-flight | planned, on replica and slot lag; meanwhile a statement is cancelled at its budget rather than slowed |
-| **Adaptive pacing** | yes | no | not applicable, no copy to pace |
+| **Adaptive pacing** | yes | no | planned |
 | **Dropped-table recovery** | opt-in quarantine, expires | inside the revert window, expires | no |
 | **Who reports progress** | the process driving the change | the cluster, so any instance can read it | the process driving the change |
 
