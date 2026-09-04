@@ -860,3 +860,78 @@ func TestPostgresReapStrandedRetryableDefersToTheOperationLease(t *testing.T) {
 	require.Len(t, reaped, 1, "a lease a peer could reclaim no longer speaks for the row")
 	assert.Equal(t, state.Task.Failed, taskState(t))
 }
+
+// Recovering a crashed retry admits one driver per staleness window on
+// PostgreSQL as it does on MySQL. The gate is a rendered interval comparison,
+// not Go, so each dialect has to execute it. Leasing the operation and claiming
+// its parent apply are separate transactions, and the parent stays
+// active-and-stale for the whole gap between them: without the operation's own
+// heartbeat in the predicate, every peer polling inside that gap re-leases the
+// same row and rotates its token. The row must still hand off promptly, so a
+// driver that releases the claim leaves it takeable on the very next poll
+// rather than after another window.
+func TestPostgresFindNextApplyOperationCrashRecoveryAdmitsOneDriverPerWindow(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_crash_recovery_window")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+
+	h := postgresHarness{db: db, dsn: dsn}
+	store := h.NewStorage(t)
+	ops := store.ApplyOperations()
+
+	staleSeconds := int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds())
+
+	// A parent apply claimed for a retry, then crashed: active, budget
+	// remaining, and no longer heartbeating.
+	var applyID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, attempt, options, updated_at)
+		VALUES ('apply-crash-recovery-window', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit',
+			$1, $2, '{}', NOW() - make_interval(secs => $3))
+		RETURNING id`, state.Apply.Running, maxRecoveryAttempts-1, staleSeconds).Scan(&applyID))
+
+	// The crashed driver stopped heartbeating the operation too.
+	var opID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO apply_operations (apply_id, deployment, operation_key, state)
+		VALUES ($1, 'region-a', 'op-1', $2)
+		RETURNING id`, applyID, state.ApplyOperation.FailedRetryable).Scan(&opID))
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
+		staleSeconds, opID)
+	require.NoError(t, err)
+
+	first, err := ops.FindNextApplyOperation(t.Context(), "driver-a")
+	require.NoError(t, err)
+	require.NotNil(t, first, "the first driver must recover the crashed retry")
+	require.Equal(t, opID, first.ID)
+
+	// driver-a holds the operation lease but has not reached ClaimApplyByID yet,
+	// so the parent apply is still active and stale.
+	second, err := ops.FindNextApplyOperation(t.Context(), "driver-b")
+	require.NoError(t, err)
+	assert.Nil(t, second, "a peer polling between the operation claim and the parent claim must not re-lease the recovering operation")
+
+	persisted, err := ops.Get(t.Context(), opID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, "driver-a", persisted.LeaseOwner, "the recovering driver keeps the operation lease")
+	assert.Equal(t, first.LeaseToken, persisted.LeaseToken, "the recovering driver's lease token must not be rotated out from under it")
+
+	// The driver that cannot acquire the parent apply hands the operation back,
+	// and the peer holding the parent takes it without waiting out a window.
+	released, err := ops.ReleaseClaim(t.Context(), first.Lease())
+	require.NoError(t, err)
+	require.True(t, released)
+
+	reclaimed, err := ops.FindNextApplyOperation(t.Context(), "parent-holder")
+	require.NoError(t, err)
+	require.NotNil(t, reclaimed, "a released crash-recovery row must be claimable on the next poll without aging")
+	assert.Equal(t, opID, reclaimed.ID)
+	assert.Equal(t, "parent-holder", reclaimed.LeaseOwner)
+	assert.Equal(t, state.ApplyOperation.FailedRetryable, reclaimed.State, "the handoff must not change the row's state")
+}
