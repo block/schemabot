@@ -487,7 +487,11 @@ the PR forever with no operator recourse. It is narrow rather than conditional: 
 successful plan that found no changes, only for the same head SHA the row already carries, and
 only against a row that is `in_progress` with a non-NULL `apply_id`. Those predicates are the
 whole authorization, expressed in the `WHERE` clause, so this one is settled by row count rather
-than by the transactional read below.
+than by the transactional read below. Note what is not among them: the owning apply is not
+required to have settled. What stands in for that is the no-op plan itself, since an apply still
+copying has not yet changed the target and its plan would still report changes. That is a property
+of the plan rather than a guard, and it is the reason this path is reached only from an operator's
+explicit plan command and is skipped outright when review-time deployment drift blocks the check.
 
 Everywhere else the refusal is decided, never inferred. Ownership is read and the write made in a
 single transaction with the row held, because a row count cannot answer the question: a plan
@@ -627,10 +631,10 @@ A stale engine poll can never rewind stored task state: terminal stored tasks st
 control-owned states (`stopped`, `failed_retryable`) are never overwritten by active engine polls,
 and active states advance strictly forward through the lifecycle.
 
-The guard belongs to the drive loop, which is where stale polls come from. The settled-apply task
-reconciliation named in UX-3 assigns state without it, and that is sound for the same reason its
-missing lease token is: it runs only against an apply that has already reached a terminal state,
-so there is no forward progress left for it to undo. *Enforced:* the forward-only state resolution
+The guard belongs to the drive loop, which is where stale polls come from. The one write that
+skips it is the read-path task reconciliation named in UX-3, which assigns task state raw. On a
+terminal apply that is harmless, since there is no forward progress left to undo; on a `resuming`
+apply it is a live gap, and UX-3 carries the detail. *Enforced:* the forward-only state resolution
 the drive loop reconciles through (`taskStateWithNoBackwardProgress`,
 `pkg/tern/local_client.go`).
 
@@ -700,9 +704,10 @@ stale comments or overwriting newer state.
 
 The token is what a driver writes under, so a write made by something that is not driving has none
 to present and the predicate is empty. That is only safe where such a write cannot race a driver.
-It holds for the settled-apply task reconciliation named in UX-3, whose whole precondition is that
-the apply is already terminal and no driver holds it. A new write path that is not a driver's and
-not conditioned on a settled apply would need its own reason, not this one. *Enforced:* a token
+The read-path task reconciliation named in UX-3 is the one write that is not a driver's, and it is
+not conditioned tightly enough to earn the exemption: it reaches a `resuming` apply, which a driver
+holds. Any new non-driver write needs a precondition that actually excludes a live driver.
+*Enforced:* a token
 check on every lease-scoped storage write
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/apply_operations.go`).
 
@@ -967,13 +972,20 @@ derive from what it wrote, computing the rollups that are not stored, such as a 
 across its shards, at read time.
 
 There is one exception on the read path, and it is a reconciliation rather than a poll. When a
-control-plane read finds task rows still active under an apply that has already settled, it asks
+control-plane read finds task rows still active and disagreeing with their apply's state, it asks
 that apply's data plane once for the truth and writes the answer back, after which the rows agree
-and later reads are served from storage. It exists because those rows are already wrong: their
-driver settled the apply elsewhere and left them behind, and no other path revisits them. It is
-worth naming as an exception rather than folding into the rule, because it is the one place a
-`GET` writes, and because it is the narrow case where a reader is not covered by the lease
-discipline below (OW-2) or the monotonicity guard above (ST-4).
+and later reads are served from storage. It exists for rows that are already wrong: a driver
+settled the apply elsewhere and left them behind, and no other path revisits them.
+
+That is the case it was built for, but it is not the only case it is reachable in, and the
+difference matters enough to state rather than round off. The read serves from storage for a
+terminal apply, and also for `resuming` — a state a driver writes as it claims the row, holding a
+lease. So this write can land while a driver is live, and it is the one reader write covered by
+neither the lease discipline below (OW-2) nor the monotonicity guard above (ST-4): it presents no
+token, so the storage lease predicate is empty, and it assigns task state raw. Two writers of the
+same engine truth make the practical divergence small, but nothing orders them. Closing this
+means gating the reconciliation on a settled apply, and until it is gated, treat UX-3, OW-2 and
+ST-4 as holding everywhere except here.
 
 That separation is what keeps a display problem a display problem. A stale percentage, a missing
 ETA, a rollup that reads oddly on a multi-table apply: none of it can move the state machine,
