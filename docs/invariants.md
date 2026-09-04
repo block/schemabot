@@ -6,7 +6,7 @@
 
 - [Does SchemaBot depend on GitHub?](#does-schemabot-depend-on-github)
 - [The two deployment shapes](#the-two-deployment-shapes)
-- [What GA and early alpha mean](#what-ga-and-early-alpha-mean)
+- [Which of these depend on the engine](#which-of-these-depend-on-the-engine)
 - [Three principles](#three-principles)
 - [What these invariants do not promise](#what-these-invariants-do-not-promise)
 - [Availability and blast radius (AV)](#availability-and-blast-radius-av)
@@ -61,6 +61,12 @@
   - [CO-8: Stop terminality is engine truth, told truthfully](#co-8-stop-terminality-is-engine-truth-told-truthfully)
   - [CO-9: Control operations are stateless](#co-9-control-operations-are-stateless)
   - [CO-10: A retired operation settles; it is never mistaken for a newer peer's](#co-10-a-retired-operation-settles-it-is-never-mistaken-for-a-newer-peers)
+- [Operator surfaces (UX)](#operator-surfaces-ux)
+  - [UX-1: An operator's command shows its effect at the bottom of the PR](#ux-1-an-operators-command-shows-its-effect-at-the-bottom-of-the-pr)
+  - [UX-2: Acknowledgment means a deployment is acting, not that a packet arrived](#ux-2-acknowledgment-means-a-deployment-is-acting-not-that-a-packet-arrived)
+  - [UX-3: Progress is a projection; reading it never changes it](#ux-3-progress-is-a-projection-reading-it-never-changes-it)
+  - [UX-4: A refusal says what to do next](#ux-4-a-refusal-says-what-to-do-next)
+  - [UX-5: One vocabulary, one meaning, every surface](#ux-5-one-vocabulary-one-meaning-every-surface)
 - [Recovery (RC)](#recovery-rc)
   - [RC-1: Nothing is orphaned](#rc-1-nothing-is-orphaned)
   - [RC-2: Settled applies stop changing](#rc-2-settled-applies-stop-changing)
@@ -157,39 +163,38 @@ more than that. Where an invariant says *remote* data plane it is talking about 
 where the two are separate processes that can be separately unreachable and separately
 versioned. [release.md](release.md) covers the deploy ordering that follows from that split.
 
-## What GA and early alpha mean
+## Which of these depend on the engine
 
-This document defines what the engine badges in the [README](../README.md) mean. The badges carry
-the current assignment, which moves as engines mature; the definition is here and does not move.
+The engine badges in the [README](../README.md) are claims about capability, and
+[engines.md](engines.md) is where they are defined: what an engine has to be able to do to be GA,
+and what each engine can do today. This section is only about how those badges relate to this
+registry, because the relationship is narrower than it looks.
 
-An engine is **GA** when it upholds every invariant in this registry. **Early alpha** means it
-does not yet, and that the gaps are specific and written down rather than left for you to find.
+Most of what is written here is not about engines at all. How work is claimed and leased, how a
+merge is gated, what a crash is recoverable from, who may authorize an apply, what an operator is
+shown: all of that sits above the engine and holds identically whichever one runs the change.
+Changing engines puts none of it at risk, and an engine cannot uphold or fail these entries
+because it is not a participant in them.
 
-The distinction to hold onto is that an engine below GA is **narrower, not looser**. Fewer classes
-of change can be executed, and fewer operations are available against one that is running, but the
-behavior at the edge of that envelope is the same as everywhere else in this document. A change
-the engine cannot execute safely is blocked at plan time rather than routed to something less
-safe. An operation it does not support is still recorded durably before it is acknowledged (CO-1)
-and still resolves to an explicit terminal outcome (CO-2), specifically a typed
-unsupported-operation decline rather than a silent drop, a false success, or an unbounded retry.
-That is the difference between an unfinished engine and an unsafe one.
+A minority of entries do describe the boundary with the engine, and those are the ones an engine
+participates in: how its terminal truth is scoped and how it outranks a queued command (ST-6,
+CO-3), what a stop means on it and how that is reported (ST-7, CO-8), which refusals it must
+surface at plan time so they gate the apply (RV-4), and whether a dropped table has a recovery
+window at all (RV-5). Engine-dependence cuts across the families rather than following them, so
+it is read per entry rather than per section.
 
-Cashed out in engine capabilities, the bar is copy and swap plus a real lever over a change that
-is already in flight: taking the load off the database, holding the change short of its swap and
-triggering that swap when the operator chooses (deferred cutover), and abandoning the change
-(`cancel`). Which verbs deliver that varies, so the bar is the ability rather than a fixed list.
-Spirit pauses and resumes; the PlanetScale engine cannot pause at all, so `cancel` is how a change
-gets off a database there. `revert` and `skip-revert` are outside the bar entirely, because they depend on
-whether the engine keeps the pre-cutover table rather than on how complete the engine is.
-[engines.md](engines.md) works through why, and is the per-engine picture generally.
+What an engine below GA does not get to be is **looser**. Fewer classes of change can be executed,
+and fewer operations are available against one that is running, but the behavior at the edge of
+that envelope is the same as everywhere else in this document. A change the engine cannot execute
+safely is blocked at plan time rather than routed to something less safe. An operation it does not
+support is still recorded durably before it is acknowledged (CO-1) and still resolves to an
+explicit terminal outcome (CO-2), specifically a typed unsupported-operation decline rather than a
+silent drop, a false success, or an unbounded retry. That is the difference between an unfinished
+engine and an unsafe one, and it is why a narrower engine is still a safe one.
 
 Where an engine's envelope is still moving, its own doc is the authority on where the boundary
 currently sits rather than this one. [postgresql.md](postgresql.md) is that doc for PostgreSQL,
 and is worth reading before pointing SchemaBot at a PostgreSQL database.
-
-Stating maturity this way is deliberate. "Early alpha" names a finite set of missing invariants
-rather than a vague confidence level, and closing the distance to GA is a reviewable list rather
-than a judgement call.
 
 Separately, PostgreSQL as a dialect of SchemaBot's *own* storage is fully supported, and is what
 AV-9 and the cross-dialect parity rule are about. The two are easy to confuse and are unrelated:
@@ -209,8 +214,8 @@ These generate most of what follows:
    permanent failure is always a fresh plan and a fresh apply.
 
 Each invariant carries an ID (`AV-*` availability, `MG-*` merge gate, `ST-*` state machine,
-`OW-*` ownership and leases, `CO-*` control operations, `RC-*` recovery, `RV-*` review
-integrity, `AZ-*` routing and authorization). When you change code near one of these, the
+`OW-*` ownership and leases, `CO-*` control operations, `UX-*` operator surfaces, `RC-*`
+recovery, `RV-*` review integrity, `AZ-*` routing and authorization). When you change code near one of these, the
 invariant is the review bar: a PR that weakens one must say so explicitly and update this
 document.
 
@@ -818,6 +823,114 @@ deployment still holds rows naming it. *Enforced:* the retired-operation list
 (`RetiredControlOperations()` in `pkg/storage/types.go`), consulted by the terminal sweep
 (`pkg/tern/control_requests.go`).
 
+## Operator surfaces (UX)
+
+The rest of this document is about what the system does. This family is about what the operator is
+shown while it does it, which is a safety property too: a guarantee an operator cannot see is one
+they cannot act on, and a surface that reads plausibly while being wrong is worse than one that
+says nothing.
+
+### UX-1: An operator's command shows its effect at the bottom of the PR
+
+When a control command takes effect on an apply that is still running, the progress comment does
+not simply change in place. A fresh comment is posted at the bottom of the PR timeline, and the
+comment it replaces is collapsed into a details block naming its successor. That is where an
+operator looks after typing a command: at the end of the conversation, for the thing they just
+did, rather than at an older comment somewhere up the page that may or may not have been edited
+since.
+
+The signal that a rotation is due is durable rather than in-memory. Every tracked progress comment
+records the phase the apply was in when it was posted, so a comment recording an earlier phase is
+known to predate the current one, and a fresh observer on a later drive claim reaches the same
+conclusion the previous one did. Each recorded phase rotates at most once.
+
+Because rotation exists to surface a command, it is gated on a command having been issued.
+Reverting has no other way in, so entering it always rotates. Skipping-revert does have another
+way in: the revert window can expire on its own, and an apply can be submitted with skip-revert
+chosen upfront. Neither is a command whose effect anyone is waiting to see, so that phase rotates
+only when a durable skip-revert control request exists for the apply, and otherwise the comment
+transitions in place. Operations that resolve straight to a terminal state, cancel among them, do
+not rotate at all, because the terminal summary already lands at the bottom. The phase is derived
+from engine-agnostic apply state, so every engine gets the same PR timeline. *Enforced:* the phase
+recorded on the tracked comment row and the rotation predicates
+(`pkg/webhook/comment_observer.go`).
+
+### UX-2: Acknowledgment means a deployment is acting, not that a packet arrived
+
+The reaction on a command comment is not a receipt. It means a deployment has decided the command
+is its work and has committed to acting on it. On a repository where several deployments see the
+same comment, only the ones that own it acknowledge, and a deployment that skips leaves a log
+rather than a mark on the PR. So a command with no acknowledgment means no deployment claimed it,
+which is a routing or configuration question, rather than meaning the command was swallowed. That
+is the visible half of AZ-5: silence only ever means another instance owns the reply.
+
+The acknowledgment is also kept close in time to the command. Where ownership can be settled from
+configuration alone, it goes on before the schema files are loaded, since on a large schema
+directory that load is most of the delay between typing a command and seeing anything happen. The
+early check is advisory: it mirrors the authoritative policy without its logs and metrics, the
+real check runs immediately afterward either way, and anything the early check misses is
+acknowledged at the later commit point. It can make an acknowledgment earlier; it cannot make one
+happen that should not. *Enforced:* the acknowledgment points in the comment-command handler
+(`pkg/webhook/issue_comment.go`).
+
+### UX-3: Progress is a projection; reading it never changes it
+
+Every progress surface renders from stored state. Nothing that reads progress polls an engine, and
+nothing that reads progress writes. The lease-holding driver is the only engine poller in the
+system: it advances task and apply state, persists per-shard rows and engine resume metadata on
+every tick, and terminalizes the apply. Readers derive from what it wrote, computing the rollups
+that are not stored, such as a table's headline across its shards, at read time.
+
+That separation is what keeps a display problem a display problem. A stale percentage, a missing
+ETA, a rollup that reads oddly on a multi-table apply: none of it can move the state machine,
+because there is no path from a rendered value back into a decision. It also means watching an
+apply never perturbs it, and two operators watching the same apply through different instances see
+the same thing rather than two independently polled versions of it. Where a reader needs to say
+something different from the stored row it clamps for display only, never writing back: a task
+whose own work finished while the apply is still in its revert window is shown at the apply's
+state, and the row is left alone. *Enforced:* the read path builds progress from stored rows only,
+with the drive loop as the sole engine poller (`pkg/tern/local_client.go`,
+`pkg/tern/local_apply_grouped.go`).
+
+### UX-4: A refusal says what to do next
+
+Whenever SchemaBot declines to do something, the message names the next action, not just the
+reason. A plan that has lost its stored routing asks for a fresh plan rather than reporting a
+missing field. A database with no configured route names the deployment and environment it looked
+under and says to add it to the server config. An apply blocked on a closed PR gets copy that
+distinguishes closed from merged, because the recovery differs and only one of them can be
+reopened. An ambiguous command is rejected with the disambiguation rather than resolved by an
+arbitrary pick (AZ-5). A failed apply says that a fresh apply resumes from where this one stopped,
+which is the fact that decides whether the operator retries or investigates first.
+
+The bar is that an operator who reads only the message knows what to do next. It is not a promise
+that the next step always exists: some situations genuinely need a human decision, and saying so
+plainly is the actionable answer. What it rules out is a dead end, where a surface reports a
+condition and leaves the operator to infer the remedy from the code. This has a hard boundary in
+AV-8: guidance is written by SchemaBot, never assembled out of an untrusted error string.
+
+### UX-5: One vocabulary, one meaning, every surface
+
+The severity glyphs are a closed set with fixed meanings, and they mean the same thing wherever
+they appear. Escalation is destructive consent in effect. Refused is a request SchemaBot
+understood and will not perform, where retrying it unchanged refuses again. Failed is an attempt
+that stopped on its own and now needs triage. Attention is something to look at and act on before
+proceeding, with nothing refused yet, which is also where errors in the operator's own input
+belong, since fixing the input and retrying can succeed. Info requires nothing. The distinctions
+are the point: what separates Refused from Attention is whether retrying unchanged can work, which
+is exactly what an operator needs to know first.
+
+Where an operation sits in its lifecycle is a second, separate vocabulary, and the two do not
+borrow from each other, except that a state which is itself a severity takes its glyph from the
+severity set so the two cannot drift apart. Both are shared rather than reimplemented per surface:
+the codepoints are identical in the CLI and in a PR comment, and the multi-deployment rollup that
+decides what an apply is called is derived once from the operation rows and rendered by both. Only
+markup differs between surfaces, ANSI color against markdown emphasis, and colored output degrades
+to the same text byte for byte when it is not going to a terminal. *Enforced:* the vocabulary and
+its rules (`pkg/glyph`), the shared rollup (`pkg/presentation`), and a custom analyzer run in CI
+and pre-commit that fails a build on a severity glyph written as a literal anywhere outside its
+home package (`pkg/analyzers/severityglyphs`).
+
 ## Recovery (RC)
 
 ### RC-1: Nothing is orphaned
@@ -1023,6 +1136,10 @@ The strongest invariants are enforced by structure, so regressions fail CI inste
   each other by tests: a table file present for one dialect and not the other, or an index that
   differs in table, ordered columns, or uniqueness, fails CI. A guard whose correctness rests on
   a unique index therefore cannot hold on one dialect and quietly not on the other (MG-5, AV-9).
+- **Severity vocabulary.** A custom analyzer runs in CI and in the pre-commit hook and fails the
+  build on a severity glyph written as a literal outside the package that owns the vocabulary, so
+  a new rendering site cannot introduce a sixth meaning or reuse an existing glyph for a new one
+  (UX-5).
 
 New invariants should aspire to this tier. When adding one, prefer a completeness test over the
 relevant registry to a hand-maintained list.

@@ -6,7 +6,7 @@
 
 GitOps for database schemas. Define your desired schema in SQL files, open a PR, and SchemaBot plans and executes your schema changes safely.
 
-**GA** means the engine upholds every runtime safety invariant in [docs/invariants.md](./docs/invariants.md). **Early alpha** means it does not yet, and that document names the specific gaps. See [docs/engines.md](./docs/engines.md) for what each engine can actually do: how it executes a change, which control operations it supports, and how it manages load.
+These badges are about capability. **GA** means the engine can change a large table online and gives an operator a real lever over a change that is already running; **early alpha** means it cannot yet. [docs/engines.md](./docs/engines.md) defines both and is the capability matrix: how each engine executes a change, which control operations it supports, and how it manages load. A narrower engine is not a looser one, which is [docs/invariants.md](./docs/invariants.md)'s subject: the runtime safety guarantees that hold whichever engine runs the change.
 
 ## Schema Changes via Pull Request
 

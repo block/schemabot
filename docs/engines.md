@@ -6,7 +6,7 @@
 
 - [Capability matrix](#capability-matrix)
 - [Why the differences exist](#why-the-differences-exist)
-- [What GA asks of an engine](#what-ga-asks-of-an-engine)
+- [What GA and early alpha mean](#what-ga-and-early-alpha-mean)
 - [Load management](#load-management)
 - [Dropped tables](#dropped-tables)
 - [Reading further](#reading-further)
@@ -152,10 +152,18 @@ VALID` and then validated. Those run whatever the table size. [postgresql.md](po
 the full boundary and is worth reading before you point SchemaBot at a PostgreSQL database; it
 tracks the engine more closely than this page does.
 
-## What GA asks of an engine
+## What GA and early alpha mean
 
-[invariants.md](invariants.md) defines **GA** as an engine that upholds every invariant in the
-registry. In terms of the matrix above, that comes down to two things.
+The engine badges on the [README](../README.md) are claims about capability, and this is where
+they are defined. An engine is **GA** when it can do the two things below. **Early alpha** means
+it cannot yet, and that what is missing is written on this page rather than left for you to
+discover against a database.
+
+Maturity is a capability question, not a safety one. An engine below GA is narrower rather than
+looser: fewer classes of change can be executed and fewer operations are available against one
+that is running, but at the edge of that envelope it behaves the same as any other engine. That
+part is [invariants.md](invariants.md)'s, and most of what is in there is not about engines at
+all.
 
 **Online DDL.** An engine that can only run what the database does natively cannot change a large
 table at all, so the harder half of a real schema gets blocked instead of applied. Falling back to
