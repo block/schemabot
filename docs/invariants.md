@@ -250,7 +250,7 @@ as one.
 blocks a merge, and an apply whose outcome cannot be established keeps blocking until an operator
 reconciles it. These invariants spend workflow availability to buy correctness. That is the right
 trade in front of a tier-0 database, and it does mean SchemaBot will sometimes stop and wait for
-a human on purpose.
+an operator on purpose.
 
 **They are not a security boundary against your own operators.** The AZ family constrains what a
 request can reach and who can authorize an apply. It does not defend against someone who is
@@ -934,8 +934,8 @@ where this one stopped, which is the fact that decides whether the operator retr
 investigates first.
 
 The bar is that an operator who reads only the message knows what to do next. It is not a promise
-that the next step always exists: some situations genuinely need a human decision, and saying so
-plainly is the actionable answer. What it rules out is a dead end, where a surface reports a
+that the next step always exists: some situations genuinely need a decision only an operator can
+make, and saying so plainly is the actionable answer. What it rules out is a dead end, where a surface reports a
 condition and leaves the operator to infer the remedy from the code. This has a hard boundary in
 AV-8: guidance is written by SchemaBot, never assembled out of an untrusted error string.
 
@@ -976,8 +976,8 @@ progressing or has reached a point where the normal path is suspended, reversibl
 undone, which is the difference between an apply that needs nothing from an operator and one that
 may. It is also why a revert window renders yellow with no checkmark: the change is applied but
 not final, and a checkmark reads as done, walk away. Orange against red carries the same
-distinction the severity set draws between `Refused` and `Failed`, whether a human stopped this
-or it broke. Those two look identical in a percentage and call for completely different reactions.
+distinction the severity set draws between `Refused` and `Failed`, whether an operator stopped
+this or it broke. Those two look identical in a percentage and call for completely different reactions.
 
 Where an operation sits in its lifecycle is a third vocabulary. The three do not borrow from each
 other, except that a state which is itself a severity takes its glyph from the severity set so the
