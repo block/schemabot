@@ -639,6 +639,7 @@ type capturingTaskStore struct {
 	mu           sync.Mutex
 	tasks        []*storage.Task
 	createCalls  int
+	updateCalls  int
 	failOnCreate int
 	err          error
 }
@@ -658,6 +659,10 @@ func (s *capturingTaskStore) Create(_ context.Context, task *storage.Task) (int6
 	return int64(len(s.tasks)), nil
 }
 
+func (s *capturingTaskStore) ReapStrandedActive(context.Context, int) ([]*storage.ReapedTask, error) {
+	return nil, nil
+}
+
 func (s *capturingTaskStore) ReapStrandedRetryable(context.Context, int) ([]*storage.ReapedTask, error) {
 	return nil, nil
 }
@@ -665,6 +670,7 @@ func (s *capturingTaskStore) ReapStrandedRetryable(context.Context, int) ([]*sto
 func (s *capturingTaskStore) Update(_ context.Context, task *storage.Task) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.updateCalls++
 	for i, storedTask := range s.tasks {
 		if storedTask.ID == task.ID || storedTask.TaskIdentifier == task.TaskIdentifier {
 			s.tasks[i] = task
@@ -4054,6 +4060,36 @@ func TestProgressByApplyIDActivePathToleratesOperationStorageError(t *testing.T)
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.Empty(t, resp.Operations)
 	assert.Equal(t, state.Apply.Running, resp.State)
+}
+
+// A task row can sit in an active state under an apply that has already reached
+// a verdict: a driver settled the apply and exited without closing the row, or
+// one failed task settled the apply while its siblings kept copying. The reader
+// cannot tell those apart, so it reports every task exactly as stored and never
+// writes. Repairing a genuinely stranded row belongs to a writer that can hold
+// a lease and wait out the parent's quiescence window, and a GET does neither.
+func TestProgressFromLocalStorageReportsActiveTaskUnderTerminalApplyVerbatim(t *testing.T) {
+	terminalStates := []string{state.Apply.Completed, state.Apply.Failed, state.Apply.Cancelled, state.Apply.Reverted, state.Apply.Stopped}
+	for _, applyState := range terminalStates {
+		t.Run(applyState, func(t *testing.T) {
+			apply := &storage.Apply{ID: 40, ApplyIdentifier: "apply_stranded", Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging", Engine: storage.EngineSpirit, State: applyState, ExternalID: "remote-apply"}
+			tasks := &capturingTaskStore{tasks: []*storage.Task{
+				{ApplyID: apply.ID, TaskIdentifier: "task_users", TableName: "users", Namespace: "testdb", DDLAction: "alter", State: state.Task.Running, ProgressPercent: 42, Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL, Engine: storage.EngineSpirit, Environment: "staging"},
+			}}
+			svc := New(&mockStorageWithApplyStores{tasks: tasks, operations: &staticApplyOperationStore{}},
+				testServerConfig(), nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+			resp, err := svc.progressFromLocalStorage(t.Context(), apply)
+
+			require.NoError(t, err)
+			require.Len(t, resp.Tables, 1)
+			assert.Equal(t, state.Task.Running, resp.Tables[0].Status, "the task's stored state is reported as stored, never rewritten to the apply's verdict")
+			assert.Equal(t, int32(42), resp.Tables[0].PercentComplete)
+			assert.Equal(t, "users", resp.Tables[0].TableName)
+			assert.Equal(t, state.Task.Running, tasks.tasks[0].State, "stored task row must be untouched by a read")
+			assert.Zero(t, tasks.updateCalls, "reading progress must not write task rows")
+		})
+	}
 }
 
 func TestProgressFromLocalStorageSingleDeploymentOmitsOperationFields(t *testing.T) {
