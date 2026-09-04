@@ -257,8 +257,8 @@ request can reach and who can authorize an apply. It does not defend against som
 legitimately allowed to change your schema and chooses badly.
 
 **They do not extend beneath the engine.** These are invariants of SchemaBot's orchestration.
-Spirit, Vitess, and PostgreSQL each have their own correctness properties and their own bugs, and
-this document does not restate or guarantee them.
+MySQL, Vitess, and PostgreSQL each have their own correctness properties and their own bugs, as
+do the engines that drive them, and this document does not restate or guarantee any of it.
 
 Finally, the absence of an entry is not the opposite of a guarantee. This registry pins what is
 enforced; behavior that is not listed is unpinned rather than known-unsafe, and if you are relying
