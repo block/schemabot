@@ -21,6 +21,21 @@ import (
 // long two drivers can run the same engine work concurrently.
 const ApplyLeaseStaleAfter = time.Minute
 
+// ApplyDriveStallAfter bounds how long a drive may go without mirroring any
+// task progress to storage before its driver presumes the drive goroutine is
+// wedged and cancels the run. A healthy drive's poll loop writes every task row
+// on every poll tick, so legitimate silence is far shorter than this window;
+// the window is kept generous so slow pre-poll phases (target schema pulls,
+// re-planning, engine acceptance) have the full window before their first
+// mirror write.
+//
+// That makes tasks.updated_at the drive's liveness signal, and this the bound
+// past which no drive the operator would still let run has spoken for a row.
+// The stranded-active reaper derives its own window from it for that reason, so
+// the two cannot drift: a row the operator would cancel a drive over is the
+// same row the reaper may settle.
+const ApplyDriveStallAfter = 5 * time.Minute
+
 // DefaultMaxDriversPerApply is the per-apply driver cap used when a deployment
 // does not configure max_drivers_per_apply.
 //

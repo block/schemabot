@@ -805,14 +805,24 @@ const strandedActiveTaskReaperLockName = "schemabot_stranded_active_task_reaper"
 // operation lease is forbidden from bumping it, so it can sit quiet while that
 // drive works.
 //
-// It is set past the window after which the operator cancels a drive that has
-// mirrored nothing (ApplyDriveStallAfter in pkg/api, which cannot be imported
-// here without inverting the dependency). A row quiet for longer than that has
-// no drive the operator would still let run, so nothing is coming back for it.
-// The margin covers the gap between the operator deciding to cancel and the
-// cancellation landing; all timestamps compared are database-side, so there is
-// no clock skew to absorb.
-const strandedActiveTaskQuiescence = 10 * time.Minute
+// It is derived from the window past which the operator cancels a drive that
+// has mirrored nothing, so the reaper cannot come to disagree with the operator
+// about which rows still have a drive behind them. The margin covers the gap
+// between the operator deciding to cancel and the cancellation landing. All
+// timestamps compared are database-side, so there is no clock skew to absorb,
+// and the guarded write re-asserts the window anyway: a drive that mirrors the
+// row before the write lands keeps it whatever the scan concluded.
+const strandedActiveTaskQuiescence = storage.ApplyDriveStallAfter + storage.ApplyLeaseStaleAfter
+
+// strandedActiveParentQuiescence is how long the parent apply must have been
+// settled before the sweep considers its task rows. It is far shorter than the
+// operation reaper's window because it is no longer what makes the sweep safe:
+// the task-row window above is, and it is the only one that holds under fan-out.
+// What is left for the parent to prove is that its verdict is final and no
+// driver still holds it, which two lease-staleness windows establish — a lease
+// that has not been heartbeated that long is already re-claimable, so an apply
+// row quiet for twice that has no live driver by the claim path's own reckoning.
+const strandedActiveParentQuiescence = 2 * storage.ApplyLeaseStaleAfter
 
 // strandedActiveTaskGate renders the condition admitting only task rows no
 // drive has touched for strandedActiveTaskQuiescence. Both the sweep's SELECT
@@ -879,7 +889,7 @@ func (s *taskStore) reapStrandedActive(ctx context.Context, limit int) ([]*stora
 		return nil, fmt.Errorf("reap stranded active tasks: limit must be positive, got %d", limit)
 	}
 
-	parentGate, parentGateArgs := strandedParentGate(s.dialect, "tasks.apply_id", strandedParentQuiescence)
+	parentGate, parentGateArgs := strandedParentGate(s.dialect, "tasks.apply_id", strandedActiveParentQuiescence)
 
 	excluded := append(append([]string{}, state.TerminalTaskStates...), state.Task.FailedRetryable)
 	selectArgs := stringArgs(excluded)
@@ -963,7 +973,7 @@ func (s *taskStore) reapStrandedActiveTask(ctx context.Context, task *storage.Ta
 		setClause = "state = ?, error_message = COALESCE(NULLIF(error_message, ''), ?), completed_at = COALESCE(completed_at, NOW())"
 		args = []any{taskState, nullString(parent.ErrorMessage)}
 	}
-	parentGate, parentGateArgs := strandedParentGate(s.dialect, "tasks.apply_id", strandedParentQuiescence)
+	parentGate, parentGateArgs := strandedParentGate(s.dialect, "tasks.apply_id", strandedActiveParentQuiescence)
 	args = append(args, task.ID, task.State)
 	args = append(args, parentGateArgs...)
 

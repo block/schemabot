@@ -1247,7 +1247,7 @@ func TestTaskStore_ReapStrandedActive_SettlesTasksUnderSettledParents(t *testing
 			lock := createTestLock(t, store, "reap_active_db", "mysql")
 			parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_active_"+tt.parentState, 1, tt.parentState, "staging")
 			setApplyErrorMessage(t, parent.ID, parentError)
-			backdateApplyUpdatedAt(t, parent.ID, strandedParentQuiescence+time.Minute)
+			backdateApplyUpdatedAt(t, parent.ID, strandedActiveParentQuiescence+time.Minute)
 
 			stranded := createRetryableReapTask(t, store, parent, "task_reap_active_users", "users", state.Task.Running, "")
 			// A failed_retryable sibling belongs to the retryable sweep, which
@@ -1301,7 +1301,7 @@ func TestTaskStore_ReapStrandedActive_SkipsRowThatLeftTheStateItWasReadIn(t *tes
 
 	lock := createTestLock(t, store, "reap_active_race_db", "mysql")
 	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_active_race", 1, state.Apply.Completed, "staging")
-	backdateApplyUpdatedAt(t, parent.ID, strandedParentQuiescence+time.Minute)
+	backdateApplyUpdatedAt(t, parent.ID, strandedActiveParentQuiescence+time.Minute)
 	task := createRetryableReapTask(t, store, parent, "task_reap_active_race", "users", state.Task.Running, "")
 
 	// Read the row as the sweep would, then let a driver move it before the
@@ -1332,7 +1332,7 @@ func TestTaskStore_ReapStrandedActive_KeepsTaskADriveIsStillMirroring(t *testing
 
 	lock := createTestLock(t, store, "reap_active_live_db", "mysql")
 	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_active_live", 1, state.Apply.Failed, "staging")
-	backdateApplyUpdatedAt(t, parent.ID, strandedParentQuiescence+time.Minute)
+	backdateApplyUpdatedAt(t, parent.ID, strandedActiveParentQuiescence+time.Minute)
 
 	// The failed deployment's task, untouched since its drive exited.
 	dead := createRetryableReapTask(t, store, parent, "task_reap_active_dead", "users", state.Task.Running, "")
@@ -1363,7 +1363,7 @@ func TestTaskStore_ReapStrandedActive_SkipsRowADriveMirroredAfterTheScan(t *test
 
 	lock := createTestLock(t, store, "reap_active_mirror_db", "mysql")
 	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_active_mirror", 1, state.Apply.Failed, "staging")
-	backdateApplyUpdatedAt(t, parent.ID, strandedParentQuiescence+time.Minute)
+	backdateApplyUpdatedAt(t, parent.ID, strandedActiveParentQuiescence+time.Minute)
 	task := createRetryableReapTask(t, store, parent, "task_reap_active_mirror", "users", state.Task.Running, "")
 	backdateTaskUpdatedAt(t, task.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
 
@@ -1387,8 +1387,11 @@ func TestTaskStore_ReapStrandedActive_WaitsOutParentQuiescence(t *testing.T) {
 
 	lock := createTestLock(t, store, "reap_active_quiet_db", "mysql")
 	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_active_quiet", 1, state.Apply.Completed, "staging")
-	backdateApplyUpdatedAt(t, parent.ID, strandedParentQuiescence-time.Minute)
+	backdateApplyUpdatedAt(t, parent.ID, strandedActiveParentQuiescence-time.Minute)
 	task := createRetryableReapTask(t, store, parent, "task_reap_active_quiet", "users", state.Task.Running, "")
+	// Age the task past its own window so the parent's is the only gate under
+	// test; otherwise this would pass on the task gate and prove nothing.
+	backdateTaskUpdatedAt(t, task.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
 
 	settled, err := store.tasks.reapStrandedActive(ctx, 10)
 	require.NoError(t, err)
