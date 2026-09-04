@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
@@ -185,6 +186,80 @@ func TestEnginePlanCreateTableIgnoresSizeCeiling(t *testing.T) {
 	change := result.Changes[0].TableChanges[0]
 	assert.Empty(t, change.ExecutionMode, "a greenfield create has no existing data for the ceiling to bound")
 	assert.Empty(t, change.ModeReason)
+}
+
+// TestEnginePlanUndeclaredTableIsBlockedDrop proves a live table whose schema
+// file is gone never vanishes from the plan: the declarative diff surfaces it
+// as a DROP TABLE that is both destructive and blocked, so the reviewer sees
+// the divergence and the apply path can never run the drop. A declared table
+// that already matches its file contributes nothing, and a partition is not
+// reported on its own — its declaration is its parent's.
+func TestEnginePlanUndeclaredTableIsBlockedDrop(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_undeclared_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY, email text NOT NULL);
+		CREATE TABLE public.legacy_users (id bigint PRIMARY KEY);
+		CREATE TABLE public.events (id bigint, day date) PARTITION BY RANGE (day);
+		CREATE TABLE public.events_2026 PARTITION OF public.events
+			FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')`)
+	require.NoError(t, err)
+	req := &engine.PlanRequest{
+		Database: "plan_undeclared_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text NOT NULL)",
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	result, err := New().Plan(t.Context(), req)
+	require.NoError(t, err)
+	assert.False(t, result.NoChanges, "an undeclared live table is a change the reviewer must see")
+	require.Len(t, result.Changes, 1)
+	assert.Equal(t, "public", result.Changes[0].Namespace)
+	require.Len(t, result.Changes[0].TableChanges, 2,
+		"the partitioned parent and the standalone table are undeclared; the partition and the declared table are not")
+
+	for i, want := range []struct{ table, ddl string }{
+		{"events", "DROP TABLE public.events"},
+		{"legacy_users", "DROP TABLE public.legacy_users"},
+	} {
+		change := result.Changes[0].TableChanges[i]
+		assert.Equal(t, want.table, change.Table)
+		assert.Equal(t, ddl.StatementDropTable, change.Operation)
+		assert.Equal(t, want.ddl, change.DDL)
+		assert.True(t, change.IsUnsafe, "a drop removes live data and must carry the unsafe flag")
+		assert.Contains(t, change.UnsafeReason, `removes table "`+want.table+`" and all of its data`)
+		assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode,
+			"the native-safe path never executes a drop, so the verdict must say so at plan time")
+		assert.Contains(t, change.ModeReason, `table "`+want.table+`" exists on the target but no schema file in namespace "public" declares it`)
+		assert.Contains(t, change.ModeReason, "restore the file to keep the table, or drop it manually after review")
+	}
+	assert.True(t, testutil.PostgresTableExists(t, db, "public", "legacy_users"), "planning must never touch the target")
+}
+
+// TestEnginePlanUndeclaredTableInMissingSchema proves a plan whose namespace
+// does not exist on the target yet reports only the greenfield create: with
+// no live tables there is nothing undeclared, and the catalog read must not
+// fail on the absent schema.
+func TestEnginePlanUndeclaredTableInMissingSchema(t *testing.T) {
+	dsn, _ := testutil.StartPostgres(t, "plan_missing_schema_test")
+	req := &engine.PlanRequest{
+		Database: "plan_missing_schema_test",
+		SchemaFiles: schema.SchemaFiles{
+			"app": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY)",
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	result, err := New().Plan(t.Context(), req)
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 1)
+	assert.Equal(t, ddl.StatementCreateTable, result.Changes[0].TableChanges[0].Operation)
 }
 
 // TestEngineApplyNativeSafe proves a planned metadata-only ALTER runs through
