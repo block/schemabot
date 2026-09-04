@@ -553,13 +553,13 @@ func (s *Service) overlayStoredDisplayMetadata(ctx context.Context, resp *apityp
 // handleDatabaseHistory handles GET /api/history/{database} requests.
 // Returns all applies for a database, sorted by created_at desc.
 func (s *Service) handleDatabaseHistory(w http.ResponseWriter, r *http.Request) {
-	database := r.PathValue("database")
+	database := storage.CanonicalKey(r.PathValue("database"))
 	if database == "" {
 		s.writeError(w, http.StatusBadRequest, "database is required")
 		return
 	}
 
-	environment := r.URL.Query().Get("environment")
+	environment := storage.CanonicalKey(r.URL.Query().Get("environment"))
 
 	applies, err := s.storage.Applies().GetByDatabase(r.Context(), database, "", environment)
 	if err != nil {
@@ -607,7 +607,7 @@ func (s *Service) handleDatabaseHistory(w http.ResponseWriter, r *http.Request) 
 // handleDatabaseEnvironments returns the list of environments for a database.
 // This is used by the CLI to discover environments when -e flag is not specified.
 func (s *Service) handleDatabaseEnvironments(w http.ResponseWriter, r *http.Request) {
-	database := r.PathValue("database")
+	database := storage.CanonicalKey(r.PathValue("database"))
 	if database == "" {
 		s.writeError(w, http.StatusBadRequest, "database is required")
 		return
@@ -826,8 +826,8 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 	filter := storage.RecentAppliesFilter{
 		Limit:       limit + 1,
-		Environment: r.URL.Query().Get("environment"),
-		Deployment:  r.URL.Query().Get("deployment"),
+		Environment: storage.CanonicalKey(r.URL.Query().Get("environment")),
+		Deployment:  storage.CanonicalKey(r.URL.Query().Get("deployment")),
 	}
 	if failuresOnly {
 		filter.States = []string{state.Apply.Failed, state.Apply.FailedRetryable}

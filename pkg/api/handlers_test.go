@@ -224,10 +224,17 @@ func (s *staticApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
 func (s *staticApplyStore) SetRevertSkipped(context.Context, int64, time.Time) error {
 	return nil
 }
+
+// GetByDatabase folds its arguments the way the real store does, so a test
+// that reaches it with a non-canonical spelling matches the fixture rows and
+// only the handler's own folding is under test.
 func (s *staticApplyStore) GetByDatabase(_ context.Context, database, dbType, environment string) ([]*storage.Apply, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
+	database = storage.CanonicalKey(database)
+	dbType = storage.CanonicalKey(dbType)
+	environment = storage.CanonicalKey(environment)
 	if len(s.applies) > 0 {
 		var applies []*storage.Apply
 		for _, apply := range s.applies {
