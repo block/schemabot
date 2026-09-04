@@ -24,6 +24,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
@@ -1583,8 +1584,10 @@ func TestEngine_Progress_FailingApplyNeverReportsCompleted(t *testing.T) {
 	result, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
 	require.NoError(t, err, "Progress()")
 	assert.Equal(t, engine.StateFailed, result.State)
-	assert.Contains(t, result.ErrorMessage, "schema change failed")
-	assert.Contains(t, result.ErrorMessage, "nonexistent_column")
+	// The target says which column is missing by quoting the statement, and
+	// what reaches the pull request is SchemaBot's account of the error code.
+	assert.Equal(t, mysqlerr.ReasonFromText("(errno 1091)"), result.ErrorMessage)
+	assert.NotContains(t, result.ErrorMessage, "nonexistent_column")
 	assert.True(t, result.Retryable)
 }
 
