@@ -36,7 +36,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 	// Basic types
 	case templates.PreviewPlan, templates.PreviewProgress, templates.PreviewWaitingForDeploy, templates.PreviewWaitingForCutover,
 		templates.PreviewCuttingOver, templates.PreviewCompleted, templates.PreviewFailed,
-		templates.PreviewUnsettledTask, templates.PreviewStopped, templates.PreviewStates:
+		templates.PreviewStopped, templates.PreviewStates:
 		templates.PreviewCLIOutput(previewType)
 	// Lock types
 	case templates.PreviewLockAcquired, templates.PreviewLockConflict,

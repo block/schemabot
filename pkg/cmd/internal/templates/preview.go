@@ -27,7 +27,6 @@ const (
 	PreviewCuttingOver       PreviewType = "cutting_over"
 	PreviewCompleted         PreviewType = "completed"
 	PreviewFailed            PreviewType = "failed"
-	PreviewUnsettledTask     PreviewType = "unsettled_task"
 	PreviewStopped           PreviewType = "stopped"
 	PreviewStates            PreviewType = "states"
 	PreviewLockAcquired      PreviewType = "lock_acquired"

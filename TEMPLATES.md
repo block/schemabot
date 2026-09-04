@@ -7854,51 +7854,6 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 </details>
 
 <details>
-<summary><a name="halt-on-failure-while-a-deployment-is-still-copying"></a><strong>Halt On Failure While A Deployment Is Still Copying</strong></summary>
-
-```
-
-┌───────────────────────────────────────────────────────┐
-│  Apply ID:     apply-multi-a1b2c3d4                   │
-│  Environment:  production                             │
-│  State:        failed                                 │
-│  Caller:       github:octocat                         │
-│  Source:       https://github.com/acme/shop/pull/412  │
-│  Started:      Jan 15 14:22:00 UTC                    │
-│  Duration:     8m                                     │
-│  Deployments:  2 running · 1 failed                   │
-└───────────────────────────────────────────────────────┘
-
-  ❌ First failure: eu-west — duplicate key name 'idx_orders_source'
-
-  Next: review failure in eu-west
-
-🔄 us-east — running table copy (orders-us-east)
-
-     ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 39.34%
-       ALTER TABLE `orders` ADD INDEX `idx_orders_source`(`source`);
-       • Rows: 156,342 / 397,453
-
-
-❌ eu-west — failed (orders-eu-west)
-  duplicate key name 'idx_orders_source'
-
-     ~ orders: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
-       ALTER TABLE `orders` ADD INDEX `idx_orders_source`(`source`);
-
-
-🔄 ap-south — running table copy (orders-ap-south)
-
-     ~ orders: 🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 14.94%
-       ALTER TABLE `orders` ADD INDEX `idx_orders_source`(`source`);
-       • Rows: 9,120 / 61,044
-
-
-
-```
-</details>
-
-<details>
 <summary><a name="all-deployments-completed"></a><strong>All Deployments Completed</strong></summary>
 
 ```
