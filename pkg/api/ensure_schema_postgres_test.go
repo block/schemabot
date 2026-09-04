@@ -97,7 +97,7 @@ func TestPostgresManualRemediation(t *testing.T) {
 		},
 		"settings": {
 			{operation: "add_column", object: "setting_value", manualReason: "definition is NOT NULL without a DEFAULT; add it manually or ship the column with a DEFAULT"},
-			{operation: "create_index", object: "idx_settings_setting_key", manualReason: "live index is non-unique where the embedded schema requires a unique index; replace it manually"},
+			{operation: "create_index", object: "idx_settings_setting_key", manualReason: "live state is non-unique where the embedded schema requires a unique index; replace it manually"},
 		},
 	}
 	err := postgresManualRemediation(tables, mixed)
@@ -105,7 +105,7 @@ func TestPostgresManualRemediation(t *testing.T) {
 	assert.Contains(t, err.Error(), `storage table "applies" is missing column "lock_id"`)
 	assert.Contains(t, err.Error(), `storage table "settings" is missing column "setting_value"`)
 	assert.Contains(t, err.Error(), "add it manually or ship the column with a DEFAULT")
-	assert.Contains(t, err.Error(), `storage table "settings" has index "idx_settings_setting_key" whose live index is non-unique`)
+	assert.Contains(t, err.Error(), `storage table "settings" has index "idx_settings_setting_key" whose live state is non-unique`)
 }
 
 // A live index satisfies an expectation only when PostgreSQL can use it: an
@@ -122,9 +122,9 @@ func TestPostgresLiveIndexManualReason(t *testing.T) {
 	assert.Empty(t, postgresLiveIndexManualReason(nonUnique, postgresLiveIndex{unique: false, valid: true}))
 	assert.Empty(t, postgresLiveIndexManualReason(nonUnique, postgresLiveIndex{unique: true, valid: true}))
 
-	assert.Contains(t, postgresLiveIndexManualReason(unique, postgresLiveIndex{unique: false, valid: true}), "live index is non-unique")
-	assert.Contains(t, postgresLiveIndexManualReason(unique, postgresLiveIndex{unique: true, valid: false}), "live index is invalid")
-	assert.Contains(t, postgresLiveIndexManualReason(nonUnique, postgresLiveIndex{unique: false, valid: false}), "live index is invalid")
+	assert.Contains(t, postgresLiveIndexManualReason(unique, postgresLiveIndex{unique: false, valid: true}), "live state is non-unique")
+	assert.Contains(t, postgresLiveIndexManualReason(unique, postgresLiveIndex{unique: true, valid: false}), "live state is invalid")
+	assert.Contains(t, postgresLiveIndexManualReason(nonUnique, postgresLiveIndex{unique: false, valid: false}), "live state is invalid")
 }
 
 // The expectations parser fails closed on schema-file statements the additive

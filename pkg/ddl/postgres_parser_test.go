@@ -581,6 +581,8 @@ func TestPostgresCostScalesWithTableSize(t *testing.T) {
 		{"add column with volatile default", `ALTER TABLE mutes ADD COLUMN token uuid DEFAULT gen_random_uuid()`, true},
 		{"add column with inline unique", `ALTER TABLE mutes ADD COLUMN slug varchar(64) UNIQUE`, true},
 		{"add generated column", `ALTER TABLE mutes ADD COLUMN total int GENERATED ALWAYS AS (a + b) STORED`, true},
+		{"add column references with default", `ALTER TABLE mutes ADD COLUMN parent_id bigint DEFAULT 1 REFERENCES parents (id)`, true},
+		{"add column references without default", `ALTER TABLE mutes ADD COLUMN parent_id bigint REFERENCES parents (id)`, false},
 		{"add foreign key not valid", `ALTER TABLE mutes ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users (id) NOT VALID`, false},
 		{"add check constraint not valid", `ALTER TABLE mutes ADD CONSTRAINT chk_positive CHECK (count > 0) NOT VALID`, false},
 		{"add column only", `ALTER TABLE mutes ADD COLUMN reason varchar(255)`, false},

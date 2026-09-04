@@ -83,6 +83,12 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Lock
 		logger.Info("storage schema up-to-date", "database", database)
 		return nil
 	}
+	// Refuse manual-remediation drift before the lock: the decision is a pure
+	// function of the scan, and a pod that will fail anyway must not promise
+	// convergence in its last pre-lock log lines or queue behind the lock.
+	if err := postgresManualRemediation(tables, drift); err != nil {
+		return err
+	}
 	// Log what the fast-path scan found before parking on the lock, so the
 	// last pre-lock line names the work this pod is waiting to do.
 	for _, table := range tables {
@@ -309,17 +315,24 @@ func postgresSchemaDriftFor(ctx context.Context, db *sql.DB, tables []string, fi
 // postgresLiveIndexManualReason reports why the live index under an expected
 // index's name cannot satisfy that expectation, or "" when it does. A live
 // index satisfies a non-unique expectation under either uniqueness, since a
-// unique index answers the same reads. Only a valid index counts: PostgreSQL
-// leaves an invalid index behind when CREATE INDEX CONCURRENTLY fails, the
-// planner never uses one, and it may not cover every existing row, so its
+// unique index answers the same reads. Only a valid index counts: the planner
+// never uses an invalid index and it may not cover every existing row, so its
 // presence says nothing about the reads or the uniqueness the embedded schema
 // relies on.
+//
+// The catalog cannot tell a failed CREATE INDEX CONCURRENTLY from one that is
+// still building — both are indisvalid=false with no discriminating flag — so
+// the reason sends the operator to pg_stat_progress_create_index before it
+// names any statement to run, and names the cause that makes both recoveries
+// fail again (duplicate keys under a unique build). Each reason starts with a
+// possessed noun so postgresManualProblem's "has index %q whose ..." template
+// reads as a sentence.
 func postgresLiveIndexManualReason(expected postgresIndexExpectation, live postgresLiveIndex) string {
 	if !live.valid {
-		return "live index is invalid — a CREATE INDEX CONCURRENTLY that did not complete leaves an unusable index under the expected name; DROP INDEX it so startup recreates it, or REINDEX INDEX CONCURRENTLY it manually"
+		return "live state is invalid — PostgreSQL marks an index invalid both while a CREATE INDEX CONCURRENTLY is still building it and after one fails part-way; check pg_stat_progress_create_index for a live build on it before any recovery, and when none is running remove the cause first (a unique build keeps failing while duplicate keys remain), then DROP INDEX it so startup recreates it or REINDEX INDEX CONCURRENTLY it manually"
 	}
 	if expected.unique && !live.unique {
-		return "live index is non-unique where the embedded schema requires a unique index; replace it manually"
+		return "live state is non-unique where the embedded schema requires a unique index; replace it manually"
 	}
 	return ""
 }
@@ -407,15 +420,22 @@ func verifyPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []string,
 		if err != nil {
 			return err
 		}
+		// Each unsatisfied expectation carries its own cause: an absent index
+		// and a present-but-unusable one need different operator action, and
+		// this error is the only thing the crashloop shows.
 		var unsatisfied []string
 		for _, index := range expected.indexes {
 			live, present := existingIndexes[index.name]
-			if !present || postgresLiveIndexManualReason(index, live) != "" {
-				unsatisfied = append(unsatisfied, index.name)
+			if !present {
+				unsatisfied = append(unsatisfied, index.name+" (missing)")
+				continue
+			}
+			if reason := postgresLiveIndexManualReason(index, live); reason != "" {
+				unsatisfied = append(unsatisfied, fmt.Sprintf("%s (%s)", index.name, reason))
 			}
 		}
 		if len(unsatisfied) > 0 {
-			return fmt.Errorf("storage table %q is missing expected valid indexes: %s", table, strings.Join(unsatisfied, ", "))
+			return fmt.Errorf("storage table %q has expected indexes that are missing, invalid, or mismatched: %s", table, strings.Join(unsatisfied, "; "))
 		}
 	}
 	return nil

@@ -226,7 +226,7 @@ func PostgresAddColumnManualReason(createTableDDL, columnName string) (string, e
 		return "definition has a DEFAULT expression whose volatility cannot be proven from the statement alone, and a volatile default rewrites the whole table under an exclusive lock; add it manually or ship the column with a constant DEFAULT", nil
 	}
 	if foreignKey && hasDefault {
-		return "definition is a FOREIGN KEY with a DEFAULT, which validates every existing row against the referenced table under an exclusive lock; add it manually or ship the column without a DEFAULT", nil
+		return "definition is a FOREIGN KEY with a DEFAULT, which validates every existing row against the referenced table under an exclusive lock; add it manually or ship the column nullable with no DEFAULT (the reference alone is metadata-only)", nil
 	}
 	if notNull && !hasDefault {
 		return "definition is NOT NULL without a DEFAULT; add it manually or ship the column with a DEFAULT", nil
@@ -343,23 +343,32 @@ func alterCmdScalesWithTableSize(cmd *pgproto.AlterTableCmd) bool {
 
 // addColumnScalesWithTableSize reports whether adding this column forces a
 // table rewrite or scan: an inline PRIMARY KEY or UNIQUE builds an index, a
-// generated or identity column is computed for every existing row, and a
-// non-constant DEFAULT is evaluated per row. A plain column with no DEFAULT
-// (or a constant one) is metadata-only.
+// generated or identity column is computed for every existing row, a
+// non-constant DEFAULT is evaluated per row, and a REFERENCES column with a
+// DEFAULT validates every existing row against the referenced table. A plain
+// column with no DEFAULT (or a constant one), including a nullable REFERENCES
+// column without one, is metadata-only.
 func addColumnScalesWithTableSize(col *pgproto.ColumnDef) bool {
+	var foreignKey, hasDefault bool
 	for _, c := range col.GetConstraints() {
 		constraint := c.GetConstraint()
-		switch constraint.GetContype() { //nolint:exhaustive
+		switch constraint.GetContype() {
 		case pgproto.ConstrType_CONSTR_PRIMARY, pgproto.ConstrType_CONSTR_UNIQUE,
 			pgproto.ConstrType_CONSTR_GENERATED, pgproto.ConstrType_CONSTR_IDENTITY:
 			return true
 		case pgproto.ConstrType_CONSTR_DEFAULT:
+			hasDefault = true
 			if !isConstantExpr(constraint.GetRawExpr()) {
 				return true
 			}
+		case pgproto.ConstrType_CONSTR_FOREIGN:
+			foreignKey = true
+		default:
+			// NOT NULL, NULL, CHECK, and the remaining shapes do not scan the
+			// table on their own when the column is new.
 		}
 	}
-	return false
+	return foreignKey && hasDefault
 }
 
 // isConstantExpr reports whether a default-value expression is a bare

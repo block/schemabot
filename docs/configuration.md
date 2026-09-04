@@ -863,16 +863,20 @@ on the storage dialect:
   additive DDL cannot be parsed or executed, or when re-verification finds
   unresolved drift.
 
-  A live index only counts as present when PostgreSQL reports it valid. A
-  `CREATE INDEX CONCURRENTLY` that fails part-way — a unique build that hits
-  duplicate keys, a cancelled session — leaves an invalid index under the
-  expected name that the planner never uses. Startup fails closed naming that
-  index rather than reading it as converged or colliding with it on a fresh
-  `CREATE INDEX`; drop it so the next startup recreates it, or
-  `REINDEX INDEX CONCURRENTLY` it by hand. A non-unique index under a name
-  the embedded schema requires to be unique fails startup the same way. Every
-  such problem across every table is named in the one startup error, and no
-  DDL runs until all of them are resolved.
+  A live index only counts as present when PostgreSQL reports it valid.
+  PostgreSQL marks an index invalid both while a `CREATE INDEX CONCURRENTLY`
+  is still building it and after one fails part-way — a unique build that
+  hits duplicate keys, a cancelled session — and the catalog does not
+  distinguish the two; in either case the planner never uses it. Startup
+  fails closed naming that index rather than reading it as converged or
+  colliding with it on a fresh `CREATE INDEX`. Before recovering, check
+  `pg_stat_progress_create_index` for a build still running on it; if one
+  is, let it finish. Otherwise remove the cause first — a unique build keeps
+  failing while duplicate keys remain — then drop the index so the next
+  startup recreates it, or `REINDEX INDEX CONCURRENTLY` it by hand. A
+  non-unique index under a name the embedded schema requires to be unique
+  fails startup the same way. Every such problem across every table is named
+  in the one startup error, and no DDL runs until all of them are resolved.
 
   Convergence is additive-only: extra columns and indexes remain in place for
   binary rollback, and `allow_destructive_schema_changes` has no effect because

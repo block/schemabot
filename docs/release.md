@@ -258,11 +258,14 @@ still starts, running against a database where the drop never happened, so the
 code in that release has to tolerate the old shape too.
 
 Diff the embedded schema files. On MySQL, additive changes need no action. On
-PostgreSQL, only new tables land automatically: a new column on an existing
-table fails startup until an operator creates it by hand, and a new non-unique
-index is only warned about at startup, so both belong in the release notes
-with their statements (see
-[configuration.md](./configuration.md)). A destructive
+PostgreSQL, new tables, metadata-only columns, and standalone indexes land
+automatically. A new index builds as a plain `CREATE INDEX` under the startup
+budget, so on a deployment with a long history it belongs in the release notes
+with its statement so operators can pre-create it. A new column whose shape
+needs manual remediation — `NOT NULL` without a `DEFAULT`, generated or
+identity, `UNIQUE`, `REFERENCES` with a `DEFAULT` — fails startup until an
+operator creates it by hand, so it always belongs in the release notes with its
+statement (see [configuration.md](./configuration.md)). A destructive
 change is a coordinated operation and belongs in the release notes with
 instructions, not in a routine patch release.
 

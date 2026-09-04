@@ -204,7 +204,7 @@ func TestEnsureSchemaPostgres_RejectsNonUniqueIndexWhereUniqueRequired(t *testin
 	require.NoError(t, err)
 
 	err = EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres))
-	require.ErrorContains(t, err, `storage table "settings" has index "idx_settings_setting_key" whose live index is non-unique where the embedded schema requires a unique index`)
+	require.ErrorContains(t, err, `storage table "settings" has index "idx_settings_setting_key" whose live state is non-unique where the embedded schema requires a unique index`)
 	require.ErrorContains(t, err, "replace it manually")
 	require.ErrorContains(t, err, `storage table "settings" is missing column "setting_value"`)
 
@@ -237,12 +237,48 @@ func TestEnsureSchemaPostgres_RejectsInvalidIndex(t *testing.T) {
 	require.Equal(t, postgresLiveIndex{unique: true, valid: false}, indexes["idx_settings_setting_key"])
 
 	err = EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres))
-	require.ErrorContains(t, err, `storage table "settings" has index "idx_settings_setting_key" whose live index is invalid`)
+	require.ErrorContains(t, err, `storage table "settings" has index "idx_settings_setting_key" whose live state is invalid`)
 	require.ErrorContains(t, err, "DROP INDEX it so startup recreates it")
 
 	indexes, err = postgresTableIndexes(ctx, db, "settings")
 	require.NoError(t, err)
 	assert.Equal(t, postgresLiveIndex{unique: true, valid: false}, indexes["idx_settings_setting_key"], "startup must leave the invalid index for the operator")
+}
+
+// The post-convergence shape check is the last line before the server takes
+// traffic, so every expected index it cannot accept is named with its cause:
+// an absent index, a non-unique index where the schema requires uniqueness,
+// and an invalid index each read differently to the operator recovering the
+// crashloop, and a healthy database passes.
+func TestVerifyPostgresSchemaShape_ReportsUnsatisfiedIndexes(t *testing.T) {
+	ctx := t.Context()
+	dsn, db := startPostgresStorage(t)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	tables, files, err := readEmbeddedPostgresSchemaFiles()
+	require.NoError(t, err)
+	require.NoError(t, verifyPostgresSchemaShape(ctx, db, tables, files))
+
+	_, err = db.ExecContext(ctx, "DROP INDEX idx_settings_setting_key")
+	require.NoError(t, err)
+	err = verifyPostgresSchemaShape(ctx, db, tables, files)
+	require.ErrorContains(t, err, `storage table "settings" has expected indexes that are missing, invalid, or mismatched: idx_settings_setting_key (missing)`)
+
+	_, err = db.ExecContext(ctx, "CREATE INDEX idx_settings_setting_key ON settings (setting_key)")
+	require.NoError(t, err)
+	err = verifyPostgresSchemaShape(ctx, db, tables, files)
+	require.ErrorContains(t, err, `storage table "settings" has expected indexes that are missing, invalid, or mismatched: idx_settings_setting_key (live state is non-unique where the embedded schema requires a unique index`)
+
+	_, err = db.ExecContext(ctx, "DROP INDEX idx_settings_setting_key")
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "INSERT INTO settings (setting_key, setting_value) VALUES ('dup', 'a'), ('dup', 'b')")
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "CREATE UNIQUE INDEX CONCURRENTLY idx_settings_setting_key ON settings (setting_key)")
+	require.Error(t, err)
+	err = verifyPostgresSchemaShape(ctx, db, tables, files)
+	require.ErrorContains(t, err, `storage table "settings" has expected indexes that are missing, invalid, or mismatched: idx_settings_setting_key (live state is invalid`)
+	require.ErrorContains(t, err, "pg_stat_progress_create_index")
 }
 
 // A storage database missing a subset of tables converges back to the full
