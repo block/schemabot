@@ -87,18 +87,21 @@ func (postgresStatementParser) Classify(stmt string) (StatementType, string, err
 	return stmtType, table, nil
 }
 
-// createSetRelation returns the schema-qualified identity of the relation
-// targeted by a CREATE TABLE or CREATE INDEX statement. Keeping this narrower
-// than Classify preserves its established bare-table-name contract for other
-// consumers while making create-set comparison schema-aware.
-func (postgresStatementParser) createSetRelation(stmt string) (string, error) {
+// createSetRelation returns the identity of the relation targeted by a CREATE
+// TABLE or CREATE INDEX statement as the parsed (schema, name) pair. Keeping
+// this narrower than Classify preserves its established bare-table-name
+// contract for other consumers while making create-set comparison
+// schema-aware. The schema is reported exactly as written: an unqualified name
+// is not resolved against a search_path, because the parser has no session to
+// resolve it against.
+func (postgresStatementParser) createSetRelation(stmt string) (relationIdentity, error) {
 	result, err := pgquery.Parse(stmt)
 	if err != nil {
-		return "", fmt.Errorf("parse create-set statement %q: %w", statementPreview(stmt), err)
+		return relationIdentity{}, fmt.Errorf("parse create-set statement %q: %w", statementPreview(stmt), err)
 	}
 	stmts := result.GetStmts()
 	if len(stmts) != 1 {
-		return "", fmt.Errorf("expected one create-set statement, got %d", len(stmts))
+		return relationIdentity{}, fmt.Errorf("expected one create-set statement, got %d", len(stmts))
 	}
 	var relation *pgproto.RangeVar
 	switch node := stmts[0].GetStmt().GetNode().(type) {
@@ -107,12 +110,9 @@ func (postgresStatementParser) createSetRelation(stmt string) (string, error) {
 	case *pgproto.Node_IndexStmt:
 		relation = node.IndexStmt.GetRelation()
 	default:
-		return "", fmt.Errorf("expected CREATE TABLE or CREATE INDEX statement")
+		return relationIdentity{}, fmt.Errorf("expected CREATE TABLE or CREATE INDEX statement")
 	}
-	if relation.GetSchemaname() == "" {
-		return relation.GetRelname(), nil
-	}
-	return relation.GetSchemaname() + "." + relation.GetRelname(), nil
+	return relationIdentity{Schema: relation.GetSchemaname(), Name: relation.GetRelname()}, nil
 }
 
 // CreateTableColumns implements StatementParser using the parsed CREATE TABLE
