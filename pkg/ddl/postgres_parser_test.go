@@ -155,6 +155,12 @@ func TestCreateSetStatements(t *testing.T) {
 			wantErrMsg: `statement 2 creates an index on "a"."t" while CREATE TABLE targets "a.t"`,
 		},
 		{
+			name:       "a dot inside a qualified name is not a schema boundary",
+			parser:     postgresParser,
+			script:     `CREATE TABLE a."b.t" (id bigint); CREATE INDEX i ON "a.b".t (id);`,
+			wantErrMsg: `statement 2 creates an index on table "a.b"."t", not CREATE TABLE target "a"."b.t"`,
+		},
+		{
 			name:       "alter follows create table",
 			parser:     postgresParser,
 			script:     "CREATE TABLE t (id bigint); ALTER TABLE t ADD COLUMN v text;",

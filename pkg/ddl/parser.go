@@ -112,6 +112,18 @@ type CreateSet struct {
 	Table      string
 }
 
+// StatementType reports the type of Statements[i] as ParseCreateSet admitted
+// it: a lone statement carries its own classification, and every statement
+// after the first in a multi-statement set is a CREATE INDEX, because
+// admission refuses any other shape. Callers read the type from here instead
+// of classifying the statement again.
+func (s CreateSet) StatementType(i int) StatementType {
+	if i == 0 {
+		return s.Type
+	}
+	return StatementCreateIndex
+}
+
 // ParseCreateSet splits and classifies a DDL script, admitting either one
 // statement or a greenfield create set: one CREATE TABLE followed only by
 // CREATE INDEX statements on that same table.
