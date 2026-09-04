@@ -43,7 +43,7 @@ engines gain features. If the two ever disagree, invariants.md is the one that h
 | **Deferred cutover** | yes | yes | planned |
 | **`cancel`** | yes | yes | planned |
 | **`revert` / `skip-revert`** | no | yes | no |
-| **Throttling** | automatic, on live target signals | a configured threshold that admits or rejects | planned; statements bounded meanwhile |
+| **Throttling** | automatic, on live target signals | a threshold that admits or rejects, adjustable mid-flight | planned; statements bounded meanwhile |
 | **Adaptive pacing** | yes | no | not applicable, no copy to pace |
 | **Dropped-table recovery** | opt-in quarantine, expires | inside the revert window, expires | not applicable, a drop is blocked at plan time |
 | **Who reports progress** | the process running the change | the cluster, so any instance can read it | the process running the change |
@@ -183,9 +183,14 @@ than a dial to optimize, and steering on it would leave replicas permanently beh
 **PlanetScale's throttle works differently, not just less automatically.** It is a threshold the
 copy is checked against, and the check either admits the work or rejects it. A deploy request
 under it is held off and then runs at full speed again, where Spirit would slow down and speed up.
-The threshold belongs to the cluster, an operator sets it ahead of time, and it governs a deploy
-request the same way it governs the cluster's other background work. SchemaBot does not adjust it,
-and there is nothing to tune per apply. PlanetScale documents the controls in
+Part of that threshold belongs to the cluster and governs a deploy request the same way it governs
+the cluster's other background work.
+
+A running deploy request also carries its own throttle ratio, and an operator can change it while
+the copy is in flight to hold the change back further or let it run. That is the lever to reach
+for when a deploy request is competing with live traffic. It is set through PlanetScale rather
+than through SchemaBot, which has no control operation for it; SchemaBot reads the resulting
+throttle state and reports it, and never sets it. PlanetScale documents the controls in
 [Throttling deploy requests](https://planetscale.com/docs/vitess/schema-changes/throttling-deploy-requests).
 
 **pg-sprite does not throttle yet.** It is planned. Until it lands, each statement gets a lock
