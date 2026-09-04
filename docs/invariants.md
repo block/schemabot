@@ -19,6 +19,7 @@
   - [AV-7: An acknowledged delivery is a promise](#av-7-an-acknowledged-delivery-is-a-promise)
   - [AV-8: Untrusted text never reaches operator surfaces raw](#av-8-untrusted-text-never-reaches-operator-surfaces-raw)
   - [AV-9: SchemaBot never destroys its own storage to start](#av-9-schemabot-never-destroys-its-own-storage-to-start)
+  - [AV-10: Anything the PR can do, the CLI can do](#av-10-anything-the-pr-can-do-the-cli-can-do)
 - [Merge gate (MG)](#merge-gate-mg)
   - [MG-1: Uncertainty is never converted into a passing check](#mg-1-uncertainty-is-never-converted-into-a-passing-check)
   - [MG-2: Absence never passes](#mg-2-absence-never-passes)
@@ -272,8 +273,9 @@ Full model: [storage-outage-behavior.md](storage-outage-behavior.md).
 GitHub is an interface to SchemaBot, not a dependency of it. CLI and API applies work when GitHub
 is down, a data plane never needs a GitHub App, and the observer side effects that do touch GitHub
 (PR comments, progress edits) are best-effort: a failure is logged and never blocks or fails the
-change. *Enforced:* the comment observer (`pkg/webhook/comment_observer.go`); a data plane's
-config carries no GitHub credentials (`deploy/local/config/grpc-tern.yaml` is a working example).
+change. AV-10 is the other half: what the interface you fall back to can actually do. *Enforced:*
+the comment observer (`pkg/webhook/comment_observer.go`); a data plane's config carries no GitHub
+credentials (`deploy/local/config/grpc-tern.yaml` is a working example).
 
 ### AV-2: Outages degrade, never destroy
 
@@ -385,6 +387,33 @@ manual remediation aborts the pass rather than leaving storage half-converged. *
 violated:* the first instance of a rolling deploy drops state the rest of the fleet is still
 reading. *Enforced:* the per-dialect bootstrappers (`pkg/api/ensure_schema.go`,
 `pkg/api/ensure_schema_postgres.go`).
+
+### AV-10: Anything the PR can do, the CLI can do
+
+AV-1 says a schema change does not need GitHub. This is the half that makes that useful: there is
+somewhere else to go. Every command a PR comment accepts has a CLI equivalent, so an operator
+whose PR surface is unavailable, or who is mid-incident and does not want to work through one, is
+never stuck waiting on it. Plan and apply, the destructive-change confirmation, stop, start,
+cancel, cutover, revert, skip-revert, release, rollback, unlock: all of it is reachable from a
+terminal. The CLI is the fallback path, and a fallback that covers most of the surface is not a
+fallback.
+
+This holds because neither surface is privileged. A PR comment and a CLI invocation converge on
+the same service methods, one called in process by the webhook handler and one reached over HTTP,
+so the PR path has no capability the API lacks and cannot acquire one. Nothing about a command's
+behavior depends on which surface asked for it: the same durability (CO-1), the same resolution
+(CO-2), the same authorization.
+
+Two things this deliberately does not say. It is not symmetric: the CLI does considerably more
+than the PR surface, including everything an operator needs for triage and onboarding, and none
+of that is expected to appear in a comment. And parity is of capability rather than of spelling.
+The PR's two-step consent for a destructive change is a confirmation flag on the CLI, and the
+paths differ in shape wherever a conversation and a terminal genuinely differ. What is fixed is
+that no ability lives on only one of them. Nor is the CLI a way around a gate: an apply still
+requires an authorized actor (AZ-4) and a verified identity (AZ-3), and reaching for the terminal
+changes who is asking, never what they are allowed to do. *Enforced:* the shared `Execute*`
+service methods behind both surfaces (`pkg/api/plan_handlers.go`, `pkg/api/control_handlers.go`),
+called by the comment-command dispatcher (`pkg/webhook`) and by the HTTP routes the CLI uses.
 
 ## Merge gate (MG)
 
