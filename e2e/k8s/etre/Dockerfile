@@ -5,9 +5,7 @@
 # server config is mounted from a ConfigMap at runtime rather than baked in, so
 # the same image works for any datasource.
 #
-# The Alpine CDN intermittently answers "temporary error (try again later)" and a
-# single failed fetch takes the whole e2e job with it, so each apk add retries
-# with backoff instead of failing on the first miss.
+# Each apk add is retried with backoff; deploy/Dockerfile explains why.
 FROM golang:1.26.3-alpine AS builder
 WORKDIR /app
 RUN for attempt in 1 2 3 4 5; do \

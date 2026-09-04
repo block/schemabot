@@ -1,6 +1,5 @@
 FROM alpine:3.19
-# The Alpine CDN intermittently answers "temporary error (try again later)" and a
-# single failed fetch takes the whole e2e job with it; retry with backoff instead.
+# Retried with backoff; deploy/Dockerfile explains why.
 RUN for attempt in 1 2 3 4 5; do \
         apk add --no-cache ca-certificates && break; \
         echo "apk add ca-certificates failed (attempt ${attempt}/5)" >&2; \
