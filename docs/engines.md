@@ -5,7 +5,14 @@
 ## Table of Contents
 
 - [Capability matrix](#capability-matrix)
+- [What the terms mean](#what-the-terms-mean)
 - [Why the differences exist](#why-the-differences-exist)
+  - [The cheap native path](#the-cheap-native-path)
+  - [Copy and swap](#copy-and-swap)
+  - [Pausing](#pausing)
+  - [The revert window](#the-revert-window)
+  - [Direct execution](#direct-execution)
+  - [PostgreSQL today](#postgresql-today)
 - [What GA and early alpha mean](#what-ga-and-early-alpha-mean)
 - [Load management](#load-management)
 - [Dropped tables](#dropped-tables)
@@ -73,15 +80,72 @@ keeps a narrower engine a safe one.
 `cancel`, which ends the change for good, and the apply settles as cancelled so the operator is
 never told it was paused. The next section covers why.
 
+## What the terms mean
+
+Every row of the matrix, in a line each.
+
+| Term | Meaning |
+|---|---|
+| **Instant DDL** | A change the database makes by editing metadata alone, without touching the rows. Done in milliseconds, with no copy and nothing to control while it runs. |
+| **Copy and swap** | Building a new version of the table, backfilling it, keeping it in step with ongoing writes, and swapping it in. Also called online DDL. It is what lets a large table change without a long lock. |
+| **Cutover** | The swap itself: the moment the new table starts taking traffic. |
+| **Deferred cutover** | Holding a finished copy at that point until an operator asks for the swap, instead of swapping as soon as the copy is ready. |
+| **Revert window** | A period after cutover in which the original table still exists, so the change can be undone. |
+| **Direct execution** | Running a statement as ordinary DDL against the database, with no copy. Quick, and it holds a lock for as long as it takes. |
+| **Throttling** | Holding the copy back while the database is under pressure. |
+| **Adaptive pacing** | Continuously adjusting how hard the copy pushes based on how the database is responding, rather than only starting and stopping it. |
+| **Quarantine** | Renaming a dropped table aside and keeping it for a while instead of dropping it outright. |
+
+A copy runs long enough to be worth steering, which is what the control operations are for. Here is
+where each one acts:
+
+```
+                    stop                      cutover           revert
+                   (start                    (deferred          skip-revert
+                   resumes)                   only)
+                      |                          |                  |
+                      v                          v                  v
+   plan ---> [ copying rows ] ---> [ waiting ] ---> swap ---> [ revert window ] ---> done
+                      |
+                      +--- cancel ends the change outright, from anywhere before the swap
+```
+
+| | Does |
+|---|---|
+| `stop` | Pause the change, keeping the work done so far. |
+| `start` | Resume a stopped change from where it left off. |
+| `cancel` | End the change for good. Nothing resumes it. |
+| `cutover` | Trigger the swap for a change held at a deferred cutover. |
+| `revert` | Undo a completed change while its revert window is open, putting the original table back. |
+| `skip-revert` | Close the revert window early and finalize the change. |
+| `release` | Let a multi-deployment rollout continue after it paused on a failure. |
+
+Not every engine has every phase, which is what the matrix above is for: a change with no copy
+never reaches most of that line, and only Vitess holds a revert window at the end of it.
+
+`rollback` is deliberately not in the table. It is a fresh plan and apply that returns the schema
+to an earlier state, so it happens after a change is over rather than to one that is running.
+`revert` is the in-flight counterpart, and it exists only while the window is open.
+
 ## Why the differences exist
 
 The first two rows drive most of the rest of the table, so start there.
 
-**The cheap native path comes first on every engine.** Some changes are metadata-only: adding a
-column at the end of a table does not have to touch the existing rows, so the server can make the
-change without rewriting them. When that works the change is done in milliseconds, and none of the
-control operations below apply, because there is nothing in flight to control. What differs is how
-an engine finds out whether it will work.
+```
+   ALTER TABLE ...
+        |
+        +-- metadata only? ----------> done in milliseconds, nothing to control
+        |
+        +-- needs to rewrite rows? --> copy and swap, minutes to hours, controllable
+```
+
+### The cheap native path
+
+Every engine tries this first. Some changes are metadata-only: adding a column at the end of a
+table does not have to touch the existing rows, so the server can make the change without
+rewriting them. When that works the change is done in milliseconds, and none of the control
+operations apply, because there is nothing in flight to control. What differs is how an engine
+finds out whether it will work.
 
 On MySQL the server can be asked. Spirit runs the statement with `ALGORITHM=INSTANT` and lets the
 server decide, rather than keeping a list of qualifying operations of its own, because eligibility
@@ -98,42 +162,70 @@ gets a budget rather than an exemption. Above a configured table size the attemp
 outright, before any DDL runs, since a rewrite there is likely enough that gambling is not worth
 the lock. That refusal becomes the routing signal into copy and swap when pg-sprite gains it.
 
-**Online DDL, or copy and swap,** is what happens when the cheap path is not possible. The engine
-builds a new table, backfills it, keeps it in sync with ongoing writes, and swaps it in. That is
-what lets a large table change without a long lock, and it is why the change becomes a
-long-running process with phases: something is in flight, so there is something to pause, to slow
-down, and to cut over when you choose. Every control operation in the matrix exists because of it.
+### Copy and swap
 
-What drives the copy decides who can report on it. A Spirit copy is driven by the process holding
-the apply, so only that process knows how far along it is, and if it dies its replacement picks up
-from a checkpoint. A deploy request outlives the process that submitted it, and any instance can
-ask the cluster for its progress and get the same answer.
+This is what happens when the cheap path is not possible. The engine builds a new table, backfills
+it, keeps it in sync with ongoing writes, and swaps it in. That is what lets a large table change
+without a long lock, and it is why the change becomes a long-running process with phases:
+something is in flight, so there is something to pause, to slow down, and to cut over when you
+choose. Every control operation in the matrix exists because of it.
 
-**Pausing is an engine capability.** `stop` and `start` are ordinary control operations, no more
-tied to one database technology than `cancel` is. What varies is whether the engine behind them
-can suspend a change and pick it back up. Spirit can: a stop checkpoints the copy and settles the
-apply as stopped, and `start` resumes from that checkpoint. The PlanetScale engine cannot, because
-a deploy request runs or it ends. So there the way to take the load off a database is `cancel`,
-which ends the change for good. Asking for a stop gets you that cancel rather than a refusal, and
-the apply settles as cancelled, so what the operator is told always matches what happened. That is
-CO-8 in [invariants.md](invariants.md).
+What drives the copy decides who can report on it:
+
+```
+   Spirit and pg-sprite                    PlanetScale
+
+   +---------------------+                 +---------------------+
+   |  SchemaBot          |                 |  SchemaBot          |
+   |   driver loop  -----|--- statements   |   watcher      -----|--- submit, then poll
+   +---------------------+           |     +---------------------+          |
+                                     v                                      v
+                              +-------------+                    +---------------------+
+                              |  database   |                    |  Vitess cluster     |
+                              +-------------+                    |   driver loop  ---+ |
+                                                                 |                   v |
+                                                                 |    +-------------+  |
+                                                                 |    |  database   |  |
+                                                                 |    +-------------+  |
+                                                                 +---------------------+
+```
+
+A Spirit copy is driven by the process holding the apply, so only that process knows how far along
+it is, and if it dies its replacement picks up from a checkpoint. A deploy request outlives the
+process that submitted it, and any instance can ask the cluster for its progress and get the same
+answer.
+
+### Pausing
+
+`stop` and `start` are ordinary control operations, no more tied to one database technology than
+`cancel` is. What varies is whether the engine behind them can suspend a change and pick it back
+up. Spirit can: a stop checkpoints the copy and settles the apply as stopped, and `start` resumes
+from that checkpoint. The PlanetScale engine cannot, because a deploy request runs or it ends. So
+there the way to take the load off a database is `cancel`, which ends the change for good. Asking
+for a stop gets you that cancel rather than a refusal, and the apply settles as cancelled, so what
+the operator is told always matches what happened. That is CO-8 in
+[invariants.md](invariants.md).
 
 `start` follows stop. On the PlanetScale engine it exists only to launch a deploy request that was
 created and deliberately left undeployed, which is how a change waits for an operator before it
 begins. It never resumes anything.
 
-The revert window is a separate decision and does not follow from where the copy ran. Both engines
-reach cutover holding two tables: the new one, about to take traffic, and the original, renamed
-aside. Spirit drops the original as soon as the swap lands, so by the time the apply reports
-success there is nothing to go back to. Vitess keeps it for a set period and offers an operation
-that swaps it back. That period is the revert window, and `skip-revert` ends it early. What
-separates the two is which table the engine chooses to keep, not where the change ran.
+### The revert window
 
-**Direct execution** is a third path on MySQL, and it is deliberately hard to turn on. Some
-statements can never run through a copy: dropping a primary key and adding a foreign key are the
-usual examples. By default they block the apply. An operator can enable a policy, per environment,
-that lets those statements run as ordinary MySQL DDL instead. The policy covers only tables under
-a configured row count, and the PR asks for a second, explicit confirmation before anything runs.
+It is a separate decision, and does not follow from where the copy ran. Both engines reach cutover
+holding two tables: the new one, about to take traffic, and the original, renamed aside. Spirit
+drops the original as soon as the swap lands, so by the time the apply reports success there is
+nothing to go back to. Vitess keeps it for a set period and offers an operation that swaps it
+back. That period is the revert window, and `skip-revert` ends it early. What separates the two is
+which table the engine chooses to keep, not where the change ran.
+
+### Direct execution
+
+This is a third path, MySQL only, and it is deliberately hard to turn on. Some statements can
+never run through a copy: dropping a primary key and adding a foreign key are the usual examples.
+By default they block the apply. An operator can enable a policy, per environment, that lets those
+statements run as ordinary MySQL DDL instead. The policy covers only tables under a configured row
+count, and the PR asks for a second, explicit confirmation before anything runs.
 
 What runs then is not an online change. It is synchronous, it blocks writes to the table for as
 long as it takes, nothing throttles it, nothing checkpoints it, and it cannot be reverted. The
@@ -142,10 +234,12 @@ hand against the database, with no plan, no audit trail, and no size limit. Vite
 design, because raw DDL sent to vtgate would bypass the online DDL machinery that engine exists to
 use. [direct-execution.md](direct-execution.md) covers the gate in full.
 
-**pg-sprite does not copy yet.** Copy and swap is on pg-sprite's roadmap, and it will arrive from
-there rather than from SchemaBot: SchemaBot executes the statement shapes the pinned pg-sprite
-supports, so its plan and apply gates widen when the pin moves. Until then, every statement runs
-as its own PostgreSQL transaction that either commits or fails.
+### PostgreSQL today
+
+pg-sprite does not copy yet. Copy and swap is on its roadmap, and it will arrive from there rather
+than from SchemaBot: SchemaBot executes the statement shapes the pinned pg-sprite supports, so its
+plan and apply gates widen when the pin moves. Until then, every statement runs as its own
+PostgreSQL transaction that either commits or fails.
 
 Most of what the PostgreSQL column is missing follows from that, rather than from anything
 permanent about the engine. The control operations arrive with the copy rather than before it,
