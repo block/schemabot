@@ -47,21 +47,23 @@ func previewCLIMultiDeploymentApplyCompleted() {
 }
 
 // previewUnsettledTaskOutput renders a rollout whose aggregate verdict has
-// settled while one deployment is still copying. Under a halt-on-failure
-// policy, eu-west failing settles the apply immediately, so us-east keeps
-// driving with no parent left to say so: the apply row is not a row its driver
-// touches, and a driver holding only an operation lease may not bump it. The
-// table is reported at the state its driver last persisted, which is also what
-// a row whose driver went away looks like until a reaper settles it.
+// settled while two of its deployments are still copying. Under a parallel
+// cutover policy every deployment copies from the start, and halt-on-failure
+// gates which deployment may be claimed rather than stopping one already in
+// flight, so eu-west failing settles the apply while its siblings drive on. The
+// apply row is not a row those drivers touch, and a driver holding only an
+// operation lease may not bump it. Each table is reported at the state its
+// driver last persisted, which is also what a row whose driver went away looks
+// like until a reaper settles it.
 func previewUnsettledTaskOutput() {
 	data := multiDeploymentProgressData([]ProgressOperation{
-		{Deployment: "us-east", Target: "orders-us-east", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
-		{Deployment: "eu-west", Target: "orders-eu-west", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt, ErrorMessage: "duplicate key name 'idx_orders_source'"},
-		{Deployment: "ap-south", Target: "orders-ap-south", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+		{Deployment: "us-east", Target: "orders-us-east", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+		{Deployment: "eu-west", Target: "orders-eu-west", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt, ErrorMessage: "duplicate key name 'idx_orders_source'"},
+		{Deployment: "ap-south", Target: "orders-ap-south", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
 	}, []TableProgress{
 		{Deployment: "us-east", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD INDEX `idx_orders_source` (`source`)", Status: state.Task.Running, RowsCopied: 156342, RowsTotal: 397453, PercentComplete: 39},
 		{Deployment: "eu-west", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD INDEX `idx_orders_source` (`source`)", Status: state.Task.Failed, RowsCopied: 0, RowsTotal: 120000, PercentComplete: 0},
-		{Deployment: "ap-south", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD INDEX `idx_orders_source` (`source`)", Status: state.Task.Pending},
+		{Deployment: "ap-south", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD INDEX `idx_orders_source` (`source`)", Status: state.Task.Running, RowsCopied: 9120, RowsTotal: 61044, PercentComplete: 14},
 	})
 	data.State = state.Apply.Failed
 	WriteProgress(data)

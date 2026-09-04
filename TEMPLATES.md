@@ -7866,7 +7866,7 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 │  Source:       https://github.com/acme/shop/pull/412  │
 │  Started:      Jan 15 14:22:00 UTC                    │
 │  Duration:     8m                                     │
-│  Deployments:  1 running · 1 halted · 1 failed        │
+│  Deployments:  2 running · 1 failed                   │
 └───────────────────────────────────────────────────────┘
 
   ❌ First failure: eu-west — duplicate key name 'idx_orders_source'
@@ -7887,10 +7887,11 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
        ALTER TABLE `orders` ADD INDEX `idx_orders_source`(`source`);
 
 
-⏸️ ap-south — halted — eu-west failed (orders-ap-south)
+🔄 ap-south — running table copy (orders-ap-south)
 
-     ~ orders: ⏳ Queued
+     ~ orders: 🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 14.94%
        ALTER TABLE `orders` ADD INDEX `idx_orders_source`(`source`);
+       • Rows: 9,120 / 61,044
 
 
 
