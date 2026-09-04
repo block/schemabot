@@ -812,24 +812,29 @@ const strandedActiveTaskReaperLockName = "schemabot_stranded_active_task_reaper"
 // that makes any of them write only on a field change breaks this window, which
 // is why they are named here rather than left to be rediscovered.
 //
-// The window is a multiple of the operator's own stall bound rather than a
-// margin over it, because the two actions are not equally recoverable. The
+// The window covers the operator's whole recovery budget rather than just its
+// stall bound, because the two actions are not equally recoverable. The
 // operator crossing that bound cancels the run so a peer can reclaim the
-// operation and finish the work. The reaper crossing it writes a terminal
-// verdict onto the row. A recoverable action may sit right on the bound; a
-// terminal one waits out a second full window, so a drive the operator would
-// have cancelled is always cancelled first and the reaper is cleaning up after
-// it rather than racing it.
+// operation and finish the work; the reaper crossing it writes a terminal
+// verdict the operator cannot undo. So the reaper waits for that recovery to
+// have played out and failed: the stall bound itself, plus a lease-staleness
+// window for the cancelled drive's lease to become re-claimable, plus a poll
+// interval for a peer to claim it. Half again the stall bound clears that
+// budget, so a drive the operator would have cancelled is always cancelled
+// first and the reaper cleans up after that path rather than racing it.
 //
-// The second window also covers the one gap in the premise: the remote sync
-// skips a stored task the remote stopped reporting, so a row can miss ticks
-// while its drive is alive. That needs a settled parent to matter at all, and
-// the doubled window puts it far outside anything a live drive produces.
+// One gap in the premise is narrowed here, not closed: the remote sync skips a
+// stored task the remote stopped reporting, so a row can miss ticks while its
+// drive is alive, and the operation watchdog reads the newest mirror across the
+// operation's tasks, so a mirroring sibling hides it from the cancel path. No
+// window length bounds that. What is left is a row the remote has gone silent
+// about for longer than the entire recovery budget, under a parent that has
+// already settled.
 //
 // All timestamps compared are database-side, so there is no clock skew to
 // absorb, and the guarded write re-asserts the window anyway: a drive that
 // mirrors the row before the write lands keeps it whatever the scan concluded.
-const strandedActiveTaskQuiescence = 2 * storage.ApplyDriveStallAfter
+const strandedActiveTaskQuiescence = 3 * storage.ApplyDriveStallAfter / 2
 
 // strandedActiveParentQuiescence is how long the parent apply must have been
 // settled before the sweep considers its task rows. It is far shorter than the
