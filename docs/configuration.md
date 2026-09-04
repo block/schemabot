@@ -358,8 +358,11 @@ Entries owned by another instance in the promotion chain (outside this instance'
 When lowercasing an existing database key, rename the server config key and
 the schema directory in lockstep. Consumer repositories' `schemabot.yaml`
 `database:` values are folded to lowercase when read, so they match the
-renamed key without a change of their own. Renaming while an apply is in
-flight is unsafe; drain all in-flight applies first.
+renamed key without a change of their own. That fold exists only on releases
+that canonicalize consumer config at ingress: while any instance in the fleet
+still runs an earlier release, keep the consumer `database:` values spelled
+exactly as the server key, or rename them in the same lockstep. Renaming while
+an apply is in flight is unsafe; drain all in-flight applies first.
 
 When upgrading to a release that folds repository identity at ingress, drain
 in-flight applies before upgrading. Rows written by earlier versions may
