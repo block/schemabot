@@ -857,12 +857,38 @@ on the storage dialect:
 - **PostgreSQL** automatically creates missing tables, columns, and standalone
   indexes. It discovers drift before taking the bootstrap advisory lock, then
   re-checks and applies each table's changes transactionally under that lock.
-  A missing `NOT NULL` column without a `DEFAULT`, a generated or identity
-  column, or a column with a constraint shape not explicitly classified as
-  safe fails startup with instructions for manual remediation. Generated and
-  identity columns rewrite the populated table under an exclusive lock.
-  Startup also fails when additive DDL cannot be parsed or executed, or when
-  re-verification finds unresolved drift.
+  A missing column converges automatically only when the `ADD COLUMN` is
+  metadata-only. A missing `NOT NULL` column without a `DEFAULT`, a generated
+  or identity column, a `UNIQUE` column, a `REFERENCES` column with a
+  `DEFAULT`, or a column with a constraint shape not explicitly classified as
+  safe fails startup with instructions for manual remediation: generated and
+  identity columns rewrite the populated table, `UNIQUE` builds a unique
+  index over it, and a foreign key with a `DEFAULT` validates every existing
+  row against the referenced table — all under an exclusive lock whose hold
+  time the startup lock timeout does not bound. Startup also fails when
+  additive DDL cannot be parsed or executed, or when re-verification finds
+  unresolved drift.
+
+  A live index only counts as present when PostgreSQL reports it valid.
+  PostgreSQL marks an index invalid both while a `CREATE INDEX CONCURRENTLY`
+  is still building it and after one fails part-way — a unique build that
+  hits duplicate keys, a cancelled session — and in either case the planner
+  never uses it. Startup fails closed naming that index rather than reading
+  it as converged or colliding with it on a fresh `CREATE INDEX`, and reads
+  `pg_stat_progress_create_index` to say which situation it is. When a build
+  is in progress — the expected state while an operator pre-creates an index
+  ahead of a release — the error says so and asks for nothing; the pod
+  restarts on its backoff and starts cleanly once the build completes. When
+  no build is visible, the error treats the index as a failed build: remove
+  the cause first — a unique build keeps failing while duplicate keys
+  remain — then drop the index so the next startup recreates it, or
+  `REINDEX INDEX CONCURRENTLY` it by hand. That view only shows other roles'
+  sessions to a caller with `pg_read_all_stats`, so if the storage role
+  lacks it and the build runs under a different role, confirm from a
+  privileged session that no build is running before recovering. A
+  non-unique index under a name the embedded schema requires to be unique
+  fails startup the same way. Every such problem across every table is named
+  in the one startup error, and no DDL runs until all of them are resolved.
 
   Convergence is additive-only: extra columns and indexes remain in place for
   binary rollback, and `allow_destructive_schema_changes` has no effect because

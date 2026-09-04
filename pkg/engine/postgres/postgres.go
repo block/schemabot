@@ -30,8 +30,10 @@ import (
 
 // Engine implements engine.Engine for PostgreSQL databases.
 type Engine struct {
-	mu sync.Mutex
-	wg sync.WaitGroup
+	mu              sync.Mutex
+	wg              sync.WaitGroup
+	pullDatabase    string
+	pullCredentials *engine.Credentials
 	// progress holds the latest state of every schema change this engine is
 	// tracking, keyed by the apply's identity (its
 	// ResumeState.MigrationContext). One engine is shared for the lifetime of a
@@ -63,6 +65,15 @@ func NewWithTableSizeLimit(tableSizeLimit int64) *Engine {
 		tableSizeLimit = DefaultNativeSafeTableSizeLimitBytes
 	}
 	return &Engine{tableSizeLimit: tableSizeLimit}
+}
+
+// NewForTarget creates a PostgreSQL engine with the target information needed
+// by capabilities whose request does not carry resolved credentials.
+func NewForTarget(tableSizeLimit int64, database string, credentials *engine.Credentials) *Engine {
+	e := NewWithTableSizeLimit(tableSizeLimit)
+	e.pullDatabase = database
+	e.pullCredentials = credentials
+	return e
 }
 
 // TableSizeLimit exposes the native-safe ceiling for wiring verification and observability.

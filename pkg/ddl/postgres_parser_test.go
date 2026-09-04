@@ -502,6 +502,9 @@ func clearParseLocations(m protoreflect.Message) {
 // Generated, identity, and unrecognized constraint shapes fail closed, quoted
 // identifiers cannot mask a missing DEFAULT, and a function-call DEFAULT fails
 // closed because its volatility cannot be proven from the statement alone.
+// UNIQUE builds an index over the whole table so it is never automatic;
+// REFERENCES is metadata-only until a DEFAULT makes the server validate every
+// existing row.
 func TestPostgresAddColumnManualReason(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -547,11 +550,24 @@ func TestPostgresAddColumnManualReason(t *testing.T) {
 			name:       "nullable unique",
 			createDDL:  "CREATE TABLE metrics (a bigint, external_id bigint UNIQUE)",
 			columnName: "external_id",
+			wantReason: "UNIQUE, which builds a unique index over the whole table",
 		},
 		{
 			name:       "nullable references",
 			createDDL:  "CREATE TABLE metrics (a bigint, parent_id bigint REFERENCES parents (id))",
 			columnName: "parent_id",
+		},
+		{
+			name:       "references with default",
+			createDDL:  "CREATE TABLE metrics (a bigint, parent_id bigint DEFAULT 1 REFERENCES parents (id))",
+			columnName: "parent_id",
+			wantReason: "FOREIGN KEY with a DEFAULT, which validates every existing row",
+		},
+		{
+			name:       "not null references with default",
+			createDDL:  "CREATE TABLE metrics (a bigint, parent_id bigint NOT NULL DEFAULT 1 REFERENCES parents (id))",
+			columnName: "parent_id",
+			wantReason: "FOREIGN KEY with a DEFAULT, which validates every existing row",
 		},
 		{
 			name:       "quoted identifier containing default",
@@ -687,6 +703,9 @@ func TestPostgresCostScalesWithTableSize(t *testing.T) {
 		{"add column with volatile default", `ALTER TABLE mutes ADD COLUMN token uuid DEFAULT gen_random_uuid()`, true},
 		{"add column with inline unique", `ALTER TABLE mutes ADD COLUMN slug varchar(64) UNIQUE`, true},
 		{"add generated column", `ALTER TABLE mutes ADD COLUMN total int GENERATED ALWAYS AS (a + b) STORED`, true},
+		{"add column references with default", `ALTER TABLE mutes ADD COLUMN parent_id bigint DEFAULT 1 REFERENCES parents (id)`, true},
+		{"add column with inline check", `ALTER TABLE mutes ADD COLUMN c int CHECK (c > 0)`, true},
+		{"add column references without default", `ALTER TABLE mutes ADD COLUMN parent_id bigint REFERENCES parents (id)`, false},
 		{"add foreign key not valid", `ALTER TABLE mutes ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users (id) NOT VALID`, false},
 		{"add check constraint not valid", `ALTER TABLE mutes ADD CONSTRAINT chk_positive CHECK (count > 0) NOT VALID`, false},
 		{"add column only", `ALTER TABLE mutes ADD COLUMN reason varchar(255)`, false},

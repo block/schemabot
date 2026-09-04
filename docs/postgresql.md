@@ -4,6 +4,7 @@
 
 ## Table of Contents
 
+- [Schema pull](#schema-pull)
 - [Supported changes](#supported-changes)
   - [Greenfield tables](#greenfield-tables)
   - [Partitioned tables](#partitioned-tables)
@@ -23,6 +24,28 @@ less safe executor: its plan is blocked.
 
 PostgreSQL target support is separate from using PostgreSQL for SchemaBot's
 own state. See [SchemaBot storage](#schemabot-storage) for that distinction.
+
+## Schema pull
+
+`schemabot pull` prints the pulled PostgreSQL schema as readable SQL, or as the
+API response when JSON output is selected. A PostgreSQL schema is the SchemaBot
+namespace. With no namespace selection, pull discovers every schema that is not
+a server or known extension schema. That discovery is best-effort: an extension
+whose schema the reserved list does not name is pulled as if it were an
+application schema, so select the schema explicitly with `--namespace` when the
+database hosts extensions. Only ordinary and partitioned tables are exported;
+views, materialized views, and foreign tables are not, and partition children
+are not exported separately from their parent.
+
+The pull is refused in full if any selected table cannot round-trip through the
+declarative format. This includes partitioned parents, foreign-key relationships,
+unlogged tables, explicit collations, and sequence defaults that cannot be
+represented safely, as well as tables carrying objects the format does not
+model at all: triggers, row-level security and policies, comments, non-default
+relation options, and table inheritance. If any selected table is refused, no
+partial output is produced. Only basic catalog detail is supported on
+PostgreSQL; a request for detailed catalog output is rejected rather than
+answered with the basic shape.
 
 ## Supported changes
 
