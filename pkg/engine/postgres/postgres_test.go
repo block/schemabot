@@ -12,6 +12,7 @@ import (
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -124,8 +125,10 @@ func TestTableChangesMapsDestructiveSafety(t *testing.T) {
 func TestTableChangesRendersOrderedExecutionSteps(t *testing.T) {
 	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
 	require.NoError(t, err)
+	exists := true
 	report := pgplan.NewReport(pgplan.SourceDiff)
 	report.Table = "users"
+	report.TableExists = &exists
 	report.Statements = []pgplan.Statement{{
 		SQL:         "ALTER TABLE public.users ADD COLUMN email text",
 		Route:       planner.RouteNative,
@@ -150,6 +153,104 @@ func TestTableChangesRendersOrderedExecutionSteps(t *testing.T) {
 	assert.Equal(t, preflight.TierAlterInPlace, tiers[0],
 		"an in-place ALTER needs only owner membership, never the index tier's schema CREATE")
 	assert.Equal(t, preflight.TierIndexBuild, tiers[1])
+}
+
+func TestTableChangesCollapsesGreenfieldCreateSet(t *testing.T) {
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+	exists := false
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "widgets"
+	report.TableExists = &exists
+	report.Statements = []pgplan.Statement{
+		{SQL: "CREATE TABLE public.widgets (id bigint PRIMARY KEY, name text)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionExecute, ExecSQL: []string{"CREATE TABLE public.widgets (id bigint PRIMARY KEY, name text)"}},
+		{SQL: "CREATE UNIQUE INDEX widgets_name_key ON public.widgets (name)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionExecute, ExecSQL: []string{"CREATE UNIQUE INDEX CONCURRENTLY widgets_name_key ON public.widgets (name)"}},
+		{SQL: "CREATE INDEX widgets_id_idx ON public.widgets (id)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionExecute, ExecSQL: []string{"CREATE INDEX CONCURRENTLY widgets_id_idx ON public.widgets (id)"}},
+	}
+
+	changes, tiers, err := tableChanges(report, parser)
+	require.NoError(t, err)
+	require.Len(t, changes, 1)
+	assert.Equal(t, "CREATE TABLE public.widgets (id bigint PRIMARY KEY, name text);\nCREATE UNIQUE INDEX widgets_name_key ON public.widgets (name);\nCREATE INDEX widgets_id_idx ON public.widgets (id)", changes[0].DDL)
+	assert.Equal(t, "widgets", changes[0].Table)
+	assert.Equal(t, ddl.StatementCreateTable, changes[0].Operation)
+	assert.False(t, changes[0].IsUnsafe)
+	assert.Empty(t, changes[0].ExecutionMode)
+	require.Equal(t, []preflight.Tier{preflight.TierCreateTable}, tiers)
+}
+
+func TestTableChangesKeepsGreenfieldVerdictsPerStatement(t *testing.T) {
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+	exists := false
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "widgets"
+	report.TableExists = &exists
+	report.Statements = []pgplan.Statement{
+		{SQL: "CREATE TABLE public.widgets (id bigint PRIMARY KEY, name text)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionExecute, ExecSQL: []string{"CREATE TABLE public.widgets (id bigint PRIMARY KEY, name text)"}},
+		{SQL: "CREATE INDEX widgets_name_idx ON public.widgets (name)", Route: planner.RouteCopyAndSwap, Backend: router.BackendCopyAndSwap, Disposition: router.DispositionUnavailable},
+		{SQL: "CREATE INDEX widgets_id_idx ON public.widgets (id)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionExecute, ExecSQL: []string{"CREATE INDEX CONCURRENTLY widgets_id_idx ON public.widgets (id)"}},
+	}
+
+	changes, tiers, err := tableChanges(report, parser)
+	require.NoError(t, err)
+	require.Len(t, changes, 3)
+	blockAbsentTableDependents(changes, tiers, report.Table)
+	assert.Empty(t, changes[0].ExecutionMode)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[2].ExecutionMode)
+	assert.Contains(t, changes[2].ModeReason, "depends on the statement that creates it")
+}
+
+func TestIsGreenfieldCreateSetRejectsUnsafeStatements(t *testing.T) {
+	exists := false
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "widgets"
+	report.TableExists = &exists
+	report.Statements = []pgplan.Statement{{SQL: "CREATE TABLE public.widgets (id bigint PRIMARY KEY)"}}
+
+	tests := []struct {
+		name     string
+		verdicts []string
+		mutate   func(*pgplan.Report)
+	}{
+		{name: "destructive verdict", verdicts: []string{"destructive statement"}},
+		{name: "destructive term", verdicts: []string{""}, mutate: func(report *pgplan.Report) {
+			report.Statements[0].Destructive = true
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			candidate := report
+			candidate.Statements = append([]pgplan.Statement(nil), report.Statements...)
+			if tt.mutate != nil {
+				tt.mutate(&candidate)
+			}
+			assert.False(t, isGreenfieldCreateSet(candidate, tt.verdicts))
+		})
+	}
+}
+
+func TestGreenfieldCreateSetRejectsNonCreateTier(t *testing.T) {
+	err := ensureGreenfieldCreateTier("widgets", preflight.TierIndexBuild)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "expected create a new table")
+}
+
+func TestGreenfieldCreateSetRejectsIndexForAnotherTable(t *testing.T) {
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "widgets"
+	report.Statements = []pgplan.Statement{
+		{SQL: "CREATE TABLE public.widgets (id bigint PRIMARY KEY)"},
+		{SQL: "CREATE INDEX gadgets_id_idx ON public.gadgets (id)"},
+	}
+
+	_, _, err = greenfieldCreateSet(report, parser)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `not CREATE TABLE target "public.widgets"`)
 }
 
 func TestTableChangesMixedVerdictsFailClosedPerStatement(t *testing.T) {
@@ -441,4 +542,30 @@ func TestRegistersWorkSynchronously(t *testing.T) {
 func TestNewWithTableSizeLimitTreatsZeroAsUnset(t *testing.T) {
 	assert.Equal(t, DefaultNativeSafeTableSizeLimitBytes, NewWithTableSizeLimit(0).TableSizeLimit())
 	assert.Equal(t, int64(42), NewWithTableSizeLimit(42).TableSizeLimit())
+}
+
+func TestPullNamespacesRejectsReservedSchema(t *testing.T) {
+	_, err := pullNamespaces(t.Context(), nil, "pg_catalog")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `schema "pg_catalog" is reserved and cannot be pulled`)
+}
+
+func TestPullSchemaRequiresConfiguredCredentials(t *testing.T) {
+	_, err := New().PullSchema(t.Context(), nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "request is required")
+
+	_, err = New().PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "orders"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "DSN credentials are required")
+}
+
+func TestPullSchemaRejectsDetailedCatalog(t *testing.T) {
+	_, err := New().PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database:      "orders",
+		CatalogDetail: ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "catalog detail")
+	assert.Contains(t, err.Error(), "unsupported; use basic")
 }

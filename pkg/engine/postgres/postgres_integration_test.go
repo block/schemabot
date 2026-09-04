@@ -3,19 +3,207 @@
 package postgres
 
 import (
+	"context"
 	"net/url"
 	"testing"
 	"time"
 
+	"github.com/block/pg-sprite/pkg/statement"
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
 )
 
 const postgresApplyDeadline = 10 * time.Second
+
+// TestEnginePullSchema exports every ordinary table in a requested schema as
+// an independently parseable declarative file, including constraints and
+// secondary indexes.
+func TestEnginePullSchema(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.accounts (id bigint PRIMARY KEY, balance bigint NOT NULL CHECK (balance >= 0));
+		CREATE INDEX accounts_balance_idx ON app.accounts (balance);
+		CREATE TABLE app.events (id bigint PRIMARY KEY, message text NOT NULL)`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, "pull_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database: "pull_test", Type: "postgres", Environment: "test", Namespace: "app",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), response.TableCount)
+	require.Len(t, response.Namespaces, 1)
+	require.Len(t, response.Namespaces["app"].Tables, 2)
+	for _, table := range []string{"accounts", "events"} {
+		ddl := response.Namespaces["app"].Tables[table]
+		parsed, parseErr := statement.ParseDesired(ddl)
+		require.NoError(t, parseErr)
+		assert.Equal(t, table, parsed.Table())
+	}
+	assert.Contains(t, response.Namespaces["app"].Tables["accounts"], "CHECK")
+	assert.Contains(t, response.Namespaces["app"].Tables["accounts"], "accounts_balance_idx")
+}
+
+// TestEnginePullSchemaRejectsMissingSchema proves a request for a schema that
+// does not exist fails instead of producing an empty baseline that a typo
+// could be mistaken for a schema with no tables.
+func TestEnginePullSchemaRejectsMissingSchema(t *testing.T) {
+	dsn, _ := testutil.StartPostgres(t, "pull_missing_test")
+
+	eng := NewForTarget(0, "pull_missing_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "missing"})
+
+	require.Error(t, err)
+	assert.Nil(t, response)
+	assert.Contains(t, err.Error(), `schema "missing" does not exist`)
+}
+
+// TestEnginePullSchemaAggregatesUnrenderableTables proves a pull never returns
+// a partial baseline and identifies every table that needs manual resolution.
+func TestEnginePullSchemaAggregatesUnrenderableTables(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_refusal_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE UNLOGGED TABLE app.audit_log (id bigint PRIMARY KEY);
+		CREATE UNLOGGED TABLE app.delivery_log (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, "pull_refusal_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
+
+	require.Error(t, err)
+	assert.Nil(t, response)
+	assert.Contains(t, err.Error(), `schema "app" table "audit_log"`)
+	assert.Contains(t, err.Error(), `schema "app" table "delivery_log"`)
+}
+
+// A table carrying trigger behavior or descriptive metadata is refused so the
+// printed schema never suggests that its declarative table definition is the
+// whole live object.
+func TestEnginePullSchemaRejectsUnmodeledTableObjects(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_objects_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.accounts (id bigint PRIMARY KEY);
+		CREATE FUNCTION app.touch_account() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+		CREATE TRIGGER touch_account BEFORE INSERT ON app.accounts FOR EACH ROW EXECUTE FUNCTION app.touch_account();
+		COMMENT ON TABLE app.accounts IS 'customer accounts'`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, "pull_objects_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
+
+	require.Error(t, err)
+	assert.Nil(t, response)
+	assert.Contains(t, err.Error(), `schema "app" table "accounts"`)
+	assert.Contains(t, err.Error(), "trigger")
+	assert.Contains(t, err.Error(), "comment")
+}
+
+// A child table created with PostgreSQL table inheritance is refused because
+// flattening inherited columns would lose the relationship to its parent.
+func TestEnginePullSchemaRejectsTableInheritance(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_inheritance_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.parent (id bigint PRIMARY KEY);
+		CREATE TABLE app.child (detail text) INHERITS (app.parent)`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, "pull_inheritance_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
+
+	require.Error(t, err)
+	assert.Nil(t, response)
+	assert.Contains(t, err.Error(), `schema "app" table "child"`)
+	assert.Contains(t, err.Error(), "table inheritance")
+}
+
+// Omitting the namespace exports each application schema while keeping server
+// and information schemas outside the response.
+func TestEnginePullSchemaDiscoversNonReservedSchemas(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_discovery_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA billing;
+		CREATE TABLE billing.invoices (id bigint PRIMARY KEY);
+		CREATE SCHEMA shipping;
+		CREATE TABLE shipping.parcels (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, "pull_discovery_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{})
+
+	require.NoError(t, err)
+	assert.Contains(t, response.Namespaces, "billing")
+	assert.Contains(t, response.Namespaces, "shipping")
+	assert.Contains(t, response.Namespaces["billing"].Tables, "invoices")
+	assert.Contains(t, response.Namespaces["shipping"].Tables, "parcels")
+	assert.NotContains(t, response.Namespaces, "pg_catalog")
+	assert.NotContains(t, response.Namespaces, "information_schema")
+}
+
+// A partitioned hierarchy selects only its parent for rendering; the child is
+// neither exported nor reported as an independently unrenderable table.
+func TestEnginePullSchemaExcludesPartitionChildren(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_partition_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.events (id bigint, created_at date) PARTITION BY RANGE (created_at);
+		CREATE TABLE app.events_2026 PARTITION OF app.events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, "pull_partition_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
+
+	require.Error(t, err)
+	assert.Nil(t, response)
+	assert.Contains(t, err.Error(), `schema "app" table "events"`)
+	assert.NotContains(t, err.Error(), "events_2026")
+}
+
+// Views are outside the table baseline, so ordinary and materialized views do
+// not become declarative tables in a successful pull.
+func TestEnginePullSchemaExcludesViews(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_views_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.accounts (id bigint PRIMARY KEY);
+		CREATE VIEW app.account_view AS SELECT id FROM app.accounts;
+		CREATE MATERIALIZED VIEW app.account_snapshot AS SELECT id FROM app.accounts`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, "pull_views_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
+
+	require.NoError(t, err)
+	require.Len(t, response.Namespaces["app"].Tables, 1)
+	assert.Contains(t, response.Namespaces["app"].Tables, "accounts")
+	assert.NotContains(t, response.Namespaces["app"].Tables, "account_view")
+	assert.NotContains(t, response.Namespaces["app"].Tables, "account_snapshot")
+}
+
+// A cancelled request remains a context failure and is never presented as a
+// refusal caused by an unrepresentable table.
+func TestEnginePullSchemaReturnsCancelledContext(t *testing.T) {
+	dsn, _ := testutil.StartPostgres(t, "pull_cancel_test")
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	eng := NewForTarget(0, "pull_cancel_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(ctx, &ternv1.PullSchemaRequest{Namespace: "public"})
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, response)
+	assert.Contains(t, err.Error(), `PostgreSQL database "pull_cancel_test" for schema pull`)
+	assert.NotContains(t, err.Error(), "refused incomplete baseline")
+}
 
 // TestEnginePlanCreateTable proves a greenfield CREATE TABLE derived from
 // desired state plans as an executable change: the role's schema CREATE
@@ -237,6 +425,64 @@ func TestEngineApplyCreateTable(t *testing.T) {
 	assert.True(t, exists)
 }
 
+// TestEngineApplyGreenfieldCreateSet proves a new table and its declared indexes
+// execute as one unit before the table can carry traffic, then converge cleanly.
+func TestEngineApplyGreenfieldCreateSet(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "create_set_test")
+	desired := "CREATE TABLE widgets (id bigint PRIMARY KEY, name text); CREATE UNIQUE INDEX widgets_name_key ON widgets (name); CREATE INDEX widgets_id_idx ON widgets (id);"
+	planRequest := &engine.PlanRequest{
+		Database:    "create_set_test",
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{"widgets.sql": desired}}},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	eng := New()
+	plan, err := eng.Plan(t.Context(), planRequest)
+	require.NoError(t, err)
+	require.Len(t, plan.Changes, 1)
+	require.Len(t, plan.Changes[0].TableChanges, 1)
+	change := plan.Changes[0].TableChanges[0]
+	assert.Empty(t, change.ExecutionMode)
+	assert.Contains(t, change.DDL, ";\nCREATE UNIQUE INDEX widgets_name_key")
+	assert.Contains(t, change.DDL, ";\nCREATE INDEX widgets_id_idx")
+
+	result, err := eng.Apply(t.Context(), applyRequest(dsn, "widgets", change.DDL))
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	progress := awaitPostgresProgress(t, eng, "widgets")
+	assert.Equal(t, engine.StateCompleted, progress.State)
+
+	rows, err := db.QueryContext(t.Context(), "SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND tablename = 'widgets' ORDER BY indexname")
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rows)
+	var indexes []string
+	for rows.Next() {
+		var index string
+		require.NoError(t, rows.Scan(&index))
+		indexes = append(indexes, index)
+	}
+	require.NoError(t, rows.Err())
+	assert.Equal(t, []string{"widgets_id_idx", "widgets_name_key", "widgets_pkey"}, indexes)
+
+	converged, err := eng.Plan(t.Context(), planRequest)
+	require.NoError(t, err)
+	assert.True(t, converged.NoChanges)
+}
+
+// TestEngineApplyCreateSetDuplicateNameRefusal proves name ownership across the
+// table and index declarations is validated before any object is created.
+func TestEngineApplyCreateSetDuplicateNameRefusal(t *testing.T) {
+	dsn, _ := testutil.StartPostgres(t, "duplicate_create_name_test")
+	eng := New()
+	_, err := eng.Apply(t.Context(), applyRequest(dsn, "widgets",
+		"CREATE TABLE public.widgets (id int PRIMARY KEY);\nCREATE INDEX widgets_pkey ON public.widgets (id)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "widgets")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.Equal(t, `the create set for "widgets" claims the same relation name twice (a CREATE INDEX name repeats the table's implicit constraint-index name or another index); fix the schema file and re-plan`, progress.ErrorMessage)
+}
+
 // TestEngineApplyCreateCollisionRefusal proves a CREATE TABLE whose name is
 // already occupied on the target is a permanent refusal directing a re-plan —
 // the apply must never guess whether the occupying relation is the desired
@@ -254,7 +500,32 @@ func TestEngineApplyCreateCollisionRefusal(t *testing.T) {
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "refused", progress.Metadata["phase"])
 	assert.False(t, progress.Retryable, "a collision refusal is permanent until a re-plan; the drive must not offer a retry")
-	assert.Contains(t, progress.ErrorMessage, "re-plan")
+	assert.Equal(t, `a relation already occupies a name the create set for "widgets" claims (the table, or one of its index names); re-plan against the current schema`, progress.ErrorMessage)
+}
+
+// TestEngineApplyCreateSetCommittedPrefixNotRetryable proves a create set
+// that fails after its CREATE TABLE committed is published as a failure the
+// drive must not retry: the table now exists, so a retry can only land on a
+// collision refusal for a state the operator did not author. The second
+// statement fails on the server because its operator class does not accept
+// the column's type — a shape the desired-schema parse admits, so nothing
+// refuses it before the first step commits.
+func TestEngineApplyCreateSetCommittedPrefixNotRetryable(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "committed_prefix_test")
+
+	eng := New()
+	_, err := eng.Apply(t.Context(), applyRequest(dsn, "widgets",
+		"CREATE TABLE public.widgets (id bigint PRIMARY KEY, name integer);\nCREATE INDEX widgets_name_idx ON public.widgets (name text_pattern_ops)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "widgets")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "failed", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable, "the CREATE TABLE committed; a retry cannot succeed, so the drive must not offer one")
+	assert.Equal(t, `step 2 of 2 failed after the CREATE TABLE for "widgets" committed; re-plan against the current schema`, progress.ErrorMessage)
+
+	var exists bool
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT to_regclass('public.widgets') IS NOT NULL").Scan(&exists))
+	assert.True(t, exists, "the committed CREATE TABLE stays for the next plan to reconcile")
 }
 
 // TestEngineApplyCreateIfNotExistsRefusal proves a CREATE TABLE carrying
