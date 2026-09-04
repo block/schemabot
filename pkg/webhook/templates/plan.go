@@ -706,8 +706,8 @@ func SummarizeChanges(data PlanCommentData) string {
 }
 
 // countStatementTypes counts CREATE, ALTER, and DROP statements across all
-// keyspaces, classifying each statement with its own dialect's parser so DDL
-// is never judged under another family's grammar. A database type with no
+// keyspaces with each dialect's parser, counting a valid greenfield create set
+// as one create. A database type with no
 // registered parser, or a statement its parser rejects, contributes nothing
 // to the typed counts — the callers' raw statement-total fallbacks keep the
 // summary honest — and each case is logged so a miscounted summary is
@@ -721,11 +721,15 @@ func countStatementTypes(changes []KeyspaceChangeData, databaseType string) (cre
 	}
 	for _, ks := range changes {
 		for _, stmt := range ks.Statements {
-			stmtType, _, err := parser.Classify(stmt)
-			if err != nil {
-				slog.Warn("plan summary could not classify a statement; it is left out of the create/alter/drop counts",
-					"database_type", databaseType, "keyspace", ks.Keyspace, "error", err)
-				continue
+			stmtType, _, classifyErr := parser.Classify(stmt)
+			if classifyErr != nil {
+				createSet, err := ddl.ParseCreateSet(parser, stmt)
+				if err != nil {
+					slog.Warn("plan summary could not classify a statement or parse it as a supported create set; it is left out of the create/alter/drop counts",
+						"database_type", databaseType, "keyspace", ks.Keyspace, "error", err)
+					continue
+				}
+				stmtType = createSet.Type
 			}
 			switch stmtType {
 			case ddl.StatementCreateTable:
@@ -803,9 +807,26 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 // under the plan's own dialect.
 func writePlanDDLBlock(sb *strings.Builder, statements []string, dialect schema.Dialect) {
 	sb.WriteString("```sql\n")
-	for i, stmt := range statements {
-		sb.WriteString(ddl.FormatDDLForDialect(dialect, stmt))
-		if i < len(statements)-1 {
+	formattedStatements := make([]string, 0, len(statements))
+	parser, parserErr := ddl.ParserForDialect(dialect)
+	for _, stmt := range statements {
+		statementsToFormat := []string{stmt}
+		if parserErr == nil {
+			if _, _, err := parser.Classify(stmt); err != nil {
+				if createSet, err := ddl.ParseCreateSet(parser, stmt); err == nil {
+					statementsToFormat = createSet.Statements
+				}
+			}
+		}
+		formattedCreateSet := make([]string, 0, len(statementsToFormat))
+		for _, statementToFormat := range statementsToFormat {
+			formattedCreateSet = append(formattedCreateSet, ddl.FormatDDLForDialect(dialect, statementToFormat))
+		}
+		formattedStatements = append(formattedStatements, strings.Join(formattedCreateSet, "\n"))
+	}
+	for i, stmt := range formattedStatements {
+		sb.WriteString(stmt)
+		if i < len(formattedStatements)-1 {
 			sb.WriteString("\n\n")
 		} else {
 			sb.WriteString("\n")

@@ -51,6 +51,19 @@ func TestMaterializedTableChangeOperation(t *testing.T) {
 		assert.Equal(t, "create", op)
 	})
 
+	t.Run("Postgres create set fallback", func(t *testing.T) {
+		parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+		require.NoError(t, err)
+
+		op, err := materializedTableChangeOperation(parser, &ternv1.TableChange{
+			TableName: "t",
+			Ddl:       "CREATE TABLE t (id bigint, v text); CREATE INDEX t_v_idx ON t (v)",
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, ddl.StatementTypeToOp(ddl.StatementCreateTable), op)
+	})
+
 	t.Run("MySQL fallback", func(t *testing.T) {
 		parser, err := ddl.ParserForDialect(schema.DialectMySQL)
 		require.NoError(t, err)
@@ -62,6 +75,24 @@ func TestMaterializedTableChangeOperation(t *testing.T) {
 
 		require.NoError(t, err)
 		assert.Equal(t, "create", op)
+	})
+
+	t.Run("MySQL single-statement fallbacks retain their operations", func(t *testing.T) {
+		parser, err := ddl.ParserForDialect(schema.DialectMySQL)
+		require.NoError(t, err)
+
+		tests := []struct {
+			ddl    string
+			wantOp string
+		}{
+			{ddl: "TRUNCATE TABLE `t`", wantOp: "truncate"},
+			{ddl: "CREATE INDEX `i` ON `t` (`v`)", wantOp: "create_index"},
+		}
+		for _, tc := range tests {
+			op, err := materializedTableChangeOperation(parser, &ternv1.TableChange{TableName: "t", Ddl: tc.ddl})
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantOp, op)
+		}
 	})
 
 	t.Run("proto change type is authoritative", func(t *testing.T) {

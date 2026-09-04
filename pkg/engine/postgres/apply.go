@@ -8,6 +8,7 @@ import (
 	"maps"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -17,7 +18,9 @@ import (
 	"github.com/block/pg-sprite/pkg/preflight"
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/schema"
 )
 
 const (
@@ -45,12 +48,25 @@ const (
 	// the session — exhaustion then surfaces as the typed budget verdict
 	// rather than an ambiguous external cancellation.
 	concurrentIndexBudget = 4 * time.Minute
+
+	// concurrentIndexHeadroom is the least the apply ceiling must exceed
+	// the concurrent index budget by. The ceiling wraps the whole apply,
+	// so the gap has to absorb everything that shares the ceiling with the
+	// build — pool dial, the privilege check, the preflight table read, the
+	// partition admission facts lookup, and the rest of the session setup
+	// executeOptimistic runs before the build — and, after the budget has
+	// already expired, the catalog verdict that names an invalid leftover
+	// index. If the ceiling fires first the verdict has no live context to
+	// run in and the failure degrades to an external cancellation that
+	// names no index, which is the outcome the verdict exists to prevent.
+	concurrentIndexHeadroom = time.Minute
 )
 
 type nativeApply struct {
 	namespace string
 	table     string
 	sql       string
+	steps     int
 }
 
 // targetConn carries one background apply's connection inputs: the raw DSN
@@ -62,9 +78,9 @@ type targetConn struct {
 	caCertPath string
 }
 
-// Apply starts one native-safe PostgreSQL statement under pg-sprite's bounded
-// optimistic executor. Planner-produced sequences use the same execution seam
-// but are deliberately not admitted by this first increment.
+// Apply starts one native-safe PostgreSQL change under pg-sprite's bounded
+// optimistic executor. A greenfield table and its declared indexes are
+// admitted as one create-set task whose sequence steps commit independently.
 func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
 	change, err := validateOptimisticApply(req)
 	if err != nil {
@@ -116,7 +132,7 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL database %q: DSN credentials are required", req.Database)
 	}
 	if len(req.Changes) != 1 || len(req.Changes[0].TableChanges) != 1 {
-		return nativeApply{}, fmt.Errorf("apply PostgreSQL database %q: native-safe increment requires exactly one planned statement", req.Database)
+		return nativeApply{}, fmt.Errorf("apply PostgreSQL database %q: native-safe increment requires exactly one planned change", req.Database)
 	}
 	tc := req.Changes[0].TableChanges[0]
 	if req.Options["defer_cutover"] == "true" {
@@ -125,10 +141,28 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	// The same tier derivation runs again inside the background apply; this
 	// synchronous check exists so a statement shape the native-safe path
 	// cannot execute is refused at acceptance, before any work is queued.
-	if _, err := preflight.RequiredTier([]string{tc.DDL}); err != nil {
+	statements, err := postgresCreateSetStatements(tc.DDL)
+	if err != nil {
+		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned DDL is not one statement or a valid greenfield create set", tc.Table)
+	}
+	if _, err := preflight.RequiredTier(statements); err != nil {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: SchemaBot's PostgreSQL support does not execute this statement shape yet", tc.Table)
 	}
-	return nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL}, nil
+	return nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL, steps: len(statements)}, nil
+}
+
+// postgresCreateSetStatements parses one statement or a greenfield create set
+// using the PostgreSQL parser and returns its canonical execution sequence.
+func postgresCreateSetStatements(script string) ([]string, error) {
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	if err != nil {
+		return nil, fmt.Errorf("select PostgreSQL statement parser: %w", err)
+	}
+	statements, err := ddl.CreateSetStatements(parser, script)
+	if err != nil {
+		return nil, fmt.Errorf("admit PostgreSQL DDL script: %w", err)
+	}
+	return statements, nil
 }
 
 func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change nativeApply, key string, started time.Time, logger *slog.Logger) {
@@ -171,27 +205,53 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		return
 	}
 
+	failure := classifyApplyFailure(err, change.table)
+	switch {
+	case failure.committedPrefix:
+		logger.Error("PostgreSQL create set failed after committing a prefix",
+			"namespace", change.namespace, "table", change.table, "error", err)
+	case failure.lockBudget:
+		logger.Warn("PostgreSQL native-safe schema change lost its lock budget; the drive will retry",
+			"namespace", change.namespace, "table", change.table, "error", err)
+	default:
+		logger.Error("PostgreSQL native-safe schema change failed", "namespace", change.namespace, "table", change.table, "error", err)
+	}
+	result := progressResult(engine.StateFailed, "failed", started, change, failure.detail)
+	result.Retryable = failure.retryable
+	e.publishProgress(key, result, logger)
+}
+
+// applyFailure is the drive-facing disposition of an operational apply
+// failure: the operator detail and whether a retry can succeed. Refusals never
+// reach it — classifyRefusal consumes them first.
+type applyFailure struct {
+	detail          string
+	retryable       bool
+	committedPrefix bool
+	lockBudget      bool
+}
+
+// classifyApplyFailure decides retryability from the failure's shape, in the
+// order the shapes nest: a create sequence that failed after its CREATE TABLE
+// committed is never retryable, even when the failing step lost a lock budget
+// that would otherwise be retryable — the table exists, so a retry can only
+// collide. classifyRefusal already consumed the statement-budget cause, so a
+// budget exceeded here is the lock budget: the statement is native-safe and
+// merely lost a bounded race with concurrent lock holders, and marking it
+// blocked would falsely tell the operator retrying cannot succeed.
+func classifyApplyFailure(err error, table string) applyFailure {
+	if detail, committed := committedCreatePrefixDetail(err, table); committed {
+		return applyFailure{detail: detail, committedPrefix: true}
+	}
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) {
-		// classifyRefusal consumed the statement-budget cause, so the budget
-		// exceeded here is the lock budget: the statement itself is
-		// native-safe and merely lost a bounded race with concurrent lock
-		// holders. Surface the typed detail as a retryable failure — marking
-		// it blocked would falsely tell the operator retrying cannot succeed.
-		result := progressResult(engine.StateFailed, "failed", started, change,
-			budgetErr.Error()+"; retry once lock contention subsides")
-		result.Retryable = true
-		e.publishProgress(key, result, logger)
-		return
+		return applyFailure{
+			detail:     budgetErr.Error() + "; retry once lock contention subsides",
+			retryable:  true,
+			lockBudget: true,
+		}
 	}
-
-	logger.Error("PostgreSQL native-safe schema change failed", "namespace", change.namespace, "table", change.table, "error", err)
-	result := progressResult(engine.StateFailed, "failed", started, change, "PostgreSQL schema change failed; see server logs")
-	// Operational failures are retryable by definition: classifyRefusal
-	// returned nil, so nothing about the plan, target, or provisioning makes
-	// a retry futile — the drive must not cancel the apply's remaining work.
-	result.Retryable = true
-	e.publishProgress(key, result, logger)
+	return applyFailure{detail: "PostgreSQL schema change failed; see server logs", retryable: true}
 }
 
 // invalidIndexDetail renders the operator-facing next step for an
@@ -241,7 +301,33 @@ func classifyRefusal(err error, table string) *refusal {
 		return nil
 	}
 	r.detail = sanitizeReasonText(r.detail)
+	var stepErr *executor.SequenceStepError
+	if errors.As(err, &stepErr) && stepErr.Total > 1 {
+		if stepErr.Step > 1 {
+			r.detail = strings.TrimSuffix(r.detail, "; re-plan against the current schema")
+		}
+		r.detail = sanitizeReasonText(r.detail + "; " + sequenceStepDetail(stepErr, table))
+	}
 	return r
+}
+
+func sequenceStepDetail(stepErr *executor.SequenceStepError, table string) string {
+	detail := fmt.Sprintf("step %d of %d failed", stepErr.Step, stepErr.Total)
+	if stepErr.Step > 1 {
+		detail += fmt.Sprintf(" after the CREATE TABLE for %q committed; re-plan against the current schema", table)
+	}
+	return detail
+}
+
+// committedCreatePrefixDetail reports the non-retryable recovery action for a
+// create sequence that failed after at least one earlier step committed.
+func committedCreatePrefixDetail(err error, table string) (string, bool) {
+	var stepErr *executor.SequenceStepError
+	if !errors.As(err, &stepErr) || stepErr.Step <= 1 {
+		return "", false
+	}
+	detail := sequenceStepDetail(stepErr, table)
+	return sanitizeReasonText(detail), true
 }
 
 // refusalForCause holds classifyRefusal's cause-to-refusal mapping; details
@@ -302,7 +388,7 @@ func refusalForCause(err error, table string) *refusal {
 	}
 	if preflight.IsNameOccupied(err) {
 		return &refusal{reason: "create-collision",
-			detail: fmt.Sprintf("a relation already occupies the name %q on the target; re-plan against the current schema", table)}
+			detail: fmt.Sprintf("a relation already occupies a name the create set for %q claims (the table, or one of its index names); re-plan against the current schema", table)}
 	}
 	if errors.Is(err, preflight.ErrSchemaNotFound) {
 		return &refusal{reason: "schema-not-found",
@@ -323,10 +409,10 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 	switch code {
 	case executor.CodeCreateCollision:
 		return &refusal{reason: "create-collision",
-			detail: fmt.Sprintf("a name the CREATE TABLE for %q needs is already taken on the target; re-plan against the current schema", table)}, true
+			detail: fmt.Sprintf("a relation already occupies a name the create set for %q claims (the table, or one of its index names); re-plan against the current schema", table)}, true
 	case executor.CodeDuplicateCreateName:
 		return &refusal{reason: "duplicate-create-name",
-			detail: fmt.Sprintf("the CREATE TABLE for %q claims the same relation name twice; fix the schema file and re-plan", table)}, true
+			detail: fmt.Sprintf("the create set for %q claims the same relation name twice (a CREATE INDEX name repeats the table's implicit constraint-index name or another index); fix the schema file and re-plan", table)}, true
 	case executor.CodePartitionOfUnsupported:
 		return &refusal{reason: "unsupported-create-step",
 			detail: fmt.Sprintf("the CREATE TABLE for %q attaches a partition to a live parent, which the native-safe create path does not run", table)}, true
@@ -382,7 +468,11 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	}
 	defer pool.Close()
 
-	tier, err := preflight.RequiredTier([]string{change.sql})
+	statements, err := postgresCreateSetStatements(change.sql)
+	if err != nil {
+		return fmt.Errorf("parse planned PostgreSQL DDL for table %q: %w", change.table, err)
+	}
+	tier, err := preflight.RequiredTier(statements)
 	if err != nil {
 		return fmt.Errorf("derive privilege tier for table %q: %w", change.table, err)
 	}
@@ -390,9 +480,12 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		// The off-ladder create tier has its own preflight sequence: the
 		// ladder checks below state facts about an existing table, and a
 		// greenfield target has none.
-		return executeCreate(ctx, pool, change)
+		return executeCreate(ctx, pool, change, statements)
 	}
-	statement, err := pgstatement.ParseOne(change.sql)
+	if len(statements) != 1 {
+		return fmt.Errorf("execute PostgreSQL table %q: privilege tier %s requires exactly one statement, got %d", change.table, tier, len(statements))
+	}
+	statement, err := pgstatement.ParseOne(statements[0])
 	if err != nil {
 		return fmt.Errorf("parse planned PostgreSQL statement for table %q: %w", change.table, err)
 	}
@@ -429,6 +522,12 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		}
 		return nil
 	}
+	// Every other statement — including a blocking CREATE INDEX — runs
+	// exactly as reviewed, under the per-statement and lock limits.
+	// SchemaBot executes the DDL the plan surfaced and never rewrites it
+	// into its concurrent form: the plan surfaces the statement as
+	// authored and the apply executes it unchanged, so the choice between
+	// a blocking and a concurrent build stays with the author.
 	if err := executor.ExecuteNative(ctx, pool, table, statement, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
 	}, executor.DefaultRetryPolicy()); err != nil {
@@ -437,22 +536,26 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	return nil
 }
 
-// executeCreate runs one greenfield CREATE TABLE through pg-sprite's create
-// path: parse the desired shape, prove the role can create in the schema,
+// executeCreate runs a greenfield create set through pg-sprite's create path:
+// parse the table and its declared indexes, prove the role can create in the schema,
 // prove the name is free, then execute — both proofs minted here, in the
 // session that executes, because absence or privilege at plan time proves
 // nothing about apply time. The table size gate deliberately does not run:
 // it bounds rewrites of existing data, and a table that does not exist yet
 // has none.
-func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply) error {
-	// The planned statement arrives schema-qualified; the desired-schema
+func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, statements []string) error {
+	// The planned statements arrive schema-qualified; the desired-schema
 	// contract wants the unqualified form and the executor pins the schema
 	// from the absence proof instead.
-	unqualified, err := pgstatement.Qualify(change.sql, "")
-	if err != nil {
-		return fmt.Errorf("render planned CREATE TABLE for table %q in unqualified form: %w", change.table, err)
+	unqualified := make([]string, len(statements))
+	for i, statement := range statements {
+		var err error
+		unqualified[i], err = pgstatement.Qualify(statement, "")
+		if err != nil {
+			return fmt.Errorf("render planned create statement %d for table %q in unqualified form: %w", i+1, change.table, err)
+		}
 	}
-	desired, err := pgstatement.ParseDesired(unqualified)
+	desired, err := pgstatement.ParseDesired(strings.Join(unqualified, ";\n"))
 	if err != nil {
 		return fmt.Errorf("parse planned CREATE TABLE for table %q: %w", change.table, err)
 	}
@@ -520,12 +623,21 @@ func progressResult(state engine.State, phase string, started time.Time, change 
 	if state == engine.StateCompleted {
 		progress = 100
 	}
+	steps := change.steps
+	if steps == 0 {
+		steps = 1
+	}
 	result := &engine.ProgressResult{
 		State: state, Progress: progress, Message: "PostgreSQL schema change " + phase,
 		ErrorMessage: detail,
 		Metadata: map[string]string{
 			"phase": phase, "elapsed": time.Since(started).Round(time.Millisecond).String(),
-			"step": "1", "steps_total": "1",
+			// Per-step position is deliberately not tracked yet: the apply
+			// publishes progress only at accept and at the terminal outcome,
+			// and nothing observes the executor's step transitions in
+			// between, so the position stays at the sequence's first step
+			// while the total reports the real create-set length.
+			"step": "1", "steps_total": strconv.Itoa(steps),
 		},
 		Tables: []engine.TableProgress{{
 			Namespace: change.namespace, Table: change.table, DDL: change.sql,
