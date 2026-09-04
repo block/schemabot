@@ -308,7 +308,7 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 			return true
 		}
 		expectedScope := (planCommentSlot{Environments: environments}).environmentScope()
-		comments, err := h.service.Storage().PlanComments().ListUnminimizedForSlot(ctx,
+		comments, err := h.service.Storage().PlanComments().ListUnretiredForSlot(ctx,
 			repo, pr, cfg.Config.Database, string(cfg.Config.GetType()))
 		if err != nil {
 			h.logger.Warn("auto-plan will post plan comment because prior plan comment state could not be read",
@@ -383,7 +383,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		h.logger.Error("failed to read the PR for auto-plan; its base branch cannot be re-verified before publishing",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
-		h.minimizeStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
+		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 		return "config discovery failed", fmt.Errorf("read %s#%d for auto-plan: %w", repo, pr, err)
 	}
 	baseRef := prInfo.BaseRef
@@ -392,7 +392,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		h.logger.Error("PR reports no base branch; a plan's base cannot be re-verified before publishing",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, missingBase)
-		h.minimizeStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
+		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 		return "config discovery failed", missingBase
 	}
 
@@ -410,7 +410,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		}
 		h.logConfigDiscoveryFailure("list PR changed files", repo, pr, headSHA, source, deliveryID, err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
-		h.minimizeStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
+		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 		return "config discovery failed", fmt.Errorf("fetch PR files for %s#%d: %w", repo, pr, err)
 	}
 
@@ -425,7 +425,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	if err != nil {
 		h.logger.Error("failed to scope PR files to what the PR proposes", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
-		h.minimizeStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
+		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 		return "config discovery failed", fmt.Errorf("scope PR files for %s#%d to what it proposes: %w", repo, pr, err)
 	}
 	if len(files) != len(changedFiles) {
@@ -440,7 +440,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	if err != nil {
 		h.logConfigDiscoveryFailure("resolve schema configs for changed files", repo, pr, headSHA, source, deliveryID, err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
-		h.minimizeStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
+		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 		return "config discovery failed", fmt.Errorf("discover configs for %s#%d: %w", repo, pr, err)
 	}
 
@@ -453,7 +453,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		// This exit posts a blocking aggregate and no plan comment, so an earlier
 		// head's plan comment would otherwise stay expanded beside it, still
 		// offering to apply DDL for a config this head no longer carries.
-		h.minimizeStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
+		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 		return "schema change under managed directory has no config", nil
 	}
 
@@ -493,7 +493,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		// moves the check on without posting a comment, which would otherwise
 		// leave the PR showing a plan — and its apply prompt — for schema this
 		// head no longer proposes.
-		h.minimizeStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
+		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 		// An aggregate participant does not own the required check for the repo —
 		// the leader does — so on a PR that touches none of this deployment's
 		// schema it has nothing to report and stays silent, rather than posting a

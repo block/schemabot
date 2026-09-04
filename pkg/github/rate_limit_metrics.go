@@ -214,6 +214,11 @@ var githubRoutePatterns = []githubRoutePattern{
 		operation: metrics.GitHubOperationEditIssueComment,
 	},
 	{
+		method:    http.MethodDelete,
+		path:      "/repos/{owner}/{repo}/issues/comments/{comment_id}",
+		operation: metrics.GitHubOperationDeleteIssueComment,
+	},
+	{
 		method:    http.MethodPost,
 		path:      "/repos/{owner}/{repo}/issues/{issue_number}/comments",
 		operation: metrics.GitHubOperationCreateIssueComment,
@@ -406,6 +411,7 @@ func gitHubRequestCategory(operation string) string {
 	case metrics.GitHubOperationAddCommentReaction,
 		metrics.GitHubOperationCreateCheckRun,
 		metrics.GitHubOperationCreateIssueComment,
+		metrics.GitHubOperationDeleteIssueComment,
 		metrics.GitHubOperationEditIssueComment,
 		metrics.GitHubOperationGraphQLMinimizeComment,
 		metrics.GitHubOperationRequestReviewers,
