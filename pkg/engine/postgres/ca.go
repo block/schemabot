@@ -69,11 +69,11 @@ func caCertPath(creds *engine.Credentials) (string, error) {
 	}
 }
 
-// spritePoolConfig builds the pg-sprite pool configuration both the plan and
-// apply dial sites share: the normalized DSN plus the CA bundle path the pool
+// spritePoolConfig builds the pg-sprite pool configuration the plan, apply,
+// and pull dial sites share: the normalized DSN plus the CA bundle path the pool
 // verifies the target against — empty when the embedded RDS trust or the
 // DSN's own settings apply. Routing every pool through one constructor keeps
-// the two dial sites from drifting apart in what they trust.
+// the dial sites from drifting apart in what they trust.
 func spritePoolConfig(dsn, caPath string) (dbconn.Config, error) {
 	normalized, err := postgresconn.ConnectionDSN(dsn)
 	if err != nil {

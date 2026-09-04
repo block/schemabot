@@ -3,20 +3,207 @@
 package postgres
 
 import (
+	"context"
 	"net/url"
 	"testing"
 	"time"
 
+	"github.com/block/pg-sprite/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
 )
 
 const postgresApplyDeadline = 10 * time.Second
+
+// TestEnginePullSchema exports every ordinary table in a requested schema as
+// an independently parseable declarative file, including constraints and
+// secondary indexes.
+func TestEnginePullSchema(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.accounts (id bigint PRIMARY KEY, balance bigint NOT NULL CHECK (balance >= 0));
+		CREATE INDEX accounts_balance_idx ON app.accounts (balance);
+		CREATE TABLE app.events (id bigint PRIMARY KEY, message text NOT NULL)`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, "pull_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database: "pull_test", Type: "postgres", Environment: "test", Namespace: "app",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), response.TableCount)
+	require.Len(t, response.Namespaces, 1)
+	require.Len(t, response.Namespaces["app"].Tables, 2)
+	for _, table := range []string{"accounts", "events"} {
+		ddl := response.Namespaces["app"].Tables[table]
+		parsed, parseErr := statement.ParseDesired(ddl)
+		require.NoError(t, parseErr)
+		assert.Equal(t, table, parsed.Table())
+	}
+	assert.Contains(t, response.Namespaces["app"].Tables["accounts"], "CHECK")
+	assert.Contains(t, response.Namespaces["app"].Tables["accounts"], "accounts_balance_idx")
+}
+
+// TestEnginePullSchemaRejectsMissingSchema proves a request for a schema that
+// does not exist fails instead of producing an empty baseline that a typo
+// could be mistaken for a schema with no tables.
+func TestEnginePullSchemaRejectsMissingSchema(t *testing.T) {
+	dsn, _ := testutil.StartPostgres(t, "pull_missing_test")
+
+	eng := NewForTarget(0, "pull_missing_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "missing"})
+
+	require.Error(t, err)
+	assert.Nil(t, response)
+	assert.Contains(t, err.Error(), `schema "missing" does not exist`)
+}
+
+// TestEnginePullSchemaAggregatesUnrenderableTables proves a pull never returns
+// a partial baseline and identifies every table that needs manual resolution.
+func TestEnginePullSchemaAggregatesUnrenderableTables(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_refusal_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE UNLOGGED TABLE app.audit_log (id bigint PRIMARY KEY);
+		CREATE UNLOGGED TABLE app.delivery_log (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, "pull_refusal_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
+
+	require.Error(t, err)
+	assert.Nil(t, response)
+	assert.Contains(t, err.Error(), `schema "app" table "audit_log"`)
+	assert.Contains(t, err.Error(), `schema "app" table "delivery_log"`)
+}
+
+// A table carrying trigger behavior or descriptive metadata is refused so the
+// printed schema never suggests that its declarative table definition is the
+// whole live object.
+func TestEnginePullSchemaRejectsUnmodeledTableObjects(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_objects_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.accounts (id bigint PRIMARY KEY);
+		CREATE FUNCTION app.touch_account() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+		CREATE TRIGGER touch_account BEFORE INSERT ON app.accounts FOR EACH ROW EXECUTE FUNCTION app.touch_account();
+		COMMENT ON TABLE app.accounts IS 'customer accounts'`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, "pull_objects_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
+
+	require.Error(t, err)
+	assert.Nil(t, response)
+	assert.Contains(t, err.Error(), `schema "app" table "accounts"`)
+	assert.Contains(t, err.Error(), "trigger")
+	assert.Contains(t, err.Error(), "comment")
+}
+
+// A child table created with PostgreSQL table inheritance is refused because
+// flattening inherited columns would lose the relationship to its parent.
+func TestEnginePullSchemaRejectsTableInheritance(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_inheritance_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.parent (id bigint PRIMARY KEY);
+		CREATE TABLE app.child (detail text) INHERITS (app.parent)`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, "pull_inheritance_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
+
+	require.Error(t, err)
+	assert.Nil(t, response)
+	assert.Contains(t, err.Error(), `schema "app" table "child"`)
+	assert.Contains(t, err.Error(), "table inheritance")
+}
+
+// Omitting the namespace exports each application schema while keeping server
+// and information schemas outside the response.
+func TestEnginePullSchemaDiscoversNonReservedSchemas(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_discovery_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA billing;
+		CREATE TABLE billing.invoices (id bigint PRIMARY KEY);
+		CREATE SCHEMA shipping;
+		CREATE TABLE shipping.parcels (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, "pull_discovery_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{})
+
+	require.NoError(t, err)
+	assert.Contains(t, response.Namespaces, "billing")
+	assert.Contains(t, response.Namespaces, "shipping")
+	assert.Contains(t, response.Namespaces["billing"].Tables, "invoices")
+	assert.Contains(t, response.Namespaces["shipping"].Tables, "parcels")
+	assert.NotContains(t, response.Namespaces, "pg_catalog")
+	assert.NotContains(t, response.Namespaces, "information_schema")
+}
+
+// A partitioned hierarchy selects only its parent for rendering; the child is
+// neither exported nor reported as an independently unrenderable table.
+func TestEnginePullSchemaExcludesPartitionChildren(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_partition_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.events (id bigint, created_at date) PARTITION BY RANGE (created_at);
+		CREATE TABLE app.events_2026 PARTITION OF app.events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, "pull_partition_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
+
+	require.Error(t, err)
+	assert.Nil(t, response)
+	assert.Contains(t, err.Error(), `schema "app" table "events"`)
+	assert.NotContains(t, err.Error(), "events_2026")
+}
+
+// Views are outside the table baseline, so ordinary and materialized views do
+// not become declarative tables in a successful pull.
+func TestEnginePullSchemaExcludesViews(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_views_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.accounts (id bigint PRIMARY KEY);
+		CREATE VIEW app.account_view AS SELECT id FROM app.accounts;
+		CREATE MATERIALIZED VIEW app.account_snapshot AS SELECT id FROM app.accounts`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, "pull_views_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
+
+	require.NoError(t, err)
+	require.Len(t, response.Namespaces["app"].Tables, 1)
+	assert.Contains(t, response.Namespaces["app"].Tables, "accounts")
+	assert.NotContains(t, response.Namespaces["app"].Tables, "account_view")
+	assert.NotContains(t, response.Namespaces["app"].Tables, "account_snapshot")
+}
+
+// A cancelled request remains a context failure and is never presented as a
+// refusal caused by an unrepresentable table.
+func TestEnginePullSchemaReturnsCancelledContext(t *testing.T) {
+	dsn, _ := testutil.StartPostgres(t, "pull_cancel_test")
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	eng := NewForTarget(0, "pull_cancel_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(ctx, &ternv1.PullSchemaRequest{Namespace: "public"})
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, response)
+	assert.Contains(t, err.Error(), `PostgreSQL database "pull_cancel_test" for schema pull`)
+	assert.NotContains(t, err.Error(), "refused incomplete baseline")
+}
 
 // TestEnginePlanCreateTable proves a greenfield CREATE TABLE derived from
 // desired state plans as an executable change: the role's schema CREATE
