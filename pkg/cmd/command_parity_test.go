@@ -39,6 +39,11 @@ var prCommandsWithoutCLICommand = map[string]string{
 // The reverse does not hold: the CLI is deliberately a superset, carrying
 // commands (status, logs, storage, serve, and others) that have no reason to be
 // issued from a PR comment.
+//
+// Only the spelling half of that parity is mechanized here: this asserts that a
+// CLI command exists to answer each comment command, not that the two do the
+// same thing. A CLI apply whose behavior drifted from comment apply still
+// passes, so the capability half remains a convention.
 func TestEveryPRCommandHasACLIEquivalent(t *testing.T) {
 	prCommands := webhook.CommandNames()
 	require.NotEmpty(t, prCommands, "webhook registers no PR comment commands")
