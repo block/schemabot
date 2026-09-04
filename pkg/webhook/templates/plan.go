@@ -804,16 +804,27 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 }
 
 // writePlanDDLBlock writes a single fenced SQL block of statements, formatted
-// under the plan's own dialect.
+// under the plan's own dialect. A greenfield create set is split so each of
+// its statements is formatted on its own line; rendering is best-effort, so a
+// statement that is neither a single statement nor a valid create set is
+// still rendered as written, and the reason is logged for triage.
 func writePlanDDLBlock(sb *strings.Builder, statements []string, dialect schema.Dialect) {
 	sb.WriteString("```sql\n")
 	formattedStatements := make([]string, 0, len(statements))
 	parser, parserErr := ddl.ParserForDialect(dialect)
+	if parserErr != nil {
+		slog.Warn("plan DDL block cannot split create sets; multi-statement DDL will be rendered as written",
+			"dialect", dialect, "error", parserErr)
+	}
 	for _, stmt := range statements {
 		statementsToFormat := []string{stmt}
 		if parserErr == nil {
 			if _, _, err := parser.Classify(stmt); err != nil {
-				if createSet, err := ddl.ParseCreateSet(parser, stmt); err == nil {
+				createSet, err := ddl.ParseCreateSet(parser, stmt)
+				if err != nil {
+					slog.Warn("plan DDL block could not classify a statement or parse it as a supported create set; it will be rendered as written",
+						"dialect", dialect, "error", err)
+				} else {
 					statementsToFormat = createSet.Statements
 				}
 			}

@@ -196,7 +196,8 @@ func (c *LocalClient) statementParser() (ddl.StatementParser, error) {
 // multi-statement input; the one multi-statement shape drift admits is a
 // greenfield create set (a CREATE TABLE followed by CREATE INDEX statements on
 // that table), canonicalized statement by statement so equivalent spellings
-// in the same order compare equal.
+// in the same order compare equal. Each statement of the set is classified
+// on its own so the DDL gates below judge every statement, not just the first.
 func canonicalDDLForDrift(p ddl.StatementParser, raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -211,13 +212,13 @@ func canonicalDDLForDrift(p ddl.StatementParser, raw string) (string, error) {
 	}
 	canonical := make([]string, 0, len(createSet.Statements))
 	for i, statement := range createSet.Statements {
-		stmtType := createSet.Type
-		if i > 0 {
-			stmtType = ddl.StatementCreateIndex
+		stmtType, _, err := p.Classify(statement)
+		if err != nil {
+			return "", fmt.Errorf("classify statement %d of create set: %w", i+1, err)
 		}
 		c, err := canonicalDriftStatement(p, statement, stmtType)
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf("statement %d of create set: %w", i+1, err)
 		}
 		canonical = append(canonical, c)
 	}

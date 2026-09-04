@@ -134,13 +134,25 @@ func TestCreateSetStatements(t *testing.T) {
 			name:       "schema-qualified targets differ",
 			parser:     postgresParser,
 			script:     "CREATE TABLE a.t (id bigint); CREATE INDEX t_id_idx ON b.t (id);",
-			wantErrMsg: `statement 2 creates an index on table "b.t", not CREATE TABLE target "a.t"`,
+			wantErrMsg: `statement 2 creates an index on table "b"."t", not CREATE TABLE target "a"."t"`,
 		},
 		{
-			name:       "qualified and unqualified targets differ",
+			name:       "qualified table with unqualified index is refused as mixed qualification",
 			parser:     postgresParser,
 			script:     "CREATE TABLE a.t (id bigint); CREATE INDEX t_id_idx ON t (id);",
-			wantErrMsg: `statement 2 creates an index on table "t", not CREATE TABLE target "a.t"`,
+			wantErrMsg: `statement 2 creates an index on "t" while CREATE TABLE targets "a"."t"; a create set cannot resolve an unqualified name against a search_path`,
+		},
+		{
+			name:       "unqualified table with qualified index is refused as mixed qualification",
+			parser:     postgresParser,
+			script:     "CREATE TABLE t (id bigint); CREATE INDEX t_id_idx ON a.t (id);",
+			wantErrMsg: `statement 2 creates an index on "a"."t" while CREATE TABLE targets "t"; a create set cannot resolve an unqualified name against a search_path`,
+		},
+		{
+			name:       "a dot inside a bare table name is not a schema qualifier",
+			parser:     postgresParser,
+			script:     `CREATE TABLE "a.t" (id bigint); CREATE INDEX t_id_idx ON a.t (id);`,
+			wantErrMsg: `statement 2 creates an index on "a"."t" while CREATE TABLE targets "a.t"`,
 		},
 		{
 			name:       "alter follows create table",

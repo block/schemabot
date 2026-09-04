@@ -157,22 +157,56 @@ func ParseCreateSet(p StatementParser, script string) (CreateSet, error) {
 		if err != nil {
 			return CreateSet{}, fmt.Errorf("identify statement %d index target: %w", i+2, err)
 		}
+		if indexTarget.qualified() != createTarget.qualified() {
+			return CreateSet{}, fmt.Errorf("statement %d creates an index on %s while CREATE TABLE targets %s; a create set cannot resolve an unqualified name against a search_path, so both must name the schema the same way", i+2, indexTarget, createTarget)
+		}
 		if indexTarget != createTarget {
-			return CreateSet{}, fmt.Errorf("statement %d creates an index on table %q, not CREATE TABLE target %q", i+2, indexTarget, createTarget)
+			return CreateSet{}, fmt.Errorf("statement %d creates an index on table %s, not CREATE TABLE target %s", i+2, indexTarget, createTarget)
 		}
 	}
 	return result, nil
 }
 
-type createSetRelationParser interface {
-	createSetRelation(stmt string) (string, error)
+// relationIdentity is the parsed (schema, name) pair naming a relation. The
+// two parts are compared as a pair, never as one joined string, so a relation
+// whose bare name contains a dot can never be mistaken for a schema-qualified
+// one. Schema is empty when the statement did not qualify the name.
+type relationIdentity struct {
+	Schema string
+	Name   string
 }
 
-func createSetRelation(p StatementParser, stmt, classifiedTable string) (string, error) {
+func (r relationIdentity) qualified() bool { return r.Schema != "" }
+
+// String renders the identity for error messages, quoting each part so that
+// a dot inside a bare name reads differently from a schema qualifier.
+func (r relationIdentity) String() string {
+	if !r.qualified() {
+		return fmt.Sprintf("%q", r.Name)
+	}
+	return fmt.Sprintf("%q.%q", r.Schema, r.Name)
+}
+
+// createSetRelationParser is implemented by a StatementParser whose grammar
+// carries a schema qualifier on CREATE TABLE and CREATE INDEX targets.
+type createSetRelationParser interface {
+	createSetRelation(stmt string) (relationIdentity, error)
+}
+
+// createSetRelation identifies the relation a create-set statement targets.
+// The identity is taken exactly as written — an unqualified name is never
+// resolved against a search_path — so a create set is only admitted when
+// every statement qualifies its target the same way. Every ParseCreateSet
+// caller today hands it plan-emitted DDL, which the planner qualifies
+// uniformly; an operator-authored set that mixes qualified and unqualified
+// names is refused with a message naming that cause rather than guessed at.
+// A parser without a schema-aware seam falls back to Classify's bare table
+// name, which is the whole identity its grammar can express.
+func createSetRelation(p StatementParser, stmt, classifiedTable string) (relationIdentity, error) {
 	if relationParser, ok := p.(createSetRelationParser); ok {
 		return relationParser.createSetRelation(stmt)
 	}
-	return classifiedTable, nil
+	return relationIdentity{Name: classifiedTable}, nil
 }
 
 // CreateSetStatements has the same admission rules as ParseCreateSet. It is
