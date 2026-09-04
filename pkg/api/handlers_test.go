@@ -225,16 +225,14 @@ func (s *staticApplyStore) SetRevertSkipped(context.Context, int64, time.Time) e
 	return nil
 }
 
-// GetByDatabase folds its arguments the way the real store does, so a test
-// that reaches it with a non-canonical spelling matches the fixture rows and
-// only the handler's own folding is under test.
+// GetByDatabase compares its arguments byte-for-byte against the fixture rows,
+// modelling a store with no collation forgiveness of its own. A handler that
+// forwards a caller's spelling unfolded therefore misses the fixture, so a
+// mixed-case request only matches when the handler folds it first.
 func (s *staticApplyStore) GetByDatabase(_ context.Context, database, dbType, environment string) ([]*storage.Apply, error) {
 	if s.err != nil {
 		return nil, s.err
 	}
-	database = storage.CanonicalKey(database)
-	dbType = storage.CanonicalKey(dbType)
-	environment = storage.CanonicalKey(environment)
 	if len(s.applies) > 0 {
 		var applies []*storage.Apply
 		for _, apply := range s.applies {

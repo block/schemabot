@@ -723,13 +723,13 @@ func databaseListResponse(config *ServerConfig, databaseType, name string) (*api
 	if config == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
-	nameFilter := strings.ToLower(name)
+	nameFilter := storage.CanonicalKey(name)
 	databaseNames := make([]string, 0, len(config.Databases))
 	for database, dbConfig := range config.Databases {
 		if databaseType != "" && dbConfig.Type != databaseType {
 			continue
 		}
-		if nameFilter != "" && !strings.Contains(strings.ToLower(database), nameFilter) {
+		if nameFilter != "" && !strings.Contains(storage.CanonicalKey(database), nameFilter) {
 			continue
 		}
 		databaseNames = append(databaseNames, database)
