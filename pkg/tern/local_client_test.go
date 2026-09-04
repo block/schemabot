@@ -4042,9 +4042,8 @@ func TestLocalClient_PullSchemaEngineWithoutCapabilityUnsupported(t *testing.T) 
 // pull path or the unsupported-capability fallback.
 func TestLocalClient_PullSchemaPostgresReachesEngine(t *testing.T) {
 	client, err := NewLocalClient(LocalConfig{
-		Database:  "orders",
-		Type:      storage.DatabaseTypePostgres,
-		TargetDSN: "postgres://localhost:5432/orders",
+		Database: "orders",
+		Type:     storage.DatabaseTypePostgres,
 	}, nil, slog.Default())
 	require.NoError(t, err)
 
@@ -4052,7 +4051,7 @@ func TestLocalClient_PullSchemaPostgresReachesEngine(t *testing.T) {
 
 	require.Error(t, err)
 	assert.NotErrorIs(t, err, ErrPullSchemaUnsupportedType)
-	assert.Contains(t, err.Error(), "PostgreSQL database")
+	assert.Contains(t, err.Error(), "DSN credentials are required")
 }
 
 // A request whose type disagrees with the client's configured type is a

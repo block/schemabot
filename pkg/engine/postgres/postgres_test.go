@@ -459,3 +459,13 @@ func TestPullSchemaRequiresConfiguredCredentials(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "DSN credentials are required")
 }
+
+func TestPullSchemaRejectsDetailedCatalog(t *testing.T) {
+	_, err := New().PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database:      "orders",
+		CatalogDetail: ternv1.PullCatalogDetail_PULL_CATALOG_DETAIL_DETAILED,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "catalog detail")
+	assert.Contains(t, err.Error(), "unsupported; use basic")
+}
