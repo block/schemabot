@@ -36,8 +36,8 @@ engines gain features. If the two ever disagree, invariants.md is the one that h
 
 | | Spirit (MySQL) | PlanetScale (Vitess) | pg-sprite (PostgreSQL) |
 |---|---|---|---|
-| **Instant DDL preferred** | yes, attempted first | yes, attempted first | not applicable, a MySQL concept |
-| **Online DDL (copy and swap)** | yes, when instant is not possible | yes, when instant is not possible | planned; those changes are blocked at plan time meanwhile |
+| **Cheap native path tried first** | yes, instant DDL | yes, instant DDL | yes, attempted under budgets that cancel a rewrite |
+| **Online DDL (copy and swap)** | yes, when instant is not possible | yes, when instant is not possible | planned; meanwhile a rewrite is refused above a size limit and cancelled by its budget below it |
 | **Escape hatch for refused statements** | direct execution: opt-in, size-bounded, separately confirmed | none, excluded by design | none, native execution is already the only path |
 | **`stop` / `start`** | yes | no | planned |
 | **Deferred cutover** | yes | yes | planned |
@@ -65,16 +65,28 @@ never told it was paused. The next section covers why.
 
 The first two rows drive most of the rest of the table, so start there.
 
-**Instant DDL** is the cheap path, and both MySQL-family engines try it first. Some changes are
-metadata-only: adding a column at the end of a table does not have to touch the existing rows, so
-MySQL can make the change without rewriting them. Spirit asks the server to run the statement with
-`ALGORITHM=INSTANT` and lets the server decide whether it can, rather than keeping a list of
-qualifying operations of its own. Eligibility changes between MySQL minor versions and can even
-depend on the table. Vitess makes the same attempt for a deploy request. When it works, the change
-is done in milliseconds, and none of the control operations below apply, because there is nothing
-in flight to control.
+**The cheap native path comes first on every engine.** Some changes are metadata-only: adding a
+column at the end of a table does not have to touch the existing rows, so the server can make the
+change without rewriting them. When that works the change is done in milliseconds, and none of the
+control operations below apply, because there is nothing in flight to control. What differs is how
+an engine finds out whether it will work.
 
-**Online DDL, or copy and swap,** is what happens when instant DDL is not possible. The engine
+On MySQL the server can be asked. Spirit runs the statement with `ALGORITHM=INSTANT` and lets the
+server decide, rather than keeping a list of qualifying operations of its own, because eligibility
+changes between MySQL minor versions and can even depend on the table. That is instant DDL, and
+Vitess makes the same attempt for a deploy request.
+
+PostgreSQL has no equivalent flag, so pg-sprite gambles instead of asking. It runs the statement
+once, under a lock timeout and a statement timeout it sets for that statement alone. If the change
+really was metadata-only it commits in milliseconds; if it turns out to rewrite the table, the
+server cancels it at the timeout and PostgreSQL's transactional DDL rolls it back cleanly, leaving
+nothing behind. The refusal is reported as a budget error rather than a failed change. Its planner
+classification is a prediction, not a promise, so even a statement it expects to be metadata-only
+gets a budget rather than an exemption. Above a configured table size the attempt is refused
+outright, before any DDL runs, since a rewrite there is likely enough that gambling is not worth
+the lock. That refusal becomes the routing signal into copy and swap when pg-sprite gains it.
+
+**Online DDL, or copy and swap,** is what happens when the cheap path is not possible. The engine
 builds a new table, backfills it, keeps it in sync with ongoing writes, and swaps it in. That is
 what lets a large table change without a long lock, and it is why the change becomes a
 long-running process with phases: something is in flight, so there is something to pause, to slow
@@ -129,13 +141,16 @@ because with no long-running copy there is nothing to pause and no swap to cut o
 the exception: it needs the engine to keep the pre-cutover table, which is the retention decision
 described above, and it is not on the PostgreSQL roadmap today.
 
-Until the copy lands, a PostgreSQL change is kept safe by refusing work rather than pacing it. A
-change that needs a copy or a rewrite is blocked when the plan is made. Only a small set of
-statement shapes is allowed at all, which is why a `DROP TABLE` never reaches the database. A
-change to a table over a configured size limit is refused. What does run gets a lock budget and a
-statement budget. [postgresql.md](postgresql.md) has the full boundary and is worth reading before
-you point SchemaBot at a PostgreSQL database; it tracks the engine more closely than this page
-does.
+Until the copy lands, a PostgreSQL change is kept safe by bounding work rather than pacing it. Only
+a small set of statement shapes is allowed at all, which is why a `DROP TABLE` never reaches the
+database. Above the configured table size limit, anything that might rewrite is refused before it
+runs. Below it, the bounded attempt described above is what stands in for a copy: the change is
+tried once, and a rewrite is cancelled by its own budget rather than allowed to hold a lock. Some
+statements skip the gamble because PostgreSQL has a genuinely online form of them, and the planner
+substitutes it: an index build becomes `CREATE INDEX CONCURRENTLY`, and a constraint is added `NOT
+VALID` and then validated. Those run whatever the table size. [postgresql.md](postgresql.md) has
+the full boundary and is worth reading before you point SchemaBot at a PostgreSQL database; it
+tracks the engine more closely than this page does.
 
 ## What GA asks of an engine
 
