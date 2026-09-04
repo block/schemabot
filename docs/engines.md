@@ -39,23 +39,27 @@ engines gain features. If the two ever disagree, invariants.md is the one that h
 | **Instant DDL preferred** | yes, attempted first | yes, attempted first | not applicable, a MySQL concept |
 | **Online DDL (copy and swap)** | yes, when instant is not possible | yes, when instant is not possible | planned; those changes are blocked at plan time meanwhile |
 | **Escape hatch for refused statements** | direct execution: opt-in, size-bounded, separately confirmed | none, excluded by design | none, native execution is already the only path |
-| **`stop` / `start` as pause and resume** | yes | no, a stop cancels the deploy request permanently | planned |
-| **`cutover`, including deferring it** | yes | yes | planned |
+| **`stop` / `start`** | yes | no | planned |
+| **Deferred cutover** | yes | yes | planned |
 | **`cancel`** | yes | yes | planned |
-| **`revert` / `skip-revert`** | no | yes | not planned |
+| **`revert` / `skip-revert`** | no | yes | no |
 | **Throttling** | automatic, on live target signals | a configured threshold that admits or rejects | planned; statements bounded meanwhile |
 | **Adaptive pacing** | yes | no | not applicable, no copy to pace |
 | **Dropped-table recovery** | opt-in quarantine, expires | inside the revert window, expires | not applicable, a drop is blocked at plan time |
 | **Who reports progress** | the process running the change | the cluster, so any instance can read it | the process running the change |
 
-A cell that says **planned** means the engine does not do this yet but is expected to. **Not
-planned** means it does not do this and there is no intention to add it.
+A cell that says **planned** means the engine does not do this yet but is expected to. A plain
+**no** means it does not do this today.
 
 Either way, asking for something an engine does not support is safe rather than surprising. The
 request is recorded durably before it is acknowledged, and then fails with a typed, terminal
 "unsupported operation" error. It does not hang, get dropped silently, or report a success that
 did not happen. That behavior is CO-1 and CO-2 in [invariants.md](invariants.md), and it is what
 keeps a narrower engine a safe one.
+
+`stop` on Vitess is the one operation that resolves rather than declines: it is carried out as a
+`cancel`, which ends the change for good, and the apply settles as cancelled so the operator is
+never told it was paused. The next section covers why.
 
 ## Why the differences exist
 
@@ -81,16 +85,16 @@ driving the apply, so only that process knows how far along it is, and if it die
 picks up from a checkpoint. A deploy request runs on the cluster instead. It outlives the process
 watching it, and any instance can ask the cluster for its progress and get the same answer.
 
-**A stop does not mean the same thing on both engines.** On Spirit it is a pause: the copy
-checkpoints, the apply settles as stopped, and `start` resumes it from that checkpoint. On Vitess
-there is no pause at all. A stop cancels the deploy request, the apply settles as cancelled, and
-nothing brings it back. The two are told apart at the source rather than at render time, so every
-operator surface names which one happened and a cancelled change never reads as merely paused.
-That is CO-8 in [invariants.md](invariants.md).
+**Only Spirit can pause a change.** A Spirit stop checkpoints the copy and settles the apply as
+stopped, and `start` picks it back up from there. Vitess has no equivalent: a deploy request runs
+or it ends. So `stop` is a MySQL operation, and on Vitess the way to take the load off a database
+is `cancel`, which ends the change for good. Asking for a stop there gets you that cancel rather
+than a refusal, and the apply settles as cancelled, so what the operator is told always matches
+what happened. That is CO-8 in [invariants.md](invariants.md).
 
-`start` on Vitess is a different operation from Spirit's resume, not a partial version of it. It
-launches a deploy request that was created and deliberately left undeployed, which is how a change
-waits for an operator before it begins rather than after it has already run.
+`start` follows stop. On Vitess it exists only to launch a deploy request that was created and
+deliberately left undeployed, which is how a change waits for an operator before it begins. It
+never resumes anything.
 
 The revert window is a separate decision and does not follow from where the copy ran. Both engines
 reach cutover holding two tables: the new one, about to take traffic, and the original, renamed
@@ -121,7 +125,7 @@ Most of what the PostgreSQL column is missing follows from that, rather than fro
 permanent about the engine. The control operations arrive with the copy rather than before it,
 because with no long-running copy there is nothing to pause and no swap to cut over. `revert` is
 the exception: it needs the engine to keep the pre-cutover table, which is the retention decision
-described above, and that is not planned here.
+described above, and it is not on the PostgreSQL roadmap today.
 
 Until the copy lands, a PostgreSQL change is kept safe by refusing work rather than pacing it. A
 change that needs a copy or a rewrite is blocked when the plan is made. Only a small set of
@@ -142,14 +146,13 @@ a copy is what lets an engine handle a whole schema rather than the easy parts o
 
 **A lever over a change that is already in flight.** A copy can run for hours, and an engine that
 can begin one but not act on one leaves the operator with a process they can only wait out. At
-minimum they must be able to take the load off the database, choose when the swap happens
-(`cutover`), and abandon the change (`cancel`).
+minimum they must be able to take the load off the database, hold the change short of its swap and
+trigger that swap when they choose (deferred cutover), and abandon the change (`cancel`).
 
 Which verbs deliver that varies, and the bar is the ability rather than a particular verb. Spirit
-pauses and resumes. Vitess has no pause: there, taking the load off means ending the change, and
-`stop` and `cancel` both do that. What GA requires is that the lever exists and that the operator
-is told plainly which outcome they got, never that every engine implements the same four verbs the
-same way.
+pauses and resumes; Vitess cannot pause at all, so `cancel` is how a change gets off a database
+there. What GA requires is that the lever exists and that the operator is told plainly what it
+did, never that every engine implements the same verbs the same way.
 
 `revert` and `skip-revert` are deliberately **not** on the list. They depend on the engine keeping
 the pre-cutover table, which is a choice about retention rather than a measure of maturity. The

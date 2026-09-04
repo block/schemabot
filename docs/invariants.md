@@ -175,13 +175,13 @@ unsupported-operation decline rather than a silent drop, a false success, or an 
 That is the difference between an unfinished engine and an unsafe one.
 
 Cashed out in engine capabilities, the bar is copy and swap plus a real lever over a change that
-is already in flight: taking the load off the database, choosing when the swap happens
-(`cutover`), and abandoning the change (`cancel`). Which verbs deliver that varies, so the bar is
-the ability rather than a fixed list. Spirit pauses and resumes; Vitess has no pause, and there a
-`stop` ends the change like a `cancel` does. `revert` and `skip-revert` are outside the bar
-entirely, because they depend on whether the engine keeps the pre-cutover table rather than on how
-complete the engine is. [engines.md](engines.md) works through why, and is the per-engine picture
-generally.
+is already in flight: taking the load off the database, holding the change short of its swap and
+triggering that swap when the operator chooses (deferred cutover), and abandoning the change
+(`cancel`). Which verbs deliver that varies, so the bar is the ability rather than a fixed list.
+Spirit pauses and resumes; Vitess cannot pause at all, so `cancel` is how a change gets off a
+database there. `revert` and `skip-revert` are outside the bar entirely, because they depend on
+whether the engine keeps the pre-cutover table rather than on how complete the engine is.
+[engines.md](engines.md) works through why, and is the per-engine picture generally.
 
 Where an engine's envelope is still moving, its own doc is the authority on where the boundary
 currently sits rather than this one. [postgresql.md](postgresql.md) is that doc for PostgreSQL,
@@ -778,10 +778,10 @@ to a data plane is a routing bug, and the internal numeric row ID appears on no 
 
 ### CO-8: Stop terminality is engine truth, told truthfully
 
-`stop` does not mean the same thing on every engine, and an operator must never have to guess
-which one they got. On Spirit a stop is a pause: the copy checkpoints, the apply settles as
-`stopped`, and `start` resumes it. On Vitess there is no pause. A stop cancels the deploy request,
-the apply settles as `cancelled`, and nothing brings it back.
+Only Spirit can pause a change. A Spirit stop checkpoints the copy, the apply settles as
+`stopped`, and `start` resumes it from there. Vitess has no pause, so a stop aimed at a Vitess
+target cancels the deploy request instead: the apply settles as `cancelled`, and nothing brings it
+back. An operator must never be told the first when they got the second.
 
 That reading is decided in one place from the target's database type, rather than inferred
 wherever a result is rendered, and it is keyed on the database type specifically so a change that
