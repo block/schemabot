@@ -33,10 +33,11 @@ wrapped in PlanetScale's API and branching model, so the copy, the cutover, the 
 the throttle are all Vitess features running on the cluster, and the engine is how SchemaBot asks
 for them. That distinction turns up several times in the table below.
 
-Engines differ, and this is where those differences are written down. Keep it separate from
-[invariants.md](invariants.md) in your head. That document says what must never be false on any
-engine, and is meant to stay put. This one says what each engine can do today, which changes as
-engines gain features. If the two ever disagree, invariants.md is the one that holds.
+Engines differ, and this is where those differences are written down. It is the companion to
+[invariants.md](invariants.md), and the two answer different questions. That document says what
+must never be false on any engine, and is meant to stay put. This one says what each engine can do
+today, which changes as engines gain features. If the two ever disagree, invariants.md is the one
+that holds.
 
 ## Capability matrix
 
