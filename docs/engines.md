@@ -39,10 +39,11 @@ revert window, and the throttle are all Vitess features on that path. The differ
 several times below.
 
 Engines differ, and this is where those differences are written down. It is the companion to
-[invariants.md](invariants.md), and the two answer different questions. That document says what
-must never be false on any engine, and is meant to stay put. This one says what each engine can do
-today, which changes as engines gain features. If the two ever disagree, invariants.md is the one
-that holds.
+[invariants.md](invariants.md), and the two answer different questions. That document is about
+SchemaBot's orchestration, and most of it holds no matter which engine executes a change. Only a
+few of its entries reach the engine boundary at all, and it names which ones. It is also meant to
+stay put, where this page moves as engines gain features. Where the two touch the same ground and
+disagree, invariants.md is the one that holds.
 
 ## Capability matrix
 
