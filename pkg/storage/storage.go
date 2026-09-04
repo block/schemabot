@@ -1099,10 +1099,11 @@ const ProgressCommentAuthorityStaleAfter = ApplyLeaseStaleAfter
 const SummaryClaimStaleAfter = 2 * time.Minute
 
 // PlanCommentStore tracks plan comments posted on PRs so a newer plan comment
-// for the same database can minimize the ones it supersedes. Rows exist only
-// for comments actually posted; minimized_at is set only after the GitHub
-// minimize call succeeded, so an unminimized row is always retried by the next
-// supersede.
+// for the same database can retire the ones it supersedes — minimizing a
+// comment whose head an apply owns, deleting one no apply acted on. Rows exist
+// only for comments actually posted; minimized_at and deleted_at are set only
+// after the corresponding GitHub call succeeded, so an unretired row is always
+// retried by the next supersede.
 // Insert canonicalizes the provided comment's repository, database, and
 // database type in place before persisting. EnvironmentScope is stored as
 // given: no query predicate filters on it, and its consumers compare it in Go
@@ -1111,21 +1112,27 @@ type PlanCommentStore interface {
 	// Insert stores a newly posted plan comment and sets comment.ID.
 	Insert(ctx context.Context, comment *PlanComment) error
 
-	// ListUnminimizedForSlot returns the not-yet-minimized comments for a
-	// (repository, pull_request, database) slot, ordered by id ascending. The
-	// caller decides which of them a newly posted comment supersedes.
-	ListUnminimizedForSlot(ctx context.Context, repo string, pr int, database, databaseType string) ([]*PlanComment, error)
+	// ListUnretiredForSlot returns the comments neither minimized nor deleted
+	// for a (repository, pull_request, database) slot, ordered by id
+	// ascending. The caller decides which of them a newly posted comment
+	// supersedes.
+	ListUnretiredForSlot(ctx context.Context, repo string, pr int, database, databaseType string) ([]*PlanComment, error)
 
-	// ListUnminimizedForRepoPR returns the not-yet-minimized comments for a
-	// whole pull request, across every database, ordered by id ascending. A
-	// caller that resolved no database — a delivery that discovers no schema
-	// config, or one whose discovery failed — still has to retire the plan
-	// comments an earlier head left expanded, and has no slot to key.
-	ListUnminimizedForRepoPR(ctx context.Context, repo string, pr int) ([]*PlanComment, error)
+	// ListUnretiredForRepoPR returns the comments neither minimized nor
+	// deleted for a whole pull request, across every database, ordered by id
+	// ascending. A caller that resolved no database — a delivery that
+	// discovers no schema config, or one whose discovery failed — still has
+	// to retire the plan comments an earlier head left behind, and has no
+	// slot to key.
+	ListUnretiredForRepoPR(ctx context.Context, repo string, pr int) ([]*PlanComment, error)
 
 	// MarkMinimized stamps minimized_at after the GitHub minimize call
 	// succeeded. An already-minimized row is not an error.
 	MarkMinimized(ctx context.Context, id int64) error
+
+	// MarkDeleted stamps deleted_at after the GitHub delete call succeeded.
+	// An already-deleted row is not an error.
+	MarkDeleted(ctx context.Context, id int64) error
 }
 
 // ApplyOperationStore manages per-(apply, deployment, operation_key) child rows

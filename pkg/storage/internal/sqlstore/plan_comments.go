@@ -1,6 +1,7 @@
 // plan_comments.go implements PlanCommentStore for tracking posted plan
-// comments so a newer plan comment for the same database can minimize the
-// ones it supersedes on GitHub.
+// comments so a newer plan comment for the same database can retire the ones
+// it supersedes on GitHub — minimizing apply-owned comments, deleting
+// unactioned ones.
 package sqlstore
 
 import (
@@ -13,7 +14,7 @@ import (
 )
 
 // planCommentColumns lists all columns for SELECT queries.
-const planCommentColumns = `id, repository, pull_request, database_name, database_type, environment_scope, head_sha, github_comment_id, github_node_id, minimized_at, created_at, updated_at`
+const planCommentColumns = `id, repository, pull_request, database_name, database_type, environment_scope, head_sha, github_comment_id, github_node_id, minimized_at, deleted_at, created_at, updated_at`
 
 // planCommentStore implements storage.PlanCommentStore using MySQL.
 type planCommentStore struct {
@@ -38,40 +39,40 @@ func (s *planCommentStore) Insert(ctx context.Context, comment *storage.PlanComm
 	return nil
 }
 
-// ListUnminimizedForSlot returns the not-yet-minimized comments for a
-// (repository, pull_request, database) slot, ordered by id ascending.
-func (s *planCommentStore) ListUnminimizedForSlot(ctx context.Context, repo string, pr int, database, databaseType string) ([]*storage.PlanComment, error) {
+// ListUnretiredForSlot returns the comments neither minimized nor deleted for
+// a (repository, pull_request, database) slot, ordered by id ascending.
+func (s *planCommentStore) ListUnretiredForSlot(ctx context.Context, repo string, pr int, database, databaseType string) ([]*storage.PlanComment, error) {
 	repo = storage.CanonicalKey(repo)
 	database = storage.CanonicalKey(database)
 	databaseType = storage.CanonicalKey(databaseType)
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+planCommentColumns+`
 		FROM plan_comments
-		WHERE repository = ? AND pull_request = ? AND database_name = ? AND database_type = ? AND minimized_at IS NULL
+		WHERE repository = ? AND pull_request = ? AND database_name = ? AND database_type = ? AND minimized_at IS NULL AND deleted_at IS NULL
 		ORDER BY id
 	`, repo, pr, database, databaseType)
 	if err != nil {
-		return nil, fmt.Errorf("query unminimized plan comments for %s#%d database %s: %w", repo, pr, database, err)
+		return nil, fmt.Errorf("query unretired plan comments for %s#%d database %s: %w", repo, pr, database, err)
 	}
 	return collectPlanComments(rows, fmt.Sprintf("%s#%d database %s", repo, pr, database))
 }
 
-// ListUnminimizedForRepoPR returns the not-yet-minimized comments for a whole
-// pull request, across every database, ordered by id ascending. The slot query
-// above answers "what did this database's newest comment supersede"; this one
-// answers "what is still expanded on this PR", which a caller that resolved no
-// database has no other way to ask. The (repository, pull_request) prefix of
-// the slot index serves it.
-func (s *planCommentStore) ListUnminimizedForRepoPR(ctx context.Context, repo string, pr int) ([]*storage.PlanComment, error) {
+// ListUnretiredForRepoPR returns the comments neither minimized nor deleted
+// for a whole pull request, across every database, ordered by id ascending.
+// The slot query above answers "what did this database's newest comment
+// supersede"; this one answers "what is still visible on this PR", which a
+// caller that resolved no database has no other way to ask. The (repository,
+// pull_request) prefix of the slot index serves it.
+func (s *planCommentStore) ListUnretiredForRepoPR(ctx context.Context, repo string, pr int) ([]*storage.PlanComment, error) {
 	repo = storage.CanonicalKey(repo)
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+planCommentColumns+`
 		FROM plan_comments
-		WHERE repository = ? AND pull_request = ? AND minimized_at IS NULL
+		WHERE repository = ? AND pull_request = ? AND minimized_at IS NULL AND deleted_at IS NULL
 		ORDER BY id
 	`, repo, pr)
 	if err != nil {
-		return nil, fmt.Errorf("query unminimized plan comments for %s#%d: %w", repo, pr, err)
+		return nil, fmt.Errorf("query unretired plan comments for %s#%d: %w", repo, pr, err)
 	}
 	return collectPlanComments(rows, fmt.Sprintf("%s#%d", repo, pr))
 }
@@ -107,6 +108,21 @@ func (s *planCommentStore) MarkMinimized(ctx context.Context, id int64) error {
 	return nil
 }
 
+// MarkDeleted stamps deleted_at after the GitHub delete call succeeded.
+// An already-deleted row is not an error.
+func (s *planCommentStore) MarkDeleted(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE plan_comments
+		SET deleted_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`,
+		    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
+		WHERE id = ? AND deleted_at IS NULL
+	`, id)
+	if err != nil {
+		return fmt.Errorf("mark plan comment %d deleted: %w", id, err)
+	}
+	return nil
+}
+
 // canonicalizePlanCommentIdentity folds the identity keys that appear in this
 // store's SQL predicates. EnvironmentScope is deliberately not folded: no
 // query filters on it, and its consumers compare it in Go against values built
@@ -125,7 +141,7 @@ func scanPlanComment(s scanner) (*storage.PlanComment, error) {
 		&comment.ID, &comment.Repository, &comment.PullRequest,
 		&comment.DatabaseName, &comment.DatabaseType, &comment.EnvironmentScope,
 		&comment.HeadSHA, &comment.GitHubCommentID, &comment.GitHubNodeID,
-		&comment.MinimizedAt, &comment.CreatedAt, &comment.UpdatedAt,
+		&comment.MinimizedAt, &comment.DeletedAt, &comment.CreatedAt, &comment.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err

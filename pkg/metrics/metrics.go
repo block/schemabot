@@ -139,17 +139,21 @@ func RecordPlan(ctx context.Context, repo, database, deployment, environment, st
 	)
 }
 
-// RecordPlanCommentMinimize counts the outcome of retiring one superseded plan
-// comment. Outcomes: "minimized" (hidden on GitHub and marked in storage),
-// "apply_owned" (kept expanded because an apply owns the plan's head),
-// "guard_error" (apply-ownership lookup failed, comment kept expanded fail
-// closed — investigate storage), "minimize_error" (GitHub minimize call
-// failed; retried on the next supersede — investigate GitHub API health),
-// "mark_error" (hidden on GitHub but the storage mark failed; the next
-// supersede re-minimizes it idempotently — investigate storage).
-func RecordPlanCommentMinimize(ctx context.Context, repo, outcome string) {
-	addCounter(ctx, "schemabot.plan_comment_minimize.total",
-		"Total number of superseded plan-comment minimize attempts by outcome", "{comment}",
+// RecordPlanCommentRetirement counts the outcome of retiring one superseded
+// plan comment. Outcomes: "minimized" (hidden on GitHub but still expandable
+// as the record of what was planned), "deleted" (no apply ever acted on the
+// plan and the repository opted into deletion, so the comment is removed from
+// the timeline), "apply_owned" (kept fully expanded because an apply owns the
+// plan's head and the repository uses the minimize-based policy),
+// "guard_error" (apply-ownership lookup failed, comment left untouched fail
+// closed — investigate storage), "minimize_error" / "delete_error" (the
+// GitHub call failed; retried on the next supersede — investigate GitHub API
+// health), "minimize_mark_error" / "delete_mark_error" (GitHub succeeded but
+// the storage mark failed; the next supersede retries the mark idempotently —
+// investigate storage).
+func RecordPlanCommentRetirement(ctx context.Context, repo, outcome string) {
+	addCounter(ctx, "schemabot.plan_comment_retirement.total",
+		"Total number of superseded plan-comment retirement attempts by outcome", "{comment}",
 		attribute.String("repository", repo),
 		attribute.String("outcome", outcome),
 	)
@@ -1444,6 +1448,7 @@ const (
 	GitHubOperationCreateCheckRun                = "create_check_run"
 	GitHubOperationCreateIssueComment            = "create_issue_comment"
 	GitHubOperationCreateInstallationAccessToken = "create_installation_access_token"
+	GitHubOperationDeleteIssueComment            = "delete_issue_comment"
 	GitHubOperationEditIssueComment              = "edit_issue_comment"
 	GitHubOperationFetchAppSlug                  = "fetch_app_slug"
 	GitHubOperationFetchBlob                     = "fetch_blob"
@@ -1642,6 +1647,7 @@ func isKnownGitHubOperation(operation string) bool {
 		GitHubOperationCreateCheckRun,
 		GitHubOperationCreateIssueComment,
 		GitHubOperationCreateInstallationAccessToken,
+		GitHubOperationDeleteIssueComment,
 		GitHubOperationEditIssueComment,
 		GitHubOperationFetchAppSlug,
 		GitHubOperationFetchBlob,

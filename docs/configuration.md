@@ -1538,13 +1538,13 @@ disagree. Align the server environment config with the deployment's
 `allowed_environments`, then run `schemabot plan -e <environment>` or push a new
 commit to refresh checks.
 
-### Plan comment minimization
+### Plan comment retirement
 
 On a frequently updated PR, plan comments pile up — every push that touches a
-schema file posts a new one. To keep the PR readable, SchemaBot minimizes
-(collapses as **Outdated**) the plan comments a newer one supersedes. This
-applies to auto-plan and `schemabot plan` comments alike; minimized comments
-stay expandable on GitHub, so the full plan history remains auditable.
+schema file posts a new one. To keep the PR readable, SchemaBot retires the
+plan comments a newer one supersedes. This applies to auto-plan and
+`schemabot plan` comments alike, and the retired comment's storage record
+always survives with its identifiers, so the plan history remains auditable.
 
 A newer plan comment for the same database supersedes a prior one when the
 prior was rendered at an older commit, or when it re-renders the same commit
@@ -1554,15 +1554,31 @@ environments.
 
 A plan outcome can also supersede without posting: when an auto-plan resolves
 to no changes, no new comment appears (the check run alone reports the green
-state), but plan comments from prior commits still collapse — the pending DDL
-and apply prompt they show no longer match the branch.
+state), but plan comments from prior commits are still retired — the pending
+DDL and apply prompt they show no longer match the branch.
 
-One safety hold: a plan comment whose commit produced an apply is never
-minimized, even after new pushes. That comment is the record of what actually
-ran against the database, and it stays visible until an operator reconciles
-the apply. All minimization fails toward visibility — if GitHub or storage
-misbehaves, comments are left expanded (extra noise), never hidden without a
-durable record.
+By default, a superseded comment is minimized (collapsed as **Outdated**) and
+stays expandable on GitHub — with one safety hold: a plan comment whose commit
+produced an apply is never minimized, even after new pushes. That comment is
+the record of what actually ran against the database, and it stays visible
+until an operator reconciles the apply.
+
+A server can opt into a delete-based policy instead, which applies to every
+repository it manages:
+
+```yaml
+delete_unactioned_plan_comments: true
+```
+
+Under this policy, a superseded plan comment no apply ever acted on is deleted
+from the PR timeline outright — its DDL never ran and is reproducible from the
+commit it was rendered at, so on a busy PR the comment is pure noise. A
+superseded comment whose commit produced an apply is minimized rather than
+deleted, keeping the record of what ran expandable on the PR.
+
+Either way, retirement fails toward visibility — if GitHub or storage
+misbehaves, comments are left as they are (extra noise), never hidden or
+removed without a durable record.
 
 ## Multi-App Routing
 
