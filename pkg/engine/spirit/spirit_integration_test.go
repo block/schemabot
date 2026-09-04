@@ -970,16 +970,23 @@ func TestEngine_FetchCurrentSchema(t *testing.T) {
 	assert.ElementsMatch(t, []string{"t1", "t2"}, tableSchemaNames(schemas))
 }
 
-// A cancelled Spirit schema change must remove resumability artifacts so a
-// later apply starts cleanly, while preserving the user's live base table.
+// A cancel that reaches a still-running schema change must clear the
+// resumability artifacts so a later apply starts cleanly, while preserving the
+// user's live base table. It disposes of them under the same policy as a cancel
+// that finds no runner alive: the copies are preserved in the quarantine, the
+// metadata describing them is dropped.
 func TestEngine_CancelledArtifactCleanup(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
 
 	baseTable := "customers"
-	artifacts := []string{
-		utils.AuxTableName(baseTable, "_new"),
-		utils.AuxTableName(baseTable, "_old"),
+	releaseTestCleanup(t, db, baseTable)
+	copies := []string{
+		utils.NewTableName(baseTable),
+		utils.OldTableName(baseTable),
+	}
+	metadata := []string{
 		utils.CheckpointTableName(baseTable),
 		"_spirit_sentinel",
 		"_spirit_checkpoint",
@@ -987,7 +994,7 @@ func TestEngine_CancelledArtifactCleanup(t *testing.T) {
 
 	_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s (id INT PRIMARY KEY)", quoteIdentifier(baseTable)))
 	require.NoError(t, err)
-	for _, artifact := range artifacts {
+	for _, artifact := range append(copies, metadata...) {
 		_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s (id INT PRIMARY KEY)", quoteIdentifier(artifact)))
 		require.NoError(t, err, "create artifact %s", artifact)
 	}
@@ -1005,9 +1012,11 @@ func TestEngine_CancelledArtifactCleanup(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.True(t, tableExists(t, db, baseTable))
-	for _, artifact := range artifacts {
-		assert.False(t, tableExists(t, db, artifact), "artifact should be dropped: %s", artifact)
+	for _, artifact := range append(copies, metadata...) {
+		assert.False(t, tableExists(t, db, artifact), "artifact should leave the target: %s", artifact)
 	}
+	assert.Len(t, listQuarantinedTables(t, db), len(copies),
+		"the copies must be preserved rather than dropped")
 }
 
 // Archive tables are maintained outside declarative schema files, so a plan
