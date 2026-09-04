@@ -39,6 +39,11 @@ const refusalNoPrimaryKeyTable = "CREATE TABLE `orders_log` (\n" +
 // statement between routed, refused, and unclassifiable is caught here, before
 // the integration tests it would also change. The integration tests remain the
 // proof that a refused shape really is refused by a live Spirit run.
+//
+// A refused shape added here wants a case in
+// TestStatementRefusalPublishesNothingFromTheTarget as well: its reason is
+// published to the pull request, and that test is what holds a reason to the
+// statement it reports.
 func TestStatementRefusalContract(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -194,12 +199,15 @@ const refusalCanaryNoPrimaryKeyTable = "CREATE TABLE `orders_log` (\n" +
 // statement is already on the PR. The target's own definition is the other
 // input to that classification, and nothing from it may reach the reason.
 //
-// This holds the category to that claim. Each statement is classified against
-// a definition whose target-only values are canaries the statement never
-// mentions, so a check that reports the current definition rather than the
-// submitted one puts a canary in the reason and fails here — including a check
-// the engine gains later, which reaches this repo through a dependency bump
-// with no diff of its own to review.
+// This holds the category to that claim, one statement shape at a time. Each
+// statement is classified against a definition whose target-only values are
+// canaries the statement never mentions, so a check that reports the current
+// definition rather than the submitted one puts a canary in the reason and
+// fails here. That reaches a check the engine gains later only when the new
+// check fires on one of the shapes below: a refusal keyed on a shape this
+// table does not enumerate would interpolate the target with nothing here to
+// notice it. A new refusal shape wants a case here alongside its contract
+// case.
 //
 // Every case also asserts the reason names something the statement declares.
 // Without it a reason that stopped interpolating its inputs at all, or an
