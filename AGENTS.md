@@ -47,7 +47,28 @@ CI mirrors local dev — every CI test job runs make targets, not bespoke comman
 
 - **Always verify the active branch before starting work.** The deployed code may be on a feature branch (e.g., a worktree), not `main`. Before implementing, check which branch has the code you're building on: `git log --oneline <branch> -- <relevant-file>`. Never branch from `main` for features that depend on unreleased work — branch from (or commit directly to) the active development branch.
 - **Never bypass pre-commit hooks.** Do not use `--no-verify` or `core.hooksPath=/dev/null`. If the hook fails, fix the issue.
-- **PR summaries should be concise** — a short paragraph or bullet list highlighting key changes and why, not low-level implementation details. When a change affects flow, architecture, state transitions, or concurrency, include a small ASCII diagram if it makes the behavior easier to review; omit diagrams when they would add noise. Do not include test plans, checklists, or verification details. Never reference internal company details (specific database names, staging environments, team names, internal URLs, deployment hostnames, org names, or test repo names) in PR titles or descriptions — this is a public OSS repo.
+- **PR summaries should be concise** — a short paragraph or bullet list highlighting key changes and why, not low-level implementation details. Do not include test plans, checklists, or verification details. Never reference internal company details (specific database names, staging environments, team names, internal URLs, deployment hostnames, org names, or test repo names) in PR titles or descriptions — this is a public OSS repo.
+- **Every PR summary carries an ASCII diagram when the change has a shape to show.** Any change to flow, architecture, state transitions, concurrency, lifecycle, or ownership gets one, so a reviewer sees the new behavior without reconstructing it from the diff. Skip it only when the change has no such shape — a comment, a test, a copy edit, a dependency bump. "The prose covers it" is not a reason to skip.
+- **Show before and after when the change rewrites behavior rather than adding it.** Complex state changes and reworked logic are where the contrast carries the point: an after-diagram alone leaves the reviewer to hold the old behavior in their head and spot the difference themselves, which is exactly the step where a reviewer misses that a transition moved or a branch went away. Label the two, and draw them to the same shape and node order so the difference between them is the only thing that stands out:
+
+  ```
+  Before                     After
+
+  ┌───────────┐              ┌───────────┐
+  │  running  │              │  running  │
+  └─────┬─────┘              └─────┬─────┘
+        │ cancel                   │ cancel
+        ▼                          ▼
+  ┌───────────┐              ┌───────────┐
+  │ cancelled │              │ releasing │
+  └───────────┘              └─────┬─────┘
+                                   │ copy quarantined
+                                   ▼
+                             ┌───────────┐
+                             │ cancelled │
+                             └───────────┘
+  ```
+- **Align the diagram in a second pass.** Put every diagram in a fenced code block (outside one, Markdown collapses the whitespace the alignment depends on), then re-read the finished block as a grid and fix the columns: box borders and corners line up column-for-column, a box is as wide as its widest content, and every connector meets the edge it points at. Ragged box lines are harder to read than no diagram, and they are invisible while writing one — checking is a separate pass over the rendered result, not something to trust to the first draft.
 - **UX changes show the rendered result, collapsed.** When a PR changes what users see (PR comments, check summaries, CLI output), embed the new rendering in the PR summary inside collapsed `<details>` blocks — one per scenario, using the TEMPLATES.md preview output where one exists — so reviewers see the actual UX without checking out the branch. Links to TEMPLATES.md anchors are not a substitute; the rendering belongs in the summary itself.
 - **Agent PR disclosures belong at the bottom.** When an agent writes or updates a PR summary/body, put the agent disclosure line after the summary content, not at the top.
 - **Do not create PRs automatically.** Wait for the user to explicitly ask before running `gh pr create`. Pushing a branch is fine; creating the PR is a separate decision.
