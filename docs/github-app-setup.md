@@ -309,4 +309,6 @@ When `repo-webhook-secret` is set, deliveries whose `X-GitHub-Hook-Installation-
 
 **"No schemabot.yaml config found" comment**: SchemaBot couldn't find a `schemabot.yaml` file in the PR's changed file directories. Make sure the file exists and is committed to the PR branch.
 
-**"database not found" comment**: The `database` field in `schemabot.yaml` doesn't match any database in your SchemaBot server config. The names must match exactly.
+**"Database Not Found" comment**: A command's `-d` flag named a database that no `schemabot.yaml` in the repository declares. Check the `database` field of the intended `schemabot.yaml`; the comparison is case-insensitive.
+
+**"not configured on this SchemaBot instance" comment**: The `database` field in `schemabot.yaml` doesn't match any key under `databases:` in your SchemaBot server config. The consumer value is folded to lowercase before matching, so only the letters need to agree with the (lowercase) server key.

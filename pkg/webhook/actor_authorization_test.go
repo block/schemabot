@@ -440,6 +440,32 @@ func TestHandleApplyCommandBlocksUnauthorizedActorBeforePlanning(t *testing.T) {
 	assert.Contains(t, body, "@mona is not authorized")
 }
 
+// TestHandleApplyCommandResolvesMixedCaseConsumerDatabase proves that a
+// consumer schemabot.yaml declaring the database in a different case than the
+// server key still resolves to the configured database. The command reaches
+// actor authorization (and is denied for an unauthorized actor) instead of
+// being reported as an unconfigured database.
+func TestHandleApplyCommandResolvesMixedCaseConsumerDatabase(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	registerApplyDiscoveryEndpointsDeclaring(t, mux, "orders", "Orders")
+
+	comments := make(chan string, 2)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		cfg.PRCommandAuthorization.AdminUsers = []string{"hubot"}
+	})
+	h := actorAuthTestHandler(cfg, installClient)
+
+	h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "mona", CommandResult{Action: action.Apply})
+
+	body := requireComment(t, comments, "mixed-case consumer database apply comment")
+	assert.Contains(t, body, "SchemaBot Command Not Authorized")
+	assert.Contains(t, body, "@mona is not authorized")
+	assert.NotContains(t, body, "is not configured on this server")
+}
+
 // Apply-scoped control commands are mutating PR comments, so the full webhook
 // path uses the same configured admin/operator authorization as apply before
 // recording durable operator intent.
@@ -1093,8 +1119,16 @@ func teamMembersHandler(t *testing.T, statusCode int, members ...string) http.Ha
 
 func registerApplyDiscoveryEndpoints(t *testing.T, mux *http.ServeMux, database string) {
 	t.Helper()
+	registerApplyDiscoveryEndpointsDeclaring(t, mux, database, database)
+}
 
-	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", database)
+// registerApplyDiscoveryEndpointsDeclaring serves a schema directory named
+// database whose schemabot.yaml declares declaredDatabase, so tests can vary
+// the author's spelling independently of the directory layout.
+func registerApplyDiscoveryEndpointsDeclaring(t *testing.T, mux *http.ServeMux, database, declaredDatabase string) {
+	t.Helper()
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", declaredDatabase)
 	schemaSQL := "CREATE TABLE `users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`))"
 
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
