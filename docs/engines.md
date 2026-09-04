@@ -85,16 +85,18 @@ driving the apply, so only that process knows how far along it is, and if it die
 picks up from a checkpoint. A deploy request runs on the cluster instead. It outlives the process
 watching it, and any instance can ask the cluster for its progress and get the same answer.
 
-**Only Spirit can pause a change.** A Spirit stop checkpoints the copy and settles the apply as
-stopped, and `start` picks it back up from there. Vitess has no equivalent: a deploy request runs
-or it ends. So `stop` is a MySQL operation, and on Vitess the way to take the load off a database
-is `cancel`, which ends the change for good. Asking for a stop there gets you that cancel rather
-than a refusal, and the apply settles as cancelled, so what the operator is told always matches
-what happened. That is CO-8 in [invariants.md](invariants.md).
+**Pausing is an engine capability.** `stop` and `start` are ordinary control operations, no more
+tied to one database technology than `cancel` is. What varies is whether the engine behind them
+can suspend a change and pick it back up. Spirit can: a stop checkpoints the copy and settles the
+apply as stopped, and `start` resumes from that checkpoint. The PlanetScale engine cannot, because
+a deploy request runs or it ends. So there the way to take the load off a database is `cancel`,
+which ends the change for good. Asking for a stop gets you that cancel rather than a refusal, and
+the apply settles as cancelled, so what the operator is told always matches what happened. That is
+CO-8 in [invariants.md](invariants.md).
 
-`start` follows stop. On Vitess it exists only to launch a deploy request that was created and
-deliberately left undeployed, which is how a change waits for an operator before it begins. It
-never resumes anything.
+`start` follows stop. On the PlanetScale engine it exists only to launch a deploy request that was
+created and deliberately left undeployed, which is how a change waits for an operator before it
+begins. It never resumes anything.
 
 The revert window is a separate decision and does not follow from where the copy ran. Both engines
 reach cutover holding two tables: the new one, about to take traffic, and the original, renamed
@@ -150,8 +152,8 @@ minimum they must be able to take the load off the database, hold the change sho
 trigger that swap when they choose (deferred cutover), and abandon the change (`cancel`).
 
 Which verbs deliver that varies, and the bar is the ability rather than a particular verb. Spirit
-pauses and resumes; Vitess cannot pause at all, so `cancel` is how a change gets off a database
-there. What GA requires is that the lever exists and that the operator is told plainly what it
+pauses and resumes; the PlanetScale engine cannot pause at all, so `cancel` is how a change gets
+off a database there. What GA requires is that the lever exists and that the operator is told plainly what it
 did, never that every engine implements the same verbs the same way.
 
 `revert` and `skip-revert` are deliberately **not** on the list. They depend on the engine keeping

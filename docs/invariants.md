@@ -178,8 +178,8 @@ Cashed out in engine capabilities, the bar is copy and swap plus a real lever ov
 is already in flight: taking the load off the database, holding the change short of its swap and
 triggering that swap when the operator chooses (deferred cutover), and abandoning the change
 (`cancel`). Which verbs deliver that varies, so the bar is the ability rather than a fixed list.
-Spirit pauses and resumes; Vitess cannot pause at all, so `cancel` is how a change gets off a
-database there. `revert` and `skip-revert` are outside the bar entirely, because they depend on
+Spirit pauses and resumes; the PlanetScale engine cannot pause at all, so `cancel` is how a change
+gets off a database there. `revert` and `skip-revert` are outside the bar entirely, because they depend on
 whether the engine keeps the pre-cutover table rather than on how complete the engine is.
 [engines.md](engines.md) works through why, and is the per-engine picture generally.
 
@@ -779,8 +779,8 @@ to a data plane is a routing bug, and the internal numeric row ID appears on no 
 ### CO-8: Stop terminality is engine truth, told truthfully
 
 Only Spirit can pause a change. A Spirit stop checkpoints the copy, the apply settles as
-`stopped`, and `start` resumes it from there. Vitess has no pause, so a stop aimed at a Vitess
-target cancels the deploy request instead: the apply settles as `cancelled`, and nothing brings it
+`stopped`, and `start` resumes it from there. The PlanetScale engine has no pause, so a stop aimed
+at a Vitess target cancels the deploy request instead: the apply settles as `cancelled`, and nothing brings it
 back. An operator must never be told the first when they got the second.
 
 That reading is decided in one place from the target's database type, rather than inferred
