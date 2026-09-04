@@ -805,14 +805,31 @@ const strandedActiveTaskReaperLockName = "schemabot_stranded_active_task_reaper"
 // operation lease is forbidden from bumping it, so it can sit quiet while that
 // drive works.
 //
-// It is derived from the window past which the operator cancels a drive that
-// has mirrored nothing, so the reaper cannot come to disagree with the operator
-// about which rows still have a drive behind them. The margin covers the gap
-// between the operator deciding to cancel and the cancellation landing. All
-// timestamps compared are database-side, so there is no clock skew to absorb,
-// and the guarded write re-asserts the window anyway: a drive that mirrors the
-// row before the write lands keeps it whatever the scan concluded.
-const strandedActiveTaskQuiescence = storage.ApplyDriveStallAfter + storage.ApplyLeaseStaleAfter
+// Three drive shapes make that unconditional write, and all three say so where
+// they make it: syncAtomicTaskProgress (local grouped drives),
+// pollTaskToCompletion (local sequential drives), and
+// syncStoredTasksFromRemoteTasks (gRPC drives against remote Tern). A change
+// that makes any of them write only on a field change breaks this window, which
+// is why they are named here rather than left to be rediscovered.
+//
+// The window is a multiple of the operator's own stall bound rather than a
+// margin over it, because the two actions are not equally recoverable. The
+// operator crossing that bound cancels the run so a peer can reclaim the
+// operation and finish the work. The reaper crossing it writes a terminal
+// verdict onto the row. A recoverable action may sit right on the bound; a
+// terminal one waits out a second full window, so a drive the operator would
+// have cancelled is always cancelled first and the reaper is cleaning up after
+// it rather than racing it.
+//
+// The second window also covers the one gap in the premise: the remote sync
+// skips a stored task the remote stopped reporting, so a row can miss ticks
+// while its drive is alive. That needs a settled parent to matter at all, and
+// the doubled window puts it far outside anything a live drive produces.
+//
+// All timestamps compared are database-side, so there is no clock skew to
+// absorb, and the guarded write re-asserts the window anyway: a drive that
+// mirrors the row before the write lands keeps it whatever the scan concluded.
+const strandedActiveTaskQuiescence = 2 * storage.ApplyDriveStallAfter
 
 // strandedActiveParentQuiescence is how long the parent apply must have been
 // settled before the sweep considers its task rows. It is far shorter than the

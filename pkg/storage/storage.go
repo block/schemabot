@@ -34,6 +34,11 @@ const ApplyLeaseStaleAfter = time.Minute
 // The stranded-active reaper derives its own window from it for that reason, so
 // the two cannot drift: a row the operator would cancel a drive over is the
 // same row the reaper may settle.
+//
+// The reaper waits a multiple of this window rather than matching it, because
+// cancelling a run is recoverable and writing a verdict onto a row is not. Both
+// read the same signal; only one of them can be wrong in a way an operator
+// cannot undo.
 const ApplyDriveStallAfter = 5 * time.Minute
 
 // DefaultMaxDriversPerApply is the per-apply driver cap used when a deployment
