@@ -1097,10 +1097,14 @@ func parseStatusState(r *http.Request, failuresOnly bool) (string, error) {
 // progressFromLocalStorage builds a ProgressResponse from local apply + task
 // records when there is no active Tern work to poll.
 //
-// Reading progress never writes. A task row left non-terminal under a settled
-// apply is clamped for display by displayTaskState and the row itself is left
-// alone: repairing it belongs to a driver or to a reaper holding a lease, never
-// to a request goroutine serving a GET.
+// Reading progress never writes, and never rewrites either: a task row left
+// non-terminal under a settled apply is reported exactly as stored. Repairing
+// it belongs to a driver or to a reaper holding a lease, never to a request
+// goroutine serving a GET, and papering over it here would make a genuinely
+// running table read as finished. A settled apply is not a promise that its
+// tasks have stopped — one failed task settles the apply to failed while its
+// siblings are still copying — so the stored state is the only honest answer,
+// and the reaper is what settles the rows that really are stranded.
 func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.Apply) (*apitypes.ProgressResponse, error) {
 	tasks, err := s.storage.Tasks().GetByApplyID(ctx, apply.ID)
 	if err != nil {
@@ -1143,7 +1147,7 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 			Keyspace:            task.Namespace,
 			ChangeType:          task.DDLAction,
 			DDL:                 task.DDL,
-			Status:              displayTaskState(apply, task),
+			Status:              task.State,
 			RowsCopied:          task.RowsCopied,
 			RowsTotal:           task.RowsTotal,
 			PercentComplete:     int32(task.ProgressPercent),
@@ -1169,33 +1173,6 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	}
 
 	return httpResp, nil
-}
-
-// displayTaskState returns the state to render for a task, which is its stored
-// state except when that state can no longer be reached.
-//
-// A settled apply's outcome is final, so a task still sitting in an active
-// state under one describes work that will never resume: its driver settled the
-// apply and exited without closing the row. Rendering it as still running would
-// show a completed apply with a table copying forever, so the reader displays
-// the apply's own outcome instead.
-//
-// The clamp is display-only and the stored row is deliberately untouched.
-// Repairing it belongs to a writer that can hold a lease — the driver's own
-// terminalization, or a reaper sweeping settled parents — because only those
-// can be ordered against a driver writing the same row.
-//
-// Settled rather than terminal is the load-bearing distinction: a stopped apply
-// is terminal but re-claimable, so a task left active under one is waiting for a
-// resume that may still arrive, and clamping it would hide live work.
-func displayTaskState(apply *storage.Apply, task *storage.Task) string {
-	if !state.IsSettledApplyState(apply.State) {
-		return task.State
-	}
-	if state.IsTerminalTaskState(task.State) {
-		return task.State
-	}
-	return state.NormalizeState(apply.State)
 }
 
 // overlayApplyOptions populates the options map on the response from the apply record.

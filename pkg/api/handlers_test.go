@@ -4062,13 +4062,15 @@ func TestProgressByApplyIDActivePathToleratesOperationStorageError(t *testing.T)
 	assert.Equal(t, state.Apply.Running, resp.State)
 }
 
-// A driver that settles an apply and exits can leave a task row behind in an
-// active state. An operator reading progress then sees a completed apply whose
-// table still claims to be copying, so the reader renders that task at the
-// apply's outcome. The stored row is left exactly as it was: repairing it
-// belongs to a writer that can hold a lease, and a GET holds none.
-func TestProgressFromLocalStorageClampsStrandedTaskUnderSettledApply(t *testing.T) {
-	for _, applyState := range []string{state.Apply.Completed, state.Apply.Failed, state.Apply.Cancelled, state.Apply.Reverted} {
+// A task row can sit in an active state under an apply that has already reached
+// a verdict: a driver settled the apply and exited without closing the row, or
+// one failed task settled the apply while its siblings kept copying. The reader
+// cannot tell those apart, so it reports every task exactly as stored and never
+// writes. Repairing a genuinely stranded row belongs to a writer that can hold
+// a lease and wait out the parent's quiescence window, and a GET does neither.
+func TestProgressFromLocalStorageReportsActiveTaskUnderTerminalApplyVerbatim(t *testing.T) {
+	terminalStates := []string{state.Apply.Completed, state.Apply.Failed, state.Apply.Cancelled, state.Apply.Reverted, state.Apply.Stopped}
+	for _, applyState := range terminalStates {
 		t.Run(applyState, func(t *testing.T) {
 			apply := &storage.Apply{ID: 40, ApplyIdentifier: "apply_stranded", Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging", Engine: storage.EngineSpirit, State: applyState, ExternalID: "remote-apply"}
 			tasks := &capturingTaskStore{tasks: []*storage.Task{
@@ -4081,31 +4083,13 @@ func TestProgressFromLocalStorageClampsStrandedTaskUnderSettledApply(t *testing.
 
 			require.NoError(t, err)
 			require.Len(t, resp.Tables, 1)
-			assert.Equal(t, applyState, resp.Tables[0].Status, "stranded task renders at the settled apply's outcome")
+			assert.Equal(t, state.Task.Running, resp.Tables[0].Status, "the task's stored state is reported as stored, never rewritten to the apply's verdict")
+			assert.Equal(t, int32(42), resp.Tables[0].PercentComplete)
 			assert.Equal(t, "users", resp.Tables[0].TableName)
 			assert.Equal(t, state.Task.Running, tasks.tasks[0].State, "stored task row must be untouched by a read")
 			assert.Zero(t, tasks.updateCalls, "reading progress must not write task rows")
 		})
 	}
-}
-
-// A stopped apply is terminal but re-claimable, so a task still active under one
-// is waiting for a resume that may yet arrive. Clamping it would hide live work,
-// so the reader shows the task exactly as stored.
-func TestProgressFromLocalStorageLeavesActiveTaskUnderStoppedApply(t *testing.T) {
-	apply := &storage.Apply{ID: 41, ApplyIdentifier: "apply_stopped", Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging", Engine: storage.EngineSpirit, State: state.Apply.Stopped, ExternalID: "remote-apply"}
-	tasks := &capturingTaskStore{tasks: []*storage.Task{
-		{ApplyID: apply.ID, TaskIdentifier: "task_users", TableName: "users", Namespace: "testdb", DDLAction: "alter", State: state.Task.Running, Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL, Engine: storage.EngineSpirit, Environment: "staging"},
-	}}
-	svc := New(&mockStorageWithApplyStores{tasks: tasks, operations: &staticApplyOperationStore{}},
-		testServerConfig(), nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
-
-	resp, err := svc.progressFromLocalStorage(t.Context(), apply)
-
-	require.NoError(t, err)
-	require.Len(t, resp.Tables, 1)
-	assert.Equal(t, state.Task.Running, resp.Tables[0].Status, "a stopped apply may resume, so its active task is not clamped")
-	assert.Zero(t, tasks.updateCalls, "reading progress must not write task rows")
 }
 
 func TestProgressFromLocalStorageSingleDeploymentOmitsOperationFields(t *testing.T) {

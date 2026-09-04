@@ -824,6 +824,13 @@ func (s *taskStore) ReapStrandedActive(ctx context.Context, limit int) ([]*stora
 // no path revisits the children. The row then reads as live work forever, which
 // is what makes a completed apply render a table still copying.
 //
+// A settled parent alone is not enough to call a row stranded, which is why the
+// parent gate's quiescence window carries real weight here. One failed task
+// settles its apply to failed while its siblings are still copying, so a row
+// under a settled parent may be describing live work; only after the parent has
+// gone quiet — no driver heartbeat, no terminal derivation — is an active child
+// row genuinely unreachable.
+//
 // failed_retryable is deliberately excluded. It is active by the task state
 // machine, but it belongs to the retryable sweep, which waits out a far longer
 // window because a retry may still be admitted against the parent. Reaping it

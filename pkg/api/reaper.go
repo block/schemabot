@@ -239,10 +239,13 @@ func (s *Service) reapStrandedRetryableTasks(ctx context.Context) {
 }
 
 // reapStrandedActiveTasks settles task rows left in an active state under a
-// settled parent apply, mirroring the parent's outcome onto them. These are the
-// rows that make a completed apply render a table still copying: their driver
-// recorded the verdict on the parent and exited without closing them, and a
-// reader cannot correct them because correcting them is a write.
+// settled, quiescent parent apply, mirroring the parent's outcome onto them.
+// These are the rows that make a completed apply render a table still copying:
+// their driver recorded the verdict on the parent and exited without closing
+// them. Only a lease-class writer can correct them — a reader cannot, because
+// correcting them is a write, and because a reader cannot tell a stranded row
+// from a sibling still copying under an apply that a failed task already
+// settled. The quiescence window is what tells those apart.
 //
 // Settlements are logged, not counted, for the same reason as the retryable
 // sweep's: they are the rare residue of a driver that stopped mid-write, so a
