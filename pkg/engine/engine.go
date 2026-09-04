@@ -215,10 +215,19 @@ type CancelledArtifactReleaser interface {
 	// is kept somewhere recoverable where the deployment offers one; the
 	// metadata describing where the copy had got to is always discarded.
 	//
-	// Callers must establish that no live schema change owns the target before
-	// calling: the engine's table names are derived from the target's own table
-	// names, so an apply running against the same tables uses the same names.
-	// The engine cannot see that apply and will not check for it.
+	// Callers must establish that no live schema change is running anywhere in
+	// the target schema before calling — not merely none on the tables the
+	// request names. The engine's table names are derived from the target's own
+	// table names, so an apply running against the same tables uses the same
+	// names; and an engine's artifacts can include schema-scoped ones shared by
+	// every schema change in the schema, one of which can be a cutover gate.
+	// Reclaiming that gate on a cancelled change's behalf releases the cutover a
+	// live change is still waiting on. The engine cannot see that change and
+	// will not check for it.
+	//
+	// Tables must not be empty. Every schema change names at least one table, so
+	// an empty list is a lost one, and the schema-scoped artifacts above would
+	// be reclaimed regardless of it.
 	ReleaseCancelledArtifacts(ctx context.Context, req *ReleaseArtifactsRequest) (*ReleaseArtifactsResult, error)
 }
 

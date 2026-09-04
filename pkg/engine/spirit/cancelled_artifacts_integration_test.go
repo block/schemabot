@@ -218,6 +218,54 @@ func TestEngine_ReleaseCancelledArtifacts_NothingToRelease(t *testing.T) {
 		"a release with nothing to preserve must not create the quarantine database")
 }
 
+// A release reclaims artifacts for the tables it was given and leaves every
+// other table on the target alone — the live tables it was not asked about, and
+// the artifacts belonging to a different table's schema change. Only the
+// schema-level artifacts, which no single table owns, are reclaimed regardless
+// of which table was named.
+func TestEngine_ReleaseCancelledArtifacts_LeavesUnnamedTablesAlone(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	const named = "orders"
+	const unnamed = "customers"
+	releaseTestCleanup(t, db, named, unnamed)
+	seedArtifact(t, db, named, 1)
+	seedArtifact(t, db, utils.NewTableName(named), 4)
+	seedArtifact(t, db, unnamed, 1)
+	seedArtifact(t, db, utils.NewTableName(unnamed), 6)
+	seedArtifact(t, db, utils.OldTableName(unnamed), 6)
+	seedArtifact(t, db, utils.CheckpointTableName(unnamed), 1)
+
+	eng := New(Config{})
+	result, err := eng.ReleaseCancelledArtifacts(t.Context(), &engine.ReleaseArtifactsRequest{
+		Database:    "testdb",
+		Tables:      []string{named},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "ReleaseCancelledArtifacts()")
+
+	require.Len(t, result.Preserved, 1, "only the named table's copy is reclaimed")
+	assert.Equal(t, "testdb."+utils.NewTableName(named), result.Preserved[0].Source)
+	assert.Empty(t, result.Discarded, "the named table left no metadata behind")
+
+	for _, survivor := range []string{
+		named,
+		unnamed,
+		utils.NewTableName(unnamed),
+		utils.OldTableName(unnamed),
+		utils.CheckpointTableName(unnamed),
+	} {
+		assert.True(t, tableExists(t, db, survivor),
+			"a release must not reach %s: it was not named", survivor)
+	}
+
+	quarantined := listQuarantinedTables(t, db)
+	require.Len(t, quarantined, 1, "only the named table's copy is quarantined")
+	assert.Contains(t, quarantined[0], utils.NewTableName(named))
+}
+
 // A caller that names the same table twice reclaims its artifacts once. The
 // quarantine move is a single atomic RENAME, so a source repeated within it
 // would fail the whole release and leave every artifact on the target.

@@ -30,6 +30,12 @@ import (
 // deferredCutoverSentinelTable is the schema-level marker a deferred cutover
 // waits on. It is one row, and it is scoped to the schema rather than to a
 // table, so it belongs to whichever schema change is deferring its cutover.
+//
+// Dropping it is not the loss of a record: it is the signal that releases a
+// deferred cutover. Dropping the one a live schema change is waiting on cuts
+// that change over without an operator asking for it, which is why a release
+// requires that no schema change in the schema is live — not merely none on the
+// tables it names.
 const deferredCutoverSentinelTable = "_spirit_sentinel"
 
 // ReleaseCancelledArtifacts reclaims a cancelled schema change's artifacts for
@@ -51,6 +57,14 @@ func (e *Engine) ReleaseCancelledArtifacts(ctx context.Context, req *engine.Rele
 	}
 	if database == "" {
 		return nil, fmt.Errorf("database is required to release cancelled schema change artifacts")
+	}
+	// Every schema change names at least one table, so an empty list is a lost
+	// one rather than a change that touched none — and it is not the no-op it
+	// looks like. The schema-level artifacts are not derived from the table
+	// list, so a release would still discard the schema's shared checkpoint and
+	// release its deferred cutover on behalf of no table at all.
+	if len(req.Tables) == 0 {
+		return nil, fmt.Errorf("tables are required to release cancelled schema change artifacts in database %s", database)
 	}
 
 	db, err := mysqlconn.Open(req.Credentials.DSN)
@@ -171,7 +185,10 @@ func dataBearingArtifacts(tables []string) []string {
 
 // metadataArtifacts names the tables that describe a copy rather than hold one.
 // The per-table checkpoints are joined by the two schema-level tables, which
-// belong to the schema change rather than to any one of its tables.
+// belong to the schema change rather than to any one of its tables — and so are
+// named whatever tables it touched. Those two are the whole reason a release
+// needs the schema to itself: they are the only artifacts here that a schema
+// change other than the cancelled one can own.
 func metadataArtifacts(tables []string) []string {
 	names := make([]string, 0, len(tables)+2)
 	for _, table := range tables {

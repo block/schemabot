@@ -39,6 +39,18 @@ func TestEngine_ReleaseCancelledArtifacts_RejectsIncompleteRequests(t *testing.T
 			},
 			wantErr: "database is required",
 		},
+		{
+			// An empty table list would still reclaim the schema-level
+			// artifacts, so it is refused rather than run as the no-op it
+			// resembles: it would discard the schema's shared checkpoint and
+			// release its deferred cutover for no named table.
+			name: "no tables",
+			req: &engine.ReleaseArtifactsRequest{
+				Database:    "shop",
+				Credentials: &engine.Credentials{DSN: "user:pass@tcp(127.0.0.1:3306)/shop"},
+			},
+			wantErr: "tables are required",
+		},
 	}
 
 	eng := New(Config{})
@@ -82,10 +94,44 @@ func TestArtifactNames_MatchSpiritNaming(t *testing.T) {
 }
 
 // The two schema-level artifacts belong to the schema change rather than to any
-// one table, so they are released even when the change touched no tables.
+// one table, so they are named whatever tables it touched. They are also the
+// only artifacts a schema change other than the cancelled one can own, which is
+// why a release refuses an empty table list rather than reclaiming them alone.
 func TestMetadataArtifacts_AlwaysIncludesSchemaLevelTables(t *testing.T) {
 	assert.Equal(t,
 		[]string{sharedCheckpointTable, deferredCutoverSentinelTable},
 		metadataArtifacts(nil))
 	assert.Empty(t, dataBearingArtifacts(nil))
+}
+
+// Every name a release reclaims is derived from a table name, never passed
+// through, and no derivation returns the table it was given. That is what keeps
+// a release off the live table it was asked about, whatever that table is
+// called — including names that already look like artifacts.
+//
+// It does not put a release beyond reach of some *other* table: Spirit's naming
+// truncates, so two long table names sharing a prefix derive the same artifact
+// names. Nothing in a name records which table produced it, so that case is
+// covered by the caller's precondition — no schema change live in the schema —
+// rather than by anything here.
+func TestArtifactNames_NeverNameTheTableTheyDeriveFrom(t *testing.T) {
+	tables := []string{
+		"orders",
+		"_orders",
+		"_orders_new",
+		strings.Repeat("a", 70),
+	}
+
+	// Only the derived names are checked. The two schema-level names are
+	// constants, not derivations, and they are Spirit's own — a schema change
+	// never targets a table called either.
+	for _, table := range tables {
+		artifacts := append(dataBearingArtifacts([]string{table}), utils.CheckpointTableName(table))
+		for _, name := range artifacts {
+			assert.NotEqual(t, table, name,
+				"artifact name derived from %q is that same table", table)
+			assert.True(t, strings.HasPrefix(name, "_"),
+				"artifact name %q must carry the leading underscore that marks it as derived", name)
+		}
+	}
 }
