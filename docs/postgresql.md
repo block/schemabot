@@ -4,6 +4,7 @@
 
 ## Table of Contents
 
+- [Schema pull](#schema-pull)
 - [Supported changes](#supported-changes)
   - [Greenfield tables](#greenfield-tables)
   - [Partitioned tables](#partitioned-tables)
@@ -24,11 +25,37 @@ less safe executor: its plan is blocked.
 PostgreSQL target support is separate from using PostgreSQL for SchemaBot's
 own state. See [SchemaBot storage](#schemabot-storage) for that distinction.
 
+## Schema pull
+
+`schemabot pull` prints the pulled PostgreSQL schema as readable SQL, or as the
+API response when JSON output is selected. A PostgreSQL schema is the SchemaBot
+namespace. With no namespace selection, pull discovers every schema that is not
+a server or known extension schema. That discovery is best-effort: an extension
+whose schema the reserved list does not name is pulled as if it were an
+application schema, so select the schema explicitly with `--namespace` when the
+database hosts extensions. Only ordinary and partitioned tables are exported;
+views, materialized views, and foreign tables are not, and partition children
+are not exported separately from their parent.
+
+The pull is refused in full if any selected table cannot round-trip through the
+declarative format. This includes partitioned parents, foreign-key relationships,
+unlogged tables, explicit collations, and sequence defaults that cannot be
+represented safely, as well as tables carrying objects the format does not
+model at all: triggers, row-level security and policies, comments, non-default
+relation options, and table inheritance. If any selected table is refused, no
+partial output is produced. Only basic catalog detail is supported on
+PostgreSQL; a request for detailed catalog output is rejected rather than
+answered with the basic shape.
+
 ## Supported changes
 
-The apply path executes a plan one statement at a time. Each statement runs as
-its own task and its own PostgreSQL transaction, and each must independently
-satisfy all of these conditions:
+The apply path normally executes a plan one statement at a time. Each statement
+runs as its own task and its own PostgreSQL transaction. The exception is a
+greenfield create set: its table and indexes run as one task through a
+pg-sprite sequence, with each sequence step in its own bounded transaction. A
+failed set leaves its committed prefix on the target, and the next plan
+reconciles that live catalog. Every statement must satisfy all of these
+conditions:
 
 - pg-sprite classifies the statement for native execution.
 - The statement is a kind the shape check admits: an `ALTER TABLE` shape
@@ -70,13 +97,12 @@ transaction, so a mid-plan failure leaves the earlier statements committed and
 the schema partially changed. Keep a PostgreSQL change to a single statement
 when a partially applied plan would be unsafe to leave in place.
 
-`CREATE INDEX` passes planning but cannot complete on the current apply path.
-pg-sprite renders every executable index build as `CREATE INDEX
+`CREATE INDEX` against an existing table passes planning but cannot complete on
+the current apply path. pg-sprite renders that build as `CREATE INDEX
 CONCURRENTLY`, which PostgreSQL refuses to run inside a transaction block, and
-the apply path runs every statement inside a transaction. The apply fails and
-is recorded as retryable, but a retry cannot succeed. Do not include index
-builds in a PostgreSQL change until the apply path executes them outside a
-transaction.
+the apply path runs it inside a transaction. Greenfield index builds are the
+exception: indexes declared with a new table run as plain, non-concurrent steps
+inside the create set and can complete.
 
 ### Greenfield tables
 
@@ -94,14 +120,13 @@ permanently: `IF NOT EXISTS` (its no-op outcome cannot be proven),
 `CREATE TABLE ... PARTITION OF` attaching a partition to a live parent, and a
 statement that claims the same relation name twice.
 
-Declare a new table without secondary indexes. A schema file that declares a
-new table together with its indexes plans the create and each index build as
-separate statements, and every statement other than the create is blocked at
-plan time with its dependency on the table's creation as the reason — and a
-blocked statement blocks the whole plan. Index builds also cannot complete on
-the current apply path, as described above. Land the bare `CREATE TABLE`
-first; a later change against the then-existing table plans on its own
-merits.
+A schema file may declare a new table together with `CREATE INDEX` statements
+on that table. SchemaBot plans and applies this greenfield create set as one
+change and one task. pg-sprite executes the table and indexes as an ordered
+sequence; because the table has no readers yet, index steps use plain
+non-`CONCURRENTLY` builds. Each step commits in its own bounded transaction, so
+a failure can leave the table and earlier indexes committed; re-plan to
+reconcile that live prefix.
 
 ### Partitioned tables
 
@@ -124,9 +149,10 @@ statement shape is outside the `ALTER TABLE`, `CREATE TABLE`, and
 is defined by the pinned
 pg-sprite version, not by SchemaBot: when a pg-sprite upgrade widens the
 shapes its engine executes, SchemaBot's plan and apply gates widen with the
-pin, with no SchemaBot code change. That shape check admits `CREATE INDEX`,
-so an index build is not blocked at plan time even though it fails at apply
-time, as described above.
+pin, with no SchemaBot code change. That shape check admits `CREATE INDEX`.
+An index build against an existing table is not blocked at plan time even
+though it fails at apply time, while an index in a greenfield create set can
+complete as described above.
 
 The plan comment lists the table and SchemaBot's reason for the refusal. For a
 PostgreSQL plan, the plan Check Run concludes unsuccessfully, and an apply
@@ -167,11 +193,14 @@ change or that depend on the target:
   failure includes the provisioning `GRANT` derived by pg-sprite.
 - Exhausting the 30-second statement budget is a permanent native-safety
   refusal. Exhausting the lock budget is retryable after contention clears.
-- Other operational failures are recorded as retryable and expose a sanitized
-  message; connection and server details remain in server logs.
+- Other operational failures are recorded as retryable when no create-set
+  prefix committed and expose a sanitized message; connection and server
+  details remain in server logs. A create-set failure after the table commits
+  is not retryable and directs the operator to re-plan against the live schema.
 
-A permanent refusal does not execute the statement and is not retried until
-the schema change, target, or role provisioning changes.
+A permanent refusal before execution leaves the target unchanged. A refusal
+from a later create-set step can leave its earlier steps committed and directs
+the operator to re-plan rather than retry the stale set.
 
 ## Unsupported workflow features
 
@@ -203,11 +232,11 @@ and applies it. The engine drains any in-flight background statement before a
 recovery path re-plans, then clears its in-memory progress so stale state from
 one apply cannot be reported for another.
 
-This recovery guarantee does not make the DDL resumable within a statement.
-Each statement is one PostgreSQL transaction: it commits or fails, and
-recovery re-plans against the live target before further work. A privilege
-refusal is a permanent failed task, includes the required provisioning
-advice, and leaves the target unchanged.
+This recovery guarantee does not make the DDL resumable within a statement or
+create-set task. Each statement or sequence step is one PostgreSQL transaction:
+it commits or fails, and recovery re-plans against the live target before
+further work. A privilege refusal is a permanent failed task, includes the
+required provisioning advice, and leaves the target unchanged.
 
 ## Configuration and credentials
 

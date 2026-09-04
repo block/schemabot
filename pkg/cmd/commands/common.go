@@ -22,6 +22,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -71,6 +72,9 @@ func (cf *ControlFlags) RequireApplyID() error {
 var ErrSilent = errors.New("silent error")
 
 // CLIConfig represents the schemabot.yaml configuration file for CLI commands.
+// Database and Type are row-identity keys: LoadCLIConfig folds them with
+// storage.CanonicalKey so the CLI names the same identity the server stores,
+// whatever case the file was written in.
 type CLIConfig struct {
 	Database string `yaml:"database"`
 	Type     string `yaml:"type"`
@@ -103,6 +107,8 @@ func LoadCLIConfig(dir string) (*CLIConfig, error) {
 	if err := decoder.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("parse config file: %w", err)
 	}
+	cfg.Database = storage.CanonicalKey(cfg.Database)
+	cfg.Type = storage.CanonicalKey(cfg.Type)
 
 	if cfg.Database == "" {
 		return nil, fmt.Errorf("schemabot.yaml: database is required")
