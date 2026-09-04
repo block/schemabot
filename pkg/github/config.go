@@ -706,10 +706,14 @@ func newDiscoveredConfig(config *SchemabotConfig, dir string) DiscoveredConfig {
 	}
 }
 
+// selectConfigByDatabaseName matches the requested database against discovered
+// configs by canonical key: FetchConfig folds every declared database at parse,
+// so folding the request here is the only comparison needed.
 func selectConfigByDatabaseName(databaseName string, configs []DiscoveredConfig) (*SchemabotConfig, string, bool, error) {
+	databaseName = storage.CanonicalKey(databaseName)
 	var matches []DiscoveredConfig
 	for _, dc := range configs {
-		if strings.EqualFold(dc.Config.Database, databaseName) {
+		if dc.Config.Database == databaseName {
 			matches = append(matches, dc)
 		}
 	}
