@@ -426,6 +426,28 @@ func IsTerminalApplyState(s string) bool {
 	return ok && info.Terminal
 }
 
+// SettledApplyStates lists the apply states whose outcome can no longer change.
+// It is the terminal set minus Stopped: a stopped apply is terminal but still
+// addressable, so a driver may claim it and resume writing its child rows.
+//
+// Terminal is not settled, and the difference decides who may write. Anything
+// that writes rows belonging to an apply it does not hold a lease on — a reaper
+// closing out stranded children — must gate on settled, so it can never touch
+// rows a driver is about to own. Read-side clamping gates on the same set for
+// the same reason: it must not paper over an apply that is coming back.
+var SettledApplyStates = []string{
+	Apply.Completed,
+	Apply.Failed,
+	Apply.Cancelled,
+	Apply.Reverted,
+}
+
+// IsSettledApplyState reports whether the apply's outcome can no longer change.
+// Accepts any format (proto, uppercase, or canonical lowercase).
+func IsSettledApplyState(s string) bool {
+	return IsState(s, SettledApplyStates...)
+}
+
 // IsRunningApplyState reports whether an apply is in a running-family state:
 // running, running_degraded (a continue rollout still in flight after a
 // sibling deployment failed), or one of the post-copy phases (catching_up,

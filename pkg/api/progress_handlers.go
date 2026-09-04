@@ -1097,39 +1097,14 @@ func parseStatusState(r *http.Request, failuresOnly bool) (string, error) {
 // progressFromLocalStorage builds a ProgressResponse from local apply + task
 // records when there is no active Tern work to poll.
 //
-// If any local task records are stale (non-terminal state on a terminal apply),
-// this method syncs them from a one-time Tern RPC before building the response.
-// Subsequent calls serve entirely from local storage.
+// Reading progress never writes. A task row left non-terminal under a settled
+// apply is clamped for display by displayTaskState and the row itself is left
+// alone: repairing it belongs to a driver or to a reaper holding a lease, never
+// to a request goroutine serving a GET.
 func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.Apply) (*apitypes.ProgressResponse, error) {
 	tasks, err := s.storage.Tasks().GetByApplyID(ctx, apply.ID)
 	if err != nil {
 		return nil, fmt.Errorf("get tasks for apply %d: %w", apply.ID, err)
-	}
-
-	// Check if any tasks are stale (non-terminal and not matching the apply
-	// state). A stopped task on a stopped apply is expected, not stale.
-	stale := false
-	if !state.IsState(apply.State, state.Apply.FailedRetryable) {
-		for _, task := range tasks {
-			if !state.IsTerminalTaskState(task.State) && task.State != apply.State {
-				stale = true
-				break
-			}
-		}
-	}
-
-	// Sync stale tasks from Tern (one-time RPC, no-op on subsequent calls).
-	if stale && apply.ExternalID != "" {
-		if err := s.syncTasksFromTern(ctx, apply, tasks); err != nil {
-			s.logger.Warn("task sync from Tern failed, serving stale data",
-				append(apply.LogAttrs(),
-					"error", err)...)
-		} else {
-			// Re-read tasks after sync; keep original on failure.
-			if refreshed, err := s.storage.Tasks().GetByApplyID(ctx, apply.ID); err == nil {
-				tasks = refreshed
-			}
-		}
 	}
 
 	// Build response from local records
@@ -1168,7 +1143,7 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 			Keyspace:            task.Namespace,
 			ChangeType:          task.DDLAction,
 			DDL:                 task.DDL,
-			Status:              task.State,
+			Status:              displayTaskState(apply, task),
 			RowsCopied:          task.RowsCopied,
 			RowsTotal:           task.RowsTotal,
 			PercentComplete:     int32(task.ProgressPercent),
@@ -1196,61 +1171,31 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	return httpResp, nil
 }
 
-// syncTasksFromTern calls the remote Tern's Progress RPC and syncs the
-// per-table state into local task records. Called once for gRPC-mode applies
-// with stale task state; subsequent reads are served from local storage.
-func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
-	deployment, err := storedDeploymentForApply(apply)
-	if err != nil {
-		return err
+// displayTaskState returns the state to render for a task, which is its stored
+// state except when that state can no longer be reached.
+//
+// A settled apply's outcome is final, so a task still sitting in an active
+// state under one describes work that will never resume: its driver settled the
+// apply and exited without closing the row. Rendering it as still running would
+// show a completed apply with a table copying forever, so the reader displays
+// the apply's own outcome instead.
+//
+// The clamp is display-only and the stored row is deliberately untouched.
+// Repairing it belongs to a writer that can hold a lease — the driver's own
+// terminalization, or a reaper sweeping settled parents — because only those
+// can be ordered against a driver writing the same row.
+//
+// Settled rather than terminal is the load-bearing distinction: a stopped apply
+// is terminal but re-claimable, so a task left active under one is waiting for a
+// resume that may still arrive, and clamping it would hide live work.
+func displayTaskState(apply *storage.Apply, task *storage.Task) string {
+	if !state.IsSettledApplyState(apply.State) {
+		return task.State
 	}
-	client, err := s.TernClient(deployment, apply.Environment)
-	if err != nil {
-		return fmt.Errorf("get tern client: %w", err)
+	if state.IsTerminalTaskState(task.State) {
+		return task.State
 	}
-
-	resp, err := client.Progress(ctx, &ternv1.ProgressRequest{
-		ApplyId:     apply.ExternalID,
-		Environment: apply.Environment,
-	})
-	if err != nil {
-		return fmt.Errorf("progress RPC: %w", err)
-	}
-
-	tableProgress := tern.IndexProtoTableProgress(resp.Tables)
-
-	now := time.Now()
-	var synced int
-	for _, task := range tasks {
-		if state.IsTerminalTaskState(task.State) {
-			continue
-		}
-		tp, ok := tableProgress.ForTask(task)
-		if !ok {
-			s.logger.Error("task has no matching table in Tern progress response",
-				append(apply.LogAttrs(),
-					"task_id", task.TaskIdentifier, "namespace", task.Namespace, "table", task.TableName)...)
-			continue
-		}
-		task.State = state.NormalizeTaskStatus(tp.Status)
-		task.RowsCopied = tp.RowsCopied
-		task.RowsTotal = tp.RowsTotal
-		task.ProgressPercent = int(tp.PercentComplete)
-		task.ChecksumRowsChecked = tp.ChecksumRowsChecked
-		task.ChecksumRowsTotal = tp.ChecksumRowsTotal
-		task.Throttled = tp.Throttled
-		task.ThrottleReason = tp.ThrottleReason
-		task.UpdatedAt = now
-		if err := s.storage.Tasks().Update(ctx, task); err != nil {
-			s.logger.Error("sync task failed", append(task.LogAttrs(), "error", err)...)
-			continue
-		}
-		synced++
-	}
-	s.logger.Info("synced stale task records from Tern",
-		append(apply.LogAttrs(),
-			"synced", synced, "total", len(tasks))...)
-	return nil
+	return state.NormalizeState(apply.State)
 }
 
 // overlayApplyOptions populates the options map on the response from the apply record.

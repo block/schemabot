@@ -623,3 +623,29 @@ func TestDeriveRolloutApplyState_PausePolicy(t *testing.T) {
 		})
 	}
 }
+
+// Settled is the terminal set minus Stopped, and the gap is load-bearing: a
+// stopped apply is terminal but re-claimable, so anything that writes or clamps
+// rows belonging to an apply it does not hold must gate on settled, never on
+// terminal.
+func TestSettledApplyStatesExcludeStopped(t *testing.T) {
+	for _, s := range SettledApplyStates {
+		assert.True(t, IsTerminalApplyState(s), "%s is settled so it must also be terminal", s)
+		assert.True(t, IsSettledApplyState(s), "%s must be settled", s)
+	}
+
+	assert.True(t, IsTerminalApplyState(Apply.Stopped), "stopped is terminal for claiming")
+	assert.False(t, IsSettledApplyState(Apply.Stopped), "stopped is re-claimable, so its verdict is not final")
+
+	for _, s := range []string{Apply.Running, Apply.Pending, Apply.Resuming, Apply.FailedRetryable} {
+		assert.False(t, IsSettledApplyState(s), "%s is not settled", s)
+	}
+}
+
+func TestIsSettledApplyStateNormalizesFormat(t *testing.T) {
+	for _, s := range []string{"completed", "COMPLETED", "STATE_COMPLETED"} {
+		assert.True(t, IsSettledApplyState(s), "%q should normalize to a settled state", s)
+	}
+	assert.False(t, IsSettledApplyState("STATE_STOPPED"))
+	assert.False(t, IsSettledApplyState(""))
+}
