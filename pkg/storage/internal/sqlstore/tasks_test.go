@@ -1098,6 +1098,16 @@ func backdateTaskCreatedAt(t *testing.T, identifier string, ageSeconds int64) {
 	require.NoError(t, err)
 }
 
+// backdateTaskUpdatedAt ages a task row's liveness signal, standing in for a
+// drive that stopped mirroring it that long ago.
+func backdateTaskUpdatedAt(t *testing.T, identifier string, age time.Duration) {
+	t.Helper()
+	_, err := testDB.ExecContext(t.Context(),
+		"UPDATE tasks SET updated_at = NOW() - INTERVAL ? SECOND WHERE task_identifier = ?",
+		int64(age.Seconds()), identifier)
+	require.NoError(t, err)
+}
+
 // Selection and the write are separate statements, so a concurrent writer can
 // advance the row in between. The write is guarded on the row still being
 // failed_retryable, so the sweep skips it rather than overwriting a newer state.
@@ -1244,6 +1254,10 @@ func TestTaskStore_ReapStrandedActive_SettlesTasksUnderSettledParents(t *testing
 			// waits out a far longer window because the parent's recovery path
 			// may still dispatch its retry. This sweep must not take it.
 			retryableSibling := createRetryableReapTask(t, store, parent, "task_reap_active_orders", "orders", state.Task.FailedRetryable, "copy failed")
+			// No drive has mirrored either row for longer than a stalled drive
+			// would be allowed to run, so nothing is coming back for them.
+			backdateTaskUpdatedAt(t, stranded.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
+			backdateTaskUpdatedAt(t, retryableSibling.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
 
 			settled, err := store.tasks.reapStrandedActive(ctx, 10)
 			require.NoError(t, err)
@@ -1295,11 +1309,72 @@ func TestTaskStore_ReapStrandedActive_SkipsRowThatLeftTheStateItWasReadIn(t *tes
 	task.State = state.Task.CuttingOver
 	require.NoError(t, store.Tasks().Update(ctx, task))
 	task.State = state.Task.Running
+	// Age the row again so the quiescence gate admits it: the state guard alone
+	// must be enough to refuse the write.
+	backdateTaskUpdatedAt(t, task.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
 
 	settled, err := store.tasks.reapStrandedActiveTask(ctx, task, parent)
 	require.NoError(t, err)
 	assert.False(t, settled, "the row moved after the scan, so it belongs to whoever moved it")
 	assertTaskState(t, store, task.TaskIdentifier, state.Task.CuttingOver)
+}
+
+// A settled parent does not mean every task under it is dead. Under a fan-out
+// rollout a halt-policy deployment that fails projects the apply to failed while
+// its siblings keep driving, and a sibling drive holding only an operation lease
+// may not bump the parent applies row — so the parent can read settled and
+// quiescent while real work continues. The task row is what that drive still
+// touches, so its own freshness is what keeps the sweep off it.
+func TestTaskStore_ReapStrandedActive_KeepsTaskADriveIsStillMirroring(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_active_live_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_active_live", 1, state.Apply.Failed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedParentQuiescence+time.Minute)
+
+	// The failed deployment's task, untouched since its drive exited.
+	dead := createRetryableReapTask(t, store, parent, "task_reap_active_dead", "users", state.Task.Running, "")
+	backdateTaskUpdatedAt(t, dead.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
+	// A sibling deployment still copying: its drive mirrored the row just now.
+	live := createRetryableReapTask(t, store, parent, "task_reap_active_live", "orders", state.Task.Running, "")
+
+	settled, err := store.tasks.reapStrandedActive(ctx, 10)
+	require.NoError(t, err)
+
+	require.Len(t, settled, 1, "only the row no drive is mirroring settles")
+	assert.Equal(t, dead.TaskIdentifier, settled[0].Task.TaskIdentifier)
+	assertTaskState(t, store, live.TaskIdentifier, state.Task.Running)
+
+	reloaded, err := store.Tasks().Get(ctx, live.TaskIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, reloaded)
+	assert.Nil(t, reloaded.CompletedAt, "a table still copying is not stamped complete")
+	assert.Empty(t, reloaded.ErrorMessage, "a live table does not inherit the failed parent's explanation")
+}
+
+// The guarded write re-asserts quiescence, so a drive that mirrors the row
+// between the sweep's scan and its write keeps it.
+func TestTaskStore_ReapStrandedActive_SkipsRowADriveMirroredAfterTheScan(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_active_mirror_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_active_mirror", 1, state.Apply.Failed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedParentQuiescence+time.Minute)
+	task := createRetryableReapTask(t, store, parent, "task_reap_active_mirror", "users", state.Task.Running, "")
+	backdateTaskUpdatedAt(t, task.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
+
+	// The scan selected the row; before the write lands, its drive mirrors a
+	// progress tick, refreshing updated_at without changing state.
+	require.NoError(t, store.Tasks().Update(ctx, task))
+
+	settled, err := store.tasks.reapStrandedActiveTask(ctx, task, parent)
+	require.NoError(t, err)
+	assert.False(t, settled, "a drive spoke for the row after the scan, so it is not stranded")
+	assertTaskState(t, store, task.TaskIdentifier, state.Task.Running)
 }
 
 // A parent settled only moments ago may still be writing its own task rows

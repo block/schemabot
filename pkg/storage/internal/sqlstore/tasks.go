@@ -797,6 +797,32 @@ func (s *taskStore) reapStrandedRetryableTask(ctx context.Context, task *storage
 // quiescence windows, and the retryable sweep frees a blocked remote drive.
 const strandedActiveTaskReaperLockName = "schemabot_stranded_active_task_reaper"
 
+// strandedActiveTaskQuiescence is how long a task row must have gone untouched
+// before the sweep settles it. It is measured on the task row, not the parent,
+// because the task row is the one a live drive writes: every tick mirrors its
+// tasks unconditionally, so tasks.updated_at is the drive's liveness signal.
+// The parent applies row is not a substitute — a drive holding only an
+// operation lease is forbidden from bumping it, so it can sit quiet while that
+// drive works.
+//
+// It is set past the window after which the operator cancels a drive that has
+// mirrored nothing (ApplyDriveStallAfter in pkg/api, which cannot be imported
+// here without inverting the dependency). A row quiet for longer than that has
+// no drive the operator would still let run, so nothing is coming back for it.
+// The margin covers the gap between the operator deciding to cancel and the
+// cancellation landing; all timestamps compared are database-side, so there is
+// no clock skew to absorb.
+const strandedActiveTaskQuiescence = 10 * time.Minute
+
+// strandedActiveTaskGate renders the condition admitting only task rows no
+// drive has touched for strandedActiveTaskQuiescence. Both the sweep's SELECT
+// and its guarded per-row UPDATE assert it, so a drive that mirrors the row
+// between the two loses the write rather than having its progress overwritten.
+func strandedActiveTaskGate(d Dialect) string {
+	return "tasks.updated_at < " + d.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(strandedActiveTaskQuiescence.Microseconds())), IntervalMicrosecond)
+}
+
 // strandedActiveTaskSweep identifies the active-task sweep to the shared
 // election wrapper.
 var strandedActiveTaskSweep = strandedSweep{
@@ -824,12 +850,20 @@ func (s *taskStore) ReapStrandedActive(ctx context.Context, limit int) ([]*stora
 // no path revisits the children. The row then reads as live work forever, which
 // is what makes a completed apply render a table still copying.
 //
-// A settled parent alone is not enough to call a row stranded, which is why the
-// parent gate's quiescence window carries real weight here. One failed task
-// settles its apply to failed while its siblings are still copying, so a row
-// under a settled parent may be describing live work; only after the parent has
-// gone quiet — no driver heartbeat, no terminal derivation — is an active child
-// row genuinely unreachable.
+// A settled parent alone is not enough to call a row stranded, and neither is a
+// quiescent one. Under a fan-out rollout a halt-policy deployment that fails
+// projects the apply to failed immediately, by design, while its sibling
+// deployments are still driving; and a sibling drive holding only an operation
+// lease is forbidden from bumping the parent applies row, so the parent can look
+// settled and quiescent while real work continues underneath it. No window on
+// the parent detects that, because the parent is not the row the live drive
+// touches.
+//
+// The task row is. Every drive tick mirrors its tasks unconditionally, which is
+// what makes tasks.updated_at the drive's liveness signal — the operator reads
+// it to cancel a stalled drive. So the sweep gates on the task's own quiescence
+// too: a row no drive has touched for longer than a stalled drive would survive
+// is stranded, whatever its siblings are doing.
 //
 // failed_retryable is deliberately excluded. It is active by the task state
 // machine, but it belongs to the retryable sweep, which waits out a far longer
@@ -856,9 +890,10 @@ func (s *taskStore) reapStrandedActive(ctx context.Context, limit int) ([]*stora
 		FROM tasks
 		WHERE state NOT IN (%s)
 			AND %s
+			AND %s
 		ORDER BY created_at, id
 		LIMIT ?
-	`, taskColumns, placeholders(len(excluded)), parentGate), selectArgs...)
+	`, taskColumns, placeholders(len(excluded)), strandedActiveTaskGate(s.dialect), parentGate), selectArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("query stranded active tasks: %w", err)
 	}
@@ -895,9 +930,10 @@ func (s *taskStore) reapStrandedActive(ctx context.Context, limit int) ([]*stora
 			return reaped, err
 		}
 		if !settled {
-			// The row left the state it was read in, or the parent left the
-			// settled set, between the read and the guarded write, so it belongs
-			// to whoever moved it.
+			// The row left the state it was read in, a drive mirrored it and
+			// refreshed its liveness, or the parent left the settled set, between
+			// the read and the guarded write. Any of the three means the row
+			// belongs to a live writer rather than to the sweep.
 			slog.DebugContext(ctx, "stranded active task changed before it could be reaped; skipping",
 				task.LogAttrs()...)
 			continue
@@ -916,9 +952,9 @@ func (s *taskStore) reapStrandedActive(ctx context.Context, limit int) ([]*stora
 //
 // completed_at is stamped because every settled parent state is non-resumable.
 //
-// The write re-asserts both the row's state and the parent gate rather than
-// trusting the sweep's read, so it can never overwrite a row a driver moved
-// after the scan selected it.
+// The write re-asserts the row's state, its quiescence, and the parent gate
+// rather than trusting the sweep's read, so it can never overwrite a row a
+// driver moved — or merely mirrored — after the scan selected it.
 func (s *taskStore) reapStrandedActiveTask(ctx context.Context, task *storage.Task, parent *storage.Apply) (bool, error) {
 	taskState := state.NormalizeState(parent.State)
 	setClause := "state = ?, completed_at = COALESCE(completed_at, NOW())"
@@ -935,6 +971,7 @@ func (s *taskStore) reapStrandedActiveTask(ctx context.Context, task *storage.Ta
 		UPDATE tasks
 		SET `+setClause+`, updated_at = NOW()
 		WHERE id = ? AND state = ?
+			AND `+strandedActiveTaskGate(s.dialect)+`
 			AND `+parentGate+`
 	`, args...)
 	if err != nil {
