@@ -522,12 +522,23 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		}
 		return nil
 	}
-	// Every other statement — including a blocking CREATE INDEX — runs
-	// exactly as reviewed, under the per-statement and lock limits.
-	// SchemaBot executes the DDL the plan surfaced and never rewrites it
-	// into its concurrent form: the plan surfaces the statement as
-	// authored and the apply executes it unchanged, so the choice between
-	// a blocking and a concurrent build stays with the author.
+	// Every other statement runs exactly as reviewed, under the
+	// per-statement and lock limits. The apply never rewrites a statement
+	// here: it executes the DDL the plan surfaced, which tableChanges
+	// renders from the plan's ExecSQL — the submitted SQL stands in only
+	// for a step carrying a blocked verdict, and a blocked step is refused
+	// before an apply is queued. For an index added to an existing table,
+	// the choice between a blocking and a concurrent build is made upstream
+	// in pg-sprite: its planner constructs the concurrent form as the safer
+	// sequence and its router promotes that into ExecSQL, so such an index
+	// takes the concurrent branch above. A blocking CREATE INDEX does not
+	// reach this call: a plain index on an existing table is rewritten at
+	// plan time or, when the rewrite could not be constructed, blocked; a
+	// partitioned parent's build is refused by CheckPartitionSupport above;
+	// and an index declared with a new table diverts to executeCreate,
+	// where greenfieldCreateSet keeps the blocking form on purpose — a
+	// table born in the run has no readers, and CONCURRENTLY cannot run
+	// inside its create sequence.
 	if err := executor.ExecuteNative(ctx, pool, table, statement, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
 	}, executor.DefaultRetryPolicy()); err != nil {
