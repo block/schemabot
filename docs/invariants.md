@@ -926,11 +926,12 @@ with the drive loop as the sole engine poller (`pkg/tern/local_client.go`,
 Whenever SchemaBot declines to do something, the message names the next action, not just the
 reason. A plan that has lost its stored routing asks for a fresh plan rather than reporting a
 missing field. A database with no configured route names the deployment and environment it looked
-under and says to add it to the server config. An apply blocked on a closed PR gets copy that
-distinguishes closed from merged, because the recovery differs and only one of them can be
-reopened. An ambiguous command is rejected with the disambiguation rather than resolved by an
-arbitrary pick (AZ-5). A failed apply says that a fresh apply resumes from where this one stopped,
-which is the fact that decides whether the operator retries or investigates first.
+under and says to add it to the server config. An apply blocked because its PR is no longer open
+is told which case it is, since an abandoned PR and a merged one need different recoveries and
+only one of them can be reopened. An ambiguous command is rejected with the disambiguation rather
+than resolved by an arbitrary pick (AZ-5). A failed apply says that a fresh apply resumes from
+where this one stopped, which is the fact that decides whether the operator retries or
+investigates first.
 
 The bar is that an operator who reads only the message knows what to do next. It is not a promise
 that the next step always exists: some situations genuinely need a human decision, and saying so
