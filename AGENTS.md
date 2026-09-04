@@ -104,7 +104,7 @@ The hook uses `--new-from-rev` to only flag issues introduced by the current bra
 
 ### Runtime Invariants
 
-[docs/invariants.md](docs/invariants.md) is the canonical registry of the MUST-statements that make SchemaBot safe in front of tier-0 databases. It is organized into families — merge gating (MG), apply state machine (ST), ownership and leases (OW), control operations (CO), recovery (RC), review and validation (RV), authorization (AZ), and availability (AV) — and each entry states the rule, what breaks if it is violated, and where it is enforced. Every entry describes shipped behavior, not intent.
+[docs/invariants.md](docs/invariants.md) is the canonical registry of the MUST-statements that make SchemaBot safe in front of tier-0 databases. It is organized into families — merge gating (MG), apply state machine (ST), ownership and leases (OW), control operations (CO), operator surfaces (UX), recovery (RC), review and validation (RV), authorization (AZ), and availability (AV) — and each entry states the rule, what breaks if it is violated, and where it is enforced. Every entry describes shipped behavior, not intent.
 
 **Before changing safety-relevant code, read the invariants that govern it.** Anything touching check state, apply state transitions, lease claims, control requests, reconciliation, DDL classification, authorization, or the drive loop is governed by at least one entry. Find them first — the failure mode of these paths is not a wrong answer, it is a confidently wrong one that unblocks a merge or half-changes a database, and a change that reads correct in isolation can still dissolve an invariant that spans two files.
 

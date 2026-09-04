@@ -73,7 +73,7 @@
   - [RC-2: Settled applies stop changing](#rc-2-settled-applies-stop-changing)
   - [RC-3: Loading nothing is not owning nothing](#rc-3-loading-nothing-is-not-owning-nothing)
   - [RC-4: Self-healing needs proof](#rc-4-self-healing-needs-proof)
-  - [RC-5: Terminal notifications fire exactly once](#rc-5-terminal-notifications-fire-exactly-once)
+  - [RC-5: A terminal summary is never lost, and never silently duplicated](#rc-5-a-terminal-summary-is-never-lost-and-never-silently-duplicated)
 - [Review integrity and data safety (RV)](#review-integrity-and-data-safety-rv)
   - [RV-1: What gets applied is what was reviewed](#rv-1-what-gets-applied-is-what-was-reviewed)
   - [RV-2: Stale plans never apply](#rv-2-stale-plans-never-apply)
@@ -472,19 +472,33 @@ gating commit.
 
 ### MG-5: Apply-owned check rows are released only by their owner
 
-A plan result never overwrites an `in_progress` check row that carries an `apply_id`, and
-apply/rollback completion updates the row only if it still holds that `apply_id` and no newer
-apply exists for the same PR, environment, and database. *Breaks if violated:* a concurrent
+An ordinary plan result never overwrites an `in_progress` check row that carries an `apply_id`.
+Ownership is released by exactly three paths, and they are the whole set: apply completion,
+rollback completion, and an explicit same-head no-op recovery. *Breaks if violated:* a concurrent
 plan or a stale driver flips a gate that live work owns.
 
-The refusal is decided, never inferred. Ownership is read and the write made in a single
-transaction with the row held, because a row count cannot answer the question: a plan rewriting a
-row with the values it already holds changes nothing, and so reports nothing changed, which is
-indistinguishable from being refused. Reading ownership after the write is no better, since it
-answers about a later moment than the one the write was authorized under. Either shortcut would
-report a refusal that never happened, or hide one that did. *Enforced:* `apply_id` ownership
+The two completion paths are conditional on ownership: they update the row only if it still holds
+that `apply_id` and no newer apply exists for the same PR, environment, and database. Rollback
+completion is the deliberate asymmetry, since it clears the gate for a row an older apply may
+still nominally own.
+
+The third path exists because an apply-owned row whose apply never arrives would otherwise block
+the PR forever with no operator recourse. It is narrow rather than conditional: it fires only on a
+successful plan that found no changes, only for the same head SHA the row already carries, and
+only against a row that is `in_progress` with a non-NULL `apply_id`. Those predicates are the
+whole authorization, expressed in the `WHERE` clause, so this one is settled by row count rather
+than by the transactional read below.
+
+Everywhere else the refusal is decided, never inferred. Ownership is read and the write made in a
+single transaction with the row held, because a row count cannot answer the question: a plan
+rewriting a row with the values it already holds changes nothing, and so reports nothing changed,
+which is indistinguishable from being refused. Reading ownership after the write is no better,
+since it answers about a later moment than the one the write was authorized under. Either shortcut
+would report a refusal that never happened, or hide one that did. *Enforced:* `apply_id` ownership
 markers on `checks` rows, with the ownership read and the conditional write in one transaction
-under a row lock (`pkg/storage/internal/sqlstore/checks.go`,
+under a row lock, and the three release paths (`CompleteForApply`,
+`MarkActionRequiredForApply`, `RecoverApplyOwnedCheckWithNoOpPlan`) enumerated on the store
+interface (`pkg/storage/storage.go`, `pkg/storage/internal/sqlstore/checks.go`,
 `pkg/webhook/apply_check_records.go`); refusals are counted.
 
 ### MG-6: Started applies keep blocking after the change disappears
@@ -556,9 +570,14 @@ Canonical model: [apply-lifecycle.md](apply-lifecycle.md) and
 
 ### ST-1: A finished apply stays finished
 
-Storage refuses any write that would move a terminal apply (`completed`, `failed`, `cancelled`,
-`reverted`, `stopped`) back to an active state. Not a retry, not an API write, not a crashed
-driver replaying stale progress.
+No path moves a terminal apply (`completed`, `failed`, `cancelled`, `reverted`, `stopped`) back
+to an active state. Not a retry, not an API write, not a crashed driver replaying stale progress.
+
+This is upheld by the routes into an active state rather than by a single predicate on the apply
+update: the claim query names the states it will claim, and the control handlers refuse a
+transition out of a terminal state before writing. There is no blanket storage-level assertion
+that would catch a new caller writing an active state directly, which is worth knowing before
+adding one.
 
 `stopped` is the one terminal state that is still addressable, because a stopped apply is holding
 a database rather than done with it. It can be claimed to resume via `start`, and it can be
@@ -592,17 +611,28 @@ have drifted since. *Enforced:* absence. Storage exposes no failed-to-active tra
 ### ST-3: Apply state flows upward, never downward
 
 A driver writes only the operation row it has claimed; the parent apply's state is derived from
-its operations' tasks using a fixed priority order, never written directly by a drive. *Breaks if
-violated:* one deployment's driver overwrites the verdict of another's. *Enforced:*
-`DeriveApplyState()` (`pkg/state/apply.go`) and the rollout projection in `pkg/tern`; lease-scoped
-writes cannot touch the parent row.
+its operations' tasks using a fixed priority order rather than asserted by a drive. *Breaks if
+violated:* one deployment's driver overwrites the verdict of another's.
+
+The protection is the lease a drive holds. A driver working an operation holds an operation lease
+and no apply lease, so the parent row is not its to write and the derivation is the only thing
+that moves it. That is a property of what the drive holds, not a rule the parent row enforces
+against all comers, so it says nothing about a caller holding an apply lease. *Enforced:*
+`DeriveApplyState()` (`pkg/state/apply.go`) and the rollout projection in `pkg/tern`;
+operation-lease-scoped writes cannot touch the parent row.
 
 ### ST-4: Stored task state never moves backward
 
 A stale engine poll can never rewind stored task state: terminal stored tasks stay terminal,
 control-owned states (`stopped`, `failed_retryable`) are never overwritten by active engine polls,
-and active states advance strictly forward through the lifecycle. *Enforced:* forward-only
-reconciliation in the progress poller (`pkg/tern/observer.go`).
+and active states advance strictly forward through the lifecycle.
+
+The guard belongs to the drive loop, which is where stale polls come from. The settled-apply task
+reconciliation named in UX-3 assigns state without it, and that is sound for the same reason its
+missing lease token is: it runs only against an apply that has already reached a terminal state,
+so there is no forward progress left for it to undo. *Enforced:* the forward-only state resolution
+the drive loop reconciles through (`taskStateWithNoBackwardProgress`,
+`pkg/tern/local_client.go`).
 
 ### ST-5: Unknown engine states are visible and blocking
 
@@ -637,8 +667,7 @@ completeness test over it (`pkg/state/metadata.go`).
 `failed_retryable` is active, not terminal: recovery re-drives it automatically. Only
 `failed_retryable` tasks reset to `pending`, so completed tasks are never re-run, and the apply
 settles to permanent `failed` when the attempt budget is spent or the recovery window closes.
-*Enforced:* retry preparation and expiry (`pkg/api/operator.go`,
-`pkg/storage/internal/sqlstore/retry.go`); budget semantics in
+*Enforced:* retry preparation and expiry (`pkg/api/operator.go`); budget semantics in
 [apply-lifecycle.md](apply-lifecycle.md).
 
 ### ST-10: Rollouts respect order and fail closed on policy
@@ -664,10 +693,17 @@ operator claim path (`pkg/api/operator.go`, `pkg/storage/internal/sqlstore/appli
 
 ### OW-2: Lease-scoped writes must hold the current token
 
-Apply and task updates, heartbeats, apply logs, and recovered observer side effects all carry the
-lease token; when another driver has claimed the row and rotated the token, the displaced driver's
-writes fail with an ownership error and it exits rather than posting stale comments or overwriting
-newer state. *Enforced:* a token check on every lease-scoped storage write
+Apply and task updates, heartbeats, apply logs, and recovered observer side effects carry the
+lease token whenever a driver makes them; when another driver has claimed the row and rotated the
+token, the displaced driver's writes fail with an ownership error and it exits rather than posting
+stale comments or overwriting newer state.
+
+The token is what a driver writes under, so a write made by something that is not driving has none
+to present and the predicate is empty. That is only safe where such a write cannot race a driver.
+It holds for the settled-apply task reconciliation named in UX-3, whose whole precondition is that
+the apply is already terminal and no driver holds it. A new write path that is not a driver's and
+not conditioned on a settled apply would need its own reason, not this one. *Enforced:* a token
+check on every lease-scoped storage write
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/apply_operations.go`).
 
 ### OW-3: A driver stops before a peer may reclaim
@@ -727,13 +763,20 @@ apply create and activate paths, under the apply target lock
 
 ### OW-6: There is one way to claim work
 
-Exactly one claim query and one lease-rotation path exist, with no side doors. Eligibility rules
-live inside the claim query itself rather than in checks that run after it, because once a
-destructive transition (say, `waiting_for_cutover` to `cutting_over`) has been claimed the work is
-already in motion, and discovering only then that it should not have been claimed is too late.
-*Enforced:* the single operation-claim query
-(`pkg/storage/internal/sqlstore/apply_operations.go`); tests pin its state arms against
-divergence.
+Work is claimed only by a claim query, and there is one lease-rotation path, with no side doors.
+Eligibility rules live inside the claim query itself rather than in checks that run after it,
+because once a destructive transition has been claimed the work is already in motion, and
+discovering only then that it should not have been claimed is too late.
+
+At the operation level there are two such queries rather than one, and they are peers: a general
+claim, and a second whose only job is the `waiting_for_cutover` to `cutting_over` transition,
+which has different eligibility from everything else. They share the lease predicate, draw from
+the same driver pool, and embed the claim clause identically, which is what makes them one
+mechanism with two eligibility gates rather than two ways in. What the invariant forbids is a
+third route that is not a claim query at all. *Enforced:* the operation-claim queries
+(`FindNextApplyOperation`, `FindNextApplyOperationCutover`,
+`pkg/storage/internal/sqlstore/apply_operations.go`), sharing one embedded claim clause; tests pin
+their state arms against divergence.
 
 ### OW-7: Ownership uncertainty fails closed
 
@@ -917,11 +960,20 @@ happen that should not. *Enforced:* the acknowledgment points in the comment-com
 
 ### UX-3: Progress is a projection; reading it never changes it
 
-Every progress surface renders from stored state. Nothing that reads progress polls an engine, and
-nothing that reads progress writes. The lease-holding driver is the only engine poller in the
-system: it advances task and apply state, persists per-shard rows and engine resume metadata on
-every tick, and terminalizes the apply. Readers derive from what it wrote, computing the rollups
-that are not stored, such as a table's headline across its shards, at read time.
+Every progress surface renders from stored state. No reader polls an engine: the lease-holding
+driver is the only engine poller in the system, advancing task and apply state, persisting
+per-shard rows and engine resume metadata on every tick, and terminalizing the apply. Readers
+derive from what it wrote, computing the rollups that are not stored, such as a table's headline
+across its shards, at read time.
+
+There is one exception on the read path, and it is a reconciliation rather than a poll. When a
+control-plane read finds task rows still active under an apply that has already settled, it asks
+that apply's data plane once for the truth and writes the answer back, after which the rows agree
+and later reads are served from storage. It exists because those rows are already wrong: their
+driver settled the apply elsewhere and left them behind, and no other path revisits them. It is
+worth naming as an exception rather than folding into the rule, because it is the one place a
+`GET` writes, and because it is the narrow case where a reader is not covered by the lease
+discipline below (OW-2) or the monotonicity guard above (ST-4).
 
 That separation is what keeps a display problem a display problem. A stale percentage, a missing
 ETA, a rollup that reads oddly on a multi-table apply: none of it can move the state machine,
@@ -1001,9 +1053,9 @@ an apply is called is derived once from the operation rows and rendered by both.
 differs between surfaces, ANSI color against markdown emphasis, and colored output degrades to the
 same text byte for byte when it is not going to a terminal. *Enforced:* the severity vocabulary
 and its rules (`pkg/glyph`), the shared bar and its colors (`pkg/ui`), the shared rollup
-(`pkg/presentation`), and a custom analyzer run in CI and pre-commit that fails a build on a
-severity glyph written as a literal anywhere outside its home package
-(`pkg/analyzers/severityglyphs`).
+(`pkg/presentation`), and a custom analyzer run by the pre-commit hook that blocks a commit
+introducing a severity glyph as a literal outside its home package
+(`pkg/analyzers/severityglyphs`, `scripts/lint-fix.sh`).
 
 ## Recovery (RC)
 
@@ -1019,9 +1071,19 @@ stranded-operation reaper (`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/r
 
 ### RC-2: Settled applies stop changing
 
-No claim, reaper, or recovery path touches an apply whose verdict is recorded. An apply that
-finished last week does not have its rows change today. *Enforced:* settled-state exclusions in
-every claim and sweep query (`pkg/storage/internal/sqlstore/applies.go`), with ST-1 as the
+No claim or recovery path reopens an apply whose verdict is recorded. An apply that finished last
+week does not get re-driven today, and its verdict does not change.
+
+Its child rows are a different question, and RC-1 is the reason: a settled apply can still have an
+operation or task row that never reached a terminal state, and something has to close those out.
+The reaper does, and a settled parent is its *precondition* rather than something it avoids. It
+asserts that parent state in both the sweep's read and the guarded write, so the write re-verifies
+the parent it was chosen for rather than trusting a read that may be seconds old, and it waits for
+a quiescence window first, because the apply's own paths may still be writing child rows just
+after it terminalized. What stays fixed is the verdict: reconciling a stranded child to match it
+is not the same as changing it. *Enforced:* settled-state exclusions in every claim and sweep
+query (`pkg/storage/internal/sqlstore/applies.go`) and the reaper's parent gate
+(`strandedParentGate`, `pkg/storage/internal/sqlstore/apply_operations.go`), with ST-1 as the
 backstop under all of them.
 
 ### RC-3: Loading nothing is not owning nothing
@@ -1037,22 +1099,31 @@ Automatic cleanup acts only where the record provably carries no engine work, as
 task, which has no checkpoint by construction. Anything uncertain keeps blocking for an operator.
 *Enforced:* narrow eligibility conditions on every self-heal path (`pkg/api/reaper.go`).
 
-### RC-5: Terminal notifications fire exactly once
+### RC-5: A terminal summary is never lost, and never silently duplicated
 
 The terminal summary (PR comment, check completion) is authorized by an atomic first-writer-wins
-claim on a unique key, so exactly one publisher posts the summary for a given terminal state.
-The claim is deliberately lease-agnostic: a publisher whose apply lease was re-claimed still
-wins or loses cleanly, and no handover can drop the summary.
+claim on a unique key, so one publisher is authorized to post the summary for a given terminal
+state. The claim is deliberately lease-agnostic: a publisher whose apply lease was re-claimed
+still wins or loses cleanly, and no handover can drop the summary.
 
-Exactly-once is scoped to a terminal state, not to the apply's whole life. An apply that stops,
-posts its summary, and later resumes has that marker superseded, which re-arms the claim so the
-next terminal state gets its own summary. Recovery is likewise separated by case: a claim sentinel
-abandoned by a crashed publisher is recovered by its own stale-claim path, while the ordinary
-claim path will only reclaim a marker that records an already-posted comment. Stealing an
-in-flight sentinel would hand two writers the same claim, which is exactly the duplicate this
-invariant exists to prevent. *Enforced:* the atomic summary claim and its stale-claim recovery
+The contract is at-least-once with a bounded duplicate, and it is that rather than exactly-once
+because posting the comment and recording that it was posted are two writes to two systems with
+no transaction across them. If the comment lands on the PR and the write recording its ID then
+fails, the marker still reads as an unfulfilled claim: it goes stale, reconciliation reclaims it,
+and a second summary is posted. That is the deliberate side to fail on. A duplicate summary is
+noise an operator can read past; a missing one is an apply that finished with nobody told.
+The duplicate is bounded to one because the reclaim posts and records in the same shape as the
+original, so the failure has to recur to recur.
+
+Single-posting is also scoped to a terminal state, not to the apply's whole life. An apply that
+stops, posts its summary, and later resumes has that marker superseded, which re-arms the claim so
+the next terminal state gets its own summary. Recovery is likewise separated by case: a claim
+sentinel abandoned by a crashed publisher is recovered by its own stale-claim path, while the
+ordinary claim path will only reclaim a marker that records an already-posted comment. Stealing an
+in-flight sentinel would hand two writers the same claim, which is the unbounded duplication this
+invariant does rule out. *Enforced:* the atomic summary claim and its stale-claim recovery
 (`pkg/storage/internal/sqlstore/apply_comments.go`), and the observer claims in the drive and
-recovery paths (`pkg/webhook/comment_observer.go`).
+recovery paths (`pkg/webhook/comment_observer.go`, `pkg/webhook/handler.go`).
 
 ## Review integrity and data safety (RV)
 
@@ -1060,17 +1131,21 @@ recovery paths (`pkg/webhook/comment_observer.go`).
 
 A deployment applying a plan reviewed elsewhere independently re-derives the change set and
 compares it immediately before each per-task engine apply. Drift fails closed, including DDL it
-cannot parse, and recomputed deltas are never applied silently. *Enforced:* pre-apply change-set
-comparison (`pkg/tern/change_set_compare.go`), applied on the review-drift and rollup paths
-(`pkg/api/plan_review_drift.go`, `pkg/api/plan_rollup.go`, `pkg/webhook/plan_drift.go`).
+cannot parse, and recomputed deltas are never applied silently. *Enforced:*
+`verifyMaterializedPlanMatchesLiveSchema` on the apply path (`pkg/tern/local_plan_drift.go`,
+called from `pkg/tern/local_client.go`). The cross-deployment comparison a plan is reviewed
+against is a separate, earlier mechanism (`pkg/tern/change_set_compare.go`, applied on the
+review-drift and rollup paths).
 
 ### RV-2: Stale plans never apply
 
 An apply is rejected when the plan's base is no longer the branch's live base. Freshness is
 mandatory, is checked at apply time against the current base, and cannot be waived by
 `--allow-unsafe`. Plan comments are suppressed as duplicates only when SchemaBot can prove it is
-not preserving a stale plan. *Enforced:* the plan-freshness gate on both apply entry points
-(`pkg/webhook/plan_freshness.go`).
+not preserving a stale plan. *Enforced:* `assertBaseSchemaStillCurrent` on both apply entry
+points (`pkg/webhook/schema_freshness.go`, called from `pkg/webhook/apply_handlers.go`). It
+compares Git tree OIDs, stops on GitHub read uncertainty, and takes no `allowUnsafe` argument to
+waive with.
 
 ### RV-3: Consent is explicit, specific, and re-checked
 
@@ -1210,10 +1285,12 @@ The strongest invariants are enforced by structure, so regressions fail CI inste
   each other by tests: a table file present for one dialect and not the other, or an index that
   differs in table, ordered columns, or uniqueness, fails CI. A guard whose correctness rests on
   a unique index therefore cannot hold on one dialect and quietly not on the other (MG-5, AV-9).
-- **Severity vocabulary.** A custom analyzer runs in CI and in the pre-commit hook and fails the
-  build on a severity glyph written as a literal outside the package that owns the vocabulary, so
-  a new rendering site cannot introduce a sixth meaning or reuse an existing glyph for a new one
-  (UX-5).
+- **Severity vocabulary.** A custom analyzer blocks a commit that introduces a severity glyph as a
+  literal outside the package that owns the vocabulary, so a new rendering site cannot introduce a
+  sixth meaning or reuse an existing glyph for a new one (UX-5). This one is weaker than the rest
+  of the list and is named here as such: it runs from the pre-commit hook over staged packages
+  rather than in CI, so it is bypassable and does not see the repository as a whole. Wiring it
+  into the lint workflow is what would make it a peer of the others.
 
 New invariants should aspire to this tier. When adding one, prefer a completeness test over the
 relevant registry to a hand-maintained list.

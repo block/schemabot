@@ -266,7 +266,9 @@ runs. Below it, the bounded attempt described above is what stands in for a copy
 tried once, and a rewrite is cancelled by its own budget rather than allowed to hold a lock. Some
 statements skip the gamble because PostgreSQL has a genuinely online form of them, and the planner
 substitutes it: an index build becomes `CREATE INDEX CONCURRENTLY`, and a constraint is added `NOT
-VALID` and then validated. Those run whatever the table size. [postgresql.md](postgresql.md) has
+VALID` and then validated. Those still sit under the size limit, which is checked once at plan time
+and again in the session that executes, so a table that grew past the limit in between is refused
+rather than run. [postgresql.md](postgresql.md) has
 the full boundary and is worth reading before you point SchemaBot at a PostgreSQL database; it
 tracks the engine more closely than this page does.
 
@@ -363,9 +365,13 @@ Sitting over that is a throttle ratio an operator can set on a running deploy re
 works the way the gate does: the ratio is the probability that any given check is refused, so a
 ratio held at three quarters lets roughly one batch in four through. That is the lever to reach
 for when a deploy request is competing with live traffic, and unlike the signal thresholds it is a
-deliberate choice rather than a reaction. It is set through PlanetScale rather than through
-SchemaBot, which has no control operation for it; SchemaBot reads the resulting throttle state and
-reports it, and never sets it. PlanetScale documents the controls in
+deliberate choice rather than a reaction. Both the signal thresholds and the ratio live on the
+PlanetScale side, and SchemaBot neither sets them nor surfaces them: Vitess publishes a throttle
+ratio, a last-throttled time, and a throttle reason per shard, and SchemaBot's progress reads none
+of them. So a throttled deploy request reads in SchemaBot as a copy that is going slowly, and the
+reason for it is in PlanetScale. That is the one place a Spirit change is better instrumented than
+a Vitess one, since Spirit surfaces both the throttle and its cause. PlanetScale documents the
+controls in
 [Throttling deploy requests](https://planetscale.com/docs/vitess/schema-changes/throttling-deploy-requests).
 
 **pg-sprite has nothing to pace yet.** A throttle governs a copy, and there is no copy. What
