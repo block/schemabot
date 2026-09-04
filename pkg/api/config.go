@@ -225,6 +225,12 @@ type ServerConfig struct {
 	// an apply owns is minimized so the record stays expandable. Defaults to
 	// false, which keeps the minimize-based policy: superseded unactioned
 	// comments are minimized and apply-owned comments stay fully expanded.
+	//
+	// "Unactioned" means no apply ran from the comment's head — it says
+	// nothing about human engagement. Deletion is irreversible where
+	// minimizing is not: the comment's reactions are lost and any permalink
+	// to it (in chat, tickets, or other PRs) breaks, and the surviving
+	// storage row keeps the comment's identifiers, not its rendered body.
 	DeleteUnactionedPlanComments bool `yaml:"delete_unactioned_plan_comments,omitempty"`
 }
 

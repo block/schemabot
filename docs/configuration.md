@@ -1576,6 +1576,13 @@ commit it was rendered at, so on a busy PR the comment is pure noise. A
 superseded comment whose commit produced an apply is minimized rather than
 deleted, keeping the record of what ran expandable on the PR.
 
+Unactioned means exactly that: no apply ran from the comment's commit. It says
+nothing about human engagement — a comment people reacted to or linked
+elsewhere is still deleted if its plan never became an apply. And unlike
+minimizing, deletion is irreversible: the comment's reactions are lost, any
+permalink to it (in chat, tickets, or other PRs) breaks, and SchemaBot's
+stored record keeps the comment's identifiers, not its rendered body.
+
 Either way, retirement fails toward visibility — if GitHub or storage
 misbehaves, comments are left as they are (extra noise), never hidden or
 removed without a durable record.
