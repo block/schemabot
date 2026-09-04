@@ -18,6 +18,14 @@ import (
 // diff here to review, and would inherit the judgement without ever being
 // read. Pinning the membership keeps the judgement attached to the checks it
 // was made about.
+//
+// What is pinned is the membership, not the wording. A check already in the
+// list that changes what its reason says keeps its name and passes here.
+// TestStatementRefusalPublishesNothingFromTheTarget holds that half by reading
+// the reason itself, for the statement shapes it enumerates, so a reason that
+// starts carrying the target's definition fails there. The two together leave
+// one gap: a wording change in a check that only fires on a shape that table
+// does not carry.
 func TestPublishableRefusalChecks(t *testing.T) {
 	assert.Equal(t, []string{
 		"addforeignkey",
