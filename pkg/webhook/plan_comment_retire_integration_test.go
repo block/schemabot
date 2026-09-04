@@ -303,6 +303,8 @@ func TestPlanCommentSupersedeDeletesUnactionedPriorComments(t *testing.T) {
 		HeadSHA:      "sha1",
 	}
 
+	fake.setCurrentHead("sha1")
+
 	// A comment for another database on the same PR must never be touched.
 	otherSlot := slot
 	otherSlot.Database = "billing"
@@ -315,6 +317,7 @@ func TestPlanCommentSupersedeDeletesUnactionedPriorComments(t *testing.T) {
 
 	// A new head supersedes the sha1 comment; no apply acted on it.
 	slot.HeadSHA = "sha2"
+	fake.setCurrentHead("sha2")
 	h.postTrackedPlanComment(repo, 42, 12345, slot, "plan at sha2")
 	assert.Equal(t, []int64{1002}, fake.deletedCommentIDs(), "the unactioned sha1 comment is deleted from GitHub")
 	assert.Empty(t, fake.minimizedNodes(), "an unactioned comment is deleted, never minimized")
@@ -378,12 +381,14 @@ func TestPlanCommentApplyOwnedHeadIsMinimizedNotDeleted(t *testing.T) {
 		Environments: []string{"staging"},
 		HeadSHA:      "shaA",
 	}
+	fake.setCurrentHead("shaA")
 	h.postTrackedPlanComment(repo, 42, 12345, slot, "plan at shaA")
 
 	// The shaA plan becomes an apply before the next push.
 	createRunningApplyForHead(t, st, repo, 42, "orders", "staging", "shaA")
 
 	slot.HeadSHA = "shaB"
+	fake.setCurrentHead("shaB")
 	h.postTrackedPlanComment(repo, 42, 12345, slot, "plan at shaB")
 
 	assert.Equal(t, []string{"IC_node1001"}, fake.minimizedNodes(),
@@ -407,10 +412,12 @@ func TestPlanCommentDeleteFailureRetriesOnNextSupersede(t *testing.T) {
 		Environments: []string{"staging"},
 		HeadSHA:      "shaA",
 	}
+	fake.setCurrentHead("shaA")
 	h.postTrackedPlanComment(repo, 42, 12345, slot, "plan at shaA")
 	fake.setDeleteFails(1001, true)
 
 	slot.HeadSHA = "shaB"
+	fake.setCurrentHead("shaB")
 	h.postTrackedPlanComment(repo, 42, 12345, slot, "plan at shaB")
 	assert.Empty(t, fake.deletedCommentIDs(), "the injected failure leaves the shaA comment on the PR")
 	assert.Equal(t, []string{"shaA", "shaB"}, unretiredHeads(t, st, repo, 42, "orders", "mysql"),
@@ -419,6 +426,7 @@ func TestPlanCommentDeleteFailureRetriesOnNextSupersede(t *testing.T) {
 	// GitHub recovers; the next supersede retires both stale comments.
 	fake.setDeleteFails(1001, false)
 	slot.HeadSHA = "shaC"
+	fake.setCurrentHead("shaC")
 	h.postTrackedPlanComment(repo, 42, 12345, slot, "plan at shaC")
 	assert.ElementsMatch(t, []int64{1001, 1002}, fake.deletedCommentIDs())
 	assert.Equal(t, []string{"shaC"}, unretiredHeads(t, st, repo, 42, "orders", "mysql"))
@@ -601,10 +609,12 @@ func TestPlanCommentSupersedeDefaultPolicyMinimizes(t *testing.T) {
 		Environments: []string{"staging"},
 		HeadSHA:      "sha1",
 	}
+	fake.setCurrentHead("sha1")
 	h.postTrackedPlanComment(repo, 42, 12345, slot, "plan at sha1")
 
 	// No apply acted on sha1; the next head minimizes its comment.
 	slot.HeadSHA = "sha2"
+	fake.setCurrentHead("sha2")
 	h.postTrackedPlanComment(repo, 42, 12345, slot, "plan at sha2")
 	assert.Equal(t, []string{"IC_node1001"}, fake.minimizedNodes(),
 		"the unactioned sha1 comment is minimized, not deleted")
@@ -614,6 +624,7 @@ func TestPlanCommentSupersedeDefaultPolicyMinimizes(t *testing.T) {
 	// An apply now owns sha2; the next head leaves its comment fully expanded.
 	createRunningApplyForHead(t, st, repo, 42, "payments", "staging", "sha2")
 	slot.HeadSHA = "sha3"
+	fake.setCurrentHead("sha3")
 	h.postTrackedPlanComment(repo, 42, 12345, slot, "plan at sha3")
 	assert.Equal(t, []string{"IC_node1001"}, fake.minimizedNodes(),
 		"the apply-owned sha2 comment stays fully expanded")
@@ -637,10 +648,12 @@ func TestPlanCommentMinimizeFailureRetriesOnNextSupersede(t *testing.T) {
 		Environments: []string{"staging"},
 		HeadSHA:      "shaA",
 	}
+	fake.setCurrentHead("shaA")
 	h.postTrackedPlanComment(repo, 42, 12345, slot, "plan at shaA")
 	fake.setMinimizeFails("IC_node1001", true)
 
 	slot.HeadSHA = "shaB"
+	fake.setCurrentHead("shaB")
 	h.postTrackedPlanComment(repo, 42, 12345, slot, "plan at shaB")
 	assert.Empty(t, fake.minimizedNodes(), "the injected failure leaves the shaA comment expanded")
 	assert.Equal(t, []string{"shaA", "shaB"}, unretiredHeads(t, st, repo, 42, "orders", "mysql"),
@@ -649,7 +662,75 @@ func TestPlanCommentMinimizeFailureRetriesOnNextSupersede(t *testing.T) {
 	// GitHub recovers; the next supersede retires both stale comments.
 	fake.setMinimizeFails("IC_node1001", false)
 	slot.HeadSHA = "shaC"
+	fake.setCurrentHead("shaC")
 	h.postTrackedPlanComment(repo, 42, 12345, slot, "plan at shaC")
 	assert.ElementsMatch(t, []string{"IC_node1001", "IC_node1002"}, fake.minimizedNodes())
 	assert.Equal(t, []string{"shaC"}, unretiredHeads(t, st, repo, 42, "orders", "mysql"))
+}
+
+// TestPlanCommentPostForStaleHeadRetiresNothing covers the concurrent-push
+// safety of the post-path sweep: a push can land while the plan that produced
+// a comment was still running, so the comment posts for a head the PR has
+// already moved past. Its sweep must not retire anything — retiring cross-head
+// priors anchored to the stale head could take down the current head's live
+// comment with nothing replacing it. The current head's own plan outcome
+// sweeps the slot instead, including the stale comment.
+func TestPlanCommentPostForStaleHeadRetiresNothing(t *testing.T) {
+	const repo = "org/plan-retire-stale-post"
+	h, st, fake := setupPlanCommentHandler(t, repo, true)
+
+	insertPlanCommentRow(t, st, repo, 42, "orders", "staging", "sha1", 9001, "IC_prior_sha1")
+	fake.setCurrentHead("sha2")
+
+	h.postTrackedPlanComment(repo, 42, 12345, planCommentSlot{
+		Database:     "orders",
+		DatabaseType: "mysql",
+		Environments: []string{"staging"},
+		HeadSHA:      "shaOld",
+	}, "plan at shaOld, posted after the branch moved to sha2")
+
+	assert.Empty(t, fake.deletedCommentIDs(), "a stale-head post must not retire other comments")
+	assert.Empty(t, fake.minimizedNodes())
+	assert.ElementsMatch(t, []string{"sha1", "shaOld"}, unretiredHeads(t, st, repo, 42, "orders", "mysql"),
+		"every comment stays expanded until the current head's own sweep")
+}
+
+// TestPlanCommentSweepSkipsRowsPostedAfterAnchor covers the ordering guard on
+// the post-path sweep: a row inserted after the sweep's own comment belongs to
+// a concurrently posted plan comment, and only that comment's own sweep may
+// decide between the two. Without the guard, two concurrent posts would each
+// see the other as superseded and take both down, leaving the PR with no
+// visible plan comment.
+func TestPlanCommentSweepSkipsRowsPostedAfterAnchor(t *testing.T) {
+	const repo = "org/plan-retire-anchor-order"
+	h, st, fake := setupPlanCommentHandler(t, repo, true)
+
+	fake.setCurrentHead("sha2")
+	h.postTrackedPlanComment(repo, 42, 12345, planCommentSlot{
+		Database:     "orders",
+		DatabaseType: "mysql",
+		Environments: []string{"staging"},
+		HeadSHA:      "sha2",
+	}, "plan at sha2")
+
+	// A concurrent post for a newer head lands in storage after the sha2
+	// comment's row but before its sweep lists the slot.
+	insertPlanCommentRow(t, st, repo, 42, "orders", "staging", "sha3", 9100, "IC_concurrent_sha3")
+
+	comments, err := st.PlanComments().ListUnretiredForSlot(t.Context(), repo, 42, "orders", "mysql")
+	require.NoError(t, err)
+	require.Len(t, comments, 2)
+	anchor := comments[0]
+	if anchor.HeadSHA != "sha2" {
+		anchor = comments[1]
+	}
+	require.Equal(t, "sha2", anchor.HeadSHA)
+
+	client, err := h.clientForRepo(repo, 12345)
+	require.NoError(t, err)
+	h.retireSupersededPlanComments(t.Context(), client, anchor)
+
+	assert.Empty(t, fake.deletedCommentIDs(), "the concurrently posted newer comment must not be retired")
+	assert.Empty(t, fake.minimizedNodes())
+	assert.ElementsMatch(t, []string{"sha2", "sha3"}, unretiredHeads(t, st, repo, 42, "orders", "mysql"))
 }

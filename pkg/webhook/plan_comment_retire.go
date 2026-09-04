@@ -78,20 +78,32 @@ func (h *Handler) postTrackedPlanComment(repo string, pr int, installationID int
 		GitHubNodeID:     nodeID,
 	}
 	if err := h.service.Storage().PlanComments().Insert(ctx, posted); err != nil {
-		// The comment is live on GitHub either way. Without a row it will
-		// never be auto-retired, so it stays expanded until an operator
-		// hides it — still retire its predecessors below.
-		h.logger.Error("failed to record posted plan comment; it will stay expanded when superseded",
+		// The comment is live on GitHub either way, but without a row it can
+		// neither be auto-retired nor anchor a sweep: an unrecorded anchor
+		// cannot prove any prior row older than itself, so its sweep retires
+		// nothing and every comment in the slot stays expanded until the next
+		// recorded post sweeps them.
+		h.logger.Error("failed to record posted plan comment; the slot's comments stay expanded until the next recorded plan comment supersedes them",
 			"repo", repo, "pr", pr, "database", slot.Database, "database_type", slot.DatabaseType,
 			"head_sha", slot.HeadSHA, "comment_id", commentID, "error", err)
+		return
 	}
 
 	h.retireSupersededPlanComments(ctx, client, posted)
 }
 
 // retireSupersededPlanComments retires the still-visible plan comments that
-// the newly posted comment supersedes, per planCommentSupersedes.
+// the newly posted comment supersedes, per planCommentSupersedes. The posted
+// comment's head is verified against the PR's current head first: a push can
+// land while the plan that produced this comment was running, and a sweep
+// anchored to the stale head would retire the newer head's live comment with
+// nothing replacing it. When the head moved, nothing is retired — the current
+// head's own plan outcome sweeps the slot, including this comment.
 func (h *Handler) retireSupersededPlanComments(ctx context.Context, client *ghclient.InstallationClient, posted *storage.PlanComment) {
+	if !h.planSweepHeadIsCurrent(ctx, client, posted.Repository, posted.PullRequest, posted.HeadSHA,
+		"database", posted.DatabaseName, "database_type", posted.DatabaseType) {
+		return
+	}
 	h.retirePlanCommentsForSlot(ctx, client,
 		posted.Repository, posted.PullRequest, posted.DatabaseName, posted.DatabaseType, posted.HeadSHA, posted)
 }
@@ -148,9 +160,9 @@ func (h *Handler) retireStalePlanCommentsForPR(ctx context.Context, client *ghcl
 	h.retireSupersededPlanCommentRows(ctx, client, priors, headSHA, nil)
 }
 
-// planSweepHeadIsCurrent reports whether headSHA is still the PR's head, for a
-// sweep with no newly posted comment anchoring it. The sweep's head comes from
-// the delivery's cached PR fetch, so a concurrent push can make it stale:
+// planSweepHeadIsCurrent reports whether headSHA is still the PR's head. The
+// sweep's head comes from the delivery's cached PR fetch or from the plan
+// that produced a posted comment, so a concurrent push can make it stale:
 // sweeping on the old head would retire the newer head's live comment with
 // nothing replacing it — minimized comments are never automatically restored,
 // and deleted comments cannot be restored at all. On a fetch failure or a
@@ -223,6 +235,15 @@ func (h *Handler) retireSupersededPlanCommentRows(ctx context.Context, client *g
 		}
 		priorAttrs := planCommentAttrs(prior)
 		if posted != nil {
+			// A row inserted after the sweep's anchor belongs to a
+			// concurrently posted comment; that comment's own sweep sees this
+			// anchor as a prior and decides between them, so retiring it here
+			// would take both down. Anchors whose insert failed carry no ID
+			// and cannot order, so they retire nothing they cannot prove older.
+			if prior.ID > posted.ID {
+				h.logger.Info("keeping plan comment expanded: it was posted after this sweep's anchor, so its own sweep decides between them", priorAttrs...)
+				continue
+			}
 			if !planCommentSupersedes(posted, prior) {
 				h.logger.Debug("keeping plan comment expanded: not superseded (same head, different environment scope)", priorAttrs...)
 				continue
