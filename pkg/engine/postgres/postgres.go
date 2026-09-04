@@ -169,6 +169,18 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 // engine role, and is meaningful only while changes[i] carries no verdict —
 // a blocked step never reaches a privilege check.
 func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.TableChange, []preflight.Tier, error) {
+	verdicts := make([]string, len(report.Statements))
+	for i, statement := range report.Statements {
+		verdicts[i], _ = executionVerdict(report.FormatVersion, statement, report.Table)
+	}
+	if isGreenfieldCreateSet(report, verdicts) {
+		change, tier, err := greenfieldCreateSet(report, parser)
+		if err != nil {
+			return nil, nil, err
+		}
+		return []engine.TableChange{change}, []preflight.Tier{tier}, nil
+	}
+
 	changes := make([]engine.TableChange, 0, len(report.Statements))
 	tiers := make([]preflight.Tier, 0, len(report.Statements))
 	for _, statement := range report.Statements {
@@ -217,6 +229,76 @@ func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.Ta
 	return changes, tiers, nil
 }
 
+// isGreenfieldCreateSet reports whether the report describes a table that
+// does not exist yet and whose every statement is executable, so the table
+// and its indexes can ship as one apply unit. A report carrying any verdict
+// or destructive step keeps its per-statement rendering so each verdict
+// stays visible to the reviewer.
+func isGreenfieldCreateSet(report pgplan.Report, verdicts []string) bool {
+	if !isGreenfieldTable(report) {
+		return false
+	}
+	if len(report.Statements) == 0 {
+		return false
+	}
+	for i, statement := range report.Statements {
+		if verdicts[i] != "" || statement.Destructive {
+			return false
+		}
+	}
+	return true
+}
+
+// isGreenfieldTable reports whether the planner proved the table absent.
+func isGreenfieldTable(report pgplan.Report) bool {
+	return report.TableExists != nil && !*report.TableExists
+}
+
+// greenfieldCreateSet renders a greenfield report as a single CREATE TABLE
+// change whose DDL carries the table and its indexes in execution order, and
+// derives the privilege tier the whole set needs. Every statement is
+// re-classified against the planner's own table so a report that is not a
+// create set fails closed here rather than at apply time.
+func greenfieldCreateSet(report pgplan.Report, parser ddl.StatementParser) (engine.TableChange, preflight.Tier, error) {
+	statements := make([]string, len(report.Statements))
+	for i, statement := range report.Statements {
+		// pg-sprite may render ExecSQL with CONCURRENTLY, which ExecuteCreate
+		// refuses for a table born in the run; canonical SQL is deliberate
+		// regardless of renderer behavior.
+		statements[i] = statement.SQL
+	}
+	createSet, err := ddl.CreateSetStatements(parser, strings.Join(statements, ";\n"))
+	if err != nil {
+		return engine.TableChange{}, 0, fmt.Errorf("validate greenfield create set for table %q: %w", report.Table, err)
+	}
+	_, table, err := parser.Classify(createSet[0])
+	if err != nil {
+		return engine.TableChange{}, 0, fmt.Errorf("classify greenfield CREATE TABLE for table %q: %w", report.Table, err)
+	}
+	if table != report.Table {
+		return engine.TableChange{}, 0, fmt.Errorf("greenfield create set targets table %q, expected planner table %q", table, report.Table)
+	}
+	tier, err := preflight.RequiredTier(createSet)
+	if err != nil {
+		return engine.TableChange{}, 0, fmt.Errorf("derive privilege tier for greenfield table %q: %w", report.Table, err)
+	}
+	if err := ensureGreenfieldCreateTier(report.Table, tier); err != nil {
+		return engine.TableChange{}, 0, err
+	}
+	return engine.TableChange{
+		Table:     report.Table,
+		Operation: ddl.StatementCreateTable,
+		DDL:       strings.Join(createSet, ";\n"),
+	}, tier, nil
+}
+
+func ensureGreenfieldCreateTier(table string, tier preflight.Tier) error {
+	if tier != preflight.TierCreateTable {
+		return fmt.Errorf("greenfield table %q requires tier %s, expected %s", table, tier, preflight.TierCreateTable)
+	}
+	return nil
+}
+
 // blockMissingPrivileges verifies the connected role holds the access each
 // executable step needs, at that step's own tier, so a missing grant surfaces
 // on the plan the operator reviews — with the exact provisioning statement —
@@ -241,7 +323,7 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 	if hasExecutableChanges(changes) && report.Table == "" {
 		return nil, fmt.Errorf("plan report carries executable steps but names no target table")
 	}
-	if report.TableExists != nil && !*report.TableExists {
+	if isGreenfieldTable(report) {
 		// A privilege probe against a table that provably does not exist can
 		// only answer "table not found" — a dead end for the operator. Only
 		// the CREATE TABLE step's off-ladder tier states facts an absent
@@ -302,7 +384,7 @@ func blockOversizedTable(ctx context.Context, pool *pgxpool.Pool, report pgplan.
 	if report.Table == "" {
 		return nil, fmt.Errorf("plan report carries executable steps but names no target table")
 	}
-	if report.TableExists != nil && !*report.TableExists {
+	if isGreenfieldTable(report) {
 		return changes, nil
 	}
 	_, err := preflight.CheckTable(ctx, pool, report.Schema, report.Table, tableSizeLimit)

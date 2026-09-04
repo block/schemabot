@@ -87,6 +87,34 @@ func (postgresStatementParser) Classify(stmt string) (StatementType, string, err
 	return stmtType, table, nil
 }
 
+// createSetRelation returns the schema-qualified identity of the relation
+// targeted by a CREATE TABLE or CREATE INDEX statement. Keeping this narrower
+// than Classify preserves its established bare-table-name contract for other
+// consumers while making create-set comparison schema-aware.
+func (postgresStatementParser) createSetRelation(stmt string) (string, error) {
+	result, err := pgquery.Parse(stmt)
+	if err != nil {
+		return "", fmt.Errorf("parse create-set statement %q: %w", statementPreview(stmt), err)
+	}
+	stmts := result.GetStmts()
+	if len(stmts) != 1 {
+		return "", fmt.Errorf("expected one create-set statement, got %d", len(stmts))
+	}
+	var relation *pgproto.RangeVar
+	switch node := stmts[0].GetStmt().GetNode().(type) {
+	case *pgproto.Node_CreateStmt:
+		relation = node.CreateStmt.GetRelation()
+	case *pgproto.Node_IndexStmt:
+		relation = node.IndexStmt.GetRelation()
+	default:
+		return "", fmt.Errorf("expected CREATE TABLE or CREATE INDEX statement")
+	}
+	if relation.GetSchemaname() == "" {
+		return relation.GetRelname(), nil
+	}
+	return relation.GetSchemaname() + "." + relation.GetRelname(), nil
+}
+
 // CreateTableColumns implements StatementParser using the parsed CREATE TABLE
 // node, so quoted identifiers and PostgreSQL expressions follow the server
 // grammar while table constraints are excluded by node type.

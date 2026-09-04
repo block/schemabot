@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -237,6 +238,64 @@ func TestEngineApplyCreateTable(t *testing.T) {
 	assert.True(t, exists)
 }
 
+// TestEngineApplyGreenfieldCreateSet proves a new table and its declared indexes
+// execute as one unit before the table can carry traffic, then converge cleanly.
+func TestEngineApplyGreenfieldCreateSet(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "create_set_test")
+	desired := "CREATE TABLE widgets (id bigint PRIMARY KEY, name text); CREATE UNIQUE INDEX widgets_name_key ON widgets (name); CREATE INDEX widgets_id_idx ON widgets (id);"
+	planRequest := &engine.PlanRequest{
+		Database:    "create_set_test",
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{"widgets.sql": desired}}},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	eng := New()
+	plan, err := eng.Plan(t.Context(), planRequest)
+	require.NoError(t, err)
+	require.Len(t, plan.Changes, 1)
+	require.Len(t, plan.Changes[0].TableChanges, 1)
+	change := plan.Changes[0].TableChanges[0]
+	assert.Empty(t, change.ExecutionMode)
+	assert.Contains(t, change.DDL, ";\nCREATE UNIQUE INDEX widgets_name_key")
+	assert.Contains(t, change.DDL, ";\nCREATE INDEX widgets_id_idx")
+
+	result, err := eng.Apply(t.Context(), applyRequest(dsn, "widgets", change.DDL))
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	progress := awaitPostgresProgress(t, eng, "widgets")
+	assert.Equal(t, engine.StateCompleted, progress.State)
+
+	rows, err := db.QueryContext(t.Context(), "SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND tablename = 'widgets' ORDER BY indexname")
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rows)
+	var indexes []string
+	for rows.Next() {
+		var index string
+		require.NoError(t, rows.Scan(&index))
+		indexes = append(indexes, index)
+	}
+	require.NoError(t, rows.Err())
+	assert.Equal(t, []string{"widgets_id_idx", "widgets_name_key", "widgets_pkey"}, indexes)
+
+	converged, err := eng.Plan(t.Context(), planRequest)
+	require.NoError(t, err)
+	assert.True(t, converged.NoChanges)
+}
+
+// TestEngineApplyCreateSetDuplicateNameRefusal proves name ownership across the
+// table and index declarations is validated before any object is created.
+func TestEngineApplyCreateSetDuplicateNameRefusal(t *testing.T) {
+	dsn, _ := testutil.StartPostgres(t, "duplicate_create_name_test")
+	eng := New()
+	_, err := eng.Apply(t.Context(), applyRequest(dsn, "widgets",
+		"CREATE TABLE public.widgets (id int PRIMARY KEY);\nCREATE INDEX widgets_pkey ON public.widgets (id)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "widgets")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.Equal(t, `the create set for "widgets" claims the same relation name twice (a CREATE INDEX name repeats the table's implicit constraint-index name or another index); fix the schema file and re-plan`, progress.ErrorMessage)
+}
+
 // TestEngineApplyCreateCollisionRefusal proves a CREATE TABLE whose name is
 // already occupied on the target is a permanent refusal directing a re-plan —
 // the apply must never guess whether the occupying relation is the desired
@@ -254,7 +313,32 @@ func TestEngineApplyCreateCollisionRefusal(t *testing.T) {
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "refused", progress.Metadata["phase"])
 	assert.False(t, progress.Retryable, "a collision refusal is permanent until a re-plan; the drive must not offer a retry")
-	assert.Contains(t, progress.ErrorMessage, "re-plan")
+	assert.Equal(t, `a relation already occupies a name the create set for "widgets" claims (the table, or one of its index names); re-plan against the current schema`, progress.ErrorMessage)
+}
+
+// TestEngineApplyCreateSetCommittedPrefixNotRetryable proves a create set
+// that fails after its CREATE TABLE committed is published as a failure the
+// drive must not retry: the table now exists, so a retry can only land on a
+// collision refusal for a state the operator did not author. The second
+// statement fails on the server because its operator class does not accept
+// the column's type — a shape the desired-schema parse admits, so nothing
+// refuses it before the first step commits.
+func TestEngineApplyCreateSetCommittedPrefixNotRetryable(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "committed_prefix_test")
+
+	eng := New()
+	_, err := eng.Apply(t.Context(), applyRequest(dsn, "widgets",
+		"CREATE TABLE public.widgets (id bigint PRIMARY KEY, name integer);\nCREATE INDEX widgets_name_idx ON public.widgets (name text_pattern_ops)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "widgets")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "failed", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable, "the CREATE TABLE committed; a retry cannot succeed, so the drive must not offer one")
+	assert.Equal(t, `step 2 of 2 failed after the CREATE TABLE for "widgets" committed; re-plan against the current schema`, progress.ErrorMessage)
+
+	var exists bool
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT to_regclass('public.widgets') IS NOT NULL").Scan(&exists))
+	assert.True(t, exists, "the committed CREATE TABLE stays for the next plan to reconcile")
 }
 
 // TestEngineApplyCreateIfNotExistsRefusal proves a CREATE TABLE carrying
