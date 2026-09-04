@@ -5269,6 +5269,37 @@ The new apply will only process tables that haven't completed.
 </details>
 
 <details>
+<summary><a name="mysql-settled-apply-with-an-unsettled-table"></a><strong>MySQL: Settled Apply With An Unsettled Table</strong></summary>
+
+```
+
+┌──────────────────────────────────┐
+│  Apply ID:  apply-a1b2c3d4e5f6   │
+│  State:     Failed               │
+│  Started:   Jan 15 14:22:00 UTC  │
+│  Duration:  7m 50s               │
+└──────────────────────────────────┘
+
+  lock wait timeout exceeded; try restarting transaction
+
+
+  ── testapp ──
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 39.34%
+       ALTER TABLE `orders` ADD INDEX `idx_total_cents`(`total_cents`);
+       • Rows: 156,342 / 397,453
+
+     ~ users: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+       ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
+
+
+To recover: Fix the issue above, then run a new apply.
+The new apply will only process tables that haven't completed.
+
+```
+</details>
+
+<details>
 <summary><a name="mysql-single-table-stopped"></a><strong>MySQL: Single Table Stopped</strong></summary>
 
 ```

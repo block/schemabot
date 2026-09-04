@@ -31,6 +31,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		previewCompletedOutput()
 	case PreviewFailed:
 		previewFailedOutput()
+	case PreviewUnsettledTask:
+		previewUnsettledTaskOutput()
 	case PreviewStopped:
 		previewStoppedOutput()
 	case PreviewStates:
