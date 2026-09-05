@@ -50,9 +50,10 @@ func (cmd *ConfigureSetupCmd) Run(g *Globals) error {
 		endpoint = defaultEndpoint
 	}
 
-	// Update profile
-	cfg.Profiles[profileName] = client.Profile{
-		Endpoint: endpoint,
+	profile, loginCleared := reconfiguredProfile(existingProfile, endpoint)
+	cfg.Profiles[profileName] = profile
+	if loginCleared {
+		fmt.Printf("\nEndpoint changed; the cached login for %s was cleared. Run `%s login` to sign in to the new endpoint.\n", existingProfile.Endpoint, cliname.Name())
 	}
 
 	// If this is the first profile or named "default", set as default
@@ -79,6 +80,25 @@ func (cmd *ConfigureSetupCmd) Run(g *Globals) error {
 	}
 
 	return nil
+}
+
+// reconfiguredProfile returns the profile to save once the operator has chosen
+// an endpoint, and reports whether a cached login was dropped. Everything
+// `login` wrote survives an unchanged endpoint. A changed endpoint drops the
+// cached token, its refresh token, and its expiry: a token is bound to the
+// server that issued it and must never be sent to a different one. The oidc
+// settings are kept either way, since `login` can still use or override them.
+func reconfiguredProfile(existing client.Profile, endpoint string) (profile client.Profile, loginCleared bool) {
+	profile = existing
+	profile.Endpoint = endpoint
+	hasLogin := existing.Token != "" || existing.RefreshToken != ""
+	if hasLogin && existing.Endpoint != endpoint {
+		profile.Token = ""
+		profile.RefreshToken = ""
+		profile.TokenExpiry = 0
+		loginCleared = true
+	}
+	return profile, loginCleared
 }
 
 // ConfigureShowCmd displays the current configuration.
