@@ -102,10 +102,33 @@ The hook uses `--new-from-rev` to only flag issues introduced by the current bra
 
 **OSS-ready code:** Never reference internal company names or proprietary details in code or comments.
 
+### Runtime Invariants
+
+[docs/invariants.md](docs/invariants.md) is the canonical registry of the MUST-statements that make SchemaBot safe in front of tier-0 databases. It is organized into families — merge gating (MG), apply state machine (ST), ownership and leases (OW), control operations (CO), operator surfaces (UX), recovery (RC), review and validation (RV), authorization (AZ), and availability (AV) — and each entry states the rule, what breaks if it is violated, and where it is enforced. Every entry describes shipped behavior, not intent.
+
+**Before changing safety-relevant code, read the invariants that govern it.** Anything touching check state, apply state transitions, lease claims, control requests, reconciliation, DDL classification, authorization, or the drive loop is governed by at least one entry. Find them first — the failure mode of these paths is not a wrong answer, it is a confidently wrong one that unblocks a merge or half-changes a database, and a change that reads correct in isolation can still dissolve an invariant that spans two files.
+
+**Cite the invariant by ID** in the PR summary and in review findings, so a reviewer can check the change against the stated rule instead of re-deriving it. "This preserves MG-5" and "this violates CO-2 — the failed request is retried forever" are both reviewable claims; "this is safe" is not.
+
+When a change interacts with an invariant, one of these is true, and the PR should say which:
+
+- **It upholds it.** Nothing further is needed beyond a test that would fail if it stopped holding.
+- **It extends the enforcement** to a new engine, dialect, or path. The invariant text usually needs no change — check whether its *Enforced:* line still names where enforcement lives.
+- **It establishes a new invariant.** Add the entry in the same PR. Give it the next ID in its family, state the rule and an *Enforced:* line naming where enforcement actually lives, and prefer a completeness test over the relevant registry to a hand-maintained list, so the next regression fails CI instead of review. Add a *Breaks if violated:* line where the consequence is not obvious from the rule; most entries do not need one and do not have one.
+- **It weakens or removes one.** This is a deliberate safety decision, never a side effect. Say so explicitly at the top of the PR summary with the reasoning, and update or delete the entry in the same PR — an invariant the code no longer honors is worse than no entry at all, because reviewers rely on the registry being true.
+- **It moves the enforcement without changing it.** Renaming, moving, splitting, or merging a file or package named in an `*Enforced:*` line is not a behavior change, but it makes the registry wrong. Update the citation in the same PR. This is the likeliest way an entry rots, precisely because nothing about the change looks safety-relevant, so it is the case least likely to prompt anyone to open the registry.
+
+**An enforcement pointer can be wrong in two ways, and only one of them is obvious.** It can dangle, naming a file that no longer exists. It can also resolve cleanly to the wrong file, when enforcement moved and the old file stayed behind, or when the pointer was mistaken to begin with. The first is mechanical. The second needs someone to ask whether the named file actually contains the mechanism the entry describes, which is the question worth asking whenever you touch a pointer: not "does this path exist" but "is this still where the rule is enforced".
+
+**Reviewing:** check the diff against the invariants its blast radius touches, not only against the ticket. An invariant broken silently is the most expensive class of defect here, since the registry is what future reviewers will trust. If a PR summary claims an invariant holds, verify the claim in the code rather than accepting it.
+
+Do not add aspirational entries. If the behavior is not enforced in shipped code, it belongs in a design doc or a TODO, not in the registry. Process-level engineering rules (how we write and review code) belong in this file, not there.
+
 ### PR Self-Review Bar
 
 Before handing a PR to the user, review it the way an operator will experience it during an incident:
 
+- **Invariants first.** Identify which entries in [docs/invariants.md](docs/invariants.md) the change touches and state, per *Runtime Invariants* above, whether it upholds, extends, establishes, or weakens each one.
 - **Safety gates first.** GitHub Check Runs are a tier-0 SchemaBot safety feature. Any code that creates, stores, reconciles, or aggregates check state must fail closed. Storage uncertainty, GitHub API uncertainty, ownership ambiguity, or in-flight apply ambiguity must never be converted into a passing check.
 - **Check Run vs stored check state.** Use precise terms. A GitHub Check Run is the visible object on the PR commit. Stored check state is SchemaBot's database record used to decide what Check Run to create or update. Comments, logs, tests, and docs should make clear which one is being changed.
 - **TOCTOU review.** For async flows, webhooks, reconciliation, and background watchers, ask what happens if the latest commit on the PR branch changes, another pod writes first, an apply starts or finishes concurrently, or a rollback changes the target schema. Use conditional storage updates, ownership identifiers, and final state reloads where stale workers could otherwise overwrite newer state.
