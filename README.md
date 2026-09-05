@@ -39,22 +39,32 @@ SchemaBot diffs your schema files against the live database, computes the DDL, a
 ```
 $ schemabot plan -s ./schema -e staging
 
-  ALTER TABLE `users` ADD COLUMN `email` VARCHAR(255) NOT NULL
+╭─────────────────────────────────────────────╮
+│  MySQL Schema Change Plan                   │
+│                                             │
+│  Database: testapp                          │
+│  Environment: staging                       │
+│  Schema name: testapp                       │
+╰─────────────────────────────────────────────╯
 
-Plan: 1 table to alter
+     ~ users
+       ALTER TABLE `users` ADD COLUMN `email` varchar(255) NOT NULL;
+
+📋 Plan: 1 table to alter
 
 $ schemabot apply -s ./schema -e staging -y
 
-Apply started: apply-a1b2c3d4
-status=running  progress=45%  table=users  rows=1.2M/2.7M  eta=3m
-status=completed
+  users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜ 65% (1,742,301/2,680,463 rows) ETA 2m 10s
+         ALTER TABLE `users` ADD COLUMN `email` varchar(255) NOT NULL
+
+  users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
 ```
 
 SchemaBot handles the full lifecycle:
 - **Plan** — diff desired vs current schema → compute DDL
 - **Apply** — execute DDL online using [Spirit](https://github.com/block/spirit) (MySQL), [PlanetScale deploy requests](https://planetscale.com/docs/vitess/schema-changes/deploy-requests) (Vitess), or [pg-sprite](https://github.com/block/pg-sprite) (PostgreSQL)
 - **Progress** — track row copy progress, ETA, per-table/per-shard status
-- **Control** — `stop` (pause), `start` (resume), `cutover` (trigger table swap), `revert` (roll back)
+- **Control** — `stop` (pause), `start` (resume), `cutover` (trigger table swap), `cancel` (end the change), `revert` (roll back)
 
 Simple changes (e.g., adding a column) use instant DDL and complete in milliseconds. Operations that require a row copy (e.g., adding an index) run online without blocking reads or writes.
 
@@ -62,17 +72,21 @@ Not every engine supports every feature, and some share a verb without sharing i
 
 ## Quick Start
 
+Try it from a clone — the demo brings up local MySQL containers, applies a schema, and seeds data:
+
 ```bash
 make demo    # Start services, apply schema, seed data
 make test    # Run all tests (unit + integration + e2e)
 ```
 
-Connect to databases:
+Connect to the demo databases:
 ```bash
 make mysql              # SchemaBot storage DB (port 13371)
 make mysql DB=staging   # Staging testapp (port 13372)
 make mysql DB=production # Production testapp (port 13373)
 ```
+
+To run SchemaBot against your own databases, grab a build from [Releases](#releases) (binary, container image, or Helm chart), then follow [docs/github-app-setup.md](./docs/github-app-setup.md) to wire up the PR workflow and [docs/configuration.md](./docs/configuration.md) for the server config. `schemabot onboard` pulls a live database's schema into a new declarative schema directory, so you start from your real tables rather than writing them out by hand.
 
 ## Architecture
 
