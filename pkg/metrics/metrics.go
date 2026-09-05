@@ -1064,8 +1064,9 @@ var knownRemoteApplyDispatchRecoveryOutcomes = map[string]bool{
 //     claimable to be re-sent under the same key. A few are normal during a
 //     data-plane restart; a run of them on one apply means it is occupying a
 //     driver on every claim without progressing, so investigate the target.
-//   - "failed": the re-send was definitively refused, so the apply was failed
-//     closed. The refusal covers the request, not the target — an earlier
+//   - "failed": the re-send can never succeed as sent — the data plane refused
+//     it, or a control-plane precondition it needs is gone — so the apply was
+//     failed closed. That answer covers the request, not the target: an earlier
 //     dispatch of the same change may still be running there, so reconcile the
 //     named database.
 func RecordRemoteApplyDispatchRecovery(ctx context.Context, database, environment, outcome string) {

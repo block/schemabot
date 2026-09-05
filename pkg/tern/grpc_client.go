@@ -3049,10 +3049,22 @@ func (c *GRPCClient) recoverAmbiguousRemoteDispatch(ctx context.Context, apply *
 			"operation_deployment", scope.operationDeployment())...)
 	metrics.RecordRemoteApplyDispatchRecovery(ctx, apply.Database, apply.Environment, "attempted")
 
-	if err := c.dispatchPendingApply(ctx, apply, scope, dispatchRecovery); err != nil {
+	err := c.dispatchPendingApply(ctx, apply, scope, dispatchRecovery)
+	// The ambiguity is resolved the moment the dispatch persists a remote apply
+	// id, which is the thing that was missing. Everything the dispatch does after
+	// that — the parent state write, the poll that drives the apply — can still
+	// fail, but it fails on an apply the control plane can now find, so the
+	// recovery counts as resolved. Reading the resolution off the stored id
+	// rather than off the error keeps attempted and resolved comparable: a poll
+	// failure would otherwise leave an attempt with no outcome at all. Failures
+	// that never got an id are recorded by settleDispatchFailure, under the
+	// classification of what they prove.
+	if scope.remoteApplyID(apply) != "" {
+		metrics.RecordRemoteApplyDispatchRecovery(ctx, apply.Database, apply.Environment, "resolved")
+	}
+	if err != nil {
 		return fmt.Errorf("recover ambiguous remote dispatch for %s: %w", apply.ApplyIdentifier, err)
 	}
-	metrics.RecordRemoteApplyDispatchRecovery(ctx, apply.Database, apply.Environment, "resolved")
 	return nil
 }
 
@@ -3061,8 +3073,12 @@ func (c *GRPCClient) recoverAmbiguousRemoteDispatch(ctx context.Context, apply *
 type dispatchFailure int
 
 const (
-	// dispatchFailurePermanent means the dispatch was refused on its merits and
-	// can never succeed as sent, so no amount of retrying changes the outcome.
+	// dispatchFailurePermanent means this dispatch can never succeed as sent, so
+	// no amount of retrying changes the outcome. It covers both the data plane
+	// refusing the request on its merits and a control-plane precondition that
+	// makes the request unsendable — a plan or tasks that are gone, a shard-scoped
+	// operation whose tasks resolve no shard. Both are settled the same way
+	// because both are answers about this dispatch that will not change.
 	dispatchFailurePermanent dispatchFailure = iota
 	// dispatchFailureRetryable means the remote Apply RPC failed in a way that
 	// may succeed on a later send.
@@ -3105,11 +3121,13 @@ func (c *GRPCClient) settleDispatchFailure(ctx context.Context, apply *storage.A
 			metrics.RecordRemoteApplyDispatchRecovery(ctx, apply.Database, apply.Environment, "unresolved")
 			return nil
 		}
-		// The dispatch was refused on its merits, so this generation will never
-		// run. The refusal is authoritative about the request, not about whether
-		// an earlier dispatch of the same key is running on the target, so name
-		// that residual risk where an operator will see it.
-		c.applyLogger(apply).ErrorContext(ctx, "dispatch recovery was definitively refused; failing the apply closed — reconcile the target, as an earlier dispatch of this change may still be running there",
+		// The dispatch cannot succeed as sent — refused by the data plane, or
+		// unsendable because a control-plane precondition is gone — so this
+		// generation will never run. Either answer is authoritative about the
+		// request, not about whether an earlier dispatch of the same key is
+		// running on the target, so name that residual risk where an operator
+		// will see it.
+		c.applyLogger(apply).ErrorContext(ctx, "dispatch recovery cannot succeed as sent; failing the apply closed — reconcile the target, as an earlier dispatch of this change may still be running there",
 			append(apply.MutableLogAttrs(),
 				"dispatch_state", scope.dispatchState(apply),
 				"operation_deployment", scope.operationDeployment(),
