@@ -7854,6 +7854,50 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 </details>
 
 <details>
+<summary><a name="halt-on-failure-a-sibling-is-still-running"></a><strong>Halt On Failure (A Sibling Is Still Running)</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-multi-a1b2c3d4                   │
+│  Environment:  production                             │
+│  State:        running (degraded)                     │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:22:00 UTC                    │
+│  Duration:     8m                                     │
+│  Deployments:  1 running · 1 halted · 1 failed        │
+└───────────────────────────────────────────────────────┘
+
+  ❌ First failure: us-east — duplicate key name 'idx_orders_source'
+
+  Next: review failure in us-east
+
+❌ us-east — failed (orders-us-east)
+  duplicate key name 'idx_orders_source'
+
+     ~ orders: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+       ALTER TABLE `orders` ADD INDEX `idx_orders_source`(`source`);
+
+
+🔄 eu-west — running table copy (orders-eu-west)
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.00%
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       • Rows: 42,000 / 120,000 · ETA: 4m 0s
+
+
+⏸️ ap-south — halted — us-east failed (orders-ap-south)
+
+     ~ orders: ⏳ Queued
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+
+
+
+```
+</details>
+
+<details>
 <summary><a name="all-deployments-completed"></a><strong>All Deployments Completed</strong></summary>
 
 ```
