@@ -4,7 +4,7 @@
 ![Vitess: GA](https://img.shields.io/badge/Vitess-GA-brightgreen)
 ![PostgreSQL: early alpha](https://img.shields.io/badge/PostgreSQL-early_alpha-orange)
 
-SchemaBot makes database schema changes safe and easy. Describe the schema you want in plain SQL files, open a PR, and SchemaBot computes the DDL and runs it online — while you watch progress and stay in control from the PR. Works with **MySQL**, **Vitess**, and **PostgreSQL**.
+SchemaBot makes database schema changes safe and easy. Describe the schema you want in plain SQL files, open a PR, and SchemaBot computes the DDL and runs it online, with live progress and controls right in the PR. Works with **MySQL**, **Vitess**, and **PostgreSQL**.
 
 ## Schema Changes via Pull Request
 
