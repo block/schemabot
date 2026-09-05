@@ -23,10 +23,13 @@ import (
 // This scenario covers a PostgreSQL apply whose plan carries two statements
 // for one table, driven as one task per statement, that lost its driver after
 // the first statement executed on the target but before that task's outcome
-// was recorded. On resume, the re-plan still lists the table — only the
-// second statement remains — so the first task must settle as completed
-// without re-running its statement, and the second task must run exactly
-// once. Every effect lands on the target and the apply completes.
+// was recorded. The test seeds that post-crash state directly — both task rows
+// stopped, the first statement already on the target — and resumes against a
+// real PostgreSQL target. The re-plan still lists the table with only the
+// second statement remaining, so the first task must settle as completed
+// without being handed to the engine, and the second task must run exactly
+// once. Re-running the first statement would fail on the column that already
+// exists, so the apply completing is itself evidence of non-re-execution.
 func TestLocalClient_ResumeApplyPostgresSettlesLandedStatementWithoutReexecution(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -167,14 +170,18 @@ func TestLocalClient_ResumeApplyPostgresSettlesLandedStatementWithoutReexecution
 	assert.Equal(t, state.Task.Completed, storedName.State)
 	assert.NotNil(t, storedName.CompletedAt)
 
-	assert.True(t, postgresColumnExists(t, targetDB, "public", "users", "email"))
-	assert.True(t, postgresColumnExists(t, targetDB, "public", "users", "name"))
+	assert.True(t, postgresColumnExists(t, targetDB, "public", "users", "name"),
+		"the remaining task's statement must land on the target")
 
 	logs, err := stor.ApplyLogs().GetByApply(ctx, applyID)
 	require.NoError(t, err)
 	assert.True(t, hasLogMessageContaining(logs,
 		fmt.Sprintf("Task %s already completed (its statement landed before its outcome was recorded)", emailTask.TaskIdentifier)),
 		"the landed task's settlement must be visible in the apply log")
+	assert.False(t, hasLogMessageContaining(logs, fmt.Sprintf("Task %s resumed", emailTask.TaskIdentifier)),
+		"the landed task must never be handed to the engine")
+	assert.True(t, hasLogMessageContaining(logs, fmt.Sprintf("Task %s resumed", nameTask.TaskIdentifier)),
+		"the remaining task must be handed to the engine")
 	assert.False(t, hasLogMessageContaining(logs,
 		fmt.Sprintf("Task %s already completed", nameTask.TaskIdentifier)),
 		"the remaining task must run, not be settled as already landed")
