@@ -4,11 +4,11 @@
 ![Vitess: GA](https://img.shields.io/badge/Vitess-GA-brightgreen)
 ![PostgreSQL: early alpha](https://img.shields.io/badge/PostgreSQL-early_alpha-orange)
 
-SchemaBot makes database schema changes safe and easy. Describe the schema you want in plain SQL files, open a PR, and SchemaBot computes the DDL and runs it online, with live progress and controls right in the PR. Works with **MySQL**, **Vitess**, and **PostgreSQL**.
+SchemaBot makes database schema changes safe and easy. Describe the schema you want in plain SQL files, open a PR, and SchemaBot computes the DDL and runs it online, with live progress and controls right in the PR or via an interactive CLI. Works with **MySQL**, **Vitess**, and **PostgreSQL**.
 
 ## Schema Changes via Pull Request
 
-Open a PR with schema changes and SchemaBot handles the rest — plan, apply, and verify across environments:
+Open a PR with your schema changes, and SchemaBot plans, applies, and verifies them across environments:
 
 ![SchemaBot PR Demo](./assets/pr-demo.gif)
 
@@ -20,7 +20,7 @@ SchemaBot provides a fully interactive CLI for planning, applying, and monitorin
 
 ## How It Works
 
-SchemaBot uses **declarative schema** — you describe the desired end state in SQL files, and SchemaBot figures out the DDL needed to get there:
+SchemaBot uses **declarative schema**. You describe the desired end state in SQL files, and SchemaBot figures out the DDL needed to get there:
 
 ```sql
 -- schema/testapp/users.sql
@@ -59,10 +59,10 @@ $ schemabot apply -s ./schema -e staging -y
 ```
 
 SchemaBot handles the full lifecycle:
-- **Plan** — diff desired vs current schema → compute DDL
-- **Apply** — execute DDL online using [Spirit](https://github.com/block/spirit) (MySQL), [PlanetScale deploy requests](https://planetscale.com/docs/vitess/schema-changes/deploy-requests) (Vitess), or [pg-sprite](https://github.com/block/pg-sprite) (PostgreSQL)
-- **Progress** — track row copy progress, ETA, per-table/per-shard status
-- **Control** — `stop` (pause), `start` (resume), `cutover` (trigger table swap), `cancel` (end the change), `revert` (roll back)
+- **Plan**: diff the desired schema against the live database and compute the DDL
+- **Apply**: execute the DDL online using [Spirit](https://github.com/block/spirit) (MySQL), [PlanetScale deploy requests](https://planetscale.com/docs/vitess/schema-changes/deploy-requests) (Vitess), or [pg-sprite](https://github.com/block/pg-sprite) (PostgreSQL)
+- **Progress**: track row copy progress, the ETA, and per-table and per-shard status
+- **Control**: `stop` (pause), `start` (resume), `cutover` (trigger the table swap), `cancel` (end the change), and `revert` (roll back)
 
 Simple changes (e.g., adding a column) use instant DDL and complete in milliseconds. Operations that require a row copy (e.g., adding an index) run online without blocking reads or writes.
 
@@ -70,7 +70,7 @@ Not every engine supports every feature, and some share a verb without sharing i
 
 ## Quick Start
 
-Try it from a clone — the demo brings up local MySQL containers, applies a schema, and seeds data ([examples/](./examples/README.md) documents the demo schemas and configs):
+Try it from a clone. The demo brings up local MySQL containers, applies a schema, and seeds data; the schemas and configs it uses are documented in [examples/](./examples/README.md):
 
 ```bash
 make demo    # Start services, apply schema, seed data
@@ -96,8 +96,8 @@ See [docs/configuration.md](./docs/configuration.md) for setup instructions (loc
 
 ## Docs
 
-General design docs live in the [docs](./docs/) folder. Three good places to start — each
-has a table of contents, so jump straight to the question you came with:
+General design docs live in the [docs](./docs/) folder. Three good places to start, each
+with a table of contents so you can jump straight to the question you came with:
 
 - [docs/invariants.md](./docs/invariants.md) is the registry of runtime safety invariants:
   what must never be false while SchemaBot is running, why each rule matters, where it is
@@ -119,6 +119,6 @@ See [docs/release.md](./docs/release.md) for how releases are cut and what is ch
 
 ## Contributing
 
-Contributors are welcome — see [CONTRIBUTING.md](./CONTRIBUTING.md).
+Contributors are welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 For feature requests and bugs, [open an issue](https://github.com/block/schemabot/issues).
