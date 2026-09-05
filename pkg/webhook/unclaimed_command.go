@@ -67,56 +67,58 @@ func (h *Handler) answerUnclaimedControlCommand(repo string, pr int, installatio
 		return
 	}
 
-	h.goSafe(repo, pr, installationID, result.DeliveryID, func() {
-		grace := h.unclaimedCommandGrace()
-		ctx, cancel := context.WithTimeout(context.Background(), grace+commandTimeout)
-		defer cancel()
+	// The grace is a wait, not work, so it is a timer rather than a sleep inside
+	// tracked work. A tracked goroutine is counted for as long as it runs, so
+	// sleeping in one would hold a shutdown drain open for the whole grace to
+	// deliver a reply that is operator visibility and never a gate. The timer
+	// schedules the answer and the answer alone is the tracked work: a deploy
+	// that lands mid-grace lets the reply go rather than delaying the drain,
+	// which is the same silence the operator would have had without this path.
+	time.AfterFunc(h.unclaimedCommandGrace(), func() {
+		h.goSafe(repo, pr, installationID, result.DeliveryID, func() {
+			ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+			defer cancel()
 
-		select {
-		case <-time.After(grace):
-		case <-ctx.Done():
-			return
-		}
+			client, err := h.clientForRepo(repo, installationID)
+			if err != nil {
+				h.logger.Error("failed to create GitHub client to check whether a control command went unclaimed",
+					"command", command, "repo", repo, "pr", pr,
+					"apply_id", result.ApplyID, "environment", result.Environment, "error", err)
+				return
+			}
+			claimed, err := client.CommentHasReaction(ctx, repo, result.CommentID, commandAcknowledgmentReaction)
+			if err != nil {
+				h.logger.Error("failed to read command acknowledgment; leaving the command unanswered rather than answering one a sibling deployment may own",
+					"command", command, "repo", repo, "pr", pr,
+					"apply_id", result.ApplyID, "environment", result.Environment, "error", err)
+				return
+			}
+			if claimed {
+				h.logger.Info("control command naming an apply this deployment does not have was claimed elsewhere",
+					"command", command, "repo", repo, "pr", pr,
+					"apply_id", result.ApplyID, "environment", result.Environment)
+				return
+			}
 
-		client, err := h.clientForRepo(repo, installationID)
-		if err != nil {
-			h.logger.Error("failed to create GitHub client to check whether a control command went unclaimed",
-				"command", command, "repo", repo, "pr", pr,
-				"apply_id", result.ApplyID, "environment", result.Environment, "error", err)
-			return
-		}
-		claimed, err := client.CommentHasReaction(ctx, repo, result.CommentID, commandAcknowledgmentReaction)
-		if err != nil {
-			h.logger.Error("failed to read command acknowledgment; leaving the command unanswered rather than answering one a sibling deployment may own",
-				"command", command, "repo", repo, "pr", pr,
-				"apply_id", result.ApplyID, "environment", result.Environment, "error", err)
-			return
-		}
-		if claimed {
-			h.logger.Info("control command naming an apply this deployment does not have was claimed elsewhere",
-				"command", command, "repo", repo, "pr", pr,
-				"apply_id", result.ApplyID, "environment", result.Environment)
-			return
-		}
+			// Mark before posting. A crash between the two leaves the command as
+			// silent as it would have been without this path, where posting first
+			// would let a redelivery add a second copy.
+			if err := client.AddReactionToComment(ctx, repo, result.CommentID, commandAcknowledgmentReaction); err != nil {
+				h.logger.Error("failed to mark an unclaimed control command as answered; leaving it unanswered rather than risking a duplicate reply",
+					"command", command, "repo", repo, "pr", pr,
+					"apply_id", result.ApplyID, "environment", result.Environment, "error", err)
+				return
+			}
 
-		// Mark before posting. A crash between the two leaves the command as
-		// silent as it would have been without this path, where posting first
-		// would let a redelivery add a second copy.
-		if err := client.AddReactionToComment(ctx, repo, result.CommentID, commandAcknowledgmentReaction); err != nil {
-			h.logger.Error("failed to mark an unclaimed control command as answered; leaving it unanswered rather than risking a duplicate reply",
+			h.logger.Warn("no deployment claimed a control command; answering it as the aggregate leader",
 				"command", command, "repo", repo, "pr", pr,
-				"apply_id", result.ApplyID, "environment", result.Environment, "error", err)
-			return
-		}
-
-		h.logger.Warn("no deployment claimed a control command; answering it as the aggregate leader",
-			"command", command, "repo", repo, "pr", pr,
-			"apply_id", result.ApplyID, "environment", result.Environment, "requested_by", requestedBy)
-		h.postComment(repo, pr, installationID, templates.RenderUnclaimedControlCommand(templates.UnclaimedControlCommandData{
-			Command:     command,
-			ApplyID:     result.ApplyID,
-			Environment: result.Environment,
-			RequestedBy: requestedBy,
-		}))
+				"apply_id", result.ApplyID, "environment", result.Environment, "requested_by", requestedBy)
+			h.postComment(repo, pr, installationID, templates.RenderUnclaimedControlCommand(templates.UnclaimedControlCommandData{
+				Command:     command,
+				ApplyID:     result.ApplyID,
+				Environment: result.Environment,
+				RequestedBy: requestedBy,
+			}))
+		})
 	})
 }

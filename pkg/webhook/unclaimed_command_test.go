@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"sync/atomic"
@@ -91,6 +92,24 @@ func TestUnclaimedControlCommandAnsweredByLeader(t *testing.T) {
 
 		requireNoComment(t, comments, "several participants answering is the duplicate noise fan-out exists to avoid")
 		assert.Equal(t, int64(0), added.Load())
+	})
+
+	t.Run("the grace does not hold a shutdown drain open", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		reactionRoutes(t, mux, false)
+		grace := 200 * time.Millisecond
+		h.unclaimedCommandGraceOverride = grace
+
+		h.handleStopCommand("octocat/hello-world", 1, 12345, "hubot", unclaimedStopResult())
+
+		started := time.Now()
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		h.DrainInProcessWebhookWork(ctx)
+		assert.Less(t, time.Since(started), grace,
+			"the grace is a scheduled wait, not tracked work, so a deploy drain must not sit through it")
+
+		requireComment(t, comments, "unclaimed control command reply")
 	})
 
 	t.Run("a repo one deployment serves answers directly", func(t *testing.T) {
