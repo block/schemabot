@@ -108,7 +108,7 @@ func tableAutoIncrementSpan(stmt string) (start, end int, ok bool) {
 		case c == '/' && i+1 < len(stmt) && stmt[i+1] == '*':
 			i = skipBlockComment(stmt, i)
 			continue
-		case c == '#' || (c == '-' && i+1 < len(stmt) && stmt[i+1] == '-'):
+		case c == '#' || isDoubleDashComment(stmt, i):
 			i = skipLineComment(stmt, i)
 			continue
 		case c == '(':
@@ -145,6 +145,18 @@ func skipQuoted(s string, i int) int {
 		}
 	}
 	return len(s)
+}
+
+// isDoubleDashComment reports whether the text at i opens a `--` comment. MySQL
+// requires a whitespace or control character after the second dash, so the two
+// dashes in an expression like `a--b`, which subtracts a negated value, are
+// operators rather than the start of a comment. Treating them as a comment would
+// skip the rest of the line, and with it the table options the counter lives in.
+func isDoubleDashComment(s string, i int) bool {
+	if s[i] != '-' || i+1 >= len(s) || s[i+1] != '-' {
+		return false
+	}
+	return i+2 >= len(s) || isSpaceOrControlByte(s[i+2])
 }
 
 func skipBlockComment(s string, i int) int {
@@ -215,6 +227,12 @@ func isSpacingByte(c byte) bool {
 
 func isWhitespaceByte(c byte) bool {
 	return isSpacingByte(c) || c == '\n' || c == '\r'
+}
+
+// isSpaceOrControlByte reports whether c is one of the whitespace or control
+// characters MySQL accepts after `--` to open a comment.
+func isSpaceOrControlByte(c byte) bool {
+	return c <= ' '
 }
 
 func isWordByte(c byte) bool {

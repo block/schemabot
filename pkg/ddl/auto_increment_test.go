@@ -121,6 +121,36 @@ func TestStripTableAutoIncrement(t *testing.T) {
 				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\n",
 		},
 		{
+			name: "two dashes in an expression are operators, not a comment",
+			stmt: "CREATE TABLE `orders` (\n" +
+				"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+				"  `a` int NOT NULL,\n" +
+				"  `b` int NOT NULL,\n" +
+				"  `net` int GENERATED ALWAYS AS ((`a`--`b`)) VIRTUAL,\n" +
+				"  PRIMARY KEY (`id`)\n" +
+				") ENGINE=InnoDB AUTO_INCREMENT=500 DEFAULT CHARSET=utf8mb4",
+			want: "CREATE TABLE `orders` (\n" +
+				"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+				"  `a` int NOT NULL,\n" +
+				"  `b` int NOT NULL,\n" +
+				"  `net` int GENERATED ALWAYS AS ((`a`--`b`)) VIRTUAL,\n" +
+				"  PRIMARY KEY (`id`)\n" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+		},
+		{
+			name: "a real line comment before the counter is still skipped",
+			stmt: "CREATE TABLE `orders` (\n" +
+				"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+				"  PRIMARY KEY (`id`)\n" +
+				") ENGINE=InnoDB -- reset AUTO_INCREMENT=9 before reload\n" +
+				"DEFAULT CHARSET=utf8mb4 AUTO_INCREMENT=500 COLLATE=utf8mb4_0900_ai_ci",
+			want: "CREATE TABLE `orders` (\n" +
+				"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+				"  PRIMARY KEY (`id`)\n" +
+				") ENGINE=InnoDB -- reset AUTO_INCREMENT=9 before reload\n" +
+				"DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+		},
+		{
 			name: "counter on a partitioned table",
 			stmt: "CREATE TABLE `events` (\n" +
 				"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
