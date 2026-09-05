@@ -8,14 +8,15 @@ set -euo pipefail
 # Identifiers are exempt and are carved out mechanically rather than by
 # judgement: URLs and markdown anchor targets are stripped before matching,
 # the match must start at a non-letter boundary so the literal inside a
-# longer word (VSchema-changed) is skipped, the two legitimate hyphenated
-# identifiers are allowlisted by value, and the files that must contain
+# longer word (VSchema-changed) is skipped, the legitimate hyphenated
+# identifiers (script names and TEMPLATES.md anchors the docs tooling
+# refers to) are allowlisted by value, and the files that must contain
 # the literal (the rule text, the generated snapshot, this script, and the
 # generator script's own name) are skipped by path.
 
 cd "$(git rev-parse --show-toplevel)"
 
-ALLOWLIST='generate-schema-change|schema-change-branch'
+ALLOWLIST='generate-schema-change|schema-change-branch|schema-change-apply-automatic'
 
 # grep exits 1 for "no match", which is a normal outcome at every stage
 # below. Anything higher is a real failure (bad pattern, unreadable tree)
