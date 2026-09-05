@@ -31,13 +31,15 @@ jobs:
           # The action's default quantifier ORs the patterns, and '**'
           # matches every file, so without 'every' this filter reports
           # code=true on every PR and the docs-only skip never fires.
-          # 'every' ANDs them: code = not markdown and not under docs/.
+          # 'every' ANDs them: code = any non-markdown file. The docs/ pattern
+          # is filetype-scoped so a future script or Go file under docs/
+          # still counts as code.
           predicate-quantifier: 'every'
           filters: |
             code:
               - '**'
               - '!**/*.md'
-              - '!docs/**'
+              - '!docs/**/*.md'
       - name: "Resolve code-change flag"
         id: out
         shell: bash
