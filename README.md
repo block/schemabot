@@ -126,6 +126,9 @@ Design and operations docs live in the [docs](./docs/) folder:
   the state machine, and how a change flows through them.
 - [docs/configuration.md](./docs/configuration.md) covers server setup: local mode, gRPC mode,
   and secret resolution.
+- [docs/auth.md](./docs/auth.md) is the authentication and authorization guide: how to go from
+  an open API to one your infrastructure trusts, one step at a time, and the model behind
+  each step.
 - [docs/invariants.md](./docs/invariants.md) is the registry of runtime safety invariants:
   what must never be false while SchemaBot is running, why each rule matters, where it is
   enforced, and what these guarantees deliberately do not cover. It opens with what happens

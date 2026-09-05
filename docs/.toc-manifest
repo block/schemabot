@@ -5,6 +5,7 @@
 # so the removal shows up here as a reviewable change.
 docs/apply-lifecycle.md
 docs/architecture.md
+docs/auth.md
 docs/check-runs.md
 docs/configuration.md
 docs/direct-execution.md
