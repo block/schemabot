@@ -8,6 +8,9 @@ on:
   # Required status checks must also report on the merge queue, or the queue
   # waits forever. Inert until a repo admin enables the merge queue.
   merge_group:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:
