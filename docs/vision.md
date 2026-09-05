@@ -62,11 +62,15 @@ ownership, an operator who can stop a change that is running. An experiment want
 should not pay for it. The same engine, the same gates, two very different amounts of scaffolding
 around them.
 
+![Both ends of the range feed into an identical set of gates: diff against the live database, lint before anything runs, explicit consent to destroy, and uncertainty never passing](../assets/vision-range.svg)
+
 ### GitOps, not GitHub
 
 The source of truth is the schema in version control, and the loop that reconciles it against the
 live database. GitHub is the best-supported interface to that loop. It is not the substrate, and
 SchemaBot should never quietly become a tool that only works if you happen to use it.
+
+![Four interfaces sit above one model: a GitHub pull request, the CLI, an API or agent, and a forge that is not built yet. All of them drive the same loop between the schema files and the live database](../assets/vision-gitops-not-github.svg)
 
 This is the pillar that is furthest along, because it is already enforced rather than intended:
 
@@ -121,6 +125,8 @@ An agent can be careful about its own change. It cannot know that another agent,
 planned against the same table forty seconds ago and is about to apply. Nothing an individual author
 does makes that safe. It has to be enforced somewhere both of them are forced to go through, and for
 schema changes that place is SchemaBot.
+
+![Four agents propose schema changes in parallel and all pass through one place, where RV-2, OW-5, OW-1 and OW-2 decide that one change applies while the others queue or block](../assets/vision-many-agents.svg)
 
 The primitives for this already exist, because concurrency was never optional. SchemaBot has always
 had to survive several pods, several operators, and redelivered webhooks racing each other:
