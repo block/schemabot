@@ -717,15 +717,17 @@ a single denied request is triageable from logs alone.
 ## 💡 For AI agents
 
 If you are an AI agent working against a SchemaBot deployment, or the person
-wiring one up, the model above compresses to a few rules:
+wiring one up, the model above compresses to a few rules. The full policy for
+an agent acting on a person's behalf, including when it may post a staging
+apply and what an operator can enforce server-side, is in
+[ai-agents.md](ai-agents.md).
 
 - **Reads are safe to delegate; writes need guardrails.** An agent working
   under supervision can call the CLI with a person's credentials for read-tier
   operations. For writes, the agent's identity is indistinguishable from the
-  person's, so keep write operations in the person's own hands or in the PR
-  workflow. If an agent is permitted to write, set ground rules for what it
-  may do without approval, and treat production writes outside the PR workflow
-  as use-at-your-own-risk.
+  person's, so production writes stay in the person's own hands. Which staging
+  writes an agent may post is a blast-radius question, and
+  [ai-agents.md](ai-agents.md#the-rules) answers it.
 - **The read tier is your surface, and it is complete.** Database discovery,
   live schema pulls, apply history, and per-table progress cover what an agent
   needs to reason about schemas across a fleet. See

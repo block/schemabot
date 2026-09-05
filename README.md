@@ -129,6 +129,9 @@ Design and operations docs live in the [docs](./docs/) folder:
 - [docs/auth.md](./docs/auth.md) is the authentication and authorization guide: how to go from
   an open API to one your infrastructure trusts, one step at a time, and the model behind
   each step.
+- [docs/ai-agents.md](./docs/ai-agents.md) is the policy for AI agents that act on a person's
+  behalf: which commands stay human-only, when an agent may post a staging apply, and what an
+  operator can enforce on the server.
 - [docs/invariants.md](./docs/invariants.md) is the registry of runtime safety invariants:
   what must never be false while SchemaBot is running, why each rule matters, where it is
   enforced, and what these guarantees deliberately do not cover. It opens with what happens
