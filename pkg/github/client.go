@@ -665,6 +665,24 @@ func (ic *InstallationClient) EditIssueComment(ctx context.Context, repo string,
 	return nil
 }
 
+// DeleteIssueComment removes an existing PR/issue comment from the timeline.
+// A comment GitHub no longer has (404) counts as deleted: retirement sweeps
+// retry failed deletes, and a retry after a crash — or after a human removed
+// the comment first — must converge instead of failing forever.
+func (ic *InstallationClient) DeleteIssueComment(ctx context.Context, repo string, commentID int64) error {
+	owner, repoName := splitRepo(repo)
+	resp, err := ic.client.Issues.DeleteComment(ctx, owner, repoName, commentID)
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
+			ic.logger.Info("issue comment already gone on GitHub; treating delete as complete",
+				"repo", repo, "comment_id", commentID)
+			return nil
+		}
+		return fmt.Errorf("delete issue comment %d: %w", commentID, err)
+	}
+	return nil
+}
+
 // MinimizeComment collapses a PR comment in the GitHub timeline as outdated.
 // The comment stays expandable — minimizing hides it from the default view
 // without editing or deleting the record. GitHub exposes this only through

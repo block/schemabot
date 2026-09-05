@@ -16,6 +16,7 @@ import (
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/mysqlerr"
 )
 
 // maxCommitLatency is the commit-latency throttle threshold: the copy backs
@@ -456,14 +457,32 @@ func (e *Engine) setSchemaChangeCompleted() {
 	}
 }
 
-// setSchemaChangeFailed sets the state to failed with an error message.
+// setSchemaChangeFailed sets the state to failed with a reason an operator can
+// read. Every caller has already logged err with the target identifiers, so the
+// detail this drops is still available where it is safe to keep it.
 func (e *Engine) setSchemaChangeFailed(err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.runningSchemaChange != nil {
 		e.runningSchemaChange.state = engine.StateFailed
 		if err != nil {
-			e.runningSchemaChange.errorMessage = err.Error()
+			e.runningSchemaChange.errorMessage = failureReason(err)
 		}
 	}
+}
+
+// failureReason renders why the schema change failed, for a pull request to
+// show. The errors reaching here are mixed — a message SchemaBot wrote, a
+// MySQL error, a dial failure, a library's own text — and all but the first
+// carry text that must not be published: a dial failure names the target host,
+// and a MySQL error quotes the row that could not be copied.
+//
+// So the message is taken only from an error explicitly marked as SchemaBot's
+// own words. Everything else is classified by mysqlerr, which reads the error
+// for its code and renders a sentence from its own vocabulary.
+func failureReason(err error) string {
+	if msg, ok := engine.OperatorMessageOf(err); ok {
+		return msg
+	}
+	return mysqlerr.Reason(err)
 }

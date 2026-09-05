@@ -250,7 +250,7 @@ func TestGreenfieldCreateSetRejectsIndexForAnotherTable(t *testing.T) {
 
 	_, _, err = greenfieldCreateSet(report, parser)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), `not CREATE TABLE target "public.widgets"`)
+	assert.Contains(t, err.Error(), `creates an index on table "public"."gadgets", not CREATE TABLE target "public"."widgets"`)
 }
 
 func TestTableChangesMixedVerdictsFailClosedPerStatement(t *testing.T) {

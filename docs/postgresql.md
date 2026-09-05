@@ -177,7 +177,17 @@ change into an eligible form or use a separately reviewed operational process;
 flags do not override an engine-blocked verdict.
 
 The engine does not execute `DROP TABLE` or other statement kinds outside its
-admitted set.
+admitted set. That includes tables that exist on the target but that no schema
+file in the namespace declares any longer, typically because a file was
+deleted from the PR. The planner enumerates the target's ordinary and
+partitioned tables (partitions are covered by their parent's declaration) and
+surfaces each undeclared table as a blocked, destructive `DROP TABLE` change,
+so the removal is visible on the plan and the apply is refused rather than the
+table lingering silently. Restore the file to keep the table, or drop it
+through a separately reviewed operational process. Because namespaces are
+derived from the schema files present in the PR, deleting the last file of a
+namespace removes that namespace from the plan altogether, and its tables are
+not enumerated.
 
 ## Apply-time refusals
 

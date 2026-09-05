@@ -1,0 +1,453 @@
+//go:build integration
+
+package spirit
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/block/spirit/pkg/utils"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/pendingdrops"
+)
+
+// releaseTestCleanup empties the target and the quarantine after the test. A
+// release deliberately leaves the live table behind and may leave preserved
+// copies in the quarantine, and the tests that plan against this database
+// expect to find only what they created themselves.
+func releaseTestCleanup(t *testing.T, db *sql.DB, tables ...string) {
+	t.Helper()
+	dropTablesOnCleanup(t, db, tables...)
+	cleanupCtx := context.WithoutCancel(t.Context())
+	t.Cleanup(func() {
+		_, err := db.ExecContext(cleanupCtx,
+			fmt.Sprintf("DROP DATABASE IF EXISTS %s", quoteIdentifier(pendingdrops.Database)))
+		assert.NoError(t, err, "drop pending drops database")
+	})
+}
+
+// seedArtifact creates an artifact table with the given number of rows so a
+// test can tell a preserved copy from an empty stand-in.
+func seedArtifact(t *testing.T, db *sql.DB, name string, rows int) {
+	t.Helper()
+	_, err := db.ExecContext(t.Context(),
+		fmt.Sprintf("CREATE TABLE %s (id INT PRIMARY KEY AUTO_INCREMENT)", quoteIdentifier(name)))
+	require.NoError(t, err, "create artifact %s", name)
+	for range rows {
+		_, err := db.ExecContext(t.Context(), fmt.Sprintf("INSERT INTO %s VALUES ()", quoteIdentifier(name)))
+		require.NoError(t, err, "seed artifact %s", name)
+	}
+}
+
+// quarantinedRowCount returns the number of rows in a quarantined table.
+func quarantinedRowCount(t *testing.T, db *sql.DB, name string) int {
+	t.Helper()
+	var count int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		fmt.Sprintf("SELECT COUNT(*) FROM %s.%s", quoteIdentifier(pendingdrops.Database), quoteIdentifier(name)),
+	).Scan(&count), "count rows in quarantined %s", name)
+	return count
+}
+
+// tablesIn returns every table in a schema, so a test can assert on what a
+// release changed by comparing the whole schema before and after rather than
+// probing the names it expected to be touched.
+func tablesIn(t *testing.T, db *sql.DB, schema string) []string {
+	t.Helper()
+	rows, err := db.QueryContext(t.Context(),
+		"SELECT table_name FROM information_schema.tables WHERE table_schema = ? ORDER BY table_name", schema)
+	require.NoError(t, err, "list tables in %s", schema)
+	defer utils.CloseAndLog(rows)
+
+	var tables []string
+	for rows.Next() {
+		var name string
+		require.NoError(t, rows.Scan(&name))
+		tables = append(tables, name)
+	}
+	require.NoError(t, rows.Err())
+	return tables
+}
+
+// quarantineDatabaseExists reports whether the quarantine database was created.
+func quarantineDatabaseExists(t *testing.T, db *sql.DB) bool {
+	t.Helper()
+	var count int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = ?",
+		pendingdrops.Database).Scan(&count))
+	return count > 0
+}
+
+// Cancelling a schema change that stopped before cutover leaves only the shadow
+// table it was copying into. Those rows are preserved in the quarantine so the
+// work stays recoverable, the checkpoints describing a copy that no longer
+// exists are dropped, and the user's live table is untouched.
+func TestEngine_ReleaseCancelledArtifacts_PreCutoverPreservesCopy(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	const baseTable = "orders"
+	releaseTestCleanup(t, db, baseTable)
+	seedArtifact(t, db, baseTable, 3)
+	seedArtifact(t, db, utils.NewTableName(baseTable), 7)
+	seedArtifact(t, db, utils.CheckpointTableName(baseTable), 1)
+	seedArtifact(t, db, sharedCheckpointTable, 1)
+	seedArtifact(t, db, deferredCutoverSentinelTable, 1)
+
+	eng := New(Config{})
+	result, err := eng.ReleaseCancelledArtifacts(t.Context(), &engine.ReleaseArtifactsRequest{
+		Database:    "testdb",
+		Tables:      []string{baseTable},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "ReleaseCancelledArtifacts()")
+	require.NotNil(t, result)
+
+	assert.True(t, tableExists(t, db, baseTable), "the live table must be left alone")
+	assert.False(t, tableExists(t, db, utils.NewTableName(baseTable)), "the shadow table must leave the target")
+
+	require.Len(t, result.Preserved, 1, "only the shadow table holds rows before cutover")
+	assert.Equal(t, "testdb."+utils.NewTableName(baseTable), result.Preserved[0].Source)
+
+	quarantined := listQuarantinedTables(t, db)
+	require.Len(t, quarantined, 1)
+	assert.Contains(t, quarantined[0], utils.NewTableName(baseTable))
+	assert.Equal(t, pendingdrops.Database+"."+quarantined[0], result.Preserved[0].Destination)
+	quarantinedAt, ok := pendingdrops.ParseTimestamp(quarantined[0])
+	require.True(t, ok, "quarantined name %q must carry a parseable timestamp", quarantined[0])
+	assert.WithinDuration(t, time.Now(), quarantinedAt, time.Minute)
+	assert.Equal(t, 7, quarantinedRowCount(t, db, quarantined[0]), "the copied rows must survive")
+
+	assert.ElementsMatch(t, []string{
+		"testdb." + utils.CheckpointTableName(baseTable),
+		"testdb." + sharedCheckpointTable,
+		"testdb." + deferredCutoverSentinelTable,
+	}, result.Discarded)
+	for _, qualified := range result.Discarded {
+		name := strings.TrimPrefix(qualified, "testdb.")
+		assert.False(t, tableExists(t, db, name), "metadata artifact should be dropped: %s", qualified)
+	}
+}
+
+// A schema change cancelled after its tables were swapped leaves both the
+// shadow table and the original it replaced. Both hold rows, so both are
+// preserved in the same move.
+func TestEngine_ReleaseCancelledArtifacts_PostCutoverPreservesBothCopies(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	const baseTable = "payments"
+	releaseTestCleanup(t, db, baseTable)
+	seedArtifact(t, db, baseTable, 2)
+	seedArtifact(t, db, utils.NewTableName(baseTable), 5)
+	seedArtifact(t, db, utils.OldTableName(baseTable), 9)
+
+	eng := New(Config{})
+	result, err := eng.ReleaseCancelledArtifacts(t.Context(), &engine.ReleaseArtifactsRequest{
+		Database:    "testdb",
+		Tables:      []string{baseTable},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "ReleaseCancelledArtifacts()")
+
+	assert.True(t, tableExists(t, db, baseTable), "the live table must be left alone")
+	require.Len(t, result.Preserved, 2)
+	assert.ElementsMatch(t, []string{
+		"testdb." + utils.NewTableName(baseTable),
+		"testdb." + utils.OldTableName(baseTable),
+	}, []string{result.Preserved[0].Source, result.Preserved[1].Source})
+
+	quarantined := listQuarantinedTables(t, db)
+	require.Len(t, quarantined, 2)
+	rowCounts := map[string]int{}
+	for _, name := range quarantined {
+		rowCounts[name] = quarantinedRowCount(t, db, name)
+	}
+	assert.ElementsMatch(t, []int{5, 9}, []int{rowCounts[quarantined[0]], rowCounts[quarantined[1]]},
+		"both copies keep their rows")
+}
+
+// A deployment that runs no quarantine also runs no cleaner to empty one, so
+// preserving a copy there would strand it in a database nothing ever sweeps.
+// The copy is dropped outright instead, the same disposal the deployment chose
+// for tables an operator asked to delete.
+func TestEngine_ReleaseCancelledArtifacts_QuarantineDisabledDropsCopy(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	const baseTable = "shipments"
+	releaseTestCleanup(t, db, baseTable)
+	seedArtifact(t, db, baseTable, 1)
+	seedArtifact(t, db, utils.NewTableName(baseTable), 4)
+	seedArtifact(t, db, utils.CheckpointTableName(baseTable), 1)
+
+	eng := New(Config{DisablePendingDrops: true})
+	result, err := eng.ReleaseCancelledArtifacts(t.Context(), &engine.ReleaseArtifactsRequest{
+		Database:    "testdb",
+		Tables:      []string{baseTable},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "ReleaseCancelledArtifacts()")
+
+	assert.True(t, tableExists(t, db, baseTable), "the live table must be left alone")
+	assert.False(t, tableExists(t, db, utils.NewTableName(baseTable)), "the shadow table must be dropped")
+	assert.Empty(t, result.Preserved, "nothing is preserved where the quarantine is off")
+	assert.ElementsMatch(t, []string{
+		"testdb." + utils.NewTableName(baseTable),
+		"testdb." + utils.CheckpointTableName(baseTable),
+	}, result.Discarded)
+	assert.False(t, quarantineDatabaseExists(t, db),
+		"no quarantine database should be created when the quarantine is disabled")
+}
+
+// Releasing a target that carries no artifacts succeeds and touches nothing, so
+// a cancel that arrives after cleanup already ran, or for a schema change that
+// never reached the copy phase, is not turned into an error.
+func TestEngine_ReleaseCancelledArtifacts_NothingToRelease(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	const baseTable = "invoices"
+	releaseTestCleanup(t, db, baseTable)
+	seedArtifact(t, db, baseTable, 1)
+
+	eng := New(Config{})
+	result, err := eng.ReleaseCancelledArtifacts(t.Context(), &engine.ReleaseArtifactsRequest{
+		Database:    "testdb",
+		Tables:      []string{baseTable},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "ReleaseCancelledArtifacts()")
+
+	assert.True(t, tableExists(t, db, baseTable), "the live table must be left alone")
+	assert.Empty(t, result.Preserved)
+	assert.Empty(t, result.Discarded)
+	assert.False(t, quarantineDatabaseExists(t, db),
+		"a release with nothing to preserve must not create the quarantine database")
+}
+
+// A release reclaims artifacts for the tables it was given and leaves every
+// other table on the target alone — the live tables it was not asked about, and
+// the artifacts belonging to a different table's schema change. Only the
+// schema-level artifacts, which no single table owns, are reclaimed regardless
+// of which table was named.
+func TestEngine_ReleaseCancelledArtifacts_LeavesUnnamedTablesAlone(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	const named = "orders"
+	const unnamed = "customers"
+	releaseTestCleanup(t, db, named, unnamed)
+	seedArtifact(t, db, named, 1)
+	seedArtifact(t, db, utils.NewTableName(named), 4)
+	seedArtifact(t, db, unnamed, 1)
+	seedArtifact(t, db, utils.NewTableName(unnamed), 6)
+	seedArtifact(t, db, utils.OldTableName(unnamed), 6)
+	seedArtifact(t, db, utils.CheckpointTableName(unnamed), 1)
+
+	eng := New(Config{})
+	result, err := eng.ReleaseCancelledArtifacts(t.Context(), &engine.ReleaseArtifactsRequest{
+		Database:    "testdb",
+		Tables:      []string{named},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "ReleaseCancelledArtifacts()")
+
+	require.Len(t, result.Preserved, 1, "only the named table's copy is reclaimed")
+	assert.Equal(t, "testdb."+utils.NewTableName(named), result.Preserved[0].Source)
+	assert.Empty(t, result.Discarded, "the named table left no metadata behind")
+
+	for _, survivor := range []string{
+		named,
+		unnamed,
+		utils.NewTableName(unnamed),
+		utils.OldTableName(unnamed),
+		utils.CheckpointTableName(unnamed),
+	} {
+		assert.True(t, tableExists(t, db, survivor),
+			"a release must not reach %s: it was not named", survivor)
+	}
+
+	quarantined := listQuarantinedTables(t, db)
+	require.Len(t, quarantined, 1, "only the named table's copy is quarantined")
+	assert.Contains(t, quarantined[0], utils.NewTableName(named))
+}
+
+// A release leaves the schema exactly as it found it apart from the artifacts
+// of the table it was given. This asserts on the whole schema rather than the
+// names a release was expected to touch, so a release that reached something
+// nobody thought to check for fails here: near-misses of the artifact naming,
+// another table's artifacts, and a timestamped copy from a run that was told to
+// keep it all have to survive.
+func TestEngine_ReleaseCancelledArtifacts_ChangesNothingElseInTheSchema(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	const target = "orders"
+	decoys := []string{
+		target,
+		"customers",
+		utils.NewTableName("customers"),
+		utils.OldTableName("customers"),
+		utils.CheckpointTableName("customers"),
+		// Near-misses of the naming: an artifact's suffix without its prefix,
+		// its prefix without its suffix, a doubly-derived name, and a name that
+		// only begins like a schema-level table.
+		target + "_new",
+		"_" + target,
+		utils.NewTableName(utils.NewTableName(target)),
+		deferredCutoverSentinelTable + "_backup",
+		// A run told to keep the table it swapped out names it with a
+		// timestamp, which no derivation a release performs reproduces.
+		utils.OldTableNameWithTimestamp(target, "20260101_000000"),
+	}
+	reclaimed := []string{
+		utils.NewTableName(target),
+		utils.CheckpointTableName(target),
+		sharedCheckpointTable,
+		deferredCutoverSentinelTable,
+	}
+
+	releaseTestCleanup(t, db, append(append([]string{}, decoys...), reclaimed...)...)
+	for _, name := range append(append([]string{}, decoys...), reclaimed...) {
+		seedArtifact(t, db, name, 1)
+	}
+	before := tablesIn(t, db, "testdb")
+
+	eng := New(Config{})
+	_, err := eng.ReleaseCancelledArtifacts(t.Context(), &engine.ReleaseArtifactsRequest{
+		Database:    "testdb",
+		Tables:      []string{target},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "ReleaseCancelledArtifacts()")
+
+	assert.ElementsMatch(t, decoys, tablesIn(t, db, "testdb"),
+		"a release must change nothing in the schema but the artifacts of the table it was given")
+	assert.Len(t, before, len(decoys)+len(reclaimed), "every seeded table must have existed to begin with")
+}
+
+// A release refused for want of a table list must be refused before it reaches
+// the target, not part way through it. The schema-level artifacts are the ones
+// an empty list would otherwise reclaim, so they are the ones that prove the
+// refusal came first.
+func TestEngine_ReleaseCancelledArtifacts_RefusedReleaseTouchesNothing(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	releaseTestCleanup(t, db, sharedCheckpointTable, deferredCutoverSentinelTable)
+	seedArtifact(t, db, sharedCheckpointTable, 1)
+	seedArtifact(t, db, deferredCutoverSentinelTable, 1)
+	before := tablesIn(t, db, "testdb")
+
+	eng := New(Config{})
+	_, err := eng.ReleaseCancelledArtifacts(t.Context(), &engine.ReleaseArtifactsRequest{
+		Database:    "testdb",
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.ErrorContains(t, err, "tables are required")
+
+	assert.Equal(t, before, tablesIn(t, db, "testdb"),
+		"a refused release must leave the target as it found it")
+	assert.False(t, quarantineDatabaseExists(t, db),
+		"a refused release must not create the quarantine database")
+}
+
+// A release reaches only the schema it was pointed at. The schema-level
+// artifacts carry the same name in every schema, so an identically named copy
+// of one next door is what proves the release stayed where it belongs.
+func TestEngine_ReleaseCancelledArtifacts_StaysInItsOwnSchema(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	const neighbour = "neighbourdb"
+	cleanupCtx := context.WithoutCancel(t.Context())
+	t.Cleanup(func() {
+		_, err := db.ExecContext(cleanupCtx,
+			fmt.Sprintf("DROP DATABASE IF EXISTS %s", quoteIdentifier(neighbour)))
+		assert.NoError(t, err, "drop neighbouring database")
+	})
+	_, err := db.ExecContext(t.Context(),
+		fmt.Sprintf("CREATE DATABASE %s", quoteIdentifier(neighbour)))
+	require.NoError(t, err, "create neighbouring database")
+
+	const target = "orders"
+	for _, name := range []string{
+		utils.NewTableName(target), utils.CheckpointTableName(target),
+		sharedCheckpointTable, deferredCutoverSentinelTable,
+	} {
+		_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s.%s (id INT PRIMARY KEY)",
+			quoteIdentifier(neighbour), quoteIdentifier(name)))
+		require.NoError(t, err, "seed %s in the neighbouring database", name)
+	}
+	neighbourBefore := tablesIn(t, db, neighbour)
+
+	releaseTestCleanup(t, db, target, utils.NewTableName(target), deferredCutoverSentinelTable)
+	seedArtifact(t, db, target, 1)
+	seedArtifact(t, db, utils.NewTableName(target), 2)
+	seedArtifact(t, db, deferredCutoverSentinelTable, 1)
+
+	eng := New(Config{})
+	_, err = eng.ReleaseCancelledArtifacts(t.Context(), &engine.ReleaseArtifactsRequest{
+		Database:    "testdb",
+		Tables:      []string{target},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "ReleaseCancelledArtifacts()")
+
+	assert.Equal(t, neighbourBefore, tablesIn(t, db, neighbour),
+		"a release must not reach a schema it was not pointed at")
+	assert.False(t, tableExists(t, db, deferredCutoverSentinelTable),
+		"the target schema's own sentinel is reclaimed")
+}
+
+// A caller that names the same table twice reclaims its artifacts once. The
+// quarantine move is a single atomic RENAME, so a source repeated within it
+// would fail the whole release and leave every artifact on the target.
+func TestEngine_ReleaseCancelledArtifacts_RepeatedTableReleasedOnce(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	const baseTable = "receipts"
+	releaseTestCleanup(t, db, baseTable)
+	seedArtifact(t, db, baseTable, 1)
+	seedArtifact(t, db, utils.NewTableName(baseTable), 5)
+	seedArtifact(t, db, utils.CheckpointTableName(baseTable), 1)
+
+	eng := New(Config{})
+	result, err := eng.ReleaseCancelledArtifacts(t.Context(), &engine.ReleaseArtifactsRequest{
+		Database:    "testdb",
+		Tables:      []string{baseTable, baseTable},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "ReleaseCancelledArtifacts()")
+	require.NotNil(t, result)
+
+	require.Len(t, result.Preserved, 1, "the copy must be preserved exactly once")
+	assert.Equal(t, "testdb."+utils.NewTableName(baseTable), result.Preserved[0].Source)
+	assert.Equal(t, []string{"testdb." + utils.CheckpointTableName(baseTable)}, result.Discarded)
+
+	assert.True(t, tableExists(t, db, baseTable), "the live table must be left alone")
+	assert.False(t, tableExists(t, db, utils.NewTableName(baseTable)), "the shadow table must leave the target")
+
+	quarantined := listQuarantinedTables(t, db)
+	require.Len(t, quarantined, 1)
+	assert.Equal(t, 5, quarantinedRowCount(t, db, quarantined[0]), "the copied rows must survive")
+}

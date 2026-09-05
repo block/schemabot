@@ -4731,7 +4731,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 *Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
-> ❌ **Error:** table users failed: schema change failed: unsafe warning: Field &#39;name&#39; doesn&#39;t have a default value
+> ❌ **Error:** A row had no value for a column that has no default. Give the column a default, or backfill the rows, before applying the change. (error 1364)
 
 1 of 3 tables completed before failure.
 

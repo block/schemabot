@@ -53,6 +53,7 @@ func TestPostgresStorageParity(t *testing.T) {
 	t.Run("SettingsUpdatedAtAdvances", func(t *testing.T) { testPostgresSettingsUpdatedAtAdvances(t, h) })
 	t.Run("LeaseGuardedApplyLogAppend", func(t *testing.T) { testPostgresLeaseGuardedApplyLogAppend(t, h) })
 	t.Run("MarkMinimizedPreservesStamp", func(t *testing.T) { testPostgresMarkMinimizedPreservesStamp(t, h) })
+	t.Run("MarkDeletedPreservesStamp", func(t *testing.T) { testPostgresMarkDeletedPreservesStamp(t, h) })
 	t.Run("LockUpdatedAtAdvances", func(t *testing.T) { testPostgresLockUpdatedAtAdvances(t, h) })
 	t.Run("LockAcquireSameOwnerConcurrent", func(t *testing.T) { testPostgresLockAcquireSameOwnerConcurrent(t, h) })
 	t.Run("ApplyCommentReclaimStaleSummaryClaim", func(t *testing.T) { testPostgresApplyCommentReclaimStaleSummaryClaim(t, h) })
@@ -303,6 +304,39 @@ func testPostgresMarkMinimizedPreservesStamp(t *testing.T, h postgresHarness) {
 	var afterRepeat *time.Time
 	require.NoError(t, h.db.QueryRowContext(ctx,
 		`SELECT minimized_at FROM plan_comments WHERE id = $1`, comment.ID).Scan(&afterRepeat))
+	require.NotNil(t, afterRepeat)
+	assert.Equal(t, *backdated, *afterRepeat, "a repeat mark must not move the stamp")
+}
+
+// testPostgresMarkDeletedPreservesStamp reads the raw deleted_at column to
+// prove a repeat mark does not move the original stamp. The row is backdated
+// between marks so the assertion cannot pass on write-clock proximity alone.
+func testPostgresMarkDeletedPreservesStamp(t *testing.T, h postgresHarness) {
+	store := h.NewStorage(t)
+	ctx := t.Context()
+
+	comment := storagetest.InsertPlanComment(t, store, "org/repo", 42, "orders", "mysql", "staging", "sha1", 100)
+
+	require.NoError(t, store.PlanComments().MarkDeleted(ctx, comment.ID))
+
+	var deletedAt *time.Time
+	require.NoError(t, h.db.QueryRowContext(ctx,
+		`SELECT deleted_at FROM plan_comments WHERE id = $1`, comment.ID).Scan(&deletedAt))
+	require.NotNil(t, deletedAt, "the row is stamped, not removed")
+
+	_, err := h.db.ExecContext(ctx,
+		`UPDATE plan_comments SET deleted_at = now() - interval '1 hour' WHERE id = $1`, comment.ID)
+	require.NoError(t, err)
+	var backdated *time.Time
+	require.NoError(t, h.db.QueryRowContext(ctx,
+		`SELECT deleted_at FROM plan_comments WHERE id = $1`, comment.ID).Scan(&backdated))
+	require.NotNil(t, backdated)
+
+	require.NoError(t, store.PlanComments().MarkDeleted(ctx, comment.ID))
+
+	var afterRepeat *time.Time
+	require.NoError(t, h.db.QueryRowContext(ctx,
+		`SELECT deleted_at FROM plan_comments WHERE id = $1`, comment.ID).Scan(&afterRepeat))
 	require.NotNil(t, afterRepeat)
 	assert.Equal(t, *backdated, *afterRepeat, "a repeat mark must not move the stamp")
 }
