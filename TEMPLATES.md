@@ -3576,16 +3576,16 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON users USING btree (last_seen_at);
 ```
 
-**`sessions`**: ⏳ Queued
-
-```sql
-ALTER TABLE sessions ADD COLUMN payload jsonb;
-```
-
 **`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
 ALTER TABLE users ADD COLUMN last_seen_at timestamptz;
+```
+
+**`sessions`**: ⏳ Queued
+
+```sql
+ALTER TABLE sessions ADD COLUMN payload jsonb;
 ```
 
 

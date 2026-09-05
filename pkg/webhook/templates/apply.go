@@ -65,16 +65,24 @@ func TaskStatusReadyForCutover(status string) bool {
 	return state.NormalizeTaskStatus(status) == state.Task.WaitingForCutover
 }
 
+// tableKey identifies one table across namespaces. The separator is a byte no
+// identifier can contain, so two distinct (namespace, table) pairs never share
+// a key even when their names concatenate to the same string.
+func tableKey(namespace, table string) string {
+	return namespace + "\x00" + table
+}
+
 // progressUnit names what one row counts as in the comment's totals. Every row
 // is one DDL statement, so the totals say "table" only while each row is a
-// distinct (namespace, table) — the common MySQL shape, where the planner folds
-// a table's changes into one statement. Once a table contributes several rows,
-// the totals say "statement", so a count never claims more tables than the plan
-// touches.
+// distinct (namespace, table) — the shape of any plan that emits one statement
+// per table, whatever the engine. Once a table contributes several rows, the
+// totals say "statement", so a count never claims more tables than the plan
+// touches. Both nouns hold in the first case; only "statement" holds in the
+// second, so the choice never overstates.
 func progressUnit(tables []TableProgressData) string {
 	distinct := make(map[string]struct{}, len(tables))
 	for _, t := range tables {
-		distinct[t.Namespace+"\x00"+t.TableName] = struct{}{}
+		distinct[tableKey(t.Namespace, t.TableName)] = struct{}{}
 	}
 	if len(distinct) == len(tables) {
 		return "table"
@@ -82,7 +90,7 @@ func progressUnit(tables []TableProgressData) string {
 	return "statement"
 }
 
-// countReadyForCutover returns how many tables are parked at the cutover
+// countReadyForCutover returns how many rows are parked at the cutover
 // barrier, per TaskStatusReadyForCutover.
 func countReadyForCutover(tables []TableProgressData) int {
 	ready := 0
@@ -455,8 +463,9 @@ func revertWindowCountdown(revertExpiresAt string) string {
 	return fmt.Sprintf("Closes in %s", formatDuration(remaining))
 }
 
-// writeCutoverSummary writes a readiness summary for cutover states,
-// showing how many tables are ready for cutover vs not yet ready.
+// writeCutoverSummary writes a readiness summary for cutover states, showing
+// how many rows are ready for cutover vs not yet ready, counted in the
+// comment's progressUnit.
 func writeCutoverSummary(sb *strings.Builder, tables []TableProgressData) {
 	ready := countReadyForCutover(tables)
 	total := len(tables)
@@ -655,10 +664,11 @@ func writeVSchemaStatus(sb *strings.Builder, changes []apitypes.VSchemaChange) {
 	}
 }
 
-// writeTableProgressSection writes the per-table progress breakdown, grouped by
+// writeTableProgressSection writes the per-row progress breakdown, grouped by
 // namespace so the operator can see which schema (MySQL) or keyspace
-// (Vitess/PlanetScale, Strata) each table belongs to. Within a namespace, tables
-// are sorted active/running first, then pending, then completed/terminal last.
+// (Vitess/PlanetScale, Strata) each table belongs to. Within a namespace, rows
+// are ordered by sortProgressRows: active/running first, then pending, then
+// completed/terminal last, with a table's rows kept together.
 func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData) {
 	// During the resume window the per-table percents are indeterminate (the data
 	// plane has not reported continuation vs fresh copy yet), so the aggregate
@@ -678,13 +688,7 @@ func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData)
 			fmt.Fprintf(sb, "**%s `%s`**\n\n", namespaceLabel(data.Engine), group.namespace)
 		}
 
-		sorted := make([]TableProgressData, len(group.tables))
-		copy(sorted, group.tables)
-		sort.SliceStable(sorted, func(i, j int) bool {
-			return tableStatePriority(sorted[i].Status) < tableStatePriority(sorted[j].Status)
-		})
-
-		for _, table := range sorted {
+		for _, table := range sortProgressRows(group.tables) {
 			// While the apply is resuming, the data plane has not yet reported whether
 			// the schema change continues from its checkpoint or restarts from scratch,
 			// so the row-copy percent is indeterminate. Render state-only until the
@@ -764,6 +768,49 @@ func renderResumingTable(sb *strings.Builder, dialect schema.Dialect, table Tabl
 // tableStatePriority returns a sort key: lower = rendered first (active on top, completed on bottom).
 func tableStatePriority(tableStatus string) int {
 	return ui.TableStatePriority(state.NormalizeTaskStatus(tableStatus))
+}
+
+// sortProgressRows orders one namespace's rows for display without modifying
+// the input. Tables are ranked by the most urgent state among their rows, and a
+// table's rows stay adjacent — ordered by their own state — so a table whose
+// plan produced several statements reads as one block rather than scattering
+// across the list by state. Tables with the same rank keep plan order. When
+// every row is a distinct table this is exactly a stable sort by state
+// priority.
+func sortProgressRows(rows []TableProgressData) []TableProgressData {
+	type tableRank struct {
+		priority   int
+		firstIndex int
+	}
+	ranks := make(map[string]tableRank, len(rows))
+	for i, row := range rows {
+		key := tableKey(row.Namespace, row.TableName)
+		priority := tableStatePriority(row.Status)
+		rank, seen := ranks[key]
+		if !seen {
+			ranks[key] = tableRank{priority: priority, firstIndex: i}
+			continue
+		}
+		if priority < rank.priority {
+			rank.priority = priority
+			ranks[key] = rank
+		}
+	}
+
+	sorted := make([]TableProgressData, len(rows))
+	copy(sorted, rows)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		ri := ranks[tableKey(sorted[i].Namespace, sorted[i].TableName)]
+		rj := ranks[tableKey(sorted[j].Namespace, sorted[j].TableName)]
+		if ri.priority != rj.priority {
+			return ri.priority < rj.priority
+		}
+		if ri.firstIndex != rj.firstIndex {
+			return ri.firstIndex < rj.firstIndex
+		}
+		return tableStatePriority(sorted[i].Status) < tableStatePriority(sorted[j].Status)
+	})
+	return sorted
 }
 
 // renderTableProgress renders a single table's progress as markdown.
@@ -1656,6 +1703,9 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 	}
 
 	collapsed := collapseNamespaceGroups && len(data.Tables) > 5
+	// Collapsed group headers count in the comment-wide unit, not a per-group
+	// one, so a group of distinct tables next to a multi-statement group does
+	// not read "3 tables" above "3 statements" for the same apply.
 	unit := progressUnit(data.Tables)
 	// On an unsuccessful apply, each completed table is labeled so the reader
 	// can tell which tables made it before the failure/stop/cancellation.

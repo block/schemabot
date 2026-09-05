@@ -22,6 +22,10 @@ func TestProgressUnit(t *testing.T) {
 			{Namespace: "billing", TableName: "users"},
 			{Namespace: "public", TableName: "users"},
 		}, "table"},
+		{"names that concatenate alike are still two tables", []TableProgressData{
+			{Namespace: "ab", TableName: "c"},
+			{Namespace: "a", TableName: "bc"},
+		}, "table"},
 		{"several rows on one table", []TableProgressData{
 			{Namespace: "public", TableName: "users"},
 			{Namespace: "public", TableName: "users"},
@@ -77,6 +81,14 @@ func TestRenderApplySummaryComment_MultiStatementTableCountsStatements(t *testin
 		assert.NotContains(t, out, "3 tables")
 	})
 
+	t.Run("cancelled", func(t *testing.T) {
+		data := multiStatementApplyData(state.Apply.Cancelled, multiStatementTableRows(state.Task.Completed, state.Task.Cancelled, state.Task.Cancelled))
+		out := RenderApplySummaryComment(data)
+
+		assert.Contains(t, out, "1 of 3 statements completed before cancellation.")
+		assert.NotContains(t, out, "3 tables")
+	})
+
 	t.Run("completed", func(t *testing.T) {
 		data := multiStatementApplyData(state.Apply.Completed, multiStatementTableRows(state.Task.Completed, state.Task.Completed, state.Task.Completed))
 		out := RenderApplySummaryComment(data)
@@ -103,6 +115,9 @@ func TestRenderApplySummaryComment_OneStatementPerTableCountsTables(t *testing.T
 		Environment: "staging",
 		Engine:      "spirit",
 		State:       state.Apply.Failed,
+		// The error text is rendered verbatim and may itself say "statement";
+		// the assertions below pin the count line, not the whole comment.
+		ErrorMessage: "table users failed: statement exceeded lock wait timeout",
 		Tables: []TableProgressData{
 			{Namespace: "testapp", TableName: "orders", DDL: "ALTER TABLE orders ADD COLUMN note varchar(255)", Status: state.Task.Completed},
 			{Namespace: "testapp", TableName: "users", DDL: "ALTER TABLE users ADD COLUMN note varchar(255)", Status: state.Task.Failed},
@@ -111,5 +126,5 @@ func TestRenderApplySummaryComment_OneStatementPerTableCountsTables(t *testing.T
 	out := RenderApplySummaryComment(data)
 
 	assert.Contains(t, out, "1 of 2 tables completed before failure.")
-	assert.NotContains(t, out, "statement")
+	assert.NotContains(t, out, "2 statements")
 }
