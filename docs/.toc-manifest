@@ -16,6 +16,7 @@ docs/lint-and-safety-levels.md
 docs/namespaces.md
 docs/pending-drops.md
 docs/postgresql.md
+docs/pre-merge-workflow.md
 docs/spirit_progress.md
 docs/storage-outage-behavior.md
 docs/strata-engine.md

@@ -131,6 +131,9 @@ Design and operations docs live in the [docs](./docs/) folder:
   the state machine, and how a change flows through them.
 - [docs/configuration.md](./docs/configuration.md) covers server setup: local mode, gRPC mode,
   and secret resolution.
+- [docs/pre-merge-workflow.md](./docs/pre-merge-workflow.md) is the workflow guide: why a
+  schema change is applied from the open PR and merged only once it is live, the developer
+  loop around that, and the two workflows for destructive changes.
 - [docs/invariants.md](./docs/invariants.md) is the registry of runtime safety invariants:
   what must never be false while SchemaBot is running, why each rule matters, where it is
   enforced, and what these guarantees deliberately do not cover. It opens with what happens
