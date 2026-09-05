@@ -390,8 +390,9 @@ per-database ruling: either the scoped lane is disabled and the plain admin gate
 applied (`scoped_lane_disabled`), or the target database could not be resolved
 and the request was rejected by the operation's own error path instead
 (`target_unresolved`). A sustained `target_unresolved` rate means stored-plan
-lookups are failing on the authorization path; the paired ERROR log carries the
-plan id and the storage error.
+lookups are failing on the authorization path. The paired log names the plan id
+in both cases: an ERROR carrying the storage error when the lookup failed, or a
+WARN when the plan does not exist.
 
 Reason values:
 

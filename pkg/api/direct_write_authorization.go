@@ -295,10 +295,13 @@ func (s *Service) authorizeDirectWrite(w http.ResponseWriter, r *http.Request, o
 // stored plan — the source of truth for what an apply will mutate — and then
 // enforces the per-database half of the direct-write decision. The plan must
 // exist and resolve at decision time: a missing plan rejects the request with
-// the same error the apply path reports for it, and a storage failure denies
-// — an unresolvable target must never authorize. Failing closed here (rather
-// than deferring the missing plan to the handler's own plan load) keeps the
-// authorization bound to a plan that existed when the decision was made.
+// the same error the apply path reports for it, and a plan-load storage failure
+// rejects it with the operation's 500 error. Neither is an authorization
+// denial; both land on the decision metric as skipped/target_unresolved, and
+// neither lets the request proceed — an unresolvable target must never
+// authorize. Failing closed here (rather than deferring the missing plan to the
+// handler's own plan load) keeps the authorization bound to a plan that existed
+// when the decision was made.
 func (s *Service) authorizeDirectWriteForStoredPlan(w http.ResponseWriter, r *http.Request, operation, planID, environment string) bool {
 	if !s.config.scopedWriteEnabled() {
 		metrics.RecordDirectWriteAuthorization(r.Context(), operation, "",
