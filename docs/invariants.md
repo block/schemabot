@@ -847,22 +847,18 @@ including when what is stored is a task that has outlived its apply's verdict (U
 
 Retryable-apply expiry is the one other path that writes rows it holds no lease on, and it is
 bounded rather than excepted. It settles an apply whose retry budget or recovery freshness has run
-out, selected by `apply_id` under a `FOR UPDATE` on the parent — which serializes it against a
-driver claiming that *apply*, and says nothing about one holding only an *operation* lease. Its
-task writes therefore read that operation lease exactly as the reaper does, because under fan-out
-the parent sits `failed_retryable` on one deployment's spent budget while a sibling deployment
-drives underneath it. Its `apply_operations` write does not, and cannot: a `failed_retryable`
-operation skipped there would have no second writer, since the operation reaper sweeps only pending
-rows and expiry never returns to an apply it has taken out of `failed_retryable`. Gating it would
-strand the row rather than defer the write. That asymmetry is named here rather than left for a
-reader to discover, because an entry that overstates its own coverage is what makes the registry
-unreliable.
+out, selected by `apply_id` under a `FOR UPDATE` on the parent, which serializes it against a driver
+claiming that *apply* and says nothing about one holding only an *operation* lease. Its task writes
+therefore read that operation lease. Its `apply_operations` write reads no lease and cannot: a
+skipped operation there would have no second writer, so gating it would strand the row rather than
+defer the write. That asymmetry is named here rather than left for a reader to discover, because an
+entry that overstates its own coverage is what makes the registry unreliable.
 
 *Enforced:* lease predicates on the driver's apply and task writes
 (`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/applies.go`), the
 reaper's task sweeps and retryable-apply expiry's task writes (`unleasedOperationGate`,
-`pkg/storage/internal/sqlstore/apply_operations.go`), and a read path that builds progress from
-stored rows without writing them (`pkg/api/progress_handlers.go`).
+`undrivenOperationGate`, `pkg/storage/internal/sqlstore/apply_operations.go`), and a read path that
+builds progress from stored rows without writing them (`pkg/api/progress_handlers.go`).
 
 ## Control operations (CO)
 
