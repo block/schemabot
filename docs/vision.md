@@ -34,14 +34,14 @@ ambition needed a home of its own. This is that home.
 ## The northstar
 
 Every database should be able to evolve safely, whether it is a weekend project or a tier-zero
-fleet, and nobody should have to become a database expert to change one without breaking it.
+fleet, and nobody should have to become a database expert first. Adding a column, adding an index,
+dropping a table that really is dead: none of that should carry a risk of taking the database down
+with it.
 
-The second half is the part that has changed.
-
-Tooling for this has existed for a long time, and much of it works. A `schema_version` table, ordered
-changelogs, checksums that catch an edited file, a runner that refuses to apply the same change
-twice. Flyway and Liquibase and everything shaped like them automated the bookkeeping, and the
-bookkeeping was a real problem worth solving.
+People have been chasing this for a long time, and a lot of what they built works. A
+`schema_version` table, ordered changelogs, checksums that catch an edited file, a runner that
+refuses to apply the same change twice. Flyway and Liquibase and everything shaped like them
+automated the bookkeeping, and the bookkeeping was a real problem worth solving.
 
 What none of it automates is judgment. A version table can tell you that change 47 ran. It has no
 opinion on whether change 47 should have. Whether the DDL matches the schema that is actually live,
