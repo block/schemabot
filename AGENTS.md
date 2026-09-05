@@ -118,6 +118,8 @@ The hook uses `--new-from-rev` to only flag issues introduced by the current bra
 
 ## Guidelines
 
+**Database integrity comes first, for every database.** SchemaBot runs in front of everything from a vibe-coded weekend experiment to a tier-0 production system, and it treats them all the same way: the integrity of the database behind it outranks convenience, speed, and feature scope. Do not frame anything, in code, docs, or review, in terms of "databases that matter" or shortcuts that are "fine for a small database". Every database matters, and a change that would be unsafe in front of production is unsafe everywhere. When a tradeoff pits integrity against anything else, integrity wins.
+
 **Terminology:** NEVER use the word "migration" in code, comments, CLI output, or error messages. ALWAYS use "schema change" instead.
 
 **"schema change" is never hyphenated.** In prose — PR comments, check summaries, CLI output, error messages, docs, code comments — write "schema change", never "schema-change".
