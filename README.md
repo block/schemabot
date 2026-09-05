@@ -80,7 +80,7 @@ See [docs/architecture.md](./docs/architecture.md) for the full documentation.
 
 ## Configuration
 
-See [docs/configuration.md](./docs/configuration.md) for setup instructions (local mode, gRPC mode, secret resolution).
+See [docs/configuration.md](./docs/configuration.md) for server setup instructions (local mode, gRPC mode, secret resolution), and [docs/cli.md](./docs/cli.md) for CLI client setup (profiles, authentication, wrapping the CLI).
 
 ## Docs
 
