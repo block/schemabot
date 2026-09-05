@@ -116,7 +116,7 @@ make mysql DB=staging   # Staging testapp (port 13372)
 make mysql DB=production # Production testapp (port 13373)
 ```
 
-To run SchemaBot against your own databases, grab a build from [Releases](#releases) (binary, container image, or Helm chart), then follow [docs/github-app-setup.md](./docs/github-app-setup.md) to wire up the PR workflow and [docs/configuration.md](./docs/configuration.md) for the server config. `schemabot onboard` pulls a live database's schema into a new declarative schema directory, so you start from your real tables rather than writing them out by hand.
+To run SchemaBot against your own databases, grab a build from [Releases](#releases) (binary, container image, or Helm chart), then follow [docs/github-app-setup.md](./docs/github-app-setup.md) to wire up the PR workflow and [docs/configuration.md](./docs/configuration.md) for the server config. [`schemabot onboard`](./docs/github-app-setup.md#6-add-schemabotyaml-config-to-your-repository) pulls a live database's schema into a new declarative schema directory, so you start from your real tables rather than writing them out by hand.
 
 ## Docs
 
