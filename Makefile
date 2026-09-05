@@ -164,10 +164,10 @@ clean: ## Clean build artifacts
 	@rm -rf bin/
 	@rm -f coverage.out
 
-docs-toc: ## Regenerate the Table of Contents in docs/*.md
+docs-toc: ## Refresh the Table of Contents in docs files that have TOC markers
 	@python3 scripts/gen-doc-toc.py
 
-check-docs-toc: ## Fail if any docs/*.md Table of Contents is stale
+check-docs-toc: ## Fail if a Table of Contents behind TOC markers is stale
 	@python3 scripts/gen-doc-toc.py --check
 
 # Generate protobuf code (only if .proto is newer than generated .pb.go)
