@@ -1035,7 +1035,7 @@ func joinDeploymentNames(deployments []DeploymentDriftEntry) string {
 // provisioning.
 func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 	n := len(changes)
-	fmt.Fprintf(sb, glyph.Refused+" **Cannot apply**: %d %s the schema change engine refuses to execute\n", n, pluralize("change", n))
+	fmt.Fprintf(sb, glyph.Refused+" **Cannot apply**: %d %s the engine refuses to execute\n", n, pluralize("change", n))
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
@@ -1056,6 +1056,14 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 // direct statement does to the table while it runs is engine-specific — an
 // engine that adopts direct execution adds its own copy here rather than
 // inheriting another engine's semantics.
+//
+// The footer names the schema change engine in full rather than "the engine".
+// It renders directly under a header noun that names the database's own native
+// DDL, so the two sit adjacent: a reader who takes the shorter form for the
+// storage engine gets the claim backwards, since the statement runs inside the
+// database and outside SchemaBot. This is the sentence that carries the
+// operator's consent to a change that cannot be reverted, so it spends the
+// words.
 func directConsentCopy(databaseType string, isMySQL bool) (headerNoun, footer string) {
 	// Strata is sharded MySQL: a direct statement there is the same native
 	// MySQL DDL, executed per shard.
