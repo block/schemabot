@@ -6,6 +6,7 @@
 
 - [The northstar](#the-northstar)
 - [From a vibe-coded experiment to a tier-zero database](#from-a-vibe-coded-experiment-to-a-tier-zero-database)
+- [Safe should also mean fast](#safe-should-also-mean-fast)
 - [GitOps, not GitHub](#gitops-not-github)
 - [Guardrails and context for agents](#guardrails-and-context-for-agents)
 - [Many agents, one database](#many-agents-one-database)
@@ -88,11 +89,49 @@ large deployment with most of it switched off.
 
 ![Both ends of the range feed into an identical set of gates: diff against the live database, lint before anything runs, explicit consent to destroy, and uncertainty never passing](../assets/vision-range.svg)
 
+## Safe should also mean fast
+
+Everything above is about not breaking the database. That is worth a lot less than it sounds if the
+price is a slower week.
+
+Mostly the two are not in tension, because the same declarative model that lets the tool reason about
+a change is what lets it do the work. You edit a file. You do not write the `ALTER`, decide whether
+it can run in place or needs a copy, pick a batch size, tune a throttle, or run anything by hand at
+midnight because that is when traffic is low.
+
+Four things should disappear:
+
+- **The second tool.** No separate console to log into, no form to click through, no ticket to file
+  and wait on. The change gets reviewed where the code gets reviewed, and driven from the same place,
+  or from the CLI if you would rather not open a browser at all.
+- **The waiting.** Copying a large table takes as long as it takes. That should be the machine's
+  time, not yours. It runs, it reports progress, and it interrupts you only when it genuinely needs a
+  decision.
+- **The coordination tax.** Does the code go first or the schema? What happens if someone else's
+  change lands while mine is still open? The tool should answer that, not a thread in a channel.
+- **The rerun.** Staging, then production, then the other region, each one a person remembering to go
+  and do it. The same file should land everywhere it applies.
+
+The one that is easiest to miss is that a change taking three weeks should not block anything for
+three weeks. The copy runs in the background, and the one moment it actually touches the application
+is a swap somebody chooses, which can be a quiet Tuesday morning instead of the middle of a release
+freeze.
+
+So the number that matters is not how fast the DDL executes. It is how much of a person's day a
+schema change costs, and the floor for that should be a couple of minutes: write the schema, read
+what the tool says will happen, say yes. When speed and integrity genuinely do collide, integrity
+wins and the change waits. That should be rare enough to be worth noticing.
+
 ## GitOps, not GitHub
 
-The source of truth is the schema in version control, and the loop that reconciles it against the
-live database. GitHub is the best-supported way into that loop. It is not the substrate, and
-SchemaBot should never quietly become a tool that only works if you happen to use it.
+The source of truth is the schema in version control. SchemaBot is the loop that reconciles it
+against the live database: read what you declared, read what is actually there, work out the
+difference, and close it safely. That loop is the product. Everything else, including GitHub, is a
+way to reach it.
+
+GitHub is the best-supported of those ways by a wide margin, and that is a deliberate choice rather
+than an accident of what got built first. It is still not the substrate, and SchemaBot should never
+quietly become a tool that only works if you happen to use GitHub.
 
 ![Four interfaces sit above one model: a GitHub pull request, the CLI, an API or agent, and a forge that is not built yet. All of them drive the same loop between the schema files and the live database](../assets/vision-gitops-not-github.svg)
 
@@ -265,6 +304,7 @@ and about engines that can be supported honestly, not about saying yes to everyt
 | Property | What already holds | What is missing |
 |---|---|---|
 | Experiment to tier zero | The plan and the gates are identical at any scale. Local mode drives a database straight from a DSN in a single process, and SchemaBot already embeds as a Go module. | The small end still pays for the large end: a server, storage, and a GitHub App for the PR flow. Embedding is a supported import rather than a supported way to run the whole loop. PostgreSQL, the likeliest engine down there, is early alpha. |
+| Safe should also mean fast | Nobody writes the DDL, picks an execution strategy, or runs anything by hand. Long changes run unattended and report progress, and a deferred cutover lets the copy finish without the swap happening until someone picks the moment. | Onboarding is still the slow part, and a change still needs a person to open a PR and say yes at least once. Nothing reports what a schema change actually costs in human time, so the claim above is a design intent rather than a measurement. |
 | GitOps, not GitHub | Enforced rather than intended. Applies work while GitHub is down, the CLI covers the full PR surface, and an outage never invents state. The process that touches your database carries no GitHub credentials. | The merge gate itself is expressed as GitHub Check Runs. No second forge is implemented, so the separation is proven by the CLI rather than by a second integration. |
 | Agents | Declarative files are already an agent-readable source of truth, and every gate is author-agnostic. | No dedicated agent surface. An agent works by reading files and opening a PR, the same as a person, with none of the plan detail available programmatically. |
 | Many agents, one database | Concurrent authors are already serialized: one apply per deployment, provable ownership, and no stale plan ever applies. The merge gate coordinates open changes with no protocol between them. | The coordination is opaque. No readable queue, no machine-readable reason for a block, no expected wait. A blocked caller can only poll. |
