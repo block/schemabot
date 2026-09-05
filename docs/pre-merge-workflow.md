@@ -352,8 +352,8 @@ there after your PR closes.
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
   ```
 
-  SchemaBot plans the edit as `ALTER TABLE orders ALTER INDEX idx_status
-  INVISIBLE`, which is metadata-only. MySQL keeps maintaining the index while
+  SchemaBot plans the edit as ``ALTER TABLE `orders` ALTER INDEX `idx_status`
+  INVISIBLE``, which is metadata-only. MySQL keeps maintaining the index while
   the optimizer stops using it, so real traffic shows you what the drop would
   cost. Deleting the keyword and applying again brings the index back with no
   rebuild.
