@@ -421,7 +421,9 @@ func classifyOperationTasks(tasks []*storage.Task) (operationID int64, usesModel
 // Under on_failure "continue" a terminal-failed sibling does not terminalize the
 // apply while other siblings are still in flight: the apply is held running until
 // the rollout settles, then takes the failed verdict. Every other policy fails
-// closed and a failed sibling terminalizes the apply immediately.
+// closed on the verdict, and still holds the apply while a sibling that a driver
+// already started still holds its target, since refusing new claims does not
+// stop it.
 //
 // Invariant: applies.state is the rollout projection over all operations of the
 // apply, not only the operation this drive is executing. The current
@@ -763,7 +765,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// Surface once, at Warn, when a sharded engine reached an active state but
 	// could not report per-shard/row-copy progress for a reason that persists for
 	// the whole apply (a missing vtgate DSN). Only the persistent reason warns:
-	// the transient reasons (schema-change context still being discovered, shard
+	// the transient reasons (schema change context still being discovered, shard
 	// rows not yet registered at copy start) can self-heal on a later poll, so a
 	// one-shot warning for them would be a false alarm that latches forever; they
 	// stay visible in the engine's per-poll Debug. Warn (not Debug) so the
