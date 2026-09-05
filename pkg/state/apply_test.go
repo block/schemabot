@@ -520,9 +520,14 @@ func TestDeriveRolloutApplyState_FailurePolicy(t *testing.T) {
 			want:     Apply.RunningDegraded,
 		},
 		{
-			name:     "continue failure with all siblings terminal settles failed",
+			name:     "continue failure with all siblings settled settles failed",
 			children: []RolloutChild{rc(Apply.Failed, true), rc(Apply.Completed, true)},
 			want:     Apply.Failed,
+		},
+		{
+			name:     "continue failure with stopped sibling holds running_degraded",
+			children: []RolloutChild{rc(Apply.Failed, true), rc(Apply.Stopped, true)},
+			want:     Apply.RunningDegraded,
 		},
 		{
 			name:     "continue failure with another failed continue sibling settles failed",
@@ -570,8 +575,13 @@ func TestDeriveRolloutApplyState_FailurePolicy(t *testing.T) {
 			want:     Apply.Failed,
 		},
 		{
-			name:     "halt failure with stopped sibling settles failed",
+			name:     "halt failure with stopped sibling holds running_degraded",
 			children: []RolloutChild{rc(Apply.Failed, false), rc(Apply.Stopped, false)},
+			want:     Apply.RunningDegraded,
+		},
+		{
+			name:     "halt failure with cancelled sibling settles failed",
+			children: []RolloutChild{rc(Apply.Failed, false), rc(Apply.Cancelled, false)},
 			want:     Apply.Failed,
 		},
 		{
@@ -595,9 +605,30 @@ func TestDeriveRolloutApplyState_FailurePolicy(t *testing.T) {
 	}
 }
 
+// A fail-closed rollout holds its verdict open while any sibling still holds the
+// deployment it was given, and the line is settled rather than terminal. Every
+// state in the registry is classified against that rule here, so a state added
+// later cannot inherit an answer: a pending sibling has touched nothing, a
+// sibling whose verdict is final has released its target, and everything else
+// keeps the parent's reservation alive — including stopped, which is terminal
+// for claiming but resumable, so a driver may write to that target again.
+func TestDeriveRolloutApplyState_HaltHoldsWhileASiblingHoldsItsTarget(t *testing.T) {
+	for sibling := range applyMetadata {
+		t.Run(sibling, func(t *testing.T) {
+			want := Apply.Failed
+			if !IsState(sibling, SettledApplyStates...) && !IsState(sibling, Apply.Pending) {
+				want = Apply.RunningDegraded
+			}
+			children := []RolloutChild{rc(Apply.Failed, false), rc(sibling, false)}
+			assert.Equal(t, want, DeriveRolloutApplyState(children),
+				"a halted rollout with a %s sibling", sibling)
+		})
+	}
+}
+
 // TestDeriveRolloutApplyState_PausePolicy is the truth table for on_failure=pause.
 // An unreleased pause failure holds the apply paused while later siblings still
-// have work to do, settles failed once nothing is left to hold, and — once
+// still hold their targets, settles failed once nothing is left to hold, and — once
 // released — behaves exactly like continue. Children are in deployment order.
 func TestDeriveRolloutApplyState_PausePolicy(t *testing.T) {
 	cases := []struct {
@@ -621,8 +652,13 @@ func TestDeriveRolloutApplyState_PausePolicy(t *testing.T) {
 			want:     Apply.Failed,
 		},
 		{
-			name:     "pause failure with later sibling stopped (stop chosen over release) settles failed",
+			name:     "pause failure with later sibling stopped holds paused",
 			children: []RolloutChild{rcPause(Apply.Failed), rcPause(Apply.Stopped)},
+			want:     Apply.Paused,
+		},
+		{
+			name:     "pause failure with later sibling cancelled settles failed",
+			children: []RolloutChild{rcPause(Apply.Failed), rcPause(Apply.Cancelled)},
 			want:     Apply.Failed,
 		},
 		{

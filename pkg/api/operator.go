@@ -2456,8 +2456,8 @@ func manifestGatedVerdict(derived string) bool {
 // apply is held running until the rollout settles, then takes the failed verdict.
 // Every other policy (halt, pause, unrecognized) fails closed to the failed
 // verdict, and holds the apply degraded until any sibling that a driver already
-// started reaches a terminal state, because refusing new claims does not stop
-// work already under way. While an apply has exactly one operation the derived value equals the
+// started settles, because refusing new claims does not stop work already under
+// way. While an apply has exactly one operation the derived value equals the
 // value ResumeApply already persisted, so this is a no-op until the
 // multi-deployment fan-out makes an apply own more than one operation.
 //
@@ -2540,7 +2540,7 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	// A failed parent is the one terminal state the rollout projection can
 	// legitimately reopen: a sibling failure may have terminalized the parent
 	// before the rollout settled, and re-deriving over the operation rows holds
-	// it degraded until every sibling is terminal. This covers both policies
+	// it degraded until every sibling settles. This covers both policies
 	// that hold — continue, which lets later siblings still run, and a
 	// fail-closed policy whose verdict landed while an already-started sibling
 	// was working. Gate the exception narrowly: the parent must be failed, the

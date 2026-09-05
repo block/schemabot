@@ -689,14 +689,21 @@ stays released, with no path back to paused. An *unrecognized* `on_failure` valu
 
 Failing closed decides the verdict, not when it is recorded. A fail-closed policy refuses new
 claims and cancels nothing, so a sibling deployment that a driver already started keeps working through
-the failure: the apply stays `running_degraded` until that sibling is terminal and only then takes
+the failure: the apply stays `running_degraded` until that sibling settles and only then takes
 the `failed` verdict. A sibling that is merely pending holds nothing, since the same policy is what
 stops it from ever starting. Recording the verdict over live work would release the reservation on
 the parent's whole target set (OW-5) while a driver is mid-change on one of those targets, and
-would take `stop` and `cancel` away from the operator who still has work to stop. *Enforced:* the
-ordered-claim gate in `FindNextApplyOperation`
+would take `stop` and `cancel` away from the operator who still has work to stop.
+
+Settled rather than terminal is what decides whether a sibling still holds its deployment, under
+every policy and not only the fail-closed ones. The two differ by one state: a `stopped` sibling is
+terminal for claiming but resumable, so an operator can start it again and a driver will write to
+that target. A rollout whose remaining sibling is stopped therefore stays open — `running_degraded`,
+or `paused` where a pause is holding it — until that sibling is started and finishes, or is
+cancelled. *Enforced:* the ordered-claim gate in `FindNextApplyOperation`
 (`pkg/storage/internal/sqlstore/apply_operations.go`) and the rollout state derivation
-(`DeriveRolloutApplyState` and `hasStartedNonTerminalWork`, `pkg/state/apply.go`).
+(`DeriveRolloutApplyState`, `hasStartedUnsettledWork` and `childHoldsItsTarget`,
+`pkg/state/apply.go`).
 
 ## Ownership and leases (OW)
 

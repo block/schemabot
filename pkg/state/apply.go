@@ -268,20 +268,20 @@ type RolloutChild struct {
 //
 //   - halt or unrecognized (both flags false): the failure stands and the apply
 //     is failed (fail closed); this dominates every other outcome.
-//   - unreleased pause (PauseOnFailure) with later, not-yet-terminal work to
-//     hold: the apply is held paused so a human can release or stop it.
+//   - unreleased pause (PauseOnFailure) with later work that still holds its
+//     target: the apply is held paused so a human can release or stop it.
 //   - continue, or a released pause (ContinueOnFailure): the failure neither
 //     forces a terminal verdict nor holds the rollout.
 //
 // After classifying every child, in precedence order:
 //
 //   - any fail-closed child → failed, or running_degraded while a sibling that
-//     already started is still working (fail closed decides the verdict, not
-//     when it is recorded);
+//     already started still holds its target (fail closed decides the verdict,
+//     not when it is recorded);
 //   - else any pause-held child → paused;
-//   - else if every child is terminal → failed (the verdict still reflects the
+//   - else if every child has settled → failed (the verdict still reflects the
 //     failure once the continue/released rollout has settled);
-//   - else → running_degraded (continue/released siblings still in flight).
+//   - else → running_degraded (siblings still holding their targets).
 //
 // An empty child set returns Pending, matching DeriveApplyState.
 func DeriveRolloutApplyState(children []RolloutChild) string {
@@ -298,12 +298,12 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 		return base
 	}
 
-	allTerminal := true
+	allSettled := true
 	hardFail := false
 	pausedHold := false
 	for i, c := range children {
-		if !IsTerminalApplyState(c.State) {
-			allTerminal = false
+		if childHoldsItsTarget(c) {
+			allSettled = false
 		}
 		if !IsState(c.State, Apply.Failed) {
 			continue
@@ -317,7 +317,7 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 		case c.ContinueOnFailure:
 			// continue, or a released pause: does not force a terminal verdict
 			// and does not hold the rollout.
-		case c.PauseOnFailure && hasLaterNonTerminal(children, i):
+		case c.PauseOnFailure && hasLaterUnsettled(children, i):
 			// unreleased pause with later work still to run: hold for a human.
 			pausedHold = true
 		case c.PauseOnFailure:
@@ -338,8 +338,9 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 		// mid-change, and would take stop and cancel away from the operator who
 		// still has live work to stop. Hold the apply until that work settles.
 		// A sibling still pending holds nothing: the same policy is what stops
-		// it from ever starting.
-		if hasStartedNonTerminalWork(children) {
+		// it from ever starting. A sibling an operator stopped still holds its
+		// target, because it can be started again.
+		if hasStartedUnsettledWork(children) {
 			return Apply.RunningDegraded
 		}
 		return Apply.Failed
@@ -347,38 +348,51 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 	if pausedHold {
 		return Apply.Paused
 	}
-	if allTerminal {
+	if allSettled {
 		return Apply.Failed
 	}
 	return Apply.RunningDegraded
 }
 
-// hasStartedNonTerminalWork reports whether any child is non-terminal and has
-// moved past pending: work a driver has already begun against a target.
+// childHoldsItsTarget reports whether a child still holds the deployment it was
+// given: its verdict is not final, so a driver may still be writing to that
+// target or may claim it and start writing again.
+//
+// Settled rather than terminal is what draws this line, and the difference is
+// one state. Stopped is terminal for claiming but not settled, because an
+// operator can start it again and a driver will resume writing — which is what
+// its hold says, that it holds the database until it is started or cancelled.
+// A rollout that reads terminal here would release the reservation on its whole
+// target set (OW-5) over a deployment a stopped sibling still owns.
+func childHoldsItsTarget(c RolloutChild) bool {
+	return !IsState(c.State, SettledApplyStates...)
+}
+
+// hasStartedUnsettledWork reports whether any child has moved past pending and
+// still holds its target: work a driver has already begun.
 //
 // This is the line a fail-closed rollout turns on, because the two kinds of
-// non-terminal sibling differ in whether the policy reaches them. A pending
-// sibling is exactly what the ordered-claim gate holds back, so it will not
-// start while the failure stands and it has touched nothing. A sibling already
-// running, draining, parked at a cutover barrier, or awaiting a retry was
-// claimed before the failure, and refusing new claims does not reach back to
-// stop it.
-func hasStartedNonTerminalWork(children []RolloutChild) bool {
+// sibling differ in whether the policy reaches them. A pending sibling is
+// exactly what the ordered-claim gate holds back, so it will not start while
+// the failure stands and it has touched nothing. A sibling already running,
+// draining, parked at a cutover barrier, awaiting a retry, or stopped by an
+// operator was claimed before the failure, and refusing new claims does not
+// reach back to release it.
+func hasStartedUnsettledWork(children []RolloutChild) bool {
 	for _, c := range children {
-		if !IsTerminalApplyState(c.State) && !IsState(c.State, Apply.Pending) {
+		if childHoldsItsTarget(c) && !IsState(c.State, Apply.Pending) {
 			return true
 		}
 	}
 	return false
 }
 
-// hasLaterNonTerminal reports whether any child after failedIndex (in
-// deployment order) is not yet in a terminal apply state. A pause-held failure
-// only holds the rollout when there is such later work for the operator to
-// release or stop.
-func hasLaterNonTerminal(children []RolloutChild, failedIndex int) bool {
+// hasLaterUnsettled reports whether any child after failedIndex (in deployment
+// order) still holds its target. A pause-held failure only holds the rollout
+// when there is such later work for the operator to release, start or stop.
+func hasLaterUnsettled(children []RolloutChild, failedIndex int) bool {
 	for later := failedIndex + 1; later < len(children); later++ {
-		if !IsTerminalApplyState(children[later].State) {
+		if childHoldsItsTarget(children[later]) {
 			return true
 		}
 	}
