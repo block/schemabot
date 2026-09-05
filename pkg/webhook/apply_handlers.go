@@ -115,6 +115,13 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		h.acknowledgeCommandActPoint(repo, pr, installationID, result)
 	}
 
+	// Read-only reporting for the gates below: when one of them blocks, its
+	// comment also names what is still in the way behind it, so the operator
+	// clears everything in one pass instead of learning the ladder one retry
+	// at a time. It decides nothing — the first blocking gate is still the
+	// command's answer.
+	preflight := h.newApplyPreflight(client, repo, pr, schemaResult, environment)
+
 	if blocked, gateErr := h.enforceOpenPR(ctx, client, repo, pr, installationID, action.Apply, environment, requestedBy, result.SuppressRetryComments); gateErr != nil {
 		return true, fmt.Errorf("apply command open-PR gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
@@ -138,7 +145,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	}
 
 	// Tier 1: review gate (server-owned review policy for this database)
-	if blocked, gateErr := h.enforceReviewGate(ctx, client, repo, pr, installationID, schemaResult, environment, requestedBy, action.Apply, result.SuppressRetryComments); gateErr != nil {
+	if blocked, gateErr := h.enforceReviewGate(ctx, client, repo, pr, installationID, schemaResult, environment, requestedBy, action.Apply, result.SuppressRetryComments, preflight); gateErr != nil {
 		return true, fmt.Errorf("apply command review gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
 		h.logger.Info("apply blocked by review gate", "repo", repo, "pr", pr, "environment", environment, "requested_by", requestedBy)
@@ -154,7 +161,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		}
 		return true, fmt.Errorf("apply command fetch PR for checks gate %s#%d: %w", repo, pr, err)
 	}
-	if blocked, gateErr := h.enforcePassingChecks(ctx, client, repo, pr, installationID, prInfo.HeadSHA, environment, result.SuppressRetryComments); gateErr != nil {
+	if blocked, gateErr := h.enforcePassingChecks(ctx, client, repo, pr, installationID, prInfo.HeadSHA, environment, result.SuppressRetryComments, preflight); gateErr != nil {
 		return true, fmt.Errorf("apply command checks gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
 		return false, nil
@@ -165,7 +172,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	lockOwner := fmt.Sprintf("%s#%d", repo, pr)
 
 	// Environment ordering enforcement: prior server-configured environments must be clean before applying.
-	if blocked, gateErr := h.checkPriorEnvironments(ctx, repo, pr, database, dbType, environment, schemaResult.Environments, installationID, result.SuppressRetryComments); gateErr != nil {
+	if blocked, gateErr := h.checkPriorEnvironments(ctx, repo, pr, database, dbType, environment, schemaResult.Environments, installationID, result.SuppressRetryComments, preflight); gateErr != nil {
 		return true, fmt.Errorf("apply command prior environment gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
 		h.logger.Info("apply blocked by environment ordering", "repo", repo, "pr", pr, "database", database, "environment", environment)
@@ -404,7 +411,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// failure releases the same way — the retryable re-drive (or a user retry)
 	// re-plans from the top and reacquires the lock, so leaving it pinned
 	// would only force the stale-lock release path on the next attempt.
-	if blocked, gateErr := h.enforcePassingChecks(ctx, client, repo, pr, installationID, prInfo.HeadSHA, environment, result.SuppressRetryComments); gateErr != nil {
+	if blocked, gateErr := h.enforcePassingChecks(ctx, client, repo, pr, installationID, prInfo.HeadSHA, environment, result.SuppressRetryComments, nil); gateErr != nil {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "fresh-HEAD checks gate read failure")
 		return true, fmt.Errorf("apply command fresh-HEAD checks gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
@@ -631,6 +638,8 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 		return true, fmt.Errorf("apply-confirm command attach server environments %s#%d: %w", repo, pr, err)
 	}
 
+	confirmPreflight := h.newApplyPreflight(client, repo, pr, schemaResult, environment)
+
 	if blocked, gateErr := h.enforceOpenPR(ctx, client, repo, pr, installationID, action.ApplyConfirm, environment, requestedBy, result.SuppressRetryComments); gateErr != nil {
 		return true, fmt.Errorf("apply-confirm command open-PR gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
@@ -644,7 +653,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	}
 
 	// Tier 1: review gate (re-check on confirm to prevent bypass)
-	if blocked, gateErr := h.enforceReviewGate(ctx, client, repo, pr, installationID, schemaResult, environment, requestedBy, action.ApplyConfirm, result.SuppressRetryComments); gateErr != nil {
+	if blocked, gateErr := h.enforceReviewGate(ctx, client, repo, pr, installationID, schemaResult, environment, requestedBy, action.ApplyConfirm, result.SuppressRetryComments, confirmPreflight); gateErr != nil {
 		return true, fmt.Errorf("apply-confirm command review gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
 		h.logger.Info("apply-confirm blocked by review gate", "repo", repo, "pr", pr, "environment", environment, "requested_by", requestedBy)
@@ -667,7 +676,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 		return true, fmt.Errorf("apply-confirm command fetch PR for checks gate %s#%d: %w", repo, pr, err)
 	}
 
-	if blocked, gateErr := h.enforcePassingChecks(ctx, client, repo, pr, installationID, confirmPRInfo.HeadSHA, environment, result.SuppressRetryComments); gateErr != nil {
+	if blocked, gateErr := h.enforcePassingChecks(ctx, client, repo, pr, installationID, confirmPRInfo.HeadSHA, environment, result.SuppressRetryComments, confirmPreflight); gateErr != nil {
 		return true, fmt.Errorf("apply-confirm command checks gate %s#%d: %w", repo, pr, gateErr)
 	} else if blocked {
 		return false, nil

@@ -118,7 +118,11 @@ func isPassingCheckConclusion(conclusion string) bool {
 // durable driver may re-drive it. suppressRetryComments silences the
 // read-failure comment on durable attempts, where the driver retries and
 // posts the single terminal answer instead; merit blocks always comment.
-func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, headSHA, environment string, suppressRetryComments bool) (blocked bool, err error) {
+//
+// preflight, when non-nil, reports the gates behind this one so a merit block
+// names everything still in the way rather than only the checks. It is
+// advisory: it changes no verdict here and takes no lock.
+func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, headSHA, environment string, suppressRetryComments bool, preflight *applyPreflight) (blocked bool, err error) {
 	config := h.service.Config()
 	if !config.ShouldRequirePassingChecks() {
 		h.logger.Debug("passing checks gate disabled", "repo", repo, "pr", pr)
@@ -169,8 +173,9 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 		h.logger.Info("apply blocked by non-passing PR checks",
 			"repo", repo, "pr", pr, "environment", environment,
 			"not_passing_count", len(notPassing))
-		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByNonPassingChecks(environment, notPassing))
+		h.postComment(repo, pr, installationID, templates.AppendPreflightChecklist(
+			templates.RenderApplyBlockedByNonPassingChecks(environment, notPassing),
+			preflight.rowsAfter(ctx, gatePRChecks)))
 		return true, nil
 	}
 
@@ -180,8 +185,9 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 			"in_progress_count", len(inProgress),
 			"missing_required_count", len(notReported),
 			"missing_required_checks", blockingCheckNames(notReported))
-		h.postComment(repo, pr, installationID,
-			templates.RenderApplyBlockedByInProgressChecks(environment, inProgress, notReported))
+		h.postComment(repo, pr, installationID, templates.AppendPreflightChecklist(
+			templates.RenderApplyBlockedByInProgressChecks(environment, inProgress, notReported),
+			preflight.rowsAfter(ctx, gatePRChecks)))
 		return true, nil
 	}
 
