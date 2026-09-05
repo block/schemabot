@@ -187,7 +187,7 @@ func (p *applyPreflight) probePriorEnvironment(ctx context.Context, priorEnv str
 		if check.Conclusion == checkConclusionSuccess {
 			return templates.PreflightReady, ""
 		}
-		return templates.PreflightBlocked, priorEnv + " is not passing"
+		return templates.PreflightBlocked, priorEnvironmentBlockedDetail(priorEnv, check.Status, check.Conclusion)
 	}
 
 	checkName := aggregateCheckNameForEnv(p.handler.promotionCheckNameForRepo(p.repo), priorEnv)
@@ -201,7 +201,25 @@ func (p *applyPreflight) probePriorEnvironment(ctx context.Context, priorEnv str
 	if checkResult.Status == checkStatusCompleted && checkResult.Conclusion == checkConclusionSuccess {
 		return templates.PreflightReady, ""
 	}
-	return templates.PreflightBlocked, priorEnv + " is not passing"
+	return templates.PreflightBlocked, priorEnvironmentBlockedDetail(priorEnv, checkResult.Status, checkResult.Conclusion)
+}
+
+// priorEnvironmentBlockedDetail names why a prior environment does not satisfy
+// the gate, splitting the reasons along the same lines the gate itself splits
+// them: one still running is something to wait for, a failed one is something
+// to fix, and a planned but unapplied one is something to run. The checklist
+// exists to tell an operator which of those they are looking at, so collapsing
+// them into a single phrase would send someone hunting for a failure in a
+// change that is only mid-flight.
+func priorEnvironmentBlockedDetail(priorEnv, status, conclusion string) string {
+	switch {
+	case status == checkStatusInProgress || status == checkStatusQueued:
+		return priorEnv + " is still running"
+	case conclusion == checkConclusionFailure:
+		return priorEnv + " failed"
+	default:
+		return priorEnv + " has pending changes"
+	}
 }
 
 // probeDatabaseLock reports the two conditions the lock gate blocks on: the

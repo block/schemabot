@@ -161,3 +161,44 @@ func TestApplyPreflightChecklistOnGateRejection(t *testing.T) {
 		assert.NotContains(t, body, "Remaining before this apply can run")
 	})
 }
+
+// The checklist's job on a prior environment is to tell an operator whether to
+// wait or to act, so the reasons the gate itself distinguishes must survive
+// into the row's detail: a change still copying is not a failure, and a plan
+// nobody has applied is neither.
+func TestPriorEnvironmentBlockedDetail(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     string
+		conclusion string
+		want       string
+	}{
+		{
+			name:   "an in-progress check is something to wait for",
+			status: checkStatusInProgress,
+			want:   "staging is still running",
+		},
+		{
+			name:   "a queued check has not started and is still something to wait for",
+			status: checkStatusQueued,
+			want:   "staging is still running",
+		},
+		{
+			name:       "a failed check is something to fix",
+			status:     checkStatusCompleted,
+			conclusion: checkConclusionFailure,
+			want:       "staging failed",
+		},
+		{
+			name:       "anything else is a change nobody has applied yet",
+			status:     checkStatusCompleted,
+			conclusion: checkConclusionActionRequired,
+			want:       "staging has pending changes",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, priorEnvironmentBlockedDetail("staging", tt.status, tt.conclusion))
+		})
+	}
+}

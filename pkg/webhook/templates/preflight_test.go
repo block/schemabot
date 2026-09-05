@@ -40,6 +40,15 @@ func TestAppendPreflightChecklist(t *testing.T) {
 		assert.Contains(t, rendered, "| Database lock | ℹ️ Lock state could not be read |")
 	})
 
+	t.Run("a status the renderer does not recognize never reads as ready", func(t *testing.T) {
+		rendered := AppendPreflightChecklist("## Review Required\n", []PreflightRow{
+			{Gate: "Prior environments", Status: PreflightStatus("something-else")},
+		})
+		assert.Contains(t, rendered, "| Prior environments | ℹ️ Status could not be read |")
+		assert.NotContains(t, rendered, "✅ Ready",
+			"an unrecognized status is uncertainty, and uncertainty must never render as ready")
+	})
+
 	t.Run("the support offer stays last", func(t *testing.T) {
 		body := offerSupportChannel("## Review Required\n\nApprove first.\n")
 		require.Contains(t, body, supportChannelOfferMarker)

@@ -33,12 +33,19 @@ type PreflightRow struct {
 // preflightStatusCell renders a row's status column.
 func preflightStatusCell(row PreflightRow) string {
 	switch row.Status {
+	case PreflightReady:
+		return "✅ Ready"
 	case PreflightBlocked:
 		return glyph.Attention + " " + row.Detail
 	case PreflightUnknown:
 		return glyph.Info + " " + row.Detail
 	default:
-		return "✅ Ready"
+		// A status this renderer does not recognize is uncertainty, and
+		// uncertainty renders as uncertainty. Reading it as ready is the one
+		// wrong answer here: it would send an operator to re-run against a gate
+		// nobody established anything about. The detail is fixed rather than the
+		// row's, which an unrecognized status has no reason to have set.
+		return glyph.Info + " Status could not be read"
 	}
 }
 
