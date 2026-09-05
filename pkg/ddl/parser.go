@@ -112,11 +112,28 @@ type CreateSet struct {
 	Table      string
 }
 
+// StatementType reports the type of Statements[i] as ParseCreateSet admitted
+// it: a lone statement carries its own classification, and every statement
+// after the first in a multi-statement set is a CREATE INDEX, because
+// admission refuses any other shape. Callers read the type from here instead
+// of classifying the statement again.
+func (s CreateSet) StatementType(i int) StatementType {
+	if i == 0 {
+		return s.Type
+	}
+	return StatementCreateIndex
+}
+
 // ParseCreateSet splits and classifies a DDL script, admitting either one
 // statement or a greenfield create set: one CREATE TABLE followed only by
-// CREATE INDEX statements on that same table. Multi-statement create sets are
-// currently a PostgreSQL-parser capability. The MySQL parser does not split
-// multi-statement scripts, so they are refused.
+// CREATE INDEX statements on that same table.
+//
+// Multi-statement create sets are currently a PostgreSQL-parser capability.
+// The MySQL parser's Split reports one entry per statement, but each entry
+// that Spirit does not rewrite carries the whole script's text rather than
+// that statement alone, so the entries cannot be classified one at a time;
+// Classify rejects the first entry as multi-statement input and the script is
+// refused with that cause.
 func ParseCreateSet(p StatementParser, script string) (CreateSet, error) {
 	statements, err := p.Split(script)
 	if err != nil {
@@ -128,10 +145,10 @@ func ParseCreateSet(p StatementParser, script string) (CreateSet, error) {
 
 	firstType, table, err := p.Classify(statements[0])
 	if err != nil && len(statements) == 1 {
-		return CreateSet{}, fmt.Errorf("multi-statement DDL scripts are not supported for this dialect: %w", err)
+		return CreateSet{}, fmt.Errorf("classify DDL statement: %w", err)
 	}
 	if err != nil {
-		return CreateSet{}, fmt.Errorf("split result does not contain individual statements; multi-statement DDL scripts are not supported for this dialect: %w", err)
+		return CreateSet{}, fmt.Errorf("classify statement 1 of %d in multi-statement DDL script: %w", len(statements), err)
 	}
 	result := CreateSet{Statements: statements, Type: firstType, Table: table}
 	if len(statements) == 1 {
@@ -157,28 +174,62 @@ func ParseCreateSet(p StatementParser, script string) (CreateSet, error) {
 		if err != nil {
 			return CreateSet{}, fmt.Errorf("identify statement %d index target: %w", i+2, err)
 		}
+		if indexTarget.qualified() != createTarget.qualified() {
+			return CreateSet{}, fmt.Errorf("statement %d creates an index on %s while CREATE TABLE targets %s; a create set cannot resolve an unqualified name against a search_path, so both must name the schema the same way", i+2, indexTarget, createTarget)
+		}
 		if indexTarget != createTarget {
-			return CreateSet{}, fmt.Errorf("statement %d creates an index on table %q, not CREATE TABLE target %q", i+2, indexTarget, createTarget)
+			return CreateSet{}, fmt.Errorf("statement %d creates an index on table %s, not CREATE TABLE target %s", i+2, indexTarget, createTarget)
 		}
 	}
 	return result, nil
 }
 
-type createSetRelationParser interface {
-	createSetRelation(stmt string) (string, error)
+// relationIdentity is the parsed (schema, name) pair naming a relation. The
+// two parts are compared as a pair, never as one joined string, so a relation
+// whose bare name contains a dot can never be mistaken for a schema-qualified
+// one. Schema is empty when the statement did not qualify the name.
+type relationIdentity struct {
+	Schema string
+	Name   string
 }
 
-func createSetRelation(p StatementParser, stmt, classifiedTable string) (string, error) {
+func (r relationIdentity) qualified() bool { return r.Schema != "" }
+
+// String renders the identity for error messages, quoting each part so that
+// a dot inside a bare name reads differently from a schema qualifier.
+func (r relationIdentity) String() string {
+	if !r.qualified() {
+		return fmt.Sprintf("%q", r.Name)
+	}
+	return fmt.Sprintf("%q.%q", r.Schema, r.Name)
+}
+
+// createSetRelationParser is implemented by a StatementParser whose grammar
+// carries a schema qualifier on CREATE TABLE and CREATE INDEX targets.
+type createSetRelationParser interface {
+	createSetRelation(stmt string) (relationIdentity, error)
+}
+
+// createSetRelation identifies the relation a create-set statement targets.
+// The identity is taken exactly as written — an unqualified name is never
+// resolved against a search_path — so a create set is only admitted when
+// every statement qualifies its target the same way. Every ParseCreateSet
+// caller today hands it plan-emitted DDL, which the planner qualifies
+// uniformly; an operator-authored set that mixes qualified and unqualified
+// names is refused with a message naming that cause rather than guessed at.
+// A parser without a schema-aware seam falls back to Classify's bare table
+// name, which is the whole identity its grammar can express.
+func createSetRelation(p StatementParser, stmt, classifiedTable string) (relationIdentity, error) {
 	if relationParser, ok := p.(createSetRelationParser); ok {
 		return relationParser.createSetRelation(stmt)
 	}
-	return classifiedTable, nil
+	return relationIdentity{Name: classifiedTable}, nil
 }
 
 // CreateSetStatements has the same admission rules as ParseCreateSet. It is
 // retained for callers that need only the split statements. Multi-statement
-// create sets are a PostgreSQL-parser capability; the MySQL parser refuses
-// them because its Split implementation does not separate the statements.
+// create sets are a PostgreSQL-parser capability; see ParseCreateSet for why
+// the MySQL parser refuses them.
 func CreateSetStatements(p StatementParser, script string) ([]string, error) {
 	createSet, err := ParseCreateSet(p, script)
 	if err != nil {

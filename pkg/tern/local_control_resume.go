@@ -450,7 +450,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 				return
 			}
 			continue
-		} else if _, err := c.verifyReplannedTaskDDL(task, replanned); err != nil {
+		} else if _, landed, err := c.verifyReplannedTaskDDL(task, replanned, tasks); err != nil {
 			// The statements this shard now needs no longer include what this
 			// task was reviewed with. Fail closed rather than apply unreviewed
 			// DDL.
@@ -459,6 +459,23 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			c.markTaskFailed(ctx, task, err.Error())
 			failedTask = task
 			break
+		} else if landed {
+			// The table still has pending statements, but every one of them
+			// is the reviewed DDL of a sibling task that is not yet terminal:
+			// this task's own statement executed before its outcome was
+			// recorded. Settle it without re-running the statement; the same
+			// durability rule as the raced-cutover branch above applies.
+			logger.Info("task statement already landed on the table, skipping", task.LogAttrs()...)
+			now := time.Now()
+			task.ProgressPercent = 100
+			task.CompletedAt = &now
+			if err := c.persistTaskStateTransition(ctx, task, apply.ID, state.Task.Completed,
+				fmt.Sprintf("Task %s already completed (its statement landed before its outcome was recorded)", task.TaskIdentifier)); err != nil {
+				logger.Error("resume aborting: persisting a landed-statement task settlement failed; the apply stays active for a later drive to redo the settlement",
+					append(task.LogAttrs(), "error", err)...)
+				return
+			}
+			continue
 		}
 
 		action = c.runEngineTask(ctx, apply, task, options)
@@ -685,9 +702,25 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 			// reviewed with: the re-plan recomputes the delta against live
 			// schema, so on a drifted deployment it can produce unreviewed DDL
 			// that overwriting task.DDL would silently apply.
-			ddl, err := c.verifyReplannedTaskDDL(task, replanned)
+			ddl, landed, err := c.verifyReplannedTaskDDL(task, replanned, tasks)
 			if err != nil {
 				return nil, err
+			}
+			if landed {
+				// The table is still in the diff, but only for the reviewed
+				// DDL of this task's not-yet-terminal siblings: this task's own
+				// statement executed before its outcome was recorded. Settle
+				// it under the same durability rule as the table-absent branch.
+				c.logger.Info("task statement already landed; settling it without re-executing",
+					task.LogAttrs()...)
+				task.ProgressPercent = 100
+				task.CompletedAt = &now
+				if err := c.persistTaskStateTransition(ctx, task, apply.ID, state.Task.Completed,
+					fmt.Sprintf("Task %s already completed (its statement landed before its outcome was recorded)", task.TaskIdentifier)); err != nil {
+					return nil, fmt.Errorf("persist completed state for task %s whose statement landed before its outcome was recorded: %w", task.TaskIdentifier, err)
+				}
+				completedCount++
+				continue
 			}
 			task.DDL = ddl
 			activeTasks = append(activeTasks, task)
@@ -727,54 +760,201 @@ func applyInRevertPhase(apply *storage.Apply) bool {
 // semantic divergence trips the guard.
 //
 // A table can carry several statements, each its own task, so the task's
-// statement is matched among all of the table's re-planned statements. When the
-// table has several and none matches, the resume cannot tell whether this
-// task's statement already landed (leaving only its siblings in the diff) or
-// the deployment drifted; every remaining statement is unreviewed for this task
-// either way, so it is refused with that ambiguity named rather than reported
-// as drift.
+// statement is matched among all of the table's re-planned statements. When
+// none matches, the table's other tasks decide what the absence means. A
+// remaining re-planned statement that is the reviewed DDL of a sibling task
+// still pending is vouched for: it is reviewed plan DDL, not drift, whether or
+// not that sibling ever runs it (a stopped or reverting sibling vouches too).
+// When every remaining statement is vouched for, this task's own statement is
+// the only thing that could have left the diff, so it landed before its
+// outcome was recorded and the task is reported landed with no DDL to run.
+// That settlement rests on the schema evidence alone, not on the siblings.
+// A remaining statement that is the reviewed DDL of a terminal sibling is not
+// drift either, but nothing pending will run it, so the resume refuses and
+// says so without calling it drift. A remaining statement no sibling was
+// reviewed with is drift and is refused. The siblings are the other tasks of
+// the same apply operation that share the task's (namespace, shard, table);
+// the callers pass the task set they are iterating so that a sibling settled
+// earlier in the same pass no longer vouches for a statement.
 //
 // A task with no reviewed DDL carries no reference to compare against (only the
 // legacy synthetic VSchema tasks, which the engine-change builder already
 // skips), so it is left to existing handling with the table's last statement.
-func (c *LocalClient) verifyReplannedTaskDDL(task *storage.Task, replanned []string) (string, error) {
+func (c *LocalClient) verifyReplannedTaskDDL(task *storage.Task, replanned []string, tasks []*storage.Task) (ddl string, landed bool, err error) {
 	if len(replanned) == 0 {
-		return "", fmt.Errorf("task %s: re-plan emitted no statements for its table", task.TaskIdentifier)
+		return "", false, fmt.Errorf("task %s: re-plan emitted no statements for its table", task.TaskIdentifier)
 	}
 	if task.DDL == "" {
-		return replanned[len(replanned)-1], nil
+		return replanned[len(replanned)-1], false, nil
 	}
 	parser, err := c.statementParser()
 	if err != nil {
-		return "", fmt.Errorf("task %s: %w", task.TaskIdentifier, err)
+		return "", false, fmt.Errorf("task %s: %w", task.TaskIdentifier, err)
 	}
 	reviewedCanon, err := canonicalDDLForDrift(parser, task.DDL)
 	if err != nil {
-		return "", fmt.Errorf("reviewed DDL for task %s: %w", task.TaskIdentifier, err)
+		return "", false, fmt.Errorf("reviewed DDL for task %s: %w", task.TaskIdentifier, err)
 	}
 	replannedCanon := make([]string, 0, len(replanned))
-	for _, ddl := range replanned {
-		canon, err := canonicalDDLForDrift(parser, ddl)
+	for _, stmt := range replanned {
+		canon, err := canonicalDDLForDrift(parser, stmt)
 		if err != nil {
-			return "", fmt.Errorf("re-planned DDL for task %s: %w", task.TaskIdentifier, err)
+			return "", false, fmt.Errorf("re-planned DDL for task %s: %w", task.TaskIdentifier, err)
 		}
 		if canon == reviewedCanon {
-			return ddl, nil
+			return stmt, false, nil
 		}
 		replannedCanon = append(replannedCanon, canon)
 	}
+
+	siblings := siblingTasks(task, tasks)
+	// Each pending sibling vouches for one occurrence of its statement, so a
+	// statement the re-plan lists more often than pending siblings were
+	// reviewed with it is still unreviewed.
+	vouchers := make(map[string]int, len(siblings.pending))
+	for _, sibling := range siblings.pending {
+		canon, err := canonicalDDLForDrift(parser, sibling.DDL)
+		if err != nil {
+			return "", false, fmt.Errorf("reviewed DDL for sibling task %s of task %s: %w", sibling.TaskIdentifier, task.TaskIdentifier, err)
+		}
+		vouchers[canon]++
+	}
+	terminalByCanon := make(map[string][]*storage.Task, len(siblings.terminal))
+	for _, sibling := range siblings.terminal {
+		canon, err := canonicalDDLForDrift(parser, sibling.DDL)
+		if err != nil {
+			return "", false, fmt.Errorf("reviewed DDL for terminal sibling task %s of task %s: %w", sibling.TaskIdentifier, task.TaskIdentifier, err)
+		}
+		terminalByCanon[canon] = append(terminalByCanon[canon], sibling)
+	}
+	// A remaining statement is vouched (a pending sibling's reviewed DDL),
+	// orphaned (a terminal sibling's reviewed DDL that nothing pending will
+	// run), or unreviewed (drift). Terminal siblings likewise explain one
+	// occurrence of their statement.
+	var orphaned []*storage.Task
+	unreviewed := make([]string, 0, len(replannedCanon))
+	for _, canon := range replannedCanon {
+		if vouchers[canon] > 0 {
+			vouchers[canon]--
+			continue
+		}
+		if owners, ok := terminalByCanon[canon]; ok {
+			orphaned = append(orphaned, owners...)
+			delete(terminalByCanon, canon)
+			continue
+		}
+		unreviewed = append(unreviewed, canon)
+	}
+	if len(unreviewed) == 0 && len(orphaned) == 0 {
+		return "", true, nil
+	}
+
 	loc := formatDriftLocation(driftChangeKey{
 		namespace: task.Namespace,
 		shard:     task.Shard,
 		table:     task.TableName,
 		operation: task.DDLAction,
 	})
-	if len(replannedCanon) > 1 {
-		return "", fmt.Errorf("re-plan has %d pending statements for %s and none is the reviewed DDL of task %s; resume cannot tell a statement that already landed from drift, so it refuses to apply unreviewed DDL: reviewed %q, re-planned %q",
-			len(replannedCanon), loc, task.TaskIdentifier, reviewedCanon, replannedCanon)
+	if len(unreviewed) == 0 {
+		return "", false, fmt.Errorf("local schema has not drifted from the reviewed plan, but resume cannot run task %s: its reviewed DDL %q is absent from the re-plan for %s while the re-plan still lists the reviewed DDL of %s, which will not run it; resume refuses to run another task's statement in this task's place",
+			task.TaskIdentifier, reviewedCanon, loc, describeTerminalSiblings(orphaned))
 	}
-	return "", fmt.Errorf("local schema has drifted from the reviewed plan; resume would apply unreviewed DDL for %s: reviewed %q, re-planned %q",
-		loc, reviewedCanon, replannedCanon[0])
+	if len(siblings.pending) == 0 && len(orphaned) == 0 && len(unreviewed) == 1 {
+		return "", false, fmt.Errorf("local schema has drifted from the reviewed plan; resume would apply unreviewed DDL for %s: reviewed %q, re-planned %q",
+			loc, reviewedCanon, unreviewed[0])
+	}
+	return "", false, fmt.Errorf("local schema has drifted from the reviewed plan; the re-plan lists %s for %s, including %s that neither task %s nor %s was reviewed with, so resume refuses to apply unreviewed DDL: reviewed %q, unreviewed %q",
+		countOf(len(replannedCanon), "pending statement"), loc, countOf(len(unreviewed), "statement"), task.TaskIdentifier, describePendingSiblings(siblings.pending), reviewedCanon, unreviewed)
+}
+
+// countOf renders a count with its regular-plural noun, e.g. "1 statement" or
+// "2 statements".
+func countOf(n int, noun string) string {
+	if n == 1 {
+		return fmt.Sprintf("1 %s", noun)
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
+}
+
+// describePendingSiblings names the pending sibling tasks for an error message
+// in a form that reads correctly with none, one, or several.
+func describePendingSiblings(siblings []*storage.Task) string {
+	switch len(siblings) {
+	case 0:
+		return "any pending sibling task"
+	case 1:
+		return "its pending sibling task " + siblings[0].TaskIdentifier
+	default:
+		ids := make([]string, len(siblings))
+		for i, sibling := range siblings {
+			ids[i] = sibling.TaskIdentifier
+		}
+		return fmt.Sprintf("its %d pending sibling tasks %s", len(siblings), strings.Join(ids, ", "))
+	}
+}
+
+// describeTerminalSiblings names the terminal sibling tasks whose reviewed DDL
+// the re-plan still lists, with each one's state, so an operator reading the
+// refusal can see which task's outcome to examine.
+func describeTerminalSiblings(siblings []*storage.Task) string {
+	descriptions := make([]string, len(siblings))
+	for i, sibling := range siblings {
+		descriptions[i] = fmt.Sprintf("%s (%s)", sibling.TaskIdentifier, sibling.State)
+	}
+	if len(siblings) == 1 {
+		return "terminal sibling task " + descriptions[0]
+	}
+	return "terminal sibling tasks " + strings.Join(descriptions, ", ")
+}
+
+// tableSiblings partitions a task's siblings by whether they still have their
+// reviewed work to do.
+type tableSiblings struct {
+	// pending siblings are not yet terminal; their reviewed DDL vouches for a
+	// statement still in the re-plan diff.
+	pending []*storage.Task
+	// terminal siblings have already settled; their reviewed DDL explains a
+	// statement still in the re-plan diff without vouching for it.
+	terminal []*storage.Task
+}
+
+// siblingTasks returns the other tasks of the same apply and apply operation
+// that share task's namespace, shard and table, split into pending and
+// terminal. A sibling with no reviewed DDL has nothing to compare against and
+// is left out of both.
+func siblingTasks(task *storage.Task, tasks []*storage.Task) tableSiblings {
+	key := shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}
+	var siblings tableSiblings
+	for _, other := range tasks {
+		if other == task || (task.ID != 0 && other.ID == task.ID) {
+			continue
+		}
+		if other.ApplyID != task.ApplyID || !sameApplyOperation(other.ApplyOperationID, task.ApplyOperationID) {
+			continue
+		}
+		if (shardTableKey{namespace: other.Namespace, shard: other.Shard, table: other.TableName}) != key {
+			continue
+		}
+		if other.DDL == "" {
+			continue
+		}
+		if state.IsTerminalTaskState(other.State) {
+			siblings.terminal = append(siblings.terminal, other)
+			continue
+		}
+		siblings.pending = append(siblings.pending, other)
+	}
+	return siblings
+}
+
+// sameApplyOperation reports whether two tasks belong to the same apply
+// operation; two legacy single-deployment tasks (no operation) count as the
+// same operation.
+func sameApplyOperation(a, b *int64) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
 }
 
 // prepareRetryableTasksForResume queues only the task work that previously

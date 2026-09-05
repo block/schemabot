@@ -54,6 +54,8 @@ wrap_sections() {
                     w = prefix upper_bare suffix
                 } else if (upper_bare == "MYSQL") {
                     w = prefix "MySQL" suffix
+                } else if (upper_bare == "POSTGRESQL") {
+                    w = prefix "PostgreSQL" suffix
                 } else if (upper_bare == "VITESS") {
                     w = prefix "Vitess" suffix
                 } else if (upper_bare == "VSCHEMA") {
