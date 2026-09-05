@@ -841,7 +841,7 @@ func (c *LocalClient) pullSchemaNamespace(ctx context.Context, req *ternv1.PullS
 		return nil, fmt.Errorf("ping database %s namespace %s for schema pull: %w", c.config.Database, namespace, err)
 	}
 
-	tables, err := spirittable.LoadSchemaFromDB(ctx, db, spirittable.WithoutUnderscoreTables, spirittable.WithoutArchiveTables, spirittable.WithStrippedAutoIncrement)
+	tables, err := spirittable.LoadSchemaFromDB(ctx, db, spirittable.WithoutUnderscoreTables, spirittable.WithoutArchiveTables)
 	if err != nil {
 		return nil, fmt.Errorf("load live schema for database %s namespace %s: %w", c.config.Database, namespace, err)
 	}
@@ -849,7 +849,13 @@ func (c *LocalClient) pullSchemaNamespace(ctx context.Context, req *ternv1.PullS
 
 	pulledTables := make(map[string]string, len(tables))
 	for _, tbl := range tables {
-		content, err := pulledSchemaFileContent(namespace, tbl.Name, tbl.Schema)
+		// The auto-increment counter is where this instance's sequence happens
+		// to sit, so it does not belong in a declarative schema file.
+		tableDDL, err := ddl.StripTableAutoIncrement(tbl.Schema)
+		if err != nil {
+			return nil, fmt.Errorf("strip auto-increment counter for database %s namespace %s table %s: %w", c.config.Database, namespace, tbl.Name, err)
+		}
+		content, err := pulledSchemaFileContent(namespace, tbl.Name, tableDDL)
 		if err != nil {
 			return nil, err
 		}
