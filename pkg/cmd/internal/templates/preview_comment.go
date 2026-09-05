@@ -273,6 +273,8 @@ func previewCommentApplyFlowAllOutput() {
 		{"SECOND TABLE CHECKSUMMING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyChecksumming()) }},
 		{"SECOND TABLE POST-CHECKSUM", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPostChecksum()) }},
 		{"THIRD TABLE RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyThirdRunning()) }},
+		// PostgreSQL: several statements on one table, each its own row
+		{"POSTGRESQL: MULTI-STATEMENT TABLE RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentApplyPostgresMultiStatement()) }},
 		// Sharded tables: compact per-shard summary (inline for few, collapsed for many)
 		{"SHARDED: SHARD PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentApplyShardProgress()) }},
 		{"SHARDED: MANY SHARDS (256)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyManyShardProgress()) }},
@@ -310,6 +312,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"SUMMARY: FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryFailed()) }},
 		{"SUMMARY: STOPPED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryStopped()) }},
 		{"SUMMARY: CANCELLED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCancelled()) }},
+		{"SUMMARY: POSTGRESQL MULTI-STATEMENT TABLE FAILED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryPostgresMultiStatementFailed()) }},
 		{"SUMMARY: COMPLETED (LARGE)", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCompletedLarge()) }},
 		{"SUMMARY: VITESS DDL + VSCHEMA", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCompletedVitessDDLWithVSchema()) }},
 		{"SUMMARY: VITESS VSCHEMA ONLY", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryCompletedVitessVSchemaOnly()) }},

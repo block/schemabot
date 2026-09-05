@@ -3555,6 +3555,52 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 </details>
 
 <details>
+<summary><a name="postgresql-multistatement-table-running"></a><strong>Postgresql: Multi-statement Table Running</strong></summary>
+
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress
+
+📊 1/3 complete · 1 running · 1 queued
+
+**Schema `public`**
+
+**`users`**: Running...
+
+```sql
+CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON users USING btree (last_seen_at);
+```
+
+**`sessions`**: ⏳ Queued
+
+```sql
+ALTER TABLE sessions ADD COLUMN payload jsonb;
+```
+
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE users ADD COLUMN last_seen_at timestamptz;
+```
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
 <summary><a name="sharded-shard-progress"></a><strong>Sharded: Shard Progress</strong></summary>
 
 
@@ -4793,6 +4839,48 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ---
 
 This schema change was cancelled and cannot be resumed. Open a new schema change to apply it again.
+
+</details>
+
+<details>
+<summary><a name="summary-postgresql-multistatement-table-failed"></a><strong>Summary: Postgresql Multi-statement Table Failed</strong></summary>
+
+
+## ❌ Schema Change Failed — Staging
+
+<!-- schemabot:offer-support-channel -->
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 3m
+
+*Applied by @jackjackbits at 2026-03-15 14:27:00 UTC*
+
+> ❌ **Error:** table users failed: schema change failed: canceling statement due to lock timeout
+
+1 of 3 statements completed before failure.
+
+### ❌ public
+
+**`users`** — Failed
+```sql
+CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON users USING btree (last_seen_at);
+```
+
+**`users`** — Completed
+```sql
+ALTER TABLE users ADD COLUMN last_seen_at timestamptz;
+```
+
+**`sessions`** — Cancelled
+```sql
+ALTER TABLE sessions ADD COLUMN payload jsonb;
+```
+
+
+---
+
+To retry:
+```
+schemabot apply -e staging
+```
 
 </details>
 

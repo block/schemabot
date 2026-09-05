@@ -16,7 +16,10 @@ import (
 	"github.com/block/schemabot/pkg/ui"
 )
 
-// TableProgressData represents progress for a single table in a PR comment.
+// TableProgressData is one progress row in a PR comment: one task, which runs
+// one DDL statement against one table. A plan with several statements on the
+// same table produces several rows carrying that table's name, so rows are
+// counted by progressUnit rather than assumed to be distinct tables.
 type TableProgressData struct {
 	TaskID          string
 	Namespace       string
@@ -60,6 +63,23 @@ type TableProgressData struct {
 // Vitess "ready_to_complete") as well as canonical task states.
 func TaskStatusReadyForCutover(status string) bool {
 	return state.NormalizeTaskStatus(status) == state.Task.WaitingForCutover
+}
+
+// progressUnit names what one row counts as in the comment's totals. Every row
+// is one DDL statement, so the totals say "table" only while each row is a
+// distinct (namespace, table) — the common MySQL shape, where the planner folds
+// a table's changes into one statement. Once a table contributes several rows,
+// the totals say "statement", so a count never claims more tables than the plan
+// touches.
+func progressUnit(tables []TableProgressData) string {
+	distinct := make(map[string]struct{}, len(tables))
+	for _, t := range tables {
+		distinct[t.Namespace+"\x00"+t.TableName] = struct{}{}
+	}
+	if len(distinct) == len(tables) {
+		return "table"
+	}
+	return "statement"
 }
 
 // countReadyForCutover returns how many tables are parked at the cutover
@@ -443,10 +463,11 @@ func writeCutoverSummary(sb *strings.Builder, tables []TableProgressData) {
 	if total == 0 {
 		return
 	}
+	unit := progressUnit(tables)
 	if ready == total {
-		fmt.Fprintf(sb, "\n**%d/%d** table(s) ready for cutover\n", ready, total)
+		fmt.Fprintf(sb, "\n**%d/%d** %s(s) ready for cutover\n", ready, total, unit)
 	} else {
-		fmt.Fprintf(sb, "\n**%d/%d** table(s) ready for cutover — waiting on %d\n", ready, total, total-ready)
+		fmt.Fprintf(sb, "\n**%d/%d** %s(s) ready for cutover — waiting on %d\n", ready, total, unit, total-ready)
 	}
 }
 
@@ -1357,7 +1378,7 @@ func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, comple
 	}
 
 	if completedCount > 0 {
-		fmt.Fprintf(sb, "\n%d of %d %s completed before failure.\n", completedCount, totalTables, pluralize("table", totalTables))
+		fmt.Fprintf(sb, "\n%d of %d %s completed before failure.\n", completedCount, totalTables, pluralize(progressUnit(data.Tables), totalTables))
 	}
 
 	writeSummaryTableList(sb, data)
@@ -1369,7 +1390,7 @@ func writeSummaryStopped(sb *strings.Builder, data ApplyStatusCommentData, compl
 	writeSummaryMetadata(sb, data)
 
 	if completedCount > 0 {
-		fmt.Fprintf(sb, "\n%d of %d %s completed before stop.\n", completedCount, totalTables, pluralize("table", totalTables))
+		fmt.Fprintf(sb, "\n%d of %d %s completed before stop.\n", completedCount, totalTables, pluralize(progressUnit(data.Tables), totalTables))
 	}
 
 	writeSummaryTableList(sb, data)
@@ -1385,7 +1406,7 @@ func writeSummaryCancelled(sb *strings.Builder, data ApplyStatusCommentData, com
 	writeSummaryMetadata(sb, data)
 
 	if completedCount > 0 {
-		fmt.Fprintf(sb, "\n%d of %d %s completed before cancellation.\n", completedCount, totalTables, pluralize("table", totalTables))
+		fmt.Fprintf(sb, "\n%d of %d %s completed before cancellation.\n", completedCount, totalTables, pluralize(progressUnit(data.Tables), totalTables))
 	}
 
 	writeSummaryTableList(sb, data)
@@ -1496,7 +1517,7 @@ func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentDa
 func completedSummaryDetailsLabel(data ApplyStatusCommentData) string {
 	var parts []string
 	if len(data.Tables) > 0 {
-		parts = append(parts, fmt.Sprintf("%d %s", len(data.Tables), pluralize("table", len(data.Tables))))
+		parts = append(parts, fmt.Sprintf("%d %s", len(data.Tables), pluralize(progressUnit(data.Tables), len(data.Tables))))
 	}
 	if len(data.VSchemaChanges) > 0 {
 		parts = append(parts, fmt.Sprintf("%d VSchema %s", len(data.VSchemaChanges), pluralize("update", len(data.VSchemaChanges))))
@@ -1516,11 +1537,14 @@ func writeCompletedNamespaceSummary(sb *strings.Builder, data ApplyStatusComment
 		return
 	}
 
+	// One unit for the whole comment: a per-namespace choice would let one
+	// line say "tables" and the next "statements" for the same apply.
+	unit := progressUnit(data.Tables)
 	sb.WriteString("Applied by namespace:\n\n")
 	for _, summary := range summaries {
 		var parts []string
 		if summary.tableCount > 0 {
-			parts = append(parts, fmt.Sprintf("%d %s", summary.tableCount, pluralize("table", summary.tableCount)))
+			parts = append(parts, fmt.Sprintf("%d %s", summary.tableCount, pluralize(unit, summary.tableCount)))
 		}
 		if summary.vschemaUpdates > 0 {
 			parts = append(parts, fmt.Sprintf("%d VSchema %s", summary.vschemaUpdates, pluralize("update", summary.vschemaUpdates)))
@@ -1632,6 +1656,7 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 	}
 
 	collapsed := collapseNamespaceGroups && len(data.Tables) > 5
+	unit := progressUnit(data.Tables)
 	// On an unsuccessful apply, each completed table is labeled so the reader
 	// can tell which tables made it before the failure/stop/cancellation.
 	labelCompleted := !state.IsState(data.State, state.Apply.Completed)
@@ -1665,7 +1690,7 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 
 			if groupCollapsed {
 				sb.WriteString("\n<details><summary>")
-				fmt.Fprintf(sb, "%s<strong>%s</strong> (%d tables)</summary>\n\n", emojiPrefix, header, len(g.tables))
+				fmt.Fprintf(sb, "%s<strong>%s</strong> (%d %s)</summary>\n\n", emojiPrefix, header, len(g.tables), pluralize(unit, len(g.tables)))
 			} else {
 				fmt.Fprintf(sb, "\n### %s%s\n\n", emojiPrefix, header)
 			}
