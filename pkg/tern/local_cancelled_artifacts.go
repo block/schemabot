@@ -15,10 +15,20 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/storage"
 )
+
+// cancelledArtifactReleaseTimeout bounds the exclusive hold the release takes on
+// the apply's target. The work under it is a schema lookup, a rename of the copy
+// into quarantine and a drop of the metadata tables, all of which can wait on a
+// metadata lock held by unrelated traffic. The budget is generous enough for that
+// wait and short enough that a target blocked on something else does not hold
+// every apply queued behind it: the hold is what other applies wait on, so an
+// unbounded one turns a stuck cancel into a stalled target.
+const cancelledArtifactReleaseTimeout = 10 * time.Minute
 
 // namespaceArtifacts collects the tables of one schema whose artifacts a
 // release should reclaim, alongside a task from that schema to resolve its
@@ -50,6 +60,9 @@ func (c *LocalClient) releaseCancelledArtifacts(ctx context.Context, eng engine.
 			apply.LogAttrs()...)
 		return nil
 	}
+
+	ctx, cancel := context.WithTimeout(ctx, cancelledArtifactReleaseTimeout)
+	defer cancel()
 
 	return c.storage.Applies().WithExclusiveTarget(ctx, apply, func(ctx context.Context) error {
 		for _, namespace := range slices.Sorted(maps.Keys(byNamespace)) {
@@ -163,8 +176,11 @@ func (c *LocalClient) cancelledArtifactTables(apply *storage.Apply, tasks []*sto
 // schema change needs to know a copy survived it, and why.
 func (c *LocalClient) logSkippedArtifactRelease(ctx context.Context, apply *storage.Apply, err error) {
 	reason := "the release failed"
-	if errors.Is(err, storage.ErrActiveApplyExists) {
+	switch {
+	case errors.Is(err, storage.ErrActiveApplyExists):
 		reason = "another schema change is running against the same target and may own the copy"
+	case errors.Is(err, context.DeadlineExceeded):
+		reason = "the release ran past the time it is allowed to hold the target, so it gave the target back"
 	}
 
 	c.logger.Warn("cancelled schema change left its artifacts on the target",
