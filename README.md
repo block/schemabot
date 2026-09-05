@@ -84,8 +84,8 @@ See [docs/configuration.md](./docs/configuration.md) for setup instructions (loc
 
 ## Docs
 
-General design docs are in the [docs](./docs/) folder. Three are worth reading before you
-put SchemaBot in front of a database you care about:
+General design docs live in the [docs](./docs/) folder. Three good places to start — each
+has a table of contents, so jump straight to the question you came with:
 
 - [docs/invariants.md](./docs/invariants.md) is the registry of runtime safety invariants:
   what must never be false while SchemaBot is running, why each rule matters, where it is
