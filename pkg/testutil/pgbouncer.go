@@ -1,6 +1,7 @@
 package testutil
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"testing"
@@ -50,7 +51,9 @@ func StartPostgresBehindPgBouncer(t *testing.T, database string, mode PgBouncerP
 	nw, err := network.New(ctx)
 	require.NoError(t, err, "failed to create docker network")
 	t.Cleanup(func() {
-		if err := nw.Remove(ctx); err != nil {
+		// The test's context is already cancelled by the time cleanup runs, so
+		// the removal needs one that outlives it or the network is left behind.
+		if err := nw.Remove(context.WithoutCancel(ctx)); err != nil {
 			t.Logf("failed to remove docker network: %v", err)
 		}
 	})
