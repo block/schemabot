@@ -79,13 +79,14 @@ What varies is the scaffolding, never the gates. A change that would be unsafe i
 is unsafe in front of a weekend project too, and it gets refused in both places.
 
 Concretely, the shape SchemaBot runs in should be a choice rather than a prerequisite. A control
-plane on Kubernetes with data planes reaching into networks it cannot. One server process with a
-database behind it. No server at all, just the CLI against a DSN. Or SchemaBot embedded as a library
-inside the application that owns the schema, close enough to run at startup. The first three work
-today, and the fourth is further along than it looks: SchemaBot already embeds as a Go module, and
-there is a test layer whose only job is keeping that startup surface stable when a host binary
-resolves different dependency versions. What is missing is the small end being genuinely small,
-instead of the large deployment with most of it switched off.
+plane on Kubernetes, with separate processes inside each network where the databases actually live,
+so the coordinating server never needs a route to them. One server process with a database behind
+it. No server at all, just the CLI against a DSN. Or SchemaBot embedded as a library inside the
+application that owns the schema, close enough to run at startup. The first three work today, and
+the fourth is further along than it looks: SchemaBot already embeds as a Go module, and there is a
+test layer whose only job is keeping that startup surface stable when a host binary resolves
+different dependency versions. What is missing is the small end being genuinely small, instead of
+the large deployment with most of it switched off.
 
 ![Both ends of the range feed into an identical set of gates: diff against the live database, lint before anything runs, explicit consent to destroy, and uncertainty never passing](../assets/vision-range.svg)
 
@@ -97,12 +98,12 @@ SchemaBot should never quietly become a tool that only works if you happen to us
 
 ![Four interfaces sit above one model: a GitHub pull request, the CLI, an API or agent, and a forge that is not built yet. All of them drive the same loop between the schema files and the live database](../assets/vision-gitops-not-github.svg)
 
-This is the part that is furthest along, because it is already enforced rather than intended. GitHub
-is an interface to SchemaBot, not a dependency of it: CLI and API applies keep working while GitHub
-is down, and a data plane never needs a GitHub App at all. Anything the pull request can do, the CLI
-can do, all of it, down to the destructive-change confirmation and every control operation. A
-fallback that covers most of the surface is not a fallback. And when GitHub is unreachable, SchemaBot
-says so rather than guessing at state.
+This is the part that is furthest along, because it is already enforced rather than intended.
+GitHub is an interface to SchemaBot, not a dependency of it: CLI and API applies keep working while
+GitHub is down, and the process that actually touches your database never needs GitHub credentials
+at all. Anything the pull request can do, the CLI can do, all of it, down to the destructive-change
+confirmation and every control operation. A fallback that covers most of the surface is not a
+fallback. And when GitHub is unreachable, SchemaBot says so rather than guessing at state.
 
 Keep widening that gap. Every feature should get asked the same question before it ships: if this
 only works through a PR comment, it is not finished. Another forge, a CI job, a terminal, or an agent
@@ -116,13 +117,21 @@ stylistic preference. Writing a correct `ALTER` means knowing the current state 
 ordering against every other pending change, and how to undo it. Editing a `CREATE TABLE` file means
 knowing none of that, because the diff engine works all three out.
 
+The file is also the context. Asking what indexes a table has today is a question you answer by
+reading one file, not by replaying every change ever made to it and trusting that none of them landed
+halfway.
+
+![On the left, an ordered pile of change scripts, where answering what indexes exist means replaying all of them in order. On the right, one CREATE TABLE file that states the answer directly, including the unique key on email and the index on created](../assets/vision-agent-context.svg)
+
 That earns SchemaBot the right to be what agents reach for, and it creates two obligations.
 
 **Context.** An agent should be able to read the schema as files, ask what a proposed change would
 actually do against the live database, and get an answer specific enough to act on: this rewrites the
 table, this holds a lock for the duration, this is refused on this engine and here is why. Most of
-that exists today, shaped for a person reading a PR comment. It should be just as available to
-something that is not reading.
+that exists today, but it is shaped for a person: markdown, prose, a table laid out for the eye. An
+agent can read that, and often does, but reading it means parsing a rendering that was never a
+contract and can change whenever someone improves the wording. The same answers should be available
+as structured data.
 
 **Guardrails that do not care who wrote the change.** This is the load-bearing one. What gets applied
 is what was reviewed. Destroying something takes consent given against the plan that is about to run,
@@ -257,8 +266,8 @@ and about engines that can be supported honestly, not about saying yes to everyt
 
 | Property | What already holds | What is missing |
 |---|---|---|
-| Experiment to tier zero | The plan and the gates are identical at any scale. Local mode drives a database straight from a DSN with no data plane, and SchemaBot already embeds as a Go module with a test layer defending that startup surface. | The small end still pays for the large end: a server, storage, and a GitHub App for the PR flow. Embedding is a supported import rather than a supported way to run the whole loop. PostgreSQL, the likeliest engine down there, is early alpha. |
-| GitOps, not GitHub | Enforced rather than intended. Applies work while GitHub is down, the CLI covers the full PR surface, and an outage never invents state. A data plane carries no GitHub credentials. | The merge gate itself is expressed as GitHub Check Runs. No second forge is implemented, so the separation is proven by the CLI rather than by a second integration. |
+| Experiment to tier zero | The plan and the gates are identical at any scale. Local mode drives a database straight from a DSN in a single process, and SchemaBot already embeds as a Go module with a test layer defending that startup surface. | The small end still pays for the large end: a server, storage, and a GitHub App for the PR flow. Embedding is a supported import rather than a supported way to run the whole loop. PostgreSQL, the likeliest engine down there, is early alpha. |
+| GitOps, not GitHub | Enforced rather than intended. Applies work while GitHub is down, the CLI covers the full PR surface, and an outage never invents state. The process that touches your database carries no GitHub credentials. | The merge gate itself is expressed as GitHub Check Runs. No second forge is implemented, so the separation is proven by the CLI rather than by a second integration. |
 | Agents | Declarative files are already an agent-readable source of truth, and every gate is author-agnostic. | No dedicated agent surface. An agent works by reading files and opening a PR, the same as a person, with none of the plan detail available programmatically. |
 | Many agents, one database | Concurrent authors are already serialized: one apply per deployment, provable ownership, and no stale plan ever applies. The merge gate coordinates open changes with no protocol between them. | The coordination is opaque. No readable queue, no machine-readable reason for a block, no expected wait. A blocked caller can only poll. |
 | One database, or ten thousand | The read API answers what is live, what changed, and what is changing. `pull --lint` audits a live schema and `fix-lint` turns a finding into an edit. | All of it is per database. No aggregate query, no grouping by rule across databases, and no way to dispatch one intent to many targets and watch or stop it as one thing. |
