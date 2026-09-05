@@ -46,6 +46,11 @@ jobs:
         continue-on-error: true
         uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # dorny/paths-filter@v3.0.3
         with:
+          # The action's default quantifier ORs the patterns, and '**'
+          # matches every file, so without 'every' this filter reports
+          # code=true on every PR and the docs-only skip never fires.
+          # 'every' ANDs them: code = not markdown and not under docs/.
+          predicate-quantifier: 'every'
           filters: |
             code:
               - '**'
