@@ -28,8 +28,9 @@ import (
 //  3. Progress() - Check current status (poll this)
 //  4. Control operations: Stop/Start/Cutover/Revert/SkipRevert
 //
-// Engines must support resume: if the server restarts mid-schema-change, the engine
-// must be able to resume from where it left off using stored state.
+// Engines must support resume: if the server restarts part-way through a schema
+// change, the engine must be able to resume from where it left off using stored
+// state.
 type Engine interface {
 	// Name returns the engine identifier (e.g., "planetscale", "spirit").
 	Name() string
@@ -75,7 +76,7 @@ type Drainer interface {
 	Drain()
 }
 
-// ShutdownHalter is an optional capability for engines whose schema-change work
+// ShutdownHalter is an optional capability for engines whose schema change work
 // runs inside this process. Such an engine holds resources on the target — for
 // Spirit, an advisory lock on the table it is copying — for exactly as long as
 // its in-process work lives, and that work outlives the drive that started it.
@@ -96,7 +97,7 @@ type ShutdownHalter interface {
 	HaltForShutdown(ctx context.Context) error
 }
 
-// HaltEngineForShutdown brings eng's in-process schema-change work down when it
+// HaltEngineForShutdown brings eng's in-process schema change work down when it
 // has any, and reports whether the engine implements the capability at all. An
 // engine that does not is one whose work is unaffected by this process exiting,
 // so there is nothing to halt and nothing to wait for.
@@ -232,7 +233,7 @@ type CancelledArtifactReleaser interface {
 }
 
 // ReleaseArtifactsRequest names the target and the tables whose cancelled
-// schema-change artifacts should be reclaimed. Tables are the target's own
+// schema change artifacts should be reclaimed. Tables are the target's own
 // table names, not the engine's derived ones — deriving those is the engine's
 // job, because only the engine knows how it names them.
 type ReleaseArtifactsRequest struct {
@@ -599,7 +600,7 @@ type ApplyRequest struct {
 	ResumeState  *ResumeState       // Fresh context or full resume state after restart
 	Credentials  *Credentials       // Resolved credentials (from discovery)
 
-	// Logger is an optional schema-change-scoped logger, already bound with
+	// Logger is an optional logger scoped to this schema change, already bound with
 	// the caller's triage identity (apply id, repo, PR, environment). Engines
 	// use it for every log line about this schema change so engine lines stay
 	// filterable by the same identity as the drive logs. Nil falls back to
@@ -703,7 +704,7 @@ const (
 	// DSN, so SHOW VITESS_MIGRATIONS cannot be queried. This persists for the
 	// whole apply — a target-resolution gap (missing vtgate endpoint).
 	PerShardUnavailableNoVtgateDSN = "no_vtgate_dsn"
-	// PerShardUnavailableNoChangeContext means no schema-change context
+	// PerShardUnavailableNoChangeContext means no schema change context
 	// identifier is known for the deploy yet, so per-shard rows cannot be
 	// correlated to this apply. Transient during setup/recovery.
 	PerShardUnavailableNoChangeContext = "no_change_context"

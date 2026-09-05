@@ -27,6 +27,18 @@ jobs:
       - name: Check docs/*.md Table of Contents freshness
         run: make check-docs-toc
 
+  # Prose terminology (AGENTS.md, Terminology) is most likely to regress in
+  # a docs-only PR, so this runs on every PR too. A single grep; costs
+  # seconds.
+  check-terminology:
+    name: "Terminology"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+      - name: Check that "schema change" is unhyphenated in prose
+        run: make check-terminology
+
   # TEMPLATES.md is generated from the built binary, so this check needs a
   # Go build and runs as its own job rather than slowing the TOC check.
   # It must not use the docs-only skip either: the drift it catches — a

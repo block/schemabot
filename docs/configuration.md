@@ -1528,7 +1528,7 @@ others. Operators can still direct help to a specific deployment with
 
 - **Tenant scoping:** When `tenant` is set, work commands must include a matching
   `--tenant` or `-t` target. Tenant scoping is a webhook ownership filter, not a
-  schema-change state field; untargeted help and invalid-command responses
+  schema change state field; untargeted help and invalid-command responses
   continue through the unscoped-command routing.
 
 - **Per-environment aggregate checks:** Each instance creates its own aggregate check run scoped to its environments (e.g., `SchemaBot (staging)`, `SchemaBot (production)`) instead of the default `SchemaBot` aggregate. Configure branch protection to require both aggregates. Set `github.check-name` when independent SchemaBot gates need distinct visible names; every instance in the same promotion chain should use the same base name.

@@ -19,7 +19,7 @@ import (
 	"github.com/block/schemabot/pkg/psclient"
 )
 
-// A PlanetScale deploy's per-shard progress keys off the Vitess schema-change
+// A PlanetScale deploy's per-shard progress keys off the Vitess schema change
 // context (the `migration_context` column in SHOW VITESS_MIGRATIONS), discovered
 // by diffing the current contexts against a pre-deploy baseline. The baseline is
 // persisted in the deploy operation's engine resume metadata, so a process that
