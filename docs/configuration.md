@@ -143,6 +143,11 @@ environment entry.
 
 ### PostgreSQL `dsn_from` targets
 
+`target_resolver` is the data-plane connection resolver: a server running
+`serve --grpc` receives an opaque execution target over gRPC and resolves it to
+a connection through this inventory, rather than routing logical database names
+through the control plane's `databases` table.
+
 `dsn_from` on a `target_resolver` target supports `type: postgres` in addition
 to `mysql`. The assembled DSN is a libpq URL that always names one database and
 always carries `sslmode=verify-full`.

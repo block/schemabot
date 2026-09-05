@@ -292,7 +292,7 @@ an error asking for a namespace-free DSN or removal of `ignore_namespaces`.
 
 `$ENV` substitution handles physical schema names that vary by *environment*. When names vary by *deployment within one environment* — several regional clusters in the same environment naming the schema `bikeshare_qa`, `bikeshare_eu_qa`, and `bikeshare_us_qa` — one schema directory cannot express the variance, and copying the directory per region would triple the source of truth.
 
-Instead, keep one canonical directory (`bikeshare/`) and map the canonical namespace to each deployment's physical schema on the data-plane target:
+Instead, keep one canonical directory (`bikeshare/`) and map the canonical namespace to each deployment's physical schema on the data-plane target. (`target_resolver` is the gRPC data plane's target-to-connection inventory — see [Configuration](configuration.md) for how targets are defined.)
 
 ```yaml
 target_resolver:
