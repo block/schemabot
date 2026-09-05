@@ -816,16 +816,24 @@ they present no token, so the storage lease predicate that protects every other 
 The pressure to break this comes from rows that genuinely need repair: a task left active under an
 apply that has already settled. That repair is real work, and it belongs to the reaper. The reaper
 is the second writer class rather than an exception to the first: it is elected, it holds its own
-advisory lock, and before it writes a task row it reads that row's operation lease exactly as the
-claim path reads it, taking only rows no driver holds (RC-2). So the two classes exclude each
-other by one mechanism rather than by two that have to be kept in agreement, and a row can still
-be attributed by reading it. A reader's job is to report what is stored, including when what is
-stored is a task that has outlived its apply's verdict (UX-3). *Enforced:* lease predicates on
-every apply and task write, including the reaper's (`unleasedOperationGate`,
-`pkg/storage/internal/sqlstore/apply_operations.go`;
-`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/applies.go`) and a read
-path that builds progress from stored rows without writing them
-(`pkg/api/progress_handlers.go`).
+advisory lock, and before it writes a task row it reads that row's operation lease the way the
+claim path reads one it may take from a peer, taking only rows no driver holds (RC-2). So the two
+classes exclude each other by one mechanism rather than by two that have to be kept in agreement,
+and a row can still be attributed by reading it. A reader's job is to report what is stored,
+including when what is stored is a task that has outlived its apply's verdict (UX-3).
+
+One writer stands outside this: `ExpireRetryable` terminalizes the task rows of an apply whose
+retry budget or recovery freshness has run out, selected by `apply_id` alone under a `FOR UPDATE`
+on the parent. The parent lock serializes it against a driver claiming that apply, but it reads no
+operation lease, so it is the one task write not covered by the sentence above. It is named here
+rather than left for a reader to discover, because an entry that overstates its own coverage is
+what makes the registry unreliable.
+
+*Enforced:* lease predicates on the driver's apply and task writes
+(`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/applies.go`), the
+reaper's task sweeps (`unleasedOperationGate`,
+`pkg/storage/internal/sqlstore/apply_operations.go`), and a read path that builds progress from
+stored rows without writing them (`pkg/api/progress_handlers.go`).
 
 ## Control operations (CO)
 
@@ -1125,11 +1133,17 @@ operation lease may not bump the parent row, so that row can read settled *and* 
 is live. No window on the parent detects that at any length.
 
 What does detect it is the lease that sibling drive holds. For task rows the sweep takes only rows
-whose operation carries no heartbeated lease, read the same way the claim path reads it, so the
-reaper may write a row only where a driver would be allowed to take it from a peer (OW-8). That is
-a mechanism rather than a timing argument, which matters because the alternative signal cannot be
-made sound at any window length: a drive mirrors its task rows every tick, but a remote sync skips
-a stored task the remote stopped reporting, so a row can go quiet while its drive is alive.
+whose operation carries no heartbeated lease, read the way the claim path reads a lease it may take
+from a peer, so the reaper may write a row only where a driver would be allowed to take it (OW-8).
+That is a mechanism rather than a timing argument, which matters because the alternative signal
+cannot be made sound at any window length: a drive mirrors its task rows every tick, but a remote
+sync skips a stored task the remote stopped reporting, so a row can go quiet while its drive is
+alive. The lease is read per operation, so a live deployment holds its own rows without shielding
+an abandoned sibling's.
+
+The gate narrows the race rather than closing it. It is a `NOT EXISTS` with no row lock, asserted
+in both the sweep's read and its guarded write, so what is left is one autocommit statement wide
+instead of the seconds between the two.
 
 A quiescence window sits on top of the lease and decides *when* a row is worth settling rather than
 whether it is safe to. It is the operator's whole recovery budget: a drive's stall bound, plus a

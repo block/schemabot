@@ -1864,14 +1864,29 @@ func strandedParentGate(d Dialect, correlation string, quiescence time.Duration)
 // unleasedOperationGate renders the NOT EXISTS admitting only task rows whose
 // operation no driver currently holds.
 //
-// This is what makes a reaper and a driver mutually exclusive by the same
-// mechanism drivers are mutually exclusive with each other, rather than by a
-// timing argument. A driver takes an operation lease to work an operation and
-// heartbeats it for as long as it lives, and the claim path treats a lease
-// whose heartbeat is older than storage.ApplyLeaseStaleAfter as re-claimable.
-// Reading the lease the same way means a reaper writes a row only where a
-// driver would be allowed to take it, so the two writer classes can never hold
-// the same row at once.
+// This is what separates a reaper from a driver by the same mechanism drivers
+// are separated from each other, rather than by a timing argument. A driver
+// takes an operation lease to work an operation and heartbeats it for as long as
+// it lives, and the claim path treats a lease whose heartbeat is older than
+// storage.ApplyLeaseStaleAfter as re-claimable. Reading the lease the same way
+// means a reaper writes a row only where a driver would be allowed to take it.
+//
+// What that buys is a window, not an impossibility. The gate is a plain
+// NOT EXISTS with no row lock, and the claim path locks apply_operations rather
+// than tasks, so a driver claiming just after the reaper's UPDATE commits is not
+// excluded by anything here. The residual race is the width of one autocommit
+// statement; without the gate it was the width of the whole scan-to-write gap,
+// which is seconds. Both sweeps assert the gate in the guarded write as well as
+// the scan so that gap is not what the write rests on.
+//
+// It reads the lease slightly more strictly than the claim path does, in both
+// directions that matter. It requires an owner, which the claim path's steal arm
+// does not test, so an operation the operation reaper released with a fresh
+// stamp is correctly unowned rather than mistaken for held. It omits the
+// occupying-state filter that freshLeaseCountSQL carries, so a heartbeated lease
+// holds the row whatever state its operation is in. Both departures make the
+// reaper more reluctant to write than a driver is to claim, which is the safe
+// direction when the write is a terminal verdict.
 //
 // It matters most under fan-out, where a live sibling drive holds only an
 // operation lease: the parent apply can be settled and quiet while that drive

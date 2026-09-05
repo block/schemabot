@@ -804,10 +804,10 @@ const strandedActiveTaskReaperLockName = "schemabot_stranded_active_task_reaper"
 // strandedActiveTaskQuiescence is how long a task row must have gone untouched
 // before the sweep settles it. It is measured on the task row, not the parent,
 // because the task row is the one a live drive writes: every tick mirrors its
-// tasks unconditionally, so tasks.updated_at is the drive's liveness signal.
-// The parent applies row is not a substitute — a drive holding only an
-// operation lease is forbidden from bumping it, so it can sit quiet while that
-// drive works.
+// tasks unconditionally, so tasks.updated_at tracks a drive's activity closely
+// enough to say when a row is worth looking at. The parent applies row is not a
+// substitute — a drive holding only an operation lease is forbidden from bumping
+// it, so it can sit quiet while that drive works.
 //
 // Three drive shapes make that unconditional write, and all three say so where
 // they make it: syncAtomicTaskProgress (local grouped drives),
@@ -896,8 +896,8 @@ func (s *taskStore) ReapStrandedActive(ctx context.Context, limit int) ([]*stora
 // touches.
 //
 // The operation the drive holds is what rules that out: the sweep takes only
-// rows whose operation carries no live lease (unleasedOperationGate), which is
-// the same test a driver applies before taking an operation from a peer. On top
+// rows whose operation carries no live lease (unleasedOperationGate), reading
+// that lease the way the claim path reads one it may take from a peer. On top
 // of that it gates on the task's own quiescence, so a row is settled only after
 // the operator's stalled-drive recovery has had its window and left it behind.
 //
@@ -991,9 +991,10 @@ func (s *taskStore) reapStrandedActive(ctx context.Context, limit int) ([]*stora
 //
 // completed_at is stamped because every settled parent state is non-resumable.
 //
-// The write re-asserts the row's state, its quiescence, and the parent gate
-// rather than trusting the sweep's read, so it can never overwrite a row a
-// driver moved — or merely mirrored — after the scan selected it.
+// The write re-asserts the row's state, its quiescence, the parent gate and the
+// operation lease rather than trusting the sweep's read, so it does not
+// overwrite a row a driver moved, mirrored, or claimed after the scan selected
+// it.
 func (s *taskStore) reapStrandedActiveTask(ctx context.Context, task *storage.Task, parent *storage.Apply) (bool, error) {
 	taskState := state.NormalizeState(parent.State)
 	setClause := "state = ?, completed_at = COALESCE(completed_at, NOW())"
