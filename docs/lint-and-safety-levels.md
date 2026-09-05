@@ -28,7 +28,7 @@ From most to least severe:
 |---|---|---|---|---|
 | ⛔ | **Cannot apply** | The engine refuses the statement outright | Always — the apply would fail | None. Rewrite the change |
 | ⚠️ | **Issues** | Unsafe (destructive) changes detected | Yes, until acknowledged | `--allow-unsafe` |
-| ⚙️ | **Direct execution** | Statements that will run as native DDL outside the engine | No — it is a consent disclosure | Confirming the apply consents |
+| ⚙️ | **Direct execution** | Statements that will run as native DDL outside the schema change engine | No — it is a consent disclosure | Confirming the apply consents |
 | 💡 | **Lint Warnings** | Advisory best-practice findings | Never | Not needed |
 
 The first two are safety gates. Direct execution is not a severity — it is a

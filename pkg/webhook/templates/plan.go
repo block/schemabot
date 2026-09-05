@@ -1056,19 +1056,26 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 // direct statement does to the table while it runs is engine-specific — an
 // engine that adopts direct execution adds its own copy here rather than
 // inheriting another engine's semantics.
+//
+// The footer names the schema change engine in full rather than "the engine".
+// It renders directly under a header noun of "native MySQL DDL", so the two
+// sit adjacent: a reader who takes the shorter form for the storage engine
+// gets the claim backwards, since the statement runs inside MySQL and outside
+// SchemaBot. This is the sentence that carries the operator's consent to a
+// change that cannot be reverted, so it spends the words.
 func directConsentCopy(databaseType string, isMySQL bool) (headerNoun, footer string) {
 	// Strata is sharded MySQL: a direct statement there is the same native
 	// MySQL DDL, executed per shard.
 	databaseType = strings.TrimSpace(databaseType)
 	if databaseType == storage.DatabaseTypeMySQL || databaseType == storage.DatabaseTypeStrata || isMySQL {
 		return "native MySQL DDL",
-			"These statements run synchronously outside the engine: writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this."
+			"These statements run synchronously outside the schema change engine: writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this."
 	}
 	// Deliberately conservative fallback for an engine that emits direct
 	// verdicts without registering its own copy above: disclose the broadest
 	// impact rather than understate what the operator is consenting to.
 	return "native DDL",
-		"These statements run synchronously outside the engine: each table is unavailable while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this."
+		"These statements run synchronously outside the schema change engine: each table is unavailable while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this."
 }
 
 // writeDirectChanges writes the section for statements the direct execution
