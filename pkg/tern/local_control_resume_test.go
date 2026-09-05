@@ -99,7 +99,7 @@ func TestVerifyReplannedTaskDDL(t *testing.T) {
 
 	t.Run("matching re-plan passes", func(t *testing.T) {
 		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-		ddl, err := c.verifyReplannedTaskDDL(tk, []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"})
+		ddl, _, err := c.verifyReplannedTaskDDL(tk, []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"}, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ddl)
 	})
@@ -108,7 +108,7 @@ func TestVerifyReplannedTaskDDL(t *testing.T) {
 		// Unquoted identifiers and extra whitespace canonicalize to the same form
 		// as the reviewed DDL, so they are not drift.
 		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-		ddl, err := c.verifyReplannedTaskDDL(tk, []string{"ALTER TABLE   users   ADD COLUMN email varchar(255)"})
+		ddl, _, err := c.verifyReplannedTaskDDL(tk, []string{"ALTER TABLE   users   ADD COLUMN email varchar(255)"}, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "ALTER TABLE   users   ADD COLUMN email varchar(255)", ddl, "the re-planned text is what the task will run")
 	})
@@ -117,7 +117,7 @@ func TestVerifyReplannedTaskDDL(t *testing.T) {
 		// The deployment drifted: the re-plan would apply a different column type
 		// than the one reviewed. This unreviewed DDL must be refused.
 		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-		_, err := c.verifyReplannedTaskDDL(tk, []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(100)"})
+		_, _, err := c.verifyReplannedTaskDDL(tk, []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(100)"}, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "drifted from the reviewed plan")
 		assert.Contains(t, err.Error(), "commerce[-80].users/alter")
@@ -128,34 +128,118 @@ func TestVerifyReplannedTaskDDL(t *testing.T) {
 		// one, in different formatting. It must resolve to its own statement,
 		// not the table's first or last.
 		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-		ddl, err := c.verifyReplannedTaskDDL(tk, []string{
+		ddl, _, err := c.verifyReplannedTaskDDL(tk, []string{
 			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
 			"ALTER TABLE users ADD COLUMN email varchar(255)",
 			"ALTER TABLE `users` ADD INDEX (`email`)",
-		})
+		}, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "ALTER TABLE users ADD COLUMN email varchar(255)", ddl)
 	})
 
-	t.Run("no match among several statements fails closed naming the ambiguity", func(t *testing.T) {
-		// The table still has pending statements but none is this task's. That
-		// is either this statement having already landed or drift; the resume
-		// cannot tell, so it refuses without calling it drift.
+	sibling := func(id, reviewed, taskState string) *storage.Task {
+		s := task(reviewed)
+		s.TaskIdentifier = id
+		s.State = taskState
+		return s
+	}
+
+	t.Run("no match with no pending siblings is drift", func(t *testing.T) {
+		// The table still has pending statements, none is this task's, and no
+		// other pending task was reviewed with them either: unreviewed DDL.
 		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-		_, err := c.verifyReplannedTaskDDL(tk, []string{
+		_, landed, err := c.verifyReplannedTaskDDL(tk, []string{
 			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
 			"ALTER TABLE `users` ADD INDEX (`name`)",
-		})
+		}, []*storage.Task{tk})
 		require.Error(t, err)
+		assert.False(t, landed)
+		assert.Contains(t, err.Error(), "drifted from the reviewed plan")
 		assert.Contains(t, err.Error(), "re-plan has 2 pending statements for commerce[-80].users/alter")
-		assert.Contains(t, err.Error(), "task_abc123")
-		assert.Contains(t, err.Error(), "cannot tell a statement that already landed from drift")
-		assert.NotContains(t, err.Error(), "drifted from the reviewed plan")
+		assert.Contains(t, err.Error(), "2 of them were reviewed by neither task task_abc123 nor its 0 pending sibling task(s)")
+	})
+
+	t.Run("statement absent while pending siblings vouch for every remaining statement is landed", func(t *testing.T) {
+		// The table still has two pending statements and neither is this
+		// task's, but both are the reviewed DDL of sibling tasks that have not
+		// run yet. The only statement that can have left the diff is this
+		// task's own, so it landed and there is nothing to run.
+		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		siblings := []*storage.Task{
+			tk,
+			sibling("task_name", "ALTER TABLE users ADD COLUMN name varchar(255)", state.Task.Stopped),
+			sibling("task_idx", "ALTER TABLE `users` ADD INDEX (`name`)", state.Task.Pending),
+		}
+		ddl, landed, err := c.verifyReplannedTaskDDL(tk, []string{
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+			"ALTER TABLE `users` ADD INDEX (`name`)",
+		}, siblings)
+		require.NoError(t, err)
+		assert.True(t, landed)
+		assert.Empty(t, ddl, "a landed task has no statement to run")
+	})
+
+	t.Run("a terminal sibling cannot vouch for a remaining statement", func(t *testing.T) {
+		// The sibling whose DDL is still in the diff is already completed, so
+		// its statement should not be pending: no pending task was reviewed
+		// with it, and that is drift.
+		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		siblings := []*storage.Task{
+			tk,
+			sibling("task_name", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", state.Task.Completed),
+		}
+		_, landed, err := c.verifyReplannedTaskDDL(tk, []string{
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+		}, siblings)
+		require.Error(t, err)
+		assert.False(t, landed)
+		assert.Contains(t, err.Error(), "drifted from the reviewed plan")
+		assert.Contains(t, err.Error(), "commerce[-80].users/alter")
+	})
+
+	t.Run("one unvouched statement among vouched siblings is drift, not landed", func(t *testing.T) {
+		// Two statements remain: one is a pending sibling's, the other was
+		// reviewed by nobody. The task's own statement may well have landed,
+		// but the diff also carries unreviewed DDL, so the resume refuses.
+		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		siblings := []*storage.Task{
+			tk,
+			sibling("task_name", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", state.Task.Stopped),
+		}
+		_, landed, err := c.verifyReplannedTaskDDL(tk, []string{
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+			"ALTER TABLE `users` ADD COLUMN `nickname` varchar(255)",
+		}, siblings)
+		require.Error(t, err)
+		assert.False(t, landed)
+		assert.Contains(t, err.Error(), "drifted from the reviewed plan")
+		assert.Contains(t, err.Error(), "re-plan has 2 pending statements for commerce[-80].users/alter")
+		assert.Contains(t, err.Error(), "1 of them were reviewed by neither task task_abc123 nor its 1 pending sibling task(s)")
+		assert.Contains(t, err.Error(), "nickname")
+		assert.NotContains(t, err.Error(), "`name`", "the vouched statement is not reported as unreviewed")
+	})
+
+	t.Run("siblings on another shard or operation do not vouch", func(t *testing.T) {
+		// Same table name, but the other tasks belong to a different shard and
+		// a different apply operation. Neither shares this task's scope, so
+		// the remaining statement is unreviewed here.
+		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		otherShard := sibling("task_shard", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", state.Task.Stopped)
+		otherShard.Shard = "80-"
+		otherOp := sibling("task_op", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", state.Task.Stopped)
+		opID := int64(7)
+		otherOp.ApplyOperationID = &opID
+		_, landed, err := c.verifyReplannedTaskDDL(tk, []string{
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+		}, []*storage.Task{tk, otherShard, otherOp})
+		require.Error(t, err)
+		assert.False(t, landed)
+		assert.Contains(t, err.Error(), "drifted from the reviewed plan")
 	})
 
 	t.Run("no re-planned statements is an error", func(t *testing.T) {
 		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-		_, err := c.verifyReplannedTaskDDL(tk, nil)
+		_, _, err := c.verifyReplannedTaskDDL(tk, nil, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "re-plan emitted no statements")
 	})
@@ -164,14 +248,14 @@ func TestVerifyReplannedTaskDDL(t *testing.T) {
 		// Only legacy synthetic VSchema tasks carry no reviewed DDL; they have no
 		// reference to compare against and are handled downstream, not here.
 		tk := task("")
-		ddl, err := c.verifyReplannedTaskDDL(tk, []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"})
+		ddl, _, err := c.verifyReplannedTaskDDL(tk, []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"}, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ddl)
 	})
 
 	t.Run("unparseable re-planned DDL fails closed", func(t *testing.T) {
 		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-		_, err := c.verifyReplannedTaskDDL(tk, []string{"this is not valid sql"})
+		_, _, err := c.verifyReplannedTaskDDL(tk, []string{"this is not valid sql"}, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "re-planned DDL for task task_abc123")
 	})
@@ -234,7 +318,7 @@ func TestTableStillNeedsChange_ReturnsReplannedDDL(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, needsChange)
 	assert.Equal(t, []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"}, replanned)
-	_, err = c.verifyReplannedTaskDDL(task, replanned)
+	_, _, err = c.verifyReplannedTaskDDL(task, replanned, []*storage.Task{task})
 	require.NoError(t, err, "matching re-plan is not drift")
 }
 
@@ -303,7 +387,7 @@ func TestTableStillNeedsChange_DriftFailsClosed(t *testing.T) {
 	replanned, needsChange, err := c.tableStillNeedsChange(t.Context(), apply, plan, task)
 	require.NoError(t, err)
 	require.True(t, needsChange)
-	_, err = c.verifyReplannedTaskDDL(task, replanned)
+	_, _, err = c.verifyReplannedTaskDDL(task, replanned, []*storage.Task{task})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "drifted from the reviewed plan")
 	assert.Contains(t, err.Error(), "testapp.users/alter")
@@ -564,6 +648,61 @@ func TestReplanAndFilterTasks_SettledTaskPersistsCompleted(t *testing.T) {
 	assert.EqualValues(t, 100, tasks[0].ProgressPercent)
 	assert.NotNil(t, tasks[0].CompletedAt)
 	assert.True(t, hasLogMessageContaining(logs.logs, "Task task_1 already completed (live schema matches the reviewed target)"),
+		"a landed settlement records its transition in the apply's durable log")
+}
+
+// A multi-statement table whose driver crashed after executing one statement
+// but before recording its outcome resumes with that statement gone from the
+// re-plan diff while its sibling statements remain. Because every remaining
+// statement is the reviewed DDL of a sibling task that has not run, the
+// re-plan settles the landed task completed without re-executing it and keeps
+// only the siblings active, each on its own reviewed statement.
+func TestReplanAndFilterTasks_LandedStatementSettlesCompleted(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	remaining := &engine.PlanResult{
+		Changes: []engine.SchemaChange{{
+			Namespace: "testapp",
+			TableChanges: []engine.TableChange{
+				{Table: "users", Operation: ddl.StatementAlterTable, DDL: "ALTER TABLE `users` ADD COLUMN `name` varchar(255)"},
+				{Table: "users", Operation: ddl.StatementAlterTable, DDL: "ALTER TABLE `users` ADD INDEX (`name`)"},
+			},
+		}},
+	}
+	c := newPlanMaterializeClientWithPlan(store, remaining)
+	logs := &mockApplyLogStore{}
+	c.storage = &exactProgressStorage{plans: store, tasks: &exactProgressTaskStore{}, logs: logs}
+
+	apply := &storage.Apply{ID: 21, ApplyIdentifier: "apply-replan-landed", Database: "testapp"}
+	usersTask := func(id, reviewed string) *storage.Task {
+		return &storage.Task{
+			TaskIdentifier: id,
+			Namespace:      "testapp",
+			TableName:      "users",
+			DDLAction:      "alter",
+			DDL:            reviewed,
+			State:          state.Task.Stopped,
+		}
+	}
+	tasks := []*storage.Task{
+		usersTask("task_email", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"),
+		usersTask("task_name", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)"),
+		usersTask("task_idx", "ALTER TABLE `users` ADD INDEX (`name`)"),
+	}
+
+	rp, err := c.replanAndFilterTasks(t.Context(), apply, tasks, &storage.Plan{})
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), rp.CompletedCount)
+	require.Len(t, rp.ActiveTasks, 2)
+	assert.Equal(t, "task_name", rp.ActiveTasks[0].TaskIdentifier)
+	assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", rp.ActiveTasks[0].DDL)
+	assert.Equal(t, "task_idx", rp.ActiveTasks[1].TaskIdentifier)
+	assert.Equal(t, "ALTER TABLE `users` ADD INDEX (`name`)", rp.ActiveTasks[1].DDL)
+
+	assert.True(t, state.IsState(tasks[0].State, state.Task.Completed),
+		"the task whose statement landed is settled completed, got %s", tasks[0].State)
+	assert.EqualValues(t, 100, tasks[0].ProgressPercent)
+	assert.NotNil(t, tasks[0].CompletedAt)
+	assert.True(t, hasLogMessageContaining(logs.logs, "Task task_email already completed (its statement landed before its outcome was recorded)"),
 		"a landed settlement records its transition in the apply's durable log")
 }
 
