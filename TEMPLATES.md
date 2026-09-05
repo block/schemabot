@@ -3555,7 +3555,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 </details>
 
 <details>
-<summary><a name="postgresql-multistatement-table-running"></a><strong>Postgresql: Multi-statement Table Running</strong></summary>
+<summary><a name="postgresql-multistatement-table-running"></a><strong>PostgreSQL: Multi-statement Table Running</strong></summary>
 
 
 ## Schema Change Status — Staging
@@ -4843,7 +4843,7 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 </details>
 
 <details>
-<summary><a name="summary-postgresql-multistatement-table-failed"></a><strong>Summary: Postgresql Multi-statement Table Failed</strong></summary>
+<summary><a name="summary-postgresql-multistatement-table-failed"></a><strong>Summary: PostgreSQL Multi-statement Table Failed</strong></summary>
 
 
 ## ❌ Schema Change Failed — Staging
