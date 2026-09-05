@@ -40,16 +40,43 @@ break.
 
 ## Why the schema ships before the code
 
-Applying from the PR buys four things that deploy-time schema changes cannot:
+One fact forces the order: **a schema change can take weeks, and the pipeline
+must never wait for it.** An online change to a large table copies every row
+at whatever pace the database can spare, and on a busy multi-terabyte table
+that is days or weeks, not minutes. If that copy were a step in the deploy,
+every release behind it would queue, the pipeline's timeout would become the
+schema change's deadline, and a copy that throttled itself under load would
+read as a stuck deploy. Applied from the open PR, the copy runs for as long as
+the database needs while the rest of the team keeps merging and deploying
+around it. CI and the deploy pipeline never see a DDL step at all. The deploy
+that eventually follows is an ordinary code deploy.
+
+Everything else follows from taking DDL out of the deploy path:
 
 - **Merge means agreement.** The required check turns green only when every
   planned change is live in every environment. Merging records a desired state
   that the databases already run. Nothing is left to happen later, so nothing
   can happen differently later.
-- **The change is decoupled from the deploy.** A large online copy can run for
-  hours or days while the PR sits open. The deploy that follows is an ordinary
-  code deploy, with no DDL in its critical path and no rollout waiting on a row
-  copy.
+- **Deploys stay rollback-safe.** A code deploy rolls back in seconds; a schema
+  change does not. With the schema already live and additive, rolling back the
+  code leaves a schema that older code ignores, so a bad release is a code
+  rollback, not an incident with a half-altered table, and the deploy pipeline
+  never has to reason about undoing DDL.
+- **Failures land in the PR, not in a release.** DDL that runs at deploy time
+  fails in production, part-way through a rollout, with nobody watching for
+  it. Applied from the PR, it fails as a comment while the author is looking,
+  before anything has merged, and the fix is another commit. The check stays
+  red until the change is live.
+- **Some changes truly need operator control.** An apply is a long-lived,
+  observable operation, not a line in a deploy script. It throttles itself
+  when the database is under load, streams progress into the PR, and can be
+  stopped, resumed, cut over, or cancelled from the PR or the CLI. The one
+  moment a row copy touches the application is the final table swap, so on a
+  busy table an operator starts the apply with `--defer-cutover`, lets the
+  copy finish on its own schedule, and triggers the swap in a quiet window of
+  their choosing. The same control keeps a change parked through a code
+  freeze, a holiday, or a Friday, with the copy done and the swap waiting.
+  None of that exists for DDL inside a deploy.
 - **The PR is the review surface and the audit trail.** SchemaBot posts the
   exact DDL it will run as a comment, the apply is a comment from a named
   person, progress streams into the timeline, and the terminal summary lands
@@ -59,6 +86,14 @@ Applying from the PR buys four things that deploy-time schema changes cannot:
   gained schema changes after it diverged is refused at apply time and asked
   to rebase. The mechanics are in
   [Applies happen before merge](#applies-happen-before-merge).
+- **Old and new code run against one schema.** A rolling deploy runs two
+  versions of the code at once, and a schema that predates both is the only
+  one both can trust. Applying ahead of the code makes that the default shape
+  of every change, rather than a discipline each author has to remember.
+- **The application never needs DDL privileges.** Schema changes run through
+  SchemaBot's own credentials, so application users and deploy pipelines can
+  be granted data access alone. A compromised service or pipeline cannot alter
+  a table.
 
 The order has one requirement: the change has to be safe to run ahead of the
 code that uses it. Adding a column, a table, or an index is invisible to code
