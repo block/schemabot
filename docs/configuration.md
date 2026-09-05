@@ -611,7 +611,7 @@ databases:
     type: mysql
     environments:
       staging:
-        dsn_secret_ref: "..."
+        dsn: "file:/run/secrets/payments-staging-dsn"
         direct_execution:
           enabled: true           # default: false
           max_table_rows: 100000  # required (positive) when enabled

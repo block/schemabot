@@ -219,8 +219,11 @@ See [namespaces](./namespaces.md) for the schema directory and namespace layout.
 
 ### Onboarding a schema directory
 
-To onboard an existing declarative schema directory, add a `schemabot.yaml` file
-next to the SQL files or namespace subdirectories it owns:
+`schemabot onboard` generates a schema directory from a live pull — `schemabot.yaml`,
+namespace subdirectories, and one `.sql` file per table — so onboarding usually starts
+there rather than with hand-written files. To onboard an existing declarative schema
+directory, add a `schemabot.yaml` file next to the SQL files or namespace
+subdirectories it owns:
 
 ```yaml
 database: widgets

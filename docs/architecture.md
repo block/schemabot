@@ -190,7 +190,8 @@ When applying, users can pass options that control execution:
 | Option | Effect |
 |---|---|
 | `--defer-cutover` | Pause before the final table swap. User must manually trigger cutover. |
-| `--enable-revert` | Keep a revert window open after cutover (Vitess only). User can roll back. |
+| `--defer-deploy` | Hold the change before any work starts until manually started (Vitess only). |
+| `--skip-revert` | Skip the revert window that normally opens after cutover (Vitess only), finalizing the change immediately. |
 | `--allow-unsafe` | Permit destructive changes (see [Unsafe Changes](#unsafe-changes) below). |
 
 ### Unsafe Changes
@@ -827,9 +828,10 @@ VSchema updates are never modelled as task rows — a task row represents table 
 
 | Flags | Behavior |
 |---|---|
-| (none) | DDLs run → auto-cutover → auto-skip revert → completed |
-| `--defer-cutover` | DDLs run → pause at waiting for cutover → user triggers cutover → completed |
-| `--defer-cutover --enable-revert` | DDLs run → pause → user triggers cutover → revert window → user reverts or skips → completed |
+| (none) | DDLs run → auto-cutover → revert window (expires on its own) → completed |
+| `--skip-revert` | DDLs run → auto-cutover → completed, with no revert window |
+| `--defer-cutover` | DDLs run → pause at waiting for cutover → user triggers cutover → revert window → user reverts, skips, or lets it expire → completed |
+| `--defer-deploy` | Held at waiting for deploy → user starts the deploy → then as one of the rows above |
 
 ### Integration Modes
 

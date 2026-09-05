@@ -37,6 +37,10 @@ SchemaBot uses **namespaces** to organize declarative schema files. A namespace 
 
 The schema directory is the source of truth. Each subdirectory is a namespace containing SQL files and optional configuration.
 
+`schemabot onboard -d <database> -e <environment> -s <schema-dir>` generates any of the layouts
+below from a live pull of the source environment, so you rarely author one by hand — the examples
+here are what it produces and what you maintain afterwards.
+
 ### MySQL — Single schema name
 
 The simplest case. One database, one schema name:
