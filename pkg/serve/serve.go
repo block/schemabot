@@ -1062,7 +1062,7 @@ func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups, opera
 			return nil, err
 		}
 		if len(adminGroups) == 0 {
-			logger.Warn("OIDC authentication enabled with no admin groups configured: all write operations will be denied (read and plan still work). Set pr_command_authorization.admin_teams to allow writes.")
+			logger.Warn("OIDC authentication enabled with no admin groups configured: every write-tier operation, plan included, will be denied; read-tier operations still work. Set pr_command_authorization.admin_teams to allow writes.")
 		}
 		logger.Info("OIDC authentication enabled", "issuer", cfg.Issuer)
 		return authz, nil
