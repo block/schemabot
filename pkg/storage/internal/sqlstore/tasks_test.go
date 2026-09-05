@@ -1661,3 +1661,65 @@ func TestTaskStore_ReapStrandedActive_ReapsTaskWhoseOperationHasNoLeaseOwner(t *
 	require.Len(t, settled, 1, "an unowned operation holds nothing, whatever its timestamp says")
 	assertTaskState(t, store, task.TaskIdentifier, state.Task.Failed)
 }
+
+// The gate is asserted on the scan as well as on the guarded write, so a leased
+// row never spends the sweep's limit. Asserting it only on the write would
+// produce the same outcome per row and hide that: the scan would fill its budget
+// with rows the write then refuses, leaving a genuinely stranded row behind them
+// for a later pass.
+func TestTaskStore_ReapStrandedActive_LeasedRowDoesNotSpendTheScanLimit(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_active_budget_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_active_budget", 1, state.Apply.Failed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedActiveParentQuiescence+time.Minute)
+
+	held := leasedOperationFor(t, store, parent, "region-a")
+	abandoned := leasedOperationFor(t, store, parent, "region-b")
+	backdateOperationHeartbeat(t, abandoned, storage.ApplyLeaseStaleAfter+time.Minute)
+
+	// The leased row is created first, so the sweep's created_at, id ordering
+	// offers it before the stranded one.
+	live := createRetryableReapTask(t, store, parent, "task_reap_budget_live", "users", state.Task.Running, "")
+	attachTaskToOperation(t, live.TaskIdentifier, held)
+	backdateTaskUpdatedAt(t, live.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
+
+	stranded := createRetryableReapTask(t, store, parent, "task_reap_budget_stranded", "orders", state.Task.Running, "")
+	attachTaskToOperation(t, stranded.TaskIdentifier, abandoned)
+	backdateTaskUpdatedAt(t, stranded.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
+
+	settled, err := store.tasks.reapStrandedActive(ctx, 1)
+	require.NoError(t, err)
+	require.Len(t, settled, 1, "the scan skips the leased row rather than spending its one slot on it")
+	assert.Equal(t, stranded.TaskIdentifier, settled[0].Task.TaskIdentifier)
+	assertTaskState(t, store, live.TaskIdentifier, state.Task.Running)
+}
+
+// The retryable sweep's scan carries the gate for the same reason.
+func TestTaskStore_ReapStrandedRetryable_LeasedRowDoesNotSpendTheScanLimit(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_retryable_budget_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_retryable_budget", 1, state.Apply.Completed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedRetryableQuiescence+time.Minute)
+
+	held := leasedOperationFor(t, store, parent, "region-a")
+	abandoned := leasedOperationFor(t, store, parent, "region-b")
+	backdateOperationHeartbeat(t, abandoned, storage.ApplyLeaseStaleAfter+time.Minute)
+
+	live := createRetryableReapTask(t, store, parent, "task_reap_rbudget_live", "users", state.Task.FailedRetryable, "copy failed")
+	attachTaskToOperation(t, live.TaskIdentifier, held)
+
+	stranded := createRetryableReapTask(t, store, parent, "task_reap_rbudget_stranded", "orders", state.Task.FailedRetryable, "copy failed")
+	attachTaskToOperation(t, stranded.TaskIdentifier, abandoned)
+
+	settled, err := store.tasks.reapStrandedRetryable(ctx, 1)
+	require.NoError(t, err)
+	require.Len(t, settled, 1, "the scan skips the leased row rather than spending its one slot on it")
+	assert.Equal(t, stranded.TaskIdentifier, settled[0].Task.TaskIdentifier)
+	assertTaskState(t, store, live.TaskIdentifier, state.Task.FailedRetryable)
+}
