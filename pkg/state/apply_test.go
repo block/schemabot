@@ -499,7 +499,7 @@ func TestDeriveRolloutApplyState_NoFailureMatchesBase(t *testing.T) {
 // base case: continue holds the apply active until siblings settle, while halt
 // and unrecognized policies fail closed to the failed verdict. Failing closed
 // decides the verdict, not when it is recorded — a fail-closed policy refuses
-// new claims and cancels nothing, so a sibling a driver already started still
+// new claims and cancels nothing, so a sibling that a driver already started still
 // holds the apply degraded, while a sibling that is only pending holds nothing.
 // The pause policy has its own truth table in
 // TestDeriveRolloutApplyState_PausePolicy.

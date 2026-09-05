@@ -480,6 +480,20 @@ func aggregateLabel(s string) string {
 	}
 }
 
+// failsClosed reports whether a terminal failure of this deployment forces the
+// rollout's verdict rather than being absorbed by the deployment's own
+// on_failure policy. Continue and pause absorb it; halt and any unrecognized
+// policy fail closed, as does the invalid combination of both flags, so a
+// caller bug cannot loosen what an operator is told by winning the continue
+// branch. This mirrors the policy precedence in state.DeriveRolloutApplyState,
+// which decides the aggregate state the same failure produces.
+func (o Operation) failsClosed() bool {
+	if o.ContinueOnFailure && o.PauseOnFailure {
+		return true
+	}
+	return !o.continuesPastFailure() && !o.pausesOnFailure()
+}
+
 // hasFailClosedFailure reports whether a terminally failed deployment is fail
 // closed under its own policy. Such a failure is already the rollout's verdict
 // and nothing that has not started will start, so it is what an operator should
@@ -491,7 +505,7 @@ func hasFailClosedFailure(ops []Operation) bool {
 		if !state.IsState(op.State, state.ApplyOperation.Failed) {
 			continue
 		}
-		if !op.continuesPastFailure() && !op.pausesOnFailure() {
+		if op.failsClosed() {
 			return true
 		}
 	}
@@ -505,8 +519,8 @@ func nextAction(aggState string, deps []Deployment, failClosed bool) NextAction 
 	// A fail-closed rollout: review the failure before anything else, even if an
 	// earlier deployment is sitting ready for cutover. The aggregate can still
 	// read running while that verdict settles, because refusing new claims does
-	// not stop a sibling a driver already started, so the failure rather than the
-	// aggregate is what says there is nothing left to wait for.
+	// not stop a sibling that a driver already started, so the failure rather
+	// than the aggregate is what says there is nothing left to wait for.
 	if aggState == state.Apply.Failed || failClosed {
 		if d, ok := firstWithState(deps, state.ApplyOperation.Failed); ok {
 			return NextAction{Kind: NextActionReviewFailure, Deployment: d.Deployment}

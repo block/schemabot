@@ -421,7 +421,7 @@ func classifyOperationTasks(tasks []*storage.Task) (operationID int64, usesModel
 // Under on_failure "continue" a terminal-failed sibling does not terminalize the
 // apply while other siblings are still in flight: the apply is held running until
 // the rollout settles, then takes the failed verdict. Every other policy fails
-// closed on the verdict, and still holds the apply while a sibling a driver
+// closed on the verdict, and still holds the apply while a sibling that a driver
 // already started is working, since refusing new claims does not stop it.
 //
 // Invariant: applies.state is the rollout projection over all operations of the

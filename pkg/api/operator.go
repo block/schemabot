@@ -2358,7 +2358,7 @@ func (s *Service) persistOperationState(ctx context.Context, driverID int, op *s
 // reopen a terminal-failed parent apply back to running when the rollout
 // projection legitimately holds it active: under on_failure "continue" because
 // later siblings still get their turn, and under a fail-closed policy because a
-// sibling a driver already started is still working.
+// sibling that a driver already started is still working.
 //
 // The reopen write is only safe when the caller holds the parent apply lease:
 // reviving a failed parent through an unscoped, last-write-wins Applies().Update
@@ -2455,7 +2455,7 @@ func manifestGatedVerdict(derived string) bool {
 // longer terminalizes the apply while other siblings are still in flight; the
 // apply is held running until the rollout settles, then takes the failed verdict.
 // Every other policy (halt, pause, unrecognized) fails closed to the failed
-// verdict, and holds the apply degraded until any sibling a driver already
+// verdict, and holds the apply degraded until any sibling that a driver already
 // started reaches a terminal state, because refusing new claims does not stop
 // work already under way. While an apply has exactly one operation the derived value equals the
 // value ResumeApply already persisted, so this is a no-op until the

@@ -688,7 +688,7 @@ stays released, with no path back to paused. An *unrecognized* `on_failure` valu
 `halt`, never like `continue`.
 
 Failing closed decides the verdict, not when it is recorded. A fail-closed policy refuses new
-claims and cancels nothing, so a sibling deployment a driver already started keeps working through
+claims and cancels nothing, so a sibling deployment that a driver already started keeps working through
 the failure: the apply stays `running_degraded` until that sibling is terminal and only then takes
 the `failed` verdict. A sibling that is merely pending holds nothing, since the same policy is what
 stops it from ever starting. Recording the verdict over live work would release the reservation on

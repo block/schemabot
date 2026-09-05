@@ -331,9 +331,9 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 	}
 	if hardFail {
 		// The verdict is decided, but the apply is not over. A fail-closed
-		// policy only refuses new claims; it cancels nothing, so a sibling a
-		// driver already started keeps writing to its target. Recording the
-		// terminal verdict over it would release the reservation on the
+		// policy only refuses new claims; it cancels nothing, so a sibling
+		// that a driver already started keeps writing to its target. Recording
+		// the terminal verdict over it would release the reservation on the
 		// parent's whole target set (OW-5) while one of those targets is
 		// mid-change, and would take stop and cancel away from the operator who
 		// still has live work to stop. Hold the apply until that work settles.

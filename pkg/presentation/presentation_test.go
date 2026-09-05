@@ -476,6 +476,20 @@ func TestDerive_HaltFailureWithRunningSiblingRunsDegraded(t *testing.T) {
 	assert.Equal(t, NextAction{Kind: NextActionReviewFailure, Deployment: "eu"}, got.NextAction)
 }
 
+// TestDerive_BothFailurePolicyFlagsPointsAtTheFailure: the two on_failure flags
+// are mutually exclusive, so a deployment carrying both is a caller bug. The
+// projection resolves it the way the aggregate state does — fail closed — so a
+// bad policy value cannot quietly cost the operator the pointer to the failure
+// that decided the rollout.
+func TestDerive_BothFailurePolicyFlagsPointsAtTheFailure(t *testing.T) {
+	got := Derive([]Operation{
+		{Deployment: "eu", State: so.Failed, ContinueOnFailure: true, PauseOnFailure: true, Error: "boom"},
+		{Deployment: "us", State: so.Running, ContinueOnFailure: true, PauseOnFailure: true},
+	})
+	assert.Equal(t, state.Apply.RunningDegraded, got.State)
+	assert.Equal(t, NextAction{Kind: NextActionReviewFailure, Deployment: "eu"}, got.NextAction)
+}
+
 // TestDerive_PauseFailureWithPendingSiblingHoldsPaused: under on_failure pause an
 // earlier failure with later work still to run holds the aggregate paused for a
 // human, and the first failure is surfaced eagerly. The held sibling renders
