@@ -1861,6 +1861,53 @@ func strandedParentGate(d Dialect, correlation string, quiescence time.Duration)
 		)`, correlation, placeholders(len(parentStates)), quiescentBefore), args
 }
 
+// unleasedOperationGate renders the NOT EXISTS admitting only task rows whose
+// operation no driver currently holds.
+//
+// This is what separates a reaper from a driver by the same mechanism drivers
+// are separated from each other, rather than by a timing argument. A driver
+// takes an operation lease to work an operation and heartbeats it for as long as
+// it lives, and the claim path treats a lease whose heartbeat is older than
+// storage.ApplyLeaseStaleAfter as re-claimable. Reading the lease the same way
+// means a reaper writes a row only where a driver would be allowed to take it.
+//
+// What that buys is a window, not an impossibility. The gate is a plain
+// NOT EXISTS with no row lock, and the claim path locks apply_operations rather
+// than tasks, so a driver claiming just after the reaper's UPDATE commits is not
+// excluded by anything here. The residual race is the width of one autocommit
+// statement; without the gate it was the width of the whole scan-to-write gap,
+// which is seconds. Both sweeps assert the gate in the guarded write as well as
+// the scan so that gap is not what the write rests on.
+//
+// It reads the lease slightly more strictly than the claim path does, in both
+// directions that matter. It requires an owner, which the claim path's steal arm
+// does not test, so an operation the operation reaper released with a fresh
+// stamp is correctly unowned rather than mistaken for held. It omits the
+// occupying-state filter that freshLeaseCountSQL carries, so a heartbeated lease
+// holds the row whatever state its operation is in. Both departures make the
+// reaper more reluctant to write than a driver is to claim, which is the safe
+// direction when the write is a terminal verdict.
+//
+// It matters most under fan-out, where a live sibling drive holds only an
+// operation lease: the parent apply can be settled and quiet while that drive
+// works, so no gate on the parent sees it, and the lease is the only signal
+// that does not depend on the drive having recently mirrored the row.
+//
+// A task with no operation is admitted. Nothing holds a lease over it, so there
+// is nothing here to exclude it by, and it is left to the caller's other gates.
+func unleasedOperationGate(d Dialect) string {
+	freshLeaseAfter := d.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+
+	return fmt.Sprintf(`NOT EXISTS (
+			SELECT 1
+			FROM apply_operations lease_holder
+			WHERE lease_holder.id = tasks.apply_operation_id
+				AND lease_holder.lease_owner <> ''
+				AND lease_holder.updated_at >= %s
+		)`, freshLeaseAfter)
+}
+
 // ReapStranded elects one reaper per pass and reaps under the lock. See
 // storage.ApplyOperationStore for the contract.
 func (s *applyOperationStore) ReapStranded(ctx context.Context, limit int) ([]*storage.ReapedOperation, error) {

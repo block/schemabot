@@ -16,7 +16,10 @@ import (
 	"github.com/block/schemabot/pkg/ui"
 )
 
-// TableProgressData represents progress for a single table in a PR comment.
+// TableProgressData is one progress row in a PR comment: one task, which runs
+// one DDL statement against one table. A plan with several statements on the
+// same table produces several rows carrying that table's name, so rows are
+// counted by progressUnit rather than assumed to be distinct tables.
 type TableProgressData struct {
 	TaskID          string
 	Namespace       string
@@ -62,7 +65,32 @@ func TaskStatusReadyForCutover(status string) bool {
 	return state.NormalizeTaskStatus(status) == state.Task.WaitingForCutover
 }
 
-// countReadyForCutover returns how many tables are parked at the cutover
+// tableKey identifies one table across namespaces. The separator is a byte no
+// identifier can contain, so two distinct (namespace, table) pairs never share
+// a key even when their names concatenate to the same string.
+func tableKey(namespace, table string) string {
+	return namespace + "\x00" + table
+}
+
+// progressUnit names what one row counts as in the comment's totals. Every row
+// is one DDL statement, so the totals say "table" only while each row is a
+// distinct (namespace, table) — the shape of any plan that emits one statement
+// per table, whatever the engine. Once a table contributes several rows, the
+// totals say "statement", so a count never claims more tables than the plan
+// touches. Both nouns hold in the first case; only "statement" holds in the
+// second, so the choice never overstates.
+func progressUnit(tables []TableProgressData) string {
+	distinct := make(map[string]struct{}, len(tables))
+	for _, t := range tables {
+		distinct[tableKey(t.Namespace, t.TableName)] = struct{}{}
+	}
+	if len(distinct) == len(tables) {
+		return "table"
+	}
+	return "statement"
+}
+
+// countReadyForCutover returns how many rows are parked at the cutover
 // barrier, per TaskStatusReadyForCutover.
 func countReadyForCutover(tables []TableProgressData) int {
 	ready := 0
@@ -435,18 +463,20 @@ func revertWindowCountdown(revertExpiresAt string) string {
 	return fmt.Sprintf("Closes in %s", formatDuration(remaining))
 }
 
-// writeCutoverSummary writes a readiness summary for cutover states,
-// showing how many tables are ready for cutover vs not yet ready.
+// writeCutoverSummary writes a readiness summary for cutover states, showing
+// how many rows are ready for cutover vs not yet ready, counted in the
+// comment's progressUnit.
 func writeCutoverSummary(sb *strings.Builder, tables []TableProgressData) {
 	ready := countReadyForCutover(tables)
 	total := len(tables)
 	if total == 0 {
 		return
 	}
+	unit := progressUnit(tables)
 	if ready == total {
-		fmt.Fprintf(sb, "\n**%d/%d** table(s) ready for cutover\n", ready, total)
+		fmt.Fprintf(sb, "\n**%d/%d** %s(s) ready for cutover\n", ready, total, unit)
 	} else {
-		fmt.Fprintf(sb, "\n**%d/%d** table(s) ready for cutover — waiting on %d\n", ready, total, total-ready)
+		fmt.Fprintf(sb, "\n**%d/%d** %s(s) ready for cutover — waiting on %d\n", ready, total, unit, total-ready)
 	}
 }
 
@@ -634,10 +664,11 @@ func writeVSchemaStatus(sb *strings.Builder, changes []apitypes.VSchemaChange) {
 	}
 }
 
-// writeTableProgressSection writes the per-table progress breakdown, grouped by
+// writeTableProgressSection writes the per-row progress breakdown, grouped by
 // namespace so the operator can see which schema (MySQL) or keyspace
-// (Vitess/PlanetScale, Strata) each table belongs to. Within a namespace, tables
-// are sorted active/running first, then pending, then completed/terminal last.
+// (Vitess/PlanetScale, Strata) each table belongs to. Within a namespace, rows
+// are ordered by sortProgressRows: active/running first, then pending, then
+// completed/terminal last, with a table's rows kept together.
 func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData) {
 	// During the resume window the per-table percents are indeterminate (the data
 	// plane has not reported continuation vs fresh copy yet), so the aggregate
@@ -657,13 +688,7 @@ func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData)
 			fmt.Fprintf(sb, "**%s `%s`**\n\n", namespaceLabel(data.Engine), group.namespace)
 		}
 
-		sorted := make([]TableProgressData, len(group.tables))
-		copy(sorted, group.tables)
-		sort.SliceStable(sorted, func(i, j int) bool {
-			return tableStatePriority(sorted[i].Status) < tableStatePriority(sorted[j].Status)
-		})
-
-		for _, table := range sorted {
+		for _, table := range sortProgressRows(group.tables) {
 			// While the apply is resuming, the data plane has not yet reported whether
 			// the schema change continues from its checkpoint or restarts from scratch,
 			// so the row-copy percent is indeterminate. Render state-only until the
@@ -743,6 +768,71 @@ func renderResumingTable(sb *strings.Builder, dialect schema.Dialect, table Tabl
 // tableStatePriority returns a sort key: lower = rendered first (active on top, completed on bottom).
 func tableStatePriority(tableStatus string) int {
 	return ui.TableStatePriority(state.NormalizeTaskStatus(tableStatus))
+}
+
+// summaryStatePriority returns the sort key the terminal summary lists rows
+// in: what went wrong first, then what landed, then what never ran, then
+// anything unexpected. Lower renders first.
+func summaryStatePriority(tableStatus string) int {
+	switch state.NormalizeTaskStatus(tableStatus) {
+	case state.Task.Failed, state.Task.Stopped, state.Task.Reverted:
+		return 0
+	case state.Task.Completed:
+		return 1
+	case state.Task.Cancelled:
+		return 2
+	default:
+		return 3
+	}
+}
+
+// sortProgressRows orders one namespace's rows for the progress comment, with
+// active tables on top and terminal ones at the bottom. See sortRowsByTable.
+func sortProgressRows(rows []TableProgressData) []TableProgressData {
+	return sortRowsByTable(rows, tableStatePriority)
+}
+
+// sortRowsByTable orders rows for display without modifying the input. Tables
+// are ranked by the most urgent state among their rows under statePriority,
+// and a table's rows stay adjacent — ordered by their own state — so a table
+// whose plan produced several statements reads as one block rather than
+// scattering across the list by state. Tables with the same rank keep plan
+// order. When every row is a distinct table this is exactly a stable sort by
+// statePriority.
+func sortRowsByTable(rows []TableProgressData, statePriority func(tableStatus string) int) []TableProgressData {
+	type tableRank struct {
+		priority   int
+		firstIndex int
+	}
+	ranks := make(map[string]tableRank, len(rows))
+	for i, row := range rows {
+		key := tableKey(row.Namespace, row.TableName)
+		priority := statePriority(row.Status)
+		rank, seen := ranks[key]
+		if !seen {
+			ranks[key] = tableRank{priority: priority, firstIndex: i}
+			continue
+		}
+		if priority < rank.priority {
+			rank.priority = priority
+			ranks[key] = rank
+		}
+	}
+
+	sorted := make([]TableProgressData, len(rows))
+	copy(sorted, rows)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		ri := ranks[tableKey(sorted[i].Namespace, sorted[i].TableName)]
+		rj := ranks[tableKey(sorted[j].Namespace, sorted[j].TableName)]
+		if ri.priority != rj.priority {
+			return ri.priority < rj.priority
+		}
+		if ri.firstIndex != rj.firstIndex {
+			return ri.firstIndex < rj.firstIndex
+		}
+		return statePriority(sorted[i].Status) < statePriority(sorted[j].Status)
+	})
+	return sorted
 }
 
 // renderTableProgress renders a single table's progress as markdown.
@@ -1357,7 +1447,7 @@ func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, comple
 	}
 
 	if completedCount > 0 {
-		fmt.Fprintf(sb, "\n%d of %d %s completed before failure.\n", completedCount, totalTables, pluralize("table", totalTables))
+		fmt.Fprintf(sb, "\n%d of %d %s completed before failure.\n", completedCount, totalTables, pluralize(progressUnit(data.Tables), totalTables))
 	}
 
 	writeSummaryTableList(sb, data)
@@ -1369,7 +1459,7 @@ func writeSummaryStopped(sb *strings.Builder, data ApplyStatusCommentData, compl
 	writeSummaryMetadata(sb, data)
 
 	if completedCount > 0 {
-		fmt.Fprintf(sb, "\n%d of %d %s completed before stop.\n", completedCount, totalTables, pluralize("table", totalTables))
+		fmt.Fprintf(sb, "\n%d of %d %s completed before stop.\n", completedCount, totalTables, pluralize(progressUnit(data.Tables), totalTables))
 	}
 
 	writeSummaryTableList(sb, data)
@@ -1385,7 +1475,7 @@ func writeSummaryCancelled(sb *strings.Builder, data ApplyStatusCommentData, com
 	writeSummaryMetadata(sb, data)
 
 	if completedCount > 0 {
-		fmt.Fprintf(sb, "\n%d of %d %s completed before cancellation.\n", completedCount, totalTables, pluralize("table", totalTables))
+		fmt.Fprintf(sb, "\n%d of %d %s completed before cancellation.\n", completedCount, totalTables, pluralize(progressUnit(data.Tables), totalTables))
 	}
 
 	writeSummaryTableList(sb, data)
@@ -1496,7 +1586,7 @@ func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentDa
 func completedSummaryDetailsLabel(data ApplyStatusCommentData) string {
 	var parts []string
 	if len(data.Tables) > 0 {
-		parts = append(parts, fmt.Sprintf("%d %s", len(data.Tables), pluralize("table", len(data.Tables))))
+		parts = append(parts, fmt.Sprintf("%d %s", len(data.Tables), pluralize(progressUnit(data.Tables), len(data.Tables))))
 	}
 	if len(data.VSchemaChanges) > 0 {
 		parts = append(parts, fmt.Sprintf("%d VSchema %s", len(data.VSchemaChanges), pluralize("update", len(data.VSchemaChanges))))
@@ -1516,11 +1606,14 @@ func writeCompletedNamespaceSummary(sb *strings.Builder, data ApplyStatusComment
 		return
 	}
 
+	// One unit for the whole comment: a per-namespace choice would let one
+	// line say "tables" and the next "statements" for the same apply.
+	unit := progressUnit(data.Tables)
 	sb.WriteString("Applied by namespace:\n\n")
 	for _, summary := range summaries {
 		var parts []string
 		if summary.tableCount > 0 {
-			parts = append(parts, fmt.Sprintf("%d %s", summary.tableCount, pluralize("table", summary.tableCount)))
+			parts = append(parts, fmt.Sprintf("%d %s", summary.tableCount, pluralize(unit, summary.tableCount)))
 		}
 		if summary.vschemaUpdates > 0 {
 			parts = append(parts, fmt.Sprintf("%d VSchema %s", summary.vschemaUpdates, pluralize("update", summary.vschemaUpdates)))
@@ -1577,42 +1670,9 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 
 	dialect := dialectForEngine(data.Engine, data.ApplyID)
 
-	// Order: failed/stopped/reverted first, then completed, then cancelled, then any remaining
-	included := make(map[int]bool)
-	var ordered []TableProgressData
-	for i, t := range data.Tables {
-		n := state.NormalizeTaskStatus(t.Status)
-		if n == state.Task.Failed || n == state.Task.Stopped || n == "reverted" {
-			ordered = append(ordered, t)
-			included[i] = true
-		}
-	}
-	for i, t := range data.Tables {
-		if included[i] {
-			continue
-		}
-		n := state.NormalizeTaskStatus(t.Status)
-		if n == state.Task.Completed {
-			ordered = append(ordered, t)
-			included[i] = true
-		}
-	}
-	for i, t := range data.Tables {
-		if included[i] {
-			continue
-		}
-		n := state.NormalizeTaskStatus(t.Status)
-		if n == state.Task.Cancelled {
-			ordered = append(ordered, t)
-			included[i] = true
-		}
-	}
-	// Catch-all: append any tables not yet included (unknown/unexpected states)
-	for i, t := range data.Tables {
-		if !included[i] {
-			ordered = append(ordered, t)
-		}
-	}
+	// What went wrong leads, then what landed, then what never ran — and a
+	// table's rows stay together so the reader meets each table once.
+	ordered := sortRowsByTable(data.Tables, summaryStatePriority)
 
 	// Group by namespace
 	type nsGroup struct {
@@ -1632,6 +1692,10 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 	}
 
 	collapsed := collapseNamespaceGroups && len(data.Tables) > 5
+	// Collapsed group headers count in the comment-wide unit, not a per-group
+	// one, so a group of distinct tables next to a multi-statement group does
+	// not read "3 tables" above "3 statements" for the same apply.
+	unit := progressUnit(data.Tables)
 	// On an unsuccessful apply, each completed table is labeled so the reader
 	// can tell which tables made it before the failure/stop/cancellation.
 	labelCompleted := !state.IsState(data.State, state.Apply.Completed)
@@ -1665,7 +1729,7 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 
 			if groupCollapsed {
 				sb.WriteString("\n<details><summary>")
-				fmt.Fprintf(sb, "%s<strong>%s</strong> (%d tables)</summary>\n\n", emojiPrefix, header, len(g.tables))
+				fmt.Fprintf(sb, "%s<strong>%s</strong> (%d %s)</summary>\n\n", emojiPrefix, header, len(g.tables), pluralize(unit, len(g.tables)))
 			} else {
 				fmt.Fprintf(sb, "\n### %s%s\n\n", emojiPrefix, header)
 			}

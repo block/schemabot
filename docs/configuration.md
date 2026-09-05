@@ -46,7 +46,7 @@
   - [Tenant-scoped command routing](#tenant-scoped-command-routing)
   - [How it works](#how-it-works)
   - [Auto-plan behavior](#auto-plan-behavior)
-  - [Plan comment minimization](#plan-comment-minimization)
+  - [Plan comment retirement](#plan-comment-retirement)
 - [Multi-App Routing](#multi-app-routing)
   - [How dispatch works](#how-dispatch-works)
 - [Secret Resolution](#secret-resolution)
@@ -142,6 +142,12 @@ With the `config_paths` example above, SchemaBot reads:
 environment entry.
 
 ### PostgreSQL `dsn_from` targets
+
+`target_resolver` is the data-plane connection resolver: a server exposing the
+gRPC listener (started with `GRPC_PORT` set) receives an opaque execution
+target over gRPC and resolves it to a connection through this inventory, rather
+than routing logical database names through the control plane's `databases`
+table.
 
 `dsn_from` on a `target_resolver` target supports `type: postgres` in addition
 to `mysql`. The assembled DSN is a libpq URL that always names one database and
@@ -611,7 +617,7 @@ databases:
     type: mysql
     environments:
       staging:
-        dsn_secret_ref: "..."
+        dsn: "file:/run/secrets/payments-staging-dsn"
         direct_execution:
           enabled: true           # default: false
           max_table_rows: 100000  # required (positive) when enabled
@@ -1522,7 +1528,7 @@ others. Operators can still direct help to a specific deployment with
 
 - **Tenant scoping:** When `tenant` is set, work commands must include a matching
   `--tenant` or `-t` target. Tenant scoping is a webhook ownership filter, not a
-  schema-change state field; untargeted help and invalid-command responses
+  schema change state field; untargeted help and invalid-command responses
   continue through the unscoped-command routing.
 
 - **Per-environment aggregate checks:** Each instance creates its own aggregate check run scoped to its environments (e.g., `SchemaBot (staging)`, `SchemaBot (production)`) instead of the default `SchemaBot` aggregate. Configure branch protection to require both aggregates. Set `github.check-name` when independent SchemaBot gates need distinct visible names; every instance in the same promotion chain should use the same base name.
