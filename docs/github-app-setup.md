@@ -163,11 +163,13 @@ You should see:
 ## 6. Add `schemabot.yaml` Config to Your Repository
 
 You don't have to write the schema directory by hand. Once the database is registered in the
-server config (step 5), `schemabot onboard -d mydb -e staging -s ./schema` pulls the live
-schema and generates the whole directory — `schemabot.yaml`, namespace subdirectories, and one
-`.sql` file per table — then verifies the result plans clean against the source environment.
-Use `--dry-run` to preview the files first. The rest of this section describes the layout it
-produces, which is also what you maintain from then on.
+server config (step 4), `schemabot onboard -d mydb -e staging -s ./schema` pulls the live
+schema and generates the whole directory — `schemabot.yaml`, a subdirectory per namespace
+(the schema name on MySQL, the keyspace on Vitess), and one `.sql` file per table — then
+verifies the result plans clean against the source environment. Use `--dry-run` to preview
+the files first. Onboard always generates the namespace-subdirectory layout shown under
+[Schema File Layout](#schema-file-layout) below; the flat MySQL layout there is a
+hand-maintained alternative.
 
 Create (or let `schemabot onboard` create) a `schemabot.yaml` file in the directory containing
 your schema SQL files:
@@ -196,7 +198,17 @@ Environment availability and promotion order are configured on the SchemaBot ser
 
 ### Schema File Layout
 
-**MySQL** (flat structure):
+**MySQL** (schema-name subdirectory — what `schemabot onboard` generates):
+
+```
+schema/
+  schemabot.yaml
+  mydb/
+    users.sql
+    orders.sql
+```
+
+**MySQL** (flat structure, hand-maintained):
 
 ```
 schema/
