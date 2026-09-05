@@ -28,8 +28,9 @@ import (
 //  3. Progress() - Check current status (poll this)
 //  4. Control operations: Stop/Start/Cutover/Revert/SkipRevert
 //
-// Engines must support resume: if the server restarts mid-schema-change, the engine
-// must be able to resume from where it left off using stored state.
+// Engines must support resume: if the server restarts part-way through a schema
+// change, the engine must be able to resume from where it left off using stored
+// state.
 type Engine interface {
 	// Name returns the engine identifier (e.g., "planetscale", "spirit").
 	Name() string
@@ -75,7 +76,7 @@ type Drainer interface {
 	Drain()
 }
 
-// ShutdownHalter is an optional capability for engines whose schema-change work
+// ShutdownHalter is an optional capability for engines whose schema change work
 // runs inside this process. Such an engine holds resources on the target — for
 // Spirit, an advisory lock on the table it is copying — for exactly as long as
 // its in-process work lives, and that work outlives the drive that started it.
@@ -96,7 +97,7 @@ type ShutdownHalter interface {
 	HaltForShutdown(ctx context.Context) error
 }
 
-// HaltEngineForShutdown brings eng's in-process schema-change work down when it
+// HaltEngineForShutdown brings eng's in-process schema change work down when it
 // has any, and reports whether the engine implements the capability at all. An
 // engine that does not is one whose work is unaffected by this process exiting,
 // so there is nothing to halt and nothing to wait for.
@@ -191,6 +192,90 @@ func RegistersWorkSynchronously(eng Engine) bool {
 type DeferredCutoverSignalRequest struct {
 	Database    string
 	Credentials *Credentials
+}
+
+// CancelledArtifactReleaser is an optional capability for engines that leave
+// their unfinished work on the target database as tables the engine itself
+// owns. Such an engine copies rows into its own tables, and cancelling the
+// schema change abandons them: nothing in the engine's own lifecycle reclaims
+// them, and they can outlive the process, the apply, and the pull request that
+// created them.
+//
+// An engine whose unfinished work lives in the service it drives (a remote
+// online-DDL service) must not implement this. Cancelling there releases the
+// work server-side and there is nothing locally to reclaim, so implementing the
+// capability would claim a responsibility the engine does not have.
+//
+// The release is stateless by design. It reclaims work belonging to a schema
+// change this process may never have run — one cancelled days later, on an
+// instance that has restarted since — so it takes the target and the tables
+// from the caller rather than from anything held in memory.
+type CancelledArtifactReleaser interface {
+	// ReleaseCancelledArtifacts reclaims what a cancelled schema change left on
+	// the target and reports what it reclaimed. Data the schema change copied
+	// is kept somewhere recoverable where the deployment offers one; the
+	// metadata describing where the copy had got to is always discarded.
+	//
+	// Callers must establish that no live schema change is running anywhere in
+	// the target schema before calling — not merely none on the tables the
+	// request names. The engine's table names are derived from the target's own
+	// table names, so an apply running against the same tables uses the same
+	// names; and an engine's artifacts can include schema-scoped ones shared by
+	// every schema change in the schema, one of which can be a cutover gate.
+	// Reclaiming that gate on a cancelled change's behalf releases the cutover a
+	// live change is still waiting on. The engine cannot see that change and
+	// will not check for it.
+	//
+	// Tables must not be empty. Every schema change names at least one table, so
+	// an empty list is a lost one, and the schema-scoped artifacts above would
+	// be reclaimed regardless of it.
+	ReleaseCancelledArtifacts(ctx context.Context, req *ReleaseArtifactsRequest) (*ReleaseArtifactsResult, error)
+}
+
+// ReleaseArtifactsRequest names the target and the tables whose cancelled
+// schema change artifacts should be reclaimed. Tables are the target's own
+// table names, not the engine's derived ones — deriving those is the engine's
+// job, because only the engine knows how it names them.
+type ReleaseArtifactsRequest struct {
+	Database    string
+	Tables      []string
+	Credentials *Credentials
+}
+
+// ReleaseArtifactsResult reports what a release reclaimed, so a caller can tell
+// an operator where their copy went. Both are empty when the schema change left
+// nothing behind, which is the ordinary outcome for a cancel that arrives
+// before any copying started.
+//
+// Every table in either field is named in full, as schema.table, so an operator
+// reading one release can act on any line of it without having to supply the
+// schema from context — including the lines naming tables that left the schema
+// the release ran against.
+type ReleaseArtifactsResult struct {
+	// Preserved names each table whose data was kept, and where it was kept.
+	Preserved []PreservedArtifact
+	// Discarded names each table that was removed outright.
+	Discarded []string
+}
+
+// PreservedArtifact records where a cancelled schema change's copied data was
+// put, so an operator can find it while it is still recoverable.
+type PreservedArtifact struct {
+	Source      string
+	Destination string
+}
+
+// ReleaseCancelledArtifacts reclaims eng's leftovers for the given target when
+// eng owns any, and reports whether the engine implements the capability at
+// all. An engine that does not is one whose unfinished work is not this
+// process's to reclaim, so there is nothing to release and nothing to report.
+func ReleaseCancelledArtifacts(ctx context.Context, eng Engine, req *ReleaseArtifactsRequest) (supported bool, result *ReleaseArtifactsResult, err error) {
+	releaser, ok := eng.(CancelledArtifactReleaser)
+	if !ok {
+		return false, nil, nil
+	}
+	result, err = releaser.ReleaseCancelledArtifacts(ctx, req)
+	return true, result, err
 }
 
 // Credentials contains the resolved credentials for accessing a database.
@@ -515,7 +600,7 @@ type ApplyRequest struct {
 	ResumeState  *ResumeState       // Fresh context or full resume state after restart
 	Credentials  *Credentials       // Resolved credentials (from discovery)
 
-	// Logger is an optional schema-change-scoped logger, already bound with
+	// Logger is an optional logger scoped to this schema change, already bound with
 	// the caller's triage identity (apply id, repo, PR, environment). Engines
 	// use it for every log line about this schema change so engine lines stay
 	// filterable by the same identity as the drive logs. Nil falls back to
@@ -619,7 +704,7 @@ const (
 	// DSN, so SHOW VITESS_MIGRATIONS cannot be queried. This persists for the
 	// whole apply — a target-resolution gap (missing vtgate endpoint).
 	PerShardUnavailableNoVtgateDSN = "no_vtgate_dsn"
-	// PerShardUnavailableNoChangeContext means no schema-change context
+	// PerShardUnavailableNoChangeContext means no schema change context
 	// identifier is known for the deploy yet, so per-shard rows cannot be
 	// correlated to this apply. Transient during setup/recovery.
 	PerShardUnavailableNoChangeContext = "no_change_context"

@@ -170,6 +170,11 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 	}, nil
 }
 
+// dropCancelledArtifacts releases the artifacts of a schema change cancelled
+// while this instance was still running it, using the connection details the
+// runner holds. It disposes of them through the same policy as a cancel that
+// arrives with no runner alive, so how a copy is disposed of never depends on
+// whether the instance that made it happened to survive.
 func (e *Engine) dropCancelledArtifacts(ctx context.Context, rm *runningSchemaChange) error {
 	if rm == nil || rm.host == "" {
 		return fmt.Errorf("cancelled schema change cleanup missing connection details")
@@ -189,22 +194,8 @@ func (e *Engine) dropCancelledArtifacts(ctx context.Context, rm *runningSchemaCh
 	if err := db.PingContext(ctx); err != nil {
 		return fmt.Errorf("connect to database %s to clean up cancelled schema change artifacts: %w", rm.database, err)
 	}
-	for _, tableName := range rm.tables {
-		for _, artifact := range []string{
-			utils.AuxTableName(tableName, "_new"),
-			utils.AuxTableName(tableName, "_old"),
-			utils.CheckpointTableName(tableName),
-		} {
-			if _, err := db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s.%s", quoteIdentifier(rm.database), quoteIdentifier(artifact))); err != nil {
-				return fmt.Errorf("drop cancelled schema change artifact %s.%s: %w", rm.database, artifact, err)
-			}
-		}
-	}
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s._spirit_sentinel", quoteIdentifier(rm.database))); err != nil {
-		return fmt.Errorf("drop cancelled schema change sentinel for database %s: %w", rm.database, err)
-	}
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s._spirit_checkpoint", quoteIdentifier(rm.database))); err != nil {
-		return fmt.Errorf("drop cancelled schema change checkpoint for database %s: %w", rm.database, err)
+	if _, err := e.releaseArtifacts(ctx, db, rm.database, rm.tables); err != nil {
+		return err
 	}
 	return nil
 }
@@ -346,7 +337,7 @@ func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engi
 	// Drop the sentinel table - Spirit will detect this and proceed with cutover.
 	// Cutover is asynchronous — Spirit performs the table swap in its goroutine.
 	// The caller should poll Progress() for state transitions.
-	_, err = db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s._spirit_sentinel", quoteIdentifier(database)))
+	_, err = db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s.%s", quoteIdentifier(database), quoteIdentifier(deferredCutoverSentinelTable)))
 	if err != nil {
 		return nil, fmt.Errorf("drop sentinel table: %w", err)
 	}
@@ -391,8 +382,8 @@ func (e *Engine) DeferredCutoverSignalExists(ctx context.Context, req *engine.De
 
 	var count int
 	if err := db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = '_spirit_sentinel'",
-		database,
+		"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+		database, deferredCutoverSentinelTable,
 	).Scan(&count); err != nil {
 		return false, fmt.Errorf("query deferred cutover signal for database %s: %w", database, err)
 	}

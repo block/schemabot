@@ -20,6 +20,7 @@ import (
 	"github.com/block/pg-sprite/pkg/router"
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/block/schemabot/pkg/ddl"
@@ -142,11 +143,13 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 		}
 		files := sortedKeys(ns.Files)
 		schemaChange := engine.SchemaChange{Namespace: namespace}
+		desiredTables := make(map[string]bool, len(files))
 		for _, filename := range files {
 			desired, err := pgstatement.ParseDesired(ns.Files[filename])
 			if err != nil {
 				return nil, fmt.Errorf("parse desired PostgreSQL schema in %q/%q: %w", namespace, filename, err)
 			}
+			desiredTables[desired.Table()] = true
 			report, err := diffplan.Plan(ctx, pool, diffplan.Request{Schema: namespace, Desired: desired})
 			if err != nil {
 				return nil, fmt.Errorf("diff PostgreSQL table %q in namespace %q from file %q: %w", desired.Table(), namespace, filename, err)
@@ -165,6 +168,11 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			}
 			schemaChange.TableChanges = append(schemaChange.TableChanges, changes...)
 		}
+		drops, err := undeclaredTableDrops(ctx, pool, namespace, desiredTables, parser)
+		if err != nil {
+			return nil, fmt.Errorf("compare live tables against schema files in namespace %q: %w", namespace, err)
+		}
+		schemaChange.TableChanges = append(schemaChange.TableChanges, drops...)
 		if len(schemaChange.TableChanges) > 0 {
 			result.Changes = append(result.Changes, schemaChange)
 		}
@@ -408,6 +416,79 @@ func blockOversizedTable(ctx context.Context, pool *pgxpool.Pool, report pgplan.
 	}
 	blockExecutableChanges(changes, fmt.Sprintf("statement for table %q: %s", report.Table, r.detail))
 	return changes, nil
+}
+
+// undeclaredTableDrops surfaces every live table in the namespace that no
+// schema file declares. Desired state is declarative: a table whose file was
+// deleted converges only by being dropped, so the plan must show that drop
+// rather than stay silent while the table lingers on the target. Each drop is
+// both destructive and blocked — SchemaBot's PostgreSQL support never
+// executes DROP TABLE, so the operator either restores the file or removes
+// the table by hand after review; a plan that hid the drop would let a merge
+// pass with the target still diverged from the repository.
+//
+// Partitions are excluded: they belong to their partitioned parent and never
+// have a file of their own, so a declared parent's partitions are not
+// undeclared. The catalog is read directly because the namespace's schema may
+// not exist yet, in which case the answer is an empty set, not an error.
+func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, namespace string, declared map[string]bool, parser ddl.StatementParser) ([]engine.TableChange, error) {
+	live, err := liveTables(ctx, pool, namespace)
+	if err != nil {
+		return nil, err
+	}
+	var drops []engine.TableChange
+	for _, table := range live {
+		if declared[table] {
+			continue
+		}
+		sql := parser.Canonicalize("DROP TABLE " + pgx.Identifier{namespace, table}.Sanitize())
+		operation, _, err := parser.Classify(sql)
+		if err != nil {
+			return nil, fmt.Errorf("classify drop for undeclared table %q: %w", table, err)
+		}
+		drops = append(drops, engine.TableChange{
+			Table:         table,
+			Operation:     operation,
+			DDL:           sql,
+			IsUnsafe:      true,
+			UnsafeReason:  sanitizeReasonText(fmt.Sprintf("statement removes table %q and all of its data", table)),
+			ExecutionMode: engine.ExecutionModeBlocked,
+			ModeReason: sanitizeReasonText(fmt.Sprintf(
+				"table %q exists on the target but no schema file in namespace %q declares it; converging would drop the table, which SchemaBot's PostgreSQL support never executes — restore the file to keep the table, or drop it manually after review",
+				table, namespace)),
+		})
+	}
+	return drops, nil
+}
+
+// liveTables lists the ordinary and partitioned tables in the namespace, in
+// name order, as the catalog names them. Partitions are omitted because
+// their declaration is their parent's.
+func liveTables(ctx context.Context, pool *pgxpool.Pool, namespace string) ([]string, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT c.relname
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1
+		  AND c.relkind IN ('r', 'p')
+		  AND NOT c.relispartition
+		ORDER BY c.relname`, namespace)
+	if err != nil {
+		return nil, fmt.Errorf("list live tables in namespace %q: %w", namespace, err)
+	}
+	defer rows.Close()
+	var tables []string
+	for rows.Next() {
+		var table string
+		if err := rows.Scan(&table); err != nil {
+			return nil, fmt.Errorf("scan live table name in namespace %q: %w", namespace, err)
+		}
+		tables = append(tables, table)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate live tables in namespace %q: %w", namespace, err)
+	}
+	return tables, nil
 }
 
 func hasExecutableChanges(changes []engine.TableChange) bool {

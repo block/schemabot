@@ -875,7 +875,7 @@ func (o *CommentObserver) decideProgressCommentAuthority(apply *storage.Apply, o
 	return true
 }
 
-// operationScopedWorkInFlight reports whether the apply's schema-change work
+// operationScopedWorkInFlight reports whether the apply's schema change work
 // is still in flight under operation-scoped dispatch — the one shape whose
 // parent apply lease is legitimately unheld mid-apply. True when the apply is
 // non-terminal and either its generation manifest still lists keys with no

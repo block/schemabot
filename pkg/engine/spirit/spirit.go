@@ -91,7 +91,7 @@ type Engine struct {
 
 // runningSchemaChange tracks the state of an in-progress schema change.
 type runningSchemaChange struct {
-	// logger is the schema-change-scoped logger carrying the caller's triage
+	// logger is the logger scoped to this schema change, carrying the caller's triage
 	// identity (apply id, repo, PR, environment); spiritLogger is the
 	// filtered Spirit logger derived from it. Both fall back to the engine's
 	// loggers when the caller did not provide one.
@@ -139,6 +139,7 @@ var _ engine.Engine = (*Engine)(nil)
 var _ engine.Drainer = (*Engine)(nil)
 var _ engine.ShutdownHalter = (*Engine)(nil)
 var _ engine.DeferredCutoverSignalChecker = (*Engine)(nil)
+var _ engine.CancelledArtifactReleaser = (*Engine)(nil)
 
 // Config holds configuration for the Spirit engine.
 type Config struct {

@@ -25,7 +25,7 @@ import (
 )
 
 // indexAddSchema declares an index the target's `events` table does not have,
-// so the plan is a single ALTER the schema-change engine copies rows for.
+// so the plan is a single ALTER that the schema change engine copies rows for.
 const indexAddSchema = "CREATE TABLE `events` (\n" +
 	"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
 	"  `actor_id` bigint unsigned NOT NULL,\n" +
