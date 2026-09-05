@@ -98,6 +98,20 @@ The hook uses `--new-from-rev` to only flag issues introduced by the current bra
 
 **Terminology:** NEVER use the word "migration" in code, comments, CLI output, or error messages. ALWAYS use "schema change" instead.
 
+**"schema change" is never hyphenated.** In prose — PR comments, check summaries, CLI output, error messages, docs, code comments — write "schema change", never "schema-change".
+
+This holds **including where it modifies a noun**: "the schema change engine", not "the schema-change engine". That is a deliberate departure from the usual compound-adjective rule, which would hyphenate it. "schema change" is a fixed term in this product and it does not split, so do not "correct" the unhyphenated attributive form back — in either direction, in review or in a docs pass.
+
+Constructions that only read correctly when hyphenated are rewritten rather than hyphenated:
+
+| Write | Not |
+|---|---|
+| a logger scoped to this schema change | a schema-change-scoped logger |
+| a PR with no schema changes | a no-schema-changes PR |
+| restarts part-way through a schema change | restarts mid-schema-change |
+
+The rule is about prose only. Identifiers keep whatever form they need: file and script names (`scripts/generate-schema-change.sh`), CLI subcommands, external URLs, generated markdown anchors, and test fixture values are left alone.
+
 **Driver terminology:** A *driver* is the operator worker that claims an apply via `FOR UPDATE SKIP LOCKED`, holds its lease (`LeaseOwner` / `LeaseToken`), and *drives* it to a terminal state. Use *driver* (noun) and *drive* (verb) — not *worker* — in new code, comments, logs, docs, and tests for the lease-holding goroutine and the work it performs. This is distinct from the **Go MySQL driver** (`github.com/go-sql-driver/mysql`, `database/sql/driver`): always refer to that as the "Go MySQL driver" or "SQL driver" and keep it import-qualified so the two senses never collide.
 
 **OSS-ready code:** Never reference internal company names or proprietary details in code or comments.

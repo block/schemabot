@@ -183,7 +183,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 // database's live schema, so it requires the same configured principals as
 // the mutating commands — the database's operator teams/users and the
 // instance admins. A plan that resolves no managed database (the stuck-check
-// rescue on a no-schema-changes PR) never reaches this gate, and databases
+// rescue on a PR with no schema changes) never reaches this gate, and databases
 // not configured on this deployment defer to the downstream ownership
 // handling so fan-out deployments stay silent. When blocked, the
 // authorization path has already posted the rejection comment.

@@ -1148,7 +1148,7 @@ type EnvironmentConfig struct {
 	OnFailure string `yaml:"on_failure,omitempty"`
 
 	// DirectExecution configures direct execution of ALTER statements the
-	// MySQL schema-change engine refuses (e.g. table reshapes it cannot copy).
+	// MySQL schema change engine refuses (e.g. table reshapes it cannot copy).
 	// When enabled, a refused statement whose table's estimated row count is
 	// within max_table_rows runs verbatim as native MySQL DDL: synchronous,
 	// blocking writes to the table while it runs, and not revertible. When
