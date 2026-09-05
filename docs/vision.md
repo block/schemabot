@@ -117,6 +117,8 @@ three weeks. The copy runs in the background, and the one moment it actually tou
 is a swap somebody chooses, which can be a quiet Tuesday morning instead of the middle of a release
 freeze.
 
+![Two timelines over the same eight hours. Done by hand, six separate moments demand a person: writing the ALTER, picking a strategy, booking a window, running it at midnight, watching it for eight hours, and doing it again in the next environment. With SchemaBot, only two do: editing the file and saying yes at the start, and picking the moment to swap at the end. Everything between them is the machine's time](../assets/vision-attention.svg)
+
 So the number that matters is not how fast the DDL executes. It is how much of a person's day a
 schema change costs, and the floor for that should be a couple of minutes: write the schema, read
 what the tool says will happen, say yes. When speed and integrity genuinely do collide, integrity
@@ -156,19 +158,24 @@ knowing none of that, because the diff engine works all three out.
 
 The file is also the context. Asking what indexes a table has today is a question you answer by
 reading one file, not by replaying every change ever made to it and trusting that none of them landed
-halfway.
+halfway. History is not the thing you trade away for that: `git log` on one table's file is every
+change that table has ever had, in order, with the author and the review attached to each one.
 
-![On the left, an ordered pile of change scripts, where answering what indexes exist means replaying all of them in order. On the right, one CREATE TABLE file that states the answer directly, including the unique key on email and the index on created](../assets/vision-agent-context.svg)
+![On the left, an ordered pile of change scripts, where answering what indexes exist means replaying all of them in order. On the right, one CREATE TABLE file that states the answer directly, including the unique key on email and the index on created. Below both, what an agent gets without asking anyone: the current state from the file, the full history from that file's git log, and what a proposed change will do from the plan](../assets/vision-agent-context.svg)
 
 That earns SchemaBot the right to be what agents reach for, and it creates two obligations.
 
 **Context.** An agent should be able to read the schema as files, ask what a proposed change would
 actually do against the live database, and get an answer specific enough to act on: this rewrites the
-table, this holds a lock for the duration, this is refused on this engine and here is why. Most of
-that exists today, but it is shaped for a person: markdown, prose, a table laid out for the eye. An
-agent can read that, and often does, but reading it means parsing a rendering that was never a
-contract and can change whenever someone improves the wording. The same answers should be available
-as structured data.
+table, this holds a lock for the duration, this is refused on this engine and here is why. That
+answer already exists as structured data. The plan API returns the change set, the per-shard detail,
+and every lint finding as JSON, and it is the same plan the PR comment is rendered from.
+
+What is missing is that nothing tells an agent it is there. Reaching it means someone knowing to
+point at an HTTP endpoint, so in practice agents read the schema files and scrape the rendered
+comment instead, which is a layout that was never a contract and changes whenever someone improves
+the wording. An MCP server and a skill are the shape of the fix: the agent discovers what it can ask
+and gets the answer in the form the tool already produces.
 
 **Guardrails that do not care who wrote the change.** This is the load-bearing one. What gets applied
 is what was reviewed. Destroying something takes consent given against the plan that is about to run,
@@ -306,7 +313,7 @@ and about engines that can be supported honestly, not about saying yes to everyt
 | Experiment to tier zero | The plan and the gates are identical at any scale. Local mode drives a database straight from a DSN in a single process, and SchemaBot already embeds as a Go module. | The small end still pays for the large end: a server, storage, and a GitHub App for the PR flow. Embedding is a supported import rather than a supported way to run the whole loop. PostgreSQL, the likeliest engine down there, is early alpha. |
 | Safe should also mean fast | Nobody writes the DDL, picks an execution strategy, or runs anything by hand. Long changes run unattended and report progress, and a deferred cutover lets the copy finish without the swap happening until someone picks the moment. | Onboarding is still the slow part, and a change still needs a person to open a PR and say yes at least once. Nothing reports what a schema change actually costs in human time, so the claim above is a design intent rather than a measurement. |
 | GitOps, not GitHub | Enforced rather than intended. Applies work while GitHub is down, the CLI covers the full PR surface, and an outage never invents state. The process that touches your database carries no GitHub credentials. | The merge gate itself is expressed as GitHub Check Runs. No second forge is implemented, so the separation is proven by the CLI rather than by a second integration. |
-| Agents | Declarative files are already an agent-readable source of truth, and every gate is author-agnostic. | No dedicated agent surface. An agent works by reading files and opening a PR, the same as a person, with none of the plan detail available programmatically. |
+| Agents | Declarative files are already an agent-readable source of truth, every gate is author-agnostic, and the plan API returns the change set, the per-shard detail, and every lint finding as JSON. | No packaged agent surface. Nothing tells an agent that API exists or how to use it, so in practice an agent reads files and opens a PR the same as a person. An MCP server and a skill are the obvious missing pieces. |
 | Many agents, one database | Concurrent authors are already serialized: one apply per deployment, provable ownership, and no stale plan ever applies. The merge gate coordinates open changes with no protocol between them. | The coordination is opaque. No readable queue, no machine-readable reason for a block, no expected wait. A blocked caller can only poll. |
 | One database, or ten thousand | The read API answers what is live, what changed, and what is changing. `pull --lint` audits a live schema and `fix-lint` turns a finding into an edit. | All of it is per database. No aggregate query, no grouping by rule across databases, and no way to dispatch one intent to many targets and watch or stop it as one thing. |
 | Everything underneath | Each engine gets its own semantics rather than a shared subset, and an engine that cannot do something safely refuses at plan time instead of guessing. | PostgreSQL is early alpha, so first class is a commitment there more than a shipped fact. The engine boundary is clean; the forge boundary is not, and neither is a plugin surface. |
