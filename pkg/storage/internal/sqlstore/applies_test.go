@@ -3384,6 +3384,141 @@ func TestApplyStore_ExpireRetryableTerminalizesRetryableOperations(t *testing.T)
 	assert.Equal(t, state.ApplyOperation.WaitingForCutover, parkedOp.State, "a healthy successor parked at the cutover barrier must be left untouched")
 }
 
+// Under fan-out the apply's retry budget belongs to the rollout, not to one
+// deployment: the redispatches of a failing deployment spend it while a sibling
+// deployment copies happily under its own operation lease. Expiry selects the
+// parent by apply_id, and a driver holding only an operation lease never bumps
+// the parent, so nothing about the parent row distinguishes the two
+// deployments' task rows. The operation lease does, and expiry reads it: the
+// abandoned deployment's rows are terminalized, the live one's are not.
+//
+// Writing the live rows would not merely be wrong for a tick. A terminal stored
+// task is the durable final answer the drive reconciles forward from, so the
+// running drive would never move them back and a healthy deployment would come
+// to rest on a failed verdict no driver ever wrote.
+func TestApplyStore_ExpireRetryable_KeepsTasksWhoseOperationADriverHolds(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "expire_fanout_db", storage.DatabaseTypeMySQL)
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_expire_fanout", 520, state.Apply.FailedRetryable, "staging")
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET attempt = ? WHERE id = ?`, maxRecoveryAttempts, apply.ID)
+	require.NoError(t, err)
+
+	// The deployment whose redispatches spent the budget: its lease has gone
+	// stale, so no driver is coming back for it.
+	abandoned := leasedOperationFor(t, store, apply, "region-a")
+	backdateOperationHeartbeat(t, abandoned, storage.ApplyLeaseStaleAfter+time.Minute)
+	// The sibling a driver is holding right now, heartbeated as of this instant.
+	held := leasedOperationFor(t, store, apply, "region-b")
+
+	strandedTask := createRetryableReapTask(t, store, apply, "task_expire_fanout_stranded", "users", state.Task.Running, "")
+	attachTaskToOperation(t, strandedTask.TaskIdentifier, abandoned)
+	liveTask := createRetryableReapTask(t, store, apply, "task_expire_fanout_live", "orders", state.Task.Running, "")
+	attachTaskToOperation(t, liveTask.TaskIdentifier, held)
+	queuedTask := createRetryableReapTask(t, store, apply, "task_expire_fanout_queued", "products", state.Task.Pending, "")
+	attachTaskToOperation(t, queuedTask.TaskIdentifier, held)
+
+	expired, err := store.Applies().ExpireRetryable(ctx)
+	require.NoError(t, err)
+	require.Len(t, expired, 1)
+	assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
+
+	persisted, err := store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.Failed, persisted.State, "the rollout's verdict is still expiry's to write")
+
+	assertTaskState(t, store, strandedTask.TaskIdentifier, state.Task.Failed)
+	assertTaskState(t, store, liveTask.TaskIdentifier, state.Task.Running)
+	assertTaskState(t, store, queuedTask.TaskIdentifier, state.Task.Pending)
+}
+
+// A drive that settles its operation into failed_retryable writes that state
+// under its lease and leaves the lease in place, so for a staleness window
+// afterwards the row carries a fresh-looking lease with no drive behind it. That
+// is the ordinary shape of a single-deployment apply that has just used its last
+// attempt, which is the apply expiry exists to terminalize. Reading that lease as
+// a live drive would leave the apply's own tables reporting a retry that has
+// already been given up on, and expiry never comes back to correct it.
+func TestApplyStore_ExpireRetryable_ExpiresTasksWhoseOperationSettledUnderAFreshLease(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "expire_settled_db", storage.DatabaseTypeMySQL)
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_expire_settled", 522, state.Apply.FailedRetryable, "staging")
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET attempt = ? WHERE id = ?`, maxRecoveryAttempts, apply.ID)
+	require.NoError(t, err)
+
+	// The lease and heartbeat the drive's own settling write left behind.
+	settled := leasedOperationFor(t, store, apply, "region-a")
+	_, err = testDB.ExecContext(ctx, `UPDATE apply_operations SET state = ?, updated_at = NOW() WHERE id = ?`,
+		state.ApplyOperation.FailedRetryable, settled)
+	require.NoError(t, err)
+
+	failedTask := createRetryableReapTask(t, store, apply, "task_expire_settled_failed", "users", state.Task.FailedRetryable, "copy failed")
+	attachTaskToOperation(t, failedTask.TaskIdentifier, settled)
+	queuedTask := createRetryableReapTask(t, store, apply, "task_expire_settled_queued", "orders", state.Task.Pending, "")
+	attachTaskToOperation(t, queuedTask.TaskIdentifier, settled)
+
+	expired, err := store.Applies().ExpireRetryable(ctx)
+	require.NoError(t, err)
+	require.Len(t, expired, 1)
+
+	assertTaskState(t, store, failedTask.TaskIdentifier, state.Task.Failed)
+	assertTaskState(t, store, queuedTask.TaskIdentifier, state.Task.Cancelled)
+}
+
+// A row expiry skips is deferred, not dropped. Expiry settles the parent in the
+// same transaction, which is the reapers' precondition, so once the driver's
+// lease goes stale the active-task sweep closes the rows out against that
+// verdict. Expiry itself never comes back — the apply it just settled no longer
+// matches its own selection — so this is the whole of the recovery path, and a
+// gate without it would strand every row it skipped.
+//
+// The queued row settles failed rather than cancelled: the sweep mirrors the
+// parent's verdict and does not draw expiry's did-no-work distinction. That is
+// coarser attribution on a table that was queued under a deployment which was
+// genuinely running, and it is the price of not writing a live drive's rows.
+func TestApplyStore_ExpireRetryable_ReapersSettleTheRowsTheLeaseGateSkipped(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "expire_handoff_db", storage.DatabaseTypeMySQL)
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_expire_handoff", 521, state.Apply.FailedRetryable, "staging")
+	_, err := testDB.ExecContext(ctx, `UPDATE applies SET attempt = ? WHERE id = ?`, maxRecoveryAttempts, apply.ID)
+	require.NoError(t, err)
+
+	held := leasedOperationFor(t, store, apply, "region-a")
+	liveTask := createRetryableReapTask(t, store, apply, "task_expire_handoff_live", "users", state.Task.Running, "")
+	attachTaskToOperation(t, liveTask.TaskIdentifier, held)
+	queuedTask := createRetryableReapTask(t, store, apply, "task_expire_handoff_queued", "orders", state.Task.Pending, "")
+	attachTaskToOperation(t, queuedTask.TaskIdentifier, held)
+
+	expired, err := store.Applies().ExpireRetryable(ctx)
+	require.NoError(t, err)
+	require.Len(t, expired, 1)
+	assertTaskState(t, store, liveTask.TaskIdentifier, state.Task.Running)
+	assertTaskState(t, store, queuedTask.TaskIdentifier, state.Task.Pending)
+
+	// The driver dies. Its lease ages out, its rows stop being mirrored, and the
+	// verdict expiry wrote has been quiet long enough to be the reaper's to
+	// mirror down.
+	backdateOperationHeartbeat(t, held, storage.ApplyLeaseStaleAfter+time.Minute)
+	backdateApplyUpdatedAt(t, apply.ID, strandedActiveParentQuiescence+time.Minute)
+	backdateTaskUpdatedAt(t, liveTask.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
+	backdateTaskUpdatedAt(t, queuedTask.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
+
+	settled, err := store.tasks.reapStrandedActive(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, settled, 2, "both rows the gate skipped are the sweep's once the lease goes stale")
+	assertTaskState(t, store, liveTask.TaskIdentifier, state.Task.Failed)
+	assertTaskState(t, store, queuedTask.TaskIdentifier, state.Task.Failed)
+}
+
 func TestApplyStore_FindMissingSummaryComment_ExcludesAppliesWithoutGitHubDestination(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()

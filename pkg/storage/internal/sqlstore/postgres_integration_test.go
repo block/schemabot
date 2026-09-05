@@ -860,3 +860,116 @@ func TestPostgresReapStrandedRetryableDefersToTheOperationLease(t *testing.T) {
 	require.Len(t, reaped, 1, "a lease a peer could reclaim no longer speaks for the row")
 	assert.Equal(t, state.Task.Failed, taskState(t))
 }
+
+// Retryable-apply expiry renders the same lease gate as the reaper's sweeps,
+// and it renders it into its own two statements, so PostgreSQL has to execute
+// them too. The fan-out shape is the one the gate exists for: one deployment's
+// redispatches spend the rollout's retry budget while a sibling copies under a
+// live operation lease, and only that lease tells the two deployments' task
+// rows apart. What the gate skips is then the active-task sweep's, once the
+// driver's lease has aged out.
+func TestPostgresExpireRetryableDefersToTheOperationLease(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_expire_lease")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+
+	h := postgresHarness{db: db, dsn: dsn}
+	store := h.NewStorage(t)
+
+	var applyID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, attempt, options, error_message)
+		VALUES ('apply-expire-lease', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', $1, $2, '{}', '')
+		RETURNING id`, state.Apply.FailedRetryable, maxRecoveryAttempts).Scan(&applyID))
+
+	// The deployment whose redispatches spent the budget, its lease long stale,
+	// and the sibling a driver is holding right now.
+	insertOperation := func(t *testing.T, deployment, key string) int64 {
+		t.Helper()
+		var id int64
+		require.NoError(t, db.QueryRowContext(t.Context(), `
+			INSERT INTO apply_operations (apply_id, deployment, operation_key, state, lease_owner, lease_token)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			RETURNING id`, applyID, deployment, key, state.ApplyOperation.Running,
+			"driver-"+deployment, "token-"+deployment).Scan(&id))
+		return id
+	}
+	abandonedOpID := insertOperation(t, "region-a", "op-1")
+	heldOpID := insertOperation(t, "region-b", "op-2")
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
+		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), abandonedOpID)
+	require.NoError(t, err)
+
+	// A third deployment whose drive settled it into failed_retryable and left
+	// its lease behind: a fresh-looking lease with no drive behind it, which the
+	// gate must not read as live.
+	settledOpID := insertOperation(t, "region-c", "op-3")
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE apply_operations SET state = $1, updated_at = NOW() WHERE id = $2`,
+		state.ApplyOperation.FailedRetryable, settledOpID)
+	require.NoError(t, err)
+
+	insertTask := func(t *testing.T, identifier, table string, opID int64, taskState string) {
+		t.Helper()
+		_, err := db.ExecContext(t.Context(), `
+			INSERT INTO tasks (task_identifier, apply_id, apply_operation_id, plan_id, database_name,
+				database_type, engine, repository, pull_request, environment, state, table_name, ddl,
+				ddl_action, options, error_message)
+			VALUES ($1, $2, $3, 1, 'testdb', 'mysql', 'spirit', 'org/repo', 7, 'staging', $4, $5, $6,
+				'ALTER', '{}', '')`,
+			identifier, applyID, opID, taskState, table,
+			"ALTER TABLE "+table+" ADD COLUMN email varchar(255)")
+		require.NoError(t, err)
+	}
+	insertTask(t, "task-expire-stranded", "users", abandonedOpID, state.Task.Running)
+	insertTask(t, "task-expire-live", "orders", heldOpID, state.Task.Running)
+	insertTask(t, "task-expire-queued", "products", heldOpID, state.Task.Pending)
+	insertTask(t, "task-expire-settled", "invoices", settledOpID, state.Task.FailedRetryable)
+
+	taskState := func(t *testing.T, identifier string) string {
+		t.Helper()
+		var got string
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			`SELECT state FROM tasks WHERE task_identifier = $1`, identifier).Scan(&got))
+		return got
+	}
+
+	expired, err := store.Applies().ExpireRetryable(t.Context())
+	require.NoError(t, err)
+	require.Len(t, expired, 1)
+	assert.Equal(t, state.Apply.Failed, expired[0].Apply.State, "the rollout's verdict is still expiry's to write")
+	assert.Equal(t, state.Task.Failed, taskState(t, "task-expire-stranded"))
+	assert.Equal(t, state.Task.Running, taskState(t, "task-expire-live"),
+		"a live driver's rows are not expiry's to terminalize")
+	assert.Equal(t, state.Task.Pending, taskState(t, "task-expire-queued"),
+		"nor the work queued behind them")
+	assert.Equal(t, state.Task.Failed, taskState(t, "task-expire-settled"),
+		"a lease its drive left behind speaks for nothing")
+
+	// The driver dies: its lease ages out, its rows stop being mirrored, and the
+	// verdict expiry wrote goes quiet long enough for the sweep to mirror it down.
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
+		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), heldOpID)
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE applies SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
+		int64((strandedActiveParentQuiescence + time.Minute).Seconds()), applyID)
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), `
+		UPDATE tasks SET updated_at = NOW() - make_interval(secs => $1)
+		WHERE task_identifier IN ('task-expire-live', 'task-expire-queued')`,
+		int64((strandedActiveTaskQuiescence + time.Minute).Seconds()))
+	require.NoError(t, err)
+
+	reaped, err := store.Tasks().ReapStrandedActive(t.Context(), 10)
+	require.NoError(t, err)
+	require.Len(t, reaped, 2, "both rows the gate skipped are the sweep's once the lease goes stale")
+	assert.Equal(t, state.Task.Failed, taskState(t, "task-expire-live"))
+	assert.Equal(t, state.Task.Failed, taskState(t, "task-expire-queued"))
+}
