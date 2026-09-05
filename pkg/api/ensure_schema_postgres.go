@@ -70,6 +70,15 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Lock
 		)
 	}
 
+	// Every cross-instance guarantee on the PostgreSQL path — this bootstrap's
+	// lock, the apply target lock, and reaper election — is one session-scoped
+	// advisory lock, so prove that a connection keeps its session before
+	// relying on any of them. The check runs ahead of the fast path because a
+	// converged pod that skips the lock still drives applies afterwards.
+	if err := verifyStorageSessionAffinity(ctx, db, locker, database); err != nil {
+		return err
+	}
+
 	// Fast path: discover drift without a lock. This is the common case and
 	// avoids advisory-lock overhead when the schema is already converged.
 	drift, err := postgresSchemaDriftFor(ctx, db, tables, files)
@@ -112,7 +121,7 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Lock
 	if err != nil {
 		return fmt.Errorf("acquire schema lock: %w", err)
 	}
-	defer utils.CloseAndLog(lockConn)
+	defer releaseEnsureSchemaLock(ctx, locker, lockConn, logger, schema.DialectPostgres, database)
 
 	// Re-check under the lock — another pod may have converged the schema while
 	// this pod waited.
@@ -674,12 +683,55 @@ func execPostgresChanges(ctx context.Context, db *sql.DB, table string, changes 
 	return nil
 }
 
+// pooledStorageRefusal is the startup refusal an operator reads when the
+// storage connection turns out not to keep one PostgreSQL session. It names
+// what SchemaBot loses, why nothing else would have reported it, and the two
+// endpoints that fix it, because a pod that refuses to boot has no other
+// surface to say it on.
+const pooledStorageRefusal = "refusing to bootstrap storage database %q: the storage connection does not keep one PostgreSQL session per connection, " +
+	"which is the signature of a transaction-mode connection pooler (PgBouncer pool_mode=transaction, a hosted platform's pooled endpoint, " +
+	"or a proxy that has stopped pinning sessions). SchemaBot serializes this bootstrap across pods, and one apply per deployment at runtime, " +
+	"with session-scoped advisory locks that such a pooler grants without excluding anyone, so two pods would converge this schema and later " +
+	"drive the same apply at once. Point the storage DSN at the database's direct session endpoint (on hosted platforms this is usually the " +
+	"standard PostgreSQL port rather than the pooled one), or run the pooler in session pool mode: %w"
+
+// sessionAffinityVerifier is implemented by a locker that can prove, on a
+// given pool, that the session its locks live on is the session its caller
+// keeps reaching. A locker without the method cannot make that claim, so the
+// bootstrap refuses it rather than assume it.
+type sessionAffinityVerifier interface {
+	VerifySessionAffinity(ctx context.Context, db *sql.DB) error
+}
+
+// verifyStorageSessionAffinity refuses to bootstrap PostgreSQL storage over a
+// connection whose session does not survive a transaction. SchemaBot has no
+// second mechanism behind the advisory lock: converging storage without it
+// means two pods executing DDL against the same database, and the runtime
+// locks that keep one apply per deployment fail the same way, so an operator
+// who lands on a pooled connection string gets a startup refusal naming the
+// fix rather than silence.
+func verifyStorageSessionAffinity(ctx context.Context, db *sql.DB, locker namedlock.Locker, database string) error {
+	verifier, ok := locker.(sessionAffinityVerifier)
+	if !ok {
+		return fmt.Errorf("storage locker %T cannot verify that its advisory locks hold one PostgreSQL session; refusing to bootstrap storage database %q without cross-instance exclusion", locker, database)
+	}
+	if err := verifier.VerifySessionAffinity(ctx, db); err != nil {
+		if errors.Is(err, namedlock.ErrNoSessionAffinity) {
+			return fmt.Errorf(pooledStorageRefusal, database, err)
+		}
+		return fmt.Errorf("verify storage session affinity for database %q: %w", database, err)
+	}
+	return nil
+}
+
 // acquirePostgresEnsureSchemaLock acquires a session-scoped advisory lock to
 // serialize EnsureSchema across pods, mirroring acquireMySQLEnsureSchemaLock
 // for the PostgreSQL bootstrap flow. It opens a dedicated *sql.DB whose pool
 // is closed before returning, so closing the returned connection terminates
-// the underlying session and releases the advisory lock — returning the
-// connection to a shared pool would leave the session (and the lock) alive.
+// the underlying session — returning the connection to a shared pool would
+// leave the session (and the lock) alive. Callers hand the connection to
+// releaseEnsureSchemaLock, which releases the lock explicitly before that
+// close so the release has an answer to report.
 func acquirePostgresEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logger, locker namedlock.Locker) (*sql.Conn, error) {
 	db, err := postgresconn.Open(dsn)
 	if err != nil {

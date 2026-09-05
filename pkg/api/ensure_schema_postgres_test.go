@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -23,6 +24,24 @@ func TestEnsurePostgresSchema_MalformedDSNFailsAtOpen(t *testing.T) {
 	err := ensurePostgresSchema("postgres://user@host:notaport/db", logger, nil)
 	require.Error(t, err)
 	require.ErrorContains(t, err, "open storage database")
+}
+
+// unverifiableLocker takes locks but cannot say whether the session they live
+// on is the session its caller keeps reaching.
+type unverifiableLocker struct{ namedlock.Locker }
+
+// The bootstrap's cross-instance exclusion is only as good as the guarantee
+// that a lock stays on a session the pod can reach. A locker that cannot
+// establish that guarantee leaves the bootstrap unable to tell an exclusive
+// convergence from a concurrent one, so startup refuses rather than assuming
+// the favorable case.
+func TestVerifyStorageSessionAffinity_RefusesLockerThatCannotVerify(t *testing.T) {
+	t.Parallel()
+
+	err := verifyStorageSessionAffinity(t.Context(), nil, unverifiableLocker{}, "schemabot")
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "refusing to bootstrap storage database \"schemabot\" without cross-instance exclusion")
 }
 
 // The embedded PostgreSQL schema files are the source of truth for the

@@ -52,6 +52,7 @@
   - [OW-6: There is one way to claim work](#ow-6-there-is-one-way-to-claim-work)
   - [OW-7: Ownership uncertainty fails closed](#ow-7-ownership-uncertainty-fails-closed)
   - [OW-8: Only drivers and elected reapers write apply and task rows](#ow-8-only-drivers-and-elected-reapers-write-apply-and-task-rows)
+  - [OW-9: An advisory lock is only exclusion where the session holds still](#ow-9-an-advisory-lock-is-only-exclusion-where-the-session-holds-still)
 - [Control operations (CO)](#control-operations-co)
   - [CO-1: Durable before acknowledged](#co-1-durable-before-acknowledged)
   - [CO-2: Every command resolves; none wedges](#co-2-every-command-resolves-none-wedges)
@@ -788,7 +789,8 @@ rather than the operation is the unit of reconciliation.
 
 The check runs whenever an apply is created or moved back into an active state, serialized across
 instances by an advisory lock keyed on (database, database type, environment) and held for the
-transaction that decides. It does not depend on a user-facing database lock being held: direct API
+transaction that decides. That lock excludes only while the connection holding it keeps one
+server session, which OW-9 covers. It does not depend on a user-facing database lock being held: direct API
 callers and `--no-lock` flows are equally bound. *Enforced:* the exclusivity check in the storage
 apply create and activate paths, under the apply target lock
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/locks.go`).
@@ -855,6 +857,38 @@ what makes the registry unreliable.
 reaper's task sweeps (`unleasedOperationGate`,
 `pkg/storage/internal/sqlstore/apply_operations.go`), and a read path that builds progress from
 stored rows without writing them (`pkg/api/progress_handlers.go`).
+
+### OW-9: An advisory lock is only exclusion where the session holds still
+
+Every guarantee SchemaBot has across instances that is not a lease predicate is one advisory
+lock: the storage bootstrap, the apply target lock behind OW-5, and reaper election. All three
+are session-scoped, so all three are exclusion only while a connection keeps reaching the same
+server session.
+
+That is a property of the connection and not of the lock. It holds against a database, and
+against a pooler that gives a client its own session for the connection's lifetime. It does not
+hold behind a transaction-mode pooler, which rebinds the backend per transaction: the lock lands
+on a session the client stops mapping to, a second caller reaching that backend takes the same
+lock, and the release comes back false because the connection asking is no longer the session
+holding it. Nothing about that reads as an error: both callers are told they hold the lock.
+
+So on PostgreSQL the property is proven at startup rather than assumed, and a proof that fails
+refuses the process rather than converging storage or driving applies without exclusion. A lock
+whose release reports it was not held is reported as lost ownership, because a caller that
+believed it held the lock has just learned it did not.
+
+The proof is one-sided by construction: it observes facts about the pool in front of it, so it
+has no false positive, and an idle pooler with spare backends can still answer every reading the
+healthy way. It is the guard against the connection string a hosted platform hands out by
+default, not a substitute for the direct endpoint.
+
+*Breaks if violated:* two pods converge the same storage schema, and later drive the same apply,
+each believing it holds the lock. *Enforced:* the session affinity probe
+(`Postgres.VerifySessionAffinity`, `pkg/namedlock/postgres_affinity.go`), refused at bootstrap
+(`verifyStorageSessionAffinity`, `pkg/api/ensure_schema_postgres.go`); the release-answer
+warnings on every advisory lock caller (`releaseEnsureSchemaLock`, `pkg/api/ensure_schema.go`;
+`releaseApplyTargetLockConn`, `pkg/storage/internal/sqlstore/applies.go`; `reapUnderElection`,
+`pkg/storage/internal/sqlstore/reaper.go`).
 
 ## Control operations (CO)
 
