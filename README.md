@@ -131,6 +131,9 @@ Design and operations docs live in the [docs](./docs/) folder:
   the state machine, and how a change flows through them.
 - [docs/configuration.md](./docs/configuration.md) covers server setup: local mode, gRPC mode,
   and secret resolution.
+- [docs/schema-intelligence.md](./docs/schema-intelligence.md) is the map of what SchemaBot
+  knows and how to query it: the live schema of every database, the history of every change
+  with its DDL and caller, and the progress of everything in flight, all on the read tier.
 - [docs/invariants.md](./docs/invariants.md) is the registry of runtime safety invariants:
   what must never be false while SchemaBot is running, why each rule matters, where it is
   enforced, and what these guarantees deliberately do not cover. It opens with what happens
