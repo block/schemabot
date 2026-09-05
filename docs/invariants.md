@@ -685,9 +685,30 @@ settles to permanent `failed` when the attempt budget is spent or the recovery w
 Multi-deployment rollouts claim operations in `deployment_order`, and a failed earlier deployment
 blocks later ones unless the config says otherwise. Once an operator releases a paused rollout it
 stays released, with no path back to paused. An *unrecognized* `on_failure` value behaves like
-`halt`, never like `continue`. *Enforced:* the ordered-claim gate in `FindNextApplyOperation`
+`halt`, never like `continue`.
+
+Failing closed decides the verdict, not when it is recorded. A fail-closed policy refuses new
+claims and cancels nothing, so a sibling deployment that a driver already started keeps working through
+the failure: the apply stays `running_degraded` until that sibling settles and only then takes
+the `failed` verdict. A sibling that is merely pending holds nothing, since the same policy is what
+stops it from ever starting. Recording the verdict over live work would release the reservation on
+the parent's whole target set (OW-5) while a driver is mid-change on one of those targets, and
+would take `stop` and `cancel` away from the operator who still has work to stop.
+
+Settled rather than terminal is what decides whether a sibling still holds its deployment, under
+every policy and not only the fail-closed ones. The two differ by one state: a `stopped` sibling is
+terminal for claiming but resumable, so an operator can start it again and a driver will write to
+that target. A rollout whose remaining sibling is stopped therefore stays open — `running_degraded`,
+or `paused` where a pause is holding it — until that sibling is started and finishes, or is
+cancelled. A rollout held open this way still resolves the stop that produced it, once that stop
+has reached every operation: the pending request is what `start` consults, so holding it open
+without completing the request would refuse the start the hold exists to preserve (CO-2).
+*Enforced:* the ordered-claim gate in `FindNextApplyOperation`
 (`pkg/storage/internal/sqlstore/apply_operations.go`) and the rollout state derivation
-(`pkg/state/apply.go`).
+(`DeriveRolloutApplyState`, `hasStartedUnsettledWork` and `childHoldsItsTarget`,
+`pkg/state/apply.go`), with `completeLandedStopForHeldOpenApply` and
+`RolloutHeldByResumableChild` keeping a held-open rollout's stop resolved and its recovery claim
+quiet (`pkg/api/operator.go`).
 
 ## Ownership and leases (OW)
 

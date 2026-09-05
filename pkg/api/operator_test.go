@@ -1242,6 +1242,11 @@ type markPendingStoppedRecordingStore struct {
 	called     bool
 	stoppedFor int64
 	count      int64
+	ops        []*storage.ApplyOperation
+}
+
+func (s *markPendingStoppedRecordingStore) ListByApply(_ context.Context, _ int64) ([]*storage.ApplyOperation, error) {
+	return s.ops, nil
 }
 
 func (s *markPendingStoppedRecordingStore) MarkPendingStoppedByApply(_ context.Context, applyID int64) (int64, error) {
@@ -1314,6 +1319,12 @@ func TestStopPendingOperationsForPendingStop(t *testing.T) {
 // terminally, and keeps a pending cancel deliverable when the terminal state
 // is stopped — a stopped apply remains cancellable, so completing the cancel
 // there would consume a command the next drive still has to deliver.
+//
+// A stop also resolves on an apply the rollout projection is holding open once
+// it has reached every operation. A stopped operation still holds its target,
+// so a stopped rollout can carry a running-family verdict; the stop request is
+// what start consults, and leaving it pending there would refuse the very start
+// that resumes the stopped operation.
 func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
 	pendingRequest := func(op storage.ControlOperation) *storage.ApplyControlRequest {
 		return &storage.ApplyControlRequest{ApplyID: 9, Operation: op, Status: storage.ControlRequestPending}
@@ -1356,16 +1367,36 @@ func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
 		assert.Equal(t, storage.ControlOperationStop, control.completed[0])
 	})
 
-	t.Run("leaves both requests pending while the apply is non-terminal", func(t *testing.T) {
+	t.Run("leaves both requests pending while an operation the stop has not reached is running", func(t *testing.T) {
 		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-running", State: state.Apply.Running}}
 		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
 			storage.ControlOperationStop:   pendingRequest(storage.ControlOperationStop),
 			storage.ControlOperationCancel: pendingRequest(storage.ControlOperationCancel),
 		}}
-		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
+		ops := &markPendingStoppedRecordingStore{ops: []*storage.ApplyOperation{
+			{ID: 1, Deployment: "region-a", State: state.ApplyOperation.Running},
+		}}
+		svc := newStopReconcileTestService(applies, ops, control)
 
 		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
-		assert.Empty(t, control.completed, "a non-terminal apply must not complete any control request")
+		assert.Empty(t, control.completed, "an apply with live work must not complete any control request")
+	})
+
+	t.Run("completes only the stop when a held-open apply has stopped every operation", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-degraded", State: state.Apply.RunningDegraded}}
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationStop:   pendingRequest(storage.ControlOperationStop),
+			storage.ControlOperationCancel: pendingRequest(storage.ControlOperationCancel),
+		}}
+		ops := &markPendingStoppedRecordingStore{ops: []*storage.ApplyOperation{
+			{ID: 1, Deployment: "region-a", State: state.ApplyOperation.Failed},
+			{ID: 2, Deployment: "region-b", State: state.ApplyOperation.Stopped},
+		}}
+		svc := newStopReconcileTestService(applies, ops, control)
+
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
+		require.Len(t, control.completed, 1, "the stop landed on every operation, so its request completes; the cancel is still deliverable")
+		assert.Equal(t, storage.ControlOperationStop, control.completed[0])
 	})
 
 	t.Run("no-op when nothing is pending", func(t *testing.T) {

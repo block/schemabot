@@ -241,7 +241,11 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		resetMatrixTables(t, ctx, db)
 		// A continue rollout that already failed one deployment and still has a
 		// pending sibling, with a queued stop: the stop must halt the pending
-		// sibling and settle the apply rather than starting more deployments.
+		// sibling rather than starting more deployments. The stopped sibling
+		// still holds its deployment, so the rollout holds running_degraded
+		// instead of settling, and the stop request completes anyway — the
+		// operator's next start is what resumes that sibling, and a stop left
+		// pending would refuse it.
 		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
 			applyIdentifier: "matrix-pending-stop",
 			parentState:     state.Apply.RunningDegraded,
@@ -278,9 +282,11 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		assert.Equal(t, state.ApplyOperation.Stopped, opState(t, ctx, stor, seed.opID("region-b")),
 			"the pending sibling must be stopped, not started, under a pending stop")
 		apply := getApply(t, ctx, stor, seed.applyID)
-		assert.Equal(t, state.Apply.Failed, apply.State, "failed + stopped settles the rollout to failed")
-		assert.True(t, stopRequestCompleted(t, ctx, stor, seed.applyID), "the pending stop request must be completed")
-		assert.Equal(t, 1, svc.matrixSummary.count(), "the settled rollout still owes exactly one terminal summary")
+		assert.Equal(t, state.Apply.RunningDegraded, apply.State,
+			"a stopped sibling holds its deployment, so the rollout holds instead of settling")
+		assert.True(t, stopRequestCompleted(t, ctx, stor, seed.applyID),
+			"the stop reached every operation, so its request must be completed rather than left to refuse the resuming start")
+		assert.Equal(t, 0, svc.matrixSummary.count(), "a rollout that has not settled owes no terminal summary")
 	})
 
 	t.Run("ConcurrentSiblingCompletionsPublishOneSummary", func(t *testing.T) {
