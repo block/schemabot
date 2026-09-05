@@ -727,3 +727,136 @@ func clearPostgresTables(t *testing.T, db *sql.DB) {
 		require.NoError(t, err)
 	}
 }
+
+// The stranded-active sweep defers to the operation lease on PostgreSQL exactly
+// as it does on MySQL. The gate is rendered SQL rather than Go, so it has to be
+// exercised on each dialect: the row here is stale by every window the sweep
+// applies, leaving the lease as the only thing that can keep it.
+func TestPostgresReapStrandedActiveDefersToTheOperationLease(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_reap_lease")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+
+	h := postgresHarness{db: db, dsn: dsn}
+	store := h.NewStorage(t)
+
+	// A settled parent, quiet long enough that no window on it protects anything.
+	var applyID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, options, error_message, updated_at)
+		VALUES ('apply-reap-lease', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', $1, '{}',
+			'target rejected the schema change', NOW() - make_interval(secs => $2))
+		RETURNING id`, state.Apply.Failed,
+		int64((strandedActiveParentQuiescence+time.Minute).Seconds())).Scan(&applyID))
+
+	// The operation a driver is holding, heartbeated as of now.
+	var opID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO apply_operations (apply_id, deployment, operation_key, state, lease_owner, lease_token)
+		VALUES ($1, 'region-a', 'op-1', $2, 'driver', 'op-token')
+		RETURNING id`, applyID, state.ApplyOperation.Running).Scan(&opID))
+
+	_, err = db.ExecContext(t.Context(), `
+		INSERT INTO tasks (task_identifier, apply_id, apply_operation_id, plan_id, database_name,
+			database_type, engine, repository, pull_request, environment, state, table_name, ddl,
+			ddl_action, options, updated_at)
+		VALUES ('task-reap-lease', $1, $2, 1, 'testdb', 'mysql', 'spirit', 'org/repo', 7, 'staging', $3,
+			'users', 'ALTER TABLE users ADD COLUMN email varchar(255)', 'ALTER', '{}',
+			NOW() - make_interval(secs => $4))`,
+		applyID, opID, state.Task.Running,
+		int64((strandedActiveTaskQuiescence + time.Minute).Seconds()))
+	require.NoError(t, err)
+
+	taskState := func(t *testing.T) string {
+		t.Helper()
+		var got string
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			`SELECT state FROM tasks WHERE task_identifier = 'task-reap-lease'`).Scan(&got))
+		return got
+	}
+
+	reaped, err := store.Tasks().ReapStrandedActive(t.Context(), 10)
+	require.NoError(t, err)
+	assert.Empty(t, reaped, "a driver holds the operation, so the row is not the reaper's to write")
+	assert.Equal(t, state.Task.Running, taskState(t))
+
+	// The driver goes away without releasing: its heartbeat ages past the point
+	// where a peer would take the operation from it.
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
+		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), opID)
+	require.NoError(t, err)
+
+	reaped, err = store.Tasks().ReapStrandedActive(t.Context(), 10)
+	require.NoError(t, err)
+	require.Len(t, reaped, 1, "a lease a peer could reclaim no longer speaks for the row")
+	assert.Equal(t, state.Task.Failed, taskState(t))
+}
+
+// The stranded-retryable sweep renders the same lease gate, and its own SQL is
+// rendered separately from the active sweep's, so PostgreSQL has to execute it
+// too. A failed_retryable row under a long-settled parent is the reaper's only
+// once no driver holds the operation the retry would run under.
+func TestPostgresReapStrandedRetryableDefersToTheOperationLease(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_reap_retry_lease")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+
+	h := postgresHarness{db: db, dsn: dsn}
+	store := h.NewStorage(t)
+
+	var applyID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, options, error_message, updated_at)
+		VALUES ('apply-reap-retry-lease', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', $1, '{}',
+			'', NOW() - make_interval(secs => $2))
+		RETURNING id`, state.Apply.Completed,
+		int64((strandedRetryableQuiescence+time.Minute).Seconds())).Scan(&applyID))
+
+	// The operation a driver is holding, heartbeated as of now.
+	var opID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO apply_operations (apply_id, deployment, operation_key, state, lease_owner, lease_token)
+		VALUES ($1, 'region-a', 'op-1', $2, 'driver', 'op-token')
+		RETURNING id`, applyID, state.ApplyOperation.Running).Scan(&opID))
+
+	_, err = db.ExecContext(t.Context(), `
+		INSERT INTO tasks (task_identifier, apply_id, apply_operation_id, plan_id, database_name,
+			database_type, engine, repository, pull_request, environment, state, table_name, ddl,
+			ddl_action, options, error_message)
+		VALUES ('task-reap-retry-lease', $1, $2, 1, 'testdb', 'mysql', 'spirit', 'org/repo', 7, 'staging', $3,
+			'users', 'ALTER TABLE users ADD COLUMN email varchar(255)', 'ALTER', '{}', 'copy failed')`,
+		applyID, opID, state.Task.FailedRetryable)
+	require.NoError(t, err)
+
+	taskState := func(t *testing.T) string {
+		t.Helper()
+		var got string
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			`SELECT state FROM tasks WHERE task_identifier = 'task-reap-retry-lease'`).Scan(&got))
+		return got
+	}
+
+	reaped, err := store.Tasks().ReapStrandedRetryable(t.Context(), 10)
+	require.NoError(t, err)
+	assert.Empty(t, reaped, "a driver holds the operation, so the retry promise is not the reaper's to retire")
+	assert.Equal(t, state.Task.FailedRetryable, taskState(t))
+
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
+		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), opID)
+	require.NoError(t, err)
+
+	reaped, err = store.Tasks().ReapStrandedRetryable(t.Context(), 10)
+	require.NoError(t, err)
+	require.Len(t, reaped, 1, "a lease a peer could reclaim no longer speaks for the row")
+	assert.Equal(t, state.Task.Failed, taskState(t))
+}

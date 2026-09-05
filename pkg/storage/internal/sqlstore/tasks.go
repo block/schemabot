@@ -697,9 +697,10 @@ func (s *taskStore) reapStrandedRetryable(ctx context.Context, limit int) ([]*st
 		FROM tasks
 		WHERE state = ?
 			AND %s
+			AND %s
 		ORDER BY created_at, id
 		LIMIT ?
-	`, taskColumns, parentGate), selectArgs...)
+	`, taskColumns, parentGate, unleasedOperationGate(s.dialect)), selectArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("query stranded retryable tasks: %w", err)
 	}
@@ -736,9 +737,9 @@ func (s *taskStore) reapStrandedRetryable(ctx context.Context, limit int) ([]*st
 			return reaped, err
 		}
 		if !settled {
-			// The row left failed_retryable (or the parent left the settled set)
-			// between the read and the guarded write, so it belongs to whoever
-			// moved it.
+			// The row left failed_retryable, a driver took its operation's lease, or
+			// the parent left the settled set, between the read and the guarded
+			// write, so it belongs to whoever moved it.
 			slog.DebugContext(ctx, "stranded retryable task changed before it could be reaped; skipping",
 				task.LogAttrs()...)
 			continue
@@ -753,9 +754,11 @@ func (s *taskStore) reapStrandedRetryable(ctx context.Context, limit int) ([]*st
 // kept — its failure is real; only the dead retry promise is retired — and
 // completed_at is stamped because failed is terminal.
 //
-// The write re-asserts the parent gate rather than trusting the sweep's read:
-// the guarded UPDATE re-verifies the parent it was chosen for, so a write never
-// lands on the strength of a read that may be seconds old.
+// The write re-asserts the parent and lease gates rather than trusting the
+// sweep's read: the guarded UPDATE re-verifies the parent it was chosen for and
+// re-reads the operation lease, so a write never lands on the strength of a read
+// that may be seconds old, and a driver that claims the operation in between
+// keeps the row.
 func (s *taskStore) reapStrandedRetryableTask(ctx context.Context, task *storage.Task) (bool, error) {
 	parentGate, parentGateArgs := strandedParentGate(s.dialect, "tasks.apply_id", strandedRetryableQuiescence)
 	args := []any{state.Task.Failed, task.ID, state.Task.FailedRetryable}
@@ -766,6 +769,7 @@ func (s *taskStore) reapStrandedRetryableTask(ctx context.Context, task *storage
 		SET state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
 		WHERE id = ? AND state = ?
 			AND `+parentGate+`
+			AND `+unleasedOperationGate(s.dialect)+`
 	`, args...)
 	if err != nil {
 		return false, fmt.Errorf("reap stranded retryable task %s (table %q): %w",
@@ -800,10 +804,10 @@ const strandedActiveTaskReaperLockName = "schemabot_stranded_active_task_reaper"
 // strandedActiveTaskQuiescence is how long a task row must have gone untouched
 // before the sweep settles it. It is measured on the task row, not the parent,
 // because the task row is the one a live drive writes: every tick mirrors its
-// tasks unconditionally, so tasks.updated_at is the drive's liveness signal.
-// The parent applies row is not a substitute — a drive holding only an
-// operation lease is forbidden from bumping it, so it can sit quiet while that
-// drive works.
+// tasks unconditionally, so tasks.updated_at tracks a drive's activity closely
+// enough to say when a row is worth looking at. The parent applies row is not a
+// substitute — a drive holding only an operation lease is forbidden from bumping
+// it, so it can sit quiet while that drive works.
 //
 // Three drive shapes make that unconditional write, and all three say so where
 // they make it: syncAtomicTaskProgress (local grouped drives),
@@ -823,13 +827,13 @@ const strandedActiveTaskReaperLockName = "schemabot_stranded_active_task_reaper"
 // budget, so a drive the operator would have cancelled is always cancelled
 // first and the reaper cleans up after that path rather than racing it.
 //
-// One gap in the premise is narrowed here, not closed: the remote sync skips a
-// stored task the remote stopped reporting, so a row can miss ticks while its
-// drive is alive, and the operation watchdog reads the newest mirror across the
-// operation's tasks, so a mirroring sibling hides it from the cancel path. No
-// window length bounds that. What is left is a row the remote has gone silent
-// about for longer than the entire recovery budget, under a parent that has
-// already settled.
+// The window is not what makes the sweep safe. The operation lease is
+// (unleasedOperationGate), and it has to be, because this window rests on a
+// premise no length can guarantee: the remote sync skips a stored task the
+// remote stopped reporting, so a row can miss ticks while its drive is alive.
+// The lease does not depend on the drive having mirrored anything. What the
+// window adds on top is that a row is only reaped once the operator's own
+// recovery has had its chance and not taken it.
 //
 // All timestamps compared are database-side, so there is no clock skew to
 // absorb, and the guarded write re-asserts the window anyway: a drive that
@@ -838,12 +842,12 @@ const strandedActiveTaskQuiescence = 3 * storage.ApplyDriveStallAfter / 2
 
 // strandedActiveParentQuiescence is how long the parent apply must have been
 // settled before the sweep considers its task rows. It is far shorter than the
-// operation reaper's window because it is no longer what makes the sweep safe:
-// the task-row window above is, and it is the only one that holds under fan-out.
-// What is left for the parent to prove is that its verdict is final and no
-// driver still holds it, which two lease-staleness windows establish — a lease
-// that has not been heartbeated that long is already re-claimable, so an apply
-// row quiet for twice that has no live driver by the claim path's own reckoning.
+// operation reaper's window because it is not what makes the sweep safe. What is
+// left for the parent to prove is that its verdict is final and no driver holds
+// the apply itself, which two lease-staleness windows establish — a lease that
+// has not been heartbeated that long is already re-claimable, so an apply row
+// quiet for twice that has no live driver by the claim path's own reckoning.
+// That is the apply-level half of what unleasedOperationGate does per operation.
 const strandedActiveParentQuiescence = 2 * storage.ApplyLeaseStaleAfter
 
 // strandedActiveTaskGate renders the condition admitting only task rows no
@@ -891,11 +895,11 @@ func (s *taskStore) ReapStrandedActive(ctx context.Context, limit int) ([]*stora
 // the parent detects that, because the parent is not the row the live drive
 // touches.
 //
-// The task row is. Every drive tick mirrors its tasks unconditionally, which is
-// what makes tasks.updated_at the drive's liveness signal — the operator reads
-// it to cancel a stalled drive. So the sweep gates on the task's own quiescence
-// too: a row no drive has touched for longer than a stalled drive would survive
-// is stranded, whatever its siblings are doing.
+// The operation the drive holds is what rules that out: the sweep takes only
+// rows whose operation carries no live lease (unleasedOperationGate), reading
+// that lease the way the claim path reads one it may take from a peer. On top
+// of that it gates on the task's own quiescence, so a row is settled only after
+// the operator's stalled-drive recovery has had its window and left it behind.
 //
 // failed_retryable is deliberately excluded. It is active by the task state
 // machine, but it belongs to the retryable sweep, which waits out a far longer
@@ -923,9 +927,11 @@ func (s *taskStore) reapStrandedActive(ctx context.Context, limit int) ([]*stora
 		WHERE state NOT IN (%s)
 			AND %s
 			AND %s
+			AND %s
 		ORDER BY created_at, id
 		LIMIT ?
-	`, taskColumns, placeholders(len(excluded)), strandedActiveTaskGate(s.dialect), parentGate), selectArgs...)
+	`, taskColumns, placeholders(len(excluded)), strandedActiveTaskGate(s.dialect), parentGate,
+		unleasedOperationGate(s.dialect)), selectArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("query stranded active tasks: %w", err)
 	}
@@ -963,9 +969,10 @@ func (s *taskStore) reapStrandedActive(ctx context.Context, limit int) ([]*stora
 		}
 		if !settled {
 			// The row left the state it was read in, a drive mirrored it and
-			// refreshed its liveness, or the parent left the settled set, between
-			// the read and the guarded write. Any of the three means the row
-			// belongs to a live writer rather than to the sweep.
+			// refreshed its liveness, a driver took its operation's lease, or the
+			// parent left the settled set, between the read and the guarded write.
+			// Any of the four means the row belongs to a live writer rather than to
+			// the sweep.
 			slog.DebugContext(ctx, "stranded active task changed before it could be reaped; skipping",
 				task.LogAttrs()...)
 			continue
@@ -984,9 +991,10 @@ func (s *taskStore) reapStrandedActive(ctx context.Context, limit int) ([]*stora
 //
 // completed_at is stamped because every settled parent state is non-resumable.
 //
-// The write re-asserts the row's state, its quiescence, and the parent gate
-// rather than trusting the sweep's read, so it can never overwrite a row a
-// driver moved — or merely mirrored — after the scan selected it.
+// The write re-asserts the row's state, its quiescence, the parent gate and the
+// operation lease rather than trusting the sweep's read, so it does not
+// overwrite a row a driver moved, mirrored, or claimed after the scan selected
+// it.
 func (s *taskStore) reapStrandedActiveTask(ctx context.Context, task *storage.Task, parent *storage.Apply) (bool, error) {
 	taskState := state.NormalizeState(parent.State)
 	setClause := "state = ?, completed_at = COALESCE(completed_at, NOW())"
@@ -1005,6 +1013,7 @@ func (s *taskStore) reapStrandedActiveTask(ctx context.Context, task *storage.Ta
 		WHERE id = ? AND state = ?
 			AND `+strandedActiveTaskGate(s.dialect)+`
 			AND `+parentGate+`
+			AND `+unleasedOperationGate(s.dialect)+`
 	`, args...)
 	if err != nil {
 		return false, fmt.Errorf("reap stranded active task %s (table %q) from %s parent apply: %w",
