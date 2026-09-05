@@ -6,6 +6,8 @@
 
 GitOps for database schemas. Define your desired schema in SQL files, open a PR, and SchemaBot plans and executes your schema changes safely.
 
+SchemaBot supports **MySQL**, **Vitess**, and **PostgreSQL**.
+
 ## Schema Changes via Pull Request
 
 Open a PR with schema changes and SchemaBot handles the rest — plan, apply, and verify across environments:
