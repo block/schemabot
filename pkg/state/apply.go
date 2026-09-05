@@ -275,7 +275,9 @@ type RolloutChild struct {
 //
 // After classifying every child, in precedence order:
 //
-//   - any fail-closed child → failed;
+//   - any fail-closed child → failed, or running_degraded while a sibling that
+//     already started is still working (fail closed decides the verdict, not
+//     when it is recorded);
 //   - else any pause-held child → paused;
 //   - else if every child is terminal → failed (the verdict still reflects the
 //     failure once the continue/released rollout has settled);
@@ -328,6 +330,18 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 		}
 	}
 	if hardFail {
+		// The verdict is decided, but the apply is not over. A fail-closed
+		// policy only refuses new claims; it cancels nothing, so a sibling a
+		// driver already started keeps writing to its target. Recording the
+		// terminal verdict over it would release the reservation on the
+		// parent's whole target set (OW-5) while one of those targets is
+		// mid-change, and would take stop and cancel away from the operator who
+		// still has live work to stop. Hold the apply until that work settles.
+		// A sibling still pending holds nothing: the same policy is what stops
+		// it from ever starting.
+		if hasStartedNonTerminalWork(children) {
+			return Apply.RunningDegraded
+		}
 		return Apply.Failed
 	}
 	if pausedHold {
@@ -337,6 +351,25 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 		return Apply.Failed
 	}
 	return Apply.RunningDegraded
+}
+
+// hasStartedNonTerminalWork reports whether any child is non-terminal and has
+// moved past pending: work a driver has already begun against a target.
+//
+// This is the line a fail-closed rollout turns on, because the two kinds of
+// non-terminal sibling differ in whether the policy reaches them. A pending
+// sibling is exactly what the ordered-claim gate holds back, so it will not
+// start while the failure stands and it has touched nothing. A sibling already
+// running, draining, parked at a cutover barrier, or awaiting a retry was
+// claimed before the failure, and refusing new claims does not reach back to
+// stop it.
+func hasStartedNonTerminalWork(children []RolloutChild) bool {
+	for _, c := range children {
+		if !IsTerminalApplyState(c.State) && !IsState(c.State, Apply.Pending) {
+			return true
+		}
+	}
+	return false
 }
 
 // hasLaterNonTerminal reports whether any child after failedIndex (in
@@ -447,8 +480,8 @@ var SettledApplyStates = []string{
 }
 
 // IsRunningApplyState reports whether an apply is in a running-family state:
-// running, running_degraded (a continue rollout still in flight after a
-// sibling deployment failed), or one of the post-copy phases (catching_up,
+// running, running_degraded (a rollout still in flight past a failed sibling,
+// whether it is continuing or halted), or one of the post-copy phases (catching_up,
 // checksumming, post_checksum) where the engine is still actively working the
 // change. Control gates that mean "the apply is actively running" — cutover
 // readiness, start reconciliation, stop eligibility — must use this so

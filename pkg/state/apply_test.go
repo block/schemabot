@@ -497,8 +497,12 @@ func TestDeriveRolloutApplyState_NoFailureMatchesBase(t *testing.T) {
 
 // TestDeriveRolloutApplyState_FailurePolicy is the truth table for the failed
 // base case: continue holds the apply active until siblings settle, while halt
-// and unrecognized policies fail closed to the failed verdict. The pause policy
-// has its own truth table in TestDeriveRolloutApplyState_PausePolicy.
+// and unrecognized policies fail closed to the failed verdict. Failing closed
+// decides the verdict, not when it is recorded — a fail-closed policy refuses
+// new claims and cancels nothing, so a sibling a driver already started still
+// holds the apply degraded, while a sibling that is only pending holds nothing.
+// The pause policy has its own truth table in
+// TestDeriveRolloutApplyState_PausePolicy.
 func TestDeriveRolloutApplyState_FailurePolicy(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -539,6 +543,49 @@ func TestDeriveRolloutApplyState_FailurePolicy(t *testing.T) {
 			name:     "continue failure with completed and pending holds running_degraded",
 			children: []RolloutChild{rc(Apply.Failed, true), rc(Apply.Completed, true), rc(Apply.Pending, true)},
 			want:     Apply.RunningDegraded,
+		},
+		{
+			name:     "halt failure with running sibling holds running_degraded",
+			children: []RolloutChild{rc(Apply.Failed, false), rc(Apply.Running, false)},
+			want:     Apply.RunningDegraded,
+		},
+		{
+			name:     "halt failure with sibling parked at the cutover barrier holds running_degraded",
+			children: []RolloutChild{rc(Apply.Failed, false), rc(Apply.WaitingForCutover, false)},
+			want:     Apply.RunningDegraded,
+		},
+		{
+			name:     "halt failure with retrying sibling holds running_degraded",
+			children: []RolloutChild{rc(Apply.Failed, false), rc(Apply.FailedRetryable, false)},
+			want:     Apply.RunningDegraded,
+		},
+		{
+			name:     "halt failure with running and pending siblings holds running_degraded",
+			children: []RolloutChild{rc(Apply.Failed, false), rc(Apply.Running, false), rc(Apply.Pending, false)},
+			want:     Apply.RunningDegraded,
+		},
+		{
+			name:     "halt failure settles failed once the started sibling completes",
+			children: []RolloutChild{rc(Apply.Failed, false), rc(Apply.Completed, false), rc(Apply.Pending, false)},
+			want:     Apply.Failed,
+		},
+		{
+			name:     "halt failure with stopped sibling settles failed",
+			children: []RolloutChild{rc(Apply.Failed, false), rc(Apply.Stopped, false)},
+			want:     Apply.Failed,
+		},
+		{
+			name:     "halt failure with a continue sibling still running holds running_degraded",
+			children: []RolloutChild{rc(Apply.Failed, false), rc(Apply.Running, true)},
+			want:     Apply.RunningDegraded,
+		},
+		{
+			name: "invalid both-flags failure holds running_degraded while a sibling works",
+			children: []RolloutChild{
+				{State: Apply.Failed, ContinueOnFailure: true, PauseOnFailure: true},
+				rc(Apply.Running, true),
+			},
+			want: Apply.RunningDegraded,
 		},
 	}
 	for _, tc := range cases {
@@ -607,6 +654,11 @@ func TestDeriveRolloutApplyState_PausePolicy(t *testing.T) {
 			name:     "halt failure dominates a pause-held sibling and fails closed",
 			children: []RolloutChild{rcPause(Apply.Failed), rc(Apply.Failed, false), rcPause(Apply.Pending)},
 			want:     Apply.Failed,
+		},
+		{
+			name:     "halt failure dominating a pause-held sibling still holds while later work runs",
+			children: []RolloutChild{rcPause(Apply.Failed), rc(Apply.Failed, false), rcPause(Apply.Running)},
+			want:     Apply.RunningDegraded,
 		},
 		{
 			name: "invalid both-flags failure fails closed rather than continuing",

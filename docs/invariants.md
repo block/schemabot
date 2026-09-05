@@ -685,9 +685,18 @@ settles to permanent `failed` when the attempt budget is spent or the recovery w
 Multi-deployment rollouts claim operations in `deployment_order`, and a failed earlier deployment
 blocks later ones unless the config says otherwise. Once an operator releases a paused rollout it
 stays released, with no path back to paused. An *unrecognized* `on_failure` value behaves like
-`halt`, never like `continue`. *Enforced:* the ordered-claim gate in `FindNextApplyOperation`
+`halt`, never like `continue`.
+
+Failing closed decides the verdict, not when it is recorded. A fail-closed policy refuses new
+claims and cancels nothing, so a sibling deployment a driver already started keeps working through
+the failure: the apply stays `running_degraded` until that sibling is terminal and only then takes
+the `failed` verdict. A sibling that is merely pending holds nothing, since the same policy is what
+stops it from ever starting. Recording the verdict over live work would release the reservation on
+the parent's whole target set (OW-5) while a driver is mid-change on one of those targets, and
+would take `stop` and `cancel` away from the operator who still has work to stop. *Enforced:* the
+ordered-claim gate in `FindNextApplyOperation`
 (`pkg/storage/internal/sqlstore/apply_operations.go`) and the rollout state derivation
-(`pkg/state/apply.go`).
+(`DeriveRolloutApplyState` and `hasStartedNonTerminalWork`, `pkg/state/apply.go`).
 
 ## Ownership and leases (OW)
 

@@ -2356,7 +2356,9 @@ func (s *Service) persistOperationState(ctx context.Context, driverID int, op *s
 
 // failedApplyReopenPolicy controls whether updateApplyStateFromOperations may
 // reopen a terminal-failed parent apply back to running when the rollout
-// projection legitimately holds it active under on_failure "continue".
+// projection legitimately holds it active: under on_failure "continue" because
+// later siblings still get their turn, and under a fail-closed policy because a
+// sibling a driver already started is still working.
 //
 // The reopen write is only safe when the caller holds the parent apply lease:
 // reviving a failed parent through an unscoped, last-write-wins Applies().Update
@@ -2372,7 +2374,7 @@ const (
 	// unscoped reconcileUnclaimableParent path, which holds no parent lease.
 	rejectFailedApplyReopen failedApplyReopenPolicy = false
 	// allowLeaseScopedFailedReopen permits a failed parent to reopen to running
-	// when the continue projection holds it active. Used only by callers that
+	// when the rollout projection holds it active. Used only by callers that
 	// pass a lease-scoped context, so the write fails closed after ownership
 	// changes.
 	allowLeaseScopedFailedReopen failedApplyReopenPolicy = true
@@ -2453,7 +2455,9 @@ func manifestGatedVerdict(derived string) bool {
 // longer terminalizes the apply while other siblings are still in flight; the
 // apply is held running until the rollout settles, then takes the failed verdict.
 // Every other policy (halt, pause, unrecognized) fails closed to the failed
-// verdict. While an apply has exactly one operation the derived value equals the
+// verdict, and holds the apply degraded until any sibling a driver already
+// started reaches a terminal state, because refusing new claims does not stop
+// work already under way. While an apply has exactly one operation the derived value equals the
 // value ResumeApply already persisted, so this is a no-op until the
 // multi-deployment fan-out makes an apply own more than one operation.
 //
@@ -2461,7 +2465,7 @@ func manifestGatedVerdict(derived string) bool {
 // lease-scoped context so the write fails closed after ownership changes; the
 // terminal-parent reconciliation path passes an unscoped context. The reopen
 // parameter encodes the matching authority — a terminal parent may only be
-// reopened (failed → running, for the continue hold-active projection) by a
+// reopened (failed → running, for the hold-active rollout projection) by a
 // caller that holds the parent lease (allowLeaseScopedFailedReopen). The
 // unscoped reconciliation path passes rejectFailedApplyReopen so it never
 // revives a terminal parent through a last-write-wins update; every other
@@ -2533,20 +2537,22 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		}
 	}
 
-	// A failed parent is the one terminal state the continue projection can
-	// legitimately reopen: a continuable sibling failure may have terminalized
-	// the parent before the rollout settled, and re-deriving over the operation
-	// rows holds it running until every sibling is terminal. Gate the exception
-	// narrowly — the parent must be failed, the child base must still be failed
-	// (a real continuable failure, not a stale parent over non-failed children),
-	// the derived projection must be the held-running degraded state, and the
-	// caller must hold the lease.
-	reopensContinuableFailedRollout := bool(reopen) &&
+	// A failed parent is the one terminal state the rollout projection can
+	// legitimately reopen: a sibling failure may have terminalized the parent
+	// before the rollout settled, and re-deriving over the operation rows holds
+	// it degraded until every sibling is terminal. This covers both policies
+	// that hold — continue, which lets later siblings still run, and a
+	// fail-closed policy whose verdict landed while an already-started sibling
+	// was working. Gate the exception narrowly: the parent must be failed, the
+	// child base must still be failed (a real failure, not a stale parent over
+	// non-failed children), the derived projection must be the held degraded
+	// state, and the caller must hold the lease.
+	reopensHeldFailedRollout := bool(reopen) &&
 		state.IsState(apply.State, state.Apply.Failed) &&
 		state.IsState(base, state.Apply.Failed) &&
 		state.IsState(derived, state.Apply.RunningDegraded)
 
-	if state.IsTerminalApplyState(apply.State) && !state.IsTerminalApplyState(derived) && !reopensContinuableFailedRollout {
+	if state.IsTerminalApplyState(apply.State) && !state.IsTerminalApplyState(derived) && !reopensHeldFailedRollout {
 		return applyProjectionResult{}, fmt.Errorf("derive apply state for terminal apply %s (%d): child operations derive non-terminal state %q from parent state %q",
 			apply.ApplyIdentifier, apply.ID, derived, apply.State)
 	}
@@ -2641,7 +2647,7 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	// operation-lease-only drives suppress the parent-level metric, so the
 	// projection that wins the parent transition is the single point that must
 	// release it: -1 when the rollout first reaches a terminal state, and +1
-	// if a continuable failure reopens the parent to keep it running, so the
+	// if a held rollout reopens the parent to keep it running, so the
 	// gauge tracks whether the apply is still in flight. A legacy
 	// single-operation apply keeps decrementing in its direct parent-lease
 	// drive and is left untouched here.
