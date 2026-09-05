@@ -965,3 +965,31 @@ func TestWithStatementTimeoutZeroWritesExplicitDisable(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "0", cfg.RuntimeParams["statement_timeout"])
 }
+
+// statement_timeout is expressed in whole milliseconds, so a finer duration
+// has to round somewhere. It rounds up: truncating would let a sub-millisecond
+// budget reach the server as 0, which disables the budget outright and turns
+// the shortest budget a caller can ask for into no budget at all.
+func TestWithStatementTimeoutRoundsSubMillisecondUp(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		d    time.Duration
+		want string
+	}{
+		{"sub-millisecond never disables", 500 * time.Microsecond, "1"},
+		{"smallest positive duration", time.Nanosecond, "1"},
+		{"partial millisecond rounds up", 1500 * time.Microsecond, "2"},
+		{"whole milliseconds are exact", time.Millisecond, "1"},
+		{"whole seconds are exact", 30 * time.Second, "30000"},
+		{"zero stays an explicit disable", 0, "0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg, err := connectionConfig("postgres://user:pass@host:5432/db", WithStatementTimeout(tc.d))
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, cfg.RuntimeParams["statement_timeout"])
+		})
+	}
+}
