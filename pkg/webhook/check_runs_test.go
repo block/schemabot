@@ -44,7 +44,7 @@ type emptyPlanCommentStore struct {
 	storage.PlanCommentStore
 }
 
-func (s *emptyPlanCommentStore) ListUnminimizedForRepoPR(ctx context.Context, repo string, pr int) ([]*storage.PlanComment, error) {
+func (s *emptyPlanCommentStore) ListUnretiredForRepoPR(ctx context.Context, repo string, pr int) ([]*storage.PlanComment, error) {
 	return nil, nil
 }
 

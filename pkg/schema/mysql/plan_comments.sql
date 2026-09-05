@@ -9,6 +9,7 @@ CREATE TABLE `plan_comments` (
   `github_comment_id` bigint NOT NULL,
   `github_node_id` varchar(255) NOT NULL,
   `minimized_at` datetime DEFAULT NULL,
+  `deleted_at` datetime DEFAULT NULL,
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),

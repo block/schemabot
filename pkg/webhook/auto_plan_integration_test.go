@@ -229,7 +229,7 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeRefreshesStalePlan(t *testin
 		t.Fatal("timed out waiting for replacement auto-plan comment")
 	}
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
-		comments, err := svc.Storage().PlanComments().ListUnminimizedForSlot(
+		comments, err := svc.Storage().PlanComments().ListUnretiredForSlot(
 			t.Context(), "octocat/hello-world", 1, dbName, "mysql")
 		if !assert.NoError(collect, err) || !assert.NotEmpty(collect, comments) {
 			return
@@ -288,7 +288,7 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeWithoutTrackedPlanPostsComme
 		t.Fatal("timed out waiting for auto-plan comment")
 	}
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
-		comments, err := svc.Storage().PlanComments().ListUnminimizedForSlot(
+		comments, err := svc.Storage().PlanComments().ListUnretiredForSlot(
 			t.Context(), "octocat/hello-world", 1, dbName, "mysql")
 		if !assert.NoError(collect, err) || !assert.NotEmpty(collect, comments) {
 			return
@@ -1069,7 +1069,7 @@ func TestE2EAutoPlanNoChangesSkipsComment(t *testing.T) {
 		t.Fatal("timed out waiting for the prior head's plan comment to be minimized")
 	}
 	require.Eventually(t, func() bool {
-		return len(unminimizedHeads(t, svc.Storage(), "octocat/hello-world", 1, dbName, "mysql")) == 0
+		return len(unretiredHeads(t, svc.Storage(), "octocat/hello-world", 1, dbName, "mysql")) == 0
 	}, 10*time.Second, 100*time.Millisecond, "the minimized plan comment must be recorded in storage")
 
 	// No comment should be posted — give it a moment to confirm nothing arrives

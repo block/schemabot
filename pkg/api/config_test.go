@@ -3114,6 +3114,23 @@ func TestServerConfig_AreChecksEnabled(t *testing.T) {
 	})
 }
 
+func TestServerConfig_DeletesUnactionedPlanComments(t *testing.T) {
+	t.Run("nil config defaults to minimize policy", func(t *testing.T) {
+		var cfg *ServerConfig
+		assert.False(t, cfg.DeletesUnactionedPlanComments())
+	})
+
+	t.Run("unset defaults to minimize policy", func(t *testing.T) {
+		cfg := ServerConfig{}
+		assert.False(t, cfg.DeletesUnactionedPlanComments())
+	})
+
+	t.Run("explicit true opts into the delete policy", func(t *testing.T) {
+		cfg := ServerConfig{DeleteUnactionedPlanComments: true}
+		assert.True(t, cfg.DeletesUnactionedPlanComments())
+	})
+}
+
 func TestServerConfig_IsEnvironmentAllowed(t *testing.T) {
 	t.Run("nil allowed_environments allows all", func(t *testing.T) {
 		cfg := ServerConfig{AllowedEnvironments: nil}

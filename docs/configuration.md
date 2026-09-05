@@ -8,7 +8,8 @@
   - [Building DSNs from separate secrets](#building-dsns-from-separate-secrets)
   - [PostgreSQL `dsn_from` targets](#postgresql-dsn_from-targets)
 - [gRPC Mode](#grpc-mode)
-- [Multi-Deployment Environment (preview)](#multi-deployment-environment-preview)
+- [Multi-Deployment Environments](#multi-deployment-environments)
+  - [Review and the Primary Deployment](#review-and-the-primary-deployment)
   - [Deployment Order](#deployment-order)
 - [Environment Order](#environment-order)
   - [Per-Database Environment Order](#per-database-environment-order)
@@ -217,11 +218,13 @@ In gRPC mode, `target` is an opaque identifier understood by the remote Tern ser
 
 The example above is a single SchemaBot deployment that owns both environments. In environment-isolated deployments, each SchemaBot config should contain only the targets for the environments that instance owns. Use `allowed_environments` to scope each instance.
 
-## Multi-Deployment Environment (preview)
+## Multi-Deployment Environments
 
-A single environment will eventually be able to fan out to multiple Tern deployments by replacing the scalar `target` / `deployment` pair with a `deployments` map. Each entry's key is a Tern deployment name (which MUST also exist as a key in `tern_deployments`), and each value carries the per-deployment `target`.
+A single environment can fan out to multiple Tern deployments by replacing the scalar `target` / `deployment` pair with a `deployments` map. Each entry's key is a Tern deployment name (which MUST also exist as a key in `tern_deployments`), and each value carries the per-deployment `target`.
 
-> **Not yet enabled in this release.** The config shape and resolver API are landed, but the plan/apply orchestration path still consumes a single deployment per `(database, environment)`. To prevent silent failures, `Validate()` currently rejects any `deployments` map with more than one entry. A single-entry map is accepted and behaves identically to the scalar `target` / `deployment` shape.
+`Validate()` accepts a `deployments` map with any number of entries, and `ResolveDatabaseTargets` returns one execution target per entry in rollout order. An apply resolves that whole set and creates one `apply_operations` row per deployment. The driver claims each row and sequences the rollout along `deployment_order` under the environment's `cutover_policy` and `on_failure` policies. Control requests (stop, cutover, cancel) are recorded durably and consumed per operation, and progress, PR comments, and CLI output render per deployment.
+
+Review does not fan out the same way. See [Review and the Primary Deployment](#review-and-the-primary-deployment).
 
 ```yaml
 storage:
@@ -255,11 +258,19 @@ tern_deployments:
 
 Rules:
 
-- `deployments` is mutually exclusive with the scalar `target` / `deployment` fields and with a local `dsn` / `dsn_from`.
+- `deployments` is mutually exclusive with the scalar `target` / `deployment` fields and with a local `dsn` / `dsn_from`. Fan-out is a gRPC-mode shape: every key must resolve through `tern_deployments`, so an environment that executes against a local DSN cannot fan out.
 - The map MUST contain at least one entry, each entry MUST set a non-empty `target`, and each map key MUST resolve through `tern_deployments` with an endpoint configured for this environment.
 - Keys under `deployments:` must be lowercase; the server refuses to start otherwise.
-- Until the orchestration path is wired, the map MUST contain exactly one entry; multi-entry maps are rejected at config load.
-- Single-deployment environments should continue to use the scalar `target` / `deployment` shape.
+- A single-entry map is accepted and behaves identically to the scalar `target` / `deployment` shape. Single-deployment environments should continue to use the scalar shape.
+- `cutover_policy` and `on_failure` are only valid alongside a `deployments` map. `cutover_policy` accepts `rolling` (the default), `barrier`, or `parallel`; `on_failure` accepts `halt` (the default), `continue`, or `pause`. Both values are captured on every operation row when the apply is created, so the policy in force at that moment travels with the rollout.
+
+### Review and the Primary Deployment
+
+An apply fans out across every deployment. Review does not: the plan reviewers see, and the plan SchemaBot persists and later applies from, is computed against the **primary deployment** only, meaning the first entry in rollout order.
+
+The remaining deployments are diffed against that reviewed plan at review time, using a diff that is not persisted. The plan check fails closed on two distinct conditions: a deployment whose schema diverges from the reviewed plan, and a deployment that cannot be diffed at all. An unreachable deployment therefore blocks the merge rather than passing quietly.
+
+A multi-deployment environment is gated on every deployment agreeing with one reviewed plan, not on one reviewed plan per deployment.
 
 ### Deployment Order
 
@@ -1538,13 +1549,13 @@ disagree. Align the server environment config with the deployment's
 `allowed_environments`, then run `schemabot plan -e <environment>` or push a new
 commit to refresh checks.
 
-### Plan comment minimization
+### Plan comment retirement
 
 On a frequently updated PR, plan comments pile up — every push that touches a
-schema file posts a new one. To keep the PR readable, SchemaBot minimizes
-(collapses as **Outdated**) the plan comments a newer one supersedes. This
-applies to auto-plan and `schemabot plan` comments alike; minimized comments
-stay expandable on GitHub, so the full plan history remains auditable.
+schema file posts a new one. To keep the PR readable, SchemaBot retires the
+plan comments a newer one supersedes. This applies to auto-plan and
+`schemabot plan` comments alike, and the retired comment's storage record
+always survives with its identifiers, so the plan history remains auditable.
 
 A newer plan comment for the same database supersedes a prior one when the
 prior was rendered at an older commit, or when it re-renders the same commit
@@ -1554,15 +1565,38 @@ environments.
 
 A plan outcome can also supersede without posting: when an auto-plan resolves
 to no changes, no new comment appears (the check run alone reports the green
-state), but plan comments from prior commits still collapse — the pending DDL
-and apply prompt they show no longer match the branch.
+state), but plan comments from prior commits are still retired — the pending
+DDL and apply prompt they show no longer match the branch.
 
-One safety hold: a plan comment whose commit produced an apply is never
-minimized, even after new pushes. That comment is the record of what actually
-ran against the database, and it stays visible until an operator reconciles
-the apply. All minimization fails toward visibility — if GitHub or storage
-misbehaves, comments are left expanded (extra noise), never hidden without a
-durable record.
+By default, a superseded comment is minimized (collapsed as **Outdated**) and
+stays expandable on GitHub — with one safety hold: a plan comment whose commit
+produced an apply is never minimized, even after new pushes. That comment is
+the record of what actually ran against the database, and it stays visible
+until an operator reconciles the apply.
+
+A server can opt into a delete-based policy instead, which applies to every
+repository it manages:
+
+```yaml
+delete_unactioned_plan_comments: true
+```
+
+Under this policy, a superseded plan comment no apply ever acted on is deleted
+from the PR timeline outright — its DDL never ran and is reproducible from the
+commit it was rendered at, so on a busy PR the comment is pure noise. A
+superseded comment whose commit produced an apply is minimized rather than
+deleted, keeping the record of what ran expandable on the PR.
+
+Unactioned means exactly that: no apply ran from the comment's commit. It says
+nothing about human engagement — a comment people reacted to or linked
+elsewhere is still deleted if its plan never became an apply. And unlike
+minimizing, deletion is irreversible: the comment's reactions are lost, any
+permalink to it (in chat, tickets, or other PRs) breaks, and SchemaBot's
+stored record keeps the comment's identifiers, not its rendered body.
+
+Either way, retirement fails toward visibility — if GitHub or storage
+misbehaves, comments are left as they are (extra noise), never hidden or
+removed without a durable record.
 
 ## Multi-App Routing
 

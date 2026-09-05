@@ -437,6 +437,18 @@ func TestTasks(t *testing.T, h Harness) {
 		_, err := store.Tasks().ReapStrandedRetryable(t.Context(), 1)
 		require.Error(t, err)
 	})
+
+	t.Run("ReapStrandedActive_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.Tasks().ReapStrandedActive(t.Context(), 1)
+		require.Error(t, err)
+	})
+
+	t.Run("ReapStrandedActive_RejectsNonPositiveLimit", func(t *testing.T) {
+		store := h.NewStorage(t)
+		_, err := store.Tasks().ReapStrandedActive(t.Context(), 0)
+		require.Error(t, err)
+	})
 }
 
 func newTask(apply *storage.Apply, identifier, table string, createdAt time.Time) *storage.Task {
