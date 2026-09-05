@@ -150,7 +150,7 @@ startup, naming the consequence:
 
 | Startup log says | Meaning |
 | --- | --- |
-| the quarantine is disabled | Expected. `DROP TABLE` executes as written, so there is nothing to reap. |
+| the quarantine is disabled | Expected. `DROP TABLE` executes as written. Note that disabling the quarantine disables its cleaner too, so tables quarantined before it was turned off stay on the target until someone removes them. |
 | no local MySQL database targets are configured | Expected for a control plane. Every target is routed to the deployment that executes against it and reaps it. The line carries `routed_mysql_targets`, which separates this from a process with no MySQL topology at all. |
 | cleanup is disabled for this process | Safe only while another deployment reaps the same targets. |
 | retention is invalid | Config bug. Logged at error, and blocks reaping until it is fixed. |

@@ -31,7 +31,11 @@ func (s *Service) StartPendingDropsCleaner(ctx context.Context) {
 	// accumulate on a target, so the reason a process is not reaping is the
 	// thing an operator needs to see.
 	if !s.config.PendingDropsEnabled() {
-		s.logger.Info("pending drops cleaner not started because the quarantine is disabled; DROP TABLE executes as written, so there is nothing to reap")
+		// Disabling the quarantine disables its cleaner with it, and this loop
+		// is the only reaper, so tables quarantined while it was on are left
+		// where they are. Saying "nothing to reap" would be false for a
+		// deployment that turned the quarantine off with tables outstanding.
+		s.logger.Info("pending drops cleaner not started because the quarantine is disabled; DROP TABLE executes as written, and any tables quarantined before it was disabled are not reaped")
 		return
 	}
 

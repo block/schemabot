@@ -134,8 +134,6 @@ func TestPendingDropsTargetCountsSeparatesRoutedTargets(t *testing.T) {
 // The routed count is of execution targets, not environments: a
 // multi-deployment environment is executed against once per deployment, and
 // each of those targets has to be reaped by the deployment that executes it.
-// An environment that routes nowhere is counted as neither, because counting
-// it would claim a deployment reaps a target no deployment executes against.
 func TestPendingDropsTargetCountsCountExecutionTargets(t *testing.T) {
 	t.Parallel()
 	databases := map[string]DatabaseConfig{
@@ -148,6 +146,21 @@ func TestPendingDropsTargetCountsCountExecutionTargets(t *testing.T) {
 				}},
 			},
 		},
+	}
+	local, routed := newPendingDropsTestService(t, databases).pendingDropsTargetCounts()
+	assert.Zero(t, local, "a routed environment has no local DSN")
+	assert.Equal(t, 2, routed, "a multi-deployment environment routes one target per deployment")
+}
+
+// An environment that configures neither a local DSN nor any routing executes
+// nowhere, so it counts as neither local nor routed. Counting it as routed
+// would tell an operator that a deployment reaps a target no deployment
+// executes against, which is the one claim the routed count exists to make
+// trustworthy. Validate() rejects this shape before startup, so it is only
+// reachable for an embedder that skips validation.
+func TestPendingDropsTargetCountsIgnoreEnvironmentsThatRouteNowhere(t *testing.T) {
+	t.Parallel()
+	databases := map[string]DatabaseConfig{
 		"mysql_unrouted": {
 			Type: storage.DatabaseTypeMySQL,
 			Environments: map[string]EnvironmentConfig{
@@ -156,13 +169,14 @@ func TestPendingDropsTargetCountsCountExecutionTargets(t *testing.T) {
 		},
 	}
 	local, routed := newPendingDropsTestService(t, databases).pendingDropsTargetCounts()
-	assert.Zero(t, local, "neither environment has a local DSN")
-	assert.Equal(t, 2, routed, "a multi-deployment environment routes one target per deployment")
+	assert.Zero(t, local, "an environment with no local DSN is not reapable from this process")
+	assert.Zero(t, routed, "an environment that routes nowhere has no deployment to reap it")
 }
 
 // The cleaner declines to start for reasons that mean different things to an
 // operator, and the message must say which one applies: a process with the
-// quarantine off has nothing to reap, while a process that quarantines but
+// quarantine off drops directly and reaps nothing, including anything
+// quarantined before it was turned off, while a process that quarantines but
 // leaves reaping to another deployment accumulates tables on its targets until
 // that deployment runs.
 func TestStartPendingDropsCleanerReportsWhyItDeclined(t *testing.T) {
@@ -186,7 +200,7 @@ func TestStartPendingDropsCleanerReportsWhyItDeclined(t *testing.T) {
 			name:      "quarantine disabled",
 			config:    PendingDropsConfig{},
 			databases: localMySQL,
-			wantLog:   "the quarantine is disabled",
+			wantLog:   "any tables quarantined before it was disabled are not reaped",
 		},
 		{
 			name:      "cleanup disabled for this process",
