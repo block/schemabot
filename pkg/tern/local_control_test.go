@@ -1697,6 +1697,101 @@ func TestLocalClient_PendingCancelResolvesPostgresUnsupportedDecline(t *testing.
 	assert.False(t, handled, "a resolved decline must not be re-consumed on the next drive claim")
 }
 
+// revertPhaseDeclineFixture stages an apply in its revert window with one
+// pending request for the given revert-phase operation, and returns the client
+// that drives it alongside the stored request the drive would consume.
+func revertPhaseDeclineFixture(t *testing.T, operation storage.ControlOperation) (*LocalClient, *storage.Apply, *testControlRequestStore, *storage.ApplyControlRequest) {
+	t.Helper()
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-postgres-" + string(operation),
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypePostgres,
+		State:           state.Apply.RevertWindow,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   operation,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	}}}
+	client := newPostgresControlTestClient(apply, nil, controlRequests)
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, operation)
+	require.NoError(t, err)
+	require.NotNil(t, pending)
+	return client, apply, controlRequests, pending
+}
+
+// A durable revert request the engine declines for its whole database type is
+// resolved as permanently failed. The decline is deterministic, so leaving the
+// request pending would re-run the same rejection on every drive claim for as
+// long as the revert window lasts. The window itself is untouched: the refusal
+// declines the operator's command rather than carrying it out, so the schema
+// change finishes the way it would have without the command, and the operator
+// reads the engine's reason on the failed request.
+func TestLocalClient_DeclinedRevertRequestResolvesTerminally(t *testing.T) {
+	client, apply, controlRequests, pending := revertPhaseDeclineFixture(t, storage.ControlOperationRevert)
+
+	_, revertErr := client.getEngine().Revert(t.Context(), nil)
+	require.Error(t, revertErr, "the PostgreSQL engine declines revert for its whole database type")
+
+	client.resolveOrRetryRevertPhaseRequest(t.Context(), client.logger, apply,
+		storage.ControlOperationRevert, storage.LogEventRevertTriggered, pending, revertErr)
+
+	stillPending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationRevert)
+	require.NoError(t, err)
+	assert.Nil(t, stillPending, "the durable revert request must be resolved, not left for the next drive claim to retry")
+	resolved, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationRevert)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, storage.ControlRequestFailed, resolved.Status, "an unsupported-operation decline is a permanent rejection")
+	assert.Contains(t, resolved.ErrorMessage, "no revert window",
+		"the failed request must carry the engine's reason, not a generic failure")
+	assert.Equal(t, state.Apply.RevertWindow, apply.State, "a declined revert must leave the revert window running")
+}
+
+// A durable skip-revert request is resolved the same way and for the same
+// reason: an engine with no revert window to close declines identically every
+// time it is asked, so the request is failed with that reason instead of
+// re-attempted until the window expires on its own.
+func TestLocalClient_DeclinedSkipRevertRequestResolvesTerminally(t *testing.T) {
+	client, apply, controlRequests, pending := revertPhaseDeclineFixture(t, storage.ControlOperationSkipRevert)
+
+	_, skipErr := client.getEngine().SkipRevert(t.Context(), nil)
+	require.Error(t, skipErr, "the PostgreSQL engine declines skip-revert for its whole database type")
+
+	client.resolveOrRetryRevertPhaseRequest(t.Context(), client.logger, apply,
+		storage.ControlOperationSkipRevert, storage.LogEventSkipRevertTriggered, pending, skipErr)
+
+	stillPending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationSkipRevert)
+	require.NoError(t, err)
+	assert.Nil(t, stillPending, "the durable skip-revert request must be resolved, not left for the next drive claim to retry")
+	resolved, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationSkipRevert)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, storage.ControlRequestFailed, resolved.Status, "an unsupported-operation decline is a permanent rejection")
+	assert.Contains(t, resolved.ErrorMessage, "no revert window",
+		"the failed request must carry the engine's reason, not a generic failure")
+	assert.Equal(t, state.Apply.RevertWindow, apply.State, "a declined skip-revert must leave the revert window running")
+}
+
+// A revert that fails for a reason a later attempt could survive stays pending.
+// Only a decline the engine issues for its whole database type is permanent, so
+// terminal resolution must not swallow the ordinary failures the operator-owned
+// retry loop exists to ride out.
+func TestLocalClient_RetryableRevertRequestFailureStaysPending(t *testing.T) {
+	client, apply, controlRequests, pending := revertPhaseDeclineFixture(t, storage.ControlOperationRevert)
+
+	client.resolveOrRetryRevertPhaseRequest(t.Context(), client.logger, apply,
+		storage.ControlOperationRevert, storage.LogEventRevertTriggered, pending,
+		errors.New("data plane is unreachable"))
+
+	stillPending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationRevert)
+	require.NoError(t, err)
+	require.NotNil(t, stillPending, "a retryable failure must leave the request for the next drive claim")
+	assert.Equal(t, storage.ControlRequestPending, stillPending.Status, "a retryable failure is not a rejection")
+}
+
 // Cancelled must never overwrite a revert-phase apply state, whichever path
 // asks for it: the engine's revert or skip-revert owns the terminal outcome,
 // and settling storage under it would report an unwinding change as resolved.
