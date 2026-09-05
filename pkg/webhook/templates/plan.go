@@ -1058,11 +1058,12 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 // inheriting another engine's semantics.
 //
 // The footer names the schema change engine in full rather than "the engine".
-// It renders directly under a header noun of "native MySQL DDL", so the two
-// sit adjacent: a reader who takes the shorter form for the storage engine
-// gets the claim backwards, since the statement runs inside MySQL and outside
-// SchemaBot. This is the sentence that carries the operator's consent to a
-// change that cannot be reverted, so it spends the words.
+// It renders directly under a header noun that names the database's own native
+// DDL, so the two sit adjacent: a reader who takes the shorter form for the
+// storage engine gets the claim backwards, since the statement runs inside the
+// database and outside SchemaBot. This is the sentence that carries the
+// operator's consent to a change that cannot be reverted, so it spends the
+// words.
 func directConsentCopy(databaseType string, isMySQL bool) (headerNoun, footer string) {
 	// Strata is sharded MySQL: a direct statement there is the same native
 	// MySQL DDL, executed per shard.
