@@ -36,12 +36,23 @@ ambition needed a home of its own. This is that home.
 Every database should be able to evolve safely, whether it is a weekend project or a tier-zero
 fleet, and nobody should have to become a database expert to change one without breaking it.
 
-The second half is the part that has changed. For most of the history of this problem, the person
-writing a schema change was a person, and the industry's answer was to make them more careful: review
-checklists, runbooks, a database team who says no. Increasingly the author is an agent, and "be more
-careful" does not generalize to something that will write a thousand changes a week without ever
-getting tired and without ever getting better. There is rarely just one of them, either. The
-guardrails have to move into the tool, and so does the coordination between whoever is writing.
+The second half is the part that has changed.
+
+Tooling for this has existed for a long time, and much of it works. A `schema_version` table, ordered
+changelogs, checksums that catch an edited file, a runner that refuses to apply the same change
+twice. Flyway and Liquibase and everything shaped like them automated the bookkeeping, and the
+bookkeeping was a real problem worth solving.
+
+What none of it automates is judgment. A version table can tell you that change 47 ran. It has no
+opinion on whether change 47 should have. Whether the DDL matches the schema that is actually live,
+whether it locks a hot table for forty minutes, whether it drops a column something is still reading:
+all of that stayed with the person, and the answer there was to make the person more careful. Review
+checklists, runbooks, a database team who says no.
+
+Increasingly the author is not a person. "Be more careful" does not generalize to something that will
+write a thousand changes a week without ever getting tired and without ever getting better, and there
+is rarely just one of them. So the judgment has to move into the tool, and so does the coordination
+between whoever is writing.
 
 ## From a vibe-coded experiment to a tier-zero database
 
