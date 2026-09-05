@@ -770,14 +770,36 @@ func tableStatePriority(tableStatus string) int {
 	return ui.TableStatePriority(state.NormalizeTaskStatus(tableStatus))
 }
 
-// sortProgressRows orders one namespace's rows for display without modifying
-// the input. Tables are ranked by the most urgent state among their rows, and a
-// table's rows stay adjacent — ordered by their own state — so a table whose
-// plan produced several statements reads as one block rather than scattering
-// across the list by state. Tables with the same rank keep plan order. When
-// every row is a distinct table this is exactly a stable sort by state
-// priority.
+// summaryStatePriority returns the sort key the terminal summary lists rows
+// in: what went wrong first, then what landed, then what never ran, then
+// anything unexpected. Lower renders first.
+func summaryStatePriority(tableStatus string) int {
+	switch state.NormalizeTaskStatus(tableStatus) {
+	case state.Task.Failed, state.Task.Stopped, state.Task.Reverted:
+		return 0
+	case state.Task.Completed:
+		return 1
+	case state.Task.Cancelled:
+		return 2
+	default:
+		return 3
+	}
+}
+
+// sortProgressRows orders one namespace's rows for the progress comment, with
+// active tables on top and terminal ones at the bottom. See sortRowsByTable.
 func sortProgressRows(rows []TableProgressData) []TableProgressData {
+	return sortRowsByTable(rows, tableStatePriority)
+}
+
+// sortRowsByTable orders rows for display without modifying the input. Tables
+// are ranked by the most urgent state among their rows under statePriority,
+// and a table's rows stay adjacent — ordered by their own state — so a table
+// whose plan produced several statements reads as one block rather than
+// scattering across the list by state. Tables with the same rank keep plan
+// order. When every row is a distinct table this is exactly a stable sort by
+// statePriority.
+func sortRowsByTable(rows []TableProgressData, statePriority func(tableStatus string) int) []TableProgressData {
 	type tableRank struct {
 		priority   int
 		firstIndex int
@@ -785,7 +807,7 @@ func sortProgressRows(rows []TableProgressData) []TableProgressData {
 	ranks := make(map[string]tableRank, len(rows))
 	for i, row := range rows {
 		key := tableKey(row.Namespace, row.TableName)
-		priority := tableStatePriority(row.Status)
+		priority := statePriority(row.Status)
 		rank, seen := ranks[key]
 		if !seen {
 			ranks[key] = tableRank{priority: priority, firstIndex: i}
@@ -808,7 +830,7 @@ func sortProgressRows(rows []TableProgressData) []TableProgressData {
 		if ri.firstIndex != rj.firstIndex {
 			return ri.firstIndex < rj.firstIndex
 		}
-		return tableStatePriority(sorted[i].Status) < tableStatePriority(sorted[j].Status)
+		return statePriority(sorted[i].Status) < statePriority(sorted[j].Status)
 	})
 	return sorted
 }
@@ -1648,42 +1670,9 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 
 	dialect := dialectForEngine(data.Engine, data.ApplyID)
 
-	// Order: failed/stopped/reverted first, then completed, then cancelled, then any remaining
-	included := make(map[int]bool)
-	var ordered []TableProgressData
-	for i, t := range data.Tables {
-		n := state.NormalizeTaskStatus(t.Status)
-		if n == state.Task.Failed || n == state.Task.Stopped || n == "reverted" {
-			ordered = append(ordered, t)
-			included[i] = true
-		}
-	}
-	for i, t := range data.Tables {
-		if included[i] {
-			continue
-		}
-		n := state.NormalizeTaskStatus(t.Status)
-		if n == state.Task.Completed {
-			ordered = append(ordered, t)
-			included[i] = true
-		}
-	}
-	for i, t := range data.Tables {
-		if included[i] {
-			continue
-		}
-		n := state.NormalizeTaskStatus(t.Status)
-		if n == state.Task.Cancelled {
-			ordered = append(ordered, t)
-			included[i] = true
-		}
-	}
-	// Catch-all: append any tables not yet included (unknown/unexpected states)
-	for i, t := range data.Tables {
-		if !included[i] {
-			ordered = append(ordered, t)
-		}
-	}
+	// What went wrong leads, then what landed, then what never ran — and a
+	// table's rows stay together so the reader meets each table once.
+	ordered := sortRowsByTable(data.Tables, summaryStatePriority)
 
 	// Group by namespace
 	type nsGroup struct {

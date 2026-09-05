@@ -52,6 +52,23 @@ func TestSortProgressRows(t *testing.T) {
 		}, rowLabels(got))
 	})
 
+	t.Run("tables with the same rank keep plan order and stay in one block each", func(t *testing.T) {
+		rows := []TableProgressData{
+			{Namespace: "public", TableName: "accounts", Status: state.Task.Running},
+			{Namespace: "public", TableName: "accounts", Status: state.Task.Completed},
+			{Namespace: "public", TableName: "sessions", Status: state.Task.Running},
+			{Namespace: "public", TableName: "sessions", Status: state.Task.Pending},
+		}
+		got := sortProgressRows(rows)
+
+		assert.Equal(t, []string{
+			"accounts:" + state.Task.Running,
+			"accounts:" + state.Task.Completed,
+			"sessions:" + state.Task.Running,
+			"sessions:" + state.Task.Pending,
+		}, rowLabels(got))
+	})
+
 	t.Run("same table name in another namespace is a different table", func(t *testing.T) {
 		rows := []TableProgressData{
 			{Namespace: "billing", TableName: "users", Status: state.Task.Completed},
@@ -63,6 +80,60 @@ func TestSortProgressRows(t *testing.T) {
 		assert.Equal(t, "public", got[0].Namespace)
 		assert.Equal(t, "billing", got[1].Namespace)
 	})
+}
+
+func TestSortRowsByTable_SummaryOrder(t *testing.T) {
+	t.Run("one row per table lists what went wrong, then what landed, then what never ran", func(t *testing.T) {
+		rows := []TableProgressData{
+			{Namespace: "testapp", TableName: "a", Status: state.Task.Running},
+			{Namespace: "testapp", TableName: "b", Status: state.Task.Cancelled},
+			{Namespace: "testapp", TableName: "c", Status: state.Task.Completed},
+			{Namespace: "testapp", TableName: "d", Status: state.Task.Reverted},
+			{Namespace: "testapp", TableName: "e", Status: state.Task.Stopped},
+			{Namespace: "testapp", TableName: "f", Status: state.Task.Completed},
+			{Namespace: "testapp", TableName: "g", Status: state.Task.Failed},
+		}
+		got := sortRowsByTable(rows, summaryStatePriority)
+
+		assert.Equal(t, []string{
+			"d:" + state.Task.Reverted,
+			"e:" + state.Task.Stopped,
+			"g:" + state.Task.Failed,
+			"c:" + state.Task.Completed,
+			"f:" + state.Task.Completed,
+			"b:" + state.Task.Cancelled,
+			"a:" + state.Task.Running,
+		}, rowLabels(got))
+	})
+
+	t.Run("a table's rows stay together ahead of another failed table", func(t *testing.T) {
+		rows := []TableProgressData{
+			{Namespace: "public", TableName: "users", Status: state.Task.Completed},
+			{Namespace: "public", TableName: "users", Status: state.Task.Failed},
+			{Namespace: "public", TableName: "sessions", Status: state.Task.Failed},
+		}
+		got := sortRowsByTable(rows, summaryStatePriority)
+
+		assert.Equal(t, []string{
+			"users:" + state.Task.Failed,
+			"users:" + state.Task.Completed,
+			"sessions:" + state.Task.Failed,
+		}, rowLabels(got))
+	})
+}
+
+func TestRenderApplySummaryComment_MultiStatementTableRowsStayTogether(t *testing.T) {
+	data := multiStatementApplyData(state.Apply.Failed, multiStatementTableRows(state.Task.Completed, state.Task.Failed, state.Task.Failed))
+	out := RenderApplySummaryComment(data)
+
+	usersFailed := "**`users`** — Failed"
+	usersCompleted := "**`users`** — Completed"
+	sessionsFailed := "**`sessions`** — Failed"
+	require.Contains(t, out, usersFailed)
+	require.Contains(t, out, usersCompleted)
+	require.Contains(t, out, sessionsFailed)
+	assert.Less(t, strings.Index(out, usersFailed), strings.Index(out, usersCompleted), "the table's failed row leads its block")
+	assert.Less(t, strings.Index(out, usersCompleted), strings.Index(out, sessionsFailed), "the other failed table follows the whole block")
 }
 
 func TestRenderApplyStatusComment_MultiStatementTableRowsStayTogether(t *testing.T) {
