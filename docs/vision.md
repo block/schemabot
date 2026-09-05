@@ -29,9 +29,9 @@ that actually holds, so aspiration needs somewhere else to live. This is that pl
 
 ## The northstar
 
-Every database that someone cares about should be able to evolve safely, whether it is a weekend
-project or a tier-zero fleet, and whoever is making the change should not have to become a database
-expert to do it without breaking something.
+Every database should be able to evolve safely, whether it is a weekend project or a tier-zero
+fleet, and whoever is making the change should not have to become a database expert to do it
+without breaking something.
 
 That second half is the part that has changed. For most of the history of this problem, the person
 writing a schema change was a person, and the industry's answer was to make them more careful:
@@ -60,8 +60,9 @@ principled reason the hobbyist gets the unsafe version.
 What has to become true is that the cost of adoption collapses at the small end without weakening
 anything at the large end. A tier-zero fleet wants the control plane: a server, durable state, lease
 ownership, an operator who can stop a change that is running. An experiment wants none of that and
-should not pay for it. The same engine, the same gates, two very different amounts of scaffolding
-around them.
+should not pay for it. What varies is the scaffolding, never the gates: a change that would be
+unsafe in front of production is unsafe in front of a weekend project too, and it gets refused in
+both places.
 
 ![Both ends of the range feed into an identical set of gates: diff against the live database, lint before anything runs, explicit consent to destroy, and uncertainty never passing](../assets/vision-range.svg)
 
@@ -207,6 +208,9 @@ regardless of how far any of the above gets:
 - **A narrower engine is not a looser one.** Adding a database or a deployment shape never comes at
   the cost of the guarantees. If a capability cannot be delivered safely on an engine, the answer is
   a refusal at plan time, not a quieter gate.
+- **Integrity outranks everything else.** Convenience, speed, and scope all lose to it, and there is
+  no size or tier at which that stops being true. Every database gets the same treatment, because
+  there is no such thing as one where the data mattering less makes a corruption acceptable.
 
 ## What this document is not
 
