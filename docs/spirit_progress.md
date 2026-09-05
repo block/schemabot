@@ -38,7 +38,7 @@ runner.Progress()     Progress()          Progress()             handleProgressB
 ```
 
 Each layer adds, transforms, or merges data. Understanding which values are live
-(read from Spirit's in-memory state) vs persisted (read from MySQL storage) is
+(read from Spirit's in-memory state) vs persisted (read from SchemaBot storage) is
 key to debugging stale-progress issues.
 
 ## What Spirit exposes
