@@ -1,8 +1,26 @@
-# <a href="./assets/schemabot-avatar.svg"><img src="./assets/schemabot-avatar.svg" alt="SchemaBot" style="height: 1em; max-width: 100%;"></a> SchemaBot
+<p align="center">
+  <img src="./assets/schemabot-avatar.svg" alt="SchemaBot" width="140" />
+</p>
 
-![MySQL: GA](https://img.shields.io/badge/MySQL-GA-brightgreen)
-![Vitess: GA](https://img.shields.io/badge/Vitess-GA-brightgreen)
-![PostgreSQL: early alpha](https://img.shields.io/badge/PostgreSQL-early_alpha-orange)
+<h1 align="center">SchemaBot</h1>
+
+<p align="center"><b>Ship database schema changes safely and easily</b></p>
+
+<p align="center">
+  <img alt="MySQL: GA" src="https://img.shields.io/badge/MySQL-GA-brightgreen" />
+  <img alt="Vitess: GA" src="https://img.shields.io/badge/Vitess-GA-brightgreen" />
+  <img alt="PostgreSQL: early alpha" src="https://img.shields.io/badge/PostgreSQL-early_alpha-orange" />
+</p>
+
+<p align="center">
+  <a href="#see-it-in-action">See it in action</a> ·
+  <a href="#why-schemabot">Why SchemaBot</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#docs">Docs</a>
+</p>
+
+---
 
 SchemaBot makes database schema changes safe and easy. Declare the schema you want in plain SQL files, then ship it through the PR workflow you already use or an interactive CLI. No migration scripts, no hand-written ALTER statements: SchemaBot computes the DDL, lints it, gates anything destructive behind explicit approval, and executes with smart defaults, instant DDL when safe and a zero-downtime online copy when not. Live progress and operator controls the whole way.
 
@@ -10,21 +28,29 @@ Made for the agentic era: in a world where agents build product features from sc
 
 *Ship schema changes as fast as your code, with the safety net your database deserves.*
 
-## Schema Changes via Pull Request
+## See It in Action
 
-Open a PR with your schema changes, and SchemaBot plans, applies, and verifies them across environments:
+**The PR workflow.** Open a PR with your schema changes, and SchemaBot plans, applies, and verifies them across environments, right from the PR timeline:
 
 ![SchemaBot PR Demo](./assets/pr-demo.gif)
 
-## Interactive CLI
-
-SchemaBot provides a fully interactive CLI for planning, applying, and monitoring schema changes:
+**The interactive CLI.** The same power from your terminal: plan, apply, and watch schema changes live:
 
 ![SchemaBot CLI Demo](./assets/cli-demo.gif)
 
+## Why SchemaBot
+
+- 🛡️ **Guardrails built in.** Every change is parsed with a real DDL parser and linted with sophisticated rules before anything executes. Destructive changes are gated behind explicit acknowledgment, and merge-blocking checks keep a PR red until the live schema matches your files.
+- ⚡ **Smart execution.** Instant when safe, online when needed, zero downtime always. Automatic throttling backs off when your database is under pressure.
+- 🚀 **Ship faster.** The entire workflow runs in PR comments: plan previews on every PR, apply with a comment, watch live progress stream in. No scripts to write, no consoles to click through.
+- 🎛️ **Stay in control.** `stop`, `start`, `cutover`, `cancel`, and `revert` a running change from the PR or the CLI. Promotion order is enforced: production won't apply until the earlier environments are green.
+- 🤖 **Agent-ready.** Declarative SQL files give agents the schema as context, and the same gates hold for every author, human or agent.
+
 ## How It Works
 
-SchemaBot uses **declarative schema**. You describe the desired end state in SQL files, and SchemaBot figures out the DDL needed to get there:
+SchemaBot uses **declarative schema**. Each table is one `CREATE TABLE` file in your repo; you describe the desired end state, and SchemaBot figures out the DDL needed to get there.
+
+**1. Edit the table's file.** Want a new column? Add it to the definition. That's the whole change:
 
 ```sql
 -- schema/testapp/users.sql
@@ -36,7 +62,9 @@ CREATE TABLE users (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 ```
 
-SchemaBot diffs your schema files against the live database, computes the DDL, and applies it:
+**2. Open a PR.** SchemaBot diffs your files against the live database and comments the exact DDL it will run. Review it like any code.
+
+**3. Apply.** Comment `schemabot apply -e staging`, then `-e production`, or run the same from the CLI. Changes run online, with live progress:
 
 ```
 $ schemabot plan -s ./schema -e staging
@@ -61,6 +89,8 @@ $ schemabot apply -s ./schema -e staging -y
 
   users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
 ```
+
+**4. Merge when green.** The required check passes only when the live schema matches your files. Applied, verified, merged, in that order.
 
 SchemaBot handles the full lifecycle:
 - **Plan**: diff the desired schema against the live database and compute the DDL
@@ -90,19 +120,14 @@ make mysql DB=production # Production testapp (port 13373)
 
 To run SchemaBot against your own databases, grab a build from [Releases](#releases) (binary, container image, or Helm chart), then follow [docs/github-app-setup.md](./docs/github-app-setup.md) to wire up the PR workflow and [docs/configuration.md](./docs/configuration.md) for the server config. `schemabot onboard` pulls a live database's schema into a new declarative schema directory, so you start from your real tables rather than writing them out by hand.
 
-## Architecture
-
-See [docs/architecture.md](./docs/architecture.md) for the full documentation.
-
-## Configuration
-
-See [docs/configuration.md](./docs/configuration.md) for setup instructions (local mode, gRPC mode, secret resolution).
-
 ## Docs
 
-General design docs live in the [docs](./docs/) folder. Three good places to start, each
-with a table of contents so you can jump straight to the question you came with:
+Design and operations docs live in the [docs](./docs/) folder:
 
+- [docs/architecture.md](./docs/architecture.md) is the full picture: the layers, the engines,
+  the state machine, and how a change flows through them.
+- [docs/configuration.md](./docs/configuration.md) covers server setup: local mode, gRPC mode,
+  and secret resolution.
 - [docs/invariants.md](./docs/invariants.md) is the registry of runtime safety invariants:
   what must never be false while SchemaBot is running, why each rule matters, where it is
   enforced, and what these guarantees deliberately do not cover. It opens with what happens
@@ -112,6 +137,8 @@ with a table of contents so you can jump straight to the question you came with:
   differences exist.
 - [docs/postgresql.md](./docs/postgresql.md) is the PostgreSQL support envelope: what plans,
   what applies, and how each refusal is reported.
+
+Each has a table of contents, so jump straight to the question you came with.
 
 ## Releases
 
