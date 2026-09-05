@@ -841,9 +841,13 @@ webhook control entry points (`pkg/api/control_handlers.go`, `pkg/webhook/contro
 A control request resolves to an explicit durable outcome: applied, superseded, or failed. A
 command may delay a drive but never wedge it. A failed request requires fresh operator intent
 rather than being retried forever, and polling windows are bounded with visible timeout failures.
+An operation an engine declines for its whole database type is one of these doomed commands, so
+every engine states that decline in the type system rather than as a generic failure, and the
+drive resolves the request with the engine's reason instead of reattempting it.
 *Breaks if violated:* an apply loops on a doomed command while holding its database lock.
 *Enforced:* request completion and bounded-retry rules in the drive loop (`pkg/api/operator.go`,
-`pkg/tern/control_requests.go`).
+`pkg/tern/control_requests.go`), and the terminal resolution of a typed unsupported-operation
+decline (`failPendingRequestForUnsupportedOperation`, `pkg/tern/local_control.go`).
 
 ### CO-3: Engine terminal truth outranks a queued command
 
