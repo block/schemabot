@@ -55,7 +55,7 @@ type BlockedChangeData struct {
 }
 
 // DirectChangeData is a planned change the database's direct execution policy
-// routes to native MySQL DDL instead of the schema-change engine. The plan
+// routes to native MySQL DDL instead of the schema change engine. The plan
 // comment discloses its semantics — blocking, not revertible — so the
 // operator consents to them when confirming the apply.
 type DirectChangeData struct {
@@ -723,10 +723,11 @@ func countStatementTypes(changes []KeyspaceChangeData, databaseType string) (cre
 		for _, stmt := range ks.Statements {
 			stmtType, _, classifyErr := parser.Classify(stmt)
 			if classifyErr != nil {
-				createSet, err := ddl.ParseCreateSet(parser, stmt)
-				if err != nil {
+				createSet, createSetErr := ddl.ParseCreateSet(parser, stmt)
+				if createSetErr != nil {
 					slog.Warn("plan summary could not classify a statement or parse it as a supported create set; it is left out of the create/alter/drop counts",
-						"database_type", databaseType, "keyspace", ks.Keyspace, "error", err)
+						"database_type", databaseType, "keyspace", ks.Keyspace,
+						"classify_error", classifyErr, "create_set_error", createSetErr)
 					continue
 				}
 				stmtType = createSet.Type
@@ -804,16 +805,27 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 }
 
 // writePlanDDLBlock writes a single fenced SQL block of statements, formatted
-// under the plan's own dialect.
+// under the plan's own dialect. A greenfield create set is split so each of
+// its statements is formatted on its own line; rendering is best-effort, so a
+// statement that is neither a single statement nor a valid create set is
+// still rendered as written, and the reason is logged for triage.
 func writePlanDDLBlock(sb *strings.Builder, statements []string, dialect schema.Dialect) {
 	sb.WriteString("```sql\n")
 	formattedStatements := make([]string, 0, len(statements))
 	parser, parserErr := ddl.ParserForDialect(dialect)
+	if parserErr != nil {
+		slog.Warn("plan DDL block cannot split create sets; multi-statement DDL will be rendered as written",
+			"dialect", dialect, "error", parserErr)
+	}
 	for _, stmt := range statements {
 		statementsToFormat := []string{stmt}
 		if parserErr == nil {
-			if _, _, err := parser.Classify(stmt); err != nil {
-				if createSet, err := ddl.ParseCreateSet(parser, stmt); err == nil {
+			if _, _, classifyErr := parser.Classify(stmt); classifyErr != nil {
+				createSet, createSetErr := ddl.ParseCreateSet(parser, stmt)
+				if createSetErr != nil {
+					slog.Warn("plan DDL block could not classify a statement or parse it as a supported create set; it will be rendered as written",
+						"dialect", dialect, "classify_error", classifyErr, "create_set_error", createSetErr)
+				} else {
 					statementsToFormat = createSet.Statements
 				}
 			}
@@ -1023,7 +1035,7 @@ func joinDeploymentNames(deployments []DeploymentDriftEntry) string {
 // provisioning.
 func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 	n := len(changes)
-	fmt.Fprintf(sb, glyph.Refused+" **Cannot apply**: %d %s the schema-change engine refuses to execute\n", n, pluralize("change", n))
+	fmt.Fprintf(sb, glyph.Refused+" **Cannot apply**: %d %s the schema change engine refuses to execute\n", n, pluralize("change", n))
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
@@ -1050,13 +1062,13 @@ func directConsentCopy(databaseType string, isMySQL bool) (headerNoun, footer st
 	databaseType = strings.TrimSpace(databaseType)
 	if databaseType == storage.DatabaseTypeMySQL || databaseType == storage.DatabaseTypeStrata || isMySQL {
 		return "native MySQL DDL",
-			"These statements run synchronously outside the schema-change engine: writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this."
+			"These statements run synchronously outside the schema change engine: writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this."
 	}
 	// Deliberately conservative fallback for an engine that emits direct
 	// verdicts without registering its own copy above: disclose the broadest
 	// impact rather than understate what the operator is consenting to.
 	return "native DDL",
-		"These statements run synchronously outside the schema-change engine: each table is unavailable while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this."
+		"These statements run synchronously outside the schema change engine: each table is unavailable while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this."
 }
 
 // writeDirectChanges writes the section for statements the direct execution

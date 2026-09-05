@@ -358,7 +358,7 @@ func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB,
 		decision := e.resolveRefusedMode(ctx, target, policy, database, table, reason)
 		if decision.mode != engine.ExecutionModeDirect {
 			metrics.RecordDirectExecution(ctx, database, decision.outcome)
-			// A refusal reason is the schema-change engine's own account of why
+			// A refusal reason is the schema change engine's own account of why
 			// it will not run the statement, and SchemaBot's bound and
 			// row-count context appended to it. It is not target output: the
 			// engine's checks interpolate only the column and type names the
@@ -367,7 +367,7 @@ func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB,
 			// and it is why a new refusal path has to be read before it is
 			// marked rather than assumed to match this one.
 			if !policy.Enabled {
-				return alterRouting{}, engine.OperatorErrorf(nil, "Statement on table %q is not supported by the schema-change engine and direct execution is not enabled for this database: %s", table, reason)
+				return alterRouting{}, engine.OperatorErrorf(nil, "Statement on table %q is not supported by the schema change engine and direct execution is not enabled for this database: %s", table, reason)
 			}
 			return alterRouting{}, engine.OperatorErrorf(nil, "Statement on table %q cannot run directly: %s", table, decision.modeReason)
 		}

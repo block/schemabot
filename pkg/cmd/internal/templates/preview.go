@@ -131,7 +131,7 @@ const (
 	PreviewCommentPlanTenant                   PreviewType = "comment_plan_tenant"                     // Tenant-targeted plan comment
 	PreviewCommentPlanEmpty                    PreviewType = "comment_plan_empty"                      // Plan comment with no changes
 	PreviewCommentNoManagedSchema              PreviewType = "comment_no_managed_schema"               // No managed schema changes in current PR
-	PreviewCommentChecksRefreshed              PreviewType = "comment_checks_refreshed"                // Plan on no-schema-changes PR recreated passing checks
+	PreviewCommentChecksRefreshed              PreviewType = "comment_checks_refreshed"                // Plan on a PR with no schema changes recreated passing checks
 	PreviewCommentChecksRefreshedTenant        PreviewType = "comment_checks_refreshed_tenant"         // Checks refreshed but gated on tenant deployments
 	PreviewCommentReconcileInProgress          PreviewType = "comment_reconcile_in_progress"           // Empty diff with in-progress apply-owned state
 	PreviewCommentReconcileCompleted           PreviewType = "comment_reconcile_completed"             // Empty diff with completed apply-owned state

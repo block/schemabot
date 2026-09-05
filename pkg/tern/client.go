@@ -172,7 +172,7 @@ type Client interface {
 // service do not implement it: that service owns its own engines and halts them
 // on its own shutdown.
 type ShutdownHalter interface {
-	// HaltForShutdown brings this client's in-flight schema-change work down,
+	// HaltForShutdown brings this client's in-flight schema change work down,
 	// checkpointed so another driver can resume it, and returns once its engine
 	// no longer holds the target. It is not an operator stop: the applies it
 	// halts stay active for reclaim.
