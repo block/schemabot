@@ -41,7 +41,7 @@ SchemaBot is built for the agentic era. In a world where agents build product fe
 - 🛡️ **Guardrails built in.** Every change is parsed with a real DDL parser and linted with sophisticated rules before anything executes. Destructive changes are gated behind explicit acknowledgment, and merge-blocking checks keep a PR red until the live schema matches your files.
 - ⚡ **Smart execution.** Instant when safe, online when needed, zero downtime always. Automatic throttling backs off when your database is under pressure.
 - 🚀 **Ship faster.** The entire workflow runs in PR comments: plan previews on every PR, apply with a comment, watch live progress stream in. No scripts to write, no consoles to click through.
-- 🎛️ **Stay in control.** `stop`, `start`, `cutover`, `cancel`, and `revert` a running change from the PR or the CLI. Promotion order is enforced: production won't apply until the earlier environments are green.
+- 🎛️ **Stay in control.** `stop`, `start`, `cutover`, `cancel`, and rollback a running change from the PR or the CLI. Promotion order is enforced: production won't apply until the earlier environments are green.
 - 🤖 **Agent-ready.** Declarative SQL files give agents the schema as context, and the same gates hold for every author, human or agent.
 
 ## How It Works
