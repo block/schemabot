@@ -1,0 +1,111 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<!--
+  Source for assets/pipeline-never-waits.gif. Render with:
+    scripts/render-animation.py assets/src/pipeline-never-waits.html assets/pipeline-never-waits.gif
+  The frame is a pure function of t in [0,1], read from the URL hash (#t=0.42),
+  so every frame is deterministic and the renderer just screenshots a sweep of t.
+-->
+<style>
+*{box-sizing:border-box}
+body{margin:0;width:760px;height:340px;background:#fff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;font-size:13px;color:#1f2328;overflow:hidden;position:relative}
+.lane{position:absolute;left:0;width:760px;height:150px}
+.lane .title{position:absolute;left:16px;top:8px;font-weight:600;font-size:14px}
+.lane .sub{position:absolute;left:16px;top:28px;color:#59636e;font-size:12px}
+.track{position:absolute;left:16px;right:16px;height:44px;border:1px solid #d1d9e0;border-radius:6px;background:#f6f8fa;overflow:hidden}
+.track .lbl{position:absolute;left:8px;top:-18px;font-size:11px;color:#59636e;text-transform:uppercase;letter-spacing:.04em}
+.rel{position:absolute;top:8px;height:28px;width:52px;border-radius:4px;background:#1a7f37;color:#fff;font-weight:600;font-size:12px;line-height:28px;text-align:center;box-shadow:0 1px 0 rgba(0,0,0,.08)}
+.rel.q{background:#bf8700}
+.rel.new{background:#0969da}
+.big{position:absolute;top:6px;height:32px;border-radius:4px;background:#e16f24;color:#fff;font-weight:600;font-size:12px;line-height:32px;padding:0 10px;white-space:nowrap}
+.big .bar{position:absolute;left:0;bottom:0;height:4px;background:#fff8}
+.pr{position:absolute;left:16px;right:16px;height:34px;border:1px solid #d1d9e0;border-radius:6px;background:#fff;padding:0 10px;line-height:32px;font-size:12px;display:flex;gap:10px;align-items:center}
+.pr .prog{flex:1;height:8px;background:#e6e8eb;border-radius:4px;overflow:hidden}
+.pr .prog i{display:block;height:100%;background:#e16f24}
+.pr .prog i.done{background:#1a7f37}
+.pr b{color:#1f2328}
+.note{position:absolute;right:16px;font-size:12px;font-weight:600}
+.clock{position:absolute;right:16px;top:8px;font-size:12px;color:#59636e}
+.axis{position:absolute;left:0;right:0;top:310px;text-align:center;color:#8c959f;font-size:11px}
+.sep{position:absolute;left:16px;right:16px;top:158px;border-top:1px dashed #d1d9e0}
+</style></head><body>
+<div id="a" class="lane" style="top:0">
+  <div class="title">Schema change inside the deploy</div>
+  <div class="sub">the copy is a pipeline step, so everything behind it waits</div>
+  <div class="clock" id="aclock"></div>
+  <div class="track" style="top:74px"><div class="lbl">deploy pipeline</div><div id="atrack"></div></div>
+  <div class="note" id="anote" style="top:126px;color:#9a6700"></div>
+</div>
+<div class="sep"></div>
+<div id="b" class="lane" style="top:166px">
+  <div class="title">Schema change applied from the open PR</div>
+  <div class="sub" id="bsub">the copy runs on the PR, and the pipeline never sees a DDL step</div>
+  <div class="clock" id="bclock"></div>
+  <div class="pr" id="bpr" style="top:50px"></div>
+  <div class="track" style="top:98px"><div class="lbl">deploy pipeline</div><div id="btrack"></div></div>
+</div>
+<div class="axis">time →</div>
+<script>
+const t = Math.min(1, Math.max(0, parseFloat((location.hash.match(/t=([\d.]+)/)||[0,0])[1])));
+const W = 728;                 // track inner width
+const SPEED = 1.35;            // track widths per full loop
+const GAP = 80;                // px between releases
+const BLOCK_AT = 0.22;         // when the copy enters the deploy-time pipeline
+const COPY_END = 0.82;         // when the PR copy finishes
+const days = Math.floor(t*14);
+document.getElementById('aclock').textContent = 'day ' + days;
+document.getElementById('bclock').textContent = 'day ' + days;
+
+function releases(track, opts){
+  let html='', n=0;
+  for (let i=0;i<40;i++){
+    const start = i*GAP;                       // px offset at t=0, rightwards
+    let x = -start + t*SPEED*W;                // moving right over time
+    let cls='rel';
+    if (opts.blockX!==undefined && x > opts.blockX - 60 - (opts.stopIndex? (i-opts.firstBlocked)*60:0)){
+      // pile up behind the block
+      const k = i - opts.firstBlocked;
+      if (k>=0){ x = opts.blockX - 60 - k*60; cls='rel q'; }
+    }
+    if (x < -60 || x > W+10) continue;
+    const v = 12+i;
+    const label = (opts.newAt!==undefined && i===opts.newAt) ? 'v'+v+' ✦' : 'v'+v;
+    if (opts.newAt!==undefined && i===opts.newAt) cls='rel new';
+    html += `<div class="${cls}" style="left:${x}px">${label}</div>`;
+    n++;
+  }
+  track.innerHTML = html;
+}
+
+// Lane A: the big copy parks in the pipeline at BLOCK_AT and never leaves.
+const A = document.getElementById('atrack');
+if (t < BLOCK_AT){
+  releases(A, {});
+} else {
+  const blockX = 300;
+  const firstBlocked = Math.ceil((BLOCK_AT*SPEED*W + 60 - blockX)/GAP) ;
+  releases(A, {blockX, firstBlocked, stopIndex:true});
+  // The same copy as lane B, just started later, so it runs at the same pace.
+  const prog = Math.min(1,(t-BLOCK_AT)/COPY_END);
+  const timedOut = t > 0.6;
+  A.insertAdjacentHTML('beforeend', `<div class="big" style="left:${blockX}px${timedOut?';background:#cf222e':''}">schema change · copying rows · ${Math.round(prog*100)}%<div class="bar" style="width:${prog*100}%"></div></div>`);
+  const waiting = Math.max(0, Math.floor((t*SPEED*W - (firstBlocked*GAP))/GAP)+1);
+  const note = document.getElementById('anote');
+  note.textContent = waiting>0 ? `${waiting} release${waiting>1?'s':''} waiting${timedOut?' · deploy timed out ⏱':''}` : '';
+  if (timedOut) note.style.color = '#cf222e';
+}
+
+// Lane B: the copy is a progress bar on the PR; the pipeline flows the whole time.
+const B = document.getElementById('btrack');
+const newAt = Math.round((COPY_END*SPEED*W)/GAP)+1;
+releases(B, {newAt: t>COPY_END ? newAt : undefined});
+const p = Math.min(1, t/COPY_END);
+const pr = document.getElementById('bpr');
+if (p<1){
+  pr.innerHTML = `<b>PR #42</b> <span>schema change · copying rows</span><div class="prog"><i style="width:${p*100}%"></i></div><span>${Math.round(p*100)}% · ETA ${Math.max(1,Math.ceil((1-p)*COPY_END*14))}d</span>`;
+} else {
+  pr.innerHTML = `<b>PR #42</b> <span>schema change · applied ✅</span><div class="prog"><i class="done" style="width:100%"></i></div><span style="color:#8250df;font-weight:600">merged</span>`;
+  document.getElementById('bsub').innerHTML = '<span style="color:#0969da;font-weight:600">✦</span> an ordinary deploy, onto a schema that is already live';
+}
+</script>
+</body></html>

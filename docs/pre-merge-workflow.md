@@ -58,6 +58,8 @@ for as long as the database needs while the rest of the team keeps merging and
 deploying around it. CI and the deploy pipeline never see a DDL step at all.
 The deploy that eventually follows is an ordinary code deploy.
 
+![Two deploy pipelines side by side over two weeks. With the schema change inside the deploy, the row copy parks in the pipeline and every release behind it queues until the deploy times out. Applied from the open PR, the copy runs on the PR while releases keep flowing, and once it is applied and merged, the next release is an ordinary deploy onto a schema that is already live](../assets/pipeline-never-waits.gif)
+
 Everything else follows from taking DDL out of the deploy path:
 
 - **Merge means agreement.** The required check turns green only when every
@@ -231,22 +233,48 @@ schema never blocks the feature the way an unapplied one does.
 
 ## The PR workflow, step by step
 
-The right-hand half of the diagram at the top of this page:
+The right-hand half of the diagram at the top of this page, as it looks on the
+PR. Every comment below is the real template SchemaBot posts:
 
 1. **Edit the table's `.sql` file and open a PR.**
-2. **SchemaBot plans automatically** and posts the DDL diff as a PR comment,
-   stamped with the commit it was computed from. It re-plans on every new
+2. **SchemaBot plans automatically.** It posts the DDL diff as a PR comment,
+   stamped with the commit it was computed from, and re-plans on every new
    commit. When the files already match the live schema there is nothing to
    plan, so no comment is posted and the passing check is the signal.
+
+   ![Step 2: the plan comment, showing the DDL SchemaBot will run and the command to apply it](../assets/pr-mockups/pre-merge-1-plan.png)
+
 3. **Apply to staging** by commenting `schemabot apply -e staging`. SchemaBot
-   re-plans the current head, takes the database lock, and starts the apply.
-   Progress streams into the PR.
-4. **Apply to production** by commenting `schemabot apply -e production`. This
-   requires the staging check to have passed, and an approving review when the
+   acknowledges the command with a 👀 reaction, re-plans the current head,
+   takes the database lock, and starts the apply.
+
+   ![Step 3: the apply command and SchemaBot's apply comment, with the lock acquired](../assets/pr-mockups/pre-merge-2-apply.png)
+
+4. **Watch the status comment.** SchemaBot edits one progress comment in place
+   for as long as the apply runs: rows copied, percent complete, an ETA, and
+   the command to stop it. A long-running copy is normal. Let it run.
+
+   ![Step 4: the status comment with a progress bar, row counts, and an ETA](../assets/pr-mockups/pre-merge-3-status.png)
+
+5. **The completion comment lands.** When the change is live, a summary posts
+   at the bottom of the timeline with the DDL that ran and the apply ID.
+
+   ![Step 5: the completion comment confirming the schema change is live](../assets/pr-mockups/pre-merge-4-applied.png)
+
+6. **Apply to production** by commenting `schemabot apply -e production`. The
+   same three comments follow, for the production database. This requires the
+   staging check to have passed, and an approving review when the
    [review gate](configuration.md#review-gate) is on.
-5. **Merge when green.** When every planned change is applied in every
-   environment, the required check passes and the PR can merge.
-6. **Deploy as usual.** For an additive change, the code rolls out onto a
+7. **The checks turn green.** When every planned change is applied in every
+   environment, the required check passes and the merge button unlocks.
+
+   ![Step 7: every check green, including SchemaBot (staging) and SchemaBot (production), and the merge button enabled](../assets/pr-mockups/pre-merge-5-checks.png)
+
+8. **Merge.** Merging records the desired state the databases already run.
+
+   ![Step 8: the pull request merged](../assets/pr-mockups/pre-merge-6-merged.png)
+
+9. **Deploy as usual.** For an additive change, the code rolls out onto a
    database that already has the shape it expects.
 
 The full command set, with every flag, is in the help comment
