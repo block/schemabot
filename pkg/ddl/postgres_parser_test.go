@@ -134,13 +134,31 @@ func TestCreateSetStatements(t *testing.T) {
 			name:       "schema-qualified targets differ",
 			parser:     postgresParser,
 			script:     "CREATE TABLE a.t (id bigint); CREATE INDEX t_id_idx ON b.t (id);",
-			wantErrMsg: `statement 2 creates an index on table "b.t", not CREATE TABLE target "a.t"`,
+			wantErrMsg: `statement 2 creates an index on table "b"."t", not CREATE TABLE target "a"."t"`,
 		},
 		{
-			name:       "qualified and unqualified targets differ",
+			name:       "qualified table with unqualified index is refused as mixed qualification",
 			parser:     postgresParser,
 			script:     "CREATE TABLE a.t (id bigint); CREATE INDEX t_id_idx ON t (id);",
-			wantErrMsg: `statement 2 creates an index on table "t", not CREATE TABLE target "a.t"`,
+			wantErrMsg: `statement 2 creates an index on "t" while CREATE TABLE targets "a"."t"; a create set cannot resolve an unqualified name against a search_path`,
+		},
+		{
+			name:       "unqualified table with qualified index is refused as mixed qualification",
+			parser:     postgresParser,
+			script:     "CREATE TABLE t (id bigint); CREATE INDEX t_id_idx ON a.t (id);",
+			wantErrMsg: `statement 2 creates an index on "a"."t" while CREATE TABLE targets "t"; a create set cannot resolve an unqualified name against a search_path`,
+		},
+		{
+			name:       "a dot inside a bare table name is not a schema qualifier",
+			parser:     postgresParser,
+			script:     `CREATE TABLE "a.t" (id bigint); CREATE INDEX t_id_idx ON a.t (id);`,
+			wantErrMsg: `statement 2 creates an index on "a"."t" while CREATE TABLE targets "a.t"`,
+		},
+		{
+			name:       "a dot inside a qualified name is not a schema boundary",
+			parser:     postgresParser,
+			script:     `CREATE TABLE a."b.t" (id bigint); CREATE INDEX i ON "a.b".t (id);`,
+			wantErrMsg: `statement 2 creates an index on table "a.b"."t", not CREATE TABLE target "a"."b.t"`,
 		},
 		{
 			name:       "alter follows create table",
@@ -179,10 +197,13 @@ func TestCreateSetStatements(t *testing.T) {
 			want:   []string{"ALTER TABLE `t` ADD COLUMN `v` varchar(20)"},
 		},
 		{
+			// The MySQL parser reports one Split entry per statement, but the
+			// CREATE TABLE entry carries the whole script, so it is refused as
+			// multi-statement input rather than classified on its own.
 			name:       "MySQL multi-statement create set is unsupported",
 			parser:     mysqlParser,
 			script:     "CREATE TABLE `t` (`id` bigint); CREATE INDEX `t_id_idx` ON `t` (`id`)",
-			wantErrMsg: "multi-statement DDL scripts are not supported for this dialect",
+			wantErrMsg: "classify statement 1 of 2 in multi-statement DDL script: expected a single statement",
 		},
 	}
 

@@ -46,7 +46,7 @@
   - [Tenant-scoped command routing](#tenant-scoped-command-routing)
   - [How it works](#how-it-works)
   - [Auto-plan behavior](#auto-plan-behavior)
-  - [Plan comment minimization](#plan-comment-minimization)
+  - [Plan comment retirement](#plan-comment-retirement)
 - [Multi-App Routing](#multi-app-routing)
   - [How dispatch works](#how-dispatch-works)
 - [Secret Resolution](#secret-resolution)
@@ -142,6 +142,12 @@ With the `config_paths` example above, SchemaBot reads:
 environment entry.
 
 ### PostgreSQL `dsn_from` targets
+
+`target_resolver` is the data-plane connection resolver: a server exposing the
+gRPC listener (started with `GRPC_PORT` set) receives an opaque execution
+target over gRPC and resolves it to a connection through this inventory, rather
+than routing logical database names through the control plane's `databases`
+table.
 
 `dsn_from` on a `target_resolver` target supports `type: postgres` in addition
 to `mysql`. The assembled DSN is a libpq URL that always names one database and
@@ -611,7 +617,7 @@ databases:
     type: mysql
     environments:
       staging:
-        dsn_secret_ref: "..."
+        dsn: "file:/run/secrets/payments-staging-dsn"
         direct_execution:
           enabled: true           # default: false
           max_table_rows: 100000  # required (positive) when enabled
