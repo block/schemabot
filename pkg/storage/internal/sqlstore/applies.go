@@ -2343,11 +2343,12 @@ func (s *applyStore) WithExclusiveTarget(ctx context.Context, apply *storage.App
 	}
 	defer releaseApplyTargetLockConn(ctx, s.locker, conn, lockName, "hold apply target")
 
-	// The re-check runs in its own transaction, committed before fn starts. The
-	// advisory lock, not an open transaction, is what keeps a competing apply
-	// out for the duration, and fn touches the target database rather than
-	// storage, so holding a storage transaction open across it would pin a
-	// connection for as long as the target work takes.
+	// The re-check runs in its own transaction, which is finished before fn
+	// starts: it only reads, so it ends by rollback and writes nothing to
+	// commit. The advisory lock, not an open transaction, is what keeps a
+	// competing apply out for the duration, and fn touches the target database
+	// rather than storage, so holding a storage transaction open across it
+	// would pin a connection for as long as the target work takes.
 	if err := s.checkTargetUnclaimed(ctx, conn, apply, database, dbType, environment, deployment); err != nil {
 		return err
 	}
