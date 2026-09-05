@@ -78,7 +78,7 @@ SchemaBot has three layers:
   - `LocalClient`: Embedded engine (single-process, for easy deployments (recommended to start))
   - `GRPCClient`: Delegates work to remote deployments (for distributed / multi-tenant architectures)
 - **Engine** ([`pkg/engine`](../pkg/engine/)): Stateless executor interface for schema change backends
-- **Storage** ([`pkg/storage`](../pkg/storage/)): Interface-based persistence (locks, plans, applies, tasks, logs, settings). MySQL implementation in [`pkg/storage/mysqlstore`](../pkg/storage/mysqlstore/), PostgreSQL implementation in [`pkg/storage/postgresstore`](../pkg/storage/postgresstore/)
+- **Storage** ([`pkg/storage`](../pkg/storage/)): Interface-based persistence (locks, plans, applies, tasks, logs, settings). MySQL implementation in [`pkg/storage/mysqlstore`](../pkg/storage/mysqlstore/), PostgreSQL implementation in [`pkg/storage/postgresstore`](../pkg/storage/postgresstore/). [Storage Outage Behavior](storage-outage-behavior.md) covers what each component does when storage is unavailable
 
 Supporting packages: [`pkg/ddl`](../pkg/ddl/) (schema diffing), [`pkg/lint`](../pkg/lint/) (safety linting and auto-fix), [`pkg/secrets`](../pkg/secrets/) (secret resolution), [`pkg/schema`](../pkg/schema/) (shared schema types and embedded storage SQL)
 
@@ -206,6 +206,8 @@ SchemaBot uses [Spirit's linter](https://github.com/block/spirit/tree/main/pkg/l
 - **Error** — blocks apply unless `--allow-unsafe` is passed (e.g., `DROP TABLE`, `DROP COLUMN`)
 - **Warning** — informational, shown to user but does not block
 - **Info** — suggestions and style preferences
+
+[Lint and Safety Levels](lint-and-safety-levels.md) is the full guide to the severity ladder, what "unsafe" means per engine, and the iconography on plan comments.
 
 Unsafe operations that produce error-severity violations:
 
@@ -464,7 +466,7 @@ full record tree and how it behaves during recovery.
 
 ### Progress Flow And Observers
 
-Tern's progress poller is where raw engine progress becomes SchemaBot state. On each tick, Tern asks the engine for progress, derives task state from the engine response, derives the apply state from those tasks, persists both, and notifies an optional `ProgressObserver`.
+Tern's progress poller is where raw engine progress becomes SchemaBot state. On each tick, Tern asks the engine for progress, derives task state from the engine response, derives the apply state from those tasks, persists both, and notifies an optional `ProgressObserver`. For the Spirit engine, [Spirit Progress](spirit_progress.md) traces every field in this pipeline from Spirit's in-memory state to what the CLI and PR comment render.
 
 ```
 Engine progress

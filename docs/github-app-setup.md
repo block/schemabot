@@ -189,7 +189,7 @@ type: mysql
 | Field | Required | Description |
 |-------|----------|-------------|
 | `database` | Yes | Must match a database name in your SchemaBot server config |
-| `type` | Yes | `"mysql"`, `"vitess"`, `"strata"`, or `"postgres"` |
+| `type` | Yes | `"mysql"`, `"vitess"`, `"strata"` (many MySQL shards behind a shared topology — see [Strata](strata-engine.md)), or `"postgres"` |
 | `ignore_namespaces` | No | Namespace subdirectories to exclude from plans, applies, and checks (see [Ignoring Namespaces](namespaces.md#ignoring-namespaces)) |
 
 Environment availability and promotion order are configured on the SchemaBot server.

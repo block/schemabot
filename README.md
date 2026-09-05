@@ -72,7 +72,7 @@ Not every engine supports every feature, and some share a verb without sharing i
 
 ## Quick Start
 
-Try it from a clone — the demo brings up local MySQL containers, applies a schema, and seeds data:
+Try it from a clone — the demo brings up local MySQL containers, applies a schema, and seeds data ([examples/](./examples/README.md) documents the demo schemas and configs):
 
 ```bash
 make demo    # Start services, apply schema, seed data
