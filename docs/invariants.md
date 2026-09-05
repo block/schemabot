@@ -20,6 +20,7 @@
   - [AV-8: Untrusted text never reaches operator surfaces raw](#av-8-untrusted-text-never-reaches-operator-surfaces-raw)
   - [AV-9: SchemaBot never destroys its own storage to start](#av-9-schemabot-never-destroys-its-own-storage-to-start)
   - [AV-10: Anything the PR can do, the CLI can do](#av-10-anything-the-pr-can-do-the-cli-can-do)
+  - [AV-11: SchemaBot states the budget its own storage statements run under](#av-11-schemabot-states-the-budget-its-own-storage-statements-run-under)
 - [Merge gate (MG)](#merge-gate-mg)
   - [MG-1: Uncertainty is never converted into a passing check](#mg-1-uncertainty-is-never-converted-into-a-passing-check)
   - [MG-2: Absence never passes](#mg-2-absence-never-passes)
@@ -420,6 +421,38 @@ registered comment commands and requires each one to have a CLI command of the s
 justified exemption naming the CLI capability that covers it. That test mechanizes the spelling
 half only: a CLI command whose behavior drifted from its comment counterpart still passes, so the
 capability half above remains a convention.
+
+### AV-11: SchemaBot states the budget its own storage statements run under
+
+Every connection SchemaBot opens to its own PostgreSQL storage sets `statement_timeout`
+explicitly, rather than running under whatever the platform configured at the role or database
+level. Setting nothing is not the same as having no budget: hosted PostgreSQL providers set one by
+default and tune it for API queries, not for DDL that rewrites a heap, so a connection that stays
+silent inherits a value nobody chose for the work it is doing.
+
+Three statement classes get three budgets, because a single value cannot serve all of them.
+Ordinary storage queries — the long-lived pool, and the bootstrap's catalog reads — run under
+`postgres.statement_timeout`. Bootstrap convergence DDL raises it per transaction, to a value
+derived from the deadline that already bounds the whole bootstrap; deriving it rather than
+choosing it is what makes it safe, since it can only end a statement that deadline was going to
+end anyway, and so cannot turn a slow but healthy boot into a crashloop. The bootstrap's
+advisory-lock connection disables the budget outright: acquiring that lock means blocking inside
+`pg_advisory_lock` until the pod that is bootstrapping finishes, so any budget shorter than the
+wait would cancel a trailing pod's legitimate queue. That wait stays bounded by the lock timeout
+scoped to the acquisition and by the bootstrap deadline.
+
+A cancelled statement is reported as what cancelled it. SQLSTATE `57014` is raised both by
+`statement_timeout` firing and by an operator's `pg_cancel_backend`, so elapsed time
+disambiguates: a cancellation arriving before the budget in force could have fired came from
+outside it, and says so rather than being reported as budget exhaustion.
+
+*Breaks if violated:* a platform-imposed timeout cancels bootstrap DDL or truncates a trailing
+pod's lock wait, and the pod crashloops reporting a bare failure that points at neither cause.
+*Enforced:* the opt-in `WithStatementTimeout` option, which has no package-level default precisely
+because one would reach the advisory-lock wait (`pkg/postgresconn/postgresconn.go`); the
+per-class budgets and the `57014` classifier in the PostgreSQL bootstrapper
+(`pkg/api/ensure_schema_postgres.go`); and the storage pool's budget at the call site that opens
+it (`pkg/serve/serve.go`).
 
 ## Merge gate (MG)
 

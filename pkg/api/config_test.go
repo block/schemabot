@@ -4576,3 +4576,79 @@ postgres:
 		require.ErrorContains(t, err, "cannot unmarshal")
 	})
 }
+
+// postgres.statement_timeout bounds ordinary storage queries. Unlike the pool
+// durations, zero is a meaningful setting rather than "use the default": it
+// disables the budget explicitly so the connection states that it has no
+// budget instead of inheriting whatever the platform imposed.
+func TestPostgresStatementTimeoutConfig(t *testing.T) {
+	t.Parallel()
+
+	postgresCfg := func(statementTimeout string) ServerConfig {
+		cfg := ServerConfig{Databases: map[string]DatabaseConfig{
+			"mydb": {
+				Type: storage.DatabaseTypePostgres,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "postgres://localhost/mydb"},
+				},
+			},
+		}}
+		cfg.Postgres.StatementTimeout = statementTimeout
+		return cfg
+	}
+
+	t.Run("unset uses the default", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("")
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, DefaultPostgresStatementTimeout, cfg.Postgres.StatementTimeoutOrDefault())
+	})
+
+	t.Run("explicit value wins over the default", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("90s")
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, 90*time.Second, cfg.Postgres.StatementTimeoutOrDefault())
+	})
+
+	t.Run("zero disables the budget rather than selecting the default", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("0")
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, time.Duration(0), cfg.Postgres.StatementTimeoutOrDefault())
+	})
+
+	t.Run("negative fails validation", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("-1s")
+		err := cfg.Validate()
+		require.ErrorContains(t, err, "postgres.statement_timeout")
+		require.ErrorContains(t, err, "must not be negative")
+	})
+
+	t.Run("unparseable fails validation", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("soon")
+		err := cfg.Validate()
+		require.ErrorContains(t, err, `postgres.statement_timeout "soon" is not a valid duration`)
+	})
+
+	t.Run("loads from file", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(`
+databases:
+  mydb:
+    type: postgres
+    environments:
+      staging:
+        dsn: postgres://localhost/mydb
+postgres:
+  statement_timeout: 45s
+`), 0o600))
+
+		cfg, err := LoadServerConfigFromFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, 45*time.Second, cfg.Postgres.StatementTimeoutOrDefault())
+	})
+}

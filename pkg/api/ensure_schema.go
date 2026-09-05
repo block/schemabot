@@ -41,6 +41,13 @@ type EnsureSchemaOption func(*ensureSchemaOptions)
 type ensureSchemaOptions struct {
 	allowDestructive bool
 	dialect          schema.Dialect
+	// postgresStatementTimeout bounds a single ordinary query on the
+	// PostgreSQL bootstrap's connection. Zero disables the budget explicitly;
+	// negative means "not set", leaving the platform's ambient value in place.
+	// It defaults to DefaultPostgresStatementTimeout rather than to "not set",
+	// so a caller that never considered the question still bootstraps under a
+	// budget SchemaBot states instead of one the platform imposed.
+	postgresStatementTimeout time.Duration
 }
 
 // WithAllowDestructiveSchemaChanges controls whether EnsureSchema may execute
@@ -69,6 +76,20 @@ func WithDialect(dialect schema.Dialect) EnsureSchemaOption {
 	return func(o *ensureSchemaOptions) { o.dialect = dialect }
 }
 
+// WithPostgresStatementTimeout bounds a single ordinary query the PostgreSQL
+// bootstrap issues — its catalog reads and existence checks. It deliberately
+// does not bound the two statement classes the bootstrap runs that are
+// expected to be slow: convergence DDL raises the budget per transaction to
+// postgresBootstrapDDLStatementTimeout, and the advisory-lock wait runs with
+// no statement budget at all. A zero duration disables the budget explicitly
+// rather than inheriting the platform's, and a negative one leaves the
+// platform's value in place. Unset, the budget is
+// DefaultPostgresStatementTimeout. Wire this from
+// PostgresConfig.StatementTimeoutOrDefault.
+func WithPostgresStatementTimeout(d time.Duration) EnsureSchemaOption {
+	return func(o *ensureSchemaOptions) { o.postgresStatementTimeout = d }
+}
+
 // EnsureSchema converges SchemaBot's own storage schema at startup, routing to
 // the bootstrapper for the storage database's dialect (MySQL unless overridden
 // with WithDialect). It is idempotent — no changes are made if the schema is
@@ -81,7 +102,10 @@ func WithDialect(dialect schema.Dialect) EnsureSchemaOption {
 // adding a dialect means adding a bootstrapper here, not threading
 // dialect-conditionals through the MySQL flow.
 func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) error {
-	o := ensureSchemaOptions{dialect: schema.DialectMySQL}
+	o := ensureSchemaOptions{
+		dialect:                  schema.DialectMySQL,
+		postgresStatementTimeout: DefaultPostgresStatementTimeout,
+	}
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -89,7 +113,7 @@ func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) e
 	case schema.DialectMySQL:
 		return ensureMySQLSchema(dsn, logger, o, namedlock.MySQL{})
 	case schema.DialectPostgres:
-		return ensurePostgresSchema(dsn, logger, namedlock.Postgres{})
+		return ensurePostgresSchema(dsn, logger, o, namedlock.Postgres{})
 	default:
 		return fmt.Errorf("no schema bootstrapper for storage dialect %q (supported: %q, %q)", o.dialect, schema.DialectMySQL, schema.DialectPostgres)
 	}

@@ -20,7 +20,7 @@ func TestEnsurePostgresSchema_MalformedDSNFailsAtOpen(t *testing.T) {
 	t.Parallel()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	err := ensurePostgresSchema("postgres://user@host:notaport/db", logger, nil)
+	err := ensurePostgresSchema("postgres://user@host:notaport/db", logger, ensureSchemaOptions{}, nil)
 	require.Error(t, err)
 	require.ErrorContains(t, err, "open storage database")
 }

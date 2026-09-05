@@ -59,7 +59,12 @@ func (cmd *ResyncIdentitySequencesCmd) Run(ctx context.Context, g *Globals) erro
 	}
 	logger.Info("resolved storage DSN", "source", source)
 
-	db, err := postgresconn.Open(dsn)
+	// An operator-supervised one-shot over every storage table: it runs as long
+	// as it needs to, bounded by ctx rather than by a statement budget. Stating
+	// that explicitly keeps a platform statement_timeout — which hosted
+	// providers set at the role or database level, tuned for API queries — from
+	// cancelling the maintenance part-way through.
+	db, err := postgresconn.Open(dsn, postgresconn.WithStatementTimeout(0))
 	if err != nil {
 		return fmt.Errorf("open storage database: %w", err)
 	}
@@ -130,7 +135,12 @@ func (cmd *CanonicalizeIdentityKeysCmd) Run(ctx context.Context, g *Globals) err
 		}
 	}
 
-	db, err := postgresconn.Open(dsn)
+	// An operator-supervised one-shot over every storage table: it runs as long
+	// as it needs to, bounded by ctx rather than by a statement budget. Stating
+	// that explicitly keeps a platform statement_timeout — which hosted
+	// providers set at the role or database level, tuned for API queries — from
+	// cancelling the maintenance part-way through.
+	db, err := postgresconn.Open(dsn, postgresconn.WithStatementTimeout(0))
 	if err != nil {
 		return fmt.Errorf("open storage database: %w", err)
 	}

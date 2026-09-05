@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -922,4 +923,45 @@ func TestIsAuthError(t *testing.T) {
 	assert.False(t, isAuthError(&pgconn.PgError{Code: "55P03"}))
 	assert.False(t, isAuthError(errors.New("connection refused")))
 	assert.False(t, isAuthError(nil))
+}
+
+// GUC names are case-insensitive on the server and pgx preserves DSN key case,
+// so a DSN-carried statement_timeout under a different spelling must be
+// replaced rather than left beside the option's value: two spellings of one
+// parameter in the startup packet would let map iteration order decide which
+// budget the session runs under.
+func TestWithStatementTimeoutReplacesCaseVariantDSNValue(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := connectionConfig("postgres://user:pass@host:5432/db?statement_TIMEOUT=1000", WithStatementTimeout(45*time.Second))
+	require.NoError(t, err)
+
+	var found []string
+	for k, v := range cfg.RuntimeParams {
+		if strings.EqualFold(k, "statement_timeout") {
+			found = append(found, k+"="+v)
+		}
+	}
+	require.Len(t, found, 1, "exactly one spelling of statement_timeout survives")
+	assert.Equal(t, "statement_timeout=45000", found[0])
+}
+
+// A negative duration means "no budget chosen": the option must leave a
+// DSN-carried statement_timeout exactly as it found it.
+func TestWithStatementTimeoutNegativeLeavesDSNValue(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := connectionConfig("postgres://user:pass@host:5432/db?statement_timeout=1000", WithStatementTimeout(-1))
+	require.NoError(t, err)
+	assert.Equal(t, "1000", cfg.RuntimeParams["statement_timeout"])
+}
+
+// Zero writes the parameter rather than omitting it, so the session runs with
+// the budget explicitly disabled instead of inheriting the platform's value.
+func TestWithStatementTimeoutZeroWritesExplicitDisable(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := connectionConfig("postgres://user:pass@host:5432/db", WithStatementTimeout(0))
+	require.NoError(t, err)
+	assert.Equal(t, "0", cfg.RuntimeParams["statement_timeout"])
 }

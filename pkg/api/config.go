@@ -1285,7 +1285,27 @@ type PostgresConfig struct {
 	// will execute native-safe DDL. When unset,
 	// postgres.DefaultNativeSafeTableSizeLimitBytes applies.
 	NativeSafeTableSizeLimitBytes *int64 `yaml:"native_safe_table_size_limit_bytes,omitempty"`
+
+	// StatementTimeout bounds a single ordinary storage query on the
+	// connections SchemaBot opens to its own PostgreSQL storage database: the
+	// long-lived storage pool and the startup bootstrap's catalog reads. It
+	// does not bound bootstrap DDL, which raises the budget per transaction to
+	// a value derived from EnsureSchemaTimeout, and it does not bound the
+	// bootstrap advisory-lock wait, which must be free to block. When unset,
+	// DefaultPostgresStatementTimeout applies. "0" disables the budget
+	// explicitly, for a deployment whose storage queries legitimately run
+	// longer than any value worth defaulting to.
+	StatementTimeout string `yaml:"statement_timeout,omitempty"`
 }
+
+// DefaultPostgresStatementTimeout bounds an ordinary storage query. Storage
+// queries are point lookups, small scans, and lease claims against SchemaBot's
+// own tables; none of them approach this, so the budget only ever ends a query
+// that is already wedged. The value exists mostly to displace an ambient one:
+// with no budget set, SchemaBot runs under whatever the platform imposed at the
+// role or database level, which hosted providers tune for API queries rather
+// than for SchemaBot's workload.
+const DefaultPostgresStatementTimeout = 30 * time.Second
 
 // NativeSafeTableSizeLimit returns the configured limit or its default.
 func (c PostgresConfig) NativeSafeTableSizeLimit() int64 {
@@ -1295,9 +1315,29 @@ func (c PostgresConfig) NativeSafeTableSizeLimit() int64 {
 	return *c.NativeSafeTableSizeLimitBytes
 }
 
+// StatementTimeoutOrDefault returns the configured storage statement budget or
+// its default. A configured "0" returns zero, meaning the budget is explicitly
+// disabled — callers pass that through to postgresconn, which writes
+// statement_timeout=0 rather than inheriting the platform's value. It assumes
+// the value has already passed validation.
+func (c PostgresConfig) StatementTimeoutOrDefault() time.Duration {
+	return parseDurationOrDefault(c.StatementTimeout, DefaultPostgresStatementTimeout)
+}
+
 func (c PostgresConfig) validate() error {
 	if c.NativeSafeTableSizeLimitBytes != nil && *c.NativeSafeTableSizeLimitBytes <= 0 {
 		return fmt.Errorf("postgres.native_safe_table_size_limit_bytes must be positive, got %d", *c.NativeSafeTableSizeLimitBytes)
+	}
+	// Zero is a meaningful setting here, unlike the pool durations: it disables
+	// the budget explicitly instead of selecting the default.
+	if c.StatementTimeout != "" {
+		d, err := time.ParseDuration(c.StatementTimeout)
+		if err != nil {
+			return fmt.Errorf("postgres.statement_timeout %q is not a valid duration: %w", c.StatementTimeout, err)
+		}
+		if d < 0 {
+			return fmt.Errorf("postgres.statement_timeout %q must not be negative (omit it to use the default, or set \"0\" to disable the budget)", c.StatementTimeout)
+		}
 	}
 	return nil
 }

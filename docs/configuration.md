@@ -26,6 +26,7 @@
 - [Storage Connection Pool](#storage-connection-pool)
 - [Spirit Run Settings](#spirit-run-settings)
 - [Postgres](#postgres)
+  - [Storage statement budget](#storage-statement-budget)
 - [PlanetScale mTLS](#planetscale-mtls)
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
@@ -784,12 +785,14 @@ over gRPC run with that deployment's engine settings.
 ## Postgres
 
 The `postgres:` block sets the largest table on which the PostgreSQL engine
-will execute native-safe DDL. The limit is expressed in bytes and defaults to
+will execute native-safe DDL, and the statement budget SchemaBot's own storage
+connections run under. The size limit is expressed in bytes and defaults to
 1 GiB:
 
 ```yaml
 postgres:
   native_safe_table_size_limit_bytes: 4294967296
+  statement_timeout: 30s
 ```
 
 The ceiling is SchemaBot's own conservatism about how much work to attempt
@@ -809,6 +812,52 @@ existing data, and a table that does not exist yet has none.
 
 The server fails startup validation when
 `native_safe_table_size_limit_bytes` is zero or negative.
+
+### Storage statement budget
+
+`postgres.statement_timeout` bounds a single ordinary query on the connections
+SchemaBot opens to its **own** PostgreSQL storage database: the long-lived
+storage pool and the startup bootstrap's catalog reads. It defaults to `30s`.
+It has nothing to do with the budgets an apply runs under, which pg-sprite sets
+on the target database.
+
+Setting it matters even where the default is right, because the alternative is
+not "no budget". A connection that sets nothing runs under whatever
+`statement_timeout` the platform set at the role or database level, and hosted
+PostgreSQL providers set one by default, tuned for API queries rather than for
+SchemaBot's workload. When it fires, PostgreSQL raises SQLSTATE `57014`, the
+same code an operator's `pg_cancel_backend` produces, so an inherited budget is
+easy to misread during triage. Stating the budget makes it SchemaBot's to
+explain.
+
+Two classes of statement deliberately do not run under this value:
+
+| Statement class | Budget | Why |
+|---|---|---|
+| Ordinary storage queries | `postgres.statement_timeout` | Point lookups, small scans, and lease claims; none approach 30s |
+| Bootstrap convergence DDL | Derived from the bootstrap deadline | An index build legitimately runs far longer than a catalog read |
+| Bootstrap advisory-lock wait | None | The wait must be free to block while another pod bootstraps |
+
+The bootstrap DDL budget is not configurable, because its safety comes from
+being derived rather than chosen: it sits just under the deadline that already
+bounds the whole bootstrap, so it can only end a statement that deadline was
+going to end anyway. No DDL that converges today starts failing because the
+budget exists; the failures it changes are ones that were already going to
+happen, and they now name a budget instead of surfacing a bare cancellation.
+
+The advisory-lock connection runs with `statement_timeout` disabled outright.
+Acquiring that lock means blocking inside `SELECT pg_advisory_lock()` until the
+pod that is bootstrapping finishes, and any budget shorter than that wait —
+SchemaBot's or the platform's — would cancel a trailing pod's legitimate queue
+and fail its startup while the leader was converging normally. The wait is
+still bounded, by the lock timeout scoped to the acquisition and by the
+bootstrap deadline.
+
+Set `statement_timeout: "0"` to disable the budget on storage queries
+explicitly, for a deployment whose storage queries legitimately run longer than
+any value worth defaulting to. That still displaces the platform's value rather
+than inheriting it. The server fails startup validation when
+`postgres.statement_timeout` is negative or is not a valid Go duration.
 
 The ceiling is process-wide: every PostgreSQL database this server drives
 shares the same value, and a database cannot override it in its own metadata.
