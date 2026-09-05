@@ -802,7 +802,12 @@ func logOperationDriveLeavesParentCancel(logger *slog.Logger, apply *storage.App
 //
 // An operation-only drive owns only its operation and never the shared
 // apply-level request, so it leaves the request pending for the operator
-// projection exactly as the surrounding branches do.
+// projection to resolve. It records the transmission on its way out: the
+// request stays pending by design there, so without the record every later tick
+// would re-send a command already refused. It reports the request as not
+// handled for the same reason the resolving branch does, which matters more
+// here: an operation-only drive returning handled would stand its whole drive
+// step down over a refusal that changed nothing.
 func (c *GRPCClient) failRefusedControlRequest(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, scope applyTaskScope, remoteID, errorMessage string, leaveParentRequestPending func(*slog.Logger, *storage.Apply, applyTaskScope)) (bool, error) {
 	message := controlRefusalMessage(operation, errorMessage)
 	logger.WarnContext(ctx, "the data plane refused the pending control request; the schema change continues and settles on its own",
@@ -812,8 +817,9 @@ func (c *GRPCClient) failRefusedControlRequest(ctx context.Context, logger *slog
 			"remote_apply_id", remoteID,
 			"error_message", message)...)
 	if scope.suppressesDirectParentApplyWrites() {
+		c.controlSendGate.recordSend(controlReq.ID, time.Now())
 		leaveParentRequestPending(logger, apply, scope)
-		return true, nil
+		return false, nil
 	}
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, eventType,
 		fmt.Sprintf("Pending %s request rejected by the data plane: %s%s", operation, message, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")

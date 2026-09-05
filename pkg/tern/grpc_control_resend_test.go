@@ -273,3 +273,65 @@ func TestControlRefusalMessageNamesTheOperation(t *testing.T) {
 	assert.Equal(t, "stop was refused with no reason given", controlRefusalMessage(storage.ControlOperationStop, ""))
 	assert.Equal(t, "the engine is mid-cutover", controlRefusalMessage(storage.ControlOperationCancel, "the engine is mid-cutover"))
 }
+
+// An operation-only drive owns only its operation, so it cannot resolve the
+// shared apply-level stop request: the operator projection does that once the
+// parent derives terminal. A refusal there must still leave the drive step
+// running — nothing stopped — and must be recorded on the send gate, so the
+// request that stays pending by design is not re-transmitted on every later
+// claim to collect the same refusal.
+func TestGRPCClient_RefusedStopOnOperationOnlyDriveLeavesTheRequestPending(t *testing.T) {
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_RUNNING,
+		progressStateSet: true,
+		stopRefusal:      "stop is not supported for this schema change; use cancel to permanently cancel it",
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-grpc-stop-refused-operation",
+		ExternalID:      "remote-grpc-stop-refused-operation",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+		CreatedAt:   time.Now(),
+	}}}
+	storedApply := *apply
+	logs := &mockApplyLogStore{}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{},
+		logs:            logs,
+		controlRequests: controlRequests,
+	}
+
+	scope := applyTaskScope{
+		applyOperationID:   42,
+		operation:          &storage.ApplyOperation{ID: 42, ApplyID: apply.ID, Deployment: "deployment-a"},
+		operationLeaseOnly: true,
+	}
+	require.True(t, scope.suppressesDirectParentApplyWrites(), "the scope under test must be one that cannot write the parent apply")
+
+	handled, err := client.processPendingStopControlRequest(t.Context(), apply, scope)
+	require.NoError(t, err, "a refusal is an answer, not a drive failure")
+	assert.False(t, handled, "nothing stopped, so the drive step must keep running")
+
+	require.Len(t, controlRequests.requests, 1)
+	assert.Equal(t, storage.ControlRequestPending, controlRequests.requests[0].Status,
+		"the shared apply-level request stays pending for the operator projection")
+
+	handled, err = client.processPendingStopControlRequest(t.Context(), apply, scope)
+	require.NoError(t, err)
+	assert.False(t, handled)
+	assert.Equal(t, 1, server.getStopCalls(), "the refused request is not re-sent on the next claim")
+}
