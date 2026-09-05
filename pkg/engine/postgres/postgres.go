@@ -19,6 +19,7 @@ import (
 	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/router"
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
+	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -419,71 +420,144 @@ func blockOversizedTable(ctx context.Context, pool *pgxpool.Pool, report pgplan.
 }
 
 // undeclaredTableDrops surfaces every live table in the namespace that no
-// schema file declares. Desired state is declarative: a table whose file was
-// deleted converges only by being dropped, so the plan must show that drop
-// rather than stay silent while the table lingers on the target. Each drop is
-// both destructive and blocked — SchemaBot's PostgreSQL support never
-// executes DROP TABLE, so the operator either restores the file or removes
-// the table by hand after review; a plan that hid the drop would let a merge
-// pass with the target still diverged from the repository.
+// schema file declares, whether its file was deleted or it was never declared
+// at all. Desired state is declarative: an undeclared table converges only by
+// being dropped, so the plan must show that drop rather than stay silent while
+// the table lingers on the target. Each drop is both destructive and blocked —
+// SchemaBot's PostgreSQL support never executes DROP TABLE — so the operator
+// either brings the table under management by declaring it in a schema file
+// or removes it through a separately reviewed process; a plan that hid the
+// drop would let a merge pass with the target still diverged from the
+// repository.
 //
-// Partitions are excluded: they belong to their partitioned parent and never
-// have a file of their own, so a declared parent's partitions are not
-// undeclared. The catalog is read directly because the namespace's schema may
-// not exist yet, in which case the answer is an empty set, not an error.
+// The enumeration follows the conventions the MySQL engine applies to its view
+// of the live schema: tables whose names begin with "_" (engine scratch,
+// checkpoint, and shadow relations) and archive tables
+// (<name>_archive_YYYY[_MM[_DD]]) are maintained outside declarative schema
+// files and are not reported. Those naming conventions are the per-table
+// exemption; ignore_namespaces is the per-namespace one.
+//
+// The verdict names only remedies the operator can follow. A table carrying
+// foreign key constraints cannot be declared — the declarative format refuses
+// foreign keys, and a file omitting them would plan their removal — so its
+// reason says the constraints stand in the way instead of pointing at a file
+// that cannot be written. The catalog is read directly because the
+// namespace's schema may not exist yet, in which case the answer is an empty
+// set, not an error.
 func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, namespace string, declared map[string]bool, parser ddl.StatementParser) ([]engine.TableChange, error) {
-	live, err := liveTables(ctx, pool, namespace)
+	tables, err := liveTables(ctx, pool, namespace)
 	if err != nil {
 		return nil, err
 	}
 	var drops []engine.TableChange
-	for _, table := range live {
-		if declared[table] {
+	for _, live := range tables {
+		if declared[live.name] {
 			continue
 		}
-		sql := parser.Canonicalize("DROP TABLE " + pgx.Identifier{namespace, table}.Sanitize())
+		if isConventionallyUnmanagedTable(live.name) {
+			continue
+		}
+		sql := parser.Canonicalize("DROP TABLE " + pgx.Identifier{namespace, live.name}.Sanitize())
 		operation, _, err := parser.Classify(sql)
 		if err != nil {
-			return nil, fmt.Errorf("classify drop for undeclared table %q: %w", table, err)
+			return nil, fmt.Errorf("classify drop for undeclared table %q: %w", live.name, err)
 		}
 		drops = append(drops, engine.TableChange{
-			Table:         table,
+			Table:         live.name,
 			Operation:     operation,
 			DDL:           sql,
 			IsUnsafe:      true,
-			UnsafeReason:  sanitizeReasonText(fmt.Sprintf("statement removes table %q and all of its data", table)),
+			UnsafeReason:  sanitizeReasonText(fmt.Sprintf("DROP TABLE removes all data from table %q", live.name)),
 			ExecutionMode: engine.ExecutionModeBlocked,
-			ModeReason: sanitizeReasonText(fmt.Sprintf(
-				"table %q exists on the target but no schema file in namespace %q declares it; converging would drop the table, which SchemaBot's PostgreSQL support never executes — restore the file to keep the table, or drop it manually after review",
-				table, namespace)),
+			ModeReason:    sanitizeReasonText(undeclaredTableReason(namespace, live)),
 		})
 	}
 	return drops, nil
 }
 
-// liveTables lists the ordinary and partitioned tables in the namespace, in
-// name order, as the catalog names them. Partitions are omitted because
-// their declaration is their parent's.
-func liveTables(ctx context.Context, pool *pgxpool.Pool, namespace string) ([]string, error) {
+// isConventionallyUnmanagedTable reports whether a table's name marks it as
+// maintained outside declarative schema files: an underscore prefix (engine
+// scratch, checkpoint, and shadow relations) or the archive naming convention
+// shared with the MySQL engine.
+func isConventionallyUnmanagedTable(name string) bool {
+	return strings.HasPrefix(name, "_") || table.IsArchiveTable(name)
+}
+
+// undeclaredTableReason explains why the drop is blocked and what the
+// operator can do about it, tailored to whether the table can be declared.
+func undeclaredTableReason(namespace string, live liveTable) string {
+	preamble := fmt.Sprintf(
+		"table %q exists on the target but no schema file in namespace %q declares it; converging would drop the table, which SchemaBot's PostgreSQL support never executes",
+		live.name, namespace)
+	if len(live.foreignKeys) == 0 {
+		return preamble + " — declare the table in a schema file to keep it under management, or drop it through a separately reviewed process"
+	}
+	return fmt.Sprintf(
+		"%s; the table cannot be declared while it carries foreign key constraint(s) %s, which schema files do not support — drop the table, or remove its foreign keys before declaring it, through a separately reviewed process",
+		preamble, strings.Join(quoteAll(live.foreignKeys), ", "))
+}
+
+func quoteAll(names []string) []string {
+	quoted := make([]string, len(names))
+	for i, name := range names {
+		quoted[i] = fmt.Sprintf("%q", name)
+	}
+	return quoted
+}
+
+// liveTable is a table the namespace holds on the target, with the foreign
+// key constraint names that decide whether a schema file could declare it.
+type liveTable struct {
+	name        string
+	foreignKeys []string
+}
+
+// liveTables lists the tables in the namespace that a schema file is expected
+// to declare, in name order, as the catalog names them.
+//
+// Tables whose declaration lives elsewhere are omitted. Partitions and
+// inheritance children are declared through their parent: neither has a file
+// of its own, so a declared parent's members are not undeclared. Extension-
+// owned tables belong to their extension: no file can declare them and the
+// server refuses to drop them while the extension is installed, so no operator
+// remedy exists for the verdict they would otherwise produce. Unlogged tables
+// are ordinary tables with definitions of their own, so they are listed and
+// must carry their own file.
+//
+// The query names every catalog relation and operator with an explicit
+// pg_catalog qualification: search_path may list a user schema before
+// pg_catalog, and a user relation named pg_class — or a user operator named
+// = — would otherwise shadow the catalog and turn a fail-closed enumeration
+// into a silent empty set.
+func liveTables(ctx context.Context, pool *pgxpool.Pool, namespace string) ([]liveTable, error) {
 	rows, err := pool.Query(ctx, `
-		SELECT c.relname
-		FROM pg_class c
-		JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE n.nspname = $1
-		  AND c.relkind IN ('r', 'p')
-		  AND NOT c.relispartition
+		SELECT c.relname,
+		       COALESCE((SELECT pg_catalog.array_agg(con.conname ORDER BY con.conname)
+		                 FROM pg_catalog.pg_constraint con
+		                 WHERE con.conrelid OPERATOR(pg_catalog.=) c.oid
+		                   AND con.contype OPERATOR(pg_catalog.=) 'f'), '{}')
+		FROM pg_catalog.pg_class c
+		JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+		WHERE n.nspname OPERATOR(pg_catalog.=) $1
+		  AND (c.relkind OPERATOR(pg_catalog.=) 'r' OR c.relkind OPERATOR(pg_catalog.=) 'p')
+		  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i
+		                  WHERE i.inhrelid OPERATOR(pg_catalog.=) c.oid)
+		  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
+		                  WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass
+		                    AND d.objid OPERATOR(pg_catalog.=) c.oid
+		                    AND d.deptype OPERATOR(pg_catalog.=) 'e')
 		ORDER BY c.relname`, namespace)
 	if err != nil {
 		return nil, fmt.Errorf("list live tables in namespace %q: %w", namespace, err)
 	}
 	defer rows.Close()
-	var tables []string
+	var tables []liveTable
 	for rows.Next() {
-		var table string
-		if err := rows.Scan(&table); err != nil {
-			return nil, fmt.Errorf("scan live table name in namespace %q: %w", namespace, err)
+		var live liveTable
+		if err := rows.Scan(&live.name, &live.foreignKeys); err != nil {
+			return nil, fmt.Errorf("scan live table in namespace %q: %w", namespace, err)
 		}
-		tables = append(tables, table)
+		tables = append(tables, live)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate live tables in namespace %q: %w", namespace, err)

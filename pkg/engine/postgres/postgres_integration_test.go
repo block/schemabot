@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/pg-sprite/pkg/dbconn"
 	"github.com/block/pg-sprite/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
@@ -376,20 +377,35 @@ func TestEnginePlanCreateTableIgnoresSizeCeiling(t *testing.T) {
 	assert.Empty(t, change.ModeReason)
 }
 
-// TestEnginePlanUndeclaredTableIsBlockedDrop proves a live table whose schema
-// file is gone never vanishes from the plan: the declarative diff surfaces it
-// as a DROP TABLE that is both destructive and blocked, so the reviewer sees
-// the divergence and the apply path can never run the drop. A declared table
-// that already matches its file contributes nothing, and a partition is not
-// reported on its own — its declaration is its parent's.
+// TestEnginePlanUndeclaredTableIsBlockedDrop proves a live table that no
+// schema file declares never vanishes from the plan: the declarative diff
+// surfaces it as a DROP TABLE that is both destructive and blocked, so the
+// reviewer sees the divergence and the apply path can never run the drop. The
+// verdict prescribes only remedies the operator can follow — a table carrying
+// a foreign key cannot be declared, so its reason names the constraint instead
+// of a file. A declared table that already matches its file contributes
+// nothing, and tables whose declaration lives elsewhere are not reported on
+// their own: a partition and an inheritance child belong to their parent, and
+// an extension-owned table belongs to the extension. Tables the naming
+// conventions mark as maintained outside schema files — an underscore prefix
+// or the archive suffix — are exempt, as they are on MySQL, while an unlogged
+// table is an ordinary table that must carry its own file.
 func TestEnginePlanUndeclaredTableIsBlockedDrop(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "plan_undeclared_test")
 	_, err := db.ExecContext(t.Context(), `
 		CREATE TABLE public.users (id bigint PRIMARY KEY, email text NOT NULL);
 		CREATE TABLE public.legacy_users (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint REFERENCES public.users (id));
 		CREATE TABLE public.events (id bigint, day date) PARTITION BY RANGE (day);
 		CREATE TABLE public.events_2026 PARTITION OF public.events
-			FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')`)
+			FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+		CREATE TABLE public.users_history () INHERITS (public.users);
+		CREATE UNLOGGED TABLE public.scratch (id bigint PRIMARY KEY);
+		CREATE TABLE public._users_new (id bigint PRIMARY KEY);
+		CREATE TABLE public.audit_log_archive_2019 (id bigint PRIMARY KEY);
+		CREATE EXTENSION hstore;
+		CREATE TABLE public.ext_owned_config (key text PRIMARY KEY);
+		ALTER EXTENSION hstore ADD TABLE public.ext_owned_config`)
 	require.NoError(t, err)
 	req := &engine.PlanRequest{
 		Database: "plan_undeclared_test",
@@ -406,48 +422,112 @@ func TestEnginePlanUndeclaredTableIsBlockedDrop(t *testing.T) {
 	assert.False(t, result.NoChanges, "an undeclared live table is a change the reviewer must see")
 	require.Len(t, result.Changes, 1)
 	assert.Equal(t, "public", result.Changes[0].Namespace)
-	require.Len(t, result.Changes[0].TableChanges, 2,
-		"the partitioned parent and the standalone table are undeclared; the partition and the declared table are not")
+	require.Len(t, result.Changes[0].TableChanges, 4,
+		"the partitioned parent, the standalone table, the foreign-key table and the unlogged table are undeclared; the declared table, its partition and inheritance child, the extension-owned table and the conventionally unmanaged tables are not")
 
-	for i, want := range []struct{ table, ddl string }{
-		{"events", "DROP TABLE public.events"},
-		{"legacy_users", "DROP TABLE public.legacy_users"},
+	const declarable = "declare the table in a schema file to keep it under management, or drop it through a separately reviewed process"
+	const foreignKeyBound = `cannot be declared while it carries foreign key constraint(s) "orders_user_id_fkey", which schema files do not support — drop the table, or remove its foreign keys before declaring it, through a separately reviewed process`
+	for i, want := range []struct{ table, ddl, remedy string }{
+		{"events", "DROP TABLE public.events", declarable},
+		{"legacy_users", "DROP TABLE public.legacy_users", declarable},
+		{"orders", "DROP TABLE public.orders", foreignKeyBound},
+		{"scratch", "DROP TABLE public.scratch", declarable},
 	} {
 		change := result.Changes[0].TableChanges[i]
 		assert.Equal(t, want.table, change.Table)
 		assert.Equal(t, ddl.StatementDropTable, change.Operation)
 		assert.Equal(t, want.ddl, change.DDL)
 		assert.True(t, change.IsUnsafe, "a drop removes live data and must carry the unsafe flag")
-		assert.Contains(t, change.UnsafeReason, `removes table "`+want.table+`" and all of its data`)
+		assert.Equal(t, `DROP TABLE removes all data from table "`+want.table+`"`, change.UnsafeReason)
 		assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode,
 			"the native-safe path never executes a drop, so the verdict must say so at plan time")
 		assert.Contains(t, change.ModeReason, `table "`+want.table+`" exists on the target but no schema file in namespace "public" declares it`)
-		assert.Contains(t, change.ModeReason, "restore the file to keep the table, or drop it manually after review")
+		assert.Contains(t, change.ModeReason, want.remedy)
 	}
-	assert.True(t, testutil.PostgresTableExists(t, db, "public", "legacy_users"), "planning must never touch the target")
+	for _, table := range []string{"legacy_users", "orders", "scratch", "users_history", "_users_new", "audit_log_archive_2019", "ext_owned_config"} {
+		assert.True(t, testutil.PostgresTableExists(t, db, "public", table), "planning must never touch the target")
+	}
 }
 
-// TestEnginePlanUndeclaredTableInMissingSchema proves a plan whose namespace
-// does not exist on the target yet reports only the greenfield create: with
-// no live tables there is nothing undeclared, and the catalog read must not
-// fail on the absent schema.
-func TestEnginePlanUndeclaredTableInMissingSchema(t *testing.T) {
-	dsn, _ := testutil.StartPostgres(t, "plan_missing_schema_test")
+// TestEnginePlanUndeclaredTablesAcrossNamespaces proves every namespace in
+// the request is reconciled against its own live tables: an undeclared table
+// in one namespace is reported there and nowhere else, so a repository with
+// several namespaces sees each divergence under the namespace that owns it.
+func TestEnginePlanUndeclaredTablesAcrossNamespaces(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_namespaces_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE SCHEMA billing;
+		CREATE TABLE app.users (id bigint PRIMARY KEY);
+		CREATE TABLE app.legacy_users (id bigint PRIMARY KEY);
+		CREATE TABLE billing.invoices (id bigint PRIMARY KEY);
+		CREATE TABLE billing.legacy_invoices (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
 	req := &engine.PlanRequest{
-		Database: "plan_missing_schema_test",
+		Database: "plan_namespaces_test",
 		SchemaFiles: schema.SchemaFiles{
-			"app": {Files: map[string]string{
-				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY)",
-			}},
+			"app":     {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY)"}},
+			"billing": {Files: map[string]string{"invoices.sql": "CREATE TABLE invoices (id bigint PRIMARY KEY)"}},
 		},
 		Credentials: &engine.Credentials{DSN: dsn},
 	}
 
 	result, err := New().Plan(t.Context(), req)
 	require.NoError(t, err)
-	require.Len(t, result.Changes, 1)
-	require.Len(t, result.Changes[0].TableChanges, 1)
-	assert.Equal(t, ddl.StatementCreateTable, result.Changes[0].TableChanges[0].Operation)
+	assert.False(t, result.NoChanges)
+	require.Len(t, result.Changes, 2)
+	dropsByNamespace := make(map[string][]string, len(result.Changes))
+	for _, change := range result.Changes {
+		for _, tc := range change.TableChanges {
+			assert.Equal(t, ddl.StatementDropTable, tc.Operation)
+			assert.Equal(t, engine.ExecutionModeBlocked, tc.ExecutionMode)
+			assert.Contains(t, tc.ModeReason, `no schema file in namespace "`+change.Namespace+`" declares it`)
+			dropsByNamespace[change.Namespace] = append(dropsByNamespace[change.Namespace], tc.Table)
+		}
+	}
+	assert.Equal(t, map[string][]string{
+		"app":     {"legacy_users"},
+		"billing": {"legacy_invoices"},
+	}, dropsByNamespace, "each namespace reports exactly its own undeclared table")
+}
+
+// TestLiveTablesUnderShadowingSearchPath proves the catalog read behind the
+// undeclared-table verdict fails closed when the target's search_path lists a
+// user schema ahead of pg_catalog: decoy relations named after the catalog
+// tables and a decoy "=" operator that never matches must not shadow the
+// catalog, or the enumeration would come back empty and an undeclared table
+// would linger silently — the very outcome the verdict exists to prevent.
+func TestLiveTablesUnderShadowingSearchPath(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_shadow_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint REFERENCES public.users (id));
+		CREATE SCHEMA hostile;
+		CREATE TABLE hostile.pg_class (oid oid, relname name, relnamespace oid, relkind "char", relispartition boolean);
+		CREATE TABLE hostile.pg_namespace (oid oid, nspname name);
+		CREATE TABLE hostile.pg_inherits (inhrelid oid);
+		CREATE TABLE hostile.pg_depend (classid oid, objid oid, deptype "char");
+		CREATE TABLE hostile.pg_constraint (conrelid oid, conname name, contype "char");
+		CREATE FUNCTION hostile.never_equal(oid, oid) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT false';
+		CREATE OPERATOR hostile.= (LEFTARG = oid, RIGHTARG = oid, FUNCTION = hostile.never_equal);
+		ALTER DATABASE plan_shadow_test SET search_path = hostile, pg_catalog, public`)
+	require.NoError(t, err)
+	poolCfg, err := spritePoolConfig(dsn, "")
+	require.NoError(t, err)
+	pool, err := dbconn.NewPool(t.Context(), poolCfg)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	var searchPath string
+	require.NoError(t, pool.QueryRow(t.Context(), "SHOW search_path").Scan(&searchPath))
+	require.Equal(t, "hostile, pg_catalog, public", searchPath, "the pool must see the hostile search_path for the test to prove anything")
+
+	tables, err := liveTables(t.Context(), pool, "public")
+	require.NoError(t, err)
+	assert.Equal(t, []liveTable{
+		{name: "orders", foreignKeys: []string{"orders_user_id_fkey"}},
+		{name: "users", foreignKeys: []string{}},
+	}, tables, "every live table and its foreign keys must be enumerated despite the shadowing search_path")
 }
 
 // TestEngineApplyNativeSafe proves a planned metadata-only ALTER runs through
