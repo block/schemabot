@@ -814,11 +814,16 @@ They are unbounded and uncoordinated, they run on contexts that end when a clien
 they present no token, so the storage lease predicate that protects every other write is empty.
 
 The pressure to break this comes from rows that genuinely need repair: a task left active under an
-apply that has already settled. That repair is real work, and it belongs to the reaper, which is
-elected, holds its own advisory lock, and proves the row is quiet before writing it (RC-2). A
-reader's job is to report what is stored, including when what is stored is a task that has
-outlived its apply's verdict (UX-3). *Enforced:* lease predicates on every apply and task write
-(`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/applies.go`) and a read
+apply that has already settled. That repair is real work, and it belongs to the reaper. The reaper
+is the second writer class rather than an exception to the first: it is elected, it holds its own
+advisory lock, and before it writes a task row it reads that row's operation lease exactly as the
+claim path reads it, taking only rows no driver holds (RC-2). So the two classes exclude each
+other by one mechanism rather than by two that have to be kept in agreement, and a row can still
+be attributed by reading it. A reader's job is to report what is stored, including when what is
+stored is a task that has outlived its apply's verdict (UX-3). *Enforced:* lease predicates on
+every apply and task write, including the reaper's (`unleasedOperationGate`,
+`pkg/storage/internal/sqlstore/apply_operations.go`;
+`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/applies.go`) and a read
 path that builds progress from stored rows without writing them
 (`pkg/api/progress_handlers.go`).
 
@@ -1117,18 +1122,26 @@ A settled parent is not on its own a promise that its children stopped, which is
 state is a precondition and not the whole gate. Under a rollout, one deployment's failure can
 settle the apply while a sibling deployment is still driving, and a driver holding only an
 operation lease may not bump the parent row, so that row can read settled *and* quiet while work
-is live. No window on the parent detects that at any length. For task rows the sweep therefore
-measures the row a live drive actually writes: every drive tick mirrors its tasks unconditionally,
-so `tasks.updated_at` is the drive's liveness signal, and the window over it is the operator's
-whole recovery budget — its stall bound, plus a lease-staleness window for a cancelled drive's
-lease to become re-claimable, plus a poll interval for a peer to claim it. Cancelling a drive is
-recoverable and writing a verdict onto a row is not, so the reaper goes last. What stays fixed
-throughout is the verdict: reconciling a stranded child to match it is not the same as changing
-it. *Enforced:* settled-state exclusions in every claim and sweep query
-(`pkg/storage/internal/sqlstore/applies.go`), the operation sweep's parent gate
-(`strandedParentGate`, `pkg/storage/internal/sqlstore/apply_operations.go`), and the active-task
-sweep's task-liveness gate (`strandedActiveTaskGate`,
-`pkg/storage/internal/sqlstore/tasks.go`), with ST-1 as the backstop under all of them.
+is live. No window on the parent detects that at any length.
+
+What does detect it is the lease that sibling drive holds. For task rows the sweep takes only rows
+whose operation carries no heartbeated lease, read the same way the claim path reads it, so the
+reaper may write a row only where a driver would be allowed to take it from a peer (OW-8). That is
+a mechanism rather than a timing argument, which matters because the alternative signal cannot be
+made sound at any window length: a drive mirrors its task rows every tick, but a remote sync skips
+a stored task the remote stopped reporting, so a row can go quiet while its drive is alive.
+
+A quiescence window sits on top of the lease and decides *when* a row is worth settling rather than
+whether it is safe to. It is the operator's whole recovery budget: a drive's stall bound, plus a
+lease-staleness window for a cancelled drive's lease to become re-claimable, plus a poll interval
+for a peer to claim it. Cancelling a drive is recoverable and writing a verdict onto a row is not,
+so the reaper goes last. What stays fixed throughout is the verdict: reconciling a stranded child
+to match it is not the same as changing it. *Enforced:* settled-state exclusions in every claim and
+sweep query (`pkg/storage/internal/sqlstore/applies.go`), the operation sweep's parent gate
+(`strandedParentGate`, `pkg/storage/internal/sqlstore/apply_operations.go`), the task sweeps' lease
+gate (`unleasedOperationGate`, same file), and the active-task sweep's quiescence window
+(`strandedActiveTaskGate`, `pkg/storage/internal/sqlstore/tasks.go`), with ST-1 as the backstop
+under all of them.
 
 ### RC-3: Loading nothing is not owning nothing
 
