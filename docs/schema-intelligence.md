@@ -130,13 +130,17 @@ Three options turn a schema dump into an inventory:
   made invisible) need a proposed change and never fire on a pull. See
   [lint-and-safety-levels.md](lint-and-safety-levels.md#auditing-a-live-schema-pull---lint).
 
-On Vitess the namespace's VSchema comes back as an artifact beside the tables,
-and `detailed` returns the namespace catalog without the per-table catalog,
-since that metadata is read from the information schema on the MySQL path
-and has no Vitess equivalent wired up yet. On PostgreSQL a schema is the namespace, ordinary and partitioned tables are
-exported, and only `basic` catalog detail is available; the envelope is in
-[postgresql.md](postgresql.md). The linters parse MySQL-family DDL only, so a
-lint request against another dialect is rejected rather than answered clean.
+The envelope differs by dialect:
+
+- **Vitess.** The namespace's VSchema comes back as an artifact beside the
+  tables. `detailed` returns the namespace catalog without the per-table
+  catalog, since that metadata is read from the information schema on the
+  MySQL path and has no Vitess equivalent wired up yet.
+- **PostgreSQL.** A schema is the namespace, ordinary and partitioned tables
+  are exported, and only `basic` catalog detail is available. The full
+  envelope is in [postgresql.md](postgresql.md).
+- **Lint.** The linters parse MySQL-family DDL only, so a lint request against
+  another dialect is rejected rather than answered clean.
 
 The CLI wraps it as `schemabot pull -d shop -e production`, with `--namespace`,
 `--table` (a client-side filter that errors when it matches nothing),
