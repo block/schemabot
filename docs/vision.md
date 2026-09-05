@@ -49,10 +49,12 @@ whether it locks a hot table for forty minutes, whether it drops a column someth
 all of that stayed with the person, and the answer there was to make the person more careful. Review
 checklists, runbooks, a database team who says no.
 
-Increasingly the author is not a person. "Be more careful" does not generalize to something that will
-write a thousand changes a week without ever getting tired and without ever getting better, and there
-is rarely just one of them. So the judgment has to move into the tool, and so does the coordination
-between whoever is writing.
+Increasingly the author is an agent, and "be more careful" does not work on an agent. It can write a
+thousand schema changes a week. It does not get tired, it does not slow down on the risky ones, and
+it does not remember the outage that taught everyone to be careful with that table. People build
+caution over years of running things. An agent starts from scratch each time. And there is rarely
+just one agent. So the judgment has to move into the tool, and so does the coordination between the
+agents writing the changes.
 
 ## From a vibe-coded experiment to a tier-zero database
 
