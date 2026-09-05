@@ -30,15 +30,6 @@ const (
 	// is min(operatorPollInterval, ApplyOperationHeartbeatInterval).
 	ApplyOperationHeartbeatInterval = 10 * time.Second
 
-	// ApplyDriveStallAfter bounds how long a drive may go without mirroring any
-	// task progress to storage before its driver presumes the drive goroutine
-	// is wedged and cancels the run. A healthy drive's poll loop writes every
-	// task row on every poll tick, so legitimate silence is far shorter than
-	// this window; the window is kept generous so slow pre-poll phases (target
-	// schema pulls, re-planning, engine acceptance) have the full window before
-	// their first mirror write.
-	ApplyDriveStallAfter = 5 * time.Minute
-
 	// DefaultDrivers is the number of concurrent operator drivers
 	// when not configured via drivers in the server config.
 	DefaultDrivers = 4
@@ -2125,7 +2116,7 @@ func (s *Service) operationHeartbeatFailureStopsDrive(ctx context.Context, drive
 // stopped making observable progress while its heartbeat stays fresh. The
 // drive's poll loop mirrors every task row to storage on every poll tick, so
 // task updated_at advances continuously while the drive goroutine is alive. A
-// drive that has mirrored nothing for the full ApplyDriveStallAfter window is
+// drive that has mirrored nothing for the full storage.ApplyDriveStallAfter window is
 // wedged — for example blocked in a target-database read that outlives its
 // cancelled context — and will never finish on its own, yet its heartbeat
 // keeps the operation lease fresh so no peer driver can reclaim the work.
@@ -2148,7 +2139,7 @@ func (s *Service) operationDriveStalled(ctx context.Context, driverID int, op *s
 		return false
 	}
 	now := s.clock.Now()
-	if now.Sub(driveStart) < ApplyDriveStallAfter {
+	if now.Sub(driveStart) < storage.ApplyDriveStallAfter {
 		return false
 	}
 	logAttrs := append(append(op.LogAttrs(), apply.IdentityLogAttrs()...),
@@ -2171,14 +2162,14 @@ func (s *Service) operationDriveStalled(ctx context.Context, driverID int, op *s
 			lastMirror = task.UpdatedAt
 		}
 	}
-	if now.Sub(lastMirror) < ApplyDriveStallAfter {
+	if now.Sub(lastMirror) < storage.ApplyDriveStallAfter {
 		return false
 	}
 	s.logger.Warn("operator: drive has mirrored no task progress for the full stall window while its heartbeat stayed fresh; the run will be cancelled so the operation can be re-claimed",
 		append(logAttrs,
 			"drive_started", driveStart,
 			"last_task_mirror", lastMirror,
-			"stall_window", ApplyDriveStallAfter)...)
+			"stall_window", storage.ApplyDriveStallAfter)...)
 	metrics.RecordOperatorResumeFailure(ctx, apply.Database, op.Deployment, apply.Environment, "drive_stalled")
 	return true
 }

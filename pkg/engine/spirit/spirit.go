@@ -139,6 +139,7 @@ var _ engine.Engine = (*Engine)(nil)
 var _ engine.Drainer = (*Engine)(nil)
 var _ engine.ShutdownHalter = (*Engine)(nil)
 var _ engine.DeferredCutoverSignalChecker = (*Engine)(nil)
+var _ engine.CancelledArtifactReleaser = (*Engine)(nil)
 
 // Config holds configuration for the Spirit engine.
 type Config struct {

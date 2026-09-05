@@ -59,8 +59,14 @@ func reapedDeployments(t *testing.T, reader *sdkmetric.ManualReader) []string {
 // reapingTaskStore serves the reaper pass a canned retryable-task reap result.
 type reapingTaskStore struct {
 	storage.TaskStore
-	reaped  []*storage.ReapedTask
-	reapErr error
+	reaped        []*storage.ReapedTask
+	reapErr       error
+	activeReaped  []*storage.ReapedTask
+	activeReapErr error
+}
+
+func (s *reapingTaskStore) ReapStrandedActive(context.Context, int) ([]*storage.ReapedTask, error) {
+	return s.activeReaped, s.activeReapErr
 }
 
 func (s *reapingTaskStore) ReapStrandedRetryable(context.Context, int) ([]*storage.ReapedTask, error) {
@@ -211,6 +217,10 @@ func (s *gatedApplyOperationStore) ReapStranded(ctx context.Context, _ int) ([]*
 type startedTaskStore struct {
 	storage.TaskStore
 	started chan struct{}
+}
+
+func (s *startedTaskStore) ReapStrandedActive(context.Context, int) ([]*storage.ReapedTask, error) {
+	return nil, nil
 }
 
 func (s *startedTaskStore) ReapStrandedRetryable(context.Context, int) ([]*storage.ReapedTask, error) {

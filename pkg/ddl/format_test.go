@@ -358,6 +358,22 @@ func TestCanonicalize(t *testing.T) {
 			expected: "ALTER TABLE `d`.`t` ADD COLUMN `b` INT GENERATED ALWAYS AS(`a`*2) STORED",
 		},
 		{
+			// DROP CONSTRAINT and DROP CHECK are not synonyms: MySQL resolves
+			// the first against the table's CHECK, FOREIGN KEY and UNIQUE
+			// constraints and the second against check constraints alone. The
+			// engine submits this canonical text rather than what the author
+			// wrote, so folding the two spellings together sends the server a
+			// statement it rejects.
+			name:     "ALTER dropping a named constraint keeps the CONSTRAINT spelling",
+			input:    "ALTER TABLE t DROP CONSTRAINT uq_name",
+			expected: "ALTER TABLE `t` DROP CONSTRAINT `uq_name`",
+		},
+		{
+			name:     "ALTER dropping a check constraint keeps the CHECK spelling",
+			input:    "ALTER TABLE t DROP CHECK chk_positive",
+			expected: "ALTER TABLE `t` DROP CHECK `chk_positive`",
+		},
+		{
 			name:     "invalid SQL returns original",
 			input:    "not valid sql",
 			expected: "not valid sql",

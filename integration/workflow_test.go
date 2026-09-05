@@ -21,6 +21,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	schemabotapi "github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
@@ -1328,11 +1329,18 @@ CREATE TABLE orders (
 
 	// Verify the MySQL error was surfaced in Progress.ErrorMessage.
 	assert.NotEmpty(t, errorMessage, "expected error_message to be set")
-	// MySQL error for FK to non-existent table should mention "users" or "referenced"
-	lowerErr := strings.ToLower(errorMessage)
-	assert.True(t,
-		strings.Contains(lowerErr, "users") || strings.Contains(lowerErr, "referenced") || strings.Contains(lowerErr, "foreign"),
-		"error message should mention FK issue, got: %s", errorMessage)
+
+	// A foreign key to a table the target has no record of fails with error
+	// 1824. What the operator reads is SchemaBot's account of that code, not
+	// the target's — the target names the referenced table in words that also
+	// quote the statement, and this message is rendered on a pull request.
+	//
+	// The reason is asserted as a substring because the apply layer prefixes
+	// the failing table, and which of the two the poll catches depends on when
+	// it lands relative to the task being recorded.
+	assert.Contains(t, errorMessage, mysqlerr.ReasonFromText("(errno 1824)"))
+	assert.NotContains(t, errorMessage, "Failed to open",
+		"the target's own wording must not reach the pull request")
 	t.Logf("Correctly captured MySQL error: %s", errorMessage)
 }
 

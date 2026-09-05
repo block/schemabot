@@ -6,6 +6,8 @@
 
 GitOps for database schemas. Define your desired schema in SQL files, open a PR, and SchemaBot plans and executes your schema changes safely.
 
+These badges are about capability. **GA** means the engine can change a large table online and gives an operator a real lever over a change that is already running; **early alpha** means it cannot yet. [docs/engines.md](./docs/engines.md) defines both and is the capability matrix: how each engine executes a change, which control operations it supports, and how it manages load. A narrower engine is not a looser one, which is [docs/invariants.md](./docs/invariants.md)'s subject: the runtime safety guarantees that hold whichever engine runs the change.
+
 ## Schema Changes via Pull Request
 
 Open a PR with schema changes and SchemaBot handles the rest — plan, apply, and verify across environments:
@@ -56,6 +58,8 @@ SchemaBot handles the full lifecycle:
 
 Simple changes (e.g., adding a column) use instant DDL and complete in milliseconds. Operations that require a row copy (e.g., adding an index) run online without blocking reads or writes.
 
+Not every engine supports every feature, and some share a verb without sharing its meaning: pausing and resuming a running change, `revert`, automatic throttling, and drop recovery all vary by engine. [docs/engines.md](./docs/engines.md) is the capability matrix showing which engine does what and why.
+
 ## Quick Start
 
 ```bash
@@ -80,9 +84,18 @@ See [docs/configuration.md](./docs/configuration.md) for setup instructions (loc
 
 ## Docs
 
-General design docs are in the [docs](./docs/) folder. The PostgreSQL support
-envelope — what plans, what applies, and how each refusal is reported — is in
-[docs/postgresql.md](./docs/postgresql.md).
+General design docs are in the [docs](./docs/) folder. Three are worth reading before you
+put SchemaBot in front of a database you care about:
+
+- [docs/invariants.md](./docs/invariants.md) is the registry of runtime safety invariants:
+  what must never be false while SchemaBot is running, why each rule matters, where it is
+  enforced, and what these guarantees deliberately do not cover. It opens with what happens
+  when GitHub is down.
+- [docs/engines.md](./docs/engines.md) is the engine capability matrix: how each engine
+  executes a change, which control operations it supports, how it manages load, and why the
+  differences exist.
+- [docs/postgresql.md](./docs/postgresql.md) is the PostgreSQL support envelope: what plans,
+  what applies, and how each refusal is reported.
 
 ## Releases
 

@@ -39,6 +39,11 @@ const refusalNoPrimaryKeyTable = "CREATE TABLE `orders_log` (\n" +
 // statement between routed, refused, and unclassifiable is caught here, before
 // the integration tests it would also change. The integration tests remain the
 // proof that a refused shape really is refused by a live Spirit run.
+//
+// A refused shape added here wants a case in
+// TestStatementRefusalPublishesNothingFromTheTarget as well: its reason is
+// published to the pull request, and that test is what holds a reason to the
+// statement it reports.
 func TestStatementRefusalContract(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -159,6 +164,112 @@ func TestStatementRefusalContract(t *testing.T) {
 			}
 			require.True(t, refused)
 			assert.Contains(t, reason, tt.wantReason)
+		})
+	}
+}
+
+// canaryPrefix marks every value in the canary definitions below that exists
+// only on the target. One prefix covers all of them, so a single assertion
+// catches a leak from any of them.
+const canaryPrefix = "cnry"
+
+// refusalCanaryOrdersTable is refusalOrdersTable with every piece of the
+// definition that a statement below does not redeclare replaced by a canary:
+// the current ENUM members, the current SET members, an untouched column's
+// name, and a default. A reason may name what the statement declares — that
+// text is already on the pull request — so only these target-only values
+// distinguish the two inputs.
+const refusalCanaryOrdersTable = "CREATE TABLE `orders` (\n" +
+	"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+	"  `status` enum('cnry_pending','cnry_settled') NOT NULL DEFAULT 'cnry_pending',\n" +
+	"  `perms` set('cnry_read','cnry_write') DEFAULT NULL,\n" +
+	"  `cnry_holder` varchar(100) DEFAULT 'cnry_unset',\n" +
+	"  PRIMARY KEY (`id`)\n" +
+	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+
+// refusalCanaryNoPrimaryKeyTable is the unkeyed definition with canary column
+// names, for the refusal that reads the current key set rather than a column.
+const refusalCanaryNoPrimaryKeyTable = "CREATE TABLE `orders_log` (\n" +
+	"  `cnry_note` varchar(100) DEFAULT NULL,\n" +
+	"  `cnry_label` varchar(100) DEFAULT NULL\n" +
+	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+
+// Routing marks a refusal reason publishable to the pull request by category:
+// the engine's statement-scope checks report the statement back, and the
+// statement is already on the PR. The target's own definition is the other
+// input to that classification, and nothing from it may reach the reason.
+//
+// This holds the category to that claim, one statement shape at a time. Each
+// statement is classified against a definition whose target-only values are
+// canaries the statement never mentions, so a check that reports the current
+// definition rather than the submitted one puts a canary in the reason and
+// fails here. That reaches a check the engine gains later only when the new
+// check fires on one of the shapes below: a refusal keyed on a shape this
+// table does not enumerate would interpolate the target with nothing here to
+// notice it. A new refusal shape wants a case here alongside its contract
+// case.
+//
+// Every case also asserts the reason names something the statement declares.
+// Without it a reason that stopped interpolating its inputs at all, or an
+// assertion aimed at the wrong string, would pass while proving nothing.
+func TestStatementRefusalPublishesNothingFromTheTarget(t *testing.T) {
+	tests := []struct {
+		name string
+		stmt string
+		// table defaults to refusalCanaryOrdersTable.
+		table string
+		// wantFromStatement is text the reason must carry, and which the
+		// statement itself declares.
+		wantFromStatement string
+	}{
+		{
+			name:              "ENUM replaced by a numeric type",
+			stmt:              "ALTER TABLE orders MODIFY COLUMN status INT NOT NULL",
+			wantFromStatement: `"status"`,
+		},
+		{
+			name:              "SET replaced by an ENUM the statement declares",
+			stmt:              "ALTER TABLE orders MODIFY COLUMN perms ENUM('draft','final')",
+			wantFromStatement: `"perms"`,
+		},
+		{
+			name:              "explicit algorithm clause",
+			stmt:              "ALTER TABLE orders ADD COLUMN shipped_at DATETIME, ALGORITHM=INPLACE",
+			wantFromStatement: "ALGORITHM=",
+		},
+		{
+			name:              "explicit lock clause",
+			stmt:              "ALTER TABLE orders ADD COLUMN shipped_at DATETIME, LOCK=NONE",
+			wantFromStatement: "LOCK=",
+		},
+		{
+			name:              "add a foreign key",
+			stmt:              "ALTER TABLE orders ADD CONSTRAINT fk FOREIGN KEY (id) REFERENCES customers (id)",
+			wantFromStatement: "foreign key",
+		},
+		{
+			name:              "add a column to a table without a primary key",
+			stmt:              "ALTER TABLE orders_log ADD COLUMN shipped_at DATETIME",
+			table:             refusalCanaryNoPrimaryKeyTable,
+			wantFromStatement: "primary key",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			table := tt.table
+			if table == "" {
+				table = refusalCanaryOrdersTable
+			}
+			require.Contains(t, table, canaryPrefix, "the definition must carry canaries or this case proves nothing")
+			require.NotContains(t, tt.stmt, canaryPrefix, "the statement must not mention a canary or a leak would be indistinguishable")
+
+			reason, refused, err := check.StatementRefusal(t.Context(), tt.stmt, table, discardLogger())
+			require.NoError(t, err)
+			require.True(t, refused, "the case must reach a refusal, or no reason is classified")
+			assert.Contains(t, reason, tt.wantFromStatement,
+				"the reason must report the submitted statement")
+			assert.NotContains(t, reason, canaryPrefix,
+				"the reason carries a value that exists only on the target: %s", reason)
 		})
 	}
 }

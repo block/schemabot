@@ -193,6 +193,90 @@ type DeferredCutoverSignalRequest struct {
 	Credentials *Credentials
 }
 
+// CancelledArtifactReleaser is an optional capability for engines that leave
+// their unfinished work on the target database as tables the engine itself
+// owns. Such an engine copies rows into its own tables, and cancelling the
+// schema change abandons them: nothing in the engine's own lifecycle reclaims
+// them, and they can outlive the process, the apply, and the pull request that
+// created them.
+//
+// An engine whose unfinished work lives in the service it drives (a remote
+// online-DDL service) must not implement this. Cancelling there releases the
+// work server-side and there is nothing locally to reclaim, so implementing the
+// capability would claim a responsibility the engine does not have.
+//
+// The release is stateless by design. It reclaims work belonging to a schema
+// change this process may never have run — one cancelled days later, on an
+// instance that has restarted since — so it takes the target and the tables
+// from the caller rather than from anything held in memory.
+type CancelledArtifactReleaser interface {
+	// ReleaseCancelledArtifacts reclaims what a cancelled schema change left on
+	// the target and reports what it reclaimed. Data the schema change copied
+	// is kept somewhere recoverable where the deployment offers one; the
+	// metadata describing where the copy had got to is always discarded.
+	//
+	// Callers must establish that no live schema change is running anywhere in
+	// the target schema before calling — not merely none on the tables the
+	// request names. The engine's table names are derived from the target's own
+	// table names, so an apply running against the same tables uses the same
+	// names; and an engine's artifacts can include schema-scoped ones shared by
+	// every schema change in the schema, one of which can be a cutover gate.
+	// Reclaiming that gate on a cancelled change's behalf releases the cutover a
+	// live change is still waiting on. The engine cannot see that change and
+	// will not check for it.
+	//
+	// Tables must not be empty. Every schema change names at least one table, so
+	// an empty list is a lost one, and the schema-scoped artifacts above would
+	// be reclaimed regardless of it.
+	ReleaseCancelledArtifacts(ctx context.Context, req *ReleaseArtifactsRequest) (*ReleaseArtifactsResult, error)
+}
+
+// ReleaseArtifactsRequest names the target and the tables whose cancelled
+// schema-change artifacts should be reclaimed. Tables are the target's own
+// table names, not the engine's derived ones — deriving those is the engine's
+// job, because only the engine knows how it names them.
+type ReleaseArtifactsRequest struct {
+	Database    string
+	Tables      []string
+	Credentials *Credentials
+}
+
+// ReleaseArtifactsResult reports what a release reclaimed, so a caller can tell
+// an operator where their copy went. Both are empty when the schema change left
+// nothing behind, which is the ordinary outcome for a cancel that arrives
+// before any copying started.
+//
+// Every table in either field is named in full, as schema.table, so an operator
+// reading one release can act on any line of it without having to supply the
+// schema from context — including the lines naming tables that left the schema
+// the release ran against.
+type ReleaseArtifactsResult struct {
+	// Preserved names each table whose data was kept, and where it was kept.
+	Preserved []PreservedArtifact
+	// Discarded names each table that was removed outright.
+	Discarded []string
+}
+
+// PreservedArtifact records where a cancelled schema change's copied data was
+// put, so an operator can find it while it is still recoverable.
+type PreservedArtifact struct {
+	Source      string
+	Destination string
+}
+
+// ReleaseCancelledArtifacts reclaims eng's leftovers for the given target when
+// eng owns any, and reports whether the engine implements the capability at
+// all. An engine that does not is one whose unfinished work is not this
+// process's to reclaim, so there is nothing to release and nothing to report.
+func ReleaseCancelledArtifacts(ctx context.Context, eng Engine, req *ReleaseArtifactsRequest) (supported bool, result *ReleaseArtifactsResult, err error) {
+	releaser, ok := eng.(CancelledArtifactReleaser)
+	if !ok {
+		return false, nil, nil
+	}
+	result, err = releaser.ReleaseCancelledArtifacts(ctx, req)
+	return true, result, err
+}
+
 // Credentials contains the resolved credentials for accessing a database.
 // These are populated by the service layer from discovery before calling the engine.
 type Credentials struct {

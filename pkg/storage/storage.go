@@ -21,6 +21,26 @@ import (
 // long two drivers can run the same engine work concurrently.
 const ApplyLeaseStaleAfter = time.Minute
 
+// ApplyDriveStallAfter bounds how long a drive may go without mirroring any
+// task progress to storage before its driver presumes the drive goroutine is
+// wedged and cancels the run. A healthy drive's poll loop writes every task row
+// on every poll tick, so legitimate silence is far shorter than this window;
+// the window is kept generous so slow pre-poll phases (target schema pulls,
+// re-planning, engine acceptance) have the full window before their first
+// mirror write.
+//
+// That makes tasks.updated_at the drive's liveness signal, and this the bound
+// past which no drive the operator would still let run has spoken for a row.
+// The stranded-active reaper derives its own window from it for that reason, so
+// the two cannot drift: a row the operator would cancel a drive over is the
+// same row the reaper may settle.
+//
+// The reaper waits a multiple of this window rather than matching it, because
+// cancelling a run is recoverable and writing a verdict onto a row is not. Both
+// read the same signal; only one of them can be wrong in a way an operator
+// cannot undo.
+const ApplyDriveStallAfter = 5 * time.Minute
+
 // DefaultMaxDriversPerApply is the per-apply driver cap used when a deployment
 // does not configure max_drivers_per_apply.
 //
@@ -967,12 +987,47 @@ type TaskStore interface {
 	// ErrStrandedTaskReaperBusy reports that another instance holds it. As with
 	// ReapStranded, the lock is an efficiency gate, not a safety one.
 	ReapStrandedRetryable(ctx context.Context, limit int) ([]*ReapedTask, error)
+
+	// ReapStrandedActive settles to their parent apply's recorded outcome the
+	// task rows still in an active state under a settled parent, returning what
+	// it reaped (at most limit rows, oldest first). A driver that records the
+	// parent's verdict and exits before closing its task rows leaves them
+	// describing work that will never resume: the verdict is final, so nothing
+	// revisits the children, and the row reads as live work forever. That is
+	// what makes a completed apply render a table still copying, and the only
+	// writer that may correct it is one holding a lease — which a reader is not.
+	//
+	// The row takes the parent's verdict rather than a decided one: every
+	// settled parent state is also a terminal task state, and a task whose own
+	// outcome was never recorded is never assumed to have succeeded, so under a
+	// failed parent it settles failed and carries the parent's explanation when
+	// it has none of its own. completed_at is stamped because every settled
+	// parent state is non-resumable.
+	//
+	// failed_retryable rows are excluded: they are ReapStrandedRetryable's, on a
+	// far longer window, because the parent's recovery path may still dispatch
+	// their retry. Only settled parents (completed, failed, cancelled, reverted)
+	// quiescent past the reaper's window qualify — stopped and failed_retryable
+	// parents are resumable, and their tasks belong to the resume path. Each
+	// write re-verifies both the row's state and the parent's, so a row a
+	// concurrent writer advanced is skipped rather than overwritten. The parent
+	// apply row is never touched.
+	//
+	// One instance reaps per pass, guarded by an advisory lock;
+	// ErrStrandedActiveTaskReaperBusy reports that another instance holds it. As
+	// with ReapStranded, the lock is an efficiency gate, not a safety one.
+	ReapStrandedActive(ctx context.Context, limit int) ([]*ReapedTask, error)
 }
 
 // ErrStrandedTaskReaperBusy reports that another instance holds the stranded
 // retryable-task reaper lock, so this pass did no work. It is an expected
 // outcome on every instance but one, not a failure.
 var ErrStrandedTaskReaperBusy = errors.New("another instance is reaping stranded retryable tasks")
+
+// ErrStrandedActiveTaskReaperBusy reports that another instance holds the
+// stranded active-task reaper lock, so this pass did no work. It is an expected
+// outcome on every instance but one, not a failure.
+var ErrStrandedActiveTaskReaperBusy = errors.New("another instance is reaping stranded active tasks")
 
 // ReapedTask records one failed_retryable task row hardened to failed under a
 // settled parent apply, carrying both rows so callers can log what the reaper
@@ -1099,10 +1154,11 @@ const ProgressCommentAuthorityStaleAfter = ApplyLeaseStaleAfter
 const SummaryClaimStaleAfter = 2 * time.Minute
 
 // PlanCommentStore tracks plan comments posted on PRs so a newer plan comment
-// for the same database can minimize the ones it supersedes. Rows exist only
-// for comments actually posted; minimized_at is set only after the GitHub
-// minimize call succeeded, so an unminimized row is always retried by the next
-// supersede.
+// for the same database can retire the ones it supersedes — minimizing a
+// comment whose head an apply owns, deleting one no apply acted on. Rows exist
+// only for comments actually posted; minimized_at and deleted_at are set only
+// after the corresponding GitHub call succeeded, so an unretired row is always
+// retried by the next supersede.
 // Insert canonicalizes the provided comment's repository, database, and
 // database type in place before persisting. EnvironmentScope is stored as
 // given: no query predicate filters on it, and its consumers compare it in Go
@@ -1111,21 +1167,27 @@ type PlanCommentStore interface {
 	// Insert stores a newly posted plan comment and sets comment.ID.
 	Insert(ctx context.Context, comment *PlanComment) error
 
-	// ListUnminimizedForSlot returns the not-yet-minimized comments for a
-	// (repository, pull_request, database) slot, ordered by id ascending. The
-	// caller decides which of them a newly posted comment supersedes.
-	ListUnminimizedForSlot(ctx context.Context, repo string, pr int, database, databaseType string) ([]*PlanComment, error)
+	// ListUnretiredForSlot returns the comments neither minimized nor deleted
+	// for a (repository, pull_request, database) slot, ordered by id
+	// ascending. The caller decides which of them a newly posted comment
+	// supersedes.
+	ListUnretiredForSlot(ctx context.Context, repo string, pr int, database, databaseType string) ([]*PlanComment, error)
 
-	// ListUnminimizedForRepoPR returns the not-yet-minimized comments for a
-	// whole pull request, across every database, ordered by id ascending. A
-	// caller that resolved no database — a delivery that discovers no schema
-	// config, or one whose discovery failed — still has to retire the plan
-	// comments an earlier head left expanded, and has no slot to key.
-	ListUnminimizedForRepoPR(ctx context.Context, repo string, pr int) ([]*PlanComment, error)
+	// ListUnretiredForRepoPR returns the comments neither minimized nor
+	// deleted for a whole pull request, across every database, ordered by id
+	// ascending. A caller that resolved no database — a delivery that
+	// discovers no schema config, or one whose discovery failed — still has
+	// to retire the plan comments an earlier head left behind, and has no
+	// slot to key.
+	ListUnretiredForRepoPR(ctx context.Context, repo string, pr int) ([]*PlanComment, error)
 
 	// MarkMinimized stamps minimized_at after the GitHub minimize call
 	// succeeded. An already-minimized row is not an error.
 	MarkMinimized(ctx context.Context, id int64) error
+
+	// MarkDeleted stamps deleted_at after the GitHub delete call succeeded.
+	// An already-deleted row is not an error.
+	MarkDeleted(ctx context.Context, id int64) error
 }
 
 // ApplyOperationStore manages per-(apply, deployment, operation_key) child rows
