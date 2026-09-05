@@ -6,8 +6,6 @@
 
 GitOps for database schemas. Define your desired schema in SQL files, open a PR, and SchemaBot plans and executes your schema changes safely.
 
-These badges are about capability. **GA** means the engine can change a large table online and gives an operator a real lever over a change that is already running; **early alpha** means it cannot yet. [docs/engines.md](./docs/engines.md) defines both and is the capability matrix: how each engine executes a change, which control operations it supports, and how it manages load. A narrower engine is not a looser one, which is [docs/invariants.md](./docs/invariants.md)'s subject: the runtime safety guarantees that hold whichever engine runs the change.
-
 ## Schema Changes via Pull Request
 
 Open a PR with schema changes and SchemaBot handles the rest — plan, apply, and verify across environments:
