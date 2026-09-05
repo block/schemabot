@@ -75,8 +75,9 @@ type ServerConfig struct {
 	// storage dialects and are validated rather than rewritten.
 	Databases map[string]DatabaseConfig `yaml:"databases"`
 
-	// TargetResolver configures how a data-plane server (serve --grpc) resolves
-	// an opaque execution target to a connection. It is distinct from the
+	// TargetResolver configures how a data-plane server (one started with
+	// GRPC_PORT set, so it exposes the gRPC listener) resolves an opaque
+	// execution target to a connection. It is distinct from the
 	// control-plane Databases routing table: the data plane receives a target
 	// over gRPC and resolves it here, rather than routing logical database names.
 	TargetResolver TargetResolverConfig `yaml:"target_resolver,omitempty"`
