@@ -62,6 +62,15 @@ lease ownership, an operator who can stop a change while it runs. An experiment 
 What varies is the scaffolding, never the gates. A change that would be unsafe in front of production
 is unsafe in front of a weekend project too, and it gets refused in both places.
 
+Concretely, the shape SchemaBot runs in should be a choice rather than a prerequisite. A control
+plane on Kubernetes with data planes reaching into networks it cannot. One server process with a
+database behind it. No server at all, just the CLI against a DSN. Or SchemaBot embedded as a library
+inside the application that owns the schema, close enough to run at startup. The first three work
+today, and the fourth is further along than it looks: SchemaBot already embeds as a Go module, and
+there is a test layer whose only job is keeping that startup surface stable when a host binary
+resolves different dependency versions. What is missing is the small end being genuinely small,
+instead of the large deployment with most of it switched off.
+
 ![Both ends of the range feed into an identical set of gates: diff against the live database, lint before anything runs, explicit consent to destroy, and uncertainty never passing](../assets/vision-range.svg)
 
 ## GitOps, not GitHub
@@ -232,7 +241,7 @@ and about engines that can be supported honestly, not about saying yes to everyt
 
 | Property | What already holds | What is missing |
 |---|---|---|
-| Experiment to tier zero | The plan and the gates are identical at any scale. Local mode drives a database straight from a DSN, with no data plane. | The small end still pays for the large end: a server, storage, and a GitHub App for the PR flow. PostgreSQL, the likeliest engine down there, is early alpha. |
+| Experiment to tier zero | The plan and the gates are identical at any scale. Local mode drives a database straight from a DSN with no data plane, and SchemaBot already embeds as a Go module with a test layer defending that startup surface. | The small end still pays for the large end: a server, storage, and a GitHub App for the PR flow. Embedding is a supported import rather than a supported way to run the whole loop. PostgreSQL, the likeliest engine down there, is early alpha. |
 | GitOps, not GitHub | Enforced rather than intended. Applies work while GitHub is down, the CLI covers the full PR surface, and an outage never invents state. A data plane carries no GitHub credentials. | The merge gate itself is expressed as GitHub Check Runs. No second forge is implemented, so the separation is proven by the CLI rather than by a second integration. |
 | Agents | Declarative files are already an agent-readable source of truth, and every gate is author-agnostic. | No dedicated agent surface. An agent works by reading files and opening a PR, the same as a person, with none of the plan detail available programmatically. |
 | Many agents, one database | Concurrent authors are already serialized: one apply per deployment, provable ownership, and no stale plan ever applies. The merge gate coordinates open changes with no protocol between them. | The coordination is opaque. No readable queue, no machine-readable reason for a block, no expected wait. A blocked caller can only poll. |
