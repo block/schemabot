@@ -115,7 +115,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		}
 	}
 
-	// Late schema change-context recovery. A progress poll can run in a process
+	// Late recovery of the schema change context. A progress poll can run in a process
 	// that never captured the pre-deploy baseline — a different replica, or an
 	// apply whose deploy was created before Vitess exposed its context — so the
 	// stored context is empty even though the deploy is live and producing

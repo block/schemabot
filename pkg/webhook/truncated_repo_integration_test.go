@@ -253,7 +253,7 @@ func TestE2EPlanCommandOnNoSchemaChangesPRRecreatesPassingCheck(t *testing.T) {
 		assert.NotContains(t, body, "truncated repository tree")
 		assert.NotContains(t, body, "Plan Failed")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for the no managed schema changes comment")
+		t.Fatal(`timed out waiting for the "No Managed Schema Changes" comment`)
 	}
 
 	select {
