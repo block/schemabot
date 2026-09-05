@@ -358,3 +358,20 @@ func TestGroupsEngineExecution(t *testing.T) {
 		})
 	}
 }
+
+// The database-type set is what config validation accepts, and callers read it
+// only to render the list of types a schemabot.yaml may declare. Handing out
+// the backing slice would let one of those readers widen what validates, so
+// each caller gets its own copy.
+func TestDatabaseTypesHandsOutACopy(t *testing.T) {
+	types := DatabaseTypes()
+	require.Equal(t, []string{DatabaseTypeMySQL, DatabaseTypeVitess, DatabaseTypeStrata, DatabaseTypePostgres}, types)
+
+	types[0] = "sqlite"
+	types = append(types, "cassandra")
+	require.Contains(t, types, "cassandra")
+
+	assert.Equal(t, DatabaseTypeMySQL, DatabaseTypes()[0], "a caller's edit must not reorder the set")
+	assert.False(t, IsDatabaseType("sqlite"), "a caller's edit must not change what validates")
+	assert.False(t, IsDatabaseType("cassandra"), "a caller's append must not widen what validates")
+}

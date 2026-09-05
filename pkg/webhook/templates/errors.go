@@ -83,7 +83,7 @@ func (d SchemaErrorData) Attribution() string {
 // accepts, so a comment that teaches the field can never offer a narrower
 // choice than the server takes.
 func (d SchemaErrorData) DatabaseTypeChoices() string {
-	return strings.Join(markdownInlineCodeList(storage.DatabaseTypes), ", ")
+	return strings.Join(markdownInlineCodeList(storage.DatabaseTypes()), ", ")
 }
 
 // SchemaConfigDocs renders the documentation link for the repository-side

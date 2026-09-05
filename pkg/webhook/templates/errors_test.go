@@ -252,7 +252,7 @@ func TestFirstContactConfigCommentsTeachTheFile(t *testing.T) {
 		})
 	}
 
-	for _, dbType := range storage.DatabaseTypes {
+	for _, dbType := range storage.DatabaseTypes() {
 		t.Run("offers type "+dbType, func(t *testing.T) {
 			assert.Contains(t, RenderInvalidConfig(data), "`"+dbType+"`")
 			assert.Contains(t, RenderNoConfig(data), "`"+dbType+"`")

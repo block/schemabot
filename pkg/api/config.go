@@ -1615,7 +1615,7 @@ func (c *ServerConfig) Validate() error {
 			return err
 		}
 		if !storage.IsDatabaseType(dbConfig.Type) {
-			return fmt.Errorf("database %q has invalid type %q (must be one of %s)", name, dbConfig.Type, strings.Join(storage.DatabaseTypes, ", "))
+			return fmt.Errorf("database %q has invalid type %q (must be one of %s)", name, dbConfig.Type, strings.Join(storage.DatabaseTypes(), ", "))
 		}
 		if len(dbConfig.Environments) == 0 {
 			return fmt.Errorf("database %q has no environments configured", name)

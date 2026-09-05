@@ -1,7 +1,7 @@
 package ui
 
-// DocsBaseURL is the prefix every documentation link SchemaBot renders is
-// built from. It is deliberately the project's canonical public home rather
+// DocsBaseURL is the prefix SchemaBot builds every documentation link it
+// renders from. It is deliberately the project's canonical public home rather
 // than a value derived from the configured GitHub host: that host serves
 // users' schema repositories, which do not carry this project's docs, so a
 // host-derived link would always be broken.

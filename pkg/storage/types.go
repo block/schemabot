@@ -293,21 +293,29 @@ const (
 	DatabaseTypePostgres = "postgres"
 )
 
-// DatabaseTypes is every type a schemabot.yaml may declare, ordered as
+// databaseTypes is every type a schemabot.yaml may declare, ordered as
 // user-facing surfaces list them. Config validation and the PR comments that
 // teach the field both read this set, so the types SchemaBot accepts and the
 // types it offers cannot drift apart: a type that validates but is never named
 // leaves a user correcting a config that was already right.
-var DatabaseTypes = []string{
+var databaseTypes = []string{
 	DatabaseTypeMySQL,
 	DatabaseTypeVitess,
 	DatabaseTypeStrata,
 	DatabaseTypePostgres,
 }
 
+// DatabaseTypes returns every type a schemabot.yaml may declare, in the order
+// user-facing surfaces list them. Each caller gets its own copy: the set backs
+// what config validation accepts, so it is not something an importer can widen
+// by holding on to the slice.
+func DatabaseTypes() []string {
+	return slices.Clone(databaseTypes)
+}
+
 // IsDatabaseType reports whether s names a database type SchemaBot supports.
 func IsDatabaseType(s string) bool {
-	return slices.Contains(DatabaseTypes, s)
+	return slices.Contains(databaseTypes, s)
 }
 
 // Engine constants.
