@@ -26,8 +26,9 @@
 
 A schema change is applied to the database **from the open pull request**, and
 the PR is allowed to merge only once the live schema matches the files in it.
-At the moment of merge, git and every environment agree. That is the whole
-product, and the picture below is the whole workflow:
+At the moment of merge, git and every environment agree. That is the pre-merge
+workflow in one sentence, and the picture below is the same workflow end to
+end:
 
 ![The SchemaBot dev loop: iterate locally against the schema file, then ship the schema through the PR, apply to staging and production, merge, then deploy](../assets/pre-merge-dev-loop.svg)
 
@@ -58,6 +59,12 @@ for as long as the database needs while the rest of the team keeps merging and
 deploying around it. CI and the deploy pipeline never see a DDL step at all.
 The deploy that eventually follows is an ordinary code deploy.
 
+A change that long also needs hands on it while it runs. It may have to be
+paused through a traffic peak and resumed afterwards, and its final table swap
+cut over at a time the team chooses rather than whenever the copy happens to
+finish. A deploy step offers none of those controls. An apply running on an
+open PR offers all of them.
+
 ![Two deploy pipelines side by side over two weeks. With the schema change inside the deploy, the row copy parks in the pipeline and every release behind it queues until the deploy times out. Applied from the open PR, the copy runs on the PR while releases keep flowing, and once it is applied and merged, the next release is an ordinary deploy onto a schema that is already live](../assets/pipeline-never-waits.gif)
 
 Everything else follows from taking DDL out of the deploy path:
@@ -72,7 +79,7 @@ Everything else follows from taking DDL out of the deploy path:
   rollback, not an incident with a half-altered table, and the deploy pipeline
   never has to reason about undoing DDL.
 - **Failures land in the PR, not in a release.** DDL that runs at deploy time
-  fails in production, part-way through a rollout, with nobody watching for
+  can fail in production part-way through a rollout, with nobody watching for
   it. Applied from the PR, it fails as a comment while the author is looking,
   before anything has merged, and the fix is another commit. The check stays
   red until the change is live.
