@@ -226,7 +226,7 @@ func RenderBlockedChangesApplyRejected(data PlanCommentData) string {
 
 	sb.WriteString("---\n\n")
 	n := len(data.BlockedChanges)
-	fmt.Fprintf(&sb, "**"+glyph.Refused+" Apply rejected**: %d planned %s the schema change engine refuses to execute\n", n, pluralize("change", n))
+	fmt.Fprintf(&sb, "**"+glyph.Refused+" Apply rejected**: %d planned %s the engine refuses to execute\n", n, pluralize("change", n))
 	for _, c := range data.BlockedChanges {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {

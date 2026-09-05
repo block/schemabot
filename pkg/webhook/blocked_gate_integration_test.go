@@ -72,7 +72,7 @@ func TestE2EApplyRejectedOnBlockedPlan(t *testing.T) {
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "⛔ Apply rejected")
-		assert.Contains(t, body, "the schema change engine refuses to execute")
+		assert.Contains(t, body, "the engine refuses to execute")
 		assert.Contains(t, body, "`users`")
 		assert.NotContains(t, body, "--allow-unsafe", "a guaranteed failure must not coach an unsafe override")
 	case <-time.After(webhookIntegrationPollDeadline):

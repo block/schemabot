@@ -367,7 +367,7 @@ func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB,
 			// and it is why a new refusal path has to be read before it is
 			// marked rather than assumed to match this one.
 			if !policy.Enabled {
-				return alterRouting{}, engine.OperatorErrorf(nil, "Statement on table %q is not supported by the schema change engine and direct execution is not enabled for this database: %s", table, reason)
+				return alterRouting{}, engine.OperatorErrorf(nil, "Statement on table %q is not supported by the engine and direct execution is not enabled for this database: %s", table, reason)
 			}
 			return alterRouting{}, engine.OperatorErrorf(nil, "Statement on table %q cannot run directly: %s", table, decision.modeReason)
 		}

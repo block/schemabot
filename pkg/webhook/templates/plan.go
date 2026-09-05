@@ -1023,7 +1023,7 @@ func joinDeploymentNames(deployments []DeploymentDriftEntry) string {
 // provisioning.
 func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 	n := len(changes)
-	fmt.Fprintf(sb, glyph.Refused+" **Cannot apply**: %d %s the schema change engine refuses to execute\n", n, pluralize("change", n))
+	fmt.Fprintf(sb, glyph.Refused+" **Cannot apply**: %d %s the engine refuses to execute\n", n, pluralize("change", n))
 	for _, c := range changes {
 		table := "`" + c.Table + "`"
 		if len(c.Shards) > 0 {
@@ -1050,13 +1050,13 @@ func directConsentCopy(databaseType string, isMySQL bool) (headerNoun, footer st
 	databaseType = strings.TrimSpace(databaseType)
 	if databaseType == storage.DatabaseTypeMySQL || databaseType == storage.DatabaseTypeStrata || isMySQL {
 		return "native MySQL DDL",
-			"These statements run synchronously outside the schema change engine: writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this."
+			"These statements run synchronously outside the engine: writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this."
 	}
 	// Deliberately conservative fallback for an engine that emits direct
 	// verdicts without registering its own copy above: disclose the broadest
 	// impact rather than understate what the operator is consenting to.
 	return "native DDL",
-		"These statements run synchronously outside the schema change engine: each table is unavailable while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this."
+		"These statements run synchronously outside the engine: each table is unavailable while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this."
 }
 
 // writeDirectChanges writes the section for statements the direct execution
