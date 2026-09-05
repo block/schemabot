@@ -18,7 +18,7 @@ import (
 
 // pkSwapSchema is a schema file declaring a composite primary key on a table
 // the target holds with a single-column key, so the plan diff is exactly the
-// primary-key reshape the schema change engine refuses.
+// primary-key reshape that the schema change engine refuses.
 const pkSwapSchema = "CREATE TABLE `users` (\n" +
 	"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
 	"  `tenant_id` bigint unsigned NOT NULL,\n" +

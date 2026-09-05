@@ -202,7 +202,7 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 }
 
 // RenderBlockedChangesApplyRejected renders the rejection comment for an
-// apply whose plan contains statements the schema change engine refuses.
+// apply whose plan contains statements that the schema change engine refuses.
 // Unlike unsafe changes there is no opt-in flag that lets a refused statement
 // through, so the comment carries no retry instructions — the guidance is to
 // rewrite the change or contact the operators.

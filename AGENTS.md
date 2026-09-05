@@ -110,7 +110,9 @@ Constructions that only read correctly when hyphenated are rewritten rather than
 | a PR with no schema changes | a no-schema-changes PR |
 | restarts part-way through a schema change | restarts mid-schema-change |
 
-The rule is about prose only. Identifiers keep whatever form they need: file and script names (`scripts/generate-schema-change.sh`), CLI subcommands, external URLs, generated markdown anchors, and test fixture values are left alone.
+The rule is about prose only. Identifiers keep whatever form they need: file and script names (`scripts/generate-schema-change.sh`), CLI subcommands, external URLs, generated markdown anchors, and test fixture values are left alone. So is the literal inside a longer word: `VSchema-changed` is a different term and is not a hit.
+
+`make check-terminology` (`scripts/check-terminology.sh`) enforces this in CI on every PR, docs-only ones included. It strips URLs and anchor targets, matches only at a word boundary, and allowlists the identifiers above by value, so a new legitimate hyphenated identifier means extending that allowlist, not weakening the rule.
 
 **Driver terminology:** A *driver* is the operator worker that claims an apply via `FOR UPDATE SKIP LOCKED`, holds its lease (`LeaseOwner` / `LeaseToken`), and *drives* it to a terminal state. Use *driver* (noun) and *drive* (verb) — not *worker* — in new code, comments, logs, docs, and tests for the lease-holding goroutine and the work it performs. This is distinct from the **Go MySQL driver** (`github.com/go-sql-driver/mysql`, `database/sql/driver`): always refer to that as the "Go MySQL driver" or "SQL driver" and keep it import-qualified so the two senses never collide.
 
