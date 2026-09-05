@@ -58,7 +58,8 @@ stay put, where this page moves as engines gain features.
 | **Cheap native path tried first** | yes, instant DDL | yes, instant DDL | yes, attempted under budgets that cancel a rewrite |
 | **Online DDL (copy and swap)** | yes, when instant is not possible | yes, when instant is not possible | planned; meanwhile a rewrite is refused above a size limit and cancelled by its budget below it |
 | **Escape hatch for refused statements** | direct execution: opt-in, size-bounded, separately confirmed | none, excluded by design | none, native execution is already the only path |
-| **`stop` / `start`** | yes | no | planned |
+| **`stop`** | yes | no | planned |
+| **`start`** | yes | deferred deploys only | planned |
 | **Deferred cutover** | yes | yes | planned |
 | **`cancel`** | yes | yes | planned |
 | **`revert` / `skip-revert`** | no | yes | no |
