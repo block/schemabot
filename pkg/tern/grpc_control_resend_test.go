@@ -160,3 +160,116 @@ func countLogMessages(logs []*storage.ApplyLog, messagePrefix string) int {
 	}
 	return count
 }
+
+// A data plane that refuses a pending stop has made a decision, not dropped a
+// delivery: the request is already recorded durably there, so re-sending it can
+// only collect the same refusal. The drive resolves the request on the refusal
+// and reports the stop as not handled, because the schema change is still
+// running and no stop took effect.
+func TestGRPCClient_RefusedStopResolvesTheRequest(t *testing.T) {
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_RUNNING,
+		progressStateSet: true,
+		stopRefusal:      "stop is not supported for this schema change; use cancel to permanently cancel it",
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-grpc-stop-refused",
+		ExternalID:      "remote-grpc-stop-refused",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+		CreatedAt:   time.Now(),
+	}}}
+	storedApply := *apply
+	logs := &mockApplyLogStore{}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{},
+		logs:            logs,
+		controlRequests: controlRequests,
+	}
+
+	handled, err := client.processPendingStopControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	require.NoError(t, err, "a refusal is an answer, not a drive failure")
+	assert.False(t, handled, "the schema change is still running, so no stop was handled")
+
+	require.Len(t, controlRequests.requests, 1)
+	refused := controlRequests.requests[0]
+	assert.Equal(t, storage.ControlRequestFailed, refused.Status, "the refused request resolves instead of staying pending")
+	assert.Contains(t, refused.ErrorMessage, "use cancel to permanently cancel it", "the operator reads the data plane's reason")
+	assert.Equal(t, 1, countLogMessages(logs.logs, "Pending stop request rejected by the data plane"),
+		"the refusal is recorded on the apply for the operator")
+
+	// A resolved request is not re-sent on the next claim.
+	handled, err = client.processPendingStopControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	require.NoError(t, err)
+	assert.False(t, handled)
+	assert.Equal(t, 1, server.getStopCalls(), "the refused request is not re-sent once it is resolved")
+}
+
+// The cancel counterpart of the refused-stop case.
+func TestGRPCClient_RefusedCancelResolvesTheRequest(t *testing.T) {
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_RUNNING,
+		progressStateSet: true,
+		cancelRefusal:    "cancel is not implemented for this schema change",
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-grpc-cancel-refused",
+		ExternalID:      "remote-grpc-cancel-refused",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+		CreatedAt:   time.Now(),
+	}}}
+	storedApply := *apply
+	logs := &mockApplyLogStore{}
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{},
+		logs:            logs,
+		controlRequests: controlRequests,
+	}
+
+	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	require.NoError(t, err, "a refusal is an answer, not a drive failure")
+	assert.False(t, handled, "the schema change is still running, so no cancel was handled")
+
+	require.Len(t, controlRequests.requests, 1)
+	refused := controlRequests.requests[0]
+	assert.Equal(t, storage.ControlRequestFailed, refused.Status, "the refused request resolves instead of staying pending")
+	assert.Contains(t, refused.ErrorMessage, "cancel is not implemented", "the operator reads the data plane's reason")
+	assert.Equal(t, 1, countLogMessages(logs.logs, "Pending cancel request rejected by the data plane"),
+		"the refusal is recorded on the apply for the operator")
+}
+
+// A refusal that arrives with no reason still has to read as an answer to the
+// command the operator issued, not as a bare "not accepted".
+func TestControlRefusalMessageNamesTheOperation(t *testing.T) {
+	assert.Equal(t, "stop was refused with no reason given", controlRefusalMessage(storage.ControlOperationStop, ""))
+	assert.Equal(t, "the engine is mid-cutover", controlRefusalMessage(storage.ControlOperationCancel, "the engine is mid-cutover"))
+}

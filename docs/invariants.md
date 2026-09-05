@@ -841,9 +841,21 @@ webhook control entry points (`pkg/api/control_handlers.go`, `pkg/webhook/contro
 A control request resolves to an explicit durable outcome: applied, superseded, or failed. A
 command may delay a drive but never wedge it. A failed request requires fresh operator intent
 rather than being retried forever, and polling windows are bounded with visible timeout failures.
+
+A refusal is one of those outcomes, not a failed delivery. When the executing side answers a
+pending request by refusing it, the drive fails the request with the stated reason instead of
+returning an error: the request is already recorded durably, so an error only leaves it pending for
+the next claim to re-send and be refused again, forever. Because the refused operation did not take
+effect, the drive reports the request as not handled and keeps driving the schema change, which is
+still running. This is why an engine that declines an operation for its whole database type states
+that decline in the type system and the RPC surface expresses it as a refusal rather than an error:
+an error is the one shape that cannot cross a plane boundary, since the gRPC server maps every error
+to a generic internal status and the caller cannot tell a deterministic decline from a transient
+failure.
 *Breaks if violated:* an apply loops on a doomed command while holding its database lock.
 *Enforced:* request completion and bounded-retry rules in the drive loop (`pkg/api/operator.go`,
-`pkg/tern/control_requests.go`).
+`pkg/tern/control_requests.go`), and the refusal paths of the pending stop, cancel, and cutover
+processors on both clients (`pkg/tern/local_control.go`, `pkg/tern/grpc_client.go`).
 
 ### CO-3: Engine terminal truth outranks a queued command
 

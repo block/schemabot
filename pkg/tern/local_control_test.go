@@ -2081,3 +2081,79 @@ func TestLocalClient_StartDistinguishesAFinishedApplyFromAMissingOne(t *testing.
 	assert.Contains(t, err.Error(), "already reached a terminal state")
 	assert.NotContains(t, err.Error(), "state start cannot act on")
 }
+
+// An engine that declines an operation for its whole database type has given a
+// deterministic answer, and the RPC surface has to express it as a refusal. An
+// error is the one shape that cannot cross the boundary: the gRPC server maps
+// every error to a generic internal status, so the caller cannot tell a
+// permanent decline from a transient failure and retries a request that can
+// never succeed.
+func TestLocalClientRevertWindowDeclinesAreRefusalsNotErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		decline error
+		call    func(*LocalClient) (bool, string, error)
+		reason  string
+	}{
+		{
+			name:    "revert",
+			decline: engine.NewUnsupportedOperationError("revert is not supported for these schema changes"),
+			reason:  "revert is not supported",
+			call: func(c *LocalClient) (bool, string, error) {
+				resp, err := c.Revert(t.Context(), &ternv1.RevertRequest{Environment: "staging"})
+				if resp == nil {
+					return false, "", err
+				}
+				return resp.Accepted, resp.ErrorMessage, err
+			},
+		},
+		{
+			name:    "skip-revert",
+			decline: engine.NewUnsupportedOperationError("skip-revert is not supported for these schema changes"),
+			reason:  "skip-revert is not supported",
+			call: func(c *LocalClient) (bool, string, error) {
+				resp, err := c.SkipRevert(t.Context(), &ternv1.SkipRevertRequest{Environment: "staging"})
+				if resp == nil {
+					return false, "", err
+				}
+				return resp.Accepted, resp.ErrorMessage, err
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newDecliningControlLocalClient(tc.decline)
+			accepted, message, err := tc.call(client)
+			require.NoError(t, err, "a deterministic decline must not surface as an error the caller would retry")
+			assert.False(t, accepted, "the operation was declined")
+			assert.Contains(t, message, tc.reason, "the refusal carries the engine's reason to the caller")
+		})
+	}
+}
+
+// newDecliningControlLocalClient builds a client whose engine declines the
+// revert-window controls for its whole database type.
+func newDecliningControlLocalClient(decline error) *LocalClient {
+	apply := &storage.Apply{
+		ID: 1, ApplyIdentifier: "apply-decline", Database: "testdb",
+		Environment: "staging", State: state.Apply.RevertWindow,
+	}
+	task := &storage.Task{
+		ID: 1, ApplyID: apply.ID, TaskIdentifier: "task-decline",
+		Database: "testdb", Namespace: "testdb", TableName: "users", State: state.Task.RevertWindow,
+	}
+	return &LocalClient{
+		config: LocalConfig{
+			Database:  "testdb",
+			Type:      storage.DatabaseTypeMySQL,
+			TargetDSN: "root@tcp(localhost:3306)/",
+		},
+		storage: &controlTestStorage{
+			applies:         &controlTestApplyStore{apply: apply},
+			tasks:           &controlTestTaskStore{tasks: []*storage.Task{task}},
+			applyLogs:       &controlTestApplyLogStore{},
+			controlRequests: &testControlRequestStore{},
+		},
+		spiritEngine: &fakeControlEngine{revertErr: decline, skipRevertErr: decline},
+		logger:       slog.Default(),
+	}
+}

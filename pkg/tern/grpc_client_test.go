@@ -545,7 +545,9 @@ type capturingTernServer struct {
 	startCalled       bool // tracks whether Start was actually invoked
 	stopCalls         int
 	cancelCalls       int
-	omitOperationKey  bool // emulate a data plane that does not echo the operation key
+	stopRefusal       string // when set, Stop answers Accepted=false with this reason
+	cancelRefusal     string // when set, Cancel answers Accepted=false with this reason
+	omitOperationKey  bool   // emulate a data plane that does not echo the operation key
 }
 
 // dispatchOperationKeyEcho mirrors the data plane's operation key derivation
@@ -614,9 +616,13 @@ func (s *capturingTernServer) Stop(_ context.Context, req *ternv1.StopRequest) (
 	s.stopCaller = req.Caller
 	s.stopCalls++
 	err := s.stopErr
+	refusal := s.stopRefusal
 	s.mu.Unlock()
 	if err != nil {
 		return nil, err
+	}
+	if refusal != "" {
+		return &ternv1.StopResponse{Accepted: false, ErrorMessage: refusal}, nil
 	}
 	return &ternv1.StopResponse{Accepted: true}, nil
 }
@@ -627,9 +633,13 @@ func (s *capturingTernServer) Cancel(_ context.Context, req *ternv1.CancelReques
 	s.cancelCaller = req.Caller
 	s.cancelCalls++
 	err := s.cancelErr
+	refusal := s.cancelRefusal
 	s.mu.Unlock()
 	if err != nil {
 		return nil, err
+	}
+	if refusal != "" {
+		return &ternv1.CancelResponse{Accepted: false, ErrorMessage: refusal}, nil
 	}
 	return &ternv1.CancelResponse{Accepted: true}, nil
 }

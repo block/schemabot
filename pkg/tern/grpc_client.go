@@ -789,6 +789,41 @@ func logOperationDriveLeavesParentCancel(logger *slog.Logger, apply *storage.App
 		append(apply.MutableLogAttrs(), "apply_operation_id", scope.applyOperationID, "remote_apply_id", scope.remoteApplyID(apply))...)
 }
 
+// failRefusedControlRequest resolves a pending stop or cancel that the data
+// plane answered with an explicit refusal. The data plane stores stop and cancel
+// durably on first receipt, so a refusal is its decision rather than a delivery
+// failure: re-sending can only collect the same refusal on every later claim,
+// while the schema change keeps running and the operator's command never
+// resolves. Failing it with the stated reason ends that loop.
+//
+// The refusal means the operation did not take effect, so this reports the
+// request as not handled, and it clears the send gate so a later request for the
+// same operation is transmitted rather than suppressed as a resend.
+//
+// An operation-only drive owns only its operation and never the shared
+// apply-level request, so it leaves the request pending for the operator
+// projection exactly as the surrounding branches do.
+func (c *GRPCClient) failRefusedControlRequest(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, scope applyTaskScope, remoteID, errorMessage string, leaveParentRequestPending func(*slog.Logger, *storage.Apply, applyTaskScope)) (bool, error) {
+	message := controlRefusalMessage(operation, errorMessage)
+	logger.WarnContext(ctx, "the data plane refused the pending control request; the schema change continues and settles on its own",
+		append(apply.MutableLogAttrs(),
+			"operation", string(operation),
+			"requested_by", controlRequestCaller(controlReq),
+			"remote_apply_id", remoteID,
+			"error_message", message)...)
+	if scope.suppressesDirectParentApplyWrites() {
+		leaveParentRequestPending(logger, apply, scope)
+		return true, nil
+	}
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, eventType,
+		fmt.Sprintf("Pending %s request rejected by the data plane: %s%s", operation, message, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+	if err := failPendingControlRequests(ctx, c.storage, apply, operation, message, remoteID); err != nil {
+		return true, fmt.Errorf("request remote gRPC %s for apply %s remote %s: refused with %q; fail pending %s request: %w", operation, apply.ApplyIdentifier, remoteID, message, operation, err)
+	}
+	c.controlSendGate.clear(controlReq.ID)
+	return false, nil
+}
+
 func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (bool, error) {
 	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop)
 	if err != nil {
@@ -869,12 +904,11 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 			}
 			return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
 		}
-		if resp == nil || !resp.Accepted {
-			errorMessage := "not accepted"
-			if resp != nil && resp.ErrorMessage != "" {
-				errorMessage = resp.ErrorMessage
-			}
-			return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: %s", apply.ApplyIdentifier, remoteID, errorMessage)
+		if resp == nil {
+			return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: the data plane returned neither a response nor an error", apply.ApplyIdentifier, remoteID)
+		}
+		if !resp.Accepted {
+			return c.failRefusedControlRequest(ctx, logger, apply, storage.ControlOperationStop, storage.LogEventStopRequested, controlReq, scope, remoteID, resp.ErrorMessage, logOperationDriveLeavesParentStop)
 		}
 		if c.controlSendGate.recordSend(controlReq.ID, now) {
 			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
@@ -985,12 +1019,11 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 			}
 			return true, fmt.Errorf("request remote gRPC cancel for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
 		}
-		if resp == nil || !resp.Accepted {
-			errorMessage := "not accepted"
-			if resp != nil && resp.ErrorMessage != "" {
-				errorMessage = resp.ErrorMessage
-			}
-			return true, fmt.Errorf("request remote gRPC cancel for apply %s remote %s: %s", apply.ApplyIdentifier, remoteID, errorMessage)
+		if resp == nil {
+			return true, fmt.Errorf("request remote gRPC cancel for apply %s remote %s: the data plane returned neither a response nor an error", apply.ApplyIdentifier, remoteID)
+		}
+		if !resp.Accepted {
+			return c.failRefusedControlRequest(ctx, logger, apply, storage.ControlOperationCancel, storage.LogEventCancelRequested, controlReq, scope, remoteID, resp.ErrorMessage, logOperationDriveLeavesParentCancel)
 		}
 		if c.controlSendGate.recordSend(controlReq.ID, now) {
 			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested,
