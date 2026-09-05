@@ -1653,12 +1653,16 @@ schemabot apply -e staging
 No `schemabot.yaml` configuration file was found in this repository.
 
 ### Setup Instructions
-Create a `schemabot.yaml` file in your schema directory:
+Create a `schemabot.yaml` file in the directory holding the `.sql` files that declare your tables:
 
 ```yaml
 database: your-database-name
 type: mysql
 ```
+
+`type` is one of `mysql`, `vitess`, `strata`, `postgres`.
+
+[Setting up `schemabot.yaml`](https://github.com/block/schemabot/blob/main/docs/github-app-setup.md#6-add-schemabotyaml-config-to-your-repository)
 
 ### If you already have a config
 Use the `-d` flag to specify which database to plan:
@@ -1709,6 +1713,8 @@ schemabot plan -e staging -d <database-name>
 No `schemabot.yaml` configuration with `database: nonexistent-db` was found in this repository.
 
 Check that your `schemabot.yaml` file has the correct `database` field matching the `-d` flag value.
+
+[Setting up `schemabot.yaml`](https://github.com/block/schemabot/blob/main/docs/github-app-setup.md#6-add-schemabotyaml-config-to-your-repository)
 <!-- schemabot:offer-support-channel -->
 
 </details>
@@ -1731,7 +1737,9 @@ type: mysql
 ```
 
 - **database** (required): The database name
-- **type** (required): `vitess` or `mysql`
+- **type** (required): one of `mysql`, `vitess`, `strata`, `postgres`
+
+[Setting up `schemabot.yaml`](https://github.com/block/schemabot/blob/main/docs/github-app-setup.md#6-add-schemabotyaml-config-to-your-repository)
 <!-- schemabot:offer-support-channel -->
 
 </details>

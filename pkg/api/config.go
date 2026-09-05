@@ -1614,10 +1614,8 @@ func (c *ServerConfig) Validate() error {
 		if err := validateDatabaseApp(name, dbConfig); err != nil {
 			return err
 		}
-		switch dbConfig.Type {
-		case storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres:
-		default:
-			return fmt.Errorf("database %q has invalid type %q (must be %s, %s, %s, or %s)", name, dbConfig.Type, storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres)
+		if !storage.IsDatabaseType(dbConfig.Type) {
+			return fmt.Errorf("database %q has invalid type %q (must be one of %s)", name, dbConfig.Type, strings.Join(storage.DatabaseTypes, ", "))
 		}
 		if len(dbConfig.Environments) == 0 {
 			return fmt.Errorf("database %q has no environments configured", name)
