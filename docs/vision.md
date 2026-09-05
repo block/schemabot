@@ -5,11 +5,12 @@
 ## Table of Contents
 
 - [The northstar](#the-northstar)
-- [Four properties](#four-properties)
+- [Five properties](#five-properties)
   - [From a vibe-coded experiment to a tier-zero database](#from-a-vibe-coded-experiment-to-a-tier-zero-database)
   - [GitOps, not GitHub](#gitops-not-github)
   - [Guardrails and context for agents](#guardrails-and-context-for-agents)
   - [Many agents, one database](#many-agents-one-database)
+  - [One database, or ten thousand](#one-database-or-ten-thousand)
 - [What does not change](#what-does-not-change)
 - [What this document is not](#what-this-document-is-not)
 - [Where we are today](#where-we-are-today)
@@ -39,7 +40,7 @@ review checklists, runbooks, a database team who says no. Increasingly the autho
 without getting tired or getting better. Nor is there usually just one of them. The guardrails, and
 the coordination between authors, both have to move into the tool.
 
-## Four properties
+## Five properties
 
 ### From a vibe-coded experiment to a tier-zero database
 
@@ -155,6 +156,45 @@ agents into polling and retries, which is how a swarm turns a correct system int
 The direction is to make the ordering, the reason for a block, and the expected wait into things a
 caller can read and act on.
 
+### One database, or ten thousand
+
+The previous property is many authors converging on one database. This one is its mirror: one
+intent, landing on many databases. Both are concurrency problems, and the second is the one that
+scales badly if it is treated as a pile of individual changes.
+
+It starts with knowing, because nothing can be changed in aggregate that cannot first be seen in
+aggregate. SchemaBot accumulates that knowledge as a side effect of doing its job: every plan it
+computed, every apply it ran, the DDL each carried, who asked, how it ended, and a live line to
+every database it manages. [schema-intelligence.md](./schema-intelligence.md) is the map of that
+surface, and it already answers three questions over one read API: what is live right now, what has
+ever changed, and what is changing now.
+
+![Three stages: know, using the read API; analyze, by linting live schemas and grouping findings by rule; and act, by dispatching one intent to many targets while each keeps its own gates](../assets/vision-fleet-shapes.svg)
+
+The pieces of the next step already exist individually. `pull` reads the live schema of any database
+SchemaBot manages. `pull --lint` audits that live schema against the rules rather than auditing a
+proposed change. `fix-lint` turns a finding into an edit of the schema files. Each of those works,
+and each of them works on one database at a time.
+
+What is missing is the aggregate. A rule broken by four hundred tables across sixty databases is
+currently four hundred separate answers, discovered one query at a time, and a fix that is correct
+in the first place has to be re-derived in every other. The useful version asks once across
+everything, groups the answer by rule rather than by database, and dispatches the result as changes
+rather than as a report. A finding that cannot be acted on is a spreadsheet.
+
+**A fleet is one shape, not the shape.** The interesting axis is not how many databases there are,
+it is how unlike each other they are: different engines, different regions, different organizations,
+different owners, different answers to whether a given change is even legal. A change that spans all
+of that is still one change to whoever asked for it, and the unit of intent should stay the change
+rather than fragmenting into one per target.
+
+This is also the property with the most obvious way to do real damage, and saying so is part of the
+vision rather than a caveat on it. Anything that can fix four hundred tables can break four hundred
+tables. So the gates do not relax at this scale, they matter more: every target computes its own
+plan against its own live schema, refuses independently under **RV-4** when its engine cannot do the
+work, and takes consent under **RV-3** rather than inheriting someone else's. What the aggregate adds
+is ordering, visibility over the whole dispatch, and one place to stop all of it.
+
 ## What does not change
 
 A vision that quietly weakens the invariants is not a vision, it is a rewrite. Three things hold
@@ -186,6 +226,7 @@ regardless of how far any of the above gets:
 | GitOps, not GitHub | AV-1, AV-10, and MG-9 are enforced. A data plane carries no GitHub credentials. | The merge gate itself is expressed as GitHub Check Runs. No second forge is implemented, so the separation is proven by the CLI rather than by a second integration. |
 | Agents | Declarative files are already an agent-readable source of truth, and every gate is author-agnostic. | No dedicated agent surface. An agent works by reading files and opening a PR, the same as a person, with none of the plan detail available programmatically. |
 | Many agents, one database | Concurrent authors are already serialized and made safe by OW-5, OW-1, OW-2, OW-6, and RV-2. The merge gate coordinates open changes with no protocol between them. | The coordination is opaque. There is no readable queue, no machine-readable reason for a block, and no expected wait, so a blocked caller can only poll. |
+| One database, or ten thousand | The read API already answers what is live, what changed, and what is changing. `pull --lint` audits a live schema and `fix-lint` turns a finding into an edit. | All of it is per database. There is no aggregate query, no grouping by rule across databases, and no way to dispatch one intent to many targets and watch or stop it as one thing. |
 
 ## Reading further
 
