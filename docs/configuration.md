@@ -46,7 +46,7 @@
   - [Tenant-scoped command routing](#tenant-scoped-command-routing)
   - [How it works](#how-it-works)
   - [Auto-plan behavior](#auto-plan-behavior)
-  - [Plan comment minimization](#plan-comment-minimization)
+  - [Plan comment retirement](#plan-comment-retirement)
 - [Multi-App Routing](#multi-app-routing)
   - [How dispatch works](#how-dispatch-works)
 - [Secret Resolution](#secret-resolution)

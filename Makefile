@@ -167,6 +167,9 @@ clean: ## Clean build artifacts
 docs-toc: ## Regenerate the Table of Contents in docs/*.md
 	@python3 scripts/gen-doc-toc.py
 
+check-docs-toc: ## Fail if any docs/*.md Table of Contents is stale
+	@python3 scripts/gen-doc-toc.py --check
+
 # Generate protobuf code (only if .proto is newer than generated .pb.go)
 proto: ## Generate protobuf code
 	@if [ pkg/proto/tern.proto -nt pkg/proto/ternv1/tern.pb.go ]; then \

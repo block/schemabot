@@ -1,0 +1,25 @@
+name: docs
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+  # Required status checks must also report on the merge queue, or the queue
+  # waits forever. Inert until a repo admin enables the merge queue.
+  merge_group:
+permissions:
+  contents: read
+jobs:
+  # Unlike the lint/test/docker workflows, this job must NOT skip on
+  # docs-only PRs — a stale Table of Contents is exactly what a docs-only PR
+  # can introduce. The check is a plain Python run with no dependencies, so
+  # running it on every PR costs seconds.
+  check-docs-toc:
+    name: "Docs TOC"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+      - name: Check docs/*.md Table of Contents freshness
+        run: make check-docs-toc

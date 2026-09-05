@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
-"""Insert or refresh a Table of Contents in each Markdown file under docs/.
+"""Insert or refresh a Table of Contents in Markdown files under docs/.
 
-Run via `make docs-toc` (see Makefile).
+Run via `make docs-toc` (see Makefile). `make check-docs-toc` runs the same
+generation in check mode (`--check`): nothing is written, and the exit code
+is non-zero if any committed TOC differs from what generation would produce.
+CI runs the check so a stale TOC fails the PR instead of drifting.
 
-For each file, the TOC lists H2 and H3 headings (skipping headings inside
-fenced code blocks), uses GitHub-style slug anchors, and is placed
-immediately after the leading H1. The block is wrapped in BEGIN/END markers
-so a re-run replaces it in place instead of appending a duplicate. Run this
-after adding or renaming headings in any doc.
+The TOC lists H2 and H3 headings (skipping headings inside fenced code
+blocks), uses GitHub-style slug anchors, and is placed immediately after the
+leading H1. The block is wrapped in BEGIN/END markers so a re-run replaces
+it in place instead of appending a duplicate. Run this after adding or
+renaming headings in any doc.
+
+A TOC is opt-in per file: the sweep over docs/*.md only refreshes files that
+already carry the markers. To give a new doc a TOC, name it explicitly
+(`python3 scripts/gen-doc-toc.py docs/new-doc.md`), which inserts the marker
+block; a doc without markers stays TOC-free through both the sweep and the
+check.
 """
 
 from __future__ import annotations
@@ -61,9 +70,8 @@ def build_toc(headings: list[tuple[int, str]]) -> str:
     return "\n".join(lines)
 
 
-def process(path: Path) -> bool:
-    original = path.read_text()
-
+def regenerate(original: str) -> str | None:
+    """Return the file content with a fresh TOC, or None for a heading-less file."""
     # Strip any existing auto-generated TOC block (matches the current and
     # any prior marker text so re-runs after a marker change still work).
     text = re.sub(
@@ -77,7 +85,7 @@ def process(path: Path) -> bool:
     headings = parse_headings(lines)
     toc_body = build_toc(headings)
     if not toc_body:
-        return False
+        return None
 
     # Insert after the leading H1 (and its trailing blank line, if any).
     insert_at = 0
@@ -93,22 +101,53 @@ def process(path: Path) -> bool:
     new_text = "\n".join(new_lines)
     if not new_text.endswith("\n"):
         new_text += "\n"
+    return new_text
 
-    if new_text == original:
-        return False
+
+def has_toc_markers(text: str) -> bool:
+    return re.search(r"<!-- BEGIN TOC[^>]*-->", text) is not None
+
+
+def process(path: Path, insert: bool, check: bool) -> str | None:
+    """Refresh one file's TOC. Returns a status ('updated'/'stale') or None."""
+    original = path.read_text()
+    if not insert and not has_toc_markers(original):
+        return None
+    new_text = regenerate(original)
+    if new_text is None or new_text == original:
+        return None
+    if check:
+        return "stale"
     path.write_text(new_text)
-    return True
+    return "updated"
 
 
 def main(argv: list[str]) -> int:
-    paths = [Path(p) for p in argv[1:]]
-    if not paths:
-        paths = sorted(Path("docs").glob("*.md"))
+    args = argv[1:]
+    check = "--check" in args
+    args = [a for a in args if a != "--check"]
+    explicit = [Path(p) for p in args]
+    paths = explicit or sorted(Path("docs").glob("*.md"))
+
+    stale: list[Path] = []
     changed = 0
     for p in paths:
-        if process(p):
+        status = process(p, insert=bool(explicit), check=check)
+        if status == "stale":
+            stale.append(p)
+        elif status == "updated":
             print(f"updated {p}")
             changed += 1
+
+    if check:
+        if stale:
+            for p in stale:
+                print(f"stale TOC: {p}")
+            print("Run `make docs-toc` and commit the result.")
+            return 1
+        print("all TOCs are current")
+        return 0
+
     print(f"{changed} file(s) updated")
     return 0
 
