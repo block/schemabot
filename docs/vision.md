@@ -61,8 +61,9 @@ One tool should serve both ends of that range.
 Today they are served by different worlds. Someone building a side project uses whatever their
 framework bundles and finds out at deploy time whether it worked. A large organization staffs a
 platform team, builds an internal pipeline, and puts humans in front of every change. What is
-striking is that both make the same mistakes: a change that locks a table, a drop nobody intended, a
-half-applied state nobody can name. Scale changes the blast radius, not the failure mode.
+striking is how little the hazards change between them. A change that locks a table, a drop nobody
+intended, a half-applied state nobody can name: all of that is reachable from either end. Scale
+changes the blast radius, not the failure mode.
 
 Safety comes from the plan and the gates, not from the size of the deployment running them. Diffing
 against the live database, linting before anything runs, asking for consent before destroying
