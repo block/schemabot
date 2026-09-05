@@ -700,10 +700,15 @@ every policy and not only the fail-closed ones. The two differ by one state: a `
 terminal for claiming but resumable, so an operator can start it again and a driver will write to
 that target. A rollout whose remaining sibling is stopped therefore stays open — `running_degraded`,
 or `paused` where a pause is holding it — until that sibling is started and finishes, or is
-cancelled. *Enforced:* the ordered-claim gate in `FindNextApplyOperation`
+cancelled. A rollout held open this way still resolves the stop that produced it, once that stop
+has reached every operation: the pending request is what `start` consults, so holding it open
+without completing the request would refuse the start the hold exists to preserve (CO-2).
+*Enforced:* the ordered-claim gate in `FindNextApplyOperation`
 (`pkg/storage/internal/sqlstore/apply_operations.go`) and the rollout state derivation
 (`DeriveRolloutApplyState`, `hasStartedUnsettledWork` and `childHoldsItsTarget`,
-`pkg/state/apply.go`).
+`pkg/state/apply.go`), with `completeLandedStopForHeldOpenApply` and
+`RolloutHeldByResumableChild` keeping a held-open rollout's stop resolved and its recovery claim
+quiet (`pkg/api/operator.go`).
 
 ## Ownership and leases (OW)
 

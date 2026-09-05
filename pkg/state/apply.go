@@ -387,6 +387,33 @@ func hasStartedUnsettledWork(children []RolloutChild) bool {
 	return false
 }
 
+// RolloutHeldByResumableChild reports whether a non-terminal projection is held
+// open only by children an operator can start again.
+//
+// Every child has reached a terminal state, so no drive will move the parent on
+// its own, and at least one has not settled: a stopped child still holds its
+// target and resumes writing on start. That shape is indistinguishable from a
+// stranded parent — one whose children all settled while the projection that
+// should have recorded their outcome never ran — from the child rows alone, and
+// the two want opposite handling. A stranded parent needs its state re-derived
+// and its target released. This one is already showing the state it should, and
+// waits on the operator who stopped it.
+func RolloutHeldByResumableChild(derived string, children []RolloutChild) bool {
+	if IsTerminalApplyState(derived) {
+		return false
+	}
+	held := false
+	for _, c := range children {
+		if !IsTerminalApplyState(c.State) {
+			return false
+		}
+		if childHoldsItsTarget(c) {
+			held = true
+		}
+	}
+	return held
+}
+
 // hasLaterUnsettled reports whether any child after failedIndex (in deployment
 // order) still holds its target. A pause-held failure only holds the rollout
 // when there is such later work for the operator to release, start or stop.

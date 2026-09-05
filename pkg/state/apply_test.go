@@ -626,9 +626,42 @@ func TestDeriveRolloutApplyState_HaltHoldsWhileASiblingHoldsItsTarget(t *testing
 	}
 }
 
+// A held-open rollout and a stranded parent present the same way to the
+// recovery claim — a non-terminal apply over children that have all reached a
+// terminal state — and only the settled line tells them apart. Every state in
+// the registry is classified against that rule here, so a state added later
+// cannot inherit an answer: a child that has not reached a terminal state means
+// a drive can still move the parent, a child that settled has released its
+// target, and a terminal-but-resumable child is the one that holds the rollout
+// open for an operator's start.
+func TestRolloutHeldByResumableChild(t *testing.T) {
+	for child := range applyMetadata {
+		t.Run(child, func(t *testing.T) {
+			want := IsTerminalApplyState(child) && !IsState(child, SettledApplyStates...)
+			children := []RolloutChild{rc(Apply.Failed, true), rc(child, true)}
+			assert.Equal(t, want, RolloutHeldByResumableChild(Apply.RunningDegraded, children),
+				"a held-open rollout with a %s child", child)
+		})
+	}
+}
+
+// A rollout that reached a terminal state is never held open, whatever its
+// children look like: the verdict is recorded and the target released, so the
+// recovery claim has nothing to reconsider.
+func TestRolloutHeldByResumableChildIgnoresTerminalRollouts(t *testing.T) {
+	children := []RolloutChild{rc(Apply.Failed, true), rc(Apply.Stopped, true)}
+	for derived := range applyMetadata {
+		if !IsTerminalApplyState(derived) {
+			continue
+		}
+		assert.False(t, RolloutHeldByResumableChild(derived, children),
+			"a %s rollout is not held open", derived)
+	}
+}
+
 // TestDeriveRolloutApplyState_PausePolicy is the truth table for on_failure=pause.
 // An unreleased pause failure holds the apply paused while later siblings still
-// still hold their targets, settles failed once nothing is left to hold, and — once
+// hold their targets, settles failed once nothing is left to hold, and — once
 // released — behaves exactly like continue. Children are in deployment order.
 func TestDeriveRolloutApplyState_PausePolicy(t *testing.T) {
 	cases := []struct {

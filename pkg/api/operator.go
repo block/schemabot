@@ -1466,6 +1466,19 @@ func (s *Service) recoverApplyOperationProjection(ctx context.Context, driverID 
 				"driver", driverID, "operation_count", result.OperationCount)...)
 		return false
 	}
+	if !result.Swapped && result.HeldByResumableChild {
+		// Every operation is terminal, which is what the claim predicate matches
+		// on, but one of them is stopped and an operator can start it again. The
+		// parent is already showing the state that says so, and holding it open
+		// is what keeps that start claimable, so there is nothing to repair here
+		// and no warning to raise. The claim refreshed the heartbeat; this
+		// driver's tick moves on to claim real work.
+		s.logger.Info("operator: claimed apply is held open by an operation an operator can start again; it stays open for that start and needs no repair",
+			append(apply.LogAttrs(),
+				"driver", driverID, "derived_state", result.DerivedState,
+				"operation_count", result.OperationCount)...)
+		return false
+	}
 	if !result.Swapped {
 		// The claim refreshed the heartbeat, so this apply is not reconsidered
 		// until the staleness window elapses again. Warn rather than debug: a
@@ -1534,8 +1547,9 @@ func (s *Service) markPendingOperationsStopped(ctx context.Context, driverID int
 // does not mutate the caller's row. A pending stop completes at any terminal
 // state. A pending cancel completes only when the terminal state is not
 // stopped: a stopped apply remains cancellable, so its pending cancel must
-// stay deliverable for the next drive. No-op when the apply is still
-// non-terminal or nothing is pending.
+// stay deliverable for the next drive. A still-non-terminal apply resolves
+// only its stop, and only once that stop has reached every operation. No-op
+// when nothing is pending.
 func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Context, driverID int, applyID int64) error {
 	apply, err := s.storage.Applies().Get(ctx, applyID)
 	if err != nil {
@@ -1545,7 +1559,7 @@ func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Cont
 		return fmt.Errorf("reload apply %d before completing pending control requests: %w", applyID, storage.ErrApplyNotFound)
 	}
 	if !state.IsTerminalApplyState(apply.State) {
-		return nil
+		return s.completeLandedStopForHeldOpenApply(ctx, driverID, apply)
 	}
 
 	if err := s.completePendingRequestForResolvedApply(ctx, driverID, apply, storage.ControlOperationStop); err != nil {
@@ -1558,6 +1572,56 @@ func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Cont
 		return nil
 	}
 	return s.completePendingRequestForResolvedApply(ctx, driverID, apply, storage.ControlOperationCancel)
+}
+
+// completeLandedStopForHeldOpenApply completes a pending stop request on an
+// apply the rollout projection is still holding open.
+//
+// A stopped operation still holds its target, so a rollout an operator stopped
+// can carry a running-family verdict with every one of its operations already
+// terminal. The stop has landed all the same, and its request is what start
+// consults: leaving it pending refuses the very start that resumes the stopped
+// operation, which is the only way that rollout ever settles. Cancel is not
+// completed here — the apply is not resolved, and the cancel is still
+// deliverable to the next drive.
+//
+// Fails closed on an incomplete generation. While the manifest still declares
+// operations that have not attached, a later dispatch can bring work this stop
+// must halt, so the request stays pending for it.
+func (s *Service) completeLandedStopForHeldOpenApply(ctx context.Context, driverID int, apply *storage.Apply) error {
+	controlReq, err := s.storage.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationStop)
+	if err != nil {
+		return fmt.Errorf("load pending stop request for held-open apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
+	}
+	if controlReq == nil {
+		return nil
+	}
+
+	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return fmt.Errorf("list apply_operations for held-open apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
+	}
+	if len(ops) == 0 {
+		s.logger.Debug("operator: leaving pending stop request for held-open apply with no operation rows",
+			append(apply.LogAttrs(), "driver", driverID)...)
+		return nil
+	}
+	if missing := apply.MissingExpectedOperationKeys(ops); len(missing) > 0 {
+		s.logger.Debug("operator: leaving pending stop request deliverable for operations the generation manifest still expects",
+			append(apply.LogAttrs(),
+				"driver", driverID, "missing_operation_keys", missing)...)
+		return nil
+	}
+	for _, op := range ops {
+		if !state.IsApplyOperationTerminal(op.State) {
+			s.logger.Debug("operator: leaving pending stop request for held-open apply with an operation the stop has not reached",
+				append(apply.LogAttrs(),
+					"driver", driverID, "operation_deployment", op.Deployment,
+					"operation_state", op.State)...)
+			return nil
+		}
+	}
+	return s.completePendingRequestForResolvedApply(ctx, driverID, apply, storage.ControlOperationStop)
 }
 
 // completePendingRequestForResolvedApply completes one pending control request
@@ -2411,6 +2475,11 @@ type applyProjectionResult struct {
 	// a healthy deployment-keyed rollout awaiting its remaining dispatches,
 	// not a stranded parent.
 	ManifestHeld bool
+	// HeldByResumableChild is true when every child reached a terminal state but
+	// the derived parent stayed non-terminal because one of them can still be
+	// started again. The apply is waiting on the operator who stopped it, not
+	// stranded behind a projection that never ran.
+	HeldByResumableChild bool
 }
 
 // anyPauseOnFailure reports whether any operation uses the on_failure=pause
@@ -2513,6 +2582,7 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	}
 	base := state.DeriveApplyState(childStates)
 	derived := state.DeriveRolloutApplyState(children)
+	heldByResumableChild := state.RolloutHeldByResumableChild(derived, children)
 
 	// A deployment-keyed apply's operations attach one dispatch at a time, so
 	// the attached rows alone cannot prove the generation is done. The stored
@@ -2571,7 +2641,7 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		s.logger.Debug("operator: derived apply state matches current; no update",
 			append(apply.LogAttrs(),
 				"driver", driverID, "operation_count", len(ops))...)
-		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived, OperationCount: len(ops), ManifestHeld: manifestHeld}, nil
+		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived, OperationCount: len(ops), ManifestHeld: manifestHeld, HeldByResumableChild: heldByResumableChild}, nil
 	}
 
 	var completedAt *time.Time
@@ -2612,7 +2682,7 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		s.logger.Info("operator: derived apply state write lost a race; skipping",
 			append(apply.LogAttrs(),
 				"driver", driverID, "derived_state", derived, "operation_count", len(ops))...)
-		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived, OperationCount: len(ops), ManifestHeld: manifestHeld}, nil
+		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived, OperationCount: len(ops), ManifestHeld: manifestHeld, HeldByResumableChild: heldByResumableChild}, nil
 	}
 	s.logger.Info("operator: updated derived apply state from apply_operations",
 		append(apply.LogAttrs(),
@@ -2661,12 +2731,13 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	}
 
 	return applyProjectionResult{
-		Swapped:        true,
-		PreviousState:  apply.State,
-		DerivedState:   derived,
-		BecameTerminal: !state.IsTerminalApplyState(apply.State) && state.IsTerminalApplyState(derived),
-		OperationCount: len(ops),
-		ManifestHeld:   manifestHeld,
+		Swapped:              true,
+		PreviousState:        apply.State,
+		DerivedState:         derived,
+		BecameTerminal:       !state.IsTerminalApplyState(apply.State) && state.IsTerminalApplyState(derived),
+		OperationCount:       len(ops),
+		ManifestHeld:         manifestHeld,
+		HeldByResumableChild: heldByResumableChild,
 	}, nil
 }
 
