@@ -123,14 +123,14 @@ To run SchemaBot against your own databases, grab a build from [Releases](#relea
 
 Guides and reference:
 
-- [Vision](./docs/vision.md): See where we’re taking SchemaBot
+- [Vision](./docs/vision.md): See what we’re building toward
 - [Quick start](#quick-start): Try it on your machine
 - [Schema intelligence](./docs/schema-intelligence.md): Get to know your fleet and what’s changing
-- [Engines](./docs/engines.md): See how SchemaBot works with your database engine
+- [Engines](./docs/engines.md): See how changes run on your database engine
 - [PostgreSQL](./docs/postgresql.md): Find out what’s supported today
-- [Configuration](./docs/configuration.md): Set up SchemaBot for your environment
-- [Safety invariants](./docs/invariants.md): Get to know the guardrails behind each change
-- [Architecture](./docs/architecture.md): Look under the hood and follow a change from start to finish
+- [Configuration](./docs/configuration.md): Set things up for your environment
+- [Safety invariants](./docs/invariants.md): Understand the guardrails behind each change
+- [Architecture](./docs/architecture.md): Follow a change from start to finish
 - [Contributing](./CONTRIBUTING.md): Come build with us
 
 ## Releases
