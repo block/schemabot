@@ -3,6 +3,7 @@ package commands
 import (
 	"bufio"
 	"fmt"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -92,13 +93,51 @@ func reconfiguredProfile(existing client.Profile, endpoint string) (profile clie
 	profile = existing
 	profile.Endpoint = endpoint
 	hasLogin := existing.Token != "" || existing.RefreshToken != ""
-	if hasLogin && existing.Endpoint != endpoint {
+	if hasLogin && !sameEndpoint(existing.Endpoint, endpoint) {
 		profile.Token = ""
 		profile.RefreshToken = ""
 		profile.TokenExpiry = 0
 		loginCleared = true
 	}
 	return profile, loginCleared
+}
+
+// sameEndpoint reports whether two configured endpoints address the same
+// server. It exists because the operator retypes the endpoint at the prompt,
+// so the same server routinely arrives spelled differently — with or without a
+// trailing slash, with the host in a different case — and an exact string
+// compare would read those as a move and sign the operator out of a server
+// they never left.
+//
+// It only collapses differences the URL grammar says are not part of the
+// address: the scheme and host are case-insensitive, and a trailing slash is
+// not a path segment. Everything else, including the port, still counts as a
+// different server. An endpoint that will not parse falls back to exact
+// equality, which errs toward clearing a login rather than carrying a token to
+// a server that did not issue it.
+func sameEndpoint(a, b string) bool {
+	if a == b {
+		return true
+	}
+	normalizedA, okA := normalizeEndpoint(a)
+	normalizedB, okB := normalizeEndpoint(b)
+	if !okA || !okB {
+		return false
+	}
+	return normalizedA == normalizedB
+}
+
+// normalizeEndpoint rewrites an endpoint into the form sameEndpoint compares,
+// reporting false when it cannot be parsed as a URL.
+func normalizeEndpoint(raw string) (string, bool) {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", false
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Host = strings.ToLower(parsed.Host)
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	return parsed.String(), true
 }
 
 // ConfigureShowCmd displays the current configuration.
