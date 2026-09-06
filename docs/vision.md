@@ -42,9 +42,9 @@ merge it, and it is. Nobody had to review it for safety. The review already happ
 There is no version of that which is quick. SchemaBot builds the new table alongside the old one and
 copies into it for three weeks, slowing down whenever the database gets busy and picking back up when
 it quiets. The application writes to the old table the entire time and never notices. When the copy
-finishes it waits. The swap is the only moment that touches the application, and you chose when that
-happens three weeks earlier, when you opened the pull request: 3am on a Sunday, when nothing is using
-the table. It takes about a second. Nobody sets an alarm for it.
+finishes it waits. Swapping to the new table is the only moment your application feels. You picked
+that moment three weeks ago, when you opened the pull request: 3am on Sunday, when nothing is using
+the table. The swap takes about a second, and nobody sets an alarm for it.
 
 **Four agents, one database.** Four agents are working on the same service. One adds a column to
 `orders`, one adds an index to it, one drops a column the team stopped reading last quarter, one is
