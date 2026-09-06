@@ -44,7 +44,7 @@ copies into it for three weeks, slowing down whenever the database gets busy and
 it quiets. The application writes to the old table the entire time and never notices. When the copy
 finishes it waits. Swapping to the new table is the only moment your application feels. You picked
 that moment three weeks ago, when you opened the pull request: 3am on Sunday, when nothing is using
-the table. The swap takes about a second, and nobody sets an alarm for it.
+the table. Nobody sets an alarm for it.
 
 **Four agents, one database.** Four agents are working on the same service. One adds a column to
 `orders`, one adds an index to it, one drops a column the team stopped reading last quarter, one is
@@ -58,11 +58,11 @@ You want the database left alone. One command stops the copy where it stands. No
 converted, nothing has to be cleaned up by hand, and when the incident is over the change picks up
 where it left off.
 
-**A change that gets refused.** Someone adds a foreign key. It is an ordinary thing to write, and on
-the last database they worked on it would have been fine. This one is sharded, and a foreign key
-across shards is not a thing that works. SchemaBot says so on the pull request, before anything has
-run, and says why. Nobody on the team today knows that rule. Somebody paid for it once, and it stayed
-paid.
+**A change that is not what it looks like.** Someone renames a column. It is two words in a file.
+Against a live database it is a drop and an add: the data in the old column goes away, and every
+running copy of the application is still asking for it by the old name. SchemaBot says so on the pull
+request, before anything runs. Nobody on the team today learned that the hard way. Somebody did,
+once, and it stayed learned.
 
 The usual alternative is a more careful person, and that works right up until the author is not a
 person. "Be more careful" does not land on an agent. It can write a thousand schema changes a week,
