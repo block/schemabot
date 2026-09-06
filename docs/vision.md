@@ -271,9 +271,9 @@ what is live right now, what has ever changed, and what is changing now.
 
 ![Three stages: know, using the read API; analyze, by linting live schemas and grouping findings by rule; and act, by dispatching one intent to many targets while each keeps its own gates](../assets/vision-fleet-shapes.svg)
 
-The pieces are there. `pull` reads the live schema of any database SchemaBot manages. `pull --lint`
-audits that live schema against the rules, rather than auditing a proposed change. `fix-lint` turns a
-finding into an edit of the schema files. All three work on one database at a time.
+The pieces are there. `pull` reads the live schema of any database SchemaBot manages, and `pull
+--lint` audits that live schema against the rules, rather than auditing a proposed change. Both work
+on one database at a time.
 
 What they should also do is work on all of them at once. A rule broken by four hundred tables across
 sixty databases is one question, not four hundred, and the fix that was right the first time is right
@@ -348,7 +348,7 @@ and about engines that can be supported honestly, not about saying yes to everyt
 | GitOps, not GitHub | Enforced rather than intended. Applies work while GitHub is down, the CLI covers the full PR surface, and an outage never invents state. The process that touches your database carries no GitHub credentials. | A second forge. The merge gate is expressed as GitHub Check Runs today, so that is the piece a second integration has to reach, and reaching it turns a separation the CLI demonstrates into one another forge proves. |
 | Agents | Declarative files are already an agent-readable source of truth, every gate is author-agnostic, and the plan API returns the change set, the per-shard detail, and every lint finding as JSON. | A packaged agent surface: an MCP server and a skill, so an agent finds that API and uses it, rather than reading files and opening a pull request the same way a person does. |
 | Many agents, one database | Concurrent authors are already serialized: one change at a time per database, ownership that has to be proven on every write, and no stale plan ever applies. The merge gate coordinates open changes with no protocol between them. | Coordination a caller can read: the queue it is in, why it is held, and how long the wait is expected to be, so a held change waits instead of polling. |
-| One database, or ten thousand | The read API answers what is live, what changed, and what is changing. `pull --lint` audits a live schema and `fix-lint` turns a finding into an edit. | The same three operations across the whole fleet at once: one aggregate query, findings grouped by rule rather than by database, and one intent dispatched to many targets and watched or stopped as a single thing. |
+| One database, or ten thousand | The read API answers what is live, what changed, and what is changing, and `pull --lint` audits a live schema against the rules. | The same operations across the whole fleet at once: one aggregate query, findings grouped by rule rather than by database, and one intent dispatched to many targets and watched or stopped as a single thing. |
 | Everything underneath | Each engine gets its own semantics rather than a shared subset, and an engine that cannot do something safely refuses at plan time instead of guessing. | PostgreSQL past early alpha, so first class there is a shipped fact and not only a commitment. The engine boundary is clean already; the forge boundary and a plugin surface get the same treatment. |
 
 ## Reading further
