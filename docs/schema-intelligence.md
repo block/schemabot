@@ -816,7 +816,28 @@ Response excerpt (illustrative values):
 
 The database-independent route, `GET /api/logs?apply_id=apply-example-73`,
 returns the same shape. Check `truncated` when present; older entries were
-left outside the returned window. Deployment logs group results by source:
+left outside the returned window.
+
+### Read deployment logs
+
+In [gRPC mode](release.md#two-planes-and-deploy-ordering), the control plane
+coordinates changes while remote data planes run the engines. Logs without
+`--deployment` come from the control plane's stored lifecycle record.
+`--deployment` (API: `deployment`) switches the read to a remote data plane.
+
+- **Use a configured deployment name**, such as `us-east`, from the apply's
+  `operations[].deployment` in progress. It selects where that apply ran;
+  it is not an environment, database name, or shard selector.
+- **Pass the SchemaBot apply ID.** The flag requires an explicit apply ID;
+  SchemaBot resolves the corresponding remote apply IDs for you. The selected
+  deployment must have an operation in that apply and use a remote client.
+  Local-only deployments reject this option; omit it in local mode.
+- **Check for partial results.** One deployment can return several log sources.
+  The response's `errors` array reports sources that could not be read, and
+  each source has its own truncation flag. Operations not yet dispatched have
+  no remote logs; inspect their control-plane logs instead.
+
+Deployment logs group results by source:
 
 <details>
 <summary>Read deployment logs</summary>
@@ -833,7 +854,7 @@ Response excerpt (illustrative values):
   "deployment": "us-east",
   "sources": [
     {
-      "external_id": "engine-apply-example-73",
+      "external_id": "remote-apply-example-73",
       "operations": [
         {
           "operation_key": "us-east"
