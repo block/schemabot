@@ -227,7 +227,7 @@ apply until it finishes. One frame from that live view:
   • Rows: 6,000,000 / 10,000,000
 ```
 
-Use `schemabot progress apply-example-73 --no-watch` for a single snapshot.
+Use `schemabot status apply-example-73` for a single snapshot.
 The API example below uses `active=true`, which also includes other in-flight
 states.
 
