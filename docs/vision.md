@@ -194,12 +194,6 @@ table, this holds a lock for the duration, this is refused on this engine and he
 answer already exists as structured data. The plan API returns the change set, the per-shard detail,
 and every lint finding as JSON, and it is the same plan the PR comment is rendered from.
 
-What is missing is that nothing tells an agent it is there. Reaching it means someone knowing to
-point at an HTTP endpoint, so in practice agents read the schema files and scrape the rendered
-comment instead, which is a layout that was never a contract and changes whenever someone improves
-the wording. An MCP server and a skill are the shape of the fix: the agent discovers what it can ask
-and gets the answer in the form the tool already produces.
-
 **Guardrails that do not care who wrote the change.** This is the load-bearing one. What gets applied
 is what was reviewed. Destroying something takes consent given against the plan that is about to run,
 re-checked if that plan moves. Uncertainty never becomes a passing check. Authorization fails closed
