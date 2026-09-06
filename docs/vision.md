@@ -41,8 +41,8 @@ with it.
 
 People have been chasing this for a long time, and a lot of what they built works. A
 `schema_version` table, ordered changelogs, checksums that catch an edited file, a runner that
-refuses to apply the same change twice. Flyway and Liquibase and everything shaped like them
-automated the bookkeeping, and the bookkeeping was a real problem worth solving.
+refuses to apply the same change twice. That generation of tools automated the bookkeeping, and the
+bookkeeping was a real problem worth solving.
 
 What none of it automates is judgment. A version table can tell you that change 47 ran. It has no
 opinion on whether change 47 should have. Whether the DDL matches the schema that is actually live,
