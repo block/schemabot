@@ -481,6 +481,40 @@ engine, caller, error message, and started, completed, and updated
 timestamps. `schemabot status` renders it; `schemabot status --json` returns
 it raw.
 
+
+<details>
+<summary>Request and response example</summary>
+
+```http
+GET /api/status?environment=production&state=running&limit=20
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "limit": 20,
+  "max_limit": 1000,
+  "state_counts": {
+    "running": 1
+  },
+  "applies": [
+    {
+      "apply_id": "apply-example-73",
+      "database": "shop",
+      "environment": "production",
+      "deployment": "us-east",
+      "engine": "spirit",
+      "state": "running",
+      "caller": "cli",
+      "updated_at": "2026-09-01T03:01:00Z"
+    }
+  ]
+}
+```
+
+</details>
+
 ### One database's history: `GET /api/history/{database}`
 
 `GET /api/history/{database}` lists every apply ever run against a database,
@@ -489,6 +523,35 @@ apply, its state, engine, environment, caller, error and error code if it
 failed, and when it started and completed. The caller is the stored identity,
 with `cli` or `owner/repo#N` as a fallback when it was not recorded.
 `schemabot status -d shop` renders it.
+
+
+<details>
+<summary>Request and response example</summary>
+
+```http
+GET /api/history/shop?environment=production
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "database": "shop",
+  "applies": [
+    {
+      "apply_id": "apply-example-42",
+      "caller": "cli",
+      "engine": "spirit",
+      "environment": "production",
+      "state": "completed",
+      "started_at": "2026-09-01T03:00:00Z",
+      "completed_at": "2026-09-01T03:02:00Z"
+    }
+  ]
+}
+```
+
+</details>
 
 ### The DDL itself: `GET /api/plans`
 
@@ -512,6 +575,76 @@ The list defaults to 20 plans and caps at 200. Check `has_more`; there is no
 pagination cursor. Filters narrow the recent results but do not provide an
 exhaustive search across all historical DDL.
 
+
+<details>
+<summary>List stored plans</summary>
+
+```http
+GET /api/plans?database=shop&environment=production
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "limit": 20,
+  "max_limit": 200,
+  "has_more": false,
+  "plans": [
+    {
+      "plan_id": "plan-example-42",
+      "database": "shop",
+      "database_type": "mysql",
+      "environment": "production",
+      "repository": "example/schemas",
+      "pull_request": 42,
+      "created_at": "2026-09-01T02:55:00Z",
+      "change_counts": {
+        "alter": 1
+      }
+    }
+  ]
+}
+```
+
+</details>
+
+
+<details>
+<summary>Read one stored plan</summary>
+
+```http
+GET /api/plans/plan-example-42
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "plan_id": "plan-example-42",
+  "database": "shop",
+  "environment": "production",
+  "plan": {
+    "plan_id": "plan-example-42",
+    "engine": "spirit",
+    "changes": [
+      {
+        "namespace": "shop",
+        "table_changes": [
+          {
+            "table_name": "orders",
+            "ddl": "ALTER TABLE `orders` ADD COLUMN `discount_code` varchar(32) DEFAULT NULL",
+            "change_type": "alter"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+</details>
+
 ### The lifecycle log: `GET /api/logs`
 
 `GET /api/logs/{database}?apply_id=…` (or `GET /api/logs?apply_id=…`) returns
@@ -521,6 +654,81 @@ state transition, every error, each with its level and source. Passing
 where the engine's own row-copy and throttle lines live. `schemabot logs
 <apply-id>` renders it and `-f` follows it.
 
+
+<details>
+<summary>Read the lifecycle log</summary>
+
+```http
+GET /api/logs/shop?apply_id=apply-example-73
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "apply_id": "apply-example-73",
+  "logs": [
+    {
+      "id": 81,
+      "apply_id": "apply-example-73",
+      "level": "info",
+      "event_type": "state_change",
+      "message": "Apply state changed",
+      "old_state": "pending",
+      "new_state": "running",
+      "created_at": "2026-09-01T03:00:00Z"
+    }
+  ]
+}
+```
+
+</details>
+
+The database-independent route, `GET /api/logs?apply_id=apply-example-73`,
+returns the same shape. Check `truncated` when present; older entries were
+left outside the returned window. Deployment logs group results by source:
+
+<details>
+<summary>Read deployment logs</summary>
+
+```http
+GET /api/logs?apply_id=apply-example-73&deployment=us-east
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "apply_id": "apply-example-73",
+  "deployment": "us-east",
+  "sources": [
+    {
+      "external_id": "engine-apply-example-73",
+      "operations": [
+        {
+          "operation_key": "us-east"
+        }
+      ],
+      "logs": [
+        {
+          "id": 12,
+          "apply_id": "apply-example-73",
+          "level": "info",
+          "event_type": "state_change",
+          "message": "Apply state changed",
+          "old_state": "pending",
+          "new_state": "running",
+          "created_at": "2026-09-01T03:00:00Z"
+        }
+      ]
+    }
+  ],
+  "errors": []
+}
+```
+
+</details>
+
 ### Locks and settings
 
 `GET /api/locks` lists every database lock currently held and who holds it (a
@@ -528,6 +736,58 @@ PR or a CLI operator), which is how a dashboard shows what is claimed before it
 shows what is running. `GET /api/settings` returns the deployment-wide settings
 that operators can change at runtime. `schemabot locks` and `schemabot
 settings` render them.
+
+
+<details>
+<summary>List locks</summary>
+
+```http
+GET /api/locks
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "locks": [
+    {
+      "database": "shop",
+      "database_type": "mysql",
+      "owner": "example/schemas#42",
+      "repository": "example/schemas",
+      "pull_request": 42,
+      "created_at": "2026-09-01T02:55:00Z"
+    }
+  ]
+}
+```
+
+</details>
+
+
+<details>
+<summary>Read settings</summary>
+
+```http
+GET /api/settings
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "settings": [
+    {
+      "key": "spirit_debug_logs",
+      "value": "false"
+    }
+  ]
+}
+```
+
+</details>
+
+Setting values are strings; an empty `settings` list means no stored overrides.
 
 ## What is changing now: `GET /api/progress/apply/{apply_id}`
 
@@ -539,14 +799,41 @@ instant DDL. Sharded engines add one entry per shard with its own rows, ETA,
 and cutover attempts. Multi-deployment applies list each operation with its
 deployment, target, state, and cutover policy.
 
-```
-  apply-7f3a…  shop / production          running        ETA 42m
 
-    orders   ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)
-             rows 61,204,113 / 88,000,000   69%   throttled: false
-             shard -80    31,010,442 / 44,000,000   70%
-             shard 80-    30,193,671 / 44,000,000   68%
+<details>
+<summary>Request and response example</summary>
+
+```http
+GET /api/progress/apply/apply-example-73
 ```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "apply_id": "apply-example-73",
+  "database": "shop",
+  "environment": "production",
+  "engine": "spirit",
+  "state": "running",
+  "tables": [
+    {
+      "table_name": "orders",
+      "ddl": "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)",
+      "status": "running",
+      "rows_copied": 6000000,
+      "rows_total": 10000000,
+      "percent_complete": 60,
+      "eta_seconds": 2520,
+      "throttled": true
+    }
+  ]
+}
+```
+
+</details>
+
+
 
 The numbers come from the engine while the apply is active, so they are as
 fresh as the last poll. Once the apply is terminal, the same endpoint answers
