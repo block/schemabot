@@ -10,11 +10,24 @@ changing now. Give your tools and agents that context with read-only access.
 
 ## Start with a question
 
-The examples below use illustrative values and show only the relevant response
-fields. Authenticate requests as described under [read-only access](#give-a-tool-read-only-access).
+The examples below use illustrative values and excerpts of the CLI output.
+Expand **API equivalent** for the HTTP requests and response fields. Authenticate requests as described under [read-only access](#give-a-tool-read-only-access).
 
-**What databases are there?** Start with `GET /api/databases`. It lists the
+**What databases are there?** Start with `schemabot databases`. It lists the
 managed databases, their engines, and their configured environments and deployments.
+
+```sh
+schemabot databases
+```
+
+```text
+DATABASE   TYPE      ENVIRONMENTS         DEPLOYMENTS
+shop       mysql     staging, production  staging: us-east; production: eu-west, us-east
+analytics  postgres  production           production: us-east
+```
+
+<details>
+<summary>API equivalent</summary>
 
 ```http
 GET /api/databases
@@ -42,10 +55,32 @@ GET /api/databases
 }
 ```
 
+</details>
+
 Use a database name and environment from this inventory in the reads below.
 
 **What does this database look like?** Pull its live schema using a database
 and environment from the inventory.
+
+```sh
+schemabot pull -d shop -e production
+```
+
+SQL output excerpt:
+
+```sql
+-- Namespace `shop` — 1 table
+
+CREATE TABLE `orders` (
+  `id` bigint unsigned NOT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+```
+
+To focus on a table, add `--table orders`; it filters names by substring.
+
+<details>
+<summary>API equivalent</summary>
 
 ```http
 POST /api/pull
@@ -68,12 +103,28 @@ Content-Type: application/json
 }
 ```
 
+</details>
+
 The response gives you the table definitions without logging into the database.
 A pull reads the environment's **primary deployment**, not every deployment or
 shard independently; it does not prove every copy in the fleet matches.
 
-**Which tables are missing a primary key?** Add `lint: true` to inspect a live
+**Which tables are missing a primary key?** Add `--lint` to inspect a live
 schema for issues. On a MySQL database, a finding looks like this:
+
+```sh
+schemabot pull -d shop -e production --lint
+```
+
+Lint output excerpt:
+
+```sql
+-- Lint: 1 violation
+--   [warning] order_events: No primary key defined
+```
+
+<details>
+<summary>API equivalent</summary>
 
 ```http
 POST /api/pull
@@ -99,6 +150,8 @@ Content-Type: application/json
 }
 ```
 
+</details>
+
 Repeat across the supported databases and environments in your inventory, then
 group these findings with their database, environment, namespace, and table.
 Your agent can list the affected tables; your dashboard can track fixes over
@@ -106,8 +159,8 @@ time. Schedule pulls and cache results rather than scanning the fleet on every
 question. For structured columns and indexes alongside the DDL, add
 `catalog_detail: detailed` where supported.
 
-**Which change added this column?** Start with `GET /api/history/{database}`,
-then inspect candidate applies through `GET /api/progress/apply/{apply_id}`.
+**Which change added this column?** Start with the database's history,
+then inspect a candidate apply.
 Check the recorded table DDL and task outcome, and follow the PR URL when one
 is present. The apply's completion time tells you when that apply finished;
 it is not a separate timestamp for each DDL statement. Stored plans add the
@@ -116,6 +169,16 @@ to its exact execution. A plan alone does not prove a change ran.
 
 
 Take a candidate `apply_id` from history, then read its execution record:
+
+```sh
+schemabot status -d shop -e production
+schemabot status apply-example-42
+```
+
+The first command prints the database's history; the second shows one apply.
+
+<details>
+<summary>API equivalent</summary>
 
 ```http
 GET /api/progress/apply/apply-example-42
@@ -137,16 +200,39 @@ GET /api/progress/apply/apply-example-42
 }
 ```
 
+</details>
+
 The completed task supplies the DDL evidence; the PR URL supplies the review
 context.
 
-**What is running across the fleet, and what needs attention?** Query
-`GET /api/status?active=true`, then fetch progress for the returned apply IDs.
+**What is running across the fleet, and what needs attention?** List running
+applies, then watch one with the CLI's live progress view.
 Compare successive snapshots to see whether copying is advancing, throttled,
-or waiting for cutover. Check `has_more`: status returns a bounded list, not
-necessarily every active apply. Narrow by environment and deployment, and use
-`state_counts` for totals across all matching applies.
+or waiting for cutover. Status returns a bounded list, so narrow by environment
+and deployment when it is truncated. The API exposes `has_more` and
+`state_counts` to distinguish the returned rows from the totals.
 
+
+```sh
+schemabot status -e production --state running --limit 100
+schemabot progress apply-example-73
+```
+
+The first command lists running applies; `progress` refreshes the selected
+apply until it finishes. One frame from that live view:
+
+```text
+~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)
+  ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
+  • Rows: 6,000,000 / 10,000,000
+```
+
+Use `schemabot progress apply-example-73 --no-watch` for a single snapshot.
+The API example below uses `active=true`, which also includes other in-flight
+states.
+
+<details>
+<summary>API equivalent</summary>
 
 ```http
 GET /api/status?active=true&environment=production&limit=100
@@ -183,6 +269,8 @@ GET /api/progress/apply/apply-example-73
   }]
 }
 ```
+
+</details>
 
 This copy is throttled at 60%; compare later snapshots before calling it stuck.
 
@@ -267,6 +355,56 @@ Three options turn a schema dump into an inventory:
   itself; the diff-based ones (unsafe drops, dropping an index that was never
   made invisible) need a proposed change and never fire on a pull. See
   [lint-and-safety-levels.md](lint-and-safety-levels.md#auditing-a-live-schema-pull---lint).
+
+For example, inspect a MySQL table with its size estimates:
+
+```sh
+schemabot pull -d shop -e production --table orders --catalog-detail detailed
+```
+
+The CLI adds this line above the table's SQL:
+
+```sql
+-- Table `orders` — rows ~18,402,551, size ~4.0 GiB (engine estimates)
+```
+
+Add `-o json` to read columns, indexes, and estimates as structured fields.
+The pretty view keeps columns and indexes in the SQL instead of repeating them.
+
+<details>
+<summary>API equivalent and structured catalog</summary>
+
+```http
+POST /api/pull
+Content-Type: application/json
+
+{"database": "shop", "environment": "production", "catalog_detail": "detailed"}
+```
+
+Response excerpt for `orders` (the CLI's `--table` filter runs client-side):
+
+```json
+{
+  "database": "shop",
+  "environment": "production",
+  "namespaces": {
+    "shop": {
+      "table_catalog": {
+        "orders": {
+          "name": "orders",
+          "kind": "table",
+          "columns": [{"name": "id", "type": "bigint unsigned", "nullable": false}],
+          "indexes": [{"name": "PRIMARY", "primary": true, "unique": true, "parts": ["id"]}],
+          "estimated_row_count": 18402551,
+          "data_size_bytes": 4294967296
+        }
+      }
+    }
+  }
+}
+```
+
+</details>
 
 The envelope differs by dialect:
 
