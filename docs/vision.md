@@ -44,28 +44,47 @@ changelogs, runners that refuse to apply the same change twice. So is some of th
 the schema you want against the one you have, refusing to write something destructive unless you ask,
 warning you about a lock: SchemaBot does all of that.
 
-What is left is how the change should run, and that is a decision every time. Adding a nullable
-column to a modern MySQL table finishes in milliseconds. Changing that column's type rebuilds the
-whole table. None of it is visible in the DDL, it shifts with the engine and the version and the size
-of the table, and getting it wrong is how a routine Tuesday becomes an incident. SchemaBot works it
-out and takes the cheapest option that is safe. When a copy is the answer it runs the copy: in the
-background, throttling itself when the database gets busy, staying honest for however many weeks it
-takes, swapping only when you say so, stoppable at any point without leaving a table half converted.
+What is left is how the change should run, and that is a decision every time.
 
-That knowledge is the point. The lock a statement takes, the drop nobody should be able to do
-quietly, the thing routine on one engine and refused on another: somebody already paid for all of it,
-usually the hard way, and it belongs in the tool. The usual alternative is a more careful person, and
-that works right up until the author is not a person. "Be more careful" does not land on an agent. It
-can write a thousand schema changes a week, it does not slow down on the risky ones, and it does not
-remember the outage that taught everyone to be careful with that table. There is rarely just one of
-them.
+> You add a column to a `CREATE TABLE` file. The MySQL table behind it has 400 million rows. The pull
+> request tells you the change is instant, you merge it, and that is the whole story.
+>
+> You add an index to the PostgreSQL database next door. That table has 900 million rows and the
+> index will take two days to build. SchemaBot builds it concurrently, never holds a lock your
+> application notices, and cleans up after itself if it fails halfway instead of leaving an invalid
+> index behind. You find out it finished by reading the pull request.
 
-Which is why this is about to matter far more than it does today. Software is being written faster
-than any review process was built to absorb, and the schema is where that speed meets something that
-does not forgive. Code can be regenerated. The data underneath it cannot. So the judgment has to live
-in the tool, applied identically whether the author is a staff engineer, someone on their first week,
-or the twelfth agent to open a pull request this hour. Get that right and schemas move as fast as the
-code that needs them, on databases nobody is scared of, at any scale, at any hour.
+Same edit, same kind of file, same afternoon. The difference between them is not visible in the DDL.
+It moves with the engine, the version, and the size of the table, and getting it wrong is how a
+routine Tuesday becomes an incident. So SchemaBot works it out and takes the cheapest option that is
+safe. When that means copying a table it copies the table, throttling itself when the database gets
+busy, staying honest for however many weeks it takes, swapping only when you say so, and stopping at
+any point without leaving a table half converted.
+
+That knowledge is the point, and it belongs in the tool rather than in whoever happens to review the
+change. The usual alternative is a more careful person, and that works right up until the author is
+not a person. "Be more careful" does not land on an agent. It can write a thousand schema changes a
+week, it does not slow down on the risky ones, and it does not remember the outage that taught
+everyone to be careful with that table. And there is rarely just one of them.
+
+> Four agents are building one feature. One adds a column to `orders`. One adds an index to the same
+> table. One drops a column the team stopped reading last quarter. One is only touching application
+> code and does not know the others exist.
+>
+> They never talk to each other. The column lands first, and within seconds the index change goes
+> red, because the file it planned against no longer matches the database. That agent rereads,
+> replans, and pushes again without anyone telling it to. The drop stops and asks a person, because
+> dropping a column is not a decision an agent gets to make on its own.
+>
+> The feature ships that afternoon. Nobody watched the database. Nobody had to.
+
+That is the thing worth building, and it is about to matter far more than it does today. Software is
+being written faster than any review process was built to absorb, and the schema is where that speed
+meets something that does not forgive. Code can be regenerated. The data underneath it cannot. So the
+judgment has to live in the tool, applied identically whether the author is a staff engineer, someone
+on their first week, or the twelfth agent to open a pull request this hour. Get that right and
+schemas move as fast as the code that needs them, on databases nobody is scared of, at any scale, at
+any hour.
 
 ## From a vibe-coded experiment to a tier-zero database
 
