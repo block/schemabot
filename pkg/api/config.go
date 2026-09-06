@@ -1338,6 +1338,18 @@ func (c PostgresConfig) validate() error {
 		if d < 0 {
 			return fmt.Errorf("postgres.statement_timeout %q must not be negative (omit it to use the default, or set \"0\" to disable the budget)", c.StatementTimeout)
 		}
+		// The storage pool blocks inside a lock acquisition for up to
+		// ApplyTargetLockWait, and statement_timeout bounds a blocked
+		// statement as readily as a computing one. A budget at or below that
+		// wait fires first, so the acquisition reports 57014 instead of the
+		// 55P03 the lock timeout would raise, and routine contention for an
+		// apply target surfaces as a failure rather than as "someone else
+		// holds it". Rejecting the value at startup is the only place that
+		// stays visible; in production the symptom appears far from the knob.
+		if d > 0 && d <= storage.ApplyTargetLockWait {
+			return fmt.Errorf("postgres.statement_timeout %q must exceed the %s apply target lock wait, or lock contention is reported as a statement timeout instead of a lock conflict (set \"0\" to disable the budget)",
+				c.StatementTimeout, storage.ApplyTargetLockWait)
+		}
 	}
 	return nil
 }

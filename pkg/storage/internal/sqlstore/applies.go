@@ -48,7 +48,9 @@ const (
 )
 
 const (
-	applyTargetLockWait           = 10 * time.Second
+	// Shared with the config validation that keeps a configured PostgreSQL
+	// statement budget above this wait, via the exported constant.
+	applyTargetLockWait           = storage.ApplyTargetLockWait
 	applyTargetLockReleaseTimeout = 5 * time.Second
 )
 

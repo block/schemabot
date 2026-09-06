@@ -4633,6 +4633,42 @@ func TestPostgresStatementTimeoutConfig(t *testing.T) {
 		require.ErrorContains(t, err, `postgres.statement_timeout "soon" is not a valid duration`)
 	})
 
+	// A budget at or below the apply target lock wait fires before that lock's
+	// own timeout, so an instance waiting its turn reports a statement timeout
+	// instead of a lock conflict and the contention stops looking like
+	// contention. Startup is the last place that is still visible.
+	t.Run("a value at or below the apply target lock wait fails validation", func(t *testing.T) {
+		t.Parallel()
+		for _, tooShort := range []string{"1s", "9999ms", "10s"} {
+			cfg := postgresCfg(tooShort)
+			err := cfg.Validate()
+			require.ErrorContains(t, err, "postgres.statement_timeout")
+			require.ErrorContains(t, err, "must exceed the 10s apply target lock wait")
+		}
+	})
+
+	t.Run("just above the apply target lock wait validates", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("10001ms")
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, 10001*time.Millisecond, cfg.Postgres.StatementTimeoutOrDefault())
+	})
+
+	// Disabling the budget outright is not "a very short budget" — nothing can
+	// cut the lock wait short, so the floor does not apply.
+	t.Run("zero is exempt from the lock wait floor", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("0")
+		require.NoError(t, cfg.Validate())
+	})
+
+	// The default has to clear the floor it is validated against, or the
+	// shipped configuration would be one the server rejects.
+	t.Run("the default clears the lock wait floor", func(t *testing.T) {
+		t.Parallel()
+		assert.Greater(t, DefaultPostgresStatementTimeout, storage.ApplyTargetLockWait)
+	})
+
 	t.Run("loads from file", func(t *testing.T) {
 		t.Parallel()
 		path := filepath.Join(t.TempDir(), "config.yaml")

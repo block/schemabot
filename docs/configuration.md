@@ -813,6 +813,12 @@ existing data, and a table that does not exist yet has none.
 The server fails startup validation when
 `native_safe_table_size_limit_bytes` is zero or negative.
 
+The ceiling is process-wide: every PostgreSQL database this server drives
+shares the same value, and a database cannot override it in its own metadata.
+These settings only apply where this server constructs the PostgreSQL engine
+itself — local-mode PostgreSQL databases. Databases routed to a remote
+deployment over gRPC run with that deployment's engine settings.
+
 ### Storage statement budget
 
 `postgres.statement_timeout` bounds a single ordinary query on the connections
@@ -830,13 +836,27 @@ same code an operator's `pg_cancel_backend` produces, so an inherited budget is
 easy to misread during triage. Stating the budget makes it SchemaBot's to
 explain.
 
-Two classes of statement deliberately do not run under this value:
+Three statement classes run under three budgets, because they fail for
+different reasons and a single value cannot serve all of them:
 
 | Statement class | Budget | Why |
 |---|---|---|
 | Ordinary storage queries | `postgres.statement_timeout` | Point lookups, small scans, and lease claims; none approach 30s |
 | Bootstrap convergence DDL | Derived from the bootstrap deadline | An index build legitimately runs far longer than a catalog read |
 | Bootstrap advisory-lock wait | None | The wait must be free to block while another pod bootstraps |
+
+There is a fourth, outside the server: the maintenance commands an operator
+runs against storage by hand disable the budget outright, because the operator
+supervising the command is the bound.
+
+`statement_timeout` bounds a statement that is *blocked*, not only one that is
+computing, which sets a floor on what this value may be. The longest a storage
+query legitimately blocks is the 10s wait to acquire an apply target's advisory
+lock: below that, the budget cancels the acquisition before its lock timeout
+can report the ordinary "another instance holds it", and routine contention
+starts surfacing as a statement timeout instead. The server rejects a non-zero
+value at or below that wait at startup rather than letting the symptom appear
+later, far from the setting that caused it.
 
 The bootstrap DDL budget is not configurable, because its safety comes from
 being derived rather than chosen: it sits just under the deadline that already
@@ -857,13 +877,8 @@ Set `statement_timeout: "0"` to disable the budget on storage queries
 explicitly, for a deployment whose storage queries legitimately run longer than
 any value worth defaulting to. That still displaces the platform's value rather
 than inheriting it. The server fails startup validation when
-`postgres.statement_timeout` is negative or is not a valid Go duration.
-
-The ceiling is process-wide: every PostgreSQL database this server drives
-shares the same value, and a database cannot override it in its own metadata.
-These settings only apply where this server constructs the PostgreSQL engine
-itself — local-mode PostgreSQL databases. Databases routed to a remote
-deployment over gRPC run with that deployment's engine settings.
+`postgres.statement_timeout` is negative, is not a valid Go duration, or is a
+non-zero value at or below the 10s lock wait described above.
 
 ## PlanetScale mTLS
 

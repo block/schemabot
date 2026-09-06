@@ -483,7 +483,7 @@ func TestEnsureSchemaPostgres_WaitsForAdvisoryLock(t *testing.T) {
 // it for API queries; a value far below what a CREATE TABLE run needs would
 // otherwise cancel the bootstrap and crashloop the pod. SchemaBot's own
 // budgets take precedence, so a fresh database still converges to the full
-// storage schema under a deliberately hostile 50ms database default.
+// storage schema under a deliberately hostile 1ms database default.
 func TestEnsureSchemaPostgres_OverridesHostileDatabaseStatementTimeout(t *testing.T) {
 	dsn, db := startPostgresStorage(t)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -563,6 +563,48 @@ func TestEnsureSchemaPostgres_StatementTimeoutIsClassified(t *testing.T) {
 	var pgErr *pgconn.PgError
 	require.ErrorAs(t, classified, &pgErr)
 	assert.Equal(t, "57014", pgErr.Code)
+}
+
+// A convergence DDL statement cancelled with SQLSTATE 57014 reports the budget
+// it ran under, both in the returned error and in the log. The log is the half
+// that matters most: a bootstrap failure crashloops the pod before it serves
+// anything, so the structured budget and elapsed fields are the only artifact
+// left to say whether the statement exhausted SchemaBot's own budget or was
+// cut short by something outside it.
+func TestExecPostgresChanges_ClassifiesCancelledStatement(t *testing.T) {
+	dsn, _ := startPostgresStorage(t)
+
+	db, err := postgresconn.Open(dsn, postgresconn.WithStatementTimeout(DefaultPostgresStatementTimeout))
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	require.NoError(t, db.PingContext(t.Context()))
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// The convergence raises statement_timeout to its own budget before
+	// running a change, so a statement is only cancelled once something
+	// tightens it again — which is what a role- or database-level value
+	// imposed outside SchemaBot does. Reproduce that from inside the change.
+	changes := []postgresSchemaChange{{
+		operation: postgresOpCreateTable,
+		object:    "cancelled_change",
+		ddl:       "SET statement_timeout = '50ms'; SELECT pg_sleep(5);",
+	}}
+
+	execErr := execPostgresChanges(t.Context(), db, "cancelled_change", changes, logger)
+	require.Error(t, execErr)
+
+	// The rendered error names the budget the convergence set, so an operator
+	// can compare it against how long the statement actually ran.
+	assert.ErrorContains(t, execErr, postgresBootstrapDDLStatementTimeout.String())
+	var pgErr *pgconn.PgError
+	require.ErrorAs(t, execErr, &pgErr, "the server's own error must stay reachable")
+	assert.Equal(t, "57014", pgErr.Code)
+
+	assert.Contains(t, logs.String(), "storage schema change failed")
+	assert.Contains(t, logs.String(), `"statement_timeout":`)
+	assert.Contains(t, logs.String(), `"elapsed":`)
 }
 
 // A cancellation that arrives before the budget could have fired did not come

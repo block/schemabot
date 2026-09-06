@@ -430,29 +430,40 @@ level. Setting nothing is not the same as having no budget: hosted PostgreSQL pr
 default and tune it for API queries, not for DDL that rewrites a heap, so a connection that stays
 silent inherits a value nobody chose for the work it is doing.
 
-Three statement classes get three budgets, because a single value cannot serve all of them.
-Ordinary storage queries — the long-lived pool, and the bootstrap's catalog reads — run under
-`postgres.statement_timeout`. Bootstrap convergence DDL raises it per transaction, to a value
-derived from the deadline that already bounds the whole bootstrap; deriving it rather than
+Statement classes get budgets sized to how they fail, because a single value cannot serve all of
+them. Ordinary storage queries — the long-lived pool, and the bootstrap's catalog reads — run
+under `postgres.statement_timeout`. Bootstrap convergence DDL raises it per transaction, to a
+value derived from the deadline that already bounds the whole bootstrap; deriving it rather than
 choosing it is what makes it safe, since it can only end a statement that deadline was going to
 end anyway, and so cannot turn a slow but healthy boot into a crashloop. The bootstrap's
 advisory-lock connection disables the budget outright: acquiring that lock means blocking inside
 `pg_advisory_lock` until the pod that is bootstrapping finishes, so any budget shorter than the
 wait would cancel a trailing pod's legitimate queue. That wait stays bounded by the lock timeout
-scoped to the acquisition and by the bootstrap deadline.
+scoped to the acquisition and by the bootstrap deadline. The maintenance commands an operator
+runs against storage by hand also disable it, the supervising operator being the bound.
 
-A cancelled statement is reported as what cancelled it. SQLSTATE `57014` is raised both by
-`statement_timeout` firing and by an operator's `pg_cancel_backend`, so elapsed time
-disambiguates: a cancellation arriving before the budget in force could have fired came from
-outside it, and says so rather than being reported as budget exhaustion.
+Because `statement_timeout` bounds a blocked statement as readily as a computing one, the
+configured budget has a floor: the longest wait a storage-pool statement legitimately blocks for
+is `storage.ApplyTargetLockWait`. A budget at or below it cancels an apply target lock
+acquisition with `57014` before the lock timeout raises the `55P03` the caller recognizes as
+ordinary contention, so config validation rejects such a value at startup.
+
+Where a budget is stated, a cancellation is reported as what cancelled it rather than as a bare
+error. SQLSTATE `57014` is raised both by `statement_timeout` firing and by an operator's
+`pg_cancel_backend`, so elapsed time disambiguates: a cancellation arriving before the budget in
+force could have fired came from outside it, and says so. This is enforced today on bootstrap
+convergence DDL, the path whose failure crashloops a pod; a `57014` on a steady-state pool query
+still surfaces as the driver's own error.
 
 *Breaks if violated:* a platform-imposed timeout cancels bootstrap DDL or truncates a trailing
 pod's lock wait, and the pod crashloops reporting a bare failure that points at neither cause.
 *Enforced:* the opt-in `WithStatementTimeout` option, which has no package-level default precisely
 because one would reach the advisory-lock wait (`pkg/postgresconn/postgresconn.go`); the
 per-class budgets and the `57014` classifier in the PostgreSQL bootstrapper
-(`pkg/api/ensure_schema_postgres.go`); and the storage pool's budget at the call site that opens
-it (`pkg/serve/serve.go`).
+(`pkg/api/ensure_schema_postgres.go`); the lock-wait floor in `PostgresConfig.validate`
+(`pkg/api/config.go`); the storage pool's budget at the call site that opens it
+(`pkg/serve/serve.go`); and the disabled budget on the operator-supervised maintenance commands
+(`pkg/cmd/commands/storage.go`).
 
 ## Merge gate (MG)
 

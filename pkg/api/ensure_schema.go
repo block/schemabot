@@ -32,7 +32,11 @@ import (
 //
 // The same constant bounds the PostgreSQL bootstrap flow — its existence
 // checks, advisory-lock wait, and transactional table creation — so tuning it
-// for MySQL/Spirit reasons also changes how long a PostgreSQL pod waits.
+// for MySQL/Spirit reasons also changes how long a PostgreSQL pod waits. It is
+// also the base of a fourth derivation: postgresBootstrapDDLStatementTimeout
+// subtracts a margin from it to bound one convergence DDL statement
+// server-side, so lowering this shortens that budget too, down to its own
+// floor.
 const EnsureSchemaTimeout = 5 * time.Minute
 
 // EnsureSchemaOption customizes EnsureSchema behavior.

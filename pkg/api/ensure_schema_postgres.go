@@ -152,8 +152,19 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions
 		if err := applyPostgresTableChanges(ctx, db, table, changes, logger); err != nil {
 			// A statement killed by the overall deadline surfaces as a context
 			// cancellation carrying no budget, so name the deadline that ended
-			// it the way the advisory-lock wait names its own.
+			// it the way the advisory-lock wait names its own. Logged as well
+			// as returned, like the MySQL bootstrap's twin: a crashlooping pod
+			// leaves nothing but the log, and the table that ran out of time is
+			// what says whether the deadline is too short or one statement is
+			// pathological.
 			if ctx.Err() != nil {
+				logger.Error("storage schema change did not complete before EnsureSchemaTimeout; SchemaBot storage will not initialize",
+					"database", database,
+					"table", table,
+					"timeout", EnsureSchemaTimeout,
+					"elapsed", time.Since(applyStart),
+					"error", err,
+				)
 				return fmt.Errorf("converge storage table %q: bootstrap did not finish within EnsureSchemaTimeout (%s): %w",
 					table, EnsureSchemaTimeout, err)
 			}
@@ -631,16 +642,27 @@ const postgresDDLLockTimeout = 10 * time.Second
 // keeps a short budget from turning a slow-but-healthy boot into a crashloop:
 // the boot path's real ceiling is unchanged.
 //
-// The margin is what buys the better error. It makes the server-side timeout
-// win the race against the client-side context deadline in every case where
-// the DDL itself is the slow thing, so the failure arrives as PostgreSQL's
-// 57014 (which postgresStatementTimeoutError renders with the budget) rather
-// than as a context cancellation carrying no budget at all. A statement that
-// starts with less than the margin left still loses that race and reports the
-// context error; that case is rare and costs only error quality.
+// The margin decides which of the two bounds reports the failure, and it does
+// so by start time rather than by remaining time. statement_timeout is armed
+// per statement, so a statement beginning at offset s from the bootstrap's
+// start fires server-side at s+budget while the context fires at
+// EnsureSchemaTimeout — the server wins only while s is under the margin.
+// Convergence runs each index in its own transaction, so on any bootstrap
+// whose cumulative work passes the margin, every later statement reports the
+// context error instead of a 57014 naming the budget. Winning is the narrow
+// case, not the common one. That costs only error quality: the caller's
+// deadline branch names EnsureSchemaTimeout, so neither outcome is a bare
+// cancellation.
+//
+// The margin must stay positive. At zero the subtraction yields a budget of
+// 0, which PostgreSQL reads as *disabled* rather than as very short — the
+// budget would silently cease to exist instead of becoming strict, the one
+// failure this whole mechanism exists to prevent. postgresBootstrapDDLFloor
+// keeps a shrunken EnsureSchemaTimeout producing a short budget instead.
 const (
-	postgresBootstrapDDLStatementTimeout = EnsureSchemaTimeout - postgresBootstrapDDLTimeoutMargin
+	postgresBootstrapDDLStatementTimeout = max(EnsureSchemaTimeout-postgresBootstrapDDLTimeoutMargin, postgresBootstrapDDLFloor)
 	postgresBootstrapDDLTimeoutMargin    = 15 * time.Second
+	postgresBootstrapDDLFloor            = 5 * time.Second
 )
 
 // applyPostgresTableChanges executes one table's additive changes. A CREATE

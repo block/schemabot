@@ -59,6 +59,41 @@ func TestConnectStoragePostgresBootsEndToEnd(t *testing.T) {
 	assert.Equal(t, "ok", setting.Value)
 }
 
+// The long-lived storage pool carries SchemaBot's own statement budget rather
+// than the platform's. This is the connection the budget rides for the whole
+// process lifetime, and losing it is silent: the pool would quietly revert to
+// whatever the hosted provider tuned for API queries, with nothing failing
+// until a storage query is cancelled in production. So the assertion is made
+// against the live session, not against the config that fed it.
+func TestConnectStoragePostgresPoolCarriesStatementBudget(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+
+	for _, tc := range []struct {
+		name       string
+		configured string
+		want       string
+	}{
+		{name: "default applies when unset", want: "30s"},
+		{name: "configured value reaches the pool", configured: "17s", want: "17s"},
+		{name: "explicit zero disables the budget", configured: "0", want: "0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dsn, _ := testutil.StartPostgres(t, "schemabot")
+			cfg := &api.ServerConfig{
+				Storage:  api.StorageConfig{DSN: dsn, Dialect: "postgres"},
+				Postgres: api.PostgresConfig{StatementTimeout: tc.configured},
+			}
+			db, err := connectStorage(t.Context(), cfg, schema.DialectPostgres, logger)
+			require.NoError(t, err)
+			t.Cleanup(func() { utils.CloseAndLog(db) })
+
+			var inForce string
+			require.NoError(t, db.QueryRowContext(t.Context(), "SHOW statement_timeout").Scan(&inForce))
+			assert.Equal(t, tc.want, inForce)
+		})
+	}
+}
+
 // A dialect without a registered store or connector fails closed instead of
 // falling back to the MySQL implementation.
 func TestStorageDialectDispatchFailsClosed(t *testing.T) {
