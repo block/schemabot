@@ -102,22 +102,22 @@ func previewLogLarge() {
 
 	// Heartbeats at 30s intervals
 	heartbeats := []struct {
-		pct    int32
-		copied int64
-		total  int64
-		eta    string
+		pct        int32
+		copied     int64
+		total      int64
+		etaSeconds int64
 	}{
-		{12, 26543, 221193, "99450/221193 12.00% copyRows ETA 4m 10s"},
-		{25, 55298, 221193, "99450/221193 25.00% copyRows ETA 3m 30s"},
-		{45, 99537, 221193, "99450/221193 45.00% copyRows ETA 2m 15s"},
-		{68, 150412, 221193, "150412/221193 68.00% copyRows ETA 1m 10s"},
-		{89, 196861, 221193, "196861/221193 89.00% copyRows ETA 25s"},
+		{12, 26543, 221193, 250},
+		{25, 55298, 221193, 210},
+		{45, 99537, 221193, 135},
+		{68, 150412, 221193, 70},
+		{89, 196861, 221193, 25},
 	}
 	for _, hb := range heartbeats {
 		tbl.PercentComplete = hb.pct
 		tbl.RowsCopied = hb.copied
 		tbl.RowsTotal = hb.total
-		tbl.ProgressDetail = hb.eta
+		tbl.ETASeconds = hb.etaSeconds
 		e.emitProgressHeartbeat(tbl, ts)
 	}
 
@@ -213,13 +213,13 @@ func previewLogMulti() {
 	tblOrders.PercentComplete = 30
 	tblOrders.RowsCopied = 66357
 	tblOrders.RowsTotal = 221193
-	tblOrders.ProgressDetail = "66357/221193 30.00% copyRows ETA 2m 30s"
+	tblOrders.ETASeconds = 150
 	e.emitProgressHeartbeat(tblOrders, tsOrders)
 
 	tblOrders.PercentComplete = 65
 	tblOrders.RowsCopied = 143776
 	tblOrders.RowsTotal = 221193
-	tblOrders.ProgressDetail = "143776/221193 65.00% copyRows ETA 1m 5s"
+	tblOrders.ETASeconds = 65
 	e.emitProgressHeartbeat(tblOrders, tsOrders)
 
 	e.emitTableStateChange(tblOrders, state.Apply.Completed, tsOrders)
@@ -245,7 +245,7 @@ func previewLogCutover() {
 	tbl.PercentComplete = 50
 	tbl.RowsCopied = 110000
 	tbl.RowsTotal = 221193
-	tbl.ProgressDetail = "110000/221193 50.00% copyRows ETA 2m 30s"
+	tbl.ETASeconds = 150
 	e.emitProgressHeartbeat(tbl, ts)
 
 	// Waiting for cutover
@@ -276,7 +276,6 @@ func previewLogDetailed() {
 		RowsCopied:      148102,
 		RowsTotal:       221193,
 		ETASeconds:      45,
-		ProgressDetail:  "148102/221193 67.00% copyRows ETA 45s",
 	}
 
 	e.emit(append(tableKVs("Table started", tbl, ts),

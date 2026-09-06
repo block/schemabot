@@ -97,7 +97,6 @@ func TestDrainedFailureKeepsLastObservedCopyPosition(t *testing.T) {
 		RowsCopied:     42000,
 		RowsTotal:      50000,
 		Progress:       84,
-		ProgressDetail: "42000/50000 84% copyRows",
 		ETASeconds:     12,
 		Throttled:      true,
 		ThrottleReason: "replica lag",
@@ -115,7 +114,6 @@ func TestDrainedFailureKeepsLastObservedCopyPosition(t *testing.T) {
 	assert.Equal(t, int64(42000), tp.RowsCopied)
 	assert.Equal(t, int64(50000), tp.RowsTotal)
 	assert.Equal(t, 84, tp.Progress)
-	assert.Equal(t, "42000/50000 84% copyRows", tp.ProgressDetail)
 	assert.Zero(t, tp.ETASeconds)
 	assert.False(t, tp.Throttled)
 	assert.Empty(t, tp.ThrottleReason)
@@ -124,8 +122,7 @@ func TestDrainedFailureKeepsLastObservedCopyPosition(t *testing.T) {
 // A completed schema change copied everything, so the drained outcome reports
 // a full bar with the row total reconciled to the copied count — the count is
 // ground truth once the copy finished, and a full bar contradicted by its own
-// rows line would misreport a change that landed. The mid-copy detail line is
-// dropped: its stale percentage would contradict the completed state.
+// rows line would misreport a change that landed.
 func TestDrainedCompletionReportsFullProgressWithLastCounters(t *testing.T) {
 	eng := New(Config{})
 	rm := registerRunningSchemaChange(eng)
@@ -135,14 +132,13 @@ func TestDrainedCompletionReportsFullProgressWithLastCounters(t *testing.T) {
 	rm.ddls = []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL"}
 	rm.tableNamespace = map[string]string{"users": "testdb"}
 	rm.lastLiveTables = []engine.TableProgress{{
-		Namespace:      "testdb",
-		Table:          "users",
-		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL",
-		State:          "copyRows",
-		RowsCopied:     49000,
-		RowsTotal:      50000,
-		Progress:       98,
-		ProgressDetail: "49000/50000 98% copyRows",
+		Namespace:  "testdb",
+		Table:      "users",
+		DDL:        "ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL",
+		State:      "copyRows",
+		RowsCopied: 49000,
+		RowsTotal:  50000,
+		Progress:   98,
 	}}
 	eng.mu.Unlock()
 
@@ -158,7 +154,6 @@ func TestDrainedCompletionReportsFullProgressWithLastCounters(t *testing.T) {
 	assert.Equal(t, int64(49000), tp.RowsCopied)
 	assert.Equal(t, int64(49000), tp.RowsTotal,
 		"the estimated total reconciles to the copied count once the copy is complete")
-	assert.Empty(t, tp.ProgressDetail)
 }
 
 // Draining an engine that is not tracking any schema change changes nothing:
