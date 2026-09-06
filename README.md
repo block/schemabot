@@ -13,6 +13,7 @@
 </p>
 
 <p align="center">
+  <a href="./docs/vision.md">Vision</a> ·
   <a href="#see-it-in-action">See it in action</a> ·
   <a href="#why-schemabot">Why SchemaBot</a> ·
   <a href="#how-it-works">How it works</a> ·
@@ -122,6 +123,10 @@ To run SchemaBot against your own databases, grab a build from [Releases](#relea
 
 Design and operations docs live in the [docs](./docs/) folder:
 
+- [docs/vision.md](./docs/vision.md) is the northstar: where SchemaBot is going and why, from a
+  weekend project to a tier-zero fleet, what it means for many agents to change one database at
+  once, and what stays fixed while the engines, forges, and interfaces underneath it change. It
+  describes direction, not shipped behavior.
 - [docs/architecture.md](./docs/architecture.md) is the full picture: the layers, the engines,
   the state machine, and how a change flows through them.
 - [docs/configuration.md](./docs/configuration.md) covers server setup: local mode, gRPC mode,
