@@ -8,7 +8,7 @@ becoming a database expert or giving up control of their data. Ask for a feature
 database changes, and ship knowing the database matches what you approved.
 
 SchemaBot offers the path from a proposed schema to a verified change in a live database.
-These are the experiences we want that path to make ordinary.
+This is what we’re building toward.
 
 > **One person shipping a feature.** You ask your coding agent to add a feature that requires a
 > schema change. It updates the app and declares the schema it needs. SchemaBot shows you exactly
