@@ -87,15 +87,16 @@ func TestClassifyRefusal(t *testing.T) {
 			name:       "create collision is a refusal whoever took the name first",
 			err:        fmt.Errorf("execute: %w", executor.ErrCreateCollision),
 			wantReason: "create-collision",
-			wantDetail: []string{"relation already occupies a name", "table, or one of its index names", "re-plan"},
+			wantDetail: []string{"table name or its composite type", "constraint's first-choice index name", "serial/identity column's sequence name", createCollisionRemedy},
 		},
 		{
 			name: "create collision identifies the failed sequence step",
 			err: fmt.Errorf("execute: %w", &executor.SequenceStepError{
 				Step: 2, Total: 3, Err: executor.ErrCreateCollision,
 			}),
-			wantReason: "create-collision",
-			wantDetail: []string{"relation already occupies a name", "step 2 of 3 failed", `CREATE TABLE for "users" committed`, "re-plan"},
+			wantReason:    "create-collision",
+			wantDetail:    []string{"step 2 of 3 failed", `CREATE TABLE for "users" committed`, createCollisionRemedy},
+			wantNotDetail: []string{"re-plan"},
 		},
 		{
 			name: "single-statement refusal omits sequence position",
@@ -103,7 +104,7 @@ func TestClassifyRefusal(t *testing.T) {
 				Step: 1, Total: 1, Err: executor.ErrCreateCollision,
 			}),
 			wantReason:    "create-collision",
-			wantDetail:    []string{"relation already occupies a name"},
+			wantDetail:    []string{"already occupied"},
 			wantNotDetail: []string{"step 1 of 1"},
 		},
 		{
@@ -182,6 +183,28 @@ func TestClassifyRefusal(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCreateCollisionRefusalEntryPathsMatch(t *testing.T) {
+	preflightRefusal := classifyRefusal(fmt.Errorf("preflight: %w", preflight.ErrRelationExists), "users")
+	executorRefusal := classifyRefusal(fmt.Errorf("execute: %w", executor.ErrCreateCollision), "users")
+
+	require.NotNil(t, preflightRefusal)
+	require.NotNil(t, executorRefusal)
+	assert.Equal(t, "create-collision", preflightRefusal.reason)
+	assert.Equal(t, preflightRefusal.detail, executorRefusal.detail)
+	assert.Equal(t, `a name the create set for "users" needs is already occupied (the table name or its composite type, an explicit index name, a constraint's first-choice index name, or a serial/identity column's sequence name); drop or rename the occupant, name the constraint's index explicitly, or use an explicitly named sequence, then re-diff the schema file`, preflightRefusal.detail)
+}
+
+func TestCreateCollisionRefusalAfterCommittedCreateStep(t *testing.T) {
+	err := &executor.SequenceStepError{Step: 2, Total: 3, Err: executor.ErrCreateCollision}
+
+	r := classifyRefusal(err, "users")
+
+	require.NotNil(t, r)
+	assert.Equal(t, `a name the create set for "users" needs is already occupied (the table name or its composite type, an explicit index name, a constraint's first-choice index name, or a serial/identity column's sequence name); step 2 of 3 failed after the CREATE TABLE for "users" committed; drop or rename the occupant, name the constraint's index explicitly, or use an explicitly named sequence, then re-diff the schema file`, r.detail)
+	assert.NotContains(t, r.detail, "re-plan")
+	assert.Equal(t, 1, strings.Count(r.detail, createCollisionRemedy))
 }
 
 // TestCommittedCreatePrefixDetail pins the retry boundary for create sets: a

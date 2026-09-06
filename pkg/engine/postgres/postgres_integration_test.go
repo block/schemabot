@@ -729,8 +729,8 @@ func TestEngineApplyCreateCollisionRefusal(t *testing.T) {
 	progress := awaitPostgresProgress(t, eng, "widgets")
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "refused", progress.Metadata["phase"])
-	assert.False(t, progress.Retryable, "a collision refusal is permanent until a re-plan; the drive must not offer a retry")
-	assert.Equal(t, `a relation already occupies a name the create set for "widgets" claims (the table, or one of its index names); re-plan against the current schema`, progress.ErrorMessage)
+	assert.False(t, progress.Retryable, "a collision refusal is permanent until the name conflict is resolved; the drive must not offer a retry")
+	assert.Equal(t, `a name the create set for "widgets" needs is already occupied (the table name or its composite type, an explicit index name, a constraint's first-choice index name, or a serial/identity column's sequence name); drop or rename the occupant, name the constraint's index explicitly, or use an explicitly named sequence, then re-diff the schema file`, progress.ErrorMessage)
 }
 
 // TestEngineApplyCreateSetCommittedPrefixNotRetryable proves a create set

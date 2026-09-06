@@ -124,10 +124,11 @@ A `CREATE TABLE` for a table that does not exist on the target plans as a
 native statement and executes through pg-sprite's create path. The two facts
 the create depends on are proved in the session that executes, not at plan
 time, because absence or privilege at plan time proves nothing about apply
-time: the role holds `CREATE` on the target schema, and the name is free. A
-relation of any kind already occupying the name is a permanent refusal
-directing a re-plan against the current schema, as is a target schema that
-does not exist.
+time: the role holds `CREATE` on the target schema, and the name is free.
+A relation or standalone composite type already occupying a name needed by
+the create set is a permanent refusal. Drop or rename the occupant, explicitly
+name a constraint's index or sequence to avoid it, then re-diff the schema
+file. A target schema that does not exist is also a permanent refusal.
 
 The create path refuses shapes whose outcome it cannot prove, each
 permanently: `IF NOT EXISTS` (its no-op outcome cannot be proven),

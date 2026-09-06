@@ -300,21 +300,40 @@ func classifyRefusal(err error, table string) *refusal {
 	if r == nil {
 		return nil
 	}
-	r.detail = sanitizeReasonText(r.detail)
 	var stepErr *executor.SequenceStepError
 	if errors.As(err, &stepErr) && stepErr.Total > 1 {
-		if stepErr.Step > 1 {
-			r.detail = strings.TrimSuffix(r.detail, "; re-plan against the current schema")
-		}
-		r.detail = sanitizeReasonText(r.detail + "; " + sequenceStepDetail(stepErr, table))
+		r.detail = withSequenceStep(r.detail, stepErr, table)
 	}
+	r.detail = sanitizeReasonText(r.detail)
 	return r
+}
+
+const replanRemedy = "re-plan against the current schema"
+
+// withSequenceStep places the failed step between the cause and its remedy,
+// so the remedy stays the last clause the operator reads. A failure past the
+// first step leaves the CREATE TABLE committed, and the remedy the cause
+// already carries (or a re-plan when it carries none) follows that fact.
+func withSequenceStep(detail string, stepErr *executor.SequenceStepError, table string) string {
+	step := fmt.Sprintf("step %d of %d failed", stepErr.Step, stepErr.Total)
+	if stepErr.Step <= 1 {
+		return detail + "; " + step
+	}
+	remedy := replanRemedy
+	for _, candidate := range []string{createCollisionRemedy, replanRemedy} {
+		if cause, found := strings.CutSuffix(detail, "; "+candidate); found {
+			detail = cause
+			remedy = candidate
+			break
+		}
+	}
+	return fmt.Sprintf("%s; %s after the CREATE TABLE for %q committed; %s", detail, step, table, remedy)
 }
 
 func sequenceStepDetail(stepErr *executor.SequenceStepError, table string) string {
 	detail := fmt.Sprintf("step %d of %d failed", stepErr.Step, stepErr.Total)
 	if stepErr.Step > 1 {
-		detail += fmt.Sprintf(" after the CREATE TABLE for %q committed; re-plan against the current schema", table)
+		detail += fmt.Sprintf(" after the CREATE TABLE for %q committed; %s", table, replanRemedy)
 	}
 	return detail
 }
@@ -380,15 +399,14 @@ func refusalForCause(err error, table string) *refusal {
 	}
 	if errors.Is(err, preflight.ErrTableNotFound) {
 		return &refusal{reason: "table-not-found",
-			detail: fmt.Sprintf("table %q does not exist on the target; re-plan against the current schema", table)}
+			detail: fmt.Sprintf("table %q does not exist on the target; %s", table, replanRemedy)}
 	}
 	if errors.Is(err, preflight.ErrNotTable) {
 		return &refusal{reason: "not-a-table",
 			detail: fmt.Sprintf("%q exists but is not an ordinary or partitioned table", table)}
 	}
 	if preflight.IsNameOccupied(err) {
-		return &refusal{reason: "create-collision",
-			detail: fmt.Sprintf("a relation already occupies a name the create set for %q claims (the table, or one of its index names); re-plan against the current schema", table)}
+		return createCollisionRefusal(table)
 	}
 	if errors.Is(err, preflight.ErrSchemaNotFound) {
 		return &refusal{reason: "schema-not-found",
@@ -408,8 +426,7 @@ func refusalForCause(err error, table string) *refusal {
 func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 	switch code {
 	case executor.CodeCreateCollision:
-		return &refusal{reason: "create-collision",
-			detail: fmt.Sprintf("a relation already occupies a name the create set for %q claims (the table, or one of its index names); re-plan against the current schema", table)}, true
+		return createCollisionRefusal(table), true
 	case executor.CodeDuplicateCreateName:
 		return &refusal{reason: "duplicate-create-name",
 			detail: fmt.Sprintf("the create set for %q claims the same relation name twice (a CREATE INDEX name repeats the table's implicit constraint-index name or another index); fix the schema file and re-plan", table)}, true
@@ -424,7 +441,7 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 			detail: fmt.Sprintf("the CREATE TABLE for %q is not a shape the native-safe create path can run; rewrite the schema file and re-plan", table)}, true
 	case executor.CodeTableNotFound:
 		return &refusal{reason: "table-not-found",
-			detail: fmt.Sprintf("table %q does not exist on the target; re-plan against the current schema", table)}, true
+			detail: fmt.Sprintf("table %q does not exist on the target; %s", table, replanRemedy)}, true
 	case executor.CodeEmptySequence, executor.CodeUnsupportedSequenceStep,
 		executor.CodeUnsupportedPartitionedParent, executor.CodeNotConcurrentIndexBuild,
 		executor.CodeUnnamedIndex, executor.CodeUnqualifiedTable:
@@ -455,6 +472,17 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return nil, true
 	}
 	return nil, false
+}
+
+const createCollisionRemedy = "drop or rename the occupant, name the constraint's index explicitly, or use an explicitly named sequence, then re-diff the schema file"
+
+// createCollisionRefusal directs the operator to change the schema file or
+// its occupant because re-planning alone reproduces the same name collision.
+func createCollisionRefusal(table string) *refusal {
+	return &refusal{
+		reason: "create-collision",
+		detail: fmt.Sprintf("a name the create set for %q needs is already occupied (the table name or its composite type, an explicit index name, a constraint's first-choice index name, or a serial/identity column's sequence name); %s", table, createCollisionRemedy),
+	}
 }
 
 func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64) error {
