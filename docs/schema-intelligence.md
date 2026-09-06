@@ -11,6 +11,9 @@ permission to change anything.
 
 ## Start with a question
 
+The examples below use illustrative values and show only the relevant response
+fields. Authenticate requests as described under [read-only access](#give-a-tool-read-only-access).
+
 **Where are we still using the old primary-key type?** List the managed databases
 with `GET /api/databases`, then pull each database and environment with
 `catalog_detail: detailed` and `lint: true` where supported. Group the findings
@@ -18,6 +21,37 @@ by rule and keep the database, environment, namespace, and table beside each
 one. Your agent can return the affected tables and the evidence; your dashboard
 can track the pattern over time. Schedule pulls and cache the results rather
 than scanning the fleet on every question.
+
+
+For one MySQL database in that inventory:
+
+```http
+POST /api/pull
+Content-Type: application/json
+
+{"database": "shop", "environment": "production", "catalog_detail": "detailed", "lint": true}
+```
+
+```json
+{
+  "database": "shop",
+  "environment": "production",
+  "namespaces": {
+    "shop": {
+      "table_catalog": {
+        "orders": {
+          "columns": [{"name": "id", "type": "int", "nullable": false}],
+          "indexes": [{"name": "PRIMARY", "primary": true, "parts": ["id"], "unique": true}]
+        }
+      }
+    }
+  }
+}
+```
+
+Here, the primary index points to an `int` column. The caller can find the
+same pattern across its inventory; `namespaces.shop.lint` also carries findings
+from the configured schema rules.
 
 A pull reads the environment's **primary deployment**, not every deployment or
 shard independently. It can also reveal differences from the repository's schema
@@ -31,12 +65,77 @@ it is not a separate timestamp for each DDL statement. Stored plans add the
 proposed DDL and source commit, but history exposes no plan ID to join a plan
 to its exact execution. A plan alone does not prove a change ran.
 
+
+Take a candidate `apply_id` from history, then read its execution record:
+
+```http
+GET /api/progress/apply/apply-example-42
+```
+
+```json
+{
+  "apply_id": "apply-example-42",
+  "state": "completed",
+  "database": "shop",
+  "environment": "production",
+  "pull_request": "https://github.com/example/schemas/pull/42",
+  "completed_at": "2026-09-01T03:02:00Z",
+  "tables": [{
+    "table_name": "orders",
+    "ddl": "ALTER TABLE `orders` ADD COLUMN `discount_code` varchar(32) DEFAULT NULL",
+    "status": "completed"
+  }]
+}
+```
+
+The completed task supplies the DDL evidence; the PR URL supplies the review
+context.
+
 **What is running across the fleet, and what needs attention?** Query
 `GET /api/status?active=true`, then fetch progress for the returned apply IDs.
 Compare successive snapshots to see whether copying is advancing, throttled,
 or waiting for cutover. Check `has_more`: status returns a bounded list, not
 necessarily every active apply. Narrow by environment and deployment, and use
 `state_counts` for totals across all matching applies.
+
+
+```http
+GET /api/status?active=true&environment=production&limit=100
+```
+
+```json
+{
+  "limit": 100,
+  "max_limit": 1000,
+  "has_more": true,
+  "state_counts": {"running": 120},
+  "applies": [{"apply_id": "apply-example-73", "database": "shop", "state": "running"}]
+}
+```
+
+This excerpt shows one row from a truncated list: 120 applies match, but only
+100 are returned. Inspect a returned apply:
+
+```http
+GET /api/progress/apply/apply-example-73
+```
+
+```json
+{
+  "apply_id": "apply-example-73",
+  "state": "running",
+  "tables": [{
+    "table_name": "orders",
+    "status": "running",
+    "rows_copied": 6000000,
+    "rows_total": 10000000,
+    "percent_complete": 60,
+    "throttled": true
+  }]
+}
+```
+
+This copy is throttled at 60%; compare later snapshots before calling it stuck.
 
 These are workflows you can build from SchemaBot's API; the caller supplies
 the search, aggregation, and presentation.
