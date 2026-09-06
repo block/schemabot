@@ -5,7 +5,6 @@
 ## Table of Contents
 
 - [Why apply before merge](#why-apply-before-merge)
-- [Declarative schema files](#declarative-schema-files)
 - [The dev loop](#the-dev-loop)
   - [Converging a local database](#converging-a-local-database)
   - [Where the data-access layer fits](#where-the-data-access-layer-fits)
@@ -54,57 +53,24 @@ Let the database change at its own pace while releases keep moving.
   let the copy run and hold the final swap for a time you choose
 - **Keep code deploys simple.** DDL runs separately, with its own progress,
   controls, and failure reporting in the PR
-- **Merge what is already live.** The required checks confirm the schema
-  work is complete in the required environments before the PR can merge
+- **Review the outcome before merging.** The PR carries the DDL, progress,
+  and result; required checks confirm the schema work is complete
+- **Keep code rollbacks simple.** A backward-compatible schema addition can
+  stay in place while you roll back the code that uses it
+- **Keep DDL credentials out of deploys.** Applications and release pipelines
+  can use data-access permissions while SchemaBot handles schema changes
+
+An open PR can change a live database. Review and authorize the change before
+applying it; enable the [review gate](configuration.md#review-gate) to enforce
+that order. Merge then records the verified result.
 
 Apply-before-merge does not always mean schema-before-code. Add a
 backward-compatible column before deploying code that uses it. Before dropping
 one, deploy code that no longer uses it. Both schema changes run from an open PR.
 
-## Declarative schema files
-
-Schema lives in a directory with a `schemabot.yaml` that names the database,
-and one subdirectory per schema name holding that schema's per-table files:
-
-```
-schema/
-├── schemabot.yaml    # names the database
-└── mydb/             # one directory per schema name
-    ├── users.sql     # desired end state of the `users` table
-    └── products.sql  # desired end state of the `products` table
-```
-
-`schema/schemabot.yaml` identifies the registered database:
-
-```yaml
-database: mydb
-type: mysql
-```
-
-The `database` value must match the server configuration. Environment names
-and promotion order are configured on the server, not in this file.
-
-Each table file holds its full desired `CREATE TABLE` statement. For example,
-`schema/mydb/users.sql` after adding a nullable email column:
-
-```sql
-CREATE TABLE `users` (
-  `id` bigint unsigned NOT NULL,
-  `email` varchar(255) DEFAULT NULL,
-  PRIMARY KEY (`id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
-```
-
-SchemaBot compares that definition with the live table and computes the DDL.
-Removing a column from the definition requests a drop; deleting a table file
-requests a table drop. Review the plan before applying either.
-
-The [onboarding guide](github-app-setup.md#6-add-schemabotyaml-config-to-your-repository)
-shows how to generate these files from an existing database. See
-[namespaces](namespaces.md) for flat layouts and multiple schema names.
-
 ## The dev loop
 
+Start with the [schema files generated during setup](github-app-setup.md#6-add-schemabotyaml-config-to-your-repository).
 Edit the desired schema, update your local database, and test the application.
 Repeat until the shape is ready to share. The same files then describe what
 staging and production should run.

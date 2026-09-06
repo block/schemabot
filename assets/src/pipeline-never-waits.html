@@ -8,32 +8,32 @@
 -->
 <style>
 *{box-sizing:border-box}
-body{margin:0;width:760px;height:340px;background:#fff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;font-size:13px;color:#1f2328;overflow:hidden;position:relative}
+body{margin:0;width:760px;height:362px;background:#fff;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;font-size:13px;color:#1f2328;overflow:hidden;position:relative}
 .lane{position:absolute;left:0;width:760px;height:150px}
 .lane .title{position:absolute;left:16px;top:8px;font-weight:600;font-size:14px}
 .lane .sub{position:absolute;left:16px;top:28px;color:#59636e;font-size:12px}
 .track{position:absolute;left:16px;right:16px;height:44px;border:1px solid #d1d9e0;border-radius:6px;background:#f6f8fa;overflow:hidden}
-.track .lbl{position:absolute;left:8px;top:-18px;font-size:11px;color:#59636e;text-transform:uppercase;letter-spacing:.04em}
+.pipeline-label{position:absolute;left:16px;font-size:11px;color:#59636e;text-transform:uppercase;letter-spacing:.04em}
 .rel{position:absolute;top:8px;height:28px;width:52px;border-radius:4px;background:#1a7f37;color:#fff;font-weight:600;font-size:12px;line-height:28px;text-align:center;box-shadow:0 1px 0 rgba(0,0,0,.08)}
 .rel.q{background:#bf8700}
 .rel.new{background:#0969da}
-.big{position:absolute;top:6px;height:32px;border-radius:4px;background:#e16f24;color:#fff;font-weight:600;font-size:12px;line-height:32px;padding:0 10px;white-space:nowrap}
+.big{position:absolute;top:6px;width:302px;height:32px;border-radius:4px;background:#e16f24;color:#fff;font-weight:600;font-size:12px;line-height:32px;padding:0 10px;white-space:nowrap}
 .big .bar{position:absolute;left:0;bottom:0;height:4px;background:#fff8}
-.pr{position:absolute;left:16px;right:16px;height:34px;border:1px solid #d1d9e0;border-radius:6px;background:#fff;padding:0 10px;line-height:32px;font-size:12px;display:flex;gap:10px;align-items:center}
+.pr{position:absolute;left:316px;top:50px}
 .pr .prog{flex:1;height:8px;background:#e6e8eb;border-radius:4px;overflow:hidden}
 .pr .prog i{display:block;height:100%;background:#e16f24}
 .pr .prog i.done{background:#1a7f37}
 .pr b{color:#1f2328}
 .note{position:absolute;right:16px;font-size:12px;font-weight:600}
 .clock{position:absolute;right:16px;top:8px;font-size:12px;color:#59636e}
-.axis{position:absolute;left:0;right:0;top:310px;text-align:center;color:#8c959f;font-size:11px}
+.axis{position:absolute;left:0;right:0;top:340px;text-align:center;color:#8c959f;font-size:11px}
 .sep{position:absolute;left:16px;right:16px;top:158px;border-top:1px dashed #d1d9e0}
 </style></head><body>
 <div id="a" class="lane" style="top:0">
   <div class="title">Schema change inside the deploy</div>
   <div class="sub">the copy is a pipeline step, so everything behind it waits</div>
   <div class="clock" id="aclock"></div>
-  <div class="track" style="top:74px"><div class="lbl">deploy pipeline</div><div id="atrack"></div></div>
+  <div class="pipeline-label" style="top:55px">deploy pipeline</div><div class="track" style="top:74px"><div id="atrack"></div></div>
   <div class="note" id="anote" style="top:126px;color:#9a6700"></div>
 </div>
 <div class="sep"></div>
@@ -42,7 +42,7 @@ body{margin:0;width:760px;height:340px;background:#fff;font-family:-apple-system
   <div class="sub" id="bsub">the copy runs on the PR, and the pipeline never sees a DDL step</div>
   <div class="clock" id="bclock"></div>
   <div class="pr" id="bpr" style="top:50px"></div>
-  <div class="track" style="top:98px"><div class="lbl">deploy pipeline</div><div id="btrack"></div></div>
+  <div class="pipeline-label" style="top:95px">deploy pipeline</div><div class="track" style="top:112px"><div id="btrack"></div></div>
 </div>
 <div class="axis">time →</div>
 <script>
@@ -78,6 +78,10 @@ function releases(track, opts){
   track.innerHTML = html;
 }
 
+function card(progress, complete=false){
+  return `<div class="big" style="left:0;top:0${complete?';background:#1a7f37':''}">PR #42 · schema change · ${complete?'applied ✓':Math.round(progress*100)+'%'}<div class="bar" style="width:${progress*100}%"></div></div>`;
+}
+
 // Lane A: the big copy parks in the pipeline at BLOCK_AT and never leaves.
 const A = document.getElementById('atrack');
 if (t < BLOCK_AT){
@@ -89,7 +93,7 @@ if (t < BLOCK_AT){
   // The same copy as lane B, just started later, so it runs at the same pace.
   const prog = Math.min(1,(t-BLOCK_AT)/COPY_END);
   const timedOut = t > 0.6;
-  A.insertAdjacentHTML('beforeend', `<div class="big" style="left:${blockX}px${timedOut?';background:#cf222e':''}">PR #42 · copying rows · ${Math.round(prog*100)}%<div class="bar" style="width:${prog*100}%"></div></div>`);
+  A.insertAdjacentHTML('beforeend', `<div style="position:absolute;left:${blockX}px;top:6px">${card(prog)}</div>`);
   const waiting = Math.max(0, Math.floor((t*SPEED*W - (firstBlocked*GAP))/GAP)+1);
   const note = document.getElementById('anote');
   note.textContent = waiting>0 ? `${waiting} release${waiting>1?'s':''} waiting${timedOut?' · deploy timed out ⏱':''}` : '';
@@ -102,11 +106,9 @@ const newAt = Math.round((COPY_END*SPEED*W)/GAP)+1;
 releases(B, {newAt: t>COPY_END ? newAt : undefined});
 const p = Math.min(1, t/COPY_END);
 const pr = document.getElementById('bpr');
-if (p<1){
-  pr.innerHTML = `<b>PR #42</b> <span>schema change · copying rows</span><div class="prog"><i style="width:${p*100}%"></i></div><span>${Math.round(p*100)}% · ETA ${Math.max(1,Math.ceil((1-p)*COPY_END*14))}d</span>`;
-} else {
-  pr.innerHTML = `<b>PR #42</b> <span>schema change · applied ✅</span><div class="prog"><i class="done" style="width:100%"></i></div><span style="color:#8250df;font-weight:600">merged</span>`;
-  document.getElementById('bsub').innerHTML = '<span style="color:#0969da;font-weight:600">✦</span> an ordinary deploy, onto a schema that is already live';
+pr.innerHTML = card(p, p===1);
+if (p===1){
+  document.getElementById('bsub').innerHTML = 'schema applied and merged · releases keep moving';
 }
 </script>
 </body></html>

@@ -8,7 +8,7 @@ assets/src/, outputs under assets/.
 
 Usage:
     scripts/render-animation.py SRC.html OUT.gif [--frames 48] [--fps 8]
-                                [--width 760] [--height 340] [--hold 12]
+                                [--width 760] [--height 362] [--hold 12]
 """
 
 import argparse
@@ -44,7 +44,7 @@ def main():
     ap.add_argument("--frames", type=int, default=48)
     ap.add_argument("--fps", type=int, default=8)
     ap.add_argument("--width", type=int, default=760)
-    ap.add_argument("--height", type=int, default=340)
+    ap.add_argument("--height", type=int, default=362)
     ap.add_argument("--hold", type=int, default=12, help="extra copies of the last frame, so the end state lingers")
     args = ap.parse_args()
 
