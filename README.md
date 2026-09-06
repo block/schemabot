@@ -121,30 +121,24 @@ To run SchemaBot against your own databases, grab a build from [Releases](#relea
 
 ## Docs
 
-Design and operations docs live in the [docs](./docs/) folder:
+Start here, then explore the design and operations docs:
 
-- [docs/vision.md](./docs/vision.md) is the northstar: where SchemaBot is going and why, from a
-  weekend project to a tier-zero fleet, what it means for many agents to change one database at
-  once, and what stays fixed while the engines, forges, and interfaces underneath it change. It
-  describes direction, not shipped behavior.
-- [docs/architecture.md](./docs/architecture.md) is the full picture: the layers, the engines,
-  the state machine, and how a change flows through them.
-- [docs/configuration.md](./docs/configuration.md) covers server setup: local mode, gRPC mode,
-  and secret resolution.
-- [docs/schema-intelligence.md](./docs/schema-intelligence.md) is the map of what SchemaBot
-  knows and how to query it: the live schema of every database, the history of every change
-  with its DDL and caller, and the progress of everything in flight, all on the read tier.
-- [docs/invariants.md](./docs/invariants.md) is the registry of runtime safety invariants:
-  what must never be false while SchemaBot is running, why each rule matters, where it is
-  enforced, and what these guarantees deliberately do not cover. It opens with what happens
-  when GitHub is down.
-- [docs/engines.md](./docs/engines.md) is the engine capability matrix: how each engine
-  executes a change, which control operations it supports, how it manages load, and why the
-  differences exist.
-- [docs/postgresql.md](./docs/postgresql.md) is the PostgreSQL support envelope: what plans,
-  what applies, and how each refusal is reported.
+- [Vision](./docs/vision.md): Where SchemaBot is going and why.
+- [Quick start](#quick-start): Get SchemaBot running locally.
+- [Schema intelligence](./docs/schema-intelligence.md): Explore your database fleet,
+  inspect live schemas, and follow schema changes through the CLI or read-only API.
+- [Engines](./docs/engines.md): Compare how engines execute changes, manage load,
+  and support control operations.
+- [PostgreSQL](./docs/postgresql.md): See what plans, what applies, and how refusals
+  are reported.
+- [Configuration](./docs/configuration.md): Set up local or gRPC mode,
+  authentication, and secret resolution.
+- [Safety invariants](./docs/invariants.md): Understand the runtime guarantees,
+  where they are enforced, and their limits.
+- [Architecture](./docs/architecture.md): Explore the layers, state machine,
+  and how a change flows through them.
+- [Contributing](./CONTRIBUTING.md): Help build SchemaBot.
 
-Each has a table of contents, so jump straight to the question you came with.
 
 ## Releases
 
