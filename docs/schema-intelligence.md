@@ -12,6 +12,10 @@ changing now. Give your tools and agents that context with read-only access.
 The examples use illustrative values and excerpts of the CLI output. Expand
 **API equivalent** for requests and response fields. See
 [read-only access](#give-a-tool-read-only-access) to configure your caller.
+All API paths are relative to your SchemaBot server URL. For OIDC installations,
+include `Authorization: Bearer <token>`; for forward-auth, send requests through
+your installation's authenticating proxy. Local installations with authentication
+disabled need no token. The examples below omit authentication headers.
 
 ## What databases exist?
 
@@ -289,6 +293,32 @@ failure. The default budgets, and how to tune them, are in
 consumer is a periodic sync that pulls each database on a schedule and keeps
 its own copy, not a per-request passthrough.
 
+<details>
+<summary>Rate-limited pull example (HTTP 429)</summary>
+
+The same pull request can return:
+
+```http
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/json
+Retry-After: 3
+```
+
+```json
+{
+  "error": "too many pull requests for this database and environment; retry in 3s",
+  "error_code": "rate_limited",
+  "retry_after_seconds": 3
+}
+```
+
+Wait at least the advertised delay before retrying. Match `error_code` rather
+than parsing `error`. Other API errors use the same `error` and `error_code`
+fields, but `error_code` can be empty; also check the HTTP status. Correct an
+invalid request or authentication failure before retrying it.
+
+</details>
+
 ## What changed in this database?
 
 `GET /api/history/{database}` lists every apply ever run against a database,
@@ -328,7 +358,7 @@ Response excerpt (illustrative values):
   "applies": [
     {
       "apply_id": "apply-example-42",
-      "caller": "cli",
+      "caller": "example/store#42",
       "engine": "spirit",
       "environment": "production",
       "state": "completed",
@@ -374,7 +404,7 @@ GET /api/progress/apply/apply-example-42
   "state": "completed",
   "database": "shop",
   "environment": "production",
-  "pull_request": "https://github.com/example/schemas/pull/42",
+  "pull_request": "https://github.com/example/store/pull/42",
   "completed_at": "2026-09-01T03:02:00Z",
   "tables": [{
     "table_name": "orders",
@@ -408,12 +438,12 @@ live view:
 Use `schemabot status apply-example-73` for a single snapshot.
 
 While an apply runs, `GET /api/progress/apply/{apply_id}` is the live view.
-For every table it returns the DDL being applied, rows copied against rows
-total, percent complete, an ETA in seconds, the checksum position, whether
-the copy is currently throttled and why, and whether the change ran as
-instant DDL. Sharded engines add one entry per shard with its own rows, ETA,
-and cutover attempts. Multi-deployment applies list each operation with its
-deployment, target, state, and cutover policy.
+Table entries identify the DDL and task state. Available metrics depend on the
+engine and execution phase: copying can report rows and percent complete;
+`eta_seconds` is an estimate and may be omitted. Do not interpret an absent ETA
+as zero time remaining. Throttled tasks can include `throttle_reason`.
+Sharded engines can add per-shard progress, and multi-deployment applies list
+operations with their deployment, target, state, and cutover policy.
 
 <details>
 <summary>Request and response example</summary>
@@ -779,11 +809,9 @@ Response excerpt (illustrative values):
 ## Read the lifecycle log
 
 `GET /api/logs/{database}?apply_id=…` (or `GET /api/logs?apply_id=…`) returns
-SchemaBot's own event stream for an apply: queued, claimed, dispatched, every
-state transition, every error, each with its level and source. Passing
-`deployment` switches to the data plane's log for the same apply, which is
-where the engine's own row-copy and throttle lines live. `schemabot logs
-<apply-id>` renders it and `-f` follows it.
+SchemaBot's stored lifecycle events for an apply, including state transitions
+and errors. In local mode, this also includes engine logs. For remote engine
+logs, see [Read deployment logs](#read-deployment-logs).
 
 <details>
 <summary>Read the lifecycle log</summary>
@@ -815,8 +843,11 @@ Response excerpt (illustrative values):
 </details>
 
 The database-independent route, `GET /api/logs?apply_id=apply-example-73`,
-returns the same shape. Check `truncated` when present; older entries were
-left outside the returned window.
+returns the same shape. The default window is the latest 50 entries, returned
+oldest first. Set `limit` to request a larger window. When `truncated` is true,
+older entries exist; increasing the limit reads further back. There is no
+pagination cursor. Remote deployment logs cap the window at 999 entries per
+source, so increasing the limit cannot always recover the whole lifecycle.
 
 ### Read deployment logs
 
@@ -866,7 +897,7 @@ Response excerpt (illustrative values):
       "logs": [
         {
           "id": 12,
-          "apply_id": "apply-example-73",
+          "apply_id": "remote-apply-example-73",
           "level": "info",
           "event_type": "state_change",
           "message": "Apply state changed",
@@ -878,6 +909,38 @@ Response excerpt (illustrative values):
     }
   ],
   "errors": []
+}
+```
+
+</details>
+
+The outer `apply_id` identifies the SchemaBot apply; each source's `external_id`
+and log entries' `apply_id` identify the remote execution. A successful HTTP
+response can still contain source errors. Keep the readable sources and report
+the missing ones; do not treat partial logs as a complete record.
+
+<details>
+<summary>Partial result example (HTTP 200)</summary>
+
+For the same request, one source may succeed while another cannot be read.
+The successful source below has no log entries yet:
+
+```json
+{
+  "apply_id": "apply-example-73",
+  "deployment": "us-east",
+  "sources": [{
+    "external_id": "remote-apply-example-73",
+    "operations": [{"operation_key": "us-east/shop"}],
+    "logs": []
+  }],
+  "errors": [{
+    "external_id": "remote-apply-example-74",
+    "operations": [{"operation_key": "us-east/archive"}],
+    "code": "RemoteLogReadFailed",
+    "reason": "remote_log_read_failed",
+    "message": "Data-plane logs could not be read; check server logs and retry."
+  }]
 }
 ```
 
@@ -906,8 +969,8 @@ Response excerpt (illustrative values):
     {
       "database": "shop",
       "database_type": "mysql",
-      "owner": "example/schemas#42",
-      "repository": "example/schemas",
+      "owner": "example/store#42",
+      "repository": "example/store",
       "pull_request": 42,
       "created_at": "2026-09-01T02:55:00Z"
     }
