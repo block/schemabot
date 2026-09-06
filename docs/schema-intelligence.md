@@ -820,10 +820,13 @@ left outside the returned window.
 
 ### Read deployment logs
 
-In [gRPC mode](release.md#two-planes-and-deploy-ordering), the control plane
-coordinates changes while remote data planes run the engines. Logs without
-`--deployment` come from the control plane's stored lifecycle record.
-`--deployment` (API: `deployment`) switches the read to a remote data plane.
+In local mode, the logs include both coordination and engine execution; omit
+`--deployment`. If your installation uses [remote data planes over gRPC](release.md#two-planes-and-deploy-ordering),
+those logs are separate: omit `--deployment` for scheduling, safety gates, and
+coordination, or add it to investigate copying, throttling, or cutover in a
+specific deployment. An investigation may need both views.
+
+`--deployment` (API: `deployment`) selects the remote data plane's logs:
 
 - **Use a configured deployment name**, such as `us-east`, from the apply's
   `operations[].deployment` in progress. It selects where that apply ran;
