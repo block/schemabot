@@ -100,8 +100,8 @@ partly does.
 
 ## Safe should also mean fast
 
-Everything above is about not breaking the database. That is worth a lot less than it sounds if the
-price is a slower week.
+Everything so far has been about safety. Speed matters just as much. Making a schema change safe does
+not make it any less tedious to run, and SchemaBot should remove the tedium too, not just the risk.
 
 Mostly the two are not in tension, because the same declarative model that lets the tool reason about
 a change is what lets it do the work. You edit a file. You do not write the `ALTER`, decide whether
