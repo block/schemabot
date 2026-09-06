@@ -1197,7 +1197,8 @@ func TestGoSafeRecoversPanicAndPostsErrorComment(t *testing.T) {
 	})
 
 	body := requireComment(t, comments, "panic recovery comment")
-	assert.Contains(t, body, "Internal error while processing this request")
+	assert.Contains(t, body, "Internal error while processing this command")
+	assert.Regexp(t, "This is a SchemaBot bug \\(error reference `[0-9a-f]{8}`\\)", body)
 	assert.NotContains(t, body, "boom", "the raw panic value must never reach the public PR comment")
 
 	logged := logBuf.String()
@@ -1226,7 +1227,9 @@ func TestGoSafeOmitsEmptyDeliveryIDFromPanicLog(t *testing.T) {
 		panic("boom")
 	})
 
-	requireComment(t, comments, "panic recovery comment")
+	body := requireComment(t, comments, "panic recovery comment")
+	assert.NotContains(t, body, "boom", "the raw panic value must never reach the public PR comment")
+
 	logged := logBuf.String()
 	assert.Contains(t, logged, "goroutine panic")
 	assert.NotContains(t, logged, "delivery_id=")

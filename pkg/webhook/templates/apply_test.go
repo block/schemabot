@@ -2091,17 +2091,16 @@ func TestRenderApplyBlockedByNonPassingChecks_EmptyList(t *testing.T) {
 }
 
 func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
-	t.Run("generic error posts sanitized copy with retry block", func(t *testing.T) {
+	t.Run("generic error renders internal-error guidance with retry block", func(t *testing.T) {
 		err := errors.New("get combined commit status: 500 Internal Server Error")
 
-		result := RenderApplyBlockedByCheckStatusError("staging", err, nil)
+		result := RenderApplyBlockedByCheckStatusError("staging", err, nil, "ab12cd34")
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "— Staging")
-		assert.Contains(t, result, "Unable to verify PR check statuses; see server logs for details.")
-		assert.NotContains(t, result, "500 Internal Server Error",
-			"raw error text must never render in PR markdown")
-		assert.Contains(t, result, "Retry:\n```\nschemabot apply -e staging\n```",
+		assert.NotContains(t, result, "get combined commit status",
+			"raw GitHub API error text must not render on the PR")
+		assert.Contains(t, result, "Unable to verify PR check statuses. Internal SchemaBot error. Retry (error reference `ab12cd34`):\n```\nschemabot apply -e staging\n```",
 			"retry command must be inside a fenced code block immediately after the retry copy")
 	})
 
@@ -2111,7 +2110,7 @@ func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
 		result := RenderApplyBlockedByCheckStatusError("production", err, &CheckStatusAccessDetails{
 			GitHubApp:          "schemabot-prod",
 			MissingPermissions: []string{"Checks: Read"},
-		})
+		}, "ab12cd34")
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "— Production")
@@ -2123,8 +2122,8 @@ func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
 			"retry command must be inside a fenced code block immediately after the retry copy")
 		assert.NotContains(t, result, "Unable to verify PR check statuses",
 			"permission branch should replace the generic verbatim message")
-		assert.NotContains(t, result, "Resolve the issue and retry:",
-			"permission branch should not also emit the generic-branch retry copy")
+		assert.NotContains(t, result, "error reference",
+			"permission branch has actionable guidance and should not also emit the generic-branch internal-error copy")
 	})
 
 	t.Run("permission error explains ambiguous check-status failure when REST probes pass", func(t *testing.T) {
@@ -2134,45 +2133,49 @@ func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
 			GitHubApp:              "schemabot-prod",
 			ChecksReadable:         true,
 			CommitStatusesReadable: true,
-		})
+		}, "ab12cd34")
 
 		assert.Contains(t, result, "SchemaBot GitHub App `schemabot-prod`")
 		assert.Contains(t, result, "Diagnostic REST probes could read both **Checks** and **Commit statuses**")
-		assert.Contains(t, result, "inspect the SchemaBot logs")
+		assert.Contains(t, result, "Internal SchemaBot error. Retry (error reference `ab12cd34`)")
 		assert.NotContains(t, result, "Grant or accept those permissions")
 	})
 
-	t.Run("nil error renders the same sanitized copy", func(t *testing.T) {
-		result := RenderApplyBlockedByCheckStatusError("staging", nil, nil)
+	t.Run("nil error skips empty fence and uses concise retry copy", func(t *testing.T) {
+		result := RenderApplyBlockedByCheckStatusError("staging", nil, nil, "ab12cd34")
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "— Staging")
-		assert.Contains(t, result, "Unable to verify PR check statuses; see server logs for details.")
+		assert.Contains(t, result, "Unable to verify PR check statuses.")
 		assert.Contains(t, result, "Retry:\n```\nschemabot apply -e staging\n```",
 			"retry command must be inside a fenced code block immediately after the retry copy")
+		assert.NotContains(t, result, "```\n```",
+			"nil-error branch should not emit an empty fenced code block")
+		assert.NotContains(t, result, "error reference",
+			"nil-error branch should not reference an error that was not surfaced")
 	})
 }
 
 func TestRenderApplyBlockedByPriorEnvCheckError(t *testing.T) {
-	t.Run("renders reason with sanitized detail", func(t *testing.T) {
-		result := RenderApplyBlockedByPriorEnvCheckError("staging", "fetch PR details")
+	t.Run("renders reason and internal-error guidance", func(t *testing.T) {
+		result := RenderApplyBlockedByPriorEnvCheckError("staging", "fetch PR details", "ab12cd34")
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
-		assert.Contains(t, result, "Could not verify staging status: failed to fetch PR details. Retry the apply command.")
-		assert.Contains(t, result, "_See server logs for details._")
+		assert.Contains(t, result, "Could not verify staging status: failed to fetch PR details.")
+		assert.Contains(t, result, "Internal SchemaBot error. Retry (error reference `ab12cd34`).")
 	})
 
 	t.Run("each reason variant produces matching body", func(t *testing.T) {
 		for _, reason := range []string{"create GitHub client", "fetch PR details", "query check runs"} {
-			result := RenderApplyBlockedByPriorEnvCheckError("production", reason)
-			assert.Contains(t, result, "Could not verify production status: failed to "+reason+". Retry the apply command.")
+			result := RenderApplyBlockedByPriorEnvCheckError("production", reason, "ab12cd34")
+			assert.Contains(t, result, "Could not verify production status: failed to "+reason+".")
 		}
 	})
 
 	t.Run("full body is stable", func(t *testing.T) {
-		expected := "## ❌ Apply Blocked\n\nCould not verify staging status: failed to create GitHub client. Retry the apply command.\n\n_See server logs for details._\n" + supportChannelOfferMarker + "\n"
+		expected := "## ❌ Apply Blocked\n\nCould not verify staging status: failed to create GitHub client. Internal SchemaBot error. Retry (error reference `ab12cd34`).\n" + supportChannelOfferMarker + "\n"
 
-		assert.Equal(t, expected, RenderApplyBlockedByPriorEnvCheckError("staging", "create GitHub client"))
+		assert.Equal(t, expected, RenderApplyBlockedByPriorEnvCheckError("staging", "create GitHub client", "ab12cd34"))
 	})
 }
 

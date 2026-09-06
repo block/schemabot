@@ -1128,13 +1128,15 @@ func verifyHMAC(signature string, body, secret []byte) bool {
 func (h *Handler) recoverPanic(repo string, pr int, installationID int64, deliveryID string) {
 	if r := recover(); r != nil {
 		stack := debug.Stack()
+		errorRef := newErrorReference()
 		attrs := []any{"repo", repo, "pr", pr, "installation_id", installationID}
 		if deliveryID != "" {
 			attrs = append(attrs, "delivery_id", deliveryID)
 		}
-		h.logger.Error("goroutine panic", append(attrs, "error", r, "stack", string(stack))...)
+		h.logger.Error("goroutine panic", append(attrs, "error_ref", errorRef, "error", r, "stack", string(stack))...)
+		metrics.RecordRecoveredPanic(context.Background(), "webhook_command")
 		h.postComment(repo, pr, installationID,
-			"**Internal error while processing this request. This is a bug — please report it.** Details are in the server logs.")
+			"**Internal error while processing this command.** This is a SchemaBot bug (error reference `"+errorRef+"`).")
 	}
 }
 

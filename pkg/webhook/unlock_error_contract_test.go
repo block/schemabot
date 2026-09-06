@@ -144,7 +144,8 @@ func TestUnlockCommandCoreTransientFailuresAreRetryable(t *testing.T) {
 		require.Error(t, err)
 		assert.True(t, retry, "a failed GitHub read during inference must stay retryable for a durable driver")
 		body := requireComment(t, comments, "inference failure comment")
-		assert.Contains(t, body, "Failed to infer database for force unlock")
+		assert.Contains(t, body, "Failed to infer the database for force unlock.")
+		assert.Regexp(t, "error reference `[0-9a-f]{8}`", body)
 	})
 
 	t.Run("lock lookup failure is retryable", func(t *testing.T) {
@@ -273,8 +274,7 @@ func TestUnlockCommandCoreTerminalDispositions(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, retry, "a missing config is a deterministic rejection the same delivery always reproduces")
 		body := requireComment(t, comments, "no-config inference rejection comment")
-		assert.Contains(t, body, "Failed to infer database for force unlock")
-		assert.Contains(t, body, "no schemabot.yaml config found")
+		assert.Contains(t, body, "No SchemaBot config was found for this PR, so there is no database to force-unlock.")
 	})
 
 	t.Run("no locks found is terminal", func(t *testing.T) {
@@ -554,7 +554,7 @@ func TestUnlockCommandCoreInferenceRejectionsAreTerminal(t *testing.T) {
 				})
 				serveConfigFile(t, mux, "schemabot.yaml", "type: mysql\n")
 			},
-			wantComment: "invalid schemabot.yaml config found",
+			wantComment: "Force unlock could not infer a database: invalid schemabot.yaml config found",
 		},
 		{
 			// A PR spanning several configs this deployment manages is
@@ -573,7 +573,7 @@ func TestUnlockCommandCoreInferenceRejectionsAreTerminal(t *testing.T) {
 				serveConfigFile(t, mux, "db/orders/schemabot.yaml", "database: orders\ntype: mysql\n")
 				serveConfigFile(t, mux, "db/payments/schemabot.yaml", "database: payments\ntype: mysql\n")
 			},
-			wantComment: "multiple SchemaBot configs match this PR",
+			wantComment: "Multiple SchemaBot configs match this PR.",
 		},
 		{
 			// A config outside this deployment's allowed_dirs is another
@@ -593,7 +593,7 @@ func TestUnlockCommandCoreInferenceRejectionsAreTerminal(t *testing.T) {
 				serveUnlockInferencePR(t, mux, "db/other/schemabot.yaml")
 				serveConfigFile(t, mux, "db/other/schemabot.yaml", "database: orders\ntype: mysql\n")
 			},
-			wantComment: "no schemabot.yaml config found",
+			wantComment: "No SchemaBot config was found for this PR",
 		},
 	}
 
@@ -612,7 +612,6 @@ func TestUnlockCommandCoreInferenceRejectionsAreTerminal(t *testing.T) {
 			require.NoError(t, err)
 			assert.False(t, retry, "a deterministic inference rejection is the command's answer; re-driving reproduces it")
 			body := requireComment(t, comments, "inference rejection comment")
-			assert.Contains(t, body, "Failed to infer database for force unlock")
 			assert.Contains(t, body, tc.wantComment)
 		})
 	}

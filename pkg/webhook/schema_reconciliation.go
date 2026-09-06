@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"strings"
@@ -16,6 +17,35 @@ import (
 type schemaChangeReconciliationRecord struct {
 	check *storage.Check
 	apply *storage.Apply
+}
+
+// prClosedForCheckRefreshError reports that a check-refresh command targeted a
+// closed PR. Its wording is composed for PR display: the user gets an explicit
+// rejection instead of a "refreshed as passing" comment on a PR that can never
+// merge.
+type prClosedForCheckRefreshError struct {
+	repo string
+	pr   int
+}
+
+func (e *prClosedForCheckRefreshError) Error() string {
+	return fmt.Sprintf("PR #%d in %s is closed; SchemaBot refreshes check state only for open PRs", e.pr, e.repo)
+}
+
+// noManagedSchemaChangesErrorDetail maps a handleNoManagedSchemaChangesForCommand
+// failure to the text rendered on the PR. The closed-PR rejection and the
+// config-discovery outcomes are authored for the user; everything else (GitHub
+// reads, storage, check updates) is an internal failure whose raw text stays in
+// the server logs.
+func noManagedSchemaChangesErrorDetail(err error, errorRef string) string {
+	var closedErr *prClosedForCheckRefreshError
+	if errors.As(err, &closedErr) {
+		return closedErr.Error()
+	}
+	if isUserMeaningfulSchemaRequestError(err) {
+		return err.Error()
+	}
+	return internalErrorDetail("Failed to check whether this PR needs schema change reconciliation.", errorRef)
 }
 
 func (h *Handler) handleNoManagedSchemaChangesForCommand(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, commandName, environment, databaseName, requestedBy string) (bool, error) {
@@ -104,7 +134,7 @@ func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Contex
 				"repo", repo, "pr", pr, "requested_by", requestedBy)
 			return nil
 		}
-		return fmt.Errorf("PR #%d in %s is closed; SchemaBot refreshes check state only for open PRs", pr, repo)
+		return &prClosedForCheckRefreshError{repo: repo, pr: pr}
 	}
 
 	headSHA := prInfo.HeadSHA

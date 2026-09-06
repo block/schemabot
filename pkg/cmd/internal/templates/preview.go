@@ -208,10 +208,12 @@ const (
 	PreviewCommentBlockedByPriorEnv     PreviewType = "comment_blocked_prior_env"            // Blocked by staging (pending)
 	PreviewCommentBlockedByPriorFailed  PreviewType = "comment_blocked_prior_env_failed"     // Blocked by staging (failed)
 	PreviewCommentBlockedByPriorInProg  PreviewType = "comment_blocked_prior_env_inprogress" // Blocked by staging (in progress)
+	PreviewCommentBlockedByPriorError   PreviewType = "comment_blocked_prior_env_error"      // Blocked: prior env check unverifiable (fail-closed)
 	PreviewCommentReviewRequired        PreviewType = "comment_review_required"              // Review gate: approval needed
 	PreviewCommentReviewGateError       PreviewType = "comment_review_gate_error"            // Review gate: fail-closed error
 	PreviewCommentChecksGateNotPassing  PreviewType = "comment_checks_gate_not_passing"      // Checks gate: non-passing CI/lint
 	PreviewCommentChecksGateInProgress  PreviewType = "comment_checks_gate_in_progress"      // Checks gate: CI still running
+	PreviewCommentChecksGateError       PreviewType = "comment_checks_gate_error"            // Checks gate: fail-closed read error
 	PreviewCommentActorNotAuthorized    PreviewType = "comment_actor_not_authorized"         // Actor authorization: user is not allowed
 	PreviewCommentActorAuthUnavailable  PreviewType = "comment_actor_auth_unavailable"       // Actor authorization: fail-closed error
 	PreviewCommentDatabaseNotConfigured PreviewType = "comment_database_not_configured"      // Actor authorization: database not configured on this instance

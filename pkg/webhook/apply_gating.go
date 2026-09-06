@@ -138,6 +138,7 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 			details.ChecksReadable = diagnostic.ChecksReadable
 			details.CommitStatusesReadable = diagnostic.CommitStatusesReadable
 		}
+		errorRef := newErrorReference()
 		h.logger.Error("failed to fetch PR check statuses, stopping apply",
 			"repo", repo,
 			"pr", pr,
@@ -152,10 +153,10 @@ func (h *Handler) enforcePassingChecks(ctx context.Context, client *ghclient.Ins
 			"missing_permissions", diagnostic.MissingPermissions,
 			"checks_error", diagnostic.ChecksError,
 			"commit_statuses_error", diagnostic.CommitStatusesError,
-			"error", err)
+			"error_ref", errorRef, "error", err)
 		if !suppressRetryComments {
 			h.postComment(repo, pr, installationID,
-				templates.RenderApplyBlockedByCheckStatusError(environment, err, details))
+				templates.RenderApplyBlockedByCheckStatusError(environment, err, details, errorRef))
 		}
 		return false, fmt.Errorf("checks gate read PR check statuses %s#%d: %w", repo, pr, err)
 	}
