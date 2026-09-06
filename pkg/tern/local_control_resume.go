@@ -422,6 +422,20 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			drainer.Drain()
 		}
 
+		// Revert-phase task states come only from an engine whose database
+		// type always drives grouped, so no task reaches this loop in one.
+		// Should one ever arrive, the schema comparison below proves nothing
+		// about it — post-cutover the live schema matches the reviewed target
+		// by definition until a revert lands — and the sequential drive has no
+		// engine reattach to learn its outcome from, so settling it here would
+		// report a reverting change as applied. Abort without finalizing so
+		// nothing is settled from evidence that cannot support it.
+		if taskInRevertPhase(task) {
+			logger.Error("resume aborting: a revert-phase task reached the sequential drive, whose schema comparison cannot settle it; the apply stays active for an operator to examine",
+				task.LogAttrs()...)
+			return
+		}
+
 		// Verify this table still needs changes before applying. There's a race
 		// between re-plan (which reads schema) and Spirit's cutover (which renames
 		// the shadow table). If Spirit completed the cutover after the re-plan read
@@ -455,7 +469,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			// task was reviewed with. Fail closed rather than apply unreviewed
 			// DDL.
 			logger.Error("resume aborting task: the re-plan no longer includes the task's reviewed DDL",
-				"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "error", err)
+				append(task.LogAttrs(), "error", err)...)
 			c.markTaskFailed(ctx, task, err.Error())
 			failedTask = task
 			break
@@ -830,7 +844,8 @@ func (c *LocalClient) verifyReplannedTaskDDL(task *storage.Task, replanned []str
 	// A remaining statement is vouched (a pending sibling's reviewed DDL),
 	// orphaned (a terminal sibling's reviewed DDL that nothing pending will
 	// run), or unreviewed (drift). Terminal siblings likewise explain one
-	// occurrence of their statement.
+	// occurrence of their statement each, so an occurrence beyond what the
+	// terminal siblings were reviewed with is still unreviewed.
 	var orphaned []*storage.Task
 	unreviewed := make([]string, 0, len(replannedCanon))
 	for _, canon := range replannedCanon {
@@ -838,9 +853,9 @@ func (c *LocalClient) verifyReplannedTaskDDL(task *storage.Task, replanned []str
 			vouchers[canon]--
 			continue
 		}
-		if owners, ok := terminalByCanon[canon]; ok {
-			orphaned = append(orphaned, owners...)
-			delete(terminalByCanon, canon)
+		if owners := terminalByCanon[canon]; len(owners) > 0 {
+			orphaned = append(orphaned, owners[0])
+			terminalByCanon[canon] = owners[1:]
 			continue
 		}
 		unreviewed = append(unreviewed, canon)
