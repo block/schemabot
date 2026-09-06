@@ -58,13 +58,16 @@ You want the database left alone. One command stops the copy where it stands. No
 converted, nothing has to be cleaned up by hand, and when the incident is over the change picks up
 where it left off.
 
-None of it should require you to know what made it dangerous. The lock a statement takes, the drop
-nobody should be able to do quietly, the thing routine on one engine and refused on another: somebody
-already paid for that knowledge, usually the hard way, and it belongs in the tool. The usual
-alternative is a more careful person, and that works right up until the author is not a person. "Be
-more careful" does not land on an agent. It can write a thousand schema changes a week, it does not
-slow down on the risky ones, and it does not remember the outage that taught everyone to be careful
-with that table. And there is rarely just one of them.
+**A change that gets refused.** Someone adds a foreign key. It is an ordinary thing to write, and on
+the last database they worked on it would have been fine. This one is sharded, and a foreign key
+across shards is not a thing that works. SchemaBot says so on the pull request, before anything has
+run, and says why. Nobody on the team today knows that rule. Somebody paid for it once, and it stayed
+paid.
+
+The usual alternative is a more careful person, and that works right up until the author is not a
+person. "Be more careful" does not land on an agent. It can write a thousand schema changes a week,
+it does not slow down on the risky ones, and it does not remember the outage that taught everyone to
+be careful with that table. And there is rarely just one of them.
 
 That is the thing worth building, and it is about to matter far more than it does today. Software is
 being written faster than any review process was built to absorb, and the schema is where that speed
