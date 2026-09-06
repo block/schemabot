@@ -302,6 +302,15 @@ Start with the database and environment you inspected:
 schemabot status -d shop -e production
 ```
 
+```text
+Schema change history for shop
+
+  APPLY ID          ENV         STATE      STARTED      DURATION  SOURCE
+  apply-example-42  production  Completed  2 hours ago  2m        example/store#42
+
+Use 'schemabot status <apply_id>' to view details
+```
+
 Take an `apply_id` from this history into the next section.
 
 <details>
@@ -343,6 +352,13 @@ to its exact execution. A plan alone does not prove a change ran.
 
 ```sh
 schemabot status apply-example-42
+```
+
+Output excerpt:
+
+```text
+~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+  ALTER TABLE `orders` ADD COLUMN `discount_code` varchar(32);
 ```
 
 <details>
@@ -570,13 +586,33 @@ Recent plans
   ⚠️ unsafe change
 ```
 
-Open a plan to see its DDL and safety classification, or narrow the list to
-one database or PR:
+To inspect a plan from the list, use its plan ID:
 
 ```sh
 schemabot list-plans plan-example-42
-schemabot list-plans -d shop -e staging
-schemabot list-plans --repository example/store --pr 42
+```
+
+```text
+plan-example-42
+  Database:    shop (mysql)
+  Environment: staging
+  Source:      example/store#42
+  Created:     2026-09-01T02:55:00Z
+
+     - old_orders
+       DROP TABLE `old_orders`;
+
+     - old_order_events
+       DROP TABLE `old_order_events`;
+
+     ~ orders
+       ALTER TABLE `orders` ADD COLUMN `discount_code` varchar(32);
+
+⚠️ Unsafe Changes Detected:
+  1. old_orders: Dropping a table permanently deletes its data
+  2. old_order_events: Dropping a table permanently deletes its data
+
+📋 Plan: 1 table to alter, 2 tables to drop
 ```
 
 Each replan has its own ID, so one PR can appear more than once. The warning
@@ -710,11 +746,27 @@ Response excerpt (illustrative values):
             "table_name": "orders",
             "ddl": "ALTER TABLE `orders` ADD COLUMN `discount_code` varchar(32) DEFAULT NULL",
             "change_type": "alter"
+          },
+          {
+            "table_name": "old_orders",
+            "ddl": "DROP TABLE `old_orders`",
+            "change_type": "drop",
+            "is_unsafe": true,
+            "unsafe_reason": "Dropping a table permanently deletes its data"
+          },
+          {
+            "table_name": "old_order_events",
+            "ddl": "DROP TABLE `old_order_events`",
+            "change_type": "drop",
+            "is_unsafe": true,
+            "unsafe_reason": "Dropping a table permanently deletes its data"
           }
         ]
       }
     ]
-  }
+  },
+  "repository": "example/store",
+  "pull_request": 42
 }
 ```
 
