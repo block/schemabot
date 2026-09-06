@@ -31,10 +31,13 @@ match its files. Deploy the code onto a database that is ready for it.
 
 Iterate locally, review the plan in the PR, and carry the same schema through your environments.
 
-This guide assumes your repository is connected to SchemaBot; the
-[GitHub App setup guide](github-app-setup.md) gets you there. The examples use
-MySQL with staging and production. Your engines, environments, and enabled
-gates determine the steps available to you.
+Before you start, your database must be registered, your repository connected
+to the GitHub App, and your identity authorized to apply changes. Follow the
+[setup guide](github-app-setup.md) if those are not in place.
+
+The examples use MySQL with staging and production. Use the environment names
+from your installation and the commands in your PR's plan comment. Available
+controls vary by [engine](engines.md#capability-matrix).
 
 ## Why apply before merge
 
@@ -71,17 +74,34 @@ schema/
     └── products.sql  # desired end state of the `products` table
 ```
 
-Each `.sql` file holds the full `CREATE TABLE` for that table: the desired end
-state, not a diff. To change a table, edit its file (add a column, add an
-index) and open a PR. SchemaBot computes the DDL needed to move the live
-database to what the file describes. Dropping is declarative too: delete the
-file to drop the table, delete the column's line to drop the column. A flat
-layout, with `schemabot.yaml` directly beside the `.sql` files, also works for
-a single schema name, and
-[`schemabot onboard`](github-app-setup.md#6-add-schemabotyaml-config-to-your-repository)
-generates the directory from a live database, so you rarely author one by
-hand. Multi-schema and per-environment naming is covered in
-[namespaces.md](namespaces.md).
+`schema/schemabot.yaml` identifies the registered database:
+
+```yaml
+database: mydb
+type: mysql
+```
+
+The `database` value must match the server configuration. Environment names
+and promotion order are configured on the server, not in this file.
+
+Each table file holds its full desired `CREATE TABLE` statement. For example,
+`schema/mydb/users.sql` after adding a nullable email column:
+
+```sql
+CREATE TABLE `users` (
+  `id` bigint unsigned NOT NULL,
+  `email` varchar(255) DEFAULT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+```
+
+SchemaBot compares that definition with the live table and computes the DDL.
+Removing a column from the definition requests a drop; deleting a table file
+requests a table drop. Review the plan before applying either.
+
+The [onboarding guide](github-app-setup.md#6-add-schemabotyaml-config-to-your-repository)
+shows how to generate these files from an existing database. See
+[namespaces](namespaces.md) for flat layouts and multiple schema names.
 
 ## The dev loop
 
@@ -143,9 +163,11 @@ swap across tables. The application must tolerate the intermediate states.
 
 ## The PR workflow, step by step
 
-Here is the workflow for a compatible schema addition. Screenshots use the
-actual comment templates with illustrative values; each shows a different
-stage of the workflow:
+Post the apply commands below as **comments on the open PR**. They refer to
+that PR's schema files. Terminal commands later in this guide are separate.
+
+Screenshots show the actual comment templates with illustrative values; they
+are examples of each stage, not a transcript of one apply.
 
 1. **Edit the table's `.sql` file and open a PR.**
 2. **SchemaBot plans automatically.** It posts the DDL diff as a PR comment,
@@ -157,14 +179,15 @@ stage of the workflow:
 
 3. **Apply to staging** by commenting `schemabot apply -e staging`. SchemaBot
    acknowledges the command with a 👀 reaction, re-plans the current head,
-   takes the database lock, and starts the apply.
+   checks the configured gates, takes the database lock, and starts the apply.
+   The reaction acknowledges the request; it does not mean the change completed.
 
    ![Step 3: the apply command and SchemaBot's apply comment, with the lock acquired](../assets/pr-mockups/pre-merge-2-apply.png)
 
 4. **Watch the status comment.** SchemaBot edits one progress comment in place
-   for as long as the apply runs: rows copied, percent complete, an ETA, and
-   the command to stop it. Use the reported
-   progress and throttle reason to see how the copy is doing.
+   while the apply runs. Depending on the engine and phase, it shows rows,
+   percent complete, an ETA, and available controls. An ETA is an estimate;
+   use the throttle reason to understand why a copy is slowing down.
 
    ![Step 4: the status comment with a progress bar, row counts, and an ETA](../assets/pr-mockups/pre-merge-3-status.png)
 
@@ -188,7 +211,7 @@ stage of the workflow:
 
    ![Step 8: the pull request merged](../assets/pr-mockups/pre-merge-6-merged.png)
 
-9. **Deploy as usual.** For an additive change, the code rolls out onto a
+9. **Deploy as usual.** For a compatible addition, the code rolls out onto a
    database that already has the shape it expects.
 
 The full command set, with every flag, is in the help comment
@@ -220,44 +243,37 @@ the gate scopes these checks to the relevant schema directory.
 
 ### What the check means
 
-SchemaBot publishes one aggregate Check Run per environment it manages
-(`SchemaBot (staging)`, `SchemaBot (production)`, or a single `SchemaBot` when
-one deployment owns every environment), Configure branch protection to require the appropriate checks.
-Internally SchemaBot keeps one row per database the PR touches and rolls them
-up conservatively: any database still in progress, failed, or waiting on an
-operator keeps the aggregate red, and only all-success turns it green
-([MG-3](invariants.md#mg-3-the-rollup-is-conservative)).
+Require the SchemaBot checks in branch protection and pin them to the
+SchemaBot GitHub App. The [setup instructions](check-runs.md#branch-protection-setup)
+explain how to choose the check names for your installation.
 
-There are exactly three ways a database's row turns green: a current plan finds
-no changes, the apply the row represents completes successfully, or the PR
-head no longer touches that database and no apply had started. Everything
-else, including uncertainty about storage or GitHub, is a reason to stay red,
-never a reason to pass
-([MG-1](invariants.md#mg-1-uncertainty-is-never-converted-into-a-passing-check),
-[MG-2](invariants.md#mg-2-absence-never-passes)).
+Read the check's status and conclusion to decide what to do next:
 
-Read the check's conclusion, not its color. GitHub renders an
-`action_required` check with the same red mark as a failure, but it is not a
-failure. It means the check is waiting on an action, usually an apply that has
-not been posted yet, and the plan comment says which. Two edges are worth
-knowing before you meet them:
+| What you see | What it means | Next step |
+|---|---|---|
+| `in_progress` | Schema work is still active | Follow the progress comment |
+| `success` | No unapplied managed schema changes remain for this check's scope | Merge when the other required checks and reviews pass |
+| `action_required` | A decision or command is needed | Read the check details and follow the next action in the PR |
+| `failure` | Planning, execution, or reconciliation failed | Read the error before replanning or starting another apply |
+| Expected, not reported | GitHub has no matching check for this head | Follow [missing-check recovery](#if-the-check-is-stuck) |
 
-- **A started apply stays authoritative.** If a later commit removes the
-  schema change after its apply started, the check stays blocked until the
-  apply settles and an operator reconciles the database with what the PR now
-  says. Closing the PR does not cancel the apply, and closing and reopening it
-  does not wash the block away
-  ([MG-6](invariants.md#mg-6-started-applies-keep-blocking-after-the-change-disappears)).
-  To stop a running apply, use `stop` or `cancel`; editing the files back
-  never does it.
-- **A completed rollback is never green.** After `rollback-confirm` succeeds,
-  the row goes to `action_required`, because the database no longer contains
-  what the PR describes. The PR either applies again or drops the change
-  ([MG-7](invariants.md#mg-7-a-completed-rollback-never-shows-green)).
+A no-change plan can pass without running an apply. A successful apply can
+also pass, but only when the aggregate's other database records are ready.
+An uncertain or missing result never counts as success.
 
-[check-runs.md](check-runs.md) has the full state table, every blocking
-reason, and the branch protection setup, including why the required check must
-be pinned to the SchemaBot GitHub App and not matched by name alone.
+Two recovery cases need extra care:
+
+- **Removing the schema edit or closing the PR.** A started apply still needs
+  to settle and be reconciled with the current files. Closing the PR does not
+  cancel it. Where supported, `stop` preserves work for a later resume;
+  `cancel` ends that apply and is not a pause
+- **Rolling back the schema.** A completed rollback leaves the check at
+  `action_required`, because the live schema no longer matches the proposal.
+  Reconcile the files and database before merging
+
+See [check runs](check-runs.md) for the full state model and
+[apply lifecycle](apply-lifecycle.md) for recovery after a stopped, cancelled,
+or failed apply.
 
 ### Promotion order
 
@@ -291,7 +307,8 @@ on PRs without schema edits too. Try these ways to refresh it:
    push does.
 
 If the check is still missing, ask an operator to check event processing and
-branch-protection configuration. Operators can also sweep every open PR for missing or stuck checks and recreate them with
+branch-protection configuration. Operators can also sweep open PRs for missing
+or stuck checks with
 `schemabot checks backfill`, described in
 [check-runs.md](check-runs.md#backfilling-missing-check-runs). Disabling the
 required check is the last resort, never the first, because it removes the
@@ -394,7 +411,7 @@ there after your PR closes.
 
 ## The safety gates in the loop
 
-Each step of the workflow is guarded, and every guard fails closed:
+These gates apply according to your installation’s configuration:
 
 | Gate | What it does | Where |
 |---|---|---|
@@ -404,7 +421,7 @@ Each step of the workflow is guarded, and every guard fails closed:
 | Promotion order | Production applies only after the prior environment's check is success | [check-runs.md](check-runs.md#environment-ordering) |
 | PR checks gate | When enabled, requires the configured CI checks to pass before applying | [configuration.md](configuration.md#pr-checks-gate) |
 | Review gate | When enabled, requires an approving review from a configured reviewer before applying; the author’s own approval never counts | [configuration.md](configuration.md#review-gate) |
-| Merge gate | The required aggregate check passes only when every change is live in every environment | [check-runs.md](check-runs.md) |
+| Merge gate | The required aggregate check passes when its scope has no unapplied managed schema changes | [check-runs.md](check-runs.md) |
 
 The full list of what must never be false while SchemaBot runs is
 [invariants.md](invariants.md); the merge gating family (MG) is the one this
