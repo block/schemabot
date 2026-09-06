@@ -53,10 +53,9 @@ The harder part is judgment. A version table can tell you that change 47 ran. It
 whether change 47 should have: whether the DDL matches the schema that is actually live, whether it
 locks a hot table for forty minutes, whether it drops a column something is still reading.
 
-Much of that is automated today, and automated well. Comparing a desired schema against a live one
-and computing the difference, refusing to generate something destructive unless explicitly told to,
-flagging a change that will hold a lock: those are solved problems in more than one tool. SchemaBot
-does all of that, and did not invent any of it. The declarative model it is built on is the same one.
+Some of that is automated. Diffing a desired schema against a live one, refusing to generate
+something destructive unless told to, flagging a change that will hold a lock: SchemaBot does all of
+it and invented none of it.
 
 Where SchemaBot goes further is everything after the plan looks right, which is usually the point
 where the work comes back to a person. Running the change is SchemaBot's job. It copies a large table
