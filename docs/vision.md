@@ -20,17 +20,9 @@
 
 This is where SchemaBot is headed.
 
-Everything else in `docs/` describes what it does today. This one is about what we want it to
-become, and why that is worth building. There are no dates in it and nothing here is a promise to
-ship. It exists so that when a decision comes up, we have something to hold it against.
-
-For what is true right now, [invariants.md](./invariants.md) is the registry of what must never be
-false while SchemaBot is running, and where each rule is enforced. [engines.md](./engines.md) is the
-capability matrix, and [postgresql.md](./postgresql.md) is the current PostgreSQL envelope. Where
-this document disagrees with any of those, believe those.
-
-Keeping them apart matters. The registry is only worth something if every line in it is true, so
-ambition needed a home of its own. This is that home.
+Everything else in `docs/` describes what it does today, and where this document disagrees with any
+of that, believe those. There are no dates here and nothing in it is a promise to ship. It exists so
+that when a decision comes up, we have something to hold it against.
 
 ## The northstar
 
