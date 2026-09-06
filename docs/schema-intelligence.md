@@ -944,13 +944,11 @@ The successful source below has no log entries yet:
 
 </details>
 
-## Check locks and settings
+## Check locks
 
 `GET /api/locks` lists every database lock currently held and who holds it (a
 PR or a CLI operator), which is how a dashboard shows what is claimed before it
-shows what is running. `GET /api/settings` returns the deployment-wide settings
-that operators can change at runtime. `schemabot locks` and `schemabot
-settings` render them.
+shows what is running.
 
 <details>
 <summary>List locks</summary>
@@ -977,30 +975,6 @@ Response excerpt (illustrative values):
 ```
 
 </details>
-
-<details>
-<summary>Read settings</summary>
-
-```http
-GET /api/settings
-```
-
-Response excerpt (illustrative values):
-
-```json
-{
-  "settings": [
-    {
-      "key": "spirit_debug_logs",
-      "value": "false"
-    }
-  ]
-}
-```
-
-</details>
-
-Setting values are strings; an empty `settings` list means no stored overrides.
 
 ## Give a tool read-only access
 
