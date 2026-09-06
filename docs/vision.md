@@ -200,7 +200,8 @@ re-checked if that plan moves. Uncertainty never becomes a passing check. Author
 at every tier. Not one of those asks whether a human or an agent produced the DDL, and none of them
 should ever start. An agent that can talk its way past a gate is a gate that was never real.
 
-SchemaBot does not make agents trustworthy. It makes the question irrelevant.
+SchemaBot does not make agents trustworthy. It checks the change rather than the author, so you never
+have to settle that question before letting one through.
 
 ## Many agents, one database
 
