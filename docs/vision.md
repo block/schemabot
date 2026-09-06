@@ -6,13 +6,6 @@
 > that is a millisecond of work or three weeks of it, says which on the pull request, and then does
 > it.
 
-The agent wrote the change. SchemaBot decided how to run it. Neither the agent nor the person
-reviewing it had to know which of those two it was going to be.
-
-This is where SchemaBot is headed. Everything else in `docs/` describes what it does today, and where
-this document disagrees with any of that, believe those. There are no dates here and nothing in it is
-a promise to ship. It exists so that when a decision comes up, we have something to hold it against.
-
 ## The northstar
 
 Every database should be able to evolve safely. A weekend project, the tier-zero fleet a business
