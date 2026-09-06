@@ -173,9 +173,11 @@ should all be able to drive the same loop, because none of them is where the tru
 ## Guardrails and context for agents
 
 Agents are bad at imperative change scripts and good at declarative desired state, and that is not a
-stylistic preference. Writing a correct `ALTER` means knowing the current state of the database, the
-ordering against every other pending change, and how to undo it. Editing a `CREATE TABLE` file means
-knowing none of that, because the diff engine works all three out.
+stylistic preference. Writing a correct `ALTER` means knowing the current state of the database, how
+your statement orders against every other change that has not landed yet, and what the inverse
+statement would be if it has to come back out. Editing a `CREATE TABLE` file means knowing none of
+that, because all three fall out of diffing the file against what is live. Going back is the same
+operation as going forward, run against an earlier version of the file.
 
 The file is also the context. Asking what indexes a table has today is a question you answer by
 reading one file, not by replaying every change ever made to it and trusting that none of them landed
