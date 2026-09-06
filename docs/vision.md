@@ -65,11 +65,10 @@ be unsafe in front of production is unsafe in front of a weekend project too, an
 both places.
 
 Concretely, the shape SchemaBot runs in should be a choice rather than a prerequisite. A coordinating
-server on Kubernetes that never needs a route to your databases, because a separate process inside
-each network does the work there. One server process with a database behind it. No server at all,
-just the CLI against a connection string. Or SchemaBot embedded as a library inside the application
-that owns the schema, close enough to run at startup. The first three work today and the fourth
-partly does.
+server on Kubernetes that never needs a route to your databases: a separate process inside each
+network does the work there. One server process with a database behind it. No server at all, just the
+CLI against a connection string. Or SchemaBot embedded as a library inside the application that owns
+the schema, close enough to run at startup. The first three work today and the fourth partly does.
 
 ![Both ends of the range feed into the same four gates: diff against the live database, lint before anything runs, explicit consent to destroy, and uncertainty never passing](../assets/vision-range.svg)
 
