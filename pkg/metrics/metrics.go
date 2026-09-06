@@ -491,6 +491,8 @@ var knownPRCommandActorAuthReasons = map[string]bool{
 	"disabled":                true,
 	"allowed_admin_team":      true,
 	"allowed_admin_user":      true,
+	"allowed_repo_admin_team": true,
+	"allowed_repo_admin_user": true,
 	"allowed_operator_team":   true,
 	"allowed_operator_user":   true,
 	"missing_actor":           true,
@@ -556,6 +558,7 @@ var knownDirectWriteAuthStatuses = map[string]bool{
 
 var knownDirectWriteAuthReasons = map[string]bool{
 	"scoped_lane_disabled":    true,
+	"target_unresolved":       true,
 	"admin_allow":             true,
 	"scoped_allow":            true,
 	"missing_identity":        true,
