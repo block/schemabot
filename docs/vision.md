@@ -58,10 +58,6 @@ You want the database left alone. One command stops the copy where it stands. No
 converted, nothing has to be cleaned up by hand, and when the incident is over the change picks up
 where it left off.
 
-What separates those from each other is not visible in the DDL. It moves with the engine, the
-version, and the size of the table, and getting it wrong is how a routine Tuesday becomes an
-incident. SchemaBot works it out and takes the cheapest option that is safe.
-
 None of it should require you to know what made it dangerous. The lock a statement takes, the drop
 nobody should be able to do quietly, the thing routine on one engine and refused on another: somebody
 already paid for that knowledge, usually the hard way, and it belongs in the tool. The usual
