@@ -11,15 +11,19 @@ const {chromium}=require('playwright');
  let browser;
  try {
   browser=await chromium.launch({headless:true,...(fs.existsSync(chrome)?{executablePath:chrome}:{})});
-  const page=await browser.newPage({viewport:{width:960,height:780},deviceScaleFactor:1});
+  const page=await browser.newPage({viewport:{width:1100,height:820},deviceScaleFactor:1});
   await page.goto(pathToFileURL(path.join(root,'assets/src/pr-workflow-demo.html')).href);
   await page.evaluate(()=>Promise.all([...document.images].map(i=>i.decode())));
   const frames=[];
-  for(let i=0;i<=216;i++){
+  for(let i=0;i<=256;i++){
    await page.evaluate(t=>window.renderFrame(t),i/8);
+   if(i===160){
+    const text=await page.locator('#progress-body').innerText();
+    if(!text.includes('100.00%')||text.includes('DEMOVALUE'))throw new Error('Progress frame must show 100% with no placeholder text');
+   }
    const frame=path.join(tmp,`${String(i).padStart(4,'0')}.png`);await page.screenshot({path:frame});frames.push(frame);
   }
   execFileSync('magick',['-delay','12','-loop','0',...frames,'-layers','Optimize',path.join(root,'assets/pr-workflow-demo.gif')]);
-  console.log('Rendered 217 frames, including 100% progress and merge');
+  console.log('Rendered 257 frames, including 100% progress and merge');
  } finally {if(browser)await browser.close();fs.rmSync(tmp,{recursive:true,force:true})}
 })().catch(e=>{console.error(e);process.exitCode=1});
