@@ -1,11 +1,5 @@
 # Vision
 
-> An agent edits one line of a `CREATE TABLE` file and opens a pull request.
->
-> SchemaBot reads the live database, works out the exact DDL that closes the gap, decides whether
-> that is a millisecond of work or three weeks of it, says which on the pull request, and then does
-> it.
-
 ## The northstar
 
 Every database should be able to evolve safely. A weekend project, the tier-zero fleet a business
