@@ -138,17 +138,7 @@ The pretty view keeps columns and indexes in the SQL instead of repeating them.
 The JSON response includes the catalog shown below. Row counts and sizes are
 engine estimates; the available catalog detail varies by dialect.
 
-<details>
-<summary>API equivalent and structured catalog</summary>
-
-```http
-POST /api/pull
-Content-Type: application/json
-
-{"database": "shop", "environment": "production", "catalog_detail": "detailed"}
-```
-
-Response excerpt for `orders` (the CLI's `--table` filter runs client-side):
+Response excerpt for `orders`:
 
 ```json
 {
@@ -160,16 +150,48 @@ Response excerpt for `orders` (the CLI's `--table` filter runs client-side):
         "orders": {
           "name": "orders",
           "kind": "table",
-          "columns": [{"name": "id", "type": "bigint unsigned", "nullable": false}],
-          "indexes": [{"name": "PRIMARY", "primary": true, "unique": true, "parts": ["id"]}],
+          "columns": [
+            {
+              "name": "id",
+              "type": "bigint unsigned",
+              "nullable": false
+            }
+          ],
+          "indexes": [
+            {
+              "name": "PRIMARY",
+              "primary": true,
+              "unique": true,
+              "parts": [
+                "id"
+              ]
+            }
+          ],
           "estimated_row_count": 18402551,
           "data_size_bytes": 4294967296
         }
+      },
+      "namespace_catalog": {
+        "name": "shop",
+        "engine": "mysql",
+        "table_count": 1
       }
     }
   }
 }
 ```
+
+<details>
+<summary>API equivalent</summary>
+
+```http
+POST /api/pull
+Content-Type: application/json
+
+{"database": "shop", "environment": "production", "catalog_detail": "detailed"}
+```
+
+The CLI's `--table` filter runs client-side.
 
 </details>
 
