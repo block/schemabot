@@ -236,6 +236,19 @@ All SQL statements processed by SchemaBot **must be parseable by the dialect's r
 - **Do not** silently skip unparseable statements with patterns like `if err != nil { continue }` unless the error is an expected type-filtering condition (e.g., `ParseCreateTable` returning an error for an `ALTER TABLE` statement).
 - Schema files are expected to contain DDL valid for their target dialect. If the dialect's parser cannot handle a valid construct, that is a bug to fix in the parser dependency (the TiDB parser / Spirit, or libpg_query), not something to work around with string splitting.
 
+### Upstream First: Fix the Engine, Not the Consumer
+
+The rule above is one instance of a general one. **When a change reaches into a dependency's territory, first ask whether the fix belongs in the dependency.** Parser semantics, DDL diffing and canonicalization, schema introspection, progress and checkpoint state, and anything that has to know how an engine works internally are the domain of [`block/spirit`](https://github.com/block/spirit) and [`block/pg-sprite`](https://github.com/block/pg-sprite), not of SchemaBot. Both are ours to change. A fix that lands upstream fixes every consumer, gets the engine's own test suite behind it, and stays correct when the engine evolves. A fix that lands here has to re-derive the engine's behavior from the outside and breaks the next time the engine changes it.
+
+Prefer the upstream change whenever it makes consumption simpler: a new exported function or option, a typed error instead of an error string to match on, a field on a status or result struct instead of a value to infer, a hook where SchemaBot currently peeks. Shortcuts that reach around the dependency are brittle by construction and are the last resort, not the first draft:
+
+- parsing the engine's log lines or error text to recover a fact the engine already knows
+- re-implementing part of its parser, differ, or introspection on our side, or string-manipulating DDL it already parses
+- copying a private helper out of it instead of asking for it to be exported
+- inferring engine state from side effects (table names, sentinel rows, timing) instead of from an API
+
+When the upstream fix is right but cannot wait for a release, land the smallest workaround here with a comment stating what upstream capability retires it, and open the upstream change in the same sitting so the workaround has an expiry. The Vitess fork (see *Vitess Dependency*) follows the same rule for the code we carry on top of upstream Vitess.
+
 ## AWS Infrastructure
 
 - **Always deploy from the worktree you're working in.** The deploy script uses `git rev-parse --show-toplevel` to resolve paths, so it builds whatever code is in your current working tree. Verify with `pwd` and `git branch --show-current` before deploying.
