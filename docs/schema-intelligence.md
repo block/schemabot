@@ -558,10 +558,11 @@ cursor; increase the limit or narrow the filters. Even at the maximum, a
 busy scope can exceed the returned list. `state_counts` still covers all
 matching applies.
 
-Each row carries the apply ID, database, environment, deployment, state,
-engine, caller, error message, and started, completed, and updated
-timestamps. `schemabot status` renders it; `schemabot status --json` returns
-it raw.
+Each row carries the apply ID, database, environment, state, engine, caller,
+error message, and started, completed, and updated timestamps. A row carries
+`deployment` only when the request is deployment-filtered; an unfiltered list
+omits the field on every row. `schemabot status` renders it;
+`schemabot status --json` returns it raw.
 
 <details>
 <summary>Request and response example</summary>
@@ -574,6 +575,7 @@ Response excerpt (illustrative values):
 
 ```json
 {
+  "active_count": 2,
   "limit": 20,
   "max_limit": 1000,
   "state_counts": {
@@ -586,30 +588,31 @@ Response excerpt (illustrative values):
       "apply_id": "apply-example-73",
       "database": "shop",
       "environment": "production",
-      "deployment": "us-east",
       "engine": "spirit",
       "state": "running",
       "caller": "example/store#42",
+      "started_at": "2026-09-01T02:41:00Z",
       "updated_at": "2026-09-01T03:01:00Z"
     },
     {
       "apply_id": "apply-example-72",
       "database": "billing",
       "environment": "production",
-      "deployment": "us-east",
       "engine": "spirit",
       "state": "waiting_for_cutover",
       "caller": "example/billing#73",
+      "started_at": "2026-09-01T01:01:00Z",
       "updated_at": "2026-09-01T03:01:00Z"
     },
     {
       "apply_id": "apply-example-71",
       "database": "accounts",
       "environment": "production",
-      "deployment": "us-east",
       "engine": "spirit",
       "state": "completed",
       "caller": "example/accounts#18",
+      "started_at": "2026-09-01T02:01:00Z",
+      "completed_at": "2026-09-01T02:58:00Z",
       "updated_at": "2026-09-01T03:01:00Z"
     }
   ]
@@ -727,7 +730,7 @@ Response excerpt (illustrative values):
       "environment": "staging",
       "repository": "example/store",
       "pull_request": 42,
-      "created_at": "2026-09-01T02:55:00Z",
+      "created_at": "2026-09-01T01:55:00Z",
       "change_counts": {
         "alter": 1,
         "drop": 2
@@ -741,7 +744,7 @@ Response excerpt (illustrative values):
       "environment": "staging",
       "repository": "example/accounts",
       "pull_request": 18,
-      "created_at": "2026-09-01T02:55:00Z",
+      "created_at": "2026-09-01T00:55:00Z",
       "change_counts": {}
     },
     {
@@ -751,7 +754,7 @@ Response excerpt (illustrative values):
       "environment": "staging",
       "repository": "example/billing",
       "pull_request": 73,
-      "created_at": "2026-09-01T02:55:00Z",
+      "created_at": "2026-08-31T23:55:00Z",
       "change_counts": {
         "create": 1
       }
@@ -763,7 +766,7 @@ Response excerpt (illustrative values):
       "environment": "staging",
       "repository": "example/warehouse",
       "pull_request": 29,
-      "created_at": "2026-09-01T02:55:00Z",
+      "created_at": "2026-08-31T22:55:00Z",
       "change_counts": {
         "alter": 2
       }
@@ -849,7 +852,7 @@ Response excerpt (illustrative values):
       "id": 81,
       "apply_id": "apply-example-73",
       "level": "info",
-      "event_type": "state_change",
+      "event_type": "state_transition",
       "message": "Apply state changed",
       "old_state": "pending",
       "new_state": "running",
@@ -908,7 +911,7 @@ Response excerpt (illustrative values):
       "external_id": "remote-apply-example-73",
       "operations": [
         {
-          "operation_key": "us-east"
+          "operation_key": "shop/-80/orders"
         }
       ],
       "logs": [
@@ -916,7 +919,7 @@ Response excerpt (illustrative values):
           "id": 12,
           "apply_id": "remote-apply-example-73",
           "level": "info",
-          "event_type": "state_change",
+          "event_type": "state_transition",
           "message": "Apply state changed",
           "old_state": "pending",
           "new_state": "running",
@@ -948,12 +951,12 @@ The successful source below has no log entries yet:
   "deployment": "us-east",
   "sources": [{
     "external_id": "remote-apply-example-73",
-    "operations": [{"operation_key": "us-east/shop"}],
+    "operations": [{"operation_key": "shop/-80/orders"}],
     "logs": []
   }],
   "errors": [{
     "external_id": "remote-apply-example-74",
-    "operations": [{"operation_key": "us-east/archive"}],
+    "operations": [{"operation_key": "archive/-80/events"}],
     "code": "RemoteLogReadFailed",
     "reason": "remote_log_read_failed",
     "message": "Data-plane logs could not be read; check server logs and retry."
