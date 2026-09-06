@@ -823,21 +823,20 @@ deployment over gRPC run with that deployment's engine settings.
 
 `postgres.statement_timeout` bounds a single ordinary query on the connections
 SchemaBot opens to its **own** PostgreSQL storage database: the long-lived
-storage pool and the startup bootstrap's catalog reads. It defaults to `30s`.
-It has nothing to do with the budgets an apply runs under, which pg-sprite sets
-on the target database.
+storage pool and the startup bootstrap's catalog reads. It defaults to `30s`,
+and `"0"` disables it. It does not affect the budgets an apply runs under,
+which pg-sprite sets on the target database.
 
-Setting it matters even where the default is right, because the alternative is
-not "no budget". A connection that sets nothing runs under whatever
-`statement_timeout` the platform set at the role or database level, and hosted
-PostgreSQL providers set one by default, tuned for API queries rather than for
-SchemaBot's workload. When it fires, PostgreSQL raises SQLSTATE `57014`, the
-same code an operator's `pg_cancel_backend` produces, so an inherited budget is
-easy to misread during triage. Stating the budget makes it SchemaBot's to
-explain.
+Set it even where the default is right, because the alternative is not "no
+budget". A connection that states nothing inherits whatever `statement_timeout`
+the platform set at the role or database level, and hosted providers set one by
+default, tuned for API queries rather than for SchemaBot. When it fires,
+PostgreSQL raises SQLSTATE `57014`, the same code an operator's
+`pg_cancel_backend` produces, so an inherited budget is easy to misread during
+triage.
 
-Three statement classes run under three budgets, because they fail for
-different reasons and a single value cannot serve all of them:
+Three classes of statement fail for different reasons, so each runs under its
+own budget:
 
 | Statement class | Budget | Why |
 |---|---|---|
@@ -845,18 +844,15 @@ different reasons and a single value cannot serve all of them:
 | Bootstrap convergence DDL | Derived from the bootstrap deadline | An index build legitimately runs far longer than a catalog read |
 | Bootstrap advisory-lock wait | None | The wait must be free to block while another pod bootstraps |
 
-There is a fourth, outside the server: the maintenance commands an operator
-runs against storage by hand disable the budget outright, because the operator
-supervising the command is the bound.
+Storage maintenance commands run from the CLI also disable the budget: the
+operator supervising the command is the bound.
 
-`statement_timeout` bounds a statement that is *blocked*, not only one that is
-computing, which sets a floor on what this value may be. The longest a storage
-query legitimately blocks is the 10s wait to acquire an apply target's advisory
-lock: below that, the budget cancels the acquisition before its lock timeout
-can report the ordinary "another instance holds it", and routine contention
-starts surfacing as a statement timeout instead. The server rejects a non-zero
-value at or below that wait at startup rather than letting the symptom appear
-later, far from the setting that caused it.
+**The value must exceed `10s`, and the server rejects a smaller non-zero value
+at startup.** `statement_timeout` bounds a blocked statement, not only a
+computing one, and the longest a storage query legitimately blocks is the 10s
+wait for an apply target's advisory lock. Below that, routine contention is
+cancelled as a statement timeout before the lock wait can report the ordinary
+"another instance holds it".
 
 The bootstrap DDL budget is not configurable, because its safety comes from
 being derived rather than chosen: it sits just under the deadline that already
