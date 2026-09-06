@@ -109,6 +109,70 @@ The response gives you the table definitions without logging into the database.
 A pull reads the environment's **primary deployment**, not every deployment or
 shard independently; it does not prove every copy in the fleet matches.
 
+**What columns and indexes can my tool read without parsing SQL?** A normal
+pull puts each table's SQL in `namespaces.<name>.tables`. On MySQL,
+`catalog_detail: detailed` keeps that SQL and adds `table_catalog`: columns
+with types and nullability, indexes with their parts and uniqueness, foreign
+keys, and estimated row counts and sizes. It also adds a `namespace_catalog`
+summary. Your tool reads JSON fields instead of interpreting `CREATE TABLE`.
+
+Request it from the CLI:
+
+```sh
+schemabot pull -d shop -e production --table orders --catalog-detail detailed
+```
+
+The CLI adds this line above the table's SQL:
+
+```sql
+-- Table `orders` — rows ~18,402,551, size ~4.0 GiB (engine estimates)
+```
+
+To see the structured payload, add `-o json`:
+
+```sh
+schemabot pull -d shop -e production --table orders --catalog-detail detailed -o json
+```
+
+The pretty view keeps columns and indexes in the SQL instead of repeating them.
+The JSON response includes the catalog shown below. Row counts and sizes are
+engine estimates; the available catalog detail varies by dialect.
+
+<details>
+<summary>API equivalent and structured catalog</summary>
+
+```http
+POST /api/pull
+Content-Type: application/json
+
+{"database": "shop", "environment": "production", "catalog_detail": "detailed"}
+```
+
+Response excerpt for `orders` (the CLI's `--table` filter runs client-side):
+
+```json
+{
+  "database": "shop",
+  "environment": "production",
+  "namespaces": {
+    "shop": {
+      "table_catalog": {
+        "orders": {
+          "name": "orders",
+          "kind": "table",
+          "columns": [{"name": "id", "type": "bigint unsigned", "nullable": false}],
+          "indexes": [{"name": "PRIMARY", "primary": true, "unique": true, "parts": ["id"]}],
+          "estimated_row_count": 18402551,
+          "data_size_bytes": 4294967296
+        }
+      }
+    }
+  }
+}
+```
+
+</details>
+
 **Which tables are missing a primary key?** Add `--lint` to inspect a live
 schema for issues. On a MySQL database, a finding looks like this:
 
@@ -156,8 +220,7 @@ Repeat across the supported databases and environments in your inventory, then
 group these findings with their database, environment, namespace, and table.
 Your agent can list the affected tables; your dashboard can track fixes over
 time. Schedule pulls and cache results rather than scanning the fleet on every
-question. For structured columns and indexes alongside the DDL, add
-`catalog_detail: detailed` where supported.
+question.
 
 **Which change added this column?** Start with the database's history,
 then inspect a candidate apply.
@@ -366,56 +429,6 @@ Three options turn a schema dump into an inventory:
   itself; the diff-based ones (unsafe drops, dropping an index that was never
   made invisible) need a proposed change and never fire on a pull. See
   [lint-and-safety-levels.md](lint-and-safety-levels.md#auditing-a-live-schema-pull---lint).
-
-For example, inspect a MySQL table with its size estimates:
-
-```sh
-schemabot pull -d shop -e production --table orders --catalog-detail detailed
-```
-
-The CLI adds this line above the table's SQL:
-
-```sql
--- Table `orders` — rows ~18,402,551, size ~4.0 GiB (engine estimates)
-```
-
-Add `-o json` to read columns, indexes, and estimates as structured fields.
-The pretty view keeps columns and indexes in the SQL instead of repeating them.
-
-<details>
-<summary>API equivalent and structured catalog</summary>
-
-```http
-POST /api/pull
-Content-Type: application/json
-
-{"database": "shop", "environment": "production", "catalog_detail": "detailed"}
-```
-
-Response excerpt for `orders` (the CLI's `--table` filter runs client-side):
-
-```json
-{
-  "database": "shop",
-  "environment": "production",
-  "namespaces": {
-    "shop": {
-      "table_catalog": {
-        "orders": {
-          "name": "orders",
-          "kind": "table",
-          "columns": [{"name": "id", "type": "bigint unsigned", "nullable": false}],
-          "indexes": [{"name": "PRIMARY", "primary": true, "unique": true, "parts": ["id"]}],
-          "estimated_row_count": 18402551,
-          "data_size_bytes": 4294967296
-        }
-      }
-    }
-  }
-}
-```
-
-</details>
 
 The envelope differs by dialect:
 
