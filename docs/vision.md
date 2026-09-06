@@ -40,56 +40,37 @@ ambition needed a home of its own. This is that home.
 ## The northstar
 
 Every database should be able to evolve safely. A weekend project, the tier-zero fleet a business
-runs on, and everything in between. And you should not have to become a database expert to get that.
-Adding a column, adding an index, dropping a table that really is dead: none of it should carry a
-risk of taking the database down with it.
+runs on, and everything in between. Adding a column, adding an index, dropping a table that really is
+dead: none of it should risk taking the database down, and none of it should require you to be a
+database expert first.
 
-People have been chasing this for a long time. A `schema_version` table, ordered changelogs,
-checksums that catch an edited file, a runner that refuses to apply the same change twice. That
-generation of tools took the bookkeeping off your hands, and the bookkeeping was worth taking.
+People have been chasing this for a long time, and the bookkeeping is solved: version tables, ordered
+changelogs, runners that refuse to apply the same change twice. So is some of the judgment. Diffing
+the schema you want against the one you have, refusing to write something destructive unless you ask,
+warning you about a lock: SchemaBot does all of that.
 
-But a version table can only tell you that change 47 ran. It has no opinion on whether change 47
-should have. That judgment is the harder problem, and some of it is automated now: diff the schema
-you want against the one you have, refuse to write something destructive unless you ask for it, warn
-you when a change is going to hold a lock. SchemaBot does all of that.
+What is left is how the change should run, and that is a decision every time. Adding a nullable
+column to a modern MySQL table finishes in milliseconds. Changing that column's type rebuilds the
+whole table. None of it is visible in the DDL, it shifts with the engine and the version and the size
+of the table, and getting it wrong is how a routine Tuesday becomes an incident. SchemaBot works it
+out and takes the cheapest option that is safe. When a copy is the answer it runs the copy: in the
+background, throttling itself when the database gets busy, staying honest for however many weeks it
+takes, swapping only when you say so, stoppable at any point without leaving a table half converted.
 
-What is left is how the change should actually run, and that is a real decision every single time.
-Adding a nullable column to a modern MySQL table is a metadata edit that finishes in milliseconds,
-and the right move is to run it and get on with your day. Changing that column's type is a rebuild of
-the whole table. Reordering a primary key is a different problem again. None of that is visible in
-the DDL. It shifts with the engine, the version, and the size of the table, and getting it wrong is
-how a routine Tuesday becomes an incident. So SchemaBot works it out, takes the cheapest option that
-is safe, and when it cannot tell, takes the safe one.
+That knowledge is the point. The lock a statement takes, the drop nobody should be able to do
+quietly, the thing routine on one engine and refused on another: somebody already paid for all of it,
+usually the hard way, and it belongs in the tool. The usual alternative is a more careful person, and
+that works right up until the author is not a person. "Be more careful" does not land on an agent. It
+can write a thousand schema changes a week, it does not slow down on the risky ones, and it does not
+remember the outage that taught everyone to be careful with that table. There is rarely just one of
+them.
 
-When a copy is the right answer, SchemaBot runs the copy. It builds the new table in the background,
-watches the database while it works, slows down when the database gets busy, and keeps going for as
-long as it takes, so nobody sits with it and nobody is awake at 2am. If that is three weeks, it stays
-honest for three weeks: it is judged against the database as it is, not as it was when you planned
-it, so a schema that moved underneath you shows up as a red check instead of a surprise at the end.
-The moment it swaps onto the new table is yours to pick, and until you pick it, nothing your
-application sees has changed. And you can stop it at any point, without leaving a table half
-converted.
-
-None of this should require you to know it. The lock a statement takes, the drop nobody should be
-able to do quietly, the thing that is routine on one engine and refused on another: that is knowledge
-somebody already paid for, usually the hard way. It belongs in the tool, on by default, for everyone.
-
-The usual answer instead is a more careful person: review checklists, runbooks, a database team who
-says no. That works, right up until the author is not a person. "Be more careful" does not land on an
-agent. It can write a thousand schema changes a week. It does not get tired, it does not slow down on
-the risky ones, and it does not remember the outage that taught everyone to be careful with that
-table. Caution is something people build over years of running things. An agent starts from scratch
-every time. And there is rarely just one of them.
-
-That is the part about to matter far more than it does today. Software is being written faster than
-any review process was designed to absorb, and the schema is where that speed meets something that
-does not forgive. Code can be regenerated. The data underneath it cannot.
-
-So the judgment has to live in the tool. Not as advice a careful person follows, but as the thing
-standing between a proposed change and a live database, applied identically whether the author is a
-staff engineer, someone on their first week, or the twelfth agent to open a pull request this hour.
-Get that right and the ceiling comes off: schemas that move as fast as the code that needs them, on
-databases nobody is scared of, at any scale, at any hour.
+Which is why this is about to matter far more than it does today. Software is being written faster
+than any review process was built to absorb, and the schema is where that speed meets something that
+does not forgive. Code can be regenerated. The data underneath it cannot. So the judgment has to live
+in the tool, applied identically whether the author is a staff engineer, someone on their first week,
+or the twelfth agent to open a pull request this hour. Get that right and schemas move as fast as the
+code that needs them, on databases nobody is scared of, at any scale, at any hour.
 
 ## From a vibe-coded experiment to a tier-zero database
 
