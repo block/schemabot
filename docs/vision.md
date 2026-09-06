@@ -23,8 +23,8 @@ This is where SchemaBot is headed.
 If you have not used it: SchemaBot changes database schemas. You describe the tables you want as
 ordinary SQL files in your repository, one `CREATE TABLE` per table, and SchemaBot compares those
 files against the database as it actually is, works out the DDL that closes the gap, and runs it
-without taking the database down. Nobody writes the `ALTER`. That comparison, and the checks around
-it, are what this document is about.
+without taking the database down. That comparison, and the checks around it, are what this document
+is about.
 
 Everything else in `docs/` describes what SchemaBot does today. This one is about what we want it to
 become, and why that is worth building. There are no dates in it and nothing here is a promise to
@@ -101,12 +101,13 @@ partly does.
 ## Safe should also mean fast
 
 Everything so far has been about safety. Speed matters just as much. Making a schema change safe does
-not make it any less tedious to run, and SchemaBot should remove the tedium too, not just the risk.
+not make it any less of a chore to run, and SchemaBot should take the chore away too, not just the
+risk.
 
 Mostly the two are not in tension, because the same declarative model that lets the tool reason about
-a change is what lets it do the work. You edit a file. You do not write the `ALTER`, decide whether
-it can run in place or needs a copy, pick a batch size, tune a throttle, or run anything by hand at
-midnight because that is when traffic is low.
+a change is what lets it do the work. You edit a file. You do not have to work out the `ALTER`,
+decide whether it can run in place or needs a copy, pick a batch size, tune a throttle, or run
+anything by hand at midnight because that is when traffic is low.
 
 Four things should disappear:
 
@@ -321,7 +322,7 @@ and about engines that can be supported honestly, not about saying yes to everyt
 | Property | What already holds | What is missing |
 |---|---|---|
 | Experiment to tier zero | The plan and the gates are identical at any scale. Local mode drives a database straight from a DSN in a single process, and SchemaBot already embeds as a Go module. | The small end still pays for the large end: a server, storage, and a GitHub App for the PR flow. Embedding is a supported import rather than a supported way to run the whole loop. PostgreSQL, the likeliest engine down there, is early alpha. |
-| Safe should also mean fast | Nobody writes the DDL, picks an execution strategy, or runs anything by hand. Long changes run unattended and report progress, and a deferred cutover lets the copy finish without the swap happening until someone picks the moment. | The rerun has not actually disappeared. A change still needs a person to say yes once per environment, `apply -e staging` and then `apply -e production`, rather than one intent that promotes itself as each environment goes green. Nothing measures what a schema change costs in human time either, so the couple of minutes above is a target rather than a number anyone can check. |
+| Safe should also mean fast | You do not have to write the DDL, pick an execution strategy, or run anything by hand. Long changes run unattended and report progress, and a deferred cutover lets the copy finish without the swap happening until someone picks the moment. | The rerun has not actually disappeared. A change still needs a person to say yes once per environment, `apply -e staging` and then `apply -e production`, rather than one intent that promotes itself as each environment goes green. Nothing measures what a schema change costs in human time either, so the couple of minutes above is a target rather than a number anyone can check. |
 | GitOps, not GitHub | Enforced rather than intended. Applies work while GitHub is down, the CLI covers the full PR surface, and an outage never invents state. The process that touches your database carries no GitHub credentials. | The merge gate itself is expressed as GitHub Check Runs. No second forge is implemented, so the separation is proven by the CLI rather than by a second integration. |
 | Agents | Declarative files are already an agent-readable source of truth, every gate is author-agnostic, and the plan API returns the change set, the per-shard detail, and every lint finding as JSON. | No packaged agent surface. Nothing tells an agent that API exists or how to use it, so in practice an agent reads files and opens a PR the same as a person. An MCP server and a skill are the obvious missing pieces. |
 | Many agents, one database | Concurrent authors are already serialized: one change at a time per database, ownership that has to be proven on every write, and no stale plan ever applies. The merge gate coordinates open changes with no protocol between them. | The coordination is opaque. No readable queue, no machine-readable reason for a block, no expected wait. A blocked caller can only poll. |
