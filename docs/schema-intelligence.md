@@ -454,12 +454,21 @@ schemabot status -e production
 Use 'schemabot status <apply_id>' to view details
 ```
 
-Open an apply from the list, or narrow the fleet view to running changes:
+To see what’s happening with a change, use its apply ID:
 
 ```sh
 schemabot status apply-example-73
-schemabot status -e production --state running --limit 100
 ```
+
+Output excerpt:
+
+```text
+~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)
+  ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
+  • Rows: 6,000,000 / 10,000,000
+```
+
+Here, `orders` is 60% copied and currently throttled.
 
 `GET /api/status` spans the registered databases. It returns the
 most recent applies across the SchemaBot instance. Alongside the list it returns
