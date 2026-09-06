@@ -299,18 +299,6 @@ However far any of the above gets, these hold:
 Breadth that costs any of that is not progress. The range described above is about deployment size
 and about engines that can be supported honestly, not about saying yes to everything.
 
-## Where we are today
-
-| Property | What already holds | What comes next |
-|---|---|---|
-| Experiment to tier zero | The plan and the gates are identical at any scale. Local mode drives a database straight from a DSN in a single process, and SchemaBot already embeds as a Go module. | Making the small end genuinely small, so a binary and a connection string run the whole loop and the server, the storage, and the GitHub App become things you add when you want them. Embedding becomes a supported way to run that loop rather than a supported import. PostgreSQL, the likeliest engine down there, gets past early alpha. |
-| Safe should also mean fast | You do not have to write the DDL, pick an execution strategy, or run anything by hand. Long changes run unattended and report progress, and a deferred cutover lets the copy finish without the swap happening until someone picks the moment. | One intent that promotes itself as each environment goes green, instead of a person saying yes once per environment with `apply -e staging` and then `apply -e production`. And a measure of what a change costs in human time, so the couple of minutes above becomes a number anyone can check rather than a target. |
-| GitOps, not GitHub | Enforced rather than intended. Applies work while GitHub is down, the CLI covers the full PR surface, and an outage never invents state. The process that touches your database carries no GitHub credentials. | A second forge. The merge gate is expressed as GitHub Check Runs today, so that is the piece a second integration has to reach, and reaching it turns a separation the CLI demonstrates into one another forge proves. |
-| Agents | Declarative files are already an agent-readable source of truth, every gate is author-agnostic, and the plan API returns the change set, the per-shard detail, and every lint finding as JSON. | A packaged agent surface: an MCP server and a skill, so an agent finds that API and uses it, rather than reading files and opening a pull request the same way a person does. |
-| Many agents, one database | Concurrent authors are already serialized: one change at a time per database, ownership that has to be proven on every write, and no stale plan ever applies. The merge gate coordinates open changes with no protocol between them. | Coordination a caller can read: the queue it is in, why it is held, and how long the wait is expected to be, so a held change waits instead of polling. |
-| One database, or ten thousand | The read API answers what is live, what changed, and what is changing, and `pull --lint` audits a live schema against the rules. | The same operations across the whole fleet at once: one aggregate query, findings grouped by rule rather than by database, and one intent dispatched to many targets and watched or stopped as a single thing. |
-| Everything underneath | Each engine gets its own semantics rather than a shared subset, and an engine that cannot do something safely refuses at plan time instead of guessing. | PostgreSQL past early alpha, so first class there is a shipped fact and not only a commitment. The engine boundary is clean already; the forge boundary and a plugin surface get the same treatment. |
-
 ## Reading further
 
 - [invariants.md](./invariants.md) is the registry of what must never be false while SchemaBot is
