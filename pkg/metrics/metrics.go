@@ -1205,6 +1205,7 @@ var knownOperatorClaimFailureReasons = map[string]bool{
 	"operation_lease_recheck_error":            true,
 	"operation_lease_recheck_missing":          true,
 	"operation_lease_rotated":                  true,
+	"operation_lease_released_by_peer":         true,
 	"missing_operation_deployment":             true,
 	"stop_reconciliation_claim_error":          true,
 	"stop_reconciliation_missing_lease_token":  true,

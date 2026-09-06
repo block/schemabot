@@ -918,14 +918,22 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 	// the operation lease survived the gap and hand the parent back when it did
 	// not, so the peer holding it drives instead.
 	if verdict := s.recheckOperationLease(ctx, driverID, op, opLease); verdict != operationLeaseHeld {
+		s.releaseParentApplyClaim(ctx, driverID, apply, op)
 		// An unproven lease is still this driver's: storage could not answer,
 		// but nothing showed the lease gone. Hand it back rather than sit on a
 		// row this drive is abandoning, or the claim query's heartbeat gate
 		// holds the operation for a full staleness window over one failed read.
+		//
+		// It goes back second because releasing it backdates the row past the
+		// staleness window, which makes the operation claimable again. Released
+		// first, a peer would take it while this driver still held a fresh
+		// parent lease, get nothing from ClaimApplyByID, and hand the row
+		// straight back — a wasted round trip recorded as parent contention.
+		// The reverse order leaves nothing claimable in between: the operation's
+		// heartbeat is fresh until this driver gives it up.
 		if verdict == operationLeaseUnproven {
 			s.releaseOperationClaimBeforeDrive(ctx, driverID, op, opLease)
 		}
-		s.releaseParentApplyClaim(ctx, driverID, apply, op)
 		return
 	}
 
@@ -1676,8 +1684,8 @@ const (
 	// gone, so this driver still holds it and owes a release.
 	operationLeaseUnproven
 	// operationLeaseLost: a successful read showed the lease is no longer this
-	// driver's — the row is gone, or a peer rotated the token onto itself.
-	// There is nothing left to release.
+	// driver's — the row is gone, a peer rotated the token onto itself, or a
+	// peer released it. There is nothing left to release.
 	operationLeaseLost
 )
 
@@ -1710,6 +1718,15 @@ func (s *Service) recheckOperationLease(ctx context.Context, driverID int, op *s
 		s.logger.Error("operator: claimed operation disappeared before its drive started; operation will not be driven",
 			append(op.LogAttrs(), "driver", driverID)...)
 		metrics.RecordOperatorClaimFailure(ctx, "operation_lease_recheck_missing")
+		return operationLeaseLost
+	}
+	// An empty token is a peer that released the row rather than one that took
+	// it, and the two need different log lines: nobody is driving the operation
+	// now, so the truthful outcome is that the next poll offers it again.
+	if current.LeaseToken == "" {
+		s.logger.Warn("operator: a peer released the operation lease between this driver's operation claim and its parent apply claim; the operation is offered again on the next poll",
+			append(op.LogAttrs(), "driver", driverID)...)
+		metrics.RecordOperatorClaimFailure(ctx, "operation_lease_released_by_peer")
 		return operationLeaseLost
 	}
 	if current.LeaseToken != opLease.Token {

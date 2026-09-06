@@ -554,15 +554,15 @@ func (s *capturingApplyStore) ExpireRetryable(context.Context) ([]*storage.Retry
 	return nil, nil
 }
 
+// queuedOperationLeaseToken is the token this double rotates onto the operation
+// row it leases out, standing in for the real store's generated token.
+const queuedOperationLeaseToken = "op-lease-token"
+
 // queuedOperationClaimStore serves the operation-level claim ladder over the
 // operation rows a dual-write captured in a capturingApplyStore. The cutover
 // probe always finds nothing, so every operator tick falls through to the
 // operation claim, which signals the apply store's findCh — one observable
 // signal per tick — and leases the first captured row exactly once.
-// queuedOperationLeaseToken is the token this double rotates onto the operation
-// row it leases out, standing in for the real store's generated token.
-const queuedOperationLeaseToken = "op-lease-token"
-
 type queuedOperationClaimStore struct {
 	storage.ApplyOperationStore
 	applies    *capturingApplyStore
