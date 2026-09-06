@@ -442,7 +442,17 @@ task record; ETA and per-shard rows are not persisted in this view.
 schemabot status -e production
 ```
 
-![CLI status output showing running, waiting, and completed changes across three example databases.](../assets/schema-intelligence-status.svg)
+```text
+2 active schema changes
+3 total: 1 Completed · 1 Running · 1 Waiting for cutover
+
+  APPLY ID          DATABASE  ENV         STATE                STARTED         SOURCE
+  apply-example-73  shop      production  Running              20 minutes ago  example/store#42
+  apply-example-72  billing   production  Waiting for cutover  2 hours ago     example/billing#73
+  apply-example-71  accounts  production  Completed            1 hour ago      example/accounts#18
+
+Use 'schemabot status <apply_id>' to view details
+```
 
 Open an apply from the list, or narrow the fleet view to running changes:
 
@@ -538,7 +548,18 @@ List recent plans across the databases in an environment:
 schemabot list-plans -e staging
 ```
 
-![CLI plan list spanning four example databases, including repeated plans, no-change plans, and unsafe changes.](../assets/schema-intelligence-listplans.svg)
+```text
+Recent plans
+
+  PLAN ID          DATABASE   ENV      CHANGES                 CREATED      SOURCE
+  plan-example-42  shop       staging  1 alter, 2 drop · ⚠️ 2  2 hours ago  example/store#42
+  plan-example-41  shop       staging  1 alter, 2 drop · ⚠️ 2  3 hours ago  example/store#42
+  plan-example-40  accounts   staging  no changes              4 hours ago  example/accounts#18
+  plan-example-39  billing    staging  1 create                5 hours ago  example/billing#73
+  plan-example-38  inventory  staging  2 alter                 6 hours ago  example/warehouse#29
+
+  ⚠️ unsafe change
+```
 
 Open a plan to see its DDL and safety classification, or narrow the list to
 one database or PR:
