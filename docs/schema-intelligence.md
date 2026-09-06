@@ -851,11 +851,9 @@ source, so increasing the limit cannot always recover the whole lifecycle.
 
 ### Read deployment logs
 
-In local mode, the logs include both coordination and engine execution; omit
-`--deployment`. If your installation uses [remote data planes over gRPC](release.md#two-planes-and-deploy-ordering),
-those logs are separate: omit `--deployment` for scheduling, safety gates, and
-coordination, or add it to investigate copying, throttling, or cutover in a
-specific deployment. An investigation may need both views.
+In local mode, omit `--deployment`. In [gRPC mode](release.md#two-planes-and-deploy-ordering),
+use it to see engine-level details about how the schema change is progressing,
+including copying, throttling, and cutover.
 
 `--deployment` (API: `deployment`) selects the remote data plane's logs:
 
