@@ -43,8 +43,8 @@ There is no version of that which is quick. SchemaBot builds the new table along
 copies into it for three weeks, slowing down whenever the database gets busy and picking back up when
 it quiets. The application writes to the old table the entire time and never notices. When the copy
 finishes it waits. Swapping to the new table is the only moment your application feels. You picked
-that moment three weeks ago, when you opened the pull request: 3am on Sunday, when nothing is using
-the table. Nobody sets an alarm for it.
+that moment three weeks ago, when you opened the pull request: 3am on Tuesday, when traffic is low.
+SchemaBot runs the cutover then, on its own, without anyone sacrificing their sleep for it.
 
 **Four agents, one database.** Four agents are working on the same service. One adds a column to
 `orders`, one adds an index to it, one drops a column the team stopped reading last quarter, one is
