@@ -59,10 +59,17 @@ and computing the difference, refusing to generate something destructive unless 
 flagging a change that will hold a lock: those are solved problems in more than one tool. SchemaBot
 does all of that, and did not invent any of it. The declarative model it is built on is the same one.
 
-What is still mostly left to the person starts after the plan looks right. Running the change against
-a large live table without hurting it. Keeping it correct when it takes three weeks and the schema
-moves underneath it. Choosing the moment it swaps, and stopping it halfway when the database
-disagrees. The usual answer there is to make the person more careful: review checklists, runbooks, a
+Where SchemaBot goes further is everything after the plan looks right, which is usually the point
+where the work comes back to a person. Running the change is SchemaBot's job. It copies a large table
+in the background, watches the database while it does, and backs off on its own when the database
+gets busy, so nobody has to sit with it or pick a window when traffic is low. A change that runs for
+three weeks is judged against the database as it is rather than as it was when the plan was made, so
+a schema that moved underneath it turns into a red check instead of a surprise at the end. The swap
+onto the new table is a decision somebody makes, and nothing about the application changes until they
+make it. And a change can be stopped while it is running, at any point, without leaving a table half
+converted.
+
+The usual answer to that list is to make the person more careful: review checklists, runbooks, a
 database team who says no.
 
 Increasingly the author is an agent, and "be more careful" does not work on an agent. It can write a
