@@ -13,6 +13,7 @@
 </p>
 
 <p align="center">
+  <a href="./docs/vision.md">Vision</a> ·
   <a href="#see-it-in-action">See it in action</a> ·
   <a href="#why-schemabot">Why SchemaBot</a> ·
   <a href="#how-it-works">How it works</a> ·
