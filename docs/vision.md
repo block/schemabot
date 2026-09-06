@@ -42,8 +42,9 @@ merge it, and it is. Nobody had to review it for safety. The review already happ
 rebuilding a table nobody can take offline. SchemaBot builds the new table alongside the old one and
 copies into it for three weeks, slowing down whenever the database gets busy and picking back up when
 it quiets. The application writes to the old table the entire time and never notices. When the copy
-finishes it waits, because the one moment that touches the application is the swap, and somebody
-picks when that happens. Not during a release freeze. A Tuesday morning.
+finishes it waits. The swap is the only moment that touches the application, and you chose when that
+happens three weeks earlier, when you opened the pull request: 3am on a Sunday, when nothing is using
+the table. It takes about a second. Nobody sets an alarm for it.
 
 **Four agents, one database.** Four agents are working on the same service. One adds a column to
 `orders`, one adds an index to it, one drops a column the team stopped reading last quarter, one is
