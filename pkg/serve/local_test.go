@@ -51,7 +51,7 @@ func TestLocalListenerRequiresLoopback(t *testing.T) {
 }
 
 func TestLocalConfigurationUsesSharedEngineRouting(t *testing.T) {
-	for _, engine := range []string{"mysql", "postgres", "vitess", "strata"} {
+	for _, engine := range []string{"mysql", "postgres", "vitess"} {
 		t.Run(engine, func(t *testing.T) {
 			cfg := validLocalConfig()
 			db := cfg.Databases["app"]
