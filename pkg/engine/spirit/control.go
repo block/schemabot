@@ -394,13 +394,19 @@ func quoteIdentifier(name string) string {
 	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
 }
 
-// Revert rolls back a completed schema change.
-// Spirit doesn't have built-in revert - this would need to be implemented separately.
+// Revert rolls back a completed schema change. Spirit has no revert window: the
+// change is applied by copying into a shadow table and swapping it in, and once
+// that swap lands there is no engine phase left to undo it from. The decline is
+// deterministic for every schema change on this engine, so it is typed rather
+// than returned as a generic failure, and a caller holding a durable revert
+// request resolves it terminally instead of retrying a rejection that can never
+// succeed.
 func (e *Engine) Revert(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, fmt.Errorf("revert not supported for Spirit engine")
+	return nil, engine.NewUnsupportedOperationError("revert is not supported for MySQL schema changes: the change is copied into a shadow table and swapped in, with no revert window to undo it from; undo it by planning and applying the inverse schema change")
 }
 
-// SkipRevert ends the revert window early.
+// SkipRevert ends the revert window early. Spirit has no revert window to end,
+// so the decline is deterministic and typed for the same reason as Revert.
 func (e *Engine) SkipRevert(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, fmt.Errorf("skip revert not supported for Spirit engine")
+	return nil, engine.NewUnsupportedOperationError("skip-revert is not supported for MySQL schema changes: there is no revert window to close, since the change is already permanent once it cuts over")
 }

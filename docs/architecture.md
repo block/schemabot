@@ -6,7 +6,7 @@
 
 - [Declarative Schema](#declarative-schema)
 - [Layers](#layers)
-- [User Layer (CLI / PR Comments / API)](#user-layer-cli-pr-comments-api)
+- [User Layer (CLI / PR Comments / API)](#user-layer-cli--pr-comments--api)
   - [Status Checks and Branch Protection](#status-checks-and-branch-protection)
   - [Apply Options](#apply-options)
   - [Unsafe Changes](#unsafe-changes)
@@ -41,14 +41,19 @@
 │                   ▼            │                                      │
 │              ┌─────────┐       │                                      │
 │              │ Storage │◀──────┘                                      │
-│              │  MySQL  │                                              │
+│              │MySQL/PG │                                              │
 │              └─────────┘                                              │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
+This document covers how the pieces fit together. Two companion docs go deeper:
+[Engines](engines.md) is the per-engine capability matrix — which engine supports
+which operations and why — and [Invariants](invariants.md) is the registry of the
+runtime safety guarantees that hold whichever engine runs the change.
+
 ## Declarative Schema
 
-SchemaBot uses declarative schema files — you describe the desired end state in SQL, and SchemaBot computes the DDL needed to get there. See the [README](../README.md#declarative-schema) for examples.
+SchemaBot uses declarative schema files — you describe the desired end state in SQL, and SchemaBot computes the DDL needed to get there. See the [README](../README.md#how-it-works) for examples.
 
 Schema files are organized by [namespace](namespaces.md) (MySQL schema name or Vitess keyspace) in a directory with a `schemabot.yaml` config.
 
@@ -73,7 +78,7 @@ SchemaBot has three layers:
   - `LocalClient`: Embedded engine (single-process, for easy deployments (recommended to start))
   - `GRPCClient`: Delegates work to remote deployments (for distributed / multi-tenant architectures)
 - **Engine** ([`pkg/engine`](../pkg/engine/)): Stateless executor interface for schema change backends
-- **Storage** ([`pkg/storage`](../pkg/storage/)): Interface-based persistence (locks, plans, applies, tasks, logs, settings). MySQL implementation in [`pkg/storage/mysqlstore`](../pkg/storage/mysqlstore/), PostgreSQL implementation in [`pkg/storage/postgresstore`](../pkg/storage/postgresstore/)
+- **Storage** ([`pkg/storage`](../pkg/storage/)): Interface-based persistence (locks, plans, applies, tasks, logs, settings). MySQL implementation in [`pkg/storage/mysqlstore`](../pkg/storage/mysqlstore/), PostgreSQL implementation in [`pkg/storage/postgresstore`](../pkg/storage/postgresstore/). [Storage Outage Behavior](storage-outage-behavior.md) covers what each component does when storage is unavailable
 
 Supporting packages: [`pkg/ddl`](../pkg/ddl/) (schema diffing), [`pkg/lint`](../pkg/lint/) (safety linting and auto-fix), [`pkg/secrets`](../pkg/secrets/) (secret resolution), [`pkg/schema`](../pkg/schema/) (shared schema types and embedded storage SQL)
 
@@ -190,7 +195,8 @@ When applying, users can pass options that control execution:
 | Option | Effect |
 |---|---|
 | `--defer-cutover` | Pause before the final table swap. User must manually trigger cutover. |
-| `--enable-revert` | Keep a revert window open after cutover (Vitess only). User can roll back. |
+| `--defer-deploy` | Hold the change before any work starts until manually started (Vitess only). |
+| `--skip-revert` | Skip the revert window that normally opens after cutover (Vitess only), finalizing the change immediately. |
 | `--allow-unsafe` | Permit destructive changes (see [Unsafe Changes](#unsafe-changes) below). |
 
 ### Unsafe Changes
@@ -200,6 +206,8 @@ SchemaBot uses [Spirit's linter](https://github.com/block/spirit/tree/main/pkg/l
 - **Error** — blocks apply unless `--allow-unsafe` is passed (e.g., `DROP TABLE`, `DROP COLUMN`)
 - **Warning** — informational, shown to user but does not block
 - **Info** — suggestions and style preferences
+
+[Lint and Safety Levels](lint-and-safety-levels.md) is the full guide to the severity ladder, what "unsafe" means per engine, and the iconography on plan comments.
 
 Unsafe operations that produce error-severity violations:
 
@@ -222,11 +230,16 @@ Users can control a running schema change via CLI, PR comments, or PlanetScale U
 
 | Command | What happens |
 |---|---|
-| `schemabot stop` | Pause execution (Spirit: checkpoint saved; Vitess: cancel permanently) |
-| `schemabot start` | Resume from checkpoint (Spirit only) |
-| `schemabot cutover` | Trigger the final table swap |
+| `schemabot stop` | Pause the change, keeping the work done so far |
+| `schemabot start` | Resume a stopped change, or launch a deploy held by `--defer-deploy` |
+| `schemabot cancel` | End the change for good — nothing resumes it |
+| `schemabot cutover` | Trigger the swap for a change held at a deferred cutover |
 | `schemabot revert` | Roll back a completed change during the revert window (Vitess only) |
-| `schemabot skip-revert` | Close the revert window and finalize (Vitess only) |
+| `schemabot skip-revert` | Close the revert window early and finalize (Vitess only) |
+| `schemabot release` | Let a multi-deployment rollout continue after it paused on a failure |
+
+Not every engine supports every operation — [Engines](engines.md) has the per-engine
+capability matrix and where in a change's life each operation acts.
 
 SchemaBot exposes no throughput control. On Spirit, the copy autoscales its write
 threads from live throttler feedback. On Vitess, throughput is a property of the
@@ -361,7 +374,7 @@ tracks those scenario tables and the review checklist for future control work.
 
 ## Tern Layer (Orchestrator)
 
-Tern is the orchestration layer. It manages the schema change lifecycle: creating records, calling the engine, polling for progress, and tracking state. It defines a proto interface (`Plan`, `Apply`, `Progress`, `Cutover`, `Stop`, `Start`, `Revert`, `SkipRevert`).
+Tern is the orchestration layer. It manages the schema change lifecycle: creating records, calling the engine, polling for progress, and tracking state. It defines a proto interface (`PullSchema`, `Plan`, `PlanDiff`, `Apply`, `Progress`, `Logs`, `Cutover`, `Stop`, `Start`, `Cancel`, `Revert`, `SkipRevert`, `Health`).
 
 ### Plan
 
@@ -453,7 +466,7 @@ full record tree and how it behaves during recovery.
 
 ### Progress Flow And Observers
 
-Tern's progress poller is where raw engine progress becomes SchemaBot state. On each tick, Tern asks the engine for progress, derives task state from the engine response, derives the apply state from those tasks, persists both, and notifies an optional `ProgressObserver`.
+Tern's progress poller is where raw engine progress becomes SchemaBot state. On each tick, Tern asks the engine for progress, derives task state from the engine response, derives the apply state from those tasks, persists both, and notifies an optional `ProgressObserver`. For the Spirit engine, [Spirit Progress](spirit_progress.md) traces every field in this pipeline from Spirit's in-memory state to what the CLI and PR comment render.
 
 ```
 Engine progress
@@ -767,11 +780,11 @@ SchemaBot has two different kinds of locking:
 - **Database locks** are coordination state for users and automation. They make ownership visible in CLI/webhook flows and let a human intentionally hold, release, or force-release work for a database.
 - **Apply invariants** are correctness rules enforced by storage. They do not depend on a database lock being present, because direct API callers and `--no-lock` flows still must not create invalid concurrent work.
 
-SchemaBot enforces one active apply per database, database type, and environment when an apply is created or moved back into an active state. Storage takes a per-target MySQL named lock, checks `applies`, writes the row, and releases the lock before returning.
+SchemaBot enforces one active apply per database, database type, and environment when an apply is created or moved back into an active state. Storage takes a per-target named lock (`GET_LOCK` on MySQL, an advisory lock on PostgreSQL), checks `applies`, writes the row, and releases the lock before returning.
 
 The named lock is internal storage infrastructure, not user-facing lock state or apply lifecycle state. It gives first writers a target-specific serialization point without creating mutex rows during the apply request. Same-target writers wait and re-check `applies`; different targets use different lock names and can proceed concurrently.
 
-If storage cannot acquire the named lock within the bounded wait, the write fails before changing `applies`. If storage cannot confirm lock release, it discards the connection so MySQL releases the session-scoped lock.
+If storage cannot acquire the named lock within the bounded wait, the write fails before changing `applies`. If storage cannot confirm lock release, it discards the connection so the database releases the session-scoped lock.
 
 The operator relies on that invariant. Additional drivers increase concurrency across independent targets; they do not make one database/environment run multiple applies at once.
 
@@ -779,7 +792,7 @@ If a driver finds no claimable apply, it waits briefly and retries once during t
 
 ### Execution Modes
 
-Both engines automatically detect and use **[instant DDL](https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-operations.html)** when possible. Instant DDL applies the change immediately via a metadata-only operation (no row copying). When instant DDL is used, the task completes in milliseconds with no copy phase.
+The MySQL-family engines (Spirit and PlanetScale) automatically detect and use **[instant DDL](https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-operations.html)** when possible. Instant DDL applies the change immediately via a metadata-only operation (no row copying). When instant DDL is used, the task completes in milliseconds with no copy phase.
 
 Operations that support instant DDL include:
 - Adding or dropping a column
@@ -827,15 +840,16 @@ VSchema updates are never modelled as task rows — a task row represents table 
 
 | Flags | Behavior |
 |---|---|
-| (none) | DDLs run → auto-cutover → auto-skip revert → completed |
-| `--defer-cutover` | DDLs run → pause at waiting for cutover → user triggers cutover → completed |
-| `--defer-cutover --enable-revert` | DDLs run → pause → user triggers cutover → revert window → user reverts or skips → completed |
+| (none) | DDLs run → auto-cutover → revert window (expires on its own) → completed |
+| `--skip-revert` | DDLs run → auto-cutover → completed, with no revert window |
+| `--defer-cutover` | DDLs run → pause at waiting for cutover → user triggers cutover → revert window → user reverts, skips, or lets it expire → completed |
+| `--defer-deploy` | Held at waiting for deploy → user starts the deploy → then as one of the rows above |
 
 ### Integration Modes
 
 There are two ways to deploy the tern layer:
 
-**Local Mode** (`LocalClient`) — Everything runs in one process. SchemaBot calls the engine directly and manages all state in its own storage (MySQL).
+**Local Mode** (`LocalClient`) — Everything runs in one process. SchemaBot calls the engine directly and manages all state in its own storage (MySQL or PostgreSQL).
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -941,19 +955,24 @@ The engine is a stateless executor. It diffs schemas, executes DDL, and reports 
 | `Plan()` | Diff desired vs current schema → compute DDL |
 | `Apply()` | Execute DDL in background |
 | `Progress()` | Return current execution status |
-| `Stop()` | Cancel execution |
-| `Start()` | Resume stopped execution (Spirit only) |
+| `Stop()` | Pause execution, keeping the work done so far |
+| `Cancel()` | End the change for good |
+| `Start()` | Resume stopped execution, or launch a deferred deploy |
 | `Cutover()` | Trigger table swap |
 | `Revert()` | Roll back completed change (Vitess only) |
 | `SkipRevert()` | Close revert window (Vitess only) |
 
 ### Engine Differences
 
+[Engines](engines.md) is the full capability matrix (including pg-sprite for
+PostgreSQL) and explains why the differences exist. The implementation-level
+contrast between the two GA engines:
+
 | | Spirit (MySQL) | PlanetScale (Vitess) |
 |---|---|---|
 | DDL execution | Inside SchemaBot process | Inside Vitess (remote) |
 | Crash recovery | Resume from checkpoint table | Query PlanetScale API |
-| Stop/Start | Pause + resume from checkpoint | Cancel permanently (no resume) |
+| Stop/Start | Pause + resume from checkpoint | `stop` refused; `start` launches a deferred deploy |
 | Cutover | Drop sentinel table | Complete deploy request |
 | Revert | Not supported | Revert deploy request |
 | Progress source | Spirit runner status | SHOW VITESS_MIGRATIONS |

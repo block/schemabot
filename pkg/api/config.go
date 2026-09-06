@@ -75,8 +75,9 @@ type ServerConfig struct {
 	// storage dialects and are validated rather than rewritten.
 	Databases map[string]DatabaseConfig `yaml:"databases"`
 
-	// TargetResolver configures how a data-plane server (serve --grpc) resolves
-	// an opaque execution target to a connection. It is distinct from the
+	// TargetResolver configures how a data-plane server (one started with
+	// GRPC_PORT set, so it exposes the gRPC listener) resolves an opaque
+	// execution target to a connection. It is distinct from the
 	// control-plane Databases routing table: the data plane receives a target
 	// over gRPC and resolves it here, rather than routing logical database names.
 	TargetResolver TargetResolverConfig `yaml:"target_resolver,omitempty"`
@@ -1146,8 +1147,8 @@ type EnvironmentConfig struct {
 	// failed deployment. Only meaningful alongside a Deployments map.
 	OnFailure string `yaml:"on_failure,omitempty"`
 
-	// DirectExecution configures direct execution of ALTER statements the
-	// MySQL schema-change engine refuses (e.g. table reshapes it cannot copy).
+	// DirectExecution configures direct execution of ALTER statements that the
+	// MySQL schema change engine refuses (e.g. table reshapes it cannot copy).
 	// When enabled, a refused statement whose table's estimated row count is
 	// within max_table_rows runs verbatim as native MySQL DDL: synchronous,
 	// blocking writes to the table while it runs, and not revertible. When

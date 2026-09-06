@@ -978,10 +978,12 @@ type TaskStore interface {
 	// freshness window's edge, which refreshes the parent heartbeat on claim,
 	// can never race the reap. Stopped and failed_retryable parents are
 	// resumable, and their failed_retryable tasks belong to the resume/retry
-	// path. Each write
-	// re-verifies the row is still failed_retryable and the parent is still
-	// settled, so a row a concurrent writer advanced is skipped rather than
-	// overwritten. The parent apply row is never touched.
+	// path. A row whose apply_operation carries a live lease is left alone
+	// whatever its parent says, because a driver holds it. Each write
+	// re-verifies the row is still failed_retryable, the parent is still
+	// settled, and the operation is still unleased, so a row a concurrent writer
+	// advanced or a driver claimed is skipped rather than overwritten. The parent
+	// apply row is never touched.
 	//
 	// One instance reaps per pass, guarded by an advisory lock;
 	// ErrStrandedTaskReaperBusy reports that another instance holds it. As with
@@ -1008,10 +1010,19 @@ type TaskStore interface {
 	// far longer window, because the parent's recovery path may still dispatch
 	// their retry. Only settled parents (completed, failed, cancelled, reverted)
 	// quiescent past the reaper's window qualify — stopped and failed_retryable
-	// parents are resumable, and their tasks belong to the resume path. Each
-	// write re-verifies both the row's state and the parent's, so a row a
-	// concurrent writer advanced is skipped rather than overwritten. The parent
-	// apply row is never touched.
+	// parents are resumable, and their tasks belong to the resume path.
+	//
+	// A settled parent is not on its own a promise that nothing is running
+	// underneath it: under a fan-out rollout one failed deployment settles the
+	// apply while its siblings keep driving, and a sibling drive holds only an
+	// operation lease, so it never touches the parent row. What excludes those
+	// rows is the lease itself — a row whose apply_operation carries a
+	// heartbeated lease belongs to the driver holding it, by the same test a
+	// driver applies before taking an operation from a peer. Each write
+	// re-verifies the row's state, the parent's, the row's own quiescence, and
+	// that the operation is still unleased, so a row a concurrent writer advanced
+	// or a driver claimed is skipped rather than overwritten. The parent apply row
+	// is never touched.
 	//
 	// One instance reaps per pass, guarded by an advisory lock;
 	// ErrStrandedActiveTaskReaperBusy reports that another instance holds it. As

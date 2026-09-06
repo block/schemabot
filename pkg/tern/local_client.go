@@ -435,7 +435,7 @@ func (c *LocalClient) Close() error {
 }
 
 // HaltForShutdown brings this client's engine down when the engine runs its
-// schema-change work in this process, so the process can exit without leaving
+// schema change work in this process, so the process can exit without leaving
 // the target held by work no lease is being renewed for.
 func (c *LocalClient) HaltForShutdown(ctx context.Context) error {
 	eng := c.getEngine()

@@ -170,7 +170,7 @@ ALTER TABLE `orders` ADD CONSTRAINT `fk_orders_user` FOREIGN KEY (`user_id`) REF
 ALTER TABLE `orders` ADD COLUMN `notes` text;
 ```
 
-⛔ **Cannot apply**: 2 changes the schema-change engine refuses to execute
+⛔ **Cannot apply**: 2 changes the engine refuses to execute
 - `users`: dropping primary key is not supported
 - `orders`: adding foreign key constraints is not supported
 
@@ -211,7 +211,7 @@ ALTER TABLE `orders` ADD COLUMN `notes` text;
 ⚙️ **Direct execution**: 1 change will run as native MySQL DDL
 - `users`: dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows
 
-These statements run synchronously outside the schema-change engine: writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this.
+These statements run synchronously outside the schema change engine: writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this.
 
 📋 **Plan**: **2** tables to alter
 
@@ -501,7 +501,7 @@ ALTER TABLE `orders` ADD COLUMN `notes` text;
 
 ---
 
-**⛔ Apply rejected**: 1 planned change the schema-change engine refuses to execute
+**⛔ Apply rejected**: 1 planned change the engine refuses to execute
 - `users`: dropping primary key is not supported; direct execution is enabled but the table has ~2,400,000 rows, above the configured limit of 1,000,000
 
 Fix what each reason names — rewrite an unsupported change, or provision the stated access — or contact your SchemaBot operators for help.
@@ -3555,6 +3555,52 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 </details>
 
 <details>
+<summary><a name="postgresql-multistatement-table-running"></a><strong>PostgreSQL: Multi-statement Table Running</strong></summary>
+
+
+## Schema Change Status — Staging
+
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**Status**: In Progress
+
+📊 1/3 complete · 1 running · 1 queued
+
+**Schema `public`**
+
+**`users`**: Running...
+
+```sql
+CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON users USING btree (last_seen_at);
+```
+
+**`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE users ADD COLUMN last_seen_at timestamptz;
+```
+
+**`sessions`**: ⏳ Queued
+
+```sql
+ALTER TABLE sessions ADD COLUMN payload jsonb;
+```
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e staging
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
 <summary><a name="sharded-shard-progress"></a><strong>Sharded: Shard Progress</strong></summary>
 
 
@@ -4793,6 +4839,48 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ---
 
 This schema change was cancelled and cannot be resumed. Open a new schema change to apply it again.
+
+</details>
+
+<details>
+<summary><a name="summary-postgresql-multistatement-table-failed"></a><strong>Summary: PostgreSQL Multi-statement Table Failed</strong></summary>
+
+
+## ❌ Schema Change Failed — Staging
+
+<!-- schemabot:offer-support-channel -->
+**Database**: `testapp` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 3m
+
+*Applied by @jackjackbits at 2026-03-15 14:27:00 UTC*
+
+> ❌ **Error:** table users failed: schema change failed: canceling statement due to lock timeout
+
+1 of 3 statements completed before failure.
+
+### ❌ public
+
+**`users`** — Failed
+```sql
+CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON users USING btree (last_seen_at);
+```
+
+**`users`** — Completed
+```sql
+ALTER TABLE users ADD COLUMN last_seen_at timestamptz;
+```
+
+**`sessions`** — Cancelled
+```sql
+ALTER TABLE sessions ADD COLUMN payload jsonb;
+```
+
+
+---
+
+To retry:
+```
+schemabot apply -e staging
+```
 
 </details>
 
@@ -7846,6 +7934,50 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 ⏸️ ap-south — halted — eu-west failed (orders-ap-south)
 
      ~ orders: 🚫 Cancelled (not started)
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+
+
+
+```
+</details>
+
+<details>
+<summary><a name="halt-on-failure-a-sibling-is-still-running"></a><strong>Halt On Failure (A Sibling Is Still Running)</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-multi-a1b2c3d4                   │
+│  Environment:  production                             │
+│  State:        running (degraded)                     │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:22:00 UTC                    │
+│  Duration:     8m                                     │
+│  Deployments:  1 running · 1 halted · 1 failed        │
+└───────────────────────────────────────────────────────┘
+
+  ❌ First failure: us-east — duplicate key name 'idx_orders_source'
+
+  Next: review failure in us-east
+
+❌ us-east — failed (orders-us-east)
+  duplicate key name 'idx_orders_source'
+
+     ~ orders: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+       ALTER TABLE `orders` ADD INDEX `idx_orders_source`(`source`);
+
+
+🔄 eu-west — running table copy (orders-eu-west)
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.00%
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       • Rows: 42,000 / 120,000 · ETA: 4m 0s
+
+
+⏸️ ap-south — halted — us-east failed (orders-ap-south)
+
+     ~ orders: ⏳ Queued
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
 
 

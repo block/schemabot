@@ -87,7 +87,7 @@ auto-cutover disabled — triggers it automatically once the engine reports
 
 ## Resume Contract
 
-Engines must support resume: if the server restarts mid-schema-change, the engine must be able to resume from where it left off. The `ResumeState` field on requests carries opaque state (e.g., Spirit's checkpoint table name) that enables this.
+Engines must support resume: if the server restarts part-way through a schema change, the engine must be able to resume from where it left off. The `ResumeState` field on requests carries opaque state (e.g., Spirit's checkpoint table name) that enables this.
 
 Tern owns persistence; engines own resume metadata semantics. Tern should load
 the persisted data and pass the resulting `ResumeState` back to the engine, but
