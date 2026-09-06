@@ -57,7 +57,7 @@ type CLI struct {
 	Webhooks   commands.WebhooksCmd   `cmd:"" help:"Manage GitHub App webhook deliveries"`
 	Checks     commands.ChecksCmd     `cmd:"" help:"Manage SchemaBot Check Runs on PRs"`
 	Storage    commands.StorageCmd    `cmd:"" help:"Operate directly on SchemaBot's storage database"`
-	Local      commands.LocalCmd      `cmd:"" help:"Run SchemaBot locally"`
+	Local      commands.LocalCmd      `cmd:"" hidden:"" help:"Internal local runtime host"`
 	Serve      commands.ServeCmd      `cmd:"" help:"Start the SchemaBot HTTP API server"`
 }
 

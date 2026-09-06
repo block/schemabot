@@ -27,7 +27,6 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/serve"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/testutil"
 )
@@ -64,7 +63,7 @@ func TestLocalRuntimeRecovery(t *testing.T) {
 	}
 	storageDSN, err := testutil.MySQLDSN(t.Context(), container, "schemabot_state", "parseTime=true")
 	require.NoError(t, err)
-	config := serve.LocalConfig{Storage: api.StorageConfig{DSN: storageDSN}, Databases: map[string]api.DatabaseConfig{
+	config := api.ServerConfig{Storage: api.StorageConfig{DSN: storageDSN}, Databases: map[string]api.DatabaseConfig{
 		"app": {Type: "mysql", Environments: map[string]api.EnvironmentConfig{"development": {DSN: dsn}}},
 	}}
 	data, err := yaml.Marshal(config)
@@ -275,4 +274,43 @@ func waitProgress(t *testing.T, endpoint, id string, predicate func(apitypes.Pro
 			require.FailNow(t, "progress deadline exceeded", "%+v", progress)
 		}
 	}
+}
+
+// PostgreSQL uses the same process host, API, and durable storage lifecycle;
+// engine and storage selection come entirely from the server configuration.
+func TestLocalRuntimePostgres(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "schemabot")
+	ctx, cancel := context.WithTimeout(t.Context(), runtimeDeadline)
+	defer cancel()
+	output, err := exec.CommandContext(ctx, "go", "build", "-o", binary, "../../pkg/cmd").CombinedOutput()
+	require.NoError(t, err, string(output))
+	storageDSN, _ := testutil.StartPostgres(t, "runtime_state")
+	targetDSN, db := testutil.StartPostgres(t, "app")
+	config := api.ServerConfig{Storage: api.StorageConfig{Dialect: "postgres", DSN: storageDSN}, Databases: map[string]api.DatabaseConfig{
+		"app": {Type: "postgres", Environments: map[string]api.EnvironmentConfig{"development": {DSN: targetDSN}}},
+	}}
+	data, err := yaml.Marshal(config)
+	require.NoError(t, err)
+	dir := t.TempDir()
+	configPath, tokenPath := filepath.Join(dir, "runtime.yaml"), filepath.Join(dir, "token")
+	require.NoError(t, os.WriteFile(configPath, data, 0600))
+	require.NoError(t, os.WriteFile(tokenPath, []byte(testToken), 0600))
+	process := startLocal(t, binary, configPath, tokenPath)
+	var plan apitypes.PlanResponse
+	request(t, process.endpoint, http.MethodPost, "/api/plan", testToken, apitypes.PlanRequest{
+		Database: "app", Environment: "development", Type: "postgres", SchemaFiles: map[string]*apitypes.SchemaFiles{
+			"public": {Files: map[string]string{"widgets.sql": "CREATE TABLE widgets (id bigint NOT NULL PRIMARY KEY, name text NOT NULL);"}},
+		},
+	}, http.StatusOK, &plan)
+	require.Empty(t, plan.Errors)
+	require.Len(t, plan.Changes, 1)
+	var apply apitypes.ApplyResponse
+	request(t, process.endpoint, http.MethodPost, "/api/apply", testToken, apitypes.ApplyRequest{PlanID: plan.PlanID, Environment: "development"}, http.StatusOK, &apply)
+	require.True(t, apply.Accepted, apply.ErrorMessage)
+	waitProgress(t, process.endpoint, apply.ApplyID, func(p apitypes.ProgressResponse) bool { return state.IsState(p.State, state.Apply.Completed) })
+	require.True(t, testutil.PostgresTableExists(t, db, "public", "widgets"))
+	process.stop(t, syscall.SIGTERM)
+	process = startLocal(t, binary, configPath, tokenPath)
+	waitProgress(t, process.endpoint, apply.ApplyID, func(p apitypes.ProgressResponse) bool { return state.IsState(p.State, state.Apply.Completed) })
+	process.stop(t, syscall.SIGTERM)
 }

@@ -7,85 +7,31 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"strings"
 	"time"
-
-	"github.com/go-sql-driver/mysql"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/auth"
-	"github.com/block/schemabot/pkg/schema"
 )
 
-// LocalConfig is the explicit configuration for a local MySQL runtime.
-// Keeping the surface limited prevents service listeners and GitHub integrations
-// from being enabled accidentally by a copied server configuration.
-type LocalConfig struct {
-	Storage   api.StorageConfig             `yaml:"storage"`
-	Databases map[string]api.DatabaseConfig `yaml:"databases"`
-}
-
-func (c LocalConfig) serverConfig() (*api.ServerConfig, error) {
-	cfg := &api.ServerConfig{Storage: c.Storage, Databases: c.Databases}
-	if c.Storage.DSN == "" && c.Storage.DSNFrom == nil {
-		return nil, fmt.Errorf("local runtime requires explicit storage.dsn or storage.dsn_from")
+// validateLocalConfig keeps local hosting explicit while leaving engine,
+// routing, and storage selection to the shared server configuration.
+func validateLocalConfig(cfg *api.ServerConfig) error {
+	if cfg.Storage.DSN == "" && cfg.Storage.DSNFrom == nil {
+		return fmt.Errorf("local runtime requires explicit storage.dsn or storage.dsn_from")
 	}
-	if c.Storage.AllowDestructiveSchemaChanges {
-		return nil, fmt.Errorf("local runtime storage cannot enable destructive schema changes")
+	if cfg.Storage.AllowDestructiveSchemaChanges {
+		return fmt.Errorf("local runtime storage cannot enable destructive schema changes")
+	}
+	if cfg.Auth.Type != "" && cfg.Auth.Type != "none" {
+		return fmt.Errorf("local runtime uses its private credential; service authentication must not be configured")
+	}
+	if cfg.GitHub.PrivateKey != "" || len(cfg.Apps) > 0 {
+		return fmt.Errorf("local runtime must not configure GitHub Apps")
 	}
 	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("validate local configuration: %w", err)
+		return fmt.Errorf("validate local configuration: %w", err)
 	}
-	dialect, err := c.Storage.ResolveDialect()
-	if err != nil {
-		return nil, fmt.Errorf("resolve local storage dialect: %w", err)
-	}
-	if dialect != schema.DialectMySQL {
-		return nil, fmt.Errorf("local runtime requires MySQL storage")
-	}
-	storageDSN, err := cfg.StorageDSN()
-	if err != nil {
-		return nil, fmt.Errorf("resolve local storage: %w", err)
-	}
-	storageName, err := localDatabaseName(storageDSN)
-	if err != nil {
-		return nil, fmt.Errorf("local storage: %w", err)
-	}
-	for name, db := range c.Databases {
-		if db.Type != "mysql" {
-			return nil, fmt.Errorf("local database %q must use MySQL", name)
-		}
-		for environment, target := range db.Environments {
-			if !target.HasLocalDSN() {
-				return nil, fmt.Errorf("local database %q environment %q requires a direct DSN", name, environment)
-			}
-			dsn, err := target.ResolveDSN()
-			if err != nil {
-				return nil, fmt.Errorf("resolve local database %q environment %q: %w", name, environment, err)
-			}
-			targetName, err := localDatabaseName(dsn)
-			if err != nil {
-				return nil, fmt.Errorf("local database %q environment %q: %w", name, environment, err)
-			}
-			// Require a distinct name even across hosts: aliases and tunnels cannot
-			// turn an address comparison into proof that storage is a separate database.
-			if strings.EqualFold(storageName, targetName) {
-				return nil, fmt.Errorf("local storage database must have a different name from target %q", name)
-			}
-		}
-	}
-	return cfg, nil
-}
-
-func localDatabaseName(dsn string) (string, error) {
-	cfg, err := mysql.ParseDSN(dsn)
-	if err != nil {
-		return "", fmt.Errorf("invalid MySQL DSN")
-	}
-	if cfg.DBName == "" {
-		return "", fmt.Errorf("MySQL DSN must name a database")
-	}
-	return cfg.DBName, nil
+	return cfg.ValidateStorageIsolation()
 }
 
 // LocalOptions controls the foreground host. Ready runs after storage and the
@@ -99,9 +45,8 @@ type LocalOptions struct {
 // RunLocal hosts the normal API and operator on an authenticated loopback
 // listener. Cancellation drains the HTTP server and existing operator shutdown
 // path; it does not issue an operator stop or cancel any stored apply.
-func RunLocal(ctx context.Context, config LocalConfig, local LocalOptions, opts ...Option) (runErr error) {
-	cfg, err := config.serverConfig()
-	if err != nil {
+func RunLocal(ctx context.Context, config api.ServerConfig, local LocalOptions, opts ...Option) (runErr error) {
+	if err := validateLocalConfig(&config); err != nil {
 		return err
 	}
 	o := options{logger: slog.Default()}
@@ -136,7 +81,7 @@ func RunLocal(ctx context.Context, config LocalConfig, local LocalOptions, opts 
 		}
 	}()
 	opts = append(opts, func(o *options) { o.authorizer = authorizer })
-	srv, err := Build(ctx, cfg, opts...)
+	srv, err := Build(ctx, &config, opts...)
 	if err != nil {
 		return fmt.Errorf("build local runtime: %w", err)
 	}

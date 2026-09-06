@@ -24,7 +24,7 @@ func TestReadPrivateLocalFile(t *testing.T) {
 
 func TestLocalServeRejectsAmbiguousConfiguration(t *testing.T) {
 	for _, data := range []string{
-		"storage: {}\ngithub: {}\n",
+		"storage: {}\nunknown_field: {}\n",
 		"storage: {}\n---\nstorage: {}\n",
 	} {
 		path := filepath.Join(t.TempDir(), "runtime.yaml")

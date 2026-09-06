@@ -14,12 +14,13 @@ import (
 	"github.com/block/spirit/pkg/utils"
 	"gopkg.in/yaml.v3"
 
+	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/serve"
 )
 
 // LocalCmd contains local runtime operations.
 type LocalCmd struct {
-	Serve LocalServeCmd `cmd:"" help:"Run an authenticated local MySQL runtime in the foreground"`
+	Serve LocalServeCmd `cmd:"" help:"Run an authenticated local runtime in the foreground"`
 }
 
 // LocalServeCmd runs with explicit configuration and a private bearer token.
@@ -35,7 +36,7 @@ func (cmd *LocalServeCmd) Run(ctx context.Context, g *Globals) error {
 	if err != nil {
 		return fmt.Errorf("read local configuration: %w", err)
 	}
-	var cfg serve.LocalConfig
+	var cfg api.ServerConfig
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(&cfg); err != nil {
