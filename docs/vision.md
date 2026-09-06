@@ -76,10 +76,12 @@ better because more infrastructure is running it. There is no principled reason 
 the unsafe version.
 
 What has to become true is that adoption gets much cheaper at the small end without anything
-loosening at the large end. A tier-zero fleet wants the whole control plane: a server, durable state,
-lease ownership, an operator who can stop a change while it runs. An experiment wants none of that.
-What varies is the scaffolding, never the gates. A change that would be unsafe in front of production
-is unsafe in front of a weekend project too, and it gets refused in both places.
+loosening at the large end. A tier-zero fleet needs machinery an experiment has no use for: a server
+that stays up, state that survives a restart, a guarantee that only one process is ever driving a
+given change, and a person who can stop one halfway through. An experiment wants a binary and a
+connection string. What varies between them is the scaffolding, never the gates. A change that would
+be unsafe in front of production is unsafe in front of a weekend project too, and it gets refused in
+both places.
 
 Concretely, the shape SchemaBot runs in should be a choice rather than a prerequisite. A control
 plane on Kubernetes, with separate processes inside each network where the databases actually live,
