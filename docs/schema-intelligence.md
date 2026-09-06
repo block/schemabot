@@ -401,7 +401,8 @@ live view:
 ```text
 ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)
   ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
-  • Rows: 6,000,000 / 10,000,000
+  • Rows: 6,000,000 / 10,000,000 · ETA: 42m 0s
+  • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
 ```
 
 Use `schemabot status apply-example-73` for a single snapshot.
@@ -439,7 +440,8 @@ Response excerpt (illustrative values):
       "rows_total": 10000000,
       "percent_complete": 60,
       "eta_seconds": 2520,
-      "throttled": true
+      "throttled": true,
+      "throttle_reason": "threads-running 21 > 18"
     }
   ]
 }
@@ -481,10 +483,12 @@ Output excerpt:
 ```text
 ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)
   ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
-  • Rows: 6,000,000 / 10,000,000
+  • Rows: 6,000,000 / 10,000,000 · ETA: 42m 0s
+  • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
 ```
 
-Here, `orders` is 60% copied and currently throttled.
+Here, `orders` is 60% copied with an estimated 42 minutes remaining. Copying
+is backing off because 21 active threads exceed the configured budget of 18.
 
 `GET /api/status` spans the registered databases. It returns the
 most recent applies across the SchemaBot instance. Alongside the list it returns
