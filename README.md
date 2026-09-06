@@ -123,21 +123,15 @@ To run SchemaBot against your own databases, grab a build from [Releases](#relea
 
 Guides and reference:
 
-- [Vision](./docs/vision.md): Where SchemaBot is going and why.
-- [Quick start](#quick-start): Get SchemaBot running locally.
-- [Schema intelligence](./docs/schema-intelligence.md): Explore live schemas and changes across your fleet.
-- [Engines](./docs/engines.md): Compare how engines execute changes, manage load,
-  and support control operations.
-- [PostgreSQL](./docs/postgresql.md): See what plans, what applies, and how refusals
-  are reported.
-- [Configuration](./docs/configuration.md): Set up local or gRPC mode,
-  authentication, and secret resolution.
-- [Safety invariants](./docs/invariants.md): Understand the runtime guarantees,
-  where they are enforced, and their limits.
-- [Architecture](./docs/architecture.md): Explore the layers, state machine,
-  and how a change flows through them.
-- [Contributing](./CONTRIBUTING.md): Help build SchemaBot.
-
+- [Vision](./docs/vision.md): See where we’re taking SchemaBot
+- [Quick start](#quick-start): Try it on your machine
+- [Schema intelligence](./docs/schema-intelligence.md): Get to know your fleet and what’s changing
+- [Engines](./docs/engines.md): See how SchemaBot works with your database engine
+- [PostgreSQL](./docs/postgresql.md): Find out what’s supported today
+- [Configuration](./docs/configuration.md): Set up SchemaBot for your environment
+- [Safety invariants](./docs/invariants.md): Get to know the guardrails behind each change
+- [Architecture](./docs/architecture.md): Look under the hood and follow a change from start to finish
+- [Contributing](./CONTRIBUTING.md): Come build with us
 
 ## Releases
 
