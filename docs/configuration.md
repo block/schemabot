@@ -821,36 +821,27 @@ deployment over gRPC run with that deployment's engine settings.
 
 ### Storage statement budget
 
-SchemaBot keeps its own state in a PostgreSQL database.
-`postgres.statement_timeout` is the time limit for a single query against that
-database. It defaults to `30s`. Set it to `"0"` to remove the limit.
+```yaml
+postgres:
+  statement_timeout: 30s   # default; "0" removes the limit
+```
 
-It has no effect on schema changes themselves. Those run under separate limits
-that pg-sprite sets on the target database.
+The time limit for a single query against SchemaBot's own storage database.
+Schema changes are unaffected: those run under limits pg-sprite sets on the
+target database.
 
-Leaving it unset does not mean there is no limit. The connection inherits
-whatever the platform set for the role or database, and managed PostgreSQL
-providers usually set one, tuned for web traffic rather than for SchemaBot.
-When that limit fires, PostgreSQL returns SQLSTATE `57014`. That is the same
-code returned when someone cancels a query by hand, so an inherited limit is
-easy to misread during an incident.
+**Minimum: just over `10s`.** The server refuses to start on anything smaller.
+The limit counts time spent waiting, and two instances contending for the same
+apply wait up to 10 seconds for each other's lock. Anything shorter turns that
+ordinary wait into a timeout.
 
-**The minimum is just over `10s`.** The server refuses to start on a smaller
-non-zero value. The reason is that `statement_timeout` counts time spent
-waiting, not only time spent working. When two instances want the same apply,
-one waits up to 10 seconds for the other to release its lock. A limit below
-that cancels the wait and reports a timeout, when the real answer was just
-"another instance has it".
+**Unset is not unlimited.** The connection inherits the platform's value, and
+managed providers usually set one tuned for web traffic. It fires as SQLSTATE
+`57014`, the same code a hand-cancelled query returns, which makes it easy to
+misread.
 
-Three things run with no limit from this setting:
-
-- **The startup bootstrap's DDL.** Building an index takes minutes, far longer
-  than an ordinary query. It gets its own limit, worked out from the
-  bootstrap's overall deadline.
-- **The bootstrap's lock wait.** One instance bootstraps while the others wait
-  their turn, and that wait has to be free to take as long as it takes.
-- **Storage maintenance commands run from the CLI.** An operator is watching
-  them, and that is the limit.
+**The startup bootstrap is exempt.** Its DDL and its lock wait have their own
+limits, as do storage maintenance commands run from the CLI.
 
 The bootstrap DDL budget is not configurable, because its safety comes from
 being derived rather than chosen: it sits just under the deadline that already
