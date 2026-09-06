@@ -38,7 +38,7 @@ database, and that is a different decision every time. What it should look like:
 request. The table has four hundred million rows in it. The check says the change is instant, so they
 merge it, and it is. Nobody had to review it for safety. The review already happened.
 
-**A change that takes three weeks.** Someone adds an index to a table with two billion rows in it.
+**A change that takes three weeks.** Someone adds an index to a table holding tens of terabytes.
 There is no version of that which is quick. SchemaBot builds the new table alongside the old one and
 copies into it for three weeks, slowing down whenever the database gets busy and picking back up when
 it quiets. The application writes to the old table the entire time and never notices. When the copy
