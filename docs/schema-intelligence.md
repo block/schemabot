@@ -14,8 +14,38 @@ permission to change anything.
 The examples below use illustrative values and show only the relevant response
 fields. Authenticate requests as described under [read-only access](#give-a-tool-read-only-access).
 
-**Where are we still using the old primary-key type?** List the managed databases
-with `GET /api/databases`, then pull each database and environment with
+**What databases are there?** Start with `GET /api/databases`. It lists the
+managed databases, their engines, and their configured environments and deployments.
+
+```http
+GET /api/databases
+```
+
+```json
+{
+  "databases": [
+    {
+      "database": "shop",
+      "type": "mysql",
+      "environments": [
+        {"environment": "staging", "deployments": ["us-east"]},
+        {"environment": "production", "deployments": ["us-east", "eu-west"]}
+      ]
+    },
+    {
+      "database": "analytics",
+      "type": "postgres",
+      "environments": [
+        {"environment": "production", "deployments": ["us-east"]}
+      ]
+    }
+  ]
+}
+```
+
+Use a database name and environment from this inventory in the reads below.
+
+**Where are we still using the old primary-key type?** Pull each database and environment with
 `catalog_detail: detailed` and `lint: true` where supported. Group the findings
 by rule and keep the database, environment, namespace, and table beside each
 one. Your agent can return the affected tables and the evidence; your dashboard
