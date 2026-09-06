@@ -18,13 +18,13 @@ func TestLocalAuthorizer(t *testing.T) {
 	for _, path := range []string{"/api/plan", "/api/apply", "/health", "/livez", "/webhook"} {
 		t.Run(path, func(t *testing.T) {
 			for _, header := range []string{"", "Bearer wrong", token} {
-				request := httptest.NewRequest(http.MethodPost, path, nil)
+				request := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, nil)
 				request.Header.Set("Authorization", header)
 				response := httptest.NewRecorder()
 				authorizer.Middleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { require.FailNow(t, "unauthenticated handler reached") })).ServeHTTP(response, request)
 				assert.Equal(t, http.StatusUnauthorized, response.Code)
 			}
-			request := httptest.NewRequest(http.MethodPost, path, nil)
+			request := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, nil)
 			request.Header.Set("Authorization", "Bearer "+token)
 			request.Header.Set("X-Forwarded-User", "claimed-human")
 			response := httptest.NewRecorder()

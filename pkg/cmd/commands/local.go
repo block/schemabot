@@ -86,7 +86,7 @@ func readPrivateLocalFile(path string) ([]byte, error) {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
 	if len(data) > 1<<20 {
-		return nil, fmt.Errorf("%s exceeds the local configuration size limit", path)
+		return nil, fmt.Errorf("%s exceeds the 1 MiB file size limit", path)
 	}
 	return data, nil
 }
