@@ -84,5 +84,5 @@
 <text x="493" y="427" font-size="11" fill="#3578e5" font-weight="600" text-anchor="middle">Read-only access</text>
 <text x="790" y="427" font-size="10.5" fill="#474e57" font-weight="400" text-anchor="middle">Search and aggregation by the caller</text>
 <path d="M24 450 L924 450" fill="none" stroke="#e5e7eb" stroke-width="1"/>
-<text x="474" y="479" font-size="13" fill="#474e57" font-weight="400" text-anchor="middle">Explore the fleet without permission to change it.</text>
+<text x="474" y="479" font-size="13" fill="#474e57" font-weight="400" text-anchor="middle">Understand what’s in your fleet, how it got there, and what’s changing now.</text>
 </svg>
