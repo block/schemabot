@@ -41,7 +41,7 @@ controls vary by [engine](engines.md#capability-matrix).
 
 ## Why apply before merge
 
-**A schema change can take weeks without holding up everyone else’s releases.**
+**A schema change should never hold up unrelated releases.**
 Run it from the open PR, and the database can take the time it needs while
 unrelated code keeps shipping. The release that needs the change waits at the
 merge gate, not inside a deploy.
