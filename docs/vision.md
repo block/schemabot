@@ -55,7 +55,7 @@ locks a hot table for forty minutes, whether it drops a column something is stil
 
 Some of that is automated. Diffing a desired schema against a live one, refusing to generate
 something destructive unless told to, flagging a change that will hold a lock: SchemaBot does all of
-it and invented none of it.
+that.
 
 Where SchemaBot goes further is everything after the plan looks right, which is usually the point
 where the work comes back to a person. Running the change is SchemaBot's job. It copies a large table
