@@ -6,6 +6,7 @@ import (
 
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // UnlockCmd releases a database lock.
@@ -17,6 +18,10 @@ type UnlockCmd struct {
 
 // Run executes the unlock command.
 func (cmd *UnlockCmd) Run(g *Globals) error {
+	// Lock records use canonical keys, and the alternate-type scan compares them byte-for-byte.
+	cmd.Database = storage.CanonicalKey(cmd.Database)
+	cmd.Type = storage.CanonicalKey(cmd.Type)
+
 	ep, err := resolveEndpoint(g.Endpoint, g.Profile)
 	if err != nil {
 		return err
