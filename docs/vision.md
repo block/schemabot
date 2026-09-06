@@ -39,44 +39,43 @@ runs on, and everything in between. Adding a column, adding an index, dropping a
 dead: none of it should risk taking the database down, and none of it should require you to be a
 database expert first.
 
-People have been chasing this for a long time, and the bookkeeping is solved: version tables, ordered
-changelogs, runners that refuse to apply the same change twice. So is some of the judgment. Diffing
-the schema you want against the one you have, refusing to write something destructive unless you ask,
-warning you about a lock: SchemaBot does all of that.
+The hard part was never writing down the schema you want. It is what happens when that meets a live
+database, and that is a different decision every time. What it should look like:
 
-What is left is how the change should run, and that is a decision every time.
+**Somebody's first week.** A new engineer adds a column to a `CREATE TABLE` file and opens a pull
+request. The table has four hundred million rows in it. The check says the change is instant, so they
+merge it, and it is. Nobody had to review it for safety. The review already happened.
 
-> You add a column to a `CREATE TABLE` file. The MySQL table behind it has 400 million rows. The pull
-> request tells you the change is instant, you merge it, and that is the whole story.
->
-> You add an index to the PostgreSQL database next door. That table has 900 million rows and the
-> index will take two days to build. SchemaBot builds it concurrently, never holds a lock your
-> application notices, and cleans up after itself if it fails halfway instead of leaving an invalid
-> index behind. You find out it finished by reading the pull request.
+**A change that takes three weeks.** A primary key is running out of room, and widening it means
+rebuilding a table nobody can take offline. SchemaBot builds the new table alongside the old one and
+copies into it for three weeks, slowing down whenever the database gets busy and picking back up when
+it quiets. The application writes to the old table the entire time and never notices. When the copy
+finishes it waits, because the one moment that touches the application is the swap, and somebody
+picks when that happens. Not during a release freeze. A Tuesday morning.
 
-Same edit, same kind of file, same afternoon. The difference between them is not visible in the DDL.
-It moves with the engine, the version, and the size of the table, and getting it wrong is how a
-routine Tuesday becomes an incident. So SchemaBot works it out and takes the cheapest option that is
-safe. When that means copying a table it copies the table, throttling itself when the database gets
-busy, staying honest for however many weeks it takes, swapping only when you say so, and stopping at
-any point without leaving a table half converted.
+**Four agents, one database.** Four agents are working on the same service. One adds a column to
+`orders`, one adds an index to it, one drops a column the team stopped reading last quarter, one is
+only touching application code. They never talk to each other. The column lands first and the index
+change goes red within seconds, because the file it planned against no longer matches the database.
+That agent rereads, replans, and pushes again with nobody prompting it. The drop stops and waits for
+a person, because dropping a column is not a decision an agent makes alone.
 
-That knowledge is the point, and it belongs in the tool rather than in whoever happens to review the
-change. The usual alternative is a more careful person, and that works right up until the author is
-not a person. "Be more careful" does not land on an agent. It can write a thousand schema changes a
-week, it does not slow down on the risky ones, and it does not remember the outage that taught
-everyone to be careful with that table. And there is rarely just one of them.
+**A change you need to stop.** It is the middle of the afternoon and something unrelated is on fire.
+You want the database left alone. One command stops the copy where it stands. Nothing is half
+converted, nothing has to be cleaned up by hand, and when the incident is over the change picks up
+where it left off.
 
-> Four agents are building one feature. One adds a column to `orders`. One adds an index to the same
-> table. One drops a column the team stopped reading last quarter. One is only touching application
-> code and does not know the others exist.
->
-> They never talk to each other. The column lands first, and within seconds the index change goes
-> red, because the file it planned against no longer matches the database. That agent rereads,
-> replans, and pushes again without anyone telling it to. The drop stops and asks a person, because
-> dropping a column is not a decision an agent gets to make on its own.
->
-> The feature ships that afternoon. Nobody watched the database. Nobody had to.
+What separates those from each other is not visible in the DDL. It moves with the engine, the
+version, and the size of the table, and getting it wrong is how a routine Tuesday becomes an
+incident. SchemaBot works it out and takes the cheapest option that is safe.
+
+None of it should require you to know what made it dangerous. The lock a statement takes, the drop
+nobody should be able to do quietly, the thing routine on one engine and refused on another: somebody
+already paid for that knowledge, usually the hard way, and it belongs in the tool. The usual
+alternative is a more careful person, and that works right up until the author is not a person. "Be
+more careful" does not land on an agent. It can write a thousand schema changes a week, it does not
+slow down on the risky ones, and it does not remember the outage that taught everyone to be careful
+with that table. And there is rarely just one of them.
 
 That is the thing worth building, and it is about to matter far more than it does today. Software is
 being written faster than any review process was built to absorb, and the schema is where that speed
