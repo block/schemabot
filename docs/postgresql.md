@@ -178,16 +178,50 @@ flags do not override an engine-blocked verdict.
 
 The engine does not execute `DROP TABLE` or other statement kinds outside its
 admitted set. That includes tables that exist on the target but that no schema
-file in the namespace declares any longer, typically because a file was
-deleted from the PR. The planner enumerates the target's ordinary and
-partitioned tables (partitions are covered by their parent's declaration) and
-surfaces each undeclared table as a blocked, destructive `DROP TABLE` change,
-so the removal is visible on the plan and the apply is refused rather than the
-table lingering silently. Restore the file to keep the table, or drop it
-through a separately reviewed operational process. Because namespaces are
-derived from the schema files present in the PR, deleting the last file of a
-namespace removes that namespace from the plan altogether, and its tables are
-not enumerated.
+file in the namespace declares. The common case is onboarding an existing
+database, where every table nobody has written a file for yet is undeclared;
+the same happens when a file is deleted from the PR, or when an imperative
+tool leaves a table behind during coexistence. A namespace is owned whole: the
+planner enumerates the target's tables and surfaces each undeclared one as a
+blocked, destructive `DROP TABLE` change, so the divergence is visible on the
+plan and the apply is refused rather than the table lingering silently.
+Because the check fails for the whole database while any change is blocked,
+an undeclared table holds up every other change to that database until it is
+resolved — including changes in other namespaces, since every namespace at
+the PR head is reconciled on every plan. Plan an onboarding accordingly:
+declare the existing tables first, or list namespaces that stay outside
+SchemaBot under `ignore_namespaces`.
+
+Two remedies clear it. Declare the table in a schema file to bring it under
+management — the file need only match the live table for the drop to
+disappear from the plan. Or drop the table through a separately reviewed
+operational process. A table carrying foreign key constraints cannot be
+declared: the declarative format does not support foreign keys, so a file
+for it fails to parse, and a file that omits them plans their removal as a
+destructive `DROP CONSTRAINT`. The plan says so and names the constraints
+instead of pointing at a file that cannot be written; the table must be
+dropped, or have its foreign keys removed before it is declared, through a
+separately reviewed process.
+
+Two kinds of table are exempt from the verdict, mirroring the MySQL engine's
+view of a live schema. Tables whose names begin with `_` (engine scratch,
+checkpoint, and shadow relations) and archive tables named
+`<table>_archive_YYYY[_MM[_DD]]` are maintained outside declarative schema
+files and are never enumerated; the naming conventions are the per-table
+exemption, and `ignore_namespaces` is the per-namespace one. Tables whose
+declaration lives elsewhere are likewise not enumerated: partitions and
+inheritance children are declared through their parent, and extension-owned
+tables (such as PostGIS's `spatial_ref_sys`) belong to their extension — no
+file can declare them and the server refuses to drop them. An unlogged table
+is an ordinary table and needs its own file.
+
+The enumeration covers ordinary and partitioned tables only. Undeclared views,
+materialized views, and foreign tables are outside the declarative format and
+are not reported. Because namespaces are derived from the schema files present
+in the PR, deleting the last file of a namespace removes that namespace from
+the plan altogether: its tables are not enumerated and the plan reports no
+change for it, so remove a namespace's final table through a separately
+reviewed process rather than by deleting its file.
 
 ## Apply-time refusals
 
