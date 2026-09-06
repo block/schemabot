@@ -207,6 +207,90 @@ func TestCreateCollisionRefusalAfterCommittedCreateStep(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(r.detail, createCollisionRemedy))
 }
 
+// TestRefusalAfterCommittedCreateStepKeepsOwnRemedy pins the shape of every
+// refusal that fails past the first step of a create set: the cause, then
+// the committed CREATE TABLE, then exactly one remedy — the refusal's own when
+// it carries one, a re-plan only when it does not. An operator reading the
+// last clause never sees two competing instructions.
+func TestRefusalAfterCommittedCreateStepKeepsOwnRemedy(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantReason string
+		wantRemedy string
+	}{
+		{
+			name:       "invariant violation keeps its inspection remedy",
+			err:        executor.ErrInvariantViolation,
+			wantReason: "engine-invariant-violation",
+			wantRemedy: "inspect the target and server logs before re-running",
+		},
+		{
+			name:       "IF NOT EXISTS keeps its drop-the-clause remedy",
+			err:        executor.ErrIfNotExistsUnsupported,
+			wantReason: "unsupported-create-step",
+			wantRemedy: "drop the clause and re-plan",
+		},
+		{
+			name:       "duplicate create name keeps its fix-the-file remedy",
+			err:        executor.ErrDuplicateCreateName,
+			wantReason: "duplicate-create-name",
+			wantRemedy: "fix the schema file and re-plan",
+		},
+		{
+			name:       "missing schema keeps its create-the-schema remedy",
+			err:        preflight.ErrSchemaNotFound,
+			wantReason: "schema-not-found",
+			wantRemedy: "create the schema first",
+		},
+		{
+			name:       "missing table states its re-plan once",
+			err:        preflight.ErrTableNotFound,
+			wantReason: "table-not-found",
+			wantRemedy: replanRemedy,
+		},
+		{
+			name:       "privilege refusal keeps its provisioning remedy",
+			err:        &preflight.PrivilegeError{Tier: preflight.TierCreateTable, Check: "has_schema_privilege(limited, 'public', 'CREATE')", Grant: `GRANT CREATE ON SCHEMA "public" TO "limited"`},
+			wantReason: "insufficient-privileges",
+			wantRemedy: `provision with: GRANT CREATE ON SCHEMA "public" TO "limited" (verified by: has_schema_privilege(limited, 'public', 'CREATE'))`,
+		},
+		{
+			name:       "refusal without a remedy gets a re-plan",
+			err:        &executor.BudgetError{Cause: executor.CauseStatement, Budget: time.Second},
+			wantReason: "not-native-safe-budget-exceeded",
+			wantRemedy: replanRemedy,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := fmt.Errorf("execute: %w", &executor.SequenceStepError{Step: 2, Total: 3, Err: tt.err})
+
+			r := classifyRefusal(err, "users")
+
+			require.NotNil(t, r)
+			assert.Equal(t, tt.wantReason, r.reason)
+			step := `; step 2 of 3 failed after the CREATE TABLE for "users" committed; `
+			assert.True(t, strings.HasSuffix(r.detail, step+tt.wantRemedy), r.detail)
+			assert.Equal(t, 1, strings.Count(r.detail, tt.wantRemedy), r.detail)
+			assert.Equal(t, 1, strings.Count(r.detail, "; step 2 of 3 failed"), r.detail)
+		})
+	}
+}
+
+// TestRefusalAtFirstSequenceStepPlacesRemedyLast pins that a first-step
+// failure of a create set names the step without claiming a committed CREATE
+// TABLE, and still ends on the refusal's own remedy.
+func TestRefusalAtFirstSequenceStepPlacesRemedyLast(t *testing.T) {
+	err := fmt.Errorf("execute: %w", &executor.SequenceStepError{Step: 1, Total: 3, Err: executor.ErrIfNotExistsUnsupported})
+
+	r := classifyRefusal(err, "users")
+
+	require.NotNil(t, r)
+	assert.Equal(t, `the planned statement for "users" carries IF NOT EXISTS, whose no-op outcome the native-safe path cannot prove; step 1 of 3 failed; drop the clause and re-plan`, r.detail)
+	assert.NotContains(t, r.detail, "committed")
+}
+
 // TestCommittedCreatePrefixDetail pins the retry boundary for create sets: a
 // first-step failure has changed nothing and may be retried, while any later
 // failure leaves the CREATE TABLE committed and requires a fresh plan.
