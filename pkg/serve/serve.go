@@ -46,11 +46,12 @@ import (
 type Option func(*options)
 
 type options struct {
-	logger  *slog.Logger
-	version string
-	commit  string
-	date    string
-	engines map[string]tern.EngineFactory
+	logger     *slog.Logger
+	version    string
+	commit     string
+	date       string
+	engines    map[string]tern.EngineFactory
+	authorizer auth.Authorizer
 }
 
 // WithLogger sets the logger Run uses. A nil logger is ignored so Run keeps
@@ -428,9 +429,12 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	// allow-all NoneAuthorizer that lets every request through (attaching an
 	// anonymous user); with "oidc" it validates Bearer JWTs and bypasses
 	// non-API paths (/webhook, health) itself.
-	authz, err := buildServerAuthorizer(ctx, cfg, logger)
-	if err != nil {
-		return nil, fmt.Errorf("setup auth: %w", err)
+	authz := o.authorizer
+	if authz == nil {
+		authz, err = buildServerAuthorizer(ctx, cfg, logger)
+		if err != nil {
+			return nil, fmt.Errorf("setup auth: %w", err)
+		}
 	}
 
 	// Initialize telemetry (OTel metrics via Prometheus /metrics endpoint).

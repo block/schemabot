@@ -125,6 +125,7 @@ Guides and reference:
 
 - [Vision](./docs/vision.md): See what we’re building toward
 - [Quick start](#quick-start): Try it on your machine
+- [Local MySQL runtime](./docs/local-runtime.md): Run the API and engine in a native process
 - [Schema intelligence](./docs/schema-intelligence.md): Get to know your fleet and what’s changing
 - [Engines](./docs/engines.md): See how changes run on your database engine
 - [PostgreSQL](./docs/postgresql.md): Find out what’s supported today
