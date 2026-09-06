@@ -31,7 +31,9 @@ SchemaBot is built for the agentic era. In a world where agents build product fe
 
 **The PR workflow.** Open a PR with your schema changes, and SchemaBot plans, applies, and verifies them across environments, right from the PR timeline:
 
-![SchemaBot PR Demo](./assets/pr-demo.gif)
+[![SchemaBot PR workflow: plan, apply, progress, completion, checks, and merge](./assets/pr-workflow-demo.gif)](./docs/pre-merge-workflow.md)
+
+[Walk through each step](./docs/pre-merge-workflow.md#the-pr-workflow-step-by-step) at your own pace
 
 **The interactive CLI.** The same power from your terminal: plan, apply, and watch schema changes live:
 

@@ -172,6 +172,7 @@ check-docs-toc: ## Fail if a Table of Contents behind TOC markers is stale
 
 docs-assets: ## Re-render the PR mock-ups and animations the docs embed (needs gh, Chrome, ImageMagick)
 	@python3 scripts/render-pr-mockups.py
+	@bash scripts/render-pr-demo.sh
 	@python3 scripts/render-animation.py assets/src/pipeline-never-waits.html assets/pipeline-never-waits.gif
 
 templates: build ## Regenerate TEMPLATES.md from the current binary
