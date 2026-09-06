@@ -21,8 +21,8 @@
 This is where SchemaBot is headed.
 
 Everything else in `docs/` describes what SchemaBot does today. This one is about what we want it to
-become, and why that is worth building. There are no dates in it and nothing here is a
-promise to ship. It exists so that when a decision comes up, we have something to hold it against.
+become, and why that is worth building. There are no dates in it and nothing here is a promise to
+ship. It exists so that when a decision comes up, we have something to hold it against.
 
 For what is true right now, [invariants.md](./invariants.md) is the registry of what must never be
 false while SchemaBot is running, and where each rule is enforced. [engines.md](./engines.md) is the
@@ -68,10 +68,12 @@ striking is how little the hazards change between them. A change that locks a ta
 intended, a half-applied state nobody can name: all of that is reachable from either end. Scale
 changes the blast radius, not the failure mode.
 
-Safety comes from the plan and the gates, not from the size of the deployment running them. Diffing
-against the live database, linting before anything runs, asking for consent before destroying
-something, refusing to call an ambiguous result a success: none of that needs a platform team to be
-correct. There is no principled reason the hobbyist gets the unsafe version.
+What keeps a change safe is a short list of checks it has to get past. Work out the exact DDL by
+diffing against the live database. Lint it before anything runs. Ask for consent before destroying
+something. Refuse to call an ambiguous result a success. Those are the gates, and this document
+calls them that from here on. Not one of them needs a platform team to be correct, and not one gets
+better because more infrastructure is running it. There is no principled reason the hobbyist gets
+the unsafe version.
 
 What has to become true is that adoption gets much cheaper at the small end without anything
 loosening at the large end. A tier-zero fleet wants the whole control plane: a server, durable state,
@@ -87,7 +89,7 @@ application that owns the schema, close enough to run at startup. The first thre
 the fourth partly does. What is missing is the small end being genuinely small, instead of the
 large deployment with most of it switched off.
 
-![Both ends of the range feed into an identical set of gates: diff against the live database, lint before anything runs, explicit consent to destroy, and uncertainty never passing](../assets/vision-range.svg)
+![Both ends of the range feed into the same four gates: diff against the live database, lint before anything runs, explicit consent to destroy, and uncertainty never passing](../assets/vision-range.svg)
 
 ## Safe should also mean fast
 
