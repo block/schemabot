@@ -37,7 +37,11 @@ type ReviewGateResult struct {
 // separate taxonomy for them. suppressRetryComments silences the
 // evaluation-failure comment on durable attempts, where the driver retries
 // and posts the single terminal answer instead; merit blocks always comment.
-func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, environment, requestedBy, commandName string, suppressRetryComments bool) (blocked bool, err error) {
+//
+// preflight, when non-nil, reports the gates behind this one so a merit block
+// names everything still in the way rather than only the approval. It is
+// advisory: it changes no verdict here and takes no lock.
+func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, environment, requestedBy, commandName string, suppressRetryComments bool, preflight *applyPreflight) (blocked bool, err error) {
 	gateResult, err := h.checkReviewGate(ctx, client, repo, pr, schemaResult.Database, schemaResult.SchemaPath)
 	if err != nil {
 		h.logger.Error("review gate check failed", "repo", repo, "pr", pr,
@@ -49,14 +53,16 @@ func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.Instal
 		return false, fmt.Errorf("review gate check %s#%d: %w", repo, pr, err)
 	}
 	if gateResult != nil && !gateResult.Approved {
-		h.postComment(repo, pr, installationID, templates.RenderReviewRequired(templates.ReviewGateData{
+		body := templates.RenderReviewRequired(templates.ReviewGateData{
 			Database:          schemaResult.Database,
 			Environment:       environment,
 			RequestedBy:       requestedBy,
 			OperatorReviewers: gateResult.OperatorReviewers,
 			OtherReviewers:    gateResult.OtherReviewers,
 			PRAuthor:          gateResult.PRAuthor,
-		}))
+		})
+		h.postComment(repo, pr, installationID,
+			templates.AppendPreflightChecklist(body, preflight.rowsAfter(ctx, gateReviewApproval)))
 		return true, nil
 	}
 	return false, nil

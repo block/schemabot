@@ -1071,6 +1071,13 @@ than resolved by an arbitrary pick (AZ-5). A failed apply says that a fresh appl
 where this one stopped, which is the fact that decides whether the operator retries or
 investigates first.
 
+An apply rejected by one of the ordered apply gates also reports the gates behind it, so the next
+action is the whole remaining list rather than the first item on it. That report is read-only and
+advisory: it takes no lock, writes nothing, decides nothing, and a gate whose inputs cannot be read
+is reported as unknown rather than as ready. The gate that blocked is still the command's answer,
+and the ladder's order is unchanged. *Enforced:* the apply gate ladder's preflight probes
+(`pkg/webhook/apply_preflight.go`).
+
 The bar is that an operator who reads only the message knows what to do next. It is not a promise
 that the next step always exists: some situations genuinely need a decision only an operator can
 make, and saying so plainly is the actionable answer. What it rules out is a dead end, where a surface reports a
