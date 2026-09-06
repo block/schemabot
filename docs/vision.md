@@ -184,8 +184,8 @@ However far any of the above gets, these hold:
   Work that has started stays accounted for until it is resolved.
 - **A narrower engine is not a looser one.** Adding an engine or deployment shape never costs a
   guarantee. Unsupported work gets an explicit refusal.
-- **Integrity outranks everything else.** Convenience, speed, and scope all lose to it. There is no
-  database where the data mattering less makes corruption acceptable.
+- **Integrity outranks everything else.** Convenience, speed, and scope all lose to it. Every
+  database deserves protection from data loss and corruption, regardless of its size.
 
 ## Build with us
 
