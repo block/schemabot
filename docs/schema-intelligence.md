@@ -287,6 +287,17 @@ keep its identity outside the admin groups that grant write access. With
 forward-auth, use the allowlisted read-service identity lane, which rejects
 write requests. See [authentication](configuration.md#authentication) for setup.
 
+A schema catalog or replication service can start with two calls: `databases`
+to discover registered sources, then `pull` with `catalog_detail: detailed`
+where supported to read their table structure without parsing DDL. Store each
+snapshot with its database, environment, namespace, table, and fetch time;
+refresh periodically and respect `Retry-After` when a pull is rate limited.
+
+Add `history` and `progress` when you need execution context, such as the DDL
+and recorded task timestamps for a SchemaBot-managed change. These records
+complement the live snapshot; they are not a stream of every schema change
+made by any means.
+
 The CLI exposes the same reads: `schemabot status`, `databases`, `list-plans`,
 and `logs` accept `--json`; `schemabot pull` uses `-o json`.
 
