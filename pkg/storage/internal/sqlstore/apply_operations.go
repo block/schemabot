@@ -21,7 +21,7 @@ import (
 )
 
 // applyOperationColumns lists all columns for SELECT queries.
-const applyOperationColumns = `id, apply_id, deployment, operation_key, operation_kind, target, external_id, external_operation_id, state, error_message,
+const applyOperationColumns = `id, apply_id, plan_id, deployment, operation_key, operation_kind, target, external_id, external_operation_id, state, error_message,
 	cutover_policy, on_failure, attempt, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
 	engine_resume_context, engine_resume_metadata, created_at, updated_at`
 
@@ -81,11 +81,11 @@ func insertApplyOperation(ctx context.Context, exec queryExecer, identity identi
 
 	id, err := identity.InsertID(ctx, exec, `
 		INSERT INTO apply_operations (
-			apply_id, deployment, operation_key, operation_kind, target, external_id, external_operation_id, state, error_message, cutover_policy, on_failure,
+			apply_id, plan_id, deployment, operation_key, operation_kind, target, external_id, external_operation_id, state, error_message, cutover_policy, on_failure,
 			started_at, completed_at, engine_resume_context, engine_resume_metadata
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		ad.ApplyID, ad.Deployment, ad.OperationKey, operationKind, ad.Target, nullString(ad.ExternalID), nullString(ad.ExternalOperationID), stateVal, nullString(ad.ErrorMessage), cutoverPolicy, onFailure,
+		ad.ApplyID, nullInt64(ad.PlanID), ad.Deployment, ad.OperationKey, operationKind, ad.Target, nullString(ad.ExternalID), nullString(ad.ExternalOperationID), stateVal, nullString(ad.ErrorMessage), cutoverPolicy, onFailure,
 		ad.StartedAt, ad.CompletedAt, nullString(ad.EngineResumeContext), nullString(ad.EngineResumeMetadata),
 	)
 	if err != nil {
@@ -2110,15 +2110,19 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 	var externalOperationID sql.NullString
 	var engineResumeContext, engineResumeMetadata sql.NullString
 	var startedAt, completedAt, leaseAcquiredAt sql.NullTime
+	var planID sql.NullInt64
 
 	if err := s.Scan(
-		&ad.ID, &ad.ApplyID, &ad.Deployment, &ad.OperationKey, &ad.OperationKind, &ad.Target, &externalID, &externalOperationID, &ad.State, &errMsg,
+		&ad.ID, &ad.ApplyID, &planID, &ad.Deployment, &ad.OperationKey, &ad.OperationKind, &ad.Target, &externalID, &externalOperationID, &ad.State, &errMsg,
 		&ad.CutoverPolicy, &ad.OnFailure, &ad.Attempt, &startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
 		&engineResumeContext, &engineResumeMetadata, &ad.CreatedAt, &ad.UpdatedAt,
 	); err != nil {
 		return nil, err
 	}
 
+	if planID.Valid {
+		ad.PlanID = planID.Int64
+	}
 	if errMsg.Valid {
 		ad.ErrorMessage = errMsg.String
 	}
