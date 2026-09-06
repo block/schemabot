@@ -7,6 +7,8 @@ import (
 	"text/template"
 
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // SchemaErrorData contains data for rendering schema request error comments.
@@ -76,6 +78,22 @@ func (d SchemaErrorData) Attribution() string {
 	return "*Requested by @" + d.RequestedBy + " at " + d.Timestamp + " UTC*"
 }
 
+// DatabaseTypeChoices renders every type a schemabot.yaml may declare as a
+// comma-separated list of code spans. It reads the same set config validation
+// accepts, so a comment that teaches the field can never offer a narrower
+// choice than the server takes.
+func (d SchemaErrorData) DatabaseTypeChoices() string {
+	return strings.Join(markdownInlineCodeList(storage.DatabaseTypes()), ", ")
+}
+
+// SchemaConfigDocs renders the documentation link for the repository-side
+// schemabot.yaml. Every comment a first-time user can reach before they have a
+// working config carries it: without one the comment states a requirement and
+// leaves the reader to guess the rest of the file (UX-4).
+func (d SchemaErrorData) SchemaConfigDocs() string {
+	return "[Setting up `schemabot.yaml`](" + ui.SchemaConfigDocURL + ")"
+}
+
 const databaseNotFoundTemplate = "## " + glyph.Attention + ` Database Not Found
 
 **Database**: ` + "`{{.DatabaseName}}`" + `{{with .EnvironmentHeader}} | {{.}}{{end}}
@@ -84,7 +102,9 @@ const databaseNotFoundTemplate = "## " + glyph.Attention + ` Database Not Found
 
 No ` + "`schemabot.yaml`" + ` configuration with ` + "`database: {{.DatabaseName}}`" + ` was found in this repository.
 
-Check that your ` + "`schemabot.yaml`" + ` file has the correct ` + "`database`" + ` field matching the ` + "`-d`" + ` flag value.`
+Check that your ` + "`schemabot.yaml`" + ` file has the correct ` + "`database`" + ` field matching the ` + "`-d`" + ` flag value.
+
+{{.SchemaConfigDocs}}`
 
 const invalidConfigTemplate = "## " + glyph.Attention + ` No Valid SchemaBot Configuration Found
 
@@ -100,7 +120,9 @@ type: mysql
 ` + "```" + `
 
 - **database** (required): The database name
-- **type** (required): ` + "`vitess`" + ` or ` + "`mysql`" + ``
+- **type** (required): one of {{.DatabaseTypeChoices}}
+
+{{.SchemaConfigDocs}}`
 
 const noConfigNoDatabaseTemplate = "## " + glyph.Info + ` No SchemaBot Configuration Found
 
@@ -111,12 +133,16 @@ const noConfigNoDatabaseTemplate = "## " + glyph.Info + ` No SchemaBot Configura
 No ` + "`schemabot.yaml`" + ` configuration file was found in this repository.
 
 ### Setup Instructions
-Create a ` + "`schemabot.yaml`" + ` file in your schema directory:
+Create a ` + "`schemabot.yaml`" + ` file in the directory holding the ` + "`.sql`" + ` files that declare your tables:
 
 ` + "```yaml" + `
 database: your-database-name
 type: mysql
 ` + "```" + `
+
+` + "`type`" + ` is one of {{.DatabaseTypeChoices}}.
+
+{{.SchemaConfigDocs}}
 
 ### If you already have a config
 Use the ` + "`-d`" + ` flag to specify which database to {{.CommandName}}:
@@ -134,12 +160,16 @@ const noConfigWithDatabaseTemplate = "## " + glyph.Info + ` No SchemaBot Configu
 No ` + "`schemabot.yaml`" + ` configuration file exists in this repository.
 
 ### Setup Instructions
-Create a ` + "`schemabot.yaml`" + ` file in your schema directory:
+Create a ` + "`schemabot.yaml`" + ` file in the directory holding the ` + "`.sql`" + ` files that declare your tables:
 
 ` + "```yaml" + `
 database: {{.DatabaseName}}
 type: mysql
-` + "```" + ``
+` + "```" + `
+
+` + "`type`" + ` is one of {{.DatabaseTypeChoices}}.
+
+{{.SchemaConfigDocs}}`
 
 const configOutsideAllowedDirsTemplate = "## " + glyph.Attention + ` SchemaBot Configuration Not Authorized
 

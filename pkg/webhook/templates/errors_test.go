@@ -4,6 +4,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // TestRenderGenericErrorAutoPlan covers the failure comment for a
@@ -221,4 +224,44 @@ func TestRenderGenericErrorSanitizesDetail(t *testing.T) {
 	})
 	assert.Contains(t, body, "&lt;img src=x&gt;", "HTML markup is escaped")
 	assert.NotContains(t, body, "<img", "raw markup never reaches the comment")
+}
+
+// A user who has not got a working schemabot.yaml yet reaches these comments
+// first, so each one must name every database type the server accepts and
+// carry a link to the page that documents the file. Offering a narrower set of
+// types than config validation takes sends a reader to "fix" a config that was
+// already correct.
+func TestFirstContactConfigCommentsTeachTheFile(t *testing.T) {
+	data := SchemaErrorData{
+		Timestamp:   "2026-07-16 18:56:00",
+		RequestedBy: "octocat",
+		Environment: "staging",
+		CommandName: "plan",
+	}
+
+	comments := map[string]string{
+		"invalid config":     RenderInvalidConfig(data),
+		"no config":          RenderNoConfig(data),
+		"no config with -d":  RenderNoConfig(withDatabase(data, "inventory")),
+		"database not found": RenderDatabaseNotFound(withDatabase(data, "inventory")),
+	}
+
+	for name, body := range comments {
+		t.Run(name, func(t *testing.T) {
+			assert.Contains(t, body, ui.SchemaConfigDocURL, "the comment links the schemabot.yaml docs")
+		})
+	}
+
+	for _, dbType := range storage.DatabaseTypes() {
+		t.Run("offers type "+dbType, func(t *testing.T) {
+			assert.Contains(t, RenderInvalidConfig(data), "`"+dbType+"`")
+			assert.Contains(t, RenderNoConfig(data), "`"+dbType+"`")
+			assert.Contains(t, RenderNoConfig(withDatabase(data, "inventory")), "`"+dbType+"`")
+		})
+	}
+}
+
+func withDatabase(data SchemaErrorData, database string) SchemaErrorData {
+	data.DatabaseName = database
+	return data
 }

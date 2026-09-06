@@ -2,14 +2,6 @@ package ui
 
 import "strings"
 
-// ThrottleDocURL points at the throttle reference doc, which explains each
-// throttle signal and how to remediate it. Rendered next to a throttle tip so
-// an operator can jump from the one-line tip to the full prose. The URL is
-// deliberately the project's canonical public home, not derived from the
-// configured GitHub host: that host serves users' schema repos, which do not
-// carry this project's docs, so a host-derived link would always be broken.
-const ThrottleDocURL = "https://github.com/block/schemabot/blob/main/docs/throttle.md"
-
 // ThrottleTip translates an engine throttle reason into a short operator-facing
 // tip. Reasons follow the grammar "<signal> <observed> <op> <threshold>", with
 // several concurrently-throttling signals joined by "; ", so the tip is keyed
