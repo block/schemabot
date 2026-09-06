@@ -215,7 +215,7 @@ func TestLogEmitter_EmitTableStateChange(t *testing.T) {
 }
 
 func TestLogEmitter_EmitProgressHeartbeat(t *testing.T) {
-	t.Run("structured ETA renders alongside a Spirit progress detail", func(t *testing.T) {
+	t.Run("structured ETA renders alongside the row counts", func(t *testing.T) {
 		e := &logEmitter{applyID: "apply-test"}
 		ts := &tableLogState{taskID: "task-orders-1"}
 		tbl := &apitypes.TableProgressResponse{
@@ -224,7 +224,6 @@ func TestLogEmitter_EmitProgressHeartbeat(t *testing.T) {
 			RowsCopied:      99450,
 			RowsTotal:       221000,
 			ETASeconds:      330,
-			ProgressDetail:  "99450/221000 45.00% copyRows",
 		}
 
 		output := captureOutput(t, func() {

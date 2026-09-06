@@ -738,7 +738,7 @@ type TableProgress struct {
 	ThrottleReason string
 	Shards         []ShardProgress // Per-shard breakdown (for Vitess)
 	IsInstant      bool            // True if using instant DDL
-	ProgressDetail string          // Human-readable progress (e.g., Spirit: "12.5% copyRows ETA 1h 30m")
+	ProgressDetail string          // Free-text note for a human reader; never parsed, never persisted
 	DDL            string          // The DDL statement being applied
 	StartedAt      *time.Time      // When execution actually began (from engine, e.g., SHOW VITESS_MIGRATIONS started_timestamp)
 	CompletedAt    *time.Time      // When execution completed (from engine)
