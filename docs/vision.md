@@ -7,28 +7,29 @@ runs on, and everything in between. Adding a column, adding an index, dropping a
 should risk taking the database down, and none of it should require you to be a database expert
 first.
 
-**Somebody's first week.** A new engineer adds a column to a `CREATE TABLE` file and opens a pull
-request. SchemaBot posts the plan: the exact DDL it will run, and how to apply it from the pull
-request itself. The table is busy and holds a lot of data, and the plan says the change is instant,
-with no table copy needed. The engineer runs the command, the checks go green, and the change merges.
+> **Somebody's first week.** A new engineer adds a column to a `CREATE TABLE` file and opens a pull
+> request. SchemaBot posts the plan: the exact DDL it will run, and how to apply it from the pull
+> request itself. The table is busy and holds a lot of data, and the plan says the change is instant,
+> with no table copy needed. The engineer runs the command, the checks go green, and the change
+> merges.
 
-**A change that runs for three weeks.** An index on a table holding tens of terabytes. There is no
-version of that which is fast. SchemaBot builds a new copy of the table alongside the live one and
-fills it for three weeks, watching the database the whole time and slowing itself down whenever that
-database gets busy. When something unrelated catches fire on a Thursday, it backs off without being
-asked. The application writes to the old table for all twenty-one days and never notices any of it.
-The only moment that touches the application is the swap at the end, and that was scheduled three
-weeks earlier in the pull request: 3am on Tuesday, when traffic is low. It happens then, on its own,
-and nobody is awake for it. Total human involvement: opening a pull request and picking a time.
+> **A change that runs for three weeks.** An index on a table holding tens of terabytes. There is no
+> version of that which is fast. SchemaBot builds a new copy of the table alongside the live one and
+> fills it for three weeks, watching the database the whole time and slowing itself down whenever that
+> database gets busy. When something unrelated catches fire on a Thursday, it backs off without being
+> asked. The application writes to the old table for all twenty-one days and never notices any of it.
+> The only moment that touches the application is the swap at the end, and that was scheduled three
+> weeks earlier in the pull request: 3am on Tuesday, when traffic is low. It happens then, on its own,
+> and nobody is awake for it. Total human involvement: opening a pull request and picking a time.
 
-**A hundred changes, nobody watching.** It is an ordinary Tuesday and a hundred schema changes are
-moving across the fleet. Most were written by agents. No human is tracking any of them. Four of those
-agents happen to be working on the same database at the same time, with no idea the others exist and
-no way to talk to each other. One change lands, and within seconds every plan built against the old
-schema goes red; those agents reread the live database, replan, and push again with nobody prompting
-them. One proposes dropping a column, and that one stops and waits for a person, because dropping a
-column is not a decision an agent makes alone. No two of them ever touched the database at once.
-Nothing was left half applied. Nobody arbitrated any of it.
+> **A hundred changes, nobody watching.** It is an ordinary Tuesday and a hundred schema changes are
+> moving across the fleet. Most were written by agents. No human is tracking any of them. Four of
+> those agents happen to be working on the same database at the same time, with no idea the others
+> exist and no way to talk to each other. One change lands, and within seconds every plan built
+> against the old schema goes red; those agents reread the live database, replan, and push again
+> with nobody prompting them. One proposes dropping a column, and that one stops and waits for a
+> person, because dropping a column is not a decision an agent makes alone. No two of them ever
+> touched the database at once. Nothing was left half applied. Nobody arbitrated any of it.
 
 Code is being written faster than any review process was built for, and the database is the part that
 does not forgive a mistake. You can regenerate the code. You cannot regenerate the data. So the
@@ -57,12 +58,14 @@ needs a platform team to be correct, and not one gets better because more infras
 it. There is no principled reason the hobbyist gets the unsafe version.
 
 What has to become true is that adoption gets much cheaper at the small end without anything
-loosening at the large end. A tier-zero fleet needs machinery an experiment has no use for: a server
-that stays up, state that survives a restart, a guarantee that only one process is ever driving a
-given change, and a person who can stop one halfway through. An experiment wants a binary and a
-connection string. What varies between them is the scaffolding, never the gates. A change that would
-be unsafe in front of production is unsafe in front of a weekend project too, and it gets refused in
-both places.
+loosening at the large end. It is tempting to file the rest under machinery only a large fleet needs:
+state that survives a restart, a guarantee that only one process is ever driving a given change,
+someone able to stop one halfway through. None of it is. A laptop that closes in the middle of a
+change needs those guarantees exactly as much as a fleet does. SchemaBot is the loop that reconciles
+the schema you wrote to the database you have, and it is the same loop at every size. What changes is
+how much infrastructure carries it: servers that stay up and hand work between each other at one end,
+one binary and a connection string at the other. A change that would be unsafe in front of production
+is unsafe in front of a weekend project too, and it gets refused in both places.
 
 Concretely, the shape SchemaBot runs in should be a choice rather than a prerequisite. A coordinating
 server on Kubernetes that never needs a route to your databases: a separate process inside each
