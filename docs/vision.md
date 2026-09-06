@@ -23,8 +23,7 @@ This is where SchemaBot is headed.
 If you have not used it: SchemaBot changes database schemas. You describe the tables you want as
 ordinary SQL files in your repository, one `CREATE TABLE` per table, and SchemaBot compares those
 files against the database as it actually is, works out the DDL that closes the gap, and runs it
-without taking the database down. That comparison, and the checks around it, are what this document
-is about.
+without taking the database down.
 
 Everything else in `docs/` describes what SchemaBot does today. This one is about what we want it to
 become, and why that is worth building. There are no dates in it and nothing here is a promise to
