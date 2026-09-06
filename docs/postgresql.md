@@ -327,3 +327,9 @@ database configuration. Conversely, PostgreSQL targets do not require
 SchemaBot's own storage database to use PostgreSQL. See
 [Configuration → Storage Dialect](configuration.md#storage-dialect) for the
 storage DSN and bootstrap behavior.
+
+The storage DSN must reach an endpoint that gives each connection its own
+PostgreSQL session, because SchemaBot coordinates its instances with
+session-scoped advisory locks. Startup refuses a transaction-mode pooled
+connection string rather than run without that coordination. See
+[Configuration → PostgreSQL storage needs a session-per-connection endpoint](configuration.md#postgresql-storage-needs-a-session-per-connection-endpoint).

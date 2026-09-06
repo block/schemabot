@@ -22,6 +22,7 @@
 - [Pending Drops](#pending-drops)
 - [Direct Execution](#direct-execution)
 - [Storage Dialect](#storage-dialect)
+  - [PostgreSQL storage needs a session-per-connection endpoint](#postgresql-storage-needs-a-session-per-connection-endpoint)
   - [Resyncing PostgreSQL identity sequences](#resyncing-postgresql-identity-sequences)
 - [Storage Connection Pool](#storage-connection-pool)
 - [Spirit Run Settings](#spirit-run-settings)
@@ -681,6 +682,29 @@ specific to the storage database — `dsn_from` on a `target_resolver` target
 supports both `mysql` and `postgres`.) See
 [Storage Schema Changes](#storage-schema-changes) for how schema
 bootstrapping differs between the two dialects.
+
+### PostgreSQL storage needs a session-per-connection endpoint
+
+SchemaBot coordinates its instances on PostgreSQL with session-scoped advisory
+locks: they serialize the startup schema bootstrap across pods and keep one
+apply per deployment at runtime. A transaction-mode connection pooler rebinds
+the server backend for every transaction, which leaves those locks on a session
+the pod no longer reaches. Two pods are then both told they hold the lock.
+
+Startup proves the connection keeps its session before relying on it, and
+refuses to bootstrap when it proves otherwise, naming the fix. If you see that
+refusal, point `storage.dsn` at the database's direct endpoint. Hosted
+PostgreSQL platforms publish two connection strings and default to the pooled
+one, so this is the connection string you get by following their setup docs:
+
+| Endpoint | Typical port | Usable for `storage.dsn` |
+| --- | --- | --- |
+| Direct / session | `5432` | Yes |
+| Pooled, session pool mode | `6432` | Yes: one backend per client connection |
+| Pooled, transaction pool mode | `6543`, `6432` | No: refused at startup |
+
+Pooling a PostgreSQL *target* database is unaffected: this applies only to
+SchemaBot's own storage database.
 
 ### Resyncing PostgreSQL identity sequences
 

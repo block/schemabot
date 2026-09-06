@@ -125,9 +125,11 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 	// before doing any work. This is critical for debugging bootstrap issues
 	// in embedded environments (e.g., Tern) where the DSN is constructed
 	// dynamically and we need to confirm we're hitting the right database.
+	var storageDatabase string
 	if diag, err := diagnoseStorageTarget(ctx, dsn); err != nil {
 		logger.Warn("storage target diagnostic failed", "error", err)
 	} else {
+		storageDatabase = diag.database
 		logger.Info("EnsureSchema storage target",
 			"hostname", diag.hostname,
 			"database", diag.database,
@@ -202,7 +204,7 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 	if err != nil {
 		return fmt.Errorf("acquire schema lock: %w", err)
 	}
-	defer utils.CloseAndLog(lockConn)
+	defer releaseEnsureSchemaLock(ctx, locker, lockConn, logger, schema.DialectMySQL, storageDatabase)
 
 	// Clean up stale Spirit internal tables only while holding the advisory
 	// lock. During a rolling deploy, another pod may be actively applying
@@ -636,6 +638,41 @@ func acquireMySQLEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.
 
 	logger.Info("acquired EnsureSchema advisory lock")
 	return conn, nil
+}
+
+// ensureSchemaLockReleaseTimeout bounds the release issued as the bootstrap
+// returns, so a storage database that has become unreachable delays startup by
+// a bounded amount rather than by whatever the driver would wait.
+const ensureSchemaLockReleaseTimeout = 10 * time.Second
+
+// releaseEnsureSchemaLock releases the bootstrap advisory lock and closes the
+// connection holding it. Closing alone already drops the lock — the pool behind
+// this connection was closed at acquire time, so closing ends the session — but
+// the release runs first for its answer: it is the only reading of whether the
+// session SchemaBot converged storage under is still the session that took the
+// lock.
+//
+// A negative answer is not a routine "the lock was not held". It means this pod
+// converged storage without the exclusion the lock was supposed to give it, so
+// another pod may have been converging the same schema alongside it, and it is
+// reported with the identifiers needed to find the pod and database involved.
+// It runs on a context detached from the bootstrap deadline, which is usually
+// spent by the time a release is due.
+func releaseEnsureSchemaLock(ctx context.Context, locker namedlock.Locker, conn *sql.Conn, logger *slog.Logger, dialect schema.Dialect, database string) {
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ensureSchemaLockReleaseTimeout)
+	defer cancel()
+
+	released, err := locker.Release(releaseCtx, conn, ensureSchemaLockName)
+	switch {
+	case err != nil:
+		logger.Warn("failed to release the EnsureSchema advisory lock",
+			"lock", ensureSchemaLockName, "dialect", dialect, "database", database, "error", err)
+	case !released:
+		logger.Warn("the EnsureSchema advisory lock was not held at release; storage was converged without cross-instance exclusion and another instance may have been converging it at the same time",
+			"lock", ensureSchemaLockName, "dialect", dialect, "database", database)
+	}
+
+	utils.CloseAndLog(conn)
 }
 
 // cleanStaleSpiritTables drops any Spirit internal tables left behind by a
