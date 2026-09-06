@@ -121,12 +121,11 @@ To run SchemaBot against your own databases, grab a build from [Releases](#relea
 
 ## Docs
 
-Guides and reference.
+Guides and reference:
 
 - [Vision](./docs/vision.md): Where SchemaBot is going and why.
 - [Quick start](#quick-start): Get SchemaBot running locally.
-- [Schema intelligence](./docs/schema-intelligence.md): Explore your database fleet,
-  inspect live schemas, and follow schema changes through the CLI or read-only API.
+- [Schema intelligence](./docs/schema-intelligence.md): Explore live schemas and changes across your fleet.
 - [Engines](./docs/engines.md): Compare how engines execute changes, manage load,
   and support control operations.
 - [PostgreSQL](./docs/postgresql.md): See what plans, what applies, and how refusals
