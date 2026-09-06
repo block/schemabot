@@ -18,11 +18,11 @@ func TestUnlockCmdCanonicalizesKeysForAlternateTypeHint(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
 			_, err := w.Write([]byte(`{"error":"lock not found"}`))
-			require.NoError(t, err)
+			assert.NoError(t, err)
 		case r.Method == http.MethodGet && r.URL.Path == "/api/locks":
 			w.Header().Set("Content-Type", "application/json")
 			_, err := w.Write([]byte(`{"locks":[{"database":"games","database_type":"vitess","owner":"org/repo#2"}]}`))
-			require.NoError(t, err)
+			assert.NoError(t, err)
 		default:
 			http.NotFound(w, r)
 		}
