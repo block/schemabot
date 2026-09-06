@@ -83,13 +83,13 @@ connection string. What varies between them is the scaffolding, never the gates.
 be unsafe in front of production is unsafe in front of a weekend project too, and it gets refused in
 both places.
 
-Concretely, the shape SchemaBot runs in should be a choice rather than a prerequisite. A control
-plane on Kubernetes, with separate processes inside each network where the databases actually live,
-so the coordinating server never needs a route to them. One server process with a database behind
-it. No server at all, just the CLI against a DSN. Or SchemaBot embedded as a library inside the
-application that owns the schema, close enough to run at startup. The first three work today and
-the fourth partly does. What is missing is the small end being genuinely small, instead of the
-large deployment with most of it switched off.
+Concretely, the shape SchemaBot runs in should be a choice rather than a prerequisite. A coordinating
+server on Kubernetes, with a separate process in each network the databases live in, so the server
+never needs a route to them. One server process with a database behind it. No server at all, just the
+CLI against a DSN. Or SchemaBot embedded as a library inside the application that owns the schema,
+close enough to run at startup. The first three work today and the fourth partly does. What is
+missing is the small end being genuinely small, instead of the large deployment with most of it
+switched off.
 
 ![Both ends of the range feed into the same four gates: diff against the live database, lint before anything runs, explicit consent to destroy, and uncertainty never passing](../assets/vision-range.svg)
 
