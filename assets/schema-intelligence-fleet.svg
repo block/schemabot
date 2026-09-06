@@ -69,7 +69,7 @@
 <circle cx="616.00" cy="188" r="2.8" fill="#3578e5"/>
 <rect x="657" y="157" width="267" height="66" rx="10" fill="#fff" stroke="#dadde1"/>
 <text x="673" y="182" font-size="13" fill="#1c1e21" font-weight="600" text-anchor="start">Find a fleet-wide pattern</text>
-<text x="673" y="203" font-size="10.8" fill="#474e57" font-weight="400" text-anchor="start">Where is this key type still used?</text>
+<text x="673" y="203" font-size="10.8" fill="#474e57" font-weight="400" text-anchor="start">Which tables lack a primary key?</text>
 <path d="M612 264 L646 264" fill="none" stroke="#ccd0d5" stroke-width="1.4"/>
 <circle cx="624.33" cy="264" r="2.8" fill="#009400"/>
 <rect x="657" y="233" width="267" height="66" rx="10" fill="#fff" stroke="#dadde1"/>

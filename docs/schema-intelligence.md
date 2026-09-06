@@ -44,21 +44,14 @@ GET /api/databases
 
 Use a database name and environment from this inventory in the reads below.
 
-**Where are we still using the old primary-key type?** Pull each database and environment with
-`catalog_detail: detailed` and `lint: true` where supported. Group the findings
-by rule and keep the database, environment, namespace, and table beside each
-one. Your agent can return the affected tables and the evidence; your dashboard
-can track the pattern over time. Schedule pulls and cache the results rather
-than scanning the fleet on every question.
-
-
-For one MySQL database in that inventory:
+**What does this database look like?** Pull its live schema using a database
+and environment from the inventory.
 
 ```http
 POST /api/pull
 Content-Type: application/json
 
-{"database": "shop", "environment": "production", "catalog_detail": "detailed", "lint": true}
+{"database": "shop", "environment": "production"}
 ```
 
 ```json
@@ -67,24 +60,51 @@ Content-Type: application/json
   "environment": "production",
   "namespaces": {
     "shop": {
-      "table_catalog": {
-        "orders": {
-          "columns": [{"name": "id", "type": "int", "nullable": false}],
-          "indexes": [{"name": "PRIMARY", "primary": true, "parts": ["id"], "unique": true}]
-        }
+      "tables": {
+        "orders": "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
       }
     }
   }
 }
 ```
 
-Here, the primary index points to an `int` column. The caller can find the
-same pattern across its inventory; `namespaces.shop.lint` also carries findings
-from the configured schema rules.
-
+The response gives you the table definitions without logging into the database.
 A pull reads the environment's **primary deployment**, not every deployment or
-shard independently. It can also reveal differences from the repository's schema
-files, but it does not prove every copy in the fleet matches.
+shard independently; it does not prove every copy in the fleet matches.
+
+**Which tables are missing a primary key?** Add `lint: true` to inspect a live
+schema for issues. On a MySQL database, a finding looks like this:
+
+```http
+POST /api/pull
+Content-Type: application/json
+
+{"database": "shop", "environment": "production", "lint": true}
+```
+
+```json
+{
+  "database": "shop",
+  "environment": "production",
+  "namespaces": {
+    "shop": {
+      "lint": [{
+        "table": "order_events",
+        "linter": "primary_key",
+        "severity": "warning",
+        "message": "No primary key defined"
+      }]
+    }
+  }
+}
+```
+
+Repeat across the supported databases and environments in your inventory, then
+group these findings with their database, environment, namespace, and table.
+Your agent can list the affected tables; your dashboard can track fixes over
+time. Schedule pulls and cache results rather than scanning the fleet on every
+question. For structured columns and indexes alongside the DDL, add
+`catalog_detail: detailed` where supported.
 
 **Which change added this column?** Start with `GET /api/history/{database}`,
 then inspect candidate applies through `GET /api/progress/apply/{apply_id}`.
