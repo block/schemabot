@@ -1207,9 +1207,27 @@ type TableChange struct {
 	// the namespace's persisted VSchema change-metadata here so a deployment
 	// that materializes the plan from a dispatch request runs the same
 	// apply-time safety gates as one reading its own stored plan.
-	Metadata      map[string]string `protobuf:"bytes,9,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Metadata map[string]string `protobuf:"bytes,9,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// Approximate number of rows in the table at plan time, for display only.
+	// Sourced from engine statistics (e.g. information_schema TABLE_ROWS), which
+	// may be stale — never treat it as an exact count or use it as a gate input.
+	// For sharded targets this is the sum across shards. Unset when no estimate
+	// is available (e.g. the table is being created, or statistics could not be
+	// read).
+	EstimatedRows *int64 `protobuf:"varint,10,opt,name=estimated_rows,json=estimatedRows,proto3,oneof" json:"estimated_rows,omitempty"`
+	// Number of shards this table change spans. Zero when the target is not
+	// sharded or the shard topology is unknown.
+	ShardCount int32 `protobuf:"varint,11,opt,name=shard_count,json=shardCount,proto3" json:"shard_count,omitempty"`
+	// Approximate row count of the largest single shard — the biggest chunk a
+	// shard-at-a-time apply works through at once. Unset when the target is not
+	// sharded or no estimate is available. Approximate like estimated_rows.
+	LargestShardRows *int64 `protobuf:"varint,12,opt,name=largest_shard_rows,json=largestShardRows,proto3,oneof" json:"largest_shard_rows,omitempty"`
+	// Approximate on-disk footprint of the table (data plus indexes), summed
+	// across shards for sharded targets. Unset when no estimate was available.
+	// Approximate like estimated_rows.
+	EstimatedBytes *int64 `protobuf:"varint,13,opt,name=estimated_bytes,json=estimatedBytes,proto3,oneof" json:"estimated_bytes,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *TableChange) Reset() {
@@ -1303,6 +1321,34 @@ func (x *TableChange) GetMetadata() map[string]string {
 		return x.Metadata
 	}
 	return nil
+}
+
+func (x *TableChange) GetEstimatedRows() int64 {
+	if x != nil && x.EstimatedRows != nil {
+		return *x.EstimatedRows
+	}
+	return 0
+}
+
+func (x *TableChange) GetShardCount() int32 {
+	if x != nil {
+		return x.ShardCount
+	}
+	return 0
+}
+
+func (x *TableChange) GetLargestShardRows() int64 {
+	if x != nil && x.LargestShardRows != nil {
+		return *x.LargestShardRows
+	}
+	return 0
+}
+
+func (x *TableChange) GetEstimatedBytes() int64 {
+	if x != nil && x.EstimatedBytes != nil {
+		return *x.EstimatedBytes
+	}
+	return 0
 }
 
 // SchemaChange is a namespace-level bundle. A PlanResponse must include at most
@@ -3948,7 +3994,7 @@ const file_tern_proto_rawDesc = "" +
 	"\x10SchemaFilesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12*\n" +
 	"\x05value\x18\x02 \x01(\v2\x14.tern.v1.SchemaFilesR\x05value:\x028\x01B\x14\n" +
-	"\x12_grouped_executionJ\x04\b\a\x10\b\"\x99\x03\n" +
+	"\x12_grouped_executionJ\x04\b\a\x10\b\"\x85\x05\n" +
 	"\vTableChange\x12\x1d\n" +
 	"\n" +
 	"table_name\x18\x01 \x01(\tR\ttableName\x12\x10\n" +
@@ -3961,10 +4007,19 @@ const file_tern_proto_rawDesc = "" +
 	"\x0eexecution_mode\x18\a \x01(\tR\rexecutionMode\x12\x1f\n" +
 	"\vmode_reason\x18\b \x01(\tR\n" +
 	"modeReason\x12>\n" +
-	"\bmetadata\x18\t \x03(\v2\".tern.v1.TableChange.MetadataEntryR\bmetadata\x1a;\n" +
+	"\bmetadata\x18\t \x03(\v2\".tern.v1.TableChange.MetadataEntryR\bmetadata\x12*\n" +
+	"\x0eestimated_rows\x18\n" +
+	" \x01(\x03H\x00R\restimatedRows\x88\x01\x01\x12\x1f\n" +
+	"\vshard_count\x18\v \x01(\x05R\n" +
+	"shardCount\x121\n" +
+	"\x12largest_shard_rows\x18\f \x01(\x03H\x01R\x10largestShardRows\x88\x01\x01\x12,\n" +
+	"\x0festimated_bytes\x18\r \x01(\x03H\x02R\x0eestimatedBytes\x88\x01\x01\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xb0\x03\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x11\n" +
+	"\x0f_estimated_rowsB\x15\n" +
+	"\x13_largest_shard_rowsB\x12\n" +
+	"\x10_estimated_bytes\"\xb0\x03\n" +
 	"\fSchemaChange\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x129\n" +
 	"\rtable_changes\x18\x02 \x03(\v2\x14.tern.v1.TableChangeR\ftableChanges\x12?\n" +
@@ -4410,6 +4465,7 @@ func file_tern_proto_init() {
 		return
 	}
 	file_tern_proto_msgTypes[9].OneofWrappers = []any{}
+	file_tern_proto_msgTypes[10].OneofWrappers = []any{}
 	file_tern_proto_msgTypes[22].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
