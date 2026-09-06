@@ -2,299 +2,203 @@
 
 ## The northstar
 
-Every database should be able to evolve safely. A weekend project, the tier-zero fleet a business
-runs on, and everything in between. Adding a column, adding an index, dropping a table: none of it
-should risk taking the database down, and none of it should require you to be a database expert
-first.
+Every database should be able to evolve safely, from a weekend project to the tier-zero fleet a
+business runs on. Anyone should be able to build with agents against a real database, without
+becoming a database expert or giving up control of their data. Ask for a feature, approve its
+database changes, and ship knowing the database matches what you approved.
 
-> **Somebody's first week.** A new engineer adds a column to a `CREATE TABLE` file and opens a pull
-> request. SchemaBot posts the plan: the exact DDL it will run, and how to apply it from the pull
-> request itself. The table is busy and holds a lot of data, and the plan says the change is
-> instant, with no table copy needed. The engineer runs the command as a PR comment, the checks go
-> green, and the change merges.
+SchemaBot offers the path from a proposed schema to a verified change in a live database.
+These are the experiences we want that path to make ordinary.
 
-> **A change that runs for three weeks.** An index on a table holding tens of terabytes. There is no
+> **One person shipping a feature.** You ask your coding agent to add a feature that requires a
+> schema change. It updates the app and declares the schema it needs. SchemaBot shows you exactly
+> what will change in your database. You approve, SchemaBot applies and verifies the change, and
+> the agent tests the feature. You ship from the tool where you started, without becoming a
+> database expert.
+
+> **Many agents, one database.** Four agents are building different features. Two need to change
+> the same table. When one change lands, the other's plan becomes stale. SchemaBot tells that agent
+> to reconcile and replan. Another proposes dropping a column, and that one waits for a person.
+> Nobody arbitrates between the agents. They work independently because the safety gates are shared
+> and the protocols are clear.
+
+> **A change that runs for three weeks.** An index add on a table holding tens of terabytes. There is no
 > version of that which is fast. SchemaBot builds a new copy of the table alongside the live one and
-> fills it for three weeks. The whole time, it is watching how long each batch of copying takes and
-> how much the database is already doing, and it slows down or stops when either climbs. The
-> application writes to the old table for all twenty-one days and never notices any of it. The only
+> fills it for three weeks. The whole time, it watches how long each batch takes and how much
+> capacity the database has to spare. When there is room, it speeds up. When pressure climbs, it
+> backs off or pauses. The copy moves as fast as the database can safely handle, without anyone
+> tuning it by hand. The application writes to the old table for all twenty-one days and never
+> notices any of it. The only
 > moment that touches the application is the swap at the end, and that was scheduled three weeks
 > earlier in the pull request: 3am on Tuesday, when traffic is low. It happens then, on its own, and
 > nobody is awake for it. Total human involvement: opening a pull request and picking a time.
 
-> **A hundred changes, nobody watching.** It is an ordinary Tuesday and a hundred schema changes are
-> moving across the fleet. Most were written by agents. No human is tracking any of them. Four of
-> those agents happen to be working on the same database at the same time, with no idea the others
-> exist and no way to talk to each other. One change lands, and within seconds every plan built
-> against the old schema goes red; those agents reread the live database, replan, and push again
-> with nobody prompting them. One proposes dropping a column, and that one stops and waits for a
-> person, because dropping a column is not a decision an agent makes alone. No two of them ever
-> touched the database at once. Nothing was left half applied. Nobody arbitrated any of it.
+> **A large database fleet spread across the company.** An engineer asks their agent: “Where are we still using the
+> old primary-key type?” Across thousands of databases, SchemaBot supplies the live schemas, lint
+> findings, and recorded change history. The agent returns the affected tables and the evidence
+> behind each finding. SchemaBot asks: “Fix this category across the fleet?” The engineer says yes.
+> SchemaBot opens pull requests in the owning repositories, each with the proposed schema edits
+> and a plan against the live database, ready for the owners to review. Every change goes through
+> the same gates. Nobody logs into a hundred databases, copies the same fix between repositories,
+> or turns an audit spreadsheet into a week of tickets.
 
-Code is being written faster than any review process was built for, and the database is the part
-that does not forgive a mistake. You can regenerate the code. You cannot regenerate the data. So the
-judgment lives in the tool rather than in whoever wrote the change. The DDL is derived from the
-files rather than typed by hand. Whether a change runs instantly or copies the table for three weeks
-is worked out from the engine and the table, not guessed. Destroying something takes consent given
-against the exact plan that is about to run. Anything ambiguous stops instead of passing. Not one of
-those asks who the author was, which is what makes it the same judgment for a staff engineer,
-someone on their first week, or the twelfth agent to open a pull request this hour.
-
-No change windows. No runbooks. No database team standing in front of every change. Schemas that move
-as fast as the code that needs them, on databases nobody is scared of, at any scale, at any hour.
+Agents are making it faster to build and iterate on features. SchemaBot helps the database keep up
+by turning the schema you want into changes it plans, checks, and runs for you. Each change stays
+reviewable: SchemaBot shows you what will happen, asks before destroying anything, and stops when
+the answer is uncertain. You keep building, without having to become a database expert—with the
+confidence to evolve your database at any scale, at any hour.
 
 ## From a vibe-coded experiment to a tier-zero database
 
-One tool should serve both ends of that range.
+SchemaBot should earn the trust of teams running tier-zero databases and be easy enough to use
+on a side project. You get that foundation from the start, whether your project stays small or
+grows into a company.
 
-Today they are served by different worlds. Someone building a side project uses whatever their
-framework bundles and finds out at deploy time whether it worked. A large organization staffs a
-platform team, builds an internal pipeline, and puts humans in front of every change. What is
-striking is how little the hazards change between them. A change that locks a table, a drop nobody
-intended, a half-applied state nobody can name: all of that is reachable from either end. Scale
-changes the blast radius, not the failure mode.
+Start with the database you have. Bring its schema into version control, preview a real change,
+and use the tools you already work in. The first useful plan should be minutes away, with the
+same safeguards trusted in production.
 
-What keeps a change safe is a short list of checks it has to get past. First, diff the files against
-the live database to work out the exact DDL: that is the plan. Then lint the plan before anything
-runs, ask for consent before destroying something, and refuse to call an ambiguous result a success.
-Those are the gates. Not one of them needs a platform team to be correct, and not one gets better
-because more infrastructure is running it. There is no principled reason the hobbyist gets the
-unsafe version.
+![Both ends of the range feed into the same gates](../assets/vision-range.svg)
 
-What has to become true is that adoption gets much cheaper at the small end without anything
-loosening at the large end. It is tempting to file the rest under machinery only a large fleet needs:
-state that survives a restart, a guarantee that only one process is ever driving a given change,
-someone able to stop one halfway through. None of it is. A laptop that closes in the middle of a
-change needs those guarantees exactly as much as a fleet does. SchemaBot is the loop that reconciles
-the schema you wrote to the database you have, and it is the same loop at every size. What changes is
-how much infrastructure carries it: servers that stay up and hand work between each other at one end,
-one binary and a connection string at the other. A change that would be unsafe in front of production
-is unsafe in front of a weekend project too, and it gets refused in both places.
-
-Concretely, the shape SchemaBot runs in should be a choice rather than a prerequisite. A running
-service on Kubernetes or any desired compute. A local process using a CLI against a connection
-string. A plugin or embedded library component that runs inside the application.
-
-![Both ends of the range feed into the same four gates: diff against the live database, lint before anything runs, explicit consent to destroy, and uncertainty never passing](../assets/vision-range.svg)
+Choose how SchemaBot fits: one binary and a connection string, a running service, or a component
+inside your favorite developer tool. The same loop at every size, with the same guarantees. Close
+a laptop or restart a server: the work must stay accounted for, ready to recover from where it left
+off. Start with a simple setup and add what you need as you grow, all the way to running a large
+company’s database fleet.
 
 ## Safe should also mean fast
 
-Everything so far has been about safety. Speed matters just as much. Making a schema change safe does
-not make it any less of a chore to run, and SchemaBot should take the chore away too, not just the
-risk.
+A safe schema change should also be an easy one. Spend your attention on what you want to build;
+let SchemaBot take care of getting the database ready.
 
-Mostly the two are not in tension, because the same declarative model that lets the tool reason about
-a change is what lets it do the work. You edit a file. You do not have to work out the `ALTER`,
-decide whether it can run in place or needs a copy, pick a batch size, tune a throttle, or run
-anything by hand at midnight because that is when traffic is low.
+You edit a file. You do not have to work out the `ALTER`, choose an execution strategy, pick a
+batch size, tune a throttle, or wake up at midnight because that is when traffic is low.
 
 Four things should disappear:
 
-- **The second tool.** No separate console to log into, no form to click through, no ticket to file
-  and wait on. The change gets reviewed where the code gets reviewed, and driven from the same place,
-  or from the CLI if you would rather not open a browser at all.
-- **The waiting.** Copying a large table takes as long as it takes. That should be the machine's
-  time, not yours. It runs, it reports progress, and it interrupts you only when it genuinely needs a
-  decision.
-- **The coordination tax.** Does the code go first or the schema? What happens if someone else's
-  change lands while mine is still open? The tool should answer that, not a thread in a channel.
-- **The rerun.** Staging, then production, then the other region, each one a person remembering to go
-  and do it. The same file should land everywhere it applies.
+- **The second tool.** No separate console, form, or ticket. Drive the change where you already work.
+- **The waiting.** Copying takes as long as it takes. That should be the machine's time, not yours.
+- **The coordination tax.** Know what can ship first and what needs another step. Get guidance
+  on deploy order and stale plans, with a clear question when application context is needed.
+- **The follow-through.** Declare the schema once. SchemaBot carries it across environments,
+  deployments, and shards, so you don't have to drive each one by hand.
 
-The one that is easiest to miss is that a change taking three weeks should not block anything for
-three weeks. A change too big to apply in place is done by building a new version of the table
-alongside the live one and swapping them at the end, so the copy can run in the background for as
-long as it needs while the application keeps using the old table. The single moment it touches the
-application is that swap, and somebody picks when it happens. It can be a quiet Tuesday morning
-instead of the middle of a release freeze.
+![The change still takes eight hours. It stops taking eight hours of your day](../assets/vision-attention.svg)
 
-![Two timelines over the same eight hours. Done by hand, six separate moments demand a person: writing the ALTER, picking a strategy, booking a window, running it at midnight, watching it for eight hours, and doing it again in the next environment. With SchemaBot, only two do: editing the file and saying yes at the start, and picking the moment to swap at the end. Everything between them is the machine's time](../assets/vision-attention.svg)
-
-So the number that matters is not how fast the DDL executes. It is how much of a person's day a
-schema change costs, and the floor for that should be a couple of minutes: write the schema, read
-what the tool says will happen, say yes. When speed and integrity genuinely do collide, integrity
-wins and the change waits. That should be rare enough to be worth noticing.
+The number that matters is how much of your day a schema change costs. The floor should be a
+couple of minutes: write the schema, read what will happen, say yes. When conditions call for a
+pause, SchemaBot should make the reason and next step clear. You should not have to choose between
+moving quickly and taking care of your data.
 
 ## GitOps, not GitHub
 
-The source of truth is the schema in version control. SchemaBot is the loop that reconciles it
-against the live database: read what you declared, read what is actually there, work out the
-difference, and close it safely. That loop is the product. Everything else, including GitHub, is a
-way to reach it.
+The source of truth for the desired schema is version control. SchemaBot is the loop that
+reconciles it against the live database. That loop is the product. Everything else, including
+GitHub, is a way to reach it.
 
-GitHub is the best-supported of those ways by a wide margin, and that is a deliberate choice rather
-than an accident of what got built first. It is still not the substrate, and SchemaBot should never
-quietly become a tool that only works if you happen to use GitHub.
+GitHub is the best-supported interface by a wide margin, and that is deliberate. It is still not
+the substrate. CLI and API applies keep working while GitHub is down, and the process that touches
+your database never needs GitHub credentials.
 
-![Four interfaces sit above one model: a GitHub pull request, the CLI, an API or agent, and a forge that is not built yet. All of them drive the same loop between the schema files and the live database](../assets/vision-gitops-not-github.svg)
+![PRs, the CLI, APIs, and other forges reach the same reconciliation loop](../assets/vision-gitops-not-github.svg)
 
-This is the part that is furthest along, because it is already enforced rather than intended.
-GitHub is an interface to SchemaBot, not a dependency of it: CLI and API applies keep working while
-GitHub is down, and the process that actually touches your database never needs GitHub credentials
-at all. Anything the pull request can do, the CLI can do, all of it, down to the destructive-change
-confirmation and every control operation. A fallback that covers most of the surface is not a
-fallback. And when GitHub is unreachable, SchemaBot says so rather than guessing at state.
-
-Keep widening that gap. Every feature should get asked the same question before it ships: if this
-only works through a PR comment, it is not finished. Another forge, meaning GitLab or Gitea or
-something that does not exist yet, along with a CI job, a terminal, or an agent calling an API,
-should all be able to drive the same loop, because none of them is where the truth lives.
+Bring the workflow to wherever people build: another forge, a terminal, or an agent calling an API.
+Every interface should drive the same loop. Developers should be able to embed that capability in
+their tools and give their users the full experience, with the gates already in place.
 
 ## Guardrails and context for agents
 
-Agents are bad at imperative change scripts and good at declarative desired state, and that is not a
-stylistic preference. Writing a correct `ALTER` means knowing the current state of the database, how
-your statement orders against every other change that has not landed yet, and what the inverse
-statement would be if it has to come back out. Editing a `CREATE TABLE` file means knowing none of
-that, because all three fall out of diffing the file against what is live. Going back is the same
-operation as going forward, run against an earlier version of the file.
+An agent should have the context to make a good change and the guidance to carry it through.
+Schema files show what should exist, the live database shows what has landed, and version control
+records how the declaration changed. The agent can understand the schema and propose what the
+feature needs without reconstructing a history of change scripts.
 
-The file is also the context. Asking what indexes a table has today is a question you answer by
-reading one file, not by replaying every change ever made to it and trusting that none of them landed
-halfway. History is not the thing you trade away for that: `git log` on one table's file is every
-change that table has ever had, in order, with the author and the review attached to each one.
+![Ordered change scripts alongside one declarative schema file, with schema context, version history, and a proposed change plan available to an agent](../assets/vision-agent-context.svg)
 
-![On the left, an ordered pile of change scripts, where answering what indexes exist means replaying all of them in order. On the right, one CREATE TABLE file that states the answer directly, including the unique key on email and the index on created. Below both, what an agent gets without asking anyone: the current state from the file, the full history from that file's git log, and what a proposed change will do from the plan](../assets/vision-agent-context.svg)
+SchemaBot turns that proposal into answers the agent can use: this change needs a table copy,
+this one can run instantly, this one needs your decision. It should be just as clear about what
+happened during execution and what to do next, so the agent can keep working without someone
+interpreting every result.
 
-That earns SchemaBot the right to be what agents reach for, and it creates two obligations.
-
-**Context.** An agent should be able to read the schema as files, ask what a proposed change would
-actually do against the live database, and get an answer specific enough to act on: this rewrites the
-table, this holds a lock for the duration, this is refused on this engine and here is why. That
-answer already exists as structured data. The plan API returns the change set, the per-shard detail,
-and every lint finding as JSON, and it is the same plan the PR comment is rendered from.
-
-**Guardrails that do not care who wrote the change.** This is the load-bearing one. What gets applied
-is what was reviewed. Destroying something takes consent given against the plan that is about to run,
-re-checked if that plan moves. Uncertainty never becomes a passing check. Authorization fails closed
-at every tier. Not one of those asks whether a human or an agent produced the DDL, and none of them
-should ever start. An agent that can talk its way past a gate is a gate that was never real.
-
-SchemaBot does not make agents trustworthy. It checks the change rather than the author, so you never
-have to settle that question before letting one through.
+You don't have to trust an agent's judgment about database safety. SchemaBot checks each proposed
+change, applies what was reviewed, and requires explicit consent before destroying anything. If
+the plan changes, it checks again. If the outcome is uncertain, it stops. Those safeguards give
+you the confidence to let agents do more.
 
 ## Many agents, one database
 
-One agent writing a schema change is the easy case. The real shape of agentic development is a swarm:
-several agents on one feature, or on several features at once, more than one of which needs the same
-database to change. The hard question stops being "is this DDL correct" and becomes "what happens
-when three of them are right at the same time".
+One agent writing a schema change is the easy case. The hard question becomes: what happens when
+three of them are right at the same time?
 
-No agent can answer that on its own. It can be careful about its own change. It cannot know that
-another agent, in another process, planned against the same table forty seconds ago and is about to
-apply. Nothing an individual author does makes that safe. It has to be enforced somewhere all of them
-are forced to pass through, and for schema changes that place is SchemaBot.
+Each agent should be free to focus on its feature, even when another process planned against the
+same table forty seconds ago. SchemaBot gives them a shared place to coordinate changes, with
+execution authority behind the gates.
 
-![Four agents propose schema changes in parallel and all pass through one place, which lets one apply while the others queue or block](../assets/vision-many-agents.svg)
+![Parallel proposals meet shared gates before execution](../assets/vision-many-agents.svg)
 
-SchemaBot handles this already, because concurrency was never optional. Several of its own processes,
-several operators, and duplicate deliveries of the same webhook all race each other today. Three
-rules hold the line. Only one change runs at a time against a given database, so two cannot
-interleave no matter how many authors produced them. One process owns a change while it runs, and
-proves it still owns it on every write, so nobody half-takes work someone else is running. And a plan
-built against a schema that has since moved never applies: planning first does not win you the race
-to submit.
+SchemaBot coordinates ownership, excludes overlapping applies, and rejects stale plans. Agents do
+not need to negotiate, discover each other, or agree on an ordering. They need a shared source of
+truth and a gate that fails closed when their view of it is stale.
 
-Then there is the merge gate, which is already an agent-to-agent protocol without either agent
-knowing it. When one change lands, every other open pull request whose files no longer match the live
-schema goes red. The second agent gets told to reconcile, by the same mechanism that would have told
-a person.
-
-That is the cheap version of a problem people usually reach for a scheduler to solve. Agents do not
-need to negotiate, discover each other, or agree on an ordering. They need a shared source of truth
-and a gate that fails closed when their view of it is stale.
-
-Being correct is not the same as being readable. An agent held behind another one should be able to
-see the queue it is in, whether the wait is seconds or three weeks, and why it is blocked, in a form
-it can act on rather than prose written for a person to read. Given that, it waits. Without it, it
-polls, and a swarm of pollers is how a correct system becomes a loud one.
+An agent waiting behind another should know why, what it needs to do next, and when it can continue.
+That turns a conflict into a next step. More agents can build in parallel without asking a person
+to untangle every collision.
 
 ## One database, or ten thousand
 
-The last section was many authors converging on one database. This one is the mirror image: one
-intent, landing on many databases.
+A team running thousands of databases should be able to understand them as easily as one.
+SchemaBot brings together what is live, what has changed, and what is changing now. An engineer,
+an agent, or a dashboard can ask across the fleet and follow an answer down to the schema and
+recorded changes behind it, with read-only access.
 
-It starts with knowing, because nothing can be changed in aggregate that cannot first be seen in
-aggregate. SchemaBot accumulates that knowledge as a side effect of doing its job: every plan it
-computed, every change it ran, the DDL each one carried, who asked for it, how it ended, and a live
-line to every database it manages. That surface already answers three questions over one read API:
-what is live right now, what has ever changed, and what is changing now.
+A rule broken by four hundred tables across sixty databases is one question, not four hundred.
+See the affected tables, choose what to fix, and have SchemaBot open pull requests for their owners
+to review. What starts as a question about the fleet becomes work ready to ship, without a week
+of copying fixes between repositories.
 
-![Three stages: know, using the read API; analyze, by linting live schemas and grouping findings by rule; and act, by dispatching one intent to many targets while each keeps its own gates](../assets/vision-fleet-shapes.svg)
+![Know what exists, analyze it together, and dispatch changes with gates on every target](../assets/vision-fleet-shapes.svg)
 
-The pieces are there. `pull` reads the live schema of any database SchemaBot manages, and `pull
---lint` audits that live schema against the rules, rather than auditing a proposed change. Both work
-on one database at a time.
-
-What they should also do is work on all of them at once. A rule broken by four hundred tables across
-sixty databases is one question, not four hundred, and the fix that was right the first time is right
-everywhere else. So ask once across everything, group the answer by rule instead of by database, and
-dispatch the result as changes rather than as a report. A finding nobody can act on is a spreadsheet.
-
-**A fleet is one shape, not the shape.** The interesting axis is not how many databases there are, it
-is how unlike each other they are: different engines, different regions, different organizations,
-different owners, different answers to whether a given change is even legal. Something that spans all
-of that is still one change to whoever asked for it, and it should stay one change rather than
-fragmenting into one per target.
-
-This is also the property with the most obvious way to do real damage, which belongs in the vision
-rather than in a caveat under it. Anything that can fix four hundred tables can break four hundred
-tables. The gates do not relax at this scale, they matter more. Every target computes its own plan
-against its own live schema, refuses on its own when its engine cannot do the work, and takes its own
-consent rather than inheriting someone else's. What the aggregate adds is ordering, visibility across
-the whole dispatch, and one place to stop all of it.
+The same desired schema can reach every environment, deployment, and shard that needs it. Each
+target gets a plan against its own live state. SchemaBot should handle the rollout order, show
+what has finished and what needs attention, and let you stop further rollout from one place.
 
 ## Everything underneath will change
 
-MySQL, Vitess, and PostgreSQL are each meant to be first class, and that phrase is doing real work.
-First class does not mean an engine is reachable through a compatibility shim that files its edges
-off. It means SchemaBot knows that engine's own semantics and uses them.
+MySQL, Vitess, and PostgreSQL are each meant to be first class. Use each engine's strengths and
+respect its semantics. A common workflow should give you the best path that engine supports, with
+a clear answer when a change is outside its capabilities. Every new engine should expand what you
+can build with the same confidence.
 
-![MySQL, Vitess, and PostgreSQL are first-class peers with their own semantics, feeding one loop that stays fixed while engines, forges, and agent surfaces are replaced around it](../assets/vision-substrate.svg)
+![Engines and interfaces change around the schema, the loop, and the gates](../assets/vision-substrate.svg)
 
-Vitess is not MySQL with sharding bolted on. It has its own online DDL, its own notion of where a
-change is running, and progress that only means anything per shard. PostgreSQL is not MySQL with
-different syntax. It has its own parser, and failure modes with no MySQL analogue: an index left
-behind in an invalid state, a lock queue where one waiter stalls every reader behind it. Flattening
-that into a shared subset produces a tool that is wrong in a different way on every engine.
-
-What keeps the cost of that honesty down is refusal. When an engine cannot do something safely,
-SchemaBot says so at plan time instead of approximating it. [engines.md](./engines.md) is the current
-matrix, and the gaps in it are deliberate. Being allowed to say no is what makes it possible to add
-an engine without the addition costing anything anywhere else.
-
-The same has to hold for everything else underneath. GitHub is one forge among the ones that exist
-today and the ones that do not exist yet. Agentic development is new enough that the surfaces it
-wants will churn faster than anything else here. New databases will arrive, some of them will matter,
-and a few of the ones that matter now will not in five years.
-
-So assume the parts get replaced. What does not: the schema in version control, the loop that
-reconciles it against what is live, and the gates in between. Everything else is an implementation of
-those three, and every one of them should be swappable without any of the three moving.
+The same holds for forges, agent interfaces, and deployment shapes. Assume the parts get replaced.
+What does not: the schema in version control, the loop that reconciles it against what is live,
+and the gates in between.
 
 ## What does not change
 
 However far any of the above gets, these hold:
 
-- **Uncertainty fails closed.** Storage that will not answer, an ambiguous ownership claim, an engine
-  state nobody recognizes. All of these block. None of them pass.
-- **The operator is never surprised.** Nothing runs that was not planned and consented to, and a
-  change that has started stays authoritative until someone resolves it.
-- **A narrower engine is not a looser one.** Adding a database or a deployment shape never costs a
-  guarantee. If something cannot be done safely on an engine, the answer is a refusal at plan time,
-  not a quieter gate.
-- **Integrity outranks everything else.** Convenience, speed, and scope all lose to it, and there is
-  no size or tier at which that stops being true. Every database gets the same treatment. There is no
-  such thing as one where the data mattering less makes corruption acceptable.
+- **Uncertainty fails closed.** An ambiguous result blocks. It never passes.
+- **The operator is never surprised.** Nothing runs without the plan and authorization it requires.
+  Work that has started stays accounted for until it is resolved.
+- **A narrower engine is not a looser one.** Adding an engine or deployment shape never costs a
+  guarantee. Unsupported work gets an explicit refusal.
+- **Integrity outranks everything else.** Convenience, speed, and scope all lose to it. There is no
+  database where the data mattering less makes corruption acceptable.
 
-Breadth that costs any of that is not progress. The range described above is about deployment size
-and about engines that can be supported honestly, not about saying yes to everything.
+## Build with us
+
+Help us make this the tool you’d trust with your own database. Try it, tell us where it falls short,
+or contribute the engine support or integration you need.
 
 ## Reading further
 
-- [invariants.md](./invariants.md) is the registry of what must never be false while SchemaBot is
-  running, and where each rule is enforced. It opens with what happens when GitHub is down.
-- [engines.md](./engines.md) is the capability matrix: what each engine can do, and why the
-  differences exist.
-- [architecture.md](./architecture.md) is how the pieces fit together today.
-- [postgresql.md](./postgresql.md) is the current PostgreSQL support envelope.
+This is the direction. The current capabilities and their boundaries live here:
+
+- [invariants.md](./invariants.md): the enforced guarantees and where they stop.
+- [engines.md](./engines.md): what each engine can do today.
+- [postgresql.md](./postgresql.md): the current PostgreSQL support envelope.
+- [schema-intelligence.md](https://github.com/block/schemabot/blob/c8f803dc39b1be3afe4906cc660847e28994ec11/docs/schema-intelligence.md): what SchemaBot knows and how to query it.
+- [architecture.md](./architecture.md): how the pieces fit together.
+- [CONTRIBUTING.md](../CONTRIBUTING.md): how to contribute.
