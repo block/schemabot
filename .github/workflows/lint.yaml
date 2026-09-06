@@ -28,11 +28,18 @@ jobs:
         continue-on-error: true
         uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # dorny/paths-filter@v3.0.3
         with:
+          # The action's default quantifier ORs the patterns, and '**'
+          # matches every file, so without 'every' this filter reports
+          # code=true on every PR and the docs-only skip never fires.
+          # 'every' ANDs them: code = any non-markdown file. The docs/ pattern
+          # is filetype-scoped so a future script or Go file under docs/
+          # still counts as code.
+          predicate-quantifier: 'every'
           filters: |
             code:
               - '**'
               - '!**/*.md'
-              - '!docs/**'
+              - '!docs/**/*.md'
       - name: "Resolve code-change flag"
         id: out
         shell: bash
@@ -50,10 +57,14 @@ jobs:
             echo "code=$FILTER_CODE" >> "$GITHUB_OUTPUT"
           fi
 
+  # The matrix legs below are required status checks on main, so they must
+  # report on every PR. A job-level skip would leave the leg names absent on
+  # a docs-only PR and the merge waiting on them forever; instead every leg
+  # runs, and the steps skip themselves, so the leg reports success in
+  # seconds without a checkout or a Go toolchain.
   golangci:
     name: lint
     needs: changes
-    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -74,13 +85,19 @@ jobs:
             args: ""
             dir: e2e/consumermodule
     steps:
+      - name: "Docs-only PR: lint has nothing to check"
+        if: needs.changes.outputs.code != 'true'
+        run: echo "No non-markdown files changed; reporting success so the required check resolves."
       - name: Checkout code
+        if: needs.changes.outputs.code == 'true'
         uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
-      - uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
+      - if: needs.changes.outputs.code == 'true'
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
         with:
           go-version-file: go.mod
           cache: false
       - name: "Restore Go cache"
+        if: needs.changes.outputs.code == 'true'
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
         with:
           path: |
@@ -89,6 +106,7 @@ jobs:
           key: go-${{ runner.os }}-${{ hashFiles('go.sum') }}
           restore-keys: go-${{ runner.os }}-
       - name: golangci-lint (${{ matrix.name }})
+        if: needs.changes.outputs.code == 'true'
         uses: golangci/golangci-lint-action@0a35821d5c230e903fcfe077583637dea1b27b47 # ratchet:golangci/golangci-lint-action@v9.0.0
         with:
           version: v2.11.4
@@ -104,7 +122,7 @@ jobs:
       # below via the action's documented install-only contract, instead of
       # relying on the lint step above leaving it there as a side effect.
       - name: golangci-lint (install for config verify)
-        if: matrix.name == 'default'
+        if: needs.changes.outputs.code == 'true' && matrix.name == 'default'
         uses: golangci/golangci-lint-action@0a35821d5c230e903fcfe077583637dea1b27b47 # ratchet:golangci/golangci-lint-action@v9.0.0
         with:
           version: v2.11.4
@@ -116,16 +134,18 @@ jobs:
       # binary — on that upgrade, delete this step and the vendored file and
       # re-enable the action's built-in verify.
       - name: golangci-lint config verify (vendored schema)
-        if: matrix.name == 'default'
+        if: needs.changes.outputs.code == 'true' && matrix.name == 'default'
         run: golangci-lint config verify --schema .github/golangci.v2.11.jsonschema.json
       - name: webhookheaders analyzer
-        if: matrix.name == 'default'
+        if: needs.changes.outputs.code == 'true' && matrix.name == 'default'
         run: make check-webhookheaders
 
   # Stable rollup for the lint matrix so a single check name can gate a merge,
   # mirroring the E2E/LocalScale/K8s rollups in test.yaml. The golangci matrix
   # check names (`lint (default)`, `lint (integration, …)`, `lint (e2e, …)`)
-  # change with the matrix, so require this `Lint` check instead.
+  # change with the matrix, so prefer requiring this `Lint` check. While the
+  # legs themselves are required, they report on docs-only PRs too (see the
+  # golangci job), so either choice resolves.
   lint-rollup:
     name: "Lint"
     needs: [changes, golangci]

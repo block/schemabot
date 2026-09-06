@@ -162,7 +162,17 @@ You should see:
 
 ## 6. Add `schemabot.yaml` Config to Your Repository
 
-Create a `schemabot.yaml` file in the directory containing your schema SQL files:
+You don't have to write the schema directory by hand. Once the database is registered in the
+server config (step 4), `schemabot onboard -d mydb -e staging -s ./schema` pulls the live
+schema and generates the whole directory — `schemabot.yaml`, a subdirectory per namespace
+(the schema name on MySQL, the keyspace on Vitess), and one `.sql` file per table — then
+verifies the result plans clean against the source environment. Use `--dry-run` to preview
+the files first. Onboard always generates the namespace-subdirectory layout shown under
+[Schema File Layout](#schema-file-layout) below; the flat MySQL layout there is a
+hand-maintained alternative.
+
+Create (or let `schemabot onboard` create) a `schemabot.yaml` file in the directory containing
+your schema SQL files:
 
 ```
 my-repo/
@@ -181,14 +191,24 @@ type: mysql
 | Field | Required | Description |
 |-------|----------|-------------|
 | `database` | Yes | Must match a database name in your SchemaBot server config |
-| `type` | Yes | `"mysql"` or `"vitess"` |
+| `type` | Yes | `"mysql"`, `"vitess"`, `"strata"` (many MySQL shards behind a shared topology — see [Strata](strata-engine.md)), or `"postgres"` |
 | `ignore_namespaces` | No | Namespace subdirectories to exclude from plans, applies, and checks (see [Ignoring Namespaces](namespaces.md#ignoring-namespaces)) |
 
 Environment availability and promotion order are configured on the SchemaBot server.
 
 ### Schema File Layout
 
-**MySQL** (flat structure):
+**MySQL** (schema-name subdirectory — what `schemabot onboard` generates):
+
+```
+schema/
+  schemabot.yaml
+  mydb/
+    users.sql
+    orders.sql
+```
+
+**MySQL** (flat structure, hand-maintained):
 
 ```
 schema/
@@ -251,8 +271,10 @@ schemabot plan -d mydb          # Plan for a specific database (multi-db repos)
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `SCHEMABOT_CONFIG_FILE` | Yes | — | Path to server config YAML |
+| `STORAGE_DSN` | No | — | Fallback storage DSN if `storage.dsn` is not set in config |
 | `GITHUB_APP_ID` | No | — | Fallback if `github.app-id` is not set in config |
 | `PORT` | No | `8080` | HTTP server port |
+| `GRPC_PORT` | No | — | gRPC server port; the gRPC listener starts only when this is set |
 | `LOG_LEVEL` | No | `info` | `debug`, `info`, `warn`, `error` |
 
 GitHub credentials (`private-key`, `webhook-secret`) are configured in the YAML config file using secret references, not environment variables. This keeps all configuration in one place and supports any secret backend.

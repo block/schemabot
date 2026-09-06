@@ -63,6 +63,14 @@ import (
 // guarded and idempotent, so concurrent reapers would be correct; they would just
 // each pay the full scan to settle rows the first one already handled.
 //
+// What keeps a reaper off a driver's rows is the lease, not the election and not
+// the quiescence windows. Every sweep takes only rows whose lease is absent or
+// stale by the claim path's own reckoning, which is the same test a driver
+// applies before taking work from a peer — so the two writer classes exclude each
+// other by one mechanism rather than by two that have to be kept in agreement.
+// The windows sit on top of that, deciding when a row is worth looking at rather
+// than whether it is safe to write.
+//
 // The retryable-task sweep reaps dead retryable tasks: failed_retryable task
 // rows under a settled parent apply. A failed_retryable task promises a retry that
 // only the parent's recovery path can dispatch, so once the parent settles the
@@ -245,7 +253,7 @@ func (s *Service) reapStrandedRetryableTasks(ctx context.Context) {
 // them. Only a lease-class writer can correct them — a reader cannot, because
 // correcting them is a write, and because a reader cannot tell a stranded row
 // from a sibling still copying under an apply that a failed task already
-// settled. The quiescence window is what tells those apart.
+// settled. The operation lease is what tells those apart.
 //
 // Settlements are logged, not counted, for the same reason as the retryable
 // sweep's: they are the rare residue of a driver that stopped mid-write, so a

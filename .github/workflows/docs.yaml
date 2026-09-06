@@ -1,0 +1,66 @@
+name: docs
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+  # Required status checks must also report on the merge queue, or the queue
+  # waits forever. Inert until a repo admin enables the merge queue.
+  merge_group:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  # Unlike the lint/test/docker workflows, this job must NOT skip on
+  # docs-only PRs — a stale Table of Contents is exactly what a docs-only PR
+  # can introduce. The check is a plain Python run with no dependencies, so
+  # running it on every PR costs seconds.
+  check-docs-toc:
+    name: "Docs TOC"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+      - name: Check docs/*.md Table of Contents freshness
+        run: make check-docs-toc
+
+  # Prose terminology (AGENTS.md, Terminology) is most likely to regress in
+  # a docs-only PR, so this runs on every PR too. A single grep; costs
+  # seconds.
+  check-terminology:
+    name: "Terminology"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+      - name: Check that "schema change" is unhyphenated in prose
+        run: make check-terminology
+
+  # TEMPLATES.md is generated from the built binary, so this check needs a
+  # Go build and runs as its own job rather than slowing the TOC check.
+  # It must not use the docs-only skip either: the drift it catches — a
+  # hand-edited TEMPLATES.md — is itself a docs-only change.
+  check-templates:
+    name: "Templates drift"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+      - name: "Configure Go"
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: "Restore Go cache"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
+      - name: Check TEMPLATES.md freshness
+        run: make check-templates

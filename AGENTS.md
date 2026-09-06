@@ -46,8 +46,30 @@ CI mirrors local dev — every CI test job runs make targets, not bespoke comman
 ## Git
 
 - **Always verify the active branch before starting work.** The deployed code may be on a feature branch (e.g., a worktree), not `main`. Before implementing, check which branch has the code you're building on: `git log --oneline <branch> -- <relevant-file>`. Never branch from `main` for features that depend on unreleased work — branch from (or commit directly to) the active development branch.
+- **Branch names must describe the work.** Use `<your-handle>/<short-topic>` — the topic being the change itself, in words a reviewer recognizes (`.../reaper-lease-gate`, `.../pull-api-rate-limit`). A branch name is a permanent label: it is what shows up in the PR list, in CI job names, in `git log --graph`, and in every link back to the work months later. Generated or placeholder names (`claude/intelligent-moser-4a453a`, `feature-1`, `patch-2`, a bare ticket id) say nothing, so every reader has to open the diff to find out what the branch is. When a tool creates the branch for you, rename it before the first push (`git branch -m <new-name>`); if it has already been pushed, push the new name and delete the old remote branch.
 - **Never bypass pre-commit hooks.** Do not use `--no-verify` or `core.hooksPath=/dev/null`. If the hook fails, fix the issue.
-- **PR summaries should be concise** — a short paragraph or bullet list highlighting key changes and why, not low-level implementation details. When a change affects flow, architecture, state transitions, or concurrency, include a small ASCII diagram if it makes the behavior easier to review; omit diagrams when they would add noise. Do not include test plans, checklists, or verification details. Never reference internal company details (specific database names, staging environments, team names, internal URLs, deployment hostnames, org names, or test repo names) in PR titles or descriptions — this is a public OSS repo.
+- **PR summaries should be concise** — a short paragraph or bullet list highlighting key changes and why, not low-level implementation details. Do not include test plans, checklists, or verification details. Never reference internal company details (specific database names, staging environments, team names, internal URLs, deployment hostnames, org names, or test repo names) in PR titles or descriptions — this is a public OSS repo.
+- **Every PR summary carries an ASCII diagram when the change has a shape to show.** Any change to flow, architecture, state transitions, concurrency, lifecycle, or ownership gets one, so a reviewer sees the new behavior without reconstructing it from the diff. Skip it when the change has no such shape — a comment, a test, a copy edit, a dependency bump — or when the shape is small enough that one sentence states it in full, such as a one-line predicate change. Beyond that, "the prose covers it" is not a reason to skip: a flow that takes a paragraph to describe is one the reviewer needs to see.
+- **Show before and after when the change rewrites behavior rather than adding it.** Complex state changes and reworked logic are where the contrast carries the point: an after-diagram alone leaves the reviewer to hold the old behavior in their head and spot the difference themselves, which is exactly the step where a reviewer misses that a transition moved or a branch went away. Label the two, and draw them to the same shape and node order so the difference between them is the only thing that stands out:
+
+  ```
+  Before                     After
+
+  ┌───────────┐              ┌───────────┐
+  │  running  │              │  running  │
+  └─────┬─────┘              └─────┬─────┘
+        │ cancel                   │ cancel
+        ▼                          ▼
+  ┌───────────┐              ┌───────────┐
+  │ cancelled │              │ releasing │
+  └───────────┘              └─────┬─────┘
+                                   │ copy quarantined
+                                   ▼
+                             ┌───────────┐
+                             │ cancelled │
+                             └───────────┘
+  ```
+- **Align the diagram in a second pass.** Put every diagram in a fenced code block (outside one, Markdown collapses the whitespace the alignment depends on), then re-read the finished block as a grid and fix the columns: box borders and corners line up column-for-column, a box is as wide as its widest content, and every connector meets the edge it points at. Ragged box lines are harder to read than no diagram, and they are invisible while writing one — checking is a separate pass over the rendered result, not something to trust to the first draft.
 - **UX changes show the rendered result, collapsed.** When a PR changes what users see (PR comments, check summaries, CLI output), embed the new rendering in the PR summary inside collapsed `<details>` blocks — one per scenario, using the TEMPLATES.md preview output where one exists — so reviewers see the actual UX without checking out the branch. Links to TEMPLATES.md anchors are not a substitute; the rendering belongs in the summary itself.
 - **Agent PR disclosures belong at the bottom.** When an agent writes or updates a PR summary/body, put the agent disclosure line after the summary content, not at the top.
 - **Do not create PRs automatically.** Wait for the user to explicitly ask before running `gh pr create`. Pushing a branch is fine; creating the PR is a separate decision.
@@ -96,7 +118,25 @@ The hook uses `--new-from-rev` to only flag issues introduced by the current bra
 
 ## Guidelines
 
+**Database integrity comes first, for every database.** SchemaBot runs in front of everything from a vibe-coded weekend experiment to a tier-0 production system, and it treats them all the same way: the integrity of the database behind it outranks convenience, speed, and feature scope. Do not frame anything, in code, docs, or review, in terms of "databases that matter" or shortcuts that are "fine for a small database". Every database matters, and a change that would be unsafe in front of production is unsafe everywhere. When a tradeoff pits integrity against anything else, integrity wins.
+
 **Terminology:** NEVER use the word "migration" in code, comments, CLI output, or error messages. ALWAYS use "schema change" instead.
+
+**"schema change" is never hyphenated.** In prose — PR comments, check summaries, CLI output, error messages, docs, code comments — write "schema change", never "schema-change".
+
+This holds **including where it modifies a noun**: "the schema change engine", not "the schema-change engine". That is a deliberate departure from the usual compound-adjective rule, which would hyphenate it. "schema change" is a fixed term in this product and it does not split, so do not "correct" the unhyphenated attributive form back — in either direction, in review or in a docs pass.
+
+Constructions that only read correctly when hyphenated are rewritten rather than hyphenated:
+
+| Write | Not |
+|---|---|
+| a logger scoped to this schema change | a schema-change-scoped logger |
+| a PR with no schema changes | a no-schema-changes PR |
+| restarts part-way through a schema change | restarts mid-schema-change |
+
+The rule is about prose only. Identifiers keep whatever form they need: file and script names (`scripts/generate-schema-change.sh`), CLI subcommands, external URLs, generated markdown anchors, and test fixture values are left alone. So is the literal inside a longer word: `VSchema-changed` is a different term and is not a hit.
+
+`make check-terminology` (`scripts/check-terminology.sh`) enforces this in CI on every PR, docs-only ones included. It strips URLs and anchor targets, matches only at a word boundary, and allowlists the identifiers above by value, so a new legitimate hyphenated identifier means extending that allowlist, not weakening the rule.
 
 **Driver terminology:** A *driver* is the operator worker that claims an apply via `FOR UPDATE SKIP LOCKED`, holds its lease (`LeaseOwner` / `LeaseToken`), and *drives* it to a terminal state. Use *driver* (noun) and *drive* (verb) — not *worker* — in new code, comments, logs, docs, and tests for the lease-holding goroutine and the work it performs. This is distinct from the **Go MySQL driver** (`github.com/go-sql-driver/mysql`, `database/sql/driver`): always refer to that as the "Go MySQL driver" or "SQL driver" and keep it import-qualified so the two senses never collide.
 
@@ -197,6 +237,19 @@ All SQL statements processed by SchemaBot **must be parseable by the dialect's r
 - **Do not** add fallback logic (e.g., `strings.Split(content, ";")`) when the parser fails. If a statement cannot be parsed, that is an error that must be surfaced to the caller.
 - **Do not** silently skip unparseable statements with patterns like `if err != nil { continue }` unless the error is an expected type-filtering condition (e.g., `ParseCreateTable` returning an error for an `ALTER TABLE` statement).
 - Schema files are expected to contain DDL valid for their target dialect. If the dialect's parser cannot handle a valid construct, that is a bug to fix in the parser dependency (the TiDB parser / Spirit, or libpg_query), not something to work around with string splitting.
+
+### Upstream First: Fix the Engine, Not the Consumer
+
+The rule above is one instance of a general one. **When a change reaches into a dependency's territory, first ask whether the fix belongs in the dependency.** Parser semantics, DDL diffing and canonicalization, schema introspection, progress and checkpoint state, and anything that has to know how an engine works internally are the domain of [`block/spirit`](https://github.com/block/spirit) and [`block/pg-sprite`](https://github.com/block/pg-sprite), not of SchemaBot. Both are ours to change. A fix that lands upstream fixes every consumer, gets the engine's own test suite behind it, and stays correct when the engine evolves. A fix that lands here has to re-derive the engine's behavior from the outside and breaks the next time the engine changes it.
+
+Prefer the upstream change whenever it makes consumption simpler: a new exported function or option, a typed error instead of an error string to match on, a field on a status or result struct instead of a value to infer, a hook where SchemaBot currently peeks. Shortcuts that reach around the dependency are brittle by construction and are the last resort, not the first draft:
+
+- parsing the engine's log lines or error text to recover a fact the engine already knows
+- re-implementing part of its parser, differ, or introspection on our side, or string-manipulating DDL it already parses
+- copying a private helper out of it instead of asking for it to be exported
+- inferring engine state from side effects (table names, sentinel rows, timing) instead of from an API
+
+When the upstream fix is right but cannot wait for a release, land the smallest workaround here with a comment stating what upstream capability retires it, and open the upstream change in the same sitting so the workaround has an expiry. The Vitess fork (see *Vitess Dependency*) follows the same rule for the code we carry on top of upstream Vitess.
 
 ## AWS Infrastructure
 

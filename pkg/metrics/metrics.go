@@ -460,7 +460,7 @@ func RecordStorageSchemaDestructiveRefusal(ctx context.Context, table, operation
 		attribute.String("table", table),
 		attribute.String("operation", operation),
 		attribute.String("scope", scope),
-		// The storage-schema bootstrap precedes any schema-change
+		// The storage-schema bootstrap precedes any schema change
 		// environment, so the counter carries the canonical unknown value.
 		EnvironmentAttribute(""),
 	)
@@ -2219,7 +2219,7 @@ var knownDirectExecutionOutcomes = map[string]bool{
 }
 
 // RecordDirectExecution increments the counter for a statement the
-// schema-change engine refused and the direct execution policy resolved — to a
+// schema change engine refused and the direct execution policy resolved — to a
 // native MySQL DDL execution (completed/failed/stopped) or to a block
 // (blocked_*). Direct executions are rare, operator-consented events: a spike
 // in failed means native DDL is erroring on the target (check the apply logs

@@ -32,6 +32,18 @@ func previewCLIMultiDeploymentApplyFailed() {
 	}))
 }
 
+func previewCLIMultiDeploymentApplyHaltedWithLiveSibling() {
+	WriteProgress(multiDeploymentProgressData([]ProgressOperation{
+		{Deployment: "us-east", Target: "orders-us-east", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt, ErrorMessage: "duplicate key name 'idx_orders_source'"},
+		{Deployment: "eu-west", Target: "orders-eu-west", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt},
+		{Deployment: "ap-south", Target: "orders-ap-south", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt},
+	}, []TableProgress{
+		{Deployment: "us-east", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD INDEX `idx_orders_source` (`source`)", Status: state.Task.Failed, RowsCopied: 0, RowsTotal: 80000, PercentComplete: 0},
+		{Deployment: "eu-west", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Running, RowsCopied: 42000, RowsTotal: 120000, PercentComplete: 35, ETASeconds: 240},
+		{Deployment: "ap-south", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Pending},
+	}))
+}
+
 func previewCLIMultiDeploymentApplyCompleted() {
 	data := multiDeploymentProgressData([]ProgressOperation{
 		{Deployment: "us-east", Target: "orders-us-east", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
@@ -53,6 +65,7 @@ func previewCLIMultiDeployAllOutput() {
 	}{
 		{"BARRIER ROLLOUT IN PROGRESS", previewCLIMultiDeploymentApplyInProgress},
 		{"HALT ON FAILURE (ONE DEPLOYMENT FAILED)", previewCLIMultiDeploymentApplyFailed},
+		{"HALT ON FAILURE (A SIBLING IS STILL RUNNING)", previewCLIMultiDeploymentApplyHaltedWithLiveSibling},
 		{"ALL DEPLOYMENTS COMPLETED", previewCLIMultiDeploymentApplyCompleted},
 	}
 	for i, section := range sections {

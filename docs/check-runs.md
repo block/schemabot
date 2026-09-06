@@ -219,8 +219,11 @@ See [namespaces](./namespaces.md) for the schema directory and namespace layout.
 
 ### Onboarding a schema directory
 
-To onboard an existing declarative schema directory, add a `schemabot.yaml` file
-next to the SQL files or namespace subdirectories it owns:
+`schemabot onboard` generates a schema directory from a live pull — `schemabot.yaml`,
+namespace subdirectories, and one `.sql` file per table — so onboarding usually starts
+there rather than with hand-written files. To onboard an existing declarative schema
+directory, add a `schemabot.yaml` file next to the SQL files or namespace
+subdirectories it owns:
 
 ```yaml
 database: widgets
@@ -275,7 +278,7 @@ because the PR does not affect a managed schema directory.
 
 ## Internal Records
 
-The `checks` MySQL table stores one internal record per
+The `checks` storage table stores one internal record per
 `repository`, `pull_request`, `environment`, `database_type`, and `database_name`.
 Aggregate check records use the same unique key, with `_aggregate` as a
 sentinel for `database_type` and `database_name`.
@@ -655,9 +658,12 @@ proof the PR is safe to re-plan. The CLI additionally holds any missing-check
 PR whose head carries an uncompleted Check Run of any age, because that run
 may belong to a started apply the scanning instance cannot see.
 
-For repositories where several deployments coordinate one shared check
-through a leader/participant aggregate configuration, the same scoping
-applies: a backfill creates only the deployment's own check. Run against a
+Several deployments can coordinate one shared check through a
+leader/participant aggregate configuration: one deployment (the leader) owns
+the single required Check Run and folds the participants' results into it,
+while each participant publishes an informational check of its own. In that
+configuration the same scoping applies: a backfill creates only the
+deployment's own check. Run against a
 participant, it recreates the participant check the leader folds; run against
 the leader, it replays the role-aware auto-plan flow, whose fold fails closed
 on expected participants that have not reported. A missing participant check
@@ -1120,8 +1126,9 @@ Common breakglass capabilities:
   -e <environment>`, `schemabot progress <apply-id>`, and `schemabot logs
   <apply-id>`.
 - Control active work with `schemabot stop <apply-id>`, `schemabot start
-  <apply-id>`, `schemabot cutover <apply-id>`, `schemabot revert <apply-id>`,
-  and `schemabot skip-revert <apply-id>`.
+  <apply-id>`, `schemabot cancel <apply-id>`, `schemabot cutover <apply-id>`,
+  `schemabot revert <apply-id>`, `schemabot skip-revert <apply-id>`, and
+  `schemabot release <apply-id>`.
 - Apply or roll back directly with `schemabot apply -s <schema-dir> -e
   <environment>` and `schemabot rollback <apply-id>`.
 - Inspect and release locks with `schemabot locks`, `schemabot unlock -d

@@ -5,7 +5,7 @@ SchemaBot exposes metrics via OpenTelemetry. All metrics are available at `GET /
 ## Custom Metrics
 
 Every SchemaBot-owned metric emits a non-empty `environment` attribute. Metrics
-that are not scoped to one schema-change environment use `environment="unknown"`.
+that are not scoped to one schema change environment use `environment="unknown"`.
 Some attributes listed below are optional and only appear when that context is
 available, such as `repository`, `github_app`, and `installation_id`.
 
@@ -57,7 +57,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.operator.stuck_pending_scan_failures` | Counter | environment | Failed stuck-pending apply scans (liveness signal for the gauge above) |
 | `schemabot.operator.stranded_operations_reaped_total` | Counter | database, deployment, environment, parent_state | Pending apply operations the reaper settled from an already-settled parent apply. `deployment` is the reaped operation's own. A one-time burst is the historical backlog draining; a climbing rate means a producer is terminalizing parents without settling their children |
 | `schemabot.engine.unrecognized_task_status_total` | Counter | database, database_type, engine, environment | Engine- or data-plane-reported task statuses with no task-state mapping. The fail-open default renders the affected work as Running, so any sustained rate means an engine or data-plane version introduced a status SchemaBot cannot classify — add an explicit mapping in `pkg/state`. The status itself is not an attribute: it is engine-controlled text with no bound on distinct values, and this counter fires only during a mapping gap. The paired drive warn carries the raw status with the task identifiers |
-| `schemabot.storage_schema.destructive_refusals_total` | Counter | table, operation, scope, environment | Destructive storage-schema DDL statements the startup bootstrap (`EnsureSchema`) refused to execute. `scope` says whether the safe clauses of the statement still ran. A nonzero rate means a starting binary's embedded schema no longer declares a table or column that exists in the storage database — expected briefly from older pods during a rolling deploy or rollback. `environment` is always `unknown`: the bootstrap precedes any schema-change environment |
+| `schemabot.storage_schema.destructive_refusals_total` | Counter | table, operation, scope, environment | Destructive storage-schema DDL statements the startup bootstrap (`EnsureSchema`) refused to execute. `scope` says whether the safe clauses of the statement still ran. A nonzero rate means a starting binary's embedded schema no longer declares a table or column that exists in the storage database — expected briefly from older pods during a rolling deploy or rollback. `environment` is always `unknown`: the bootstrap precedes any schema change environment |
 | `schemabot.drop_table.already_absent_total` | Counter | database, environment | DROP TABLE targets that were already absent when the apply reached them |
 | `schemabot.pending_drops.tables_moved_total` | Counter | database, environment | Dropped tables quarantined into the pending drops database |
 | `schemabot.pending_drops.cleanup_dropped_total` | Counter | database, environment | Expired quarantined tables permanently dropped by the cleaner |
@@ -455,7 +455,7 @@ The `otelhttp` middleware automatically produces standard HTTP metrics for every
 | `http.server.response.body.size` | Histogram | environment | Response body sizes |
 
 SchemaBot attaches `environment="unknown"` to these process-wide HTTP metrics
-because routing-level request metrics do not belong to one schema-change
+because routing-level request metrics do not belong to one schema change
 environment. Environment-specific operation metrics use the real environment.
 
 ## Adding New Metrics
