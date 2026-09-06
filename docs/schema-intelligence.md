@@ -1,8 +1,7 @@
 # Schema intelligence
 
 SchemaBot can tell you what is in your databases, how it got there, and what is
-changing now. Give your tools and agents that context without giving them
-permission to change anything.
+changing now. Give your tools and agents that context with read-only access.
 
 ![SchemaBot brings live schemas, recorded changes, and active progress from a distributed database fleet into view.](../assets/schema-intelligence-fleet.svg)
 
