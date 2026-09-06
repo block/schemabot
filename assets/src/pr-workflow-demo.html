@@ -1,0 +1,41 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+*{box-sizing:border-box}body{margin:0;background:#fff;color:#1f2328;font:15px -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;width:960px;height:780px;overflow:hidden}.header{height:100px;padding:22px 30px;border-bottom:1px solid #d1d9e0;background:#fff;position:relative;z-index:2}.header h1{font-size:24px;margin:0 0 10px;font-weight:500}.muted{color:#59636e}.badge{background:#1a7f37;color:white;border-radius:20px;padding:5px 12px;margin-right:10px}.viewport{height:642px;overflow:hidden;padding:22px 30px}.timeline{border-left:2px solid #d1d9e0;margin-left:18px;padding-left:38px}.card{position:relative;border:1px solid #d1d9e0;border-radius:6px;background:white;margin-bottom:22px}.avatar{position:absolute;left:-59px;top:0;width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#6e40c9,#2da44e)}.avatar.bot{background:white}.hd{background:#f6f8fa;border-bottom:1px solid #d1d9e0;border-radius:6px 6px 0 0;padding:12px 16px;color:#59636e}.hd strong{color:#1f2328}.bd{padding:18px;line-height:1.6}.bd h2{font-size:22px;margin:0 0 14px;border-bottom:1px solid #d1d9e0;padding-bottom:10px}.bd p{margin:10px 0}code{font:13px Menlo,monospace;background:#eff1f3;border-radius:4px;padding:2px 4px}pre{background:#f6f8fa;padding:16px;border-radius:6px;white-space:pre-wrap;font:14px/1.7 Menlo,monospace;margin:12px 0}.sql{color:#cf222e}.button{background:#1f883d;border:1px solid #1a7f37;border-radius:6px;padding:8px 16px;color:white;font-weight:600;display:inline-block}.editor{border:1px solid #0969da;box-shadow:0 0 0 2px #0969da22;border-radius:6px;padding:14px;height:70px;white-space:pre-wrap}.caret{border-right:2px solid #0969da}.rx{border:1px solid #54aeff;border-radius:18px;background:#ddf4ff;padding:2px 8px;display:inline-block}.progress{font-size:16px;white-space:nowrap}.foot{height:38px;padding:10px 30px;border-top:1px solid #d1d9e0;color:#59636e;font-size:12px;background:white;position:absolute;bottom:0;width:100%}.checks{border:1px solid #d1d9e0;border-radius:6px;margin-bottom:20px;padding:16px;line-height:2}.check{color:#1a7f37}.merged{background:#fbefff;border-color:#d8b9ed}.cursor{position:fixed;width:17px;height:24px;z-index:10;pointer-events:none;filter:drop-shadow(1px 1px 1px #fff)}
+</style></head><body>
+<div class="header"><h1>Add an index to users <span class="muted">#42</span></h1><span class="badge" id="badge">Open</span><span class="muted" id="prmeta">octocat wants to merge 1 commit into main</span></div>
+<div class="viewport" id="viewport"><div class="timeline" id="timeline"></div></div>
+<div class="foot">Illustrative PR workflow · one environment · elapsed time compressed</div>
+<svg class="cursor" id="cursor" viewBox="0 0 20 28"><path d="M1 1V23L6 18L10 27L14 25L10 17H18Z" fill="#24292f" stroke="white"/></svg>
+<script>
+const cmd='schemabot apply -e staging';
+const ddl='ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);';
+function card(body,bot=true,id=''){return `<div class="card" id="${id}">${bot?'<img class="avatar bot" src="../schemabot-avatar-200.png">':'<span class="avatar"></span>'}<div class="hd"><strong>${bot?'schemabot':'octocat'}</strong> commented <span class="muted">just now</span></div><div class="bd">${body}</div></div>`}
+const plan=card(`<h2>Schema Change Plan — Staging</h2><p><b>Database:</b> <code>testapp</code> | <b>Type:</b> MySQL</p><pre class="sql">${ddl}</pre><p>📋 Plan: 1 table to alter</p><hr><p>▶️ To apply all schema changes from this PR, comment:</p><pre>${cmd}</pre>`,true,'plan');
+const clamp=x=>Math.max(0,Math.min(1,x));
+const ease=x=>{x=clamp(x);return x*x*(3-2*x)};
+window.renderFrame=function(t){
+ let h=plan;
+ if(t>=2){let typed=cmd.slice(0,Math.floor(clamp((t-2)/2)*cmd.length));h+=card(t<5?`<div class="editor">${typed}<span class="caret"> </span></div><p style="text-align:right"><span class="button" id="post">Comment</span></p>`:`<p>${cmd}</p>${t>=5.5?'<span class="rx">👀 1</span>':''}`,false,'command')}
+ if(t>=6.5)h+=card(`<h2>Schema Change Apply — Staging</h2><p>🔒 <b>Lock acquired</b> by <code>example/shop#42</code></p><pre class="sql">${ddl}</pre><p><b>Applying automatically</b></p>`,true,'apply');
+ let pct=Math.round(clamp((t-8)/10)*100),filled=Math.round(pct/5),done=pct===100;
+ if(t>=8)h+=card(`<h2>Schema Change Status — Staging</h2><p><b>Database:</b> <code>testapp</code> | <b>Apply ID:</b> <code>apply-example-42</code></p><p><b>Status:</b> ${done?'Completed':'In Progress'}</p><p class="progress"><b>users:</b> ${Array(filled).fill(done?'🟩':'🟦').join('')+Array(20-filled).fill('⬜').join('')} <b>${pct.toFixed(2)}%</b></p><pre class="sql">${ddl}</pre><p>• Rows: ${Math.round(7200000*pct/100).toLocaleString('en-US')} / 7,200,000${done?'':' · ETA: '+Math.ceil((100-pct)*3.3)+'s'}</p>${done?'<p class="check">✓ Complete</p>':'<hr><p>To stop this schema change:</p><pre>schemabot stop apply-example-42 -e staging</pre>'}`,true,'progress');
+ if(t>=20)h+=card(`<h2>✅ Schema Change Applied — Staging</h2><p>Applied successfully — your schema changes are live!</p><p><code>apply-example-42</code></p><pre class="sql">${ddl}</pre>`,true,'complete');
+ if(t>=21)h+=`<div class="checks" id="checks"><b class="check">✓ All checks have passed</b><br>✓ ci / test<br>✓ SchemaBot (staging)${t>=24?'':'<hr><span class="button" id="merge">'+(t>=23.3?'Confirm merge':'Merge pull request')+'</span>'}</div>`;
+ if(t>=24)h+=`<div class="checks merged" id="merged"><b>🟣 Pull request successfully merged and closed</b><br>You’re all set. The branch has been merged.</div>`;
+ document.getElementById('timeline').innerHTML=h;
+ const viewport=document.getElementById('viewport');
+ let target=t<2?'plan':t<6.5?'command':t<8?'apply':t<20?'progress':t<21?'complete':t<24?'checks':'merged';
+ let el=document.getElementById(target);
+ // Keep the active action in view while retaining context above it.
+ let desired=Math.max(0,el.offsetTop-130);
+ const stages=[[2,'plan'],[6.5,'command'],[8,'apply'],[20,'progress'],[21,'complete'],[24,'checks']];
+ const stage=stages.find(([start])=>t>=start&&t<start+0.65);
+ if(stage){const previous=document.getElementById(stage[1]);const from=Math.max(0,previous.offsetTop-130);desired=from+(desired-from)*ease((t-stage[0])/0.65)}
+ viewport.scrollTop=desired;
+ const badge=document.getElementById('badge');badge.textContent=t>=24?'Merged':'Open';badge.style.background=t>=24?'#8250df':'#1a7f37';
+ document.getElementById('prmeta').textContent=t>=24?'octocat merged 1 commit into main':'octocat wants to merge 1 commit into main';
+ const cursor=document.getElementById('cursor');cursor.style.display='none';
+ let button=t>=4&&t<5?document.getElementById('post'):t>=22&&t<24?document.getElementById('merge'):null;
+ if(button){let r=button.getBoundingClientRect(),p=ease(t>=22?(t-22):t-4);cursor.style.display='block';cursor.style.left=(600+(r.x+r.width*.6-600)*p)+'px';cursor.style.top=(480+(r.y+12-480)*p)+'px'}
+};
+window.renderFrame(0);
+</script></body></html>
