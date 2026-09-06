@@ -20,6 +20,12 @@
 
 This is where SchemaBot is headed.
 
+If you have not used it: SchemaBot changes database schemas. You describe the tables you want as
+ordinary SQL files in your repository, one `CREATE TABLE` per table, and SchemaBot compares those
+files against the database as it actually is, works out the DDL that closes the gap, and runs it
+without taking the database down. Nobody writes the `ALTER`. That comparison, and the checks around
+it, are what this document is about.
+
 Everything else in `docs/` describes what SchemaBot does today. This one is about what we want it to
 become, and why that is worth building. There are no dates in it and nothing here is a promise to
 ship. It exists so that when a decision comes up, we have something to hold it against.
@@ -34,10 +40,10 @@ ambition needed a home of its own. This is that home.
 
 ## The northstar
 
-Every database should be able to evolve safely, whether it is a weekend project or a tier-zero
-fleet, and nobody should have to become a database expert first. Adding a column, adding an index,
-dropping a table that really is dead: none of that should carry a risk of taking the database down
-with it.
+Every database should be able to evolve safely, whether it is a weekend project or the tier-zero
+fleet a company cannot stay open without, and nobody should have to become a database expert first.
+Adding a column, adding an index, dropping a table that really is dead: none of that should carry a
+risk of taking the database down with it.
 
 People have been chasing this for a long time, and a lot of what they built works. A
 `schema_version` table, ordered changelogs, checksums that catch an edited file, a runner that
@@ -68,12 +74,12 @@ striking is how little the hazards change between them. A change that locks a ta
 intended, a half-applied state nobody can name: all of that is reachable from either end. Scale
 changes the blast radius, not the failure mode.
 
-What keeps a change safe is a short list of checks it has to get past. Work out the exact DDL by
-diffing against the live database. Lint it before anything runs. Ask for consent before destroying
-something. Refuse to call an ambiguous result a success. Those are the gates, and this document
-calls them that from here on. Not one of them needs a platform team to be correct, and not one gets
-better because more infrastructure is running it. There is no principled reason the hobbyist gets
-the unsafe version.
+What keeps a change safe is a short list of checks it has to get past. First, diff the files against
+the live database to work out the exact DDL: that is the plan, and this document uses the word that
+way from here on. Then lint the plan before anything runs, ask for consent before destroying
+something, and refuse to call an ambiguous result a success. Those are the gates. Not one of them
+needs a platform team to be correct, and not one gets better because more infrastructure is running
+it. There is no principled reason the hobbyist gets the unsafe version.
 
 What has to become true is that adoption gets much cheaper at the small end without anything
 loosening at the large end. A tier-zero fleet needs machinery an experiment has no use for: a server
@@ -84,12 +90,11 @@ be unsafe in front of production is unsafe in front of a weekend project too, an
 both places.
 
 Concretely, the shape SchemaBot runs in should be a choice rather than a prerequisite. A coordinating
-server on Kubernetes, with a separate process in each network the databases live in, so the server
-never needs a route to them. One server process with a database behind it. No server at all, just the
-CLI against a DSN. Or SchemaBot embedded as a library inside the application that owns the schema,
-close enough to run at startup. The first three work today and the fourth partly does. What is
-missing is the small end being genuinely small, instead of the large deployment with most of it
-switched off.
+server on Kubernetes that never needs a route to your databases, because a separate process inside
+each network does the work there. One server process with a database behind it. No server at all,
+just the CLI against a connection string. Or SchemaBot embedded as a library inside the application
+that owns the schema, close enough to run at startup. The first three work today and the fourth
+partly does.
 
 ![Both ends of the range feed into the same four gates: diff against the live database, lint before anything runs, explicit consent to destroy, and uncertainty never passing](../assets/vision-range.svg)
 
@@ -117,9 +122,11 @@ Four things should disappear:
   and do it. The same file should land everywhere it applies.
 
 The one that is easiest to miss is that a change taking three weeks should not block anything for
-three weeks. The copy runs in the background, and the one moment it actually touches the application
-is a swap somebody chooses, which can be a quiet Tuesday morning instead of the middle of a release
-freeze.
+three weeks. A change too big to apply in place is done by building a new version of the table
+alongside the live one and swapping them at the end, so the copy can run in the background for as
+long as it needs while the application keeps using the old table. The single moment it touches the
+application is that swap, and somebody picks when it happens. It can be a quiet Tuesday morning
+instead of the middle of a release freeze.
 
 ![Two timelines over the same eight hours. Done by hand, six separate moments demand a person: writing the ALTER, picking a strategy, booking a window, running it at midnight, watching it for eight hours, and doing it again in the next environment. With SchemaBot, only two do: editing the file and saying yes at the start, and picking the moment to swap at the end. Everything between them is the machine's time](../assets/vision-attention.svg)
 
@@ -149,9 +156,9 @@ confirmation and every control operation. A fallback that covers most of the sur
 fallback. And when GitHub is unreachable, SchemaBot says so rather than guessing at state.
 
 Keep widening that gap. Every feature should get asked the same question before it ships: if this
-only works through a PR comment, it is not finished. Another forge, a CI job, a terminal, or an agent
-calling an API should all be able to drive the same loop, because none of them is where the truth
-lives.
+only works through a PR comment, it is not finished. Another forge, meaning GitLab or Gitea or
+something that does not exist yet, along with a CI job, a terminal, or an agent calling an API,
+should all be able to drive the same loop, because none of them is where the truth lives.
 
 ## Guardrails and context for agents
 
@@ -204,12 +211,12 @@ are forced to pass through, and for schema changes that place is SchemaBot.
 ![Four agents propose schema changes in parallel and all pass through one place, which lets one apply while the others queue or block](../assets/vision-many-agents.svg)
 
 The primitives are already there, because concurrency was never optional. SchemaBot has always had to
-survive several pods, several operators, and redelivered webhooks racing each other. One apply runs
-at a time per deployment, so two changes to the same database cannot interleave no matter how many
-authors produced them. Every drive runs under a claim and writes under a lease token, so nobody can
-half-take a change someone else is driving. And a plan built against a schema that has since moved
-never applies, which is the multiplayer race stated as a rule: planning first does not win you the
-race to submit.
+survive several of its own processes, several operators, and duplicate webhook deliveries racing each
+other. Only one change runs at a time against a given database, so two of them cannot interleave no
+matter how many authors produced them. A change in flight is owned by exactly one process, which has
+to prove it still holds that ownership on every write, so a second one cannot half-take a change
+someone else is running. And a plan built against a schema that has since moved never applies, which
+is the multiplayer race stated as a rule: planning first does not win you the race to submit.
 
 Then there is the merge gate, which is already an agent-to-agent protocol without either agent
 knowing it. When one change lands, every other open pull request whose files no longer match the live
@@ -233,7 +240,7 @@ intent, landing on many databases.
 
 It starts with knowing, because nothing can be changed in aggregate that cannot first be seen in
 aggregate. SchemaBot accumulates that knowledge as a side effect of doing its job: every plan it
-computed, every apply it ran, the DDL each one carried, who asked for it, how it ended, and a live
+computed, every change it ran, the DDL each one carried, who asked for it, how it ended, and a live
 line to every database it manages. That surface already answers three questions over one read API:
 what is live right now, what has ever changed, and what is changing now.
 
@@ -317,7 +324,7 @@ and about engines that can be supported honestly, not about saying yes to everyt
 | Safe should also mean fast | Nobody writes the DDL, picks an execution strategy, or runs anything by hand. Long changes run unattended and report progress, and a deferred cutover lets the copy finish without the swap happening until someone picks the moment. | The rerun has not actually disappeared. A change still needs a person to say yes once per environment, `apply -e staging` and then `apply -e production`, rather than one intent that promotes itself as each environment goes green. Nothing measures what a schema change costs in human time either, so the couple of minutes above is a target rather than a number anyone can check. |
 | GitOps, not GitHub | Enforced rather than intended. Applies work while GitHub is down, the CLI covers the full PR surface, and an outage never invents state. The process that touches your database carries no GitHub credentials. | The merge gate itself is expressed as GitHub Check Runs. No second forge is implemented, so the separation is proven by the CLI rather than by a second integration. |
 | Agents | Declarative files are already an agent-readable source of truth, every gate is author-agnostic, and the plan API returns the change set, the per-shard detail, and every lint finding as JSON. | No packaged agent surface. Nothing tells an agent that API exists or how to use it, so in practice an agent reads files and opens a PR the same as a person. An MCP server and a skill are the obvious missing pieces. |
-| Many agents, one database | Concurrent authors are already serialized: one apply per deployment, provable ownership, and no stale plan ever applies. The merge gate coordinates open changes with no protocol between them. | The coordination is opaque. No readable queue, no machine-readable reason for a block, no expected wait. A blocked caller can only poll. |
+| Many agents, one database | Concurrent authors are already serialized: one change at a time per database, ownership that has to be proven on every write, and no stale plan ever applies. The merge gate coordinates open changes with no protocol between them. | The coordination is opaque. No readable queue, no machine-readable reason for a block, no expected wait. A blocked caller can only poll. |
 | One database, or ten thousand | The read API answers what is live, what changed, and what is changing. `pull --lint` audits a live schema and `fix-lint` turns a finding into an edit. | All of it is per database. No aggregate query, no grouping by rule across databases, and no way to dispatch one intent to many targets and watch or stop it as one thing. |
 | Everything underneath | Each engine gets its own semantics rather than a shared subset, and an engine that cannot do something safely refuses at plan time instead of guessing. | PostgreSQL is early alpha, so first class is a commitment there more than a shipped fact. The engine boundary is clean; the forge boundary is not, and neither is a plugin surface. |
 
