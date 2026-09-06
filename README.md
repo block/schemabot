@@ -14,7 +14,7 @@
 
 <p align="center">
   <a href="./docs/vision.md">Vision</a> ·
-  <a href="#see-it-in-action">See it in action</a> ·
+  <a href="#the-pr-workflow">The PR workflow</a> ·
   <a href="#why-schemabot">Why SchemaBot</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#quick-start">Quick start</a> ·
@@ -27,11 +27,13 @@ SchemaBot makes database schema changes safe and easy. Declare the schema you wa
 
 SchemaBot is built for the agentic era. In a world where agents build product features from scratch, SchemaBot gives them the guardrails, context, and tooling to safely evolve your database schema. Declarative SQL files are a version-controlled source of truth an agent can read and reason about, and every change passes the same linting, safety gates, and merge-blocking checks, no matter who (or what) wrote it. Block runs SchemaBot today for the majority of its production schema changes, across a large fleet of MySQL and Vitess databases, with PostgreSQL in-flight.
 
-## See It in Action
+## The PR workflow
 
-**The PR workflow.** Open a PR with your schema changes, and SchemaBot plans, applies, and verifies them across environments, right from the PR timeline:
+Open a PR with your schema changes, and SchemaBot plans, applies, and verifies them across environments, right from the PR timeline:
 
 [![SchemaBot PR workflow: plan, apply, progress, completion, checks, and merge](./assets/pr-workflow-demo.gif)](./docs/pre-merge-workflow.md)
+
+*Illustrated using SchemaBot’s actual PR comments*
 
 [Walk through each step](./docs/pre-merge-workflow.md#the-pr-workflow-step-by-step) at your own pace
 
