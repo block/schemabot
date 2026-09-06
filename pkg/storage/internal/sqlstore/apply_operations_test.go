@@ -2145,6 +2145,12 @@ func TestApplyOperationStore_FindNextApplyOperation_FailedRetryableCrashRecovery
 		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
 	})
 	require.NoError(t, err)
+	// The crashed driver stopped heartbeating this row too, so it is stale
+	// alongside its parent.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, id)
+	require.NoError(t, err)
 
 	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "recovery-operator")
 	require.NoError(t, err)
@@ -2261,6 +2267,12 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsFailedRetryableParentA
 		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
 	})
 	require.NoError(t, err)
+	// The crashed driver stopped heartbeating this row too, so it is stale
+	// alongside its parent.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, id)
+	require.NoError(t, err)
 
 	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
@@ -2291,11 +2303,111 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsFailedRetryableParentA
 		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
 	})
 	require.NoError(t, err)
+	// The crashed driver stopped heartbeating this row too, so it is stale
+	// alongside its parent.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, id)
+	require.NoError(t, err)
 
 	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	require.NotNil(t, claimed, "a crashed retry must be recoverable even with the budget spent; the attempt was already counted")
 	assert.Equal(t, id, claimed.ID)
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_FailedRetryableCrashRecoveryAdmitsOneDriverPerWindow
+// verifies that recovering a crashed retry admits exactly one driver per
+// staleness window. Leasing the operation and claiming its parent apply are
+// separate transactions, so the parent stays active-and-stale for the whole gap
+// between them. Every peer polling inside that gap sees the same crash-recovery
+// shape, and if they could all lease the row they would each rotate its token —
+// leaving whichever driver went on to win the parent lease holding a superseded
+// operation token, so its first operation-scoped write is refused and the drive
+// ends having done nothing. Because a driver that loses the parent claim
+// releases its operation lease (which backdates the row past the window), that
+// race would re-run identically every window and the apply could never
+// terminalize.
+func TestApplyOperationStore_FindNextApplyOperation_FailedRetryableCrashRecoveryAdmitsOneDriverPerWindow(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_fr_crash_one_driver", 1, state.Apply.Running, "staging")
+	// Parent claimed for retry then crashed: running, budget remaining, stale.
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET state = ?, attempt = ?, updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, state.Apply.Running, maxRecoveryAttempts-1, apply.ID)
+	require.NoError(t, err)
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, id)
+	require.NoError(t, err)
+
+	first, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+	require.NoError(t, err)
+	require.NotNil(t, first, "the first driver must recover the crashed retry")
+	require.Equal(t, id, first.ID)
+
+	// driver-a holds the operation lease but has not reached ClaimApplyByID yet,
+	// so the parent apply is still active and stale.
+	second, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+	require.NoError(t, err)
+	assert.Nil(t, second, "a peer polling between the operation claim and the parent claim must not re-lease the recovering operation")
+
+	persisted, err := store.ApplyOperations().Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, "driver-a", persisted.LeaseOwner, "the recovering driver keeps the operation lease")
+	assert.Equal(t, first.LeaseToken, persisted.LeaseToken, "the recovering driver's lease token must not be rotated out from under it")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_FailedRetryableCrashRecoveryHandsOffOnRelease
+// verifies the crash-recovery arm still hands off promptly: the driver that
+// leases the operation but cannot acquire the parent apply lease releases its
+// claim, and the peer holding the parent must be able to take the row on its
+// very next poll rather than waiting out a staleness window.
+func TestApplyOperationStore_FindNextApplyOperation_FailedRetryableCrashRecoveryHandsOffOnRelease(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_fr_crash_handoff", 1, state.Apply.Running, "staging")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET state = ?, attempt = ?, updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, state.Apply.Running, maxRecoveryAttempts-1, apply.ID)
+	require.NoError(t, err)
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, id)
+	require.NoError(t, err)
+
+	blocked, err := store.ApplyOperations().FindNextApplyOperation(ctx, "blocked-driver")
+	require.NoError(t, err)
+	require.NotNil(t, blocked)
+
+	released, err := store.ApplyOperations().ReleaseClaim(ctx, blocked.Lease())
+	require.NoError(t, err)
+	require.True(t, released)
+
+	reclaimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "parent-holder")
+	require.NoError(t, err)
+	require.NotNil(t, reclaimed, "a released crash-recovery row must be claimable on the next poll without aging")
+	assert.Equal(t, id, reclaimed.ID)
+	assert.Equal(t, "parent-holder", reclaimed.LeaseOwner)
+	assert.Equal(t, state.ApplyOperation.FailedRetryable, reclaimed.State, "the handoff must not change the row's state")
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_RecoversStaleSetupPhase
