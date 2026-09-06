@@ -121,6 +121,9 @@ type Storage interface {
 	// WebhookEvents returns the durable webhook event inbox store.
 	WebhookEvents() WebhookEventStore
 
+	// PendingDrops returns the pending-drops quarantine ledger store.
+	PendingDrops() PendingDropStore
+
 	// Ping verifies the database connection is alive.
 	Ping(ctx context.Context) error
 
@@ -1470,4 +1473,63 @@ type ControlRequestStore interface {
 	// keep warning about a command the operator has since re-issued
 	// successfully. It reports whether the stored row changed.
 	ClearRemoteFailure(ctx context.Context, applyID int64, operation ControlOperation) (bool, error)
+}
+
+// PendingDropStore records the tables this deployment moved into an engine's
+// pending-drops quarantine, and tracks them until the retention period expires
+// and they are permanently removed.
+//
+// The ledger is a derived index over the targets this deployment executes
+// against, never an authority: the server holding the quarantine schema is the
+// truth, and the reaper re-syncs from it on every visit. Two things depend on
+// the rows. Discovery reads them to learn which servers hold expired
+// quarantines, so cleanup cost scales with drops rather than with the number of
+// registered databases. Re-run convergence reads them as proof that an
+// interrupted DROP phase already executed.
+//
+// Support is expressed by whether rows exist rather than by configuration. A
+// deployment that only dispatches to remote data planes never quarantines, so
+// it writes no rows, so every query here returns nothing and its cleanup pass
+// is a no-op by construction. The same holds for an engine with no quarantine
+// implementation.
+type PendingDropStore interface {
+	// Record inserts ledger rows for tables that are about to be quarantined.
+	// Callers must write before the engine performs the move: an interruption
+	// between the two then orphans a row, which the reaper resolves to a no-op,
+	// rather than a quarantined table no deployment has any record of.
+	//
+	// Rows already present for the same target, environment, and quarantined
+	// name are left untouched, so a retried write and an adoption of a table
+	// this deployment already recorded are both idempotent.
+	Record(ctx context.Context, drops []*PendingDrop) error
+
+	// LatestForTable returns the most recently recorded row for a source table
+	// on a target, or nil when this deployment has no record of quarantining it.
+	//
+	// Callers compare RunID themselves rather than passing it in. A row written
+	// by a different run holds that run's data, and the quarantined names of two
+	// applies dropping the same table differ only by timestamp, so a caller that
+	// matched on run identity inside the query could not tell "no record at all"
+	// apart from "an earlier apply's copy" — two cases that fail closed for
+	// different reasons.
+	LatestForTable(ctx context.Context, target, environment, databaseName, originalTable string) (*PendingDrop, error)
+
+	// ListExpired returns quarantined rows whose quarantine time is at or before
+	// cutoff, oldest first, capped at limit. These are the candidates a cleanup
+	// pass groups by target and sweeps.
+	ListExpired(ctx context.Context, cutoff time.Time, limit int) ([]*PendingDrop, error)
+
+	// ListQuarantined returns every row for a target still in the quarantined
+	// state. The reaper reads it while connected to that target so it can adopt
+	// tables present in the quarantine schema with no matching row.
+	ListQuarantined(ctx context.Context, target, environment string) ([]*PendingDrop, error)
+
+	// SetState drives rows to a terminal state after a sweep has established
+	// what happened to each quarantined table.
+	SetState(ctx context.Context, ids []int64, state PendingDropState) error
+
+	// Prune deletes terminal rows whose state last changed at or before cutoff,
+	// so the ledger does not grow without bound once its rows are useful for
+	// neither discovery nor re-run proof. Returns the number of rows deleted.
+	Prune(ctx context.Context, cutoff time.Time, limit int) (int64, error)
 }
