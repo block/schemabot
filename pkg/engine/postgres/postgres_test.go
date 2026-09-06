@@ -544,6 +544,51 @@ func TestNewWithTableSizeLimitTreatsZeroAsUnset(t *testing.T) {
 	assert.Equal(t, int64(42), NewWithTableSizeLimit(42).TableSizeLimit())
 }
 
+// The undeclared-table reason offers only remedies the operator can carry
+// out, and which remedy applies depends on where the table's foreign key
+// constraints live: none, on the table itself, on other tables, or both. Every
+// constraint on either side is named so the operator knows what a drop or a
+// hand-written file has to account for.
+func TestUndeclaredTableReasonNamesRemedyPerForeignKeySide(t *testing.T) {
+	const preamble = `table "orders" exists on the target but no schema file in namespace "public" declares it; converging would drop the table, which SchemaBot's PostgreSQL support never executes`
+	tests := []struct {
+		name string
+		live liveTable
+		want string
+	}{
+		{
+			name: "no foreign keys on either side",
+			live: liveTable{name: "orders"},
+			want: preamble + " — declare the table in a schema file to keep it under management, or drop it through a separately reviewed process",
+		},
+		{
+			name: "owns one foreign key",
+			live: liveTable{name: "orders", foreignKeys: []string{"orders_user_id_fkey"}},
+			want: preamble + `; the table cannot be declared while it carries foreign key constraint(s) "orders_user_id_fkey", which schema files do not support — drop the table, or remove its foreign keys before declaring it, through a separately reviewed process`,
+		},
+		{
+			name: "owns several foreign keys",
+			live: liveTable{name: "orders", foreignKeys: []string{"orders_shop_id_fkey", "orders_user_id_fkey"}},
+			want: preamble + `; the table cannot be declared while it carries foreign key constraint(s) "orders_shop_id_fkey", "orders_user_id_fkey", which schema files do not support — drop the table, or remove its foreign keys before declaring it, through a separately reviewed process`,
+		},
+		{
+			name: "referenced by foreign keys on other tables",
+			live: liveTable{name: "orders", referencedBy: []string{"invoices_order_id_fkey", "shipments_order_id_fkey"}},
+			want: preamble + `; foreign key constraint(s) "invoices_order_id_fkey", "shipments_order_id_fkey" on other tables reference it, and schema files do not support foreign keys, so the schema pull cannot write a file for it — declare the table by hand in a schema file to keep it under management, or drop it together with the referencing constraints through a separately reviewed process`,
+		},
+		{
+			name: "owns and is referenced by foreign keys",
+			live: liveTable{name: "orders", foreignKeys: []string{"orders_user_id_fkey"}, referencedBy: []string{"invoices_order_id_fkey"}},
+			want: preamble + `; the table cannot be declared while it carries foreign key constraint(s) "orders_user_id_fkey", which schema files do not support, and foreign key constraint(s) "invoices_order_id_fkey" on other tables reference it — drop the table together with the referencing constraints, or remove its own foreign keys and declare it by hand, through a separately reviewed process`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, undeclaredTableReason("public", tt.live))
+		})
+	}
+}
+
 func TestPullNamespacesRejectsReservedSchema(t *testing.T) {
 	_, err := pullNamespaces(t.Context(), nil, "pg_catalog")
 	require.Error(t, err)
