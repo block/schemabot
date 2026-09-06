@@ -1271,6 +1271,10 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 							OR (
 								a.state IN (%s)
 								AND a.updated_at < %s
+								-- Names no column of a, but belongs to this arm
+								-- alone: hoisted out of the EXISTS it would gate
+								-- deliberate redispatch too and stall every retry
+								-- for a staleness window.
 								AND apply_operations.updated_at < %s
 							)
 						)
