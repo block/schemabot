@@ -89,7 +89,7 @@ if (t < BLOCK_AT){
   // The same copy as lane B, just started later, so it runs at the same pace.
   const prog = Math.min(1,(t-BLOCK_AT)/COPY_END);
   const timedOut = t > 0.6;
-  A.insertAdjacentHTML('beforeend', `<div class="big" style="left:${blockX}px${timedOut?';background:#cf222e':''}">schema change · copying rows · ${Math.round(prog*100)}%<div class="bar" style="width:${prog*100}%"></div></div>`);
+  A.insertAdjacentHTML('beforeend', `<div class="big" style="left:${blockX}px${timedOut?';background:#cf222e':''}">PR #42 · copying rows · ${Math.round(prog*100)}%<div class="bar" style="width:${prog*100}%"></div></div>`);
   const waiting = Math.max(0, Math.floor((t*SPEED*W - (firstBlocked*GAP))/GAP)+1);
   const note = document.getElementById('anote');
   note.textContent = waiting>0 ? `${waiting} release${waiting>1?'s':''} waiting${timedOut?' · deploy timed out ⏱':''}` : '';
