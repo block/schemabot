@@ -791,10 +791,12 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	}
 
 	planResp := planResponseFromProto(resp)
-	// Record the primary deployment this plan was created against so the
+	// Record the primary rollout member this plan was created against so the
 	// review-time drift rollup can verify the baseline still maps to the primary
-	// at rollup time.
+	// at rollup time. Both halves are needed: one deployment can address several
+	// targets, so the deployment alone does not identify the member.
 	planResp.Deployment = deployment
+	planResp.Target = resolvedTarget.Target
 	return resp, planResp, nil
 }
 

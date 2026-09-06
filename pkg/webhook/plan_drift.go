@@ -7,6 +7,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
@@ -35,15 +36,16 @@ import (
 //
 // primaryPlan is the reviewed primary plan proto returned by
 // executePlanProtoWithTransientRetry, reused as the rollup baseline so the
-// comparison is against exactly what was reviewed.
-func (h *Handler) reviewTimeDrift(ctx context.Context, planReq api.PlanRequest, primaryPlan *ternv1.PlanResponse, primaryDeployment string, repo string, pr int) (reviewDriftOutcome, *templates.DeploymentDriftData) {
+// comparison is against exactly what was reviewed. primaryMember is the
+// deployment and target that plan was created against.
+func (h *Handler) reviewTimeDrift(ctx context.Context, planReq api.PlanRequest, primaryPlan *ternv1.PlanResponse, primaryMember routing.ExecutionTarget, repo string, pr int) (reviewDriftOutcome, *templates.DeploymentDriftData) {
 	if len(primaryPlan.GetErrors()) > 0 {
 		h.logger.Debug("skipping review-time drift rollup: primary plan reported errors",
 			"repo", repo, "pr", pr, "database", planReq.Database, "environment", planReq.Environment)
 		return reviewDriftOutcome{state: driftNotEvaluated}, nil
 	}
 
-	rollup, err := h.service.RollupReviewTimeDrift(ctx, planReq, primaryPlan, primaryDeployment)
+	rollup, err := h.service.RollupReviewTimeDrift(ctx, planReq, primaryPlan, primaryMember)
 	if err != nil {
 		h.logger.Error("review-time drift rollup failed; the plan check will block the PR closed",
 			"repo", repo,
