@@ -48,13 +48,15 @@ key to debugging stale-progress issues.
 | Field           | Type              | Notes |
 |-----------------|-------------------|-------|
 | `CurrentState`  | `status.State`    | Atomic int32 enum: `Initial`, `CopyRows`, `WaitingOnSentinelTable`, `Checksum`, `CutOver`, `Close`, ... |
-| `Summary`       | `string`          | `"71436/221193 32.30% copyRows ETA 5m 30s"` |
+| `Summary`       | `string`          | Human-readable line for logs, e.g. `"71436/221193 32.30% copyRows ETA 5m 30s"`. Display-only: every value in it is also one of the structured fields below, and nothing in SchemaBot parses it. |
 | `Tables[]`      | `[]TableProgress` | Per-table: `TableName`, `RowsCopied` (uint64), `RowsTotal` (uint64), `IsComplete` (bool) |
+| `ETA`           | `status.ETA`      | `State` (`""` outside the copy, `measuring`, `ready`, `due`) and `Duration` (remaining copy time, meaningful only when `State == ETAReady`). |
+| `Checksum`      | `status.ChecksumProgress` | `RowsChecked` / `RowsTotal` for the verify phase; zero outside it. |
 | `Resume`        | `bool`            | True only after the runner successfully resumed from its durable checkpoint; a fresh start (or an abandoned resume attempt) reports false. |
 | `Throttle`      | `status.ThrottleStatus` | `Throttled` (bool), `Reason` (display-only string, `"<signal> <observed> <op> <threshold>"`), `Utilization` (float64, 0 means unknown — never render it as idle). |
 
 Key details:
-- **ETA is embedded in `Summary`**, not a separate field. Downstream layers parse it out with a regex.
+- **The ETA is a structured field.** `ETA.State` says whether an estimate exists yet — `measuring` during the initial window before a copy rate is known, `due` once the copy is essentially finished — so a consumer can show "calculating" instead of a misleading zero. `ETA.Duration` is only meaningful when the state is `ready`. If Spirit reports something SchemaBot needs and it is only in `Summary`, the fix is a new field on `status.Progress` upstream, not a parser here.
 - **`IsComplete`** comes from the chunker's in-memory `finalChunkSent` flag, NOT from the checkpoint table. This means `IsComplete` is lost on crash — it only exists while the runner is alive.
 - **`RowsCopied` can exceed `RowsTotal`** when the initial MySQL estimate is low. Downstream renderers treat this as an active estimate-exceeded state rather than a percentage above 100%.
 - **`Checksum` progress (`prog.Checksum.RowsChecked` / `RowsTotal`) is populated only while
@@ -111,7 +113,9 @@ Two properties matter for display:
    - Each table's `State` is the raw Spirit phase string (`copyRows`, `applyChangeset`, ...).
    - Calculates `Progress` percent (clamped 0–100) and preserves raw `RowsCopied`
      so renderers can detect when the initial estimate was exceeded.
-   - Sets `ProgressDetail` = formatted summary like `"12345/50000 24% copyRows"`.
+   - Surfaces the runner's single `ETA` as `ETASeconds` on the tables still
+     copying, and only when `ETA.State` is `ready` — a still-measuring or
+     essentially-done estimate is not yet a number.
    - When `IsComplete` is true, reconciles `RowsTotal = RowsCopied` (the estimate
      was never a count; the copied total is ground truth once the copy finishes)
      and sets `Progress` to 100. The table keeps the runner phase while the
@@ -132,6 +136,11 @@ Two properties matter for display:
    (`logEngineResumeOnce`).
 
 Key types: `engine.ProgressResult`, `engine.TableProgress` (`pkg/engine/engine.go`).
+
+`engine.TableProgress.ProgressDetail` is a free-text note for a human, never a
+data channel: Spirit's `Summary` line while the runner has no per-table progress
+yet, or a marker that a statement ran as native DDL outside the runner. Nothing
+downstream parses it, and the drive does not persist it.
 
 When no runner exists (engine stopped, no active schema change), returns `StatePending` with
 message `"No active schema change"`.
@@ -280,19 +289,12 @@ adds apply-level fields: `apply_id`, `database`, `environment`.
 
 The TUI polls the API every **2 seconds** via `tick()`.
 
-`parseProgressResult()` converts the JSON response to internal types. For each table,
-if `ProgressDetail` is non-empty, it runs `ParseSpiritProgress()` — a regex parser
-in `pkg/cmd/internal/templates/progress.go` that extracts structured data from Spirit's summary string:
-
-```
-"71436/221193 32.30% copyRows ETA 5m 30s"
- ↓       ↓      ↓       ↓          ↓
-RowsCopied RowsTotal Percent State    ETA
-```
-
-The parsed values override the structured API fields (`RowsCopied`, `RowsTotal`, `Percent`)
-because `ProgressDetail` comes directly from Spirit and is more current than the separately-polled
-numeric fields.
+`parseProgressResult()` converts the JSON response to internal types through
+`templates.ParseProgressResponse()`, a field-for-field mapping of the structured
+API fields (`RowsCopied`, `RowsTotal`, `PercentComplete`, `ETASeconds`, the
+checksum counters, the throttle status). The renderer draws the bar, the rows
+line, and the ETA from those fields alone — the same fields the PR comment
+renders from, so the two surfaces always agree.
 
 ## TUI rendering reference
 
@@ -446,9 +448,12 @@ The `⠋` is a Braille spinner (animated in the TUI, static here).
    applies with stale heartbeats and call `Tern.ResumeApply()`, which re-plans against the
    actual DB state to determine what still needs to be done.
 
-5. **ETA is only available via `ProgressDetail` parsing.** Spirit embeds ETA in its summary string.
-   The engine layer doesn't extract it into a separate field — it flows through as `ProgressDetail`
-   and is parsed by the CLI with a regex. If the regex fails, no ETA is shown.
+5. **The ETA is structured end to end.** Spirit reports `status.ETA{State, Duration}`; the
+   engine surfaces it as `ETASeconds` only when the state is `ready`; the drive persists it
+   on the task row; the API and CLI carry it as `eta_seconds` / `ETASeconds`; and both the CLI
+   and the PR comment render it through `ui.FormatETA`. No layer derives it from text, so a
+   missing ETA means Spirit had none to give (still measuring, or essentially done), not that
+   a parser failed.
 
 6. **Estimate-exceeded display.** Spirit can report `RowsCopied > RowsTotal` when MySQL's initial
    estimate is low. SchemaBot preserves the raw copied count, clamps determinate percentages to 100,

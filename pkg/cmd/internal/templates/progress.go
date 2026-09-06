@@ -672,37 +672,9 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		return b.String()
 	}
 
-	// In-progress state - try to parse Spirit's progress detail
+	// In-progress state — rendered from the structured copy fields, which are
+	// the same source the PR comment renders from.
 	switch {
-	case t.ProgressDetail != "":
-		if info := ParseSpiritProgress(t.ProgressDetail); info != nil {
-			if ui.EstimateExceeded(info.RowsCopied, info.RowsTotal) && info.State == "copyRows" {
-				b.WriteString(formatEstimateExceededTable(t, info.RowsCopied, activityBar, activityLabel))
-				return b.String()
-			}
-
-			// Parsed successfully - show emoji progress bar with structured data
-			displayPercent := ui.RowCopyDisplayPercent(info.Percent, info.RowsCopied)
-			bar := ui.ProgressBarRowCopy(displayPercent)
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s%s\n", t.TableName, bar,
-				ui.FormatRowCopyPercent(info.Percent, info.RowsCopied, info.RowsTotal), throttledSuffix(t))
-			if t.DDL != "" {
-				b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
-			}
-			// Rows and ETA on the same line, rendered from the structured ETA
-			// so the CLI and PR comment show the same value via FormatETA.
-			writeStructuredRowsAndETA(&b, t)
-			if info.State != "" && info.State != "copyRows" {
-				fmt.Fprintf(&b, indentDetail+"Status: %s\n", info.State)
-			}
-		} else {
-			// Can't parse - show raw detail
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s:\n", t.TableName)
-			if t.DDL != "" {
-				b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
-			}
-			fmt.Fprintf(&b, "    %s\n", t.ProgressDetail)
-		}
 	case t.RowsTotal > 0 && t.RowsCopied == 0:
 		// Row total is known but the copy hasn't reported progress yet
 		// (Vitess VReplication / Spirit ramp-up — can take a while on a large
