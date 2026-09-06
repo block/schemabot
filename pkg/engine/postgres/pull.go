@@ -16,33 +16,32 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 )
 
+// The pull's catalog reads carry the same pg_catalog qualification as
+// liveTables: a search_path that lists a user schema first must not let a
+// decoy relation or operator hand the pull a wrong baseline.
 const listPostgresSchemas = `
 SELECT nspname
-FROM pg_namespace
+FROM pg_catalog.pg_namespace
 ORDER BY nspname`
 
-const postgresSchemaExists = `SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)`
-
-const listPostgresTables = `
-SELECT c.relname
-FROM pg_class AS c
-JOIN pg_namespace AS n ON n.oid = c.relnamespace
-WHERE n.nspname = $1
-  AND c.relkind IN ('r', 'p')
-  AND c.relispartition = false
-ORDER BY c.relname`
+const postgresSchemaExists = `
+SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace
+               WHERE nspname OPERATOR(pg_catalog.=) $1)`
 
 const inspectUnmodeledPostgresTableObjects = `
 SELECT
-  EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = c.oid AND NOT tgisinternal),
+  EXISTS (SELECT 1 FROM pg_catalog.pg_trigger
+          WHERE tgrelid OPERATOR(pg_catalog.=) c.oid AND NOT tgisinternal),
   c.relrowsecurity OR c.relforcerowsecurity,
-  EXISTS (SELECT 1 FROM pg_policy WHERE polrelid = c.oid),
-  EXISTS (SELECT 1 FROM pg_description WHERE objoid = c.oid AND objsubid >= 0),
-  COALESCE(cardinality(c.reloptions), 0) > 0,
-  EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = c.oid) AND NOT c.relispartition
-FROM pg_class AS c
-JOIN pg_namespace AS n ON n.oid = c.relnamespace
-WHERE n.nspname = $1 AND c.relname = $2`
+  EXISTS (SELECT 1 FROM pg_catalog.pg_policy WHERE polrelid OPERATOR(pg_catalog.=) c.oid),
+  EXISTS (SELECT 1 FROM pg_catalog.pg_description
+          WHERE objoid OPERATOR(pg_catalog.=) c.oid AND objsubid OPERATOR(pg_catalog.>=) 0),
+  COALESCE(pg_catalog.cardinality(c.reloptions), 0) OPERATOR(pg_catalog.>) 0,
+  EXISTS (SELECT 1 FROM pg_catalog.pg_inherits WHERE inhrelid OPERATOR(pg_catalog.=) c.oid)
+    AND NOT c.relispartition
+FROM pg_catalog.pg_class AS c
+JOIN pg_catalog.pg_namespace AS n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+WHERE n.nspname OPERATOR(pg_catalog.=) $1 AND c.relname OPERATOR(pg_catalog.=) $2`
 
 type unmodeledTableObjects struct {
 	trigger     bool
@@ -241,22 +240,18 @@ func isContextError(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
+// pullTables names the tables a pull renders: the same set the plan holds
+// schema files accountable for, so a pulled baseline declares exactly what a
+// later plan would otherwise report as undeclared. Partitions and
+// extension-owned tables have no file of their own and are left out.
 func pullTables(ctx context.Context, pool *pgxpool.Pool, namespace string) ([]string, error) {
-	rows, err := pool.Query(ctx, listPostgresTables, namespace)
+	live, err := liveTables(ctx, pool, namespace)
 	if err != nil {
-		return nil, fmt.Errorf("query PostgreSQL tables in schema %q: %w", namespace, err)
+		return nil, err
 	}
-	defer rows.Close()
-	var tables []string
-	for rows.Next() {
-		var table string
-		if err := rows.Scan(&table); err != nil {
-			return nil, fmt.Errorf("scan PostgreSQL table in schema %q: %w", namespace, err)
-		}
-		tables = append(tables, table)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate PostgreSQL tables in schema %q: %w", namespace, err)
+	tables := make([]string, len(live))
+	for i, t := range live {
+		tables[i] = t.name
 	}
 	return tables, nil
 }
