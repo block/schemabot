@@ -217,13 +217,13 @@ are forced to pass through, and for schema changes that place is SchemaBot.
 
 ![Four agents propose schema changes in parallel and all pass through one place, which lets one apply while the others queue or block](../assets/vision-many-agents.svg)
 
-The primitives are already there, because concurrency was never optional. SchemaBot has always had to
-survive several of its own processes, several operators, and duplicate webhook deliveries racing each
-other. Only one change runs at a time against a given database, so two of them cannot interleave no
-matter how many authors produced them. A change in flight is owned by exactly one process, which has
-to prove it still holds that ownership on every write, so a second one cannot half-take a change
-someone else is running. And a plan built against a schema that has since moved never applies, which
-is the multiplayer race stated as a rule: planning first does not win you the race to submit.
+SchemaBot handles this already, because concurrency was never optional. Several of its own processes,
+several operators, and duplicate deliveries of the same webhook all race each other today. Three
+rules hold the line. Only one change runs at a time against a given database, so two cannot
+interleave no matter how many authors produced them. One process owns a change while it runs, and
+proves it still owns it on every write, so nobody half-takes work someone else is running. And a plan
+built against a schema that has since moved never applies: planning first does not win you the race
+to submit.
 
 Then there is the merge gate, which is already an agent-to-agent protocol without either agent
 knowing it. When one change lands, every other open pull request whose files no longer match the live
@@ -234,11 +234,10 @@ That is the cheap version of a problem people usually reach for a scheduler to s
 need to negotiate, discover each other, or agree on an ordering. They need a shared source of truth
 and a gate that fails closed when their view of it is stale.
 
-What is missing is legibility. Serialization is correct today but opaque. An agent queued behind
-another cannot see the queue, cannot tell whether it is waiting seconds or three weeks, and gets a
-red check explaining the problem in prose written for a human. So it polls, and a swarm of pollers is
-how a correct system becomes a loud one. The ordering, the reason for a block, and the expected wait
-should all be things a caller can read.
+Being correct is not the same as being readable. An agent held behind another one should be able to
+see the queue it is in, whether the wait is seconds or three weeks, and why it is blocked, in a form
+it can act on rather than prose written for a person to read. Given that, it waits. Without it, it
+polls, and a swarm of pollers is how a correct system becomes a loud one.
 
 ## One database, or ten thousand
 
@@ -253,16 +252,14 @@ what is live right now, what has ever changed, and what is changing now.
 
 ![Three stages: know, using the read API; analyze, by linting live schemas and grouping findings by rule; and act, by dispatching one intent to many targets while each keeps its own gates](../assets/vision-fleet-shapes.svg)
 
-The next step exists in pieces. `pull` reads the live schema of any database SchemaBot manages.
-`pull --lint` audits that live schema against the rules, rather than auditing a proposed change.
-`fix-lint` turns a finding into an edit of the schema files. All three work. All three work on one
-database at a time.
+The pieces are there. `pull` reads the live schema of any database SchemaBot manages. `pull --lint`
+audits that live schema against the rules, rather than auditing a proposed change. `fix-lint` turns a
+finding into an edit of the schema files. All three work on one database at a time.
 
-The aggregate is what is missing. A rule broken by four hundred tables across sixty databases is
-currently four hundred separate answers, found one query at a time, and a fix that was correct in the
-first place has to be re-derived everywhere else. The version worth building asks once across
-everything, groups the answer by rule instead of by database, and dispatches the result as changes
-instead of as a report. A finding nobody can act on is a spreadsheet.
+What they should also do is work on all of them at once. A rule broken by four hundred tables across
+sixty databases is one question, not four hundred, and the fix that was right the first time is right
+everywhere else. So ask once across everything, group the answer by rule instead of by database, and
+dispatch the result as changes rather than as a report. A finding nobody can act on is a spreadsheet.
 
 **A fleet is one shape, not the shape.** The interesting axis is not how many databases there are, it
 is how unlike each other they are: different engines, different regions, different organizations,
@@ -325,15 +322,15 @@ and about engines that can be supported honestly, not about saying yes to everyt
 
 ## Where we are today
 
-| Property | What already holds | What is missing |
+| Property | What already holds | What comes next |
 |---|---|---|
-| Experiment to tier zero | The plan and the gates are identical at any scale. Local mode drives a database straight from a DSN in a single process, and SchemaBot already embeds as a Go module. | The small end still pays for the large end: a server, storage, and a GitHub App for the PR flow. Embedding is a supported import rather than a supported way to run the whole loop. PostgreSQL, the likeliest engine down there, is early alpha. |
-| Safe should also mean fast | You do not have to write the DDL, pick an execution strategy, or run anything by hand. Long changes run unattended and report progress, and a deferred cutover lets the copy finish without the swap happening until someone picks the moment. | The rerun has not actually disappeared. A change still needs a person to say yes once per environment, `apply -e staging` and then `apply -e production`, rather than one intent that promotes itself as each environment goes green. Nothing measures what a schema change costs in human time either, so the couple of minutes above is a target rather than a number anyone can check. |
-| GitOps, not GitHub | Enforced rather than intended. Applies work while GitHub is down, the CLI covers the full PR surface, and an outage never invents state. The process that touches your database carries no GitHub credentials. | The merge gate itself is expressed as GitHub Check Runs. No second forge is implemented, so the separation is proven by the CLI rather than by a second integration. |
-| Agents | Declarative files are already an agent-readable source of truth, every gate is author-agnostic, and the plan API returns the change set, the per-shard detail, and every lint finding as JSON. | No packaged agent surface. Nothing tells an agent that API exists or how to use it, so in practice an agent reads files and opens a PR the same as a person. An MCP server and a skill are the obvious missing pieces. |
-| Many agents, one database | Concurrent authors are already serialized: one change at a time per database, ownership that has to be proven on every write, and no stale plan ever applies. The merge gate coordinates open changes with no protocol between them. | The coordination is opaque. No readable queue, no machine-readable reason for a block, no expected wait. A blocked caller can only poll. |
-| One database, or ten thousand | The read API answers what is live, what changed, and what is changing. `pull --lint` audits a live schema and `fix-lint` turns a finding into an edit. | All of it is per database. No aggregate query, no grouping by rule across databases, and no way to dispatch one intent to many targets and watch or stop it as one thing. |
-| Everything underneath | Each engine gets its own semantics rather than a shared subset, and an engine that cannot do something safely refuses at plan time instead of guessing. | PostgreSQL is early alpha, so first class is a commitment there more than a shipped fact. The engine boundary is clean; the forge boundary is not, and neither is a plugin surface. |
+| Experiment to tier zero | The plan and the gates are identical at any scale. Local mode drives a database straight from a DSN in a single process, and SchemaBot already embeds as a Go module. | Making the small end genuinely small, so a binary and a connection string run the whole loop and the server, the storage, and the GitHub App become things you add when you want them. Embedding becomes a supported way to run that loop rather than a supported import. PostgreSQL, the likeliest engine down there, gets past early alpha. |
+| Safe should also mean fast | You do not have to write the DDL, pick an execution strategy, or run anything by hand. Long changes run unattended and report progress, and a deferred cutover lets the copy finish without the swap happening until someone picks the moment. | One intent that promotes itself as each environment goes green, instead of a person saying yes once per environment with `apply -e staging` and then `apply -e production`. And a measure of what a change costs in human time, so the couple of minutes above becomes a number anyone can check rather than a target. |
+| GitOps, not GitHub | Enforced rather than intended. Applies work while GitHub is down, the CLI covers the full PR surface, and an outage never invents state. The process that touches your database carries no GitHub credentials. | A second forge. The merge gate is expressed as GitHub Check Runs today, so that is the piece a second integration has to reach, and reaching it turns a separation the CLI demonstrates into one another forge proves. |
+| Agents | Declarative files are already an agent-readable source of truth, every gate is author-agnostic, and the plan API returns the change set, the per-shard detail, and every lint finding as JSON. | A packaged agent surface: an MCP server and a skill, so an agent finds that API and uses it, rather than reading files and opening a pull request the same way a person does. |
+| Many agents, one database | Concurrent authors are already serialized: one change at a time per database, ownership that has to be proven on every write, and no stale plan ever applies. The merge gate coordinates open changes with no protocol between them. | Coordination a caller can read: the queue it is in, why it is held, and how long the wait is expected to be, so a held change waits instead of polling. |
+| One database, or ten thousand | The read API answers what is live, what changed, and what is changing. `pull --lint` audits a live schema and `fix-lint` turns a finding into an edit. | The same three operations across the whole fleet at once: one aggregate query, findings grouped by rule rather than by database, and one intent dispatched to many targets and watched or stopped as a single thing. |
+| Everything underneath | Each engine gets its own semantics rather than a shared subset, and an engine that cannot do something safely refuses at plan time instead of guessing. | PostgreSQL past early alpha, so first class there is a shipped fact and not only a commitment. The engine boundary is clean already; the forge boundary and a plugin surface get the same treatment. |
 
 ## Reading further
 
