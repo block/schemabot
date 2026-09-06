@@ -762,6 +762,21 @@ func (ic *InstallationClient) AddReactionToComment(ctx context.Context, repo str
 	return nil
 }
 
+// CommentHasReaction reports whether any account has left the named reaction
+// on a comment. On a repository several SchemaBot deployments serve, the
+// acknowledgment reaction is the one signal every deployment can read about
+// what the others decided, so this is how a deployment learns whether a
+// command was claimed at all.
+func (ic *InstallationClient) CommentHasReaction(ctx context.Context, repo string, commentID int64, reaction string) (bool, error) {
+	owner, repoName := splitRepo(repo)
+	opts := &gh.ListReactionOptions{Content: reaction, ListOptions: gh.ListOptions{PerPage: 1}}
+	reactions, _, err := ic.client.Reactions.ListIssueCommentReactions(ctx, owner, repoName, commentID, opts)
+	if err != nil {
+		return false, fmt.Errorf("list %q reactions on comment %d in %s: %w", reaction, commentID, repo, err)
+	}
+	return len(reactions) > 0, nil
+}
+
 // PullRequestInfo holds relevant PR metadata. The base branch is carried by
 // ref only: GitHub's pull.base.sha is a snapshot from PR creation, not the
 // branch tip, so callers that need the current base commit must resolve

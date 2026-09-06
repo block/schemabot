@@ -209,6 +209,11 @@ var githubRoutePatterns = []githubRoutePattern{
 		operation: metrics.GitHubOperationAddCommentReaction,
 	},
 	{
+		method:    http.MethodGet,
+		path:      "/repos/{owner}/{repo}/issues/comments/{comment_id}/reactions",
+		operation: metrics.GitHubOperationListCommentReactions,
+	},
+	{
 		method:    http.MethodPatch,
 		path:      "/repos/{owner}/{repo}/issues/comments/{comment_id}",
 		operation: metrics.GitHubOperationEditIssueComment,

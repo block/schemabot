@@ -817,7 +817,14 @@ func (h *Handler) knownEnvironments() []string {
 	return h.service.Config().KnownEnvironments()
 }
 
-// acknowledgeCommand adds the eyes reaction to the command comment,
+// commandAcknowledgmentReaction is the reaction a deployment leaves on a
+// command comment to signal that the command is its work and it has committed
+// to acting (UX-2). On a repository several deployments serve it is also the
+// only signal about a command that every one of them can read, which is how a
+// command no deployment claimed is distinguished from one a sibling owns.
+const commandAcknowledgmentReaction = "eyes"
+
+// acknowledgeCommand adds the acknowledgment reaction to the command comment,
 // signalling "this deployment is acting on your command".
 func (h *Handler) acknowledgeCommand(repo string, pr int, installationID int64, deliveryID string, commentID int64) {
 	if commentID <= 0 || h.ghClients.Len() == 0 {
@@ -832,7 +839,7 @@ func (h *Handler) acknowledgeCommand(repo string, pr int, installationID int64, 
 				"repo", repo, "pr", pr, "error", err)
 			return
 		}
-		if err := client.AddReactionToComment(ctx, repo, commentID, "eyes"); err != nil {
+		if err := client.AddReactionToComment(ctx, repo, commentID, commandAcknowledgmentReaction); err != nil {
 			h.logger.Error("failed to add command acknowledgment reaction",
 				"repo", repo, "pr", pr, "error", err)
 		}

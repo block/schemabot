@@ -1363,8 +1363,15 @@ their own review requirement. *Enforced:* the review gate and actor authorizatio
 An unscoped PR command resolves to exactly one unambiguous database or is rejected with guidance,
 never resolved by an arbitrary pick. A malformed command is rejected rather than "helpfully"
 corrected into something executable, especially one carrying `--allow-unsafe`. Every command
-receives a response, and silence only ever means another instance owns the reply. *Enforced:*
-command discovery and the unowned-command policy (`pkg/webhook/commands.go`).
+receives a response, and silence only ever means another instance owns the reply.
+
+Deferring to the owner is right whenever an owner exists. When a command names an apply no
+deployment stores, every deployment defers to an owner that will never speak, so the aggregate
+leader closes the gap: after a grace period it re-reads the command comment's acknowledgment
+reaction — the one signal about the command that every deployment can read (UX-2) — and, if
+nothing claimed it, answers once, marking the comment as it does so a redelivery stays quiet.
+*Enforced:* command discovery and the unowned-command policy (`pkg/webhook/commands.go`), and the
+leader's unclaimed-command follow-up (`pkg/webhook/unclaimed_command.go`).
 
 ## Structural enforcement
 
