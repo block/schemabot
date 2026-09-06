@@ -160,6 +160,10 @@ When a change interacts with an invariant, one of these is true, and the PR shou
 
 **Reviewing:** check the diff against the invariants its blast radius touches, not only against the ticket. An invariant broken silently is the most expensive class of defect here, since the registry is what future reviewers will trust. If a PR summary claims an invariant holds, verify the claim in the code rather than accepting it.
 
+**An invariant is a rule every engine holds to.** State it without naming a dialect, an engine, a SQL state, or a configuration key. Engines belong in the sentences that say *how each one upholds the rule*, and in the *Enforced:* line — never in the rule itself. AV-9 is the shape: the rule is that the startup bootstrap never destroys SchemaBot's own storage, and MySQL and PostgreSQL then appear only as the two different mechanisms that achieve it.
+
+This interlocks with the paragraph below, and running the two together is the test worth applying before adding any entry: **state the rule engine-agnostically and ask whether it is true on every engine today.** If it is not — because only one dialect implements it — then the agnostic form is aspirational and the entry does not go in. Rewriting it truthfully is the other half of the trap, because the honest version is a page of one dialect's mechanism in a registry that carries none. An entry that fails both ways is not an invariant yet, however real the behavior is. Per-dialect behavior belongs where it can be stated precisely and checked: the option's documentation, a comment where the value is defined, and a test over the validation that enforces it.
+
 Do not add aspirational entries. If the behavior is not enforced in shipped code, it belongs in a design doc or a TODO, not in the registry. Process-level engineering rules (how we write and review code) belong in this file, not there.
 
 ### PR Self-Review Bar
