@@ -52,9 +52,10 @@ That agent rereads, replans, and pushes again with nobody prompting it. The drop
 a person, because dropping a column is not a decision an agent makes alone.
 
 **A change you need to stop.** It is the middle of the afternoon and something unrelated is on fire.
-You want the database left alone. One command stops the copy where it stands. Nothing is half
-converted, nothing has to be cleaned up by hand, and when the incident is over the change picks up
-where it left off.
+The copy has already backed off on its own, because SchemaBot watches the database it is copying into
+and slows down when that database is under load. If you want it gone entirely, one command stops it
+where it stands. Nothing is half converted, nothing has to be cleaned up by hand, and when the
+incident is over the change picks up where it left off.
 
 **A change that is not what it looks like.** Someone renames a column. It is two words in a file.
 Against a live database it is a drop and an add: the data in the old column goes away, and every
