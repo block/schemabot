@@ -1908,6 +1908,47 @@ func unleasedOperationGate(d Dialect) string {
 		)`, freshLeaseAfter)
 }
 
+// undrivenOperationGate renders the NOT EXISTS admitting only task rows whose
+// operation no driver is part-way through driving. It is the variant for a
+// writer that gets one attempt at a row rather than a standing offer to try
+// again, and it returns its positional arguments alongside the clause.
+//
+// The lease terms are unleasedOperationGate's, read the same way, and the
+// difference is the occupying-state filter that gate deliberately omits. That
+// omission makes a reaper more reluctant to write, which costs a reaper nothing:
+// a row it passes over comes back on the next sweep. It costs a one-shot writer
+// the row outright, and the shape it costs it on is the ordinary one. A drive
+// that settles its operation into a resumable state writes that state under its
+// lease and leaves the lease in place, so for a full staleness window afterwards
+// the row reads exactly like a live drive's. A single-deployment apply that has
+// just failed retryably is in that window every time.
+//
+// What the state filter cannot separate is the two things a leased
+// failed_retryable row can mean. A redispatch keeps that state for its whole
+// drive (see driverOccupyingOperationStates, which counts it for the fan-out cap
+// precisely because a driver really is occupying it), and a drive that has
+// settled leaves the identical row behind. Nothing in the row distinguishes
+// them; only the heartbeat going stale does, and that is the wait a one-shot
+// writer cannot take. So this gate admits them, which is the same exposure the
+// row had before any gate existed, rather than trading a live-sibling hole for a
+// window in which the ordinary case is never written at all.
+//
+// A task with no operation is admitted, as in unleasedOperationGate.
+func undrivenOperationGate(d Dialect) (string, []any) {
+	freshLeaseAfter := d.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+	drivingStates := claimableApplyStates()
+
+	return fmt.Sprintf(`NOT EXISTS (
+			SELECT 1
+			FROM apply_operations lease_holder
+			WHERE lease_holder.id = tasks.apply_operation_id
+				AND lease_holder.lease_owner <> ''
+				AND lease_holder.state IN (%s)
+				AND lease_holder.updated_at >= %s
+		)`, placeholders(len(drivingStates)), freshLeaseAfter), stringArgs(drivingStates)
+}
+
 // ReapStranded elects one reaper per pass and reaps under the lock. See
 // storage.ApplyOperationStore for the contract.
 func (s *applyOperationStore) ReapStranded(ctx context.Context, limit int) ([]*storage.ReapedOperation, error) {
