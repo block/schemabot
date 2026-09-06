@@ -36,45 +36,36 @@ request. SchemaBot posts the plan: the exact DDL it will run, and how to apply i
 request itself. The table is busy and holds a lot of data, and the plan says the change is instant,
 with no table copy needed. The engineer runs the command, the checks go green, and the change merges.
 
-**A change that takes three weeks.** Someone adds an index to a table holding tens of terabytes.
-There is no version of that which is quick. SchemaBot builds the new table alongside the old one and
-copies into it for three weeks, slowing down whenever the database gets busy and picking back up when
-it quiets. The application writes to the old table the entire time and never notices. When the copy
-finishes it waits. Swapping to the new table is the only moment your application feels. You picked
-that moment three weeks ago, when you opened the pull request: 3am on Tuesday, when traffic is low.
-SchemaBot runs the cutover then, on its own, without anyone sacrificing their sleep for it.
+**A change that runs for three weeks.** An index on a table holding tens of terabytes. There is no
+version of that which is fast. SchemaBot builds a new copy of the table alongside the live one and
+fills it for three weeks, watching the database the whole time and slowing itself down whenever that
+database gets busy. When something unrelated catches fire on a Thursday, it backs off without being
+asked. The application writes to the old table for all twenty-one days and never notices any of it.
+The only moment that touches the application is the swap at the end, and that was scheduled three
+weeks earlier in the pull request: 3am on Tuesday, when traffic is low. It happens then, on its own,
+and nobody is awake for it. Total human involvement: opening a pull request and picking a time.
 
-**Four agents, one database.** Four agents are working on the same service. One adds a column to
-`orders`, one adds an index to it, one drops a column the team stopped reading last quarter, one is
-only touching application code. They never talk to each other. The column lands first and the index
-change goes red within seconds, because the file it planned against no longer matches the database.
-That agent rereads, replans, and pushes again with nobody prompting it. The drop stops and waits for
-a person, because dropping a column is not a decision an agent makes alone.
+**A hundred changes, nobody watching.** It is an ordinary Tuesday and a hundred schema changes are
+moving across the fleet. Most were written by agents. No human is tracking any of them. Four of those
+agents happen to be working on the same database at the same time, with no idea the others exist and
+no way to talk to each other. One change lands, and within seconds every plan built against the old
+schema goes red; those agents reread the live database, replan, and push again with nobody prompting
+them. One proposes dropping a column, and that one stops and waits for a person, because dropping a
+column is not a decision an agent makes alone. No two of them ever touched the database at once.
+Nothing was left half applied. Nobody arbitrated any of it.
 
-**A change you need to stop.** It is the middle of the afternoon and something unrelated is on fire.
-The copy has already backed off on its own, because SchemaBot watches the database it is copying into
-and slows down when that database is under load. If you want it gone entirely, one command stops it
-where it stands. Nothing is half converted, nothing has to be cleaned up by hand, and when the
-incident is over the change picks up where it left off.
+The usual alternative is a more careful person: somebody who already paid for that knowledge, usually
+the hard way, and remembers. That works right up until the author is not a person. "Be more careful"
+does not land on an agent. It can write a thousand schema changes a week, it does not slow down on
+the risky ones, and it does not remember the outage that taught everyone to be careful with that
+table. And there is rarely just one of them.
 
-**A change that is not what it looks like.** Someone renames a column. It is two words in a file.
-Against a live database it is a drop and an add: the data in the old column goes away, and every
-running copy of the application is still asking for it by the old name. SchemaBot says so on the pull
-request, before anything runs. Nobody on the team today learned that the hard way. Somebody did,
-once, and it stayed learned.
-
-The usual alternative is a more careful person, and that works right up until the author is not a
-person. "Be more careful" does not land on an agent. It can write a thousand schema changes a week,
-it does not slow down on the risky ones, and it does not remember the outage that taught everyone to
-be careful with that table. And there is rarely just one of them.
-
-That is the thing worth building, and it is about to matter far more than it does today. Software is
-being written faster than any review process was built to absorb, and the schema is where that speed
-meets something that does not forgive. Code can be regenerated. The data underneath it cannot. So the
-judgment has to live in the tool, applied identically whether the author is a staff engineer, someone
-on their first week, or the twelfth agent to open a pull request this hour. Get that right and
-schemas move as fast as the code that needs them, on databases nobody is scared of, at any scale, at
-any hour.
+Code is being written faster than any review process was built for, and the database is the part that
+does not forgive a mistake. You can regenerate the code. You cannot regenerate the data. So the
+judgment has to live in the tool, and it has to be the same judgment whether the author is a staff
+engineer, someone on their first week, or the twelfth agent to open a pull request this hour. Get
+that right and schemas move as fast as the code that needs them, on databases nobody is scared of, at
+any scale, at any hour.
 
 ## From a vibe-coded experiment to a tier-zero database
 
