@@ -439,6 +439,15 @@ task record; ETA and per-shard rows are not persisted in this view.
 ## What’s running across the fleet?
 
 ```sh
+schemabot status -e production
+```
+
+![CLI status output showing running, waiting, and completed changes across three example databases.](../assets/schema-intelligence-status.svg)
+
+Open an apply from the list, or narrow the fleet view to running changes:
+
+```sh
+schemabot status apply-example-73
 schemabot status -e production --state running --limit 100
 ```
 
@@ -470,7 +479,7 @@ it raw.
 <summary>Request and response example</summary>
 
 ```http
-GET /api/status?environment=production&state=running&limit=20
+GET /api/status?environment=production&limit=20
 ```
 
 Response excerpt (illustrative values):
@@ -480,7 +489,9 @@ Response excerpt (illustrative values):
   "limit": 20,
   "max_limit": 1000,
   "state_counts": {
-    "running": 1
+    "running": 1,
+    "waiting_for_cutover": 1,
+    "completed": 1
   },
   "applies": [
     {
@@ -490,7 +501,27 @@ Response excerpt (illustrative values):
       "deployment": "us-east",
       "engine": "spirit",
       "state": "running",
-      "caller": "cli",
+      "caller": "example/store#42",
+      "updated_at": "2026-09-01T03:01:00Z"
+    },
+    {
+      "apply_id": "apply-example-72",
+      "database": "billing",
+      "environment": "production",
+      "deployment": "us-east",
+      "engine": "spirit",
+      "state": "waiting_for_cutover",
+      "caller": "example/billing#73",
+      "updated_at": "2026-09-01T03:01:00Z"
+    },
+    {
+      "apply_id": "apply-example-71",
+      "database": "accounts",
+      "environment": "production",
+      "deployment": "us-east",
+      "engine": "spirit",
+      "state": "completed",
+      "caller": "example/accounts#18",
       "updated_at": "2026-09-01T03:01:00Z"
     }
   ]
@@ -500,6 +531,26 @@ Response excerpt (illustrative values):
 </details>
 
 ## Inspect a stored plan
+
+List recent plans across the databases in an environment:
+
+```sh
+schemabot list-plans -e staging
+```
+
+![CLI plan list spanning four example databases, including repeated plans, no-change plans, and unsafe changes.](../assets/schema-intelligence-listplans.svg)
+
+Open a plan to see its DDL and safety classification, or narrow the list to
+one database or PR:
+
+```sh
+schemabot list-plans plan-example-42
+schemabot list-plans -d shop -e staging
+schemabot list-plans --repository example/store --pr 42
+```
+
+Each replan has its own ID, so one PR can appear more than once. The warning
+marker identifies plans with unsafe changes.
 
 History records executions. Plans describe what was proposed.
 `GET /api/plans` lists stored plans, filterable by `database`, `environment`,
@@ -525,7 +576,7 @@ exhaustive search across all historical DDL.
 <summary>List stored plans</summary>
 
 ```http
-GET /api/plans?database=shop&environment=production
+GET /api/plans?environment=staging
 ```
 
 Response excerpt (illustrative values):
@@ -540,12 +591,62 @@ Response excerpt (illustrative values):
       "plan_id": "plan-example-42",
       "database": "shop",
       "database_type": "mysql",
-      "environment": "production",
-      "repository": "example/schemas",
+      "environment": "staging",
+      "repository": "example/store",
       "pull_request": 42,
       "created_at": "2026-09-01T02:55:00Z",
       "change_counts": {
-        "alter": 1
+        "alter": 1,
+        "drop": 2
+      },
+      "unsafe_count": 2
+    },
+    {
+      "plan_id": "plan-example-41",
+      "database": "shop",
+      "database_type": "mysql",
+      "environment": "staging",
+      "repository": "example/store",
+      "pull_request": 42,
+      "created_at": "2026-09-01T02:55:00Z",
+      "change_counts": {
+        "alter": 1,
+        "drop": 2
+      },
+      "unsafe_count": 2
+    },
+    {
+      "plan_id": "plan-example-40",
+      "database": "accounts",
+      "database_type": "mysql",
+      "environment": "staging",
+      "repository": "example/accounts",
+      "pull_request": 18,
+      "created_at": "2026-09-01T02:55:00Z",
+      "change_counts": {}
+    },
+    {
+      "plan_id": "plan-example-39",
+      "database": "billing",
+      "database_type": "mysql",
+      "environment": "staging",
+      "repository": "example/billing",
+      "pull_request": 73,
+      "created_at": "2026-09-01T02:55:00Z",
+      "change_counts": {
+        "create": 1
+      }
+    },
+    {
+      "plan_id": "plan-example-38",
+      "database": "inventory",
+      "database_type": "mysql",
+      "environment": "staging",
+      "repository": "example/warehouse",
+      "pull_request": 29,
+      "created_at": "2026-09-01T02:55:00Z",
+      "change_counts": {
+        "alter": 2
       }
     }
   ]
@@ -567,7 +668,7 @@ Response excerpt (illustrative values):
 {
   "plan_id": "plan-example-42",
   "database": "shop",
-  "environment": "production",
+  "environment": "staging",
   "plan": {
     "plan_id": "plan-example-42",
     "engine": "spirit",

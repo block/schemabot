@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="788.8" height="280" viewBox="0 0 788.8 280" role="img" aria-labelledby="title desc">
+<title id="title">Stored plans across shop, accounts, billing, and inventory</title>
+<desc id="desc">Recent plans
+
+  PLAN ID          DATABASE   ENV      CHANGES                 CREATED      SOURCE
+  plan-example-42  shop       staging  1 alter, 2 drop · ⚠️ 2  2 hours ago  example/store#42
+  plan-example-41  shop       staging  1 alter, 2 drop · ⚠️ 2  3 hours ago  example/store#42
+  plan-example-40  accounts   staging  no changes              4 hours ago  example/accounts#18
+  plan-example-39  billing    staging  1 create                5 hours ago  example/billing#73
+  plan-example-38  inventory  staging  2 alter                 6 hours ago  example/warehouse#29
+
+  ⚠️ unsafe change</desc>
+<rect x=".5" y=".5" width="787.8" height="279" rx="10" fill="#fafbfc" stroke="#dadde1"/>
+<g font-family="Menlo, Consolas, monospace" font-size="13" xml:space="preserve"><text x="20" y="29" fill="#1c1e21">$ schemabot list-plans -e staging</text>
+<text x="20.0" y="61" fill="#1c1e21" font-weight="600" textLength="93.6" lengthAdjust="spacingAndGlyphs">Recent plans</text>
+<text x="20.0" y="103" fill="#1c1e21" font-weight="400" textLength="15.6" lengthAdjust="spacingAndGlyphs">  </text>
+<text x="35.6" y="103" fill="#68707c" font-weight="400" textLength="624.0" lengthAdjust="spacingAndGlyphs">PLAN ID          DATABASE   ENV      CHANGES                 CREATED      SOURCE</text>
+<text x="20.0" y="124" fill="#1c1e21" font-weight="400" textLength="717.6" lengthAdjust="spacingAndGlyphs">  plan-example-42  shop       staging  1 alter, 2 drop · ⚠️ 2  2 hours ago  example/store#42</text>
+<text x="20.0" y="145" fill="#1c1e21" font-weight="400" textLength="717.6" lengthAdjust="spacingAndGlyphs">  plan-example-41  shop       staging  1 alter, 2 drop · ⚠️ 2  3 hours ago  example/store#42</text>
+<text x="20.0" y="166" fill="#1c1e21" font-weight="400" textLength="741.0" lengthAdjust="spacingAndGlyphs">  plan-example-40  accounts   staging  no changes              4 hours ago  example/accounts#18</text>
+<text x="20.0" y="187" fill="#1c1e21" font-weight="400" textLength="733.2" lengthAdjust="spacingAndGlyphs">  plan-example-39  billing    staging  1 create                5 hours ago  example/billing#73</text>
+<text x="20.0" y="208" fill="#1c1e21" font-weight="400" textLength="748.8" lengthAdjust="spacingAndGlyphs">  plan-example-38  inventory  staging  2 alter                 6 hours ago  example/warehouse#29</text>
+<text x="20.0" y="250" fill="#1c1e21" font-weight="400" textLength="15.6" lengthAdjust="spacingAndGlyphs">  </text>
+<text x="35.6" y="250" fill="#68707c" font-weight="400" textLength="124.8" lengthAdjust="spacingAndGlyphs">⚠️ unsafe change</text>
+</g></svg>
