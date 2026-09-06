@@ -27,16 +27,15 @@ that when a decision comes up, we have something to hold it against.
 ## The northstar
 
 Every database should be able to evolve safely. A weekend project, the tier-zero fleet a business
-runs on, and everything in between. Adding a column, adding an index, dropping a table that really is
-dead: none of it should risk taking the database down, and none of it should require you to be a
+runs on, and everything in between. Adding a column, adding an index, dropping a table: 
+none of it should risk taking the database down, and none of it should require you to be a
 database expert first.
 
-The hard part was never writing down the schema you want. It is what happens when that meets a live
-database, and that is a different decision every time. What it should look like:
-
 **Somebody's first week.** A new engineer adds a column to a `CREATE TABLE` file and opens a pull
-request. The table has four hundred million rows in it. The check says the change is instant, so they
-merge it, and it is. Nobody had to review it for safety. The review already happened.
+request. SchemaBot generates the plan which shows the exact DDL that it will run, with instructions
+on how to apply via the PR. Even though the table is busy and has a lot of data, 
+SchemaBot signals it can run the change instantly without an unneeded table copy. 
+The engineer's applies the change instantly via the SchemaBot command, the PR checks pass and the PR gets merged.
 
 **A change that takes three weeks.** Someone adds an index to a table holding tens of terabytes.
 There is no version of that which is quick. SchemaBot builds the new table alongside the old one and
