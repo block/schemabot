@@ -52,11 +52,11 @@ intended, a half-applied state nobody can name: all of that is reachable from ei
 changes the blast radius, not the failure mode.
 
 What keeps a change safe is a short list of checks it has to get past. First, diff the files against
-the live database to work out the exact DDL: that is the plan, and this document uses the word that
-way from here on. Then lint the plan before anything runs, ask for consent before destroying
-something, and refuse to call an ambiguous result a success. Those are the gates. Not one of them
-needs a platform team to be correct, and not one gets better because more infrastructure is running
-it. There is no principled reason the hobbyist gets the unsafe version.
+the live database to work out the exact DDL: that is the plan. Then lint the plan before anything
+runs, ask for consent before destroying something, and refuse to call an ambiguous result a success.
+Those are the gates. Not one of them needs a platform team to be correct, and not one gets better
+because more infrastructure is running it. There is no principled reason the hobbyist gets the
+unsafe version.
 
 What has to become true is that adoption gets much cheaper at the small end without anything
 loosening at the large end. It is tempting to file the rest under machinery only a large fleet needs:
@@ -68,11 +68,9 @@ how much infrastructure carries it: servers that stay up and hand work between e
 one binary and a connection string at the other. A change that would be unsafe in front of production
 is unsafe in front of a weekend project too, and it gets refused in both places.
 
-Concretely, the shape SchemaBot runs in should be a choice rather than a prerequisite. A coordinating
-server on Kubernetes that never needs a route to your databases: a separate process inside each
-network does the work there. One server process with a database behind it. No server at all, just the
-CLI against a connection string. Or SchemaBot embedded as a library inside the application that owns
-the schema, close enough to run at startup. The first three work today and the fourth partly does.
+Concretely, the shape SchemaBot runs in should be a choice rather than a prerequisite. A running
+service on Kubernetes or any desired compute. A local process using a CLI against a connection
+string. A plugin or embedded library component that runs inside the application.
 
 ![Both ends of the range feed into the same four gates: diff against the live database, lint before anything runs, explicit consent to destroy, and uncertainty never passing](../assets/vision-range.svg)
 
