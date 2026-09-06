@@ -31,10 +31,14 @@ first.
 > person, because dropping a column is not a decision an agent makes alone. No two of them ever
 > touched the database at once. Nothing was left half applied. Nobody arbitrated any of it.
 
-Code is being written faster than any review process was built for, and the database is the part that
-does not forgive a mistake. You can regenerate the code. You cannot regenerate the data. So the
-judgment has to live in the tool, and it has to be the same judgment whether the author is a staff
-engineer, someone on their first week, or the twelfth agent to open a pull request this hour.
+Code is being written faster than any review process was built for, and the database is the part
+that does not forgive a mistake. You can regenerate the code. You cannot regenerate the data. So the
+judgment lives in the tool rather than in whoever wrote the change. The DDL is derived from the
+files rather than typed by hand. Whether a change runs instantly or copies the table for three weeks
+is worked out from the engine and the table, not guessed. Destroying something takes consent given
+against the exact plan that is about to run. Anything ambiguous stops instead of passing. Not one of
+those asks who the author was, which is what makes it the same judgment for a staff engineer,
+someone on their first week, or the twelfth agent to open a pull request this hour.
 
 No change windows. No runbooks. No database team standing in front of every change. Schemas that move
 as fast as the code that needs them, on databases nobody is scared of, at any scale, at any hour.
