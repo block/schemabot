@@ -40,7 +40,7 @@ ambition needed a home of its own. This is that home.
 ## The northstar
 
 Every database should be able to evolve safely, whether it is a weekend project or the tier-zero
-fleet a company cannot stay open without, and nobody should have to become a database expert first.
+fleet a business runs on, and nobody should have to become a database expert first.
 Adding a column, adding an index, dropping a table that really is dead: none of that should carry a
 risk of taking the database down with it.
 
