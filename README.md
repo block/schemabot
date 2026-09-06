@@ -121,7 +121,7 @@ To run SchemaBot against your own databases, grab a build from [Releases](#relea
 
 ## Docs
 
-Start here, then explore the design and operations docs:
+Guides and reference.
 
 - [Vision](./docs/vision.md): Where SchemaBot is going and why.
 - [Quick start](#quick-start): Get SchemaBot running locally.
