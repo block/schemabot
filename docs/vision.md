@@ -16,12 +16,11 @@ first.
 > **A change that runs for three weeks.** An index on a table holding tens of terabytes. There is no
 > version of that which is fast. SchemaBot builds a new copy of the table alongside the live one and
 > fills it for three weeks. The whole time, it is watching how long each batch of copying takes and
-> how much the database is already doing, and it slows down or stops when either climbs. It never
-> learns why the database got busy on a Thursday, and it does not need to. The application writes to
-> the old table for all twenty-one days and never notices any of it. The only moment that touches
-> the application is the swap at the end, and that was scheduled three weeks earlier in the pull
-> request: 3am on Tuesday, when traffic is low. It happens then, on its own, and nobody is awake for
-> it. Total human involvement: opening a pull request and picking a time.
+> how much the database is already doing, and it slows down or stops when either climbs. The
+> application writes to the old table for all twenty-one days and never notices any of it. The only
+> moment that touches the application is the swap at the end, and that was scheduled three weeks
+> earlier in the pull request: 3am on Tuesday, when traffic is low. It happens then, on its own, and
+> nobody is awake for it. Total human involvement: opening a pull request and picking a time.
 
 > **A hundred changes, nobody watching.** It is an ordinary Tuesday and a hundred schema changes are
 > moving across the fleet. Most were written by agents. No human is tracking any of them. Four of
