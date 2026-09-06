@@ -230,9 +230,8 @@ intent, landing on many databases.
 It starts with knowing, because nothing can be changed in aggregate that cannot first be seen in
 aggregate. SchemaBot accumulates that knowledge as a side effect of doing its job: every plan it
 computed, every apply it ran, the DDL each one carried, who asked for it, how it ended, and a live
-line to every database it manages. [schema-intelligence.md](./schema-intelligence.md) maps that
-surface. It already answers three questions over one read API: what is live right now, what has ever
-changed, and what is changing now.
+line to every database it manages. That surface already answers three questions over one read API:
+what is live right now, what has ever changed, and what is changing now.
 
 ![Three stages: know, using the read API; analyze, by linting live schemas and grouping findings by rule; and act, by dispatching one intent to many targets while each keeps its own gates](../assets/vision-fleet-shapes.svg)
 
