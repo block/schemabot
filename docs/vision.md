@@ -9,9 +9,9 @@ first.
 
 > **Somebody's first week.** A new engineer adds a column to a `CREATE TABLE` file and opens a pull
 > request. SchemaBot posts the plan: the exact DDL it will run, and how to apply it from the pull
-> request itself. The table is busy and holds a lot of data, and the plan says the change is instant,
-> with no table copy needed. The engineer runs the command, the checks go green, and the change
-> merges.
+> request itself. The table is busy and holds a lot of data, and the plan says the change is
+> instant, with no table copy needed. The engineer runs the command as a PR comment, the checks go
+> green, and the change merges.
 
 > **A change that runs for three weeks.** An index on a table holding tens of terabytes. There is no
 > version of that which is fast. SchemaBot builds a new copy of the table alongside the live one and
