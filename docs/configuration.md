@@ -821,32 +821,36 @@ deployment over gRPC run with that deployment's engine settings.
 
 ### Storage statement budget
 
-`postgres.statement_timeout` bounds any single query SchemaBot runs against its
-**own** PostgreSQL storage database: the long-lived storage pool and the
-startup bootstrap's catalog reads. Defaults to `30s`; `"0"` disables it. It
-does not affect applies, whose budgets pg-sprite sets on the target database.
+SchemaBot keeps its own state in a PostgreSQL database.
+`postgres.statement_timeout` is the time limit for a single query against that
+database. It defaults to `30s`. Set it to `"0"` to remove the limit.
 
-Leaving it unset does not mean "no limit". The connection inherits whatever the
-platform set at the role or database level, and managed providers ship a
-default tuned for API traffic. That budget surfaces as SQLSTATE `57014`, the
-same code `pg_cancel_backend` returns, so it is easy to mistake for an operator
-cancelling the query by hand.
+It has no effect on schema changes themselves. Those run under separate limits
+that pg-sprite sets on the target database.
 
-**Minimum: greater than `10s`.** The server rejects a smaller non-zero value at
-startup. `statement_timeout` bounds a *blocked* statement as well as a
-computing one, and a storage query blocks for up to 10s waiting on an apply
-target's advisory lock. Set it lower and routine lock contention is cancelled
-as a timeout before the lock wait can report that another instance holds the
-target.
+Leaving it unset does not mean there is no limit. The connection inherits
+whatever the platform set for the role or database, and managed PostgreSQL
+providers usually set one, tuned for web traffic rather than for SchemaBot.
+When that limit fires, PostgreSQL returns SQLSTATE `57014`. That is the same
+code returned when someone cancels a query by hand, so an inherited limit is
+easy to misread during an incident.
 
-Three paths deliberately run outside this budget:
+**The minimum is just over `10s`.** The server refuses to start on a smaller
+non-zero value. The reason is that `statement_timeout` counts time spent
+waiting, not only time spent working. When two instances want the same apply,
+one waits up to 10 seconds for the other to release its lock. A limit below
+that cancels the wait and reports a timeout, when the real answer was just
+"another instance has it".
 
-- **Bootstrap convergence DDL** derives its own from the bootstrap deadline, so
-  an index build is not held to a catalog read's limit.
-- **The bootstrap advisory-lock wait** is unbounded, leaving it free to block
-  while another instance finishes bootstrapping.
-- **Storage maintenance commands** run from the CLI are unbounded; the operator
-  supervising the command is the bound.
+Three things run with no limit from this setting:
+
+- **The startup bootstrap's DDL.** Building an index takes minutes, far longer
+  than an ordinary query. It gets its own limit, worked out from the
+  bootstrap's overall deadline.
+- **The bootstrap's lock wait.** One instance bootstraps while the others wait
+  their turn, and that wait has to be free to take as long as it takes.
+- **Storage maintenance commands run from the CLI.** An operator is watching
+  them, and that is the limit.
 
 The bootstrap DDL budget is not configurable, because its safety comes from
 being derived rather than chosen: it sits just under the deadline that already
