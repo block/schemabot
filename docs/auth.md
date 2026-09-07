@@ -7,6 +7,7 @@
 - [Set up your server](#set-up-your-server)
   - [Where SchemaBot runs](#where-schemabot-runs)
   - [Choose your setup](#choose-your-setup)
+  - [Connect GitHub](#connect-github)
   - [Run locally](#run-locally)
   - [Connect your identity provider](#connect-your-identity-provider)
   - [Use your existing proxy](#use-your-existing-proxy)
@@ -17,7 +18,8 @@
   - [Give a tool read-only access](#give-a-tool-read-only-access)
   - [How access checks work](#how-access-checks-work)
 - [Check your access](#check-your-access)
-  - [If your request is denied](#if-your-request-is-denied)
+  - [Check the GitHub connection](#check-the-github-connection)
+  - [Check CLI and API access](#check-cli-and-api-access)
 - [Troubleshoot access](#troubleshoot-access)
   - [Check how group names match](#check-how-group-names-match)
   - [When a check cannot be completed](#when-a-check-cannot-be-completed)
@@ -136,6 +138,7 @@ if its current alpha status fits your needs.
 | What you want to do | Start here |
 |---|---|
 | Try SchemaBot on your machine | [Run locally](#run-locally) |
+| Use pull requests to manage schemas | [Connect GitHub](#connect-github) |
 | Let your team use its existing login | [Connect your identity provider](#oidc-bearer-tokens) |
 | Use a proxy that already checks who's signed in | [Use your existing proxy](#forward_auth-authenticating-proxy) |
 | Connect a dashboard, tool, or agent | [Give a tool read-only access](#calling-schemabot-as-a-service) |
@@ -156,6 +159,55 @@ If you do not have an identity provider or an authenticating proxy yet, you
 can still try SchemaBot locally without either. Sharing an authenticated
 server requires setting up one of those services first; SchemaBot does not
 provide its own user accounts or password login.
+
+### Connect GitHub
+
+For the PR workflow, create and install your own GitHub App. People use their
+GitHub accounts to review changes and post commands; they do not need to sign
+in through the CLI or your identity provider to use this workflow.
+
+Three pieces work together:
+
+| Piece | What it does |
+|---|---|
+| App installation and private key | Let SchemaBot read files and reviews, then post plans, comments, and checks in the repositories you select |
+| Webhook secret | Lets SchemaBot verify that an incoming event was signed with the secret you configured in GitHub |
+| Command permissions | Decide which GitHub users and teams may run commands against each database |
+
+Follow the [GitHub App setup guide](github-app-setup.md) to create the App,
+select its permissions and events, generate a private key, and install it on
+your schema repositories. Include **Members: Read** when using GitHub teams
+for command permissions or review checks.
+
+Add the App credentials to your server configuration:
+
+```yaml
+github:
+  app-id: "123456"
+  private-key: "file:/run/secrets/github-app.pem"
+  webhook-secret: "env:GITHUB_WEBHOOK_SECRET"
+```
+
+Replace `123456` with your App ID. Make the downloaded private key available
+at that path on the server, and set `GITHUB_WEBHOOK_SECRET` in the server's
+environment to the same secret you entered in the App's webhook settings.
+The private key authenticates SchemaBot to GitHub; the webhook secret verifies
+incoming deliveries. They are different credentials.
+
+Set the App's webhook URL to your server's `/webhook` endpoint, for example
+`https://schemabot.example.com/webhook`. GitHub must be able to reach it
+without an interactive login. If your proxy protects `/api/*`, give `/webhook`
+a separate route that accepts GitHub deliveries and lets SchemaBot verify
+their signatures. This does not require making the API public.
+
+Always configure the webhook secret for a shared installation. Without it,
+the single-App configuration skips signature verification. A signed delivery
+proves where the event came from; it does not grant the comment author
+permission to apply a change.
+
+Next, [set GitHub command permissions](#github-side-authorization), then
+[check the GitHub connection](#check-the-github-connection). CLI and API
+access can be configured separately if you need those interfaces too.
 
 ### Run locally
 
@@ -511,6 +563,80 @@ matched against token groups as described [above](#oidc-bearer-tokens).
 Keep these permissions in server configuration controlled by the people who
 operate SchemaBot, rather than in schema files that database teams can edit.
 
+#### Example: two teams in one monorepo
+
+Suppose `myorg/monorepo` contains a payments module and a catalog module.
+Each keeps its schema next to its application code:
+
+```text
+modules/
+  payments/schema/
+    schemabot.yaml       # database: payments, type: mysql
+    payments/
+      orders.sql
+  catalog/schema/
+    schemabot.yaml       # database: catalog, type: mysql
+    catalog/
+      products.sql
+```
+
+For example, `modules/payments/schema/schemabot.yaml` contains:
+
+```yaml
+database: payments
+type: mysql
+```
+
+The catalog file uses `database: catalog`. These files identify the target
+database; they do not grant access to it. In the **server configuration**,
+restrict each database to its module's directory and its team's GitHub group:
+
+```yaml
+repos:
+  myorg/monorepo: {}
+
+pr_command_authorization:
+  enabled: true
+  admin_teams: [myorg/db-admins]
+
+databases:
+  payments:
+    type: mysql
+    allowed_repos: [myorg/monorepo]
+    allowed_dirs: [modules/payments/schema]
+    operator_teams: [myorg/payments-team]
+    environments:
+      staging:
+        dsn: "env:PAYMENTS_STAGING_DSN"
+  catalog:
+    type: mysql
+    allowed_repos: [myorg/monorepo]
+    allowed_dirs: [modules/catalog/schema]
+    operator_teams: [myorg/catalog-team]
+    environments:
+      staging:
+        dsn: "env:CATALOG_STAGING_DSN"
+```
+
+Merge these fields into your existing server configuration, retaining your
+other database environments. Set the two DSN environment variables to your
+staging database connection strings. Installing the App on the repository
+is still required; listing it in `repos` does not install it.
+
+| Situation | Result |
+|---|---|
+| A payments-team member runs a command targeting `payments` | The database's operator grant allows the command to continue through the remaining checks |
+| The same person targets `catalog`, with no other grant | Command authorization denies it |
+| A PR declares `payments` under `modules/catalog/schema` | That directory is not accepted as a schema source for `payments` |
+| A database admin targets either database | The admin grant permits the command; source restrictions and other safety checks still apply |
+
+`allowed_dirs` includes the named directory and its descendants. It controls
+where a database's schema may be declared, not who may edit application code.
+Use GitHub review rules or CODEOWNERS for code ownership. The operator grant
+is per database, not per directory or environment; it covers that database's
+configured environments. Keep review requirements separate from the grant.
+
+
 <a id="calling-schemabot-as-a-service"></a>
 
 ### Give a tool read-only access
@@ -574,6 +700,45 @@ not permit those operations.
 
 ## Check your access
 
+Check each interface you configured. A working GitHub connection does not
+verify CLI access, and a successful CLI login does not verify GitHub.
+
+### Check the GitHub connection
+
+Open a PR in a repository where you installed the App and post this comment:
+
+```text
+schemabot help
+```
+
+SchemaBot should reply with its command reference. Excerpt:
+
+```markdown
+## 📚 SchemaBot Help
+
+| Command | Description |
+|---------|-------------|
+| `schemabot plan [-e <env>]` | Preview schema changes |
+| `schemabot apply -e <env>` | Plan, lock, and apply after safety rechecks |
+```
+
+This checks that GitHub can deliver the comment event and SchemaBot can post
+a reply. It does not prove that you may plan or apply a database change.
+Follow the [PR workflow](pre-merge-workflow.md) to test a schema change and
+its checks after configuring command permissions.
+
+If no reply arrives, inspect the App's **Recent Deliveries** in GitHub:
+
+| What you see | What to check |
+|---|---|
+| No delivery for the comment | Confirm the App is installed on this repository and subscribed to **Issue comment** events |
+| A redirect to a login page | Route `/webhook` to SchemaBot without requiring a browser login |
+| `401` | Check that the server and App use the same webhook secret |
+| A successful delivery, but no reply | Inspect SchemaBot's logs for that delivery; acceptance does not mean the command completed |
+| A reply denying your command | Check the comment author's GitHub team membership and the target database's command permissions |
+
+### Check CLI and API access
+
 For the OIDC profile configured above, list the databases your server manages:
 
 ```sh
@@ -627,7 +792,7 @@ For forward-auth, call through the authenticating proxy using its sign-in
 method. Do not set user or group headers yourself; the proxy must strip
 caller-supplied identity headers and supply the verified values.
 
-### If your request is denied
+#### If your request is denied
 
 An invalid or missing OIDC token returns:
 
