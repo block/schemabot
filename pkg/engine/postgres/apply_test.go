@@ -87,7 +87,7 @@ func TestClassifyRefusal(t *testing.T) {
 			name:       "create collision is a refusal whoever took the name first",
 			err:        fmt.Errorf("execute: %w", executor.ErrCreateCollision),
 			wantReason: "create-collision",
-			wantDetail: []string{"(table, index, constraint, or sequence)", createCollisionRemedy},
+			wantDetail: []string{"(table, view, index, or sequence)", createCollisionRemedy},
 		},
 		{
 			name: "create collision identifies the failed sequence step",
@@ -95,7 +95,7 @@ func TestClassifyRefusal(t *testing.T) {
 				Step: 2, Total: 3, Err: executor.ErrCreateCollision,
 			}),
 			wantReason:    "create-collision",
-			wantDetail:    []string{"step 2 of 3 failed", `CREATE TABLE for "users" committed`, createCollisionRemedy},
+			wantDetail:    []string{`for "users"`, "step 2 of 3 failed after the CREATE TABLE committed", createCollisionRemedy},
 			wantNotDetail: []string{replanRemedy},
 		},
 		{
@@ -193,14 +193,47 @@ func TestCreateCollisionRefusalEntryPathsMatch(t *testing.T) {
 	require.NotNil(t, executorRefusal)
 	assert.Equal(t, "create-collision", preflightRefusal.reason)
 	assert.Equal(t, preflightRefusal.detail, executorRefusal.detail)
-	assert.Equal(t, `a name the create set for "users" needs is already occupied (table, index, constraint, or sequence); re-plan, and if it recurs drop or rename the occupant or give the constraint, index, or sequence another name`, preflightRefusal.detail)
+	assert.Equal(t, `a name the create set for "users" needs is already occupied (table, view, index, or sequence); re-plan, and if it recurs drop or rename the occupant or give the constraint, index, or sequence another name`, preflightRefusal.detail)
 }
 
-// statusReasonColumnWidth is the narrowest operator surface a refusal detail
-// is rendered on: the CLI status table clamps its failure-reason column and
-// truncates from the tail, which is where the remedy sits. A create-collision
-// detail for any realistic table name must fit so the remedy survives.
-const statusReasonColumnWidth = 240
+// The CLI status listing is the narrowest operator surface a refusal detail
+// is rendered on: it clamps the failure reason to statusReasonColumnWidth
+// bytes and truncates from the tail, where the remedy sits. The full
+// create-collision remedy cannot fit there for every shape — a legal table
+// name alone runs to maxIdentifierLength bytes — so what the composition
+// guarantees, and what these tests pin, is narrower: the remedy leads with
+// the re-plan that resolves a lost race on its own, and that lead lands
+// inside the clamp for a table name of any legal length, whether the
+// collision was the single statement or a step past the committed CREATE
+// TABLE. A realistic single-statement detail still fits whole.
+const (
+	statusReasonColumnWidth = 240
+	statusReasonKeptWidth   = statusReasonColumnWidth - len("...")
+	maxIdentifierLength     = 63
+	createCollisionLead     = "; re-plan"
+)
+
+func TestCreateCollisionRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
+	longest := strings.Repeat("a", maxIdentifierLength)
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "single statement", err: fmt.Errorf("preflight: %w", preflight.ErrRelationExists)},
+		{name: "step past the committed CREATE TABLE", err: fmt.Errorf("execute: %w",
+			&executor.SequenceStepError{Step: 2, Total: 3, Err: executor.ErrCreateCollision})},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := classifyRefusal(tt.err, longest)
+
+			require.NotNil(t, r)
+			lead := strings.Index(r.detail, createCollisionLead)
+			require.GreaterOrEqual(t, lead, 0, r.detail)
+			assert.LessOrEqual(t, lead+len(createCollisionLead), statusReasonKeptWidth, r.detail)
+		})
+	}
+}
 
 func TestCreateCollisionRefusalFitsStatusReasonColumn(t *testing.T) {
 	table := strings.Repeat("a", 30)
@@ -218,7 +251,7 @@ func TestCreateCollisionRefusalAfterCommittedCreateStep(t *testing.T) {
 	r := classifyRefusal(err, "users")
 
 	require.NotNil(t, r)
-	assert.Equal(t, `a name the create set for "users" needs is already occupied (table, index, constraint, or sequence); step 2 of 3 failed after the CREATE TABLE for "users" committed; re-plan, and if it recurs drop or rename the occupant or give the constraint, index, or sequence another name`, r.detail)
+	assert.Equal(t, `a name the create set for "users" needs is already occupied (table, view, index, or sequence); step 2 of 3 failed after the CREATE TABLE committed; re-plan, and if it recurs drop or rename the occupant or give the constraint, index, or sequence another name`, r.detail)
 	assert.NotContains(t, r.detail, replanRemedy)
 	assert.Equal(t, 1, strings.Count(r.detail, createCollisionRemedy))
 }
@@ -315,7 +348,7 @@ func TestRefusalAfterCommittedCreateStepKeepsOwnRemedy(t *testing.T) {
 
 			require.NotNil(t, r)
 			assert.Equal(t, tt.wantReason, r.reason)
-			step := `; step 2 of 3 failed after the CREATE TABLE for "users" committed; `
+			step := `; step 2 of 3 failed after the CREATE TABLE committed; `
 			assert.True(t, strings.HasSuffix(r.detail, step+tt.wantRemedy), r.detail)
 			assert.Equal(t, 1, strings.Count(r.detail, tt.wantRemedy), r.detail)
 			assert.Equal(t, 1, strings.Count(r.detail, "; step 2 of 3 failed"), r.detail)
@@ -379,12 +412,18 @@ func TestProgressResultReportsCreateSequenceLength(t *testing.T) {
 // pg-sprite's full outcome vocabulary: every code the executor can return
 // maps to an explicit disposition — refusal or operational — so a code added
 // upstream fails this test instead of silently draining into the generic
-// retryable tail.
+// retryable tail. Every refusal also carries a cause: it is the clause the
+// composed detail opens with, and a remedy alone would publish a detail that
+// starts mid-sentence.
 func TestRefusalForOutcomeTotalOverExecutorCodes(t *testing.T) {
 	for _, code := range executor.Codes() {
 		t.Run(string(code), func(t *testing.T) {
-			_, known := refusalForOutcome(code, "users")
-			assert.True(t, known, "outcome code %q has no explicit apply disposition", code)
+			r, known := refusalForOutcome(code, "users")
+			require.True(t, known, "outcome code %q has no explicit apply disposition", code)
+			if r != nil {
+				assert.NotEmpty(t, r.reason, "refusal for %q has no reason", code)
+				assert.NotEmpty(t, r.cause, "refusal for %q has no cause", code)
+			}
 		})
 	}
 }

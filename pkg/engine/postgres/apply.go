@@ -201,6 +201,11 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	if r := classifyRefusal(err, change.table); r != nil {
 		// The taxonomy's reason survives in the operator-facing detail; no
 		// metadata carries it because nothing downstream consumes one yet.
+		// The server error is what identifies the occupant or the missing
+		// grant, and only the log carries it: the detail is kept generic
+		// because it is published to GitHub.
+		logger.Warn("PostgreSQL schema change refused",
+			"namespace", change.namespace, "table", change.table, "reason", r.reason, "error", err)
 		e.publishProgress(key, progressResult(engine.StateFailed, "refused", started, change, r.detail), logger)
 		return
 	}
@@ -294,9 +299,11 @@ type refusal struct {
 
 // classifyRefusal maps pg-sprite's typed refusal inputs to permanent
 // refusals, for both the plan-time privilege check and the apply path — one
-// classifier so the same underlying failure reads identically on both
-// surfaces. A nil result means the failure is operational — a retry may
-// succeed once conditions change. Lock-budget exhaustion is deliberately
+// classifier so the same underlying failure carries the same reason and
+// detail on both surfaces; the plan surface prefixes the detail with the
+// statement it blocks, the apply surface publishes it bare. A nil result
+// means the failure is operational — a retry may succeed once conditions
+// change. Lock-budget exhaustion is deliberately
 // operational: the statement is native-safe and only lost a bounded race
 // with concurrent lock holders. Every cause and remedy is built from typed
 // error fields and identifiers, never from wrapped server output, and the
@@ -318,7 +325,7 @@ func classifyRefusal(err error, table string) *refusal {
 	remedy := r.remedy
 	var stepErr *executor.SequenceStepError
 	if errors.As(err, &stepErr) && stepErr.Total > 1 {
-		clauses = append(clauses, sequenceStepClause(stepErr, table))
+		clauses = append(clauses, sequenceStepClause(stepErr))
 		if stepErr.Step > 1 && remedy == "" {
 			remedy = replanRemedy
 		}
@@ -333,23 +340,30 @@ func classifyRefusal(err error, table string) *refusal {
 const replanRemedy = "re-plan against the current schema"
 
 // sequenceStepClause names the failed step of a multi-statement create set
-// and, past the first step, the CREATE TABLE that step left committed.
-func sequenceStepClause(stepErr *executor.SequenceStepError, table string) string {
+// and, past the first step, that the CREATE TABLE committed. It sits between
+// a cause and a remedy and does not repeat the table: the cause before it
+// names the table where that matters, and every surface renders the detail
+// beside the table it belongs to. Keeping the clause short is what lets the
+// remedy's lead survive the narrowest operator surface, which truncates the
+// detail from the tail, for a table name of any legal length.
+func sequenceStepClause(stepErr *executor.SequenceStepError) string {
 	clause := fmt.Sprintf("step %d of %d failed", stepErr.Step, stepErr.Total)
 	if stepErr.Step > 1 {
-		clause += fmt.Sprintf(" after the CREATE TABLE for %q committed", table)
+		clause += " after the CREATE TABLE committed"
 	}
 	return clause
 }
 
 // committedCreatePrefixDetail reports the non-retryable recovery action for a
-// create sequence that failed after at least one earlier step committed.
+// create sequence that failed after at least one earlier step committed. No
+// cause precedes this detail, so it names the table itself.
 func committedCreatePrefixDetail(err error, table string) (string, bool) {
 	var stepErr *executor.SequenceStepError
 	if !errors.As(err, &stepErr) || stepErr.Step <= 1 {
 		return "", false
 	}
-	detail := sequenceStepClause(stepErr, table) + "; " + replanRemedy
+	detail := fmt.Sprintf("step %d of %d failed after the CREATE TABLE for %q committed; %s",
+		stepErr.Step, stepErr.Total, table, replanRemedy)
 	return sanitizeReasonText(detail), true
 }
 
@@ -493,14 +507,17 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 // and then the operator changes the name on one side or the other.
 const createCollisionRemedy = "re-plan, and if it recurs drop or rename the occupant or give the constraint, index, or sequence another name"
 
-// createCollisionRefusal names the kinds of name a create set claims so the
-// operator knows where to look; the server error identifying the occupant
-// stays in the logs. The wording is kept short because the composed detail
-// must survive the narrowest operator surface with its remedy intact.
+// createCollisionRefusal names the kinds of relation that can hold a name
+// the create set claims, so the operator knows where to look; the server
+// error identifying the occupant stays in the logs. The list is the
+// occupant's side, not the claimant's — a named constraint claims a name
+// through the index it creates, so the index is what occupies it. The
+// wording is kept short because the composed detail must survive the
+// narrowest operator surface with its remedy's lead intact.
 func createCollisionRefusal(table string) *refusal {
 	return &refusal{
 		reason: "create-collision",
-		cause:  fmt.Sprintf("a name the create set for %q needs is already occupied (table, index, constraint, or sequence)", table),
+		cause:  fmt.Sprintf("a name the create set for %q needs is already occupied (table, view, index, or sequence)", table),
 		remedy: createCollisionRemedy,
 	}
 }

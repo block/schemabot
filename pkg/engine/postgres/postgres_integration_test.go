@@ -731,7 +731,7 @@ func TestEngineApplyCreateCollisionRefusal(t *testing.T) {
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "refused", progress.Metadata["phase"])
 	assert.False(t, progress.Retryable, "a collision refusal is permanent until the name conflict is resolved; the drive must not offer a retry")
-	assert.Equal(t, `a name the create set for "widgets" needs is already occupied (table, index, constraint, or sequence); re-plan, and if it recurs drop or rename the occupant or give the constraint, index, or sequence another name`, progress.ErrorMessage)
+	assert.Equal(t, `a name the create set for "widgets" needs is already occupied (table, view, index, or sequence); re-plan, and if it recurs drop or rename the occupant or give the constraint, index, or sequence another name`, progress.ErrorMessage)
 }
 
 // TestEngineApplyCreateSetCommittedPrefixNotRetryable proves a create set
