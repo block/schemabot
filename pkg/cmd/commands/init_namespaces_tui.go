@@ -188,7 +188,7 @@ func configureInitWizard(m *initWizard, cmd *InitCmd) {
 	for _, i := range []int{2, 6, 7} {
 		m.skip[i] = true
 	}
-	for i, v := range map[int]string{0: cmd.Type, 1: cmd.Database, 3: cmd.DSN, 4: cmd.StorageDSN} {
+	for i, v := range map[int]string{0: cmd.Type, 1: cmd.Database} {
 		m.skip[i] = v != ""
 	}
 	m.explicitNamespaces = len(cmd.Namespaces) > 0
@@ -196,13 +196,8 @@ func configureInitWizard(m *initWizard, cmd *InitCmd) {
 		m.fields[5].hint = "We’ll find the namespaces available through your connection."
 	}
 	m.skip[5] = m.explicitNamespaces
-	// Both conventional connection variables can be accepted without another
-	// prompt when already set. Their references remain visible in the review.
-	for _, i := range []int{3, 4} {
-		if os.Getenv(strings.TrimPrefix(m.fields[i].value, "env:")) != "" {
-			m.skip[i] = true
-		}
-	}
+	// Connection steps always remain visible, even when flags or environment
+	// variables supplied them. Users confirm the target before discovery.
 	m.selected = map[string]bool{}
 	if slices.Contains(m.skip, false) {
 		for m.skip[m.step] {

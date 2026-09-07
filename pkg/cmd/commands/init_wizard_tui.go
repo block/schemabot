@@ -53,8 +53,8 @@ func newInitWizard(cmd *InitCmd, profile string, output io.Writer) *initWizard {
 		{"Database engine", "Which database are you working with?", value(cmd.Type, "mysql")},
 		{"Database name", "Give your database a name, like shop or analytics.", cmd.Database},
 		{"Environment", "Where are you working? Start with development if you’re trying things out.", value(cmd.Environment, "development")},
-		{"Database connection", "Point us to an environment variable so your credentials stay out of your files.", value(cmd.DSN, "env:DATABASE_URL")},
-		{"SchemaBot state connection", "SchemaBot keeps plans and progress in a separate database. Point us to its connection variable.", value(cmd.StorageDSN, "env:SCHEMABOT_STORAGE_DSN")},
+		{"Connect your database", "Use a connection variable you’ve already set. Confirm it below, or edit the variable name.", value(cmd.DSN, "env:DATABASE_URL")},
+		{"Connect SchemaBot’s state database", "Plans and progress live in a separate database. It can share your application’s server.", value(cmd.StorageDSN, "env:SCHEMABOT_STORAGE_DSN")},
 		{"Namespaces", "Which namespaces would you like to bring in? You can list several, separated by commas.", strings.Join(cmd.Namespaces, ", ")},
 		{"Schema directory", "Choose a home for your schema files. This is where you’ll make changes.", value(cmd.SchemaDir, "schema")},
 		{"Connection profile", "Give this connection a profile name so you can use it again.", profile},
@@ -239,6 +239,10 @@ func (m *initWizard) contentView() string {
 			b.WriteString(m.namespaceView())
 		default:
 			b.WriteString(m.input.View() + "\n\n")
+			if m.step == 3 || m.step == 4 {
+				b.WriteString(wrap.Render(initConnectionSummary(m.fields[0].value, m.input.Value())) + "\n\n")
+				b.WriteString(muted.Render("Credentials stay in your environment.") + "\n\n")
+			}
 		}
 		if m.err != "" {
 			b.WriteString(wrap.Render(m.renderer.NewStyle().Foreground(lipgloss.Color("1")).Render(m.err)) + "\n\n")

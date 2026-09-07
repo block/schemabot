@@ -20,8 +20,9 @@ needs the engine's scratch privileges. Setup never applies application schema ch
 
 ## Follow the wizard
 
-The wizard asks only for the decisions it still needs. It reuses connection variables you’ve
-already set, keeps `development`, `schema`, and your default profile as editable defaults,
+The wizard confirms both connections before discovering namespaces, even when their variables
+are already set. Each connection step shows the host and database without credentials; edit
+the variable reference to use a different connection. It keeps `development`, `schema`, and your default profile as editable defaults,
 and includes everything in the final review.
 
 Before setting up a runtime, SchemaBot reads the target catalog to discover namespaces. One

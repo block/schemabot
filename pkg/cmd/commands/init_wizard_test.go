@@ -204,3 +204,38 @@ func TestInitWizardPreservesExplicitNamespaceWithComma(t *testing.T) {
 	m := newInitWizard(&InitCmd{Namespaces: original}, "default", io.Discard)
 	require.Equal(t, original, m.namespaceChoices(original))
 }
+
+func TestInitWizardConfirmsConfiguredConnections(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://demo:secret@localhost:5432/shop?sslmode=disable")
+	t.Setenv("SCHEMABOT_STORAGE_DSN", "postgres://demo:secret@localhost:5432/state?sslmode=disable")
+	m := newInitWizard(&InitCmd{Type: "postgres", Database: "shop", DSN: "env:DATABASE_URL", StorageDSN: "env:SCHEMABOT_STORAGE_DSN"}, "default", io.Discard)
+	require.Equal(t, 3, m.step)
+	require.Contains(t, m.View(), "localhost:5432")
+	require.Contains(t, m.View(), `Database: "shop"`)
+	require.NotContains(t, m.View(), "secret")
+	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, 4, m.step)
+	require.Contains(t, m.View(), `Database: "state"`)
+	require.False(t, m.confirmed)
+}
+
+func TestInitConnectionSummaryRedactsCredentials(t *testing.T) {
+	for _, tt := range []struct{ engine, dsn string }{
+		{"mysql", "demo:secret@tcp(localhost:3306)/shop"},
+		{"postgres", "postgres://demo:secret@localhost:5432/shop?sslmode=disable"},
+		{"postgres", "host=localhost port=5432 dbname=shop user=demo password=secret sslmode=disable"},
+		{"postgres", "postgres://demo:secret@%invalid"},
+	} {
+		t.Run(tt.dsn, func(t *testing.T) {
+			t.Setenv("WIZARD_TEST_DSN", tt.dsn)
+			got := initConnectionSummary(tt.engine, "env:WIZARD_TEST_DSN")
+			require.NotContains(t, got, "secret")
+			require.NotContains(t, got, "demo")
+			require.NotContains(t, got, "sslmode")
+		})
+	}
+	t.Setenv("WIZARD_TEST_DSN", "postgres://user:secret@localhost/shop%1B%5B2J?sslmode=disable")
+	require.NotContains(t, initConnectionSummary("postgres", "env:WIZARD_TEST_DSN"), "\x1b")
+	t.Setenv("WIZARD_TEST_DSN", "")
+	require.Contains(t, initConnectionSummary("postgres", "env:WIZARD_TEST_DSN"), "isn’t set")
+}
