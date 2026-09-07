@@ -222,3 +222,20 @@ func TestRenderGenericErrorSanitizesDetail(t *testing.T) {
 	assert.Contains(t, body, "&lt;img src=x&gt;", "HTML markup is escaped")
 	assert.NotContains(t, body, "<img", "raw markup never reaches the comment")
 }
+
+func TestSetupGuidanceExperimentalStrata(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		for _, database := range []string{"", "example"} {
+			data := SchemaErrorData{ExperimentalStrataEnabled: enabled, DatabaseName: database}
+			for _, body := range []string{RenderNoConfig(data), RenderInvalidConfig(data)} {
+				assert.Contains(t, body, "`mysql`")
+				assert.Contains(t, body, "`postgres`")
+				if enabled {
+					assert.Contains(t, body, "`strata` (experimental)")
+				} else {
+					assert.NotContains(t, body, "strata")
+				}
+			}
+		}
+	}
+}
