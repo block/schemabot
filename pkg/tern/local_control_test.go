@@ -232,6 +232,10 @@ func newMySQLControlTestClient(apply *storage.Apply, tasks []*storage.Task, eng 
 }
 
 func newVitessControlTestClient(apply *storage.Apply, tasks []*storage.Task, resumeState *storage.EngineResumeState, eng engine.Engine) *LocalClient {
+	return newVitessControlTestClientWithRequests(apply, tasks, resumeState, eng, &testControlRequestStore{})
+}
+
+func newVitessControlTestClientWithRequests(apply *storage.Apply, tasks []*storage.Task, resumeState *storage.EngineResumeState, eng engine.Engine, controlRequests *testControlRequestStore) *LocalClient {
 	return &LocalClient{
 		config: LocalConfig{
 			Database: "testdb",
@@ -242,7 +246,7 @@ func newVitessControlTestClient(apply *storage.Apply, tasks []*storage.Task, res
 			tasks:           &controlTestTaskStore{tasks: tasks},
 			applyLogs:       &controlTestApplyLogStore{},
 			applyOperations: &controlTestApplyOperationStore{data: resumeState},
-			controlRequests: &testControlRequestStore{},
+			controlRequests: controlRequests,
 		},
 		planetscaleEngine: eng,
 		logger:            slog.Default(),
@@ -1610,7 +1614,9 @@ func TestLocalClient_CancelRejectsSkippingRevertApply(t *testing.T) {
 // as permanently failed — not retried and not executed. Failing the stored
 // request stops the operator-owned retry loop, and the apply keeps its
 // revert-phase state so the in-flight revert or finalization drives the
-// terminal outcome.
+// terminal outcome. The drive is told the cancel did not take effect, for the
+// same reason: the revert owns the outcome, and a drive that stood down here
+// would settle the apply stopped on top of it.
 func TestLocalClient_PendingCancelFailsClosedForRevertPhase(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              42,
@@ -1641,10 +1647,10 @@ func TestLocalClient_PendingCancelFailsClosedForRevertPhase(t *testing.T) {
 		logger:            slog.Default(),
 	}
 
-	handled, err := client.processPendingCancelControlRequest(t.Context(), apply)
+	tookEffect, err := client.processPendingCancelControlRequest(t.Context(), apply)
 
 	require.NoError(t, err)
-	assert.True(t, handled)
+	assert.False(t, tookEffect, "the refusal cancelled nothing, so the drive must keep driving the revert to its own outcome")
 	assert.Nil(t, eng.cancelReq, "cancel must not touch the engine for a revert-phase apply")
 	assert.Equal(t, state.Apply.Reverting, apply.State, "revert-phase apply must keep its state")
 	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
@@ -1771,6 +1777,88 @@ func TestLocalClient_PendingCancelResolvesPostgresUnsupportedDecline(t *testing.
 	handled, err = client.processPendingCancelControlRequest(t.Context(), apply)
 	require.NoError(t, err)
 	assert.False(t, handled, "a resolved decline must not be re-consumed on the next drive claim")
+}
+
+// revertWindowRefusalFixture stages a schema change whose stored task has cut
+// over and is holding its revert window, with one pending request for the given
+// operation. The apply row still reads running: the drive learns the phase from
+// the task the engine reported it on, which is how a revert-phase refusal is
+// reached while the drive is mid-flight.
+func revertWindowRefusalFixture(operation storage.ControlOperation) (*LocalClient, *storage.Apply, *storage.Task, *testControlRequestStore) {
+	operationID := int64(99)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-vitess-revert-window-refusal",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-vitess-revert-window-refusal",
+		State:            state.Task.RevertWindow,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   operation,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	}}}
+	client := newVitessControlTestClientWithRequests(apply, []*storage.Task{task}, nil, &controlCaptureEngine{}, controlRequests)
+	return client, apply, task, controlRequests
+}
+
+// A durable cancel can land on a schema change that has already cut over and is
+// holding its revert window. The drive refuses it permanently — the operator has
+// to choose revert or skip-revert — and that refusal must change nothing else:
+// the change is applied and its revert phase is still running against the
+// database, so settling the apply stopped would report an outcome that
+// contradicts what the engine is doing underneath (CO-5), and would leave the
+// revert window with no drive watching it expire.
+func TestLocalClient_PendingCancelRefusedInRevertWindowLeavesTheDriveRunning(t *testing.T) {
+	client, apply, task, controlRequests := revertWindowRefusalFixture(storage.ControlOperationCancel)
+
+	tookEffect, err := client.processPendingCancelControlRequest(t.Context(), apply)
+
+	require.NoError(t, err)
+	assert.False(t, tookEffect, "a refused cancel must not read as an operator cancel, or the drive loop would settle the revert-window apply stopped")
+	assert.Equal(t, state.Apply.Running, apply.State, "the apply must be left for its revert phase to settle")
+	assert.Equal(t, state.Task.RevertWindow, task.State, "the cut-over task keeps its revert window")
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.Nil(t, pending, "the durable cancel request must be resolved, not left pending")
+	resolved, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, storage.ControlRequestFailed, resolved.Status, "a revert-phase refusal is a permanent rejection")
+	assert.Contains(t, resolved.ErrorMessage, "use revert to undo it or skip-revert to finalize it",
+		"the failed request must tell the operator which command does what they wanted")
+
+	tookEffect, err = client.processPendingCancelControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.False(t, tookEffect, "a resolved refusal must not be re-consumed on the next drive claim")
+}
+
+// Stop refuses a revert-window schema change for the same reason cancel does,
+// and owes the drive the same answer: nothing was paused, so the drive keeps
+// driving and the apply is not settled stopped.
+func TestLocalClient_PendingStopRefusedInRevertWindowLeavesTheDriveRunning(t *testing.T) {
+	client, apply, task, controlRequests := revertWindowRefusalFixture(storage.ControlOperationStop)
+
+	tookEffect, err := client.processPendingStopControlRequest(t.Context(), apply)
+
+	require.NoError(t, err)
+	assert.False(t, tookEffect, "a refused stop must not read as an operator stop, or the drive loop would settle the revert-window apply stopped")
+	assert.Equal(t, state.Apply.Running, apply.State, "the apply must be left for its revert phase to settle")
+	assert.Equal(t, state.Task.RevertWindow, task.State, "the cut-over task keeps its revert window")
+	resolved, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, storage.ControlRequestFailed, resolved.Status, "a revert-phase refusal is a permanent rejection")
+	assert.Contains(t, resolved.ErrorMessage, "use revert to undo it or skip-revert to finalize it",
+		"the failed request must tell the operator which command does what they wanted")
 }
 
 // revertPhaseDeclineFixture stages an apply in its revert window with one

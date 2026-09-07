@@ -842,7 +842,14 @@ func (c *GRPCClient) failRefusedControlRequest(ctx context.Context, logger *slog
 	return false, nil
 }
 
-func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (bool, error) {
+// processPendingStopControlRequest consumes a durable stop request against this
+// apply. It returns two independent facts about one request, and only the second
+// is its return value: the request is resolved in storage either way, while
+// tookEffect reports whether the apply is now stopped. The drive stands down on
+// tookEffect and settles the apply stopped, so a branch that resolves a request
+// without stopping anything — a refusal, an engine decline — reports false and
+// leaves the drive exactly as it found it.
+func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (tookEffect bool, err error) {
 	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop)
 	if err != nil {
 		return false, err
@@ -998,7 +1005,11 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 	return false, nil
 }
 
-func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (bool, error) {
+// processPendingCancelControlRequest consumes a durable cancel request against
+// this apply. Its return follows the same contract as the stop counterpart:
+// tookEffect reports whether the apply is now cancelled, not whether the request
+// was resolved.
+func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (tookEffect bool, err error) {
 	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationCancel)
 	if err != nil {
 		return false, err
@@ -1179,9 +1190,13 @@ func (c *GRPCClient) controlPathProgress(ctx context.Context, apply *storage.App
 	return progress, nil
 }
 
-func (c *GRPCClient) processPendingCancelOrStopControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (bool, error) {
-	if handled, err := c.processPendingCancelControlRequest(ctx, apply, scope); handled || err != nil {
-		return handled, err
+// processPendingCancelOrStopControlRequest consumes whichever of the two the
+// operator issued, cancel first because it is the stronger intent. tookEffect
+// reports whether one of them took effect, so the drive stands down only when
+// the apply is really stopped or cancelled.
+func (c *GRPCClient) processPendingCancelOrStopControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (tookEffect bool, err error) {
+	if tookEffect, err := c.processPendingCancelControlRequest(ctx, apply, scope); tookEffect || err != nil {
+		return tookEffect, err
 	}
 	return c.processPendingStopControlRequest(ctx, apply, scope)
 }
@@ -2270,7 +2285,7 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 		if target == "" {
 			target = apply.Database
 		}
-		if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
+		if tookEffect, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); tookEffect || err != nil {
 			return err
 		}
 		changes := make([]*ternv1.TableChange, 0, len(namespaces))
@@ -2468,7 +2483,7 @@ func (c *GRPCClient) ResumeApplyOperationCutover(ctx context.Context, apply *sto
 		return fmt.Errorf("apply_operation %d (apply %s): no remote apply id for cutover drive", applyOperationID, apply.ApplyIdentifier)
 	}
 	// Honor a stop that raced in after the cutover claim before forcing the swap.
-	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
+	if tookEffect, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); tookEffect || err != nil {
 		return err
 	}
 	poll, err := c.triggerRemoteOperationCutover(ctx, apply, scope, remoteID)
@@ -2567,7 +2582,7 @@ func (c *GRPCClient) triggerRemoteOperationCutover(ctx context.Context, apply *s
 		return false, fmt.Errorf("preflight remote cutover for apply_operation %d (apply %s): remote is %s, not parked at the cutover barrier", scope.applyOperationID, apply.ApplyIdentifier, remoteState)
 	}
 	// Re-check a raced stop immediately before forcing the swap.
-	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
+	if tookEffect, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); tookEffect || err != nil {
 		return false, err
 	}
 	cutoverResp, err := c.client.Cutover(ctx, &ternv1.CutoverRequest{
@@ -2603,7 +2618,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 		return fmt.Errorf("apply is required")
 	}
 	logger := c.applyLogger(apply)
-	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
+	if tookEffect, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); tookEffect || err != nil {
 		return err
 	}
 	if err := c.processPendingCutoverControlRequest(ctx, apply, scope); err != nil {
@@ -2646,7 +2661,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 		}
 	}
 	if startRequested && state.IsState(apply.State, state.Apply.WaitingForDeploy) {
-		if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
+		if tookEffect, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); tookEffect || err != nil {
 			return err
 		}
 		if err := c.processPendingStartControlRequest(ctx, apply, scope); err != nil {
@@ -2656,7 +2671,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 
 	remoteID := scope.remoteApplyID(apply)
 	if remoteID != "" && state.IsState(apply.State, state.Apply.Pending) && !startRequested {
-		if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
+		if tookEffect, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); tookEffect || err != nil {
 			return err
 		}
 		_, err := c.client.Start(ctx, &ternv1.StartRequest{
@@ -2899,7 +2914,7 @@ func (c *GRPCClient) waitForPendingStopBeforeStart(ctx context.Context, apply *s
 			// Stop this operation's own remote work once, then defer: the
 			// operation-only drive must not spin waiting for a parent stop it
 			// will never complete.
-			handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope)
+			tookEffect, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope)
 			if err != nil {
 				return false, err
 			}
@@ -2910,7 +2925,7 @@ func (c *GRPCClient) waitForPendingStopBeforeStart(ctx context.Context, apply *s
 			if stillPending == nil {
 				return false, nil
 			}
-			if !handled {
+			if !tookEffect {
 				logOperationDriveLeavesParentStop(logger, apply, scope)
 			}
 			logger.InfoContext(ctx, "operation-only drive deferring pending gRPC start until apply-level stop resolves",
@@ -3109,7 +3124,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	if target == "" {
 		target = apply.Database
 	}
-	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
+	if tookEffect, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); tookEffect || err != nil {
 		return err
 	}
 
@@ -4362,11 +4377,11 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				return stopErr
 			}
 		case <-ticker.C:
-			if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); err != nil {
+			if tookEffect, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); err != nil {
 				logger.Warn("pending gRPC stop request processing failed; current apply owner will exit for operator retry",
 					append(apply.MutableLogAttrs(), "error", err)...)
 				return err
-			} else if handled {
+			} else if tookEffect {
 				return nil
 			}
 			if err := c.processPendingCutoverControlRequest(ctx, apply, scope); err != nil {

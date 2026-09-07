@@ -1942,7 +1942,9 @@ func TestLocalClient_StartQueuesOwnerRequest(t *testing.T) {
 // it is a permanent rejection. Processing it must resolve the request terminally
 // (failed) with the operator-facing reason instead of bubbling a retryable error
 // that keeps the request pending and spins the operator-owned retry loop forever.
-// The apply stays in the revert window for the operator to revert or skip-revert.
+// The apply stays in the revert window for the operator to revert or skip-revert,
+// and the drive is told the stop did not take effect: resolving the request and
+// pausing the change are separate facts, and only the request was resolved.
 func TestLocalClient_ProcessPendingStopControlRequestRejectsRevertWindow(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              321,
@@ -1984,10 +1986,10 @@ func TestLocalClient_ProcessPendingStopControlRequestRejectsRevertWindow(t *test
 		logger:            slog.Default(),
 	}
 
-	handled, err := client.processPendingStopControlRequest(t.Context(), apply)
+	tookEffect, err := client.processPendingStopControlRequest(t.Context(), apply)
 
 	require.NoError(t, err, "a permanent rejection must not bubble a retryable error")
-	assert.True(t, handled, "the durable request is resolved, so the owner must not retry")
+	assert.False(t, tookEffect, "nothing was paused, so the drive must keep driving rather than settle the apply stopped")
 	assert.Equal(t, 0, fakeEngine.stopCount, "stop must not touch the engine for a revert-window apply")
 	assert.Equal(t, state.Apply.RevertWindow, apply.State, "revert-window apply must not be recorded as cancelled or stopped")
 	assert.Equal(t, state.Task.RevertWindow, task.State, "revert-window task must be preserved")

@@ -1122,7 +1122,14 @@ func (c *LocalClient) failRefusedControlRequest(ctx context.Context, logger *slo
 	return nil
 }
 
-func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply) (bool, error) {
+// processPendingStopControlRequest consumes a durable stop request against this
+// apply. It returns two independent facts about one request, and only the second
+// is its return value: the request is resolved in storage either way, while
+// tookEffect reports whether the apply is now stopped. The drive stands down on
+// tookEffect and settles the apply stopped, so a branch that resolves a request
+// without stopping anything, a refusal or an engine decline, reports false and
+// leaves the drive exactly as it found it.
+func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply) (tookEffect bool, err error) {
 	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop)
 	if err != nil {
 		return false, err
@@ -1172,7 +1179,11 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop, message); err != nil {
 			return true, err
 		}
-		return true, nil
+		// The request is resolved, but no stop took effect: the change is applied
+		// and its revert phase is still running against the database. Reporting it
+		// as an operator stop would stand the drive down and settle the apply
+		// stopped, contradicting what the engine is still doing underneath.
+		return false, nil
 	}
 
 	stopCtx := context.WithoutCancel(ctx)
@@ -1218,7 +1229,11 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 	return true, nil
 }
 
-func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, apply *storage.Apply) (bool, error) {
+// processPendingCancelControlRequest consumes a durable cancel request against
+// this apply. Its return follows the same contract as the stop counterpart:
+// tookEffect reports whether the apply is now cancelled, not whether the request
+// was resolved.
+func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, apply *storage.Apply) (tookEffect bool, err error) {
 	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationCancel)
 	if err != nil {
 		return false, err
@@ -1250,7 +1265,9 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel, message); err != nil {
 			return true, err
 		}
-		return true, nil
+		// See the stop counterpart: the request is resolved and nothing was
+		// cancelled, so the drive must not stand down over it.
+		return false, nil
 	}
 
 	cancelCtx := context.WithoutCancel(ctx)
@@ -1293,9 +1310,13 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 	return true, nil
 }
 
-func (c *LocalClient) processPendingCancelOrStopControlRequest(ctx context.Context, apply *storage.Apply) (bool, error) {
-	if handled, err := c.processPendingCancelControlRequest(ctx, apply); handled || err != nil {
-		return handled, err
+// processPendingCancelOrStopControlRequest consumes whichever of the two the
+// operator issued, cancel first because it is the stronger intent. tookEffect
+// reports whether one of them took effect, so the drive stands down only when
+// the apply is really stopped or cancelled.
+func (c *LocalClient) processPendingCancelOrStopControlRequest(ctx context.Context, apply *storage.Apply) (tookEffect bool, err error) {
+	if tookEffect, err := c.processPendingCancelControlRequest(ctx, apply); tookEffect || err != nil {
+		return tookEffect, err
 	}
 	return c.processPendingStopControlRequest(ctx, apply)
 }
