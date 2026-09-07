@@ -34,7 +34,7 @@ screen = pyte.Screen(88, 24)
 stream = pyte.Stream(screen)
 process = subprocess.Popen([binary, 'init'], cwd=work, env=env, stdin=slave, stdout=slave, stderr=slave)
 os.close(slave)
-steps = [('Database engine', '\r'), ('Database name', 'shop\r'), ('Environment', '\r'), ('Database connection', '\r'), ('SchemaBot state connection', '\r'), ('Namespaces', '\r'), ('Schema directory', '\r'), ('Connection profile', '\r'), ('Ready when you are', '\r')]
+steps = [('Database engine', '\r'), ('Database name', 'shop\r'), ('Ready when you are', '\r')]
 frames = []
 text = ''
 seen = 0
@@ -71,7 +71,7 @@ try:
             frames.append({'time': round(time.monotonic() - start, 3), 'rows': rows})
             if seen < len(steps) and steps[seen][0] in visible:
                 print('Recording:', steps[seen][0], flush=True)
-                time.sleep(.7 if seen < 8 else 2)
+                time.sleep(.7 if seen < 2 else 2)
                 os.write(master, steps[seen][1].encode())
                 seen += 1
         if process.poll() is not None and not ready:

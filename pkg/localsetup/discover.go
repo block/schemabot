@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/block/mysql"
@@ -17,6 +18,9 @@ import (
 // runtime nor opens the state database, so abandoning setup has no side effects.
 // MySQL stays within the DSN's database, matching the existing pull semantics.
 func DiscoverNamespaces(ctx context.Context, engine, dsn string) ([]string, error) {
+	if strings.TrimSpace(dsn) == "" {
+		return nil, fmt.Errorf("set a database connection before discovering namespaces")
+	}
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	var db *sql.DB

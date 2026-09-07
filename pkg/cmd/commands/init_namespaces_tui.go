@@ -35,7 +35,11 @@ func (m *initWizard) discoverNamespaces() tea.Cmd {
 	m.cancelDiscovery = cancel
 	return func() tea.Msg {
 		defer cancel()
-		names, err := m.discover(ctx, engine, os.Getenv(strings.TrimPrefix(ref, "env:")))
+		dsn := os.Getenv(strings.TrimPrefix(ref, "env:"))
+		if !initVariable.MatchString(ref) || strings.TrimSpace(dsn) == "" {
+			return initNamespacesMsg{generation: generation, err: fmt.Errorf("choose an env:VARIABLE connection that you’ve already set")}
+		}
+		names, err := m.discover(ctx, engine, dsn)
 		return initNamespacesMsg{generation, names, err}
 	}
 }

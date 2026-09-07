@@ -2,7 +2,7 @@
   "wizard": "\u2713 Your schema is ready                                                                \n                                                                                        \n  1 table \u00b7 schema                                                                      \n  Baseline plan: no changes.                                                            \n                                                                                        \n  Make your first edit, then review the plan:                                           \n                                                                                        \n    schemabot plan -s 'schema' -e 'development' --profile 'default'",
   "wizard_frames": [
     {
-      "time": 2.619,
+      "time": 1.026,
       "rows": [
         [
           {
@@ -223,7 +223,7 @@
       ]
     },
     {
-      "time": 2.637,
+      "time": 1.044,
       "rows": [
         [
           {
@@ -286,14 +286,14 @@
               "59636e",
               false
             ],
-            "text": "Let\u2019s get your schema ready.   1 / 8"
+            "text": "Let\u2019s get your schema ready."
           },
           {
             "style": [
               "default",
               false
             ],
-            "text": "                                                  "
+            "text": "                                                          "
           }
         ],
         [
@@ -549,7 +549,7 @@
       ]
     },
     {
-      "time": 3.343,
+      "time": 1.75,
       "rows": [
         [
           {
@@ -612,14 +612,14 @@
               "59636e",
               false
             ],
-            "text": "Let\u2019s get your schema ready.   1 / 8"
+            "text": "Let\u2019s get your schema ready."
           },
           {
             "style": [
               "default",
               false
             ],
-            "text": "                                                  "
+            "text": "                                                          "
           }
         ],
         [
@@ -889,7 +889,7 @@
       ]
     },
     {
-      "time": 3.355,
+      "time": 1.762,
       "rows": [
         [
           {
@@ -952,14 +952,14 @@
               "59636e",
               false
             ],
-            "text": "Let\u2019s get your schema ready.   2 / 8"
+            "text": "Let\u2019s get your schema ready."
           },
           {
             "style": [
               "default",
               false
             ],
-            "text": "                                                  "
+            "text": "                                                          "
           }
         ],
         [
@@ -1187,7 +1187,7 @@
       ]
     },
     {
-      "time": 4.063,
+      "time": 2.471,
       "rows": [
         [
           {
@@ -1250,14 +1250,14 @@
               "59636e",
               false
             ],
-            "text": "Let\u2019s get your schema ready.   2 / 8"
+            "text": "Let\u2019s get your schema ready."
           },
           {
             "style": [
               "default",
               false
             ],
-            "text": "                                                  "
+            "text": "                                                          "
           }
         ],
         [
@@ -1485,7 +1485,7 @@
       ]
     },
     {
-      "time": 4.072,
+      "time": 2.479,
       "rows": [
         [
           {
@@ -1548,1886 +1548,14 @@
               "59636e",
               false
             ],
-            "text": "Let\u2019s get your schema ready.   3 / 8"
+            "text": "Let\u2019s get your schema ready."
           },
           {
             "style": [
               "default",
               false
             ],
-            "text": "                                                  "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "default",
-              true
-            ],
-            "text": "Environment"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                           "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "Where are you working? Start with development if you\u2019re trying things"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                 "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "out."
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                  "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  \u203a development                                                                         "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "enter continue \u00b7 shift+tab back \u00b7 esc cancel"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                          "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ]
-      ]
-    },
-    {
-      "time": 4.779,
-      "rows": [
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "default",
-              true
-            ],
-            "text": "SchemaBot"
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "  /  setup"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                   "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "Let\u2019s get your schema ready.   3 / 8"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                  "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "default",
-              true
-            ],
-            "text": "Environment"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                           "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "Where are you working? Start with development if you\u2019re trying things"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                 "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "out."
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                  "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  \u203a development                                                                         "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "enter continue \u00b7 shift+tab back \u00b7 esc cancel"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                          "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ]
-      ]
-    },
-    {
-      "time": 4.789,
-      "rows": [
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "default",
-              true
-            ],
-            "text": "SchemaBot"
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "  /  setup"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                   "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "Let\u2019s get your schema ready.   4 / 8"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                  "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "default",
-              true
-            ],
-            "text": "Database connection"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                   "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "Point us to an environment variable so your credentials stay out of your"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "              "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "files."
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  \u203a env:DATABASE_URL                                                                    "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "enter continue \u00b7 shift+tab back \u00b7 esc cancel"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                          "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ]
-      ]
-    },
-    {
-      "time": 5.496,
-      "rows": [
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "default",
-              true
-            ],
-            "text": "SchemaBot"
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "  /  setup"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                   "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "Let\u2019s get your schema ready.   4 / 8"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                  "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "default",
-              true
-            ],
-            "text": "Database connection"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                   "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "Point us to an environment variable so your credentials stay out of your"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "              "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "files."
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  \u203a env:DATABASE_URL                                                                    "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "enter continue \u00b7 shift+tab back \u00b7 esc cancel"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                          "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ]
-      ]
-    },
-    {
-      "time": 5.506,
-      "rows": [
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "default",
-              true
-            ],
-            "text": "SchemaBot"
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "  /  setup"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                   "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "Let\u2019s get your schema ready.   5 / 8"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                  "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "default",
-              true
-            ],
-            "text": "SchemaBot state connection"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                            "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "SchemaBot keeps plans and progress in a separate database. Point us to"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "its connection variable."
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                              "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  \u203a env:SCHEMABOT_STORAGE_DSN                                                           "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "enter continue \u00b7 shift+tab back \u00b7 esc cancel"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                          "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ]
-      ]
-    },
-    {
-      "time": 6.215,
-      "rows": [
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "default",
-              true
-            ],
-            "text": "SchemaBot"
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "  /  setup"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                   "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "Let\u2019s get your schema ready.   5 / 8"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                  "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "default",
-              true
-            ],
-            "text": "SchemaBot state connection"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                            "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "SchemaBot keeps plans and progress in a separate database. Point us to"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "its connection variable."
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                              "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  \u203a env:SCHEMABOT_STORAGE_DSN                                                           "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "enter continue \u00b7 shift+tab back \u00b7 esc cancel"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                          "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ]
-      ]
-    },
-    {
-      "time": 6.223,
-      "rows": [
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "default",
-              true
-            ],
-            "text": "SchemaBot"
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "  /  setup"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                   "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "Let\u2019s get your schema ready.   6 / 8"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                  "
+            "text": "                                                          "
           }
         ],
         [
@@ -3475,1227 +1603,7 @@
               "59636e",
               false
             ],
-            "text": "Which namespaces would you like to bring in? You can list several,"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                    "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "separated by commas."
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                  "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  \u203a shop                                                                                "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "enter continue \u00b7 shift+tab back \u00b7 esc cancel"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                          "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ]
-      ]
-    },
-    {
-      "time": 6.931,
-      "rows": [
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "default",
-              true
-            ],
-            "text": "SchemaBot"
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "  /  setup"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                   "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "Let\u2019s get your schema ready.   6 / 8"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                  "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "default",
-              true
-            ],
-            "text": "Namespaces"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                            "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "Which namespaces would you like to bring in? You can list several,"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                    "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "separated by commas."
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                  "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  \u203a shop                                                                                "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "enter continue \u00b7 shift+tab back \u00b7 esc cancel"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                          "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ]
-      ]
-    },
-    {
-      "time": 6.939,
-      "rows": [
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "default",
-              true
-            ],
-            "text": "SchemaBot"
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "  /  setup"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                   "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "Let\u2019s get your schema ready.   7 / 8"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                  "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "default",
-              true
-            ],
-            "text": "Schema directory"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                      "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "Choose a home for your schema files. This is where you\u2019ll make changes."
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "               "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  \u203a schema                                                                              "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "enter continue \u00b7 shift+tab back \u00b7 esc cancel"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                          "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ]
-      ]
-    },
-    {
-      "time": 7.646,
-      "rows": [
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "default",
-              true
-            ],
-            "text": "SchemaBot"
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "  /  setup"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                   "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "Let\u2019s get your schema ready.   7 / 8"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                  "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "default",
-              true
-            ],
-            "text": "Schema directory"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                      "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "Choose a home for your schema files. This is where you\u2019ll make changes."
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "               "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  \u203a schema                                                                              "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "enter continue \u00b7 shift+tab back \u00b7 esc cancel"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                          "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ]
-      ]
-    },
-    {
-      "time": 7.662,
-      "rows": [
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "default",
-              true
-            ],
-            "text": "SchemaBot"
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "  /  setup"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                   "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "Let\u2019s get your schema ready.   8 / 8"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                  "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "default",
-              true
-            ],
-            "text": "Connection profile"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                    "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "Give this connection a profile name so you can use it again."
+            "text": "We\u2019ll find the namespaces available through your connection."
           },
           {
             "style": [
@@ -4720,7 +1628,7 @@
               "default",
               false
             ],
-            "text": "  \u203a default                                                                             "
+            "text": "  Looking for your namespaces\u2026                                                          "
           }
         ],
         [
@@ -4730,6 +1638,15 @@
               false
             ],
             "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  You can cancel while we connect.                                                      "
           }
         ],
         [
@@ -4745,23 +1662,14 @@
               "59636e",
               false
             ],
-            "text": "enter continue \u00b7 shift+tab back \u00b7 esc cancel"
+            "text": "shift+tab edit connection \u00b7 esc cancel"
           },
           {
             "style": [
               "default",
               false
             ],
-            "text": "                                          "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
+            "text": "                                                "
           }
         ],
         [
@@ -4875,305 +1783,7 @@
       ]
     },
     {
-      "time": 8.368,
-      "rows": [
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "default",
-              true
-            ],
-            "text": "SchemaBot"
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "  /  setup"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                   "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "Let\u2019s get your schema ready.   8 / 8"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                  "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "default",
-              true
-            ],
-            "text": "Connection profile"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                    "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "Give this connection a profile name so you can use it again."
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                          "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  \u203a default                                                                             "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "59636e",
-              false
-            ],
-            "text": "enter continue \u00b7 shift+tab back \u00b7 esc cancel"
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                          "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ]
-      ]
-    },
-    {
-      "time": 8.372,
+      "time": 2.498,
       "rows": [
         [
           {
@@ -5244,6 +1854,24 @@
               false
             ],
             "text": "                                                                    "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  Found shop. We\u2019ll use that.                                                           "
           }
         ],
         [
@@ -5454,24 +2082,6 @@
               "default",
               false
             ],
-            "text": "  We\u2019ll prepare SchemaBot\u2019s state database an                                           "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
             "text": "                                                                                        "
           }
         ],
@@ -5541,7 +2151,7 @@
       ]
     },
     {
-      "time": 10.381,
+      "time": 4.504,
       "rows": [
         [
           {
@@ -5612,6 +2222,24 @@
               false
             ],
             "text": "                                                                    "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  Found shop. We\u2019ll use that.                                                           "
           }
         ],
         [
@@ -5908,29 +2536,11 @@
             ],
             "text": "                                                                                        "
           }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
         ]
       ]
     },
     {
-      "time": 10.383,
+      "time": 4.506,
       "rows": [
         [
           {
@@ -6151,7 +2761,7 @@
       ]
     },
     {
-      "time": 10.4,
+      "time": 4.52,
       "rows": [
         [
           {
@@ -6168,226 +2778,9 @@
               "default",
               false
             ],
-            "text": "  SchemaBot  /  connect and verify                                                      "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
             "text": "                                                                                        "
           }
         ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  "
-          },
-          {
-            "style": [
-              "0969da",
-              false
-            ],
-            "text": "\u28fd "
-          },
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": " Setting up your database connection...                                             "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  Your application\u2019s schema stays as it is.                                             "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  esc cancel                                                                            "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ]
-      ]
-    },
-    {
-      "time": 10.429,
-      "rows": [
         [
           {
             "style": [
@@ -6599,30 +2992,30 @@
             ],
             "text": "                                                                                        "
           }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
         ]
       ]
     },
     {
-      "time": 10.495,
+      "time": 4.617,
       "rows": [
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
         [
           {
             "style": [
@@ -6834,30 +3227,30 @@
             ],
             "text": "                                                                                        "
           }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
         ]
       ]
     },
     {
-      "time": 10.596,
+      "time": 4.718,
       "rows": [
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
         [
           {
             "style": [
@@ -7069,30 +3462,30 @@
             ],
             "text": "                                                                                        "
           }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
         ]
       ]
     },
     {
-      "time": 10.662,
+      "time": 4.818,
       "rows": [
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
         [
           {
             "style": [
@@ -7135,24 +3528,6 @@
               "default",
               false
             ],
-            "text": "  \u2713 Starting SchemaBot...                                                               "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "  \u2713 Reading your live schema...                                                         "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
             "text": "  "
           },
           {
@@ -7160,14 +3535,14 @@
               "0969da",
               false
             ],
-            "text": "\u28bf "
+            "text": "\u287f "
           },
           {
             "style": [
               "default",
               false
             ],
-            "text": " Checking that your schema files match...                                           "
+            "text": " Starting SchemaBot...                                                              "
           }
         ],
         [
@@ -7326,7 +3701,947 @@
       ]
     },
     {
-      "time": 10.671,
+      "time": 4.918,
+      "rows": [
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  SchemaBot  /  connect and verify                                                      "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  \u2713 Setting up your database connection...                                              "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  "
+          },
+          {
+            "style": [
+              "0969da",
+              false
+            ],
+            "text": "\u28df "
+          },
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": " Starting SchemaBot...                                                              "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  Your application\u2019s schema stays as it is.                                             "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  esc cancel                                                                            "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ]
+      ]
+    },
+    {
+      "time": 5.023,
+      "rows": [
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  SchemaBot  /  connect and verify                                                      "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  \u2713 Setting up your database connection...                                              "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  "
+          },
+          {
+            "style": [
+              "0969da",
+              false
+            ],
+            "text": "\u28ef "
+          },
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": " Starting SchemaBot...                                                              "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  Your application\u2019s schema stays as it is.                                             "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  esc cancel                                                                            "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ]
+      ]
+    },
+    {
+      "time": 5.122,
+      "rows": [
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  SchemaBot  /  connect and verify                                                      "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  \u2713 Setting up your database connection...                                              "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  "
+          },
+          {
+            "style": [
+              "0969da",
+              false
+            ],
+            "text": "\u28f7 "
+          },
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": " Starting SchemaBot...                                                              "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  Your application\u2019s schema stays as it is.                                             "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  esc cancel                                                                            "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ]
+      ]
+    },
+    {
+      "time": 5.136,
+      "rows": [
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  SchemaBot  /  connect and verify                                                      "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  \u2713 Setting up your database connection...                                              "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  \u2713 Starting SchemaBot...                                                               "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  \u2713 Reading your live schema...                                                         "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  "
+          },
+          {
+            "style": [
+              "0969da",
+              false
+            ],
+            "text": "\u28f7 "
+          },
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": " Checking that your schema files match...                                           "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  Your application\u2019s schema stays as it is.                                             "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "  esc cancel                                                                            "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ]
+      ]
+    },
+    {
+      "time": 5.142,
       "rows": [
         [
           {
@@ -7547,8 +4862,26 @@
       ]
     },
     {
-      "time": 10.672,
+      "time": 5.143,
       "rows": [
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
+        [
+          {
+            "style": [
+              "default",
+              false
+            ],
+            "text": "                                                                                        "
+          }
+        ],
         [
           {
             "style": [
@@ -7628,24 +4961,6 @@
               false
             ],
             "text": "    schemabot plan -s 'schema' -e 'development' --profile 'default'                     "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
-          }
-        ],
-        [
-          {
-            "style": [
-              "default",
-              false
-            ],
-            "text": "                                                                                        "
           }
         ],
         [
