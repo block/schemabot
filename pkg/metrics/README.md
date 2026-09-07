@@ -47,6 +47,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.remote_apply_key_echo_mismatch_total` | Counter | database, environment | Remote dispatches refused fail-closed because the data plane's accepted response echoed a different operation key than the dispatch derives — see [Remote Apply Attaches](#remote-apply-attaches) |
 | `schemabot.remote_apply_deployment_id_conflict_total` | Counter | database, environment, deployment | Remote dispatch results refused fail-closed because the deployment already correlates to a different remote apply id — see [Remote Apply Attaches](#remote-apply-attaches) |
 | `schemabot.lock_operations_total` | Counter | operation, database, environment, status | Lock acquire/release operations |
+| `schemabot.auth_decisions.total` | Counter | tier, decision, reason | Every `/api` request's admission decision at the auth middleware. See [API Auth Decisions](#api-auth-decisions) |
 | `schemabot.direct_write_authorization.total` | Counter | operation, database, environment, status, reason | Per-database direct-write (CLI/API) authorization decisions at the handler layer |
 | `schemabot.rate_limit_decisions.total` | Counter | endpoint, scope, environment, decision | API request-budget decisions on rate-limited endpoints. `scope` is which budget was consulted (`caller` or `target`) and `decision` is `allow` or `limit`, so the limited rate has a denominator and a client approaching its budget is visible before it is turned away. The caller identity and target database are deliberately absent (hundreds of each); a limited request logs both — see [Rate Limits](#rate-limits) |
 | `schemabot.operator.resumed_total` | Counter | database, environment, previous_state | Applies resumed by the operator |
@@ -375,6 +376,36 @@ Operation values:
 |---|---|
 | `acquire` | Try to acquire the database lock for a plan/apply workflow. |
 | `release` | Try to release the database lock, either by owner or administrative override. |
+
+### API Auth Decisions
+
+`schemabot.auth_decisions.total` records the auth middleware's decision for
+every `/api` request, before any handler runs. It is the top of the funnel:
+[Direct Write Authorization](#direct-write-authorization) below only sees the
+write-tier requests this counter has already admitted. Exempt paths (`/livez`,
+`/health`, `/tern-health/*`, `/webhook`) are not counted.
+
+`tier` is `read` or `write` (see [auth.md](../../docs/auth.md#the-two-tier-api-model)
+for how a route is classified), `decision` is `allow` or `deny`, and `reason`
+says why. Allows carry an empty reason on a normally authenticated request;
+the two named allow reasons are the ones an operator should watch:
+
+| Reason | Decision | Meaning |
+|---|---|---|
+| `auth_disabled` | allow | `auth.type` is `none`. A non-zero `tier=write` rate here is unauthenticated mutation. |
+| `loopback_source` | allow | A forward-auth request whose trust anchor was satisfied from a loopback address, so the identity headers were caller-supplied. The break-glass path. |
+| `unauthenticated` | deny | No usable credential (OIDC: missing or invalid token). |
+| `not_admin` | deny | Write-tier request whose groups grant no write access: under OIDC no admin team, under forward-auth neither `write_groups` nor any database's `operator_groups`. |
+| `untrusted_proxy` | deny | Forward-auth request that did not arrive through a trusted proxy. |
+| `no_identity` | deny | Trusted proxy, but the user header was empty. |
+| `not_authorized` | deny | Forward-auth read-tier request from a caller in none of `read_groups`, `write_groups`, or `operator_groups` while `read_groups` narrows reads. |
+| `no_service_identity` | deny | Gateway lane: a listed gateway forwarded no caller SPIFFE ID. |
+| `service_not_authorized` | deny | Gateway lane: the forwarded caller is not in `read_service_spiffe`. |
+| `service_caller_write` | deny | Gateway lane: a service caller attempted a write-tier request. |
+
+A rising `deny` rate under one reason is either a probe or a missing grant.
+Every deny is also logged with the subject and path, so a single denied
+request is triaged from the log line, not from the counter.
 
 ### Direct Write Authorization
 

@@ -1150,7 +1150,7 @@ merge base, or either tree.
 
 ## Review Gate
 
-SchemaBot can block `apply` and `apply-confirm` until the PR has a satisfying review. This prevents unapproved schema changes from being applied to any environment.
+When `review_policy.enabled` is true, SchemaBot blocks `apply` and `apply-confirm` until the PR has a qualifying approval. This is a server-instance setting: it applies to the environments served by that instance. Other instances can configure their review gate separately.
 
 ```yaml
 review_policy:
@@ -1202,6 +1202,8 @@ The base branch is used, not the PR's head branch, to prevent a PR from relaxing
 Approval is checked at the time of `schemabot apply` and `schemabot apply-confirm`. Once an apply is executing, there is no ongoing approval check. If a PR is force-pushed after approval, GitHub may dismiss approvals; `apply-confirm` re-checks the gate and blocks if the approval no longer satisfies the policy. Team membership and CODEOWNERS are evaluated fresh at each gate check.
 
 ## Authentication
+
+This section is the YAML reference. For setup instructions, working examples, and help with denied requests, start with the [authentication guide](auth.md).
 
 By default (`auth.type: none` or unset) the SchemaBot API is unauthenticated — every request is allowed, which suits local development and deployments where the network is the only boundary. Setting `auth.type` turns on per-request authentication and a two-tier authorization model:
 
