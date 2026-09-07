@@ -4634,25 +4634,29 @@ func TestPostgresStatementTimeoutConfig(t *testing.T) {
 		require.ErrorContains(t, err, `postgres.statement_timeout "soon" is not a valid duration`)
 	})
 
-	// A budget at or below the apply target lock wait fires before that lock's
-	// own timeout, so an instance waiting its turn reports a statement timeout
-	// instead of a lock conflict and the contention stops looking like
-	// contention. Startup is the last place that is still visible.
-	t.Run("a value at or below the apply target lock wait fails validation", func(t *testing.T) {
+	// A budget that does not clear the apply target lock wait fires before that
+	// lock's own timeout, so an instance waiting its turn reports a statement
+	// timeout instead of a lock conflict and the contention stops looking like
+	// contention. Startup is the last place that is still visible. The floor
+	// sits above the wait rather than at it, so a budget in the band just over
+	// the wait is refused too: it comes out the right way round only because of
+	// how the acquisition is currently written.
+	t.Run("a value below the floor fails validation", func(t *testing.T) {
 		t.Parallel()
-		for _, tooShort := range []string{"1s", "9999ms", "10s"} {
+		for _, tooShort := range []string{"1s", "9999ms", "10s", "10001ms", "14999ms"} {
 			cfg := postgresCfg(tooShort)
 			err := cfg.Validate()
 			require.ErrorContains(t, err, "postgres.statement_timeout")
-			require.ErrorContains(t, err, "must exceed the 10s apply target lock wait")
+			require.ErrorContains(t, err, "must be at least 15s")
+			require.ErrorContains(t, err, "10s apply target lock wait")
 		}
 	})
 
-	t.Run("just above the apply target lock wait validates", func(t *testing.T) {
+	t.Run("a value at the floor validates", func(t *testing.T) {
 		t.Parallel()
-		cfg := postgresCfg("10001ms")
+		cfg := postgresCfg("15s")
 		require.NoError(t, cfg.Validate())
-		assert.Equal(t, 10001*time.Millisecond, cfg.Postgres.StatementTimeoutOrDefault())
+		assert.Equal(t, 15*time.Second, cfg.Postgres.StatementTimeoutOrDefault())
 	})
 
 	// Disabling the budget outright is not "a very short budget" — nothing can
@@ -4667,7 +4671,8 @@ func TestPostgresStatementTimeoutConfig(t *testing.T) {
 	// shipped configuration would be one the server rejects.
 	t.Run("the default clears the lock wait floor", func(t *testing.T) {
 		t.Parallel()
-		assert.Greater(t, DefaultPostgresStatementTimeout, storage.ApplyTargetLockWait)
+		assert.GreaterOrEqual(t, DefaultPostgresStatementTimeout, MinPostgresStatementTimeout)
+		assert.Greater(t, MinPostgresStatementTimeout, storage.ApplyTargetLockWait)
 	})
 
 	// statement_timeout is a millisecond integer GUC, so a budget past the
