@@ -164,16 +164,7 @@ When a change interacts with an invariant, one of these is true, and the PR shou
 
 **Reviewing:** check the diff against the invariants its blast radius touches, not only against the ticket. An invariant broken silently is the most expensive class of defect here, since the registry is what future reviewers will trust. If a PR summary claims an invariant holds, verify the claim in the code rather than accepting it.
 
-**An entry is a principle, not a case log.** This is the most common way the registry is damaged, and it never looks like damage while it is being written: a change handles a case the rule did not obviously mention, so the author appends a paragraph about that case. Do that a few times and the entry stops being a rule a reader can apply to code it does not mention, and becomes a history of the situations that happened to come up. Before adding any text to an existing entry, ask whether the rule as written already covers your case. It usually does, which means the disposition is *upholds* and the only thing that may need to change is the `*Enforced:*` line.
-
-Keep out of entry text:
-
-- **An instance of the rule.** "A request resolves to applied, superseded, or failed" already decides what a refusal resolves to. Restating it for one path adds words and no rule.
-- **Rationale and mechanism.** Why the code must do this, what breaks in which order, how the RPC layer collapses errors, what the next claim would re-send. An entry states the invariant; `*Breaks if violated:*` gets one line for the consequence, and the reasoning belongs in the PR summary or a design doc.
-- **Carve-outs for edge cases.** An entry that needs "not every X is a Y" is describing implementation, and the exception rots faster than the rule. If a case genuinely falls outside the rule, the rule is stated at the wrong altitude: fix the rule, do not annex an exception to it.
-- **Engineering conventions.** How to express a decline in the type system, error versus typed value, naming, log shape. Those are rules about writing code and belong in this file.
-
-Length is the cheapest signal that something has gone wrong. Entries are a few sentences; the existing ones show the altitude. If an addition runs to a paragraph, it is almost certainly a case, a rationale, or an exception rather than a principle.
+**An entry is a principle, not a case log.** Before adding text to an entry, ask whether the rule as written already covers your case. It usually does, which means the disposition is *upholds* and at most the `*Enforced:*` line changes. Keep instances of the rule, rationale, carve-outs, and coding conventions out of entry text: reasoning belongs in the PR summary, and rules about writing code belong in this file. Entries are a few sentences, so an addition that runs to a paragraph is a case rather than a principle.
 
 Do not add aspirational entries. If the behavior is not enforced in shipped code, it belongs in a design doc or a TODO, not in the registry. Process-level engineering rules (how we write and review code) belong in this file, not there.
 
