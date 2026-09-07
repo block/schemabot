@@ -307,6 +307,8 @@ You can now [check your access](#verify-a-request).
 
 ## Use your existing proxy
 
+Block uses this authentication method for its production SchemaBot deployment.
+
 A proxy sits between your callers and SchemaBot. If it already checks who's
 signed in, it can pass their username and groups to SchemaBot in HTTP headers.
 Set `auth.type: forward_auth` to use that information. This setting does not
