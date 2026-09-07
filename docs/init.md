@@ -18,18 +18,23 @@ in your schema files. Keep those variables available for later CLI invocations.
 Setup initializes SchemaBot's metadata tables in the state database. Baseline planning also
 needs the engine's scratch privileges. Setup never applies application schema changes.
 
+Private databases do not need a public endpoint. Run SchemaBot somewhere that can reach
+them: on your VPN, through an existing tunnel, or on a machine inside the private network.
+If a connection check fails, keep the wizard open, restore access, and retry.
+
 ## Follow the wizard
 
 The wizard confirms both connections before discovering namespaces, even when their variables
 are already set. Each connection step shows the host and database without credentials; edit
-the variable reference to use a different connection. It keeps `development`, `schema`, and your default profile as editable defaults,
+the variable reference to use a different connection. Press Enter to test access, then continue
+after “Connected” appears. The check runs a read-only query and creates no metadata. It keeps `development`, `schema`, and your default profile as editable defaults,
 and includes everything in the final review.
 
 Before setting up a runtime, SchemaBot reads the target catalog to discover namespaces. One
 result is selected automatically; multiple results appear in a searchable list. Use Space to
 select namespaces and Enter to continue. MySQL stays within the database named in the DSN;
 PostgreSQL lists accessible application schemas. No results or a failed connection stops here
-with a chance to retry or edit the connection. Discovery never opens the state database.
+with a chance to retry or edit the connection. Discovery uses only the application connection. State metadata is initialized only after the final review.
 
 Use Shift+Tab from the review to edit any decision, or Escape to cancel. Explicit
 `--namespace` flags keep their supplied scope and bypass discovery.
