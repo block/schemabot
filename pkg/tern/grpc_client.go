@@ -843,12 +843,16 @@ func (c *GRPCClient) failRefusedControlRequest(ctx context.Context, logger *slog
 }
 
 // processPendingStopControlRequest consumes a durable stop request against this
-// apply. It returns two independent facts about one request, and only the second
-// is its return value: the request is resolved in storage either way, while
-// tookEffect reports whether the apply is now stopped. The drive stands down on
-// tookEffect and settles the apply stopped, so a branch that resolves a request
-// without stopping anything — a refusal, an engine decline — reports false and
-// leaves the drive exactly as it found it.
+// apply. Its return says one thing: whether the stop took effect, so the drive
+// stands down and lets the apply settle stopped. It does not report whether the
+// request was dealt with, and the two come apart in both directions. A refusal
+// resolves the request without stopping anything and reports false, leaving the
+// drive exactly as it found it. Two shapes go the other way and report true
+// while deliberately leaving the request pending: an accepted stop whose apply
+// row has not settled, and an operation-only drive that finds its parent apply
+// already terminal, since it owns no apply-level request and leaves that one to
+// the operator projection. So a new branch owes the drive an answer about the
+// change, not about its own bookkeeping.
 func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (tookEffect bool, err error) {
 	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop)
 	if err != nil {
@@ -1007,8 +1011,8 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 
 // processPendingCancelControlRequest consumes a durable cancel request against
 // this apply. Its return follows the same contract as the stop counterpart:
-// tookEffect reports whether the apply is now cancelled, not whether the request
-// was resolved.
+// tookEffect reports whether the cancel took effect, which is independent of
+// whether the request was resolved.
 func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (tookEffect bool, err error) {
 	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationCancel)
 	if err != nil {

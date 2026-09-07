@@ -1123,12 +1123,14 @@ func (c *LocalClient) failRefusedControlRequest(ctx context.Context, logger *slo
 }
 
 // processPendingStopControlRequest consumes a durable stop request against this
-// apply. It returns two independent facts about one request, and only the second
-// is its return value: the request is resolved in storage either way, while
-// tookEffect reports whether the apply is now stopped. The drive stands down on
-// tookEffect and settles the apply stopped, so a branch that resolves a request
-// without stopping anything, a refusal or an engine decline, reports false and
-// leaves the drive exactly as it found it.
+// apply. Its return says one thing: whether the stop took effect, so the drive
+// stands down and lets the apply settle stopped. It does not report whether the
+// request was dealt with, and the two come apart in both directions. A refusal
+// or an engine decline resolves the request without stopping anything and
+// reports false, leaving the drive exactly as it found it. An accepted stop
+// whose apply row has not settled leaves the request pending on purpose and
+// reports true. So a new branch owes the drive an answer about the change, not
+// about its own bookkeeping.
 func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply) (tookEffect bool, err error) {
 	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop)
 	if err != nil {
@@ -1177,7 +1179,9 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending stop request rejected: %s%s", message, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop, message); err != nil {
-			return true, err
+			// Whether or not the request resolved, the refusal already decided
+			// that nothing was stopped, so the drive is owed the same answer.
+			return false, err
 		}
 		// The request is resolved, but no stop took effect: the change is applied
 		// and its revert phase is still running against the database. Reporting it
@@ -1231,8 +1235,8 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 
 // processPendingCancelControlRequest consumes a durable cancel request against
 // this apply. Its return follows the same contract as the stop counterpart:
-// tookEffect reports whether the apply is now cancelled, not whether the request
-// was resolved.
+// tookEffect reports whether the cancel took effect, which is independent of
+// whether the request was resolved.
 func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, apply *storage.Apply) (tookEffect bool, err error) {
 	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationCancel)
 	if err != nil {
@@ -1263,7 +1267,9 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending cancel request rejected: %s%s", message, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel, message); err != nil {
-			return true, err
+			// See the stop counterpart: the refusal already decided nothing was
+			// cancelled, so a failed write does not change the drive's answer.
+			return false, err
 		}
 		// See the stop counterpart: the request is resolved and nothing was
 		// cancelled, so the drive must not stand down over it.

@@ -235,7 +235,7 @@ func newVitessControlTestClient(apply *storage.Apply, tasks []*storage.Task, res
 	return newVitessControlTestClientWithRequests(apply, tasks, resumeState, eng, &testControlRequestStore{})
 }
 
-func newVitessControlTestClientWithRequests(apply *storage.Apply, tasks []*storage.Task, resumeState *storage.EngineResumeState, eng engine.Engine, controlRequests *testControlRequestStore) *LocalClient {
+func newVitessControlTestClientWithRequests(apply *storage.Apply, tasks []*storage.Task, resumeState *storage.EngineResumeState, eng engine.Engine, controlRequests storage.ControlRequestStore) *LocalClient {
 	return &LocalClient{
 		config: LocalConfig{
 			Database: "testdb",
@@ -1859,6 +1859,36 @@ func TestLocalClient_PendingStopRefusedInRevertWindowLeavesTheDriveRunning(t *te
 	assert.Equal(t, storage.ControlRequestFailed, resolved.Status, "a revert-phase refusal is a permanent rejection")
 	assert.Contains(t, resolved.ErrorMessage, "use revert to undo it or skip-revert to finalize it",
 		"the failed request must tell the operator which command does what they wanted")
+}
+
+// failPendingErrorStore makes the durable write that resolves a request fail, so
+// a test can reach an error path the drive's own callers never expose.
+type failPendingErrorStore struct {
+	*testControlRequestStore
+	err error
+}
+
+func (s *failPendingErrorStore) FailPending(context.Context, int64, storage.ControlOperation, string) error {
+	return s.err
+}
+
+// The refusal decides that nothing was stopped before the drive tries to record
+// it, so a storage failure recording it changes what the operator can read, not
+// what happened to their schema change. The drive is owed the same answer either
+// way, and the request stays pending for a later claim to resolve.
+func TestLocalClient_PendingStopRefusalReportsNoEffectWhenResolvingTheRequestFails(t *testing.T) {
+	_, apply, task, requests := revertWindowRefusalFixture(storage.ControlOperationStop)
+	store := &failPendingErrorStore{testControlRequestStore: requests, err: errors.New("apply lease lost")}
+	client := newVitessControlTestClientWithRequests(apply, []*storage.Task{task}, nil, &controlCaptureEngine{}, store)
+
+	tookEffect, err := client.processPendingStopControlRequest(t.Context(), apply)
+
+	require.ErrorContains(t, err, "apply lease lost", "the storage failure must reach the caller")
+	assert.False(t, tookEffect, "the refusal already decided nothing was stopped, so a failed write must not report a stop")
+	assert.Equal(t, state.Apply.Running, apply.State, "the apply must be left for its revert phase to settle")
+	pending, err := requests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.NotNil(t, pending, "the request could not be resolved, so it stays pending for a later claim")
 }
 
 // revertPhaseDeclineFixture stages an apply in its revert window with one
