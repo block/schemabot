@@ -49,11 +49,14 @@ func completePendingControlRequests(ctx context.Context, store storage.Storage, 
 // settlePendingRequestsForTerminalApply settles the pending control requests
 // that a terminal apply moots: a pending stop is settled (the apply can no
 // longer be stopped), and a pending revert or skip-revert can no longer act
-// because the revert window is gone. A pending cancel is mooted by every terminal
-// state except stopped — a stopped apply remains cancellable, so its pending
-// cancel stays deliverable for the next drive. Sweeping the mooted requests
-// keeps a request issued moments before the apply settled — or one that lost
-// to a contradictory command — from lingering pending forever.
+// because the revert window is gone. Sweeping the mooted requests keeps a
+// request issued moments before the apply settled — or one that lost to a
+// contradictory command — from lingering pending forever.
+//
+// A pending cancel is mooted by every terminal state except stopped, since a
+// stopped apply remains cancellable and its pending cancel stays deliverable
+// for the next drive. The cancel is settled rather than completed outright: the
+// terminal state decides whether the operator's command took effect.
 func settlePendingRequestsForTerminalApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) error {
 	ops := []storage.ControlOperation{
 		storage.ControlOperationStop,
@@ -295,12 +298,6 @@ func ensureApplyLeaseForControlRequest(ctx context.Context, store storage.Storag
 	return nil
 }
 
-// completePendingRequestIfStoredApplyResolved reloads the apply and, when its
-// stored state is terminal, completes the operation's pending control requests
-// and refreshes the caller's copy of the apply. It returns false without error
-// when the stored apply has not resolved yet — the caller decides whether that
-// means the request stays pending (a settle deferred to the apply-state
-// projection) or the consumption failed.
 // settlePendingCancelIfStoredApplyResolved is the cancel counterpart of
 // completePendingRequestIfStoredApplyResolved: it reloads the apply and, once
 // the stored row is terminal, settles the pending cancel against the state the
@@ -328,6 +325,12 @@ func settlePendingCancelIfStoredApplyResolved(ctx context.Context, store storage
 	return true, nil
 }
 
+// completePendingRequestIfStoredApplyResolved reloads the apply and, when its
+// stored state is terminal, completes the operation's pending control requests
+// and refreshes the caller's copy of the apply. It returns false without error
+// when the stored apply has not resolved yet — the caller decides whether that
+// means the request stays pending (a settle deferred to the apply-state
+// projection) or the consumption failed.
 func completePendingRequestIfStoredApplyResolved(ctx context.Context, store storage.Storage, apply *storage.Apply, operation storage.ControlOperation) (bool, error) {
 	if store == nil {
 		return false, fmt.Errorf("storage is not available")
