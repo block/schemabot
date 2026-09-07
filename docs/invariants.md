@@ -758,7 +758,8 @@ once. Giving up on a timer is also the one place a driver acts without proof, so
 the fallback; a driver that can still reach storage learns it was displaced by reading the token
 instead (OW-4). *Enforced:* one staleness constant (`ApplyLeaseStaleAfter` in
 `pkg/storage/storage.go`) read by both the heartbeat loop (`pkg/api/operator.go`) and every claim
-query (`pkg/storage/internal/sqlstore/applies.go`).
+query, at the apply level (`pkg/storage/internal/sqlstore/applies.go`) and the operation level
+(`pkg/storage/internal/sqlstore/apply_operations.go`).
 
 ### OW-4: Lease loss is proven, never inferred
 
@@ -1247,7 +1248,7 @@ waive with.
 
 ### RV-3: Consent is explicit, specific, and re-checked
 
-Unsafe changes (error-severity lint findings such as drops and column narrowing) block without
+Unsafe changes (error-severity lint findings such as table and column drops) block without
 `--allow-unsafe`. Changes an operator cannot undo mid-flight, such as direct execution's
 write-blocking DDL with no cutover and no revert, require the operator to confirm the specific
 consequences disclosed to them. The re-plan that runs just before execution re-checks that

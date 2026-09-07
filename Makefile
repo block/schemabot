@@ -170,7 +170,7 @@ docs-toc: ## Refresh the Table of Contents in docs files that have TOC markers
 check-docs-toc: ## Fail if a Table of Contents behind TOC markers is stale
 	@python3 scripts/gen-doc-toc.py --check
 
-docs-assets: ## Re-render the PR mock-ups and animations the docs embed (needs gh, Chrome, ImageMagick, Node.js/Playwright)
+docs-assets: templates ## Re-render the PR mock-ups and animations the docs embed (needs gh, Chrome, ImageMagick, Node.js/Playwright)
 	@python3 scripts/render-pr-mockups.py
 	@python3 scripts/prepare-pr-demo.py
 	@bash scripts/render-pr-demo.sh

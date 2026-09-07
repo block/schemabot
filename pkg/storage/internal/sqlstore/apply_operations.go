@@ -1077,11 +1077,34 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	//         and recent — a fresh bounded retry; and
 	//       * parent already claimed into an active state but its lease has gone
 	//         stale — crash recovery, with no budget gate (the attempt was already
-	//         admitted and counted when the parent was claimed).
+	//         admitted and counted when the parent was claimed), and gated on this
+	//         operation row's OWN heartbeat as well as the parent's.
 	//     Claiming a failed_retryable parent transitions it to running and refreshes
 	//     applies.updated_at (see persistApplyClaim), so once a driver owns the
 	//     retry neither sub-condition matches and peers back off instead of
 	//     churning on a row another driver is actively driving.
+	//
+	//     The parent's heartbeat alone cannot carry the crash-recovery
+	//     sub-condition, which is why it also gates on this row's updated_at.
+	//     The operation claim and the parent claim are separate transactions —
+	//     a driver leases the row here, then acquires the parent lease in
+	//     ApplyStore.ClaimApplyByID several round trips later — so the parent
+	//     stays stale for the whole gap, and every peer polling inside it would
+	//     otherwise lease the same row and rotate its token. The driver that
+	//     went on to win the parent lease would then hold a superseded
+	//     operation token, and its first operation-scoped write would be
+	//     refused with ErrApplyLeaseLost, ending the drive before it did
+	//     anything. Because the peer that loses the parent claim releases its
+	//     operation lease (backdating updated_at past the window, see
+	//     ReleaseClaim), the row starts every staleness window released and
+	//     stale, so that race would re-run identically each window and the
+	//     apply could never terminalize. Gating on this row's own heartbeat —
+	//     which this claim refreshes in the same transaction, exactly as the
+	//     stale-active clause does — admits one driver per window. The
+	//     deliberate-redispatch sub-condition needs no such gate: it is
+	//     resolved by the parent claim's guarded failed_retryable -> running
+	//     transition, and a heartbeat gate there would stall every retry for a
+	//     full staleness window.
 	//
 	// There is intentionally no "pending + pending start request" clause to
 	// match ApplyStore.ClaimApplyByID's pending-start clause. That apply-level
@@ -1248,6 +1271,11 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 							OR (
 								a.state IN (%s)
 								AND a.updated_at < %s
+								-- Names no column of a, but belongs to this arm
+								-- alone: hoisted out of the EXISTS it would gate
+								-- deliberate redispatch too and stall every retry
+								-- for a staleness window.
+								AND apply_operations.updated_at < %s
 							)
 						)
 				)
@@ -1256,7 +1284,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyOperationColumns, terminalStatePlaceholders, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, retryFreshnessCutoff, activeStatePlaceholders, staleClaimCutoff), queryArgs...)
+	`, applyOperationColumns, terminalStatePlaceholders, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, retryFreshnessCutoff, activeStatePlaceholders, staleClaimCutoff, staleClaimCutoff), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {

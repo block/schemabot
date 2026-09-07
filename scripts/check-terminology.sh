@@ -35,9 +35,8 @@ hits=$(tolerate_no_match git grep -n -I -i 'schema-change' -- . \
         ':!TEMPLATES.md' \
         ':!scripts/check-terminology.sh' \
         ':!scripts/generate-schema-change.sh' \
-    | perl -pe 's{https?://\S+}{}g; s{\(#[^)]*\)}{}g' \
-    | tolerate_no_match grep -i -E '(^|[^A-Za-z])schema-change' \
-    | tolerate_no_match grep -v -i -E "$ALLOWLIST")
+    | ALLOWLIST="$ALLOWLIST" perl -pe 's{https?://\S+}{}g; s{\(#[^)]*\)}{}g; s{(?<![A-Za-z0-9_-])(?:$ENV{ALLOWLIST})(?![A-Za-z0-9_-])}{}gi' \
+    | tolerate_no_match grep -i -E '(^|[^A-Za-z])schema-change')
 
 if [ -n "$hits" ]; then
     echo "$hits"

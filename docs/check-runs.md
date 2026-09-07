@@ -243,8 +243,9 @@ configured environment, and publishes the normal aggregate check for the
 discovered database.
 
 On the happy path, where the live database already matches the declarative
-schema files, the aggregate check completes successfully with a clear no-op
-summary:
+schema files (for PostgreSQL, that also means no live table is left
+undeclared — see [Blocked plans](postgresql.md#blocked-plans)), the
+aggregate check completes successfully with a clear no-op summary:
 
 ```text
 SchemaBot (staging) — Schema up to date

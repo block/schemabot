@@ -132,7 +132,7 @@ swap across tables. The application must tolerate the intermediate states.
 Post the apply commands below as **comments on the open PR**. They refer to
 that PR's schema files. Terminal commands later in this guide are separate.
 
-Screenshots show the actual comment templates with illustrative values; they
+Screenshots are snapshots of the comment templates with illustrative values; they
 are examples of each stage, not a transcript of one apply.
 
 1. **Edit the table's `.sql` file and open a PR.**
@@ -269,8 +269,6 @@ on PRs without schema edits too. Try these ways to refresh it:
    head.
 2. **Comment `schemabot plan`.** That asks SchemaBot to re-plan the current
    head directly, refreshing the check without changing the branch.
-3. **Close and reopen the PR.** Reopening triggers a PR event the same way a
-   push does.
 
 If the check is still missing, ask an operator to check event processing and
 branch-protection configuration. Operators can also sweep open PRs for missing
@@ -301,7 +299,7 @@ new schema. Removing a column, table, or index needs a different sequence:
   it. That is the additive order in reverse, across two PRs. First the code
   stops reading and writing the column and the generated model no longer
   includes it. Then, once nothing running references it, a schema PR drops it.
-  `DROP TABLE`, `DROP COLUMN`, and type narrowing block apply until the
+  `DROP TABLE` and `DROP COLUMN` block apply until the
   operator passes `--allow-unsafe`, and the acknowledgment is recorded on the
   PR.
 
@@ -381,7 +379,7 @@ These gates apply according to your installation’s configuration:
 
 | Gate | What it does | Where |
 |---|---|---|
-| Lint and unsafe changes | Plan-time linting with a real parser. Error-severity findings (`DROP TABLE`, `DROP COLUMN`, type narrowing, dropping a visible index) block apply until `--allow-unsafe`; changes the engine cannot run at all block with no override | [lint-and-safety-levels.md](lint-and-safety-levels.md) |
+| Lint and unsafe changes | Plan-time linting with a real parser. Error-severity findings (`DROP TABLE`, `DROP COLUMN`, dropping a visible index) block apply until `--allow-unsafe`; changes the engine cannot run at all block with no override | [lint-and-safety-levels.md](lint-and-safety-levels.md) |
 | Schema freshness | `apply` is refused when the PR head moved since the plan, when the confirmed plan no longer matches the head, or when the base branch's schema directory changed after the PR diverged | [configuration.md](configuration.md#base-branch-schema-freshness) |
 | Database lock | One PR (or CLI operator) holds a database at a time, from `apply` until merge, close, or `unlock`; a competing apply is refused with the holder named | [check-runs.md](check-runs.md#unlock) |
 | Promotion order | Production applies only after the prior environment's check is success | [check-runs.md](check-runs.md#environment-ordering) |

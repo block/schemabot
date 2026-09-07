@@ -323,6 +323,8 @@ github:
 
 When `repo-webhook-secret` is set, deliveries whose `X-GitHub-Hook-Installation-Target-Type` header is `repository` are HMAC-verified against this secret. Such deliveries carry no installation id in their payload, so SchemaBot resolves the App's installation for the repo via the App JWT and caches it. Leave `repo-webhook-secret` unset to disable this path; App-installed deliveries are unaffected either way.
 
+Follow the [pre-merge workflow](pre-merge-workflow.md) to take your first schema change through review, apply, and merge.
+
 ## Troubleshooting
 
 **Webhook not receiving events**: Check that the webhook URL is reachable from GitHub. Use the **Recent Deliveries** tab on your GitHub App's settings page to see delivery attempts and response codes.

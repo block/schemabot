@@ -2,8 +2,9 @@
 """Render PR timeline mock-ups for the docs from the real comment templates.
 
 Every comment body comes verbatim from TEMPLATES.md, the snapshot the binary
-regenerates and CI checks for drift, so a mock-up shows exactly what SchemaBot
-posts. GitHub's own markdown API renders each body to HTML (the same renderer a
+regenerates and CI checks for drift. The images are manually regenerated
+snapshots: run `make docs-assets` after changing the templates they show.
+GitHub's own markdown API renders each body to HTML (the same renderer a
 PR uses, syntax highlighting included), a thin GitHub-styled timeline frame is
 wrapped around the comments, and headless Chrome screenshots the result.
 

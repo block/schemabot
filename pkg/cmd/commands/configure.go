@@ -3,6 +3,7 @@ package commands
 import (
 	"bufio"
 	"fmt"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -50,9 +51,10 @@ func (cmd *ConfigureSetupCmd) Run(g *Globals) error {
 		endpoint = defaultEndpoint
 	}
 
-	// Update profile
-	cfg.Profiles[profileName] = client.Profile{
-		Endpoint: endpoint,
+	profile, loginCleared := reconfiguredProfile(existingProfile, endpoint)
+	cfg.Profiles[profileName] = profile
+	if loginCleared {
+		fmt.Printf("\nEndpoint changed; the cached login for %s was cleared. Run `%s login` to sign in to the new endpoint.\n", existingProfile.Endpoint, cliname.Name())
 	}
 
 	// If this is the first profile or named "default", set as default
@@ -79,6 +81,63 @@ func (cmd *ConfigureSetupCmd) Run(g *Globals) error {
 	}
 
 	return nil
+}
+
+// reconfiguredProfile returns the profile to save once the operator has chosen
+// an endpoint, and reports whether a cached login was dropped. Everything
+// `login` wrote survives an unchanged endpoint. A changed endpoint drops the
+// cached token, its refresh token, and its expiry: a token is bound to the
+// server that issued it and must never be sent to a different one. The oidc
+// settings are kept either way, since `login` can still use or override them.
+func reconfiguredProfile(existing client.Profile, endpoint string) (profile client.Profile, loginCleared bool) {
+	profile = existing
+	profile.Endpoint = endpoint
+	hasLogin := existing.Token != "" || existing.RefreshToken != ""
+	if hasLogin && !sameEndpoint(existing.Endpoint, endpoint) {
+		profile.Token = ""
+		profile.RefreshToken = ""
+		profile.TokenExpiry = 0
+		loginCleared = true
+	}
+	return profile, loginCleared
+}
+
+// sameEndpoint reports whether two configured endpoints address the same
+// server. It exists because the operator retypes the endpoint at the prompt,
+// so the same server routinely arrives spelled differently — with or without a
+// trailing slash, with the host in a different case — and an exact string
+// compare would read those as a move and sign the operator out of a server
+// they never left.
+//
+// It only collapses differences the URL grammar says are not part of the
+// address: the scheme and host are case-insensitive, and a trailing slash is
+// not a path segment. Everything else, including the port, still counts as a
+// different server. An endpoint that will not parse falls back to exact
+// equality, which errs toward clearing a login rather than carrying a token to
+// a server that did not issue it.
+func sameEndpoint(a, b string) bool {
+	if a == b {
+		return true
+	}
+	normalizedA, okA := normalizeEndpoint(a)
+	normalizedB, okB := normalizeEndpoint(b)
+	if !okA || !okB {
+		return false
+	}
+	return normalizedA == normalizedB
+}
+
+// normalizeEndpoint rewrites an endpoint into the form sameEndpoint compares,
+// reporting false when it cannot be parsed as a URL.
+func normalizeEndpoint(raw string) (string, bool) {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", false
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Host = strings.ToLower(parsed.Host)
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	return parsed.String(), true
 }
 
 // ConfigureShowCmd displays the current configuration.
