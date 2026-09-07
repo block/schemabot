@@ -332,8 +332,9 @@ func ensureGreenfieldCreateTier(table string, tier preflight.Tier) error {
 // refusal blocks the steps at its tier; a table-scoped refusal blocks every
 // executable step; any other failure fails the plan — an executable plan
 // must never be produced while the check's answer is unknown. Reasons come
-// from classifyRefusal, so the same failure reads identically at plan and
-// apply time. The returned slice is the input with verdicts marked.
+// from classifyRefusal, so the same failure carries the same detail at plan
+// and apply time; here it is prefixed with the statement it blocks. The
+// returned slice is the input with verdicts marked.
 func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgplan.Report, changes []engine.TableChange, tiers []preflight.Tier) ([]engine.TableChange, error) {
 	if len(changes) != len(tiers) {
 		return nil, fmt.Errorf("verify privileges for table %q: %d planned changes carry %d privilege tiers", report.Table, len(changes), len(tiers))
