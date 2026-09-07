@@ -14,10 +14,10 @@ const {chromium}=require('playwright');
   const page=await browser.newPage({viewport:{width:1100,height:820},deviceScaleFactor:1});
   await page.goto(pathToFileURL(path.join(root,'assets/src/pr-workflow-demo.html')).href);
   await page.evaluate(()=>Promise.all([...document.images].map(i=>i.decode())));
-  const frames=[],fps=20,introSeconds=4,duration=17+introSeconds;
+  const frames=[],fps=20,introSeconds=4,duration=18.5+introSeconds;
   let lastCamera;
   // Keep reading pauses, but compress copying to three seconds.
-  const timing=[[0,0],[2,3],[4,7],[5,10],[8,20],[9,21.5],[10,23],[12,25],[14,29],[17,32]];
+  const timing=[[0,0],[2,3],[4,7],[5,9],[6.5,10],[9.5,20],[10.5,21.5],[11.5,23],[13.5,25],[15.5,29],[18.5,32]];
   function sceneTime(seconds){
    if(seconds<introSeconds)return -1;
    seconds-=introSeconds;
@@ -29,7 +29,7 @@ const {chromium}=require('playwright');
   }
   for(let i=0;i<=duration*fps;i++){
    // Hold the settled merge view without repainting identical DOM each frame.
-   if(i>(15+introSeconds)*fps){frames.push(frames[frames.length-1]);continue;}
+   if(i>(16.5+introSeconds)*fps){frames.push(frames[frames.length-1]);continue;}
    await page.evaluate(({t,dt})=>window.renderFrame(t,dt),{t:sceneTime(i/fps),dt:1/fps});
    const camera=await page.evaluate(()=>previousScroll);
    const t=sceneTime(i/fps);
@@ -44,7 +44,7 @@ const {chromium}=require('playwright');
     const checks=await page.locator('#checks').innerText();
     if(!checks.includes('1 apply pending')||!checks.includes('Merging is blocked'))throw new Error('Initial schema check must block merge');
    }
-   if(i===(8+introSeconds)*fps){
+   if(i===(9.5+introSeconds)*fps){
     const text=await page.locator('#progress-body').innerText();
     if(!text.includes('100.00%')||text.includes('DEMOVALUE'))throw new Error('Progress frame must show 100% with no placeholder text');
    }
@@ -74,6 +74,6 @@ const {chromium}=require('playwright');
    held+=Number(delay);
   }
   if(held<200)throw new Error('Final GIF reading pause must last two seconds');
-  console.log('Rendered 421 frames: approximately 21 seconds, including the file diff, 100% progress and merge');
+  console.log('Rendered 451 frames: approximately 22.5 seconds, including the file diff, 100% progress and merge');
  } finally {if(browser)await browser.close();fs.rmSync(tmp,{recursive:true,force:true})}
 })().catch(e=>{console.error(e);process.exitCode=1});

@@ -19,7 +19,7 @@ pre,code{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liber
 <div class="footer">Illustrative workflow using rendered comment templates · elapsed time compressed</div>
 <script src="pr-workflow-comments.js"></script><script>
 const command='schemabot apply -e staging',clamp=x=>Math.max(0,Math.min(1,x)),ease=x=>{x=clamp(x);return x*x*(3-2*x)};
-function card(id,body,bot=true){return `<div class="c" id="${id}">${bot?'<img class="av" src="../schemabot-avatar-200.png">':'<span class="av h"><svg width="23" height="23" viewBox="0 0 24 24" fill="#8c959f"><circle cx="12" cy="8" r="4"/><path d="M4 23v-4a8 8 0 0116 0v4z"/></svg></span>'}<div class="hd"><b>${bot?'schemabot':'octocat'}</b> commented <span>now</span><span class="lbl ${bot?'bot':''}">${bot?'bot':'Author'}</span><span class="more">···</span></div><div class="bd" id="${id}-body">${body}</div></div>`}
+function card(id,body,bot=true){return `<div class="c" id="${id}">${bot?'<img class="av" src="../schemabot-avatar-200.png">':'<img class="av h" src="../octocat-avatar-200.png">'}<div class="hd"><b>${bot?'schemabot':'octocat'}</b> commented <span>now</span><span class="lbl ${bot?'bot':''}">${bot?'bot':'Author'}</span><span class="more">···</span></div><div class="bd" id="${id}-body">${body}</div></div>`}
 document.getElementById('timeline').innerHTML=card('plan',COMMENTS.plan)+card('command','',false)+card('apply',COMMENTS.apply)+card('progress',COMMENTS.running)+card('summary',COMMENTS.summary);
 // Move the captured conversation explicitly so collapsing the comment editor
 // cannot make the browser clamp scrollTop and jump back up the thread.
@@ -46,17 +46,7 @@ window.renderFrame=function(t,frameSeconds=1/12){
  let p=Math.round(clamp((t-10)/10)*100); // Whole polling updates, followed by a visible 100% frame.
  p=t>=20?100:Math.floor(p/4)*4;
  const bars='🟦'.repeat(Math.round(p/5))+'⬜'.repeat(20-Math.round(p/5));
- const progressBody=document.getElementById('progress-body');
- if(t<21.5){progressBody.style.height='';delete progressBody.dataset.completeHeight;}
  setHTML(document.getElementById('progress-body'),t>=21.5?COMMENTS.complete:COMMENTS.running.replace('DEMOVALUEBARTOKEN',bars).replace('DEMOVALUEPERCENTTOKEN',p.toFixed(2)).replace('DEMOVALUEROWSTOKEN',Math.round(7200000*p/100).toLocaleString('en-US')).replace('DEMOVALUEETATOKEN',p===100?'0s':`${Math.floor((100-p)*3.3/60)}m ${Math.round((100-p)*3.3%60)}s`));
- // Keep the status card anchored as its completed template becomes shorter.
- if(t>=10&&t<21.5)progressBody.dataset.runningHeight=progressBody.offsetHeight;
- if(t>=21.5){
-  if(!progressBody.dataset.completeHeight){progressBody.style.height='';progressBody.dataset.completeHeight=progressBody.offsetHeight;}
-  const from=Number(progressBody.dataset.runningHeight||progressBody.dataset.completeHeight),to=Number(progressBody.dataset.completeHeight);
-  progressBody.style.height=`${from+(to-from)*ease((t-21.5)/1.2)}px`;
-  progressBody.style.overflow='hidden';
- }
  const checks=document.getElementById('checks');checks.classList.remove('hidden');
  const applied=t>=21.5,active=t>=8&&!applied;
  const checkColor=applied?'#1a7f37':active?'#9a6700':'#cf222e';

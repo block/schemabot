@@ -186,7 +186,7 @@ def render_markdown(body, cache):
 
 
 def comment(who, body_html, bot, when, reactions=()):
-    avatar = '<img class="av" src="bot.png">' if bot else '<span class="av h"></span>'
+    avatar = '<img class="av" src="bot.png">' if bot else '<img class="av h" src="octocat.png">'
     label = '<span class="lbl bot">bot</span>' if bot else '<span class="lbl">Author</span>'
     rx = ""
     if reactions:
@@ -285,6 +285,7 @@ def main():
     cache = {}
     with tempfile.TemporaryDirectory() as work:
         shutil.copy(BOT_AVATAR, os.path.join(work, "bot.png"))
+        shutil.copy(os.path.join(REPO_ROOT, "assets", "octocat-avatar-200.png"), os.path.join(work, "octocat.png"))
         for name, frames in scenarios.items():
             for n, frame in enumerate(frames, 1):
                 stem = f"{name}-{n}-{frame['name']}"
