@@ -1333,6 +1333,12 @@ CLI configuration saves are atomic and reject a stale loaded revision, so a conc
 login cannot silently erase a newer registration. *Enforced:* `pkg/cmd/client/local_profile.go`
 and `pkg/cmd/client/config.go`.
 
+Initialization verifies a baseline using staged schema files before publishing them. It never
+applies to the target, replaces an existing schema directory, or treats a different existing
+profile as consent to reroute it. Identical imported files may be reused for a retry. Failed setup
+retains the runtime and its state so a retry does not invent a second execution authority.
+*Enforced:* `pkg/cmd/commands/init.go` and the native no-replace publication helpers.
+
 ## Structural enforcement
 
 The strongest invariants are enforced by structure, so regressions fail CI instead of review:
