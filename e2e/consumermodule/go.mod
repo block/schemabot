@@ -128,5 +128,3 @@ replace github.com/block/schemabot => ../..
 // Mirror the parent module's replace directives; replaces do not propagate
 // across module boundaries.
 replace vitess.io/vitess => github.com/block/vitess v0.0.0-20260907005807-88d15fda31ea
-
-replace github.com/pingcap/tidb/pkg/parser => github.com/block/tidb/pkg/parser v0.0.0-20260506200501-e528fd979fc8

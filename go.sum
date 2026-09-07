@@ -121,8 +121,6 @@ github.com/block/pg-sprite v0.2.0 h1:H6w/MNJf1rc7XtdVEI0Sq63I2+MkiifPgkS3qfZ9Rz8
 github.com/block/pg-sprite v0.2.0/go.mod h1:vZxHdTMrCOPAYgswveB7PSjOaOuRgnDLGRw6WoOizRg=
 github.com/block/spirit v0.17.1-0.20260907005557-10804bbe247c h1:Gdd1vWs0UKLlvq84+4wMveyls7QkFqhQDpF21KR2cIA=
 github.com/block/spirit v0.17.1-0.20260907005557-10804bbe247c/go.mod h1:Lg97/e4zr2X3AQXRUrDVAQZOVqFDZ09px503h4v/Yss=
-github.com/block/tidb/pkg/parser v0.0.0-20260506200501-e528fd979fc8 h1:+OfdTacrEyjlqcRUpBFX9uJ6ROBq6cUjwY4DClhnsdU=
-github.com/block/tidb/pkg/parser v0.0.0-20260506200501-e528fd979fc8/go.mod h1:zDLDsfNBU5+L6T4J9/OgWAHc/WZvMUjbpgHqQ/t3yKo=
 github.com/block/vitess v0.0.0-20260907005807-88d15fda31ea h1:t9VROoN/aCzwwh7Ap90TLijZz3rZHZ6HUgWymC+yVS8=
 github.com/block/vitess v0.0.0-20260907005807-88d15fda31ea/go.mod h1:193fxGVSfNHDStC08wSg/RzROVHmMh6XoT+QdfSoLjY=
 github.com/bndr/gotabulate v1.1.2 h1:yC9izuZEphojb9r+KYL4W9IJKO/ceIO8HDwxMA24U4c=
@@ -524,6 +522,8 @@ github.com/pingcap/errors v0.11.5-0.20260310054046-9c8b3586e4b2 h1:cLgCk5mwDG9lD
 github.com/pingcap/errors v0.11.5-0.20260310054046-9c8b3586e4b2/go.mod h1:ktAJCA9lxrHHjVyVl2pKJFvzBnq2eZbb+CUOjBRPlXo=
 github.com/pingcap/log v1.1.1-0.20260227082333-572e590d08f1 h1:A2bEfgSb7hLwR9mxDszgGKweF+xY9YoTDG+8RjdFjDE=
 github.com/pingcap/log v1.1.1-0.20260227082333-572e590d08f1/go.mod h1:pxfz2oJfAuhwrb3/rcLqD//GS/5gRP4gD022iP3cEO0=
+github.com/pingcap/tidb/pkg/parser v0.0.0-20260504140133-511dba1dbe17 h1:cfAVPis6GP6lxQgm1WGaNGi4rVXTB4KDvYf96LjqRCM=
+github.com/pingcap/tidb/pkg/parser v0.0.0-20260504140133-511dba1dbe17/go.mod h1:zDLDsfNBU5+L6T4J9/OgWAHc/WZvMUjbpgHqQ/t3yKo=
 github.com/pires/go-proxyproto v0.11.0 h1:gUQpS85X/VJMdUsYyEgyn59uLJvGqPhJV5YvG68wXH4=
 github.com/pires/go-proxyproto v0.11.0/go.mod h1:ZKAAyp3cgy5Y5Mo4n9AlScrkCZwUy0g3Jf+slqQVcuU=
 github.com/pkg/errors v0.8.0/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
