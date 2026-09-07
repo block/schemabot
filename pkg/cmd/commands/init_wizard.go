@@ -2,6 +2,7 @@ package commands
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -27,7 +28,7 @@ func (cmd *InitCmd) missingInputs() []string {
 	return missing
 }
 
-func (cmd *InitCmd) collectInputs(g *Globals) error {
+func (cmd *InitCmd) collectInputs(ctx context.Context, g *Globals) error {
 	if cmd.Type != "" && cmd.Type != "mysql" && cmd.Type != "postgres" {
 		return fmt.Errorf("database engine must be mysql or postgres")
 	}
@@ -47,7 +48,7 @@ func (cmd *InitCmd) collectInputs(g *Globals) error {
 		}
 		return fmt.Errorf("initialization needs --%s; provide the missing flags or run init in a terminal", strings.Join(missing, ", --"))
 	}
-	if err := cmd.promptInputs(os.Stdin, os.Stdout, g); err != nil {
+	if err := cmd.promptInputs(ctx, os.Stdin, os.Stdout, g); err != nil {
 		return err
 	}
 	cmd.progress = func(message string) { fmt.Fprintln(os.Stderr, message) }
@@ -56,7 +57,7 @@ func (cmd *InitCmd) collectInputs(g *Globals) error {
 
 // Prompt only collects decisions. Registration, verification, file publication,
 // and conflict handling remain in initialize for both people and agents.
-func (cmd *InitCmd) promptInputs(input io.Reader, output io.Writer, g *Globals) error {
+func (cmd *InitCmd) promptInputs(ctx context.Context, input io.Reader, output io.Writer, g *Globals) error {
 	reader := bufio.NewReader(input)
 	ask := func(label, fallback string) (string, error) {
 		if fallback != "" {
@@ -68,7 +69,23 @@ func (cmd *InitCmd) promptInputs(input io.Reader, output io.Writer, g *Globals) 
 				return "", err
 			}
 		}
-		value, err := reader.ReadString('\n')
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		type answer struct {
+			value string
+			err   error
+		}
+		ready := make(chan answer, 1)
+		go func() { value, err := reader.ReadString('\n'); ready <- answer{value, err} }()
+		var value string
+		var err error
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("setup cancelled: %w", ctx.Err())
+		case result := <-ready:
+			value, err = result.value, result.err
+		}
 		if err != nil {
 			return "", fmt.Errorf("setup cancelled before completion: %w", err)
 		}

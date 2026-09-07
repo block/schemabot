@@ -47,7 +47,7 @@ type initResult struct {
 }
 
 func (cmd *InitCmd) Run(ctx context.Context, g *Globals) error {
-	if err := cmd.collectInputs(g); err != nil {
+	if err := cmd.collectInputs(ctx, g); err != nil {
 		if cmd.JSON && !errors.Is(err, ErrSilent) {
 			return client.ExitWithJSON("initialization_error", err.Error())
 		}
