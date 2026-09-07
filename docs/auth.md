@@ -116,6 +116,25 @@ GitHub and API permissions decide who may ask it to act.
 
 ## Choose your setup
 
+For shared use, there are two ways to prove who is making a CLI or API
+request. The difference is **where that identity gets checked**:
+
+- **OIDC: SchemaBot checks a token from your login provider.** You sign in
+  through your identity provider, which issues a signed token. The CLI sends
+  that token to SchemaBot, and SchemaBot verifies it. You do not need a proxy
+  to authenticate callers. OIDC support is **alpha**.
+- **Forward-auth: a proxy checks the caller first.** Requests pass through an
+  authenticating reverse proxy before reaching SchemaBot. The proxy verifies
+  the caller and sends their username and groups in trusted headers;
+  SchemaBot uses those values to check permissions. This is the method
+  **Block uses in production**.
+
+Both can use your team's identity provider. With OIDC, SchemaBot verifies its
+tokens directly; with forward-auth, your proxy handles authentication. Choose
+forward-auth if you have or plan to set up an authenticating proxy, or need
+per-database write permissions. OIDC lets you connect your provider directly
+if its current alpha status fits your needs.
+
 | What you want to do | Start here |
 |---|---|
 | Try SchemaBot on your machine | [Run locally](#run-locally) |
@@ -128,7 +147,7 @@ GitHub and API permissions decide who may ask it to act.
 GitHub is optional. If you only use the CLI or API, you can skip the GitHub
 permissions section.
 
-Before choosing, note the difference in API permissions:
+The permission options differ too:
 
 | Setup | Who can read? | Who can run changes? |
 |---|---|---|
