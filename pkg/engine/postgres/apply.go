@@ -205,6 +205,11 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	if r := classifyRefusal(err, change.table); r != nil {
 		// The taxonomy's reason survives in the operator-facing detail; no
 		// metadata carries it because nothing downstream consumes one yet.
+		// The server error is what identifies the occupant or the missing
+		// grant, and only the log carries it: the detail is kept generic
+		// because it is published to GitHub.
+		logger.Warn("PostgreSQL schema change refused",
+			"namespace", change.namespace, "table", change.table, "reason", r.reason, "error", err)
 		e.publishProgress(key, progressResult(engine.StateFailed, "refused", started, change, r.detail), logger)
 		return
 	}
@@ -258,7 +263,7 @@ func classifyApplyFailure(err error, table string) applyFailure {
 	return applyFailure{detail: "PostgreSQL schema change failed; see server logs", retryable: true}
 }
 
-// invalidIndexDetail renders the operator-facing next step for an
+// invalidIndexAdvice renders the operator-facing cause and next step for an
 // invalid-index verdict, matching pg-sprite's own ownership standard: a drop
 // is named only where the executor proved the entry is a failed build's
 // debris on the target table — this build's own leftover, or an abandoned
@@ -268,29 +273,43 @@ func classifyApplyFailure(err error, table string) applyFailure {
 // steps, never a statement to run — the index under the name may be healthy
 // or may be exactly what it is meant to be. Only the typed identifiers are
 // interpolated, never the wrapped build or cleanup errors, which may carry
-// raw server text.
-func invalidIndexDetail(invalidErr *executor.InvalidIndexError) string {
+// raw server text. The two halves leave unsanitized so classifyRefusal can
+// compose a sequence-step clause between them and sanitize the whole; the
+// operational path composes them through invalidIndexDetail.
+func invalidIndexAdvice(invalidErr *executor.InvalidIndexError) (cause, remedy string) {
 	name := fmt.Sprintf("%q.%q", invalidErr.Schema, invalidErr.Index)
-	var advice string
 	switch invalidErr.Code() {
 	case executor.CodeInvalidIndexOwnLeftover:
-		advice = fmt.Sprintf("this build left its own invalid index %s on the target; drop the invalid index, then retry", name)
+		return fmt.Sprintf("this build left its own invalid index %s on the target", name),
+			"drop the invalid index, then retry"
 	case executor.CodeInvalidIndexAbandoned:
-		advice = fmt.Sprintf("an abandoned invalid index %s occupies the name on the target table with no backend building it; confirm it is still invalid with no builder, drop the invalid index, then retry", name)
+		return fmt.Sprintf("an abandoned invalid index %s occupies the name on the target table with no backend building it", name),
+			"confirm it is still invalid with no builder, drop the invalid index, then retry"
 	case executor.CodeInvalidIndexBuildInFlight:
-		advice = fmt.Sprintf("an invalid index %s occupies the name and backend %d is still building it; wait for that build to finish or fail, then retry", name, invalidErr.BuilderPID)
+		return fmt.Sprintf("an invalid index %s occupies the name and backend %d is still building it", name, invalidErr.BuilderPID),
+			"wait for that build to finish or fail, then retry"
 	case executor.CodeInvalidIndexBuilderUnobservable:
-		advice = fmt.Sprintf("an invalid index %s occupies the name on the target table and the engine role cannot observe whether a backend is building it; check pg_stat_progress_create_index with a role granted pg_read_all_stats before any recovery, then retry", name)
+		return fmt.Sprintf("an invalid index %s occupies the name on the target table and the engine role cannot observe whether a backend is building it", name),
+			"check pg_stat_progress_create_index with a role granted pg_read_all_stats before any recovery, then retry"
 	case executor.CodeInvalidIndexOtherTable:
-		advice = fmt.Sprintf("an invalid index %s already occupies the name on a different table%s; this change cannot claim it — rename the index in the schema file and re-plan, or clear the entry through that table's own change", name, invalidIndexTableSuffix(invalidErr))
+		return fmt.Sprintf("an invalid index %s already occupies the name on a different table%s", name, invalidIndexTableSuffix(invalidErr)),
+			"this change cannot claim it — rename the index in the schema file and re-plan, or clear the entry through that table's own change"
 	case executor.CodeInvalidIndexNotDroppable:
-		advice = fmt.Sprintf("an invalid index %s occupies the name and is a partitioned table's index, an index partition, or a constraint's index rather than a failed build's leftover; an operator must resolve it on the target, or rename the index in the schema file and re-plan", name)
+		return fmt.Sprintf("an invalid index %s occupies the name and is a partitioned table's index, an index partition, or a constraint's index rather than a failed build's leftover", name),
+			"an operator must resolve it on the target, or rename the index in the schema file and re-plan"
 	default:
 		// CodeInvalidIndexUnproven and any future verdict fail safe with
 		// investigation steps: the index under the name may be healthy.
-		advice = fmt.Sprintf("index %s may be invalid but its catalog state could not be verified; inspect pg_index.indisvalid on the target before any recovery, then retry", name)
+		return fmt.Sprintf("index %s may be invalid but its catalog state could not be verified", name),
+			"inspect pg_index.indisvalid on the target before any recovery, then retry"
 	}
-	return sanitizeReasonText(advice)
+}
+
+// invalidIndexDetail composes the advice for the operational (retryable)
+// publish path, where no sequence-step clause intervenes.
+func invalidIndexDetail(invalidErr *executor.InvalidIndexError) string {
+	cause, remedy := invalidIndexAdvice(invalidErr)
+	return sanitizeReasonText(cause + "; " + remedy)
 }
 
 // invalidIndexTableSuffix names the table the invalid index sits on when the
@@ -305,58 +324,91 @@ func invalidIndexTableSuffix(invalidErr *executor.InvalidIndexError) string {
 
 // refusal is a typed apply outcome that retrying cannot fix: the schema
 // change, the target table, or role provisioning must change first.
+//
+// cause names what failed and remedy names what the operator changes; they
+// are kept apart so the failed sequence step can be placed between them
+// without parsing the rendered text. detail is the operator-facing line
+// classifyRefusal composes from them — the only field consumers read.
 type refusal struct {
 	reason string
+	cause  string
+	remedy string
 	detail string
 }
 
 // classifyRefusal maps pg-sprite's typed refusal inputs to permanent
 // refusals, for both the plan-time privilege check and the apply path — one
-// classifier so the same underlying failure reads identically on both
-// surfaces. A nil result means the failure is operational — a retry may
-// succeed once conditions change. Lock-budget exhaustion is deliberately
+// classifier so the same underlying failure carries the same reason and
+// detail on both surfaces; the plan surface prefixes the detail with the
+// statement it blocks, the apply surface publishes it bare. A nil result
+// means the failure is operational — a retry may succeed once conditions
+// change. Lock-budget exhaustion is deliberately
 // operational: the statement is native-safe and only lost a bounded race
-// with concurrent lock holders. Every detail string is built from typed
-// error fields and identifiers, never from wrapped server output, and every
-// detail is sanitized at this single exit — a refusal is safe to render on
-// operator-facing surfaces by construction, whichever branch produced it.
+// with concurrent lock holders. Every cause and remedy is built from typed
+// error fields and identifiers, never from wrapped server output, and the
+// composed detail is sanitized at this single exit — a refusal is safe to
+// render on operator-facing surfaces by construction, whichever branch
+// produced it.
+//
+// The detail reads cause, then the failed sequence step when the statement
+// was one of several, then the remedy, so the remedy stays the last clause
+// the operator reads. A failure past the first step leaves the CREATE TABLE
+// committed; a refusal that carries no remedy of its own then gets a re-plan,
+// because the plan that produced the sequence no longer matches the target.
 func classifyRefusal(err error, table string) *refusal {
 	r := refusalForCause(err, table)
 	if r == nil {
 		return nil
 	}
-	r.detail = sanitizeReasonText(r.detail)
+	clauses := []string{r.cause}
+	remedy := r.remedy
 	var stepErr *executor.SequenceStepError
 	if errors.As(err, &stepErr) && stepErr.Total > 1 {
-		if stepErr.Step > 1 {
-			r.detail = strings.TrimSuffix(r.detail, "; re-plan against the current schema")
+		clauses = append(clauses, sequenceStepClause(stepErr))
+		if stepErr.Step > 1 && remedy == "" {
+			remedy = replanRemedy
 		}
-		r.detail = sanitizeReasonText(r.detail + "; " + sequenceStepDetail(stepErr, table))
 	}
+	if remedy != "" {
+		clauses = append(clauses, remedy)
+	}
+	r.detail = sanitizeReasonText(strings.Join(clauses, "; "))
 	return r
 }
 
-func sequenceStepDetail(stepErr *executor.SequenceStepError, table string) string {
-	detail := fmt.Sprintf("step %d of %d failed", stepErr.Step, stepErr.Total)
+const replanRemedy = "re-plan against the current schema"
+
+// sequenceStepClause names the failed step of a multi-statement create set
+// and, past the first step, that the CREATE TABLE committed. It sits between
+// a cause and a remedy and does not repeat the table: the cause before it
+// names the table where that matters, and every surface renders the detail
+// beside the table it belongs to. Keeping the clause short is what lets the
+// remedy's lead survive the narrowest operator surface, which truncates the
+// detail from the tail, for a table name of any legal length.
+func sequenceStepClause(stepErr *executor.SequenceStepError) string {
+	clause := fmt.Sprintf("step %d of %d failed", stepErr.Step, stepErr.Total)
 	if stepErr.Step > 1 {
-		detail += fmt.Sprintf(" after the CREATE TABLE for %q committed; re-plan against the current schema", table)
+		clause += " after the CREATE TABLE committed"
 	}
-	return detail
+	return clause
 }
 
 // committedCreatePrefixDetail reports the non-retryable recovery action for a
-// create sequence that failed after at least one earlier step committed.
+// create sequence that failed after at least one earlier step committed. No
+// cause precedes this detail, so it names the table itself.
 func committedCreatePrefixDetail(err error, table string) (string, bool) {
 	var stepErr *executor.SequenceStepError
 	if !errors.As(err, &stepErr) || stepErr.Step <= 1 {
 		return "", false
 	}
-	detail := sequenceStepDetail(stepErr, table)
+	detail := fmt.Sprintf("step %d of %d failed after the CREATE TABLE for %q committed; %s",
+		stepErr.Step, stepErr.Total, table, replanRemedy)
 	return sanitizeReasonText(detail), true
 }
 
-// refusalForCause holds classifyRefusal's cause-to-refusal mapping; details
-// leave unsanitized and classifyRefusal sanitizes them at its return.
+// refusalForCause holds classifyRefusal's cause-to-refusal mapping; causes
+// and remedies leave unsanitized and classifyRefusal sanitizes the composed
+// detail at its return.
 func refusalForCause(err error, table string) *refusal {
 	var privilegeErr *preflight.PrivilegeError
 	if errors.As(err, &privilegeErr) {
@@ -367,12 +419,13 @@ func refusalForCause(err error, table string) *refusal {
 			// would send them hunting for an object the target lacks.
 			object = fmt.Sprintf("in the schema that would hold table %q", table)
 		}
-		detail := fmt.Sprintf("the engine role lacks access for %s %s; provision with: %s (verified by: %s)",
-			privilegeErr.Tier, object, privilegeErr.Grant, privilegeErr.Check)
+		remedy := fmt.Sprintf("provision with: %s (verified by: %s)", privilegeErr.Grant, privilegeErr.Check)
 		if privilegeErr.Hint != "" {
-			detail += "; " + privilegeErr.Hint
+			remedy += "; " + privilegeErr.Hint
 		}
-		return &refusal{reason: "insufficient-privileges", detail: detail}
+		return &refusal{reason: "insufficient-privileges",
+			cause:  fmt.Sprintf("the engine role lacks access for %s %s", privilegeErr.Tier, object),
+			remedy: remedy}
 	}
 	// An invalid-index verdict is decided by its own code, never by the build
 	// failure it wraps — a budget-cancelled concurrent build leaves its own
@@ -386,20 +439,20 @@ func refusalForCause(err error, table string) *refusal {
 	if errors.As(err, &invalidErr) {
 		r, _ := refusalForOutcome(invalidErr.Code(), table)
 		if r != nil {
-			r.detail = invalidIndexDetail(invalidErr)
+			r.cause, r.remedy = invalidIndexAdvice(invalidErr)
 		}
 		return r
 	}
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
-		return &refusal{reason: "not-native-safe-budget-exceeded", detail: budgetErr.Error()}
+		return &refusal{reason: "not-native-safe-budget-exceeded", cause: budgetErr.Error()}
 	}
 	var partitionErr *preflight.UnsupportedPartitionedParentError
 	if errors.As(err, &partitionErr) {
 		// The typed error's message is a fixed English sentence with no
 		// interpolated identifiers or server text — a deliberate pg-sprite
 		// property — so rendering it verbatim is safe by construction.
-		return &refusal{reason: "unsupported-partitioned-parent", detail: partitionErr.Error()}
+		return &refusal{reason: "unsupported-partitioned-parent", cause: partitionErr.Error()}
 	}
 	var sizeErr *preflight.SizeError
 	if errors.As(err, &sizeErr) {
@@ -407,23 +460,22 @@ func refusalForCause(err error, table string) *refusal {
 		// property of PostgreSQL or of the change, when it is SchemaBot's
 		// own conservatism for the native-safe path.
 		return &refusal{reason: "table-too-large",
-			detail: sizeErr.Error() + "; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit"}
+			cause: sizeErr.Error() + "; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit"}
 	}
 	if errors.Is(err, preflight.ErrTableNotFound) {
-		return &refusal{reason: "table-not-found",
-			detail: fmt.Sprintf("table %q does not exist on the target; re-plan against the current schema", table)}
+		return tableNotFoundRefusal(table)
 	}
 	if errors.Is(err, preflight.ErrNotTable) {
 		return &refusal{reason: "not-a-table",
-			detail: fmt.Sprintf("%q exists but is not an ordinary or partitioned table", table)}
+			cause: fmt.Sprintf("%q exists but is not an ordinary or partitioned table", table)}
 	}
 	if preflight.IsNameOccupied(err) {
-		return &refusal{reason: "create-collision",
-			detail: fmt.Sprintf("a relation already occupies a name the create set for %q claims (the table, or one of its index names); re-plan against the current schema", table)}
+		return createCollisionRefusal(table)
 	}
 	if errors.Is(err, preflight.ErrSchemaNotFound) {
 		return &refusal{reason: "schema-not-found",
-			detail: fmt.Sprintf("the schema that would hold table %q does not exist on the target; create the schema first", table)}
+			cause:  fmt.Sprintf("the schema that would hold table %q does not exist on the target", table),
+			remedy: "create the schema first"}
 	}
 	r, _ := refusalForOutcome(executor.OutcomeCode(err), table)
 	return r
@@ -439,52 +491,56 @@ func refusalForCause(err error, table string) *refusal {
 func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 	switch code {
 	case executor.CodeCreateCollision:
-		return &refusal{reason: "create-collision",
-			detail: fmt.Sprintf("a relation already occupies a name the create set for %q claims (the table, or one of its index names); re-plan against the current schema", table)}, true
+		return createCollisionRefusal(table), true
 	case executor.CodeDuplicateCreateName:
 		return &refusal{reason: "duplicate-create-name",
-			detail: fmt.Sprintf("the create set for %q claims the same relation name twice (a CREATE INDEX name repeats the table's implicit constraint-index name or another index); fix the schema file and re-plan", table)}, true
+			cause:  fmt.Sprintf("the create set for %q claims the same relation name twice (a CREATE INDEX name repeats the table's implicit constraint-index name or another index)", table),
+			remedy: "fix the schema file and re-plan"}, true
 	case executor.CodePartitionOfUnsupported:
 		return &refusal{reason: "unsupported-create-step",
-			detail: fmt.Sprintf("the CREATE TABLE for %q attaches a partition to a live parent, which the native-safe create path does not run", table)}, true
+			cause: fmt.Sprintf("the CREATE TABLE for %q attaches a partition to a live parent, which the native-safe create path does not run", table)}, true
 	case executor.CodeIfNotExistsUnsupported:
 		return &refusal{reason: "unsupported-create-step",
-			detail: fmt.Sprintf("the planned statement for %q carries IF NOT EXISTS, whose no-op outcome the native-safe path cannot prove; drop the clause and re-plan", table)}, true
+			cause:  fmt.Sprintf("the planned statement for %q carries IF NOT EXISTS, whose no-op outcome the native-safe path cannot prove", table),
+			remedy: "drop the clause and re-plan"}, true
 	case executor.CodeUnsupportedCreateStep:
 		return &refusal{reason: "unsupported-create-step",
-			detail: fmt.Sprintf("the CREATE TABLE for %q is not a shape the native-safe create path can run; rewrite the schema file and re-plan", table)}, true
+			cause:  fmt.Sprintf("the CREATE TABLE for %q is not a shape the native-safe create path can run", table),
+			remedy: "rewrite the schema file and re-plan"}, true
 	case executor.CodeTableNotFound:
-		return &refusal{reason: "table-not-found",
-			detail: fmt.Sprintf("table %q does not exist on the target; re-plan against the current schema", table)}, true
+		return tableNotFoundRefusal(table), true
 	case executor.CodeEmptySequence, executor.CodeUnsupportedSequenceStep,
 		executor.CodeUnsupportedPartitionedParent, executor.CodeNotConcurrentIndexBuild,
 		executor.CodeUnnamedIndex, executor.CodeUnqualifiedTable:
 		// Shape refusals: the executor refused the statement's form at
 		// admission, so retrying the identical plan refails the same way.
 		return &refusal{reason: "unsupported-statement-shape",
-			detail: fmt.Sprintf("the planned statement for %q is not a shape the native-safe path can run; rewrite the schema change and re-plan", table)}, true
+			cause:  fmt.Sprintf("the planned statement for %q is not a shape the native-safe path can run", table),
+			remedy: "rewrite the schema change and re-plan"}, true
 	case executor.CodeBudgetStatementExceeded:
 		// Normally consumed upstream by the typed BudgetError arm, which
 		// renders the budget's own figures; this mapping keeps the outcome
 		// vocabulary total.
 		return &refusal{reason: "not-native-safe-budget-exceeded",
-			detail: fmt.Sprintf("the statement for table %q ran past its statement budget and was cancelled", table)}, true
+			cause: fmt.Sprintf("the statement for table %q ran past its statement budget and was cancelled", table)}, true
 	case executor.CodeInvariantViolation:
 		// Never a retry candidate per the executor's contract: an invariant
 		// breach means the engine's own safety accounting failed, so the
 		// apply fails closed until an operator has inspected the target.
 		return &refusal{reason: "engine-invariant-violation",
-			detail: fmt.Sprintf("the engine's safety invariants did not hold while changing table %q; inspect the target and server logs before re-running", table)}, true
+			cause:  fmt.Sprintf("the engine's safety invariants did not hold while changing table %q", table),
+			remedy: "inspect the target and server logs before re-running"}, true
 	case executor.CodeInvalidIndexOtherTable, executor.CodeInvalidIndexNotDroppable:
 		// The permanent members of the invalid-index family: the requested
 		// name is held by an entry this change can never clear — an invalid
 		// index on a different table, or one the server will not drop
 		// concurrently (a partitioned table's index, an index partition, a
 		// constraint's index). Retrying unchanged reproduces the verdict.
-		// The typed-verdict path replaces this detail with the code's own
-		// advice; this mapping keeps the vocabulary total.
+		// The typed-verdict path replaces this cause and remedy with the
+		// code's own advice; this mapping keeps the vocabulary total.
 		return &refusal{reason: "invalid-index-occupied",
-			detail: fmt.Sprintf("an invalid index already occupies a name the change to %q needs and is not a failed build's leftover; rename the index in the schema file and re-plan, or resolve the entry on the target", table)}, true
+			cause:  fmt.Sprintf("an invalid index already occupies a name the change to %q needs and is not a failed build's leftover", table),
+			remedy: "rename the index in the schema file and re-plan, or resolve the entry on the target"}, true
 	case executor.CodeBudgetLockExceeded, executor.CodeCancelledByCaller,
 		executor.CodeCancelledExternally, executor.CodeInvalidIndexOwnLeftover,
 		executor.CodeInvalidIndexAbandoned, executor.CodeInvalidIndexBuildInFlight,
@@ -498,6 +554,38 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return nil, true
 	}
 	return nil, false
+}
+
+// createCollisionRemedy leads with a re-plan because that alone resolves a
+// lost race for the table name: the next plan sees the occupant and diffs
+// against it. Only a collision that survives a re-plan is a schema-file
+// problem — an explicitly named constraint or index claims a name another
+// relation holds (an unnamed one picks a free name on its own), or a serial
+// column's auto-named sequence lands on a standalone type of that name —
+// and then the operator changes the name on one side or the other.
+const createCollisionRemedy = "re-plan, and if it recurs drop or rename the occupant or give the constraint, index, or sequence another name"
+
+// createCollisionRefusal names the kinds of relation that can hold a name
+// the create set claims, so the operator knows where to look; the server
+// error identifying the occupant stays in the logs. The list is the
+// occupant's side, not the claimant's — a named constraint claims a name
+// through the index it creates, so the index is what occupies it. The
+// wording is kept short because the composed detail must survive the
+// narrowest operator surface with its remedy's lead intact.
+func createCollisionRefusal(table string) *refusal {
+	return &refusal{
+		reason: "create-collision",
+		cause:  fmt.Sprintf("a name the create set for %q needs is already occupied (table, view, index, or sequence)", table),
+		remedy: createCollisionRemedy,
+	}
+}
+
+func tableNotFoundRefusal(table string) *refusal {
+	return &refusal{
+		reason: "table-not-found",
+		cause:  fmt.Sprintf("table %q does not exist on the target", table),
+		remedy: replanRemedy,
+	}
 }
 
 func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64) error {
