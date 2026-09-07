@@ -1258,7 +1258,7 @@ waive with.
 
 ### RV-3: Consent is explicit, specific, and re-checked
 
-Unsafe changes (error-severity lint findings such as drops and column narrowing) block without
+Unsafe changes (error-severity lint findings such as table and column drops) block without
 `--allow-unsafe`. Changes an operator cannot undo mid-flight, such as direct execution's
 write-blocking DDL with no cutover and no revert, require the operator to confirm the specific
 consequences disclosed to them. The re-plan that runs just before execution re-checks that
