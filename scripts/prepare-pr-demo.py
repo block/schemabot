@@ -29,8 +29,8 @@ schema="""CREATE TABLE `users` (
   `id` bigint unsigned NOT NULL,
   `email` varchar(255) DEFAULT NULL,
   `created_at` datetime NOT NULL,
-  KEY `idx_email_created` (`email`, `created_at`),
-  PRIMARY KEY (`id`)
+  PRIMARY KEY (`id`),
+  KEY `idx_email_created` (`email`, `created_at`)
 ) ENGINE=InnoDB;"""
 highlighted=m['render_markdown']('```sql\n'+schema+'\n```',cache)
 comments['diffLines']=re.search(r'<pre\b[^>]*>(.*?)</pre>',highlighted,re.S).group(1).splitlines()

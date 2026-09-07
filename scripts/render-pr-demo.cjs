@@ -38,11 +38,11 @@ const {chromium}=require('playwright');
    }
    lastCamera=camera;
    if(i===0){
-    if(!(await page.locator('#diff-view').isVisible())||!(await page.locator('.added').innerText()).includes('idx_email_created'))throw new Error('Opening frame must show the index diff');
+    if(!(await page.locator('#diff-view').isVisible())||!(await page.locator('.code.added').allTextContents()).join(' ').includes('idx_email_created'))throw new Error('Opening frame must show the index diff');
    }
    if(i===introSeconds*fps){
     const checks=await page.locator('#checks').innerText();
-    if(!checks.includes('Action required')||!checks.includes('Merging is blocked'))throw new Error('Initial schema check must block merge');
+    if(!checks.includes('1 apply pending')||!checks.includes('Merging is blocked'))throw new Error('Initial schema check must block merge');
    }
    if(i===(8+introSeconds)*fps){
     const text=await page.locator('#progress-body').innerText();
