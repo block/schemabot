@@ -719,3 +719,11 @@ func TestWriteNamespaceChanges_NoCollapseUnderThreshold(t *testing.T) {
 	assert.NotContains(t, plainOutput, "more keyspaces")
 	assert.Equal(t, 4, strings.Count(plainOutput, "ADD COLUMN"), "each keyspace should show DDL")
 }
+
+func TestWritePlanHeaderPostgres(t *testing.T) {
+	output := captureStdout(func() {
+		templates.WritePlanHeader(templates.PlanHeaderData{Database: "shop", Engine: "postgres", IsMySQL: true})
+	})
+	assert.Contains(t, output, "PostgreSQL Schema Change Plan")
+	assert.NotContains(t, output, "MySQL Schema Change Plan")
+}
