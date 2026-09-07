@@ -831,7 +831,9 @@ long-lived pool and on the startup bootstrap alike. It applies in every mode,
 unlike the ceiling above. Must be over `10s` or the server refuses to start: a
 query can spend up to 10 seconds waiting for another instance's lock, and the
 limit counts waiting as well as working. A negative value or an unparseable
-duration is refused too.
+duration is refused too. The limit is set when the connection opens, so a
+transaction pooler in front of storage discards it — point SchemaBot at a
+session pooler or directly at the database.
 
 Schema changes are unaffected. They run under limits pg-sprite sets on the
 target database. The bootstrap raises the limit for its own schema DDL, where
