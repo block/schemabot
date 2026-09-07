@@ -67,17 +67,11 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if err != nil {
 		return nil, err
 	}
-	profile := g.Profile
-	if profile == "" {
-		profile = os.Getenv("SCHEMABOT_PROFILE")
-	}
-	if profile == "" {
-		profile = "local"
-	}
 	cfg, err := client.LoadConfig()
 	if err != nil {
 		return nil, err
 	}
+	profile := client.ResolveProfileName(cfg, g.Profile)
 	if existing, ok := cfg.Profiles[profile]; ok && !reflect.DeepEqual(existing, client.Profile{LocalRuntime: cmd.Runtime}) {
 		return nil, fmt.Errorf("profile %q already has a different connection; choose another --profile", profile)
 	}

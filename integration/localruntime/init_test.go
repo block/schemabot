@@ -51,6 +51,15 @@ func TestInitEngines(t *testing.T) {
 				return cmd.CombinedOutput()
 			}
 			args := []string{"init", "--database", "app", "--environment", "development", "--type", engine, "--dsn", "env:INIT_TARGET", "--storage-dsn", "env:INIT_STORAGE", "--schema-dir", root, "--namespace", namespace, "--profile", "project", "--json"}
+			// A fresh installation works with the normal default profile too.
+			defaultArgs := slices.Clone(args)
+			profileIndex := slices.Index(defaultArgs, "--profile")
+			defaultArgs = append(defaultArgs[:profileIndex], defaultArgs[profileIndex+2:]...)
+			output, err := run(defaultArgs...)
+			require.NoError(t, err, string(output))
+			output, err = run("databases")
+			require.NoError(t, err, string(output))
+			require.Contains(t, string(output), "app")
 			for range 2 {
 				output, err := run(args...)
 				require.NoError(t, err, string(output))
@@ -65,7 +74,7 @@ func TestInitEngines(t *testing.T) {
 				require.Equal(t, 1, result.Tables)
 			}
 			// A normal invocation resolves the saved connection after init exits.
-			output, err := run("plan", "--profile", "project", "-e", "development", "-s", root, "--json")
+			output, err = run("plan", "--profile", "project", "-e", "development", "-s", root, "--json")
 			require.NoError(t, err, string(output))
 			var plans map[string]apitypes.PlanResponse
 			require.NoError(t, json.Unmarshal(output, &plans), string(output))
