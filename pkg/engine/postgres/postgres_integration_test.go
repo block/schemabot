@@ -621,6 +621,9 @@ func TestEngineApplyNativeSafe(t *testing.T) {
 	assert.Equal(t, 100, progress.Progress)
 	assert.Equal(t, "completed", progress.Metadata["phase"])
 	assert.Equal(t, "1", progress.Metadata["step"])
+	assert.Equal(t, "1", progress.Metadata["steps_total"])
+	assert.Equal(t, "ALTER TABLE public.users ADD COLUMN email text", progress.Metadata["statement"],
+		"the terminal position names the statement the executor ran")
 
 	var exists bool
 	err = db.QueryRowContext(t.Context(), `SELECT EXISTS (
@@ -681,6 +684,9 @@ func TestEngineApplyGreenfieldCreateSet(t *testing.T) {
 	assert.True(t, result.Accepted)
 	progress := awaitPostgresProgress(t, eng, "widgets")
 	assert.Equal(t, engine.StateCompleted, progress.State)
+	assert.Equal(t, "3", progress.Metadata["step"], "a completed create set reports its last step, not the first")
+	assert.Equal(t, "3", progress.Metadata["steps_total"])
+	assert.Contains(t, progress.Metadata["statement"], "CREATE INDEX widgets_id_idx")
 
 	rows, err := db.QueryContext(t.Context(), "SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND tablename = 'widgets' ORDER BY indexname")
 	require.NoError(t, err)
@@ -753,6 +759,9 @@ func TestEngineApplyCreateSetCommittedPrefixNotRetryable(t *testing.T) {
 	assert.Equal(t, "failed", progress.Metadata["phase"])
 	assert.False(t, progress.Retryable, "the CREATE TABLE committed; a retry cannot succeed, so the drive must not offer one")
 	assert.Equal(t, `step 2 of 2 failed after the CREATE TABLE for "widgets" committed; re-plan against the current schema`, progress.ErrorMessage)
+	assert.Equal(t, "2", progress.Metadata["step"], "the position names the step that failed")
+	assert.Equal(t, "2", progress.Metadata["steps_total"])
+	assert.Contains(t, progress.Metadata["statement"], "CREATE INDEX widgets_name_idx")
 
 	var exists bool
 	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT to_regclass('public.widgets') IS NOT NULL").Scan(&exists))

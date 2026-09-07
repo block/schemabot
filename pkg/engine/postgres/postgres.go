@@ -18,6 +18,7 @@ import (
 	pgplan "github.com/block/pg-sprite/pkg/plan"
 	"github.com/block/pg-sprite/pkg/planner"
 	"github.com/block/pg-sprite/pkg/preflight"
+	"github.com/block/pg-sprite/pkg/progress"
 	"github.com/block/pg-sprite/pkg/router"
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
 	spirittable "github.com/block/spirit/pkg/table"
@@ -44,8 +45,26 @@ type Engine struct {
 	// accepting a second apply on the same target must not evict the first
 	// one's state while it is still running, or the running apply's driver
 	// would be told its work no longer exists.
-	progress       map[string]*engine.ProgressResult
+	progress       map[string]*trackedApply
 	tableSizeLimit int64
+
+	// execute is a test seam standing in for executeOptimistic, so the apply
+	// drive — accept, claim, execute, terminal publish — can be exercised
+	// against an executor the test scripts instead of a target to dial. Nil
+	// selects the real executor.
+	execute func(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64, tracker *progress.Tracker) error
+}
+
+// trackedApply pairs the progress the engine has published for one apply
+// with the pg-sprite tracker its executor feeds. The published result changes
+// only at accept and at the terminal outcome; the tracker is what moves in
+// between, so Progress reads the step position and statement from it. The
+// logger is the apply's own, so a poll that cannot read the tracker logs
+// under the identifiers the apply was accepted with.
+type trackedApply struct {
+	result  *engine.ProgressResult
+	tracker *progress.Tracker
+	logger  *slog.Logger
 }
 
 // DefaultNativeSafeTableSizeLimitBytes preserves the native-safe execution
@@ -648,14 +667,45 @@ func blockChangesAtTier(changes []engine.TableChange, tiers []preflight.Tier, ti
 // and the table cell separator is neutralized so a crafted identifier cannot
 // break comment layout.
 func sanitizeReasonText(s string) string {
+	return strings.ReplaceAll(singleLine(s), "|", "/")
+}
+
+// maxStatementMetadataLen bounds the statement text carried in progress
+// metadata. The value is stored and rendered alongside other clamped
+// operator-facing summaries, and a statement is unbounded input — a create
+// set's index definition can run to any length — so it is cut on a rune
+// boundary with an ellipsis rather than trusted to fit.
+const maxStatementMetadataLen = 255
+
+// sanitizeStatementText prepares the SQL the executor is running for
+// progress metadata. Unlike a reason, which is prose SchemaBot composes, a
+// statement is quoted back to the operator as the SQL it is: control and
+// format characters are stripped and whitespace collapses to one line, but
+// the text is otherwise left as written, so `||` stays concatenation and
+// `1 | 2` stays a bitwise or. A surface that embeds the value in Markdown
+// backslash-escapes the delimiters it cares about at render time, the way
+// the comment templates already do for engine-influenced inline text; the
+// metadata carries the statement, not one surface's escaping of it.
+func sanitizeStatementText(s string) string {
+	s = singleLine(s)
+	runes := []rune(s)
+	if len(runes) > maxStatementMetadataLen {
+		return string(runes[:maxStatementMetadataLen-1]) + "…"
+	}
+	return s
+}
+
+// singleLine strips control and format characters and collapses every
+// whitespace run — newlines included — to one space, so the result cannot
+// span lines or carry a bidi override.
+func singleLine(s string) string {
 	s = strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
 			return ' '
 		}
 		return r
 	}, s)
-	s = strings.Join(strings.Fields(s), " ")
-	return strings.ReplaceAll(s, "|", "/")
+	return strings.Join(strings.Fields(s), " ")
 }
 
 func executionVerdict(formatVersion int, statement pgplan.Statement, table string) (string, string) {
