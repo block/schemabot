@@ -8,11 +8,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	runtimehost "github.com/block/schemabot/pkg/localruntime"
 )
 
@@ -65,7 +67,23 @@ func TestInitEngines(t *testing.T) {
 			// A normal invocation resolves the saved connection after init exits.
 			output, err := run("plan", "--profile", "project", "-e", "development", "-s", root, "--json")
 			require.NoError(t, err, string(output))
-			require.Contains(t, string(output), "plan_id")
+			var plans map[string]apitypes.PlanResponse
+			require.NoError(t, json.Unmarshal(output, &plans), string(output))
+			require.Empty(t, plans["development"].Changes)
+			require.NoError(t, os.WriteFile(filepath.Join(root, namespace, "notes.sql"), []byte("CREATE TABLE notes (id bigint NOT NULL PRIMARY KEY);"), 0600))
+			output, err = run("plan", "--profile", "project", "-e", "development", "-s", root, "--json")
+			require.NoError(t, err, string(output))
+			require.NoError(t, json.Unmarshal(output, &plans), string(output))
+			require.NotEmpty(t, plans["development"].Changes)
+			// A rejected import never publishes a schema directory.
+			rejectedRoot := filepath.Join(t.TempDir(), "schema")
+			rejectedArgs := slices.Clone(args)
+			rejectedArgs[slices.Index(rejectedArgs, "--schema-dir")+1] = rejectedRoot
+			rejectedArgs[slices.Index(rejectedArgs, "--namespace")+1] = "missing_namespace"
+			output, err = run(rejectedArgs...)
+			require.Error(t, err, string(output))
+			_, err = os.Stat(rejectedRoot)
+			require.True(t, os.IsNotExist(err))
 			config, err := os.ReadFile(filepath.Join(manager.Dir, "runtime.yaml"))
 			require.NoError(t, err)
 			require.Contains(t, string(config), "env:INIT_TARGET")

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/cmd/client"
@@ -119,7 +120,9 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 }
 
 func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Manager, stage, root, profile string, namespaces []string) (*initResult, error) {
-	connection, err := manager.Ensure(ctx)
+	startupCtx, cancelStartup := context.WithTimeout(ctx, 30*time.Second)
+	connection, err := manager.Ensure(startupCtx)
+	cancelStartup()
 	if err != nil {
 		return nil, err
 	}
