@@ -50,6 +50,15 @@ func TestInitEngines(t *testing.T) {
 				cmd.Env = append(os.Environ(), "HOME="+home, "SCHEMABOT_ENDPOINT=", "SCHEMABOT_TOKEN=", "SCHEMABOT_PROFILE=", "INIT_TARGET="+targetDSN, "INIT_STORAGE="+storageDSN)
 				return cmd.CombinedOutput()
 			}
+			missingOutput, missingErr := run("init", "--non-interactive", "--json")
+			require.Error(t, missingErr)
+			var missing struct {
+				Error   string   `json:"error"`
+				Missing []string `json:"missing"`
+			}
+			require.NoError(t, json.Unmarshal(missingOutput, &missing))
+			require.Equal(t, "missing_inputs", missing.Error)
+			require.Contains(t, missing.Missing, "database")
 			args := []string{"init", "--database", "app", "--environment", "development", "--type", engine, "--dsn", "env:INIT_TARGET", "--storage-dsn", "env:INIT_STORAGE", "--schema-dir", root, "--namespace", namespace, "--profile", "project", "--json"}
 			// A fresh installation works with the normal default profile too.
 			defaultArgs := slices.Clone(args)

@@ -1,0 +1,116 @@
+{
+  "wizard": "SchemaBot setup\nConnect your database. Start with a verified schema.\n\nDatabase engine (mysql or postgres): mysql\nDatabase name: shop\nEnvironment [development]: \nDatabase connection variable [env:DATABASE_URL]: \nSeparate state database variable [env:SCHEMABOT_STORAGE_DSN]: \nNamespaces (comma-separated) [shop]: \nSchema directory [schema]: \nConnection profile [default]: \n\nDatabase: shop (mysql) / development\nScope: shop\nSchema: schema\nProfile: default\n\nSchemaBot will initialize metadata in the separate state database and verify a plan.\nNo application schema changes will be applied.\nContinue? (y/N) [n]: y\n\nRegistering the database connection...\nStarting SchemaBot...\nReading the live schema...\nVerifying the schema baseline...\nSaving the verified schema and connection...\nSchema ready in schema.\nBaseline plan: no changes.\nProfile \"default\" is ready. Edit the schema, then run a plan.\n",
+  "events": [
+    {
+      "time": 0.931,
+      "text": "SchemaBot setup\nConnect your database. Start with a verified schema.\n\nDatabase engine (mysql or postgres): "
+    },
+    {
+      "time": 1.054,
+      "text": "mysql\n"
+    },
+    {
+      "time": 1.054,
+      "text": "Database name: "
+    },
+    {
+      "time": 1.178,
+      "text": "shop\n"
+    },
+    {
+      "time": 1.178,
+      "text": "Environment [development]: "
+    },
+    {
+      "time": 1.306,
+      "text": "\n"
+    },
+    {
+      "time": 1.306,
+      "text": "Database connection variable [env:DATABASE_URL]: "
+    },
+    {
+      "time": 1.437,
+      "text": "\n"
+    },
+    {
+      "time": 1.437,
+      "text": "Separate state database variable [env:SCHEMABOT_STORAGE_DSN]: "
+    },
+    {
+      "time": 1.565,
+      "text": "\n"
+    },
+    {
+      "time": 1.565,
+      "text": "Namespaces (comma-separated) [shop]: "
+    },
+    {
+      "time": 1.696,
+      "text": "\n"
+    },
+    {
+      "time": 1.696,
+      "text": "Schema directory [schema]: "
+    },
+    {
+      "time": 1.825,
+      "text": "\n"
+    },
+    {
+      "time": 1.826,
+      "text": "Connection profile [default]: "
+    },
+    {
+      "time": 1.952,
+      "text": "\n"
+    },
+    {
+      "time": 1.952,
+      "text": "\nDatabase: shop (mysql) / development\nScope: shop\nSchema: schema\nProfile: default\n"
+    },
+    {
+      "time": 1.952,
+      "text": "\nSchemaBot will initialize metadata in the separate state database and verify a plan.\nNo application schema changes will be applied.\n"
+    },
+    {
+      "time": 1.952,
+      "text": "Continue? (y/N) [n]: "
+    },
+    {
+      "time": 2.08,
+      "text": "y\n"
+    },
+    {
+      "time": 2.08,
+      "text": "\n"
+    },
+    {
+      "time": 2.081,
+      "text": "Registering the database connection...\n"
+    },
+    {
+      "time": 2.101,
+      "text": "Starting SchemaBot...\n"
+    },
+    {
+      "time": 2.704,
+      "text": "Reading the live schema...\n"
+    },
+    {
+      "time": 2.713,
+      "text": "Verifying the schema baseline...\n"
+    },
+    {
+      "time": 2.72,
+      "text": "Saving the verified schema and connection...\n"
+    },
+    {
+      "time": 2.727,
+      "text": "Schema ready in schema.\nBaseline plan: no changes.\nProfile \"default\" is ready. Edit the schema, then run a plan.\n"
+    }
+  ],
+  "diff": "--- schema/shop/users.sql\n+++ schema/shop/users.sql\n@@ -1,5 +1,5 @@\n CREATE TABLE `users` (\n   `id` bigint NOT NULL,\n-  `email` varchar(255) NOT NULL,\n+  `email` varchar(320) NOT NULL,\n   PRIMARY KEY (`id`)\n ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci\n",
+  "plan": "\u256d\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e\n\u2502  MySQL Schema Change Plan                   \u2502\n\u2502                                             \u2502\n\u2502  Database: shop                             \u2502\n\u2502  Schema name: schema                        \u2502\n\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f\n\n\u001b[1mDevelopment\u001b[0m\n\n  \u001b[1m\u2500\u2500 shop \u2500\u2500\u001b[0m\n\n     ~ users\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`users`\u001b[0m MODIFY COLUMN `email` \u001b[34mvarchar\u001b[0m(320) \u001b[34mNOT\u001b[0m \u001b[34mNULL\u001b[0m;\n\n\ud83d\udccb Plan: 1 table to alter\n\n",
+  "plan_stderr": ""
+}
