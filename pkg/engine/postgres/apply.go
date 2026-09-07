@@ -177,17 +177,21 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	}
 
 	var invalidErr *executor.InvalidIndexError
-	if errors.As(err, &invalidErr) {
-		// An invalid index — pre-existing or a build's own unrecovered
-		// leftover — is operational: an operator clears it and a retry can
-		// succeed. Checked before the refusal and budget arms because the
-		// verdict wraps the build failure that produced it (a budget-
-		// cancelled build leaves its own invalid index), and that inner
-		// cause must not be read as the outcome — the index the operator
-		// clears is. The detail is built from the typed identifiers and
-		// verdict code, never the wrapped build or cleanup errors, which
-		// may carry raw server text; the full cause lands in the server
-		// log below it.
+	if errors.As(err, &invalidErr) && !invalidErr.Code().Permanent() {
+		// An invalid index an operator can clear — a build's own leftover,
+		// abandoned debris, another backend's build to wait out, or a
+		// builder this role cannot observe — is operational: once it is
+		// cleared a retry can succeed. Checked before the refusal and budget
+		// arms because the verdict wraps the build failure that produced it
+		// (a budget-cancelled build leaves its own invalid index), and that
+		// inner cause must not be read as the outcome — the index the
+		// operator clears is. The permanent verdicts (the name is occupied
+		// on another table, or by an index the server will not drop
+		// concurrently) fall through to classifyRefusal: retrying unchanged
+		// reproduces them. The detail is built from the typed identifiers
+		// and verdict code, never the wrapped build or cleanup errors, which
+		// may carry raw server text; the full cause lands in the server log
+		// below it.
 		logger.Error("PostgreSQL concurrent index build left or found an invalid index",
 			"namespace", change.namespace, "table", change.table,
 			"index_schema", invalidErr.Schema, "index", invalidErr.Index, "error", err)
@@ -259,28 +263,63 @@ func classifyApplyFailure(err error, table string) applyFailure {
 	return applyFailure{detail: "PostgreSQL schema change failed; see server logs", retryable: true}
 }
 
-// invalidIndexDetail renders the operator-facing next step for an
+// invalidIndexAdvice renders the operator-facing cause and next step for an
 // invalid-index verdict, matching pg-sprite's own ownership standard: a drop
-// is named only when the entry is proven this build's own leftover. A
-// pre-existing invalid entry may be another actor's still-running build, and
-// an unproven verdict may sit on a healthy index — both get investigation
-// steps, never a statement to run. Only the typed identifiers are
+// is named only where the executor proved the entry is a failed build's
+// debris on the target table — this build's own leftover, or an abandoned
+// entry with no builder. A build still in flight says wait; an entry on
+// another table, one the server will not drop concurrently, one whose
+// builder this role cannot see, and an unproven verdict get investigation
+// steps, never a statement to run — the index under the name may be healthy
+// or may be exactly what it is meant to be. Only the typed identifiers are
 // interpolated, never the wrapped build or cleanup errors, which may carry
-// raw server text.
-func invalidIndexDetail(invalidErr *executor.InvalidIndexError) string {
+// raw server text. The two halves leave unsanitized so classifyRefusal can
+// compose a sequence-step clause between them and sanitize the whole; the
+// operational path composes them through invalidIndexDetail.
+func invalidIndexAdvice(invalidErr *executor.InvalidIndexError) (cause, remedy string) {
 	name := fmt.Sprintf("%q.%q", invalidErr.Schema, invalidErr.Index)
-	var advice string
 	switch invalidErr.Code() {
 	case executor.CodeInvalidIndexOwnLeftover:
-		advice = fmt.Sprintf("this build left its own invalid index %s on the target; drop the invalid index, then retry", name)
-	case executor.CodeInvalidIndexPreexisting:
-		advice = fmt.Sprintf("an invalid index %s already occupies the name on the target and may be another actor's build still in progress; check pg_stat_activity before any recovery, then retry", name)
+		return fmt.Sprintf("this build left its own invalid index %s on the target", name),
+			"drop the invalid index, then retry"
+	case executor.CodeInvalidIndexAbandoned:
+		return fmt.Sprintf("an abandoned invalid index %s occupies the name on the target table with no backend building it", name),
+			"confirm it is still invalid with no builder, drop the invalid index, then retry"
+	case executor.CodeInvalidIndexBuildInFlight:
+		return fmt.Sprintf("an invalid index %s occupies the name and backend %d is still building it", name, invalidErr.BuilderPID),
+			"wait for that build to finish or fail, then retry"
+	case executor.CodeInvalidIndexBuilderUnobservable:
+		return fmt.Sprintf("an invalid index %s occupies the name on the target table and the engine role cannot observe whether a backend is building it", name),
+			"check pg_stat_progress_create_index with a role granted pg_read_all_stats before any recovery, then retry"
+	case executor.CodeInvalidIndexOtherTable:
+		return fmt.Sprintf("an invalid index %s already occupies the name on a different table%s", name, invalidIndexTableSuffix(invalidErr)),
+			"this change cannot claim it — rename the index in the schema file and re-plan, or clear the entry through that table's own change"
+	case executor.CodeInvalidIndexNotDroppable:
+		return fmt.Sprintf("an invalid index %s occupies the name and is a partitioned table's index, an index partition, or a constraint's index rather than a failed build's leftover", name),
+			"an operator must resolve it on the target, or rename the index in the schema file and re-plan"
 	default:
 		// CodeInvalidIndexUnproven and any future verdict fail safe with
 		// investigation steps: the index under the name may be healthy.
-		advice = fmt.Sprintf("index %s may be invalid but its catalog state could not be verified; inspect pg_index.indisvalid on the target before any recovery, then retry", name)
+		return fmt.Sprintf("index %s may be invalid but its catalog state could not be verified", name),
+			"inspect pg_index.indisvalid on the target before any recovery, then retry"
 	}
-	return sanitizeReasonText(advice)
+}
+
+// invalidIndexDetail composes the advice for the operational (retryable)
+// publish path, where no sequence-step clause intervenes.
+func invalidIndexDetail(invalidErr *executor.InvalidIndexError) string {
+	cause, remedy := invalidIndexAdvice(invalidErr)
+	return sanitizeReasonText(cause + "; " + remedy)
+}
+
+// invalidIndexTableSuffix names the table the invalid index sits on when the
+// catalog inspection saw it; the verdict carries no table when the state
+// could not be inspected.
+func invalidIndexTableSuffix(invalidErr *executor.InvalidIndexError) string {
+	if invalidErr.Table == "" {
+		return ""
+	}
+	return fmt.Sprintf(" (%q)", invalidErr.Table)
 }
 
 // refusal is a typed apply outcome that retrying cannot fix: the schema
@@ -388,15 +427,21 @@ func refusalForCause(err error, table string) *refusal {
 			cause:  fmt.Sprintf("the engine role lacks access for %s %s", privilegeErr.Tier, object),
 			remedy: remedy}
 	}
-	// An invalid-index verdict is operational even when the build failure it
-	// wraps would classify as a refusal on its own — a budget-cancelled
-	// concurrent build leaves its own invalid index, and the index the
-	// operator clears is the outcome, not the inner budget exhaustion.
-	// Declined before the budget arm so the nested cause can never shadow
-	// the verdict.
+	// An invalid-index verdict is decided by its own code, never by the build
+	// failure it wraps — a budget-cancelled concurrent build leaves its own
+	// invalid index, and the index the operator clears is the outcome, not
+	// the inner budget exhaustion. Decided before the budget arm so the
+	// nested cause can never shadow the verdict. Only the permanent members
+	// of the family refuse: the name is occupied on another table, or by an
+	// index the server will not drop concurrently, so retrying unchanged
+	// reproduces the verdict. Every other member is operational.
 	var invalidErr *executor.InvalidIndexError
 	if errors.As(err, &invalidErr) {
-		return nil
+		r, _ := refusalForOutcome(invalidErr.Code(), table)
+		if r != nil {
+			r.cause, r.remedy = invalidIndexAdvice(invalidErr)
+		}
+		return r
 	}
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
@@ -485,14 +530,34 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "engine-invariant-violation",
 			cause:  fmt.Sprintf("the engine's safety invariants did not hold while changing table %q", table),
 			remedy: "inspect the target and server logs before re-running"}, true
-	case executor.CodeBudgetLockExceeded, executor.CodeCancelledExternally,
-		executor.CodeInvalidIndexOwnLeftover, executor.CodeInvalidIndexPreexisting,
-		executor.CodeInvalidIndexUnproven, executor.CodePoolTooSmall,
+	case executor.CodeInvalidIndexOtherTable, executor.CodeInvalidIndexNotDroppable:
+		// The permanent members of the invalid-index family: the requested
+		// name is held by an entry this change can never clear — an invalid
+		// index on a different table, or one the server will not drop
+		// concurrently (a partitioned table's index, an index partition, a
+		// constraint's index). Retrying unchanged reproduces the verdict.
+		// The typed-verdict path replaces this cause and remedy with the
+		// code's own advice; this mapping keeps the vocabulary total.
+		return &refusal{reason: "invalid-index-occupied",
+			cause:  fmt.Sprintf("an invalid index already occupies a name the change to %q needs and is not a failed build's leftover", table),
+			remedy: "rename the index in the schema file and re-plan, or resolve the entry on the target"}, true
+	case executor.CodePoolTooSmall:
+		// The pool is sized by the target DSN, so every retry against the
+		// same configuration is refused at admission the same way; only an
+		// operator raising the pool ceiling changes the outcome.
+		return &refusal{reason: "pool-too-small",
+			cause:  fmt.Sprintf("the target's connection pool cannot hold every session the change to %q needs at once", table),
+			remedy: "raise the pool size on the target DSN, then re-run"}, true
+	case executor.CodeBudgetLockExceeded, executor.CodeCancelledByCaller,
+		executor.CodeCancelledExternally, executor.CodeInvalidIndexOwnLeftover,
+		executor.CodeInvalidIndexAbandoned, executor.CodeInvalidIndexBuildInFlight,
+		executor.CodeInvalidIndexBuilderUnobservable, executor.CodeInvalidIndexUnproven,
 		executor.CodeExecutionFailed:
-		// Operational outcomes: a bounded lock race, an external stop, an
-		// invalid-index state an operator clears, engine pool sizing, or a
-		// failure outside the typed set. A retry can succeed once
-		// conditions change, so none is a permanent refusal.
+		// Operational outcomes: a bounded lock race, the caller's own
+		// context ending or an external stop, an invalid-index state an
+		// operator clears or waits out, or a failure outside the typed set.
+		// A retry can succeed once conditions change, so none is a permanent
+		// refusal.
 		return nil, true
 	}
 	return nil, false

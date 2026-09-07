@@ -118,6 +118,42 @@ func TestClassifyRefusal(t *testing.T) {
 			err:  fmt.Errorf("execute: %w", executor.ErrCancelledExternally),
 		},
 		{
+			name: "the caller's own cancellation is operational",
+			err:  fmt.Errorf("execute: %w", executor.ErrCancelledByCaller),
+		},
+		{
+			name: "invalid index on another table is a refusal that renders the typed advice",
+			err: fmt.Errorf("execute: %w", &executor.InvalidIndexError{
+				Schema:  "public",
+				Index:   "users_ref_idx",
+				Table:   "shipments",
+				Cleanup: executor.ErrInvalidIndexOnOtherTable,
+			}),
+			wantReason:    "invalid-index-occupied",
+			wantDetail:    []string{`"public"."users_ref_idx"`, `"shipments"`, "re-plan"},
+			wantNotDetail: []string{"drop the invalid index"},
+		},
+		{
+			name: "non-droppable invalid index is a refusal even when it wraps a statement-budget cause",
+			err: fmt.Errorf("execute: %w", &executor.InvalidIndexError{
+				Schema:  "public",
+				Index:   "users_pkey",
+				Table:   "users",
+				Build:   &executor.BudgetError{Cause: executor.CauseStatement, Budget: time.Second},
+				Cleanup: executor.ErrInvalidIndexNotDroppable,
+			}),
+			wantReason:    "invalid-index-occupied",
+			wantDetail:    []string{`"public"."users_pkey"`, "constraint's index", "operator must resolve"},
+			wantNotDetail: []string{"budget", "drop the invalid index"},
+		},
+		{
+			name: "abandoned invalid index is operational",
+			err: fmt.Errorf("execute: %w", &executor.InvalidIndexError{
+				Schema: "public", Index: "users_ref_idx", Table: "users",
+				Cleanup: executor.ErrAbandonedInvalidIndex,
+			}),
+		},
+		{
 			name: "partitioned-parent admission refusal renders the typed sentence",
 			err: fmt.Errorf("admit statement for partitioned PostgreSQL table %q: %w", "users",
 				&preflight.UnsupportedPartitionedParentError{Cause: preflight.PartitionCauseConcurrentIndexBuild}),
@@ -156,6 +192,12 @@ func TestClassifyRefusal(t *testing.T) {
 			name:       "non-table relation is a refusal",
 			err:        fmt.Errorf("preflight: %w", preflight.ErrNotTable),
 			wantReason: "not-a-table",
+		},
+		{
+			name:       "pool too small for the build's sessions is a refusal that names the pool",
+			err:        fmt.Errorf("admit concurrent build: %w", executor.ErrPoolTooSmall),
+			wantReason: "pool-too-small",
+			wantDetail: []string{"connection pool", `"users"`, "raise the pool size"},
 		},
 		{
 			name: "untyped error is operational",
@@ -339,6 +381,13 @@ func TestRefusalAfterCommittedCreateStepKeepsOwnRemedy(t *testing.T) {
 			wantReason: "not-native-safe-budget-exceeded",
 			wantRemedy: replanRemedy,
 		},
+		{
+			name: "permanent invalid-index verdict keeps the typed advice's remedy",
+			err: &executor.InvalidIndexError{Schema: "public", Index: "users_ref_idx", Table: "shipments",
+				Cleanup: executor.ErrInvalidIndexOnOtherTable},
+			wantReason: "invalid-index-occupied",
+			wantRemedy: "this change cannot claim it — rename the index in the schema file and re-plan, or clear the entry through that table's own change",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -415,7 +464,26 @@ func TestProgressResultReportsCreateSequenceLength(t *testing.T) {
 // retryable tail. Every refusal also carries a cause: it is the clause the
 // composed detail opens with, and a remedy alone would publish a detail that
 // starts mid-sentence.
+//
+// The disposition is also pinned to the executor's own verdict: a code
+// pg-sprite marks permanent refuses here, and a code it does not marks
+// operational, unless the exception table names the code and states why
+// SchemaBot's apply policy departs from the engine's floor. Departing in the
+// other direction — retrying a code the engine calls permanent — is never
+// sanctioned, because the drive would re-run a verdict that cannot change
+// until its attempt ceiling ends it.
 func TestRefusalForOutcomeTotalOverExecutorCodes(t *testing.T) {
+	// refusedThoughNotPermanent lists the codes SchemaBot refuses although
+	// pg-sprite leaves them retryable, with the reason for each. The
+	// engine's Permanent doc names this direction of disagreement as an
+	// adapter's own retry policy.
+	refusedThoughNotPermanent := map[executor.Code]string{
+		// The statement budget is sized as SchemaBot's native-safety lease:
+		// a statement that needs longer is not native-safe under this
+		// policy, so re-running it unchanged would only spend the lease
+		// again.
+		executor.CodeBudgetStatementExceeded: "the statement budget is the native-safety lease",
+	}
 	for _, code := range executor.Codes() {
 		t.Run(string(code), func(t *testing.T) {
 			r, known := refusalForOutcome(code, "users")
@@ -424,6 +492,14 @@ func TestRefusalForOutcomeTotalOverExecutorCodes(t *testing.T) {
 				assert.NotEmpty(t, r.reason, "refusal for %q has no reason", code)
 				assert.NotEmpty(t, r.cause, "refusal for %q has no cause", code)
 			}
+			refused := r != nil
+			if why, exempt := refusedThoughNotPermanent[code]; exempt {
+				assert.False(t, code.Permanent(), "exception for %q is stale: the engine now marks it permanent", code)
+				assert.True(t, refused, "code %q is listed as a policy refusal (%s) but is operational", code, why)
+				return
+			}
+			assert.Equal(t, code.Permanent(), refused,
+				"disposition for %q disagrees with the engine's permanence verdict", code)
 		})
 	}
 }
@@ -459,11 +535,14 @@ func TestRetryPathFitsUnderApplyCeiling(t *testing.T) {
 }
 
 // TestInvalidIndexDetailMatchesVerdictOwnership pins the advice ladder to
-// the verdict code: a drop is named only for the build's own proven
-// leftover; a pre-existing entry gets an in-progress-build check; an
-// unproven verdict gets catalog inspection because the index may be healthy.
-// Every branch names the index and none renders the wrapped build or
-// cleanup errors, which may carry raw server text.
+// the verdict code: a drop is named only where the executor proved the entry
+// is a failed build's debris on the target table — this build's own leftover
+// or an abandoned entry; a build in flight says wait and names the builder;
+// an entry on another table, one the server will not drop concurrently, one
+// whose builder the role cannot see, and an unproven verdict get
+// investigation steps because the index may be healthy or intentional. Every
+// branch names the index and none renders the wrapped build or cleanup
+// errors, which may carry raw server text.
 func TestInvalidIndexDetailMatchesVerdictOwnership(t *testing.T) {
 	rawServerText := errors.New("ERROR: deadline exceeded at host db-internal-1.example.com")
 	tests := []struct {
@@ -480,11 +559,46 @@ func TestInvalidIndexDetailMatchesVerdictOwnership(t *testing.T) {
 			wantNotDetail: []string{"db-internal-1"},
 		},
 		{
-			name: "pre-existing entry gets an in-progress-build check, never a drop",
-			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx",
-				Build: rawServerText, Cleanup: executor.ErrPreexistingInvalidIndex},
-			wantDetail:    []string{`"public"."big_ref_idx"`, "another actor's build", "pg_stat_activity"},
+			name: "abandoned entry names the drop after a re-check",
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx", Table: "orders",
+				Cleanup: executor.ErrAbandonedInvalidIndex},
+			wantDetail:    []string{`"public"."big_ref_idx"`, "abandoned", "no backend building it", "drop the invalid index", "retry"},
+			wantNotDetail: []string{"db-internal-1"},
+		},
+		{
+			name: "build in flight says wait and names the builder, never a drop",
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx", Table: "orders",
+				BuilderPID: 4242, Cleanup: executor.ErrInvalidIndexBuildInFlight},
+			wantDetail:    []string{`"public"."big_ref_idx"`, "backend 4242", "still building it", "wait"},
 			wantNotDetail: []string{"drop the invalid index", "db-internal-1"},
+		},
+		{
+			name: "unobservable builder gets a privileged progress check, never a drop",
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx", Table: "orders",
+				Cleanup: executor.ErrInvalidIndexBuilderUnobservable},
+			wantDetail:    []string{`"public"."big_ref_idx"`, "cannot observe", "pg_stat_progress_create_index", "pg_read_all_stats"},
+			wantNotDetail: []string{"drop the invalid index", "db-internal-1"},
+		},
+		{
+			name: "entry on another table names that table and a re-plan, never a drop",
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx", Table: "shipments",
+				Cleanup: executor.ErrInvalidIndexOnOtherTable},
+			wantDetail:    []string{`"public"."big_ref_idx"`, "different table", `"shipments"`, "re-plan"},
+			wantNotDetail: []string{"drop the invalid index", "retry", "db-internal-1"},
+		},
+		{
+			name: "entry on another table with no inspected table name still re-plans",
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx",
+				Cleanup: executor.ErrInvalidIndexOnOtherTable},
+			wantDetail:    []string{`"public"."big_ref_idx"`, "different table;", "re-plan"},
+			wantNotDetail: []string{"drop the invalid index", `("")`},
+		},
+		{
+			name: "non-droppable entry is left to an operator, never a drop",
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx", Table: "orders",
+				Cleanup: executor.ErrInvalidIndexNotDroppable},
+			wantDetail:    []string{`"public"."big_ref_idx"`, "constraint's index", "operator must resolve", "re-plan"},
+			wantNotDetail: []string{"drop the invalid index", "retry", "db-internal-1"},
 		},
 		{
 			name: "unproven verdict gets catalog inspection, never a drop",
