@@ -611,8 +611,6 @@ matched against token groups as described [above](#oidc-bearer-tokens).
 
 Keep these permissions in server configuration controlled by the people who
 operate SchemaBot, rather than in schema files that database teams can edit.
-The underlying guarantee is documented in
-[AZ-4](invariants.md#az-4-applying-takes-an-authorized-actor).
 
 <a id="the-decision-flow"></a>
 
@@ -656,8 +654,7 @@ restricted to one database. Per-database and per-environment permissions apply
 to writes under `forward_auth`.
 
 In the route rules, `GET` and `HEAD` requests are reads, as is `POST /api/pull`.
-Other requests require write access by default. This rule is covered by
-[AZ-2](invariants.md#az-2-authorization-fails-closed-at-every-tier).
+Other requests require write access by default.
 
 ## Proxy and network details
 
@@ -704,8 +701,7 @@ any caller-supplied identity header before setting the verified value.
 
 SchemaBot accepts the request only from a trusted gateway, for a listed
 service identity, and for a read operation. User and group headers do not
-grant additional permissions on this path. This separation is covered by
-[AZ-3](invariants.md#az-3-identity-comes-from-a-verified-lane).
+grant additional permissions on this path.
 
 ```yaml
 auth:
