@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/url"
@@ -17,6 +18,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	gomysql "github.com/block/mysql"
 	"github.com/block/schemabot/pkg/engine"
 	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
@@ -28,7 +30,6 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage"
-	gomysql "github.com/go-sql-driver/mysql"
 	"gopkg.in/yaml.v3"
 )
 
@@ -1545,11 +1546,22 @@ func LoadServerConfigFromFile(path string) (*ServerConfig, error) {
 		return nil, fmt.Errorf("read config file: %w", err)
 	}
 
+	return ParseServerConfig(data)
+}
+
+// ParseServerConfig decodes one strict YAML document and applies the same
+// normalization and validation for file-backed and privately loaded configs.
+func ParseServerConfig(data []byte) (*ServerConfig, error) {
 	var config ServerConfig
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(&config); err != nil {
 		return nil, fmt.Errorf("parse config file: %w", err)
+	}
+
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("config must contain one YAML document")
 	}
 
 	if err := config.canonicalizeRepositories(); err != nil {

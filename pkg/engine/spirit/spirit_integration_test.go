@@ -29,7 +29,7 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
 
-	drivermysql "github.com/go-sql-driver/mysql"
+	drivermysql "github.com/block/mysql"
 )
 
 // Shared test infrastructure
@@ -117,7 +117,7 @@ func tableSchemaNames(schemas []table.TableSchema) []string {
 func setupTestMySQL(t *testing.T) (string, *sql.DB) {
 	t.Helper()
 
-	db, err := sql.Open("mysql", sharedDSN)
+	db, err := sql.Open("block-mysql", sharedDSN)
 	require.NoError(t, err, "connect to mysql")
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 
@@ -2200,7 +2200,7 @@ func containsHelper(s, substr string) bool {
 // and report the deferred-cutover signal as absent.
 func TestEngine_StatelessControlAddressesDSNSchema(t *testing.T) {
 	ctx := t.Context()
-	db, err := sql.Open("mysql", sharedDSN)
+	db, err := sql.Open("block-mysql", sharedDSN)
 	require.NoError(t, err, "open database")
 	defer utils.CloseAndLog(db)
 
@@ -2214,7 +2214,7 @@ func TestEngine_StatelessControlAddressesDSNSchema(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
 		defer cancel()
-		cleanupDB, cleanupErr := sql.Open("mysql", sharedDSN)
+		cleanupDB, cleanupErr := sql.Open("block-mysql", sharedDSN)
 		require.NoError(t, cleanupErr, "open database for stateless control cleanup")
 		defer utils.CloseAndLog(cleanupDB)
 		_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, "DROP DATABASE IF EXISTS `"+physicalSchema+"`")

@@ -90,6 +90,7 @@
   - [AZ-3: Identity comes from a verified lane](#az-3-identity-comes-from-a-verified-lane)
   - [AZ-4: Applying takes an authorized actor](#az-4-applying-takes-an-authorized-actor)
   - [AZ-5: Commands never guess](#az-5-commands-never-guess)
+  - [AZ-6: Local hosting preserves its boundaries](#az-6-local-hosting-preserves-its-boundaries)
 - [Structural enforcement](#structural-enforcement)
 - [Engineering rules live in AGENTS.md](#engineering-rules-live-in-agentsmd)
 
@@ -758,7 +759,8 @@ once. Giving up on a timer is also the one place a driver acts without proof, so
 the fallback; a driver that can still reach storage learns it was displaced by reading the token
 instead (OW-4). *Enforced:* one staleness constant (`ApplyLeaseStaleAfter` in
 `pkg/storage/storage.go`) read by both the heartbeat loop (`pkg/api/operator.go`) and every claim
-query (`pkg/storage/internal/sqlstore/applies.go`).
+query, at the apply level (`pkg/storage/internal/sqlstore/applies.go`) and the operation level
+(`pkg/storage/internal/sqlstore/apply_operations.go`).
 
 ### OW-4: Lease loss is proven, never inferred
 
@@ -875,9 +877,16 @@ webhook control entry points (`pkg/api/control_handlers.go`, `pkg/webhook/contro
 A control request resolves to an explicit durable outcome: applied, superseded, or failed. A
 command may delay a drive but never wedge it. A failed request requires fresh operator intent
 rather than being retried forever, and polling windows are bounded with visible timeout failures.
+An operation an engine declines for its whole database type is one of these doomed commands, so
+every engine states that decline in the type system rather than as a generic failure, and the
+drive resolves the request with the engine's reason instead of reattempting it.
 *Breaks if violated:* an apply loops on a doomed command while holding its database lock.
 *Enforced:* request completion and bounded-retry rules in the drive loop (`pkg/api/operator.go`,
-`pkg/tern/control_requests.go`).
+`pkg/tern/control_requests.go`), the terminal resolution of a typed unsupported-operation
+decline (`failPendingRequestForUnsupportedOperation`, `pkg/tern/local_control.go`), reached from
+the stop and cancel paths in that file and from the revert and skip-revert paths in
+`pkg/tern/local_apply_grouped.go`, and the refusal paths of the pending control-request processors
+on both clients (`pkg/tern/local_control.go`, `pkg/tern/grpc_client.go`).
 
 ### CO-3: Engine terminal truth outranks a queued command
 
@@ -1223,11 +1232,21 @@ recovery paths (`pkg/webhook/comment_observer.go`, `pkg/webhook/handler.go`).
 
 A deployment applying a plan reviewed elsewhere independently re-derives the change set and
 compares it immediately before each per-task engine apply. Drift fails closed, including DDL it
-cannot parse, and recomputed deltas are never applied silently. *Enforced:*
-`verifyMaterializedPlanMatchesLiveSchema` on the apply path (`pkg/tern/local_plan_drift.go`,
-called from `pkg/tern/local_client.go`). The cross-deployment comparison a plan is reviewed
-against is a separate, earlier mechanism (`pkg/tern/change_set_compare.go`, applied on the
-review-drift and rollup paths).
+cannot parse, and recomputed deltas are never applied silently. A task may settle as completed
+without SchemaBot running its reviewed DDL only on evidence from the reviewed target: the
+resume re-plan of the reviewed schema set against the live target no longer lists the task's
+statement, and every statement it still lists is the reviewed DDL of another task of the same
+apply operation on that table that is neither terminal nor in a revert phase — one that will
+still run it forward. A statement the re-plan still lists that only a terminal or revert-phase
+sibling was reviewed with refuses the resume instead, since nothing will run it forward.
+*Enforced:* `verifyMaterializedPlanMatchesLiveSchema` on the apply path
+(`pkg/tern/local_plan_drift.go`, called from `pkg/tern/local_client.go`);
+`verifyReplannedTaskDDL` on the resume path (`pkg/tern/local_control_resume.go`, called from
+`replanAndFilterTasks` and `resumeApplySequential`); `settleLostVerifiedTask` on the lost-work
+path (`pkg/tern/local_apply_sequential.go`, judged by `replanVerdictForTask` and reached from
+the sequential and grouped drives). The cross-deployment comparison a plan is reviewed against
+is a separate, earlier mechanism (`pkg/tern/change_set_compare.go`, applied on the review-drift
+and rollup paths).
 
 ### RV-2: Stale plans never apply
 
@@ -1241,7 +1260,7 @@ waive with.
 
 ### RV-3: Consent is explicit, specific, and re-checked
 
-Unsafe changes (error-severity lint findings such as drops and column narrowing) block without
+Unsafe changes (error-severity lint findings such as table and column drops) block without
 `--allow-unsafe`. Changes an operator cannot undo mid-flight, such as direct execution's
 write-blocking DDL with no cutover and no revert, require the operator to confirm the specific
 consequences disclosed to them. The re-plan that runs just before execution re-checks that
@@ -1359,6 +1378,19 @@ never resolved by an arbitrary pick. A malformed command is rejected rather than
 corrected into something executable, especially one carrying `--allow-unsafe`. Every command
 receives a response, and silence only ever means another instance owns the reply. *Enforced:*
 command discovery and the unowned-command policy (`pkg/webhook/commands.go`).
+
+### AZ-6: Local hosting preserves its boundaries
+
+The internal local host reserves a numeric loopback listener before storage bootstrap or
+operator startup. Every route, including probes, requires its private credential. Local hosting
+rejects service authentication configuration and GitHub Apps rather than silently changing their
+authorization behavior. Its credential identifies the runtime, not an independently approved human.
+
+State storage must use an explicit connection and a different database name from each locally
+configured target in the same database family. This conservative name check does not establish
+isolation for dynamically resolved targets. Local hosting never opts into destructive storage
+bootstrap. *Enforced:* `pkg/serve/local.go`, `pkg/auth/local.go`, and
+`pkg/api/storage_isolation.go`; process recovery is covered in `integration/localruntime`.
 
 ## Structural enforcement
 

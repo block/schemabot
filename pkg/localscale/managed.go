@@ -207,7 +207,7 @@ func startManagedCluster(ctx context.Context, keyspaces []KeyspaceConfig, logger
 // on the managed cluster's mysqld. vttest's init_db.sql only grants vt_dba@'localhost'
 // (socket-only), so we need a separate user for TCP access (branch proxy upstream).
 func createManagedTCPUser(mysqlDSNBase string, logger *slog.Logger) error {
-	db, err := sql.Open("mysql", mysqlDSNBase)
+	db, err := sql.Open("block-mysql", mysqlDSNBase)
 	if err != nil {
 		return fmt.Errorf("connect to mysqld: %w", err)
 	}
@@ -338,7 +338,7 @@ func startManagedClusters(
 // and returns a *sql.DB connected to it.
 func createManagedMetadataDB(ctx context.Context, mysqlDSNBase string) (*sql.DB, string, error) {
 	// Connect without database to create it.
-	rootDB, err := sql.Open("mysql", mysqlDSNBase)
+	rootDB, err := sql.Open("block-mysql", mysqlDSNBase)
 	if err != nil {
 		return nil, "", fmt.Errorf("connect to mysqld for metadata: %w", err)
 	}
@@ -354,7 +354,7 @@ func createManagedMetadataDB(ctx context.Context, mysqlDSNBase string) (*sql.DB,
 
 	// Connect to the localscale database.
 	dsn := mysqlDSNBase + "localscale"
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	if err != nil {
 		return nil, "", fmt.Errorf("connect to localscale database: %w", err)
 	}

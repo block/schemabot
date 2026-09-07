@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 	"github.com/square/etre"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

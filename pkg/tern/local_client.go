@@ -99,10 +99,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/statement"
 	spirittable "github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
 	"github.com/block/schemabot/pkg/ddl"

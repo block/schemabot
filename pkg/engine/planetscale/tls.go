@@ -7,7 +7,7 @@ import (
 	"os"
 	"sync/atomic"
 
-	mysql "github.com/go-sql-driver/mysql"
+	mysql "github.com/block/mysql"
 )
 
 // mtlsConfigName is the Go MySQL driver TLS config name registered by RegisterMTLS.

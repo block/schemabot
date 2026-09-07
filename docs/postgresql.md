@@ -178,16 +178,78 @@ flags do not override an engine-blocked verdict.
 
 The engine does not execute `DROP TABLE` or other statement kinds outside its
 admitted set. That includes tables that exist on the target but that no schema
-file in the namespace declares any longer, typically because a file was
-deleted from the PR. The planner enumerates the target's ordinary and
-partitioned tables (partitions are covered by their parent's declaration) and
-surfaces each undeclared table as a blocked, destructive `DROP TABLE` change,
-so the removal is visible on the plan and the apply is refused rather than the
-table lingering silently. Restore the file to keep the table, or drop it
-through a separately reviewed operational process. Because namespaces are
-derived from the schema files present in the PR, deleting the last file of a
-namespace removes that namespace from the plan altogether, and its tables are
-not enumerated.
+file in the namespace declares. The common case is onboarding an existing
+database, where every table nobody has written a file for yet is undeclared;
+the same happens when a file is deleted from the PR, or when an imperative
+tool leaves a table behind during coexistence. A namespace is owned whole: the
+schema files declare the set of tables, not just each table's shape, so the
+only convergence for a table with no file is a drop. The planner enumerates
+the target's tables and surfaces each undeclared one as a blocked, destructive
+`DROP TABLE` change: the engine will never run the drop, so the one choice
+left is whether to report the divergence, and hiding it would turn a target
+that does not match its declaration into a passing check.
+Because the check fails for the whole database while any change is blocked,
+an undeclared table holds up every other change to that database until it is
+resolved — including changes in other namespaces, since every namespace at
+the PR head is reconciled on every plan. Plan an onboarding accordingly:
+declare the existing tables first, or list namespaces that stay outside
+SchemaBot under `ignore_namespaces`.
+
+Two remedies clear it. Declare the table in a schema file to bring it under
+management — the file need only match the live table for the drop to
+disappear from the plan. Or drop the table through a separately reviewed
+operational process. `schemabot pull` and `schemabot onboard` write the files
+for the tables the plan holds accountable, so onboarding an existing database
+is a pull, not hand-writing every file; the pull refuses a namespace as a
+whole when any of its tables carries objects the format cannot represent
+(triggers, policies, comments, relation options, inheritance, partitioning,
+or foreign keys on either side), and those tables need a hand-written file or
+a reviewed drop before the rest can be pulled. `CREATE UNLOGGED TABLE`,
+`PARTITION BY` and a child of `INHERITS` flattened to its own columns are all
+accepted in a hand-written file.
+
+Foreign keys change which remedy is available, and the plan says which. The
+declarative format does not support foreign keys, so a table that owns them
+cannot be declared: a file for it fails to parse, and a file that omits them
+plans their removal as a destructive `DROP CONSTRAINT`. The plan names the
+constraints; the table must be dropped, or have its foreign keys removed
+before it is declared, through a separately reviewed process. A table that
+other tables reference can be declared — the constraints live on the
+referencing tables, not in its own definition — but only by a hand-written
+file, because the pull refuses to render a table it would describe
+incompletely; and a drop has to take the referencing constraints with it. The
+plan names those constraints too, so both sides of one relationship explain
+themselves.
+
+Archive tables named `<table>_archive_YYYY[_MM[_DD]]` are exempt from the
+verdict, as they are in the MySQL engine's view of a live schema: an archive
+is a retired copy kept outside declarative schema files. That naming
+convention is the only per-table exemption — a leading underscore means
+nothing on PostgreSQL — and `ignore_namespaces` is the per-namespace one.
+Tables whose definition lives elsewhere are likewise not enumerated: a
+partition is declared through its parent's `PARTITION BY` and follows the
+parent's verdict wherever the parent lives, and extension-owned tables (such
+as PostGIS's `spatial_ref_sys`) belong to their extension — no file can
+declare them and the server refuses to drop them. An inheritance child and an
+unlogged table are ordinary tables with definitions of their own, and each
+needs its own file.
+
+The enumeration covers ordinary and partitioned tables only. Undeclared views,
+materialized views, and foreign tables are outside the declarative format and
+are not reported. Because namespaces are derived from the schema files present
+in the PR, deleting the last file of a namespace removes that namespace from
+the plan altogether: its tables are not enumerated and the plan reports no
+change for it, so remove a namespace's final table through a separately
+reviewed process rather than by deleting its file.
+
+SchemaBot's own catalog reads — the undeclared-table enumeration and the
+schema pull — name every catalog relation, function and operator with an
+explicit `pg_catalog.` qualification, so a target whose `search_path` lists a
+user schema ahead of `pg_catalog` cannot shadow the catalog and turn either
+into a silently wrong answer. pg-sprite's introspection pins its own
+transaction-local `search_path`; its preflight reads run on the shared
+connection pool with the session's `search_path` and are the library's
+surface.
 
 ## Apply-time refusals
 

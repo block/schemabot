@@ -24,7 +24,7 @@ func TestRenderPlanComment_BlockedShownOnPlanAndApply(t *testing.T) {
 	}
 
 	plan := RenderPlanComment(data)
-	assert.Contains(t, plan, "⛔ **Cannot apply**: 1 change the schema change engine refuses to execute")
+	assert.Contains(t, plan, "⛔ **Cannot apply**: 1 change the engine refuses to execute")
 	assert.Contains(t, plan, "`users`: dropping primary key is not supported")
 	assert.Contains(t, plan, "An apply will fail on these statements.")
 
@@ -81,7 +81,7 @@ func TestRenderPlanComment_BlockedForeignKey(t *testing.T) {
 		},
 	})
 
-	assert.Contains(t, out, "⛔ **Cannot apply**: 1 change the schema change engine refuses to execute")
+	assert.Contains(t, out, "⛔ **Cannot apply**: 1 change the engine refuses to execute")
 	assert.Contains(t, out, "`orders`: adding foreign key constraints is not supported")
 	assert.Contains(t, out, "An apply will fail on these statements.")
 }

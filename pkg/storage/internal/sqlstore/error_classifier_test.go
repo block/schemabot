@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	gomysql "github.com/go-sql-driver/mysql"
+	gomysql "github.com/block/mysql"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 )

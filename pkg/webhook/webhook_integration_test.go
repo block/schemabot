@@ -81,7 +81,7 @@ import (
 	"testing"
 	"time"
 
-	mysql "github.com/go-sql-driver/mysql"
+	mysql "github.com/block/mysql"
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -205,14 +205,14 @@ func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *a
 
 	if databaseType == storage.DatabaseTypeMySQL {
 		// Create the app database on the target.
-		targetDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+		targetDB, err := sql.Open("block-mysql", e2eTargetDSN+"&multiStatements=true")
 		require.NoError(t, err)
 		_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+appDBName+"`")
 		require.NoError(t, err)
 		_ = targetDB.Close()
 
 		t.Cleanup(func() {
-			db, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+			db, err := sql.Open("block-mysql", e2eTargetDSN+"&multiStatements=true")
 			if err == nil {
 				_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+appDBName+"`")
 				_ = db.Close()
@@ -229,7 +229,7 @@ func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *a
 	require.NotEmpty(t, appDSN, "target DSN is required for database type %s", databaseType)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = schemabotDB.Close() })
 
@@ -1001,7 +1001,7 @@ func setupE2EServiceMultiEnv(t *testing.T, appDBName string) *api.Service {
 	t.Helper()
 	ctx := t.Context()
 
-	targetDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+	targetDB, err := sql.Open("block-mysql", e2eTargetDSN+"&multiStatements=true")
 	require.NoError(t, err)
 
 	stagingDB := appDBName + "_staging"
@@ -1014,7 +1014,7 @@ func setupE2EServiceMultiEnv(t *testing.T, appDBName string) *api.Service {
 	_ = targetDB.Close()
 
 	t.Cleanup(func() {
-		db, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+		db, err := sql.Open("block-mysql", e2eTargetDSN+"&multiStatements=true")
 		if err == nil {
 			_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+stagingDB+"`")
 			_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+productionDB+"`")
@@ -1026,7 +1026,7 @@ func setupE2EServiceMultiEnv(t *testing.T, appDBName string) *api.Service {
 	productionDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+productionDB, 1)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = schemabotDB.Close() })
 
@@ -1094,7 +1094,7 @@ func startE2EMySQLContainer(ctx context.Context, baseName, dbName string, schema
 			_ = container.Terminate(ctx)
 			return nil, fmt.Errorf("build mysql dsn: %w", err)
 		}
-		db, err := sql.Open("mysql", dsn)
+		db, err := sql.Open("block-mysql", dsn)
 		if err != nil {
 			_ = container.Terminate(ctx)
 			return nil, fmt.Errorf("open db: %w", err)
@@ -1173,7 +1173,7 @@ func setupE2EServiceWithAllowedEnvs(t *testing.T, allowedEnvs []string) *api.Ser
 func setupE2EServiceWithConfig(t *testing.T, serverConfig *api.ServerConfig) *api.Service {
 	t.Helper()
 
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = schemabotDB.Close() })
 

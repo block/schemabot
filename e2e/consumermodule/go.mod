@@ -36,8 +36,9 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.3 // indirect
 	github.com/aws/smithy-go v1.27.7 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
+	github.com/block/mysql v0.0.0-20260906224346-ee0a93fe50d6 // indirect
 	github.com/block/pg-sprite v0.2.0 // indirect
-	github.com/block/spirit v0.16.1-0.20260903162727-fc5f1dfb0a40 // indirect
+	github.com/block/spirit v0.17.1-0.20260907005557-10804bbe247c // indirect
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -48,8 +49,6 @@ require (
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-mysql-org/go-mysql v1.16.1-0.20260731133054-6f853f178dc3 // indirect
-	github.com/go-mysql/hotswap-dsn-driver v1.0.1 // indirect
-	github.com/go-sql-driver/mysql v1.10.0 // indirect
 	github.com/goccy/go-json v0.10.6 // indirect
 	github.com/gofri/go-github-ratelimit/v2 v2.0.2 // indirect
 	github.com/golang-jwt/jwt/v4 v4.5.2 // indirect
@@ -126,6 +125,4 @@ replace github.com/block/schemabot => ../..
 
 // Mirror the parent module's replace directives; replaces do not propagate
 // across module boundaries.
-replace vitess.io/vitess => github.com/block/vitess v0.0.0-20260703150944-881ec2298245
-
-replace github.com/pingcap/tidb/pkg/parser => github.com/block/tidb/pkg/parser v0.0.0-20260506200501-e528fd979fc8
+replace vitess.io/vitess => github.com/block/vitess v0.0.0-20260907005807-88d15fda31ea

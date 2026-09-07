@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
+	drivermysql "github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	drivermysql "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -108,7 +108,7 @@ func createControlPlaneStorage(t *testing.T, dpDSN string) storage.Storage {
 
 	adminCfg := *cfg
 	adminCfg.DBName = ""
-	adminDB, err := sql.Open("mysql", adminCfg.FormatDSN())
+	adminDB, err := sql.Open("block-mysql", adminCfg.FormatDSN())
 	require.NoError(t, err, "open admin connection for control-plane storage database")
 	defer utils.CloseAndLog(adminDB)
 	require.NoError(t, adminDB.PingContext(t.Context()), "ping admin connection")
@@ -120,7 +120,7 @@ func createControlPlaneStorage(t *testing.T, dpDSN string) storage.Storage {
 	bootCfg := *cfg
 	bootCfg.DBName = databaseName
 	bootCfg.MultiStatements = true
-	bootDB, err := sql.Open("mysql", bootCfg.FormatDSN())
+	bootDB, err := sql.Open("block-mysql", bootCfg.FormatDSN())
 	require.NoError(t, err, "open bootstrap connection for control-plane storage")
 	defer utils.CloseAndLog(bootDB)
 	require.NoError(t, bootDB.PingContext(t.Context()), "ping bootstrap connection")
@@ -138,7 +138,7 @@ func createControlPlaneStorage(t *testing.T, dpDSN string) storage.Storage {
 
 	storeCfg := *cfg
 	storeCfg.DBName = databaseName
-	db, err := sql.Open("mysql", storeCfg.FormatDSN())
+	db, err := sql.Open("block-mysql", storeCfg.FormatDSN())
 	require.NoError(t, err, "open control-plane storage connection")
 	require.NoError(t, db.PingContext(t.Context()), "ping control-plane storage connection")
 	return mysqlstore.New(db)

@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -95,7 +95,7 @@ func startSchemaBot(t *testing.T, ternGRPCAddr string) string {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	// Create MySQL storage for SchemaBot
-	db, err := sql.Open("mysql", schemabotDSN)
+	db, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 	storage := schemabotmysql.New(db)
@@ -188,7 +188,7 @@ func TestGRPC_ExternalID_StoredOnApply(t *testing.T) {
 	ctx := t.Context()
 
 	// Create a unique target database for this test
-	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
+	targetDB, err := sql.Open("block-mysql", targetDSN+"&multiStatements=true")
 	require.NoError(t, err, "open target db")
 	defer utils.CloseAndLog(targetDB)
 
@@ -211,7 +211,7 @@ func TestGRPC_ExternalID_StoredOnApply(t *testing.T) {
 	require.NoError(t, err, "start tern grpc")
 
 	// Create SchemaBot with its own storage and a GRPCClient to remote Tern
-	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	defer utils.CloseAndLog(schemabotDB)
 	schemabotStorage := schemabotmysql.New(schemabotDB)
@@ -325,7 +325,7 @@ func TestGRPC_TaskStateUpdatedOnCompletion(t *testing.T) {
 	// Create a unique target database for this test. The close cleanup is
 	// registered before the drop cleanup so it runs after it (cleanups run
 	// LIFO): the drop still has a live handle.
-	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
+	targetDB, err := sql.Open("block-mysql", targetDSN+"&multiStatements=true")
 	require.NoError(t, err, "open target db")
 	t.Cleanup(func() { utils.CloseAndLog(targetDB) })
 
@@ -356,7 +356,7 @@ func TestGRPC_TaskStateUpdatedOnCompletion(t *testing.T) {
 
 	// Create SchemaBot with its own storage and a GRPCClient to remote Tern.
 	// The GRPCClient must have storage so pollForCompletion can update tasks.
-	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	defer utils.CloseAndLog(schemabotDB)
 	schemabotStorage := schemabotmysql.New(schemabotDB)
@@ -487,7 +487,7 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 	// Create a unique target database for this test. The close cleanup is
 	// registered before the drop cleanup so it runs after it (cleanups run
 	// LIFO): the drop still has a live handle.
-	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
+	targetDB, err := sql.Open("block-mysql", targetDSN+"&multiStatements=true")
 	require.NoError(t, err, "open target db")
 	t.Cleanup(func() { utils.CloseAndLog(targetDB) })
 	require.NoError(t, targetDB.PingContext(ctx), "ping target db")
@@ -532,7 +532,7 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 	// storage, which closes this DB, and every Tern client it was given. These
 	// closes only cover an early failure before the service exists, so they
 	// discard the error the service's own close makes inevitable.
-	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	defer func() { _ = schemabotDB.Close() }()
 	require.NoError(t, schemabotDB.PingContext(ctx), "ping schemabot db")
@@ -634,7 +634,7 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 	// so the first retryable failure goes through the real expiry pass
 	// immediately, settling the remote apply and its tasks to the same terminal
 	// states exhaustion would reach, with the engine error intact.
-	ternDB, err := sql.Open("mysql", ternStorageDSN)
+	ternDB, err := sql.Open("block-mysql", ternStorageDSN)
 	require.NoError(t, err, "open tern storage db")
 	t.Cleanup(func() { utils.CloseAndLog(ternDB) })
 	require.NoError(t, ternDB.PingContext(ctx), "ping tern storage db")
@@ -789,7 +789,7 @@ func TestGRPC_ServerSideTargetPlan(t *testing.T) {
 func TestGRPC_ServerSideDeploymentStoredOnApply(t *testing.T) {
 	ctx := t.Context()
 
-	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
+	targetDB, err := sql.Open("block-mysql", targetDSN+"&multiStatements=true")
 	require.NoError(t, err, "open target db")
 	defer utils.CloseAndLog(targetDB)
 
@@ -809,7 +809,7 @@ func TestGRPC_ServerSideDeploymentStoredOnApply(t *testing.T) {
 	ternGRPCAddr, err := startTernGRPC(ctx, appDSN, ternStorageDSN)
 	require.NoError(t, err, "start tern grpc")
 
-	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	defer utils.CloseAndLog(schemabotDB)
 	schemabotStorage := schemabotmysql.New(schemabotDB)

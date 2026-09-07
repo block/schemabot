@@ -71,7 +71,7 @@ func TestWriteShardProgressPersistsPerShardTasksUnderLease(t *testing.T) {
 	require.NoError(t, err)
 
 	// Stamp the operation lease the operator drive holds.
-	leaseDB, err := sql.Open("mysql", dsn)
+	leaseDB, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(leaseDB)
 	require.NoError(t, leaseDB.PingContext(ctx))

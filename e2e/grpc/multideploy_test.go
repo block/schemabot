@@ -14,11 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/schemabot/e2e/testutil"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -117,7 +117,7 @@ func multiDeployTernMySQLDSN(t *testing.T, deployment string) string {
 func multiDeployCreateTestTable(t *testing.T, deployment, tableName, ddl string) {
 	t.Helper()
 	dsn := multiDeployTernMySQLDSN(t, deployment)
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoErrorf(t, err, "open tern mysql (%s)", deployment)
 	// Defer close immediately so the handle is reclaimed even if the create
 	// below fails a require.* assertion, and so close errors are logged.
@@ -126,7 +126,7 @@ func multiDeployCreateTestTable(t *testing.T, deployment, tableName, ddl string)
 	require.NoErrorf(t, err, "create table %s on %s", tableName, deployment)
 
 	t.Cleanup(func() {
-		db2, err := sql.Open("mysql", dsn)
+		db2, err := sql.Open("block-mysql", dsn)
 		if err != nil {
 			t.Logf("cleanup: open tern mysql (%s): %v", deployment, err)
 			return
@@ -153,7 +153,7 @@ func multiDeployCreateTestTable(t *testing.T, deployment, tableName, ddl string)
 func multiDeploySeedRows(t *testing.T, deployment, tableName, columns, valueTemplate string, rowCount int) {
 	t.Helper()
 	dsn := multiDeployTernMySQLDSN(t, deployment)
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoErrorf(t, err, "open tern mysql (%s)", deployment)
 	defer utils.CloseAndLog(db)
 
@@ -228,7 +228,7 @@ func multiDeployTernStorageDSN(t *testing.T, deployment string) string {
 func multiDeployClearTernStorage(t *testing.T, deployments ...string) {
 	t.Helper()
 	for _, d := range deployments {
-		db, err := sql.Open("mysql", multiDeployTernStorageDSN(t, d))
+		db, err := sql.Open("block-mysql", multiDeployTernStorageDSN(t, d))
 		require.NoErrorf(t, err, "cleanup: open tern storage db (%s)", d)
 		func() {
 			defer utils.CloseAndLog(db)
@@ -293,7 +293,7 @@ func multiDeployClearTernStorage(t *testing.T, deployments ...string) {
 // applies row on the deployment's Tern.
 func multiDeploySpendRecoveryBudget(t *testing.T, deployment string) {
 	t.Helper()
-	db, err := sql.Open("mysql", multiDeployTernStorageDSN(t, deployment))
+	db, err := sql.Open("block-mysql", multiDeployTernStorageDSN(t, deployment))
 	require.NoErrorf(t, err, "open tern storage db (%s)", deployment)
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 	require.NoErrorf(t, db.PingContext(t.Context()), "ping tern storage db (%s)", deployment)

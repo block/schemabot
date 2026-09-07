@@ -37,7 +37,7 @@ func seedOperationScopedApply(t *testing.T, repo, database string) *operationSco
 	t.Helper()
 	ctx := t.Context()
 
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
 	require.NoError(t, schemabotDB.PingContext(ctx))

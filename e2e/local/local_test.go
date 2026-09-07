@@ -21,8 +21,8 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -49,7 +49,7 @@ func TestMain(m *testing.M) {
 
 	dsn := os.Getenv("E2E_TESTAPP_STAGING_DSN")
 	if dsn != "" {
-		db, err := sql.Open("mysql", dsn)
+		db, err := sql.Open("block-mysql", dsn)
 		if err == nil {
 			// Find all tables that are NOT base fixtures
 			rows, err := db.QueryContext(context.Background(), `
@@ -116,7 +116,7 @@ func TestLocal_SchemaBot_Health(t *testing.T) {
 func TestLocal_SchemaBot_SchemaApplied(t *testing.T) {
 	dsn := mysqlDSN(t)
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "connect to MySQL")
 	defer utils.CloseAndLog(db)
 
@@ -142,7 +142,7 @@ func TestLocal_SchemaBot_SchemaApplied(t *testing.T) {
 func TestLocal_Demo_TestAppTablesCreated(t *testing.T) {
 	// Skip this test if demo tables don't exist (requires 'make demo' first)
 	stagingDSN := testappStagingDSN(t)
-	db, err := sql.Open("mysql", stagingDSN)
+	db, err := sql.Open("block-mysql", stagingDSN)
 	if err != nil {
 		t.Skip("Cannot connect to staging database")
 	}
@@ -170,7 +170,7 @@ func TestLocal_Demo_TestAppTablesCreated(t *testing.T) {
 	})
 
 	t.Run("production", func(t *testing.T) {
-		prodDB, err := sql.Open("mysql", productionDSN)
+		prodDB, err := sql.Open("block-mysql", productionDSN)
 		require.NoError(t, err, "connect to production MySQL")
 		defer utils.CloseAndLog(prodDB)
 
@@ -1221,7 +1221,7 @@ func TestLocal_Demo_FullValidation(t *testing.T) {
 	require.Equalf(t, http.StatusOK, resp.StatusCode, "SchemaBot health check failed")
 
 	schemabotDSN := mysqlDSN(t)
-	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "connect to schemabot MySQL")
 	defer utils.CloseAndLog(schemabotDB)
 
@@ -1237,7 +1237,7 @@ func TestLocal_Demo_FullValidation(t *testing.T) {
 	}
 
 	stagingDSN := testappStagingDSN(t)
-	stagingDB, err := sql.Open("mysql", stagingDSN)
+	stagingDB, err := sql.Open("block-mysql", stagingDSN)
 	require.NoError(t, err, "connect to staging MySQL")
 	defer utils.CloseAndLog(stagingDB)
 
@@ -1259,7 +1259,7 @@ func TestLocal_Demo_FullValidation(t *testing.T) {
 		}
 
 		productionDSN := testappProductionDSN(t)
-		productionDB, err := sql.Open("mysql", productionDSN)
+		productionDB, err := sql.Open("block-mysql", productionDSN)
 		require.NoError(t, err, "connect to production MySQL")
 		defer utils.CloseAndLog(productionDB)
 

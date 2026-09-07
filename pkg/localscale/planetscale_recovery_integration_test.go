@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

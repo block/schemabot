@@ -13,7 +13,8 @@
 </p>
 
 <p align="center">
-  <a href="#see-it-in-action">See it in action</a> ·
+  <a href="./docs/vision.md">Vision</a> ·
+  <a href="#the-pr-workflow">The PR workflow</a> ·
   <a href="#why-schemabot">Why SchemaBot</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#quick-start">Quick start</a> ·
@@ -26,11 +27,15 @@ SchemaBot makes database schema changes safe and easy. Declare the schema you wa
 
 SchemaBot is built for the agentic era. In a world where agents build product features from scratch, SchemaBot gives them the guardrails, context, and tooling to safely evolve your database schema. Declarative SQL files are a version-controlled source of truth an agent can read and reason about, and every change passes the same linting, safety gates, and merge-blocking checks, no matter who (or what) wrote it. Block runs SchemaBot today for the majority of its production schema changes, across a large fleet of MySQL and Vitess databases, with PostgreSQL in-flight.
 
-## See It in Action
+## The PR workflow
 
-**The PR workflow.** Open a PR with your schema changes, and SchemaBot plans, applies, and verifies them across environments, right from the PR timeline:
+Open a PR with your schema changes, and SchemaBot plans, applies, and verifies them across environments, right from the PR timeline:
 
-![SchemaBot PR Demo](./assets/pr-demo.gif)
+[![SchemaBot PR workflow: plan, apply, progress, completion, checks, and merge](./assets/pr-workflow-demo.gif)](./docs/pre-merge-workflow.md)
+
+*Illustrated using SchemaBot’s actual PR comments*
+
+[Walk through each step](./docs/pre-merge-workflow.md#the-pr-workflow-step-by-step) at your own pace
 
 **The interactive CLI.** The same power from your terminal: plan, apply, and watch schema changes live:
 
@@ -120,23 +125,18 @@ To run SchemaBot against your own databases, grab a build from [Releases](#relea
 
 ## Docs
 
-Design and operations docs live in the [docs](./docs/) folder:
+Guides and reference:
 
-- [docs/architecture.md](./docs/architecture.md) is the full picture: the layers, the engines,
-  the state machine, and how a change flows through them.
-- [docs/configuration.md](./docs/configuration.md) covers server setup: local mode, gRPC mode,
-  and secret resolution.
-- [docs/invariants.md](./docs/invariants.md) is the registry of runtime safety invariants:
-  what must never be false while SchemaBot is running, why each rule matters, where it is
-  enforced, and what these guarantees deliberately do not cover. It opens with what happens
-  when GitHub is down.
-- [docs/engines.md](./docs/engines.md) is the engine capability matrix: how each engine
-  executes a change, which control operations it supports, how it manages load, and why the
-  differences exist.
-- [docs/postgresql.md](./docs/postgresql.md) is the PostgreSQL support envelope: what plans,
-  what applies, and how each refusal is reported.
-
-Each has a table of contents, so jump straight to the question you came with.
+- [Vision](./docs/vision.md): See what we’re building toward
+- [Quick start](#quick-start): Try it on your machine
+- [Pre-merge workflow](./docs/pre-merge-workflow.md): Take a schema change from your first edit to a merged PR
+- [Schema intelligence](./docs/schema-intelligence.md): Get to know your fleet and what’s changing
+- [Engines](./docs/engines.md): See how changes run on your database engine
+- [PostgreSQL](./docs/postgresql.md): Find out what’s supported today
+- [Configuration](./docs/configuration.md): Set things up for your environment
+- [Safety invariants](./docs/invariants.md): Understand the guardrails behind each change
+- [Architecture](./docs/architecture.md): Follow a change from start to finish
+- [Contributing](./CONTRIBUTING.md): Come build with us
 
 ## Releases
 

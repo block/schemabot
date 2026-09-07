@@ -29,7 +29,7 @@ const pkSwapSchema = "CREATE TABLE `users` (\n" +
 // database so the plan produces the refused primary-key reshape.
 func seedPKSwapTargetTable(t *testing.T, dbName string) {
 	t.Helper()
-	db, err := sql.Open("mysql", driftDSN(t, dbName))
+	db, err := sql.Open("block-mysql", driftDSN(t, dbName))
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 	_, err = db.ExecContext(t.Context(), "CREATE TABLE `users` (\n"+
@@ -72,7 +72,7 @@ func TestE2EApplyRejectedOnBlockedPlan(t *testing.T) {
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "⛔ Apply rejected")
-		assert.Contains(t, body, "the schema change engine refuses to execute")
+		assert.Contains(t, body, "the engine refuses to execute")
 		assert.Contains(t, body, "`users`")
 		assert.NotContains(t, body, "--allow-unsafe", "a guaranteed failure must not coach an unsafe override")
 	case <-time.After(webhookIntegrationPollDeadline):

@@ -26,6 +26,7 @@ const (
 	DirectWriteReasonAdminAllow            = "admin_allow"
 	DirectWriteReasonScopedAllow           = "scoped_allow"
 	DirectWriteReasonScopedLaneDisabled    = "scoped_lane_disabled"
+	DirectWriteReasonTargetUnresolved      = "target_unresolved"
 	DirectWriteReasonMissingIdentity       = "missing_identity"
 	DirectWriteReasonNotAdmin              = "not_admin"
 	DirectWriteReasonNotDatabaseOperator   = "not_database_operator"
@@ -294,10 +295,13 @@ func (s *Service) authorizeDirectWrite(w http.ResponseWriter, r *http.Request, o
 // stored plan — the source of truth for what an apply will mutate — and then
 // enforces the per-database half of the direct-write decision. The plan must
 // exist and resolve at decision time: a missing plan rejects the request with
-// the same error the apply path reports for it, and a storage failure denies
-// — an unresolvable target must never authorize. Failing closed here (rather
-// than deferring the missing plan to the handler's own plan load) keeps the
-// authorization bound to a plan that existed when the decision was made.
+// the same error the apply path reports for it, and a plan-load storage failure
+// rejects it with the operation's 500 error. Neither is an authorization
+// denial; both land on the decision metric as skipped/target_unresolved, and
+// neither lets the request proceed — an unresolvable target must never
+// authorize. Failing closed here (rather than deferring the missing plan to the
+// handler's own plan load) keeps the authorization bound to a plan that existed
+// when the decision was made.
 func (s *Service) authorizeDirectWriteForStoredPlan(w http.ResponseWriter, r *http.Request, operation, planID, environment string) bool {
 	if !s.config.scopedWriteEnabled() {
 		metrics.RecordDirectWriteAuthorization(r.Context(), operation, "",
@@ -308,16 +312,28 @@ func (s *Service) authorizeDirectWriteForStoredPlan(w http.ResponseWriter, r *ht
 	if err != nil {
 		s.logger.Error("failed to load plan for direct write authorization",
 			"operation", operation, "plan_id", planID, "environment", environment, "error", err)
+		s.recordUnresolvedDirectWriteTarget(r, operation, environment)
 		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("%s failed: get plan %s: %v", operation, planID, err))
 		return false
 	}
 	if plan == nil {
 		s.logger.Warn("rejecting direct write because the stored plan does not exist",
 			"operation", operation, "plan_id", planID, "environment", environment)
+		s.recordUnresolvedDirectWriteTarget(r, operation, environment)
 		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("%s failed: plan not found: %s", operation, planID))
 		return false
 	}
 	return s.authorizeDirectWrite(w, r, operation, plan.Database, environment)
+}
+
+// recordUnresolvedDirectWriteTarget counts a direct-write decision that never
+// reached an authorization outcome because the target database could not be
+// resolved. The request is rejected by the operation's own error path, but the
+// decision still lands on the metric as skipped so a run of storage failures on
+// the authorization path is visible as a rate rather than only in the logs.
+func (s *Service) recordUnresolvedDirectWriteTarget(r *http.Request, operation, environment string) {
+	metrics.RecordDirectWriteAuthorization(r.Context(), operation, "",
+		s.config.metricEnvironmentAttribute(environment), "skipped", DirectWriteReasonTargetUnresolved)
 }
 
 // authorizeDirectDatabaseWrite is authorizeDirectWrite for environment-less

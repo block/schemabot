@@ -3176,7 +3176,7 @@ func TestApplyStore_ClaimApplyByIDConcurrentPendingClaims(t *testing.T) {
 	const drivers = 16
 	stores := make([]*Storage, drivers)
 	for i := range drivers {
-		db, openErr := sql.Open("mysql", testDSNChangedRows)
+		db, openErr := sql.Open("block-mysql", testDSNChangedRows)
 		require.NoError(t, openErr)
 		db.SetMaxOpenConns(1)
 		db.SetMaxIdleConns(1)
@@ -3958,7 +3958,7 @@ func createTestApplyWithStateEnvDeployment(t *testing.T, store *Storage, lock *s
 // DB error tests
 
 func TestApplyStore_Create_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -3971,7 +3971,7 @@ func TestApplyStore_Create_DBError(t *testing.T) {
 }
 
 func TestApplyStore_Get_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -3981,7 +3981,7 @@ func TestApplyStore_Get_DBError(t *testing.T) {
 }
 
 func TestApplyStore_GetByApplyIdentifier_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -3991,7 +3991,7 @@ func TestApplyStore_GetByApplyIdentifier_DBError(t *testing.T) {
 }
 
 func TestApplyStore_GetByLock_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4001,7 +4001,7 @@ func TestApplyStore_GetByLock_DBError(t *testing.T) {
 }
 
 func TestApplyStore_GetInProgress_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4011,7 +4011,7 @@ func TestApplyStore_GetInProgress_DBError(t *testing.T) {
 }
 
 func TestApplyStore_Update_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4021,7 +4021,7 @@ func TestApplyStore_Update_DBError(t *testing.T) {
 }
 
 func TestApplyStore_Delete_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4031,7 +4031,7 @@ func TestApplyStore_Delete_DBError(t *testing.T) {
 }
 
 func TestApplyStore_DeleteByPR_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4041,7 +4041,7 @@ func TestApplyStore_DeleteByPR_DBError(t *testing.T) {
 }
 
 func TestApplyStore_GetByDatabase_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4051,7 +4051,7 @@ func TestApplyStore_GetByDatabase_DBError(t *testing.T) {
 }
 
 func TestApplyStore_GetByPR_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4061,7 +4061,7 @@ func TestApplyStore_GetByPR_DBError(t *testing.T) {
 }
 
 func TestApplyStore_GetByPlan_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 

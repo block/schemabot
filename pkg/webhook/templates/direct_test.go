@@ -151,7 +151,7 @@ func TestRenderBlockedChangesApplyRejected(t *testing.T) {
 		},
 	})
 
-	assert.Contains(t, out, "**⛔ Apply rejected**: 1 planned change the schema change engine refuses to execute")
+	assert.Contains(t, out, "**⛔ Apply rejected**: 1 planned change the engine refuses to execute")
 	assert.Contains(t, out, "`users`: dropping primary key is not supported")
 	assert.Contains(t, out, "above the configured limit of 1,000,000")
 	assert.Contains(t, out, "Fix what each reason names")

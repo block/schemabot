@@ -26,7 +26,7 @@ From most to least severe:
 
 | Icon | Section | What it means | Blocks apply? | Override |
 |---|---|---|---|---|
-| ⛔ | **Cannot apply** | The schema change engine refuses the statement outright | Always — the apply would fail | None. Rewrite the change |
+| ⛔ | **Cannot apply** | The engine refuses the statement outright | Always — the apply would fail | None. Rewrite the change |
 | ⚠️ | **Issues** | Unsafe (destructive) changes detected | Yes, until acknowledged | `--allow-unsafe` |
 | ⚙️ | **Direct execution** | Statements that will run as native DDL outside the schema change engine | No — it is a consent disclosure | Confirming the apply consents |
 | 💡 | **Lint Warnings** | Advisory best-practice findings | Never | Not needed |

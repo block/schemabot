@@ -91,7 +91,7 @@ func seedRunningApplyWithTask(t *testing.T, stor storage.Storage, databaseType, 
 // hands the apply to a fresh claim in production.
 func expireApplyLease(t *testing.T, dsn string, applyID int64) {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "open database to expire the apply lease")
 	defer utils.CloseAndLog(db)
 	_, err = db.ExecContext(t.Context(),

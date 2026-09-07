@@ -48,7 +48,7 @@ func seedAbandonedCopy(t *testing.T, dbName string) {
 // the schema the PR declares plans as a single ALTER against it.
 func seedPreChangeEvents(t *testing.T, dbName string) {
 	t.Helper()
-	db, err := sql.Open("mysql", driftDSN(t, dbName))
+	db, err := sql.Open("block-mysql", driftDSN(t, dbName))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(t.Context()), "connect to target")
@@ -66,7 +66,7 @@ func seedPreChangeEvents(t *testing.T, dbName string) {
 // PR's plan will hand the engine.
 func seedCopyArtifacts(t *testing.T, dbName string) {
 	t.Helper()
-	db, err := sql.Open("mysql", driftDSN(t, dbName))
+	db, err := sql.Open("block-mysql", driftDSN(t, dbName))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(t.Context()), "connect to target")
@@ -91,7 +91,7 @@ func seedCopyArtifacts(t *testing.T, dbName string) {
 // both behind for the copy to still be resumable.
 func requireCopyIntact(t *testing.T, dbName string) {
 	t.Helper()
-	db, err := sql.Open("mysql", driftDSN(t, dbName))
+	db, err := sql.Open("block-mysql", driftDSN(t, dbName))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(t.Context()), "connect to target")
@@ -214,7 +214,7 @@ func seedTwoTableTargetWithOneCopy(t *testing.T, dbName string) {
 	t.Helper()
 	seedPreChangeEvents(t, dbName)
 
-	db, err := sql.Open("mysql", driftDSN(t, dbName))
+	db, err := sql.Open("block-mysql", driftDSN(t, dbName))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(t.Context()), "connect to target")
@@ -604,7 +604,7 @@ func TestE2EApplyConfirmProceedsWhenDiscardWasDisclosed(t *testing.T) {
 
 	// The copy the operator agreed to lose is gone, and the index they asked for
 	// is on the table.
-	db, err := sql.Open("mysql", driftDSN(t, dbName))
+	db, err := sql.Open("block-mysql", driftDSN(t, dbName))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(t.Context()))

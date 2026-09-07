@@ -194,7 +194,7 @@ func newMultiOpResumeFixture(t *testing.T, taskStates []string) *multiOpResumeFi
 		tasks = append(tasks, task)
 	}
 
-	leaseDB, err := sql.Open("mysql", dsn)
+	leaseDB, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(leaseDB) })
 	require.NoError(t, leaseDB.PingContext(ctx))

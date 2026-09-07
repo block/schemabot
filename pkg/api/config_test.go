@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	gomysql "github.com/go-sql-driver/mysql"
+	gomysql "github.com/block/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"

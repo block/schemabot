@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/block/mysql"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/pendingdrops"

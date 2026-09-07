@@ -1773,7 +1773,7 @@ func TestE2EApplyStaleBaseSchemaOutranksUnsafePrompt(t *testing.T) {
 	svc := setupE2EService(t, dbName)
 
 	// The live target already carries the column the newer base commit added.
-	targetDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+	targetDB, err := sql.Open("block-mysql", e2eTargetDSN+"&multiStatements=true")
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 	_, err = targetDB.ExecContext(t.Context(),
@@ -1868,7 +1868,7 @@ func TestE2EApplyConfirmStaleBaseSchemaAtFinalGateOutranksUnsafePrompt(t *testin
 
 	// The live target already carries the column the newer base commit added,
 	// so the re-plan from the stale snapshot emits a destructive DROP COLUMN.
-	targetDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+	targetDB, err := sql.Open("block-mysql", e2eTargetDSN+"&multiStatements=true")
 	require.NoError(t, err)
 	defer utils.CloseAndLog(targetDB)
 	_, err = targetDB.ExecContext(t.Context(),
@@ -3132,7 +3132,7 @@ func seedTargetTable(t *testing.T, dbName, ddl string) {
 	t.Helper()
 
 	appDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+dbName, 1) + "&multiStatements=true"
-	db, err := sql.Open("mysql", appDSN)
+	db, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 

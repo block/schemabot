@@ -195,7 +195,7 @@ type statusApplySeed struct {
 func startStatusOnlySchemaBot(t *testing.T) (string, *schemabotmysql.Storage) {
 	t.Helper()
 
-	db, err := sql.Open("mysql", schemabotDSN)
+	db, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	clearStorageDB(t, db)
 

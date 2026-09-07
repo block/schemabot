@@ -15,10 +15,10 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/block/mysql"
 	"github.com/block/schemabot/e2e/testutil"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -385,7 +385,7 @@ func grpcEnsureNoActiveChange(t *testing.T, database, env string) {
 func grpcClearSchemabotState(t *testing.T) {
 	t.Helper()
 	dsn := grpcSchemabotMySQLDSN(t)
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	if err != nil {
 		t.Logf("warning: could not open schemabot db to clear state: %v", err)
 		return
@@ -418,7 +418,7 @@ func grpcClearTernStorage(t *testing.T, env string) {
 	testappDSN := grpcTernMySQLDSN(t, env)
 	ternDSN := strings.Replace(testappDSN, "/testapp", "/tern", 1)
 
-	db, err := sql.Open("mysql", ternDSN)
+	db, err := sql.Open("block-mysql", ternDSN)
 	if err != nil {
 		t.Logf("warning: could not open tern storage db (%s): %v", env, err)
 		return
@@ -452,7 +452,7 @@ func grpcClearTernStorage(t *testing.T, env string) {
 func grpcCreateTestTable(t *testing.T, env, tableName, ddl string) {
 	t.Helper()
 	dsn := grpcTernMySQLDSN(t, env)
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoErrorf(t, err, "open tern mysql (%s)", env)
 
 	_, err = db.ExecContext(t.Context(), ddl)
@@ -460,7 +460,7 @@ func grpcCreateTestTable(t *testing.T, env, tableName, ddl string) {
 	_ = db.Close()
 
 	t.Cleanup(func() {
-		db2, err := sql.Open("mysql", dsn)
+		db2, err := sql.Open("block-mysql", dsn)
 		if err != nil {
 			return
 		}
@@ -487,7 +487,7 @@ func grpcSeedRows(t *testing.T, env, tableName, columns, valueTemplate string, r
 func grpcColumnExists(t *testing.T, env, tableName, columnName string) bool {
 	t.Helper()
 	dsn := grpcTernMySQLDSN(t, env)
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoErrorf(t, err, "open tern mysql (%s)", env)
 	defer utils.CloseAndLog(db)
 

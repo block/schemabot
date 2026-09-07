@@ -44,7 +44,7 @@ type testServer struct {
 func createTestDB(t *testing.T, prefix string) (appDBName, appDSN string) {
 	t.Helper()
 
-	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
+	targetDB, err := sql.Open("block-mysql", targetDSN+"&multiStatements=true")
 	require.NoError(t, err, "open target db")
 
 	appDBName = prefix + fmt.Sprintf("%d", time.Now().UnixNano()%10000)
@@ -74,7 +74,7 @@ func startTestServerWithOperatorInterval(t *testing.T, appDBName, appDSN string,
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	clearStorageDB(t, schemabotDB)
 	store := mysqlstore.New(schemabotDB)
@@ -287,7 +287,7 @@ func TestFullWorkflow_Spirit_PlanApplyVerify(t *testing.T) {
 	waitForState(t, "http://"+ts.Addr, applyID, "completed", 10*time.Second)
 
 	// Step 3: Verify the table exists in the target database
-	targetConn, err := sql.Open("mysql", appDSN)
+	targetConn, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err, "open target connection")
 	defer func() { _ = targetConn.Close() }()
 
@@ -357,7 +357,7 @@ func TestFullWorkflow_Spirit_DDLScenarios(t *testing.T) {
 	ts := startTestServer(t, appDBName, appDSN)
 
 	// Connect to app database for verification queries
-	appDB, err := sql.Open("mysql", appDSN)
+	appDB, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err, "open app db")
 	defer func() { _ = appDB.Close() }()
 
@@ -637,7 +637,7 @@ func TestFullWorkflow_Spirit_UnsafeChangeDetection(t *testing.T) {
 	ts := startTestServer(t, appDBName, appDSN)
 
 	// Connect to app database for setup
-	appDB, err := sql.Open("mysql", appDSN)
+	appDB, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err, "open app db")
 	defer func() { _ = appDB.Close() }()
 
@@ -808,7 +808,7 @@ func TestCLI_PlanApply(t *testing.T) {
 	ts := startTestServer(t, appDBName, appDSN)
 
 	// Connect to app database for verification
-	appDB, err := sql.Open("mysql", appDSN)
+	appDB, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err, "open app db")
 	defer func() { _ = appDB.Close() }()
 
@@ -965,7 +965,7 @@ func TestFullWorkflow_Spirit_DDLWithProgress(t *testing.T) {
 	ts := startTestServer(t, appDBName, appDSN)
 
 	// Connect to app database for seeding and verification
-	appDB, err := sql.Open("mysql", appDSN)
+	appDB, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err, "open app db")
 	defer func() { _ = appDB.Close() }()
 
@@ -1463,7 +1463,7 @@ CREATE TABLE ccc_cancelled (
 	assert.Equal(t, state.Task.Pending, tableStates["ccc_cancelled"], "ccc_cancelled")
 
 	// Verify aaa_first table was actually created in DB (partial success committed)
-	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
+	targetDB, err := sql.Open("block-mysql", targetDSN+"&multiStatements=true")
 	require.NoError(t, err, "open target db")
 	defer func() { _ = targetDB.Close() }()
 

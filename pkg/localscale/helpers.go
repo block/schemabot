@@ -320,7 +320,7 @@ func (s *Server) getBranchSchemaFromBackend(ctx context.Context, backend *databa
 }
 
 func (s *Server) getBranchSchemaWithDSN(ctx context.Context, dsnBase, branch, keyspace string) ([]string, error) {
-	db, err := sql.Open("mysql", dsnBase+branchDBName(branch, keyspace))
+	db, err := sql.Open("block-mysql", dsnBase+branchDBName(branch, keyspace))
 	if err != nil {
 		return nil, fmt.Errorf("open branch db %s/%s: %w", branch, keyspace, err)
 	}
@@ -578,7 +578,7 @@ func (s *Server) getDeployRequestInfo(ctx context.Context, ref deployRequest) (*
 // and shuts down any TCP proxy associated with the branch. Branches live on
 // the backend's mysqld (not the metadata DB), so we connect there for the DROP.
 func (s *Server) dropBranchDatabases(ctx context.Context, backend *databaseBackend, branch string) {
-	db, err := sql.Open("mysql", backend.mysqlDSNBase)
+	db, err := sql.Open("block-mysql", backend.mysqlDSNBase)
 	if err != nil {
 		s.logger.Error("dropBranchDatabases: open backend", "branch", branch, "error", err)
 		return
@@ -760,7 +760,7 @@ func (s *Server) openBranchDB(ctx context.Context, branch, keyspace string) (*sq
 	}
 
 	dsn := backend.mysqlDSNBase + branchDBName(branch, keyspace)
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open branch db %s/%s: %w", branch, keyspace, err)
 	}
@@ -859,7 +859,7 @@ const onlineDDLSidecarTable = "schema_migrations"
 func (s *Server) waitForOnlineDDLReady(ctx context.Context) error {
 	deadline := time.Now().Add(onlineDDLReadyTimeout)
 	for key, backend := range s.backends {
-		db, err := sql.Open("mysql", backend.mysqlDSNBase)
+		db, err := sql.Open("block-mysql", backend.mysqlDSNBase)
 		if err != nil {
 			return fmt.Errorf("connect to mysqld for %s/%s: %w", key.org, key.database, err)
 		}
