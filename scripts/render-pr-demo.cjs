@@ -15,6 +15,7 @@ const {chromium}=require('playwright');
   await page.goto(pathToFileURL(path.join(root,'assets/src/pr-workflow-demo.html')).href);
   await page.evaluate(()=>Promise.all([...document.images].map(i=>i.decode())));
   const frames=[],fps=20,introSeconds=2.5,duration=17+introSeconds;
+  let lastCamera;
   // Keep reading pauses, but compress copying to three seconds.
   const timing=[[0,0],[2,3],[4,7],[5,10],[8,20],[9,21.5],[10,23],[12,25],[14,29],[17,32]];
   function sceneTime(seconds){
@@ -30,6 +31,12 @@ const {chromium}=require('playwright');
    // Hold the settled merge view without repainting identical DOM each frame.
    if(i>(15+introSeconds)*fps){frames.push(frames[frames.length-1]);continue;}
    await page.evaluate(({t,dt})=>window.renderFrame(t,dt),{t:sceneTime(i/fps),dt:1/fps});
+   const camera=await page.evaluate(()=>previousScroll);
+   const t=sceneTime(i/fps);
+   if(t>=7&&t<=20&&lastCamera!==undefined){
+    if(camera<lastCamera-1||camera-lastCamera>26)throw new Error('Command-to-status scrolling must move forward without jumps');
+   }
+   lastCamera=camera;
    if(i===0){
     if(!(await page.locator('#diff-view').isVisible())||!(await page.locator('.added').innerText()).includes('idx_email_created'))throw new Error('Opening frame must show the index diff');
    }
