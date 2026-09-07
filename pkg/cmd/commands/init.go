@@ -80,13 +80,16 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 		return nil, err
 	}
 	// Stage beside the destination so publication remains an atomic rename.
+	if err := os.MkdirAll(filepath.Dir(root), 0700); err != nil {
+		return nil, fmt.Errorf("create schema parent directory: %w", err)
+	}
 	stage, err := os.MkdirTemp(filepath.Dir(root), ".schemabot-init-*")
 	if err != nil {
 		return nil, fmt.Errorf("create schema staging directory: %w", err)
 	}
 	defer func() {
 		if err := os.RemoveAll(stage); err != nil {
-			slog.Warn("remove schema staging directory", "error", err)
+			slog.Warn("remove schema staging directory", "path", stage, "error", err)
 		}
 	}()
 	dir, err := localruntime.Directory(cmd.Runtime)

@@ -32,7 +32,7 @@ func TestInitEngines(t *testing.T) {
 			execSQL(t, db, "CREATE TABLE widgets (id bigint NOT NULL PRIMARY KEY, name text NOT NULL)")
 			execSQL(t, db, "INSERT INTO widgets VALUES (1, 'keep me')")
 			home := t.TempDir()
-			root := filepath.Join(t.TempDir(), "schema")
+			root := filepath.Join(t.TempDir(), "nested", "schema")
 			namespace := "app"
 			if engine == "postgres" {
 				namespace = "public"

@@ -1337,7 +1337,8 @@ Initialization verifies a baseline using staged schema files before publishing t
 applies to the target, replaces an existing schema directory, or treats a different existing
 profile as consent to reroute it. Identical imported files may be reused for a retry. Failed setup
 retains the runtime and its state so a retry does not invent a second execution authority.
-*Enforced:* `pkg/cmd/commands/init.go` and the native no-replace publication helpers.
+*Enforced:* `pkg/cmd/commands/init.go` `pkg/cmd/commands/init_publish_darwin.go`, and
+`pkg/cmd/commands/init_publish_linux.go`.
 
 ## Structural enforcement
 
