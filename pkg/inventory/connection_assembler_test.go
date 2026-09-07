@@ -4,7 +4,7 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -210,7 +210,7 @@ func TestVitessConnectionAssemblerCustomDatabaseAttribute(t *testing.T) {
 
 // The PlanetScale database name attribute is required: without it every API
 // call would fall back to addressing the database by its registered
-// identifier, which is an arbitrary routing key rather than a PlanetScale name.
+// identifier, which is an arbitrary routing key rather than a PlanetScale name. sadscan:disable kingfisher.planetscale.2
 func TestVitessConnectionAssemblerRequiresDatabase(t *testing.T) {
 	_, _, err := VitessConnectionAssembler{}.Assemble(
 		"",
@@ -339,7 +339,7 @@ func TestPostgresConnectionAssemblerBuildsLibpqURL(t *testing.T) {
 		&Credentials{Username: "pgsprite_engine", Password: "s3cret"},
 	)
 	require.NoError(t, err)
-	assert.Equal(t, "postgresql://pgsprite_engine:s3cret@orders.cluster-abc.us-east-1.rds.amazonaws.com:5432/orders?sslmode=verify-full", dsn)
+	assert.Equal(t, "postgresql://pgsprite_engine:s3cret@orders.cluster-abc.us-east-1.rds.amazonaws.com:5432/orders?sslmode=verify-full", dsn) // sadscan:disable np.postgres.1
 	assert.Equal(t, map[string]string{
 		"extra":               "field",
 		MetadataPostgresCARef: PostgresCARefEmbeddedRDSGlobal,
