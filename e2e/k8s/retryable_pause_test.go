@@ -29,6 +29,14 @@ import (
 //     apply that goes on to change the schema with nobody watching.
 //   - Once the failure injection stops, the data plane's own recovery claims
 //     another attempt and both planes land completed with the DDL applied.
+//
+// The pause is transient by design: the data plane's recovery reclaims a
+// failed_retryable apply as soon as a driver's claim poll sees it, so the wire
+// may render STATE_FAILED_RETRYABLE for less than one observation interval.
+// The test therefore accepts either witness of the pause — the wire state, or
+// the data plane's stored attempt counter advancing past its pre-kill value,
+// which only a claim out of failed_retryable does — so a pause that recovery
+// has already consumed still counts as observed.
 func TestK8s_DataPlaneRetryablePauseHoldsControlPlaneOpenUntilRecovery(t *testing.T) {
 	cleanupState(t)
 
@@ -43,6 +51,7 @@ func TestK8s_DataPlaneRetryablePauseHoldsControlPlaneOpenUntilRecovery(t *testin
 	podClient := dialDataPlanePod(t, pods[0])
 	killer := testutil.OpenMySQL(t, testutil.TernStagingDSN(t))
 	controlPlaneDB := testutil.OpenMySQL(t, testutil.SchemabotDSN(t))
+	dataPlaneDB := testutil.OpenMySQL(t, storageDSNs(t)[0])
 
 	// Return from the fixture at dispatch rather than waiting for the control
 	// plane to report running: the control plane's view lags the engine by a
@@ -55,20 +64,24 @@ func TestK8s_DataPlaneRetryablePauseHoldsControlPlaneOpenUntilRecovery(t *testin
 	// completes with no pause to observe.
 	fixture := startIndexAddApplyWithOptions(t, "k8s_retry_pause", false, nil, 2000000)
 	waitForPodApplyState(t, podClient, fixture.DataPlaneApplyID, ternv1.State_STATE_RUNNING, testutil.PollDeadline)
+	attemptBeforeKills := storedDataPlaneApplyAttempt(t, dataPlaneDB, fixture.DataPlaneApplyID)
 
 	// Kill the data plane's target connections on every poll tick until the
-	// pause is visible on the wire. Spirit may absorb a single kill mid-chunk,
-	// so the injection repeats until the pause is actually observed. Each tick
-	// observes the wire before it injects: once the pause is visible, the data
+	// pause is observed. Spirit may absorb a single kill mid-chunk, so the
+	// injection repeats until the pause is actually observed. Each tick
+	// observes before it injects: once the pause has happened, the data
 	// plane's own recovery attempt may already be re-driving the apply, and a
 	// kill landing on that attempt would sabotage the very recovery the rest
 	// of the test waits for. The wire trails the engine — the pause is stamped
 	// to storage before it renders on the wire — so a tick can still inject
 	// just after the engine run has already failed; observing first narrows
-	// that window rather than closing it. Throughout, the control plane's
-	// stored apply must stay non-terminal: the data plane will retry, so any
-	// terminal state here is the split-brain this stack prevents.
+	// that window rather than closing it. The pause counts as observed when
+	// the wire shows it or when the stored attempt counter proves recovery
+	// has already claimed out of it. Throughout, the control plane's stored
+	// apply must stay non-terminal: the data plane will retry, so any terminal
+	// state here is the split-brain this stack prevents.
 	var lastWireState ternv1.State
+	var lastAttempt int
 	kills := 0
 	testutil.Poll(t, 3*time.Minute, 250*time.Millisecond,
 		func() bool {
@@ -82,18 +95,23 @@ func TestK8s_DataPlaneRetryablePauseHoldsControlPlaneOpenUntilRecovery(t *testin
 			if lastWireState == ternv1.State_STATE_FAILED_RETRYABLE {
 				return true
 			}
+			lastAttempt = storedDataPlaneApplyAttempt(t, dataPlaneDB, fixture.DataPlaneApplyID)
+			if lastAttempt > attemptBeforeKills {
+				return true
+			}
 
 			killDataPlaneTargetConnections(t, killer)
 			kills++
 			return false
 		},
 		func() string {
-			return fmt.Sprintf("timeout waiting for the data-plane pause to cross the wire as STATE_FAILED_RETRYABLE, last wire state: %s", lastWireState)
+			return fmt.Sprintf("timeout waiting for the data-plane pause: wire never showed STATE_FAILED_RETRYABLE (last %s) and the stored attempt never advanced past %d (last %d)",
+				lastWireState, attemptBeforeKills, lastAttempt)
 		})
 	require.Positive(t, kills,
 		"the pause must come from injected connection kills, not a failure the apply produced on its own")
 
-	// The pause is on the wire and the control plane is still holding. Stop
+	// The pause has been observed and the control plane is still holding. Stop
 	// injecting failures: the data plane's next recovery attempt must finish
 	// the schema change and reconcile both planes to completed.
 	testutil.WaitForState(t, fixture.Endpoint, fixture.ApplyID, state.Apply.Completed, 3*time.Minute)
@@ -123,6 +141,19 @@ func storedControlPlaneApplyState(t *testing.T, db *sql.DB, applyID string) stri
 	require.NoError(t, db.QueryRowContext(t.Context(),
 		"SELECT state FROM applies WHERE apply_identifier = ?", applyID).Scan(&applyState))
 	return applyState
+}
+
+// storedDataPlaneApplyAttempt reads the data plane's stored attempt counter for
+// its apply. The counter advances only when a driver claims the apply out of
+// failed_retryable, so an increase is durable proof that a retryable pause
+// happened and recovery has already picked it up, even after the pause itself
+// has left the wire.
+func storedDataPlaneApplyAttempt(t *testing.T, db *sql.DB, applyID string) int {
+	t.Helper()
+	var attempt int
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT attempt FROM applies WHERE apply_identifier = ?", applyID).Scan(&attempt))
+	return attempt
 }
 
 // killDataPlaneTargetConnections kills every connection the data plane holds
