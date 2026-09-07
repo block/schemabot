@@ -554,6 +554,10 @@ func (s *capturingApplyStore) ExpireRetryable(context.Context) ([]*storage.Retry
 	return nil, nil
 }
 
+// queuedOperationLeaseToken is the token this double rotates onto the operation
+// row it leases out, standing in for the real store's generated token.
+const queuedOperationLeaseToken = "op-lease-token"
+
 // queuedOperationClaimStore serves the operation-level claim ladder over the
 // operation rows a dual-write captured in a capturingApplyStore. The cutover
 // probe always finds nothing, so every operator tick falls through to the
@@ -561,9 +565,10 @@ func (s *capturingApplyStore) ExpireRetryable(context.Context) ([]*storage.Retry
 // signal per tick — and leases the first captured row exactly once.
 type queuedOperationClaimStore struct {
 	storage.ApplyOperationStore
-	applies *capturingApplyStore
-	mu      sync.Mutex
-	claimed bool
+	applies    *capturingApplyStore
+	mu         sync.Mutex
+	claimed    bool
+	leaseOwner string
 }
 
 func (s *queuedOperationClaimStore) capturedOperation() *storage.ApplyOperation {
@@ -599,8 +604,9 @@ func (s *queuedOperationClaimStore) FindNextApplyOperation(_ context.Context, ow
 		return nil, nil
 	}
 	s.claimed = true
+	s.leaseOwner = owner
 	op.LeaseOwner = owner
-	op.LeaseToken = "op-lease-token"
+	op.LeaseToken = queuedOperationLeaseToken
 	return op, nil
 }
 
@@ -609,15 +615,31 @@ func (s *queuedOperationClaimStore) FindNextApplyOperation(_ context.Context, ow
 func (s *queuedOperationClaimStore) ReleaseClaim(_ context.Context, lease storage.OperationLease) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.claimed || lease.Token != "op-lease-token" {
+	if !s.claimed || lease.Token != queuedOperationLeaseToken {
 		return false, nil
 	}
 	s.claimed = false
+	s.leaseOwner = ""
 	return true, nil
 }
 
+// Get returns the row with whatever lease the claim rotated onto it, the way
+// the real store persists it: a driver re-reads the row to confirm its
+// operation lease survived the separate transaction that claims the parent
+// apply, and a double that dropped the lease on read would look to that driver
+// like a peer had rotated it away.
 func (s *queuedOperationClaimStore) Get(context.Context, int64) (*storage.ApplyOperation, error) {
-	return s.capturedOperation(), nil
+	op := s.capturedOperation()
+	if op == nil {
+		return nil, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.claimed {
+		op.LeaseOwner = s.leaseOwner
+		op.LeaseToken = queuedOperationLeaseToken
+	}
+	return op, nil
 }
 
 func (s *queuedOperationClaimStore) ListByApply(context.Context, int64) ([]*storage.ApplyOperation, error) {

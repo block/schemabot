@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/block/schemabot/pkg/schema"
