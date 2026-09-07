@@ -54,7 +54,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 
 	"github.com/block/schemabot/e2e/testutil"
 	"github.com/block/schemabot/pkg/apitypes"
@@ -523,7 +523,7 @@ func TestK8s_PlanApply_CreateTable(t *testing.T) {
 
 	// Register cleanup for the table the apply created
 	t.Cleanup(func() {
-		db, err := sql.Open("mysql", dsn)
+		db, err := sql.Open("block-mysql", dsn)
 		if err != nil {
 			return
 		}

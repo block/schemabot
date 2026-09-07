@@ -202,7 +202,7 @@ func setupPlanCommentHandler(t *testing.T, repo string, deleteUnactioned bool) (
 	t.Helper()
 	ctx := t.Context()
 
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	// Redundant close for early-exit leak safety: svc.Close below owns the
 	// handle (the store is built over it), so this close is expected to see an

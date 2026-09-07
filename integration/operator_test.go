@@ -88,7 +88,7 @@ func newOperatorClaimFixture(t *testing.T, appDBPrefix string) *operatorClaimFix
 	t.Helper()
 
 	appDBName, _ := createTestDB(t, appDBPrefix)
-	storageDB, err := sql.Open("mysql", schemabotDSN)
+	storageDB, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, storageDB.PingContext(t.Context()))
 	clearStorageDB(t, storageDB)
@@ -133,7 +133,7 @@ func TestOperator_BasicClaimAndResume(t *testing.T) {
 	ts.Service.StopOperator()
 
 	// Remove the table so the second plan contains DDL that recovery can resume.
-	targetConn, err := sql.Open("mysql", appDSN)
+	targetConn, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err)
 	require.NoError(t, targetConn.PingContext(ctx))
 	defer utils.CloseAndLog(targetConn)
@@ -177,7 +177,7 @@ func TestOperator_BasicClaimAndResume(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, ts.Storage.ApplyOperations().MarkStarted(ctx, staleOpID))
 
-	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 	defer utils.CloseAndLog(schemabotDB)
@@ -416,7 +416,7 @@ func TestOperator_ReconcilesClaimedOperationWhoseParentSettled(t *testing.T) {
 	// driver that was running it is no longer presumed live. Written directly
 	// because every storage write path refreshes updated_at, which is the
 	// heartbeat itself.
-	storageDB, err := sql.Open("mysql", schemabotDSN)
+	storageDB, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	require.NoError(t, storageDB.PingContext(ctx))
 	t.Cleanup(func() {
@@ -473,7 +473,7 @@ func TestOperator_StartResumesStoppedApplyWhoseDeploymentsNeverStarted(t *testin
 	waitForState(t, "http://"+ts.Addr, firstApplyID, "completed", 20*time.Second)
 	ts.Service.StopOperator()
 
-	targetConn, err := sql.Open("mysql", appDSN)
+	targetConn, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err)
 	require.NoError(t, targetConn.PingContext(ctx))
 	defer utils.CloseAndLog(targetConn)
@@ -615,7 +615,7 @@ func TestOperator_ProjectsApplyLeftBehindItsSettledOperations(t *testing.T) {
 	// Age the apply's heartbeat past the lease staleness window so the crashed
 	// drive is no longer presumed live. Written directly because every storage
 	// write path refreshes updated_at, which is the heartbeat itself.
-	storageDB, err := sql.Open("mysql", schemabotDSN)
+	storageDB, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	require.NoError(t, storageDB.PingContext(ctx))
 	t.Cleanup(func() {
@@ -787,7 +787,7 @@ func TestOperator_OperationDeploymentDrivesByOperationDeployment(t *testing.T) {
 	waitForState(t, "http://"+ts.Addr, applyID, "completed", 20*time.Second)
 	ts.Service.StopOperator()
 
-	targetConn, err := sql.Open("mysql", appDSN)
+	targetConn, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err)
 	require.NoError(t, targetConn.PingContext(ctx))
 	defer utils.CloseAndLog(targetConn)
@@ -856,7 +856,7 @@ func TestOperator_OperationDeploymentDrivesByOperationDeployment(t *testing.T) {
 
 	// Age both rows so the operation-claim loop leases the operation on its
 	// first poll.
-	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 	defer utils.CloseAndLog(schemabotDB)
@@ -967,7 +967,7 @@ func TestOperator_OperationMissingDeploymentFailsClosed(t *testing.T) {
 
 	// Age both rows so the operation-claim loop leases the operation on its
 	// first poll.
-	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 	defer utils.CloseAndLog(schemabotDB)
@@ -1068,7 +1068,7 @@ func TestOperator_OperationWithoutTasksFailsClosed(t *testing.T) {
 
 	// Age both rows so the operation-claim loop leases the operation and its
 	// parent apply on the first poll.
-	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 	defer utils.CloseAndLog(schemabotDB)
@@ -1373,7 +1373,7 @@ func TestOperator_MultipleWorkersResumeDifferentTargets(t *testing.T) {
 	db1Name, db1DSN := createTestDB(t, "multi_worker_a_")
 	db2Name, db2DSN := createTestDB(t, "multi_worker_b_")
 
-	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 	clearStorageDB(t, schemabotDB)

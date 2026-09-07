@@ -7,7 +7,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/block/schemabot/pkg/engine"
