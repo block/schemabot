@@ -90,10 +90,11 @@ func dispatchApplyAwaitingDeployWithPendingCancel(t *testing.T, stor storage.Sto
 // change, and the backend completes it before an operator drive consumes the
 // durable cancel request. The drive that claims the apply must learn the
 // backend's terminal truth before running the cancel: it settles the apply and
-// its task to completed — the authoritative outcome — and completes the durable
-// cancel request without ever invoking the engine's cancel. Running the cancel
-// instead would have the backend reject it forever, and the operator would
-// re-claim the apply and re-run the doomed cancel on every poll.
+// its task to completed — the authoritative outcome — and resolves the durable
+// cancel request as a command that did not take effect, without ever invoking
+// the engine's cancel. Running the cancel instead would have the backend reject
+// it forever, and the operator would re-claim the apply and re-run the doomed
+// cancel on every poll.
 func TestLocalClient_DriveAdoptsEngineTerminalTruthBeforeConsumingCancel(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -128,7 +129,7 @@ func TestLocalClient_DriveAdoptsEngineTerminalTruthBeforeConsumingCancel(t *test
 	assert.Equal(t, 100, settledTasks[0].ProgressPercent, "a completed task reports full progress")
 	assert.NotNil(t, settledTasks[0].CompletedAt, "a completed task must carry its completion time")
 
-	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationCancel, storage.ControlRequestCompleted)
+	requireOutrunCancelSettled(t, stor, apply.ID)
 	recorded := eng.recorded()
 	assert.Contains(t, recorded, "Progress", "the drive must read the engine's authoritative state")
 	assert.NotContains(t, recorded, "Cancel", "the doomed cancel must never reach the engine")

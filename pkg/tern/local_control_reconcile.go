@@ -109,11 +109,12 @@ func (c *LocalClient) reconcileEngineTerminalTruthBeforeCommands(ctx context.Con
 	if suppressParentApplyWrites(ctx) {
 		return true, nil
 	}
-	// The adopted terminal state moots the pending commands: the sweep
-	// completes the pending stop, and the pending cancel too for every adopted
-	// state (none of them is stopped, the one state that keeps a cancel
-	// deliverable).
-	if err := completePendingRequestsForTerminalApply(ctx, c.storage, apply); err != nil {
+	// The adopted terminal state moots the pending commands: the sweep settles
+	// the pending stop, and the pending cancel too for every adopted state (none
+	// of them is stopped, the one state that keeps a cancel deliverable). The
+	// adopted state is the engine's terminal truth, so a cancel it overtook is
+	// failed with that reason rather than reported applied.
+	if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
 		return true, err
 	}
 	c.notifyTerminalObserver(apply, tasks)

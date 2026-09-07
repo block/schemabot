@@ -1230,11 +1230,7 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 	// filterable by apply_id/repo/pr without hand-listing the attrs per call.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
-		logger.Info("completing pending cancel request for terminal apply",
-			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
-		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
-			fmt.Sprintf("Pending cancel request completed for terminal apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
-		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
+		if err := settlePendingCancelForTerminalApply(ctx, c.storage, c.logger, apply, controlReq); err != nil {
 			return true, err
 		}
 		return true, nil
@@ -1275,11 +1271,11 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 		// cancel is reported as not handled because none took effect.
 		return false, c.failRefusedControlRequest(cancelCtx, logger, apply, storage.ControlOperationCancel, storage.LogEventCancelRequested, controlReq, resp.ErrorMessage)
 	}
-	completed, err := completePendingRequestIfStoredApplyResolved(cancelCtx, c.storage, apply, storage.ControlOperationCancel)
+	settled, err := settlePendingCancelIfStoredApplyResolved(cancelCtx, c.storage, c.logger, apply, controlReq)
 	if err != nil {
 		return true, err
 	}
-	if !completed {
+	if !settled {
 		// The cancel was accepted but the apply row has not settled — the settle
 		// lost the apply lease and moved only the drive's own operation row, so
 		// the apply-state projection owns the rest. The request stays pending on

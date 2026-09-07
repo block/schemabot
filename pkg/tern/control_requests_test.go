@@ -11,12 +11,11 @@ import (
 )
 
 // A terminal apply moots every pending window/stop control request: a stop is
-// settled, a revert or skip-revert can no longer act once the revert window
+// settled, and a revert or skip-revert can no longer act once the revert window
 // is gone — including a request that lost to a contradictory command (e.g. a
-// revert still pending after skip-revert finalized the apply) — and a cancel
-// has nothing left to terminate. The sweep completes all of them so no request
-// lingers pending forever.
-func TestCompletePendingRequestsForTerminalApply(t *testing.T) {
+// revert still pending after skip-revert finalized the apply). The sweep
+// completes all of them so no request lingers pending forever.
+func TestSettlePendingRequestsForTerminalApply(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              7,
 		ApplyIdentifier: "apply-terminal-sweep",
@@ -28,7 +27,6 @@ func TestCompletePendingRequestsForTerminalApply(t *testing.T) {
 		storage.ControlOperationStop,
 		storage.ControlOperationRevert,
 		storage.ControlOperationSkipRevert,
-		storage.ControlOperationCancel,
 		// A pending row for a retired operation, written by a previous release;
 		// no driver services it, so the sweep is its only settlement path.
 		storage.ControlOperation("volume"),
@@ -42,7 +40,7 @@ func TestCompletePendingRequestsForTerminalApply(t *testing.T) {
 	controlRequests := &testControlRequestStore{requests: requests}
 	store := &mockStorage{controlRequests: controlRequests}
 
-	require.NoError(t, completePendingRequestsForTerminalApply(t.Context(), store, apply))
+	require.NoError(t, settlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
 
 	for _, op := range sweptOps {
 		pending, err := controlRequests.GetPending(t.Context(), apply.ID, op)
@@ -55,11 +53,88 @@ func TestCompletePendingRequestsForTerminalApply(t *testing.T) {
 	}
 }
 
+// A cancel that an apply outran never took effect, so the sweep resolves it as a
+// rejection rather than reporting it applied: the failed request is what lights
+// up the PR comment's "Command not applied" notice and what a re-issued cancel
+// is answered with, and the apply history records the same outcome.
+func TestSettlePendingRequestsForTerminalApplyFailsAnOutrunCancel(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-mooted-cancel",
+		Database:        "testdb",
+		Environment:     "staging",
+		State:           state.Apply.Completed,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+		{ApplyID: apply.ID, Operation: storage.ControlOperationCancel, Status: storage.ControlRequestPending, RequestedBy: "armand"},
+	}}
+	logs := &mockApplyLogStore{}
+	store := &mockStorage{controlRequests: controlRequests, logs: logs}
+
+	require.NoError(t, settlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.Nil(t, pending, "the mooted cancel must not stay pending")
+	settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, storage.ControlRequestFailed, settled.Status)
+	assert.Equal(t, "the schema change completed before the cancel could take effect; the change is live on the target",
+		settled.ErrorMessage)
+
+	require.Len(t, logs.logs, 1, "settling a mooted cancel must record exactly one apply event")
+	assert.Equal(t, storage.LogLevelWarn, logs.logs[0].Level)
+	assert.Equal(t, "Cancel did not take effect: the schema change completed before the cancel could take effect; the change is live on the target (caller: armand)",
+		logs.logs[0].Message)
+}
+
+// An apply that settles cancelled resolved its pending cancel rather than
+// outrunning it, so the request completes and the history records that the
+// command took effect.
+func TestSettlePendingRequestsForCancelledApplyCompletesTheCancel(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-cancelled-sweep",
+		Database:        "testdb",
+		Environment:     "staging",
+		State:           state.Apply.Cancelled,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+		{ApplyID: apply.ID, Operation: storage.ControlOperationCancel, Status: storage.ControlRequestPending, RequestedBy: "armand"},
+	}}
+	logs := &mockApplyLogStore{}
+	store := &mockStorage{controlRequests: controlRequests, logs: logs}
+
+	require.NoError(t, settlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
+
+	settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, storage.ControlRequestCompleted, settled.Status)
+	require.Len(t, logs.logs, 1)
+	assert.Equal(t, storage.LogLevelInfo, logs.logs[0].Level)
+	assert.Equal(t, "Pending cancel request completed for cancelled apply (caller: armand)", logs.logs[0].Message)
+}
+
+// A cancel outrun by a terminal state other than completed names that state
+// without claiming the change is live: a failed or reverted apply left nothing
+// on the target, so the reason must not tell the operator to go look for it. A
+// cancelled apply is the cancel having taken effect, and a stopped apply stays
+// cancellable, so neither outran the command.
+func TestCancelOutrunReason(t *testing.T) {
+	reason := cancelOutrunReason(state.Apply.Failed)
+	assert.Equal(t, "the schema change reached failed before the cancel could take effect", reason)
+	assert.NotContains(t, reason, "live on the target")
+	assert.Empty(t, cancelOutrunReason(state.Apply.Cancelled))
+	assert.Empty(t, cancelOutrunReason(state.Apply.Stopped))
+}
+
 // A stopped apply is terminal but remains cancellable: the sweep must complete
 // the mooted stop while keeping a pending cancel deliverable, so a cancel
 // issued against the stopped apply is still delivered by the next drive
 // instead of being silently consumed.
-func TestCompletePendingRequestsForStoppedApplyKeepsCancelPending(t *testing.T) {
+func TestSettlePendingRequestsForStoppedApplyKeepsCancelPending(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              7,
 		ApplyIdentifier: "apply-stopped-sweep",
@@ -73,7 +148,7 @@ func TestCompletePendingRequestsForStoppedApplyKeepsCancelPending(t *testing.T) 
 	}}
 	store := &mockStorage{controlRequests: controlRequests}
 
-	require.NoError(t, completePendingRequestsForTerminalApply(t.Context(), store, apply))
+	require.NoError(t, settlePendingRequestsForTerminalApply(t.Context(), store, discardLogger(), apply))
 
 	pendingStop, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
 	require.NoError(t, err)
