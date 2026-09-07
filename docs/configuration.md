@@ -826,44 +826,14 @@ postgres:
   statement_timeout: 30s   # default; "0" removes the limit
 ```
 
-The time limit for a single query against SchemaBot's own storage database.
-Schema changes are unaffected: those run under limits pg-sprite sets on the
-target database.
+Time limit for a single query against SchemaBot's own storage database. Must be
+over `10s` or the server refuses to start: a query can spend up to 10 seconds
+waiting for another instance's lock, and the limit counts waiting as well as
+working. A negative value or an unparseable duration is refused too.
 
-**Minimum: just over `10s`.** The server refuses to start on anything smaller.
-The limit counts time spent waiting, and two instances contending for the same
-apply wait up to 10 seconds for each other's lock. Anything shorter turns that
-ordinary wait into a timeout.
-
-**Unset is not unlimited.** The connection inherits the platform's value, and
-managed providers usually set one tuned for web traffic. It fires as SQLSTATE
-`57014`, the same code a hand-cancelled query returns, which makes it easy to
-misread.
-
-**The startup bootstrap is exempt.** Its DDL and its lock wait have their own
-limits, as do storage maintenance commands run from the CLI.
-
-The bootstrap DDL budget is not configurable, because its safety comes from
-being derived rather than chosen: it sits just under the deadline that already
-bounds the whole bootstrap, so it can only end a statement that deadline was
-going to end anyway. No DDL that converges today starts failing because the
-budget exists; the failures it changes are ones that were already going to
-happen, and they now name a budget instead of surfacing a bare cancellation.
-
-The advisory-lock connection runs with `statement_timeout` disabled outright.
-Acquiring that lock means blocking inside `SELECT pg_advisory_lock()` until the
-pod that is bootstrapping finishes, and any budget shorter than that wait —
-SchemaBot's or the platform's — would cancel a trailing pod's legitimate queue
-and fail its startup while the leader was converging normally. The wait is
-still bounded, by the lock timeout scoped to the acquisition and by the
-bootstrap deadline.
-
-Set `statement_timeout: "0"` to disable the budget on storage queries
-explicitly, for a deployment whose storage queries legitimately run longer than
-any value worth defaulting to. That still displaces the platform's value rather
-than inheriting it. The server fails startup validation when
-`postgres.statement_timeout` is negative, is not a valid Go duration, or is a
-non-zero value at or below the 10s lock wait described above.
+Schema changes are unaffected. They run under limits pg-sprite sets on the
+target database. The startup bootstrap sets its own, derived from the deadline
+that already bounds it.
 
 ## PlanetScale mTLS
 
