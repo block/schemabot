@@ -103,3 +103,7 @@ terraform.rc
 
 # CLI tool configs
 .bk.yaml
+
+# Python tooling caches
+__pycache__/
+*.pyc

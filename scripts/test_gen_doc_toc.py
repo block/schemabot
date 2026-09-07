@@ -1,4 +1,4 @@
-"""Regression checks for per-document TOC depth. Run with python3 -m unittest discover -s scripts -p 'test_gen_doc_toc.py'."""
+"""Regression checks for per-document TOC depth. Run with python3 -B -m unittest discover -s scripts -p 'test_gen_doc_toc.py'."""
 import runpy
 import subprocess
 import tempfile
@@ -79,6 +79,39 @@ class DepthTests(unittest.TestCase):
             result = subprocess.run([sys.executable, str(script), '--check'],
                                     cwd=tmp, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_duplicate_depth_is_rejected(self):
+        doc = self.document(3).replace('max-depth=3', 'max-depth=3; MAX-DEPTH=4')
+        with self.assertRaisesRegex(ValueError, 'only once'):
+            TOC['regenerate'](doc)
+
+    def test_specific_setting_errors(self):
+        for value, message in [('7', 'choose a heading level'),
+                               ('3x', 'no spaces and an integer'),
+                               ('', 'no spaces and an integer')]:
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, message):
+                TOC['regenerate'](self.document(value))
+        with self.assertRaisesRegex(ValueError, 'must be lowercase'):
+            TOC['regenerate'](self.document(3).replace('max-depth', 'MAX-DEPTH'))
+
+    def test_broken_toc_guidance_matches_depth(self):
+        script = Path(__file__).with_name('gen-doc-toc.py').resolve()
+        for depth, headings in [(2, 'H2'), (4, 'H2–H4'), (6, 'H2–H6')]:
+            with self.subTest(depth=depth), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / 'guide.md'
+                doc = self.document(depth).split('## Start')[0]
+                if depth < 6:
+                    doc += '#' * (depth + 1) + ' Deeper section\n'
+                path.write_text(doc)
+                result = subprocess.run([sys.executable, str(script), str(path)],
+                                        cwd=tmp, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f'no {headings} headings', result.stdout)
+                self.assertNotIn('H2–H2', result.stdout)
+                if depth < 6:
+                    self.assertIn(f'increase max-depth above {depth}', result.stdout)
+                else:
+                    self.assertNotIn('increase max-depth', result.stdout)
 
 
 if __name__ == '__main__':
