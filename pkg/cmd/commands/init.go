@@ -193,6 +193,9 @@ func publishInitSchema(stage, root string) error {
 	if publishErr == nil {
 		return nil
 	}
+	if info, err := os.Lstat(root); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("schema import cannot reuse symlinks: %s", root)
+	}
 	// Removing a directory with rmdir can only succeed while it is empty.
 	// A concurrent file creation or symlink replacement fails closed; the
 	// subsequent no-replace rename also preserves a concurrently created target.
