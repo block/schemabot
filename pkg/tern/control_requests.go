@@ -110,7 +110,9 @@ func settlePendingCancelForTerminalApply(ctx context.Context, store storage.Stor
 // cancelOutrunReason names what overtook an accepted cancel on an apply that
 // reached applyState, and returns "" when nothing did. It is read by an operator
 // looking for the effect of a command they issued, so it says what happened to
-// the schema change rather than reporting a rejection.
+// the schema change rather than reporting a rejection. The state is normalized
+// before it reaches the operator, so a caller holding a proto-form state does
+// not put SchemaBot's internal spelling of it in a PR comment.
 func cancelOutrunReason(applyState string) string {
 	switch {
 	case state.IsState(applyState, state.Apply.Cancelled):
@@ -124,7 +126,7 @@ func cancelOutrunReason(applyState string) string {
 	case state.IsState(applyState, state.Apply.Completed):
 		return "the schema change completed before the cancel could take effect; the change is live on the target"
 	default:
-		return fmt.Sprintf("the schema change reached %s before the cancel could take effect", applyState)
+		return fmt.Sprintf("the schema change reached %s before the cancel could take effect", state.NormalizeState(applyState))
 	}
 }
 
@@ -142,7 +144,7 @@ func discloseSettledTerminalCancel(ctx context.Context, store storage.Storage, l
 	var level, message string
 	if reason == "" {
 		level = storage.LogLevelInfo
-		message = fmt.Sprintf("Pending cancel request completed for %s apply%s", apply.State, callerApplyLogSuffix(caller))
+		message = fmt.Sprintf("Pending cancel request completed for %s apply%s", state.NormalizeState(apply.State), callerApplyLogSuffix(caller))
 		logger.InfoContext(ctx, "completing pending cancel request for terminal apply",
 			append(apply.LogAttrs(), "requested_by", caller)...)
 	} else {

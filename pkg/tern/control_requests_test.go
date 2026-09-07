@@ -128,6 +128,9 @@ func TestCancelOutrunReason(t *testing.T) {
 	assert.NotContains(t, reason, "live on the target")
 	assert.Empty(t, cancelOutrunReason(state.Apply.Cancelled))
 	assert.Empty(t, cancelOutrunReason(state.Apply.Stopped))
+
+	assert.Equal(t, reason, cancelOutrunReason("STATE_FAILED"),
+		"a proto-form state must reach the operator in the same vocabulary as every other surface")
 }
 
 // A stopped apply is terminal but remains cancellable: the sweep must complete
