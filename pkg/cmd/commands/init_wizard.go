@@ -36,7 +36,7 @@ func (cmd *InitCmd) collectInputs(ctx context.Context, g *Globals) error {
 	if len(missing) == 0 {
 		return nil
 	}
-	if cmd.NonInteractive || cmd.JSON || !ui.IsTerminal(os.Stdin) {
+	if cmd.NonInteractive || cmd.JSON || !ui.IsTerminal(os.Stdin) || !ui.IsTerminal(os.Stdout) {
 		if cmd.JSON {
 			if err := json.NewEncoder(os.Stdout).Encode(struct {
 				Error   string   `json:"error"`
@@ -46,7 +46,7 @@ func (cmd *InitCmd) collectInputs(ctx context.Context, g *Globals) error {
 			}
 			return ErrSilent
 		}
-		return fmt.Errorf("initialization needs --%s; provide the missing flags or run init in a terminal", strings.Join(missing, ", --"))
+		return fmt.Errorf("initialization needs --%s; provide the missing flags or run init with terminal input and output", strings.Join(missing, ", --"))
 	}
 	if err := cmd.promptInputs(ctx, os.Stdin, os.Stdout, g); err != nil {
 		return err
