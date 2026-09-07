@@ -23,7 +23,10 @@ type Config struct {
 
 // Profile represents a named configuration profile.
 type Profile struct {
-	Endpoint string `yaml:"endpoint"`
+	// LocalRuntime names an explicitly provisioned runtime. Endpoint and credentials
+	// are resolved together; unreachable remote profiles never enable local mode.
+	LocalRuntime string `yaml:"local_runtime,omitempty"`
+	Endpoint     string `yaml:"endpoint"`
 	// Token is the cached Bearer token for this profile's endpoint, written by
 	// `schemabot login`. Scoping it to a profile keeps a token bound to the
 	// server it was issued for, so it is never sent to a different endpoint.
