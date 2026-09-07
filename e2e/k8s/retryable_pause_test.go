@@ -21,9 +21,9 @@ import (
 // database. The data plane parks the apply between its own recovery attempts,
 // and that pause must be survivable end to end:
 //
-//   - The pause crosses the wire as STATE_FAILED_RETRYABLE, so the control
-//     plane can tell "paused, will self-retry" from a settled failure without
-//     inspecting per-table statuses.
+//   - The pause never settles as a failure: the wire either renders
+//     STATE_FAILED_RETRYABLE or has already moved on to the recovery attempt,
+//     and STATE_FAILED anywhere in between fails the test.
 //   - The control plane's stored apply stays non-terminal for the whole pause.
 //     A terminal verdict here would end the drive and orphan a live remote
 //     apply that goes on to change the schema with nobody watching.
@@ -123,7 +123,7 @@ func TestK8s_DataPlaneRetryablePauseHoldsControlPlaneOpenUntilRecovery(t *testin
 	var dataPlaneApplyState, dataPlaneTaskState string
 	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
 		func() bool {
-			dataPlaneApplyState, dataPlaneTaskState = storedK8sApplyAndTaskStates(t, storageDSNs(t)[0], fixture.DataPlaneApplyID)
+			dataPlaneApplyState, dataPlaneTaskState = storedApplyAndTaskStates(t, dataPlaneDB, fixture.DataPlaneApplyID)
 			return state.IsState(dataPlaneApplyState, state.Apply.Completed) &&
 				state.IsState(dataPlaneTaskState, state.Task.Completed)
 		},
@@ -139,20 +139,19 @@ func storedControlPlaneApplyState(t *testing.T, db *sql.DB, applyID string) stri
 	t.Helper()
 	var applyState string
 	require.NoError(t, db.QueryRowContext(t.Context(),
-		"SELECT state FROM applies WHERE apply_identifier = ?", applyID).Scan(&applyState))
+		"SELECT `state` FROM `applies` WHERE `apply_identifier` = ?", applyID).Scan(&applyState))
 	return applyState
 }
 
 // storedDataPlaneApplyAttempt reads the data plane's stored attempt counter for
-// its apply. The counter advances only when a driver claims the apply out of
-// failed_retryable, so an increase is durable proof that a retryable pause
-// happened and recovery has already picked it up, even after the pause itself
-// has left the wire.
+// its apply. The counter only advances out of failed_retryable, so an increase
+// is durable proof that a retryable pause happened and recovery has already
+// picked it up, even after the pause itself has left the wire.
 func storedDataPlaneApplyAttempt(t *testing.T, db *sql.DB, applyID string) int {
 	t.Helper()
 	var attempt int
 	require.NoError(t, db.QueryRowContext(t.Context(),
-		"SELECT attempt FROM applies WHERE apply_identifier = ?", applyID).Scan(&attempt))
+		"SELECT `attempt` FROM `applies` WHERE `apply_identifier` = ?", applyID).Scan(&attempt))
 	return attempt
 }
 
