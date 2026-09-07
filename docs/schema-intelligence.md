@@ -514,8 +514,8 @@ schemabot status -e production
 3 total: 1 Completed · 1 Running · 1 Waiting for cutover
 
   APPLY ID          DATABASE  ENV         STATE                STARTED         SOURCE
-  apply-example-73  shop      production  Running              20 minutes ago  example/store#42
   apply-example-72  billing   production  Waiting for cutover  2 hours ago     example/billing#73
+  apply-example-73  shop      production  Running              20 minutes ago  example/store#42
   apply-example-71  accounts  production  Completed            1 hour ago      example/accounts#18
 
 Use 'schemabot status <apply_id>' to view details
@@ -558,10 +558,15 @@ cursor; increase the limit or narrow the filters. Even at the maximum, a
 busy scope can exceed the returned list. `state_counts` still covers all
 matching applies.
 
-Each row carries the apply ID, database, environment, deployment, state,
-engine, caller, error message, and started, completed, and updated
-timestamps. `schemabot status` renders it; `schemabot status --json` returns
-it raw.
+Applies being driven right now are listed first, oldest start first — the
+longer a schema change has held a table, the higher it sits — and the rest
+follow, most recently active first.
+
+Each row carries the apply ID, database, environment, state, engine, caller,
+error message, and started, completed, and updated timestamps. A row carries
+`deployment` only when the request is deployment-filtered; an unfiltered list
+omits the field on every row. `schemabot status` renders it;
+`schemabot status --json` returns it raw.
 
 <details>
 <summary>Request and response example</summary>
@@ -574,6 +579,7 @@ Response excerpt (illustrative values):
 
 ```json
 {
+  "active_count": 2,
   "limit": 20,
   "max_limit": 1000,
   "state_counts": {
@@ -583,33 +589,34 @@ Response excerpt (illustrative values):
   },
   "applies": [
     {
-      "apply_id": "apply-example-73",
-      "database": "shop",
-      "environment": "production",
-      "deployment": "us-east",
-      "engine": "spirit",
-      "state": "running",
-      "caller": "example/store#42",
-      "updated_at": "2026-09-01T03:01:00Z"
-    },
-    {
       "apply_id": "apply-example-72",
       "database": "billing",
       "environment": "production",
-      "deployment": "us-east",
       "engine": "spirit",
       "state": "waiting_for_cutover",
       "caller": "example/billing#73",
+      "started_at": "2026-09-01T01:01:00Z",
+      "updated_at": "2026-09-01T03:01:00Z"
+    },
+    {
+      "apply_id": "apply-example-73",
+      "database": "shop",
+      "environment": "production",
+      "engine": "spirit",
+      "state": "running",
+      "caller": "example/store#42",
+      "started_at": "2026-09-01T02:41:00Z",
       "updated_at": "2026-09-01T03:01:00Z"
     },
     {
       "apply_id": "apply-example-71",
       "database": "accounts",
       "environment": "production",
-      "deployment": "us-east",
       "engine": "spirit",
       "state": "completed",
       "caller": "example/accounts#18",
+      "started_at": "2026-09-01T02:01:00Z",
+      "completed_at": "2026-09-01T02:58:00Z",
       "updated_at": "2026-09-01T03:01:00Z"
     }
   ]
@@ -674,9 +681,12 @@ marker identifies plans with unsafe changes.
 History records executions. Plans describe what was proposed.
 `GET /api/plans` lists stored plans, filterable by `database`, `environment`,
 `repository`, and `pull_request` (with `repository`), plus a `last` window.
-Each summary carries the plan ID, database, environment, deployment, the
-repository, PR, and head SHA it was planned from, a count of changes by
-operation, and how many were unsafe or blocked.
+Each summary carries the plan ID, database, database type, environment, and
+creation time, plus a count of changes by operation and how many were unsafe
+or blocked; a plan with no changes omits the counts. The repository, PR, and
+head SHA it was planned from appear when the plan came from a PR (an ad-hoc
+CLI plan has none, and older plans may lack the SHA); `deployment` names the
+primary deployment the plan was computed against, when one was recorded.
 
 `GET /api/plans/{plan_id}` returns the full plan: for every table, the exact
 DDL that was computed, the change type, whether it was classified unsafe and
@@ -727,7 +737,7 @@ Response excerpt (illustrative values):
       "environment": "staging",
       "repository": "example/store",
       "pull_request": 42,
-      "created_at": "2026-09-01T02:55:00Z",
+      "created_at": "2026-09-01T01:55:00Z",
       "change_counts": {
         "alter": 1,
         "drop": 2
@@ -741,8 +751,7 @@ Response excerpt (illustrative values):
       "environment": "staging",
       "repository": "example/accounts",
       "pull_request": 18,
-      "created_at": "2026-09-01T02:55:00Z",
-      "change_counts": {}
+      "created_at": "2026-09-01T00:55:00Z"
     },
     {
       "plan_id": "plan-example-39",
@@ -751,7 +760,7 @@ Response excerpt (illustrative values):
       "environment": "staging",
       "repository": "example/billing",
       "pull_request": 73,
-      "created_at": "2026-09-01T02:55:00Z",
+      "created_at": "2026-08-31T23:55:00Z",
       "change_counts": {
         "create": 1
       }
@@ -763,7 +772,7 @@ Response excerpt (illustrative values):
       "environment": "staging",
       "repository": "example/warehouse",
       "pull_request": 29,
-      "created_at": "2026-09-01T02:55:00Z",
+      "created_at": "2026-08-31T22:55:00Z",
       "change_counts": {
         "alter": 2
       }
@@ -787,7 +796,16 @@ Response excerpt (illustrative values):
 {
   "plan_id": "plan-example-42",
   "database": "shop",
+  "database_type": "mysql",
   "environment": "staging",
+  "repository": "example/store",
+  "pull_request": 42,
+  "created_at": "2026-09-01T02:55:00Z",
+  "change_counts": {
+    "alter": 1,
+    "drop": 2
+  },
+  "unsafe_count": 2,
   "plan": {
     "plan_id": "plan-example-42",
     "engine": "spirit",
@@ -817,9 +835,7 @@ Response excerpt (illustrative values):
         ]
       }
     ]
-  },
-  "repository": "example/store",
-  "pull_request": 42
+  }
 }
 ```
 
@@ -849,7 +865,7 @@ Response excerpt (illustrative values):
       "id": 81,
       "apply_id": "apply-example-73",
       "level": "info",
-      "event_type": "state_change",
+      "event_type": "state_transition",
       "message": "Apply state changed",
       "old_state": "pending",
       "new_state": "running",
@@ -908,7 +924,8 @@ Response excerpt (illustrative values):
       "external_id": "remote-apply-example-73",
       "operations": [
         {
-          "operation_key": "us-east"
+          "target": "shop-production",
+          "operation_kind": "work"
         }
       ],
       "logs": [
@@ -916,7 +933,7 @@ Response excerpt (illustrative values):
           "id": 12,
           "apply_id": "remote-apply-example-73",
           "level": "info",
-          "event_type": "state_change",
+          "event_type": "state_transition",
           "message": "Apply state changed",
           "old_state": "pending",
           "new_state": "running",
@@ -932,7 +949,13 @@ Response excerpt (illustrative values):
 </details>
 
 The outer `apply_id` identifies the SchemaBot apply; each source's `external_id`
-and log entries' `apply_id` identify the remote execution. A successful HTTP
+and log entries' `apply_id` identify the remote execution. Each source lists
+the operations it ran with the `target` it resolved to and its
+`operation_kind` (`work` for an operation that runs DDL, `group_finalizer` for
+the operation that completes a grouped apply); `operation_key`
+(`namespace/shard/table`) appears only for sharded operations, where one apply
+fans out per shard — a single-operation apply lists its operation without a
+key. A successful HTTP
 response can still contain source errors. Keep the readable sources and report
 the missing ones; do not treat partial logs as a complete record.
 
@@ -948,12 +971,12 @@ The successful source below has no log entries yet:
   "deployment": "us-east",
   "sources": [{
     "external_id": "remote-apply-example-73",
-    "operations": [{"operation_key": "us-east/shop"}],
+    "operations": [{"target": "shop-production", "operation_kind": "work"}],
     "logs": []
   }],
   "errors": [{
     "external_id": "remote-apply-example-74",
-    "operations": [{"operation_key": "us-east/archive"}],
+    "operations": [{"target": "archive-production", "operation_kind": "work"}],
     "code": "RemoteLogReadFailed",
     "reason": "remote_log_read_failed",
     "message": "Data-plane logs could not be read; check server logs and retry."
