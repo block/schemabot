@@ -23,7 +23,7 @@ window.renderFrame=(t,dt)=>{
   }).join('')+'</div>').join('');
   content.style.transform='none';
   const screenText=frame.rows.map(r=>r.map(s=>s.text).join('')).join('\n');
-  document.getElementById('caption').textContent=screenText.includes('Your schema is ready')?'Your baseline is verified. Ready for the first edit.':screenText.includes('/  connect and verify')?'SchemaBot imports and verifies your schema.':screenText.includes('Ready when you are')?'Review your database, files, and connections.':screenText.includes('space select')?'Choose the namespaces you want to manage.':screenText.includes('Connecting and finding')?'Connect and discover what is available.':screenText.includes('Database name')?'Give your database a name.':'Choose your database engine.';
+  document.getElementById('caption').textContent=screenText.includes('Your schema is ready')?'Your baseline is verified. Ready for the first edit.':screenText.includes('/  connect and verify')?'SchemaBot imports and verifies your schema.':screenText.includes('Ready when you are')?'Review your database, files, and connections.':screenText.includes('space select')?'Choose the namespaces you want to manage.':screenText.includes('Connecting and finding')?'Connect and discover what is available.':screenText.includes('Connect SchemaBot’s state database')?'Confirm where SchemaBot keeps plans and progress.':screenText.includes('Connect your database')?'Confirm the host and database before connecting.':screenText.includes('Database name')?'Give your database a name.':'Choose your database engine.';
   document.getElementById('progress').style.width='33.33%';
   return;
  }else if(phase===1){
