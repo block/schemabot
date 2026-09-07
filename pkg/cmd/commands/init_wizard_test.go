@@ -185,3 +185,16 @@ func TestInitWizardDiscoveryFailureAndStaleResponse(t *testing.T) {
 	require.Equal(t, 5, m.step)
 	require.Contains(t, m.err, "connection unavailable")
 }
+
+func TestInitWizardDiscoveryNeverFallsBackToAmbientConnection(t *testing.T) {
+	t.Setenv("UNSET_INIT_TARGET", "")
+	m := newInitWizard(&InitCmd{DSN: "env:UNSET_INIT_TARGET"}, "default", io.Discard)
+	m.ctx = t.Context()
+	m.step = 5
+	m.discover = func(context.Context, string, string) ([]string, error) {
+		t.Fatal("must not connect with an empty DSN")
+		return nil, nil
+	}
+	msg := m.discoverNamespaces()().(initNamespacesMsg)
+	require.Error(t, msg.err)
+}

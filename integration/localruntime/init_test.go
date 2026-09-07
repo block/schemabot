@@ -40,7 +40,7 @@ func TestInitEngines(t *testing.T) {
 			}
 			discovered, err := localsetup.DiscoverNamespaces(t.Context(), engine, targetDSN)
 			require.NoError(t, err)
-			require.Contains(t, discovered, namespace)
+			require.Equal(t, []string{namespace}, discovered)
 			if engine == "postgres" {
 				execSQL(t, db, "CREATE SCHEMA analytics")
 				discovered, err = localsetup.DiscoverNamespaces(t.Context(), engine, targetDSN)
