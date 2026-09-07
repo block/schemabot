@@ -7,6 +7,7 @@
 - [Responsibilities](#responsibilities)
 - [Plan](#plan)
 - [Apply](#apply)
+  - [Shard selection (phased applies)](#shard-selection-phased-applies)
 - [Progress and control](#progress-and-control)
 - [Onboarding](#onboarding)
 - [Non-goals (for now)](#non-goals-for-now)
