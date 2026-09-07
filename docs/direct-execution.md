@@ -119,6 +119,12 @@ requirements come with those pieces:
 
 Engine notes:
 
+- **Sharded MySQL (Strata):** each shard's engine instance evaluates its own
+  estimate, so `max_table_rows` is a per-shard bound, and one over-bound or
+  unknown-size shard blocks the whole apply through the normal
+  any-shard-blocked aggregation. A direct statement that does run executes per
+  shard, not atomically across shards — the same property every sharded
+  change has.
 - **PlanetScale/Vitess: excluded by design.** Raw DDL against vtgate would
   bypass Vitess online DDL — schema tracking, revert, and the deploy
   workflow — which is the reason that engine exists. Config validation
