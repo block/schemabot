@@ -2,6 +2,7 @@ package mysqlerr
 
 import (
 	"errors"
+	"slices"
 
 	blockmysql "github.com/block/mysql"
 	upstreammysql "github.com/go-sql-driver/mysql"
@@ -43,10 +44,5 @@ func Is(err error, codes ...uint16) bool {
 	if !ok {
 		return false
 	}
-	for _, code := range codes {
-		if number == code {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(codes, number)
 }
