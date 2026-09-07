@@ -31,8 +31,8 @@ Let your agent prepare the change and explain what will happen. Under the
 policy below, you run the production command yourself. That keeps the final
 decision with you and makes the recorded action match who took it.
 
-PR approval is a separate check. When you enable the review gate, SchemaBot
-requires approval before apply in any environment. That check still applies
+PR approval is a separate check. Where the review gate is enabled, SchemaBot
+requires approval before applying a change. That check still applies
 when an agent sends the command, but it cannot tell whether you reviewed what
 your agent is about to do with your credentials.
 
@@ -90,7 +90,8 @@ do. They cannot make an action “human only” when the agent uses your account
   grants too. See [GitHub permissions](auth.md#github-side-authorization).
 - **Require review before apply.** Enable
   [`review_policy`](configuration.md#review-gate) to require a qualifying
-  approval in every environment. The PR author's own approval does not count.
+  approval for the environments served by that instance. The PR author's
+  own approval does not count.
 - **Keep destructive changes an explicit choice.** `--allow-unsafe` is a
   per-command opt-in. Leaving it out preserves the unsafe-change gate, but
   the server cannot tell whether you or your agent supplied the flag.

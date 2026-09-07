@@ -1150,7 +1150,7 @@ merge base, or either tree.
 
 ## Review Gate
 
-SchemaBot can block `apply` and `apply-confirm` until the PR has a satisfying review. This prevents unapproved schema changes from being applied to any environment.
+When `review_policy.enabled` is true, SchemaBot blocks `apply` and `apply-confirm` until the PR has a qualifying approval. This is a server-instance setting: it applies to the environments served by that instance. Other instances can configure their review gate separately.
 
 ```yaml
 review_policy:
