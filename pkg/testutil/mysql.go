@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql" // database/sql driver for the readiness probe below
+	_ "github.com/block/mysql" // database/sql driver for the readiness probe below
 	"github.com/moby/moby/api/types/network"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"

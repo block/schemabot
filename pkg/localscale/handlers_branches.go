@@ -183,7 +183,7 @@ func (s *Server) snapshotBranch(ctx context.Context, backend *databaseBackend, o
 	// Open a connection to the backend's mysqld for branch database creation.
 	// Each org/database has its own managed cluster with its own mysqld.
 	s.logger.Info("branch snapshot: opening backend mysqld", "dsn_prefix", backend.mysqlDSNBase)
-	backendDB, err := sql.Open("mysql", backend.mysqlDSNBase)
+	backendDB, err := sql.Open("block-mysql", backend.mysqlDSNBase)
 	if err != nil {
 		return fmt.Errorf("open backend mysqld: %w", err)
 	}
@@ -216,7 +216,7 @@ func (s *Server) snapshotBranch(ctx context.Context, backend *databaseBackend, o
 
 		// Execute CREATE TABLEs in branch database (on the backend's mysqld)
 		if len(stmts) > 0 {
-			branchDB, err := sql.Open("mysql", backend.mysqlDSNBase+branchDBName(branchName, keyspace))
+			branchDB, err := sql.Open("block-mysql", backend.mysqlDSNBase+branchDBName(branchName, keyspace))
 			if err != nil {
 				return fmt.Errorf("open branch database %s: %w", keyspace, err)
 			}

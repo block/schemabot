@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	mysql "github.com/go-sql-driver/mysql"
+	mysql "github.com/block/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
 	"github.com/block/spirit/pkg/statement"
@@ -167,7 +167,7 @@ func (e *Engine) fetchBranchSchemaViaMySQL(ctx context.Context, password *ps.Dat
 		g.Go(func() error {
 			ksCfg := mysqlCfg.Clone()
 			ksCfg.DBName = ks
-			db, err := sql.Open("mysql", ksCfg.FormatDSN())
+			db, err := sql.Open("block-mysql", ksCfg.FormatDSN())
 			if err != nil {
 				return fmt.Errorf("open branch MySQL for keyspace %s: %w", ks, err)
 			}

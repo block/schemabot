@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/dbconn"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -397,9 +398,19 @@ func connectionConfig(dsn string, opts ...Option) (*pgx.ConnConfig, error) {
 // system trust store carries, so verifying an RDS connection requires this
 // pool explicitly. The pool is built once and shared: it is read-only after
 // construction.
+//
+// The bundle comes from block/mysql, which is now the one copy of it in the
+// dependency graph — spirit used to embed its own and expose the bytes, and
+// dropped both when it started delegating to the driver. The pool is Postgres's
+// here, but the roots are the same: RDS issues from the same private Amazon
+// CAs regardless of engine.
+//
+// RDSTLSConfig clones its pool per call, so taking RootCAs off it does not
+// alias anything the MySQL side is using — appending here could not widen trust
+// for MySQL connections even if a caller tried.
 var rdsRootPool = sync.OnceValues(func() (*x509.CertPool, error) {
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(dbconn.GetEmbeddedRDSBundle()) {
+	pool := mysql.RDSTLSConfig().RootCAs
+	if pool == nil {
 		return nil, fmt.Errorf("embedded RDS global CA bundle contains no usable certificates")
 	}
 	return pool, nil
@@ -443,7 +454,7 @@ func hasRuntimeParam(params map[string]string, key string) bool {
 // counterpart of the TLS mode mysqlconn injects for RDS MySQL targets. An
 // explicit sslmode — including disable — always wins, and non-RDS hosts are
 // left untouched. Both DSN forms are handled: URL
-// (postgres://user:pass@host/db) and keyword/value (host=... user=...).
+// (postgres://user:pass@host/db) and keyword/value (host=... user=...). sadscan:disable np.postgres.1
 // RDS detection considers only the DSN's first host: a multi-host DSN whose
 // RDS host is a fallback gets no injection, so spell out sslmode explicitly
 // in multi-host DSNs.

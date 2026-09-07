@@ -7,9 +7,9 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/dbconn"
 	dsndriver "github.com/go-mysql/hotswap-dsn-driver"
-	"github.com/go-sql-driver/mysql"
 )
 
 var openSQL = sql.Open
@@ -55,9 +55,21 @@ func WithConnectTimeout(d time.Duration) Option {
 	}
 }
 
+// driverName is block/mysql, Block's fork of go-sql-driver/mysql. It registers
+// itself as "block-mysql" rather than "mysql" so that a binary whose
+// dependency graph still reaches upstream — this one does, via
+// hotswapDriverName below — can link both without two sql.Register calls
+// colliding under one name.
+const driverName = "block-mysql"
+
 // hotswapDriverName is Daniel Nichter's (https://github.com/daniel-nichter)
-// hot-swap DSN driver, a drop-in replacement for github.com/go-sql-driver/mysql
-// that re-reads credentials on an access-denied error. See OpenReloadable.
+// hot-swap DSN driver, which re-reads credentials on an access-denied error.
+// See OpenReloadable.
+//
+// It wraps upstream go-sql-driver/mysql and cannot be pointed at the fork, so
+// pools opened with it return upstream's *mysql.MySQLError while pools opened
+// with driverName return the fork's. Nothing may compare those types directly;
+// read an error code through mysqlerr.Number, which accepts either.
 const hotswapDriverName = "mysql-hotswap-dsn"
 
 // Open returns a MySQL connection using the same target-DSN normalization as
@@ -68,7 +80,7 @@ func Open(dsn string, opts ...Option) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	db, err := openSQL("mysql", connectionDSN)
+	db, err := openSQL(driverName, connectionDSN)
 	if err != nil {
 		return nil, fmt.Errorf("open MySQL connection: %w", err)
 	}

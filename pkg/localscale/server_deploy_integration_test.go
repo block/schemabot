@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -355,7 +355,7 @@ func TestBranchDDLError(t *testing.T) {
 
 	// Apply invalid DDL — table doesn't exist
 	dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s", pw.Username, pw.PlainText, pw.Hostname, "testapp_sharded")
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "open branch MySQL")
 	require.NoError(t, db.PingContext(ctx), "ping branch MySQL")
 	_, err = db.ExecContext(ctx, "ALTER TABLE nonexistent_table ADD COLUMN x INT")

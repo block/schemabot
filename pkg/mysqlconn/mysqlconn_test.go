@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -195,7 +195,10 @@ func TestOpenNormalizesRDSDSNBeforeOpening(t *testing.T) {
 	_, err := Open("spirit:secret@tcp(database.cluster-abc123.us-west-2.rds.amazonaws.com:3306)/app?parseTime=true")
 
 	require.ErrorIs(t, err, openErr)
-	assert.Equal(t, "mysql", gotDriver)
+	// Not "mysql": that name still belongs to upstream go-sql-driver, which
+	// remains linked because the hot-swap driver embeds it. Opening under it
+	// here would silently bypass the fork rather than fail.
+	assert.Equal(t, "block-mysql", gotDriver)
 	cfg, parseErr := mysql.ParseDSN(gotDSN)
 	require.NoError(t, parseErr)
 	assert.Equal(t, "rds", cfg.TLSConfig)
