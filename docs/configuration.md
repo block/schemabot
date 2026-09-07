@@ -815,7 +815,7 @@ The server fails startup validation when
 
 The ceiling is process-wide: every PostgreSQL database this server drives
 shares the same value, and a database cannot override it in its own metadata.
-These settings only apply where this server constructs the PostgreSQL engine
+The ceiling only applies where this server constructs the PostgreSQL engine
 itself — local-mode PostgreSQL databases. Databases routed to a remote
 deployment over gRPC run with that deployment's engine settings.
 
@@ -826,14 +826,16 @@ postgres:
   statement_timeout: 30s   # default; "0" removes the limit
 ```
 
-Time limit for a single query against SchemaBot's own storage database. Must be
-over `10s` or the server refuses to start: a query can spend up to 10 seconds
-waiting for another instance's lock, and the limit counts waiting as well as
-working. A negative value or an unparseable duration is refused too.
+Time limit for a single query against SchemaBot's own storage database, on the
+long-lived pool and on the startup bootstrap alike. It applies in every mode,
+unlike the ceiling above. Must be over `10s` or the server refuses to start: a
+query can spend up to 10 seconds waiting for another instance's lock, and the
+limit counts waiting as well as working. A negative value or an unparseable
+duration is refused too.
 
 Schema changes are unaffected. They run under limits pg-sprite sets on the
-target database. The startup bootstrap sets its own, derived from the deadline
-that already bounds it.
+target database. The bootstrap raises the limit for its own schema DDL, where
+an index build legitimately outruns a query.
 
 ## PlanetScale mTLS
 

@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
 )
@@ -78,7 +79,24 @@ func TestConnectStoragePostgresPoolCarriesStatementBudget(t *testing.T) {
 		{name: "explicit zero disables the budget", configured: "0", want: "0"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			dsn, _ := testutil.StartPostgres(t, "schemabot")
+			dsn, adminDB := testutil.StartPostgres(t, "schemabot")
+
+			// Every case runs against a hostile database default, so what the
+			// pool reports can only have come from SchemaBot writing it. On a
+			// fresh container the server reports 0 with no budget set at all,
+			// which is indistinguishable from an explicit disable — the zero
+			// case would assert nothing.
+			_, err := adminDB.ExecContext(t.Context(),
+				`ALTER DATABASE schemabot SET statement_timeout = '50ms'`)
+			require.NoError(t, err)
+
+			baseline, err := postgresconn.Open(dsn)
+			require.NoError(t, err)
+			t.Cleanup(func() { utils.CloseAndLog(baseline) })
+			var inherited string
+			require.NoError(t, baseline.QueryRowContext(t.Context(), "SHOW statement_timeout").Scan(&inherited))
+			require.Equal(t, "50ms", inherited, "the hostile default must reach a fresh session")
+
 			cfg := &api.ServerConfig{
 				Storage:  api.StorageConfig{DSN: dsn, Dialect: "postgres"},
 				Postgres: api.PostgresConfig{StatementTimeout: tc.configured},

@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -59,6 +60,14 @@ func WithConnectTimeout(d time.Duration) Option {
 		}
 	}
 }
+
+// MaxStatementTimeout is the largest budget PostgreSQL accepts, since
+// statement_timeout is a millisecond integer GUC and the server rejects
+// anything above the signed 32-bit maximum. Exceeding it is not a clamp but a
+// FATAL raised while the backend applies the startup packet, so every
+// connection fails at dial rather than one statement failing late. Exported so
+// config validation can refuse the value where an operator can still see it.
+const MaxStatementTimeout = time.Duration(math.MaxInt32) * time.Millisecond
 
 // WithStatementTimeout bounds how long the server lets a single statement run
 // on every connection the pool opens, as a session statement_timeout carried

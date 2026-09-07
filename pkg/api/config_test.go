@@ -20,6 +20,7 @@ import (
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/pendingdrops"
+	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
@@ -4667,6 +4668,25 @@ func TestPostgresStatementTimeoutConfig(t *testing.T) {
 	t.Run("the default clears the lock wait floor", func(t *testing.T) {
 		t.Parallel()
 		assert.Greater(t, DefaultPostgresStatementTimeout, storage.ApplyTargetLockWait)
+	})
+
+	// statement_timeout is a millisecond integer GUC, so a budget past the
+	// signed 32-bit maximum is not clamped: the backend raises a FATAL while
+	// applying the startup packet and every connection fails at dial. Startup
+	// validation is where the value can still be named.
+	t.Run("a value above what PostgreSQL accepts fails validation", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("600h")
+		err := cfg.Validate()
+		require.ErrorContains(t, err, "postgres.statement_timeout")
+		require.ErrorContains(t, err, "exceeds the")
+	})
+
+	t.Run("the largest accepted value validates", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg(postgresconn.MaxStatementTimeout.String())
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, postgresconn.MaxStatementTimeout, cfg.Postgres.StatementTimeoutOrDefault())
 	})
 
 	t.Run("loads from file", func(t *testing.T) {

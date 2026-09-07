@@ -22,6 +22,7 @@ import (
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/pendingdrops"
+	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/ratelimit"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
@@ -1349,6 +1350,14 @@ func (c PostgresConfig) validate() error {
 		if d > 0 && d <= storage.ApplyTargetLockWait {
 			return fmt.Errorf("postgres.statement_timeout %q must exceed the %s apply target lock wait, or lock contention is reported as a statement timeout instead of a lock conflict (set \"0\" to disable the budget)",
 				c.StatementTimeout, storage.ApplyTargetLockWait)
+		}
+		// Above the server's own maximum the budget is not clamped: applying
+		// the startup packet raises a FATAL, so every connection fails at dial
+		// and the server never starts. Refusing it here names the setting
+		// instead, since the dial failure names only the parameter.
+		if d > postgresconn.MaxStatementTimeout {
+			return fmt.Errorf("postgres.statement_timeout %q exceeds the %s PostgreSQL accepts, which would fail every connection at dial (set \"0\" to disable the budget)",
+				c.StatementTimeout, postgresconn.MaxStatementTimeout)
 		}
 	}
 	return nil
