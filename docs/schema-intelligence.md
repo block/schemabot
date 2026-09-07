@@ -514,8 +514,8 @@ schemabot status -e production
 3 total: 1 Completed · 1 Running · 1 Waiting for cutover
 
   APPLY ID          DATABASE  ENV         STATE                STARTED         SOURCE
-  apply-example-73  shop      production  Running              20 minutes ago  example/store#42
   apply-example-72  billing   production  Waiting for cutover  2 hours ago     example/billing#73
+  apply-example-73  shop      production  Running              20 minutes ago  example/store#42
   apply-example-71  accounts  production  Completed            1 hour ago      example/accounts#18
 
 Use 'schemabot status <apply_id>' to view details
@@ -558,6 +558,10 @@ cursor; increase the limit or narrow the filters. Even at the maximum, a
 busy scope can exceed the returned list. `state_counts` still covers all
 matching applies.
 
+Applies being driven right now are listed first, oldest start first — the
+longer a schema change has held a table, the higher it sits — and the rest
+follow, most recently active first.
+
 Each row carries the apply ID, database, environment, state, engine, caller,
 error message, and started, completed, and updated timestamps. A row carries
 `deployment` only when the request is deployment-filtered; an unfiltered list
@@ -585,16 +589,6 @@ Response excerpt (illustrative values):
   },
   "applies": [
     {
-      "apply_id": "apply-example-73",
-      "database": "shop",
-      "environment": "production",
-      "engine": "spirit",
-      "state": "running",
-      "caller": "example/store#42",
-      "started_at": "2026-09-01T02:41:00Z",
-      "updated_at": "2026-09-01T03:01:00Z"
-    },
-    {
       "apply_id": "apply-example-72",
       "database": "billing",
       "environment": "production",
@@ -602,6 +596,16 @@ Response excerpt (illustrative values):
       "state": "waiting_for_cutover",
       "caller": "example/billing#73",
       "started_at": "2026-09-01T01:01:00Z",
+      "updated_at": "2026-09-01T03:01:00Z"
+    },
+    {
+      "apply_id": "apply-example-73",
+      "database": "shop",
+      "environment": "production",
+      "engine": "spirit",
+      "state": "running",
+      "caller": "example/store#42",
+      "started_at": "2026-09-01T02:41:00Z",
       "updated_at": "2026-09-01T03:01:00Z"
     },
     {
@@ -677,9 +681,12 @@ marker identifies plans with unsafe changes.
 History records executions. Plans describe what was proposed.
 `GET /api/plans` lists stored plans, filterable by `database`, `environment`,
 `repository`, and `pull_request` (with `repository`), plus a `last` window.
-Each summary carries the plan ID, database, environment, deployment, the
-repository, PR, and head SHA it was planned from, a count of changes by
-operation, and how many were unsafe or blocked.
+Each summary carries the plan ID, database, database type, environment, and
+creation time, plus a count of changes by operation and how many were unsafe
+or blocked; a plan with no changes omits the counts. The repository, PR, and
+head SHA it was planned from appear when the plan came from a PR (an ad-hoc
+CLI plan has none, and older plans may lack the SHA); `deployment` names the
+primary deployment the plan was computed against, when one was recorded.
 
 `GET /api/plans/{plan_id}` returns the full plan: for every table, the exact
 DDL that was computed, the change type, whether it was classified unsafe and
@@ -744,8 +751,7 @@ Response excerpt (illustrative values):
       "environment": "staging",
       "repository": "example/accounts",
       "pull_request": 18,
-      "created_at": "2026-09-01T00:55:00Z",
-      "change_counts": {}
+      "created_at": "2026-09-01T00:55:00Z"
     },
     {
       "plan_id": "plan-example-39",
@@ -790,7 +796,16 @@ Response excerpt (illustrative values):
 {
   "plan_id": "plan-example-42",
   "database": "shop",
+  "database_type": "mysql",
   "environment": "staging",
+  "repository": "example/store",
+  "pull_request": 42,
+  "created_at": "2026-09-01T02:55:00Z",
+  "change_counts": {
+    "alter": 1,
+    "drop": 2
+  },
+  "unsafe_count": 2,
   "plan": {
     "plan_id": "plan-example-42",
     "engine": "spirit",
@@ -820,9 +835,7 @@ Response excerpt (illustrative values):
         ]
       }
     ]
-  },
-  "repository": "example/store",
-  "pull_request": 42
+  }
 }
 ```
 
@@ -935,7 +948,10 @@ Response excerpt (illustrative values):
 </details>
 
 The outer `apply_id` identifies the SchemaBot apply; each source's `external_id`
-and log entries' `apply_id` identify the remote execution. A successful HTTP
+and log entries' `apply_id` identify the remote execution. Each source lists
+the operations it ran; `operation_key` (`namespace/shard/table`) appears only
+for sharded operations, where one apply fans out per shard — a
+single-operation apply lists its operation without a key. A successful HTTP
 response can still contain source errors. Keep the readable sources and report
 the missing ones; do not treat partial logs as a complete record.
 
