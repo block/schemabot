@@ -505,9 +505,12 @@ func TestEnsureSchemaPostgres_OverridesHostileDatabaseStatementTimeout(t *testin
 	require.NoError(t, fresh.QueryRowContext(t.Context(), "SHOW statement_timeout").Scan(&inherited))
 	require.Equal(t, "1ms", inherited)
 
+	// No statement timeout option: the bootstrap's own default has to be what
+	// displaces the hostile value. This is the surface an embedder gets when
+	// it calls EnsureSchema without opting in, so a default of "inherit
+	// whatever the platform set" would fail here rather than in production.
 	require.NoError(t, EnsureSchema(dsn, logger,
-		WithDialect(schema.DialectPostgres),
-		WithPostgresStatementTimeout(DefaultPostgresStatementTimeout)))
+		WithDialect(schema.DialectPostgres)))
 
 	requireStorageTables(t, db)
 }
