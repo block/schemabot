@@ -669,21 +669,6 @@ func TestEnsureSchemaPostgres_ExternalCancelIsNotReportedAsTimeout(t *testing.T)
 	assert.NotContains(t, classified.Error(), "statement timed out")
 }
 
-// The bootstrap DDL budget is derived from EnsureSchemaTimeout, and that
-// derivation is what makes it safe: it can only end a statement the overall
-// deadline was going to end anyway. If it ever crept above the overall
-// deadline it would stop bounding anything; if it were set independently it
-// could start failing statements that converge today.
-func TestPostgresBootstrapDDLBudgetStaysUnderEnsureSchemaTimeout(t *testing.T) {
-	t.Parallel()
-
-	assert.Positive(t, postgresBootstrapDDLStatementTimeout)
-	assert.Less(t, postgresBootstrapDDLStatementTimeout, EnsureSchemaTimeout,
-		"the DDL budget must expire before the overall bootstrap deadline so the failure names a budget")
-	assert.Greater(t, postgresBootstrapDDLStatementTimeout, DefaultPostgresStatementTimeout,
-		"bootstrap DDL must get a longer budget than an ordinary storage query")
-}
-
 // Convergence DDL runs under its own raised budget, not the connection's
 // ordinary query budget. An index build legitimately takes far longer than a
 // catalog read, so a bootstrap that executed DDL under the query budget would

@@ -1299,10 +1299,11 @@ type PostgresConfig struct {
 	StatementTimeout string `yaml:"statement_timeout,omitempty"`
 }
 
-// DefaultPostgresStatementTimeout bounds an ordinary storage query. Storage
-// queries are point lookups, small scans, and lease claims against SchemaBot's
-// own tables; none of them approach this, so the budget only ever ends a query
-// that is already wedged. The value exists mostly to displace an ambient one:
+// DefaultPostgresStatementTimeout bounds an ordinary storage query. Point
+// lookups, small scans, and lease claims against SchemaBot's own tables sit far
+// under it. The webhook inbox claim walk is the exception worth knowing about:
+// it reads across retained terminal rows, so it grows until something purges
+// them. The value exists mostly to displace an ambient one:
 // with no budget set, SchemaBot runs under whatever the platform imposed at the
 // role or database level, which hosted providers tune for API queries rather
 // than for SchemaBot's workload.
