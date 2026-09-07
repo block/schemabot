@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,6 +32,29 @@ func TestRemoteControlSendGate(t *testing.T) {
 	gate.clear(1)
 	assert.True(t, gate.shouldSend(1, base.Add(2*time.Second)), "a cleared request transmits immediately again")
 	assert.True(t, gate.recordSend(1, base.Add(2*time.Second)), "a cleared request's next transmission is first again")
+}
+
+// One gate is shared by every apply a process drives, so its three methods are
+// reached concurrently by drives that have nothing else in common. The map
+// behind it is only safe because they serialize.
+func TestRemoteControlSendGateIsConcurrentlyAccessed(t *testing.T) {
+	gate := &remoteControlSendGate{}
+	base := time.Now()
+
+	var wg sync.WaitGroup
+	for i := range 8 {
+		wg.Go(func() {
+			id := int64(i)
+			for range 50 {
+				gate.shouldSend(id, base)
+				gate.recordSend(id, base)
+				gate.clear(id)
+			}
+		})
+	}
+	wg.Wait()
+
+	assert.True(t, gate.shouldSend(1, base), "every request was cleared, so each transmits immediately again")
 }
 
 // An accepted cancel is stored durably by the data plane and consumed by its
@@ -215,6 +239,8 @@ func TestGRPCClient_RefusedStopResolvesTheRequest(t *testing.T) {
 	assert.Contains(t, refused.ErrorMessage, apply.ApplyIdentifier)
 	require.Equal(t, 1, countLogMessages(logs.logs, "Pending stop request rejected by the data plane"),
 		"the refusal is recorded on the apply for the operator")
+	require.Equal(t, 0, countLogMessages(logs.logs, "Remote stop accepted"),
+		"a refused stop is never also recorded to the operator as accepted")
 	for _, entry := range logs.logs {
 		assert.NotContains(t, entry.Message, apply.ExternalID,
 			"the apply log renders into the PR timeline, so it names the apply the operator knows and not the remote id")
@@ -275,6 +301,8 @@ func TestGRPCClient_RefusedCancelResolvesTheRequest(t *testing.T) {
 	assert.Contains(t, refused.ErrorMessage, apply.ApplyIdentifier)
 	require.Equal(t, 1, countLogMessages(logs.logs, "Pending cancel request rejected by the data plane"),
 		"the refusal is recorded on the apply for the operator")
+	require.Equal(t, 0, countLogMessages(logs.logs, "Remote cancel accepted"),
+		"a refused cancel is never also recorded to the operator as accepted")
 	for _, entry := range logs.logs {
 		assert.NotContains(t, entry.Message, apply.ExternalID,
 			"the apply log renders into the PR timeline, so it names the apply the operator knows and not the remote id")

@@ -795,8 +795,11 @@ func logOperationDriveLeavesParentCancel(logger *slog.Logger, apply *storage.App
 //
 // The refusal means the operation did not take effect, so this reports the
 // request as not handled, and it drops the resolved request's send-gate entry
-// as map hygiene: the gate is keyed on the request id, and a later request for
-// the same operation is a new row with a new id.
+// so a re-issued command transmits at once. There is one control request row
+// per apply and operation, and re-requesting reuses that row rather than
+// inserting a new one, so the send gate would otherwise still hold the failed
+// request's timestamp under the same id and throttle the operator's next stop
+// or cancel for the rest of the interval.
 //
 // An operation-only drive owns only its operation and never the shared
 // apply-level request, so it leaves the request pending for the operator

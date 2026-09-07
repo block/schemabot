@@ -883,10 +883,8 @@ drive resolves the request with the engine's reason instead of reattempting it.
 A refusal from the executing side is one of those outcomes too, not a failed delivery. The request
 is already recorded durably, so a drive that answers a refusal with an error only leaves it pending
 for the next claim to re-send and be refused again. The drive fails the request with the stated
-reason instead. A refused stop or cancel is always a decision about a schema change that is still
-running, so those two drives additionally report the request as not handled and keep driving. Not
-every refusal is a decision: a cutover refused because the engine has not finished staging it
-clears on its own and stays pending for the next progress tick.
+reason instead. A refused stop or cancel is a decision about a schema change that is still running,
+so those two drives additionally report the request as not handled and keep driving.
 
 A decline the operator's request has to cross a plane boundary to collect is stated on the RPC
 surface as a refusal rather than an error, because the gRPC server maps every error to one generic
