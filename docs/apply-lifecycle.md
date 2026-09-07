@@ -5,8 +5,6 @@
 ## Table of Contents
 
 - [Foundations](#foundations)
-  - [The record tree](#the-record-tree)
-  - [Active vs terminal](#active-vs-terminal)
 - [The one rule](#the-one-rule)
 - [State reference](#state-reference)
 - [The retry budget](#the-retry-budget)
