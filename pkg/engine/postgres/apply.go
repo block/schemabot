@@ -484,14 +484,23 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 	return nil, false
 }
 
-const createCollisionRemedy = "drop or rename the occupant, name the constraint's index explicitly, or use an explicitly named sequence, then re-diff the schema file"
+// createCollisionRemedy leads with a re-plan because that alone resolves a
+// lost race for the table name: the next plan sees the occupant and diffs
+// against it. Only a collision that survives a re-plan is a schema-file
+// problem — an explicitly named constraint or index claims a name another
+// relation holds (an unnamed one picks a free name on its own), or a serial
+// column's auto-named sequence lands on a standalone type of that name —
+// and then the operator changes the name on one side or the other.
+const createCollisionRemedy = "re-plan, and if it recurs drop or rename the occupant or give the constraint, index, or sequence another name"
 
-// createCollisionRefusal directs the operator to change the schema file or
-// its occupant because re-planning alone reproduces the same name collision.
+// createCollisionRefusal names the kinds of name a create set claims so the
+// operator knows where to look; the server error identifying the occupant
+// stays in the logs. The wording is kept short because the composed detail
+// must survive the narrowest operator surface with its remedy intact.
 func createCollisionRefusal(table string) *refusal {
 	return &refusal{
 		reason: "create-collision",
-		cause:  fmt.Sprintf("a name the create set for %q needs is already occupied (the table name or its composite type, an explicit index name, a constraint's first-choice index name, or a serial/identity column's sequence name)", table),
+		cause:  fmt.Sprintf("a name the create set for %q needs is already occupied (table, index, constraint, or sequence)", table),
 		remedy: createCollisionRemedy,
 	}
 }

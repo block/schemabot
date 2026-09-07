@@ -87,7 +87,7 @@ func TestClassifyRefusal(t *testing.T) {
 			name:       "create collision is a refusal whoever took the name first",
 			err:        fmt.Errorf("execute: %w", executor.ErrCreateCollision),
 			wantReason: "create-collision",
-			wantDetail: []string{"table name or its composite type", "constraint's first-choice index name", "serial/identity column's sequence name", createCollisionRemedy},
+			wantDetail: []string{"(table, index, constraint, or sequence)", createCollisionRemedy},
 		},
 		{
 			name: "create collision identifies the failed sequence step",
@@ -96,7 +96,7 @@ func TestClassifyRefusal(t *testing.T) {
 			}),
 			wantReason:    "create-collision",
 			wantDetail:    []string{"step 2 of 3 failed", `CREATE TABLE for "users" committed`, createCollisionRemedy},
-			wantNotDetail: []string{"re-plan"},
+			wantNotDetail: []string{replanRemedy},
 		},
 		{
 			name: "single-statement refusal omits sequence position",
@@ -193,7 +193,23 @@ func TestCreateCollisionRefusalEntryPathsMatch(t *testing.T) {
 	require.NotNil(t, executorRefusal)
 	assert.Equal(t, "create-collision", preflightRefusal.reason)
 	assert.Equal(t, preflightRefusal.detail, executorRefusal.detail)
-	assert.Equal(t, `a name the create set for "users" needs is already occupied (the table name or its composite type, an explicit index name, a constraint's first-choice index name, or a serial/identity column's sequence name); drop or rename the occupant, name the constraint's index explicitly, or use an explicitly named sequence, then re-diff the schema file`, preflightRefusal.detail)
+	assert.Equal(t, `a name the create set for "users" needs is already occupied (table, index, constraint, or sequence); re-plan, and if it recurs drop or rename the occupant or give the constraint, index, or sequence another name`, preflightRefusal.detail)
+}
+
+// statusReasonColumnWidth is the narrowest operator surface a refusal detail
+// is rendered on: the CLI status table clamps its failure-reason column and
+// truncates from the tail, which is where the remedy sits. A create-collision
+// detail for any realistic table name must fit so the remedy survives.
+const statusReasonColumnWidth = 240
+
+func TestCreateCollisionRefusalFitsStatusReasonColumn(t *testing.T) {
+	table := strings.Repeat("a", 30)
+
+	r := classifyRefusal(fmt.Errorf("preflight: %w", preflight.ErrRelationExists), table)
+
+	require.NotNil(t, r)
+	assert.LessOrEqual(t, len(r.detail), statusReasonColumnWidth, r.detail)
+	assert.True(t, strings.HasSuffix(r.detail, createCollisionRemedy), r.detail)
 }
 
 func TestCreateCollisionRefusalAfterCommittedCreateStep(t *testing.T) {
@@ -202,9 +218,38 @@ func TestCreateCollisionRefusalAfterCommittedCreateStep(t *testing.T) {
 	r := classifyRefusal(err, "users")
 
 	require.NotNil(t, r)
-	assert.Equal(t, `a name the create set for "users" needs is already occupied (the table name or its composite type, an explicit index name, a constraint's first-choice index name, or a serial/identity column's sequence name); step 2 of 3 failed after the CREATE TABLE for "users" committed; drop or rename the occupant, name the constraint's index explicitly, or use an explicitly named sequence, then re-diff the schema file`, r.detail)
-	assert.NotContains(t, r.detail, "re-plan")
+	assert.Equal(t, `a name the create set for "users" needs is already occupied (table, index, constraint, or sequence); step 2 of 3 failed after the CREATE TABLE for "users" committed; re-plan, and if it recurs drop or rename the occupant or give the constraint, index, or sequence another name`, r.detail)
+	assert.NotContains(t, r.detail, replanRemedy)
 	assert.Equal(t, 1, strings.Count(r.detail, createCollisionRemedy))
+}
+
+// TestRefusalWithoutRemedyAtFirstStepGetsNoReplan pins the boundary of the
+// re-plan fallback: a first-step refusal committed nothing, so the plan still
+// matches the target and there is nothing to re-plan. The detail names the
+// step and stops.
+func TestRefusalWithoutRemedyAtFirstStepGetsNoReplan(t *testing.T) {
+	err := fmt.Errorf("execute: %w", &executor.SequenceStepError{Step: 1, Total: 3,
+		Err: &executor.BudgetError{Cause: executor.CauseStatement, Budget: time.Second}})
+
+	r := classifyRefusal(err, "users")
+
+	require.NotNil(t, r)
+	assert.Equal(t, "not-native-safe-budget-exceeded", r.reason)
+	assert.True(t, strings.HasSuffix(r.detail, "; step 1 of 3 failed"), r.detail)
+	assert.NotContains(t, r.detail, "re-plan")
+}
+
+// TestTableNotFoundRefusalCarriesItsOwnReplan reads the missing-table refusal
+// at the first step, where the fallback cannot contribute a re-plan, so the
+// re-plan in the detail is provably the refusal's own remedy.
+func TestTableNotFoundRefusalCarriesItsOwnReplan(t *testing.T) {
+	err := fmt.Errorf("execute: %w", &executor.SequenceStepError{Step: 1, Total: 3, Err: preflight.ErrTableNotFound})
+
+	r := classifyRefusal(err, "users")
+
+	require.NotNil(t, r)
+	assert.Equal(t, "table-not-found", r.reason)
+	assert.Equal(t, `table "users" does not exist on the target; step 1 of 3 failed; `+replanRemedy, r.detail)
 }
 
 // TestRefusalAfterCommittedCreateStepKeepsOwnRemedy pins the shape of every

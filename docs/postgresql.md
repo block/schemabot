@@ -125,10 +125,18 @@ native statement and executes through pg-sprite's create path. The two facts
 the create depends on are proved in the session that executes, not at plan
 time, because absence or privilege at plan time proves nothing about apply
 time: the role holds `CREATE` on the target schema, and the name is free.
-A relation or standalone composite type already occupying a name needed by
-the create set is a permanent refusal. Drop or rename the occupant, explicitly
-name a constraint's index or sequence to avoid it, then re-diff the schema
-file. A target schema that does not exist is also a permanent refusal.
+A name needed by the create set that is already occupied is a permanent
+refusal. The occupant is a relation of any kind — table, view, index, or
+sequence — or a standalone type (an enum, domain, range, or shell type; every
+table owns a composite type of its name, so these collide too). Re-plan
+first: a lost race for the table name resolves on the next plan, which sees
+the occupant and diffs against it. A collision that recurs after a re-plan is
+a schema-file problem — an explicitly named constraint or index claims a name
+another relation holds (an unnamed constraint picks a free index name on its
+own), or a serial column's auto-named sequence lands on a standalone type of
+that name — so drop or rename the occupant, or give the constraint, index,
+or sequence another name. A target schema that does not exist is also a
+permanent refusal.
 
 The create path refuses shapes whose outcome it cannot prove, each
 permanently: `IF NOT EXISTS` (its no-op outcome cannot be proven),
@@ -140,8 +148,10 @@ on that table. SchemaBot plans and applies this greenfield create set as one
 change and one task. pg-sprite executes the table and indexes as an ordered
 sequence; because the table has no readers yet, index steps use plain
 non-`CONCURRENTLY` builds. Each step commits in its own bounded transaction, so
-a failure can leave the table and earlier indexes committed; re-plan to
-reconcile that live prefix.
+a failure can leave the table and earlier indexes committed. Such a failure
+is never retried as the same set: its detail names the failed step and the
+committed table, then ends on the refusal's own remedy, or on a re-plan to
+reconcile that live prefix when the refusal has none.
 
 ### Partitioned tables
 
@@ -285,8 +295,9 @@ change or that depend on the target:
   is not retryable and directs the operator to re-plan against the live schema.
 
 A permanent refusal before execution leaves the target unchanged. A refusal
-from a later create-set step can leave its earlier steps committed and directs
-the operator to re-plan rather than retry the stale set.
+from a later create-set step can leave its earlier steps committed; it is
+never retried as the stale set, and its detail ends on the refusal's own
+remedy, falling back to a re-plan only when the refusal carries none.
 
 ## Unsupported workflow features
 
