@@ -16,6 +16,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	runtimehost "github.com/block/schemabot/pkg/localruntime"
+	"github.com/block/schemabot/pkg/localsetup"
 )
 
 // Initialization runs the installed CLI, creates its own private runtime and
@@ -36,6 +37,15 @@ func TestInitEngines(t *testing.T) {
 			namespace := "app"
 			if engine == "postgres" {
 				namespace = "public"
+			}
+			discovered, err := localsetup.DiscoverNamespaces(t.Context(), engine, targetDSN)
+			require.NoError(t, err)
+			require.Contains(t, discovered, namespace)
+			if engine == "postgres" {
+				execSQL(t, db, "CREATE SCHEMA analytics")
+				discovered, err = localsetup.DiscoverNamespaces(t.Context(), engine, targetDSN)
+				require.NoError(t, err)
+				require.Contains(t, discovered, "analytics")
 			}
 			manager := runtimehost.Manager{Dir: filepath.Join(home, ".schemabot", "runtimes", "local"), Binary: binary, Version: "dev"}
 			t.Cleanup(func() {

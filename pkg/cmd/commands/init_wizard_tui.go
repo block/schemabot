@@ -22,13 +22,22 @@ type initField struct{ label, hint, value string }
 // The wizard edits a private draft. Only explicit confirmation copies it back;
 // initialize remains the sole registration and verification path (AZ-6).
 type initWizard struct {
-	fields               []initField
-	step, width          int
-	height, scroll       int
-	input                textinput.Model
-	renderer             *lipgloss.Renderer
-	err                  string
-	confirmed, cancelled bool
+	fields                                   []initField
+	step, width                              int
+	height, scroll                           int
+	input                                    textinput.Model
+	renderer                                 *lipgloss.Renderer
+	err                                      string
+	confirmed, cancelled                     bool
+	ctx                                      context.Context
+	cancelDiscovery                          context.CancelFunc
+	discover                                 func(context.Context, string, string) ([]string, error)
+	skip                                     []bool
+	explicitNamespaces, editing, discovering bool
+	generation, cursor                       int
+	names                                    []string
+	selected                                 map[string]bool
+	notice                                   string
 }
 
 func newInitWizard(cmd *InitCmd, profile string, output io.Writer) *initWizard {
@@ -51,22 +60,28 @@ func newInitWizard(cmd *InitCmd, profile string, output io.Writer) *initWizard {
 	m.input = textinput.New()
 	m.input.Prompt = "› "
 	m.input.CharLimit = 1024
+	configureInitWizard(m, cmd)
 	m.loadField()
 	return m
 }
-func (m *initWizard) Init() tea.Cmd { return textinput.Blink }
+func (m *initWizard) Init() tea.Cmd {
+	if m.step == 5 && !m.explicitNamespaces {
+		m.input.SetValue("")
+		return m.discoverNamespaces()
+	}
+	return textinput.Blink
+}
 func (m *initWizard) loadField() {
 	if m.step >= len(m.fields) {
 		m.input.Blur()
 		return
 	}
-	if m.step == 5 && m.fields[5].value == "" {
-		m.fields[5].value = m.fields[1].value
-		if m.fields[0].value == "postgres" {
-			m.fields[5].value = "public"
-		}
-	}
+	m.input.Placeholder = ""
 	m.input.SetValue(m.fields[m.step].value)
+	if m.step == 5 && !m.explicitNamespaces {
+		m.input.SetValue("")
+		m.input.Placeholder = "Search namespaces"
+	}
 	m.input.CursorEnd()
 	m.input.Focus()
 }
@@ -105,21 +120,35 @@ func (m *initWizard) validate() string {
 }
 func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case initNamespacesMsg:
+		return m, m.acceptNamespaces(msg)
 	case tea.WindowSizeMsg:
 		m.height = max(8, msg.Height)
 		m.width = max(20, min(72, msg.Width-4))
 		m.input.Width = max(10, m.width-4)
 	case tea.KeyMsg:
+		if m.step == 5 && !m.explicitNamespaces && msg.String() != "shift+tab" && msg.String() != "esc" && msg.String() != "ctrl+c" {
+			return m.namespaceKey(msg)
+		}
 		switch msg.String() {
 		case "ctrl+c", "esc":
 			m.cancelled = true
 			return m, tea.Quit
 		case "shift+tab":
+			m.editing = true
+			if m.cancelDiscovery != nil {
+				m.cancelDiscovery()
+			}
+			m.generation++
+			m.discovering = false
 			if m.step > 0 {
-				if m.step < len(m.fields) && m.step != 0 {
+				if m.step < len(m.fields) && m.step != 0 && (m.step != 5 || m.explicitNamespaces) {
 					m.fields[m.step].value = m.input.Value()
 				}
 				m.step--
+				if m.step == 4 && !m.explicitNamespaces {
+					m.step = 3
+				}
 				m.err = ""
 				m.loadField()
 			}
@@ -153,9 +182,7 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.step != 0 {
 				m.fields[m.step].value = strings.TrimSpace(m.input.Value())
 			}
-			m.step++
-			m.loadField()
-			return m, textinput.Blink
+			return m, tea.Batch(m.advance(), textinput.Blink)
 		}
 	}
 	if m.step > 0 && m.step < len(m.fields) {
@@ -180,9 +207,10 @@ func (m *initWizard) contentView() string {
 	}
 	if m.step < len(m.fields) {
 		f := m.fields[m.step]
-		b.WriteString(muted.Render(fmt.Sprintf("Let’s get your schema ready.   %d / %d", m.step+1, len(m.fields))) + "\n\n")
+		b.WriteString(muted.Render("Let’s get your schema ready.") + "\n\n")
 		b.WriteString(bold.Render(f.label) + "\n" + wrap.Render(muted.Render(f.hint)) + "\n\n")
-		if m.step == 0 {
+		switch {
+		case m.step == 0:
 			for _, engine := range []struct{ key, label, detail string }{{"mysql", "MySQL", "Online schema changes with Spirit"}, {"postgres", "PostgreSQL", "Declarative schemas for Postgres"}} {
 				line := "  " + engine.label
 				if f.value == engine.key {
@@ -190,7 +218,9 @@ func (m *initWizard) contentView() string {
 				}
 				b.WriteString(line + "\n  " + muted.Render(engine.detail) + "\n\n")
 			}
-		} else {
+		case m.step == 5 && !m.explicitNamespaces:
+			b.WriteString(m.namespaceView())
+		default:
 			b.WriteString(m.input.View() + "\n\n")
 		}
 		if m.err != "" {
@@ -200,9 +230,15 @@ func (m *initWizard) contentView() string {
 		if m.step == 0 {
 			help = "↑/↓ choose · enter continue · esc cancel"
 		}
+		if m.step == 5 && !m.explicitNamespaces {
+			help = "shift+tab edit connection · esc cancel"
+		}
 		b.WriteString(muted.Render(help))
 	} else {
 		b.WriteString(bold.Render("Ready when you are") + "\n\n")
+		if m.notice != "" {
+			b.WriteString(wrap.Render(m.notice) + "\n\n")
+		}
 		for _, f := range m.fields {
 			b.WriteString(wrap.Render(muted.Render(f.label+": ")+f.value) + "\n")
 		}
@@ -228,11 +264,14 @@ func (m *initWizard) View() string {
 }
 
 func (cmd *InitCmd) promptInputs(ctx context.Context, input io.Reader, output io.Writer, g *Globals) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	cfg, err := client.LoadConfig()
 	if err != nil {
 		return err
 	}
 	m := newInitWizard(cmd, client.ResolveProfileName(cfg, g.Profile), output)
+	m.ctx = ctx
 	_, err = tea.NewProgram(m, tea.WithInput(input), tea.WithOutput(output), tea.WithContext(ctx)).Run()
 	if ctx.Err() != nil {
 		return fmt.Errorf("setup cancelled: %w", ctx.Err())
@@ -249,6 +288,14 @@ func (cmd *InitCmd) promptInputs(ctx context.Context, input io.Reader, output io
 	cmd.DSN = m.fields[3].value
 	cmd.StorageDSN = m.fields[4].value
 	cmd.Namespaces = strings.Split(m.fields[5].value, ",")
+	if !m.explicitNamespaces {
+		cmd.Namespaces = nil
+		for _, name := range m.names {
+			if m.selected[name] {
+				cmd.Namespaces = append(cmd.Namespaces, name)
+			}
+		}
+	}
 	for i := range cmd.Namespaces {
 		cmd.Namespaces[i] = strings.TrimSpace(cmd.Namespaces[i])
 	}

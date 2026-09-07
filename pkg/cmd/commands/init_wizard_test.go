@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -18,7 +19,8 @@ func wizardKey(m *initWizard, k tea.KeyType) { m.Update(tea.KeyMsg{Type: k}) }
 func TestInitWizardNavigationAndValidation(t *testing.T) {
 	t.Setenv("DATABASE_URL", "test-only")
 	t.Setenv("SCHEMABOT_STORAGE_DSN", "test-only")
-	m := newInitWizard(&InitCmd{}, "default", io.Discard)
+	m := newInitWizard(&InitCmd{Namespaces: []string{"public"}}, "default", io.Discard)
+	m.editing = true
 	wizardKey(m, tea.KeyDown)
 	require.Equal(t, "postgres", m.fields[0].value)
 	wizardKey(m, tea.KeyEnter)
@@ -136,4 +138,50 @@ func TestInitWizardNarrowReviewCanScroll(t *testing.T) {
 	wizardKey(m, tea.KeyDown)
 	require.NotEqual(t, before, m.View())
 	require.False(t, m.confirmed)
+}
+
+func TestInitWizardDiscoverySelectsOneAndReviewsDefaults(t *testing.T) {
+	m := newInitWizard(&InitCmd{}, "default", io.Discard)
+	m.step = 5
+	m.generation = 1
+	m.discovering = true
+	m.Update(initNamespacesMsg{generation: 1, names: []string{"public"}})
+	require.Equal(t, len(m.fields), m.step)
+	require.Equal(t, "public", m.fields[5].value)
+	require.Contains(t, m.View(), "Found public")
+	require.False(t, m.confirmed)
+	wizardKey(m, tea.KeyShiftTab)
+	require.Equal(t, 7, m.step)
+	m.input.SetValue("my-profile")
+	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, "my-profile", m.fields[7].value)
+}
+func TestInitWizardDiscoveryPickerKeepsSelectionAcrossSearch(t *testing.T) {
+	m := newInitWizard(&InitCmd{}, "default", io.Discard)
+	m.step = 5
+	m.generation = 1
+	m.loadField()
+	m.Update(initNamespacesMsg{generation: 1, names: []string{"analytics", "public", "reports"}})
+	wizardKey(m, tea.KeyEnter)
+	require.Contains(t, m.err, "at least one")
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" ")})
+	m.input.SetValue("reports")
+	m.cursor = 0
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" ")})
+	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, "analytics, reports", m.fields[5].value)
+	require.Equal(t, len(m.fields), m.step)
+}
+func TestInitWizardDiscoveryFailureAndStaleResponse(t *testing.T) {
+	m := newInitWizard(&InitCmd{}, "default", io.Discard)
+	m.step = 5
+	m.generation = 2
+	m.Update(initNamespacesMsg{generation: 1, names: []string{"wrong_database"}})
+	require.Empty(t, m.names)
+	m.Update(initNamespacesMsg{generation: 2})
+	require.Equal(t, 5, m.step)
+	require.Contains(t, m.err, "didn’t find")
+	m.Update(initNamespacesMsg{generation: 2, err: fmt.Errorf("connection unavailable")})
+	require.Equal(t, 5, m.step)
+	require.Contains(t, m.err, "connection unavailable")
 }
