@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"log"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/block/schemabot/pkg/testutil"
 
 	_ "github.com/block/mysql"
+	"github.com/block/spirit/pkg/utils"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -115,8 +117,8 @@ func openLockConn(t *testing.T, driverName, dsn string) *sql.Conn {
 // and returns the connection plus a terminate func that ends the database
 // session by closing the connection and its pool. Tests that exercise
 // session-end behavior call terminate mid-test; the registered cleanup only
-// guards an early exit before terminate runs, so as the redundant closer it
-// discards the already-closed errors that follow a normal terminate.
+// guards an early exit before that happens, so it skips the connection once
+// terminate has closed it — a second *sql.Conn close reports ErrConnDone.
 func openTerminableLockConn(t *testing.T, driverName, dsn string) (*sql.Conn, func(t *testing.T)) {
 	t.Helper()
 	db, err := sql.Open(driverName, dsn)
@@ -124,12 +126,16 @@ func openTerminableLockConn(t *testing.T, driverName, dsn string) (*sql.Conn, fu
 	require.NoError(t, testutil.PingMySQL(t.Context(), db))
 	conn, err := db.Conn(t.Context())
 	require.NoError(t, err)
+	var terminated atomic.Bool
 	t.Cleanup(func() {
-		_ = conn.Close()
-		_ = db.Close()
+		if !terminated.Load() {
+			utils.CloseAndLog(conn)
+		}
+		utils.CloseAndLog(db)
 	})
 	terminate := func(t *testing.T) {
 		t.Helper()
+		terminated.Store(true)
 		assert.NoError(t, conn.Close())
 		assert.NoError(t, db.Close())
 	}

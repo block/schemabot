@@ -457,7 +457,7 @@ func grpcCreateTestTable(t *testing.T, env, tableName, ddl string) {
 
 	_, err = db.ExecContext(t.Context(), ddl)
 	require.NoErrorf(t, err, "create table %s on %s", tableName, env)
-	_ = db.Close()
+	utils.CloseAndLog(db)
 
 	t.Cleanup(func() {
 		db2, err := sql.Open("block-mysql", dsn)

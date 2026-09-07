@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/spirit/pkg/utils"
 )
 
 // directPolicyMetadata is the engine metadata an enabled direct execution
@@ -51,7 +52,7 @@ func pkColumns(t *testing.T, database, tableName string) []string {
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY'
 		ORDER BY ORDINAL_POSITION`, database, tableName)
 	require.NoError(t, err, "query PK columns")
-	defer func() { _ = rows.Close() }()
+	defer utils.CloseAndLog(rows)
 	var cols []string
 	for rows.Next() {
 		var col string

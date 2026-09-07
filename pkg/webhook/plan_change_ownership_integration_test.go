@@ -26,6 +26,7 @@ import (
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/spirit/pkg/utils"
 )
 
 const (
@@ -473,7 +474,7 @@ func seedOwnershipReconcileTable(t *testing.T, dbName string) {
 	t.Helper()
 	db, err := sql.Open("block-mysql", driftDSN(t, dbName))
 	require.NoError(t, err)
-	defer func() { _ = db.Close() }()
+	defer utils.CloseAndLog(db)
 	_, err = db.ExecContext(t.Context(), "CREATE TABLE `reconcile_state` (\n"+
 		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n"+
 		"  `pending` tinyint(1) NOT NULL DEFAULT '0',\n"+
@@ -489,7 +490,7 @@ func resetOwnershipHistory(t *testing.T, dbName string) {
 	t.Helper()
 	db, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
-	defer func() { _ = db.Close() }()
+	defer utils.CloseAndLog(db)
 	ctx := t.Context()
 	_, err = db.ExecContext(ctx, "DELETE FROM tasks WHERE database_name = ?", dbName)
 	require.NoError(t, err)
