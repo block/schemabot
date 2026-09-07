@@ -8,8 +8,8 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/dbconn"
-	"github.com/go-sql-driver/mysql"
 )
 
 // ConnectionAssembler turns a resolved endpoint and credentials into the
@@ -302,7 +302,7 @@ const (
 	// identifier is a routing and display key, while this name is what every
 	// PlanetScale API call must address.
 	MetadataDatabase = "database"
-	// MetadataTokenName is the PlanetScale service token id.
+	// MetadataTokenName is the PlanetScale service token id. sadscan:disable kingfisher.planetscale.2
 	MetadataTokenName = "token_name"
 	// MetadataTokenValue is the PlanetScale service token secret.
 	MetadataTokenValue = "token_value"

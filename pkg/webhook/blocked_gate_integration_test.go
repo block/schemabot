@@ -29,7 +29,7 @@ const pkSwapSchema = "CREATE TABLE `users` (\n" +
 // database so the plan produces the refused primary-key reshape.
 func seedPKSwapTargetTable(t *testing.T, dbName string) {
 	t.Helper()
-	db, err := sql.Open("mysql", driftDSN(t, dbName))
+	db, err := sql.Open("block-mysql", driftDSN(t, dbName))
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 	_, err = db.ExecContext(t.Context(), "CREATE TABLE `users` (\n"+

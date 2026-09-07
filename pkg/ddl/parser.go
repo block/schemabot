@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/parser"
 	"github.com/block/spirit/pkg/parser/ast"
 	"github.com/block/spirit/pkg/parser/format"
@@ -456,9 +457,9 @@ func (tidbStatementParser) Canonicalize(ddl string) string {
 	// For ALTER TABLE, reconstruct from the normalized Alter field.
 	if stmt.Alter != "" {
 		if stmt.Schema != "" {
-			return fmt.Sprintf("ALTER TABLE `%s`.`%s` %s", stmt.Schema, stmt.Table, stmt.Alter)
+			return fmt.Sprintf("ALTER TABLE %s.%s %s", sqlescape.EscapeIdentifier(stmt.Schema), sqlescape.EscapeIdentifier(stmt.Table), stmt.Alter)
 		}
-		return fmt.Sprintf("ALTER TABLE `%s` %s", stmt.Table, stmt.Alter)
+		return fmt.Sprintf("ALTER TABLE %s %s", sqlescape.EscapeIdentifier(stmt.Table), stmt.Alter)
 	}
 
 	// For CREATE TABLE and DROP TABLE, use TiDB's Restore for canonical format.
