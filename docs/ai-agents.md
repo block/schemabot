@@ -93,10 +93,11 @@ the agent uses your credentials.
   [`review_policy`](configuration.md#review-gate) to require a qualifying
   approval for the environments served by that instance. The PR author's
   own approval does not count.
-- **Keep destructive changes an explicit choice.** `--allow-unsafe` is a
-  per-command opt-in. Leaving it out preserves the unsafe-change gate, but
-  the server cannot tell whether you or your agent supplied the flag.
-- **Watch for denied commands.**
-  `schemabot.pr_command_actor_authorization.total` records which kind of grant
-  allowed a PR command or why it was blocked. A rise in `not_authorized`
-  denials is a reason to check the command logs and account permissions.
+- **Review destructive changes before allowing them.** Changes flagged as unsafe
+  require `--allow-unsafe` to proceed. If your agent uses your credentials, it
+  can supply that flag too—SchemaBot cannot tell whether you personally
+  approved the change.
+- **Check the logs when a command is denied.** They explain why it was blocked
+  and help you check the caller's permissions. The
+  `schemabot.pr_command_actor_authorization.total` metric can help you spot
+  patterns across requests.
