@@ -178,6 +178,9 @@ reachable; it does not check connectivity to each database.
 
 ## Connect your identity provider
 
+> **Alpha:** OIDC support is still evolving. Test login and permissions with
+> your identity provider before relying on this setup in production.
+
 An identity provider is the service your team uses to sign in. SchemaBot
 supports OpenID Connect (OIDC), a standard that lets it verify that login.
 Your provider issues a signed token, and the CLI sends it with each request.
