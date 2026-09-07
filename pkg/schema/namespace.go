@@ -7,6 +7,10 @@ import (
 	"strings"
 )
 
+// EmptyNamespaceDeclaration keeps an explicitly empty namespace in version
+// control. It is metadata for grouping, not a SQL statement sent to an engine.
+const EmptyNamespaceDeclaration = "-- This namespace is empty. Add CREATE TABLE declarations here.\n"
+
 // GroupFilesByNamespace groups schema files by namespace using their relative paths.
 // Two layouts are supported:
 //
@@ -87,6 +91,9 @@ func GroupFilesByNamespace(files map[string]string, defaultNamespace string, env
 
 		if result[namespace] == nil {
 			result[namespace] = &Namespace{Files: make(map[string]string)}
+		}
+		if content == EmptyNamespaceDeclaration {
+			continue
 		}
 		result[namespace].Files[filename] = content
 	}

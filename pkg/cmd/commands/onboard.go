@@ -11,6 +11,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -233,7 +234,7 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 		if len(pulled.Tables) == 0 && len(pulled.Artifacts) == 0 {
 			// Keep empty scope explicit: a comment-only SQL file declares no tables
 			// while preserving the namespace for future plans and version control.
-			files[filepath.Join(namespace, "schema.sql")] = "-- This namespace is empty. Add CREATE TABLE declarations here.\n"
+			files[filepath.Join(namespace, "schema.sql")] = schema.EmptyNamespaceDeclaration
 		}
 		tableNames := make([]string, 0, len(pulled.Tables))
 		for tableName := range pulled.Tables {

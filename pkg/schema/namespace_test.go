@@ -335,3 +335,15 @@ func TestResolveIgnoreNamespaces(t *testing.T) {
 	assert.Equal(t, []string{"fixtures_$ENV"},
 		ResolveIgnoreNamespaces([]string{"fixtures_$ENV"}, ""))
 }
+
+func TestGroupFilesByNamespaceEmptyDeclaration(t *testing.T) {
+	grouped, _, err := GroupFilesByNamespace(map[string]string{"public/schema.sql": EmptyNamespaceDeclaration}, "app", "development", nil)
+	require.NoError(t, err)
+	require.Contains(t, grouped, "public")
+	require.Empty(t, grouped["public"].Files)
+	// User edits are SQL again; nothing other than the exact declaration is skipped.
+	edited := EmptyNamespaceDeclaration + "CREATE TABLE users (id bigint);"
+	grouped, _, err = GroupFilesByNamespace(map[string]string{"public/schema.sql": edited}, "app", "development", nil)
+	require.NoError(t, err)
+	require.Equal(t, edited, grouped["public"].Files["schema.sql"])
+}
