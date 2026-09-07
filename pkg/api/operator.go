@@ -910,6 +910,33 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 		return
 	}
 
+	// The parent claim above is a second transaction, so a peer can rotate this
+	// operation's lease onto itself between the two. Driving on would run engine
+	// work under a capability this driver no longer holds, and surface as
+	// whichever operation-scoped write happened to be attempted first — a
+	// re-plan, a task transition — rather than as the claim race it is. Confirm
+	// the operation lease survived the gap and hand the parent back when it did
+	// not, so the peer holding it drives instead.
+	if verdict := s.recheckOperationLease(ctx, driverID, op, opLease); verdict != operationLeaseHeld {
+		s.releaseParentApplyClaim(ctx, driverID, apply, op)
+		// An unproven lease is still this driver's: storage could not answer,
+		// but nothing showed the lease gone. Hand it back rather than sit on a
+		// row this drive is abandoning, or the claim query's heartbeat gate
+		// holds the operation for a full staleness window over one failed read.
+		//
+		// It goes back second because releasing it backdates the row past the
+		// staleness window, which makes the operation claimable again. Released
+		// first, a peer would take it while this driver still held a fresh
+		// parent lease, get nothing from ClaimApplyByID, and hand the row
+		// straight back — a wasted round trip recorded as parent contention.
+		// The reverse order leaves nothing claimable in between: the operation's
+		// heartbeat is fresh until this driver gives it up.
+		if verdict == operationLeaseUnproven {
+			s.releaseOperationClaimBeforeDrive(ctx, driverID, op, opLease)
+		}
+		return
+	}
+
 	// Two capabilities, two scopes:
 	//   - applyLeaseCtx guards parent applies writes — the engine's state
 	//     transitions and the derived-state reconcile.
@@ -1643,6 +1670,128 @@ func (s *Service) completePendingRequestForResolvedApply(ctx context.Context, dr
 		append(apply.LogAttrs(),
 			"driver", driverID, "operation", op)...)
 	return nil
+}
+
+// operationLeaseVerdict is what a pre-drive lease re-check concluded. The three
+// answers differ in what this driver still holds, which is what decides whether
+// it has an operation lease to hand back.
+type operationLeaseVerdict int
+
+const (
+	// operationLeaseHeld: the row still carries this drive's token.
+	operationLeaseHeld operationLeaseVerdict = iota
+	// operationLeaseUnproven: storage could not answer. Nothing showed the lease
+	// gone, so this driver still holds it and owes a release.
+	operationLeaseUnproven
+	// operationLeaseLost: a successful read showed the lease is no longer this
+	// driver's — the row is gone, a peer rotated the token onto itself, or a
+	// peer released it. There is nothing left to release.
+	operationLeaseLost
+)
+
+// recheckOperationLease re-reads the operation row to see whether it still
+// carries this drive's lease token. It spans the gap between the operation claim
+// and the parent apply claim, so a peer that rotated the token in that gap is
+// detected before any engine work runs rather than through the first refused
+// write.
+//
+// It narrows that race rather than closing it: the read takes no row lock, so a
+// peer can still rotate between this read and the drive's first write, where the
+// lease-guarded write catches it (OW-2). What the claim query's own heartbeat
+// gate closes is the window that produced the rotation in the first place; this
+// re-check is what turns the remainder into an early, correctly named claim race
+// instead of a late failure attributed to whichever write ran first.
+//
+// Uncertainty is not displacement (OW-4): a storage failure answers unproven,
+// not lost, so the caller hands the lease back for an immediate retry instead of
+// treating a blip as a peer.
+func (s *Service) recheckOperationLease(ctx context.Context, driverID int, op *storage.ApplyOperation, opLease storage.OperationLease) operationLeaseVerdict {
+	current, err := s.storage.ApplyOperations().Get(ctx, op.ID)
+	if err != nil {
+		s.logClaimFailure(ctx, "operator: could not re-read the claimed operation to confirm its lease survived the parent claim; operation will not be driven", "operation_lease_recheck_error",
+			append(op.LogAttrs(),
+				"driver", driverID,
+				"error", err)...)
+		return operationLeaseUnproven
+	}
+	if current == nil {
+		s.logger.Error("operator: claimed operation disappeared before its drive started; operation will not be driven",
+			append(op.LogAttrs(), "driver", driverID)...)
+		metrics.RecordOperatorClaimFailure(ctx, "operation_lease_recheck_missing")
+		return operationLeaseLost
+	}
+	// An empty token is a peer that released the row rather than one that took
+	// it, and the two need different log lines: nobody is driving the operation
+	// now, so the truthful outcome is that the next poll offers it again.
+	if current.LeaseToken == "" {
+		s.logger.Warn("operator: a peer released the operation lease between this driver's operation claim and its parent apply claim; the operation is offered again on the next poll",
+			append(op.LogAttrs(), "driver", driverID)...)
+		metrics.RecordOperatorClaimFailure(ctx, "operation_lease_released_by_peer")
+		return operationLeaseLost
+	}
+	if current.LeaseToken != opLease.Token {
+		s.logger.Warn("operator: a peer rotated the operation lease between this driver's operation claim and its parent apply claim; the peer drives the operation",
+			append(op.LogAttrs(),
+				"driver", driverID,
+				"current_lease_owner", current.LeaseOwner)...)
+		metrics.RecordOperatorClaimFailure(ctx, "operation_lease_rotated")
+		return operationLeaseLost
+	}
+	return operationLeaseHeld
+}
+
+// releaseOperationClaimBeforeDrive hands back an operation lease this driver
+// holds but will not drive under, so the next poll can offer the row
+// immediately. Without it the claim query's heartbeat gate — refreshed by this
+// driver's own claim — keeps the row unclaimable for a full staleness window,
+// which is the stall the release exists to avoid.
+func (s *Service) releaseOperationClaimBeforeDrive(ctx context.Context, driverID int, op *storage.ApplyOperation, opLease storage.OperationLease) {
+	released, err := s.storage.ApplyOperations().ReleaseClaim(ctx, opLease)
+	if err != nil {
+		s.logClaimFailure(ctx, "operator: failed to release the operation lease this driver will not drive under; the operation is retried once its lease goes stale", "operation_lease_release_error",
+			append(op.LogAttrs(),
+				"driver", driverID,
+				"error", err)...)
+		return
+	}
+	if !released {
+		s.logger.Warn("operator: operation lease already rotated before this driver could release it; the new lease owner drives the operation",
+			append(op.LogAttrs(), "driver", driverID)...)
+		return
+	}
+	s.logger.Info("operator: released the operation lease this driver will not drive under; the operation is offered on the next poll",
+		append(op.LogAttrs(), "driver", driverID)...)
+}
+
+// releaseParentApplyClaim hands back a parent apply lease this driver acquired
+// but will not drive under, so the peer that owns the operation can claim it on
+// its next poll instead of waiting out the staleness window. A parent left
+// leased here is exactly the stall the release avoids: the operation claim only
+// re-offers the row while the parent's heartbeat is stale.
+func (s *Service) releaseParentApplyClaim(ctx context.Context, driverID int, apply *storage.Apply, op *storage.ApplyOperation) {
+	released, err := s.storage.Applies().ReleaseClaim(ctx, apply.Lease())
+	if err != nil {
+		s.logClaimFailure(ctx, "operator: failed to release the parent apply claim this driver will not drive; the parent is retried once its lease goes stale", "operation_parent_release_error",
+			append(apply.LogAttrs(),
+				"driver", driverID,
+				"apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment,
+				"error", err)...)
+		return
+	}
+	if !released {
+		s.logger.Warn("operator: parent apply lease already rotated before this driver could release it; the new lease owner drives the apply",
+			append(apply.LogAttrs(),
+				"driver", driverID,
+				"apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment)...)
+		return
+	}
+	s.logger.Info("operator: released the parent apply claim for an operation this driver no longer leases",
+		append(apply.LogAttrs(),
+			"driver", driverID,
+			"apply_operation_id", op.ID,
+			"operation_deployment", op.Deployment)...)
 }
 
 // reconcileUnclaimableParent handles a claimed operation whose parent apply

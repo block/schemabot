@@ -366,6 +366,10 @@ func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB,
 			// on this pull request. That is what makes it publishable here,
 			// and it is why a new refusal path has to be read before it is
 			// marked rather than assumed to match this one.
+			//
+			// It names the schema change engine in full because failureReason
+			// publishes this message verbatim as the apply's failure reason,
+			// with no sentence around it to establish which engine is meant.
 			if !policy.Enabled {
 				return alterRouting{}, engine.OperatorErrorf(nil, "Statement on table %q is not supported by the schema change engine and direct execution is not enabled for this database: %s", table, reason)
 			}

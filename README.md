@@ -13,6 +13,7 @@
 </p>
 
 <p align="center">
+  <a href="./docs/vision.md">Vision</a> ·
   <a href="#see-it-in-action">See it in action</a> ·
   <a href="#why-schemabot">Why SchemaBot</a> ·
   <a href="#how-it-works">How it works</a> ·
@@ -120,29 +121,19 @@ To run SchemaBot against your own databases, grab a build from [Releases](#relea
 
 ## Docs
 
-Design and operations docs live in the [docs](./docs/) folder:
+Guides and reference:
 
-- [docs/architecture.md](./docs/architecture.md) is the full picture: the layers, the engines,
-  the state machine, and how a change flows through them.
-- [docs/configuration.md](./docs/configuration.md) covers server setup: local mode, gRPC mode,
-  and secret resolution.
-- [docs/auth.md](./docs/auth.md) is the authentication and authorization guide: how to go from
-  an open API to one your infrastructure trusts, one step at a time, and the model behind
-  each step.
-- [docs/ai-agents.md](./docs/ai-agents.md) is the policy for AI agents that act on a person's
-  behalf: which commands stay human-only, when an agent may post a staging apply, and what an
-  operator can enforce on the server.
-- [docs/invariants.md](./docs/invariants.md) is the registry of runtime safety invariants:
-  what must never be false while SchemaBot is running, why each rule matters, where it is
-  enforced, and what these guarantees deliberately do not cover. It opens with what happens
-  when GitHub is down.
-- [docs/engines.md](./docs/engines.md) is the engine capability matrix: how each engine
-  executes a change, which control operations it supports, how it manages load, and why the
-  differences exist.
-- [docs/postgresql.md](./docs/postgresql.md) is the PostgreSQL support envelope: what plans,
-  what applies, and how each refusal is reported.
-
-Each has a table of contents, so jump straight to the question you came with.
+- [Vision](./docs/vision.md): See what we’re building toward
+- [Quick start](#quick-start): Try it on your machine
+- [Schema intelligence](./docs/schema-intelligence.md): Get to know your fleet and what’s changing
+- [Engines](./docs/engines.md): See how changes run on your database engine
+- [PostgreSQL](./docs/postgresql.md): Find out what’s supported today
+- [Configuration](./docs/configuration.md): Set things up for your environment
+- [Authentication](./docs/auth.md): Choose who can read and change your databases
+- [AI agents](./docs/ai-agents.md): Set clear boundaries for your assistants
+- [Safety invariants](./docs/invariants.md): Understand the guardrails behind each change
+- [Architecture](./docs/architecture.md): Follow a change from start to finish
+- [Contributing](./CONTRIBUTING.md): Come build with us
 
 ## Releases
 

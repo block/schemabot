@@ -118,6 +118,10 @@ The hook uses `--new-from-rev` to only flag issues introduced by the current bra
 
 ## Guidelines
 
+**Database integrity comes first, for every database.** SchemaBot runs in front of everything from a vibe-coded weekend experiment to a tier-0 production system, and it treats them all the same way: the integrity of the database behind it outranks convenience, speed, and feature scope. Do not frame anything, in code, docs, or review, in terms of "databases that matter" or shortcuts that are "fine for a small database". Every database matters, and a change that would be unsafe in front of production is unsafe everywhere. When a tradeoff pits integrity against anything else, integrity wins.
+
+**Keep the schema intelligence guide in sync with the API.** When changing the request or response payloads, field semantics, filters, limits, or availability of `GET /api/databases`, `POST /api/pull`, `GET /api/status`, `GET /api/history/{database}`, `GET /api/plans`, `GET /api/plans/{plan_id}`, `GET /api/progress/apply/{apply_id}`, `GET /api/logs`, `GET /api/logs/{database}`, or `GET /api/locks`, update [docs/schema-intelligence.md](docs/schema-intelligence.md) in the same PR. Update the affected explanations and request/response examples, including catalog, lint, and deployment-specific payloads. Changes to the corresponding CLI commands or rendering must also update the guide's command/output examples. Every command example must have matching visible output; use fictional values and the actual response types or CLI formatters.
+
 **Terminology:** NEVER use the word "migration" in code, comments, CLI output, or error messages. ALWAYS use "schema change" instead.
 
 **"schema change" is never hyphenated.** In prose — PR comments, check summaries, CLI output, error messages, docs, code comments — write "schema change", never "schema-change".
@@ -235,6 +239,19 @@ All SQL statements processed by SchemaBot **must be parseable by the dialect's r
 - **Do not** add fallback logic (e.g., `strings.Split(content, ";")`) when the parser fails. If a statement cannot be parsed, that is an error that must be surfaced to the caller.
 - **Do not** silently skip unparseable statements with patterns like `if err != nil { continue }` unless the error is an expected type-filtering condition (e.g., `ParseCreateTable` returning an error for an `ALTER TABLE` statement).
 - Schema files are expected to contain DDL valid for their target dialect. If the dialect's parser cannot handle a valid construct, that is a bug to fix in the parser dependency (the TiDB parser / Spirit, or libpg_query), not something to work around with string splitting.
+
+### Upstream First: Fix the Engine, Not the Consumer
+
+The rule above is one instance of a general one. **When a change reaches into a dependency's territory, first ask whether the fix belongs in the dependency.** Parser semantics, DDL diffing and canonicalization, schema introspection, progress and checkpoint state, and anything that has to know how an engine works internally are the domain of [`block/spirit`](https://github.com/block/spirit) and [`block/pg-sprite`](https://github.com/block/pg-sprite), not of SchemaBot. Both are ours to change. A fix that lands upstream fixes every consumer, gets the engine's own test suite behind it, and stays correct when the engine evolves. A fix that lands here has to re-derive the engine's behavior from the outside and breaks the next time the engine changes it.
+
+Prefer the upstream change whenever it makes consumption simpler: a new exported function or option, a typed error instead of an error string to match on, a field on a status or result struct instead of a value to infer, a hook where SchemaBot currently peeks. Shortcuts that reach around the dependency are brittle by construction and are the last resort, not the first draft:
+
+- parsing the engine's log lines or error text to recover a fact the engine already knows
+- re-implementing part of its parser, differ, or introspection on our side, or string-manipulating DDL it already parses
+- copying a private helper out of it instead of asking for it to be exported
+- inferring engine state from side effects (table names, sentinel rows, timing) instead of from an API
+
+When the upstream fix is right but cannot wait for a release, land the smallest workaround here with a comment stating what upstream capability retires it, and open the upstream change in the same sitting so the workaround has an expiry. The Vitess fork (see *Vitess Dependency*) follows the same rule for the code we carry on top of upstream Vitess.
 
 ## AWS Infrastructure
 

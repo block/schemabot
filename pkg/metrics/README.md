@@ -99,7 +99,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **status** (PR command actor authorization): `allowed`, `denied`, `error`, `skipped`, `unknown`
 
-**reason** (PR command actor authorization): `disabled`, `allowed_admin_team`, `allowed_admin_user`, `allowed_operator_team`, `allowed_operator_user`, `missing_actor`, `missing_server_config`, `missing_database_config`, `no_configured_principal`, `not_authorized`, `github_error`, `unknown`
+**reason** (PR command actor authorization): `disabled`, `allowed_admin_team`, `allowed_admin_user`, `allowed_repo_admin_team`, `allowed_repo_admin_user`, `allowed_operator_team`, `allowed_operator_user`, `missing_actor`, `missing_server_config`, `missing_database_config`, `no_configured_principal`, `not_authorized`, `github_error`, `unknown`
 
 **operation** (check ownership): `apply_finished`, `apply_cancelled_finished`, `rollback_finished`
 
@@ -135,7 +135,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **status** (GitHub API): `success`, `error`, `not_found` (a 404 answer to a read operation — an expected "no" from probes like schemabot.yaml lookups; 404s on auth and write operations stay `error`), `transport_error` (no HTTP response: dial/TLS failure or deadline — the signature of GitHub being unreachable), `cancelled` (SchemaBot cancelled the request itself, e.g. during shutdown), `unknown`
 
-**reason** (operator claim failures): `expire_retryable_error`, `missing_lease_token`, `operation_storage_error`, `missing_operation_lease_token`, `operation_set_list_error`, `operation_set_missing`, `operation_task_inspect_error`, `operation_cutover_storage_error`, `missing_operation_cutover_lease_token`, `operation_cutover_set_list_error`, `operation_cutover_set_invalid`, `operation_parent_load_error`, `operation_parent_missing`, `operation_parent_claim_error`, `operation_parent_not_claimable`, `operation_lease_release_error`, `missing_operation_deployment`, `stop_reconciliation_claim_error`, `stop_reconciliation_missing_lease_token`, `operation_projection_claim_error`, `operation_projection_missing_lease_token`, `stranded_reaper_error`, `stranded_task_reaper_error`, `unknown`
+**reason** (operator claim failures): `expire_retryable_error`, `missing_lease_token`, `operation_storage_error`, `missing_operation_lease_token`, `operation_set_list_error`, `operation_set_missing`, `operation_task_inspect_error`, `operation_cutover_storage_error`, `missing_operation_cutover_lease_token`, `operation_cutover_set_list_error`, `operation_cutover_set_invalid`, `operation_parent_load_error`, `operation_parent_missing`, `operation_parent_claim_error`, `operation_parent_not_claimable`, `operation_parent_release_error`, `operation_lease_release_error`, `operation_lease_recheck_error`, `operation_lease_recheck_missing`, `operation_lease_rotated`, `operation_lease_released_by_peer`, `missing_operation_deployment`, `stop_reconciliation_claim_error`, `stop_reconciliation_missing_lease_token`, `operation_projection_claim_error`, `operation_projection_missing_lease_token`, `stranded_reaper_error`, `stranded_task_reaper_error`, `unknown`
 
 **reason** (operator resume failures): `missing_deployment`, `no_client`, `resume_error`, `lease_lost`, `retry_budget_exhausted`, `recovery_window_expired`
 
@@ -416,15 +416,21 @@ forward-auth middleware has admitted the caller to the write tier. A spike in
 grant — the `reason` attribute says whether the target database, the
 environment, or the group membership mismatched.
 
-Status values: `allowed`, `denied`, and `skipped` (the decision could not reach
-an authorization outcome — for example the stored plan lookup failed — and the
-request was rejected by the operation's own error path instead).
+Status values: `allowed`, `denied`, and `skipped`. A `skipped` decision made no
+per-database ruling: either the scoped lane is disabled and the plain admin gate
+applied (`scoped_lane_disabled`), or the target database could not be resolved
+and the request was rejected by the operation's own error path instead
+(`target_unresolved`). A sustained `target_unresolved` rate means stored-plan
+lookups are failing on the authorization path. The paired log names the plan id
+in both cases: an ERROR carrying the storage error when the lookup failed, or a
+WARN when the plan does not exist.
 
 Reason values:
 
 | Reason | Meaning |
 |---|---|
 | `scoped_lane_disabled` | No database has `operator_groups`; the decision is the plain admin gate. |
+| `target_unresolved` | The stored plan named by the request failed to load or does not exist, so no target database was available to authorize against. |
 | `admin_allow` | Allowed via deployment `write_groups` membership. |
 | `scoped_allow` | Allowed via the target database's `operator_groups` grant. |
 | `missing_identity` | No authenticated user in the request context. |

@@ -14,10 +14,10 @@
 AI agents reach SchemaBot in two roles, and they need different treatment.
 
 - **As a service.** An agent that inventories schemas, answers questions about
-  what is in a database, or watches applies is a service consumer. It calls
-  the API with its own identity and gets the read tier. The server enforces
-  that boundary, and [auth.md](auth.md#calling-schemabot-as-a-service) covers
-  how.
+  what is in a database, or watches applies is a service consumer. Give it its
+  own identity with read-only access. The forward-auth service   lane enforces
+  that boundary; OIDC requires keeping admin groups out of   the service
+  token, and [auth.md](auth.md#calling-schemabot-as-a-service) covers   how.
 - **As a person's assistant.** An agent that runs the CLI with an operator's
   credentials, or posts a PR comment from their GitHub account, is
   indistinguishable from that person. SchemaBot records the comment author or
@@ -25,19 +25,20 @@ AI agents reach SchemaBot in two roles, and they need different treatment.
   see that an agent pressed the key. The server cannot enforce a boundary
   here. The boundary has to live in the agent's instructions.
 
-This document is the policy for the second role. It is written so it can be
-dropped into an agent's instructions as-is, and it ends with what an operator
-can do on the server side to make the policy hard to break.
+Use the conservative policy below as a starting point for your agent’s
+instructions. Adapt it to your team’s approval and delegation practices. The
+final section distinguishes server-enforced checks from instructions that rely
+on the agent following them.
 
 ## Why the production line is bright
 
-A production apply through the PR workflow requires an approved pull request,
-and the `schemabot apply` comment that starts it is SchemaBot's record of who
-signed off. When an agent posts that comment from a person's account, its
-keystroke lands where the person's sign-off belongs. The apply is still
-authorized, the audit trail still names the person, and nobody actually
-decided. That is the failure the rest of this document exists to prevent, and
-it is why the production rule has no exceptions, not even a direct request.
+With the review gate enabled, an apply through the PR workflow requires an
+approved pull request, and the `schemabot apply` comment that starts it is
+SchemaBot's record of who signed off. When an agent posts that comment from a
+person's account, its keystroke lands where the person's sign-off belongs. The
+audit trail names the person regardless of whether they reviewed that
+particular action. This policy keeps production execution with the person so
+the recorded operator and the person acting are the same.
 
 ## The rules
 
@@ -51,15 +52,14 @@ it is why the production rule has no exceptions, not even a direct request.
 | The person has said they will post every command themselves | That overrides the staging defaults |
 | Reads: status, progress, history, plan output, live schema pulls | The agent acts freely |
 
-Staging is where the environment exists to be tried on, so no stamp is needed
-and there is no sign-off for an agent to stand in for. Handing every staging
-command back to the person just adds a round trip. What still decides whether
-the agent acts or asks is blast radius, not the approval model. A staging
-database owned by a critical service is shared with every team that tests
-against it, so an apply there is felt beyond the PR it came from, and a
-long-running apply holds that database's lock while it runs. If your
-organization ranks services by criticality, that ranking is the input to this
-rule. If it does not, treat every shared staging database as critical.
+Staging can still have approval requirements: the configured review gate
+applies there too. Within this policy, blast radius determines whether the
+agent asks before acting. A staging database owned by a critical service is
+shared with every team that tests against it, so an apply there is felt beyond
+the PR it came from, and a long-running apply holds that database's lock while
+it runs. If your organization ranks services by criticality, that ranking is
+the input to this rule. If it does not, treat every shared staging database as
+critical.
 
 ## Instructions for an agent
 
@@ -76,33 +76,37 @@ The rules above, in the imperative voice an agent's instructions use:
 - Reads are yours. Use `status`, `progress`, the plan output, apply history,
   and `pull` freely to understand a change before anyone acts on it.
 - A `403` is an answer, not an obstacle. Denials are the configuration working
-  as intended. The fix is an operator adding a grant, never retrying, switching
-  credentials, or proposing `auth.type: none` to clear the error.
+  as intended. The fix is an operator adding a grant, never retrying,
+  switching   credentials, or proposing `auth.type: none` to clear the error.
 - Schema changes go through the PR workflow. If a task calls for changing a
   schema, the path is a pull request editing the declarative schema files,
   where plans, checks, and review gates apply.
 
 ## What operators can enforce
 
-The policy above lives in the agent. These server-side settings make the
-important parts hold even if an agent ignores it.
+The policy above lives in the agent. Server settings enforce identity and
+approval checks. They cannot enforce “human only” when an assistant uses the
+human’s credentials.
 
 - **Give agent services their own identity, and only the read tier.** Under
   `forward_auth`, the service-caller lane grants read access to a listed
   SPIFFE ID and nothing else; under `oidc`, a service token without an admin
-  team reads and cannot write. No configuration grants a service the write
-  tier, so an agent calling as itself cannot apply anything. See
-  [calling SchemaBot as a service](auth.md#calling-schemabot-as-a-service).
+  team reads and cannot write. An OIDC service token with an admin group can
+  write, so the identity   provider must keep those groups out of service
+  tokens. See   [calling SchemaBot as a service](auth.md#calling-schemabot-as-
+  a-service).
 - **Keep bot accounts out of the operator lists.** PR command authorization
   checks the comment author against `admin_teams`, `admin_users`,
-  `operator_teams`, and `operator_users`. A bot or agent GitHub account that
-  appears in none of them cannot command an apply, whatever it posts. See
-  [GitHub-side authorization](auth.md#github-side-authorization).
-- **Turn on the review gate for production.** With
-  [`review_policy`](configuration.md#review-gate) enabled, a production apply
-  needs an approval from a configured reviewer, and the PR author's own
-  approval never counts. An agent that authored the PR cannot approve it, and
-  an agent posting the apply comment from an unapproved PR is blocked.
+  `operator_teams`, and `operator_users`. Enable `pr_command_authorization`
+  and check repository-level admin grants   too; leaving an account out of
+  database operator lists alone is not enough. See   [GitHub-side
+  authorization](auth.md#github-side-authorization).
+- **Require PR approval before apply.** With
+  [`review_policy`](configuration.md#review-gate) enabled, an apply in any
+  environment   needs an approval from a configured reviewer, and the PR
+  author's own   approval never counts. An agent that authored the PR cannot
+  approve it, and   an agent posting the apply comment from an unapproved PR
+  is blocked.
 - **Refuse unsafe changes by default.** `--allow-unsafe` is a per-command
   opt-in, so an agent that follows the rule never sends it, and an operator
   reviewing history can see exactly which commands carried it.
