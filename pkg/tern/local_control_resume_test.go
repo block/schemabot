@@ -199,8 +199,52 @@ func TestVerifyReplannedTaskDDL(t *testing.T) {
 		assert.Contains(t, err.Error(), "has not drifted from the reviewed plan")
 		assert.Contains(t, err.Error(), "cannot run task task_abc123")
 		assert.Contains(t, err.Error(), "absent from the re-plan for commerce[-80].users/alter")
-		assert.Contains(t, err.Error(), "terminal sibling task task_name (failed)")
+		assert.Contains(t, err.Error(), "sibling task task_name (failed)")
 		assert.NotContains(t, err.Error(), "has drifted")
+	})
+
+	t.Run("only a sibling that will still run its statement vouches for it", func(t *testing.T) {
+		// The one remaining statement is a sibling's reviewed DDL. Whether that
+		// settles this task as landed depends solely on whether the sibling
+		// will still run the statement forward: a pending, running or stopped
+		// sibling will, so it vouches; a terminal sibling never will, and a
+		// sibling in a revert phase is unwinding it, so neither may vouch and
+		// the resume refuses, naming the sibling and its state.
+		cases := []struct {
+			siblingState string
+			vouches      bool
+		}{
+			{state.Task.Pending, true},
+			{state.Task.Running, true},
+			{state.Task.Stopped, true},
+			{state.Task.RevertWindow, false},
+			{state.Task.Reverting, false},
+			{state.Task.Reverted, false},
+			{state.Task.Completed, false},
+		}
+		for _, tc := range cases {
+			t.Run(tc.siblingState, func(t *testing.T) {
+				tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+				siblings := []*storage.Task{
+					tk,
+					sibling("task_name", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", tc.siblingState),
+				}
+				ddl, landed, err := c.verifyReplannedTaskDDL(tk, []string{
+					"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+				}, siblings)
+				if tc.vouches {
+					require.NoError(t, err)
+					assert.True(t, landed)
+					assert.Empty(t, ddl)
+					return
+				}
+				require.Error(t, err)
+				assert.False(t, landed)
+				assert.Contains(t, err.Error(), "has not drifted from the reviewed plan")
+				assert.Contains(t, err.Error(), "sibling task task_name ("+tc.siblingState+")")
+				assert.Contains(t, err.Error(), "which will not run it")
+			})
+		}
 	})
 
 	t.Run("a terminal sibling explains one statement but unreviewed DDL beside it is still drift", func(t *testing.T) {
@@ -357,7 +401,7 @@ func TestVerifyReplannedTaskDDL(t *testing.T) {
 		require.Error(t, err)
 		assert.False(t, landed)
 		assert.Contains(t, err.Error(), "has not drifted from the reviewed plan")
-		assert.Contains(t, err.Error(), "terminal sibling tasks task_t1 (failed), task_t2 (failed)")
+		assert.Contains(t, err.Error(), "sibling tasks task_t1 (failed), task_t2 (failed)")
 		assert.NotContains(t, err.Error(), "has drifted")
 	})
 
@@ -378,7 +422,7 @@ func TestVerifyReplannedTaskDDL(t *testing.T) {
 		require.Error(t, err)
 		assert.False(t, landed)
 		assert.Contains(t, err.Error(), "has not drifted from the reviewed plan")
-		assert.Contains(t, err.Error(), "terminal sibling tasks task_t1 (failed), task_t2 (cancelled)")
+		assert.Contains(t, err.Error(), "sibling tasks task_t1 (failed), task_t2 (cancelled)")
 		assert.NotContains(t, err.Error(), "has drifted")
 	})
 
@@ -1148,6 +1192,53 @@ func TestResumeApplyWithTasks_RefusesSequentialResumeOfRevertPhaseTask(t *testin
 			for _, entry := range logs.logs {
 				assert.NotEqual(t, storage.LogEventStateTransition, entry.EventType,
 					"the durable log must not record a transition the rows do not carry: %q", entry.Message)
+			}
+		})
+	}
+}
+
+// A resume mid-revert can find one task's statement back in the re-plan diff
+// while another's is not: the engine unwinds statement by statement. The task
+// whose statement is absent must not be settled completed on the strength of a
+// sibling that is unwinding the statement still listed — that sibling will not
+// run it forward — so the re-plan refuses before any task row, apply row, or
+// durable state transition is written, on the sequential and the grouped path
+// alike.
+func TestResumeApplyWithTasks_RevertPhaseSiblingDoesNotVouchForLandedStatement(t *testing.T) {
+	for _, siblingState := range []string{state.Task.RevertWindow, state.Task.Reverting} {
+		t.Run(siblingState, func(t *testing.T) {
+			logs := &mockApplyLogStore{}
+			taskStore := &exactProgressTaskStore{}
+			c, eng, apply, applies, tasks := newLandedSiblingResume(t, taskStore, logs)
+			plan := &storage.Plan{ID: 5}
+			apply.PlanID = plan.ID
+			apply.State = state.Apply.Reverting
+			applies.stored = *apply
+			c.storage.(*exactProgressStorage).plans = &fakePlanStore{
+				getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil },
+			}
+			// task_email's statement is absent from the re-plan; the only
+			// statement listed is task_name's, and task_name is unwinding it.
+			tasks[1].State = siblingState
+			taskStore.tasks = tasks
+
+			err := c.resumeApplyWithTasks(t.Context(), apply, tasks, nil, false, false)
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "sibling task task_name ("+siblingState+"), which will not run it")
+			assert.True(t, state.IsState(tasks[0].State, state.Task.Running),
+				"the task whose statement is absent is left as found, got %s", tasks[0].State)
+			assert.Nil(t, tasks[0].CompletedAt)
+			assert.True(t, state.IsState(tasks[1].State, siblingState),
+				"the revert-phase sibling keeps its state, got %s", tasks[1].State)
+			assert.Empty(t, eng.applied, "nothing is handed to the engine")
+			stored, err := applies.Get(t.Context(), apply.ID)
+			require.NoError(t, err)
+			assert.True(t, state.IsState(stored.State, state.Apply.Reverting),
+				"the apply row is left as found; stored state was %q", stored.State)
+			for _, entry := range logs.logs {
+				assert.NotEqual(t, storage.LogEventStateTransition, entry.EventType,
+					"the durable log must not record a settlement the re-plan refused: %q", entry.Message)
 			}
 		})
 	}

@@ -1233,10 +1233,11 @@ compares it immediately before each per-task engine apply. Drift fails closed, i
 cannot parse, and recomputed deltas are never applied silently. A task may settle as completed
 without SchemaBot running its reviewed DDL only on evidence from the reviewed target: the
 resume re-plan of the reviewed schema set against the live target no longer lists the task's
-statement, and every statement it still lists is the reviewed DDL of another, not-yet-terminal
-task of the same apply operation on that table. A statement the re-plan still lists that only a
-terminal sibling was reviewed with refuses the resume instead, since nothing pending will run
-it. *Enforced:* `verifyMaterializedPlanMatchesLiveSchema` on the apply path
+statement, and every statement it still lists is the reviewed DDL of another task of the same
+apply operation on that table that is neither terminal nor in a revert phase — one that will
+still run it forward. A statement the re-plan still lists that only a terminal or revert-phase
+sibling was reviewed with refuses the resume instead, since nothing will run it forward.
+*Enforced:* `verifyMaterializedPlanMatchesLiveSchema` on the apply path
 (`pkg/tern/local_plan_drift.go`, called from `pkg/tern/local_client.go`);
 `verifyReplannedTaskDDL` on the resume path (`pkg/tern/local_control_resume.go`, called from
 `replanAndFilterTasks` and `resumeApplySequential`); `settleLostVerifiedTask` on the lost-work
