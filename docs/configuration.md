@@ -1248,6 +1248,10 @@ auth:
 
 A valid token clears the read tier. The write tier additionally requires the token's groups to include an admin team from `pr_command_authorization.admin_teams`. Machine callers pass a token via `--token` / `SCHEMABOT_TOKEN`; a group-less service token (client-credentials grant) gets read access.
 
+The browser login command caches the ID token as the bearer credential. Login and refresh use that token's `exp` claim for the cached `token_expiry`, independently of the access token's `expires_in`. Commands refresh within 60 seconds of the cached expiry when a refresh token and OIDC settings are available. Run `schemabot login` once after upgrading to replace an older cached access-token expiry.
+
+The ID token must have a future, positive integer `exp` value in Unix seconds. Login or refresh returns an error for a missing, malformed, or already expired value; it never falls back to the access token's lifetime. A failed refresh preserves the existing cache and reports a warning. The CLI reads `exp` only to schedule renewal; the server still verifies every bearer token before granting access. Explicit `--token` and `SCHEMABOT_TOKEN` credentials are not refreshed automatically.
+
 ### Forward-auth (authenticating proxy)
 
 Use this when SchemaBot runs behind an authenticating reverse proxy that has already verified the caller and forwards the identity as HTTP headers — the pattern used by the Kubernetes API server's authenticating proxy, Grafana's auth proxy, and oauth2-proxy.

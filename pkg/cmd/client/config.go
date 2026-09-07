@@ -344,8 +344,7 @@ func ResolveBearerToken(ctx context.Context, tokenFlag, endpointFlag, profileFla
 	if result.RefreshToken != "" {
 		profile.RefreshToken = result.RefreshToken
 	}
-	// Always set expiry, clearing it when the provider omits one, so a stale
-	// value can't make every subsequent command refresh immediately.
+	// Persist the new ID token expiry alongside the credential it describes.
 	profile.TokenExpiry = unixExpiry(result.Expiry)
 	cfg.Profiles[profileName] = profile
 	if err := SaveConfig(cfg); err != nil {
