@@ -4,6 +4,9 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -20,7 +23,7 @@ func TestEnsurePostgresSchema_MalformedDSNFailsAtOpen(t *testing.T) {
 	t.Parallel()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	err := ensurePostgresSchema("postgres://user@host:notaport/db", logger, nil)
+	err := ensurePostgresSchema("postgres://user@host:notaport/db", logger, ensureSchemaOptions{}, nil)
 	require.Error(t, err)
 	require.ErrorContains(t, err, "open storage database")
 }
@@ -192,4 +195,56 @@ func TestPostgresExpectationsFor_EmbeddedFiles(t *testing.T) {
 		require.NoError(t, err, "table %s", table)
 		assert.NotEmpty(t, expected.columns, "table %s", table)
 	}
+}
+
+// The bootstrap DDL budget is derived from EnsureSchemaTimeout, and that
+// derivation is what makes it safe: it can only end a statement the overall
+// deadline was going to end anyway. If it ever crept above the overall
+// deadline it would stop bounding anything; if it were set independently it
+// could start failing statements that converge today.
+func TestPostgresBootstrapDDLBudgetStaysUnderEnsureSchemaTimeout(t *testing.T) {
+	t.Parallel()
+
+	assert.Positive(t, postgresBootstrapDDLStatementTimeout)
+	assert.Less(t, postgresBootstrapDDLStatementTimeout, EnsureSchemaTimeout,
+		"the DDL budget must expire before the overall bootstrap deadline so the failure names a budget")
+	assert.Greater(t, postgresBootstrapDDLStatementTimeout, DefaultPostgresStatementTimeout,
+		"bootstrap DDL must get a longer budget than an ordinary storage query")
+}
+
+// 57014 is raised both by statement_timeout expiring and by an operator's
+// pg_cancel_backend, so elapsed time is what tells them apart: a cancellation
+// that arrives before the budget could have fired came from outside SchemaBot.
+// Getting this backwards would tell an operator to look for an external cause
+// during their own timeout, and vice versa.
+func TestPostgresStatementTimeoutError(t *testing.T) {
+	t.Parallel()
+
+	cancelled := &pgconn.PgError{Code: postgresQueryCanceled, Message: "canceling statement due to statement timeout"}
+
+	t.Run("exhausting the budget names the budget", func(t *testing.T) {
+		t.Parallel()
+		err := postgresStatementTimeoutError(cancelled, 30*time.Second, 30*time.Second)
+		assert.ErrorContains(t, err, "exhausting its 30s statement_timeout")
+		assert.ErrorIs(t, err, cancelled)
+	})
+
+	t.Run("cancelled early points outside SchemaBot", func(t *testing.T) {
+		t.Parallel()
+		err := postgresStatementTimeoutError(cancelled, 30*time.Second, time.Second)
+		assert.ErrorContains(t, err, "something outside SchemaBot cancelled it")
+		assert.ErrorIs(t, err, cancelled)
+	})
+
+	t.Run("a disabled budget cannot have fired early", func(t *testing.T) {
+		t.Parallel()
+		err := postgresStatementTimeoutError(cancelled, 0, time.Second)
+		assert.ErrorContains(t, err, "exhausting its 0s statement_timeout")
+	})
+
+	t.Run("another error passes through untouched", func(t *testing.T) {
+		t.Parallel()
+		other := &pgconn.PgError{Code: "55P03", Message: "lock not available"}
+		assert.Equal(t, other, postgresStatementTimeoutError(other, 30*time.Second, time.Second))
+	})
 }

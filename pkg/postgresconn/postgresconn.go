@@ -14,8 +14,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -57,6 +59,72 @@ func WithConnectTimeout(d time.Duration) Option {
 			cfg.ConnectTimeout = d
 		}
 	}
+}
+
+// MaxStatementTimeout is the largest budget PostgreSQL accepts, since
+// statement_timeout is a millisecond integer GUC and the server rejects
+// anything above the signed 32-bit maximum. Exceeding it is not a clamp but a
+// FATAL raised while the backend applies the startup packet, so every
+// connection fails at dial rather than one statement failing late. Exported so
+// config validation can refuse the value where an operator can still see it.
+const MaxStatementTimeout = time.Duration(math.MaxInt32) * time.Millisecond
+
+// WithStatementTimeout bounds how long the server lets a single statement run
+// on every connection the pool opens, as a session statement_timeout carried
+// in the startup packet. A zero duration disables the budget explicitly
+// (statement_timeout=0), which is not the same as omitting the option: the
+// option always writes the parameter, so the connection runs under SchemaBot's
+// stated budget rather than whatever the platform set at the role or database
+// level. Omitting it inherits that ambient value.
+//
+// A negative duration leaves the parameter untouched, so a DSN-carried
+// statement_timeout keeps whatever it set. A positive duration finer than the
+// millisecond statement_timeout is expressed in rounds up, never down to the
+// zero that would disable it.
+//
+// There is deliberately no package-level default. statement_timeout bounds
+// *any* statement, including one that is legitimately blocking: the
+// EnsureSchema advisory lock waits inside SELECT pg_advisory_lock() for as
+// long as its lock_timeout allows, and a default budget below that wait would
+// cancel a trailing pod's legitimate queue for the leader's bootstrap. Callers
+// opt in with a budget they can justify for the statements they run.
+func WithStatementTimeout(d time.Duration) Option {
+	return func(cfg *pgx.ConnConfig) {
+		if d < 0 {
+			return
+		}
+		setRuntimeParam(cfg, "statement_timeout", strconv.FormatInt(statementTimeoutMillis(d), 10))
+	}
+}
+
+// statementTimeoutMillis converts d to the whole milliseconds
+// statement_timeout is expressed in, rounding a positive duration up.
+// Truncating instead would let a sub-millisecond budget land on 0, which the
+// server reads as no budget at all — turning the shortest budget a caller can
+// ask for into its absence, the one direction this option exists to rule out.
+// Zero is passed through, because there it is the caller's explicit disable
+// rather than a rounding artifact.
+func statementTimeoutMillis(d time.Duration) int64 {
+	if d == 0 {
+		return 0
+	}
+	// (d-1)/ms + 1 rounds up without the overflow that (d+ms-1)/ms risks near
+	// the maximum duration.
+	return int64((d-1)/time.Millisecond) + 1
+}
+
+// setRuntimeParam sets a startup-packet parameter, first removing any
+// differently-cased spelling of the same name. GUC names are case-insensitive
+// on the server and pgx preserves DSN key case in RuntimeParams, so a plain
+// assignment could leave two spellings of one parameter in the startup packet
+// and let map iteration order decide which wins.
+func setRuntimeParam(cfg *pgx.ConnConfig, key, value string) {
+	for k := range cfg.RuntimeParams {
+		if strings.EqualFold(k, key) {
+			delete(cfg.RuntimeParams, k)
+		}
+	}
+	cfg.RuntimeParams[key] = value
 }
 
 // WithRootCAs pins the certificate authorities the connection trusts when the

@@ -26,6 +26,7 @@
 - [Storage Connection Pool](#storage-connection-pool)
 - [Spirit Run Settings](#spirit-run-settings)
 - [Postgres](#postgres)
+  - [Storage statement budget](#storage-statement-budget)
 - [PlanetScale mTLS](#planetscale-mtls)
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
@@ -784,12 +785,14 @@ over gRPC run with that deployment's engine settings.
 ## Postgres
 
 The `postgres:` block sets the largest table on which the PostgreSQL engine
-will execute native-safe DDL. The limit is expressed in bytes and defaults to
+will execute native-safe DDL, and the statement budget SchemaBot's own storage
+connections run under. The size limit is expressed in bytes and defaults to
 1 GiB:
 
 ```yaml
 postgres:
   native_safe_table_size_limit_bytes: 4294967296
+  statement_timeout: 30s
 ```
 
 The ceiling is SchemaBot's own conservatism about how much work to attempt
@@ -812,9 +815,27 @@ The server fails startup validation when
 
 The ceiling is process-wide: every PostgreSQL database this server drives
 shares the same value, and a database cannot override it in its own metadata.
-These settings only apply where this server constructs the PostgreSQL engine
+The ceiling only applies where this server constructs the PostgreSQL engine
 itself — local-mode PostgreSQL databases. Databases routed to a remote
 deployment over gRPC run with that deployment's engine settings.
+
+### Storage statement budget
+
+```yaml
+postgres:
+  statement_timeout: 30s   # default; "0" removes the limit
+```
+
+Time limit for a single query against SchemaBot's own storage database, on the
+long-lived pool and on the startup bootstrap alike. It applies in every mode,
+unlike the ceiling above. Must be over `10s` or the server refuses to start: a
+query can spend up to 10 seconds waiting for another instance's lock, and the
+limit counts waiting as well as working. A negative value or an unparseable
+duration is refused too.
+
+Schema changes are unaffected. They run under limits pg-sprite sets on the
+target database. The bootstrap raises the limit for its own schema DDL, where
+an index build legitimately outruns a query.
 
 ## PlanetScale mTLS
 

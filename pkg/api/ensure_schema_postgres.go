@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/utils"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/namedlock"
@@ -30,10 +31,16 @@ import (
 // Concurrency-safe across pods: discovers drift without a lock, acquires the
 // PostgreSQL advisory lock only when needed, then re-discovers under the lock.
 // A change that needs manual remediation aborts the whole convergence before
-// any DDL executes. Each transaction bounds its lock wait with lock_timeout.
-// Plain CREATE INDEX holds a SHARE lock for the full build, blocking writes;
-// EnsureSchemaTimeout is the build's only duration ceiling.
-func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Locker) error {
+// any DDL executes. Each transaction bounds its lock wait with lock_timeout
+// and its execution with statement_timeout.
+//
+// Three statement classes run under three different budgets, because they fail
+// for different reasons and a single value cannot serve all of them:
+//
+//	catalog reads      o.postgresStatementTimeout   ordinary queries
+//	convergence DDL    postgresBootstrapDDLStatementTimeout (per transaction)
+//	advisory-lock wait none — must be free to block for the leader
+func ensurePostgresSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, locker namedlock.Locker) error {
 	ctx, cancel := context.WithTimeout(context.Background(), EnsureSchemaTimeout)
 	defer cancel()
 
@@ -42,7 +49,7 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Lock
 		return err
 	}
 
-	db, err := postgresconn.Open(dsn)
+	db, err := postgresconn.Open(dsn, postgresconn.WithStatementTimeout(o.postgresStatementTimeout))
 	if err != nil {
 		return fmt.Errorf("open storage database: %w", err)
 	}
@@ -143,6 +150,24 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Lock
 			continue
 		}
 		if err := applyPostgresTableChanges(ctx, db, table, changes, logger); err != nil {
+			// A statement killed by the overall deadline surfaces as a context
+			// cancellation carrying no budget, so name the deadline that ended
+			// it the way the advisory-lock wait names its own. Logged as well
+			// as returned, like the MySQL bootstrap's twin: a crashlooping pod
+			// leaves nothing but the log, and the table that ran out of time is
+			// what says whether the deadline is too short or one statement is
+			// pathological.
+			if ctx.Err() != nil {
+				logger.Error("storage schema change did not complete before EnsureSchemaTimeout; SchemaBot storage will not initialize",
+					"database", database,
+					"table", table,
+					"timeout", EnsureSchemaTimeout,
+					"elapsed", time.Since(applyStart),
+					"error", err,
+				)
+				return fmt.Errorf("converge storage table %q: bootstrap did not finish within EnsureSchemaTimeout (%s): %w",
+					table, EnsureSchemaTimeout, err)
+			}
 			return fmt.Errorf("converge storage table %q: %w", table, err)
 		}
 	}
@@ -600,6 +625,46 @@ func missingPostgresTables(ctx context.Context, db *sql.DB, want []string) ([]st
 // fails visibly instead.
 const postgresDDLLockTimeout = 10 * time.Second
 
+// postgresBootstrapDDLStatementTimeout bounds how long a convergence DDL
+// statement may run once its lock is granted. lock_timeout bounds only the
+// wait for the lock; without a statement budget a CREATE INDEX against a large
+// storage table runs until something outside SchemaBot stops it.
+//
+// The value is derived from EnsureSchemaTimeout rather than chosen, and the
+// derivation is the safety argument. EnsureSchemaTimeout already bounds the
+// whole bootstrap through the context every statement runs under, so a
+// statement that outlives this budget was going to be cancelled by that
+// context anyway — its transaction began after the context did, so the context
+// deadline is always the earlier of the two. No statement that converges today
+// fails once this budget exists; the only statements it affects are ones that
+// would have died at the context deadline, and they now die a little sooner
+// with an error naming a budget instead of a bare cancellation. That is what
+// keeps a short budget from turning a slow-but-healthy boot into a crashloop:
+// the boot path's real ceiling is unchanged.
+//
+// The margin decides which of the two bounds reports the failure, and it does
+// so by start time rather than by remaining time. statement_timeout is armed
+// per statement, so a statement beginning at offset s from the bootstrap's
+// start fires server-side at s+budget while the context fires at
+// EnsureSchemaTimeout — the server wins only while s is under the margin.
+// Convergence runs each index in its own transaction, so on any bootstrap
+// whose cumulative work passes the margin, every later statement reports the
+// context error instead of a 57014 naming the budget. Winning is the narrow
+// case, not the common one. That costs only error quality: the caller's
+// deadline branch names EnsureSchemaTimeout, so neither outcome is a bare
+// cancellation.
+//
+// The margin must stay positive. At zero the subtraction yields a budget of
+// 0, which PostgreSQL reads as *disabled* rather than as very short — the
+// budget would silently cease to exist instead of becoming strict, the one
+// failure this whole mechanism exists to prevent. postgresBootstrapDDLFloor
+// keeps a shrunken EnsureSchemaTimeout producing a short budget instead.
+const (
+	postgresBootstrapDDLStatementTimeout = max(EnsureSchemaTimeout-postgresBootstrapDDLTimeoutMargin, postgresBootstrapDDLFloor)
+	postgresBootstrapDDLTimeoutMargin    = 15 * time.Second
+	postgresBootstrapDDLFloor            = 5 * time.Second
+)
+
 // applyPostgresTableChanges executes one table's additive changes. A CREATE
 // TABLE change contains its complete embedded schema file, including indexes,
 // executed as one transaction; pgx's simple query protocol executes that
@@ -657,14 +722,39 @@ func execPostgresChanges(ctx context.Context, db *sql.DB, table string, changes 
 		strconv.FormatInt(postgresDDLLockTimeout.Milliseconds(), 10)); err != nil {
 		return fmt.Errorf("set lock_timeout for table %q: %w", table, err)
 	}
+	// DDL runs under a budget of its own, raised from the connection's ordinary
+	// query budget: an index build legitimately takes far longer than a catalog
+	// read. Transaction-local like lock_timeout above, so the connection
+	// returns to the pool on its session default.
+	if _, err := tx.ExecContext(ctx, "SELECT set_config('statement_timeout', $1, true)",
+		strconv.FormatInt(postgresBootstrapDDLStatementTimeout.Milliseconds(), 10)); err != nil {
+		return fmt.Errorf("set statement_timeout for table %q: %w", table, err)
+	}
 	for _, change := range changes {
 		logger.Info("schema change",
 			"table", table,
 			"operation", change.operation,
 			"object", change.object,
 			"ddl", change.ddl,
+			"statement_timeout", postgresBootstrapDDLStatementTimeout,
+			"lock_timeout", postgresDDLLockTimeout,
 		)
+		start := time.Now()
 		if _, err := tx.ExecContext(ctx, change.ddl); err != nil {
+			elapsed := time.Since(start)
+			err = postgresStatementTimeoutError(err, postgresBootstrapDDLStatementTimeout, elapsed)
+			// Logged as well as returned: on the boot path a crashloop's only
+			// artifact is the log, and the structured budget and elapsed fields
+			// are what separate a platform-imposed cancellation from a genuinely
+			// slow statement.
+			logger.Error("storage schema change failed",
+				"table", table,
+				"operation", change.operation,
+				"object", change.object,
+				"statement_timeout", postgresBootstrapDDLStatementTimeout,
+				"elapsed", elapsed,
+				"error", err,
+			)
 			return fmt.Errorf("execute %s for %q: %w", change.operation, change.object, err)
 		}
 	}
@@ -674,14 +764,59 @@ func execPostgresChanges(ctx context.Context, db *sql.DB, table string, changes 
 	return nil
 }
 
+// postgresQueryCanceled is the SQLSTATE PostgreSQL raises when a statement is
+// cancelled. statement_timeout expiring and an operator's pg_cancel_backend
+// both produce it, which is why elapsed time has to disambiguate them.
+const postgresQueryCanceled = "57014"
+
+// postgresStatementTimeoutError names the budget that ended a cancelled
+// bootstrap statement, so an operator reading the failure sees a statement
+// timeout rather than a bare "change failed" and knows which budget to look at.
+//
+// SQLSTATE 57014 alone does not say who did the cancelling: statement_timeout
+// firing and an operator's pg_cancel_backend raise the same code. Elapsed time
+// corroborates, as it does in pg-sprite's executor. The budget in force cannot
+// fire before it has elapsed, so a cancellation that arrives earlier came from
+// outside the budget — an operator cancelling the backend, an administrative
+// termination, or a shorter budget imposed somewhere SchemaBot did not set it.
+// Saying so is the point: an operator who cancelled nothing learns that
+// something else is cancelling SchemaBot's bootstrap DDL, which is the finding,
+// not a detail.
+//
+// Errors that are not statement cancellations pass through untouched.
+func postgresStatementTimeoutError(err error, budget, elapsed time.Duration) error {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != postgresQueryCanceled {
+		return err
+	}
+	if budget > 0 && elapsed < budget {
+		return fmt.Errorf("statement cancelled after %s, before its %s statement_timeout could fire — "+
+			"something outside SchemaBot cancelled it (an operator cancelling the backend, or a shorter "+
+			"statement_timeout imposed at the role or database level): %w",
+			elapsed.Round(time.Millisecond), budget, err)
+	}
+	return fmt.Errorf("statement timed out after %s, exhausting its %s statement_timeout: %w",
+		elapsed.Round(time.Millisecond), budget, err)
+}
+
 // acquirePostgresEnsureSchemaLock acquires a session-scoped advisory lock to
 // serialize EnsureSchema across pods, mirroring acquireMySQLEnsureSchemaLock
 // for the PostgreSQL bootstrap flow. It opens a dedicated *sql.DB whose pool
 // is closed before returning, so closing the returned connection terminates
 // the underlying session and releases the advisory lock — returning the
 // connection to a shared pool would leave the session (and the lock) alive.
+//
+// The connection also runs with statement_timeout explicitly disabled.
+// Acquiring the lock means blocking inside SELECT pg_advisory_lock() until the
+// leader finishes its bootstrap — up to EnsureSchemaTimeout. A statement
+// budget shorter than that wait, whether SchemaBot's own or one the platform
+// imposed at the role or database level, would cancel a trailing pod's
+// legitimate queue and fail its startup while the leader was still converging
+// normally. Disabling the budget is not an unbounded wait: the wait is bounded
+// server-side by the lock_timeout namedlock scopes to the acquisition, and
+// client-side by ctx.
 func acquirePostgresEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logger, locker namedlock.Locker) (*sql.Conn, error) {
-	db, err := postgresconn.Open(dsn)
+	db, err := postgresconn.Open(dsn, postgresconn.WithStatementTimeout(0))
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}

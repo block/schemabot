@@ -506,6 +506,7 @@ func connectStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.D
 	}
 	if err := api.EnsureSchema(dsn, logger,
 		api.WithAllowDestructiveSchemaChanges(cfg.Storage.AllowDestructiveSchemaChanges),
+		api.WithPostgresStatementTimeout(cfg.Postgres.StatementTimeoutOrDefault()),
 		api.WithDialect(dialect)); err != nil {
 		return nil, fmt.Errorf("ensure storage schema: %w", err)
 	}
@@ -535,8 +536,14 @@ func openStoragePool(dialect schema.Dialect, dsn string, cfg *api.ServerConfig) 
 		return mysqlconn.OpenReloadable(dsn, cfg.StorageDSN,
 			mysqlconn.WithConnectTimeout(connectTimeout))
 	case schema.DialectPostgres:
+		// The storage pool carries a statement budget of its own so steady-state
+		// storage queries run under a value SchemaBot states rather than
+		// whatever the platform imposed at the role or database level. It is
+		// the ordinary-query budget, not the bootstrap's DDL budget: this pool
+		// never executes DDL.
 		return postgresconn.OpenReloadable(dsn, cfg.StorageDSN,
-			postgresconn.WithConnectTimeout(connectTimeout))
+			postgresconn.WithConnectTimeout(connectTimeout),
+			postgresconn.WithStatementTimeout(cfg.Postgres.StatementTimeoutOrDefault()))
 	default:
 		return nil, fmt.Errorf("no storage connector for storage dialect %q (supported: %q, %q)", dialect, schema.DialectMySQL, schema.DialectPostgres)
 	}

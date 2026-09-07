@@ -22,6 +22,7 @@ import (
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/pendingdrops"
+	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/ratelimit"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
@@ -1285,7 +1286,28 @@ type PostgresConfig struct {
 	// will execute native-safe DDL. When unset,
 	// postgres.DefaultNativeSafeTableSizeLimitBytes applies.
 	NativeSafeTableSizeLimitBytes *int64 `yaml:"native_safe_table_size_limit_bytes,omitempty"`
+
+	// StatementTimeout bounds a single ordinary storage query on the
+	// connections SchemaBot opens to its own PostgreSQL storage database: the
+	// long-lived storage pool and the startup bootstrap's catalog reads. It
+	// does not bound bootstrap DDL, which raises the budget per transaction to
+	// a value derived from EnsureSchemaTimeout, and it does not bound the
+	// bootstrap advisory-lock wait, which must be free to block. When unset,
+	// DefaultPostgresStatementTimeout applies. "0" disables the budget
+	// explicitly, for a deployment whose storage queries legitimately run
+	// longer than any value worth defaulting to.
+	StatementTimeout string `yaml:"statement_timeout,omitempty"`
 }
+
+// DefaultPostgresStatementTimeout bounds an ordinary storage query. Point
+// lookups, small scans, and lease claims against SchemaBot's own tables sit far
+// under it. The webhook inbox claim walk is the exception worth knowing about:
+// it reads across retained terminal rows, so it grows until something purges
+// them. The value exists mostly to displace an ambient one:
+// with no budget set, SchemaBot runs under whatever the platform imposed at the
+// role or database level, which hosted providers tune for API queries rather
+// than for SchemaBot's workload.
+const DefaultPostgresStatementTimeout = 30 * time.Second
 
 // NativeSafeTableSizeLimit returns the configured limit or its default.
 func (c PostgresConfig) NativeSafeTableSizeLimit() int64 {
@@ -1295,9 +1317,49 @@ func (c PostgresConfig) NativeSafeTableSizeLimit() int64 {
 	return *c.NativeSafeTableSizeLimitBytes
 }
 
+// StatementTimeoutOrDefault returns the configured storage statement budget or
+// its default. A configured "0" returns zero, meaning the budget is explicitly
+// disabled — callers pass that through to postgresconn, which writes
+// statement_timeout=0 rather than inheriting the platform's value. It assumes
+// the value has already passed validation.
+func (c PostgresConfig) StatementTimeoutOrDefault() time.Duration {
+	return parseDurationOrDefault(c.StatementTimeout, DefaultPostgresStatementTimeout)
+}
+
 func (c PostgresConfig) validate() error {
 	if c.NativeSafeTableSizeLimitBytes != nil && *c.NativeSafeTableSizeLimitBytes <= 0 {
 		return fmt.Errorf("postgres.native_safe_table_size_limit_bytes must be positive, got %d", *c.NativeSafeTableSizeLimitBytes)
+	}
+	// Zero is a meaningful setting here, unlike the pool durations: it disables
+	// the budget explicitly instead of selecting the default.
+	if c.StatementTimeout != "" {
+		d, err := time.ParseDuration(c.StatementTimeout)
+		if err != nil {
+			return fmt.Errorf("postgres.statement_timeout %q is not a valid duration: %w", c.StatementTimeout, err)
+		}
+		if d < 0 {
+			return fmt.Errorf("postgres.statement_timeout %q must not be negative (omit it to use the default, or set \"0\" to disable the budget)", c.StatementTimeout)
+		}
+		// The storage pool blocks inside a lock acquisition for up to
+		// ApplyTargetLockWait, and statement_timeout bounds a blocked
+		// statement as readily as a computing one. A budget at or below that
+		// wait fires first, so the acquisition reports 57014 instead of the
+		// 55P03 the lock timeout would raise, and routine contention for an
+		// apply target surfaces as a failure rather than as "someone else
+		// holds it". Rejecting the value at startup is the only place that
+		// stays visible; in production the symptom appears far from the knob.
+		if d > 0 && d <= storage.ApplyTargetLockWait {
+			return fmt.Errorf("postgres.statement_timeout %q must exceed the %s apply target lock wait, or lock contention is reported as a statement timeout instead of a lock conflict (set \"0\" to disable the budget)",
+				c.StatementTimeout, storage.ApplyTargetLockWait)
+		}
+		// Above the server's own maximum the budget is not clamped: applying
+		// the startup packet raises a FATAL, so every connection fails at dial
+		// and the server never starts. Refusing it here names the setting
+		// instead, since the dial failure names only the parameter.
+		if d > postgresconn.MaxStatementTimeout {
+			return fmt.Errorf("postgres.statement_timeout %q exceeds the %s PostgreSQL accepts, which would fail every connection at dial (set \"0\" to disable the budget)",
+				c.StatementTimeout, postgresconn.MaxStatementTimeout)
+		}
 	}
 	return nil
 }
