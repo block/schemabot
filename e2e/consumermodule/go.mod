@@ -38,7 +38,7 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/block/mysql v0.0.0-20260906224346-ee0a93fe50d6 // indirect
 	github.com/block/pg-sprite v0.2.0 // indirect
-	github.com/block/spirit v0.17.1-0.20260906233530-f224250b7f77 // indirect
+	github.com/block/spirit v0.17.1-0.20260907005557-10804bbe247c // indirect
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -127,6 +127,6 @@ replace github.com/block/schemabot => ../..
 
 // Mirror the parent module's replace directives; replaces do not propagate
 // across module boundaries.
-replace vitess.io/vitess => github.com/block/vitess v0.0.0-20260906225607-80920b9b8b04
+replace vitess.io/vitess => github.com/block/vitess v0.0.0-20260907005807-88d15fda31ea
 
 replace github.com/pingcap/tidb/pkg/parser => github.com/block/tidb/pkg/parser v0.0.0-20260506200501-e528fd979fc8
