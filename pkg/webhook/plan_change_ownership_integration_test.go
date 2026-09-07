@@ -471,7 +471,7 @@ func applyDeclaredSchemaForPullRequest(t *testing.T, svc *api.Service, dbName st
 // so the plan sees a drop for an object storage has no history for.
 func seedOwnershipReconcileTable(t *testing.T, dbName string) {
 	t.Helper()
-	db, err := sql.Open("mysql", driftDSN(t, dbName))
+	db, err := sql.Open("block-mysql", driftDSN(t, dbName))
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 	_, err = db.ExecContext(t.Context(), "CREATE TABLE `reconcile_state` (\n"+
@@ -487,7 +487,7 @@ func seedOwnershipReconcileTable(t *testing.T, dbName string) {
 // reads only what this run records.
 func resetOwnershipHistory(t *testing.T, dbName string) {
 	t.Helper()
-	db, err := sql.Open("mysql", e2eSchemabotDSN)
+	db, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	defer func() { _ = db.Close() }()
 	ctx := t.Context()

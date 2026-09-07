@@ -20,7 +20,7 @@ import (
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/testutil"
 
-	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/block/mysql"
 )
 
 var sharedDSN string
@@ -52,7 +52,7 @@ func TestMain(m *testing.M) {
 func setupCleanerTest(t *testing.T) *sql.DB {
 	t.Helper()
 
-	db, err := sql.Open("mysql", sharedDSN)
+	db, err := sql.Open("block-mysql", sharedDSN)
 	require.NoError(t, err, "connect to mysql")
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 	require.NoError(t, testutil.PingMySQL(t.Context(), db), "reach mysql")

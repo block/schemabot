@@ -39,7 +39,7 @@ func newAdoptTestFixture(t *testing.T, desired map[string]string) *adoptTestFixt
 	cleanupTasks(t, dsn)
 	cleanupTestTables(t, dsn)
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 	require.NoError(t, db.PingContext(t.Context()))

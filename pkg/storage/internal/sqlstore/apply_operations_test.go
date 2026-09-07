@@ -1604,7 +1604,7 @@ func TestApplyOperationStore_FindNextApplyOperation_ConcurrentClaimsStoppedWithP
 	const drivers = 16
 	stores := make([]*Storage, drivers)
 	for i := range drivers {
-		db, openErr := sql.Open("mysql", testDSNChangedRows)
+		db, openErr := sql.Open("block-mysql", testDSNChangedRows)
 		require.NoError(t, openErr)
 		db.SetMaxOpenConns(1)
 		db.SetMaxIdleConns(1)
@@ -2475,7 +2475,7 @@ func TestApplyOperationStore_FindNextApplyOperation_ConcurrentClaims(t *testing.
 	const drivers = 16
 	stores := make([]*Storage, drivers)
 	for i := range drivers {
-		db, openErr := sql.Open("mysql", testDSNChangedRows)
+		db, openErr := sql.Open("block-mysql", testDSNChangedRows)
 		require.NoError(t, openErr)
 		db.SetMaxOpenConns(1)
 		db.SetMaxIdleConns(1)
@@ -2643,7 +2643,7 @@ func TestApplyOperationStore_FindNextApplyOperation_ConcurrentDriversClaimDistin
 	const drivers = 16
 	stores := make([]*Storage, drivers)
 	for i := range drivers {
-		db, openErr := sql.Open("mysql", testDSNChangedRows)
+		db, openErr := sql.Open("block-mysql", testDSNChangedRows)
 		require.NoError(t, openErr)
 		db.SetMaxOpenConns(1)
 		db.SetMaxIdleConns(1)
@@ -4760,7 +4760,7 @@ func assertApplyOperationState(t *testing.T, store *Storage, id int64, expected 
 }
 
 func TestApplyOperationStore_Heartbeat_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4802,7 +4802,7 @@ func TestApplyOperationStore_DeleteByApply(t *testing.T) {
 // DB error tests — mirror the pattern used by apply_comments_test.go.
 
 func TestApplyOperationStore_Insert_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4814,7 +4814,7 @@ func TestApplyOperationStore_Insert_DBError(t *testing.T) {
 }
 
 func TestApplyOperationStore_Get_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4824,7 +4824,7 @@ func TestApplyOperationStore_Get_DBError(t *testing.T) {
 }
 
 func TestApplyOperationStore_GetByApplyAndDeployment_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4834,7 +4834,7 @@ func TestApplyOperationStore_GetByApplyAndDeployment_DBError(t *testing.T) {
 }
 
 func TestApplyOperationStore_ListByApply_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4844,7 +4844,7 @@ func TestApplyOperationStore_ListByApply_DBError(t *testing.T) {
 }
 
 func TestApplyOperationStore_UpdateState_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4854,7 +4854,7 @@ func TestApplyOperationStore_UpdateState_DBError(t *testing.T) {
 }
 
 func TestApplyOperationStore_MarkStarted_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4864,7 +4864,7 @@ func TestApplyOperationStore_MarkStarted_DBError(t *testing.T) {
 }
 
 func TestApplyOperationStore_MarkCompleted_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4874,7 +4874,7 @@ func TestApplyOperationStore_MarkCompleted_DBError(t *testing.T) {
 }
 
 func TestApplyOperationStore_MarkFailed_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4884,7 +4884,7 @@ func TestApplyOperationStore_MarkFailed_DBError(t *testing.T) {
 }
 
 func TestApplyOperationStore_DeleteByApply_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 

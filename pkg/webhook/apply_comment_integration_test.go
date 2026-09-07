@@ -162,7 +162,7 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 	ctx := t.Context()
 
 	// Set up SchemaBot storage
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
 
@@ -812,7 +812,7 @@ func setupApplyCommentFixture(t *testing.T, p applyCommentFixtureParams) *applyC
 	t.Helper()
 	ctx := t.Context()
 
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	// svc.Close below owns closing the store's DB; this early-failure safety
 	// close is redundant once svc exists, so discard its guaranteed
@@ -2388,7 +2388,7 @@ func (s *failingCommentSupersedeStorage) heal() { s.healed.Store(true) }
 func TestE2EReconcileMissingSummaryCommentsPostsSummary(t *testing.T) {
 	ctx := t.Context()
 
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
 
@@ -2607,7 +2607,7 @@ func seedReconcileScenario(t *testing.T, st storage.Storage, schemabotDB *sql.DB
 func TestE2EReconcileMissingSummaryCommentsRepairsStoppedApply(t *testing.T) {
 	ctx := t.Context()
 
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	// Redundant early-exit closer: svc owns the storage (and this handle) and
 	// closes it below, so discard the guaranteed already-closed error.
@@ -2649,7 +2649,7 @@ func TestE2EReconcileMissingSummaryCommentsRepairsStoppedApply(t *testing.T) {
 func TestE2EReconcileMissingSummaryCommentsRespectsFreshClaim(t *testing.T) {
 	ctx := t.Context()
 
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	// Redundant early-exit closer: svc owns the storage (and this handle) and
 	// closes it below, so discard the guaranteed already-closed error.
@@ -2693,7 +2693,7 @@ func TestE2EReconcileMissingSummaryCommentsRespectsFreshClaim(t *testing.T) {
 func TestE2EAggregateTerminalObserverClaimsSummaryExactlyOnce(t *testing.T) {
 	ctx := t.Context()
 
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
 	st := mysqlstore.New(schemabotDB)
@@ -2746,7 +2746,7 @@ func TestE2EAggregateTerminalObserverClaimsSummaryExactlyOnce(t *testing.T) {
 func TestE2EApplyCommentUpsertOnResume(t *testing.T) {
 	ctx := t.Context()
 
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = schemabotDB.Close() })
 
@@ -2853,7 +2853,7 @@ func TestE2EApplyCommentUpsertOnResume(t *testing.T) {
 func TestE2ECommentObserverSkipsTerminalSideEffectsAfterLeaseLoss(t *testing.T) {
 	ctx := t.Context()
 
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
 
@@ -2987,7 +2987,7 @@ func TestE2ECommentObserverSkipsTerminalSideEffectsAfterLeaseLoss(t *testing.T) 
 
 // TestE2EEditTrackedCommentNotFound tests that editing a non-existent comment is handled gracefully.
 func TestE2EEditTrackedCommentNotFound(t *testing.T) {
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = schemabotDB.Close() })
 
@@ -3036,7 +3036,7 @@ func TestE2EEditTrackedCommentNotFound(t *testing.T) {
 func TestE2EInitialProgressCommentFinalizedForFastApply(t *testing.T) {
 	ctx := t.Context()
 
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
 	st := mysqlstore.New(schemabotDB)

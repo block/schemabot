@@ -35,7 +35,7 @@ func TestLocalClient_ResumedDriveCapturesEngineLogs(t *testing.T) {
 	cleanupTestTables(t, dsn)
 
 	ctx := t.Context()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "open target database")
 	defer utils.CloseAndLog(db)
 	_, err = db.ExecContext(ctx, "CREATE TABLE users (id INT PRIMARY KEY)")

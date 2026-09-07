@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -566,7 +566,7 @@ func TestStaticResolverResolveTargetDSNFromPostgres(t *testing.T) {
 
 	assert.Equal(t, "orders-prod", got.Target)
 	assert.Equal(t, "postgres", got.DatabaseType)
-	assert.Equal(t, "postgresql://pgsprite_engine:s3cret@orders.cluster-abc.us-east-1.rds.amazonaws.com:5432/orders?sslmode=verify-full", got.DSN)
+	assert.Equal(t, "postgresql://pgsprite_engine:s3cret@orders.cluster-abc.us-east-1.rds.amazonaws.com:5432/orders?sslmode=verify-full", got.DSN) // sadscan:disable np.postgres.1
 	assert.Equal(t, map[string]string{
 		"extra":               "field",
 		MetadataPostgresCARef: PostgresCARefEmbeddedRDSGlobal,
@@ -617,7 +617,7 @@ func TestStaticResolverDSNFromPostgresDefaults(t *testing.T) {
 
 	got, err := resolver.ResolveTarget(t.Context(), Request{Target: "orders-prod"})
 	require.NoError(t, err)
-	assert.Equal(t, "postgresql://pgsprite_engine:s3cret@orders.cluster-abc.us-east-1.rds.amazonaws.com:5432/orders?sslmode=verify-full", got.DSN)
+	assert.Equal(t, "postgresql://pgsprite_engine:s3cret@orders.cluster-abc.us-east-1.rds.amazonaws.com:5432/orders?sslmode=verify-full", got.DSN) // sadscan:disable np.postgres.1
 	assert.Equal(t, PostgresCARefEmbeddedRDSGlobal, got.Metadata[MetadataPostgresCARef])
 }
 
