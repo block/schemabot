@@ -6,7 +6,7 @@
 # the same image works for any datasource.
 #
 # Each apk add is retried with backoff; deploy/Dockerfile explains why.
-FROM golang:1.26.3-alpine AS builder
+FROM golang:1.27.1-alpine AS builder
 WORKDIR /app
 RUN for attempt in 1 2 3 4 5; do \
         apk add --no-cache git && break; \
@@ -18,7 +18,7 @@ RUN for attempt in 1 2 3 4 5; do \
 RUN git clone --depth 1 --branch v0.15.0 https://github.com/square/etre.git .
 RUN go build -o etre ./bin/etre
 
-FROM alpine:3.19
+FROM alpine:3.24
 RUN for attempt in 1 2 3 4 5; do \
         apk add --no-cache ca-certificates && break; \
         echo "apk add ca-certificates failed (attempt ${attempt}/5)" >&2; \
