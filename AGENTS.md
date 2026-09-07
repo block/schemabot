@@ -166,6 +166,10 @@ When a change interacts with an invariant, one of these is true, and the PR shou
 
 **An entry is a principle, not a case log.** Before adding text to an entry, ask whether the rule as written already covers your case. It usually does, which means the disposition is *upholds* and at most the `*Enforced:*` line changes. Keep instances of the rule, rationale, carve-outs, and coding conventions out of entry text: reasoning belongs in the PR summary, and rules about writing code belong in this file. Entries are a few sentences, so an addition that runs to a paragraph is a case rather than a principle.
 
+**An invariant is a rule every engine holds to.** State it without naming a dialect, an engine, a SQL state, or a configuration key. Engines belong in the sentences that say *how each one upholds the rule*, and in the *Enforced:* line — never in the rule itself. AV-9 is the shape: the rule is that the startup bootstrap never destroys SchemaBot's own storage, and MySQL and PostgreSQL then appear only as the two different mechanisms that achieve it.
+
+This interlocks with the paragraph below, and running the two together is the test worth applying before adding any entry: **state the rule engine-agnostically and ask whether it is true on every engine today.** If it is not — because only one dialect implements it — then the agnostic form is aspirational and the entry does not go in. Rewriting it truthfully is the other half of the trap, because the honest version is a page of one dialect's mechanism in a registry that carries none. An entry that fails both ways is not an invariant yet, however real the behavior is. Per-dialect behavior belongs where it can be stated precisely and checked: the option's documentation, a comment where the value is defined, and a test over the validation that enforces it.
+
 Do not add aspirational entries. If the behavior is not enforced in shipped code, it belongs in a design doc or a TODO, not in the registry. Process-level engineering rules (how we write and review code) belong in this file, not there.
 
 ### PR Self-Review Bar
