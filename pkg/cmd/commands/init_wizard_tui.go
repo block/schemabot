@@ -287,18 +287,7 @@ func (cmd *InitCmd) promptInputs(ctx context.Context, input io.Reader, output io
 	cmd.Environment = m.fields[2].value
 	cmd.DSN = m.fields[3].value
 	cmd.StorageDSN = m.fields[4].value
-	cmd.Namespaces = strings.Split(m.fields[5].value, ",")
-	if !m.explicitNamespaces {
-		cmd.Namespaces = nil
-		for _, name := range m.names {
-			if m.selected[name] {
-				cmd.Namespaces = append(cmd.Namespaces, name)
-			}
-		}
-	}
-	for i := range cmd.Namespaces {
-		cmd.Namespaces[i] = strings.TrimSpace(cmd.Namespaces[i])
-	}
+	cmd.Namespaces = m.namespaceChoices(cmd.Namespaces)
 	cmd.SchemaDir = m.fields[6].value
 	g.Profile = m.fields[7].value
 	if _, err := os.Stat(cmd.SchemaDir); err == nil {
