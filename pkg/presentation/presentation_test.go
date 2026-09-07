@@ -337,11 +337,34 @@ func TestDerive_AggregateBarrierWorkedExample(t *testing.T) {
 }
 
 // TestDerive_AggregateFailedHaltExample: with halt_on_failure on, a failed
-// deployment halts the rest; the aggregate stays failed (fail-closed) and points
-// the operator at the failed deployment.
+// deployment halts every deployment that has not started. The queued ones render
+// halted and the operator is pointed at the failure, while eu — already parked at
+// the cutover barrier holding its database — keeps the aggregate degraded until
+// it is resolved, since the halt refuses new claims rather than stopping work
+// already under way.
 func TestDerive_AggregateFailedHaltExample(t *testing.T) {
 	got := Derive([]Operation{
 		rolling("eu", so.WaitingForCutover),
+		rolling("us", so.Failed),
+		rolling("au", so.Pending),
+		rolling("ca", so.Pending),
+	})
+
+	assert.Equal(t, state.Apply.RunningDegraded, got.State)
+	assert.Equal(t, "running (degraded)", got.Label)
+	assert.Equal(t, NextAction{Kind: NextActionReviewFailure, Deployment: "us"}, got.NextAction)
+	assert.Equal(t, StateHalted, got.Deployments[2].Presentation)
+	assert.Equal(t, "halted — us failed", got.Deployments[2].Label)
+	assert.Equal(t, StateHalted, got.Deployments[3].Presentation)
+}
+
+// TestDerive_AggregateFailedHaltSettlesOnceStartedWorkEnds: the same halted
+// rollout once nothing is left working. Only queued deployments remain
+// non-terminal, and the halt is what keeps them queued, so the aggregate takes
+// the failed verdict.
+func TestDerive_AggregateFailedHaltSettlesOnceStartedWorkEnds(t *testing.T) {
+	got := Derive([]Operation{
+		rolling("eu", so.Completed),
 		rolling("us", so.Failed),
 		rolling("au", so.Pending),
 		rolling("ca", so.Pending),
@@ -351,7 +374,6 @@ func TestDerive_AggregateFailedHaltExample(t *testing.T) {
 	assert.Equal(t, "failed", got.Label)
 	assert.Equal(t, NextAction{Kind: NextActionReviewFailure, Deployment: "us"}, got.NextAction)
 	assert.Equal(t, StateHalted, got.Deployments[2].Presentation)
-	assert.Equal(t, "halted — us failed", got.Deployments[2].Label)
 	assert.Equal(t, StateHalted, got.Deployments[3].Presentation)
 }
 
@@ -425,7 +447,8 @@ func TestDerive_FirstFailurePicksEarliestInOrder(t *testing.T) {
 // earlier deployment can be failed while a later one is still copying. The
 // rollout is held running_degraded so the live sibling runs to completion, and
 // the first failure is surfaced eagerly onto the in-progress comment rather than
-// waiting for the terminal summary.
+// waiting for the terminal summary. The rollout still has work ahead of it, so
+// it offers no review-failure next action while it is in flight.
 func TestDerive_FirstFailureWhileSiblingStillRunning(t *testing.T) {
 	got := Derive([]Operation{
 		{Deployment: "eu", State: so.Failed, ContinueOnFailure: true, Error: "boom"},
@@ -439,16 +462,32 @@ func TestDerive_FirstFailureWhileSiblingStillRunning(t *testing.T) {
 	assert.Equal(t, "eu", got.FirstFailure.Deployment)
 }
 
-// TestDerive_HaltFailureWithRunningSiblingStaysFailed: a halt-policy failure is
-// fail-closed even while a sibling is still running — only on_failure continue
-// holds the rollout running_degraded.
-func TestDerive_HaltFailureWithRunningSiblingStaysFailed(t *testing.T) {
+// TestDerive_HaltFailureWithRunningSiblingRunsDegraded: a halt-policy failure is
+// fail-closed on the verdict, but the halt only refuses new claims — a sibling
+// already copying is unaffected by it, so the rollout runs degraded until that
+// sibling is terminal and the operator can still stop it.
+func TestDerive_HaltFailureWithRunningSiblingRunsDegraded(t *testing.T) {
 	got := Derive([]Operation{
 		rolling("eu", so.Failed),
 		rolling("us", so.Running),
 	})
-	assert.Equal(t, state.Apply.Failed, got.State)
-	assert.Equal(t, "failed", got.Label)
+	assert.Equal(t, state.Apply.RunningDegraded, got.State)
+	assert.Equal(t, "running (degraded)", got.Label)
+	assert.Equal(t, NextAction{Kind: NextActionReviewFailure, Deployment: "eu"}, got.NextAction)
+}
+
+// TestDerive_BothFailurePolicyFlagsPointsAtTheFailure: the two on_failure flags
+// are mutually exclusive, so a deployment carrying both is a caller bug. The
+// projection resolves it the way the aggregate state does — fail closed — so a
+// bad policy value cannot quietly cost the operator the pointer to the failure
+// that decided the rollout.
+func TestDerive_BothFailurePolicyFlagsPointsAtTheFailure(t *testing.T) {
+	got := Derive([]Operation{
+		{Deployment: "eu", State: so.Failed, ContinueOnFailure: true, PauseOnFailure: true, Error: "boom"},
+		{Deployment: "us", State: so.Running, ContinueOnFailure: true, PauseOnFailure: true},
+	})
+	assert.Equal(t, state.Apply.RunningDegraded, got.State)
+	assert.Equal(t, NextAction{Kind: NextActionReviewFailure, Deployment: "eu"}, got.NextAction)
 }
 
 // TestDerive_PauseFailureWithPendingSiblingHoldsPaused: under on_failure pause an

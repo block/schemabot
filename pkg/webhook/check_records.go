@@ -141,10 +141,12 @@ func planCheckConclusion(hasChanges, hasPlanErrors, hasFinalRefusal, driftBlocke
 // planRefusalFailsCheck reports whether a plan's engine-blocked changes are
 // final enough to fail the check rather than leave the PR at action-required.
 //
-// A refusal is final when it is a property of the statement rather than of live
-// target state, so no re-plan can lift it and no apply the operator runs can
-// satisfy it: PostgreSQL blocks a change it has no authoritative classifier
-// verdict for, and Vitess refuses constructs it cannot execute at all. The
+// A refusal is final when no apply SchemaBot runs can satisfy it, so leaving
+// the PR at action-required would coach an apply that is certain to be
+// refused. PostgreSQL blocks a change it has no authoritative classifier
+// verdict for and a DROP TABLE it never executes — the latter is lifted only
+// by the operator changing the repository or the target and re-planning, never
+// by an apply — and Vitess refuses constructs it cannot execute at all. The
 // MySQL engine also marks a refused statement blocked, but there the verdict
 // previews a direct-execution routing decision that apply time re-resolves
 // against live policy and table size, so a plan blocked at review can still

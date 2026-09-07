@@ -3415,7 +3415,7 @@ func TestHandleAtomicProgressTickReleasesAtCutoverBarrier(t *testing.T) {
 // resolved without a vtgate DSN), the drive surfaces it once per apply at Warn —
 // always visible in Datadog without enabling debug logging. It fires once (not
 // per poll), stays silent during setup states, and stays silent for transient
-// reasons (schema-change context still being discovered, shard rows not yet
+// reasons (schema change context still being discovered, shard rows not yet
 // registered) that can self-heal on a later poll.
 func TestHandleAtomicProgressTickPerShardUnavailableWarn(t *testing.T) {
 	newApply := func() *storage.Apply {

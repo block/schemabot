@@ -18,7 +18,7 @@ import (
 
 // pkSwapSchema is a schema file declaring a composite primary key on a table
 // the target holds with a single-column key, so the plan diff is exactly the
-// primary-key reshape the schema-change engine refuses.
+// primary-key reshape that the schema change engine refuses.
 const pkSwapSchema = "CREATE TABLE `users` (\n" +
 	"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
 	"  `tenant_id` bigint unsigned NOT NULL,\n" +
@@ -72,7 +72,7 @@ func TestE2EApplyRejectedOnBlockedPlan(t *testing.T) {
 	select {
 	case body := <-result.comments:
 		assert.Contains(t, body, "⛔ Apply rejected")
-		assert.Contains(t, body, "the schema-change engine refuses to execute")
+		assert.Contains(t, body, "the engine refuses to execute")
 		assert.Contains(t, body, "`users`")
 		assert.NotContains(t, body, "--allow-unsafe", "a guaranteed failure must not coach an unsafe override")
 	case <-time.After(webhookIntegrationPollDeadline):

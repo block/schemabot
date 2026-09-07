@@ -93,7 +93,7 @@ type Lock struct {
 	// DatabaseName is the name of the database being locked.
 	DatabaseName string
 
-	// DatabaseType is the type of database: "vitess" or "mysql".
+	// DatabaseType is the type of database (one of the DatabaseType* constants).
 	DatabaseType string
 
 	// Repository is the GitHub repository (owner/repo format).
@@ -213,7 +213,7 @@ type Check struct {
 	// Environment is the target environment: "staging" or "production".
 	Environment string
 
-	// DatabaseType is the database type: "vitess" or "mysql".
+	// DatabaseType is the database type (one of the DatabaseType* constants).
 	DatabaseType string
 
 	// DatabaseName is the name of the database.
@@ -447,7 +447,7 @@ type Plan struct {
 	// Database is the target database name.
 	Database string
 
-	// DatabaseType is "vitess" or "mysql".
+	// DatabaseType is one of the DatabaseType* constants.
 	DatabaseType string
 
 	// Deployment is the Tern deployment selected by server config at plan time.
@@ -639,7 +639,7 @@ type Apply struct {
 	// Database is the target database name (denormalized from lock for queries).
 	Database string
 
-	// DatabaseType is "vitess" or "mysql" (denormalized from lock for queries).
+	// DatabaseType is one of the DatabaseType* constants (denormalized from lock for queries).
 	DatabaseType string
 
 	// Repository is the GitHub repository (denormalized from lock for GetByPR).
@@ -1280,7 +1280,7 @@ type Task struct {
 	// Database is the target database name.
 	Database string
 
-	// DatabaseType is "vitess" or "mysql".
+	// DatabaseType is one of the DatabaseType* constants.
 	DatabaseType string
 
 	// Engine is the schema change engine: "spirit", "planetscale", etc.
