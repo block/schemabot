@@ -79,12 +79,9 @@ to. It is separate from your database address:
 - For shared use, configure a hostname and HTTPS, for example
   `https://schemabot.example.com`, through your reverse proxy or load balancer
 
-For a shared URL, point its DNS record at your proxy or load balancer,
-configure a TLS certificate for that hostname, and route requests to the
-SchemaBot server's HTTP port. Your hosting platform may provide a hostname
-and managed certificate for you. Use the resulting HTTPS URL as the
-`endpoint` in your CLI profile. Setting `endpoint` does not create the
-hostname, certificate, or routing.
+For shared use, your hosting platform may provide an HTTPS URL for the service.
+Use that URL as the `endpoint` in your CLI profile. If you manage HTTPS
+yourself, configure it through your proxy or load balancer.
 
 Configure authentication below before opening API access to other callers,
 unless you deliberately restrict access through your network. You can set up
@@ -326,7 +323,9 @@ You can now [check your access](#verify-a-request).
 
 ## Use your existing proxy
 
-Block uses this authentication method for its production SchemaBot deployment.
+Block uses forward-auth in production, identifying its trusted proxy through
+a service-mesh certificate identity (`trusted_proxy_spiffe`). It does not
+use source-IP allowlisting (`trusted_proxy_cidrs`) in that configuration.
 
 A proxy sits between your callers and SchemaBot. If it already checks who's
 signed in, it can pass their username and groups to SchemaBot in HTTP headers.
@@ -334,14 +333,20 @@ Set `auth.type: forward_auth` to use that information. This setting does not
 install a proxy or create a login page; your proxy must already handle login
 and forward requests to SchemaBot.
 
-Tell SchemaBot which proxy may supply identities. This example trusts one
-proxy source address; replace it with the address SchemaBot actually sees:
+Tell SchemaBot which proxy may supply identities. If your infrastructure uses
+a service mesh, its certificates can identify the proxy by a **SPIFFE ID**—a
+name such as `spiffe://example.org/ns/ingress/sa/proxy`. The mesh verifies the
+certificate and forwards that identity to SchemaBot.
+
+This example shows that pattern with illustrative names. Replace the SPIFFE ID
+and header names with the values your mesh and proxy supply:
 
 ```yaml
 auth:
   type: forward_auth
   forward_auth:
-    trusted_proxy_cidrs: [192.0.2.10/32]
+    trusted_proxy_spiffe:
+      - spiffe://example.org/ns/ingress/sa/proxy
     user_header: X-Forwarded-User
     groups_header: X-Forwarded-Groups
     groups_delimiter: ","
@@ -349,10 +354,25 @@ auth:
     write_groups: [myorg/schema-admins]
 ```
 
-The `/32` means one IP address. Only trust addresses controlled by your proxy.
 The proxy must remove identity headers supplied by callers and set its own
-values after authenticating them. Otherwise, someone could claim to be an
-admin by sending a header.
+values after authenticating them. With SPIFFE-based trust, the mesh must also
+sanitize `X-Forwarded-Client-Cert` (XFCC), the header carrying the verified
+certificate identity. Callers must not be able to bypass the mesh and reach
+SchemaBot directly; SchemaBot does not verify the certificate itself.
+
+**No service mesh? You can trust the proxy's source IP instead.** Replace
+`trusted_proxy_spiffe` with `trusted_proxy_cidrs` in the example above:
+
+```yaml
+trusted_proxy_cidrs: [192.0.2.10/32]
+```
+
+This field belongs under `auth.forward_auth`. Replace the example address
+with the proxy source address SchemaBot sees; `/32` means one IPv4 address.
+Only allow addresses controlled by your proxy, since callers from those
+addresses can supply identity headers. If you configure both SPIFFE IDs and
+CIDRs, requests must match both. See [proxy trust details](#choose-which-proxies-to-trust)
+for the full behavior.
 
 In this example:
 
