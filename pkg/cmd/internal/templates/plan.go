@@ -46,7 +46,7 @@ func WritePlanHeader(data PlanHeaderData) {
 		dbType = data.EngineLabel
 	}
 
-	if data.Engine == "postgres" {
+	if strings.EqualFold(data.Engine, "postgres") || strings.EqualFold(data.Engine, "PostgreSQL") {
 		dbType = "PostgreSQL"
 	}
 
