@@ -149,20 +149,28 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions
 			logger.Debug("storage table already converged", "table", table)
 			continue
 		}
+		tableStart := time.Now()
 		if err := applyPostgresTableChanges(ctx, db, table, changes, logger); err != nil {
 			// A statement killed by the overall deadline surfaces as a context
 			// cancellation carrying no budget, so name the deadline that ended
 			// it the way the advisory-lock wait names its own. Logged as well
 			// as returned, like the MySQL bootstrap's twin: a crashlooping pod
-			// leaves nothing but the log, and the table that ran out of time is
-			// what says whether the deadline is too short or one statement is
-			// pathological.
+			// leaves nothing but the log.
+			//
+			// The two durations are what separate the causes. This branch runs
+			// only once the context is done, so the total is always about the
+			// whole deadline and says nothing on its own. Time spent on the
+			// table that ran out is the discriminator: near the deadline means
+			// that one table's work is pathological, while a small share of a
+			// spent deadline means the earlier tables consumed it and the
+			// deadline is simply too short for the drift set.
 			if ctx.Err() != nil {
 				logger.Error("storage schema change did not complete before EnsureSchemaTimeout; SchemaBot storage will not initialize",
 					"database", database,
 					"table", table,
 					"timeout", EnsureSchemaTimeout,
 					"elapsed", time.Since(applyStart),
+					"table_elapsed", time.Since(tableStart),
 					"error", err,
 				)
 				return fmt.Errorf("converge storage table %q: bootstrap did not finish within EnsureSchemaTimeout (%s): %w",
