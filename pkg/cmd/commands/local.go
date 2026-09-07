@@ -1,10 +1,8 @@
 package commands
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/block/spirit/pkg/utils"
-	"gopkg.in/yaml.v3"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/serve"
@@ -36,22 +33,18 @@ func (cmd *LocalServeCmd) Run(ctx context.Context, g *Globals) error {
 	if err != nil {
 		return fmt.Errorf("read local configuration: %w", err)
 	}
-	var cfg api.ServerConfig
-	dec := yaml.NewDecoder(bytes.NewReader(data))
-	dec.KnownFields(true)
-	if err := dec.Decode(&cfg); err != nil {
+	cfg, err := api.ParseServerConfig(data)
+	if err != nil {
 		return fmt.Errorf("parse local configuration: %w", err)
 	}
-	var extra any
-	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
-		return fmt.Errorf("local configuration must contain one YAML document")
-	}
+
 	token, err := readPrivateLocalFile(cmd.TokenFile)
 	if err != nil {
 		return fmt.Errorf("read local token: %w", err)
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel()}))
-	return serve.RunLocal(ctx, cfg, serve.LocalOptions{
+	slog.SetDefault(logger)
+	return serve.RunLocal(ctx, *cfg, serve.LocalOptions{
 		Address: cmd.Listen,
 		Token:   strings.TrimSpace(string(token)),
 		Ready: func(endpoint string) error {

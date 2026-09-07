@@ -1,8 +1,12 @@
 package serve
 
 import (
+	"context"
+	"net"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -28,6 +32,12 @@ func TestLocalConfiguration(t *testing.T) {
 		mutate  func(*api.ServerConfig)
 		message string
 	}{
+		{"service auth", func(c *api.ServerConfig) { c.Auth.Type = "oidc" }, "private credential"},
+		{"legacy GitHub App", func(c *api.ServerConfig) { c.GitHub.PrivateKey = "key" }, "must not configure GitHub Apps"},
+		{"named GitHub App", func(c *api.ServerConfig) { c.Apps = map[string]api.GitHubAppConfig{"app": {PrivateKey: "key"}} }, "must not configure GitHub Apps"},
+		{"shared validation", func(c *api.ServerConfig) { c.MetricsPort = 65536 }, "metrics_port"},
+		{"missing database registry", func(c *api.ServerConfig) { c.Databases = nil }, "databases or target_resolver"},
+		{"malformed storage", func(c *api.ServerConfig) { c.Storage.DSN = "invalid" }, "invalid MySQL DSN"},
 		{"explicit storage", func(c *api.ServerConfig) { c.Storage.DSN = "" }, "explicit storage"},
 		{"preserve storage", func(c *api.ServerConfig) { c.Storage.AllowDestructiveSchemaChanges = true }, "cannot enable destructive"},
 		{"separate storage", func(c *api.ServerConfig) { c.Storage.DSN = "other@tcp(alias:3306)/app" }, "different name"},
@@ -75,4 +85,22 @@ func TestLocalConfigurationPreservesRemoteRouting(t *testing.T) {
 	require.NoError(t, validateLocalConfig(&cfg))
 	assert.Equal(t, "127.0.0.1:9090", cfg.TernDeployments["regional"]["development"])
 	assert.Equal(t, "regional", cfg.Databases["app"].Environments["development"].Deployment)
+}
+
+// An occupied listener must fail before Build touches configuration-dependent
+// resources. The unreadable TLS files would make Build fail immediately if it
+// ran first, without needing a database or a long connection timeout.
+func TestLocalListenerReservedBeforeBuild(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	var lc net.ListenConfig
+	listener, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, listener.Close()) }()
+	cfg := validLocalConfig()
+	missing := filepath.Join(t.TempDir(), "missing.pem")
+	cfg.PlanetScale.MTLS = &api.PlanetScaleMTLSConfig{CABundle: missing, ClientCert: missing, ClientKey: missing}
+	require.NoError(t, validateLocalConfig(&cfg))
+	err = RunLocal(ctx, cfg, LocalOptions{Address: listener.Addr().String(), Token: strings.Repeat("a", 64)})
+	require.ErrorContains(t, err, "listen for local runtime")
 }
