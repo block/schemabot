@@ -530,11 +530,11 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 	// Create SchemaBot with its own storage and a GRPCClient to remote Tern.
 	// The service owns both handles once it is built — its Close closes the
 	// storage, which closes this DB, and every Tern client it was given. These
-	// closes only cover an early failure before the service exists, so they
-	// discard the error the service's own close makes inevitable.
+	// closes only cover an early failure before the service exists; closing an
+	// already-closed pool is a no-op.
 	schemabotDB, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
-	defer func() { _ = schemabotDB.Close() }()
+	defer utils.CloseAndLog(schemabotDB)
 	require.NoError(t, schemabotDB.PingContext(ctx), "ping schemabot db")
 	schemabotStorage := schemabotmysql.New(schemabotDB)
 
@@ -543,7 +543,7 @@ func TestGRPC_FailedTableErrorSurfacesInTaskRecord(t *testing.T) {
 		Storage: schemabotStorage,
 	})
 	require.NoError(t, err, "create tern client")
-	defer func() { _ = ternClient.Close() }()
+	defer utils.CloseAndLog(ternClient)
 
 	serverConfig := &schemabotapi.ServerConfig{
 		Databases: map[string]schemabotapi.DatabaseConfig{

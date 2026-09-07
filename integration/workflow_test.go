@@ -26,6 +26,7 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
+	"github.com/block/spirit/pkg/utils"
 )
 
 // =============================================================================
@@ -55,7 +56,7 @@ func createTestDB(t *testing.T, prefix string) (appDBName, appDSN string) {
 
 	t.Cleanup(func() {
 		_, _ = targetDB.ExecContext(t.Context(), "DROP DATABASE IF EXISTS "+appDBName)
-		_ = targetDB.Close()
+		utils.CloseAndLog(targetDB)
 	})
 
 	return appDBName, appDSN
@@ -114,10 +115,10 @@ func startTestServerWithOperatorInterval(t *testing.T, appDBName, appDSN string,
 	waitForHTTP(t, "http://"+addr+"/health", 5*time.Second)
 
 	t.Cleanup(func() {
-		_ = server.Close()
-		_ = svc.Close()
-		_ = localClient.Close()
-		_ = schemabotDB.Close()
+		utils.CloseAndLog(server)
+		utils.CloseAndLog(svc)
+		utils.CloseAndLog(localClient)
+		utils.CloseAndLog(schemabotDB)
 	})
 
 	return testServer{Addr: addr, Storage: store, Service: svc}
@@ -289,7 +290,7 @@ func TestFullWorkflow_Spirit_PlanApplyVerify(t *testing.T) {
 	// Step 3: Verify the table exists in the target database
 	targetConn, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err, "open target connection")
-	defer func() { _ = targetConn.Close() }()
+	defer utils.CloseAndLog(targetConn)
 
 	var tableName string
 	err = targetConn.QueryRowContext(ctx, "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'users'", appDBName).Scan(&tableName)
@@ -359,7 +360,7 @@ func TestFullWorkflow_Spirit_DDLScenarios(t *testing.T) {
 	// Connect to app database for verification queries
 	appDB, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err, "open app db")
-	defer func() { _ = appDB.Close() }()
+	defer utils.CloseAndLog(appDB)
 
 	// Helper to plan and apply a schema change
 	planAndApply := func(t *testing.T, schemaFiles map[string]string, prNum int, allowUnsafe bool) map[string]any {
@@ -639,7 +640,7 @@ func TestFullWorkflow_Spirit_UnsafeChangeDetection(t *testing.T) {
 	// Connect to app database for setup
 	appDB, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err, "open app db")
-	defer func() { _ = appDB.Close() }()
+	defer utils.CloseAndLog(appDB)
 
 	// Create initial table with data
 	_, err = appDB.ExecContext(ctx, `
@@ -810,7 +811,7 @@ func TestCLI_PlanApply(t *testing.T) {
 	// Connect to app database for verification
 	appDB, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err, "open app db")
-	defer func() { _ = appDB.Close() }()
+	defer utils.CloseAndLog(appDB)
 
 	endpoint := "http://" + ts.Addr
 
@@ -967,7 +968,7 @@ func TestFullWorkflow_Spirit_DDLWithProgress(t *testing.T) {
 	// Connect to app database for seeding and verification
 	appDB, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err, "open app db")
-	defer func() { _ = appDB.Close() }()
+	defer utils.CloseAndLog(appDB)
 
 	// Track the current schema state
 	currentSchema := map[string]string{}
@@ -1465,7 +1466,7 @@ CREATE TABLE ccc_cancelled (
 	// Verify aaa_first table was actually created in DB (partial success committed)
 	targetDB, err := sql.Open("block-mysql", targetDSN+"&multiStatements=true")
 	require.NoError(t, err, "open target db")
-	defer func() { _ = targetDB.Close() }()
+	defer utils.CloseAndLog(targetDB)
 
 	var tableName string
 	err = targetDB.QueryRowContext(ctx, `

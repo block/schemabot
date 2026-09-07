@@ -484,7 +484,7 @@ func waitForIndex(t *testing.T, db *sql.DB, tableName, indexName string, timeout
 				return false
 			}
 			found := rows.Next()
-			_ = rows.Close()
+			utils.CloseAndLog(rows)
 			return found
 		},
 		func() string {

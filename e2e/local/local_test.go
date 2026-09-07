@@ -66,7 +66,7 @@ func TestMain(m *testing.M) {
 						tablesToDrop = append(tablesToDrop, name)
 					}
 				}
-				_ = rows.Close()
+				utils.CloseAndLog(rows)
 				// Drop Spirit internal tables first (they may have FK constraints)
 				for _, tbl := range tablesToDrop {
 					if strings.HasPrefix(tbl, "_") {
@@ -83,7 +83,7 @@ func TestMain(m *testing.M) {
 					log.Printf("Cleaned up %d leftover test tables", len(tablesToDrop))
 				}
 			}
-			_ = db.Close()
+			utils.CloseAndLog(db)
 		}
 	}
 	os.Exit(m.Run())

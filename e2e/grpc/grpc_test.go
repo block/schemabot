@@ -71,12 +71,12 @@ func TestMain(m *testing.M) {
 					_ = rows.Scan(&table)
 					tables = append(tables, table)
 				}
-				_ = rows.Close()
+				utils.CloseAndLog(rows)
 				for _, table := range tables {
 					_, _ = db.ExecContext(context.Background(), "DELETE FROM `"+table+"`")
 				}
 			}
-			_ = db.Close()
+			utils.CloseAndLog(db)
 		}
 	}
 
@@ -100,9 +100,9 @@ func TestMain(m *testing.M) {
 				_ = rows.Scan(&name)
 				_, _ = db.ExecContext(context.Background(), "DROP TABLE IF EXISTS `"+name+"`")
 			}
-			_ = rows.Close()
+			utils.CloseAndLog(rows)
 		}
-		_ = db.Close()
+		utils.CloseAndLog(db)
 	}
 
 	os.Exit(m.Run())

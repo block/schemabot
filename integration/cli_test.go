@@ -711,7 +711,7 @@ CREATE TABLE items (
 		rows, err := db.QueryContext(t.Context(), "SHOW INDEX FROM items WHERE Key_name = 'idx_name'")
 		require.NoError(t, err, "show index")
 		hasIndex := rows.Next()
-		_ = rows.Close()
+		utils.CloseAndLog(rows)
 		assert.True(t, hasIndex, "expected idx_name index to exist after stop/start/cutover")
 	})
 
@@ -955,7 +955,7 @@ func startSchemaBotLocalDB(t *testing.T, dbName string) string {
 		ctx, cancel := testutil.CleanupContext(30 * time.Second)
 		defer cancel()
 		_, _ = targetDB.ExecContext(ctx, "DROP DATABASE IF EXISTS "+dbName)
-		_ = targetDB.Close()
+		utils.CloseAndLog(targetDB)
 	})
 
 	_, err = targetDB.ExecContext(t.Context(), "CREATE DATABASE IF NOT EXISTS "+dbName)

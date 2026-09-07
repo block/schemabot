@@ -19,6 +19,7 @@ import (
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
+	"github.com/block/spirit/pkg/utils"
 )
 
 // A rollback reverts a previously applied schema change, so once it completes
@@ -34,7 +35,7 @@ func TestRefreshChecksForTerminalApply_CompletedRollbackIsActionRequired(t *test
 	db, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.PingContext(ctx))
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(db) })
 
 	const (
 		repo = "octocat/rollback-check"
