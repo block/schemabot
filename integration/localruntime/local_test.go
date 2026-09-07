@@ -72,7 +72,7 @@ func TestLocalRuntimeRecovery(t *testing.T) {
 	configPath := filepath.Join(dir, "runtime.yaml")
 	tokenPath := filepath.Join(dir, "token")
 	require.NoError(t, os.WriteFile(configPath, data, 0600))
-	require.NoError(t, os.WriteFile(tokenPath, []byte(testToken), 0600))
+	require.NoError(t, os.WriteFile(tokenPath, []byte(testToken+"\n"), 0600))
 	start := func() *localProcess { return startLocal(t, binary, configPath, tokenPath) }
 	process := start()
 	// A conflicting listener fails before storage boot or execution, and leaves
@@ -294,7 +294,7 @@ func TestLocalRuntimePostgres(t *testing.T) {
 	dir := t.TempDir()
 	configPath, tokenPath := filepath.Join(dir, "runtime.yaml"), filepath.Join(dir, "token")
 	require.NoError(t, os.WriteFile(configPath, data, 0600))
-	require.NoError(t, os.WriteFile(tokenPath, []byte(testToken), 0600))
+	require.NoError(t, os.WriteFile(tokenPath, []byte(testToken+"\n"), 0600))
 	process := startLocal(t, binary, configPath, tokenPath)
 	var plan apitypes.PlanResponse
 	request(t, process.endpoint, http.MethodPost, "/api/plan", testToken, apitypes.PlanRequest{

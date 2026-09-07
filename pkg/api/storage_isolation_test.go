@@ -3,6 +3,8 @@ package api
 import (
 	"testing"
 
+	"github.com/block/schemabot/pkg/schema"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -11,6 +13,7 @@ func TestStorageIsolationAcrossDatabaseFamilies(t *testing.T) {
 		name, dialect, storageDSN, engine, targetDSN string
 		shared                                       bool
 	}{
+		{"case-folded names", "mysql", "root@tcp(localhost:3306)/STATE", "mysql", "root@tcp(alias:3306)/state", true},
 		{"postgres URL", "postgres", "postgres://user@localhost/state", "postgres", "postgres://user@localhost/app", false},
 		{"postgres keyword", "postgres", "host=localhost user=user dbname=state", "postgres", "host=alias user=user dbname=state", true},
 		{"postgres aliases", "postgres", "postgres://user@localhost/state", "postgres", "postgres://user@alias/state", true},
@@ -29,4 +32,9 @@ func TestStorageIsolationAcrossDatabaseFamilies(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConnectionRequiresDatabaseName(t *testing.T) {
+	_, err := connectionDatabaseName(schema.DialectMySQL, "root@tcp(localhost:3306)/")
+	require.ErrorContains(t, err, "must name a database")
 }

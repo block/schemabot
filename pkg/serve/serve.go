@@ -1034,9 +1034,9 @@ func checkSuiteRecoveryOptions(logger *slog.Logger) []webhook.HandlerOption {
 
 // buildServerAuthorizer constructs the API authorizer exactly as the server
 // wires it: admin teams from PR command authorization, and the operator-group
-// union that widens forward-auth write admission. Every server build and any
-// test that claims to exercise the real authorizer wiring must go through
-// this function, so the union cannot be dropped from one without the other.
+// union that widens forward-auth write admission. Hosted server builds and tests of their configured authorization use this
+// function. The local host injects its private-token authorizer separately and
+// rejects service authentication configuration before Build.
 func buildServerAuthorizer(ctx context.Context, cfg *api.ServerConfig, logger *slog.Logger) (auth.Authorizer, error) {
 	return buildAuthorizer(ctx, cfg.Auth, cfg.PRCommandAuthorization.AdminTeams, cfg.OperatorGroupUnion(), logger)
 }

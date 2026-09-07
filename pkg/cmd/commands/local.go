@@ -1,10 +1,8 @@
 package commands
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,7 +10,6 @@ import (
 	"strings"
 
 	"github.com/block/spirit/pkg/utils"
-	"gopkg.in/yaml.v3"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/localruntime"
@@ -86,21 +83,16 @@ func readPrivateLocalFile(path string) ([]byte, error) {
 }
 
 func parseLocalConfig(data []byte) (api.ServerConfig, error) {
-	var cfg api.ServerConfig
-	dec := yaml.NewDecoder(bytes.NewReader(data))
-	dec.KnownFields(true)
-	if err := dec.Decode(&cfg); err != nil {
-		return cfg, fmt.Errorf("parse local configuration: %w", err)
+	cfg, err := api.ParseServerConfig(data)
+	if err != nil {
+		return api.ServerConfig{}, fmt.Errorf("parse local configuration: %w", err)
 	}
-	var extra any
-	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
-		return cfg, fmt.Errorf("local configuration must contain one YAML document")
-	}
-	return cfg, nil
+	return *cfg, nil
 }
 
 func runLocalServer(ctx context.Context, cfg api.ServerConfig, token, address string, g *Globals, ready func(string) error) error {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel()}))
+	slog.SetDefault(logger)
 	return serve.RunLocal(ctx, cfg, serve.LocalOptions{Address: address, Token: token, Ready: ready}, serve.WithLogger(logger), serve.WithBuildInfo(g.Version, g.Commit, g.Date))
 }
 

@@ -13,8 +13,9 @@ import (
 
 // ValidateStorageIsolation requires a distinct database name for state and each
 // directly connected target in the same database family. Hostnames cannot prove
-// separation because aliases and tunnels can reach the same server. Remote
-// execution targets are resolved by their data plane, not by this process.
+// separation because aliases and tunnels can reach the same server. Targets without a
+// locally configured DSN need isolation checks where their concrete connection
+// and namespace are resolved; this name comparison cannot verify them.
 func (c *ServerConfig) ValidateStorageIsolation() error {
 	dialect, err := c.Storage.ResolveDialect()
 	if err != nil {
@@ -32,7 +33,7 @@ func (c *ServerConfig) ValidateStorageIsolation() error {
 		targetDialect := schema.DialectForDatabaseType(db.Type)
 		for environment, target := range db.Environments {
 			if !target.HasLocalDSN() {
-				slog.Debug("storage isolation belongs to the remote data plane", "database", name, "environment", environment)
+				slog.Debug("storage isolation requires a resolved target connection and namespace", "database", name, "environment", environment)
 				continue
 			}
 			targetDSN, err := target.ResolveDSN()

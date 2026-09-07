@@ -7,6 +7,11 @@ import (
 	"strings"
 	"testing"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -44,4 +49,47 @@ func TestLocalAuthorizerRequiresToken(t *testing.T) {
 		_, err := NewLocalAuthorizer(token, nil)
 		require.Error(t, err)
 	}
+}
+
+// Local probes remain authenticated and counted even though hosted probes
+// bypass authentication. Both admitted and denied requests stay observable.
+func TestLocalProbeAuthMetrics(t *testing.T) {
+	reader := metric.NewManualReader()
+	provider := metric.NewMeterProvider(metric.WithReader(reader))
+	previous := otel.GetMeterProvider()
+	otel.SetMeterProvider(provider)
+	defer func() { otel.SetMeterProvider(previous); require.NoError(t, provider.Shutdown(t.Context())) }()
+	token := strings.Repeat("a", 64)
+	authorizer, err := NewLocalAuthorizer(token, nil)
+	require.NoError(t, err)
+	for _, header := range []string{"", "Bearer " + token} {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/health", nil)
+		req.Header.Set("Authorization", header)
+		response := httptest.NewRecorder()
+		authorizer.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })).ServeHTTP(response, req)
+		if header == "" {
+			assert.Equal(t, http.StatusUnauthorized, response.Code)
+		} else {
+			assert.Equal(t, http.StatusOK, response.Code)
+		}
+	}
+	var collected metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &collected))
+	decisions := map[string]int64{}
+	for _, scope := range collected.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			if m.Name != "schemabot.auth_decisions.total" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok)
+			for _, point := range sum.DataPoints {
+				reason, ok := point.Attributes.Value(attribute.Key("reason"))
+				require.True(t, ok)
+				decisions[reason.AsString()] += point.Value
+			}
+		}
+	}
+	assert.Equal(t, int64(1), decisions["local_token_invalid"])
+	assert.Equal(t, int64(1), decisions["local_token"])
 }
