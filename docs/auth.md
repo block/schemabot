@@ -7,19 +7,18 @@
 - [Set up your server](#set-up-your-server)
   - [Where SchemaBot runs](#where-schemabot-runs)
   - [Choose your setup](#choose-your-setup)
-  - [Connect GitHub](#connect-github)
+- [Connect GitHub](#connect-github)
+  - [Choose who can run GitHub commands](#choose-who-can-run-github-commands)
+  - [Check the GitHub connection](#check-the-github-connection)
+- [Connect the CLI and API](#connect-the-cli-and-api)
   - [Run locally](#run-locally)
   - [Connect your identity provider](#connect-your-identity-provider)
   - [Use your existing proxy](#use-your-existing-proxy)
-- [Set permissions](#set-permissions)
   - [What read and write access include](#what-read-and-write-access-include)
   - [Grant a team access to its database](#grant-a-team-access-to-its-database)
-  - [Choose who can run GitHub commands](#choose-who-can-run-github-commands)
   - [Give a tool read-only access](#give-a-tool-read-only-access)
   - [How access checks work](#how-access-checks-work)
-- [Check your access](#check-your-access)
-  - [Check the GitHub connection](#check-the-github-connection)
-  - [Check CLI and API access](#check-cli-and-api-access)
+  - [Check your access](#check-your-access)
 - [Troubleshoot access](#troubleshoot-access)
   - [Check how group names match](#check-how-group-names-match)
   - [When a check cannot be completed](#when-a-check-cannot-be-completed)
@@ -34,9 +33,10 @@ Set up your SchemaBot server and control who can view schemas and run schema
 changes. Authentication checks who is making a request;
 authorization checks what they are allowed to do.
 
-Follow the setup for your chosen authentication method, set permissions,
-and check your access. Troubleshooting and advanced configuration are here
-when you need them.
+After setting up the server, follow [Connect GitHub](#connect-github) for
+the PR workflow or [Connect the CLI and API](#connect-the-cli-and-api) for
+direct access. Each section covers its setup, permissions, and verification.
+You only need both if you use both interfaces.
 
 You can use SchemaBot through GitHub pull requests, the command line (CLI), or
 the API. GitHub commands use the comment author's GitHub account. The CLI and
@@ -160,7 +160,7 @@ can still try SchemaBot locally without either. Sharing an authenticated
 server requires setting up one of those services first; SchemaBot does not
 provide its own user accounts or password login.
 
-### Connect GitHub
+## Connect GitHub
 
 For the PR workflow, create and install your own GitHub App. People use their
 GitHub accounts to review changes and post commands; they do not need to sign
@@ -212,323 +212,8 @@ the single-App configuration skips signature verification. A signed delivery
 proves where the event came from; it does not grant the comment author
 permission to apply a change.
 
-Next, [set GitHub command permissions](#github-side-authorization), then
-[check the GitHub connection](#check-the-github-connection). CLI and API
-access can be configured separately if you need those interfaces too.
-
-### Run locally
-
-For local development, you can leave authentication off:
-
-```yaml
-auth:
-  type: none
-```
-
-This is also the default when `auth` is unset. Anyone who can reach the API
-can read and write, so keep access restricted to your machine. Before sharing
-the server, add authentication or a network restriction that limits access
-to the callers you intend. Signing GitHub webhooks does not protect the API.
-
-Requests still appear in metrics, and writes are logged with the method,
-path, and source address. Without authentication, they are recorded as
-anonymous rather than as a particular person.
-
-With the local quick-start server running on its default port, check the API:
-
-```sh
-curl --fail-with-body http://localhost:13370/api/databases
-```
-
-A successful response contains a `databases` list. For example, a server with
-no databases registered returns:
-
-```json
-{"databases": []}
-```
-
-The quick start lists its demo databases instead. This confirms the API is
-reachable; it does not check connectivity to each database.
-
-<a id="oidc-bearer-tokens"></a>
-
-### Connect your identity provider
-
-> **Alpha:** OIDC support is still evolving. Test login and permissions with
-> your identity provider before relying on this setup in production.
-
-An identity provider is the service your team uses to sign in. SchemaBot
-supports OpenID Connect (OIDC), a standard that lets it verify that login.
-Your provider issues a signed token, and the CLI sends it with each request.
-
-#### Configure the server
-
-You'll need permission to register an application with your identity provider
-to complete this setup. Register a **public client** for the
-CLI: this is a client that does not keep a client secret on the user's machine.
-
-| Provider setting | Value for this example |
-|---|---|
-| Client ID | `schemabot-cli`, or the ID your provider assigns |
-| Login flow | Authorization code with PKCE |
-| Redirect URI | `http://127.0.0.1:8765/callback` |
-| Requested scopes | `openid`, `email`, `groups`, `offline_access` |
-
-PKCE protects the browser login, and the redirect returns the result to the
-CLI on your own machine. The CLI requests those four scopes: `openid` enables
-login, `email` identifies the user, `groups` supplies memberships, and
-`offline_access` requests a refresh token so you do not have to sign in for
-every session. Configure your provider to accept them and include group
-memberships in the ID token when users need write access.
-
-Use your provider's documentation for registering a native or public OIDC
-application. The registration screens differ, but these are the values you
-need to carry into SchemaBot:
-
-| Value | Where it comes from | Where you use it |
-|---|---|---|
-| Issuer URL | Your provider's OIDC settings; it may include a tenant or realm path | Server `auth.issuer` and CLI `oidc.issuer` |
-| Client ID | The application registration you just created | Server `auth.audience` and CLI `oidc.client_id` |
-| Server URL | The address where you host SchemaBot | CLI `endpoint` |
-| Admin group | A group your provider includes in the user's ID token | Server `pr_command_authorization.admin_teams` |
-
-Use those actual values in the examples below. `schemabot-cli` is an example
-client ID, not a value every provider will assign.
-
-Add these settings to the server configuration:
-
-```yaml
-auth:
-  type: oidc
-  issuer: "https://issuer.example.com"
-  audience: "schemabot-cli"
-  groups_claim: "groups"
-```
-
-- `issuer` is your provider's OIDC issuer URL
-- `audience` identifies the application a token was issued for; for CLI login,
-  it must match the client ID you registered
-- `groups_claim` names the field in the token that contains group memberships;
-  the default is `groups`
-
-SchemaBot checks the token's signature, expiry, issuer, and audience. It
-caches the provider's signing keys but needs network access to discover the
-provider and refresh those keys.
-
-#### Sign in from the CLI
-
-Start the server with the OIDC settings above before continuing. If startup
-fails during provider discovery, check the issuer URL and whether the server
-can reach it. Your CLI and browser also need to reach the identity provider.
-
-A profile tells the CLI which server to contact and which provider to use
-for login. Create `~/.schemabot/config.yaml` (and its parent directory if it
-does not exist), or add this profile to your existing file:
-
-```yaml
-default_profile: demo
-profiles:
-  demo:
-    endpoint: https://schemabot.example.com
-    oidc:
-      issuer: https://issuer.example.com
-      client_id: schemabot-cli
-```
-
-Keep the file accessible only to your account, then sign in:
-
-```sh
-chmod 600 ~/.schemabot/config.yaml
-schemabot login --profile demo
-```
-
-After you sign in through the browser, the CLI confirms that it saved the
-login. Example output:
-
-```text
-Logged in as jane@example.com. Token cached for profile "demo".
-```
-
-You now have read access. [List your databases](#verify-a-request) to check
-that the login works; you can add write permissions when you need them.
-
-Your CLI requests now use that saved token. Reconfiguring the same endpoint
-keeps your login; changing the endpoint clears the tokens, so you must sign
-in again. The CLI refuses to send tokens over unencrypted HTTP except to your
-own machine's loopback address.
-
-#### Choose who can run changes
-
-With OIDC, anyone with a valid token can view schemas and change history
-across the deployment. To let a group run changes too, add it to the server's
-admin team list:
-
-```yaml
-pr_command_authorization:
-  admin_teams: [myorg/schema-admins]
-```
-
-Configure your provider to include a matching group in those users' ID tokens.
-Despite its name, `pr_command_authorization.admin_teams` also supplies the
-OIDC API admin list. `admin_users` does not: it contains GitHub usernames,
-which cannot be matched to an OIDC login.
-
-OIDC admins can operate across the deployment. If you need to limit a team to
-particular databases or environments, use the proxy option below. The
-`read_groups` and `operator_groups` settings apply only to that option.
-
-You can now [check your access](#verify-a-request).
-
-<a id="forward_auth-authenticating-proxy"></a>
-
-### Use your existing proxy
-
-A proxy sits between your callers and SchemaBot. If it already checks who's
-signed in, it can pass their username and groups to SchemaBot in HTTP headers.
-Set `auth.type: forward_auth` to use that information. This setting does not
-install a proxy or create a login page; your proxy must already handle login
-and forward requests to SchemaBot.
-
-Tell SchemaBot which proxy may supply identities. If your infrastructure uses
-a service mesh, its certificates can identify the proxy by a **SPIFFE ID**—a
-name such as `spiffe://example.org/ns/ingress/sa/proxy`. The mesh verifies the
-certificate and forwards that identity to SchemaBot.
-
-Block uses this pattern in production, with `trusted_proxy_spiffe` rather
-than source-IP allowlisting (`trusted_proxy_cidrs`).
-
-This example uses illustrative names. Replace the SPIFFE ID
-and header names with the values your mesh and proxy supply:
-
-```yaml
-auth:
-  type: forward_auth
-  forward_auth:
-    trusted_proxy_spiffe:
-      - spiffe://example.org/ns/ingress/sa/proxy
-    user_header: X-Forwarded-User
-    groups_header: X-Forwarded-Groups
-    groups_delimiter: ","
-    read_groups: []
-    write_groups: [myorg/schema-admins]
-```
-
-The proxy must remove identity headers supplied by callers and set its own
-values after authenticating them. With SPIFFE-based trust, the mesh must also
-sanitize `X-Forwarded-Client-Cert` (XFCC), the header carrying the verified
-certificate identity. Callers must not be able to bypass the mesh and reach
-SchemaBot directly; SchemaBot does not verify the certificate itself.
-
-**No service mesh? You can trust the proxy's source IP instead.** Replace
-`trusted_proxy_spiffe` with `trusted_proxy_cidrs` in the example above:
-
-```yaml
-trusted_proxy_cidrs: [192.0.2.10/32]
-```
-
-This field belongs under `auth.forward_auth`. Replace the example address
-with the proxy source address SchemaBot sees; `/32` means one IPv4 address.
-Only allow addresses controlled by your proxy, since callers from those
-addresses can supply identity headers. If you configure both SPIFFE IDs and
-CIDRs, requests must match both. See [proxy trust details](#choose-which-proxies-to-trust)
-for the full behavior.
-
-In this example:
-
-- Any authenticated user can read because `read_groups` is empty
-- Members of `myorg/schema-admins` can run changes across the deployment
-- Other users cannot write unless you [grant database access](#per-database-operator-scoping)
-
-To limit readers too, put their group names in `read_groups`. Members of
-`write_groups` or any database's `operator_groups` also have read access;
-you do not need to list them twice. Read access covers the entire deployment,
-not just the databases a team may change.
-
-To check browser access, open `https://schemabot.example.com/api/databases`
-through your proxy and complete its login. Use your actual hostname. You
-should see JSON containing a `databases` list, as in the
-[response example](#verify-a-request). A login page or redirect in place of
-JSON means the request has not reached the authenticated API yet.
-
-**CLI access needs the proxy's supported authentication method.** A browser
-login does not sign the CLI in, and `schemabot login` handles OIDC rather than
-arbitrary proxy login flows. Use the authentication method your proxy supports for terminal clients.
-For example, a proxy that accepts Bearer tokens may work with the CLI's `--token` or `SCHEMABOT_TOKEN`; a proxy that only accepts browser
-cookies will need a different client integration. Do not send your own
-`X-Forwarded-User` or group headers to work around this.
-
-If you use a service mesh, see the
-[proxy and network details](#proxy-and-network-details) for certificate-based
-identity and port-forwarding considerations.
-
-## Set permissions
-
-<a id="the-two-tier-api-model"></a>
-
-### What read and write access include
-
-Before granting access, choose what the caller needs to do. The API has two
-permission levels, called **tiers** in configuration and logs:
-
-| Access | Operations |
-|---|---|
-| Read | List databases, pull live schemas, view stored plans, status, progress, logs, history, and locks |
-| Write | Create plans, apply changes, stop or resume work, cut over, cancel, revert, skip revert, roll back, acquire or release locks, change settings, and run check or webhook maintenance |
-
-Creating a plan requires write access because it stages a change. Reading a
-plan that already exists requires only read access.
-
-Read permission covers all databases managed by the server; it cannot be
-restricted to one database. Per-database and per-environment permissions apply
-to writes under `forward_auth`.
-
-In the route rules, `GET` and `HEAD` requests are reads, as is `POST /api/pull`.
-Other requests require write access by default.
-
-<a id="per-database-operator-scoping"></a>
-
-### Grant a team access to its database
-
-With `forward_auth`, you can let a team run changes against its own database
-without making it an admin. Add the team's group to `operator_groups`, and
-choose the environments where that access applies with `operator_environments`.
-
-Add these fields to your existing proxy and database settings; keep the
-trusted proxy settings you already configured. Set `STAGING_PAYMENTS_DSN`
-and `PROD_PAYMENTS_DSN` in the server's environment to the corresponding
-database connection strings.
-
-```yaml
-auth:
-  type: forward_auth
-  forward_auth:
-    operator_environments: [staging]     # scoped writes allowed here, instance-wide
-databases:
-  payments:
-    type: mysql
-    operator_groups: [myorg/payments-team]
-    environments:
-      staging:
-        dsn: "env:STAGING_PAYMENTS_DSN"
-      production:
-        dsn: "env:PROD_PAYMENTS_DSN"
-```
-
-This group can plan and apply changes to `payments` in `staging`. This grant
-does not let it apply to production or another database. An admin group still
-has access everywhere. Configuring `operator_groups` with another auth type
-is a startup error.
-
-There are two details to account for:
-
-- **Direct changes do not require a PR.** Repository restrictions
-  (`allowed_repos` and `allowed_dirs`) apply to plans from PRs. Direct API
-  access still records plans, applies, and the caller, but has no PR review
-  trail. Leave production out of `operator_environments` if you want these
-  teams to use PRs there.
-- **Locks cover all environments.** A staging operator can lock its database
-  across the deployment, which can also hold up production changes. Forcing
-  someone else's lock to release requires an admin.
+Set command permissions and check the connection below. You can configure
+CLI and API access separately if you need those interfaces too.
 
 <a id="github-side-authorization"></a>
 
@@ -643,6 +328,382 @@ Use GitHub review rules or CODEOWNERS for code ownership. The operator grant
 is per database, not per directory or environment; it covers that database's
 configured environments. Keep review requirements separate from the grant.
 
+### Check the GitHub connection
+
+Open a PR in a repository where you installed the App and post this comment:
+
+```text
+schemabot help
+```
+
+SchemaBot should reply with its command reference. Excerpt:
+
+```markdown
+## 📚 SchemaBot Help
+
+| Command | Description |
+|---------|-------------|
+| `schemabot plan [-e <env>]` | Preview schema changes |
+| `schemabot apply -e <env>` | Plan, lock, and apply after safety rechecks |
+```
+
+This checks that GitHub can deliver the comment event and SchemaBot can post
+a reply. It does not prove that you may plan or apply a database change.
+Follow the [App setup test](github-app-setup.md#7-test-it) to test a schema change and
+its checks after configuring command permissions.
+
+If no reply arrives, inspect the App's **Recent Deliveries** in GitHub:
+
+| What you see | What to check |
+|---|---|
+| No delivery for the comment | Confirm the App is installed on this repository and subscribed to **Issue comment** events |
+| A redirect to a login page | Route `/webhook` to SchemaBot without requiring a browser login |
+| `401` | Check that the server and App use the same webhook secret |
+| A successful delivery, but no reply | Inspect SchemaBot's logs for that delivery; acceptance does not mean the command completed |
+| A reply denying your command | Check the comment author's GitHub team membership and the target database's command permissions |
+
+## Connect the CLI and API
+
+Choose local access, OIDC, or an authenticating proxy below. Then set the
+permissions your callers need and check the connection.
+
+### Run locally
+
+For local development, you can leave authentication off:
+
+```yaml
+auth:
+  type: none
+```
+
+This is also the default when `auth` is unset. Anyone who can reach the API
+can read and write, so keep access restricted to your machine. Before sharing
+the server, add authentication or a network restriction that limits access
+to the callers you intend. Signing GitHub webhooks does not protect the API.
+
+Requests still appear in metrics, and writes are logged with the method,
+path, and source address. Without authentication, they are recorded as
+anonymous rather than as a particular person.
+
+With the local quick-start server running on its default port, check the API:
+
+```sh
+curl --fail-with-body http://localhost:13370/api/databases
+```
+
+A successful response contains a `databases` list. For example, a server with
+no databases registered returns:
+
+```json
+{"databases": []}
+```
+
+The quick start lists its demo databases instead. This confirms the API is
+reachable; it does not check connectivity to each database.
+
+<a id="oidc-bearer-tokens"></a>
+
+### Connect your identity provider
+
+> **Alpha:** OIDC support is still evolving. Test login and permissions with
+> your identity provider before relying on this setup in production.
+
+An identity provider is the service your team uses to sign in. SchemaBot
+supports OpenID Connect (OIDC), a standard that lets it verify that login.
+Your provider issues a signed token, and the CLI sends it with each request.
+
+#### Configure the server
+
+You'll need permission to register an application with your identity provider
+to complete this setup. Register a **public client** for the
+CLI: this is a client that does not keep a client secret on the user's machine.
+
+| Provider setting | Value for this example |
+|---|---|
+| Client ID | `schemabot-cli`, or the ID your provider assigns |
+| Login flow | Authorization code with PKCE |
+| Redirect URI | `http://127.0.0.1:8765/callback` |
+| Requested scopes | `openid`, `email`, `groups`, `offline_access` |
+
+PKCE protects the browser login, and the redirect returns the result to the
+CLI on your own machine. The CLI requests those four scopes: `openid` enables
+login, `email` identifies the user, `groups` supplies memberships, and
+`offline_access` requests a refresh token so you do not have to sign in for
+every session. Configure your provider to accept them and include group
+memberships in the ID token when users need write access. These scope names
+are fixed in the current CLI; some providers need an explicit `groups` scope
+and claim mapper before login will work. If your provider requires a
+separate permission or consent for offline access, enable that too.
+
+Use your provider's documentation for registering a native or public OIDC
+application. The registration screens differ, but these are the values you
+need to carry into SchemaBot:
+
+| Value | Where it comes from | Where you use it |
+|---|---|---|
+| Issuer URL | Your provider's OIDC settings; it may include a tenant or realm path | Server `auth.issuer` and CLI `oidc.issuer` |
+| Client ID | The application registration you just created | Server `auth.audience` and CLI `oidc.client_id` |
+| Server URL | The address where you host SchemaBot | CLI `endpoint` |
+| Admin group | A group your provider includes in the user's ID token | Server `pr_command_authorization.admin_teams` |
+
+Use those actual values in the examples below. `schemabot-cli` is an example
+client ID, not a value every provider will assign.
+
+Add these settings to the server configuration:
+
+```yaml
+auth:
+  type: oidc
+  issuer: "https://issuer.example.com"
+  audience: "schemabot-cli"
+  groups_claim: "groups"
+```
+
+- `issuer` is your provider's OIDC issuer URL
+- `audience` identifies the application a token was issued for; for CLI login,
+  it must match the client ID you registered
+- `groups_claim` names the field in the token that contains group memberships;
+  the default is `groups`
+
+The CLI sends the **ID token**, not the OAuth access token. Configure group
+memberships in the ID token itself; adding them only to the access token or
+the provider's user-info response does not give the CLI write access.
+`groups_claim` accepts a top-level string or array of strings, for example:
+
+```json
+{
+  "iss": "https://issuer.example.com",
+  "aud": "schemabot-cli",
+  "sub": "user-123",
+  "groups": ["myorg/schema-admins"]
+}
+```
+
+This is an excerpt of the decoded claims, not a token you can send. The
+provider also supplies the expiry and signs the token. A missing groups
+claim gives no group memberships; an unsupported claim format rejects the
+request.
+
+SchemaBot checks the token's signature, expiry, issuer, and audience. It
+caches the provider's signing keys but needs network access to discover the
+provider and refresh those keys.
+
+#### Sign in from the CLI
+
+Start the server with the OIDC settings above before continuing. If startup
+fails during provider discovery, check the issuer URL and whether the server
+can reach it. Your CLI and browser also need to reach the identity provider.
+
+A profile tells the CLI which server to contact and which provider to use
+for login. Create `~/.schemabot/config.yaml` (and its parent directory if it
+does not exist), or add this profile to your existing file:
+
+```yaml
+default_profile: demo
+profiles:
+  demo:
+    endpoint: https://schemabot.example.com
+    oidc:
+      issuer: https://issuer.example.com
+      client_id: schemabot-cli
+```
+
+Keep the file accessible only to your account, then sign in:
+
+```sh
+chmod 600 ~/.schemabot/config.yaml
+schemabot login --profile demo
+```
+
+After you sign in through the browser, the CLI confirms that it saved the
+login. Example output:
+
+```text
+Logged in as jane@example.com. Token cached for profile "demo".
+```
+
+You now have read access. [List your databases](#verify-a-request) to check
+that the login works; you can add write permissions when you need them.
+
+The CLI saves the ID token and, when issued, the refresh token in this
+profile. Refresh requires the provider to return a new ID token as well;
+a refresh response containing only an access token is not supported.
+
+Your CLI requests now use that saved token. Reconfiguring the same endpoint
+keeps your login; changing the endpoint clears the tokens, so you must sign
+in again. The CLI refuses to send tokens over unencrypted HTTP except to your
+own machine's loopback address.
+
+#### Choose who can run changes
+
+With OIDC, anyone with a valid token can view schemas and change history
+across the deployment. To let a group run changes too, add it to the server's
+admin team list:
+
+```yaml
+pr_command_authorization:
+  admin_teams: [myorg/schema-admins]
+```
+
+Configure your provider to include a matching group in those users' ID tokens.
+Despite its name, `pr_command_authorization.admin_teams` also supplies the
+OIDC API admin list. `admin_users` does not: it contains GitHub usernames,
+which cannot be matched to an OIDC login.
+
+OIDC admins can operate across the deployment. If you need to limit a team to
+particular databases or environments, use the proxy option below. The
+`read_groups` and `operator_groups` settings apply only to that option.
+
+You can now [check your access](#verify-a-request).
+
+<a id="forward_auth-authenticating-proxy"></a>
+
+### Use your existing proxy
+
+A proxy sits between your callers and SchemaBot. If it already checks who's
+signed in, it can pass their username and groups to SchemaBot in HTTP headers.
+Set `auth.type: forward_auth` to use that information. This setting does not
+install a proxy or create a login page; your proxy must already handle login
+and forward requests to SchemaBot.
+
+Tell SchemaBot which proxy may supply identities. If your infrastructure uses
+a service mesh, its certificates can identify the proxy by a **SPIFFE ID**—a
+name such as `spiffe://example.org/ns/ingress/sa/proxy`. The mesh verifies the
+certificate and forwards that identity to SchemaBot.
+
+Block uses this pattern in production, with `trusted_proxy_spiffe` rather
+than source-IP allowlisting (`trusted_proxy_cidrs`).
+
+This example uses illustrative names. Replace the SPIFFE ID
+and header names with the values your mesh and proxy supply:
+
+```yaml
+auth:
+  type: forward_auth
+  forward_auth:
+    trusted_proxy_spiffe:
+      - spiffe://example.org/ns/ingress/sa/proxy
+    user_header: X-Forwarded-User
+    groups_header: X-Forwarded-Groups
+    groups_delimiter: ","
+    read_groups: []
+    write_groups: [myorg/schema-admins]
+```
+
+The proxy must remove identity headers supplied by callers and set its own
+values after authenticating them. With SPIFFE-based trust, the mesh must also
+sanitize `X-Forwarded-Client-Cert` (XFCC), the header carrying the verified
+certificate identity. Callers must not be able to bypass the mesh and reach
+SchemaBot directly; SchemaBot does not verify the certificate itself.
+
+**No service mesh? You can trust the proxy's source IP instead.** Replace
+`trusted_proxy_spiffe` with `trusted_proxy_cidrs` in the example above:
+
+```yaml
+trusted_proxy_cidrs: [192.0.2.10/32]
+```
+
+This field belongs under `auth.forward_auth`. Replace the example address
+with the proxy source address SchemaBot sees; `/32` means one IPv4 address.
+Only allow addresses controlled by your proxy, since callers from those
+addresses can supply identity headers. If you configure both SPIFFE IDs and
+CIDRs, requests must match both. See [proxy trust details](#choose-which-proxies-to-trust)
+for the full behavior.
+
+In this example:
+
+- Any authenticated user can read because `read_groups` is empty
+- Members of `myorg/schema-admins` can run changes across the deployment
+- Other users cannot write unless you [grant database access](#per-database-operator-scoping)
+
+To limit readers too, put their group names in `read_groups`. Members of
+`write_groups` or any database's `operator_groups` also have read access;
+you do not need to list them twice. Read access covers the entire deployment,
+not just the databases a team may change.
+
+To check browser access, open `https://schemabot.example.com/api/databases`
+through your proxy and complete its login. Use your actual hostname. You
+should see JSON containing a `databases` list, as in the
+[response example](#verify-a-request). A login page or redirect in place of
+JSON means the request has not reached the authenticated API yet.
+
+**CLI access needs the proxy's supported authentication method.** A browser
+login does not sign the CLI in, and `schemabot login` handles OIDC rather than
+arbitrary proxy login flows. Use the authentication method your proxy supports for terminal clients.
+For example, a proxy that accepts Bearer tokens may work with the CLI's `--token` or `SCHEMABOT_TOKEN`; a proxy that only accepts browser
+cookies will need a different client integration. Do not send your own
+`X-Forwarded-User` or group headers to work around this.
+
+If you use a service mesh, see the
+[proxy and network details](#proxy-and-network-details) for certificate-based
+identity and port-forwarding considerations.
+
+<a id="the-two-tier-api-model"></a>
+
+### What read and write access include
+
+Before granting access, choose what the caller needs to do. The API has two
+permission levels, called **tiers** in configuration and logs:
+
+| Access | Operations |
+|---|---|
+| Read | List databases, pull live schemas, view stored plans, status, progress, logs, history, and locks |
+| Write | Create plans, apply changes, stop or resume work, cut over, cancel, revert, skip revert, roll back, acquire or release locks, change settings, and run check or webhook maintenance |
+
+Creating a plan requires write access because it stages a change. Reading a
+plan that already exists requires only read access.
+
+Read permission covers all databases managed by the server; it cannot be
+restricted to one database. Per-database and per-environment permissions apply
+to writes under `forward_auth`.
+
+In the route rules, `GET` and `HEAD` requests are reads, as is `POST /api/pull`.
+Other requests require write access by default.
+
+<a id="per-database-operator-scoping"></a>
+
+### Grant a team access to its database
+
+With `forward_auth`, you can let a team run changes against its own database
+without making it an admin. Add the team's group to `operator_groups`, and
+choose the environments where that access applies with `operator_environments`.
+
+Add these fields to your existing proxy and database settings; keep the
+trusted proxy settings you already configured. Set `STAGING_PAYMENTS_DSN`
+and `PROD_PAYMENTS_DSN` in the server's environment to the corresponding
+database connection strings.
+
+```yaml
+auth:
+  type: forward_auth
+  forward_auth:
+    operator_environments: [staging]     # scoped writes allowed here, instance-wide
+databases:
+  payments:
+    type: mysql
+    operator_groups: [myorg/payments-team]
+    environments:
+      staging:
+        dsn: "env:STAGING_PAYMENTS_DSN"
+      production:
+        dsn: "env:PROD_PAYMENTS_DSN"
+```
+
+This group can plan and apply changes to `payments` in `staging`. This grant
+does not let it apply to production or another database. An admin group still
+has access everywhere. Configuring `operator_groups` with another auth type
+is a startup error.
+
+There are two details to account for:
+
+- **Direct changes do not require a PR.** Repository restrictions
+  (`allowed_repos` and `allowed_dirs`) apply to plans from PRs. Direct API
+  access still records plans, applies, and the caller, but has no PR review
+  trail. Leave production out of `operator_environments` if you want these
+  teams to use PRs there.
+- **Locks cover all environments.** A staging operator can lock its database
+  across the deployment, which can also hold up production changes. Forcing
+  someone else's lock to release requires an admin.
 
 <a id="calling-schemabot-as-a-service"></a>
 
@@ -705,46 +766,10 @@ not permit those operations.
 
 <a id="verify-a-request"></a>
 
-## Check your access
+### Check your access
 
-Check each interface you configured. A working GitHub connection does not
-verify CLI access, and a successful CLI login does not verify GitHub.
-
-### Check the GitHub connection
-
-Open a PR in a repository where you installed the App and post this comment:
-
-```text
-schemabot help
-```
-
-SchemaBot should reply with its command reference. Excerpt:
-
-```markdown
-## 📚 SchemaBot Help
-
-| Command | Description |
-|---------|-------------|
-| `schemabot plan [-e <env>]` | Preview schema changes |
-| `schemabot apply -e <env>` | Plan, lock, and apply after safety rechecks |
-```
-
-This checks that GitHub can deliver the comment event and SchemaBot can post
-a reply. It does not prove that you may plan or apply a database change.
-Follow the [App setup test](github-app-setup.md#7-test-it) to test a schema change and
-its checks after configuring command permissions.
-
-If no reply arrives, inspect the App's **Recent Deliveries** in GitHub:
-
-| What you see | What to check |
-|---|---|
-| No delivery for the comment | Confirm the App is installed on this repository and subscribed to **Issue comment** events |
-| A redirect to a login page | Route `/webhook` to SchemaBot without requiring a browser login |
-| `401` | Check that the server and App use the same webhook secret |
-| A successful delivery, but no reply | Inspect SchemaBot's logs for that delivery; acceptance does not mean the command completed |
-| A reply denying your command | Check the comment author's GitHub team membership and the target database's command permissions |
-
-### Check CLI and API access
+For GitHub, use [the connection check](#check-the-github-connection) in its
+setup section. The steps below verify CLI and API access separately.
 
 For the OIDC profile configured above, list the databases your server manages:
 
