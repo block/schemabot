@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Render the recorded wizard and first plan with a stable palette and reading pauses.
-// Requires Playwright, Chrome, and ImageMagick, like render-pr-demo.cjs.
+// Requires Playwright and ImageMagick; uses Chrome when installed, otherwise Playwright Chromium.
 const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const {execFileSync}=require('node:child_process');
 const {pathToFileURL}=require('node:url');

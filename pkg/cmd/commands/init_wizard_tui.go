@@ -312,7 +312,7 @@ func (m *initWizard) contentView() string {
 		b.WriteString(bold.Render("Connections") + "\n")
 		b.WriteString(wrap.Render("Application: "+m.fields[3].value) + "\n")
 		b.WriteString(wrap.Render("SchemaBot state: "+m.fields[4].value) + "\n")
-		if _, err := os.Stat(m.fields[6].value); err == nil {
+		if entries, err := os.ReadDir(m.fields[6].value); err == nil && len(entries) > 0 {
 			b.WriteString("\nYou already have schema files here. We’ll verify them and keep your edits.\n")
 		}
 		b.WriteString("\n" + wrap.Render("We’ll prepare SchemaBot’s state and verify your schema files. We won’t change your application’s schema.") + "\n\n")
@@ -360,7 +360,7 @@ func (cmd *InitCmd) promptInputs(ctx context.Context, input io.Reader, output io
 	cmd.Namespaces = m.namespaceChoices(cmd.Namespaces)
 	cmd.SchemaDir = m.fields[6].value
 	g.Profile = m.fields[7].value
-	if _, err := os.Stat(cmd.SchemaDir); err == nil {
+	if entries, err := os.ReadDir(cmd.SchemaDir); err == nil && len(entries) > 0 {
 		cmd.ReuseSchema = true
 	}
 	return nil
