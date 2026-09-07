@@ -924,7 +924,8 @@ Response excerpt (illustrative values):
       "external_id": "remote-apply-example-73",
       "operations": [
         {
-          "operation_key": "shop/-80/orders"
+          "target": "shop-production",
+          "operation_kind": "work"
         }
       ],
       "logs": [
@@ -949,9 +950,12 @@ Response excerpt (illustrative values):
 
 The outer `apply_id` identifies the SchemaBot apply; each source's `external_id`
 and log entries' `apply_id` identify the remote execution. Each source lists
-the operations it ran; `operation_key` (`namespace/shard/table`) appears only
-for sharded operations, where one apply fans out per shard — a
-single-operation apply lists its operation without a key. A successful HTTP
+the operations it ran with the `target` it resolved to and its
+`operation_kind` (`work` for an operation that runs DDL, `group_finalizer` for
+the operation that completes a grouped apply); `operation_key`
+(`namespace/shard/table`) appears only for sharded operations, where one apply
+fans out per shard — a single-operation apply lists its operation without a
+key. A successful HTTP
 response can still contain source errors. Keep the readable sources and report
 the missing ones; do not treat partial logs as a complete record.
 
@@ -967,12 +971,12 @@ The successful source below has no log entries yet:
   "deployment": "us-east",
   "sources": [{
     "external_id": "remote-apply-example-73",
-    "operations": [{"operation_key": "shop/-80/orders"}],
+    "operations": [{"target": "shop-production", "operation_kind": "work"}],
     "logs": []
   }],
   "errors": [{
     "external_id": "remote-apply-example-74",
-    "operations": [{"operation_key": "archive/-80/events"}],
+    "operations": [{"target": "archive-production", "operation_kind": "work"}],
     "code": "RemoteLogReadFailed",
     "reason": "remote_log_read_failed",
     "message": "Data-plane logs could not be read; check server logs and retry."
