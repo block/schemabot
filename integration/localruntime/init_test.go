@@ -38,6 +38,7 @@ func TestInitEngines(t *testing.T) {
 			if engine == "postgres" {
 				namespace = "public"
 			}
+			require.NoError(t, localsetup.CheckConnection(t.Context(), engine, targetDSN))
 			discovered, err := localsetup.DiscoverNamespaces(t.Context(), engine, targetDSN)
 			require.NoError(t, err)
 			require.Equal(t, []string{namespace}, discovered)

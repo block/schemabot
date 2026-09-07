@@ -23,6 +23,8 @@ type initField struct{ label, hint, value string }
 // The wizard edits a private draft. Only explicit confirmation copies it back;
 // initialize remains the sole registration and verification path (AZ-6).
 type initWizard struct {
+	checkingConnection, connectionChecked    bool
+	check                                    func(context.Context, string, string) error
 	fields                                   []initField
 	step, width                              int
 	height, scroll                           int
@@ -77,6 +79,7 @@ func (m *initWizard) Init() tea.Cmd {
 	return textinput.Blink
 }
 func (m *initWizard) loadField() {
+	m.connectionChecked = false
 	if m.step >= len(m.fields) {
 		m.input.Blur()
 		return
@@ -125,6 +128,20 @@ func (m *initWizard) validate() string {
 }
 func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case initConnectionMsg:
+		if msg.generation != m.generation || !m.checkingConnection {
+			return m, nil
+		}
+		m.checkingConnection = false
+		if m.cancelDiscovery != nil {
+			m.cancelDiscovery()
+		}
+		if msg.err != nil {
+			m.err = msg.err.Error()
+		} else {
+			m.connectionChecked = true
+		}
+		return m, nil
 	case initNamespacesMsg:
 		return m, m.acceptNamespaces(msg)
 	case tea.WindowSizeMsg:
@@ -132,12 +149,18 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = max(20, min(72, msg.Width-4))
 		m.input.Width = max(10, m.width-4)
 	case tea.KeyMsg:
+		if m.checkingConnection && msg.String() != "esc" && msg.String() != "ctrl+c" && msg.String() != "shift+tab" {
+			return m, nil
+		}
 		if m.step == 5 && !m.explicitNamespaces && msg.String() != "shift+tab" && msg.String() != "esc" && msg.String() != "ctrl+c" {
 			return m.namespaceKey(msg)
 		}
 		switch msg.String() {
 		case "ctrl+c", "esc":
 			m.cancelled = true
+			if m.cancelDiscovery != nil {
+				m.cancelDiscovery()
+			}
 			return m, tea.Quit
 		case "shift+tab":
 			m.editing = true
@@ -146,6 +169,7 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.generation++
 			m.discovering = false
+			m.checkingConnection = false
 			if m.step > 0 {
 				if m.step < len(m.fields) && m.step != 0 && (m.step != 5 || m.explicitNamespaces) {
 					m.fields[m.step].value = m.input.Value()
@@ -184,20 +208,28 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.err = m.validate(); m.err != "" {
 				return m, nil
 			}
+			if (m.step == 3 || m.step == 4) && !m.connectionChecked {
+				return m, tea.Batch(m.checkConnection(), m.spinner.Tick)
+			}
 			if m.step != 0 {
 				m.fields[m.step].value = strings.TrimSpace(m.input.Value())
 			}
 			return m, tea.Batch(m.advance(), textinput.Blink)
 		}
 	}
-	if m.discovering {
+	if m.discovering || m.checkingConnection {
 		var c tea.Cmd
 		m.spinner, c = m.spinner.Update(msg)
 		return m, c
 	}
 	if m.step > 0 && m.step < len(m.fields) {
 		var c tea.Cmd
+		before := m.input.Value()
 		m.input, c = m.input.Update(msg)
+		if m.input.Value() != before {
+			m.connectionChecked = false
+			m.err = ""
+		}
 		return m, c
 	}
 	return m, nil
@@ -242,12 +274,24 @@ func (m *initWizard) contentView() string {
 			if m.step == 3 || m.step == 4 {
 				b.WriteString(wrap.Render(initConnectionSummary(m.fields[0].value, m.input.Value())) + "\n\n")
 				b.WriteString(muted.Render("Credentials stay in your environment.") + "\n\n")
+				if m.checkingConnection {
+					b.WriteString(m.spinner.View() + " Checking connection…\n\n")
+				}
+				if m.connectionChecked {
+					b.WriteString(blue.Render("✓ Connected") + "\n\n")
+				}
 			}
 		}
 		if m.err != "" {
 			b.WriteString(wrap.Render(m.renderer.NewStyle().Foreground(lipgloss.Color("1")).Render(m.err)) + "\n\n")
+			if m.step == 3 || m.step == 4 {
+				b.WriteString(wrap.Render("Private network? Connect your VPN or tunnel, then retry here.") + "\n\n")
+			}
 		}
 		help := "enter continue · shift+tab back · esc cancel"
+		if (m.step == 3 || m.step == 4) && !m.connectionChecked {
+			help = "enter check connection · shift+tab back · esc cancel"
+		}
 		if m.step == 0 {
 			help = "↑/↓ choose · enter continue · esc cancel"
 		}

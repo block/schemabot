@@ -1,11 +1,16 @@
 package commands
 
 import (
+	"context"
 	"fmt"
+
 	"net"
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/block/schemabot/pkg/localsetup"
+	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/block/mysql"
 	"github.com/jackc/pgx/v5"
@@ -40,4 +45,27 @@ func initConnectionSummary(engine, ref string) string {
 		return "Connection variable found."
 	}
 	return fmt.Sprintf("Host: %q\nDatabase: %q", host, database)
+}
+
+type initConnectionMsg struct {
+	generation int
+	err        error
+}
+
+func (m *initWizard) checkConnection() tea.Cmd {
+	m.checkingConnection = true
+	m.connectionChecked = false
+	m.generation++
+	generation := m.generation
+	ctx := m.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, m.cancelDiscovery = context.WithCancel(ctx)
+	engine, dsn := m.fields[0].value, os.Getenv(strings.TrimPrefix(strings.TrimSpace(m.input.Value()), "env:"))
+	check := m.check
+	if check == nil {
+		check = localsetup.CheckConnection
+	}
+	return func() tea.Msg { return initConnectionMsg{generation, check(ctx, engine, dsn)} }
 }
