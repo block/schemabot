@@ -116,9 +116,9 @@ PANELS = {
         '<div class="sc-details"><div class="sc-label">3 successful checks ⌄</div>'
         '<div class="sc-entry"><span class="sc-tick">✓</span><span>ci / test</span><span class="sc-muted">— Successful</span></div>'
         '<div class="sc-entry"><span class="sc-tick">✓</span><img src="bot.png"><span>SchemaBot (staging)</span>'
-        '<span class="sc-muted">— Successful</span><span class="sc-required">Required</span><span class="sc-muted">···</span></div>'
+        '<span class="sc-muted">— All applies complete</span><span class="sc-required">Required</span><span class="sc-muted">···</span></div>'
         '<div class="sc-entry"><span class="sc-tick">✓</span><img src="bot.png"><span>SchemaBot (production)</span>'
-        '<span class="sc-muted">— Successful</span><span class="sc-required">Required</span><span class="sc-muted">···</span></div></div>'
+        '<span class="sc-muted">— All applies complete</span><span class="sc-required">Required</span><span class="sc-muted">···</span></div></div>'
         '<div class="sc-foot"><span class="sc-tick">✓</span>This branch has no conflicts with the base branch'
         '<span class="sc-button">Merge pull request</span></div></div>'
     ),
