@@ -8,15 +8,16 @@ GitHub's own markdown API renders each body to HTML (the same renderer a
 PR uses, syntax highlighting included), a thin GitHub-styled timeline frame is
 wrapped around the comments, and headless Chrome screenshots the result.
 
-Requirements: `gh` (authenticated), Google Chrome or Chromium, and ImageMagick
+Requirements: `gh` (authenticated, unless using `--prepared`), Google Chrome or Chromium, and ImageMagick
 (`magick`) for trimming. Output lands in assets/pr-mockups/ by default.
 
 Usage:
-    scripts/render-pr-mockups.py [--scenario NAME] [--out DIR] [--list]
+    scripts/render-pr-mockups.py [--scenario NAME] [--out DIR] [--list] [--prepared]
 """
 
 import argparse
 import html
+import json
 import os
 import re
 import shutil
@@ -73,7 +74,7 @@ body{margin:0;padding:24px;background:#fff;font-family:-apple-system,BlinkMacSys
 .bd p,.bd ul,.bd blockquote,.bd pre,.bd details,.bd table{margin:0 0 16px}
 .bd p:last-child,.bd pre:last-child,.bd details:last-child{margin-bottom:0}
 .bd code{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;font-size:85%;background:#f0f1f3;padding:.2em .4em;border-radius:6px}
-.bd pre{background:#f6f8fa;padding:16px;border-radius:6px;overflow:auto;font-size:85%;line-height:1.45}
+.bd pre{font-family:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;background:#f6f8fa;padding:16px;border-radius:6px;overflow:auto;font-size:85%;line-height:1.45}
 .bd pre code{background:none;padding:0;font-size:100%}
 .bd hr{height:.25em;border:0;background:#d1d9e0;margin:24px 0}
 .bd blockquote{border-left:.25em solid #d1d9e0;padding:0 1em;color:#59636e}
@@ -196,7 +197,7 @@ def comment(who, body_html, bot, when, reactions=()):
     )
 
 
-def build_frame(frame, sections, cache):
+def build_frame(frame, sections, cache, prepared=None):
     parts = []
     for item in frame.get("items", []):
         kind = item[0]
@@ -204,7 +205,14 @@ def build_frame(frame, sections, cache):
             _, anchor, when = item
             if anchor not in sections:
                 fail(f"anchor {anchor!r} not found in TEMPLATES.md")
-            parts.append(comment("schemabot", render_markdown(prepare(sections[anchor]), cache), True, when))
+            if prepared is None:
+                body = render_markdown(prepare(sections[anchor]), cache)
+            else:
+                key = {"mysql-plan": "plan", "schema-change-apply-automatic": "apply", "single-table-running": "running", "summary-completed": "summary"}[anchor]
+                body = prepared[key]
+                for token, value in {"DEMOVALUEBARTOKEN": "🟦" * 12 + "⬜" * 8, "DEMOVALUEPERCENTTOKEN": "60.00", "DEMOVALUEROWSTOKEN": "4,320,000", "DEMOVALUEETATOKEN": "2m 12s"}.items():
+                    body = body.replace(token, value)
+            parts.append(comment("schemabot", body, True, when))
         elif kind == "human":
             _, text, when, reactions = item
             parts.append(comment("octocat", f"<p>{html.escape(text)}</p>", False, when, reactions))
@@ -248,6 +256,7 @@ def screenshot(chrome, html_path, png_path):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--prepared", action="store_true", help="use the committed GitHub-rendered demo comments without network access")
     ap.add_argument("--scenario", help="render only this scenario")
     ap.add_argument("--out", default=DEFAULT_OUT, help="output directory")
     ap.add_argument("--list", action="store_true", help="list scenarios and frames")
@@ -266,6 +275,10 @@ def main():
             fail(f"unknown scenario {args.scenario!r}; see --list")
         scenarios = {args.scenario: SCENARIOS[args.scenario]}
 
+    prepared = None
+    if args.prepared:
+        with open(os.path.join(REPO_ROOT, "assets/src/pr-workflow-comments.js"), encoding="utf-8") as f:
+            prepared = json.loads(f.read().split("window.COMMENTS = ", 1)[1].rstrip(";\n"))
     sections = load_sections()
     chrome = find_chrome()
     os.makedirs(args.out, exist_ok=True)
@@ -277,7 +290,7 @@ def main():
                 stem = f"{name}-{n}-{frame['name']}"
                 html_path = os.path.join(work, stem + ".html")
                 with open(html_path, "w", encoding="utf-8") as f:
-                    f.write(build_frame(frame, sections, cache))
+                    f.write(build_frame(frame, sections, cache, prepared))
                 png_path = os.path.join(args.out, stem + ".png")
                 screenshot(chrome, html_path, png_path)
                 print(os.path.relpath(png_path, REPO_ROOT))

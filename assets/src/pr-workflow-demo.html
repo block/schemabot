@@ -39,14 +39,10 @@ window.renderFrame=function(t,frameSeconds=1/12){
  document.getElementById('conversation').classList.toggle('hidden',showingDiff);
  document.querySelectorAll('.tabs>span').forEach((tab,i)=>tab.classList.toggle('selected',i===(showingDiff?3:0)));
  if(showingDiff){page.scrollTop=0;previousScroll=0;content.style.transform='';return;}
- for(const [id,start] of [['command',3],['apply',8],['progress',10],['summary',23]])document.getElementById(id).classList.toggle('hidden',t<start);
+ for(const [id,start] of [['command',3],['apply',7.5],['progress',10],['summary',23]])document.getElementById(id).classList.toggle('hidden',t<start);
  const commandBody=document.getElementById('command-body');
- if(t<7)commandBody.style.minHeight='';
- else if(t<8)commandBody.style.minHeight=commandBody.dataset.editorHeight||'232px';
- else commandBody.style.minHeight='';
  if(t<7){let typed=command.slice(0,Math.floor(clamp((t-3.8)/2.4)*command.length));setHTML(commandBody,`<div class="editor-tabs"><b>Write</b><span class="tiny">Preview</span></div><div class="editor">${typed}<span class="caret" style="opacity:${Math.floor(t*2)%2}"> </span></div><div class="editor-foot"><span>Markdown is supported</span><button class="btn ${t>6.8?'pressed':''}" id="post">Comment</button></div>`);commandBody.style.padding='0'}
  else {commandBody.style.padding='16px';setHTML(commandBody,`<p>${command}</p>${t>=7.5?'<span class="rx"><span>👀 1</span></span>':''}`)}
- if(t<7)commandBody.dataset.editorHeight=`${commandBody.offsetHeight}px`;
  let p=Math.round(clamp((t-10)/10)*100); // Whole polling updates, followed by a visible 100% frame.
  p=t>=20?100:Math.floor(p/4)*4;
  const bars='🟦'.repeat(Math.round(p/5))+'⬜'.repeat(20-Math.round(p/5));
@@ -75,11 +71,12 @@ window.renderFrame=function(t,frameSeconds=1/12){
 
  const state=document.getElementById('state');state.textContent=t>=29?'Merged':'Open';state.style.background=t>=29?'#8250df':'#1f883d';
  setHTML(document.getElementById('prmeta'),t>=29?'<b>octocat</b> merged 1 commit into <code>main</code> from <code>add-user-index</code>':'<b>octocat</b> wants to merge 1 commit into <code>main</code> from <code>add-user-index</code>');
- let target=t<3?'checks':t<8?'command':t<10?'apply':t<23?'progress':t<25?'summary':'checks';
+ let target=t<3?'checks':t<7.5?'command':t<10?'apply':t<23?'progress':t<25?'summary':'checks';
  const el=document.getElementById(target),r=el.getBoundingClientRect(),vr=page.getBoundingClientRect();
  let desired=Math.min(Math.max(0,content.offsetHeight+64-page.clientHeight),Math.max(0,Math.round(previousScroll)+r.top-vr.top-20));
- if(t>=20)desired=Math.max(previousScroll,desired);
- if(t===0)previousScroll=Math.max(0,desired);
+ if(t>=7)desired=Math.max(previousScroll,desired);
+ // Switching tabs starts at the PR header, then scrolls to the plan.
+ if(t<1)desired=0;
  // Smooth camera motion, like scrolling a real conversation; retain the thread.
  const scrollStep=(desired-previousScroll)*(1-Math.pow(0.72,frameSeconds*12));
  previousScroll+=Math.max(-500*frameSeconds,Math.min(500*frameSeconds,scrollStep));
