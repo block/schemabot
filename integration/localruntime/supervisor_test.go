@@ -28,7 +28,7 @@ import (
 )
 
 // Independent CLI invocations share one detached runtime. The same profile
-// carries a real plan and apply on either engine, then reconnects after a
+// carries a real plan, apply, and verified schema import on either engine, then reconnects after a
 // graceful stop without losing completed work.
 func TestSupervisorEngines(t *testing.T) {
 	binary := filepath.Join(t.TempDir(), "schemabot")
@@ -123,6 +123,22 @@ func TestSupervisorEngines(t *testing.T) {
 			var count int
 			require.NoError(t, db.QueryRowContext(verifyCtx, "SELECT COUNT(*) FROM widgets").Scan(&count))
 			assert.Zero(t, count)
+			// The imported files must plan back to an unchanged live database.
+			// Exercise the CLI's default verification, including engine inference.
+			schemaRoot := t.TempDir()
+			onboardCtx, cancelOnboard := context.WithTimeout(t.Context(), runtimeDeadline)
+			defer cancelOnboard()
+			onboard := exec.CommandContext(onboardCtx, binary, "onboard", "--profile", "alpha", "-d", "app", "-e", "development", "-s", schemaRoot, "--namespace", namespace)
+			onboard.Env = append(os.Environ(), "HOME="+home, "SCHEMABOT_ENDPOINT=", "SCHEMABOT_TOKEN=", "SCHEMABOT_PROFILE=")
+			output, err := onboard.CombinedOutput()
+			require.NoError(t, err, string(output))
+			assert.Contains(t, string(output), "Verified: pulled schema produces no schema changes in the source environment.")
+			config, err := os.ReadFile(filepath.Join(schemaRoot, "schemabot.yaml"))
+			require.NoError(t, err)
+			assert.Equal(t, "database: app\ntype: "+engine+"\n", string(config))
+			schema, err := os.ReadFile(filepath.Join(schemaRoot, namespace, "widgets.sql"))
+			require.NoError(t, err)
+			assert.Contains(t, string(schema), "widgets")
 			require.NoError(t, manager.Stop(verifyCtx))
 			record, err := manager.Status(verifyCtx)
 			require.NoError(t, err)

@@ -204,8 +204,10 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 	if strings.TrimSpace(resp.Database) == "" {
 		return nil, fmt.Errorf("pull schema response database is empty")
 	}
-	if resp.Type != storage.DatabaseTypeMySQL && resp.Type != storage.DatabaseTypeVitess {
-		return nil, fmt.Errorf("onboard currently supports %s and %s databases; got %s", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, resp.Type)
+	switch resp.Type {
+	case storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypePostgres:
+	default:
+		return nil, fmt.Errorf("onboard currently supports %s, %s, and %s databases; got %s", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypePostgres, resp.Type)
 	}
 	if len(resp.Namespaces) == 0 {
 		return nil, fmt.Errorf("pull schema returned no tables for database %s environment %s", resp.Database, resp.Environment)

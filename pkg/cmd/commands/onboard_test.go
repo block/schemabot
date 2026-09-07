@@ -410,3 +410,25 @@ func validPullSchemaResponse() *apitypes.PullSchemaResponse {
 		},
 	}
 }
+
+// PostgreSQL pull output includes quoted identifiers and index statements in the
+// table file. Import it verbatim so verification plans the same desired schema.
+func TestBuildOnboardWritePlanPostgres(t *testing.T) {
+	root := t.TempDir()
+	ddl := "CREATE TABLE \"Order\" (\n  \"id\" bigint NOT NULL PRIMARY KEY,\n  \"name\" text NOT NULL\n);\nCREATE INDEX \"idx_name\" ON \"Order\" (\"name\");\n"
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database: "app", Type: "postgres", Environment: "development", TableCount: 1,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"public": {Tables: map[string]string{"Order": ddl}},
+		},
+	}, nil)
+	require.NoError(t, err)
+	require.NoError(t, plan.write())
+	config, err := os.ReadFile(filepath.Join(root, "schemabot.yaml"))
+	require.NoError(t, err)
+	assert.Equal(t, "database: app\ntype: postgres\n", string(config))
+	contents, err := os.ReadFile(filepath.Join(root, "public", "Order.sql"))
+	require.NoError(t, err)
+	assert.Equal(t, ddl, string(contents))
+	assert.Equal(t, "postgres", plan.databaseType)
+}
