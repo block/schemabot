@@ -23,6 +23,7 @@ import (
 // Both routes use the same initialization workflow.
 type InitCmd struct {
 	NonInteractive bool         `name:"non-interactive" help:"Never prompt; report missing inputs instead"`
+	interactive    bool         `kong:"-"`
 	progress       func(string) `kong:"-"`
 	ReuseSchema    bool         `name:"reuse-schema" help:"Verify existing desired files without replacing them"`
 	Database       string       `short:"d" help:"Name to register for this database"`
@@ -53,7 +54,7 @@ func (cmd *InitCmd) Run(ctx context.Context, g *Globals) error {
 		}
 		return err
 	}
-	result, err := cmd.initialize(ctx, g)
+	result, err := cmd.initializeWithUI(ctx, g)
 	if err != nil {
 		if cmd.JSON {
 			return client.ExitWithJSON("initialization_error", err.Error())
@@ -63,7 +64,9 @@ func (cmd *InitCmd) Run(ctx context.Context, g *Globals) error {
 	if cmd.JSON {
 		return json.NewEncoder(os.Stdout).Encode(result)
 	}
-	fmt.Printf("Schema ready in %s.\nBaseline plan: no changes.\nProfile %q is ready. Edit the schema, then run a plan.\n", cmd.SchemaDir, result.Profile)
+	display := *result
+	display.SchemaDir = cmd.SchemaDir
+	fmt.Print(initCompletion(&display, cmd.Environment))
 	return nil
 }
 

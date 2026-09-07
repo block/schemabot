@@ -92,6 +92,7 @@ require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/aquarapid/vaultlib v0.5.1 // indirect
 	github.com/armon/go-metrics v0.4.1 // indirect
+	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.21 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.36 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.36 // indirect
