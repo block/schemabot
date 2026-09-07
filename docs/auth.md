@@ -191,6 +191,13 @@ github:
 Replace `123456` with your App ID. Make the downloaded private key available
 at that path on the server, and set `GITHUB_WEBHOOK_SECRET` in the server's
 environment to the same secret you entered in the App's webhook settings.
+Both `private-key` and `webhook-secret` accept `file:` and `env:` references;
+the example mixes them only to show the two options. Use whichever fits your
+hosting setup—for example, `env:GITHUB_APP_PRIVATE_KEY` for the key or
+`file:/run/secrets/github-webhook-secret` for the webhook secret. See
+[Secret resolution](configuration.md#secret-resolution) for supported sources
+and formats.
+
 The private key authenticates SchemaBot to GitHub; the webhook secret verifies
 incoming deliveries. They are different credentials.
 

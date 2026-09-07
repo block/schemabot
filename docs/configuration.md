@@ -1656,7 +1656,9 @@ Operator commands inherit this scoping: a Check Run scan or backfill resolves ea
 
 ## Secret Resolution
 
-DSN values support secret resolution prefixes:
+Database DSNs and GitHub credentials (`private-key` and `webhook-secret`)
+support these secret resolution prefixes. Choose the source that fits your
+hosting setup; neither credential requires a particular source:
 
 | Prefix | Example | Description |
 |---|---|---|
