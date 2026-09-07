@@ -312,17 +312,14 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 		return fmt.Errorf("process pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if resp == nil {
-		errorMessage := "not accepted"
+		errorMessage := "the cutover path returned neither a response nor an error"
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
 			return err
 		}
 		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, errorMessage)
 	}
 	if !resp.Accepted {
-		errorMessage := "not accepted"
-		if resp.ErrorMessage != "" {
-			errorMessage = resp.ErrorMessage
-		}
+		errorMessage := controlRefusalMessage(storage.ControlOperationCutover, resp.ErrorMessage)
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
 			return err
 		}
@@ -371,12 +368,21 @@ func (c *LocalClient) requestCancel(ctx context.Context, req *ternv1.CancelReque
 		return nil, fmt.Errorf("schema change %s is already terminal (state: %s)", apply.ApplyIdentifier, apply.State)
 	}
 
+	// A revert-phase apply has already cut over, so this is a decision about the
+	// schema change rather than a failure to act on it. It answers as a refusal
+	// and not an error: a caller on the far side of a plane boundary sees every
+	// error as one generic internal status, so it cannot tell this apart from a
+	// transient failure and leaves its durable request pending to re-send the
+	// same doomed cancel on every later claim.
 	if revertPhase, err := c.applyRevertPhaseBlock(ctx, apply); err != nil {
 		return nil, err
 	} else if revertPhase != "" {
-		c.logger.Warn("cancel rejected: schema change is in a revert phase and has already cut over",
+		c.logger.Warn("cancel refused: schema change is in a revert phase and has already cut over",
 			"apply_id", apply.ApplyIdentifier, "state", apply.State, "revert_phase", revertPhase)
-		return nil, errors.New(revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase))
+		return &ternv1.CancelResponse{
+			Accepted:     false,
+			ErrorMessage: revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase),
+		}, nil
 	}
 
 	controlStore := c.storage.ControlRequests()
@@ -426,14 +432,20 @@ func (c *LocalClient) requestStop(ctx context.Context, req *ternv1.StopRequest, 
 		return nil, fmt.Errorf("no active schema change")
 	}
 
+	// A revert-phase apply has already cut over, so this is a decision about the
+	// schema change rather than a failure to act on it, and it answers as a
+	// refusal for the same reason the cancel path does.
 	if revertPhase, err := c.applyRevertPhaseBlock(ctx, apply); err != nil {
 		return nil, err
 	} else if revertPhase != "" {
-		c.logger.Warn("stop rejected: schema change is in a revert phase and has already cut over",
+		c.logger.Warn("stop refused: schema change is in a revert phase and has already cut over",
 			"apply_id", apply.ApplyIdentifier,
 			"state", apply.State,
 			"revert_phase", revertPhase)
-		return nil, errors.New(revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase))
+		return &ternv1.StopResponse{
+			Accepted:     false,
+			ErrorMessage: revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase),
+		}, nil
 	}
 
 	controlStore := c.storage.ControlRequests()
@@ -1084,6 +1096,32 @@ func (c *LocalClient) failPendingRequestForUnsupportedOperation(ctx context.Cont
 	return true, nil
 }
 
+// failRefusedControlRequest resolves a pending control request that the stop or
+// cancel path answered with an explicit refusal. The refusal is a decision, not
+// a delivery failure: the request is already recorded durably, so a later claim
+// can only re-send it and collect the same refusal while the schema change keeps
+// running unwatched. Failing it with the stated reason ends that loop and leaves
+// the operator a request whose answer they can read.
+//
+// The refusal means the operation did not take effect, so callers report the
+// request as not handled: the drive would otherwise record an operator stop or
+// cancel over a change that is still running.
+func (c *LocalClient) failRefusedControlRequest(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, errorMessage string) error {
+	message := controlRefusalMessage(operation, errorMessage)
+	caller := controlRequestCaller(controlReq)
+	logger.Warn("rejecting pending control request: the operation was refused; the schema change continues and settles on its own",
+		"operation", string(operation),
+		"requested_by", caller,
+		"state", apply.State,
+		"error_message", message)
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, eventType, storage.LogSourceSchemaBot,
+		fmt.Sprintf("Pending %s request rejected: %s%s", operation, message, callerApplyLogSuffix(caller)), "", "")
+	if err := failPendingControlRequests(ctx, c.storage, apply, operation, message); err != nil {
+		return fmt.Errorf("process pending %s for apply %s: refused with %q; fail pending %s request: %w", operation, apply.ApplyIdentifier, message, operation, err)
+	}
+	return nil
+}
+
 func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply) (bool, error) {
 	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop)
 	if err != nil {
@@ -1151,12 +1189,15 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		}
 		return true, fmt.Errorf("process pending stop for apply %s: %w", apply.ApplyIdentifier, err)
 	}
-	if resp == nil || !resp.Accepted {
-		errorMessage := "not accepted"
-		if resp != nil && resp.ErrorMessage != "" {
-			errorMessage = resp.ErrorMessage
-		}
-		return true, fmt.Errorf("process pending stop for apply %s: %s", apply.ApplyIdentifier, errorMessage)
+	if resp == nil {
+		return true, fmt.Errorf("process pending stop for apply %s: the stop path returned neither a response nor an error", apply.ApplyIdentifier)
+	}
+	if !resp.Accepted {
+		// The refusal is the answer, so resolve the request on it. Returning an
+		// error would leave the request pending and every later claim would
+		// collect the same refusal while the schema change kept running.
+		// Report the stop as not handled: none took effect.
+		return false, c.failRefusedControlRequest(stopCtx, logger, apply, storage.ControlOperationStop, storage.LogEventStopRequested, controlReq, resp.ErrorMessage)
 	}
 	completed, err := completePendingRequestIfStoredApplyResolved(stopCtx, c.storage, apply, storage.ControlOperationStop)
 	if err != nil {
@@ -1226,12 +1267,13 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 		}
 		return true, fmt.Errorf("process pending cancel for apply %s: %w", apply.ApplyIdentifier, err)
 	}
-	if resp == nil || !resp.Accepted {
-		errorMessage := "not accepted"
-		if resp != nil && resp.ErrorMessage != "" {
-			errorMessage = resp.ErrorMessage
-		}
-		return true, fmt.Errorf("process pending cancel for apply %s: %s", apply.ApplyIdentifier, errorMessage)
+	if resp == nil {
+		return true, fmt.Errorf("process pending cancel for apply %s: the cancel path returned neither a response nor an error", apply.ApplyIdentifier)
+	}
+	if !resp.Accepted {
+		// See the stop counterpart: the refusal resolves the request, and the
+		// cancel is reported as not handled because none took effect.
+		return false, c.failRefusedControlRequest(cancelCtx, logger, apply, storage.ControlOperationCancel, storage.LogEventCancelRequested, controlReq, resp.ErrorMessage)
 	}
 	completed, err := completePendingRequestIfStoredApplyResolved(cancelCtx, c.storage, apply, storage.ControlOperationCancel)
 	if err != nil {
@@ -2048,6 +2090,10 @@ func (c *LocalClient) Revert(ctx context.Context, req *ternv1.RevertRequest) (*t
 	}
 	c.logger.Info("sending revert request to engine", task.LogAttrs()...)
 	if _, err = eng.Revert(ctx, controlReq); err != nil {
+		if unsupported, ok := engine.AsUnsupportedOperation(err); ok {
+			c.logDeclinedControlOperation(task, "revert", unsupported)
+			return &ternv1.RevertResponse{Accepted: false, ErrorMessage: unsupported.Error()}, nil
+		}
 		return nil, fmt.Errorf("revert failed: %w", err)
 	}
 	c.logger.Info("engine accepted the revert request", task.LogAttrs()...)
@@ -2067,10 +2113,27 @@ func (c *LocalClient) SkipRevert(ctx context.Context, req *ternv1.SkipRevertRequ
 	}
 	c.logger.Info("sending skip-revert request to engine", task.LogAttrs()...)
 	if _, err = eng.SkipRevert(ctx, controlReq); err != nil {
+		if unsupported, ok := engine.AsUnsupportedOperation(err); ok {
+			c.logDeclinedControlOperation(task, "skip-revert", unsupported)
+			return &ternv1.SkipRevertResponse{Accepted: false, ErrorMessage: unsupported.Error()}, nil
+		}
 		return nil, fmt.Errorf("skip revert failed: %w", err)
 	}
 	c.logger.Info("engine accepted the skip-revert request", task.LogAttrs()...)
 	return &ternv1.SkipRevertResponse{Accepted: true}, nil
+}
+
+// logDeclinedControlOperation records an engine declining a control operation
+// for its whole database type. The decline is returned to the caller as a
+// refused response rather than an error, because an error is the one shape that
+// cannot survive the RPC boundary: the gRPC server maps every error to a
+// generic internal status, and the caller cannot tell a deterministic refusal
+// from a transient failure, so it retries a request no retry can ever satisfy.
+// A refusal carries its reason to both the immediate caller and the durable
+// control request, which resolves on it.
+func (c *LocalClient) logDeclinedControlOperation(task *storage.Task, operation string, err error) {
+	c.logger.Warn("the engine does not support this control operation; refusing it so the request resolves instead of retrying",
+		append(task.LogAttrs(), "operation", operation, "error", err)...)
 }
 
 // getActiveTaskForDatabase finds the first non-terminal task for a database.

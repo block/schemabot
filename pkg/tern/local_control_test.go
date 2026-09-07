@@ -399,6 +399,82 @@ func TestLocalClient_CancelQueuesCancelRequestForApplyOwner(t *testing.T) {
 	assert.Equal(t, apply.Environment, wakeEnvironment)
 }
 
+// A cancel that lands on an apply already past cutover is a decision about the
+// schema change, not a failure to deliver the command. It answers as a refusal
+// carrying the reason, so a control plane on the far side of the RPC boundary
+// can resolve its durable request instead of reading a generic internal error
+// and re-sending the same doomed cancel on every later claim. No request is
+// queued: nothing is going to consume it.
+func TestLocalClient_CancelRefusesRevertWindowWithAReason(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-vitess-revert-window-cancel",
+		State:           state.Apply.RevertWindow,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-vitess-revert-window-cancel",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.RevertWindow,
+	}
+	eng := &controlCaptureEngine{}
+	client := newVitessControlTestClient(apply, []*storage.Task{task}, nil, eng)
+
+	resp, err := client.Cancel(t.Context(), &ternv1.CancelRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.NoError(t, err, "a refusal is an answer, not a transport failure")
+	require.NotNil(t, resp)
+	assert.False(t, resp.Accepted)
+	assert.Equal(t, "schema change apply-vitess-revert-window-cancel is in the revert window and has already been applied: use revert to undo it or skip-revert to finalize it", resp.ErrorMessage)
+	assert.NotContains(t, resp.ErrorMessage, task.TaskIdentifier, "the refusal names the apply identifier, not the per-table task id")
+	assert.Nil(t, eng.cancelReq, "a refused cancel must not touch the engine")
+	assert.Equal(t, state.Apply.RevertWindow, apply.State, "a refused cancel must not move the apply")
+	controlReq, err := client.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq, "a refused cancel queues nothing for an owner to consume")
+}
+
+// Stop refuses a revert-phase apply for the same reason cancel does, and on the
+// same shape: the reason travels in the response so the caller can resolve its
+// durable request rather than retry a command the apply can never accept.
+func TestLocalClient_StopRefusesRevertWindowWithAReason(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-revert-window-stop-refusal",
+		State:           state.Apply.RevertWindow,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-revert-window-stop-refusal",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.RevertWindow,
+	}
+	eng := &controlCaptureEngine{}
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, eng)
+
+	resp, err := client.Stop(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.NoError(t, err, "a refusal is an answer, not a transport failure")
+	require.NotNil(t, resp)
+	assert.False(t, resp.Accepted)
+	assert.Equal(t, "schema change apply-revert-window-stop-refusal is in the revert window and has already been applied: use revert to undo it or skip-revert to finalize it", resp.ErrorMessage)
+	assert.Nil(t, eng.stopReq, "a refused stop must not touch the engine")
+	assert.Equal(t, state.Apply.RevertWindow, apply.State, "a refused stop must not move the apply")
+	controlReq, err := client.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq, "a refused stop queues nothing for an owner to consume")
+}
+
 // Apply-owner stop is only authoritative after the local Spirit runner stops.
 // If the engine cannot stop, storage must remain active so user-facing status
 // does not diverge from a runner that is still copying rows.
@@ -2175,4 +2251,80 @@ func TestLocalClient_StartDistinguishesAFinishedApplyFromAMissingOne(t *testing.
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "already reached a terminal state")
 	assert.NotContains(t, err.Error(), "state start cannot act on")
+}
+
+// An engine that declines an operation for its whole database type has given a
+// deterministic answer, and the RPC surface has to express it as a refusal. An
+// error is the one shape that cannot cross the boundary: the gRPC server maps
+// every error to a generic internal status, so the caller cannot tell a
+// permanent decline from a transient failure and retries a request that can
+// never succeed.
+func TestLocalClientRevertWindowDeclinesAreRefusalsNotErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		decline error
+		call    func(*LocalClient) (bool, string, error)
+		reason  string
+	}{
+		{
+			name:    "revert",
+			decline: engine.NewUnsupportedOperationError("revert is not supported for these schema changes"),
+			reason:  "revert is not supported",
+			call: func(c *LocalClient) (bool, string, error) {
+				resp, err := c.Revert(t.Context(), &ternv1.RevertRequest{Environment: "staging"})
+				if resp == nil {
+					return false, "", err
+				}
+				return resp.Accepted, resp.ErrorMessage, err
+			},
+		},
+		{
+			name:    "skip-revert",
+			decline: engine.NewUnsupportedOperationError("skip-revert is not supported for these schema changes"),
+			reason:  "skip-revert is not supported",
+			call: func(c *LocalClient) (bool, string, error) {
+				resp, err := c.SkipRevert(t.Context(), &ternv1.SkipRevertRequest{Environment: "staging"})
+				if resp == nil {
+					return false, "", err
+				}
+				return resp.Accepted, resp.ErrorMessage, err
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newDecliningControlLocalClient(tc.decline)
+			accepted, message, err := tc.call(client)
+			require.NoError(t, err, "a deterministic decline must not surface as an error the caller would retry")
+			assert.False(t, accepted, "the operation was declined")
+			assert.Contains(t, message, tc.reason, "the refusal carries the engine's reason to the caller")
+		})
+	}
+}
+
+// newDecliningControlLocalClient builds a client whose engine declines the
+// revert-window controls for its whole database type.
+func newDecliningControlLocalClient(decline error) *LocalClient {
+	apply := &storage.Apply{
+		ID: 1, ApplyIdentifier: "apply-decline", Database: "testdb",
+		Environment: "staging", State: state.Apply.RevertWindow,
+	}
+	task := &storage.Task{
+		ID: 1, ApplyID: apply.ID, TaskIdentifier: "task-decline",
+		Database: "testdb", Namespace: "testdb", TableName: "users", State: state.Task.RevertWindow,
+	}
+	return &LocalClient{
+		config: LocalConfig{
+			Database:  "testdb",
+			Type:      storage.DatabaseTypeMySQL,
+			TargetDSN: "root@tcp(localhost:3306)/",
+		},
+		storage: &controlTestStorage{
+			applies:         &controlTestApplyStore{apply: apply},
+			tasks:           &controlTestTaskStore{tasks: []*storage.Task{task}},
+			applyLogs:       &controlTestApplyLogStore{},
+			controlRequests: &testControlRequestStore{},
+		},
+		spiritEngine: &fakeControlEngine{revertErr: decline, skipRevertErr: decline},
+		logger:       slog.Default(),
+	}
 }

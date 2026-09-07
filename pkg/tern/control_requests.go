@@ -105,6 +105,17 @@ func failPendingControlRequests(ctx context.Context, store storage.Storage, appl
 	return nil
 }
 
+// controlRefusalMessage renders the reason the executing side gave for refusing
+// a control request. A refusal that arrives without a reason still has to read
+// as an answer to the operator's command rather than a bare "not accepted", so
+// the fallback names the operation that was refused.
+func controlRefusalMessage(operation storage.ControlOperation, errorMessage string) string {
+	if errorMessage == "" {
+		return fmt.Sprintf("%s was refused with no reason given", operation)
+	}
+	return errorMessage
+}
+
 func markApplyCuttingOverForControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply, logger *slog.Logger) error {
 	if !state.IsState(apply.State, state.Apply.WaitingForCutover) && !state.IsRunningApplyState(apply.State) {
 		return nil

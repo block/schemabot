@@ -879,12 +879,23 @@ rather than being retried forever, and polling windows are bounded with visible 
 An operation an engine declines for its whole database type is one of these doomed commands, so
 every engine states that decline in the type system rather than as a generic failure, and the
 drive resolves the request with the engine's reason instead of reattempting it.
+
+A refusal from the executing side is one of those outcomes too, not a failed delivery. The request
+is already recorded durably, so a drive that answers a refusal with an error only leaves it pending
+for the next claim to re-send and be refused again. The drive fails the request with the stated
+reason instead. A refused stop or cancel is a decision about a schema change that is still running,
+so those two drives additionally report the request as not handled and keep driving.
+
+A decline the operator's request has to cross a plane boundary to collect is stated on the RPC
+surface as a refusal rather than an error, because the gRPC server maps every error to one generic
+internal status and the caller cannot tell a deterministic decline from a transient failure.
 *Breaks if violated:* an apply loops on a doomed command while holding its database lock.
 *Enforced:* request completion and bounded-retry rules in the drive loop (`pkg/api/operator.go`,
-`pkg/tern/control_requests.go`), and the terminal resolution of a typed unsupported-operation
+`pkg/tern/control_requests.go`), the terminal resolution of a typed unsupported-operation
 decline (`failPendingRequestForUnsupportedOperation`, `pkg/tern/local_control.go`), reached from
 the stop and cancel paths in that file and from the revert and skip-revert paths in
-`pkg/tern/local_apply_grouped.go`.
+`pkg/tern/local_apply_grouped.go`, and the refusal paths of the pending stop, cancel, and cutover
+processors on both clients (`pkg/tern/local_control.go`, `pkg/tern/grpc_client.go`).
 
 ### CO-3: Engine terminal truth outranks a queued command
 
