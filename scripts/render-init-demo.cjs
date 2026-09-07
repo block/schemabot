@@ -9,7 +9,8 @@ const {chromium}=require('playwright');
  const root=path.resolve(__dirname,'..'),tmp=fs.mkdtempSync(path.join(os.tmpdir(),'init-gif-'));
  const recording=JSON.parse(fs.readFileSync(path.join(root,'assets/src/init-demo-recording.json')));
  if(!recording.wizard.includes('Baseline plan: no changes.')||!recording.plan.includes('MODIFY COLUMN'))throw new Error('Record a successful real wizard and plan first');
- const browser=await chromium.launch({headless:true,executablePath:process.env.CHROME||'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'});
+ const chrome=process.env.CHROME||'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+ const browser=await chromium.launch({headless:true,...(fs.existsSync(chrome)?{executablePath:chrome}:{})});
  try{
   const page=await browser.newPage({viewport:{width:1100,height:820},deviceScaleFactor:1});
   await page.goto(pathToFileURL(path.join(root,'assets/src/init-demo.html')).href);
