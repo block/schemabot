@@ -231,7 +231,9 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 			return nil, fmt.Errorf("pulled namespace %s is empty", namespace)
 		}
 		if len(pulled.Tables) == 0 && len(pulled.Artifacts) == 0 {
-			return nil, fmt.Errorf("pulled namespace %s contains no tables or artifacts", namespace)
+			// Keep empty scope explicit: a comment-only SQL file declares no tables
+			// while preserving the namespace for future plans and version control.
+			files[filepath.Join(namespace, "schema.sql")] = "-- This namespace is empty. Add CREATE TABLE declarations here.\n"
 		}
 		tableNames := make([]string, 0, len(pulled.Tables))
 		for tableName := range pulled.Tables {

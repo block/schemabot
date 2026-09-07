@@ -108,11 +108,37 @@ func TestInitEngines(t *testing.T) {
 			after, err := os.ReadFile(schemaPath)
 			require.NoError(t, err)
 			require.Equal(t, edited, after)
+			// Explicit reuse accepts harmless formatting/comments without replacing files.
+			require.NoError(t, os.Remove(filepath.Join(root, namespace, "notes.sql")))
+			output, err = run(append(slices.Clone(args), "--reuse-schema")...)
+			require.NoError(t, err, string(output))
+			after, err = os.ReadFile(schemaPath)
+			require.NoError(t, err)
+			require.Equal(t, edited, after)
+
 			ctx, cancel := context.WithTimeout(t.Context(), runtimeDeadline)
 			defer cancel()
 			var name string
 			require.NoError(t, db.QueryRowContext(ctx, "SELECT name FROM widgets WHERE id = 1").Scan(&name))
 			require.Equal(t, "keep me", name)
+			// An explicitly empty live namespace is a valid starting point.
+			execSQL(t, db, "DROP TABLE widgets")
+			blankRoot := filepath.Join(t.TempDir(), "schema")
+			blankArgs := slices.Clone(args)
+			blankArgs[slices.Index(blankArgs, "--schema-dir")+1] = blankRoot
+			output, err = run(blankArgs...)
+			require.NoError(t, err, string(output))
+			var blank struct {
+				Tables   int  `json:"tables"`
+				Verified bool `json:"verified"`
+			}
+			require.NoError(t, json.Unmarshal(output, &blank))
+			require.Zero(t, blank.Tables)
+			require.True(t, blank.Verified)
+			marker, err := os.ReadFile(filepath.Join(blankRoot, namespace, "schema.sql"))
+			require.NoError(t, err)
+			require.Contains(t, string(marker), "-- This namespace is empty")
+
 		})
 	}
 }

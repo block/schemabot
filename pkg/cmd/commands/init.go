@@ -21,6 +21,7 @@ import (
 // InitCmd uses explicit inputs for the shared initialization workflow. A future
 // wizard can collect the same inputs without implementing a second setup path.
 type InitCmd struct {
+	ReuseSchema bool     `name:"reuse-schema" help:"Verify existing desired files without replacing them"`
 	Database    string   `short:"d" required:"" help:"Name to register for this database"`
 	Environment string   `short:"e" required:"" help:"Environment to initialize"`
 	Type        string   `required:"" enum:"mysql,postgres" help:"Database engine: mysql or postgres"`
@@ -128,14 +129,22 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 	if err != nil {
 		return nil, fmt.Errorf("import live schema: %w", err)
 	}
-	plan, err := buildOnboardWritePlan(stage, pulled, nil)
-	if err != nil {
-		return nil, err
+	var ignored []string
+	if cmd.ReuseSchema {
+		ignored, err = stageExistingInitSchema(root, stage, cmd.Database, cmd.Type, cmd.Environment, namespaces)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		plan, err := buildOnboardWritePlan(stage, pulled, nil)
+		if err != nil {
+			return nil, err
+		}
+		if err := plan.write(); err != nil {
+			return nil, err
+		}
 	}
-	if err := plan.write(); err != nil {
-		return nil, err
-	}
-	baseline, _, err := client.CallPlanAPI(connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, stage, "", 0, nil, false)
+	baseline, _, err := client.CallPlanAPI(connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, stage, "", 0, ignored, false)
 	if err != nil {
 		return nil, fmt.Errorf("verify baseline: %w", err)
 	}

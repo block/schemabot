@@ -240,19 +240,6 @@ func TestBuildOnboardWritePlanRejectsInvalidPullResponse(t *testing.T) {
 			},
 			want: "returned no tables",
 		},
-		{
-			name:       "empty namespace",
-			schemaRoot: t.TempDir(),
-			resp: &apitypes.PullSchemaResponse{
-				Database:    "orders",
-				Type:        "mysql",
-				Environment: "production",
-				Namespaces: map[string]*apitypes.PulledNamespace{
-					"orders": {Tables: map[string]string{}},
-				},
-			},
-			want: "contains no tables or artifacts",
-		},
 	}
 
 	for _, tt := range tests {
@@ -431,4 +418,15 @@ func TestBuildOnboardWritePlanPostgres(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, ddl, string(contents))
 	assert.Equal(t, "postgres", plan.databaseType)
+}
+
+func TestBuildOnboardWritePlanEmptyNamespace(t *testing.T) {
+	for _, engine := range []string{"mysql", "postgres"} {
+		t.Run(engine, func(t *testing.T) {
+			plan, err := buildOnboardWritePlan(t.TempDir(), &apitypes.PullSchemaResponse{Database: "app", Type: engine, Namespaces: map[string]*apitypes.PulledNamespace{"app": {Tables: map[string]string{}}}}, nil)
+			require.NoError(t, err)
+			require.NoError(t, plan.write())
+			require.Equal(t, "-- This namespace is empty. Add CREATE TABLE declarations here.\n", plan.files[filepath.Join("app", "schema.sql")])
+		})
+	}
 }
