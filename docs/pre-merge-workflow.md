@@ -55,8 +55,10 @@ Let the database change at its own pace while releases keep moving.
   controls, and failure reporting in the PR
 - **Review the outcome before merging.** The PR carries the DDL, progress,
   and result; required checks confirm the schema work is complete
-- **Keep code rollbacks simple.** A backward-compatible schema addition can
-  stay in place while you roll back the code that uses it
+- **Keep code rollbacks simple.** If a release has a bug, roll back the application
+  without undoing the schema change. A backward-compatible addition—such as a new
+  index or an optional column—can stay in place because the previous version of
+  the code still works with it
 - **Keep DDL credentials out of deploys.** Applications and release pipelines
   can use data-access permissions while SchemaBot handles schema changes
 
