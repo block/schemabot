@@ -281,7 +281,12 @@ type: mysql
 
 The catalog file uses `database: catalog`. These files identify the target
 database; they do not grant access to it. In the **server configuration**,
-restrict each database to its module's directory and its team's GitHub group:
+restrict each database to its module's directory and its team's GitHub group.
+
+The DSNs below use `env:` as an example. You can instead use mounted secret
+files (`file:`) or AWS Secrets Manager (`secretsmanager:`). Choose the source
+you already use to supply credentials to your server; see
+[Secret resolution](configuration.md#secret-resolution) for the formats.
 
 ```yaml
 repos:
@@ -311,9 +316,11 @@ databases:
 ```
 
 Merge these fields into your existing server configuration, retaining your
-other database environments. Set the two DSN environment variables to your
-staging database connection strings. Installing the App on the repository
-is still required; listing it in `repos` does not install it.
+other database environments. Replace each DSN reference with the source of
+that database's staging connection string.
+
+Installing the App on the repository is still required; listing it in
+`repos` does not install it.
 
 | Situation | Result |
 |---|---|
