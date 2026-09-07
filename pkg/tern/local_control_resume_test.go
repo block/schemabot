@@ -361,6 +361,27 @@ func TestVerifyReplannedTaskDDL(t *testing.T) {
 		assert.NotContains(t, err.Error(), "has drifted")
 	})
 
+	t.Run("a shared statement listed once names every terminal sibling reviewed with it", func(t *testing.T) {
+		// Two terminal siblings were reviewed with the same statement and the
+		// re-plan lists it once. The one occurrence is reviewed plan DDL, not
+		// drift, and the operator cannot tell from the statement alone which
+		// sibling's outcome left it behind, so the refusal names both.
+		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		siblings := []*storage.Task{
+			tk,
+			sibling("task_t1", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", state.Task.Failed),
+			sibling("task_t2", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", state.Task.Cancelled),
+		}
+		_, landed, err := c.verifyReplannedTaskDDL(tk, []string{
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+		}, siblings)
+		require.Error(t, err)
+		assert.False(t, landed)
+		assert.Contains(t, err.Error(), "has not drifted from the reviewed plan")
+		assert.Contains(t, err.Error(), "terminal sibling tasks task_t1 (failed), task_t2 (cancelled)")
+		assert.NotContains(t, err.Error(), "has drifted")
+	})
+
 	t.Run("a sibling with no reviewed DDL neither vouches nor blocks", func(t *testing.T) {
 		// A legacy synthetic sibling carries no DDL. It has nothing to compare
 		// against, so it is left out of the sibling set: it must not fail the
@@ -1080,30 +1101,56 @@ func TestResumeApplySequential_AbortsWhenLandedStatementSettlementRefused(t *tes
 
 // A task in an engine-monitored revert phase carries no evidence a schema
 // comparison can settle: post-cutover the live schema matches the reviewed
-// target until the revert lands. Revert-phase states never reach the
-// sequential drive today, so if one does the drive aborts before comparing
-// schemas, running the engine, or finalizing — leaving the task in its
-// revert-phase state and the apply active — rather than settle it completed
-// and report a reverting change as applied.
-func TestResumeApplySequential_AbortsOnRevertPhaseTask(t *testing.T) {
-	logs := &mockApplyLogStore{}
-	taskStore := &exactProgressTaskStore{}
-	c, eng, apply, applies, tasks := newLandedSiblingResume(t, taskStore, logs)
-	tasks[0].State = state.Task.RevertWindow
-	taskStore.tasks = tasks
+// target until the revert lands. Revert-phase states never reach a sequential
+// resume today, so if one does the resume refuses before it writes the apply
+// running, compares schemas, runs the engine, or finalizes — leaving the task
+// in its revert-phase state and the apply row exactly as the claim found it,
+// so the apply stays claimable and each re-claim fails the same way — rather
+// than settle the task completed and report a reverting change as applied.
+func TestResumeApplyWithTasks_RefusesSequentialResumeOfRevertPhaseTask(t *testing.T) {
+	cases := []struct {
+		name       string
+		taskState  string
+		applyState string
+	}{
+		{name: "revert window open", taskState: state.Task.RevertWindow, applyState: state.Apply.RevertWindow},
+		{name: "revert in flight", taskState: state.Task.Reverting, applyState: state.Apply.Reverting},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := &mockApplyLogStore{}
+			taskStore := &exactProgressTaskStore{}
+			c, eng, apply, applies, tasks := newLandedSiblingResume(t, taskStore, logs)
+			plan := &storage.Plan{ID: 5}
+			apply.PlanID = plan.ID
+			apply.State = tc.applyState
+			applies.stored = *apply
+			c.storage.(*exactProgressStorage).plans = &fakePlanStore{
+				getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil },
+			}
+			tasks[0].State = tc.taskState
+			taskStore.tasks = tasks
 
-	c.resumeApplySequential(t.Context(), apply, tasks, &storage.Plan{}, nil)
+			err := c.resumeApplyWithTasks(t.Context(), apply, tasks, nil, false, false)
 
-	assert.True(t, state.IsState(tasks[0].State, state.Task.RevertWindow),
-		"a revert-phase task keeps its state through the sequential drive, got %s", tasks[0].State)
-	assert.Nil(t, tasks[0].CompletedAt)
-	assert.Empty(t, eng.applied, "the drive must abort before handing any task to the engine")
-	stored, err := applies.Get(t.Context(), apply.ID)
-	require.NoError(t, err)
-	assert.True(t, state.IsState(stored.State, state.Apply.Running),
-		"the drive must abort before finalization; stored state was %q", stored.State)
-	assert.Nil(t, stored.CompletedAt)
-	assert.Empty(t, logs.logs, "the durable log must not record a settlement the task row does not carry")
+			require.ErrorIs(t, err, errRevertPhaseTaskInSequentialResume)
+			assert.True(t, state.IsState(tasks[0].State, tc.taskState),
+				"a revert-phase task keeps its state through the refused resume, got %s", tasks[0].State)
+			assert.Nil(t, tasks[0].CompletedAt)
+			assert.True(t, state.IsState(tasks[1].State, state.Task.Running),
+				"the sibling task is left as found, got %s", tasks[1].State)
+			assert.Empty(t, eng.applied, "the resume must refuse before handing any task to the engine")
+			stored, err := applies.Get(t.Context(), apply.ID)
+			require.NoError(t, err)
+			assert.True(t, state.IsState(stored.State, tc.applyState),
+				"the resume must refuse before writing the apply running; stored state was %q", stored.State)
+			assert.Nil(t, stored.CompletedAt)
+			for _, entry := range logs.logs {
+				assert.NotEqual(t, storage.LogEventStateTransition, entry.EventType,
+					"the durable log must not record a transition the rows do not carry: %q", entry.Message)
+			}
+		})
+	}
 }
 
 // sameApplyOperation scopes sibling vouching to one apply operation. Two legacy

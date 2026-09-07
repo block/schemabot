@@ -422,20 +422,6 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			drainer.Drain()
 		}
 
-		// Revert-phase task states come only from an engine whose database
-		// type always drives grouped, so no task reaches this loop in one.
-		// Should one ever arrive, the schema comparison below proves nothing
-		// about it — post-cutover the live schema matches the reviewed target
-		// by definition until a revert lands — and the sequential drive has no
-		// engine reattach to learn its outcome from, so settling it here would
-		// report a reverting change as applied. Abort without finalizing so
-		// nothing is settled from evidence that cannot support it.
-		if taskInRevertPhase(task) {
-			logger.Error("resume aborting: a revert-phase task reached the sequential drive, whose schema comparison cannot settle it; the apply stays active for an operator to examine",
-				task.LogAttrs()...)
-			return
-		}
-
 		// Verify this table still needs changes before applying. There's a race
 		// between re-plan (which reads schema) and Spirit's cutover (which renames
 		// the shadow table). If Spirit completed the cutover after the re-plan read
@@ -833,35 +819,48 @@ func (c *LocalClient) verifyReplannedTaskDDL(task *storage.Task, replanned []str
 		}
 		vouchers[canon]++
 	}
-	terminalByCanon := make(map[string][]*storage.Task, len(siblings.terminal))
-	for _, sibling := range siblings.terminal {
+	// Terminal siblings likewise explain one occurrence of their statement
+	// each, so an occurrence beyond what the terminal siblings were reviewed
+	// with is still unreviewed.
+	terminalCanons := make([]string, len(siblings.terminal))
+	terminalOwners := make(map[string]int, len(siblings.terminal))
+	for i, sibling := range siblings.terminal {
 		canon, err := canonicalDDLForDrift(parser, sibling.DDL)
 		if err != nil {
 			return "", false, fmt.Errorf("reviewed DDL for terminal sibling task %s of task %s: %w", sibling.TaskIdentifier, task.TaskIdentifier, err)
 		}
-		terminalByCanon[canon] = append(terminalByCanon[canon], sibling)
+		terminalCanons[i] = canon
+		terminalOwners[canon]++
 	}
 	// A remaining statement is vouched (a pending sibling's reviewed DDL),
 	// orphaned (a terminal sibling's reviewed DDL that nothing pending will
-	// run), or unreviewed (drift). Terminal siblings likewise explain one
-	// occurrence of their statement each, so an occurrence beyond what the
-	// terminal siblings were reviewed with is still unreviewed.
-	var orphaned []*storage.Task
+	// run), or unreviewed (drift).
+	orphanedCanons := make(map[string]struct{})
 	unreviewed := make([]string, 0, len(replannedCanon))
 	for _, canon := range replannedCanon {
 		if vouchers[canon] > 0 {
 			vouchers[canon]--
 			continue
 		}
-		if owners := terminalByCanon[canon]; len(owners) > 0 {
-			orphaned = append(orphaned, owners[0])
-			terminalByCanon[canon] = owners[1:]
+		if terminalOwners[canon] > 0 {
+			terminalOwners[canon]--
+			orphanedCanons[canon] = struct{}{}
 			continue
 		}
 		unreviewed = append(unreviewed, canon)
 	}
-	if len(unreviewed) == 0 && len(orphaned) == 0 {
+	if len(unreviewed) == 0 && len(orphanedCanons) == 0 {
 		return "", true, nil
+	}
+	// The refusal names every terminal sibling reviewed with an orphaned
+	// statement, not only the ones whose occurrence the accounting consumed:
+	// when two terminal siblings share a statement the re-plan lists once,
+	// either could be the one whose outcome the operator has to examine.
+	var orphaned []*storage.Task
+	for i, sibling := range siblings.terminal {
+		if _, ok := orphanedCanons[terminalCanons[i]]; ok {
+			orphaned = append(orphaned, sibling)
+		}
 	}
 
 	loc := formatDriftLocation(driftChangeKey{
@@ -1343,6 +1342,13 @@ func (c *LocalClient) persistReattachedResumeStates(ctx context.Context, apply *
 // a later attempt can retry against intact storage — failing the apply here
 // would abandon engine work that is still in flight on the provider.
 var errGroupedResumeStateUnavailable = errors.New("grouped resume state unavailable")
+
+// errRevertPhaseTaskInSequentialResume marks a sequential resume that found a
+// task in an engine-monitored revert phase. Only the grouped drive reattaches
+// to the engine that can settle such a task, so the sequential drive refuses
+// before writing anything: the apply stays claimable, and every re-claim
+// fails the same way until an operator examines it.
+var errRevertPhaseTaskInSequentialResume = errors.New("revert-phase task cannot be settled by a sequential resume")
 
 // groupedResumeState returns the ResumeState handed to the engine when a
 // grouped apply is resumed. Recovery must reattach to the engine's existing
@@ -2075,10 +2081,33 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		return nil
 	}
 
+	grouped := c.usesGroupedApply(apply, options)
+	// A revert-phase task is settled only by reattaching to the engine that
+	// holds its revert window or is unwinding it, and only the grouped drive
+	// reattaches. Revert-phase states come only from an engine whose database
+	// type always drives grouped, so none should reach a sequential resume;
+	// should one ever arrive, refuse before anything is written. Past this
+	// point the sequential drive persists the apply running and then compares
+	// schemas that prove nothing post-cutover — the live schema matches the
+	// reviewed target by definition until a revert lands — so settling the
+	// task there would report a reverting change as applied. Resting the task
+	// retryable would be no better: a later claim requeues it and drives it
+	// forward into that same comparison. Neither the task row nor the apply
+	// row is written, so the apply stays claimable and visibly stuck — each
+	// re-claim fails the resume and is counted as one — until an operator
+	// examines it.
+	if !grouped {
+		if task := firstRevertPhaseTask(activeTasks, apply.ID); task != nil {
+			logger.Error("refusing sequential resume: a revert-phase task reached a drive whose schema comparison cannot settle it; the task and apply rows are left as found for an operator to examine",
+				task.LogAttrs()...)
+			return fmt.Errorf("apply %s task %s is in %s: %w", apply.ApplyIdentifier, task.TaskIdentifier, task.State, errRevertPhaseTaskInSequentialResume)
+		}
+	}
+
 	c.prepareRetryableTasksForResume(ctx, apply, activeTasks)
 	c.prepareStoppedTasksForResume(ctx, apply, activeTasks, startRequested)
 
-	if c.usesGroupedApply(apply, options) {
+	if grouped {
 		resumeCtx, cancelResume := context.WithCancel(ctx)
 		cancelGeneration := c.setApplyCancel(cancelResume)
 		defer c.clearApplyCancel(cancelGeneration)
