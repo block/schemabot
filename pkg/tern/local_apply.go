@@ -58,8 +58,12 @@ func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage
 			return blockingTask{}, released, nil
 		}
 
-		// Retry: 10 attempts with 100ms sleep gives 1 second total wait.
-		// Handles the race where storage is updated but Spirit hasn't fully finished.
+		// Retry a bounded number of times with a short sleep between
+		// attempts, to ride out the window where storage is updated but the
+		// engine has not fully finished. The sleep is the floor of each
+		// attempt, not its length: an attempt that probes a running apply
+		// waits on the engine's progress read, so the loop's worst case is
+		// the attempt count times that read's own bound.
 		if attempt < 9 {
 			c.logger.Debug("found potentially stale active task, retrying",
 				"task_id", blocking.taskIdentifier, "table", blocking.table, "shard", blocking.shard,
@@ -597,14 +601,17 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		return false
 	}
 
-	// The raw target credentials (no namespace mapping) are safe here only
-	// because no engine's Progress opens a connection from them: Spirit's is
-	// purely in-memory, and the PostgreSQL engine's reads the target only
-	// through the session its own executor already holds for the running
-	// apply. An engine whose Progress connected from these credentials would
-	// have to resolve them per task (credentialsForTask) before this probe,
-	// or under schema overrides it would address the canonical name instead
-	// of the physical schema.
+	// The raw target credentials (no namespace mapping) are correct here
+	// because per-namespace resolution only exists for MySQL, whose engine
+	// never connects from a Progress request — Spirit's progress is purely
+	// in-memory. For every other database type credentialsForTask is the
+	// identity: the target-level credentials are the task's credentials, so
+	// an engine whose Progress does connect from them (PlanetScale builds an
+	// API client; PostgreSQL reads only through the session its own executor
+	// already holds) addresses exactly what the apply itself addressed. Were
+	// MySQL's engine ever to connect from these credentials, this probe would
+	// have to resolve them per task first, or under schema overrides it
+	// would address the canonical name instead of the physical schema.
 	//
 	// The task identifier rides along for engines that key progress by apply
 	// identity (postgres): a probe about work the engine is still running

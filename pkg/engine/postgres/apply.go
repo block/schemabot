@@ -45,10 +45,25 @@ const (
 	// on the session the executor reserved for the build's failure verdict,
 	// and the tracker serializes it against the executor's own end-of-build
 	// fence — so a poll that hangs on a half-open socket would hold up the
-	// apply's verdict and its terminal publish. A short deadline of the
-	// engine's own keeps that coupling bounded regardless of what the
-	// caller's context or the target's server-side timeouts do.
-	executorProgressReadTimeout = 5 * time.Second
+	// apply's verdict and its terminal publish. A deadline of the engine's
+	// own keeps that coupling bounded regardless of what the caller's
+	// context does.
+	//
+	// The bound sits above the statement_timeout the apply pool runs its
+	// sessions under (spritePoolConfig leaves it at pg-sprite's default) so
+	// that on a live connection the server ends a slow read first: a
+	// statement_timeout cancels the query and hands the session back
+	// intact, whereas a client deadline expiring mid-query closes the
+	// connection — and that connection is the one the build's failure
+	// verdict needs. The engine's deadline is therefore the bound of last
+	// resort, for the socket the server's cancellation can no longer reach.
+	executorProgressReadTimeout = dbconn.DefaultStatementTimeout + executorProgressReadHeadroom
+
+	// executorProgressReadHeadroom is how far the read deadline sits past
+	// the session's statement_timeout: long enough that the server's
+	// cancellation error reaches the client before the client gives up on
+	// the socket.
+	executorProgressReadHeadroom = 5 * time.Second
 
 	// concurrentIndexBudget bounds one CREATE INDEX CONCURRENTLY build.
 	// Concurrent builds get their own budget instead of the per-statement
@@ -191,11 +206,13 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	ctx, cancel := context.WithTimeout(ctx, optimisticApplyCeiling)
 	defer cancel()
 	// Every terminal result carries the executor's final position: the
-	// tracker has finished by the time executeOptimistic returns, so the
-	// read is memory-only and a failed create reports the step that failed,
-	// not the sequence's first step. The error branch guards that premise
-	// rather than an expected outcome — a tracker still reporting a live
-	// build here means the executor returned without finishing it.
+	// executor finishes its tracker before it returns, so the read is
+	// memory-only and a failed create reports the step that failed, not the
+	// sequence's first step. The error branch is an invariant guard, not an
+	// expected outcome — a tracker still reporting a live build here means
+	// the executor returned without finishing it, and the terminal result
+	// then carries the tracker's last-known position instead of a fresh
+	// read the reserved session can no longer answer.
 	publish := func(result *engine.ProgressResult) {
 		if err := executorProgressMetadata(ctx, tracker, result.Metadata); err != nil {
 			logger.Warn("PostgreSQL apply terminal progress reports the last-known executor position",
@@ -203,7 +220,11 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		}
 		e.publishProgress(key, result, logger)
 	}
-	err := executeOptimistic(ctx, conn, change, e.tableSizeLimit, tracker)
+	execute := e.execute
+	if execute == nil {
+		execute = executeOptimistic
+	}
+	err := execute(ctx, conn, change, e.tableSizeLimit, tracker)
 	if err == nil {
 		publish(progressResult(engine.StateCompleted, "completed", started, change, ""))
 		return
@@ -822,19 +843,23 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 // length it announced, and the statement text of that step. Each key is
 // written only once the executor has reported it, so before execution starts
 // the metadata keeps progressResult's pre-execution position. The statement
-// passes through sanitizeReasonText because the metadata is destined for
-// operator-facing single-line rendering, and the value must be safe for that
-// surface the moment one starts reading it.
+// passes through sanitizeStatementText because the metadata is destined for
+// operator-facing single-line rendering and is stored at a bounded width,
+// and the value must satisfy both the moment one starts reading it.
 //
 // For an active concurrent index build the tracker queries the session the
 // executor reserved for the build's failure verdict. The read runs on its
 // own bounded context, detached from the caller's cancellation: a poller or
 // drive context cancelled mid-query would otherwise tear down that session
-// and leave the build's verdict indeterminate, and the deadline caps how long
-// the read can hold the tracker's fence against the executor. A tracker read
-// fails only when the server's progress view cannot be queried; the snapshot
-// still carries the last-known position, which is written before the error
-// is returned for the caller to log.
+// and leave the build's verdict indeterminate. The deadline starts before
+// the tracker takes its observer lock, so the wait behind another observer's
+// read counts against the same budget as the read itself — the poller is not
+// always the apply's own driver, since another apply's conflict probe reads
+// this tracker too, and a read parked behind one must not hold the
+// executor's fence for longer than the engine allows any single read. A
+// tracker read fails only when the server's progress view cannot be queried;
+// the snapshot still carries the last-known position, which is written
+// before the error is returned for the caller to log.
 func executorProgressMetadata(ctx context.Context, tracker *progress.Tracker, metadata map[string]string) error {
 	if tracker == nil {
 		return nil
@@ -848,7 +873,7 @@ func executorProgressMetadata(ctx context.Context, tracker *progress.Tracker, me
 	if snapshot.Step > 0 {
 		metadata["step"] = strconv.Itoa(snapshot.Step)
 	}
-	if statement := sanitizeReasonText(snapshot.Detail.Statement); statement != "" {
+	if statement := sanitizeStatementText(snapshot.Detail.Statement); statement != "" {
 		metadata["statement"] = statement
 	}
 	if err != nil {

@@ -9,9 +9,11 @@ import (
 	"log/slog"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/block/pg-sprite/pkg/dbconn"
 	"github.com/block/pg-sprite/pkg/executor"
 	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/progress"
@@ -471,7 +473,8 @@ func newTestTracker(t *testing.T) *progress.Tracker {
 // TestProgressReportsExecutorStepPosition proves a poll during execution
 // reads the step the executor is running from the pg-sprite tracker — not
 // the first-step position the engine recorded at accept — and carries that
-// step's statement in the operator-safe form the progress table renders.
+// step's statement in the single-line, control-free form the progress
+// metadata is contracted to hold.
 func TestProgressReportsExecutorStepPosition(t *testing.T) {
 	eng := New()
 	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE public.widgets (id bigint PRIMARY KEY)", steps: 3}
@@ -486,16 +489,39 @@ func TestProgressReportsExecutorStepPosition(t *testing.T) {
 	assert.NotContains(t, before.Metadata, "statement")
 
 	tracker.Start(3, progress.OperationAdmitting)
-	tracker.StartStep(2, progress.OperationBrief, "CREATE INDEX widgets_name_idx\n\tON public.widgets (name) | WHERE\x00 true")
+	tracker.StartStep(2, progress.OperationBrief, "CREATE INDEX widgets_name_idx\n\tON public.widgets ((first_name || ' ' ||\x00 last_name))")
 
 	during, err := eng.Progress(t.Context(), req)
 	require.NoError(t, err)
 	assert.Equal(t, engine.StateRunning, during.State)
 	assert.Equal(t, "2", during.Metadata["step"])
 	assert.Equal(t, "3", during.Metadata["steps_total"])
-	assert.Equal(t, "CREATE INDEX widgets_name_idx ON public.widgets (name) / WHERE true", during.Metadata["statement"],
-		"the statement collapses whitespace, drops control runes, and neutralizes the table cell separator")
+	assert.Equal(t, "CREATE INDEX widgets_name_idx ON public.widgets ((first_name || ' ' || last_name))", during.Metadata["statement"],
+		"the statement collapses whitespace and drops control runes but keeps its SQL operators intact")
 	assert.Equal(t, change.sql, during.Tables[0].DDL, "the table's DDL stays the planned change, not the step in flight")
+}
+
+// TestSanitizeStatementText pins the statement metadata contract: one line,
+// no control or format runes, bounded length, and otherwise the SQL exactly
+// as the executor runs it — a reason may trade its pipes for slashes because
+// it is prose, but a statement's pipes are operators.
+func TestSanitizeStatementText(t *testing.T) {
+	t.Run("keeps SQL operators and collapses layout", func(t *testing.T) {
+		got := sanitizeStatementText("SELECT 1 | 2,\n\ta || b\u202e FROM t\r\n")
+		assert.Equal(t, "SELECT 1 | 2, a || b FROM t", got)
+	})
+	t.Run("clamps on a rune boundary with an ellipsis", func(t *testing.T) {
+		long := strings.Repeat("é", maxStatementMetadataLen+40)
+		got := sanitizeStatementText(long)
+		runes := []rune(got)
+		assert.Len(t, runes, maxStatementMetadataLen)
+		assert.Equal(t, '…', runes[len(runes)-1])
+		assert.Equal(t, strings.Repeat("é", maxStatementMetadataLen-1), string(runes[:len(runes)-1]))
+	})
+	t.Run("leaves a statement at the limit untouched", func(t *testing.T) {
+		exact := strings.Repeat("x", maxStatementMetadataLen)
+		assert.Equal(t, exact, sanitizeStatementText(exact))
+	})
 }
 
 // TestPublishProgressKeepsTerminalPositionAsPublished proves a terminal
@@ -522,14 +548,68 @@ func TestPublishProgressKeepsTerminalPositionAsPublished(t *testing.T) {
 	assert.Equal(t, "CREATE INDEX widgets_name_idx ON public.widgets (name)", got.Metadata["statement"])
 }
 
-// TestApplyRegistersExecutorTracker proves Apply itself hands the tracker it
-// gives the executor to the progress record it claims, so a poll during
-// execution reads the executor's live step rather than the planned first
-// step. The poll-time tests above inject the tracker through claimProgress
-// directly; this one pins the wiring they take for granted.
-func TestApplyRegistersExecutorTracker(t *testing.T) {
-	eng := New()
-	const key = "task-a"
+// backgroundApplyDeadline bounds how long a unit test waits for the
+// engine's background apply drive to publish, or for a blocked call to
+// return. The drives under test run a scripted executor, so anything close
+// to this is a hang, not a slow target.
+const backgroundApplyDeadline = 10 * time.Second
+
+// scriptedExecutor stands in for pg-sprite's executor behind the engine's
+// execute seam. It hands the tracker the drive gave it to the test, then
+// waits to be released so the test can poll the engine mid-execution, and
+// returns whatever outcome the test scripted.
+type scriptedExecutor struct {
+	trackers    chan *progress.Tracker
+	released    chan struct{}
+	releaseOnce sync.Once
+	run         func(tracker *progress.Tracker) error
+}
+
+func newScriptedExecutor(run func(tracker *progress.Tracker) error) *scriptedExecutor {
+	return &scriptedExecutor{trackers: make(chan *progress.Tracker, 1), released: make(chan struct{}), run: run}
+}
+
+func (s *scriptedExecutor) execute(ctx context.Context, _ targetConn, _ nativeApply, _ int64, tracker *progress.Tracker) error {
+	s.trackers <- tracker
+	select {
+	case <-s.released:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return s.run(tracker)
+}
+
+// release lets the parked executor return. It is safe to call more than
+// once, so a test can release mid-way and cleanup can release again for a
+// test that failed before it got there — otherwise the drive would stay
+// parked and Drain would wait on it for the apply ceiling.
+func (s *scriptedExecutor) release() {
+	s.releaseOnce.Do(func() { close(s.released) })
+}
+
+// tracker returns the tracker the drive handed the executor, failing the
+// test if the drive never reached it.
+func (s *scriptedExecutor) tracker(t *testing.T) *progress.Tracker {
+	t.Helper()
+	select {
+	case tracker := <-s.trackers:
+		return tracker
+	case <-time.After(backgroundApplyDeadline):
+		t.Fatal("the background drive never reached the executor")
+		return nil
+	}
+}
+
+// applyAlterUsers wires scripted in as eng's executor and accepts one
+// native-safe change through Apply under key, logging to logger, with
+// credentials the executor never dials. When the test ends the executor is
+// released and the engine drained, in that order, so a drive parked at the
+// executor cannot outlive the test or hold Drain open.
+func applyAlterUsers(t *testing.T, eng *Engine, scripted *scriptedExecutor, key string, logger *slog.Logger) {
+	t.Helper()
+	eng.execute = scripted.execute
+	t.Cleanup(eng.Drain)
+	t.Cleanup(scripted.release)
 	accepted, err := eng.Apply(t.Context(), &engine.ApplyRequest{
 		Database: "app",
 		Changes: []engine.SchemaChange{{
@@ -538,31 +618,197 @@ func TestApplyRegistersExecutorTracker(t *testing.T) {
 				Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN email text",
 			}},
 		}},
-		Credentials: &engine.Credentials{DSN: "postgres://schemabot:secret@127.0.0.1:1/app?sslmode=disable"},
+		Credentials: &engine.Credentials{DSN: "postgres://schemabot:secret@db.invalid/app?sslmode=disable"},
 		ResumeState: &engine.ResumeState{MigrationContext: key},
+		Logger:      logger,
 	})
 	require.NoError(t, err)
 	require.True(t, accepted.Accepted)
+}
 
-	// The background drive fails fast against the unreachable target and
-	// publishes its terminal result over the record, but the tracker claimed
-	// at accept stays with the record for as long as the engine tracks it.
+// pollProgress reads the engine's progress for key.
+func pollProgress(t *testing.T, eng *Engine, key string) *engine.ProgressResult {
+	t.Helper()
+	got, err := eng.Progress(t.Context(), &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: key}})
+	require.NoError(t, err)
+	return got
+}
+
+// TestApplyRegistersExecutorTracker proves Apply hands the executor the very
+// tracker it claimed for the progress record, so a poll during execution
+// reads the step the executor is running, and the terminal result published
+// when the executor returns carries the position the executor finished at.
+// The poll-time tests above inject the tracker through claimProgress
+// directly; this one pins the wiring they take for granted, end to end
+// through the apply drive.
+func TestApplyRegistersExecutorTracker(t *testing.T) {
+	scripted := newScriptedExecutor(func(tracker *progress.Tracker) error {
+		tracker.Finish(nil)
+		return nil
+	})
+	eng := New()
+	const key = "task-a"
+	applyAlterUsers(t, eng, scripted, key, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	tracker := scripted.tracker(t)
 	eng.mu.Lock()
 	tracked := eng.progress[key]
 	eng.mu.Unlock()
 	require.NotNil(t, tracked, "Apply must claim a progress record under the task identity")
-	assert.NotNil(t, tracked.tracker, "the claimed record must carry the executor's tracker for Progress to read")
+	require.Same(t, tracker, tracked.tracker, "the executor must feed the tracker the progress record reads")
 
-	drained := make(chan struct{})
+	tracker.Start(2, progress.OperationAdmitting)
+	tracker.StartStep(2, progress.OperationBrief, "ALTER TABLE public.users ADD COLUMN email text")
+	during := pollProgress(t, eng, key)
+	assert.Equal(t, engine.StateRunning, during.State)
+	assert.Equal(t, "2", during.Metadata["step"], "a poll mid-execution reads the executor's live step")
+	assert.Equal(t, "2", during.Metadata["steps_total"])
+
+	scripted.release()
+	require.Eventually(t, func() bool {
+		return pollProgress(t, eng, key).State.IsTerminal()
+	}, backgroundApplyDeadline, 10*time.Millisecond, "the drive must publish a terminal result once the executor returns")
+	terminal := pollProgress(t, eng, key)
+	assert.Equal(t, engine.StateCompleted, terminal.State)
+	assert.Equal(t, "2", terminal.Metadata["step"], "the terminal result carries the position the executor finished at")
+	assert.Equal(t, "2", terminal.Metadata["steps_total"])
+	assert.Equal(t, "ALTER TABLE public.users ADD COLUMN email text", terminal.Metadata["statement"])
+}
+
+// TestTerminalPublishReportsAnUnfinishedExecutorBuild pins the guard on the
+// terminal publish's premise: an executor that returns while its tracker
+// still reports a live build has broken the contract the fold-in relies on,
+// and the drive says so — the terminal result carries the tracker's
+// last-known position and the failed read is logged under the apply's
+// identifiers — instead of publishing silently as though the position were
+// final.
+func TestTerminalPublishReportsAnUnfinishedExecutorBuild(t *testing.T) {
+	session := &indexProgressSession{err: errors.New("connection reset by peer")}
+	scripted := newScriptedExecutor(func(tracker *progress.Tracker) error {
+		tracker.Start(2, progress.OperationAdmitting)
+		tracker.StartStep(2, progress.OperationConcurrentIndex, "CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)")
+		tracker.SetConcurrentBuild(session, 42)
+		return errors.New("executor returned mid-build")
+	})
+	eng := New()
+	var logs bytes.Buffer
+	const key = "task-a"
+	applyAlterUsers(t, eng, scripted, key, slog.New(slog.NewTextHandler(&logs, nil)))
+	scripted.tracker(t)
+	scripted.release()
+
+	require.Eventually(t, func() bool {
+		return pollProgress(t, eng, key).State.IsTerminal()
+	}, backgroundApplyDeadline, 10*time.Millisecond)
+	terminal := pollProgress(t, eng, key)
+	assert.Equal(t, engine.StateFailed, terminal.State)
+	assert.Equal(t, "2", terminal.Metadata["step"], "the terminal result keeps the tracker's last-known position")
+	assert.Equal(t, "CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)", terminal.Metadata["statement"])
+	assert.True(t, session.queried, "the terminal fold-in reads the tracker the executor left active")
+	assert.Contains(t, logs.String(), "terminal progress reports the last-known executor position")
+	assert.Contains(t, logs.String(), "task_id=task-a")
+	assert.Contains(t, logs.String(), "connection reset by peer")
+}
+
+// blockingProgressSession is a reserved build session whose progress read
+// parks until the test releases it, so a test can hold a tracker read open
+// and observe what else the engine lets through meanwhile.
+type blockingProgressSession struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingProgressSession) QueryRow(ctx context.Context, _ string, _ ...any) pgx.Row {
+	close(s.started)
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+	}
+	return failingRow{err: errors.New("progress read released")}
+}
+
+// TestProgressReadsTheTrackerOutsideTheEngineLock proves a poll's tracker
+// read — a database round trip for an active concurrent index build — never
+// holds the engine lock: while one poll is parked on the server, Apply's
+// claim and the drive's terminal publish still go through. Otherwise a slow
+// progress view would stall every apply the engine tracks.
+func TestProgressReadsTheTrackerOutsideTheEngineLock(t *testing.T) {
+	eng := New()
+	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE public.widgets (id bigint PRIMARY KEY)", steps: 2}
+	tracker := newTestTracker(t)
+	tracker.Start(2, progress.OperationAdmitting)
+	tracker.StartStep(2, progress.OperationConcurrentIndex, "CREATE INDEX CONCURRENTLY widgets_name_idx ON public.widgets (name)")
+	session := &blockingProgressSession{started: make(chan struct{}), release: make(chan struct{})}
+	tracker.SetConcurrentBuild(session, 42)
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, logger)
+
+	polled := make(chan error, 1)
 	go func() {
-		eng.Drain()
-		close(drained)
+		_, err := eng.Progress(t.Context(), &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: "task-a"}})
+		polled <- err
 	}()
 	select {
-	case <-drained:
-	case <-time.After(30 * time.Second):
-		t.Fatal("background apply against an unreachable target did not reach a terminal state")
+	case <-session.started:
+	case <-time.After(backgroundApplyDeadline):
+		t.Fatal("the poll never reached the tracker's progress read")
 	}
+
+	claimed := make(chan struct{})
+	go func() {
+		defer close(claimed)
+		eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), newTestTracker(t), logger)
+		eng.publishProgress("task-b", progressResult(engine.StateCompleted, "completed", time.Now(), change, ""), logger)
+	}()
+	select {
+	case <-claimed:
+	case <-time.After(backgroundApplyDeadline):
+		t.Fatal("a claim and publish waited behind another apply's tracker read")
+	}
+
+	close(session.release)
+	select {
+	case err := <-polled:
+		require.NoError(t, err, "a failed tracker read is logged, not returned to the poller")
+	case <-time.After(backgroundApplyDeadline):
+		t.Fatal("the parked poll did not return once its read was released")
+	}
+}
+
+// TestProgressNeverReadsTheTrackerForATerminalApply proves a poll on a
+// published terminal result answers from the record alone: even a tracker
+// that still holds an active build session is not consulted, so a finished
+// apply's poll never reaches the target.
+func TestProgressNeverReadsTheTrackerForATerminalApply(t *testing.T) {
+	eng := New()
+	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE public.widgets (id bigint PRIMARY KEY)", steps: 2}
+	tracker, session := activeBuildTracker(t, errors.New("progress view unavailable"))
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, slog.Default())
+	terminal := progressResult(engine.StateFailed, "failed", time.Now(), change, "detail")
+	terminal.Metadata["step"] = "2"
+	eng.publishProgress("task-a", terminal, slog.Default())
+
+	got, err := eng.Progress(t.Context(), &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: "task-a"}})
+
+	require.NoError(t, err)
+	assert.Equal(t, engine.StateFailed, got.State)
+	assert.Equal(t, "2", got.Metadata["step"])
+	assert.False(t, session.queried, "a terminal poll must not read the tracker")
+}
+
+// TestExecutorProgressReadOutlivesTheSessionStatementTimeout pins the order
+// of the two deadlines on a tracker read: the apply pool leaves pg-sprite's
+// default statement_timeout on every session, and the engine's read deadline
+// must sit past it, so a slow progress query is cancelled by the server —
+// which hands the session back intact — before the client gives up on the
+// socket and closes the connection the build's failure verdict runs on.
+func TestExecutorProgressReadOutlivesTheSessionStatementTimeout(t *testing.T) {
+	cfg, err := spritePoolConfig("postgres://schemabot:secret@db.invalid/app", "")
+	require.NoError(t, err)
+	require.Zero(t, cfg.StatementTimeout, "the apply pool runs under pg-sprite's default statement_timeout")
+	require.Positive(t, executorProgressReadHeadroom)
+	assert.Greater(t, executorProgressReadTimeout, dbconn.DefaultStatementTimeout)
+	assert.Equal(t, dbconn.DefaultStatementTimeout+executorProgressReadHeadroom, executorProgressReadTimeout)
 }
 
 // indexProgressSession stands in for the session the executor reserves for a
