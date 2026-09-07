@@ -45,11 +45,11 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 	var stoppedByUser bool
 
 	for i, task := range tasks {
-		if tookEffect, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
+		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 			logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 				"error", err)
 			return
-		} else if tookEffect {
+		} else if standDown {
 			stoppedByUser = true
 			break
 		}
@@ -187,11 +187,11 @@ func sequentialEngineApplyRequest(task *storage.Task, options map[string]string,
 // Returns the outcome: taskContinue (completed), taskFailed, taskStopped, taskAbort, or taskHandover.
 func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, task *storage.Task, options map[string]string) taskAction {
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
-	if tookEffect, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
+	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		logger.Warn("pending stop request processing failed before sequential engine apply; current apply owner will exit for operator retry",
 			"task_id", task.TaskIdentifier, "error", err)
 		return taskAbort
-	} else if tookEffect {
+	} else if standDown {
 		return taskStopped
 	}
 	taskCreds, err := c.credentialsForTask(task)
@@ -547,11 +547,11 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				"task_id", task.TaskIdentifier, "table", task.TableName)
 			return taskHandover
 		case <-ticker.C:
-			if tookEffect, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
+			if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 				logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 					"task_id", task.TaskIdentifier, "error", err)
 				return taskAbort
-			} else if tookEffect {
+			} else if standDown {
 				task.State = state.Task.Stopped
 				return taskStopped
 			}

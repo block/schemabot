@@ -1986,10 +1986,10 @@ func TestLocalClient_ProcessPendingStopControlRequestRejectsRevertWindow(t *test
 		logger:            slog.Default(),
 	}
 
-	tookEffect, err := client.processPendingStopControlRequest(t.Context(), apply)
+	standDown, err := client.processPendingStopControlRequest(t.Context(), apply)
 
 	require.NoError(t, err, "a permanent rejection must not bubble a retryable error")
-	assert.False(t, tookEffect, "nothing was paused, so the drive must keep driving rather than settle the apply stopped")
+	assert.False(t, standDown, "nothing was paused, so the drive must keep driving rather than settle the apply stopped")
 	assert.Equal(t, 0, fakeEngine.stopCount, "stop must not touch the engine for a revert-window apply")
 	assert.Equal(t, state.Apply.RevertWindow, apply.State, "revert-window apply must not be recorded as cancelled or stopped")
 	assert.Equal(t, state.Task.RevertWindow, task.State, "revert-window task must be preserved")
@@ -3350,6 +3350,61 @@ func TestHandleAtomicProgressTickOperationGate(t *testing.T) {
 		assert.Equal(t, state.Apply.Completed, apply.State, "a single-operation apply terminalizes when its operation completes")
 		assert.NotNil(t, apply.CompletedAt, "a completed apply stamps completed_at")
 	})
+}
+
+// A grouped apply holding its revert window is where an operator's cancel meets
+// a change that has already cut over. The drive refuses the command — only
+// revert or skip-revert can act from there — and then has to keep polling: the
+// engine is still working underneath, and a drive that exited on the refusal
+// would settle the apply stopped over a live revert window and leave nobody
+// watching it expire (CO-5).
+func TestHandleAtomicProgressTickRefusedCancelInRevertWindowKeepsPolling(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              11,
+		ApplyIdentifier: "apply-revert-window-refusal",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		State:           state.Apply.Running,
+	}
+	opID := int64(1)
+	tasks := []*storage.Task{{
+		TaskIdentifier:   "task-users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &opID,
+		State:            state.Task.RevertWindow,
+		TableName:        "users",
+		Namespace:        "testdb",
+	}}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	}}}
+	stor := &exactProgressStorage{
+		applies:         &snapshotApplyStore{stored: *apply},
+		tasks:           &exactProgressTaskStore{tasks: tasks},
+		controlRequests: controlRequests,
+		applyOperations: &listApplyOperationStore{ops: []*storage.ApplyOperation{{ID: opID, State: state.ApplyOperation.Running}}},
+	}
+	client := &LocalClient{storage: stor, logger: slog.Default()}
+	eng := &fakeControlEngine{progressResult: &engine.ProgressResult{
+		State:  engine.StateRevertWindow,
+		Tables: []engine.TableProgress{{Namespace: "testdb", Table: "users", State: state.Task.RevertWindow, Progress: 100}},
+	}}
+	ps := &atomicPollState{lastProgressLog: time.Now(), stateEnteredAt: time.Now()}
+
+	done := client.handleAtomicProgressTick(t.Context(), eng, apply, tasks, &engine.Credentials{}, nil, ps, apply.GetOptions().Map(), false)
+
+	assert.False(t, done, "a refused cancel is not an operator cancel, so the drive must keep polling the revert window")
+	assert.Equal(t, state.Apply.RevertWindow, apply.State,
+		"the apply tracks the phase the engine reported, not the command that was refused")
+	assert.Equal(t, state.Task.RevertWindow, tasks[0].State, "the cut-over task keeps its revert window")
+	resolved, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, storage.ControlRequestFailed, resolved.Status,
+		"the refusal is permanent, so the request resolves rather than being re-collected every tick")
 }
 
 // Under an ordered-cutover policy a multi-deployment operation runs its copy

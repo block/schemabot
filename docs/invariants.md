@@ -909,10 +909,14 @@ resolved by drive ordering. *Enforced:* pending-stop checks in pollers and the c
 
 ### CO-5: The revert phase owns the outcome
 
-Once an apply is `reverting` or `skipping_revert`, stop, cancel, and cutover are refused for the
-whole phase, because storage must never settle on a state that contradicts what the engine is
-still doing to the database underneath. *Enforced:* revert-phase gates in the control paths
-(`pkg/tern/local_control.go`).
+Once an apply has entered its revert phase — the window held open after cutover, or a revert or
+skip-revert in flight — stop, cancel, and cutover are refused for the whole phase, and its drive
+keeps driving the phase to its own outcome rather than settling on the refused command, because
+storage must never settle on a state that contradicts what the engine is still doing to the
+database underneath. *Enforced:* revert-phase gates in the control paths
+(`pkg/tern/local_control.go`), and the drive loops that act on their answer
+(`pkg/tern/local_apply_grouped.go`, `pkg/tern/local_apply_sequential.go`,
+`pkg/tern/local_control_resume.go`).
 
 ### CO-6: Commands act only where they have an effect
 

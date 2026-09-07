@@ -1647,10 +1647,10 @@ func TestLocalClient_PendingCancelFailsClosedForRevertPhase(t *testing.T) {
 		logger:            slog.Default(),
 	}
 
-	tookEffect, err := client.processPendingCancelControlRequest(t.Context(), apply)
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply)
 
 	require.NoError(t, err)
-	assert.False(t, tookEffect, "the refusal cancelled nothing, so the drive must keep driving the revert to its own outcome")
+	assert.False(t, standDown, "the refusal cancelled nothing, so the drive must keep driving the revert to its own outcome")
 	assert.Nil(t, eng.cancelReq, "cancel must not touch the engine for a revert-phase apply")
 	assert.Equal(t, state.Apply.Reverting, apply.State, "revert-phase apply must keep its state")
 	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
@@ -1820,10 +1820,10 @@ func revertWindowRefusalFixture(operation storage.ControlOperation) (*LocalClien
 func TestLocalClient_PendingCancelRefusedInRevertWindowLeavesTheDriveRunning(t *testing.T) {
 	client, apply, task, controlRequests := revertWindowRefusalFixture(storage.ControlOperationCancel)
 
-	tookEffect, err := client.processPendingCancelControlRequest(t.Context(), apply)
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply)
 
 	require.NoError(t, err)
-	assert.False(t, tookEffect, "a refused cancel must not read as an operator cancel, or the drive loop would settle the revert-window apply stopped")
+	assert.False(t, standDown, "a refused cancel must not read as an operator cancel, or the drive loop would settle the revert-window apply stopped")
 	assert.Equal(t, state.Apply.Running, apply.State, "the apply must be left for its revert phase to settle")
 	assert.Equal(t, state.Task.RevertWindow, task.State, "the cut-over task keeps its revert window")
 	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
@@ -1836,9 +1836,9 @@ func TestLocalClient_PendingCancelRefusedInRevertWindowLeavesTheDriveRunning(t *
 	assert.Contains(t, resolved.ErrorMessage, "use revert to undo it or skip-revert to finalize it",
 		"the failed request must tell the operator which command does what they wanted")
 
-	tookEffect, err = client.processPendingCancelControlRequest(t.Context(), apply)
+	standDown, err = client.processPendingCancelControlRequest(t.Context(), apply)
 	require.NoError(t, err)
-	assert.False(t, tookEffect, "a resolved refusal must not be re-consumed on the next drive claim")
+	assert.False(t, standDown, "a resolved refusal must not be re-consumed on the next drive claim")
 }
 
 // Stop refuses a revert-window schema change for the same reason cancel does,
@@ -1847,10 +1847,10 @@ func TestLocalClient_PendingCancelRefusedInRevertWindowLeavesTheDriveRunning(t *
 func TestLocalClient_PendingStopRefusedInRevertWindowLeavesTheDriveRunning(t *testing.T) {
 	client, apply, task, controlRequests := revertWindowRefusalFixture(storage.ControlOperationStop)
 
-	tookEffect, err := client.processPendingStopControlRequest(t.Context(), apply)
+	standDown, err := client.processPendingStopControlRequest(t.Context(), apply)
 
 	require.NoError(t, err)
-	assert.False(t, tookEffect, "a refused stop must not read as an operator stop, or the drive loop would settle the revert-window apply stopped")
+	assert.False(t, standDown, "a refused stop must not read as an operator stop, or the drive loop would settle the revert-window apply stopped")
 	assert.Equal(t, state.Apply.Running, apply.State, "the apply must be left for its revert phase to settle")
 	assert.Equal(t, state.Task.RevertWindow, task.State, "the cut-over task keeps its revert window")
 	resolved, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationStop)
@@ -1881,12 +1881,30 @@ func TestLocalClient_PendingStopRefusalReportsNoEffectWhenResolvingTheRequestFai
 	store := &failPendingErrorStore{testControlRequestStore: requests, err: errors.New("apply lease lost")}
 	client := newVitessControlTestClientWithRequests(apply, []*storage.Task{task}, nil, &controlCaptureEngine{}, store)
 
-	tookEffect, err := client.processPendingStopControlRequest(t.Context(), apply)
+	standDown, err := client.processPendingStopControlRequest(t.Context(), apply)
 
 	require.ErrorContains(t, err, "apply lease lost", "the storage failure must reach the caller")
-	assert.False(t, tookEffect, "the refusal already decided nothing was stopped, so a failed write must not report a stop")
+	assert.False(t, standDown, "the refusal already decided nothing was stopped, so a failed write must not report a stop")
 	assert.Equal(t, state.Apply.Running, apply.State, "the apply must be left for its revert phase to settle")
 	pending, err := requests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.NotNil(t, pending, "the request could not be resolved, so it stays pending for a later claim")
+}
+
+// Cancel answers a failed refusal write the same way stop does: the refusal
+// already decided that nothing was cancelled, so the drive keeps driving the
+// revert phase to its own outcome no matter what the storage write does.
+func TestLocalClient_PendingCancelRefusalReportsNoEffectWhenResolvingTheRequestFails(t *testing.T) {
+	_, apply, task, requests := revertWindowRefusalFixture(storage.ControlOperationCancel)
+	store := &failPendingErrorStore{testControlRequestStore: requests, err: errors.New("apply lease lost")}
+	client := newVitessControlTestClientWithRequests(apply, []*storage.Task{task}, nil, &controlCaptureEngine{}, store)
+
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply)
+
+	require.ErrorContains(t, err, "apply lease lost", "the storage failure must reach the caller")
+	assert.False(t, standDown, "the refusal already decided nothing was cancelled, so a failed write must not stand the drive down")
+	assert.Equal(t, state.Apply.Running, apply.State, "the apply must be left for its revert phase to settle")
+	pending, err := requests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, err)
 	assert.NotNil(t, pending, "the request could not be resolved, so it stays pending for a later claim")
 }

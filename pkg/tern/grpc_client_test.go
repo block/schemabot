@@ -957,7 +957,7 @@ type mockStorage struct {
 	tasks           *mockTaskStore
 	plans           *mockPlanStore
 	logs            *mockApplyLogStore
-	controlRequests *testControlRequestStore
+	controlRequests storage.ControlRequestStore
 	operations      *mockApplyOperationStore
 }
 

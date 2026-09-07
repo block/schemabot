@@ -389,11 +389,11 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 	var stoppedByUser bool
 
 	for i, task := range tasks {
-		if tookEffect, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
+		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 			logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 				"error", err)
 			return
-		} else if tookEffect {
+		} else if standDown {
 			stoppedByUser = true
 			break
 		}
@@ -1886,7 +1886,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	if handled, err := c.reconcileEngineTerminalTruthBeforeCommands(ctx, apply, tasks); handled || err != nil {
 		return err
 	}
-	if tookEffect, err := c.processPendingCancelOrStopControlRequest(ctx, apply); tookEffect || err != nil {
+	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); standDown || err != nil {
 		return err
 	}
 	// A stopped apply is claimed only to deliver a pending control request. A
