@@ -164,6 +164,8 @@ When a change interacts with an invariant, one of these is true, and the PR shou
 
 **Reviewing:** check the diff against the invariants its blast radius touches, not only against the ticket. An invariant broken silently is the most expensive class of defect here, since the registry is what future reviewers will trust. If a PR summary claims an invariant holds, verify the claim in the code rather than accepting it.
 
+**An entry is a principle, not a case log.** Before adding text to an entry, ask whether the rule as written already covers your case. It usually does, which means the disposition is *upholds* and at most the `*Enforced:*` line changes. Keep instances of the rule, rationale, carve-outs, and coding conventions out of entry text: reasoning belongs in the PR summary, and rules about writing code belong in this file. Entries are a few sentences, so an addition that runs to a paragraph is a case rather than a principle.
+
 Do not add aspirational entries. If the behavior is not enforced in shipped code, it belongs in a design doc or a TODO, not in the registry. Process-level engineering rules (how we write and review code) belong in this file, not there.
 
 ### PR Self-Review Bar

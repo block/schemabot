@@ -6773,6 +6773,73 @@ func TestControlRejectionsNameTheOperatorApplyID(t *testing.T) {
 			assert.NotContains(t, log.Message, remoteID, "no apply log line names the remote id")
 		}
 	})
+
+	// Cancel is queued durably and then attempted immediately, exactly as stop
+	// is. A rejected immediate attempt leaves the durable request pending for
+	// the owning drive, so the apply log is the only place an operator learns
+	// why nothing happened yet — and it reads in their terms.
+	t.Run("a rejected immediate cancel is logged against the operator apply id", func(t *testing.T) {
+		mock := &mockTernClient{
+			isRemote: true,
+			cancelResp: &ternv1.CancelResponse{
+				Accepted:     false,
+				ErrorMessage: "Schema change " + remoteID + " is already cutting over",
+			},
+		}
+		apply := activeTestApply(operatorID)
+		apply.ExternalID = remoteID
+		tasks := []*storage.Task{{
+			ID:             31,
+			TaskIdentifier: "task-cancel-relay",
+			ApplyID:        apply.ID,
+			State:          state.Task.Running,
+		}}
+		svc, stores := newControlTestServiceWithStores(mock, apply, tasks)
+
+		w := postControl(t, svc, "/api/cancel", operatorID)
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		require.NotNil(t, mock.cancelReq, "the queued cancel is followed by an immediate attempt")
+		assert.Equal(t, remoteID, mock.cancelReq.ApplyId, "the data plane is still addressed by its own id")
+
+		require.True(t, hasApplyLogMessageContaining(stores.applyLogs.logs, "Immediate cancel attempt was not accepted"),
+			"the apply log must record why the cancel request is still pending")
+		require.True(t, hasApplyLogMessageContaining(stores.applyLogs.logs, "is already cutting over"),
+			"the apply log carries the reason the attempt was refused")
+		for _, log := range stores.applyLogs.logs {
+			assert.NotContains(t, log.Message, remoteID, "no apply log line names the remote id")
+		}
+
+		pending, err := stores.controls.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+		require.NoError(t, err)
+		require.NotNil(t, pending, "a refused immediate attempt leaves the durable request for the owning drive")
+	})
+
+	// A refusal is not obliged to carry a reason. The log line still has to read
+	// as a sentence rather than trailing a colon into nothing.
+	t.Run("a rejected immediate cancel with no reason logs a complete sentence", func(t *testing.T) {
+		mock := &mockTernClient{cancelResp: &ternv1.CancelResponse{Accepted: false}}
+		apply := activeTestApply(operatorID)
+		apply.ExternalID = remoteID
+		tasks := []*storage.Task{{
+			ID:             32,
+			TaskIdentifier: "task-cancel-relay-silent",
+			ApplyID:        apply.ID,
+			State:          state.Task.Running,
+		}}
+		svc, stores := newControlTestServiceWithStores(mock, apply, tasks)
+
+		w := postControl(t, svc, "/api/cancel", operatorID)
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+		var logged string
+		for _, log := range stores.applyLogs.logs {
+			if strings.Contains(log.Message, "Immediate cancel attempt was not accepted") {
+				logged = log.Message
+			}
+		}
+		require.NotEmpty(t, logged, "the apply log must record the refused attempt even with no reason")
+		assert.NotContains(t, logged, "pending:", "with no reason there is nothing to introduce with a colon")
+	})
 }
 
 // Revert and skip-revert are contradictory intents for the same revert window —

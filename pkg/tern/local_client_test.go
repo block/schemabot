@@ -545,6 +545,8 @@ type fakeControlEngine struct {
 	planResult              *engine.PlanResult
 	applyResult             *engine.ApplyResult
 	applyErr                error
+	revertErr               error
+	skipRevertErr           error
 	externallyAuthoritative bool
 }
 
@@ -609,10 +611,16 @@ func (e *fakeControlEngine) Cutover(context.Context, *engine.ControlRequest) (*e
 }
 
 func (e *fakeControlEngine) Revert(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	if e.revertErr != nil {
+		return nil, e.revertErr
+	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
 func (e *fakeControlEngine) SkipRevert(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	if e.skipRevertErr != nil {
+		return nil, e.skipRevertErr
+	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
 

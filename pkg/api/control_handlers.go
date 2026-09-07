@@ -1019,6 +1019,20 @@ func cancelResponseFromControlRequest(controlReq *storage.ApplyControlRequest) (
 	return resp, nil
 }
 
+// immediateCancelNotAcceptedMessage renders the apply-log line for a cancel the
+// fast path attempted and the executing side did not accept. The reason is
+// rewritten for the operator, who reads this on the PR timeline and cannot
+// resolve a data-plane identifier. A refusal is not obliged to carry a reason,
+// so the sentence stands on its own when none is given rather than trailing a
+// colon into nothing.
+func immediateCancelNotAcceptedMessage(apply *storage.Apply, errorMessage string) string {
+	const notAccepted = "Immediate cancel attempt was not accepted; durable cancel request remains pending"
+	if errorMessage == "" {
+		return notAccepted
+	}
+	return fmt.Sprintf("%s: %s", notAccepted, apply.OperatorFacingMessage(errorMessage))
+}
+
 func (s *Service) tryImmediateCancel(ctx context.Context, client tern.Client, apply *storage.Apply, caller string) {
 	if multiOp, err := s.applyHasMultipleOperations(ctx, apply); err != nil {
 		s.logger.Warn("could not determine apply operation count; attempting single-deployment immediate cancel",
@@ -1043,13 +1057,18 @@ func (s *Service) tryImmediateCancel(ctx context.Context, client tern.Client, ap
 			append(apply.LogAttrs(), "tern_apply_id", ternApplyID, "requested_by", caller, "error", err)...)
 		return
 	}
-	if resp == nil || !resp.Accepted {
-		errorMessage := "not accepted"
-		if resp != nil && resp.ErrorMessage != "" {
-			errorMessage = resp.ErrorMessage
-		}
+	if resp == nil {
+		s.logger.Warn("immediate cancel returned nil response; durable cancel request remains pending for apply owner retry",
+			append(apply.LogAttrs(), "tern_apply_id", ternApplyID, "requested_by", caller)...)
+		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventCancelRequested,
+			"Immediate cancel attempt returned no response; durable cancel request remains pending")
+		return
+	}
+	if !resp.Accepted {
 		s.logger.Warn("immediate cancel was not accepted; durable cancel request remains pending for apply owner retry",
-			append(apply.LogAttrs(), "tern_apply_id", ternApplyID, "requested_by", caller, "error_message", errorMessage)...)
+			append(apply.LogAttrs(), "tern_apply_id", ternApplyID, "requested_by", caller, "error_message", resp.ErrorMessage, "cancelled_count", resp.CancelledCount, "skipped_count", resp.SkippedCount)...)
+		s.logControlOperationForApply(ctx, apply, caller, storage.LogEventCancelRequested,
+			immediateCancelNotAcceptedMessage(apply, resp.ErrorMessage))
 		return
 	}
 	cancelCompleted, err := s.completeImmediateCancelRequestIfCancelled(ctx, apply, caller)
