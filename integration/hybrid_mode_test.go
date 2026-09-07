@@ -27,6 +27,7 @@ import (
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
+	"github.com/block/schemabot/pkg/testctx"
 )
 
 // TestHybridMode_LocalAndNamedRemoteTargets verifies that one SchemaBot Service
@@ -64,8 +65,12 @@ func TestHybridMode_LocalAndNamedRemoteTargets(t *testing.T) {
 	require.NoError(t, err, "create grpc database")
 
 	t.Cleanup(func() {
-		_, _ = targetDB.ExecContext(ctx, "DROP DATABASE IF EXISTS "+localDBName)
-		_, _ = targetDB.ExecContext(ctx, "DROP DATABASE IF EXISTS "+grpcDBName)
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		_, err := targetDB.ExecContext(cleanupCtx, "DROP DATABASE IF EXISTS "+localDBName)
+		assert.NoError(t, err, "drop local database %s", localDBName)
+		_, err = targetDB.ExecContext(cleanupCtx, "DROP DATABASE IF EXISTS "+grpcDBName)
+		assert.NoError(t, err, "drop grpc database %s", grpcDBName)
 	})
 
 	baseCfg, err := mysql.ParseDSN(targetDSN)

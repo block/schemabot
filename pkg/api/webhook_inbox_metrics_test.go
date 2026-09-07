@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/testctx"
 )
 
 // fakeWebhookEventStore serves a fixed InboxStats snapshot; every other method
@@ -93,7 +94,9 @@ func TestCollectWebhookInboxMetricsRecordsGauges(t *testing.T) {
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, mp.Shutdown(cleanupCtx))
 	})
 
 	store := &fakeWebhookEventStore{stats: &storage.WebhookInboxStats{
@@ -173,7 +176,9 @@ func TestCollectWebhookInboxMetricsUnknownReturnsToZeroAfterCleanup(t *testing.T
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, mp.Shutdown(cleanupCtx))
 	})
 
 	store := &fakeWebhookEventStore{stats: &storage.WebhookInboxStats{
@@ -234,7 +239,9 @@ func TestCollectWebhookInboxMetricsSkipsGaugesAndCountsFailureOnStoreError(t *te
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, mp.Shutdown(cleanupCtx))
 	})
 
 	svc := newInboxMetricsTestService(t, &fakeWebhookEventStore{err: errors.New("db down")})

@@ -18,6 +18,7 @@ import (
 	_ "github.com/block/mysql"
 	"github.com/block/schemabot/e2e/testutil"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/testctx"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/require"
 )
@@ -465,7 +466,7 @@ func grpcCreateTestTable(t *testing.T, env, tableName, ddl string) {
 			return
 		}
 		defer utils.CloseAndLog(db2)
-		ctx, cancel := testutil.CleanupContext(30 * time.Second)
+		ctx, cancel := testctx.Cleanup(t, 30*time.Second)
 		defer cancel()
 		for _, suffix := range []string{"_new", "_old", "_chkpnt", ""} {
 			name := tableName

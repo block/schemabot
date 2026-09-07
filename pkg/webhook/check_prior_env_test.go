@@ -18,6 +18,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/testctx"
 )
 
 // TestPromotionGateEnvironments covers per-database promotion order
@@ -666,7 +667,9 @@ func TestCheckPriorEnvironmentsScopedTargetMissingFromOrderFailsClosed(t *testin
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, mp.Shutdown(cleanupCtx))
 	})
 
 	client, mux := setupGitHubServer(t)

@@ -249,4 +249,30 @@ if [ -n "$PKG_FILES" ]; then
     run_severityglyphs "integration" $SEVERITYGLYPHS_PKGS
 fi
 
+# Run cleanupctx analyzer on staged packages to flag t.Context() inside
+# t.Cleanup callbacks, where it is already cancelled. The build tags go through
+# GOFLAGS rather than `go run -tags=...`: that flag selects the files compiled
+# into the checker, while the tags the checker must analyze under are the ones
+# its package loader sees, and singlechecker's own -tags flag is a no-op.
+run_cleanupctx() {
+    local build_tags="$1"
+    shift
+    local packages=("$@")
+
+    if ! GOFLAGS=${build_tags:+-tags=$build_tags} go run ./cmd/cleanupctx-check "${packages[@]}" 2>&1; then
+        echo ""
+        echo "cleanupctx: teardown runs after the test context is cancelled, so it needs"
+        echo "a context of its own: ctx, cancel := testctx.Cleanup(t, 30*time.Second)."
+        exit 1
+    fi
+}
+
+if [ -n "$PKG_FILES" ]; then
+    CLEANUPCTX_PKGS=$(echo "$PKG_FILES" | xargs -n1 dirname | sort -u | sed 's|^|./|' | sed 's|$|/...|')
+    echo "Running cleanupctx analyzer..."
+    run_cleanupctx "" $CLEANUPCTX_PKGS
+    run_cleanupctx "integration" $CLEANUPCTX_PKGS
+    run_cleanupctx "e2e" $CLEANUPCTX_PKGS
+fi
+
 echo "All lint checks passed!"

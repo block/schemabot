@@ -136,7 +136,7 @@ help: ## Show this help message
 	@echo "$$HELP_HEADER"
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
-lint: check-closeandlog check-webhookheaders ## Run all linters (golangci-lint + custom analyzers)
+lint: check-closeandlog check-webhookheaders check-cleanupctx ## Run all linters (golangci-lint + custom analyzers)
 	@echo "Running golangci-lint..."
 	@docker run --rm -v $$(pwd):/app -w /app golangci/golangci-lint:latest golangci-lint run --timeout=5m
 	@echo "Running golangci-lint (consumer module)..."
@@ -150,6 +150,17 @@ check-closeandlog: ## Run closeandlog analyzer (flags _ = x.Close() patterns)
 check-webhookheaders: ## Run webhookheaders analyzer (flags inline `## ...` markdown headers in pkg/webhook handlers)
 	@echo "Running webhookheaders analyzer..."
 	@go run ./cmd/webhookheaders-check $$(go list ./pkg/webhook/... | grep -v '/templates$$')
+
+# The build tags go through GOFLAGS, not `go run -tags=...`: that flag selects
+# the files compiled into the checker binary, while the tags the checker must
+# analyze under are the ones its package loader sees. singlechecker's own
+# -tags flag is a documented no-op, so GOFLAGS is the only path that reaches
+# the loader — without it the integration and e2e tests go unchecked.
+check-cleanupctx: ## Run cleanupctx analyzer (flags t.Context() inside t.Cleanup callbacks)
+	@echo "Running cleanupctx analyzer..."
+	@go run ./cmd/cleanupctx-check ./...
+	@GOFLAGS=-tags=integration go run ./cmd/cleanupctx-check ./...
+	@GOFLAGS=-tags=e2e go run ./cmd/cleanupctx-check ./...
 
 lint-fix: ## Run golangci-lint with auto-fix enabled
 	@echo "Running golangci-lint with auto-fix..."

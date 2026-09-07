@@ -14,6 +14,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
@@ -28,6 +29,7 @@ import (
 	ghclient "github.com/block/schemabot/pkg/github"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/testctx"
 )
 
 // TestE2EApplyCreateDualWritesApplyOperationRow verifies the service-level
@@ -96,7 +98,9 @@ func TestE2EWebhookMetrics(t *testing.T) {
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, mp.Shutdown(cleanupCtx))
 	})
 
 	dbName := "webhook_metrics_test"

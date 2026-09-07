@@ -21,6 +21,7 @@ import (
 	"github.com/block/schemabot/e2e/testutil"
 	"github.com/block/schemabot/pkg/localscale"
 	"github.com/block/schemabot/pkg/psclient"
+	"github.com/block/schemabot/pkg/testctx"
 )
 
 // TestMTLS_BranchConnection verifies that LocalScale branch proxies enforce
@@ -40,7 +41,11 @@ func TestMTLS_BranchConnection(t *testing.T) {
 		BranchTLSMode: "mtls",
 	})
 	require.NoError(t, err, "start LocalScale container with mTLS")
-	t.Cleanup(func() { _ = lsc.Terminate(ctx) })
+	t.Cleanup(func() {
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		assert.NoError(t, lsc.Terminate(cleanupCtx), "terminate LocalScale container")
+	})
 
 	require.NoError(t, lsc.SeedVSchema(ctx, "test-org", "testdb", "testkeyspace", []byte(`{"sharded": false}`)))
 	require.NoError(t, lsc.SeedDDL(ctx, "test-org", "testdb", "testkeyspace",

@@ -63,6 +63,7 @@ import (
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
+	"github.com/block/schemabot/pkg/testctx"
 	"github.com/block/spirit/pkg/lint"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
@@ -523,12 +524,15 @@ func TestK8s_PlanApply_CreateTable(t *testing.T) {
 
 	// Register cleanup for the table the apply created
 	t.Cleanup(func() {
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
 		db, err := sql.Open("block-mysql", dsn)
-		if err != nil {
+		if !assert.NoError(t, err, "open target db to drop %s", tableName) {
 			return
 		}
 		defer utils.CloseAndLog(db)
-		_, _ = db.ExecContext(t.Context(), "DROP TABLE IF EXISTS `"+tableName+"`")
+		_, err = db.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `"+tableName+"`")
+		assert.NoError(t, err, "drop table %s", tableName)
 	})
 }
 

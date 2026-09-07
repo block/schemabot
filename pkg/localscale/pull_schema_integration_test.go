@@ -12,11 +12,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/block/schemabot/e2e/testutil"
 	"github.com/block/schemabot/pkg/localscale"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
+	"github.com/block/schemabot/pkg/testctx"
 )
 
 // Pulling a live Vitess schema exports each keyspace as a namespace with table
@@ -44,7 +44,7 @@ func TestPullSchemaLoadsLiveVitessSchema(t *testing.T) {
 	require.NoError(t, err, "start LocalScale")
 	if os.Getenv("DEBUG") != "1" {
 		t.Cleanup(func() {
-			cleanupCtx, cancel := testutil.CleanupContext(30 * time.Second)
+			cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
 			defer cancel()
 			assert.NoError(t, lsc.Terminate(cleanupCtx), "terminate LocalScale")
 		})

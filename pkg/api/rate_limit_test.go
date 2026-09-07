@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -21,6 +22,7 @@ import (
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
+	"github.com/block/schemabot/pkg/testctx"
 )
 
 // newRateLimitedPullService configures two MySQL databases on one production
@@ -335,7 +337,9 @@ func TestPullRateLimitMetricClampsCallerSuppliedEnvironment(t *testing.T) {
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, mp.Shutdown(cleanupCtx))
 	})
 
 	svc, _ := newRateLimitedPullService(t, EndpointRateLimitConfig{

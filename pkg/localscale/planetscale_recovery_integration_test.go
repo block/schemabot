@@ -31,8 +31,8 @@ import (
 // stored context blanked but the persisted baseline present, and must rediscover
 // the in-flight context.
 func TestPlanetScaleProgressRecoversMigrationContextFromBaseline(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	cleanupActiveDeployRequests(t)
+	t.Cleanup(func() { cleanupActiveDeployRequests(t) })
 	ctx := t.Context()
 
 	const keyspace = "testapp_sharded"

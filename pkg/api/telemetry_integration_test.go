@@ -11,6 +11,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
+	"github.com/block/schemabot/pkg/testctx"
 )
 
 // TestMetricsAfterRequests starts a real service with MySQL storage, hits
@@ -47,7 +49,11 @@ func TestMetricsAfterRequests(t *testing.T) {
 	// Set up telemetry and routes exactly as serve.go does.
 	tel, err := SetupTelemetry(logger)
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, tel.Shutdown(t.Context())) })
+	t.Cleanup(func() {
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, tel.Shutdown(cleanupCtx))
+	})
 
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)

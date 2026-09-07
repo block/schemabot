@@ -83,6 +83,7 @@ import (
 
 	mysql "github.com/block/mysql"
 	gh "github.com/google/go-github/v86/github"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 
@@ -92,8 +93,10 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
+	"github.com/block/schemabot/pkg/testctx"
 	"github.com/block/schemabot/pkg/testutil"
 	"github.com/block/spirit/pkg/statement"
+	"github.com/block/spirit/pkg/utils"
 )
 
 var (
@@ -212,11 +215,15 @@ func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *a
 		_ = targetDB.Close()
 
 		t.Cleanup(func() {
+			cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+			defer cancel()
 			db, err := sql.Open("block-mysql", e2eTargetDSN+"&multiStatements=true")
-			if err == nil {
-				_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+appDBName+"`")
-				_ = db.Close()
+			if !assert.NoError(t, err, "open target db to drop %s", appDBName) {
+				return
 			}
+			defer utils.CloseAndLog(db)
+			_, err = db.ExecContext(cleanupCtx, "DROP DATABASE IF EXISTS `"+appDBName+"`")
+			assert.NoError(t, err, "drop app database %s", appDBName)
 		})
 
 		if appDSN == "" {
@@ -1014,12 +1021,17 @@ func setupE2EServiceMultiEnv(t *testing.T, appDBName string) *api.Service {
 	_ = targetDB.Close()
 
 	t.Cleanup(func() {
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
 		db, err := sql.Open("block-mysql", e2eTargetDSN+"&multiStatements=true")
-		if err == nil {
-			_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+stagingDB+"`")
-			_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+productionDB+"`")
-			_ = db.Close()
+		if !assert.NoError(t, err, "open target db to drop %s and %s", stagingDB, productionDB) {
+			return
 		}
+		defer utils.CloseAndLog(db)
+		_, err = db.ExecContext(cleanupCtx, "DROP DATABASE IF EXISTS `"+stagingDB+"`")
+		assert.NoError(t, err, "drop staging database %s", stagingDB)
+		_, err = db.ExecContext(cleanupCtx, "DROP DATABASE IF EXISTS `"+productionDB+"`")
+		assert.NoError(t, err, "drop production database %s", productionDB)
 	})
 
 	stagingDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+stagingDB, 1)

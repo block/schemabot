@@ -5,8 +5,10 @@ import (
 	"log/slog"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/block/schemabot/pkg/tern"
+	"github.com/block/schemabot/pkg/testctx"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
@@ -25,7 +27,9 @@ func TestCheckRemoteDeploymentHealthRecordsEachDeployment(t *testing.T) {
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, mp.Shutdown(cleanupCtx))
 	})
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))

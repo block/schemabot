@@ -27,6 +27,7 @@ import (
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/testctx"
 )
 
 func TestE2EApplyWithChanges(t *testing.T) {
@@ -1846,7 +1847,15 @@ func TestE2EApplyConfirmStaleBaseSchemaAtFinalGateOutranksUnsafePrompt(t *testin
 		PendingPlanID: pendingPlanID,
 	}))
 	t.Cleanup(func() {
-		_ = svc.Storage().Locks().ForceRelease(t.Context(), dbName, "mysql")
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		// Best-effort: the scenario under test may have released the lock
+		// already, so a missing lock is the expected outcome rather than a
+		// teardown failure. Log whatever comes back so a real storage error
+		// is still visible.
+		if err := svc.Storage().Locks().ForceRelease(cleanupCtx, dbName, "mysql"); err != nil {
+			t.Logf("release lock on %s: %v", dbName, err)
+		}
 	})
 
 	// The confirmation plan the user reviewed, rendered at the current HEAD so

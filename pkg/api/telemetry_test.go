@@ -14,6 +14,7 @@ import (
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/testctx"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -33,7 +34,11 @@ func TestSetupTelemetry(t *testing.T) {
 
 	tel, err := SetupTelemetry(logger)
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, tel.Shutdown(t.Context())) })
+	t.Cleanup(func() {
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, tel.Shutdown(cleanupCtx))
+	})
 
 	require.NotNil(t, tel.MetricsHandler)
 	assert.Nil(t, tel.tracerProvider, "tracerProvider should be nil without OTLP endpoint")
@@ -110,7 +115,11 @@ func TestMetricsEndpoint(t *testing.T) {
 
 	tel, err := SetupTelemetry(logger)
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, tel.Shutdown(t.Context())) })
+	t.Cleanup(func() {
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, tel.Shutdown(cleanupCtx))
+	})
 
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", tel.MetricsHandler)
@@ -133,7 +142,9 @@ func TestRecordPlanMetric(t *testing.T) {
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, mp.Shutdown(cleanupCtx))
 	})
 
 	metrics.RecordPlan(t.Context(), "testrepo", "testdb", "pie", "staging", "success")
@@ -190,7 +201,9 @@ func TestOtelHTTPMetrics(t *testing.T) {
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, mp.Shutdown(cleanupCtx))
 	})
 
 	svc := newTestService()
@@ -267,7 +280,9 @@ func TestSchemaBotMetricsIncludeEnvironmentAttribute(t *testing.T) {
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, mp.Shutdown(cleanupCtx))
 	})
 
 	metrics.RecordPlan(t.Context(), "org/repo", "mydb", "pie", "staging", "success")
@@ -422,7 +437,9 @@ func TestRecordApplyMetrics(t *testing.T) {
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, mp.Shutdown(cleanupCtx))
 	})
 
 	metrics.RecordApply(t.Context(), "testrepo", "mydb", "pie", "staging", "success")
@@ -442,7 +459,9 @@ func TestRecordCheckOwnershipMissMetric(t *testing.T) {
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, mp.Shutdown(cleanupCtx))
 	})
 
 	metrics.RecordCheckOwnershipMiss(t.Context(), "apply_finished", "org/repo", "mydb", "mysql", "pie", "staging")
@@ -472,7 +491,9 @@ func TestRecordSourcePolicyBlockMetric(t *testing.T) {
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, mp.Shutdown(cleanupCtx))
 	})
 
 	metrics.RecordSourcePolicyBlock(t.Context(), "plan", "mydb", "staging", "unauthorized_repo")
@@ -515,7 +536,9 @@ func TestRecordPRCommandActorAuthorizationMetric(t *testing.T) {
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, mp.Shutdown(cleanupCtx))
 	})
 
 	metrics.RecordPRCommandActorAuthorization(t.Context(), "apply", "mydb", "staging", "org/repo", "allowed", "allowed_admin_user")
@@ -560,7 +583,9 @@ func TestRecordStatusCheckOperationMetric(t *testing.T) {
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, mp.Shutdown(cleanupCtx))
 	})
 
 	metrics.RecordStatusCheckOperation(t.Context(), metrics.StatusCheckOperation{
@@ -628,7 +653,9 @@ func TestRecordPlanDurationMetric(t *testing.T) {
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, mp.Shutdown(cleanupCtx))
 	})
 
 	metrics.RecordPlanDuration(t.Context(), 500*time.Millisecond, "testrepo", "mydb", "pie", "staging", "success")
@@ -644,7 +671,9 @@ func TestRecordWebhookEventMetric(t *testing.T) {
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, mp.Shutdown(cleanupCtx))
 	})
 
 	metrics.RecordWebhookEvent(t.Context(), "default", "issue_comment", "created", "org/repo", "processed")
@@ -701,7 +730,9 @@ func TestRecordControlOperationMetric(t *testing.T) {
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, mp.Shutdown(cleanupCtx))
 	})
 
 	metrics.RecordControlOperation(t.Context(), "cutover", "mydb", "pie", "staging", "success")
@@ -719,7 +750,9 @@ func TestRecordLockOperationMetric(t *testing.T) {
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, mp.Shutdown(cleanupCtx))
 	})
 
 	metrics.RecordLockOperation(t.Context(), "acquire", "mydb", "success")
@@ -737,7 +770,9 @@ func TestRecordOperatorMetrics(t *testing.T) {
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, mp.Shutdown(cleanupCtx))
 	})
 
 	metrics.RecordOperatorResume(t.Context(), "testdb", "pie", "staging", "running")
@@ -828,7 +863,9 @@ func TestRecordRemoteDeploymentHealthMetrics(t *testing.T) {
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, mp.Shutdown(cleanupCtx))
 	})
 
 	metrics.RecordRemoteDeploymentHealth(t.Context(), "pie", "staging", true)
@@ -884,7 +921,9 @@ func setupTraceTest(t *testing.T) *tracetest.InMemoryExporter {
 	otel.SetTracerProvider(tp)
 	t.Cleanup(func() {
 		otel.SetTracerProvider(prevTP)
-		if err := tp.Shutdown(t.Context()); err != nil {
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		if err := tp.Shutdown(cleanupCtx); err != nil {
 			t.Logf("tracer shutdown: %v", err)
 		}
 	})

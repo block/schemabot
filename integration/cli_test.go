@@ -26,6 +26,7 @@ import (
 	schemabotapi "github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
+	"github.com/block/schemabot/pkg/testctx"
 )
 
 // TestCLI_Schemabot_GRPC tests the schemabot CLI commands with gRPC backend.
@@ -922,7 +923,7 @@ func startSchemaBotLocal(t *testing.T) string {
 	server := &http.Server{Handler: mux}
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(func() {
-		ctx, cancel := testutil.CleanupContext(5 * time.Second)
+		ctx, cancel := testctx.Cleanup(t, 5*time.Second)
 		defer cancel()
 		_ = server.Shutdown(ctx)
 	})
@@ -952,7 +953,7 @@ func startSchemaBotLocalDB(t *testing.T, dbName string) string {
 	targetDB, err := sql.Open("block-mysql", targetDSN+"&multiStatements=true")
 	require.NoError(t, err, "open target db connection")
 	t.Cleanup(func() {
-		ctx, cancel := testutil.CleanupContext(30 * time.Second)
+		ctx, cancel := testctx.Cleanup(t, 30*time.Second)
 		defer cancel()
 		_, _ = targetDB.ExecContext(ctx, "DROP DATABASE IF EXISTS "+dbName)
 		_ = targetDB.Close()
@@ -1006,7 +1007,7 @@ func startSchemaBotLocalDB(t *testing.T, dbName string) string {
 	server := &http.Server{Handler: mux}
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(func() {
-		ctx, cancel := testutil.CleanupContext(5 * time.Second)
+		ctx, cancel := testctx.Cleanup(t, 5*time.Second)
 		defer cancel()
 		_ = server.Shutdown(ctx)
 	})
@@ -1073,7 +1074,7 @@ func startSchemaBotWithGRPC(t *testing.T) string {
 	server := &http.Server{Handler: mux}
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(func() {
-		ctx, cancel := testutil.CleanupContext(5 * time.Second)
+		ctx, cancel := testctx.Cleanup(t, 5*time.Second)
 		defer cancel()
 		_ = server.Shutdown(ctx)
 	})

@@ -23,6 +23,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/e2eutil"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/testctx"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 )
@@ -411,7 +412,7 @@ func createTestTable(t *testing.T, tableName, ddlStmt string) {
 			return
 		}
 		defer utils.CloseAndLog(db2)
-		ctx, cancel := testutil.CleanupContext(30 * time.Second)
+		ctx, cancel := testctx.Cleanup(t, 30*time.Second)
 		defer cancel()
 		for _, suffix := range []string{"_new", "_old", "_chkpnt", ""} {
 			name := tableName

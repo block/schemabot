@@ -15,6 +15,7 @@ import (
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/testctx"
 )
 
 // reaperMetricReader points the global meter provider at a manual reader for the
@@ -27,7 +28,9 @@ func reaperMetricReader(t *testing.T) *sdkmetric.ManualReader {
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		require.NoError(t, mp.Shutdown(cleanupCtx))
 	})
 	return reader
 }

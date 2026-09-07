@@ -27,6 +27,7 @@ import (
 	"github.com/block/schemabot/e2e/testutil"
 	"github.com/block/schemabot/pkg/localscale"
 	"github.com/block/schemabot/pkg/psclient"
+	"github.com/block/schemabot/pkg/testctx"
 )
 
 //go:embed testdata/schema
@@ -465,9 +466,13 @@ func waitForDeployState(t *testing.T, ctx context.Context, number uint64, wantSt
 }
 
 // cleanupActiveDeployRequests skips-revert or cancels any active deploy requests
-// so the next test isn't blocked by the gated deployment check.
-func cleanupActiveDeployRequests(t *testing.T, ctx context.Context) {
+// so the next test isn't blocked by the gated deployment check. It owns its
+// context because every caller registers it as teardown, where the test's own
+// context is already cancelled.
+func cleanupActiveDeployRequests(t *testing.T) {
 	t.Helper()
+	ctx, cancel := testctx.Cleanup(t, 30*time.Second)
+	defer cancel()
 	start := time.Now()
 	cleaned := 0
 	// Scan all deploy requests and skip-revert or cancel any that are active
@@ -476,7 +481,14 @@ func cleanupActiveDeployRequests(t *testing.T, ctx context.Context) {
 			Organization: testOrg, Database: testDB, Number: i,
 		})
 		if err != nil {
-			break // no more deploy requests
+			// The scan learns where the list ends by asking for one deploy
+			// request past it, so a lookup failure is the normal stop signal.
+			// A dead context is not: it stops the scan before it has examined
+			// anything, leaving active deploy requests to block the next test.
+			if ctx.Err() != nil {
+				t.Errorf("cleanupActiveDeployRequests: context expired at deploy request %d: %v", i, ctx.Err())
+			}
+			break
 		}
 		switch dr.DeploymentState {
 		case "complete_pending_revert":

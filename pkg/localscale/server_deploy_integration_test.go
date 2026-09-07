@@ -16,8 +16,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/block/schemabot/e2e/testutil"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/testctx"
 )
 
 var drState = state.DeployRequest
@@ -25,8 +25,8 @@ var drState = state.DeployRequest
 // TestDeployRequestDiffNoChanges verifies that CreateDeployRequest returns no_changes
 // when branch schema matches main schema (no DDL applied to branch).
 func TestDeployRequestDiffNoChanges(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	cleanupActiveDeployRequests(t)
+	t.Cleanup(func() { cleanupActiveDeployRequests(t) })
 	ctx := t.Context()
 	branchName := createBranch(t, ctx, "no-changes")
 
@@ -49,8 +49,8 @@ func TestDeployRequestDiffNoChanges(t *testing.T) {
 // TestDeployRequestDiffCreateTable verifies the schema differ produces correct
 // DDL for CREATE TABLE operations and deploys them successfully.
 func TestDeployRequestDiffCreateTable(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	cleanupActiveDeployRequests(t)
+	t.Cleanup(func() { cleanupActiveDeployRequests(t) })
 	ctx := t.Context()
 	branchName := createBranchWithDDL(t, ctx, "diff-ct",
 		map[string][]string{
@@ -78,8 +78,8 @@ func TestDeployRequestDiffCreateTable(t *testing.T) {
 // in-flight LocalScale work before clearing metadata, so the next deploy request
 // starts from a clean state and can apply successfully.
 func TestResetStateCanRunImmediatelyAfterDeploySubmit(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	cleanupActiveDeployRequests(t)
+	t.Cleanup(func() { cleanupActiveDeployRequests(t) })
 	ctx := t.Context()
 
 	indexName := fmt.Sprintf("idx_reset_%d", time.Now().UnixNano())
@@ -123,8 +123,8 @@ func TestResetStateCanRunImmediatelyAfterDeploySubmit(t *testing.T) {
 // TestBranchDatabaseCleanupOnSkipRevert verifies that branch databases are dropped
 // after skip-revert closes the revert window.
 func TestBranchDatabaseCleanupOnSkipRevert(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	cleanupActiveDeployRequests(t)
+	t.Cleanup(func() { cleanupActiveDeployRequests(t) })
 	ctx := t.Context()
 	branchName := createBranchWithDDL(t, ctx, "cleanup",
 		map[string][]string{
@@ -170,8 +170,8 @@ func TestBranchDatabaseCleanupOnSkipRevert(t *testing.T) {
 // TestBranchVSchemaSnapshotAndDiff verifies VSchema snapshot at branch creation
 // and VSchema diff at deploy request creation.
 func TestBranchVSchemaSnapshotAndDiff(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	cleanupActiveDeployRequests(t)
+	t.Cleanup(func() { cleanupActiveDeployRequests(t) })
 	ctx := t.Context()
 	branchName := createBranch(t, ctx, "vschema-diff")
 
@@ -209,8 +209,8 @@ func TestBranchVSchemaSnapshotAndDiff(t *testing.T) {
 // TestStateValidation verifies that control operations fail on deploy requests
 // in various terminal/non-actionable states (ready, complete, cancelled).
 func TestStateValidation(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	cleanupActiveDeployRequests(t)
+	t.Cleanup(func() { cleanupActiveDeployRequests(t) })
 	tests := []struct {
 		name    string
 		ddlCol  string
@@ -307,8 +307,8 @@ func TestStateValidation(t *testing.T) {
 
 // TestMultiKeyspaceDDLDeploy verifies DDL changes across both keyspaces in a single deploy.
 func TestMultiKeyspaceDDLDeploy(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	cleanupActiveDeployRequests(t)
+	t.Cleanup(func() { cleanupActiveDeployRequests(t) })
 	ctx := t.Context()
 
 	// Cancel any pending Vitess migrations from earlier tests to avoid
@@ -340,8 +340,8 @@ func TestMultiKeyspaceDDLDeploy(t *testing.T) {
 
 // TestBranchDDLError verifies that invalid DDL fails via MySQL connection and the branch recovers.
 func TestBranchDDLError(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	cleanupActiveDeployRequests(t)
+	t.Cleanup(func() { cleanupActiveDeployRequests(t) })
 	ctx := t.Context()
 	branchName := createBranch(t, ctx, "ddl-error")
 
@@ -378,8 +378,8 @@ func TestBranchDDLError(t *testing.T) {
 // the configured RevertWindowDuration (5s in test config), transitioning from
 // complete_pending_revert to complete without manual intervention.
 func TestRevertWindowExpiration(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	cleanupActiveDeployRequests(t)
+	t.Cleanup(func() { cleanupActiveDeployRequests(t) })
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 
@@ -435,8 +435,8 @@ func TestRevertWindowExpiration(t *testing.T) {
 // TestDeployRequestPendingToReady verifies that CreateDeployRequest returns "pending"
 // immediately and asynchronously transitions to "ready" when changes are detected.
 func TestDeployRequestPendingToReady(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	cleanupActiveDeployRequests(t)
+	t.Cleanup(func() { cleanupActiveDeployRequests(t) })
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 
@@ -480,12 +480,8 @@ func TestDeployRequestPendingToReady(t *testing.T) {
 // only meaningful if the deploy request reports the setting, so LocalScale has to
 // report it the way the PlanetScale API does: nested under the deployment.
 func TestDeployRequestReportsTheCutoverSettingItWasCreatedWith(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() {
-		cleanupCtx, cancel := testutil.CleanupContext(30 * time.Second)
-		defer cancel()
-		cleanupActiveDeployRequests(t, cleanupCtx)
-	})
+	cleanupActiveDeployRequests(t)
+	t.Cleanup(func() { cleanupActiveDeployRequests(t) })
 
 	tests := []struct {
 		name        string
@@ -515,7 +511,7 @@ func TestDeployRequestReportsTheCutoverSettingItWasCreatedWith(t *testing.T) {
 			})
 			require.NoError(t, err, "CreateDeployRequest")
 			t.Cleanup(func() {
-				cleanupCtx, cancel := testutil.CleanupContext(30 * time.Second)
+				cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
 				defer cancel()
 				_, _ = testClient.CancelDeployRequest(cleanupCtx, &ps.CancelDeployRequestRequest{
 					Organization: testOrg,
@@ -539,12 +535,8 @@ func TestDeployRequestReportsTheCutoverSettingItWasCreatedWith(t *testing.T) {
 // separately — otherwise a change still copying rows and waiting for the
 // operator renders as already swapped.
 func TestDeployRequestReportsWhetherItRanInstantly(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() {
-		cleanupCtx, cancel := testutil.CleanupContext(30 * time.Second)
-		defer cancel()
-		cleanupActiveDeployRequests(t, cleanupCtx)
-	})
+	cleanupActiveDeployRequests(t)
+	t.Cleanup(func() { cleanupActiveDeployRequests(t) })
 
 	tests := []struct {
 		name       string
@@ -578,7 +570,7 @@ func TestDeployRequestReportsWhetherItRanInstantly(t *testing.T) {
 			// failure. On the passing path the deploy is already complete and
 			// this cancel is refused — hence the discarded result.
 			t.Cleanup(func() {
-				cleanupCtx, cancel := testutil.CleanupContext(30 * time.Second)
+				cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
 				defer cancel()
 				_, _ = testClient.CancelDeployRequest(cleanupCtx, &ps.CancelDeployRequestRequest{
 					Organization: testOrg,
@@ -617,8 +609,8 @@ func TestDeployRequestReportsWhetherItRanInstantly(t *testing.T) {
 // TestDeployRequestPendingToNoChanges verifies that CreateDeployRequest returns "pending"
 // and transitions to "no_changes" when branch matches main.
 func TestDeployRequestPendingToNoChanges(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	cleanupActiveDeployRequests(t)
+	t.Cleanup(func() { cleanupActiveDeployRequests(t) })
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 
@@ -646,8 +638,8 @@ func TestDeployRequestPendingToNoChanges(t *testing.T) {
 // TestDeploySubmittingToQueued verifies that DeployDeployRequest returns "submitting"
 // immediately and asynchronously transitions to "queued" after DDL submission.
 func TestDeploySubmittingToQueued(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	cleanupActiveDeployRequests(t)
+	t.Cleanup(func() { cleanupActiveDeployRequests(t) })
 	cancelAllVitessMigrations(t, t.Context())
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
@@ -683,8 +675,8 @@ func TestDeploySubmittingToQueued(t *testing.T) {
 // instant-eligible on the branch and reported in the deploy request.
 // Uses the /apply-schema HTTP endpoint which tests ALGORITHM=INSTANT.
 func TestInstantDDLEligibility(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	cleanupActiveDeployRequests(t)
+	t.Cleanup(func() { cleanupActiveDeployRequests(t) })
 	ctx := t.Context()
 
 	// ADD COLUMN NULL is instant in MySQL 8.4.
@@ -716,8 +708,8 @@ func TestInstantDDLEligibility(t *testing.T) {
 // TestCancelInProgressToCompleteCancel verifies that cancelling an in-progress deploy
 // transitions through in_progress_cancel → complete_cancel via the state processor.
 func TestCancelInProgressToCompleteCancel(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	cleanupActiveDeployRequests(t)
+	t.Cleanup(func() { cleanupActiveDeployRequests(t) })
 	cancelAllVitessMigrations(t, t.Context())
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
@@ -761,11 +753,11 @@ func TestCancelInProgressToCompleteCancel(t *testing.T) {
 // TestRevertWithVSchemaTransitionalState verifies that reverting a VSchema-only deploy
 // transitions through in_progress_revert_vschema.
 func TestRevertWithVSchemaTransitionalState(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	cleanupActiveDeployRequests(t)
+	t.Cleanup(func() { cleanupActiveDeployRequests(t) })
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
-	cleanupActiveDeployRequests(t, ctx)
+	cleanupActiveDeployRequests(t)
 
 	// Apply VSchema-only change
 	branchName := createBranchWithDDL(t, ctx, "revert-vschema",
@@ -804,11 +796,11 @@ func TestRevertWithVSchemaTransitionalState(t *testing.T) {
 // TestCompleteRevertError verifies that a failed revert produces the complete_revert_error state
 // instead of complete_error.
 func TestCompleteRevertError(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	cleanupActiveDeployRequests(t)
+	t.Cleanup(func() { cleanupActiveDeployRequests(t) })
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
-	cleanupActiveDeployRequests(t, ctx)
+	cleanupActiveDeployRequests(t)
 
 	cancelAllVitessMigrations(t, ctx)
 
@@ -843,8 +835,8 @@ func TestCompleteRevertError(t *testing.T) {
 
 // TestRefreshSchema verifies that syncing a branch re-snapshots schema from main.
 func TestRefreshSchema(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	cleanupActiveDeployRequests(t)
+	t.Cleanup(func() { cleanupActiveDeployRequests(t) })
 	ctx := t.Context()
 
 	// Create a branch and apply DDL to it
@@ -881,8 +873,8 @@ func TestRefreshSchema(t *testing.T) {
 // TestRefreshSchemaAndApply verifies the full --branch reuse workflow:
 // create branch once, then sync + apply DDL multiple times.
 func TestRefreshSchemaAndApply(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	t.Cleanup(func() { cleanupActiveDeployRequests(t, t.Context()) })
+	cleanupActiveDeployRequests(t)
+	t.Cleanup(func() { cleanupActiveDeployRequests(t) })
 	cancelAllVitessMigrations(t, t.Context())
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()

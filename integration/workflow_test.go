@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -26,6 +27,7 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
+	"github.com/block/schemabot/pkg/testctx"
 )
 
 // =============================================================================
@@ -54,8 +56,11 @@ func createTestDB(t *testing.T, prefix string) (appDBName, appDSN string) {
 	appDSN = strings.Replace(targetDSN, "/target_test", "/"+appDBName, 1)
 
 	t.Cleanup(func() {
-		_, _ = targetDB.ExecContext(t.Context(), "DROP DATABASE IF EXISTS "+appDBName)
-		_ = targetDB.Close()
+		ctx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
+		_, err := targetDB.ExecContext(ctx, "DROP DATABASE IF EXISTS "+appDBName)
+		assert.NoError(t, err, "drop app database %s", appDBName)
+		utils.CloseAndLog(targetDB)
 	})
 
 	return appDBName, appDSN

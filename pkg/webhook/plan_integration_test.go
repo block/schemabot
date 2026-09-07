@@ -29,6 +29,8 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
+	"github.com/block/schemabot/pkg/testctx"
+	"github.com/block/spirit/pkg/utils"
 )
 
 func TestE2EPlanWithChanges(t *testing.T) {
@@ -808,11 +810,15 @@ func TestE2EPlanUsesServerSideTarget(t *testing.T) {
 	_ = targetDB.Close()
 
 	t.Cleanup(func() {
+		cleanupCtx, cancel := testctx.Cleanup(t, 30*time.Second)
+		defer cancel()
 		db, err := sql.Open("block-mysql", e2eTargetDSN+"&multiStatements=true")
-		if err == nil {
-			_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+dbName+"`")
-			_ = db.Close()
+		if !assert.NoError(t, err, "open target db to drop %s", dbName) {
+			return
 		}
+		defer utils.CloseAndLog(db)
+		_, err = db.ExecContext(cleanupCtx, "DROP DATABASE IF EXISTS `"+dbName+"`")
+		assert.NoError(t, err, "drop app database %s", dbName)
 	})
 
 	appDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+dbName, 1)

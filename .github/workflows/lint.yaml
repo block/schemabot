@@ -140,6 +140,11 @@ jobs:
       - name: webhookheaders analyzer
         if: needs.changes.outputs.code == 'true' && matrix.name == 'default'
         run: make check-webhookheaders
+      # Runs on the default leg only: the target sweeps every build tag itself,
+      # so running it per matrix leg would repeat the same three passes.
+      - name: cleanupctx analyzer
+        if: needs.changes.outputs.code == 'true' && matrix.name == 'default'
+        run: make check-cleanupctx
 
   # Stable rollup for the lint matrix so a single check name can gate a merge,
   # mirroring the E2E/LocalScale/K8s rollups in test.yaml. The golangci matrix

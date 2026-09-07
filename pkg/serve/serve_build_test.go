@@ -1,7 +1,6 @@
 package serve
 
 import (
-	"context"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +15,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
+	"github.com/block/schemabot/pkg/testctx"
 )
 
 // stubTernClient satisfies tern.Client for tests that only need a non-nil client
@@ -57,7 +57,7 @@ func TestServerMetricsHandlerSeparateFromAPIHandler(t *testing.T) {
 	// SetupTelemetry installs global OTel providers; shut them down so state
 	// does not leak into later tests.
 	t.Cleanup(func() {
-		shutdownCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		shutdownCtx, cancel := testctx.Cleanup(t, 5*time.Second)
 		defer cancel()
 		_ = telemetry.Shutdown(shutdownCtx)
 	})
@@ -107,7 +107,7 @@ func TestForwardAuthEnforcedThroughServerHandler(t *testing.T) {
 	telemetry, err := api.SetupTelemetry(logger)
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		shutdownCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		shutdownCtx, cancel := testctx.Cleanup(t, 5*time.Second)
 		defer cancel()
 		_ = telemetry.Shutdown(shutdownCtx)
 	})
@@ -184,7 +184,7 @@ func TestForwardAuthServiceCallerLaneThroughServerHandler(t *testing.T) {
 	telemetry, err := api.SetupTelemetry(logger)
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		shutdownCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		shutdownCtx, cancel := testctx.Cleanup(t, 5*time.Second)
 		defer cancel()
 		_ = telemetry.Shutdown(shutdownCtx)
 	})
@@ -273,7 +273,7 @@ func TestForwardAuthOperatorScopingThroughServerHandler(t *testing.T) {
 	telemetry, err := api.SetupTelemetry(logger)
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		shutdownCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		shutdownCtx, cancel := testctx.Cleanup(t, 5*time.Second)
 		defer cancel()
 		_ = telemetry.Shutdown(shutdownCtx)
 	})
