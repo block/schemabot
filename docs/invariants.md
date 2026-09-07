@@ -1328,6 +1328,11 @@ lock. An identical registration is reusable; new registrations require a stopped
 reads its configuration again under that same lock so it cannot start with a superseded snapshot.
 *Enforced:* `pkg/localsetup/register.go` and `pkg/localruntime/manager.go`.
 
+Local profile registration never replaces a different connection or changes the default profile.
+CLI configuration saves are atomic and reject a stale loaded revision, so a concurrent setup or
+login cannot silently erase a newer registration. *Enforced:* `pkg/cmd/client/local_profile.go`
+and `pkg/cmd/client/config.go`.
+
 ## Structural enforcement
 
 The strongest invariants are enforced by structure, so regressions fail CI instead of review:
