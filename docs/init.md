@@ -18,21 +18,27 @@ needs the engine's scratch privileges. Setup never applies application schema ch
 ## Follow the wizard
 
 The wizard asks for the engine, database name, environment, connection references, namespace
-scope, schema directory, and profile. Review the summary and confirm to continue.
+scope, schema directory, and profile. Use arrow keys to choose an engine, Enter to continue,
+and Shift+Tab to go back. Review the summary before connecting. Escape cancels setup.
 
 SchemaBot imports into a temporary directory and verifies a no-change plan before publishing
 the files. A successful setup ends with:
 
 ```text
-Schema ready in schema.
-Baseline plan: no changes.
-Profile "default" is ready. Edit the schema, then run a plan.
+  ✓ Schema ready
+
+  1 table · schema
+  Baseline plan: no changes.
+
+  Edit your schema files, then review your first change:
+
+    schemabot plan -s 'schema' -e 'development' --profile 'default'
 ```
 
 An empty namespace gets a comment-only `schema.sql` file that preserves its scope. Add your
 first table declaration there when you are ready; setup does not invent a sample table.
 
-If schema files already exist, the wizard offers to verify and reuse them. It checks their
+If schema files already exist, the review screen explains that they will be verified and reused. It checks their
 database, engine, and namespace scope, and preserves their contents. Differences from the live
 database stop setup with the plan details; they are not applied automatically.
 

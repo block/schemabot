@@ -1,68 +1,94 @@
 package commands
 
 import (
-	"bytes"
-	"context"
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/stretchr/testify/require"
 )
 
-func TestInitWizardCollectsInputsWithoutInitializing(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("SCHEMABOT_PROFILE", "")
-	cmd := InitCmd{SchemaDir: filepath.Join(t.TempDir(), "schema")}
-	var output bytes.Buffer
-	g := &Globals{}
-	input := "postgres\nshop\n\n\n\n\n\n\ny\n"
-	require.NoError(t, cmd.promptInputs(t.Context(), strings.NewReader(input), &output, g))
-	require.Empty(t, cmd.missingInputs())
-	require.Equal(t, []string{"public"}, cmd.Namespaces)
-	require.Equal(t, "env:DATABASE_URL", cmd.DSN)
-	require.Equal(t, "default", g.Profile)
-	require.Contains(t, output.String(), "No application schema changes will be applied")
-	_, err := os.Stat(filepath.Join(home, ".schemabot"))
-	require.True(t, os.IsNotExist(err))
-}
+func wizardKey(m *initWizard, k tea.KeyType) { m.Update(tea.KeyMsg{Type: k}) }
 
-func TestInitWizardCancellationAndNonInteractive(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+func TestInitWizardNavigationAndValidation(t *testing.T) {
+	t.Setenv("DATABASE_URL", "test-only")
+	t.Setenv("SCHEMABOT_STORAGE_DSN", "test-only")
+	m := newInitWizard(&InitCmd{}, "default", io.Discard)
+	wizardKey(m, tea.KeyDown)
+	require.Equal(t, "postgres", m.fields[0].value)
+	wizardKey(m, tea.KeyEnter)
+	m.input.SetValue("Bad Name")
+	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, 1, m.step)
+	require.NotEmpty(t, m.err)
+	m.input.SetValue("shop")
+	wizardKey(m, tea.KeyEnter)
+	wizardKey(m, tea.KeyShiftTab)
+	require.Equal(t, "shop", m.input.Value())
+	wizardKey(m, tea.KeyEnter)
+	wizardKey(m, tea.KeyEnter)
+	m.input.SetValue("postgres://secret")
+	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, 3, m.step)
+	require.Contains(t, m.err, "env:VARIABLE")
+	m.input.SetValue("env:DATABASE_URL")
+	wizardKey(m, tea.KeyEnter)
+	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, "public", m.input.Value())
+	for m.step < len(m.fields) {
+		wizardKey(m, tea.KeyEnter)
+	}
+	require.False(t, m.confirmed)
+	require.Contains(t, m.View(), "No application schema changes")
+	wizardKey(m, tea.KeyEnter)
+	require.True(t, m.confirmed)
+}
+func TestInitWizardReviewExistingFilesAndCancel(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "users.sql")
+	require.NoError(t, os.WriteFile(path, []byte("existing"), 0600))
+	m := newInitWizard(&InitCmd{SchemaDir: root}, "default", io.Discard)
+	m.step = len(m.fields)
+	require.Contains(t, m.View(), "verified and preserved")
+	wizardKey(m, tea.KeyEsc)
+	require.False(t, m.confirmed)
+	require.True(t, m.cancelled)
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, "existing", string(data))
+}
+func TestInitWizardNonInteractive(t *testing.T) {
 	cmd := InitCmd{NonInteractive: true}
 	err := cmd.collectInputs(t.Context(), &Globals{})
 	require.ErrorContains(t, err, "--database")
 	require.ErrorContains(t, err, "--namespace")
-	cmd = InitCmd{SchemaDir: filepath.Join(t.TempDir(), "schema")}
-	var output bytes.Buffer
-	err = cmd.promptInputs(t.Context(), strings.NewReader("mysql\nshop\n\n\n\n\n\n\nn\n"), &output, &Globals{})
-	require.ErrorContains(t, err, "nothing was initialized")
 }
-
-func TestInitWizardContextCancelsBlockedPrompt(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	input, writer := io.Pipe()
-	t.Cleanup(func() { require.NoError(t, input.Close()); require.NoError(t, writer.Close()) })
-	ctx, cancel := context.WithCancel(t.Context())
-	cmd := InitCmd{}
-	started := make(chan struct{}, 1)
-	output := promptSignalWriter{started: started}
-	done := make(chan error, 1)
-	go func() { done <- cmd.promptInputs(ctx, input, output, &Globals{}) }()
-	<-started
-	cancel()
-	require.ErrorIs(t, <-done, context.Canceled)
+func TestInitWizardMissingVariableAndNarrowTerminal(t *testing.T) {
+	t.Setenv("DATABASE_URL", "")
+	m := newInitWizard(&InitCmd{}, "default", io.Discard)
+	m.step = 3
+	m.loadField()
+	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, 3, m.step)
+	require.Contains(t, m.err, "Set this environment variable")
+	m.Update(tea.WindowSizeMsg{Width: 40, Height: 24})
+	require.NotEmpty(t, m.View())
 }
-
-type promptSignalWriter struct{ started chan struct{} }
-
-func (w promptSignalWriter) Write(p []byte) (int, error) {
-	select {
-	case w.started <- struct{}{}:
-	default:
-	}
-	return len(p), nil
+func TestInitProgressCancellationWaitsForCleanup(t *testing.T) {
+	cancelled := false
+	m := &initProgress{cancel: func() { cancelled = true }}
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	require.True(t, cancelled)
+	require.True(t, m.stopping)
+	require.Nil(t, cmd)
+	require.Nil(t, m.finished)
+	_, cmd = m.Update(initFinishedMsg{})
+	require.NotNil(t, cmd)
+}
+func TestInitCompletionQuotesNextCommand(t *testing.T) {
+	output := initCompletion(&initResult{SchemaDir: "my schema", Profile: "dev's profile"}, "development")
+	require.Contains(t, output, "-s 'my schema'")
+	require.Contains(t, output, "--profile 'dev'\"'\"'s profile'")
 }
