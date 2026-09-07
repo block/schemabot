@@ -5,6 +5,9 @@ The wizard and explicit CLI flags use the same setup workflow.
 
 ![SchemaBot setup, a schema edit, and the first plan](../assets/init-demo.gif)
 
+The demo shows PostgreSQL: choose an engine, name the database, select namespaces, review
+the setup, and verify the baseline before making a first edit.
+
 ## Before you start
 
 Use MySQL or PostgreSQL, with an existing application database and a separate database for
