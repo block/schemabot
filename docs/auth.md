@@ -4,6 +4,8 @@
 
 ## Table of Contents
 
+- [Where SchemaBot runs](#where-schemabot-runs)
+  - [Which configuration file to edit](#which-configuration-file-to-edit)
 - [Choose your setup](#choose-your-setup)
 - [Run locally](#run-locally)
 - [Connect your identity provider](#connect-your-identity-provider)
@@ -39,7 +41,40 @@ API use the access settings on your server. Configure each path you use.
 
 ![GitHub PR commands and API requests use separate authentication and permission checks before reaching SchemaBot.](../assets/auth-access.svg)
 
-This guide assumes you have a [server configuration](configuration.md).
+## Where SchemaBot runs
+
+SchemaBot runs as a service that connects to your databases, plans schema
+changes, and coordinates running them. You host that service yourself: on your
+laptop while trying it out, or on infrastructure your team manages for shared
+use. Hosting it means keeping that process running and giving it access to
+the databases it manages.
+
+The CLI connects to this service. If you use the GitHub workflow, GitHub sends
+it webhook events when someone opens a PR or posts a command. SchemaBot also
+uses a storage database to remember plans, change history, and ongoing work.
+
+Your **SchemaBot server URL** is the address the CLI and other API clients use,
+for example `https://schemabot.example.com`. It is separate from your database
+address. This guide controls who can use SchemaBot; the database credentials
+in your server configuration control which databases SchemaBot can connect to.
+
+If you do not have a server yet:
+
+- Start with the [local quick start](../README.md#quick-start) to run SchemaBot
+  and the demo databases on your machine
+- For shared hosting, use a [released binary, container image, or Helm chart](../README.md#releases)
+  with your own [server configuration](configuration.md); the repository also
+  includes [Docker Compose](../deploy/local/docker-compose.yml) and
+  [Kubernetes examples](../deploy/k8s)
+- If you want PR commands, follow the [GitHub App setup](github-app-setup.md)
+  to connect GitHub to your service
+
+Once your server is running, choose how callers should access it below.
+
+### Which configuration file to edit
+
+Your [server configuration](configuration.md) contains the database connections
+and the access rules covered here.
 The YAML examples are additions to that file unless they explicitly say they
 belong in your local CLI profile. Merge them into existing sections rather
 than adding a second `auth` or `databases` key. Replace example hostnames and
