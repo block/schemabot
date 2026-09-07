@@ -11,9 +11,10 @@ import (
 
 // RefreshToken exchanges a refresh token for a fresh set of tokens at the
 // issuer's token endpoint, using the same public client as login. It returns the
-// new ID token and its expiry plus the refresh token, so a cached session
-// can be renewed without another browser
-// round-trip. RedirectPort is unused for the refresh grant.
+// new ID token, access token, and refresh token. Expiry is the ID token's expiry,
+// used to renew the cached bearer credential without another browser round-trip.
+// The refresh token is retained if the provider does not rotate it.
+// RedirectPort is unused for the refresh grant.
 func RefreshToken(ctx context.Context, cfg LoginConfig, refreshToken string) (*LoginResult, error) {
 	if cfg.Issuer == "" {
 		return nil, errors.New("refresh: issuer is required")
