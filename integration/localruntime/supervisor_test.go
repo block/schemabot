@@ -22,6 +22,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	runtimehost "github.com/block/schemabot/pkg/localruntime"
+	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/testutil"
 )
@@ -146,7 +147,7 @@ func supervisorDatabase(t *testing.T, engine string) (string, string, *sql.DB) {
 	testcontainers.CleanupContainer(t, container)
 	dsn, err := testutil.MySQLDSN(t.Context(), container, "app", "parseTime=true")
 	require.NoError(t, err)
-	db, err := sql.Open("mysql", dsn)
+	db, err := mysqlconn.Open(dsn)
 	require.NoError(t, err)
 	require.NoError(t, testutil.PingMySQL(t.Context(), db))
 	t.Cleanup(func() { assert.NoError(t, db.Close()) })
