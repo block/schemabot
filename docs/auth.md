@@ -113,7 +113,9 @@ GitHub-side authorization that gates PR comment commands.
 Every API request is classified into one of two tiers before any handler runs.
 
 The **read tier** is visibility: `status`, `progress`, `logs`, listing locks,
-history, database discovery, and `pull`, which exports a live schema.
+history, database discovery, and `pull`, which exports a live schema. See
+[Schema intelligence](schema-intelligence.md) for CLI examples and API request
+and response payloads.
 
 The **write tier** is anything that stages or makes a change: `plan`, `apply`,
 the control operations (`stop`, `start`, `cancel`, `cutover`, `revert`,
@@ -392,79 +394,24 @@ history, and progress requests with response examples.
 
 ## The decision flow
 
-One API request, end to end. The right-hand column under "write" is the
-two-phase decision that [per-database operator
-scoping](#per-database-operator-scoping) explains in detail.
+With API authentication enabled, SchemaBot first checks who is calling, then
+whether they have permission for the request.
 
-```
-                          API request
-                               │
-                ┌──────────────┴──────────────┐
-                │ exempt path?                │──▶ bypass: probes are open,
-                │ /livez /health /webhook …   │    webhooks verify HMAC
-                └──────────────┬──────────────┘
-                               │ /api/…
-                               ▼
-                ┌─────────────────────────────┐
-                │ authenticate (auth.type)    │──▶ 401 unauthenticated
-                │ none / oidc / forward_auth  │
-                └──────────────┬──────────────┘
-                               │ subject + groups
-                               ▼
-                ┌─────────────────────────────┐
-                │ classify tier               │
-                │ GET/HEAD + read list → read │
-                │ everything else → write     │
-                └──────┬───────────────┬──────┘
-                  read │               │ write
-                       ▼               ▼
-         ┌──────────────────┐  ┌────────────────────────┐
-         │ in read_groups,  │  │ in write_groups?       │─ yes ▶ allow
-         │ write_groups, or │  │ (admin: every database)│       (admin)
-         │ operator_groups? │  └───────────┬────────────┘
-         │ (empty = open)   │              │ no
-         └────────┬─────────┘              ▼
-              yes │ no ▶ 403   ┌────────────────────────┐
-                  ▼            │ in any database's      │─ no ─▶ 403
-                allow          │ operator_groups?       │
-                               └───────────┬────────────┘
-                                           │ yes: admitted, target
-                                           │ not yet known (middleware)
-                                           ▼
-                               ┌────────────────────────┐
-                               │ handler resolves the   │─ lookup ─▶ 500
-                               │ target database        │   fails
-                               └───────────┬────────────┘
-                                           ▼
-                               ┌────────────────────────┐
-                               │ groups grant THIS      │─ no ─▶ 403
-                               │ database, in an allowed│
-                               │ environment?           │
-                               └───────────┬────────────┘
-                                           │ yes
-                                           ▼
-                                    allow (scoped)
-```
+![API requests need a verified identity and read, admin, or scoped write access. Missing identity returns 401; missing permission returns 403.](../assets/auth-decision-flow.svg)
 
-The group checks shown are `forward_auth`'s, the richest of the three
-authenticators. Under `oidc` a valid token clears the read tier, only the admin
-teams clear the write tier, and there is no operator branch. Under `none`
-everything is allowed, counted, and logged.
+A valid OIDC token can read; writes require an admin group. With `forward_auth`,
+you can also restrict readers and grant writes to specific databases and
+environments. With `auth.type: none`, these access checks are disabled.
 
-A worked example: a caller whose forwarded groups include
-`myorg/payments-team` sends `POST /api/apply` for the `payments` database in
-`staging`. The middleware admits the request, because `myorg/payments-team` is
-listed in some database's `operator_groups`. The handler then resolves the
-target from the stored plan, sees that the caller's group grants `payments`
-and that `staging` is in `operator_environments`, and allows. The same caller
-targeting `production`, or any other database, gets a `403` at the handler
-that names the groups which would have granted access.
+For example, a team granted staging access to `payments` can apply there, but
+cannot apply to production or another database. SchemaBot checks the target
+before allowing the request to continue. See
+[per-database operator scoping](#per-database-operator-scoping) for the config
+and how the check works.
 
-A few operations take the admin exit only. Settings mutation, checks
-maintenance, webhook redrive, and force lock release have no single target
-database to scope to, or would let a scoped caller undo someone else's safety
-brake, so the operator branch never applies to them: `write_groups` or
-nothing.
+Some operations always need an admin: changing settings, maintaining checks,
+redriving webhooks, and forcing a lock release. A database operator grant does
+not permit those operations.
 
 ## Per-database operator scoping
 
@@ -548,6 +495,11 @@ four endpoints:
 | `POST /api/pull` | A live schema snapshot of one database |
 | `GET /api/history/{database}` | Every apply for a database, with states and timestamps |
 | `GET /api/progress/apply/{apply_id}` | Per-table detail for one apply: the DDL, change type, and timestamps |
+
+For requests, response payloads, and CLI examples, see
+[database discovery](schema-intelligence.md#what-databases-exist),
+[live schema pulls](schema-intelligence.md#whats-in-this-database), and
+[change history](schema-intelligence.md#what-changed-in-this-database).
 
 The expected call pattern is periodic sync: recurring `pull` calls across the
 databases the service cares about, with `history` and `progress` answering
