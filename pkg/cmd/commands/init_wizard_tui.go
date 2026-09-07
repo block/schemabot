@@ -24,6 +24,7 @@ type initField struct{ label, hint, value string }
 type initWizard struct {
 	fields               []initField
 	step, width          int
+	height, scroll       int
 	input                textinput.Model
 	renderer             *lipgloss.Renderer
 	err                  string
@@ -37,15 +38,15 @@ func newInitWizard(cmd *InitCmd, profile string, output io.Writer) *initWizard {
 		}
 		return s
 	}
-	m := &initWizard{width: 72, renderer: lipgloss.NewRenderer(output), fields: []initField{
-		{"Database engine", "Choose the engine your database runs.", value(cmd.Type, "mysql")},
-		{"Database name", "A name for this connection, such as shop or analytics.", cmd.Database},
-		{"Environment", "Where this database runs.", value(cmd.Environment, "development")},
-		{"Database connection", "Use an environment variable, never paste a password.", value(cmd.DSN, "env:DATABASE_URL")},
-		{"SchemaBot state connection", "A separate, existing database for plans and progress.", value(cmd.StorageDSN, "env:SCHEMABOT_STORAGE_DSN")},
-		{"Namespaces", "Which live namespaces should SchemaBot import? Separate with commas.", strings.Join(cmd.Namespaces, ", ")},
-		{"Schema directory", "Your editable schema files will live here.", value(cmd.SchemaDir, "schema")},
-		{"Connection profile", "A saved connection for your next SchemaBot command.", profile},
+	m := &initWizard{width: 72, height: 24, renderer: lipgloss.NewRenderer(output), fields: []initField{
+		{"Database engine", "Which database are you working with?", value(cmd.Type, "mysql")},
+		{"Database name", "Give your database a name, like shop or analytics.", cmd.Database},
+		{"Environment", "Where are you working? Start with development if you’re trying things out.", value(cmd.Environment, "development")},
+		{"Database connection", "Point us to an environment variable so your credentials stay out of your files.", value(cmd.DSN, "env:DATABASE_URL")},
+		{"SchemaBot state connection", "SchemaBot keeps plans and progress in a separate database. Point us to its connection variable.", value(cmd.StorageDSN, "env:SCHEMABOT_STORAGE_DSN")},
+		{"Namespaces", "Which namespaces would you like to bring in? You can list several, separated by commas.", strings.Join(cmd.Namespaces, ", ")},
+		{"Schema directory", "Choose a home for your schema files. This is where you’ll make changes.", value(cmd.SchemaDir, "schema")},
+		{"Connection profile", "Give this connection a profile name so you can use it again.", profile},
 	}}
 	m.input = textinput.New()
 	m.input.Prompt = "› "
@@ -75,7 +76,7 @@ func (m *initWizard) validate() string {
 		return ""
 	}
 	if v == "" {
-		return "Enter a value to continue."
+		return "Fill this in and we can keep going."
 	}
 	switch m.step {
 	case 1:
@@ -84,10 +85,10 @@ func (m *initWizard) validate() string {
 		}
 	case 3, 4:
 		if !initVariable.MatchString(v) {
-			return "Use env:VARIABLE_NAME. Keep the connection string in your environment."
+			return "Use env:VARIABLE_NAME here, with the connection string saved in that variable."
 		}
 		if os.Getenv(strings.TrimPrefix(v, "env:")) == "" {
-			return "Set this environment variable before continuing, or choose one already set."
+			return "This variable is empty. Choose one you’ve already set, or restart setup after setting it."
 		}
 	case 5:
 		if _, err := onboardPullNamespaces(strings.Split(v, ",")); err != nil {
@@ -95,9 +96,9 @@ func (m *initWizard) validate() string {
 		}
 	case 6:
 		if info, err := os.Stat(v); err == nil && !info.IsDir() {
-			return "Choose a directory, not a file."
+			return "There’s a file at that path. Choose a folder for your schema files."
 		} else if err != nil && !os.IsNotExist(err) {
-			return "Cannot read this path: " + err.Error()
+			return "We couldn’t read that path: " + err.Error()
 		}
 	}
 	return ""
@@ -105,6 +106,7 @@ func (m *initWizard) validate() string {
 func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		m.height = max(8, msg.Height)
 		m.width = max(20, min(72, msg.Width-4))
 		m.input.Width = max(10, m.width-4)
 	case tea.KeyMsg:
@@ -123,6 +125,15 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, textinput.Blink
 		case "up", "down", "left", "right":
+			if m.step == len(m.fields) {
+				if msg.String() == "up" {
+					m.scroll = max(0, m.scroll-1)
+				}
+				if msg.String() == "down" {
+					m.scroll = min(m.scroll+1, max(0, len(strings.Split(m.contentView(), "\n"))-(m.height-4)))
+				}
+				return m, nil
+			}
 			if m.step == 0 {
 				if m.fields[0].value == "mysql" {
 					m.fields[0].value = "postgres"
@@ -154,9 +165,9 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	return m, nil
 }
-func (m *initWizard) View() string {
+func (m *initWizard) contentView() string {
 	if m.cancelled {
-		return "\n  Setup cancelled. Nothing was initialized.\n"
+		return "\n  Setup cancelled. Come back whenever you’re ready.\n"
 	}
 	blue := m.renderer.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#0969DA", Dark: "#79C0FF"})
 	bold := m.renderer.NewStyle().Bold(true)
@@ -169,7 +180,7 @@ func (m *initWizard) View() string {
 	}
 	if m.step < len(m.fields) {
 		f := m.fields[m.step]
-		b.WriteString(muted.Render(fmt.Sprintf("Connect your database   %d / %d", m.step+1, len(m.fields))) + "\n\n")
+		b.WriteString(muted.Render(fmt.Sprintf("Let’s get your schema ready.   %d / %d", m.step+1, len(m.fields))) + "\n\n")
 		b.WriteString(bold.Render(f.label) + "\n" + wrap.Render(muted.Render(f.hint)) + "\n\n")
 		if m.step == 0 {
 			for _, engine := range []struct{ key, label, detail string }{{"mysql", "MySQL", "Online schema changes with Spirit"}, {"postgres", "PostgreSQL", "Declarative schemas for Postgres"}} {
@@ -191,17 +202,29 @@ func (m *initWizard) View() string {
 		}
 		b.WriteString(muted.Render(help))
 	} else {
-		b.WriteString(bold.Render("Ready to connect") + "\n\n")
+		b.WriteString(bold.Render("Ready when you are") + "\n\n")
 		for _, f := range m.fields {
 			b.WriteString(wrap.Render(muted.Render(f.label+": ")+f.value) + "\n")
 		}
 		if _, err := os.Stat(m.fields[6].value); err == nil {
-			b.WriteString("\nExisting schema files will be verified and preserved.\n")
+			b.WriteString("\nYou already have schema files here. We’ll verify them and keep your edits.\n")
 		}
-		b.WriteString("\n" + wrap.Render("SchemaBot will prepare its state database, read your schema, and verify a baseline plan. No application schema changes will be applied.") + "\n\n")
+		b.WriteString("\n" + wrap.Render("We’ll prepare SchemaBot’s state database and check that your schema files match the live database. We won’t change your application’s schema.") + "\n\n")
 		b.WriteString(blue.Render("enter connect and verify") + muted.Render(" · shift+tab edit · esc cancel"))
 	}
-	return "\n" + m.renderer.NewStyle().PaddingLeft(2).Render(b.String()) + "\n"
+	return m.renderer.NewStyle().Width(m.width + 2).PaddingLeft(2).Render(b.String())
+}
+
+func (m *initWizard) View() string {
+	content := m.contentView()
+	wrap := m.renderer.NewStyle().Width(m.width)
+	lines := strings.Split(content, "\n")
+	if m.step == len(m.fields) && len(lines) > m.height-2 {
+		available := m.height - 4
+		offset := min(m.scroll, len(lines)-available)
+		content = strings.Join(lines[offset:offset+available], "\n") + "\n" + wrap.Render("  ↑/↓ scroll · enter connect · shift+tab edit · esc cancel")
+	}
+	return "\n" + content + "\n"
 }
 
 func (cmd *InitCmd) promptInputs(ctx context.Context, input io.Reader, output io.Writer, g *Globals) error {
@@ -218,7 +241,7 @@ func (cmd *InitCmd) promptInputs(ctx context.Context, input io.Reader, output io
 		return err
 	}
 	if !m.confirmed {
-		return fmt.Errorf("setup cancelled; nothing was initialized")
+		return ErrSilent
 	}
 	cmd.Type = m.fields[0].value
 	cmd.Database = m.fields[1].value

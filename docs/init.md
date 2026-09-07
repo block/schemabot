@@ -25,12 +25,12 @@ SchemaBot imports into a temporary directory and verifies a no-change plan befor
 the files. A successful setup ends with:
 
 ```text
-  ✓ Schema ready
+  ✓ Your schema is ready
 
   1 table · schema
   Baseline plan: no changes.
 
-  Edit your schema files, then review your first change:
+  Make your first edit, then review the plan:
 
     schemabot plan -s 'schema' -e 'development' --profile 'default'
 ```

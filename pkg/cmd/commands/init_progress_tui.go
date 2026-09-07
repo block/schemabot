@@ -61,9 +61,9 @@ func (m *initProgress) View() string {
 		b.WriteString(marker + " " + s + "\n")
 	}
 	if m.stopping {
-		b.WriteString("\nStopping safely…\n")
+		b.WriteString("\nFinishing cleanup…\n")
 	} else {
-		b.WriteString("\nNo application schema changes will be applied.\nesc cancel\n")
+		b.WriteString("\nYour application’s schema stays as it is.\nesc cancel\n")
 	}
 	return "\n" + lipgloss.NewStyle().Width(m.width).PaddingLeft(2).Render(b.String())
 }
@@ -79,7 +79,7 @@ func (cmd *InitCmd) initializeWithUI(ctx context.Context, g *Globals) (*initResu
 	m := &initProgress{spinner: s, cancel: cancel, width: 72}
 	// The program stays alive until initialization returns, including after cancel,
 	// so cleanup finishes before the terminal is returned to the shell.
-	p := tea.NewProgram(m, tea.WithInput(os.Stdin), tea.WithOutput(os.Stdout))
+	p := tea.NewProgram(m, tea.WithInput(os.Stdin), tea.WithOutput(os.Stdout), tea.WithoutSignalHandler())
 	cmd.progress = func(stage string) { p.Send(initStageMsg(stage)) }
 	defer func() { cmd.progress = nil }()
 	m.run = func() tea.Msg { r, err := cmd.initialize(runCtx, g); return initFinishedMsg{r, err} }
@@ -98,5 +98,5 @@ func initCompletion(result *initResult, environment string) string {
 	if result.Tables == 1 {
 		noun = "table"
 	}
-	return fmt.Sprintf("\n  ✓ Schema ready\n\n  %d %s · %s\n  Baseline plan: no changes.\n\n  Edit your schema files, then review your first change:\n\n    %s\n\n", result.Tables, noun, result.SchemaDir, next)
+	return fmt.Sprintf("\n  ✓ Your schema is ready\n\n  %d %s · %s\n  Baseline plan: no changes.\n\n  Make your first edit, then review the plan:\n\n    %s\n\n", result.Tables, noun, result.SchemaDir, next)
 }

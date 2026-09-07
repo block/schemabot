@@ -117,7 +117,7 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 		return nil, err
 	}
 	manager := localruntime.Manager{Dir: dir, Binary: binary, Version: g.Version}
-	cmd.reportProgress("Registering the database connection...")
+	cmd.reportProgress("Setting up your database connection...")
 	_, err = localsetup.Register(manager, localsetup.Registration{
 		Database: cmd.Database, Environment: cmd.Environment, Engine: cmd.Type,
 		Connection: api.EnvironmentConfig{DSN: cmd.DSN},
@@ -142,7 +142,7 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 		return nil, err
 	}
 	client.SetLocalAuth(connection.Token, connection.Endpoint)
-	cmd.reportProgress("Reading the live schema...")
+	cmd.reportProgress("Reading your live schema...")
 	pulled, err := client.CallPullSchemaAPI(connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, namespaces...)
 	if err != nil {
 		return nil, fmt.Errorf("import live schema: %w", err)
@@ -162,7 +162,7 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 			return nil, err
 		}
 	}
-	cmd.reportProgress("Verifying the schema baseline...")
+	cmd.reportProgress("Checking that your schema files match...")
 	baseline, _, err := client.CallPlanAPI(connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, stage, "", 0, ignored, false)
 	if err != nil {
 		return nil, fmt.Errorf("verify baseline: %w", err)
@@ -176,7 +176,7 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	cmd.reportProgress("Saving the verified schema and connection...")
+	cmd.reportProgress("Saving your schema files and connection...")
 	if err := publishInitSchema(stage, root); err != nil {
 		return nil, err
 	}
