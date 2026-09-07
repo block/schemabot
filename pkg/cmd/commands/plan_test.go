@@ -722,7 +722,7 @@ func TestWriteNamespaceChanges_NoCollapseUnderThreshold(t *testing.T) {
 
 func TestWritePlanHeaderPostgres(t *testing.T) {
 	output := captureStdout(func() {
-		templates.WritePlanHeader(templates.PlanHeaderData{Database: "shop", Engine: "postgres", IsMySQL: true})
+		templates.WritePlanHeader(templates.PlanHeaderData{Database: "shop", Engine: "PostgreSQL", IsMySQL: true})
 	})
 	assert.Contains(t, output, "PostgreSQL Schema Change Plan")
 	assert.NotContains(t, output, "MySQL Schema Change Plan")
