@@ -24,6 +24,8 @@ func RegisterLocalProfile(name, runtimeID string) (bool, error) {
 	}
 	wanted := Profile{LocalRuntime: runtimeID}
 	if existing, ok := cfg.Profiles[name]; ok {
+		// Treat unexpected fields as a conflict. Local profiles must not
+		// retain remote credentials or acquire new behavior silently.
 		if reflect.DeepEqual(existing, wanted) {
 			return false, nil
 		}

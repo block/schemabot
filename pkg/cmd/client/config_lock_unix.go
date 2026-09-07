@@ -20,11 +20,11 @@ func lockConfig(path string) (*os.File, error) {
 	info, err := f.Stat()
 	if err != nil {
 		utils.CloseAndLog(f)
-		return nil, err
+		return nil, fmt.Errorf("inspect config lock %s: %w", path, err)
 	}
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
 		utils.CloseAndLog(f)
-		return nil, fmt.Errorf("config lock must be a private regular file")
+		return nil, fmt.Errorf("config lock %s must be a private regular file", path)
 	}
 	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		utils.CloseAndLog(f)
