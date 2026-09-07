@@ -661,6 +661,8 @@ github.com/vmihailenco/tagparser v0.1.2 h1:gnjoVuB/kljJ5wICEEOpx98oXMWPLj22G67Vb
 github.com/vmihailenco/tagparser v0.1.2/go.mod h1:OeAg3pn3UbLjkWt+rN9oFYB6u/cQgqMEUPoW2WPyhdI=
 github.com/wasilibs/go-pgquery v0.0.0-20260728010200-155ebad2880e h1:yWIo9Ibxg0qNScjPcdaH99BfetgmYepCxs9a6TFC2LM=
 github.com/wasilibs/go-pgquery v0.0.0-20260728010200-155ebad2880e/go.mod h1:ZSyYLCRbk2xPqu7lgfrDSSHm+g/7Rxk6JK4KE2cxJ3s=
+github.com/wasilibs/go-pgquery v0.0.0-20260904030559-0fedd6786608 h1:DqC87JRswkyYVejHZglY37dnbbOlMpZ5DspESm04qpQ=
+github.com/wasilibs/go-pgquery v0.0.0-20260904030559-0fedd6786608/go.mod h1:SprEKrRdgM05pxCQllNAqAmrTDZpUFPFrCuAP2XPvQ0=
 github.com/wasilibs/wazero-helpers v0.0.0-20250123031827-cd30c44769bb h1:gQ+ZV4wJke/EBKYciZ2MshEouEHFuinB85dY3f5s1q8=
 github.com/wasilibs/wazero-helpers v0.0.0-20250123031827-cd30c44769bb/go.mod h1:jMeV4Vpbi8osrE/pKUxRZkVaA0EX7NZN0A9/oRzgpgY=
 github.com/xlab/treeprint v1.2.0 h1:HzHnuAF1plUN2zGlAFHbSQP2qJ0ZAD3XF5XD7OesXRQ=
@@ -906,6 +908,8 @@ google.golang.org/protobuf v1.23.0/go.mod h1:EGpADcykh3NcUnDUJcl1+ZksZNG86OlYog2
 google.golang.org/protobuf v1.26.0-rc.1/go.mod h1:jlhhOSvTdKEhbULTjvd4ARK9grFBp09yW+WbY/TyQbw=
 google.golang.org/protobuf v1.36.11 h1:fV6ZwhNocDyBLK0dj+fg8ektcVegBBuEolpbTQyBNVE=
 google.golang.org/protobuf v1.36.11/go.mod h1:HTf+CrKn2C3g5S8VImy6tdcUvCska2kB7j23XfzDpco=
+google.golang.org/protobuf v1.36.12 h1:pJOKDDOyeXErUroCihFAd5LQuwXBSpVnKGrj5o/fwxc=
+google.golang.org/protobuf v1.36.12/go.mod h1:HTf+CrKn2C3g5S8VImy6tdcUvCska2kB7j23XfzDpco=
 gopkg.in/DataDog/dd-trace-go.v1 v1.74.8 h1:h96ji92t9eXbPvSWhJ+lrPWetHiQNYlt48JKRO09NFA=
 gopkg.in/DataDog/dd-trace-go.v1 v1.74.8/go.mod h1:LpHbtHsCZBlm1HWrlVOUQcEXwMWZnU6yMvmtd1GvSDI=
 gopkg.in/alecthomas/kingpin.v2 v2.2.6/go.mod h1:FMv+mEhP44yOT+4EoQTLFTRgOQ1FBLkstjWtayDeSgw=

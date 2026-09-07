@@ -36,7 +36,7 @@ require (
 	github.com/testcontainers/testcontainers-go/modules/localstack v0.43.0
 	github.com/testcontainers/testcontainers-go/modules/mysql v0.43.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.43.0
-	github.com/wasilibs/go-pgquery v0.0.0-20260728010200-155ebad2880e
+	github.com/wasilibs/go-pgquery v0.0.0-20260904030559-0fedd6786608
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.68.0
 	go.opentelemetry.io/otel v1.43.0
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.43.0
@@ -58,7 +58,7 @@ require (
 	golang.org/x/tools v0.48.0
 	google.golang.org/genproto/googleapis/api v0.0.0-20260414002931-afd174a4e478
 	google.golang.org/grpc v1.80.0
-	google.golang.org/protobuf v1.36.11
+	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
 	vitess.io/vitess v0.24.1
 )
