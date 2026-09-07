@@ -212,6 +212,37 @@ func TestPostgresBootstrapDDLBudgetStaysUnderEnsureSchemaTimeout(t *testing.T) {
 		"bootstrap DDL must get a longer budget than an ordinary storage query")
 }
 
+// A budget of 0 disables statement_timeout rather than making it strict, so
+// the derivation must never reach one however far the bootstrap ceiling is
+// shortened. The shipped ceiling sits far above the margin, so the floor that
+// guarantees this is only exercised at ceilings nobody ships — which is
+// exactly why it is worth pinning here instead of trusting it on inspection.
+func TestPostgresBootstrapDDLBudgetNeverDerivesADisabledBudget(t *testing.T) {
+	t.Parallel()
+
+	const margin = 15 * time.Second
+	const floor = 5 * time.Second
+
+	for _, tc := range []struct {
+		name    string
+		ceiling time.Duration
+		want    time.Duration
+	}{
+		{name: "a roomy ceiling keeps the margin below it", ceiling: 5 * time.Minute, want: 4*time.Minute + 45*time.Second},
+		{name: "a ceiling just above the margin still subtracts", ceiling: 25 * time.Second, want: 10 * time.Second},
+		{name: "a ceiling at the margin would derive a disable", ceiling: margin, want: floor},
+		{name: "a ceiling under the margin would derive a negative", ceiling: 5 * time.Second, want: floor},
+		{name: "a zero ceiling cannot disable the budget", ceiling: 0, want: floor},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := postgresBootstrapDDLBudget(tc.ceiling, margin, floor)
+			assert.Equal(t, tc.want, got)
+			assert.Positive(t, got, "a derived budget of 0 or less disables statement_timeout")
+		})
+	}
+}
+
 // 57014 is raised both by statement_timeout expiring and by an operator's
 // pg_cancel_backend, so elapsed time is what tells them apart: a cancellation
 // that arrives before the budget could have fired came from outside SchemaBot.

@@ -654,16 +654,25 @@ const postgresDDLLockTimeout = 10 * time.Second
 // deadline branch names EnsureSchemaTimeout, so neither outcome is a bare
 // cancellation.
 //
-// The margin must stay positive. At zero the subtraction yields a budget of
-// 0, which PostgreSQL reads as *disabled* rather than as very short — the
-// budget would silently cease to exist instead of becoming strict, the one
-// failure this whole mechanism exists to prevent. postgresBootstrapDDLFloor
-// keeps a shrunken EnsureSchemaTimeout producing a short budget instead.
+// The subtraction must stay positive. Once the ceiling reaches the margin it
+// yields a budget of 0, which PostgreSQL reads as *disabled* rather than as
+// very short — the budget would silently cease to exist instead of becoming
+// strict, the one failure this whole mechanism exists to prevent. The floor
+// keeps a shrunken ceiling deriving a short budget instead. Today's ceiling is
+// far above the margin, so the floor is not what selects the shipped value;
+// postgresBootstrapDDLBudget exists so that guard is checkable at the ceilings
+// where it does select, rather than resting on this comment.
+func postgresBootstrapDDLBudget(ceiling, margin, floor time.Duration) time.Duration {
+	return max(ceiling-margin, floor)
+}
+
 const (
-	postgresBootstrapDDLStatementTimeout = max(EnsureSchemaTimeout-postgresBootstrapDDLTimeoutMargin, postgresBootstrapDDLFloor)
-	postgresBootstrapDDLTimeoutMargin    = 15 * time.Second
-	postgresBootstrapDDLFloor            = 5 * time.Second
+	postgresBootstrapDDLTimeoutMargin = 15 * time.Second
+	postgresBootstrapDDLFloor         = 5 * time.Second
 )
+
+var postgresBootstrapDDLStatementTimeout = postgresBootstrapDDLBudget(
+	EnsureSchemaTimeout, postgresBootstrapDDLTimeoutMargin, postgresBootstrapDDLFloor)
 
 // applyPostgresTableChanges executes one table's additive changes. A CREATE
 // TABLE change contains its complete embedded schema file, including indexes,
