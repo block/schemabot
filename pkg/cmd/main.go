@@ -57,6 +57,7 @@ type CLI struct {
 	Webhooks   commands.WebhooksCmd   `cmd:"" help:"Manage GitHub App webhook deliveries"`
 	Checks     commands.ChecksCmd     `cmd:"" help:"Manage SchemaBot Check Runs on PRs"`
 	Storage    commands.StorageCmd    `cmd:"" help:"Operate directly on SchemaBot's storage database"`
+	Local      commands.LocalCmd      `cmd:"" hidden:"" help:"Internal local runtime host"`
 	Serve      commands.ServeCmd      `cmd:"" help:"Start the SchemaBot HTTP API server"`
 }
 
@@ -88,20 +89,23 @@ func main() {
 	// Bound the resolution so a slow or unreachable issuer during a token refresh
 	// can't hang the CLI at startup. Cancel as soon as it returns rather than via
 	// defer, since the os.Exit below would skip a deferred cancel.
-	authCtx, cancelAuth := context.WithTimeout(context.Background(), 30*time.Second)
-	token, err := client.ResolveBearerToken(authCtx, cli.Token, cli.Endpoint, cli.Profile)
-	cancelAuth()
-	if err != nil {
-		// Per ResolveBearerToken's contract: an empty token with an error is a hard
-		// failure; a non-empty token with an error is a non-fatal warning (the
-		// returned token is still usable and re-login can fix it).
-		if token == "" {
-			fmt.Fprintf(os.Stderr, "\033[31mError: %v\033[0m\n", err)
-			os.Exit(1)
+	// Hosting a local runtime does not use a remote profile or its credentials.
+	if ctx.Command() != "local serve" {
+		authCtx, cancelAuth := context.WithTimeout(context.Background(), 30*time.Second)
+		token, err := client.ResolveBearerToken(authCtx, cli.Token, cli.Endpoint, cli.Profile)
+		cancelAuth()
+		if err != nil {
+			// Per ResolveBearerToken's contract: an empty token with an error is a hard
+			// failure; a non-empty token with an error is a non-fatal warning (the
+			// returned token is still usable and re-login can fix it).
+			if token == "" {
+				fmt.Fprintf(os.Stderr, "\033[31mError: %v\033[0m\n", err)
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stderr, "\033[33mWarning: %v\033[0m\n", err)
 		}
-		fmt.Fprintf(os.Stderr, "\033[33mWarning: %v\033[0m\n", err)
+		client.SetAuthToken(token)
 	}
-	client.SetAuthToken(token)
 
 	// Cancel long-running commands on Ctrl+C / SIGTERM. The first signal
 	// cancels the context so in-flight requests stop and the command can print
@@ -132,7 +136,7 @@ func main() {
 	}()
 	ctx.BindTo(runCtx, (*context.Context)(nil))
 
-	err = ctx.Run(&cli.Globals)
+	err := ctx.Run(&cli.Globals)
 	// Release the watcher and stop intercepting signals now that the command
 	// is done; explicit rather than deferred, since the os.Exit below would
 	// skip a deferred call.

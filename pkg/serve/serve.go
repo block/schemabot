@@ -46,11 +46,12 @@ import (
 type Option func(*options)
 
 type options struct {
-	logger  *slog.Logger
-	version string
-	commit  string
-	date    string
-	engines map[string]tern.EngineFactory
+	logger     *slog.Logger
+	version    string
+	commit     string
+	date       string
+	engines    map[string]tern.EngineFactory
+	authorizer auth.Authorizer
 }
 
 // WithLogger sets the logger Run uses. A nil logger is ignored so Run keeps
@@ -428,9 +429,12 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	// allow-all NoneAuthorizer that lets every request through (attaching an
 	// anonymous user); with "oidc" it validates Bearer JWTs and bypasses
 	// non-API paths (/webhook, health) itself.
-	authz, err := buildServerAuthorizer(ctx, cfg, logger)
-	if err != nil {
-		return nil, fmt.Errorf("setup auth: %w", err)
+	authz := o.authorizer
+	if authz == nil {
+		authz, err = buildServerAuthorizer(ctx, cfg, logger)
+		if err != nil {
+			return nil, fmt.Errorf("setup auth: %w", err)
+		}
 	}
 
 	// Initialize telemetry (OTel metrics via Prometheus /metrics endpoint).
@@ -1030,9 +1034,9 @@ func checkSuiteRecoveryOptions(logger *slog.Logger) []webhook.HandlerOption {
 
 // buildServerAuthorizer constructs the API authorizer exactly as the server
 // wires it: admin teams from PR command authorization, and the operator-group
-// union that widens forward-auth write admission. Every server build and any
-// test that claims to exercise the real authorizer wiring must go through
-// this function, so the union cannot be dropped from one without the other.
+// union that widens forward-auth write admission. Hosted server builds and tests of their configured authorization use this
+// function. The local host injects its private-token authorizer separately and
+// rejects service authentication configuration before Build.
 func buildServerAuthorizer(ctx context.Context, cfg *api.ServerConfig, logger *slog.Logger) (auth.Authorizer, error) {
 	return buildAuthorizer(ctx, cfg.Auth, cfg.PRCommandAuthorization.AdminTeams, cfg.OperatorGroupUnion(), logger)
 }

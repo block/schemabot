@@ -1208,7 +1208,7 @@ By default (`auth.type: none` or unset) the SchemaBot API is unauthenticated —
 - **Read tier** — visibility: `status`, `progress`, `logs`, `locks` (list), history, database discovery, and `pull` (read a live schema).
 - **Write tier** — anything that stages or makes a change: `plan`, `apply`, controls (`stop`/`start`/`cutover`/`revert`/`skip-revert`/`rollback`), `unlock`, and settings mutation. `plan` is a write because it stages a change against a database.
 
-Any unclassified `/api` route is treated as write (fail-closed). The `/webhook` and health endpoints are exempt — webhooks authenticate themselves via HMAC. Prometheus metrics are served on a dedicated listener (see [Metrics](#metrics)), not on the API port. Two authenticators are available.
+Any unclassified `/api` route is treated as write (fail-closed). For the hosted server, `/webhook` and health endpoints are exempt — webhooks authenticate themselves via HMAC. The internal local host instead requires its private credential on every route, including probes; see [AZ-6](invariants.md#az-6-local-hosting-preserves-its-boundaries). Prometheus metrics are served on a dedicated listener (see [Metrics](#metrics)), not on the API port. Two authenticators are available.
 
 ### OIDC (Bearer tokens)
 
