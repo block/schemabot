@@ -77,8 +77,9 @@ You can copy this into your agent's instructions:
 
 ## Back it up with server settings
 
-Instructions guide your agent. Server settings control what its account can
-do. They cannot make an action “human only” when the agent uses your account.
+Instructions guide your agent. Server settings control what it can do with
+the credentials you give it. They cannot make an action “human only” when
+the agent uses your credentials.
 
 - **Give services their own read-only access.** The `forward_auth` service lane
   limits listed SPIFFE identities to reads. With OIDC, keep admin groups out
