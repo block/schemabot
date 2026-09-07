@@ -81,8 +81,8 @@ Instructions guide your agent. Server settings control what it can do with
 the credentials you give it. They cannot make an action “human only” when
 the agent uses your credentials.
 
-- **Give services their own read-only access.** The `forward_auth` service lane
-  limits listed SPIFFE identities to reads. With OIDC, keep admin groups out
+- **Give services their own read-only access.** With a service mesh, `forward_auth`
+  can limit requests from listed services to reads. With OIDC, keep admin groups out
   of service tokens: a token with an admin group can write, even when it
   belongs to a service. See [service access](auth.md#calling-schemabot-as-a-service).
 - **Choose which accounts can run PR commands.** Enable
