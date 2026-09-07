@@ -16,6 +16,7 @@ import (
 	"github.com/block/pg-sprite/pkg/dbconn"
 	"github.com/block/pg-sprite/pkg/executor"
 	"github.com/block/pg-sprite/pkg/preflight"
+	"github.com/block/pg-sprite/pkg/progress"
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
 
 	"github.com/block/schemabot/pkg/ddl"
@@ -102,16 +103,25 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		}
 	}
 
-	started := time.Now()
-	key := progressIdentity(req.ResumeState)
-	e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""))
-	bgCtx := context.WithoutCancel(ctx)
-	conn := targetConn{dsn: req.Credentials.DSN, caCertPath: caPath}
+	// One tracker per apply: pg-sprite's executor records each step it
+	// starts on it, and Progress reads the position back, so the poller
+	// sees the step in flight rather than only the accept and terminal
+	// states the engine itself publishes.
+	tracker, err := progress.NewTracker(progress.WallClock{})
+	if err != nil {
+		return nil, fmt.Errorf("apply PostgreSQL database %q: %w", req.Database, err)
+	}
+
 	logger := req.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	e.wg.Go(func() { e.runOptimisticApply(bgCtx, conn, change, key, started, logger) })
+	started := time.Now()
+	key := progressIdentity(req.ResumeState)
+	e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""), tracker, logger)
+	bgCtx := context.WithoutCancel(ctx)
+	conn := targetConn{dsn: req.Credentials.DSN, caCertPath: caPath}
+	e.wg.Go(func() { e.runOptimisticApply(bgCtx, conn, change, key, started, logger, tracker) })
 
 	return &engine.ApplyResult{
 		Accepted:    true,
@@ -165,14 +175,25 @@ func postgresCreateSetStatements(script string) ([]string, error) {
 	return statements, nil
 }
 
-func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change nativeApply, key string, started time.Time, logger *slog.Logger) {
+func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change nativeApply, key string, started time.Time, logger *slog.Logger, tracker *progress.Tracker) {
 	// The context arrives detached from the caller (an accepted apply must
 	// survive the request), so boundedness comes from the ceiling instead.
 	ctx, cancel := context.WithTimeout(ctx, optimisticApplyCeiling)
 	defer cancel()
-	err := executeOptimistic(ctx, conn, change, e.tableSizeLimit)
+	// Every terminal result carries the executor's final position: the
+	// tracker has finished by the time executeOptimistic returns, so the
+	// read is memory-only and a failed create reports the step that failed,
+	// not the sequence's first step.
+	publish := func(result *engine.ProgressResult) {
+		if err := executorProgressMetadata(ctx, tracker, result.Metadata); err != nil {
+			logger.Warn("PostgreSQL apply terminal progress reports the last-known executor position",
+				"namespace", change.namespace, "table", change.table, "task_id", key, "error", err)
+		}
+		e.publishProgress(key, result, logger)
+	}
+	err := executeOptimistic(ctx, conn, change, e.tableSizeLimit, tracker)
 	if err == nil {
-		e.publishProgress(key, progressResult(engine.StateCompleted, "completed", started, change, ""), logger)
+		publish(progressResult(engine.StateCompleted, "completed", started, change, ""))
 		return
 	}
 
@@ -198,7 +219,7 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		result := progressResult(engine.StateFailed, "failed", started, change,
 			invalidIndexDetail(invalidErr))
 		result.Retryable = true
-		e.publishProgress(key, result, logger)
+		publish(result)
 		return
 	}
 
@@ -210,7 +231,7 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		// because it is published to GitHub.
 		logger.Warn("PostgreSQL schema change refused",
 			"namespace", change.namespace, "table", change.table, "reason", r.reason, "error", err)
-		e.publishProgress(key, progressResult(engine.StateFailed, "refused", started, change, r.detail), logger)
+		publish(progressResult(engine.StateFailed, "refused", started, change, r.detail))
 		return
 	}
 
@@ -227,7 +248,7 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	}
 	result := progressResult(engine.StateFailed, "failed", started, change, failure.detail)
 	result.Retryable = failure.retryable
-	e.publishProgress(key, result, logger)
+	publish(result)
 }
 
 // applyFailure is the drive-facing disposition of an operational apply
@@ -595,7 +616,10 @@ func tableNotFoundRefusal(table string) *refusal {
 	}
 }
 
-func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64) error {
+// executeOptimistic runs the planned change through pg-sprite's executors,
+// each feeding the tracker so a concurrent Progress poll reads the step and
+// statement in flight.
+func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64, tracker *progress.Tracker) error {
 	poolCfg, err := spritePoolConfig(conn.dsn, conn.caCertPath)
 	if err != nil {
 		return fmt.Errorf("prepare pg-sprite apply pool for table %q: %w", change.table, err)
@@ -618,7 +642,7 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		// The off-ladder create tier has its own preflight sequence: the
 		// ladder checks below state facts about an existing table, and a
 		// greenfield target has none.
-		return executeCreate(ctx, pool, change, statements)
+		return executeCreate(ctx, pool, change, statements, tracker)
 	}
 	if len(statements) != 1 {
 		return fmt.Errorf("execute PostgreSQL table %q: privilege tier %s requires exactly one statement, got %d", change.table, tier, len(statements))
@@ -654,8 +678,8 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		// dedicated index-build executor runs it under the CONCURRENTLY
 		// budget policy and returns a catalog-verified verdict — including
 		// the invalid-index recovery a failed build needs.
-		if _, err := executor.BuildIndexConcurrently(ctx, pool, change.sql,
-			executor.ConcurrentBudget{Overall: concurrentIndexBudget}); err != nil {
+		if _, err := executor.BuildIndexConcurrentlyWithProgress(ctx, pool, change.sql,
+			executor.ConcurrentBudget{Overall: concurrentIndexBudget}, tracker); err != nil {
 			return fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", change.table, err)
 		}
 		return nil
@@ -677,9 +701,9 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	// where greenfieldCreateSet keeps the blocking form on purpose — a
 	// table born in the run has no readers, and CONCURRENTLY cannot run
 	// inside its create sequence.
-	if err := executor.ExecuteNative(ctx, pool, table, statement, executor.Budget{
+	if err := executor.ExecuteNativeWithProgress(ctx, pool, table, statement, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
-	}, executor.DefaultRetryPolicy()); err != nil {
+	}, executor.DefaultRetryPolicy(), tracker); err != nil {
 		return fmt.Errorf("execute native-safe PostgreSQL statement on table %q: %w", change.table, err)
 	}
 	return nil
@@ -692,7 +716,7 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 // nothing about apply time. The table size gate deliberately does not run:
 // it bounds rewrites of existing data, and a table that does not exist yet
 // has none.
-func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, statements []string) error {
+func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, statements []string, tracker *progress.Tracker) error {
 	// The planned statements arrive schema-qualified; the desired-schema
 	// contract wants the unqualified form and the executor pins the schema
 	// from the absence proof instead.
@@ -716,9 +740,9 @@ func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, 
 	if err != nil {
 		return fmt.Errorf("verify PostgreSQL table %q is absent: %w", change.table, err)
 	}
-	if _, err := executor.ExecuteCreate(ctx, pool, absent, role, desired, executor.Budget{
+	if _, err := executor.ExecuteCreateWithProgress(ctx, pool, absent, role, desired, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
-	}, executor.DefaultRetryPolicy()); err != nil {
+	}, executor.DefaultRetryPolicy(), tracker); err != nil {
 		return fmt.Errorf("execute PostgreSQL CREATE TABLE %q: %w", change.table, err)
 	}
 	return nil
@@ -731,29 +755,79 @@ func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, 
 // of a target, and answering with whichever apply wrote last would report
 // another schema change's state, including a terminal one, for work that is
 // still in flight. A caller asking about an apply the engine is not tracking
-// gets the idle sentinel. Rich server progress is intentionally absent until
-// the PostgreSQL executor exposes it.
-func (e *Engine) Progress(_ context.Context, req *engine.ProgressRequest) (*engine.ProgressResult, error) {
+// gets the idle sentinel.
+//
+// While the apply runs, the step position and statement come from the
+// pg-sprite tracker its executor feeds; the engine's own record only moves at
+// accept and at the terminal outcome. The tracker read happens outside the
+// engine lock: for an active concurrent index build it queries the server's
+// progress view, and a poll must never hold up Apply or publishProgress on
+// a database round trip.
+func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*engine.ProgressResult, error) {
 	var key string
 	if req != nil {
 		key = progressIdentity(req.ResumeState)
 	}
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	tracked := e.progress[key]
 	if tracked == nil {
+		e.mu.Unlock()
 		// The exact idle message is a cross-engine contract: stale-task
 		// recovery compares against it verbatim to auto-resolve work
 		// abandoned by a crashed server.
 		return &engine.ProgressResult{State: engine.StatePending, Message: "No active schema change"}, nil
 	}
-	result := *tracked
-	result.Metadata = cloneMetadata(tracked.Metadata)
-	result.Tables = cloneTables(tracked.Tables)
-	if len(result.Tables) > 0 && result.Tables[0].StartedAt != nil && !result.State.IsTerminal() {
+	result := *tracked.result
+	result.Metadata = cloneMetadata(tracked.result.Metadata)
+	result.Tables = cloneTables(tracked.result.Tables)
+	tracker, logger := tracked.tracker, tracked.logger
+	e.mu.Unlock()
+
+	if result.State.IsTerminal() {
+		// A terminal result already carries the executor's final position,
+		// folded in when it was published.
+		return &result, nil
+	}
+	if len(result.Tables) > 0 && result.Tables[0].StartedAt != nil {
 		result.Metadata["elapsed"] = time.Since(*result.Tables[0].StartedAt).Round(time.Millisecond).String()
 	}
+	if err := executorProgressMetadata(ctx, tracker, result.Metadata); err != nil {
+		// The poll still answers with the last-known position: a progress
+		// view the engine cannot read this instant is not a reason to tell
+		// the driver its apply is unobservable.
+		logger.Warn("PostgreSQL apply progress reports the last-known executor position",
+			"task_id", key, "error", err)
+	}
 	return &result, nil
+}
+
+// executorProgressMetadata folds the tracker's current position into the
+// published metadata: the 1-based step the executor is running, the sequence
+// length it announced, and the statement text of that step. Each key is
+// written only once the executor has reported it, so before execution starts
+// the metadata keeps progressResult's pre-execution position. The statement
+// passes through sanitizeReasonText because it renders in operator-facing
+// tables. A tracker read fails only when the server's index-build progress
+// view cannot be queried; the snapshot still carries the last-known position,
+// which is written before the error is returned for the caller to log.
+func executorProgressMetadata(ctx context.Context, tracker *progress.Tracker, metadata map[string]string) error {
+	if tracker == nil {
+		return nil
+	}
+	snapshot, err := tracker.Progress(ctx)
+	if snapshot.TotalSteps > 0 {
+		metadata["steps_total"] = strconv.Itoa(snapshot.TotalSteps)
+	}
+	if snapshot.Step > 0 {
+		metadata["step"] = strconv.Itoa(snapshot.Step)
+	}
+	if statement := sanitizeReasonText(snapshot.Detail.Statement); statement != "" {
+		metadata["statement"] = statement
+	}
+	if err != nil {
+		return fmt.Errorf("read pg-sprite executor progress: %w", err)
+	}
+	return nil
 }
 
 // progressIdentity extracts the apply identity that keys engine progress.
@@ -781,11 +855,10 @@ func progressResult(state engine.State, phase string, started time.Time, change 
 		ErrorMessage: detail,
 		Metadata: map[string]string{
 			"phase": phase, "elapsed": time.Since(started).Round(time.Millisecond).String(),
-			// Per-step position is deliberately not tracked yet: the apply
-			// publishes progress only at accept and at the terminal outcome,
-			// and nothing observes the executor's step transitions in
-			// between, so the position stays at the sequence's first step
-			// while the total reports the real create-set length.
+			// The position the record carries before the executor has
+			// reported one: the first step of the planned sequence, with the
+			// total taken from the plan. Once execution starts,
+			// executorProgressMetadata overwrites both from the tracker.
 			"step": "1", "steps_total": strconv.Itoa(steps),
 		},
 		Tables: []engine.TableProgress{{
@@ -813,18 +886,18 @@ func progressResult(state engine.State, phase string, started time.Time, change 
 // Entries for applies that are still running are never retired, so an
 // in-flight change always answers for itself no matter how many siblings the
 // engine accepts.
-func (e *Engine) claimProgress(key string, result *engine.ProgressResult) {
+func (e *Engine) claimProgress(key string, result *engine.ProgressResult, tracker *progress.Tracker, logger *slog.Logger) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.progress == nil {
-		e.progress = make(map[string]*engine.ProgressResult)
+		e.progress = make(map[string]*trackedApply)
 	}
-	for tracked, progress := range e.progress {
-		if tracked != key && progress.State.IsTerminal() {
-			delete(e.progress, tracked)
+	for id, tracked := range e.progress {
+		if id != key && tracked.result.State.IsTerminal() {
+			delete(e.progress, id)
 		}
 	}
-	e.progress[key] = result
+	e.progress[key] = &trackedApply{result: result, tracker: tracker, logger: logger}
 }
 
 // publishProgress stores a background apply's progress unless the engine has
@@ -835,12 +908,13 @@ func (e *Engine) claimProgress(key string, result *engine.ProgressResult) {
 func (e *Engine) publishProgress(key string, result *engine.ProgressResult, logger *slog.Logger) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if _, tracked := e.progress[key]; !tracked {
+	tracked, ok := e.progress[key]
+	if !ok {
 		logger.Warn("PostgreSQL apply progress discarded: the engine no longer tracks this schema change",
 			"task_id", key, "state", result.State)
 		return
 	}
-	e.progress[key] = result
+	tracked.result = result
 }
 
 func cloneMetadata(metadata map[string]string) map[string]string {

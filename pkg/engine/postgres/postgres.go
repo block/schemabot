@@ -18,6 +18,7 @@ import (
 	pgplan "github.com/block/pg-sprite/pkg/plan"
 	"github.com/block/pg-sprite/pkg/planner"
 	"github.com/block/pg-sprite/pkg/preflight"
+	"github.com/block/pg-sprite/pkg/progress"
 	"github.com/block/pg-sprite/pkg/router"
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
 	spirittable "github.com/block/spirit/pkg/table"
@@ -44,8 +45,20 @@ type Engine struct {
 	// accepting a second apply on the same target must not evict the first
 	// one's state while it is still running, or the running apply's driver
 	// would be told its work no longer exists.
-	progress       map[string]*engine.ProgressResult
+	progress       map[string]*trackedApply
 	tableSizeLimit int64
+}
+
+// trackedApply pairs the progress the engine has published for one apply
+// with the pg-sprite tracker its executor feeds. The published result changes
+// only at accept and at the terminal outcome; the tracker is what moves in
+// between, so Progress reads the step position and statement from it. The
+// logger is the apply's own, so a poll that cannot read the tracker logs
+// under the identifiers the apply was accepted with.
+type trackedApply struct {
+	result  *engine.ProgressResult
+	tracker *progress.Tracker
+	logger  *slog.Logger
 }
 
 // DefaultNativeSafeTableSizeLimitBytes preserves the native-safe execution
