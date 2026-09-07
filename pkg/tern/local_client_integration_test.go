@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
+	drivermysql "github.com/block/mysql"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
-	drivermysql "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go/modules/mysql"
@@ -63,7 +63,7 @@ func TestMain(m *testing.M) {
 	}
 
 	// Wait for MySQL to be ready
-	db, err := sql.Open("mysql", sharedDSN)
+	db, err := sql.Open("block-mysql", sharedDSN)
 	if err != nil {
 		_ = sharedContainer.Terminate(ctx)
 		log.Fatalf("failed to open database: %v", err)
@@ -102,7 +102,7 @@ func setupMySQLContainer(t *testing.T) (*mysql.MySQLContainer, string) {
 // cleanupTestTables removes test tables to avoid conflicts between tests
 func cleanupTestTables(t *testing.T, dsn string) {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "failed to open database for cleanup")
 	defer utils.CloseAndLog(db)
 
@@ -117,7 +117,7 @@ func cleanupTestTables(t *testing.T, dsn string) {
 // This is needed because tasks from previous tests can affect tests that expect no active schema change.
 func cleanupTasks(t *testing.T, dsn string) {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "failed to open database for task cleanup")
 	defer utils.CloseAndLog(db)
 
@@ -188,7 +188,7 @@ func setupStorageSchema(t *testing.T, dsn string) {
 // Requires setupStorageSchema to have been called first.
 func createStorage(t *testing.T, dsn string) storage.Storage {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "failed to open database for storage")
 	return mysqlstore.New(db)
 }
@@ -203,7 +203,7 @@ func createStorage(t *testing.T, dsn string) storage.Storage {
 func buildSchemaWithAllTables(t *testing.T, dsn string, testTableSchemas map[string]string) map[string]string {
 	t.Helper()
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "failed to open database for schema building")
 	defer utils.CloseAndLog(db)
 
@@ -571,7 +571,7 @@ func TestLocalClient_PullSchemaLoadsLiveMySQLSchema(t *testing.T) {
 
 	container, dsn := setupMySQLContainer(t)
 	_ = container // container is managed by TestMain
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "open database")
 	defer utils.CloseAndLog(db)
 
@@ -580,7 +580,7 @@ func TestLocalClient_PullSchemaLoadsLiveMySQLSchema(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
 		defer cancel()
-		cleanupDB, cleanupErr := sql.Open("mysql", dsn)
+		cleanupDB, cleanupErr := sql.Open("block-mysql", dsn)
 		require.NoError(t, cleanupErr, "open database for pull schema cleanup")
 		defer utils.CloseAndLog(cleanupDB)
 		_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `pull_schema_users`, `pull_schema_users_archive_2026_06_12`")
@@ -689,7 +689,7 @@ func TestLocalClient_PullSchemaCatalogForeignKeysAndGeneratedColumns(t *testing.
 
 	container, dsn := setupMySQLContainer(t)
 	_ = container
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "open database")
 	defer utils.CloseAndLog(db)
 
@@ -700,7 +700,7 @@ func TestLocalClient_PullSchemaCatalogForeignKeysAndGeneratedColumns(t *testing.
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
 		defer cancel()
-		cleanupDB, cleanupErr := sql.Open("mysql", dsn)
+		cleanupDB, cleanupErr := sql.Open("block-mysql", dsn)
 		require.NoError(t, cleanupErr, "open database for catalog cleanup")
 		defer utils.CloseAndLog(cleanupDB)
 		_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, dropStmt)
@@ -776,7 +776,7 @@ func TestLocalClient_PullSchemaDiscoversNonReservedNamespaces(t *testing.T) {
 
 	container, dsn := setupMySQLContainer(t)
 	_ = container // container is managed by TestMain
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "open database")
 	defer utils.CloseAndLog(db)
 
@@ -794,7 +794,7 @@ func TestLocalClient_PullSchemaDiscoversNonReservedNamespaces(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
 		defer cancel()
-		cleanupDB, cleanupErr := sql.Open("mysql", dsn)
+		cleanupDB, cleanupErr := sql.Open("block-mysql", dsn)
 		require.NoError(t, cleanupErr, "open database for namespace discovery cleanup")
 		defer utils.CloseAndLog(cleanupDB)
 		for _, stmt := range []string{
@@ -850,7 +850,7 @@ func TestLocalClient_PullSchemaOverridesReadPhysicalSchema(t *testing.T) {
 
 	container, dsn := setupMySQLContainer(t)
 	_ = container // container is managed by TestMain
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "open database")
 	defer utils.CloseAndLog(db)
 
@@ -874,7 +874,7 @@ func TestLocalClient_PullSchemaOverridesReadPhysicalSchema(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
 		defer cancel()
-		cleanupDB, cleanupErr := sql.Open("mysql", dsn)
+		cleanupDB, cleanupErr := sql.Open("block-mysql", dsn)
 		require.NoError(t, cleanupErr, "open database for schema override pull cleanup")
 		defer utils.CloseAndLog(cleanupDB)
 		for _, stmt := range []string{
@@ -964,7 +964,7 @@ func TestLocalClient_ApplySchemaOverridesTargetPhysicalSchema(t *testing.T) {
 
 	ctx := t.Context()
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "open database")
 	defer utils.CloseAndLog(db)
 
@@ -987,7 +987,7 @@ func TestLocalClient_ApplySchemaOverridesTargetPhysicalSchema(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
 		defer cancel()
-		cleanupDB, cleanupErr := sql.Open("mysql", dsn)
+		cleanupDB, cleanupErr := sql.Open("block-mysql", dsn)
 		require.NoError(t, cleanupErr, "open database for schema override apply cleanup")
 		defer utils.CloseAndLog(cleanupDB)
 		for _, stmt := range []string{
@@ -1062,7 +1062,7 @@ func TestLocalClient_Plan(t *testing.T) {
 	ctx := t.Context()
 
 	// Create initial table
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "failed to open database")
 	defer utils.CloseAndLog(db)
 
@@ -1184,7 +1184,7 @@ func TestLocalClient_Apply(t *testing.T) {
 	ctx := t.Context()
 
 	// Create initial table
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "failed to open database")
 	defer utils.CloseAndLog(db)
 
@@ -1260,7 +1260,7 @@ func TestLocalClient_Apply_IdempotentDispatch(t *testing.T) {
 
 	ctx := t.Context()
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "failed to open database")
 	defer utils.CloseAndLog(db)
 
@@ -1365,7 +1365,7 @@ func TestLocalClient_Apply_WritesApplyOperationRow(t *testing.T) {
 
 	ctx := t.Context()
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "failed to open database")
 	defer utils.CloseAndLog(db)
 
@@ -2173,7 +2173,7 @@ func TestLocalClient_ResumeApplyGroupedFinalSchemaCheckCompletesWithoutReapply(t
 	require.NoError(t, err)
 	assert.Nil(t, pendingStart)
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(ctx))
@@ -2210,7 +2210,7 @@ func TestLocalClient_ResumeApplyDeferredCutoverRecoveryPreservesCutoverReadyStor
 	stor := createStorage(t, dsn)
 	defer utils.CloseAndLog(stor)
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(ctx))
@@ -2220,7 +2220,7 @@ func TestLocalClient_ResumeApplyDeferredCutoverRecoveryPreservesCutoverReadyStor
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		cleanupCtx := context.WithoutCancel(t.Context())
-		cleanupDB, cleanupErr := sql.Open("mysql", dsn)
+		cleanupDB, cleanupErr := sql.Open("block-mysql", dsn)
 		require.NoError(t, cleanupErr)
 		defer utils.CloseAndLog(cleanupDB)
 		_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `_spirit_sentinel`")
@@ -2445,7 +2445,7 @@ func TestLocalClient_ResumeApplyDeferredCutoverFailureMarksApplyRetryable(t *tes
 	stor := createStorage(t, dsn)
 	defer utils.CloseAndLog(stor)
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(ctx))
@@ -2455,7 +2455,7 @@ func TestLocalClient_ResumeApplyDeferredCutoverFailureMarksApplyRetryable(t *tes
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		cleanupCtx := context.WithoutCancel(t.Context())
-		cleanupDB, cleanupErr := sql.Open("mysql", dsn)
+		cleanupDB, cleanupErr := sql.Open("block-mysql", dsn)
 		require.NoError(t, cleanupErr)
 		defer utils.CloseAndLog(cleanupDB)
 		_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `_spirit_sentinel`")
@@ -2573,7 +2573,7 @@ func TestLocalClient_ResumeApplyDeferredCutoverAbsentSentinelReconcilesCompleted
 	stor := createStorage(t, dsn)
 	defer utils.CloseAndLog(stor)
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(ctx))
@@ -2684,7 +2684,7 @@ func TestLocalClient_ResumeApplyDeferredCutoverAbsentSentinelFailsWhenWorkRemain
 	stor := createStorage(t, dsn)
 	defer utils.CloseAndLog(stor)
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(ctx))
@@ -2927,7 +2927,7 @@ func TestLocalClient_ResumeApplyGroupedStartRequestFailsWhenEngineRejects(t *tes
 	require.NoError(t, err)
 	assert.Nil(t, pendingStart)
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(ctx))
@@ -3419,7 +3419,7 @@ func TestLocalClient_Apply_MultiTableSequential(t *testing.T) {
 	ctx := t.Context()
 
 	// Create two initial tables
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "failed to open database")
 	defer utils.CloseAndLog(db)
 
@@ -3559,7 +3559,7 @@ func TestLocalClient_StartApplyHeartbeat(t *testing.T) {
 	_ = container
 	setupStorageSchema(t, dsn)
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -3625,7 +3625,7 @@ func TestLocalClient_Apply_AtomicHeartbeat(t *testing.T) {
 
 	ctx := t.Context()
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -3811,7 +3811,7 @@ func TestLocalClient_Apply_SequentialNamespaceMatchesTask(t *testing.T) {
 	ctx := t.Context()
 
 	// Create a table to alter
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx, "CREATE TABLE users (id INT PRIMARY KEY)")
 	require.NoError(t, err)
@@ -3829,7 +3829,7 @@ func TestLocalClient_Apply_SequentialNamespaceMatchesTask(t *testing.T) {
 	defer utils.CloseAndLog(client)
 
 	// Load current schema
-	dbConn, err := sql.Open("mysql", dsn)
+	dbConn, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(dbConn)
 

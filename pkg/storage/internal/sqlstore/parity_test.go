@@ -6,7 +6,7 @@ import (
 	"database/sql"
 	"testing"
 
-	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/block/mysql"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/storage"
@@ -25,7 +25,7 @@ func (mysqlHarness) NewStorage(t *testing.T) storage.Storage {
 
 func (mysqlHarness) NewUnreachableStorage(t *testing.T) storage.Storage {
 	t.Helper()
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 	return NewMySQL(db)

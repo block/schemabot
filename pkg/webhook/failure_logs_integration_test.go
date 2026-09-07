@@ -28,7 +28,7 @@ import (
 func TestE2EFailedApplySummaryCarriesRecentLogs(t *testing.T) {
 	ctx := t.Context()
 
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })

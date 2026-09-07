@@ -9,8 +9,9 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.14
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.44.5
 	github.com/aws/aws-sdk-go-v2/service/sts v1.43.3
+	github.com/block/mysql v0.0.0-20260906224346-ee0a93fe50d6
 	github.com/block/pg-sprite v0.2.0
-	github.com/block/spirit v0.16.1-0.20260903162727-fc5f1dfb0a40
+	github.com/block/spirit v0.17.1-0.20260907005557-10804bbe247c
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
@@ -18,8 +19,6 @@ require (
 	github.com/coreos/go-oidc/v3 v3.18.0
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/go-mysql-org/go-mysql v1.16.1-0.20260731133054-6f853f178dc3
-	github.com/go-mysql/hotswap-dsn-driver v1.0.1
-	github.com/go-sql-driver/mysql v1.10.0
 	github.com/gofri/go-github-ratelimit/v2 v2.0.2
 	github.com/google/go-github/v86 v86.0.0
 	github.com/google/uuid v1.6.0
@@ -140,6 +139,7 @@ require (
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
+	github.com/go-sql-driver/mysql v1.10.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
 	github.com/goccy/go-json v0.10.6 // indirect
 	github.com/godbus/dbus/v5 v5.2.2 // indirect
@@ -274,7 +274,4 @@ require (
 )
 
 // needed for Strata and vtcombo OnlineDDL suppport
-replace vitess.io/vitess => github.com/block/vitess v0.0.0-20260703150944-881ec2298245
-
-// needed for SPATIAL index support in Spirit v0.13.0
-replace github.com/pingcap/tidb/pkg/parser => github.com/block/tidb/pkg/parser v0.0.0-20260506200501-e528fd979fc8
+replace vitess.io/vitess => github.com/block/vitess v0.0.0-20260907005807-88d15fda31ea

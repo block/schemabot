@@ -119,7 +119,7 @@ func TestCheckStore_RepeatedPlanResultLandsUnderChangedRows(t *testing.T) {
 
 func newChangedRowsStore(t *testing.T) *Storage {
 	t.Helper()
-	db, err := sql.Open("mysql", testDSNChangedRows)
+	db, err := sql.Open("block-mysql", testDSNChangedRows)
 	require.NoError(t, err)
 	require.NoError(t, db.PingContext(t.Context()))
 	t.Cleanup(func() {

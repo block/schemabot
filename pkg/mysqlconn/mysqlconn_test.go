@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -195,56 +195,12 @@ func TestOpenNormalizesRDSDSNBeforeOpening(t *testing.T) {
 	_, err := Open("spirit:secret@tcp(database.cluster-abc123.us-west-2.rds.amazonaws.com:3306)/app?parseTime=true")
 
 	require.ErrorIs(t, err, openErr)
-	assert.Equal(t, "mysql", gotDriver)
+	// Not "mysql": that name belongs to upstream go-sql-driver. Nothing in
+	// SchemaBot's graph registers it any more, so opening under it would fail
+	// outright — but a dependency that reaches upstream again would make it
+	// resolve to the wrong driver silently, which is what this pins.
+	assert.Equal(t, "block-mysql", gotDriver)
 	cfg, parseErr := mysql.ParseDSN(gotDSN)
 	require.NoError(t, parseErr)
 	assert.Equal(t, "rds", cfg.TLSConfig)
-}
-
-func TestOpenReloadableUsesHotswapDriver(t *testing.T) {
-	originalOpenSQL := openSQL
-	t.Cleanup(func() { openSQL = originalOpenSQL })
-
-	openErr := errors.New("stop before network connection")
-	var gotDriver string
-	openSQL = func(driverName, _ string) (*sql.DB, error) {
-		gotDriver = driverName
-		return nil, openErr
-	}
-
-	_, err := OpenReloadable("spirit:secret@tcp(127.0.0.1:3306)/app", func() (string, error) {
-		return "", nil
-	})
-
-	require.ErrorIs(t, err, openErr)
-	assert.Equal(t, hotswapDriverName, gotDriver)
-}
-
-func TestReloadConnectionDSN(t *testing.T) {
-	t.Run("re-applies RDS transport to the reloaded DSN", func(t *testing.T) {
-		got := reloadConnectionDSN(func() (string, error) {
-			return "spirit:rotated@tcp(database.cluster-abc123.us-west-2.rds.amazonaws.com:3306)/app", nil
-		})
-
-		cfg, err := mysql.ParseDSN(got)
-		require.NoError(t, err)
-		assert.Equal(t, "rotated", cfg.Passwd)
-		assert.Equal(t, "rds", cfg.TLSConfig)
-	})
-
-	t.Run("keeps current DSN when reload fails", func(t *testing.T) {
-		got := reloadConnectionDSN(func() (string, error) {
-			return "", errors.New("secret file unreadable")
-		})
-
-		assert.Empty(t, got)
-	})
-
-	t.Run("keeps current DSN when the reloaded DSN is unparseable", func(t *testing.T) {
-		got := reloadConnectionDSN(func() (string, error) {
-			return "not-a-valid-dsn", nil
-		})
-
-		assert.Empty(t, got)
-	})
 }
