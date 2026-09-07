@@ -6,9 +6,6 @@
 
 - [Schema pull](#schema-pull)
 - [Supported changes](#supported-changes)
-  - [Index builds](#index-builds)
-  - [Greenfield tables](#greenfield-tables)
-  - [Partitioned tables](#partitioned-tables)
 - [Blocked plans](#blocked-plans)
 - [Apply-time refusals](#apply-time-refusals)
 - [Unsupported workflow features](#unsupported-workflow-features)
