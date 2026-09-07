@@ -1305,6 +1305,19 @@ corrected into something executable, especially one carrying `--allow-unsafe`. E
 receives a response, and silence only ever means another instance owns the reply. *Enforced:*
 command discovery and the unowned-command policy (`pkg/webhook/commands.go`).
 
+### AZ-6: Local hosting preserves its boundaries
+
+The internal local host reserves a numeric loopback listener before storage bootstrap or
+operator startup. Every route, including probes, requires its private credential. Local hosting
+rejects service authentication configuration and GitHub Apps rather than silently changing their
+authorization behavior. Its credential identifies the runtime, not an independently approved human.
+
+State storage must use an explicit connection and a different database name from each locally
+configured target in the same database family. This conservative name check does not establish
+isolation for dynamically resolved targets. Local hosting never opts into destructive storage
+bootstrap. *Enforced:* `pkg/serve/local.go`, `pkg/auth/local.go`, and
+`pkg/api/storage_isolation.go`; process recovery is covered in `integration/localruntime`.
+
 ## Structural enforcement
 
 The strongest invariants are enforced by structure, so regressions fail CI instead of review:

@@ -1,5 +1,8 @@
 """Regression checks for per-document TOC depth. Run with python3 -m unittest discover -s scripts -p 'test_gen_doc_toc.py'."""
 import runpy
+import subprocess
+import tempfile
+import sys
 import unittest
 from pathlib import Path
 
@@ -23,6 +26,7 @@ class DepthTests(unittest.TestCase):
         self.assertIn('- [Start](#start)', result)
         self.assertNotIn('[Detail]', result)
         self.assertIn('### Detail', result)
+        self.assertIn('max-depth=2', result)
         self.assertEqual(result, TOC['regenerate'](result))
 
     def test_subsections_opt_in(self):
@@ -42,6 +46,39 @@ class DepthTests(unittest.TestCase):
         for depth in ('1', '7', '20', 'two'):
             with self.subTest(depth=depth), self.assertRaises(ValueError):
                 TOC['regenerate'](self.document(depth))
+
+    def test_case_typo_is_rejected(self):
+        for key in ('MAX-DEPTH', 'Max-Depth'):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                TOC['regenerate'](self.document(3).replace('max-depth', key))
+
+    def test_invalid_sweep_does_not_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            docs = Path(tmp) / 'docs'
+            docs.mkdir()
+            good = docs / 'a.md'
+            good.write_text(self.document(2))
+            bad = docs / 'b.md'
+            bad.write_text(self.document('two'))
+            before = good.read_bytes()
+            script = Path(__file__).with_name('gen-doc-toc.py').resolve()
+            result = subprocess.run([sys.executable, str(script)], cwd=tmp,
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('b.md', result.stderr)
+            self.assertEqual(before, good.read_bytes())
+            self.assertFalse((docs / '.toc-manifest').exists())
+
+    def test_explicit_default_passes_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            docs = Path(tmp) / 'docs'
+            docs.mkdir()
+            (docs / 'a.md').write_text(TOC['regenerate'](self.document(2)))
+            (docs / '.toc-manifest').write_text('docs/a.md\n')
+            script = Path(__file__).with_name('gen-doc-toc.py').resolve()
+            result = subprocess.run([sys.executable, str(script), '--check'],
+                                    cwd=tmp, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == '__main__':

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/url"
@@ -1483,11 +1484,22 @@ func LoadServerConfigFromFile(path string) (*ServerConfig, error) {
 		return nil, fmt.Errorf("read config file: %w", err)
 	}
 
+	return ParseServerConfig(data)
+}
+
+// ParseServerConfig decodes one strict YAML document and applies the same
+// normalization and validation for file-backed and privately loaded configs.
+func ParseServerConfig(data []byte) (*ServerConfig, error) {
 	var config ServerConfig
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(&config); err != nil {
 		return nil, fmt.Errorf("parse config file: %w", err)
+	}
+
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("config must contain one YAML document")
 	}
 
 	if err := config.canonicalizeRepositories(); err != nil {

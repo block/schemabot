@@ -101,7 +101,7 @@ def parse_headings(lines: list[str]) -> list[tuple[int, str]]:
     return headings
 
 
-def build_toc(headings: list[tuple[int, str]], max_depth: int = 2) -> str:
+def build_toc(headings: list[tuple[int, str]], max_depth: int) -> str:
     if not any(2 <= level <= max_depth for level, _ in headings):
         return ""
     lines = ["## Table of Contents", ""]
@@ -119,16 +119,21 @@ def build_toc(headings: list[tuple[int, str]], max_depth: int = 2) -> str:
     return "\n".join(lines)
 
 
+def toc_settings(original: str) -> tuple[int, str]:
+    """Read depth and preserve an explicit setting, including the default."""
+    marker = re.search(r"<!-- BEGIN TOC[^>]*-->", original)
+    if not marker or "max-depth" not in marker.group().lower():
+        return 2, BEGIN
+    depth = re.search(r"max-depth=([2-6])(?=[;)\s])", marker.group())
+    if not depth or marker.group().lower().count("max-depth") != 1:
+        raise ValueError("use lowercase max-depth=N with a heading level from 2 to 6")
+    value = int(depth.group(1))
+    return value, BEGIN.replace(") -->", f"; max-depth={value}) -->")
+
+
 def regenerate(original: str) -> str | None:
     """Return the file content with a fresh TOC, or None for a heading-less file."""
-    marker = re.search(r"<!-- BEGIN TOC[^>]*-->", original)
-    max_depth = 2
-    if marker and "max-depth" in marker.group():
-        depth = re.search(r"max-depth=([2-6])(?=[;)\s])", marker.group())
-        if not depth:
-            raise ValueError("TOC max-depth must be a heading level from 2 to 6")
-        max_depth = int(depth.group(1))
-    begin = BEGIN if max_depth == 2 else BEGIN.replace(") -->", f"; max-depth={max_depth}) -->")
+    max_depth, begin = toc_settings(original)
     # Strip any existing auto-generated TOC block (matches the current and
     # any prior marker text so re-runs after a marker change still work).
     text = re.sub(
@@ -238,6 +243,16 @@ def main(argv: list[str]) -> int:
     explicit = [Path(p) for p in args]
     paths = explicit or sorted(Path("docs").glob("**/*.md"))
 
+    # Validate every selected marker before the write sweep changes any file.
+    for p in paths:
+        original = p.read_text()
+        if explicit or has_toc_markers(original):
+            try:
+                toc_settings(original)
+            except ValueError as exc:
+                print(f"{p}: {exc}", file=sys.stderr)
+                return 1
+
     stale: list[Path] = []
     broken: list[Path] = []
     changed = 0
@@ -261,7 +276,12 @@ def main(argv: list[str]) -> int:
 
     failed = False
     for p in broken:
-        print(f"broken TOC: {p} has no headings within its TOC depth")
+        depth, _ = toc_settings(p.read_text())
+        print(
+            f"broken TOC: {p} has no H2–H{depth} headings to list; "
+            "add main sections or set max-depth=3 (up to 6) in the BEGIN TOC "
+            "marker, then run `make docs-toc`"
+        )
         failed = True
 
     if not explicit and examined == 0:
