@@ -17,11 +17,10 @@ import (
 // driverName is the database/sql driver the readiness probe below opens with.
 //
 // It has to name whatever the blank import above registers, and block/mysql
-// registers "block-mysql" rather than "mysql" so a binary still reaching
-// upstream go-sql-driver can link both. Nothing here registers "mysql" any
-// more, so the old literal failed the wait strategy with `unknown driver
-// "mysql"` before a single test ran — and it failed inside a container start
-// hook, which surfaces as the whole package failing rather than as a bad
+// registers "block-mysql" rather than "mysql". Nothing in SchemaBot registers
+// "mysql" any more, so the old literal failed the wait strategy with `unknown
+// driver "mysql"` before a single test ran — and it failed inside a container
+// start hook, which surfaces as the whole package failing rather than as a bad
 // driver name. Named, so the import and the string that depends on it cannot
 // drift apart again.
 const driverName = "block-mysql"

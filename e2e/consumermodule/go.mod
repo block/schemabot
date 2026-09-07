@@ -49,8 +49,6 @@ require (
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-mysql-org/go-mysql v1.16.1-0.20260731133054-6f853f178dc3 // indirect
-	github.com/go-mysql/hotswap-dsn-driver v1.0.1 // indirect
-	github.com/go-sql-driver/mysql v1.10.0 // indirect
 	github.com/goccy/go-json v0.10.6 // indirect
 	github.com/gofri/go-github-ratelimit/v2 v2.0.2 // indirect
 	github.com/golang-jwt/jwt/v4 v4.5.2 // indirect

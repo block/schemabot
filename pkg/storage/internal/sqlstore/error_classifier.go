@@ -37,12 +37,12 @@ func NewMySQLErrorClassifier() ErrorClassifier {
 }
 
 // The codes are read through mysqlerr.Number rather than by asserting a
-// driver's error type, because the storage pool this classifier serves can be
-// opened either way: the credential-reloading pool goes through the hot-swap
-// driver, which returns upstream go-sql-driver's *mysql.MySQLError, while a
-// plain pool returns block/mysql's. Asserting one type would silently classify
-// every error from the other pool as non-retryable, turning deadlocks that used
-// to be retried into surfaced failures.
+// driver's error type. Asserting a type is what silently broke here before: the
+// credential-reloading storage pool went through a hot-swap DSN driver that
+// embedded upstream go-sql-driver, so it returned a *mysql.MySQLError of a type
+// no errors.As against block/mysql's could match — and the failure mode was
+// every deadlock from that pool classified as non-retryable, not an error
+// anyone would see. See mysqlerr.Number.
 func (mysqlErrorClassifier) IsRetryableConflict(err error) bool {
 	return mysqlerr.Is(err, mysqlErrDeadlock, mysqlErrLockWaitTimeout)
 }

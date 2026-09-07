@@ -4,34 +4,28 @@ import (
 	"errors"
 	"slices"
 
-	blockmysql "github.com/block/mysql"
-	upstreammysql "github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 )
 
-// Number reports the MySQL server error code carried by err, from either MySQL
-// driver linked into this binary.
+// Number reports the MySQL server error code carried by err.
 //
-// Two are linked, and that is not incidental. SchemaBot opens its own pools
-// with block/mysql (registered as "block-mysql"), but the credential-reloading
-// storage pool goes through go-mysql/hotswap-dsn-driver, which embeds upstream
-// go-sql-driver/mysql and cannot be pointed at the fork. So a pool's errors are
-// upstream's *mysql.MySQLError or the fork's depending on which opened it.
-//
-// The two structs are field-identical and carry the same codes, but they are
-// distinct types in distinct packages, so errors.As against one silently
-// returns false for the other. Silently is the problem: a retry classifier that
-// checks only one type does not fail loudly on the other, it just stops
-// recognizing deadlocks and starts surfacing them as permanent errors. Reading
-// the code through here instead of asserting a driver's type at the call site
-// is what keeps that from depending on which pool an error came from.
+// It exists so no call site asserts a driver's error type directly. SchemaBot
+// links exactly one MySQL driver — block/mysql — and that is a property worth
+// keeping rather than assuming: it stopped being true once, when the
+// credential-reloading storage pool went through a hot-swap DSN driver that
+// embedded upstream go-sql-driver/mysql and could not be pointed at the fork.
+// The two *mysql.MySQLError structs are field-identical and carry the same
+// codes, but they are distinct types in distinct packages, so errors.As against
+// one silently returns false for the other. Silently is the problem: a retry
+// classifier that checks only one type does not fail loudly on the other, it
+// just stops recognizing deadlocks and starts surfacing them as permanent
+// errors. Reading the code through here means a second driver re-entering the
+// graph is a change to one function rather than a hunt through every classifier
+// in the repo.
 func Number(err error) (uint16, bool) {
-	var blockErr *blockmysql.MySQLError
-	if errors.As(err, &blockErr) {
-		return blockErr.Number, true
-	}
-	var upstreamErr *upstreammysql.MySQLError
-	if errors.As(err, &upstreamErr) {
-		return upstreamErr.Number, true
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) {
+		return mysqlErr.Number, true
 	}
 	return 0, false
 }
