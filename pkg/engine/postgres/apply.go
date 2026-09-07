@@ -40,6 +40,16 @@ const (
 	// catalog verdict — so it only fires on genuine hangs.
 	optimisticApplyCeiling = 5 * time.Minute
 
+	// executorProgressReadTimeout bounds one read of the executor's tracker.
+	// For an active concurrent index build that read is a single-row query
+	// on the session the executor reserved for the build's failure verdict,
+	// and the tracker serializes it against the executor's own end-of-build
+	// fence — so a poll that hangs on a half-open socket would hold up the
+	// apply's verdict and its terminal publish. A short deadline of the
+	// engine's own keeps that coupling bounded regardless of what the
+	// caller's context or the target's server-side timeouts do.
+	executorProgressReadTimeout = 5 * time.Second
+
 	// concurrentIndexBudget bounds one CREATE INDEX CONCURRENTLY build.
 	// Concurrent builds get their own budget instead of the per-statement
 	// limit: their snapshot waits are lock waits by implementation, so the
@@ -183,7 +193,9 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	// Every terminal result carries the executor's final position: the
 	// tracker has finished by the time executeOptimistic returns, so the
 	// read is memory-only and a failed create reports the step that failed,
-	// not the sequence's first step.
+	// not the sequence's first step. The error branch guards that premise
+	// rather than an expected outcome — a tracker still reporting a live
+	// build here means the executor returned without finishing it.
 	publish := func(result *engine.ProgressResult) {
 		if err := executorProgressMetadata(ctx, tracker, result.Metadata); err != nil {
 			logger.Warn("PostgreSQL apply terminal progress reports the last-known executor position",
@@ -762,7 +774,11 @@ func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, 
 // accept and at the terminal outcome. The tracker read happens outside the
 // engine lock: for an active concurrent index build it queries the server's
 // progress view, and a poll must never hold up Apply or publishProgress on
-// a database round trip.
+// a database round trip. The coupling runs the other way too: the tracker
+// serializes that query against the executor's own end-of-build fence, so
+// a read still on the wire delays the apply's failure verdict and the
+// terminal publish behind it. executorProgressMetadata bounds every read
+// with the engine's own deadline so that delay is never open-ended.
 func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*engine.ProgressResult, error) {
 	var key string
 	if req != nil {
@@ -806,15 +822,26 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 // length it announced, and the statement text of that step. Each key is
 // written only once the executor has reported it, so before execution starts
 // the metadata keeps progressResult's pre-execution position. The statement
-// passes through sanitizeReasonText because it renders in operator-facing
-// tables. A tracker read fails only when the server's index-build progress
-// view cannot be queried; the snapshot still carries the last-known position,
-// which is written before the error is returned for the caller to log.
+// passes through sanitizeReasonText because the metadata is destined for
+// operator-facing single-line rendering, and the value must be safe for that
+// surface the moment one starts reading it.
+//
+// For an active concurrent index build the tracker queries the session the
+// executor reserved for the build's failure verdict. The read runs on its
+// own bounded context, detached from the caller's cancellation: a poller or
+// drive context cancelled mid-query would otherwise tear down that session
+// and leave the build's verdict indeterminate, and the deadline caps how long
+// the read can hold the tracker's fence against the executor. A tracker read
+// fails only when the server's progress view cannot be queried; the snapshot
+// still carries the last-known position, which is written before the error
+// is returned for the caller to log.
 func executorProgressMetadata(ctx context.Context, tracker *progress.Tracker, metadata map[string]string) error {
 	if tracker == nil {
 		return nil
 	}
-	snapshot, err := tracker.Progress(ctx)
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), executorProgressReadTimeout)
+	defer cancel()
+	snapshot, err := tracker.Progress(readCtx)
 	if snapshot.TotalSteps > 0 {
 		metadata["steps_total"] = strconv.Itoa(snapshot.TotalSteps)
 	}
@@ -857,8 +884,11 @@ func progressResult(state engine.State, phase string, started time.Time, change 
 			"phase": phase, "elapsed": time.Since(started).Round(time.Millisecond).String(),
 			// The position the record carries before the executor has
 			// reported one: the first step of the planned sequence, with the
-			// total taken from the plan. Once execution starts,
-			// executorProgressMetadata overwrites both from the tracker.
+			// total taken from the plan. executorProgressMetadata replaces
+			// each key as the tracker reports it — the total once the
+			// executor announces its sequence, the step once it starts one —
+			// so through the executor's admission checks the record still
+			// shows the planned first step.
 			"step": "1", "steps_total": strconv.Itoa(steps),
 		},
 		Tables: []engine.TableProgress{{

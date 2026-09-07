@@ -576,8 +576,8 @@ func (c *LocalClient) pendingDriverRequest(ctx context.Context, apply *storage.A
 // storage believes is in-flight, the task is updated in storage and no longer blocks.
 // Resting tasks (Stopped, FailedRetryable) are left untouched.
 //
-// The engine probe is in-memory and database-scoped: it reports this process's
-// last run on the database, not the task's actual cross-process state. The
+// The engine probe answers from this process's own memory of the work: it
+// reports what this process ran, not the task's actual cross-process state. The
 // task's parent apply lease decides whether that memory is authoritative — a
 // fresh lease means a live driver owns the work and the task keeps blocking,
 // and a terminal report is only trusted when the last lease belongs to this
@@ -598,11 +598,13 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 	}
 
 	// The raw target credentials (no namespace mapping) are safe here only
-	// because Spirit's Progress is purely in-memory and never queries by
-	// request database or connection schema. An engine whose Progress inspects
-	// the database must resolve credentials per task (credentialsForTask)
-	// before this probe, or under schema overrides it would address the
-	// canonical name instead of the physical schema.
+	// because no engine's Progress opens a connection from them: Spirit's is
+	// purely in-memory, and the PostgreSQL engine's reads the target only
+	// through the session its own executor already holds for the running
+	// apply. An engine whose Progress connected from these credentials would
+	// have to resolve them per task (credentialsForTask) before this probe,
+	// or under schema overrides it would address the canonical name instead
+	// of the physical schema.
 	//
 	// The task identifier rides along for engines that key progress by apply
 	// identity (postgres): a probe about work the engine is still running

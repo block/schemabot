@@ -1,6 +1,8 @@
 package postgres
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +15,7 @@ import (
 	"github.com/block/pg-sprite/pkg/executor"
 	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/progress"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -517,6 +520,146 @@ func TestPublishProgressKeepsTerminalPositionAsPublished(t *testing.T) {
 	assert.Equal(t, "2", got.Metadata["step"])
 	assert.Equal(t, "2", got.Metadata["steps_total"])
 	assert.Equal(t, "CREATE INDEX widgets_name_idx ON public.widgets (name)", got.Metadata["statement"])
+}
+
+// TestApplyRegistersExecutorTracker proves Apply itself hands the tracker it
+// gives the executor to the progress record it claims, so a poll during
+// execution reads the executor's live step rather than the planned first
+// step. The poll-time tests above inject the tracker through claimProgress
+// directly; this one pins the wiring they take for granted.
+func TestApplyRegistersExecutorTracker(t *testing.T) {
+	eng := New()
+	const key = "task-a"
+	accepted, err := eng.Apply(t.Context(), &engine.ApplyRequest{
+		Database: "app",
+		Changes: []engine.SchemaChange{{
+			Namespace: "public",
+			TableChanges: []engine.TableChange{{
+				Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN email text",
+			}},
+		}},
+		Credentials: &engine.Credentials{DSN: "postgres://schemabot:secret@127.0.0.1:1/app?sslmode=disable"},
+		ResumeState: &engine.ResumeState{MigrationContext: key},
+	})
+	require.NoError(t, err)
+	require.True(t, accepted.Accepted)
+
+	// The background drive fails fast against the unreachable target and
+	// publishes its terminal result over the record, but the tracker claimed
+	// at accept stays with the record for as long as the engine tracks it.
+	eng.mu.Lock()
+	tracked := eng.progress[key]
+	eng.mu.Unlock()
+	require.NotNil(t, tracked, "Apply must claim a progress record under the task identity")
+	assert.NotNil(t, tracked.tracker, "the claimed record must carry the executor's tracker for Progress to read")
+
+	drained := make(chan struct{})
+	go func() {
+		eng.Drain()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(30 * time.Second):
+		t.Fatal("background apply against an unreachable target did not reach a terminal state")
+	}
+}
+
+// indexProgressSession stands in for the session the executor reserves for a
+// concurrent index build, with a progress view whose read fails. It records
+// the context the read arrived on so a test can check how the engine bounds
+// it.
+type indexProgressSession struct {
+	err             error
+	queried         bool
+	cancelledAtRead error
+	hadDeadline     bool
+}
+
+func (s *indexProgressSession) QueryRow(ctx context.Context, _ string, _ ...any) pgx.Row {
+	s.queried = true
+	s.cancelledAtRead = ctx.Err()
+	_, s.hadDeadline = ctx.Deadline()
+	return failingRow{err: s.err}
+}
+
+type failingRow struct{ err error }
+
+func (r failingRow) Scan(...any) error { return r.err }
+
+// activeBuildTracker returns a tracker mid-way through a concurrent index
+// build whose server-side progress read fails with readErr.
+func activeBuildTracker(t *testing.T, readErr error) (*progress.Tracker, *indexProgressSession) {
+	t.Helper()
+	tracker := newTestTracker(t)
+	tracker.Start(2, progress.OperationAdmitting)
+	tracker.StartStep(2, progress.OperationConcurrentIndex, "CREATE INDEX CONCURRENTLY widgets_name_idx ON public.widgets (name)")
+	session := &indexProgressSession{err: readErr}
+	tracker.SetConcurrentBuild(session, 42)
+	return tracker, session
+}
+
+// TestExecutorProgressMetadataKeepsLastKnownPositionOnReadError proves the
+// read's error contract: when the server's progress view cannot be queried,
+// the metadata still receives the tracker's last-known step, total, and
+// statement, and the wrapped error goes back to the caller to log.
+func TestExecutorProgressMetadataKeepsLastKnownPositionOnReadError(t *testing.T) {
+	readErr := errors.New("connection reset by peer")
+	tracker, session := activeBuildTracker(t, readErr)
+	metadata := map[string]string{"step": "1", "steps_total": "1"}
+
+	err := executorProgressMetadata(t.Context(), tracker, metadata)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, readErr)
+	assert.Contains(t, err.Error(), "read pg-sprite executor progress")
+	assert.True(t, session.queried)
+	assert.Equal(t, "2", metadata["step"])
+	assert.Equal(t, "2", metadata["steps_total"])
+	assert.Equal(t, "CREATE INDEX CONCURRENTLY widgets_name_idx ON public.widgets (name)", metadata["statement"])
+}
+
+// TestExecutorProgressMetadataReadsOnItsOwnBoundedContext proves the
+// progress-view read never inherits the caller's cancellation — a cancelled
+// poller or drive context must not tear down the session the executor
+// reserved for its failure verdict — while still carrying a deadline of the
+// engine's own.
+func TestExecutorProgressMetadataReadsOnItsOwnBoundedContext(t *testing.T) {
+	tracker, session := activeBuildTracker(t, errors.New("progress view unavailable"))
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	err := executorProgressMetadata(ctx, tracker, map[string]string{})
+
+	require.Error(t, err)
+	require.True(t, session.queried)
+	assert.NoError(t, session.cancelledAtRead, "the read must not observe the caller's cancellation")
+	assert.True(t, session.hadDeadline, "the read must carry the engine's own deadline")
+}
+
+// TestProgressAnswersLastKnownPositionWhenTrackerReadFails proves a poll
+// whose progress-view read fails still answers: the running state and the
+// tracker's last-known position come back with a nil error, and the failure
+// is logged for triage instead of telling the driver its apply is
+// unobservable.
+func TestProgressAnswersLastKnownPositionWhenTrackerReadFails(t *testing.T) {
+	eng := New()
+	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE public.widgets (id bigint PRIMARY KEY)", steps: 2}
+	tracker, _ := activeBuildTracker(t, errors.New("connection reset by peer"))
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, logger)
+
+	got, err := eng.Progress(t.Context(), &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: "task-a"}})
+
+	require.NoError(t, err)
+	assert.Equal(t, engine.StateRunning, got.State)
+	assert.Equal(t, "2", got.Metadata["step"])
+	assert.Equal(t, "2", got.Metadata["steps_total"])
+	assert.Equal(t, "CREATE INDEX CONCURRENTLY widgets_name_idx ON public.widgets (name)", got.Metadata["statement"])
+	assert.Contains(t, logs.String(), "reports the last-known executor position")
+	assert.Contains(t, logs.String(), "task_id=task-a")
+	assert.Contains(t, logs.String(), "connection reset by peer")
 }
 
 // TestRefusalForOutcomeTotalOverExecutorCodes pins the classifier to
