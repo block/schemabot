@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -90,7 +91,22 @@ func main() {
 	// can't hang the CLI at startup. Cancel as soon as it returns rather than via
 	// defer, since the os.Exit below would skip a deferred cancel.
 	// Hosting a local runtime does not use a remote profile or its credentials.
-	if ctx.Command() != "local serve" {
+	var localEndpoint string
+	if !strings.HasPrefix(ctx.Command(), "local ") {
+		if usesLocalRuntime(ctx.Command()) {
+			localCtx, cancelLocal := context.WithTimeout(context.Background(), 30*time.Second)
+			connection, err := client.ResolveLocalConnection(localCtx, cli.Endpoint, cli.Profile, cli.Token, version)
+			cancelLocal()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			if connection != nil {
+				localEndpoint = connection.Endpoint
+				cli.Endpoint = connection.Endpoint
+				cli.Token = connection.Token
+			}
+		}
 		authCtx, cancelAuth := context.WithTimeout(context.Background(), 30*time.Second)
 		token, err := client.ResolveBearerToken(authCtx, cli.Token, cli.Endpoint, cli.Profile)
 		cancelAuth()
@@ -105,6 +121,9 @@ func main() {
 			fmt.Fprintf(os.Stderr, "\033[33mWarning: %v\033[0m\n", err)
 		}
 		client.SetAuthToken(token)
+		if localEndpoint != "" {
+			client.SetLocalAuth(token, localEndpoint)
+		}
 	}
 
 	// Cancel long-running commands on Ctrl+C / SIGTERM. The first signal
@@ -149,5 +168,19 @@ func main() {
 			fmt.Fprintf(os.Stderr, "\033[31mError: %v\033[0m\n", err)
 		}
 		os.Exit(1)
+	}
+}
+
+// Only commands that use the schema API may implicitly start a selected runtime.
+func usesLocalRuntime(command string) bool {
+	parts := strings.Fields(command)
+	if len(parts) == 0 {
+		return false
+	}
+	switch parts[0] {
+	case "plan", "onboard", "pull", "apply", "progress", "cutover", "stop", "cancel", "start", "release", "revert", "skip-revert", "rollback", "databases", "unlock", "locks", "logs", "status", "list-plans":
+		return true
+	default:
+		return false
 	}
 }
