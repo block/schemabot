@@ -193,6 +193,15 @@ func publishInitSchema(stage, root string) error {
 	if publishErr == nil {
 		return nil
 	}
+	// Removing a directory with rmdir can only succeed while it is empty.
+	// A concurrent file creation or symlink replacement fails closed; the
+	// subsequent no-replace rename also preserves a concurrently created target.
+	if entries, err := os.ReadDir(root); err == nil && len(entries) == 0 {
+		if err := removeEmptyInitDir(root); err != nil {
+			return fmt.Errorf("schema directory changed before publication: %w", err)
+		}
+		return renameInitSchema(stage, root)
+	}
 	existing, err := initSchemaSnapshot(root)
 	if err != nil {
 		return fmt.Errorf("publish schema directory (%w): %w", publishErr, err)

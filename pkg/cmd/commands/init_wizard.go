@@ -26,6 +26,11 @@ func (cmd *InitCmd) missingInputs() []string {
 }
 
 func (cmd *InitCmd) collectInputs(ctx context.Context, g *Globals) error {
+	return cmd.collectInputsWithTerminalState(ctx, g, ui.IsTerminal(os.Stdin), ui.IsTerminal(os.Stdout))
+}
+
+func (cmd *InitCmd) collectInputsWithTerminalState(ctx context.Context, g *Globals, stdinTerminal, stdoutTerminal bool) error {
+	cmd.interactive = !cmd.NonInteractive && !cmd.JSON && stdinTerminal && stdoutTerminal
 	if cmd.Type != "" && cmd.Type != "mysql" && cmd.Type != "postgres" {
 		return fmt.Errorf("database engine must be mysql or postgres")
 	}
@@ -33,7 +38,7 @@ func (cmd *InitCmd) collectInputs(ctx context.Context, g *Globals) error {
 	if len(missing) == 0 {
 		return nil
 	}
-	if cmd.NonInteractive || cmd.JSON || !ui.IsTerminal(os.Stdin) || !ui.IsTerminal(os.Stdout) {
+	if !cmd.interactive {
 		if cmd.JSON {
 			if err := json.NewEncoder(os.Stdout).Encode(struct {
 				Error   string   `json:"error"`

@@ -265,3 +265,53 @@ func TestInitConnectionFailureRetryAndEdit(t *testing.T) {
 	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("X")})
 	require.False(t, m.connectionChecked)
 }
+
+func TestInitTerminalModes(t *testing.T) {
+	for _, tt := range []struct {
+		name                                      string
+		noninteractive, json, stdin, stdout, want bool
+	}{
+		{"terminal", false, false, true, true, true},
+		{"explicit noninteractive", true, false, true, true, false},
+		{"json", false, true, true, true, false},
+		{"redirected input", false, false, false, true, false},
+		{"redirected output", false, false, true, false, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := InitCmd{Database: "shop", Environment: "dev", Type: "postgres", DSN: "env:APP", StorageDSN: "env:STATE", Namespaces: []string{"public"}, NonInteractive: tt.noninteractive, JSON: tt.json}
+			require.NoError(t, cmd.collectInputsWithTerminalState(t.Context(), &Globals{}, tt.stdin, tt.stdout))
+			require.Equal(t, tt.want, cmd.interactive)
+		})
+	}
+	cmd := InitCmd{Type: "unknown"}
+	require.ErrorContains(t, cmd.collectInputsWithTerminalState(t.Context(), &Globals{}, true, true), "must be mysql or postgres")
+}
+
+func TestInitPublishEmptyDirectoryPreservesConcurrentFiles(t *testing.T) {
+	root := t.TempDir()
+	stage := filepath.Join(root, "stage")
+	dest := filepath.Join(root, "schema")
+	require.NoError(t, os.Mkdir(stage, 0700))
+	require.NoError(t, os.Mkdir(dest, 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(stage, "schema.sql"), []byte("verified"), 0600))
+	require.NoError(t, publishInitSchema(stage, dest))
+	data, err := os.ReadFile(filepath.Join(dest, "schema.sql"))
+	require.NoError(t, err)
+	require.Equal(t, "verified", string(data))
+	require.Error(t, removeEmptyInitDir(dest))
+	link := filepath.Join(root, "link")
+	require.NoError(t, os.Symlink(dest, link))
+	require.Error(t, removeEmptyInitDir(link))
+	require.FileExists(t, filepath.Join(dest, "schema.sql"))
+}
+
+func TestInitWizardRejectsTrailingNamespaceBeforeReview(t *testing.T) {
+	m := newInitWizard(&InitCmd{Namespaces: []string{"public"}}, "default", io.Discard)
+	m.step = 5
+	m.loadField()
+	m.input.SetValue("public,")
+	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, 5, m.step)
+	require.NotEmpty(t, m.err)
+	require.False(t, m.confirmed)
+}
