@@ -645,7 +645,7 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
 	}
 	if resp == nil {
-		errorMessage := "not accepted"
+		errorMessage := "the data plane returned neither a response nor an error"
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage, remoteID); err != nil {
 			return err
 		}
@@ -654,10 +654,7 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %s", apply.ApplyIdentifier, remoteID, errorMessage)
 	}
 	if !resp.Accepted {
-		errorMessage := "not accepted"
-		if resp.ErrorMessage != "" {
-			errorMessage = resp.ErrorMessage
-		}
+		errorMessage := controlRefusalMessage(storage.ControlOperationCutover, resp.ErrorMessage)
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage, remoteID); err != nil {
 			return err
 		}
@@ -797,32 +794,44 @@ func logOperationDriveLeavesParentCancel(logger *slog.Logger, apply *storage.App
 // resolves. Failing it with the stated reason ends that loop.
 //
 // The refusal means the operation did not take effect, so this reports the
-// request as not handled, and it clears the send gate so a later request for the
-// same operation is transmitted rather than suppressed as a resend.
+// request as not handled, and it drops the resolved request's send-gate entry
+// as map hygiene: the gate is keyed on the request id, and a later request for
+// the same operation is a new row with a new id.
 //
 // An operation-only drive owns only its operation and never the shared
 // apply-level request, so it leaves the request pending for the operator
-// projection to resolve. It records the transmission on its way out: the
-// request stays pending by design there, so without the record every later tick
-// would re-send a command already refused. It reports the request as not
-// handled for the same reason the resolving branch does, which matters more
-// here: an operation-only drive returning handled would stand its whole drive
-// step down over a refusal that changed nothing.
-func (c *GRPCClient) failRefusedControlRequest(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, scope applyTaskScope, remoteID, errorMessage string, leaveParentRequestPending func(*slog.Logger, *storage.Apply, applyTaskScope)) (bool, error) {
+// projection to resolve, and says so in its own line rather than reusing the
+// caller's — a drive that reported the same sentence twice per tick would read
+// as two drives. It records the transmission on its way out: the request stays
+// pending by design there, so without the record every later tick would re-send
+// a command already refused. It reports the request as not handled for the same
+// reason the resolving branch does, which matters more here: an operation-only
+// drive returning handled would stand its whole drive step down over a refusal
+// that changed nothing.
+func (c *GRPCClient) failRefusedControlRequest(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, scope applyTaskScope, remoteID, errorMessage string) (bool, error) {
 	message := controlRefusalMessage(operation, errorMessage)
+	if scope.suppressesDirectParentApplyWrites() {
+		logger.WarnContext(ctx, "the data plane refused the pending control request; this operation-only drive leaves the shared apply-level request for the operator projection and keeps driving",
+			append(apply.MutableLogAttrs(),
+				"operation", string(operation),
+				"requested_by", controlRequestCaller(controlReq),
+				"apply_operation_id", scope.applyOperationID,
+				"remote_apply_id", remoteID,
+				"error_message", message)...)
+		c.controlSendGate.recordSend(controlReq.ID, time.Now())
+		return false, nil
+	}
 	logger.WarnContext(ctx, "the data plane refused the pending control request; the schema change continues and settles on its own",
 		append(apply.MutableLogAttrs(),
 			"operation", string(operation),
 			"requested_by", controlRequestCaller(controlReq),
 			"remote_apply_id", remoteID,
 			"error_message", message)...)
-	if scope.suppressesDirectParentApplyWrites() {
-		c.controlSendGate.recordSend(controlReq.ID, time.Now())
-		leaveParentRequestPending(logger, apply, scope)
-		return false, nil
-	}
+	// The durable record is rewritten for the operator by failPendingControlRequests;
+	// the apply log lands on the same PR timeline, so it is rewritten here too rather
+	// than naming a remote identifier that resolves to nothing on the control plane.
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, eventType,
-		fmt.Sprintf("Pending %s request rejected by the data plane: %s%s", operation, message, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+		fmt.Sprintf("Pending %s request rejected by the data plane: %s%s", operation, apply.OperatorFacingMessage(message, remoteID), callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 	if err := failPendingControlRequests(ctx, c.storage, apply, operation, message, remoteID); err != nil {
 		return true, fmt.Errorf("request remote gRPC %s for apply %s remote %s: refused with %q; fail pending %s request: %w", operation, apply.ApplyIdentifier, remoteID, message, operation, err)
 	}
@@ -914,7 +923,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 			return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: the data plane returned neither a response nor an error", apply.ApplyIdentifier, remoteID)
 		}
 		if !resp.Accepted {
-			return c.failRefusedControlRequest(ctx, logger, apply, storage.ControlOperationStop, storage.LogEventStopRequested, controlReq, scope, remoteID, resp.ErrorMessage, logOperationDriveLeavesParentStop)
+			return c.failRefusedControlRequest(ctx, logger, apply, storage.ControlOperationStop, storage.LogEventStopRequested, controlReq, scope, remoteID, resp.ErrorMessage)
 		}
 		if c.controlSendGate.recordSend(controlReq.ID, now) {
 			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
@@ -1029,7 +1038,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 			return true, fmt.Errorf("request remote gRPC cancel for apply %s remote %s: the data plane returned neither a response nor an error", apply.ApplyIdentifier, remoteID)
 		}
 		if !resp.Accepted {
-			return c.failRefusedControlRequest(ctx, logger, apply, storage.ControlOperationCancel, storage.LogEventCancelRequested, controlReq, scope, remoteID, resp.ErrorMessage, logOperationDriveLeavesParentCancel)
+			return c.failRefusedControlRequest(ctx, logger, apply, storage.ControlOperationCancel, storage.LogEventCancelRequested, controlReq, scope, remoteID, resp.ErrorMessage)
 		}
 		if c.controlSendGate.recordSend(controlReq.ID, now) {
 			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested,
@@ -2566,12 +2575,11 @@ func (c *GRPCClient) triggerRemoteOperationCutover(ctx context.Context, apply *s
 	if err != nil {
 		return false, fmt.Errorf("request remote cutover for apply_operation %d (apply %s) remote %s: %w", scope.applyOperationID, apply.ApplyIdentifier, remoteID, err)
 	}
-	if cutoverResp == nil || !cutoverResp.Accepted {
-		message := "not accepted"
-		if cutoverResp != nil && cutoverResp.ErrorMessage != "" {
-			message = cutoverResp.ErrorMessage
-		}
-		return false, fmt.Errorf("request remote cutover for apply_operation %d (apply %s) remote %s: %s", scope.applyOperationID, apply.ApplyIdentifier, remoteID, message)
+	if cutoverResp == nil {
+		return false, fmt.Errorf("request remote cutover for apply_operation %d (apply %s) remote %s: the data plane returned neither a response nor an error", scope.applyOperationID, apply.ApplyIdentifier, remoteID)
+	}
+	if !cutoverResp.Accepted {
+		return false, fmt.Errorf("request remote cutover for apply_operation %d (apply %s) remote %s: %s", scope.applyOperationID, apply.ApplyIdentifier, remoteID, controlRefusalMessage(storage.ControlOperationCutover, cutoverResp.ErrorMessage))
 	}
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered,
 		fmt.Sprintf("Remote ordered cutover accepted for apply %s operation %d (remote %s)", apply.ApplyIdentifier, scope.applyOperationID, remoteID), "", "")

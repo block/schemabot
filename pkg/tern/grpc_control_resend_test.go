@@ -1,6 +1,8 @@
 package tern
 
 import (
+	"bytes"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -170,7 +172,7 @@ func TestGRPCClient_RefusedStopResolvesTheRequest(t *testing.T) {
 	server := &capturingTernServer{
 		progressState:    ternv1.State_STATE_RUNNING,
 		progressStateSet: true,
-		stopRefusal:      "stop is not supported for this schema change; use cancel to permanently cancel it",
+		stopRefusal:      "schema change remote-grpc-stop-refused is in the revert window and has already been applied: use revert to undo it or skip-revert to finalize it",
 	}
 	client, cleanup := testCapturingGRPCClient(t, server)
 	defer cleanup()
@@ -208,9 +210,15 @@ func TestGRPCClient_RefusedStopResolvesTheRequest(t *testing.T) {
 	require.Len(t, controlRequests.requests, 1)
 	refused := controlRequests.requests[0]
 	assert.Equal(t, storage.ControlRequestFailed, refused.Status, "the refused request resolves instead of staying pending")
-	assert.Contains(t, refused.ErrorMessage, "use cancel to permanently cancel it", "the operator reads the data plane's reason")
-	assert.Equal(t, 1, countLogMessages(logs.logs, "Pending stop request rejected by the data plane"),
+	assert.Contains(t, refused.ErrorMessage, "use revert to undo it or skip-revert to finalize it", "the operator reads the data plane's reason")
+	assert.NotContains(t, refused.ErrorMessage, apply.ExternalID, "the durable record names the apply the operator knows")
+	assert.Contains(t, refused.ErrorMessage, apply.ApplyIdentifier)
+	require.Equal(t, 1, countLogMessages(logs.logs, "Pending stop request rejected by the data plane"),
 		"the refusal is recorded on the apply for the operator")
+	for _, entry := range logs.logs {
+		assert.NotContains(t, entry.Message, apply.ExternalID,
+			"the apply log renders into the PR timeline, so it names the apply the operator knows and not the remote id")
+	}
 
 	// A resolved request is not re-sent on the next claim.
 	handled, err = client.processPendingStopControlRequest(t.Context(), apply, wholeApplyTaskScope())
@@ -224,7 +232,7 @@ func TestGRPCClient_RefusedCancelResolvesTheRequest(t *testing.T) {
 	server := &capturingTernServer{
 		progressState:    ternv1.State_STATE_RUNNING,
 		progressStateSet: true,
-		cancelRefusal:    "cancel is not implemented for this schema change",
+		cancelRefusal:    "schema change remote-grpc-cancel-refused is in the revert window and has already been applied: use revert to undo it or skip-revert to finalize it",
 	}
 	client, cleanup := testCapturingGRPCClient(t, server)
 	defer cleanup()
@@ -262,9 +270,15 @@ func TestGRPCClient_RefusedCancelResolvesTheRequest(t *testing.T) {
 	require.Len(t, controlRequests.requests, 1)
 	refused := controlRequests.requests[0]
 	assert.Equal(t, storage.ControlRequestFailed, refused.Status, "the refused request resolves instead of staying pending")
-	assert.Contains(t, refused.ErrorMessage, "cancel is not implemented", "the operator reads the data plane's reason")
-	assert.Equal(t, 1, countLogMessages(logs.logs, "Pending cancel request rejected by the data plane"),
+	assert.Contains(t, refused.ErrorMessage, "use revert to undo it or skip-revert to finalize it", "the operator reads the data plane's reason")
+	assert.NotContains(t, refused.ErrorMessage, apply.ExternalID, "the durable record names the apply the operator knows")
+	assert.Contains(t, refused.ErrorMessage, apply.ApplyIdentifier)
+	require.Equal(t, 1, countLogMessages(logs.logs, "Pending cancel request rejected by the data plane"),
 		"the refusal is recorded on the apply for the operator")
+	for _, entry := range logs.logs {
+		assert.NotContains(t, entry.Message, apply.ExternalID,
+			"the apply log renders into the PR timeline, so it names the apply the operator knows and not the remote id")
+	}
 }
 
 // A refusal that arrives with no reason still has to read as an answer to the
@@ -284,7 +298,7 @@ func TestGRPCClient_RefusedStopOnOperationOnlyDriveLeavesTheRequestPending(t *te
 	server := &capturingTernServer{
 		progressState:    ternv1.State_STATE_RUNNING,
 		progressStateSet: true,
-		stopRefusal:      "stop is not supported for this schema change; use cancel to permanently cancel it",
+		stopRefusal:      "schema change remote-grpc-stop-refused-operation is in the revert window and has already been applied: use revert to undo it or skip-revert to finalize it",
 	}
 	client, cleanup := testCapturingGRPCClient(t, server)
 	defer cleanup()
@@ -334,4 +348,66 @@ func TestGRPCClient_RefusedStopOnOperationOnlyDriveLeavesTheRequestPending(t *te
 	require.NoError(t, err)
 	assert.False(t, handled)
 	assert.Equal(t, 1, server.getStopCalls(), "the refused request is not re-sent on the next claim")
+}
+
+// A queued start waiting behind an apply-level stop is deferred by an
+// operation-only drive rather than waited on: the drive cannot resolve the
+// shared stop, so spinning would hold the claim for a request it will never
+// complete. A refusal on the way through must leave one account of that
+// deferral in the log — an operator triaging a stuck start reads the same
+// sentence twice as two drives when it is one.
+func TestGRPCClient_RefusedStopBeforeStartLogsTheDeferralOnce(t *testing.T) {
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_RUNNING,
+		progressStateSet: true,
+		stopRefusal:      "schema change remote-grpc-stop-refused-before-start is in the revert window and has already been applied: use revert to undo it or skip-revert to finalize it",
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+	var logged bytes.Buffer
+	client.logger = slog.New(slog.NewTextHandler(&logged, nil))
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-grpc-stop-refused-before-start",
+		ExternalID:      "remote-grpc-stop-refused-before-start",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	startReq := &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+		CreatedAt:   time.Now(),
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+		CreatedAt:   time.Now(),
+	}, startReq}}
+	storedApply := *apply
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{},
+		logs:            &mockApplyLogStore{},
+		controlRequests: controlRequests,
+	}
+
+	scope := applyTaskScope{
+		applyOperationID:   42,
+		operation:          &storage.ApplyOperation{ID: 42, ApplyID: apply.ID, Deployment: "deployment-a"},
+		operationLeaseOnly: true,
+	}
+
+	deferred, err := client.waitForPendingStopBeforeStart(t.Context(), apply, scope, startReq)
+	require.NoError(t, err, "a refusal is an answer, not a drive failure")
+	assert.True(t, deferred, "the start defers to the operator while the apply-level stop is unresolved")
+	assert.Equal(t, 1, strings.Count(logged.String(), "operation-only drive leaving apply-level stop request for operator projection"),
+		"the deferral is accounted for once per pass, not once by the refusal and again by the caller")
 }

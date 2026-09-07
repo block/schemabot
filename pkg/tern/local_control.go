@@ -312,17 +312,14 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 		return fmt.Errorf("process pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if resp == nil {
-		errorMessage := "not accepted"
+		errorMessage := "the cutover path returned neither a response nor an error"
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
 			return err
 		}
 		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, errorMessage)
 	}
 	if !resp.Accepted {
-		errorMessage := "not accepted"
-		if resp.ErrorMessage != "" {
-			errorMessage = resp.ErrorMessage
-		}
+		errorMessage := controlRefusalMessage(storage.ControlOperationCutover, resp.ErrorMessage)
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
 			return err
 		}
@@ -371,12 +368,21 @@ func (c *LocalClient) requestCancel(ctx context.Context, req *ternv1.CancelReque
 		return nil, fmt.Errorf("schema change %s is already terminal (state: %s)", apply.ApplyIdentifier, apply.State)
 	}
 
+	// A revert-phase apply has already cut over, so this is a decision about the
+	// schema change rather than a failure to act on it. It answers as a refusal
+	// and not an error: a caller on the far side of a plane boundary sees every
+	// error as one generic internal status, so it cannot tell this apart from a
+	// transient failure and leaves its durable request pending to re-send the
+	// same doomed cancel on every later claim.
 	if revertPhase, err := c.applyRevertPhaseBlock(ctx, apply); err != nil {
 		return nil, err
 	} else if revertPhase != "" {
-		c.logger.Warn("cancel rejected: schema change is in a revert phase and has already cut over",
+		c.logger.Warn("cancel refused: schema change is in a revert phase and has already cut over",
 			"apply_id", apply.ApplyIdentifier, "state", apply.State, "revert_phase", revertPhase)
-		return nil, errors.New(revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase))
+		return &ternv1.CancelResponse{
+			Accepted:     false,
+			ErrorMessage: revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase),
+		}, nil
 	}
 
 	controlStore := c.storage.ControlRequests()
@@ -426,14 +432,20 @@ func (c *LocalClient) requestStop(ctx context.Context, req *ternv1.StopRequest, 
 		return nil, fmt.Errorf("no active schema change")
 	}
 
+	// A revert-phase apply has already cut over, so this is a decision about the
+	// schema change rather than a failure to act on it, and it answers as a
+	// refusal for the same reason the cancel path does.
 	if revertPhase, err := c.applyRevertPhaseBlock(ctx, apply); err != nil {
 		return nil, err
 	} else if revertPhase != "" {
-		c.logger.Warn("stop rejected: schema change is in a revert phase and has already cut over",
+		c.logger.Warn("stop refused: schema change is in a revert phase and has already cut over",
 			"apply_id", apply.ApplyIdentifier,
 			"state", apply.State,
 			"revert_phase", revertPhase)
-		return nil, errors.New(revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase))
+		return &ternv1.StopResponse{
+			Accepted:     false,
+			ErrorMessage: revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase),
+		}, nil
 	}
 
 	controlStore := c.storage.ControlRequests()

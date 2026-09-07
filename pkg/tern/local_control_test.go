@@ -399,6 +399,82 @@ func TestLocalClient_CancelQueuesCancelRequestForApplyOwner(t *testing.T) {
 	assert.Equal(t, apply.Environment, wakeEnvironment)
 }
 
+// A cancel that lands on an apply already past cutover is a decision about the
+// schema change, not a failure to deliver the command. It answers as a refusal
+// carrying the reason, so a control plane on the far side of the RPC boundary
+// can resolve its durable request instead of reading a generic internal error
+// and re-sending the same doomed cancel on every later claim. No request is
+// queued: nothing is going to consume it.
+func TestLocalClient_CancelRefusesRevertWindowWithAReason(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-vitess-revert-window-cancel",
+		State:           state.Apply.RevertWindow,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-vitess-revert-window-cancel",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.RevertWindow,
+	}
+	eng := &controlCaptureEngine{}
+	client := newVitessControlTestClient(apply, []*storage.Task{task}, nil, eng)
+
+	resp, err := client.Cancel(t.Context(), &ternv1.CancelRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.NoError(t, err, "a refusal is an answer, not a transport failure")
+	require.NotNil(t, resp)
+	assert.False(t, resp.Accepted)
+	assert.Equal(t, "schema change apply-vitess-revert-window-cancel is in the revert window and has already been applied: use revert to undo it or skip-revert to finalize it", resp.ErrorMessage)
+	assert.NotContains(t, resp.ErrorMessage, task.TaskIdentifier, "the refusal names the apply identifier, not the per-table task id")
+	assert.Nil(t, eng.cancelReq, "a refused cancel must not touch the engine")
+	assert.Equal(t, state.Apply.RevertWindow, apply.State, "a refused cancel must not move the apply")
+	controlReq, err := client.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq, "a refused cancel queues nothing for an owner to consume")
+}
+
+// Stop refuses a revert-phase apply for the same reason cancel does, and on the
+// same shape: the reason travels in the response so the caller can resolve its
+// durable request rather than retry a command the apply can never accept.
+func TestLocalClient_StopRefusesRevertWindowWithAReason(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-revert-window-stop-refusal",
+		State:           state.Apply.RevertWindow,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-revert-window-stop-refusal",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.RevertWindow,
+	}
+	eng := &controlCaptureEngine{}
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, eng)
+
+	resp, err := client.Stop(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.NoError(t, err, "a refusal is an answer, not a transport failure")
+	require.NotNil(t, resp)
+	assert.False(t, resp.Accepted)
+	assert.Equal(t, "schema change apply-revert-window-stop-refusal is in the revert window and has already been applied: use revert to undo it or skip-revert to finalize it", resp.ErrorMessage)
+	assert.Nil(t, eng.stopReq, "a refused stop must not touch the engine")
+	assert.Equal(t, state.Apply.RevertWindow, apply.State, "a refused stop must not move the apply")
+	controlReq, err := client.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq, "a refused stop queues nothing for an owner to consume")
+}
+
 // Apply-owner stop is only authoritative after the local Spirit runner stops.
 // If the engine cannot stop, storage must remain active so user-facing status
 // does not diverge from a runner that is still copying rows.
