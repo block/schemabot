@@ -3,6 +3,7 @@ package commands
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -18,19 +19,21 @@ import (
 	"github.com/block/schemabot/pkg/localsetup"
 )
 
-// InitCmd uses explicit inputs for the shared initialization workflow. A future
-// wizard can collect the same inputs without implementing a second setup path.
+// InitCmd accepts explicit inputs or collects missing decisions in a terminal.
+// Both routes use the same initialization workflow.
 type InitCmd struct {
-	ReuseSchema bool     `name:"reuse-schema" help:"Verify existing desired files without replacing them"`
-	Database    string   `short:"d" required:"" help:"Name to register for this database"`
-	Environment string   `short:"e" required:"" help:"Environment to initialize"`
-	Type        string   `required:"" enum:"mysql,postgres" help:"Database engine: mysql or postgres"`
-	DSN         string   `required:"" help:"Target connection as env:VARIABLE (credentials stay out of schema files)"`
-	StorageDSN  string   `name:"storage-dsn" required:"" help:"Existing separate state database as env:VARIABLE; startup initializes SchemaBot metadata tables"`
-	SchemaDir   string   `name:"schema-dir" short:"s" default:"schema" help:"New schema directory, or unchanged files from a prior initialization"`
-	Namespaces  []string `name:"namespace" required:"" help:"Explicit namespace to import; repeat for multiple namespaces"`
-	Runtime     string   `default:"local" hidden:"" help:"Local runtime identity"`
-	JSON        bool     `name:"json" help:"Return the verified setup result as JSON"`
+	NonInteractive bool         `name:"non-interactive" help:"Never prompt; report missing inputs instead"`
+	progress       func(string) `kong:"-"`
+	ReuseSchema    bool         `name:"reuse-schema" help:"Verify existing desired files without replacing them"`
+	Database       string       `short:"d" help:"Name to register for this database"`
+	Environment    string       `short:"e" help:"Environment to initialize"`
+	Type           string       `help:"Database engine: mysql or postgres"`
+	DSN            string       `help:"Target connection as env:VARIABLE (credentials stay out of schema files)"`
+	StorageDSN     string       `name:"storage-dsn" help:"Existing separate state database as env:VARIABLE; startup initializes SchemaBot metadata tables"`
+	SchemaDir      string       `name:"schema-dir" short:"s" default:"schema" help:"New schema directory, or unchanged files from a prior initialization"`
+	Namespaces     []string     `name:"namespace" help:"Explicit namespace to import; repeat for multiple namespaces"`
+	Runtime        string       `default:"local" hidden:"" help:"Local runtime identity"`
+	JSON           bool         `name:"json" help:"Return the verified setup result as JSON"`
 }
 
 type initResult struct {
@@ -44,14 +47,23 @@ type initResult struct {
 }
 
 func (cmd *InitCmd) Run(ctx context.Context, g *Globals) error {
+	if err := cmd.collectInputs(g); err != nil {
+		if cmd.JSON && !errors.Is(err, ErrSilent) {
+			return client.ExitWithJSON("initialization_error", err.Error())
+		}
+		return err
+	}
 	result, err := cmd.initialize(ctx, g)
 	if err != nil {
+		if cmd.JSON {
+			return client.ExitWithJSON("initialization_error", err.Error())
+		}
 		return err
 	}
 	if cmd.JSON {
 		return json.NewEncoder(os.Stdout).Encode(result)
 	}
-	fmt.Printf("Imported %d tables into %s.\nBaseline plan: no changes.\nProfile %q is ready. Edit the schema, then run a plan.\n", result.Tables, result.SchemaDir, result.Profile)
+	fmt.Printf("Schema ready in %s.\nBaseline plan: no changes.\nProfile %q is ready. Edit the schema, then run a plan.\n", cmd.SchemaDir, result.Profile)
 	return nil
 }
 
@@ -102,6 +114,7 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 		return nil, err
 	}
 	manager := localruntime.Manager{Dir: dir, Binary: binary, Version: g.Version}
+	cmd.reportProgress("Registering the database connection...")
 	_, err = localsetup.Register(manager, localsetup.Registration{
 		Database: cmd.Database, Environment: cmd.Environment, Engine: cmd.Type,
 		Connection: api.EnvironmentConfig{DSN: cmd.DSN},
@@ -118,6 +131,7 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 }
 
 func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Manager, stage, root, profile string, namespaces []string) (*initResult, error) {
+	cmd.reportProgress("Starting SchemaBot...")
 	startupCtx, cancelStartup := context.WithTimeout(ctx, 30*time.Second)
 	connection, err := manager.Ensure(startupCtx)
 	cancelStartup()
@@ -125,6 +139,7 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 		return nil, err
 	}
 	client.SetLocalAuth(connection.Token, connection.Endpoint)
+	cmd.reportProgress("Reading the live schema...")
 	pulled, err := client.CallPullSchemaAPI(connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, namespaces...)
 	if err != nil {
 		return nil, fmt.Errorf("import live schema: %w", err)
@@ -144,6 +159,7 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 			return nil, err
 		}
 	}
+	cmd.reportProgress("Verifying the schema baseline...")
 	baseline, _, err := client.CallPlanAPI(connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, stage, "", 0, ignored, false)
 	if err != nil {
 		return nil, fmt.Errorf("verify baseline: %w", err)
@@ -157,6 +173,7 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	cmd.reportProgress("Saving the verified schema and connection...")
 	if err := publishInitSchema(stage, root); err != nil {
 		return nil, err
 	}
@@ -215,4 +232,10 @@ func initSchemaSnapshot(root string) (map[string]string, error) {
 		return nil
 	})
 	return result, err
+}
+
+func (cmd *InitCmd) reportProgress(message string) {
+	if cmd.progress != nil {
+		cmd.progress(message)
+	}
 }
