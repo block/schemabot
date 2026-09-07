@@ -58,6 +58,11 @@ for example `https://schemabot.example.com`. It is separate from your database
 address. This guide controls who can use SchemaBot; the database credentials
 in your server configuration control which databases SchemaBot can connect to.
 
+For a shared installation, you or the person hosting it chooses the hostname
+and configures HTTPS, usually through a reverse proxy or load balancer that
+routes requests to SchemaBot. Setting `endpoint` in the CLI does not create
+that address or its certificate. Ask whoever hosts the service for its URL.
+
 If you do not have a server yet:
 
 - Start with the [local quick start](../README.md#quick-start) to run SchemaBot
@@ -98,6 +103,18 @@ sections explain the details if you need them.
 GitHub is optional. If you only use the CLI or API, you can skip the GitHub
 permissions section.
 
+Before choosing, note the difference in API permissions:
+
+| Setup | Who can read? | Who can run changes? |
+|---|---|---|
+| OIDC | Anyone with a valid token for this server | Configured admin groups, across the deployment |
+| Forward-auth | Authenticated users, optionally limited by group | Admin groups, or teams granted specific databases and environments |
+
+If you do not have an identity provider or an authenticating proxy yet, you
+can still try SchemaBot locally without either. Sharing an authenticated
+server requires setting up one of those services first; SchemaBot does not
+provide its own user accounts or password login.
+
 ## Run locally
 
 For local development, you can leave authentication off:
@@ -115,6 +132,22 @@ to the callers you intend. Signing GitHub webhooks does not protect the API.
 Requests still appear in metrics, and writes are logged with the method,
 path, and source address. Without authentication, they are recorded as
 anonymous rather than as a particular person.
+
+With the local quick-start server running on its default port, check the API:
+
+```sh
+curl --fail-with-body http://localhost:13370/api/databases
+```
+
+A successful response contains a `databases` list. For example, a server with
+no databases registered returns:
+
+```json
+{"databases": []}
+```
+
+The quick start lists its demo databases instead. This confirms the API is
+reachable; it does not check connectivity to each database.
 
 <a id="oidc-bearer-tokens"></a>
 
@@ -144,8 +177,19 @@ login, `email` identifies the user, `groups` supplies memberships, and
 every session. Configure your provider to accept them and include group
 memberships in the ID token when users need write access.
 
-The registration screens differ by provider. Use its issuer URL and assigned
-client ID in both configurations below; `schemabot-cli` is just an example ID.
+Use your provider's documentation for registering a native or public OIDC
+application. The registration screens differ, but these are the values you
+need to carry into SchemaBot:
+
+| Value | Where it comes from | Where you use it |
+|---|---|---|
+| Issuer URL | Your provider's OIDC settings; it may include a tenant or realm path | Server `auth.issuer` and CLI `oidc.issuer` |
+| Client ID | The application registration you just created | Server `auth.audience` and CLI `oidc.client_id` |
+| Server URL | The address where you host SchemaBot | CLI `endpoint` |
+| Admin group | A group your provider includes in the user's ID token | Server `pr_command_authorization.admin_teams` |
+
+Use those actual values in the examples below. `schemabot-cli` is an example
+client ID, not a value every provider will assign.
 
 Add these settings to the server configuration:
 
@@ -268,8 +312,21 @@ To limit readers too, put their group names in `read_groups`. Members of
 you do not need to list them twice. Read access covers the entire deployment,
 not just the databases a team may change.
 
-Send requests through your proxy using its normal login method, then
-[check your access](#verify-a-request). If you use a service mesh, see the
+To check browser access, open `https://schemabot.example.com/api/databases`
+through your proxy and complete its login. Use your actual hostname. You
+should see JSON containing a `databases` list, as in the
+[response example](#verify-a-request). A login page or redirect in place of
+JSON means the request has not reached the authenticated API yet.
+
+**CLI access needs the proxy's supported authentication method.** A browser
+login does not sign the CLI in, and `schemabot login` handles OIDC rather than
+arbitrary proxy login flows. Ask the proxy operator how terminal clients
+should authenticate. For example, a proxy that accepts Bearer tokens may work
+with the CLI's `--token` or `SCHEMABOT_TOKEN`; a proxy that only accepts browser
+cookies will need a different client integration. Do not send your own
+`X-Forwarded-User` or group headers to work around this.
+
+If you use a service mesh, see the
 [proxy and network details](#proxy-and-network-details) for certificate-based
 identity and port-forwarding considerations.
 
@@ -277,7 +334,7 @@ identity and port-forwarding considerations.
 
 ## Check your access
 
-After CLI login, list the databases your server manages:
+For the OIDC profile configured above, list the databases your server manages:
 
 ```sh
 schemabot databases --profile demo
@@ -290,9 +347,19 @@ DATABASE  TYPE   ENVIRONMENTS  DEPLOYMENTS
 shop      mysql  staging       staging: us-east
 ```
 
-For a direct API call with OIDC, get a compatible token from your provider and
-store it in `SCHEMABOT_TOKEN`. The CLI's saved login does not automatically set
-this environment variable. Replace the hostname below with your server.
+If you use only the CLI, that is enough to check read access. A successful
+read does not prove that the account can create plans or apply changes; those
+also require the write permissions described above.
+
+**Optional: call the API directly.** This example assumes you already have a
+valid token from your provider in `SCHEMABOT_TOKEN`. The CLI's saved login does
+not set this variable. For an application calling the API, follow your
+provider's token-issuance documentation; the token must be a signed JWT from
+the configured issuer and include the configured audience. A token for some
+other API will not work. See [tool access](#calling-schemabot-as-a-service)
+for service accounts.
+
+Replace the hostname below with your server:
 
 ```sh
 curl --fail-with-body https://schemabot.example.com/api/databases \
