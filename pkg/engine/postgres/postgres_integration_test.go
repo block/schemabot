@@ -1013,6 +1013,35 @@ func TestEngineApplyConcurrentIndexOnOtherTableRefused(t *testing.T) {
 	assert.NotContains(t, progress.ErrorMessage, "drop the invalid index")
 }
 
+// TestEngineApplyConcurrentIndexBackingConstraintRefused proves an invalid
+// index holding the requested name on the target table but backing a
+// constraint is a permanent refusal, not a retry: the server will not drop a
+// constraint's index concurrently, so no recovery this change can run clears
+// the name. The detail names the index, leaves it to an operator, and never
+// tells anyone to drop it.
+func TestEngineApplyConcurrentIndexBackingConstraintRefused(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "invalid_index_constraint_test")
+	_, err := db.ExecContext(t.Context(),
+		"CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text, CONSTRAINT orders_ref_idx UNIQUE (ref))")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(),
+		"UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'public.orders_ref_idx'::regclass")
+	require.NoError(t, err)
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders",
+		"CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "orders")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable, "a constraint's invalid index is permanent until an operator resolves it or the plan changes")
+	assert.Contains(t, progress.ErrorMessage, "orders_ref_idx")
+	assert.Contains(t, progress.ErrorMessage, "constraint's index")
+	assert.Contains(t, progress.ErrorMessage, "an operator must resolve it")
+	assert.NotContains(t, progress.ErrorMessage, "drop the invalid index")
+}
+
 // applyRequest builds a single-statement apply request with the same identity
 // shape the drive layer uses: the task identifier stamped into
 // ResumeState.MigrationContext keys the engine's progress to this apply.

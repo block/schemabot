@@ -541,16 +541,23 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return &refusal{reason: "invalid-index-occupied",
 			cause:  fmt.Sprintf("an invalid index already occupies a name the change to %q needs and is not a failed build's leftover", table),
 			remedy: "rename the index in the schema file and re-plan, or resolve the entry on the target"}, true
+	case executor.CodePoolTooSmall:
+		// The pool is sized by the target DSN, so every retry against the
+		// same configuration is refused at admission the same way; only an
+		// operator raising the pool ceiling changes the outcome.
+		return &refusal{reason: "pool-too-small",
+			cause:  fmt.Sprintf("the target's connection pool cannot hold every session the change to %q needs at once", table),
+			remedy: "raise the pool size on the target DSN, then re-run"}, true
 	case executor.CodeBudgetLockExceeded, executor.CodeCancelledByCaller,
 		executor.CodeCancelledExternally, executor.CodeInvalidIndexOwnLeftover,
 		executor.CodeInvalidIndexAbandoned, executor.CodeInvalidIndexBuildInFlight,
 		executor.CodeInvalidIndexBuilderUnobservable, executor.CodeInvalidIndexUnproven,
-		executor.CodePoolTooSmall, executor.CodeExecutionFailed:
+		executor.CodeExecutionFailed:
 		// Operational outcomes: a bounded lock race, the caller's own
 		// context ending or an external stop, an invalid-index state an
-		// operator clears or waits out, engine pool sizing, or a failure
-		// outside the typed set. A retry can succeed once conditions
-		// change, so none is a permanent refusal.
+		// operator clears or waits out, or a failure outside the typed set.
+		// A retry can succeed once conditions change, so none is a permanent
+		// refusal.
 		return nil, true
 	}
 	return nil, false

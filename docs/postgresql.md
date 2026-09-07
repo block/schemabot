@@ -284,11 +284,18 @@ change or that depend on the target:
   refusal. Exhausting the lock budget is retryable after contention clears.
 - A concurrent index build runs under its own 4-minute budget. A build that
   leaves an invalid index behind — including one cancelled by that budget — or
-  finds one already under the requested name fails as a retryable operational
-  failure naming the index and the recovery step; the invalid index, not the
-  cause that produced it, is the outcome an operator acts on. Only a budget
-  exhaustion that provably left nothing is a permanent refusal. A parent-level
-  index build on a partitioned table is refused permanently.
+  finds one already under the requested name that an operator can clear (a
+  failed build's leftover, an abandoned entry, or another backend's build to
+  wait out) fails as a retryable operational failure naming the index and the
+  recovery step; the invalid index, not the cause that produced it, is the
+  outcome an operator acts on. An invalid index under the requested name that
+  this change can never clear — one on a different table, or one that backs a
+  constraint or belongs to a partitioned table — is refused permanently with
+  the same naming, as is a budget exhaustion that provably left nothing. A
+  parent-level index build on a partitioned table is refused permanently, and
+  so is a target connection pool too small to hold the build's sessions at
+  once, since the pool is sized by the target DSN and a retry sees the same
+  pool.
 - Other operational failures are recorded as retryable when no create-set
   prefix committed and expose a sanitized message; connection and server
   details remain in server logs. A create-set failure after the table commits

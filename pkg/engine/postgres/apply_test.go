@@ -194,6 +194,12 @@ func TestClassifyRefusal(t *testing.T) {
 			wantReason: "not-a-table",
 		},
 		{
+			name:       "pool too small for the build's sessions is a refusal that names the pool",
+			err:        fmt.Errorf("admit concurrent build: %w", executor.ErrPoolTooSmall),
+			wantReason: "pool-too-small",
+			wantDetail: []string{"connection pool", `"users"`, "raise the pool size"},
+		},
+		{
 			name: "untyped error is operational",
 			err:  errors.New("dial tcp: connection refused"),
 		},
@@ -458,7 +464,26 @@ func TestProgressResultReportsCreateSequenceLength(t *testing.T) {
 // retryable tail. Every refusal also carries a cause: it is the clause the
 // composed detail opens with, and a remedy alone would publish a detail that
 // starts mid-sentence.
+//
+// The disposition is also pinned to the executor's own verdict: a code
+// pg-sprite marks permanent refuses here, and a code it does not marks
+// operational, unless the exception table names the code and states why
+// SchemaBot's apply policy departs from the engine's floor. Departing in the
+// other direction — retrying a code the engine calls permanent — is never
+// sanctioned, because the drive would re-run a verdict that cannot change
+// until its attempt ceiling ends it.
 func TestRefusalForOutcomeTotalOverExecutorCodes(t *testing.T) {
+	// refusedThoughNotPermanent lists the codes SchemaBot refuses although
+	// pg-sprite leaves them retryable, with the reason for each. The
+	// engine's Permanent doc names this direction of disagreement as an
+	// adapter's own retry policy.
+	refusedThoughNotPermanent := map[executor.Code]string{
+		// The statement budget is sized as SchemaBot's native-safety lease:
+		// a statement that needs longer is not native-safe under this
+		// policy, so re-running it unchanged would only spend the lease
+		// again.
+		executor.CodeBudgetStatementExceeded: "the statement budget is the native-safety lease",
+	}
 	for _, code := range executor.Codes() {
 		t.Run(string(code), func(t *testing.T) {
 			r, known := refusalForOutcome(code, "users")
@@ -467,6 +492,14 @@ func TestRefusalForOutcomeTotalOverExecutorCodes(t *testing.T) {
 				assert.NotEmpty(t, r.reason, "refusal for %q has no reason", code)
 				assert.NotEmpty(t, r.cause, "refusal for %q has no cause", code)
 			}
+			refused := r != nil
+			if why, exempt := refusedThoughNotPermanent[code]; exempt {
+				assert.False(t, code.Permanent(), "exception for %q is stale: the engine now marks it permanent", code)
+				assert.True(t, refused, "code %q is listed as a policy refusal (%s) but is operational", code, why)
+				return
+			}
+			assert.Equal(t, code.Permanent(), refused,
+				"disposition for %q disagrees with the engine's permanence verdict", code)
 		})
 	}
 }
