@@ -21,6 +21,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	runtimehost "github.com/block/schemabot/pkg/localruntime"
+	"github.com/block/schemabot/pkg/localsetup"
 	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/testutil"
@@ -41,7 +42,7 @@ func TestSupervisorEngines(t *testing.T) {
 			home := t.TempDir()
 			dir := filepath.Join(home, ".schemabot", "runtimes", "shared")
 			manager := runtimehost.Manager{Dir: dir, Binary: binary, Version: "dev"}
-			changed, err := manager.Register(runtimehost.Registration{
+			changed, err := localsetup.Register(manager, localsetup.Registration{
 				Database: "app", Environment: "development", Engine: engine,
 				Storage:    api.StorageConfig{Dialect: engine, DSN: storageDSN},
 				Connection: api.EnvironmentConfig{DSN: targetDSN},

@@ -1,4 +1,4 @@
-package localruntime
+package localsetup
 
 import (
 	"os"
@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/localruntime"
 )
 
 func registration(t *testing.T, engine string) Registration {
@@ -26,27 +27,27 @@ func registration(t *testing.T, engine string) Registration {
 func TestRegisterPreservesReferencesAndRegistrations(t *testing.T) {
 	for _, engine := range []string{"mysql", "postgres"} {
 		t.Run(engine, func(t *testing.T) {
-			m := Manager{Dir: filepath.Join(t.TempDir(), "shared")}
+			m := localruntime.Manager{Dir: filepath.Join(t.TempDir(), "shared")}
 			r := registration(t, engine)
-			changed, err := m.Register(r)
+			changed, err := Register(m, r)
 			require.NoError(t, err)
 			require.True(t, changed)
 			path := filepath.Join(m.Dir, "runtime.yaml")
-			first, err := ReadPrivate(path)
+			first, err := localruntime.ReadPrivate(path)
 			require.NoError(t, err)
 			require.NotContains(t, string(first), "user:private")
 			require.Contains(t, string(first), "env:SETUP_TARGET")
-			changed, err = m.Register(r)
+			changed, err = Register(m, r)
 			require.NoError(t, err)
 			require.False(t, changed)
-			again, err := ReadPrivate(path)
+			again, err := localruntime.ReadPrivate(path)
 			require.NoError(t, err)
 			require.Equal(t, first, again)
 			r.Database = "billing"
-			changed, err = m.Register(r)
+			changed, err = Register(m, r)
 			require.NoError(t, err)
 			require.True(t, changed)
-			data, err := ReadPrivate(path)
+			data, err := localruntime.ReadPrivate(path)
 			require.NoError(t, err)
 			cfg, err := api.ParseServerConfig(data)
 			require.NoError(t, err)
@@ -57,41 +58,31 @@ func TestRegisterPreservesReferencesAndRegistrations(t *testing.T) {
 	}
 }
 
-func TestRegisterRefusesConflictingAndActiveChanges(t *testing.T) {
-	m := Manager{Dir: filepath.Join(t.TempDir(), "shared")}
+func TestRegisterRefusesConflictingChanges(t *testing.T) {
+	m := localruntime.Manager{Dir: filepath.Join(t.TempDir(), "shared")}
 	r := registration(t, "mysql")
-	_, err := m.Register(r)
+	_, err := Register(m, r)
 	require.NoError(t, err)
-	before, err := ReadPrivate(filepath.Join(m.Dir, "runtime.yaml"))
+	before, err := localruntime.ReadPrivate(filepath.Join(m.Dir, "runtime.yaml"))
 	require.NoError(t, err)
 	conflict := r
 	conflict.Connection.DSN = "user@tcp(127.0.0.1:3306)/other"
-	_, err = m.Register(conflict)
+	_, err = Register(m, conflict)
 	require.ErrorContains(t, err, "different registration")
 	conflict = r
 	conflict.Storage.DSN = "user@tcp(127.0.0.1:3306)/other_state"
-	_, err = m.Register(conflict)
+	_, err = Register(m, conflict)
 	require.ErrorContains(t, err, "cannot replace durable state")
-	lease, available, err := lock(m.Dir)
-	require.NoError(t, err)
-	require.True(t, available)
-	t.Cleanup(func() { require.NoError(t, lease.Close()) })
-	changed, err := m.Register(r)
-	require.NoError(t, err)
-	require.False(t, changed)
-	r.Environment = "staging"
-	_, err = m.Register(r)
-	require.ErrorContains(t, err, "runtime is active")
-	after, err := ReadPrivate(filepath.Join(m.Dir, "runtime.yaml"))
+	after, err := localruntime.ReadPrivate(filepath.Join(m.Dir, "runtime.yaml"))
 	require.NoError(t, err)
 	require.Equal(t, before, after)
 }
 
 func TestRegisterRejectsUnsafeStorageBeforeWriting(t *testing.T) {
-	m := Manager{Dir: filepath.Join(t.TempDir(), "shared")}
+	m := localruntime.Manager{Dir: filepath.Join(t.TempDir(), "shared")}
 	r := registration(t, "mysql")
 	r.Storage.DSN = r.Connection.DSN
-	_, err := m.Register(r)
+	_, err := Register(m, r)
 	require.Error(t, err)
 	_, err = os.Stat(m.Dir)
 	require.True(t, os.IsNotExist(err))

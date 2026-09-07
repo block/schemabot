@@ -1326,7 +1326,7 @@ Local registration preserves existing targets and durable storage configuration.
 through the shared host guards and publishes configuration atomically under the runtime's lifetime
 lock. An identical registration is reusable; new registrations require a stopped runtime. Startup
 reads its configuration again under that same lock so it cannot start with a superseded snapshot.
-*Enforced:* `pkg/localruntime/register.go` and `pkg/localruntime/manager.go`.
+*Enforced:* `pkg/localsetup/register.go` and `pkg/localruntime/manager.go`.
 
 ## Structural enforcement
 
