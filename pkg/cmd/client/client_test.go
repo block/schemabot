@@ -183,6 +183,25 @@ func TestCheckActiveSchemaChangeRequestsActiveOnly(t *testing.T) {
 	assert.Equal(t, "staging", gotEnvironment)
 }
 
+// The preflight compares the operator's flags against stored keys, which the
+// server returns canonically, so a database or environment typed in a different
+// case must still find the busy apply rather than report the database idle.
+func TestCheckActiveSchemaChangeFoldsKeysBeforeComparing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, err := w.Write([]byte(`{"active_count":1,"limit":1000,"applies":[` +
+			`{"apply_id":"apply-busy","database":"orders","environment":"staging","state":"running"}]}`))
+		assert.NoError(t, err)
+	}))
+	t.Cleanup(server.Close)
+
+	active, err := CheckActiveSchemaChange(server.URL, "Orders", "Staging")
+	require.NoError(t, err)
+	require.NotNil(t, active)
+	assert.Equal(t, "apply-busy", active.ApplyID)
+	assert.Equal(t, "running", active.State)
+}
+
 func TestReadSchemaFiles_RegularDirectories(t *testing.T) {
 	dir := t.TempDir()
 

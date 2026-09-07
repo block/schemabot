@@ -6,17 +6,23 @@ import (
 
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // UnlockCmd releases a database lock.
 type UnlockCmd struct {
 	Database string `short:"d" required:"" help:"Database name"`
-	Type     string `short:"t" help:"Database type: mysql or vitess" default:"mysql"`
+	Type     string `short:"t" help:"Database type: mysql, vitess, strata, or postgres" default:"mysql"`
 	Force    bool   `help:"Force release lock (bypass ownership check)"`
 }
 
 // Run executes the unlock command.
 func (cmd *UnlockCmd) Run(g *Globals) error {
+	// Lock records are keyed canonically, so every message below echoes the
+	// stored identity of the lock rather than the flag spelling.
+	database := storage.CanonicalKey(cmd.Database)
+	dbType := storage.CanonicalKey(cmd.Type)
+
 	ep, err := resolveEndpoint(g.Endpoint, g.Profile)
 	if err != nil {
 		return err
@@ -29,32 +35,32 @@ func (cmd *UnlockCmd) Run(g *Globals) error {
 		var existingLock *client.LockInfo
 		err := withLoading("Checking database lock...", true, func() error {
 			var lockErr error
-			existingLock, lockErr = client.GetLock(ep, cmd.Database, cmd.Type)
+			existingLock, lockErr = client.GetLock(ep, database, dbType)
 			return lockErr
 		})
 		if err != nil {
 			return fmt.Errorf("check lock: %w", err)
 		}
 		if existingLock == nil {
-			reportNoLockFound(ep, cmd.Database, cmd.Type)
+			reportNoLockFound(ep, database, dbType)
 			return nil
 		}
 
 		if err := withLoading("Releasing database lock...", true, func() error {
-			return client.ForceReleaseLock(ep, cmd.Database, cmd.Type)
+			return client.ForceReleaseLock(ep, database, dbType)
 		}); err != nil {
 			return fmt.Errorf("force release lock: %w", err)
 		}
-		templates.WriteLockForceReleased(cmd.Database, cmd.Type, existingLock.Owner)
+		templates.WriteLockForceReleased(database, dbType, existingLock.Owner)
 		return nil
 	}
 
 	// Normal release - ownership required
 	err = withLoading("Releasing database lock...", true, func() error {
-		return client.ReleaseLock(ep, cmd.Database, cmd.Type, owner)
+		return client.ReleaseLock(ep, database, dbType, owner)
 	})
 	if errors.Is(err, client.ErrLockNotFound) {
-		reportNoLockFound(ep, cmd.Database, cmd.Type)
+		reportNoLockFound(ep, database, dbType)
 		return nil
 	}
 	if errors.Is(err, client.ErrLockNotOwned) {
@@ -62,20 +68,20 @@ func (cmd *UnlockCmd) Run(g *Globals) error {
 		var existingLock *client.LockInfo
 		getErr := withLoading("Checking database lock...", true, func() error {
 			var lockErr error
-			existingLock, lockErr = client.GetLock(ep, cmd.Database, cmd.Type)
+			existingLock, lockErr = client.GetLock(ep, database, dbType)
 			return lockErr
 		})
 		if getErr != nil || existingLock == nil {
 			return fmt.Errorf("lock is not owned by you")
 		}
-		templates.WriteUnlockNotOwned(cmd.Database, cmd.Type, existingLock.Owner)
+		templates.WriteUnlockNotOwned(database, dbType, existingLock.Owner)
 		return ErrSilent
 	}
 	if err != nil {
 		return fmt.Errorf("release lock: %w", err)
 	}
 
-	templates.WriteLockReleased(cmd.Database, cmd.Type)
+	templates.WriteLockReleased(database, dbType)
 	return nil
 }
 
@@ -98,17 +104,21 @@ func reportNoLockFound(ep, database, dbType string) {
 		return
 	}
 	if other := lockUnderOtherType(locks, database, dbType); other != nil {
-		templates.WriteLockExistsUnderOtherType(database, dbType, other.DatabaseType)
+		templates.WriteLockExistsUnderOtherType(database, dbType, storage.CanonicalKey(other.DatabaseType))
 		return
 	}
 	templates.WriteNoLockFound(database, dbType)
 }
 
 // lockUnderOtherType returns a lock held on the database under a database
-// type other than the requested one, or nil if none exists.
+// type other than the requested one, or nil if none exists. Both sides are
+// compared canonically: locks have no expiry, so a row written before the
+// server folded lock keys can still be listed in its original spelling.
 func lockUnderOtherType(locks []*client.LockInfo, database, dbType string) *client.LockInfo {
+	database = storage.CanonicalKey(database)
+	dbType = storage.CanonicalKey(dbType)
 	for _, lock := range locks {
-		if lock.Database == database && lock.DatabaseType != dbType {
+		if storage.CanonicalKey(lock.Database) == database && storage.CanonicalKey(lock.DatabaseType) != dbType {
 			return lock
 		}
 	}
