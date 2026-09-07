@@ -33,8 +33,8 @@ const {chromium}=require('playwright');
    await page.evaluate(({t,dt})=>window.renderFrame(t,dt),{t:sceneTime(i/fps),dt:1/fps});
    const camera=await page.evaluate(()=>previousScroll);
    const t=sceneTime(i/fps);
-   if(t>=7&&t<=20&&lastCamera!==undefined){
-    if(camera<lastCamera-1||camera-lastCamera>26)throw new Error('Command-to-status scrolling must move forward without jumps');
+   if(t>=7&&lastCamera!==undefined){
+    if(camera<lastCamera-1||camera-lastCamera>26)throw new Error('Workflow scrolling must move forward without jumps');
    }
    lastCamera=camera;
    if(i===0){

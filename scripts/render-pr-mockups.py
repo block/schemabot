@@ -96,7 +96,7 @@ body{margin:0;padding:24px;background:#fff;font-family:-apple-system,BlinkMacSys
 .box .pill{margin-left:auto;color:#59636e;font-weight:400}
 .box .btn{background:#1f883d;color:#fff;font-weight:600;padding:6px 16px;border-radius:6px;font-size:14px}
 .box.merged{border-color:#8250df}
-.box.merged .row{background:#fbefff;color:#1f2328}
+.box.merged .row{background:#fff;color:#1f2328}
 .i{width:16px;height:16px;border-radius:50%;display:inline-block;flex:none}
 .i.ok{background:#1a7f37}.i.m{background:#8250df}
 .pl-c{color:#59636e}.pl-c1,.pl-s .pl-v{color:#0550ae}.pl-e,.pl-en{color:#6639ba}
