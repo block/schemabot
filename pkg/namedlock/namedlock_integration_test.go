@@ -97,7 +97,7 @@ type lockerCase struct {
 // the DSNs.
 func lockerCases() []lockerCase {
 	return []lockerCase{
-		{name: "mysql", locker: MySQL{}, driver: "mysql", dsn: mysqlDSN},
+		{name: "mysql", locker: MySQL{}, driver: "block-mysql", dsn: mysqlDSN},
 		{name: "postgres", locker: Postgres{}, driver: "pgx", dsn: postgresDSN},
 	}
 }
