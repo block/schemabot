@@ -22,7 +22,7 @@ const {chromium}=require('playwright');
    const pixels=await page.screenshot();
    if(previous && pixels.equals(previous))frames[frames.length-1].delay+=10;
    else { fs.writeFileSync(frame,pixels);frames.push({path:frame,delay:10});previous=pixels; }
-   if([30,85,160,250,330,400].includes(i))fs.writeFileSync(path.join(tmp,'preview-'+i+'.png'),pixels);
+   if([30,85,130,160,190,250,330,400].includes(i))fs.writeFileSync(path.join(tmp,'preview-'+i+'.png'),pixels);
   }
   const palette=path.join(tmp,'palette.png');
   execFileSync('magick',[...frames.filter((_,i)=>i%5===0).map(f=>f.path),'-append','-colors','256','-unique-colors',palette]);

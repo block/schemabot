@@ -40,7 +40,7 @@ os.close(slave)
 # recording captures typing, cursor movement, and checkbox changes as they happen.
 engine_keys = [(0.9, '\x1b[B'), (0.8, '\r')] if args.engine == 'postgres' else [(0.9, '\x1b[B'), (0.7, '\x1b[A'), (0.7, '\r')]
 steps = [('Database engine', engine_keys), ('Database name', [(0.25, c) for c in 'shop'] + [(0.7, '\r')])]
-steps.extend([('Connect your database', [(2.5, '\r')]), ('Connect SchemaBot’s state database', [(2.5, '\r')])])
+steps.extend([('Connect your database', [(1.5, '\r')]), ('✓ Connected', [(2.0, '\r')]), ('Connect SchemaBot’s state database', [(1.5, '\r')]), ('✓ Connected', [(2.0, '\r')])])
 if args.engine == 'postgres':
     steps.append(('space select', [(0.8, ' '), (0.8, '\x1b[B'), (0.8, ' '), (1.0, '\r')]))
 steps.append(('Ready when you are', [(2.0, '\r')]))
