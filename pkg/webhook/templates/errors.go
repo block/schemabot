@@ -36,13 +36,12 @@ type SchemaErrorData struct {
 	AvailableDatabases string
 }
 
-// DatabaseTypeOptions lists types offered during setup, not all legacy types.
+// DatabaseTypeOptions lists supported setup types, with Strata behind server opt-in.
 func (d SchemaErrorData) DatabaseTypeOptions() string {
-	options := "`mysql` or `postgres`"
 	if d.ExperimentalStrataEnabled {
-		options += ", or `strata` (experimental)"
+		return "`mysql`, `postgres`, `vitess`, or `strata` (experimental)"
 	}
-	return options
+	return "`mysql`, `postgres`, or `vitess`"
 }
 
 // EnvironmentHeader renders the environment header segment: the single

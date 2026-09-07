@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -230,6 +231,7 @@ func TestSetupGuidanceExperimentalStrata(t *testing.T) {
 			for _, body := range []string{RenderNoConfig(data), RenderInvalidConfig(data)} {
 				assert.Contains(t, body, "`mysql`")
 				assert.Contains(t, body, "`postgres`")
+				assert.Contains(t, body, "`vitess`")
 				if enabled {
 					assert.Contains(t, body, "`strata` (experimental)")
 				} else {
@@ -237,5 +239,24 @@ func TestSetupGuidanceExperimentalStrata(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestInvalidConfigDatabaseTypeLine(t *testing.T) {
+	for _, tc := range []struct {
+		enabled bool
+		want    string
+	}{
+		{false, "- **type** (required): `mysql`, `postgres`, or `vitess`"},
+		{true, "- **type** (required): `mysql`, `postgres`, `vitess`, or `strata` (experimental)"},
+	} {
+		body := RenderInvalidConfig(SchemaErrorData{ExperimentalStrataEnabled: tc.enabled})
+		var got string
+		for line := range strings.SplitSeq(body, "\n") {
+			if strings.HasPrefix(line, "- **type**") {
+				got = line
+			}
+		}
+		assert.Equal(t, tc.want, got)
 	}
 }

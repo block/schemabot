@@ -1660,7 +1660,7 @@ database: your-database-name
 type: mysql
 ```
 
-`type`: `mysql` or `postgres`
+`type`: `mysql`, `postgres`, or `vitess`
 
 ### If you already have a config
 Use the `-d` flag to specify which database to plan:
@@ -1733,7 +1733,7 @@ type: mysql
 ```
 
 - **database** (required): The database name
-- **type** (required): `mysql` or `postgres`
+- **type** (required): `mysql`, `postgres`, or `vitess`
 <!-- schemabot:offer-support-channel -->
 
 </details>
