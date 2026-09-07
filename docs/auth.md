@@ -724,7 +724,7 @@ SchemaBot should reply with its command reference. Excerpt:
 
 This checks that GitHub can deliver the comment event and SchemaBot can post
 a reply. It does not prove that you may plan or apply a database change.
-Follow the [PR workflow](pre-merge-workflow.md) to test a schema change and
+Follow the [App setup test](github-app-setup.md#7-test-it) to test a schema change and
 its checks after configuring command permissions.
 
 If no reply arrives, inspect the App's **Recent Deliveries** in GitHub:
