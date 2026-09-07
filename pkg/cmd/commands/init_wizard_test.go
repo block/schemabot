@@ -1,12 +1,15 @@
 package commands
 
 import (
+	"context"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/stretchr/testify/require"
 )
 
@@ -41,7 +44,7 @@ func TestInitWizardNavigationAndValidation(t *testing.T) {
 		wizardKey(m, tea.KeyEnter)
 	}
 	require.False(t, m.confirmed)
-	require.Contains(t, m.View(), "No application schema changes")
+	require.Contains(t, strings.Join(strings.Fields(m.View()), " "), "We won’t change your application’s schema")
 	wizardKey(m, tea.KeyEnter)
 	require.True(t, m.confirmed)
 }
@@ -51,7 +54,7 @@ func TestInitWizardReviewExistingFilesAndCancel(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte("existing"), 0600))
 	m := newInitWizard(&InitCmd{SchemaDir: root}, "default", io.Discard)
 	m.step = len(m.fields)
-	require.Contains(t, m.View(), "verified and preserved")
+	require.Contains(t, strings.Join(strings.Fields(m.View()), " "), "verify them and keep your edits")
 	wizardKey(m, tea.KeyEsc)
 	require.False(t, m.confirmed)
 	require.True(t, m.cancelled)
@@ -72,7 +75,7 @@ func TestInitWizardMissingVariableAndNarrowTerminal(t *testing.T) {
 	m.loadField()
 	wizardKey(m, tea.KeyEnter)
 	require.Equal(t, 3, m.step)
-	require.Contains(t, m.err, "Set this environment variable")
+	require.Contains(t, m.err, "This variable is empty")
 	m.Update(tea.WindowSizeMsg{Width: 40, Height: 24})
 	require.NotEmpty(t, m.View())
 }
@@ -91,4 +94,46 @@ func TestInitCompletionQuotesNextCommand(t *testing.T) {
 	output := initCompletion(&initResult{SchemaDir: "my schema", Profile: "dev's profile"}, "development")
 	require.Contains(t, output, "-s 'my schema'")
 	require.Contains(t, output, "--profile 'dev'\"'\"'s profile'")
+}
+
+func TestInitWizardContextCancellationLeavesInputsUntouched(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	input, writer := io.Pipe()
+	t.Cleanup(func() { require.NoError(t, input.Close()); require.NoError(t, writer.Close()) })
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	output := initSignalWriter{started: make(chan struct{}, 1)}
+	original := InitCmd{Database: "shop"}
+	cmd := original
+	done := make(chan error, 1)
+	go func() { done <- cmd.promptInputs(ctx, input, output, &Globals{}) }()
+	<-output.started
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	require.Equal(t, original.Database, cmd.Database)
+	require.Empty(t, cmd.Type)
+}
+
+type initSignalWriter struct{ started chan struct{} }
+
+func (w initSignalWriter) Write(p []byte) (int, error) {
+	select {
+	case w.started <- struct{}{}:
+	default:
+	}
+	return len(p), nil
+}
+
+func TestInitWizardNarrowReviewCanScroll(t *testing.T) {
+	m := newInitWizard(&InitCmd{}, "default", io.Discard)
+	m.step = len(m.fields)
+	m.Update(tea.WindowSizeMsg{Width: 40, Height: 24})
+	before := m.View()
+	require.Contains(t, before, "scroll")
+	for line := range strings.SplitSeq(before, "\n") {
+		require.LessOrEqual(t, lipgloss.Width(line), 40)
+	}
+	wizardKey(m, tea.KeyDown)
+	require.NotEqual(t, before, m.View())
+	require.False(t, m.confirmed)
 }
