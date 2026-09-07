@@ -27,6 +27,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/testutil"
 )
@@ -51,7 +52,7 @@ func TestLocalRuntimeRecovery(t *testing.T) {
 	testcontainers.CleanupContainer(t, container)
 	dsn, err := testutil.MySQLDSN(t.Context(), container, "app", "parseTime=true")
 	require.NoError(t, err)
-	db, err := sql.Open("mysql", dsn)
+	db, err := mysqlconn.Open(dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	require.NoError(t, testutil.PingMySQL(t.Context(), db))
