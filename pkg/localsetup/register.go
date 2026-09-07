@@ -47,7 +47,11 @@ func Register(m localruntime.Manager, r Registration) (bool, error) {
 			if err := serve.ValidateLocalConfig(existing); err != nil {
 				return nil, err
 			}
-			if !reflect.DeepEqual(existing.Storage, requested.Storage) {
+			// Pool tuning is not a change of durable state authority. Keep the
+			// existing pool settings rather than asking setup to reproduce them.
+			wantedStorage := requested.Storage
+			wantedStorage.Pool = existing.Storage.Pool
+			if !reflect.DeepEqual(existing.Storage, wantedStorage) {
 				return nil, fmt.Errorf("runtime storage differs; registration cannot replace durable state storage")
 			}
 			cfg = *existing

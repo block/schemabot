@@ -87,3 +87,22 @@ func TestRegisterRejectsUnsafeStorageBeforeWriting(t *testing.T) {
 	_, err = os.Stat(m.Dir)
 	require.True(t, os.IsNotExist(err))
 }
+
+func TestRegisterPreservesExistingStoragePool(t *testing.T) {
+	m := localruntime.Manager{Dir: filepath.Join(t.TempDir(), "shared")}
+	r := registration(t, "mysql")
+	r.Storage.Pool.MaxOpenConns = 17
+	_, err := Register(m, r)
+	require.NoError(t, err)
+	r.Database = "billing"
+	r.Storage.Pool = api.StoragePoolConfig{}
+	changed, err := Register(m, r)
+	require.NoError(t, err)
+	require.True(t, changed)
+	data, err := localruntime.ReadPrivate(filepath.Join(m.Dir, "runtime.yaml"))
+	require.NoError(t, err)
+	cfg, err := api.ParseServerConfig(data)
+	require.NoError(t, err)
+	require.Equal(t, 17, cfg.Storage.Pool.MaxOpenConns)
+	require.Len(t, cfg.Databases, 2)
+}
