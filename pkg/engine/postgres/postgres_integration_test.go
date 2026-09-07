@@ -951,13 +951,13 @@ func TestEngineApplyPartitionedParentConcurrentIndexRefusal(t *testing.T) {
 	assert.Contains(t, progress.ErrorMessage, "cannot build parent-level indexes concurrently")
 }
 
-// TestEngineApplyConcurrentIndexPreexistingInvalidRetryable proves an
-// invalid index already occupying the target name fails the build as a
-// retryable operational failure whose detail names the index and the
-// investigation step — the entry may be another actor's build still in
-// progress, so the advice is to check for one before any recovery, never a
-// statement to run.
-func TestEngineApplyConcurrentIndexPreexistingInvalidRetryable(t *testing.T) {
+// TestEngineApplyConcurrentIndexAbandonedInvalidRetryable proves an
+// abandoned invalid index already occupying the target name — on the target
+// table, with no backend building it — fails the build as a retryable
+// operational failure whose detail names the index and the recovery: an
+// operator confirms the entry is still invalid and unowned, drops it, and the
+// drive offers the retry.
+func TestEngineApplyConcurrentIndexAbandonedInvalidRetryable(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "invalid_index_test")
 	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
 	require.NoError(t, err)
@@ -976,8 +976,40 @@ func TestEngineApplyConcurrentIndexPreexistingInvalidRetryable(t *testing.T) {
 	assert.Equal(t, "failed", progress.Metadata["phase"])
 	assert.True(t, progress.Retryable, "an operator can clear the invalid index; the drive must offer the retry")
 	assert.Contains(t, progress.ErrorMessage, "orders_ref_idx")
-	assert.Contains(t, progress.ErrorMessage, "another actor's build")
-	assert.Contains(t, progress.ErrorMessage, "pg_stat_activity")
+	assert.Contains(t, progress.ErrorMessage, "abandoned invalid index")
+	assert.Contains(t, progress.ErrorMessage, "no backend building it")
+	assert.Contains(t, progress.ErrorMessage, "drop the invalid index")
+}
+
+// TestEngineApplyConcurrentIndexOnOtherTableRefused proves an invalid index
+// holding the requested name on a different table in the schema is a
+// permanent refusal, not a retry: this change can never clear another table's
+// entry, so the detail names both the index and the table it sits on and
+// sends the author back to the schema file.
+func TestEngineApplyConcurrentIndexOnOtherTableRefused(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "invalid_index_other_table_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE public.shipments (id bigint PRIMARY KEY, ref text)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "CREATE INDEX orders_ref_idx ON public.shipments (ref)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(),
+		"UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'public.orders_ref_idx'::regclass")
+	require.NoError(t, err)
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders",
+		"CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "orders")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable, "another table's invalid index is permanent until the plan or target changes")
+	assert.Contains(t, progress.ErrorMessage, "orders_ref_idx")
+	assert.Contains(t, progress.ErrorMessage, `"shipments"`)
+	assert.Contains(t, progress.ErrorMessage, "re-plan")
+	assert.NotContains(t, progress.ErrorMessage, "drop the invalid index")
 }
 
 // applyRequest builds a single-statement apply request with the same identity

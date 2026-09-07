@@ -117,6 +117,42 @@ func TestClassifyRefusal(t *testing.T) {
 			err:  fmt.Errorf("execute: %w", executor.ErrCancelledExternally),
 		},
 		{
+			name: "the caller's own cancellation is operational",
+			err:  fmt.Errorf("execute: %w", executor.ErrCancelledByCaller),
+		},
+		{
+			name: "invalid index on another table is a refusal that renders the typed advice",
+			err: fmt.Errorf("execute: %w", &executor.InvalidIndexError{
+				Schema:  "public",
+				Index:   "users_ref_idx",
+				Table:   "shipments",
+				Cleanup: executor.ErrInvalidIndexOnOtherTable,
+			}),
+			wantReason:    "invalid-index-occupied",
+			wantDetail:    []string{`"public"."users_ref_idx"`, `"shipments"`, "re-plan"},
+			wantNotDetail: []string{"drop the invalid index"},
+		},
+		{
+			name: "non-droppable invalid index is a refusal even when it wraps a statement-budget cause",
+			err: fmt.Errorf("execute: %w", &executor.InvalidIndexError{
+				Schema:  "public",
+				Index:   "users_pkey",
+				Table:   "users",
+				Build:   &executor.BudgetError{Cause: executor.CauseStatement, Budget: time.Second},
+				Cleanup: executor.ErrInvalidIndexNotDroppable,
+			}),
+			wantReason:    "invalid-index-occupied",
+			wantDetail:    []string{`"public"."users_pkey"`, "constraint's index", "operator must resolve"},
+			wantNotDetail: []string{"budget", "drop the invalid index"},
+		},
+		{
+			name: "abandoned invalid index is operational",
+			err: fmt.Errorf("execute: %w", &executor.InvalidIndexError{
+				Schema: "public", Index: "users_ref_idx", Table: "users",
+				Cleanup: executor.ErrAbandonedInvalidIndex,
+			}),
+		},
+		{
 			name: "partitioned-parent admission refusal renders the typed sentence",
 			err: fmt.Errorf("admit statement for partitioned PostgreSQL table %q: %w", "users",
 				&preflight.UnsupportedPartitionedParentError{Cause: preflight.PartitionCauseConcurrentIndexBuild}),
@@ -268,11 +304,14 @@ func TestRetryPathFitsUnderApplyCeiling(t *testing.T) {
 }
 
 // TestInvalidIndexDetailMatchesVerdictOwnership pins the advice ladder to
-// the verdict code: a drop is named only for the build's own proven
-// leftover; a pre-existing entry gets an in-progress-build check; an
-// unproven verdict gets catalog inspection because the index may be healthy.
-// Every branch names the index and none renders the wrapped build or
-// cleanup errors, which may carry raw server text.
+// the verdict code: a drop is named only where the executor proved the entry
+// is a failed build's debris on the target table — this build's own leftover
+// or an abandoned entry; a build in flight says wait and names the builder;
+// an entry on another table, one the server will not drop concurrently, one
+// whose builder the role cannot see, and an unproven verdict get
+// investigation steps because the index may be healthy or intentional. Every
+// branch names the index and none renders the wrapped build or cleanup
+// errors, which may carry raw server text.
 func TestInvalidIndexDetailMatchesVerdictOwnership(t *testing.T) {
 	rawServerText := errors.New("ERROR: deadline exceeded at host db-internal-1.example.com")
 	tests := []struct {
@@ -289,11 +328,46 @@ func TestInvalidIndexDetailMatchesVerdictOwnership(t *testing.T) {
 			wantNotDetail: []string{"db-internal-1"},
 		},
 		{
-			name: "pre-existing entry gets an in-progress-build check, never a drop",
-			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx",
-				Build: rawServerText, Cleanup: executor.ErrPreexistingInvalidIndex},
-			wantDetail:    []string{`"public"."big_ref_idx"`, "another actor's build", "pg_stat_activity"},
+			name: "abandoned entry names the drop after a re-check",
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx", Table: "orders",
+				Cleanup: executor.ErrAbandonedInvalidIndex},
+			wantDetail:    []string{`"public"."big_ref_idx"`, "abandoned", "no backend building it", "drop the invalid index", "retry"},
+			wantNotDetail: []string{"db-internal-1"},
+		},
+		{
+			name: "build in flight says wait and names the builder, never a drop",
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx", Table: "orders",
+				BuilderPID: 4242, Cleanup: executor.ErrInvalidIndexBuildInFlight},
+			wantDetail:    []string{`"public"."big_ref_idx"`, "backend 4242", "still building it", "wait"},
 			wantNotDetail: []string{"drop the invalid index", "db-internal-1"},
+		},
+		{
+			name: "unobservable builder gets a privileged progress check, never a drop",
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx", Table: "orders",
+				Cleanup: executor.ErrInvalidIndexBuilderUnobservable},
+			wantDetail:    []string{`"public"."big_ref_idx"`, "cannot observe", "pg_stat_progress_create_index", "pg_read_all_stats"},
+			wantNotDetail: []string{"drop the invalid index", "db-internal-1"},
+		},
+		{
+			name: "entry on another table names that table and a re-plan, never a drop",
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx", Table: "shipments",
+				Cleanup: executor.ErrInvalidIndexOnOtherTable},
+			wantDetail:    []string{`"public"."big_ref_idx"`, "different table", `"shipments"`, "re-plan"},
+			wantNotDetail: []string{"drop the invalid index", "retry", "db-internal-1"},
+		},
+		{
+			name: "entry on another table with no inspected table name still re-plans",
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx",
+				Cleanup: executor.ErrInvalidIndexOnOtherTable},
+			wantDetail:    []string{`"public"."big_ref_idx"`, "different table;", "re-plan"},
+			wantNotDetail: []string{"drop the invalid index", `("")`},
+		},
+		{
+			name: "non-droppable entry is left to an operator, never a drop",
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx", Table: "orders",
+				Cleanup: executor.ErrInvalidIndexNotDroppable},
+			wantDetail:    []string{`"public"."big_ref_idx"`, "constraint's index", "operator must resolve", "re-plan"},
+			wantNotDetail: []string{"drop the invalid index", "retry", "db-internal-1"},
 		},
 		{
 			name: "unproven verdict gets catalog inspection, never a drop",
