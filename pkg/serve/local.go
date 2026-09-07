@@ -13,9 +13,9 @@ import (
 	"github.com/block/schemabot/pkg/auth"
 )
 
-// validateLocalConfig keeps local hosting explicit while leaving engine,
+// ValidateLocalConfig keeps local hosting explicit while leaving engine,
 // routing, and storage selection to the shared server configuration.
-func validateLocalConfig(cfg *api.ServerConfig) error {
+func ValidateLocalConfig(cfg *api.ServerConfig) error {
 	if cfg.Storage.DSN == "" && cfg.Storage.DSNFrom == nil {
 		return fmt.Errorf("local runtime requires explicit storage.dsn or storage.dsn_from")
 	}
@@ -46,7 +46,7 @@ type LocalOptions struct {
 // listener. Cancellation drains the HTTP server and existing operator shutdown
 // path; it does not issue an operator stop or cancel any stored apply.
 func RunLocal(ctx context.Context, config api.ServerConfig, local LocalOptions, opts ...Option) (runErr error) {
-	if err := validateLocalConfig(&config); err != nil {
+	if err := ValidateLocalConfig(&config); err != nil {
 		return err
 	}
 	o := options{logger: slog.Default()}

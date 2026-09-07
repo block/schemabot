@@ -17,7 +17,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
-	"gopkg.in/yaml.v3"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
@@ -39,15 +38,17 @@ func TestSupervisorEngines(t *testing.T) {
 	for _, engine := range []string{"mysql", "postgres"} {
 		t.Run(engine, func(t *testing.T) {
 			storageDSN, targetDSN, db := supervisorDatabase(t, engine)
-			config := api.ServerConfig{Storage: api.StorageConfig{Dialect: engine, DSN: storageDSN}, Databases: map[string]api.DatabaseConfig{"app": {Type: engine, Environments: map[string]api.EnvironmentConfig{"development": {DSN: targetDSN}}}}}
-			data, err := yaml.Marshal(config)
-			require.NoError(t, err)
 			home := t.TempDir()
 			dir := filepath.Join(home, ".schemabot", "runtimes", "shared")
-			require.NoError(t, os.MkdirAll(dir, 0700))
-			require.NoError(t, os.WriteFile(filepath.Join(dir, "runtime.yaml"), data, 0600))
-			require.NoError(t, os.WriteFile(filepath.Join(home, ".schemabot", "config.yaml"), []byte("profiles:\n  alpha:\n    local_runtime: shared\n  beta:\n    local_runtime: shared\n"), 0600))
 			manager := runtimehost.Manager{Dir: dir, Binary: binary, Version: "dev"}
+			changed, err := manager.Register(runtimehost.Registration{
+				Database: "app", Environment: "development", Engine: engine,
+				Storage:    api.StorageConfig{Dialect: engine, DSN: storageDSN},
+				Connection: api.EnvironmentConfig{DSN: targetDSN},
+			})
+			require.NoError(t, err)
+			require.True(t, changed)
+			require.NoError(t, os.WriteFile(filepath.Join(home, ".schemabot", "config.yaml"), []byte("profiles:\n  alpha:\n    local_runtime: shared\n  beta:\n    local_runtime: shared\n"), 0600))
 			t.Cleanup(func() {
 				ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), runtimeDeadline)
 				defer cancel()

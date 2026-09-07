@@ -84,6 +84,13 @@ func (m Manager) Ensure(ctx context.Context) (Connection, error) {
 		return Connection{}, err
 	}
 	if available {
+		// Setup may have published a registration after the initial read. The
+		// startup lease makes this snapshot authoritative until the child exits.
+		config, err = ReadPrivate(filepath.Join(m.Dir, "runtime.yaml"))
+		if err != nil {
+			utils.CloseAndLog(lease)
+			return Connection{}, fmt.Errorf("read runtime configuration: %w", err)
+		}
 		err = m.start(ctx, lease, config, binary)
 		utils.CloseAndLog(lease)
 		if err != nil {

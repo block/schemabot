@@ -1322,6 +1322,12 @@ isolation for dynamically resolved targets. Local hosting never opts into destru
 bootstrap. *Enforced:* `pkg/serve/local.go`, `pkg/auth/local.go`, and
 `pkg/api/storage_isolation.go`; process recovery is covered in `integration/localruntime`.
 
+Local registration preserves existing targets and durable storage configuration. It validates
+through the shared host guards and publishes configuration atomically under the runtime's lifetime
+lock. An identical registration is reusable; new registrations require a stopped runtime. Startup
+reads its configuration again under that same lock so it cannot start with a superseded snapshot.
+*Enforced:* `pkg/localruntime/register.go` and `pkg/localruntime/manager.go`.
+
 ## Structural enforcement
 
 The strongest invariants are enforced by structure, so regressions fail CI instead of review:
