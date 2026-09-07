@@ -5,14 +5,15 @@ let recording,previousScroll=0;
 const clean=s=>s.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g,'').replace(/\r/g,'');
 const escape=s=>s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
 const ansi=s=>{let html='',last=0,style='';const re=/\x1b\[([0-9;]*)m/g;let m;while((m=re.exec(s))){html+='<span style="'+style+'">'+escape(s.slice(last,m.index))+'</span>';for(const code of m[1].split(';')){if(code==='0'||code==='')style='';if(code==='1')style+='font-weight:600;';if(code==='34')style+='color:#0969da;';if(code==='35')style+='color:#8250df;';}last=re.lastIndex;}return html+'<span style="'+style+'">'+escape(s.slice(last))+'</span>';};
-window.setRecording=data=>{recording=data; const first=data.wizard_frames.findIndex(f=>f.rows.some(r=>r.map(s=>s.text).join('').includes('esc cancel'))); if(first>0)recording.wizard_frames=data.wizard_frames.slice(first);};
+window.setRecording=data=>{recording=data; document.querySelector('.sub').textContent='SchemaBot · '+(data.engine==='postgres'?'PostgreSQL':'MySQL')+' · local setup'; const first=data.wizard_frames.findIndex(f=>f.rows.some(r=>r.map(s=>s.text).join('').includes('esc cancel'))); if(first>0)recording.wizard_frames=data.wizard_frames.slice(first);};
 window.renderFrame=(t,dt)=>{
- const phase=t<18?0:t<23?1:2;
+ const phase=t<30?0:t<36?1:2;
  for(let i=0;i<3;i++)document.getElementById('s'+i).className='step '+(i===phase?'active':i<phase?'done':'');
  let lines;
  if(phase===0){
+  if(t<2){document.getElementById('content').innerHTML='<div class=cmd>'+escape('$ schemabot init'.slice(0,Math.floor(t*10)))+'▌</div>';document.getElementById('caption').textContent='Start with schemabot init';return;}
   const frames=recording.wizard_frames;
-  const recordedTime=Math.min(t/15,1)*frames[frames.length-1].time;
+  const recordedTime=Math.min(Math.max(0,t-2)/25,1)*frames[frames.length-1].time;
   const frame=frames.filter(f=>f.time<=recordedTime).at(-1)||frames[0];
   const colors={default:'#1f2328',black:'#1f2328',red:'#cf222e',green:'#1a7f37',brown:'#9a6700',blue:'#0969da',magenta:'#8250df',cyan:'#0550ae',white:'#59636e',brightblack:'#59636e'};
   const content=document.getElementById('content');
@@ -21,14 +22,15 @@ window.renderFrame=(t,dt)=>{
    return '<span style="color:'+color+';font-weight:'+(span.style[1]?'600':'400')+'">'+escape(span.text)+'</span>';
   }).join('')+'</div>').join('');
   content.style.transform='none';
-  document.getElementById('caption').textContent='Actual terminal rendering · keyboard-driven setup';
+  const screenText=frame.rows.map(r=>r.map(s=>s.text).join('')).join('\n');
+  document.getElementById('caption').textContent=screenText.includes('Your schema is ready')?'Your baseline is verified. Ready for the first edit.':screenText.includes('/  connect and verify')?'SchemaBot imports and verifies your schema.':screenText.includes('Ready when you are')?'Review your database, files, and connections.':screenText.includes('space select')?'Choose the namespaces you want to manage.':screenText.includes('Connecting and finding')?'Connect and discover what is available.':screenText.includes('Database name')?'Give your database a name.':'Choose your database engine.';
   document.getElementById('progress').style.width='33.33%';
   return;
  }else if(phase===1){
-  lines=['schema/shop/users.sql','',...clean(recording.diff).trimEnd().split('\n').slice(2)];
+  lines=[recording.schema_file,'',...clean(recording.diff).trimEnd().split('\n').slice(2)];
   document.getElementById('caption').textContent='Give email addresses more room.';
  }else{
-  lines=['$ schemabot plan -s schema -e development','',...recording.plan.replace(/\r/g,'').trimEnd().split('\n')];
+  if(t<38){lines=['$ schemabot plan -s schema -e development'.slice(0,Math.floor((t-36)*23))+'▌'];}else lines=['$ schemabot plan -s schema -e development','',...recording.plan.replace(/\r/g,'').trimEnd().split('\n')];
   document.getElementById('caption').textContent='The next change is a plan you can review.';
  }
  const html=lines.map(line=>{
@@ -40,7 +42,7 @@ window.renderFrame=(t,dt)=>{
  previousScroll+= (wanted-previousScroll)*(1-Math.pow(.65,dt*12));
  if(phase!==0)previousScroll=0;
  content.style.transform=`translateY(${-Math.round(previousScroll)}px)`;
- document.getElementById('label').textContent=phase===1?'shop — schema/shop/users.sql':'shop — terminal';
+ document.getElementById('label').textContent=phase===1?'shop — '+recording.schema_file:'shop — terminal';
  document.getElementById('progress').style.width=((phase+1)/3*1100)+'px';
 };
 </script></body></html>
