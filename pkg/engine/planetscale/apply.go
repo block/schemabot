@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	mysql "github.com/go-sql-driver/mysql"
+	mysql "github.com/block/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
 	"github.com/block/spirit/pkg/table"
@@ -600,7 +600,7 @@ func (e *Engine) applyKeyspaceChangesOnce(ctx context.Context, sc engine.SchemaC
 	}
 	dsn := mysqlCfg.FormatDSN()
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	if err != nil {
 		return fmt.Errorf("open branch connection for %s: %w", sc.Namespace, err)
 	}

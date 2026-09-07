@@ -49,6 +49,9 @@ func detach(cmd *exec.Cmd, lease *os.File) {
 
 func inheritedLock(dir string) (*os.File, error) {
 	f := os.NewFile(3, "runtime lease")
+	if f == nil {
+		return nil, fmt.Errorf("runtime lease was not inherited")
+	}
 	info, err := f.Stat()
 	if err != nil {
 		utils.CloseAndLog(f)

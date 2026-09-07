@@ -36,7 +36,7 @@ func TestLocalClient_ShardScopedDispatchDrivesItsTasks(t *testing.T) {
 
 	ctx := t.Context()
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	_, err = db.ExecContext(ctx, "CREATE TABLE users (id INT PRIMARY KEY)")

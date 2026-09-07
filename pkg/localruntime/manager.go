@@ -51,10 +51,10 @@ func (m Manager) record() (Record, error) {
 	var r Record
 	data, err := ReadPrivate(filepath.Join(m.Dir, "manifest.json"))
 	if err != nil {
-		return r, err
+		return r, fmt.Errorf("read runtime manifest: %w", err)
 	}
 	if err := json.Unmarshal(data, &r); err != nil {
-		return r, fmt.Errorf("invalid runtime manifest")
+		return r, fmt.Errorf("invalid runtime manifest: %w", err)
 	}
 	if r.ID != filepath.Base(m.Dir) || r.Generation == "" {
 		return r, fmt.Errorf("runtime manifest identity mismatch")
@@ -258,7 +258,7 @@ func (m Manager) Stop(ctx context.Context) error {
 func loopback(endpoint string) error {
 	u, err := url.Parse(endpoint)
 	if err != nil {
-		return fmt.Errorf("invalid runtime endpoint")
+		return fmt.Errorf("invalid runtime endpoint: %w", err)
 	}
 	ip := net.ParseIP(u.Hostname())
 	if u.Scheme != "http" || ip == nil || !ip.IsLoopback() || u.Port() == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
