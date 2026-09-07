@@ -198,3 +198,9 @@ func TestInitWizardDiscoveryNeverFallsBackToAmbientConnection(t *testing.T) {
 	msg := m.discoverNamespaces()().(initNamespacesMsg)
 	require.Error(t, msg.err)
 }
+
+func TestInitWizardPreservesExplicitNamespaceWithComma(t *testing.T) {
+	original := []string{"sales,west", "public"}
+	m := newInitWizard(&InitCmd{Namespaces: original}, "default", io.Discard)
+	require.Equal(t, original, m.namespaceChoices(original))
+}
