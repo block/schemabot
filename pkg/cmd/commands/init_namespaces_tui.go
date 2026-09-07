@@ -88,7 +88,7 @@ func (m *initWizard) namespaceKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	if len(m.names) == 0 {
 		if msg.String() == "enter" {
-			return m, m.discoverNamespaces()
+			return m, tea.Batch(m.discoverNamespaces(), m.spinner.Tick)
 		}
 		return m, nil
 	}
@@ -131,7 +131,7 @@ func (m *initWizard) namespaceKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 func (m *initWizard) namespaceView() string {
 	if m.discovering {
-		return "Looking for your namespaces…\n\nYou can cancel while we connect.\n"
+		return m.spinner.View() + " Connecting and finding your namespaces…\n\nYou can cancel while we connect.\n"
 	}
 	if len(m.names) == 0 {
 		return "enter try again · shift+tab edit connection · esc cancel\n"
@@ -153,7 +153,11 @@ func (m *initWizard) namespaceView() string {
 		if m.selected[names[i]] {
 			check = "✓"
 		}
-		fmt.Fprintf(&b, "%s [%s] %s\n", cursor, check, names[i])
+		line := fmt.Sprintf("%s [%s] %s", cursor, check, names[i])
+		if i == m.cursor {
+			line = m.spinner.Style.Bold(true).Render(line)
+		}
+		b.WriteString(line + "\n")
 	}
 	if len(names) > visible {
 		fmt.Fprintf(&b, "\n%d matches · use ↑/↓ to browse\n", len(names))
@@ -171,7 +175,7 @@ func (m *initWizard) advance() tea.Cmd {
 		m.input.SetValue("")
 		m.input.Placeholder = "Search namespaces"
 		m.names = nil
-		return m.discoverNamespaces()
+		return tea.Batch(m.discoverNamespaces(), m.spinner.Tick)
 	}
 	return nil
 }

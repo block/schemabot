@@ -129,7 +129,7 @@ func (w initSignalWriter) Write(p []byte) (int, error) {
 func TestInitWizardNarrowReviewCanScroll(t *testing.T) {
 	m := newInitWizard(&InitCmd{}, "default", io.Discard)
 	m.step = len(m.fields)
-	m.Update(tea.WindowSizeMsg{Width: 40, Height: 24})
+	m.Update(tea.WindowSizeMsg{Width: 40, Height: 20})
 	before := m.View()
 	require.Contains(t, before, "scroll")
 	for line := range strings.SplitSeq(before, "\n") {

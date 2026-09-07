@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -25,6 +26,7 @@ type initWizard struct {
 	fields                                   []initField
 	step, width                              int
 	height, scroll                           int
+	spinner                                  spinner.Model
 	input                                    textinput.Model
 	renderer                                 *lipgloss.Renderer
 	err                                      string
@@ -57,6 +59,9 @@ func newInitWizard(cmd *InitCmd, profile string, output io.Writer) *initWizard {
 		{"Schema directory", "Choose a home for your schema files. This is where you’ll make changes.", value(cmd.SchemaDir, "schema")},
 		{"Connection profile", "Give this connection a profile name so you can use it again.", profile},
 	}}
+	m.spinner = spinner.New()
+	m.spinner.Spinner = spinner.Dot
+	m.spinner.Style = m.renderer.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#0969DA", Dark: "#79C0FF"})
 	m.input = textinput.New()
 	m.input.Prompt = "› "
 	m.input.CharLimit = 1024
@@ -67,7 +72,7 @@ func newInitWizard(cmd *InitCmd, profile string, output io.Writer) *initWizard {
 func (m *initWizard) Init() tea.Cmd {
 	if m.step == 5 && !m.explicitNamespaces {
 		m.input.SetValue("")
-		return m.discoverNamespaces()
+		return tea.Batch(m.discoverNamespaces(), m.spinner.Tick)
 	}
 	return textinput.Blink
 }
@@ -185,6 +190,11 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(m.advance(), textinput.Blink)
 		}
 	}
+	if m.discovering {
+		var c tea.Cmd
+		m.spinner, c = m.spinner.Update(msg)
+		return m, c
+	}
 	if m.step > 0 && m.step < len(m.fields) {
 		var c tea.Cmd
 		m.input, c = m.input.Update(msg)
@@ -201,7 +211,14 @@ func (m *initWizard) contentView() string {
 	muted := m.renderer.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#59636E", Dark: "#9DA7B3"})
 	wrap := m.renderer.NewStyle().Width(m.width)
 	var b strings.Builder
-	b.WriteString(bold.Render("SchemaBot") + muted.Render("  /  setup") + "\n\n")
+	stage := "connect"
+	if m.step == 5 {
+		stage = "choose schemas"
+	}
+	if m.step > 5 {
+		stage = "review setup"
+	}
+	b.WriteString(bold.Render("SchemaBot") + muted.Render("  /  "+stage) + "\n\n")
 	if m.confirmed {
 		return ""
 	}
@@ -239,13 +256,18 @@ func (m *initWizard) contentView() string {
 		if m.notice != "" {
 			b.WriteString(wrap.Render(m.notice) + "\n\n")
 		}
-		for _, f := range m.fields {
-			b.WriteString(wrap.Render(muted.Render(f.label+": ")+f.value) + "\n")
-		}
+		b.WriteString(bold.Render("Your database") + "\n")
+		b.WriteString(wrap.Render(m.fields[1].value+" · "+m.fields[0].value+" · "+m.fields[2].value) + "\n")
+		b.WriteString(wrap.Render("Namespaces: "+m.fields[5].value) + "\n\n")
+		b.WriteString(bold.Render("Your schema files") + "\n")
+		b.WriteString(wrap.Render(m.fields[6].value+" · profile "+m.fields[7].value) + "\n\n")
+		b.WriteString(bold.Render("Connections") + "\n")
+		b.WriteString(wrap.Render("Application: "+m.fields[3].value) + "\n")
+		b.WriteString(wrap.Render("SchemaBot state: "+m.fields[4].value) + "\n")
 		if _, err := os.Stat(m.fields[6].value); err == nil {
 			b.WriteString("\nYou already have schema files here. We’ll verify them and keep your edits.\n")
 		}
-		b.WriteString("\n" + wrap.Render("We’ll prepare SchemaBot’s state database and check that your schema files match the live database. We won’t change your application’s schema.") + "\n\n")
+		b.WriteString("\n" + wrap.Render("We’ll prepare SchemaBot’s state and verify your schema files. We won’t change your application’s schema.") + "\n\n")
 		b.WriteString(blue.Render("enter connect and verify") + muted.Render(" · shift+tab edit · esc cancel"))
 	}
 	return m.renderer.NewStyle().Width(m.width + 2).PaddingLeft(2).Render(b.String())
