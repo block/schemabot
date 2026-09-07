@@ -131,7 +131,7 @@ func TestClassifyRefusal(t *testing.T) {
 			}),
 			wantReason:    "invalid-index-occupied",
 			wantDetail:    []string{`"public"."users_ref_idx"`, `"shipments"`, "re-plan"},
-			wantNotDetail: []string{"drop the invalid index"},
+			wantNotDetail: []string{"retry removes it"},
 		},
 		{
 			name: "non-droppable invalid index is a refusal even when it wraps a statement-budget cause",
@@ -144,7 +144,7 @@ func TestClassifyRefusal(t *testing.T) {
 			}),
 			wantReason:    "invalid-index-occupied",
 			wantDetail:    []string{`"public"."users_pkey"`, "constraint's index", "operator must resolve"},
-			wantNotDetail: []string{"budget", "drop the invalid index"},
+			wantNotDetail: []string{"budget", "retry removes it"},
 		},
 		{
 			name: "abandoned invalid index is operational",
@@ -535,9 +535,10 @@ func TestRetryPathFitsUnderApplyCeiling(t *testing.T) {
 }
 
 // TestInvalidIndexDetailMatchesVerdictOwnership pins the advice ladder to
-// the verdict code: a drop is named only where the executor proved the entry
-// is a failed build's debris on the target table — this build's own leftover
-// or an abandoned entry; a build in flight says wait and names the builder;
+// the verdict code: a removal is promised only where the executor proved the
+// entry is a failed build's debris on the target table — this build's own
+// leftover or an abandoned entry — and there the retry performs it; a build
+// in flight says wait and names the builder;
 // an entry on another table, one the server will not drop concurrently, one
 // whose builder the role cannot see, and an unproven verdict get
 // investigation steps because the index may be healthy or intentional. Every
@@ -552,17 +553,17 @@ func TestInvalidIndexDetailMatchesVerdictOwnership(t *testing.T) {
 		wantNotDetail []string
 	}{
 		{
-			name: "own leftover names the drop",
+			name: "own leftover says the retry removes and rebuilds it",
 			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx",
 				Build: rawServerText, Cleanup: executor.ErrBuildLeftInvalidIndex},
-			wantDetail:    []string{`"public"."big_ref_idx"`, "drop the invalid index", "retry"},
+			wantDetail:    []string{`"public"."big_ref_idx"`, "own invalid index", "retry removes it", "rebuilds the index"},
 			wantNotDetail: []string{"db-internal-1"},
 		},
 		{
-			name: "abandoned entry names the drop after a re-check",
+			name: "abandoned entry says the retry removes and rebuilds it",
 			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx", Table: "orders",
 				Cleanup: executor.ErrAbandonedInvalidIndex},
-			wantDetail:    []string{`"public"."big_ref_idx"`, "abandoned", "no backend building it", "drop the invalid index", "retry"},
+			wantDetail:    []string{`"public"."big_ref_idx"`, "abandoned", "no backend building it", "retry removes it", "rebuilds the index"},
 			wantNotDetail: []string{"db-internal-1"},
 		},
 		{
@@ -570,42 +571,42 @@ func TestInvalidIndexDetailMatchesVerdictOwnership(t *testing.T) {
 			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx", Table: "orders",
 				BuilderPID: 4242, Cleanup: executor.ErrInvalidIndexBuildInFlight},
 			wantDetail:    []string{`"public"."big_ref_idx"`, "backend 4242", "still building it", "wait"},
-			wantNotDetail: []string{"drop the invalid index", "db-internal-1"},
+			wantNotDetail: []string{"retry removes it", "db-internal-1"},
 		},
 		{
 			name: "unobservable builder gets a privileged progress check, never a drop",
 			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx", Table: "orders",
 				Cleanup: executor.ErrInvalidIndexBuilderUnobservable},
 			wantDetail:    []string{`"public"."big_ref_idx"`, "cannot observe", "pg_stat_progress_create_index", "pg_read_all_stats"},
-			wantNotDetail: []string{"drop the invalid index", "db-internal-1"},
+			wantNotDetail: []string{"retry removes it", "db-internal-1"},
 		},
 		{
 			name: "entry on another table names that table and a re-plan, never a drop",
 			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx", Table: "shipments",
 				Cleanup: executor.ErrInvalidIndexOnOtherTable},
 			wantDetail:    []string{`"public"."big_ref_idx"`, "different table", `"shipments"`, "re-plan"},
-			wantNotDetail: []string{"drop the invalid index", "retry", "db-internal-1"},
+			wantNotDetail: []string{"retry removes it", "retry", "db-internal-1"},
 		},
 		{
 			name: "entry on another table with no inspected table name still re-plans",
 			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx",
 				Cleanup: executor.ErrInvalidIndexOnOtherTable},
 			wantDetail:    []string{`"public"."big_ref_idx"`, "different table;", "re-plan"},
-			wantNotDetail: []string{"drop the invalid index", `("")`},
+			wantNotDetail: []string{"retry removes it", `("")`},
 		},
 		{
 			name: "non-droppable entry is left to an operator, never a drop",
 			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx", Table: "orders",
 				Cleanup: executor.ErrInvalidIndexNotDroppable},
 			wantDetail:    []string{`"public"."big_ref_idx"`, "constraint's index", "operator must resolve", "re-plan"},
-			wantNotDetail: []string{"drop the invalid index", "retry", "db-internal-1"},
+			wantNotDetail: []string{"retry removes it", "retry", "db-internal-1"},
 		},
 		{
 			name: "unproven verdict gets catalog inspection, never a drop",
 			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx",
 				Build: rawServerText, Cleanup: rawServerText},
 			wantDetail:    []string{`"public"."big_ref_idx"`, "pg_index.indisvalid"},
-			wantNotDetail: []string{"drop the invalid index", "db-internal-1"},
+			wantNotDetail: []string{"retry removes it", "db-internal-1"},
 		},
 	}
 	for _, tt := range tests {
@@ -821,7 +822,7 @@ func TestExecuteOptimisticRefusesUnreadableCABundle(t *testing.T) {
 		caCertPath: filepath.Join(t.TempDir(), "missing.pem"),
 	}
 
-	err := executeOptimistic(t.Context(), conn, nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE widgets (id bigint PRIMARY KEY)"}, DefaultNativeSafeTableSizeLimitBytes)
+	err := executeOptimistic(t.Context(), conn, nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE widgets (id bigint PRIMARY KEY)"}, DefaultNativeSafeTableSizeLimitBytes, slog.Default())
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "open pg-sprite apply pool")

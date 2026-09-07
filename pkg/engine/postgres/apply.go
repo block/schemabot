@@ -170,7 +170,7 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	// survive the request), so boundedness comes from the ceiling instead.
 	ctx, cancel := context.WithTimeout(ctx, optimisticApplyCeiling)
 	defer cancel()
-	err := executeOptimistic(ctx, conn, change, e.tableSizeLimit)
+	err := executeOptimistic(ctx, conn, change, e.tableSizeLimit, logger)
 	if err == nil {
 		e.publishProgress(key, progressResult(engine.StateCompleted, "completed", started, change, ""), logger)
 		return
@@ -264,10 +264,11 @@ func classifyApplyFailure(err error, table string) applyFailure {
 }
 
 // invalidIndexAdvice renders the operator-facing cause and next step for an
-// invalid-index verdict, matching pg-sprite's own ownership standard: a drop
-// is named only where the executor proved the entry is a failed build's
-// debris on the target table — this build's own leftover, or an abandoned
-// entry with no builder. A build still in flight says wait; an entry on
+// invalid-index verdict, matching pg-sprite's own ownership standard: a
+// removal is named only where the executor proved the entry is a failed
+// build's debris on the target table — this build's own leftover, or an
+// abandoned entry with no builder — and there the retry performs it, so the
+// operator's step is to let the retry run. A build still in flight says wait; an entry on
 // another table, one the server will not drop concurrently, one whose
 // builder this role cannot see, and an unproven verdict get investigation
 // steps, never a statement to run — the index under the name may be healthy
@@ -281,10 +282,10 @@ func invalidIndexAdvice(invalidErr *executor.InvalidIndexError) (cause, remedy s
 	switch invalidErr.Code() {
 	case executor.CodeInvalidIndexOwnLeftover:
 		return fmt.Sprintf("this build left its own invalid index %s on the target", name),
-			"drop the invalid index, then retry"
+			"the retry removes it and rebuilds the index; drop it yourself only if the retries are exhausted"
 	case executor.CodeInvalidIndexAbandoned:
 		return fmt.Sprintf("an abandoned invalid index %s occupies the name on the target table with no backend building it", name),
-			"confirm it is still invalid with no builder, drop the invalid index, then retry"
+			"the retry removes it and rebuilds the index; drop it yourself only if the retries are exhausted"
 	case executor.CodeInvalidIndexBuildInFlight:
 		return fmt.Sprintf("an invalid index %s occupies the name and backend %d is still building it", name, invalidErr.BuilderPID),
 			"wait for that build to finish or fail, then retry"
@@ -595,7 +596,7 @@ func tableNotFoundRefusal(table string) *refusal {
 	}
 }
 
-func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64) error {
+func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64, logger *slog.Logger) error {
 	poolCfg, err := spritePoolConfig(conn.dsn, conn.caCertPath)
 	if err != nil {
 		return fmt.Errorf("prepare pg-sprite apply pool for table %q: %w", change.table, err)
@@ -650,15 +651,8 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	}
 	if statement.Kind() == pgstatement.KindCreateIndex && statement.Concurrent() {
 		// A concurrent build cannot run inside a transaction block, so it
-		// must not reach the transactional optimistic executor: pg-sprite's
-		// dedicated index-build executor runs it under the CONCURRENTLY
-		// budget policy and returns a catalog-verified verdict — including
-		// the invalid-index recovery a failed build needs.
-		if _, err := executor.BuildIndexConcurrently(ctx, pool, change.sql,
-			executor.ConcurrentBudget{Overall: concurrentIndexBudget}); err != nil {
-			return fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", change.table, err)
-		}
-		return nil
+		// must not reach the transactional optimistic executor.
+		return buildIndexConcurrently(ctx, pool, change, logger)
 	}
 	// Every other statement runs exactly as reviewed, under the
 	// per-statement and lock limits. The apply never rewrites a statement
@@ -722,6 +716,73 @@ func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, 
 		return fmt.Errorf("execute PostgreSQL CREATE TABLE %q: %w", change.table, err)
 	}
 	return nil
+}
+
+// buildIndexConcurrently runs a CREATE INDEX CONCURRENTLY through pg-sprite's
+// dedicated index-build executor, which runs it outside a transaction block
+// under the CONCURRENTLY budget policy and returns a catalog-verified
+// verdict. When the executor refuses before building because an invalid
+// index it can prove abandoned occupies the requested name — an earlier
+// build's leftover with no backend behind it, or debris an interrupted
+// recovery quarantined on the table — the build is re-run through
+// pg-sprite's recovery, which removes the entry under a lock-held proof of
+// abandonment and then builds. That is the state a re-driven apply meets
+// after a crash or cancellation mid-build, and it converges without an
+// operator; every verdict the recovery cannot prove — a build in flight,
+// another table's entry, an index the server will not drop concurrently, an
+// unverifiable catalog — is returned as the executor typed it.
+//
+// A leftover this drive's own build produced is not recovered here. Its
+// build just failed under the budget this drive holds, and a rebuild inside
+// the same apply ceiling could only degrade to an external cancellation that
+// names nothing; the failure stays operational and retryable, and the next
+// drive meets the leftover as abandoned debris and recovers it.
+func buildIndexConcurrently(ctx context.Context, pool *pgxpool.Pool, change nativeApply, logger *slog.Logger) error {
+	_, err := executor.BuildIndexConcurrently(ctx, pool, change.sql,
+		executor.ConcurrentBudget{Overall: concurrentIndexBudget})
+	if err == nil {
+		return nil
+	}
+	var invalidErr *executor.InvalidIndexError
+	if !errors.As(err, &invalidErr) || !abandonedBeforeBuild(invalidErr) {
+		return fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", change.table, err)
+	}
+	logger.Info("PostgreSQL concurrent index build found an abandoned invalid index under the requested name; recovering it before the build",
+		"namespace", change.namespace, "table", change.table,
+		"index_schema", invalidErr.Schema, "index", invalidErr.Index, "verdict", invalidErr.Code())
+
+	// The recovery is one envelope — abandonment proof, quarantine drops,
+	// then the build — bounded as a whole by the same budget a plain build
+	// gets, so the ceiling headroom pinned for the build holds for the
+	// recovery too. The executor's served mode would spend that budget once
+	// on the drops and once more on the build; caller-owned mode makes this
+	// deadline the only bound on both, and the build's own catalog verdict
+	// still runs after it on the executor's detached context.
+	recoveryCtx, cancel := context.WithTimeout(ctx, concurrentIndexBudget)
+	defer cancel()
+	report, err := executor.RebuildAbandonedIndex(recoveryCtx, pool, change.sql,
+		executor.ConcurrentBudget{CallerOwned: true})
+	if err != nil {
+		return fmt.Errorf("rebuild PostgreSQL index concurrently over abandoned invalid index %q.%q on table %q: %w",
+			invalidErr.Schema, invalidErr.Index, change.table, err)
+	}
+	logger.Info("PostgreSQL concurrent index build recovered an abandoned invalid index and built the index",
+		"namespace", change.namespace, "table", change.table,
+		"index_schema", invalidErr.Schema, "index", invalidErr.Index,
+		"dropped", len(report.Dropped), "skipped", len(report.Skipped), "duration", report.Duration)
+	return nil
+}
+
+// abandonedBeforeBuild reports whether an invalid-index verdict is one the
+// build refused on before running, over an entry pg-sprite's recovery can
+// remove: the build never ran (no build failure is wrapped), and the entry
+// is proven abandoned, or sits on the target table with a builder this role
+// cannot observe — a case the recovery settles with its table lock rather
+// than the progress view. A verdict wrapping a build failure is this
+// drive's own leftover, and one the recovery would refuse is not this
+// actor's to clear.
+func abandonedBeforeBuild(invalidErr *executor.InvalidIndexError) bool {
+	return invalidErr.Build == nil && invalidErr.Recoverable()
 }
 
 // Progress reports phase, elapsed time, and statement position for the apply

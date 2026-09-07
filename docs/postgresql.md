@@ -109,8 +109,13 @@ The apply runs the reviewed build through pg-sprite's dedicated concurrent
 index-build executor — outside a transaction block, under a 4-minute overall
 budget instead of the per-statement lock and statement limits — and reports
 completion only once the catalog shows the index valid. A build that fails
-part-way leaves an invalid index; the stored failure names it and is retryable
-once an operator has cleared it. A concurrent build against a partitioned
+part-way leaves an invalid index; the stored failure names it and is retryable.
+The next drive recovers that leftover itself: when the build finds an invalid
+index under the requested name that pg-sprite can prove abandoned — on the
+target table, with no backend building it — it runs pg-sprite's recovery,
+which removes the entry under a lock-held proof of abandonment and then
+builds, so a change interrupted mid-build converges without an operator
+dropping anything. A concurrent build against a partitioned
 parent is refused permanently, because PostgreSQL cannot build parent-level
 indexes concurrently.
 
@@ -283,12 +288,17 @@ change or that depend on the target:
 - Exhausting the 30-second statement budget is a permanent native-safety
   refusal. Exhausting the lock budget is retryable after contention clears.
 - A concurrent index build runs under its own 4-minute budget. A build that
-  leaves an invalid index behind — including one cancelled by that budget — or
-  finds one already under the requested name that an operator can clear (a
-  failed build's leftover, an abandoned entry, or another backend's build to
-  wait out) fails as a retryable operational failure naming the index and the
-  recovery step; the invalid index, not the cause that produced it, is the
-  outcome an operator acts on. An invalid index under the requested name that
+  finds an invalid index already under the requested name that pg-sprite
+  proves abandoned — a failed build's leftover on the target table with no
+  backend building it, or quarantine debris an interrupted recovery left —
+  recovers it inside the same apply: the proven entry is removed and the
+  index built, under one budget of the same length as a plain build. A build
+  that leaves an invalid index behind — including one cancelled by that
+  budget — or finds one another backend is still building fails as a
+  retryable operational failure naming the index and the next step; the
+  invalid index, not the cause that produced it, is the outcome the retry
+  acts on, and the next drive recovers the leftover as abandoned. An invalid
+  index under the requested name that
   this change can never clear — one on a different table, or one that backs a
   constraint or belongs to a partitioned table — is refused permanently with
   the same naming, as is a budget exhaustion that provably left nothing. A
