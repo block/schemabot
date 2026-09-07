@@ -62,8 +62,8 @@ database stop setup with the plan details; they are not applied automatically.
 
 ## Use an agent or script
 
-Supply the same decisions as flags. `--non-interactive` never prompts, and `--json` returns a
-structured result. For example, against a supported database with one table:
+Supply the same decisions as flags. Both `--non-interactive` and `--json` suppress prompts;
+`--json` also returns a structured result. For example, against a supported database with one table:
 
 ```console
 $ schemabot init --non-interactive --json --type mysql \
