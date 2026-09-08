@@ -269,5 +269,60 @@
         "output": "\n  \u001b[1m── commerce ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered. Apply ID: apply-example-84\n"
       }
     ]
+  },
+  {
+    "height": 740,
+    "name": "cli-ops",
+    "title": "From the fleet to one change.",
+    "frames": [
+      {
+        "seconds": 4,
+        "command": "schemabot status -e staging",
+        "caption": "Find a running change across your databases",
+        "output": "\u001b[1m1 active schema change\u001b[0m\n\u001b[2m4 total: 2 Completed · 1 Failed · 1 Running\u001b[0m\n\n  \u001b[2mAPPLY ID          DATABASE  ENV      STATE      STARTED         SOURCE\u001b[0m\n  apply-example-84  shop      staging  \u001b[36mRunning  \u001b[0m  10 minutes ago  https://github.com/acme/store/pull/42\n  apply-example-72  billing   staging  \u001b[32mCompleted\u001b[0m  1 hour ago      https://github.com/acme/billing/pull/18\n  apply-example-71  catalog   staging  \u001b[31mFailed   \u001b[0m  2 hours ago     https://github.com/acme/store/pull/40\n  apply-example-70  accounts  staging  \u001b[32mCompleted\u001b[0m  3 hours ago     https://github.com/acme/accounts/pull/12\n\n\u001b[2mUse 'schemabot status \u003capply_id\u003e' to view details\u001b[0m\n"
+      },
+      {
+        "seconds": 3,
+        "command": "schemabot progress apply-example-84",
+        "caption": "Follow the deploy request across four shards",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n  Deploy Request:  https://app.planetscale.com/acme/shop/deploy-requests/42\n\n  \u001b[1m── commerce ──\u001b[0m\n\n     ~ orders: 🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 13.75%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 550,000 / 4,000,000 · ETA: 4m 45s\n       • \u001b[2mShards: 4 (4 copying)\u001b[0m\n           \u001b[36m◉ -40\u001b[0m: 25.00% (250,000/1,000,000 rows) ETA 3m 45s\n           \u001b[36m◉ 40-80\u001b[0m: 15.00% (150,000/1,000,000 rows) ETA 4m 15s\n           \u001b[36m◉ 80-c0\u001b[0m: 10.00% (100,000/1,000,000 rows) ETA 4m 30s\n           \u001b[36m◉ c0-\u001b[0m: 5.00% (50,000/1,000,000 rows) ETA 4m 45s\n\n\n\u001b[2mESC detach • c cancel\u001b[0m\n"
+      },
+      {
+        "seconds": 1.2,
+        "command": "",
+        "caption": "Each shard reports its own rows and ETA",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n  Deploy Request:  https://app.planetscale.com/acme/shop/deploy-requests/42\n\n  \u001b[1m── commerce ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 41.25%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 1,650,000 / 4,000,000 · ETA: 4m 0s\n       • \u001b[2mShards: 4 (4 copying)\u001b[0m\n           \u001b[36m◉ -40\u001b[0m: 65.00% (650,000/1,000,000 rows) ETA 1m 45s\n           \u001b[36m◉ 40-80\u001b[0m: 45.00% (450,000/1,000,000 rows) ETA 2m 45s\n           \u001b[36m◉ 80-c0\u001b[0m: 35.00% (350,000/1,000,000 rows) ETA 3m 15s\n           \u001b[36m◉ c0-\u001b[0m: 20.00% (200,000/1,000,000 rows) ETA 4m 0s\n\n\n\u001b[2mESC detach • c cancel\u001b[0m\n"
+      },
+      {
+        "seconds": 1.2,
+        "command": "",
+        "caption": "",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n  Deploy Request:  https://app.planetscale.com/acme/shop/deploy-requests/42\n\n  \u001b[1m── commerce ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 72.50%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 2,900,000 / 4,000,000 · ETA: 2m 45s\n       • \u001b[2mShards: 4 (1 complete, 3 copying)\u001b[0m\n           \u001b[32m✓ -40\u001b[0m: 1,000,000 rows\n           \u001b[36m◉ 40-80\u001b[0m: 80.00% (800,000/1,000,000 rows) ETA 1m 0s\n           \u001b[36m◉ 80-c0\u001b[0m: 65.00% (650,000/1,000,000 rows) ETA 1m 45s\n           \u001b[36m◉ c0-\u001b[0m: 45.00% (450,000/1,000,000 rows) ETA 2m 45s\n\n\n\u001b[2mESC detach • c cancel\u001b[0m\n"
+      },
+      {
+        "seconds": 1.2,
+        "command": "",
+        "caption": "",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n  Deploy Request:  https://app.planetscale.com/acme/shop/deploy-requests/42\n\n  \u001b[1m── commerce ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜ 98.75%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 3,950,000 / 4,000,000 · ETA: 15s\n       • \u001b[2mShards: 4 (3 complete, 1 copying)\u001b[0m\n           \u001b[32m✓ -40\u001b[0m: 1,000,000 rows\n           \u001b[32m✓ 40-80\u001b[0m: 1,000,000 rows\n           \u001b[32m✓ 80-c0\u001b[0m: 1,000,000 rows\n           \u001b[36m◉ c0-\u001b[0m: 95.00% (950,000/1,000,000 rows) ETA 15s\n\n\n\u001b[2mESC detach • c cancel\u001b[0m\n"
+      },
+      {
+        "seconds": 2,
+        "command": "",
+        "caption": "Every shard reaches 100%",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n  Deploy Request:  https://app.planetscale.com/acme/shop/deploy-requests/42\n\n  \u001b[1m── commerce ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 100.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 4,000,000 / 4,000,000\n       • \u001b[2mShards: 4 (4 complete)\u001b[0m\n           \u001b[32m✓ -40\u001b[0m: 1,000,000 rows\n           \u001b[32m✓ 40-80\u001b[0m: 1,000,000 rows\n           \u001b[32m✓ 80-c0\u001b[0m: 1,000,000 rows\n           \u001b[32m✓ c0-\u001b[0m: 1,000,000 rows\n\n\n\u001b[2mESC detach • c cancel\u001b[0m\n"
+      },
+      {
+        "seconds": 3,
+        "command": "schemabot logs apply-example-84 -f",
+        "caption": "After detaching with ESC, follow the change in its logs",
+        "output": "Following logs for apply-example-84... (Ctrl+C to stop)\n\n\u001b[2m14:20:00\u001b[0m \u001b[32m[INF]\u001b[0m Apply queued: apply-example-84\n\u001b[2m14:20:05\u001b[0m \u001b[32m[INF]\u001b[0m Apply state derived from its 1 operation row(s): running [pending -\u003e running]\n"
+      },
+      {
+        "seconds": 4,
+        "command": "",
+        "caption": "A new log entry confirms completion",
+        "output": "Following logs for apply-example-84... (Ctrl+C to stop)\n\n\u001b[2m14:20:00\u001b[0m \u001b[32m[INF]\u001b[0m Apply queued: apply-example-84\n\u001b[2m14:20:05\u001b[0m \u001b[32m[INF]\u001b[0m Apply state derived from its 1 operation row(s): running [pending -\u003e running]\n\u001b[2m14:35:00\u001b[0m \u001b[32m[INF]\u001b[0m Apply state derived from its 1 operation row(s): completed [running -\u003e completed]\n"
+      }
+    ]
   }
 ]

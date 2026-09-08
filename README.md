@@ -37,9 +37,13 @@ Open a PR with your schema changes, and SchemaBot plans, applies, and verifies t
 
 [Walk through each step](./docs/pre-merge-workflow.md#the-pr-workflow-step-by-step) at your own pace
 
-**From your terminal.** Review the SQL, apply the change, and follow it to completion.
+**Plan and apply a change.** Review the SQL, apply the change, and follow it to completion.
 
 ![CLI plan and apply workflow, rendered with real CLI templates](./assets/cli-plan-apply.gif)
+
+**From the fleet to one change.** Find a running change, follow each shard, and read its logs.
+
+![Fleet status, per-shard progress, and apply logs](./assets/cli-ops.gif)
 
 [Get started with the CLI](./docs/cli.md) · [Explore your database fleet](./docs/schema-intelligence.md)
 
