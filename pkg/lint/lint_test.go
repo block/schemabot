@@ -237,8 +237,8 @@ func TestPlanChangesBooleanKeywordDefaultConverges(t *testing.T) {
 	})
 }
 
-// booleanDefaultTable renders a one-column table around the column definition
-// under test, so each case states only the default it is about.
+// booleanDefaultTable wraps the column definition under test in a table with a
+// primary key, so each case states only the default it is about.
 func booleanDefaultTable(column string) string {
 	return "CREATE TABLE `widgets` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, " + column +
 		", PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
