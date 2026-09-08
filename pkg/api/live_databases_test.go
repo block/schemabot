@@ -31,8 +31,18 @@ func TestLocalRegistrationPublishesOnlyAdditions(t *testing.T) {
 			}
 		})
 	}
+	snapshot := original.withDatabaseSnapshot()
 	publish()
 	wg.Wait()
+	// One response keeps the database and environment set it started with.
+	response, err := databaseListResponse(snapshot, "", "")
+	require.NoError(t, err)
+	require.Len(t, response.Databases, 1)
+	require.Len(t, response.Databases[0].Environments, 1)
+	require.Equal(t, "app", response.Databases[0].Database)
+	environments, err := snapshot.DatabaseEnvironments("app")
+	require.NoError(t, err)
+	require.Equal(t, []string{"dev"}, environments)
 	require.Equal(t, "env:BILLING", original.Database("billing").Environments["dev"].DSN)
 	dsn, err := original.Database("billing").Environments["dev"].ResolveDSN()
 	require.NoError(t, err)

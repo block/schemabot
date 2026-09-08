@@ -1311,37 +1311,42 @@ command discovery and the unowned-command policy (`pkg/webhook/commands.go`).
 
 ### AZ-6: Local hosting preserves its boundaries
 
-The internal local host reserves a numeric loopback listener before storage bootstrap or
-operator startup. Every route, including probes, requires its private credential. Local hosting
-rejects service authentication configuration and GitHub Apps rather than silently changing their
-authorization behavior. Its credential identifies the runtime, not an independently approved human.
+The local host accepts only authenticated loopback traffic. It rejects service authentication
+and GitHub Apps rather than changing their authorization behavior. Its credential identifies
+the runtime, not an independently approved human.
 
-State storage must use an explicit connection and a different database name from each locally
-configured target in the same database family. This conservative name check does not establish
-isolation for dynamically resolved targets. Local hosting never opts into destructive storage
-bootstrap. *Enforced:* `pkg/serve/local.go`, `pkg/auth/local.go`, and
-`pkg/api/storage_isolation.go`; process recovery is covered in `integration/localruntime`.
+State storage must use an explicit connection and a different database name from each configured
+target in the same database family. This name check does not establish isolation for dynamically
+resolved targets. Local hosting never permits destructive storage bootstrap.
 
-Local registration preserves existing targets and durable storage configuration. It validates
-through the shared host guards. A running host serializes additive registrations, persists their
-declarations, and publishes an immutable database snapshot without replacing existing engine clients.
-Existing targets and server settings cannot be replaced through registration. New connection secrets
-remain in memory when declarations use secret references. Startup and stopped-host registration use
-the same lifetime lock; live updates require the signed control channel and an exact configuration
-revision. *Enforced:* `pkg/localsetup/register.go`, `pkg/localruntime/config.go`,
-`pkg/localruntime/host.go`, and `pkg/api/live_databases.go`.
+*Enforced:* `pkg/serve/local.go`, `pkg/auth/local.go`, and `pkg/api/storage_isolation.go`.
 
-Local profile registration never replaces a different connection or changes the default profile.
-CLI configuration saves are atomic and reject a stale loaded revision, so a concurrent setup or
-login cannot silently erase a newer registration. *Enforced:* `pkg/cmd/client/local_profile.go`
-and `pkg/cmd/client/config.go`.
+### AZ-7: Local registration preserves existing work
 
-Initialization verifies a baseline using staged schema files before publishing them. It never
-applies to the target, replaces an existing schema directory, or treats a different existing
-profile as consent to reroute it. Identical imported files may be reused for a retry. Failed setup
-retains the runtime and its state so a retry does not invent a second execution authority.
-*Enforced:* `pkg/cmd/commands/init.go` `pkg/cmd/commands/init_publish_darwin.go`, and
-`pkg/cmd/commands/init_publish_linux.go`.
+Adding a database or environment must preserve existing targets, server settings, durable state,
+and active applies. Every addition passes the local host's safety checks, and concurrent registrations
+must not overwrite one another. The running host must accept configuration changes before they are
+published. Secret references remain references on disk.
+
+*Enforced:* `pkg/localsetup/register.go`, `pkg/localruntime/config.go`,
+`pkg/localruntime/manager.go`, `pkg/localruntime/host.go`, and `pkg/api/live_databases.go`.
+
+### AZ-8: Profile registration preserves connection identity
+
+Registering a local profile must not replace a different connection, change the default profile,
+or overwrite a concurrent configuration update. Retrying an identical registration is safe.
+
+*Enforced:* `pkg/cmd/client/local_profile.go` and `pkg/cmd/client/config.go`.
+
+### AZ-9: Initialization preserves the target and existing files
+
+Initialization verifies the imported schema before publishing it and never applies changes to the
+target. It must not overwrite existing schema files or redirect an existing profile to another
+connection. A retry may reuse identical imported files. Failed setup preserves the runtime and
+its state so the retry uses the same execution authority.
+
+*Enforced:* `pkg/cmd/commands/init.go`, `pkg/cmd/commands/init_publish_darwin.go`,
+`pkg/cmd/commands/init_publish_linux.go`, and `pkg/cmd/commands/init_publish_other.go`.
 
 ## Structural enforcement
 
