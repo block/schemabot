@@ -245,6 +245,14 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	}
 
 	var invalidErr *executor.InvalidIndexError
+	if errors.Is(err, executor.ErrCancelledExternally) && e.consumeCancelRequested(key) {
+		detail := "Concurrent index build cancelled"
+		if errors.As(err, &invalidErr) {
+			detail = invalidIndexDetail(invalidErr)
+		}
+		publish(progressResult(engine.StateCancelled, "cancelled", started, change, detail))
+		return
+	}
 	if errors.As(err, &invalidErr) && !invalidErr.Code().Permanent() {
 		// An invalid index a retry recovers or an operator clears — a build's
 		// own leftover, abandoned debris, another backend's build to wait
@@ -1004,7 +1012,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 // tracker read fails only when the server's progress view cannot be queried;
 // the snapshot still carries the last-known position, which is written
 // before the error is returned for the caller to log.
-func executorProgressMetadata(ctx context.Context, tracker *progress.Tracker, metadata map[string]string) error {
+func executorProgressMetadata(ctx context.Context, tracker buildTracker, metadata map[string]string) error {
 	if tracker == nil {
 		return nil
 	}

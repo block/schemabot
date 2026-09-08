@@ -942,6 +942,52 @@ func TestEngineApplyConcurrentIndexBuild(t *testing.T) {
 	assert.True(t, valid, "the built index must be catalog-valid, not merely present")
 }
 
+// An operator cancel signals a concurrent build parked behind an open writer,
+// settles the apply as cancelled, and preserves the invalid index entry that
+// the next drive uses for automatic recovery.
+func TestEngineCancelConcurrentIndexBuild(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "cancel_index_build_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
+	require.NoError(t, err)
+	writer, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(writer)
+	writerTx, err := writer.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	defer func() {
+		if err := writerTx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			t.Errorf("roll back writer transaction: %v", err)
+		}
+	}()
+	_, err = writerTx.ExecContext(t.Context(), "INSERT INTO public.orders (id, ref) VALUES (1, 'held')")
+	require.NoError(t, err)
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders",
+		"CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		var invalid bool
+		err := db.QueryRowContext(t.Context(), `SELECT NOT indisvalid FROM pg_index WHERE indexrelid = to_regclass('public.orders_ref_idx')`).Scan(&invalid)
+		return err == nil && invalid
+	}, postgresApplyDeadline, 10*time.Millisecond, "the build never parked after creating its invalid catalog entry")
+
+	result, err := eng.Cancel(t.Context(), &engine.ControlRequest{
+		ResumeState: &engine.ResumeState{MigrationContext: applyTaskID("orders")},
+	})
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	require.NoError(t, writerTx.Rollback())
+
+	got := awaitPostgresProgress(t, eng, "orders")
+	assert.Equal(t, engine.StateCancelled, got.State)
+	assert.Contains(t, got.ErrorMessage, "orders_ref_idx")
+	var invalid bool
+	err = db.QueryRowContext(t.Context(), `SELECT NOT indisvalid FROM pg_index WHERE indexrelid = 'public.orders_ref_idx'::regclass`).Scan(&invalid)
+	require.NoError(t, err)
+	assert.True(t, invalid)
+}
+
 // TestEngineApplyPartitionedParentConcurrentIndexRefusal proves the
 // partition admission policy runs at apply time: a concurrent build against
 // a partitioned parent is permanently refused with the typed fixed-sentence

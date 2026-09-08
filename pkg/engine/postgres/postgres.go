@@ -65,9 +65,15 @@ type Engine struct {
 // logger is the apply's own, so a poll that cannot read the tracker logs
 // under the identifiers the apply was accepted with.
 type trackedApply struct {
-	result  *engine.ProgressResult
-	tracker *progress.Tracker
-	logger  *slog.Logger
+	result          *engine.ProgressResult
+	tracker         buildTracker
+	logger          *slog.Logger
+	cancelRequested bool
+}
+
+type buildTracker interface {
+	Progress(context.Context) (progress.Snapshot, error)
+	CancelBuild(context.Context) error
 }
 
 // DefaultNativeSafeTableSizeLimitBytes preserves the native-safe execution
@@ -817,21 +823,12 @@ func (e *Engine) Drain() {
 	e.mu.Unlock()
 }
 
-// Stop declines: a PostgreSQL schema change runs each statement as a single
-// transactional DDL with no engine phase to pause — an in-flight statement
-// either commits or fails on its own. The typed decline lets the control
-// path resolve a durable stop request terminally instead of retrying it.
+// Stop declines: a concurrent index build has no resumable midpoint, so stop
+// would be a permanent cancel under a misleading name. Other PostgreSQL DDL
+// also has no engine phase to pause. The typed decline lets the control path
+// resolve a durable stop request terminally instead of retrying it (CO-8).
 func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, engine.NewUnsupportedOperationError("stop is not supported for PostgreSQL schema changes: each statement runs as a single transaction that commits or fails on its own")
-}
-
-// Cancel declines: the engine runs each statement as one transaction and does
-// not track the database backend executing it, so it cannot terminate the
-// statement itself. An in-flight DDL can still be interrupted at the database
-// — during a lock pileup that is exactly what an operator needs — so the
-// decline reason points at the out-of-band path instead of stopping at "no".
-func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, engine.NewUnsupportedOperationError("cancel is not implemented for PostgreSQL schema changes: the engine cannot terminate its in-flight statement, which commits or fails as one transaction; to interrupt it at the database, find the backend running the DDL in pg_stat_activity and cancel it with pg_cancel_backend")
+	return nil, engine.NewUnsupportedOperationError("stop is not supported for PostgreSQL schema changes: concurrent index builds have no resumable midpoint, and other statements commit or fail on their own")
 }
 
 // Start declines: PostgreSQL schema changes cannot be stopped, so there is

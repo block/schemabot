@@ -134,6 +134,21 @@ Indexes declared together with a new table take a different path: they run as
 plain, non-concurrent steps inside the greenfield create set, because the table
 has no readers yet (see [Greenfield tables](#greenfield-tables)).
 
+### Control operations
+
+Cancel is supported only while an existing table's concurrent index build is
+active. SchemaBot signals that build's backend through its pg-sprite progress
+tracker; the engine role must be able to observe and signal the backend, which
+requires membership in `pg_signal_backend` when PostgreSQL does not otherwise
+permit it. If the build has already finished or its backend is no longer
+running, cancel has no effect and the apply continues to the build's actual
+verdict. If the backend is not observable, the request is refused with the
+privilege remedy rather than claiming a cancellation that might not land.
+
+Stop remains unsupported. A concurrent build has no resumable midpoint, so a
+stop would be a permanent cancel under a misleading name; non-concurrent
+statements likewise have no engine phase to pause.
+
 ### Greenfield tables
 
 A `CREATE TABLE` for a table that does not exist on the target plans as a

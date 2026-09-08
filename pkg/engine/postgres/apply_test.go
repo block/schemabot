@@ -715,6 +715,34 @@ func TestApplyRegistersExecutorTracker(t *testing.T) {
 	assert.Equal(t, "ALTER TABLE public.users ADD COLUMN email text", terminal.Metadata["statement"])
 }
 
+// An executor cancellation is this apply's operator cancellation only when
+// the engine recorded that it sent the signal. The invalid leftover remains
+// named so the next drive can recover it.
+func TestApplyClassifiesRequestedConcurrentBuildCancel(t *testing.T) {
+	scripted := newScriptedExecutor(func(tracker *progress.Tracker) error {
+		tracker.Finish(errors.New("cancelled"))
+		return &executor.InvalidIndexError{
+			Schema: "public", Index: "users_email_idx", Table: "users",
+			Build: executor.ErrCancelledExternally, Cleanup: executor.ErrBuildLeftInvalidIndex,
+		}
+	})
+	eng := New()
+	const key = "task-a"
+	applyAlterUsers(t, eng, scripted, key, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	scripted.tracker(t)
+	eng.mu.Lock()
+	eng.progress[key].cancelRequested = true
+	eng.mu.Unlock()
+	scripted.release()
+
+	require.Eventually(t, func() bool {
+		return pollProgress(t, eng, key).State.IsTerminal()
+	}, backgroundApplyDeadline, 10*time.Millisecond)
+	terminal := pollProgress(t, eng, key)
+	assert.Equal(t, engine.StateCancelled, terminal.State)
+	assert.Contains(t, terminal.ErrorMessage, "users_email_idx")
+}
+
 // TestTerminalPublishReportsAnUnfinishedExecutorBuild pins the guard on the
 // terminal publish's premise: an executor that returns while its tracker
 // still reports a live build has broken the contract the fold-in relies on,
