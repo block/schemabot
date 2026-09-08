@@ -14,11 +14,9 @@
 
 <p align="center">
   <a href="./docs/vision.md">Vision</a> ·
-  <a href="#the-pr-workflow">The PR workflow</a> ·
-  <a href="#from-your-terminal">From your terminal</a> ·
-  <a href="#why-schemabot">Why SchemaBot</a> ·
-  <a href="#how-it-works">How it works</a> ·
   <a href="#quick-start">Quick start</a> ·
+  <a href="#the-pr-workflow">PR workflow</a> ·
+  <a href="#from-your-terminal">CLI</a> ·
   <a href="#docs">Docs</a>
 </p>
 
