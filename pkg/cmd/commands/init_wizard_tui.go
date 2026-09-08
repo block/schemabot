@@ -260,7 +260,7 @@ func (m *initWizard) contentView() string {
 		b.WriteString(bold.Render(f.label) + "\n" + wrap.Render(muted.Render(f.hint)) + "\n\n")
 		switch {
 		case m.step == 0:
-			for _, engine := range []struct{ key, label, detail string }{{"mysql", "MySQL", "Online schema changes with Spirit"}, {"postgres", "PostgreSQL", "Declarative schemas for Postgres"}} {
+			for _, engine := range []struct{ key, label, detail string }{{"mysql", "MySQL", "Online schema changes with Spirit"}, {"postgres", "PostgreSQL", "Schema changes with pg-sprite"}} {
 				line := "  " + engine.label
 				if f.value == engine.key {
 					line = blue.Render("› " + engine.label)
