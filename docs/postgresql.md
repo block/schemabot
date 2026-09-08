@@ -111,11 +111,17 @@ budget instead of the per-statement lock and statement limits — and reports
 completion only once the catalog shows the index valid. A build that fails
 part-way leaves an invalid index; the stored failure names it and is retryable.
 The next drive recovers that leftover itself: when the build finds an invalid
-index under the requested name that pg-sprite can prove abandoned — on the
-target table, with no backend building it — it runs pg-sprite's recovery,
-which removes the entry under a lock-held proof of abandonment and then
-builds, so a change interrupted mid-build converges without an operator
-dropping anything. A concurrent build against a partitioned
+index under the requested name, or quarantined on the table by an interrupted
+recovery, that pg-sprite can prove abandoned — on the target table, with no
+backend building it, or with a builder the engine role cannot see through the
+progress view — it runs pg-sprite's recovery, which removes the entry under a
+lock-held proof of abandonment and then builds, so a change interrupted
+mid-build converges without an operator dropping anything. The lock is the
+proof: a build still holding the table, visible or not, stops the recovery at
+its lock budget and the apply fails retryable, still naming the index. A
+recovery that cannot prove the entry unchanged through to its removal fails
+retryable the same way; one that finds the connection pool a session short is
+refused permanently, since a retry sees the same pool. A concurrent build against a partitioned
 parent is refused permanently, because PostgreSQL cannot build parent-level
 indexes concurrently.
 
@@ -288,24 +294,30 @@ change or that depend on the target:
 - Exhausting the 30-second statement budget is a permanent native-safety
   refusal. Exhausting the lock budget is retryable after contention clears.
 - A concurrent index build runs under its own 4-minute budget. A build that
-  finds an invalid index already under the requested name that pg-sprite
-  proves abandoned — a failed build's leftover on the target table with no
-  backend building it, or quarantine debris an interrupted recovery left —
+  finds an invalid index already under the requested name or quarantined on
+  the table that pg-sprite proves abandoned — a failed build's leftover on
+  the target table with no backend building it, one whose builder the engine
+  role cannot observe, or quarantine debris an interrupted recovery left —
   recovers it inside the same apply: the proven entry is removed and the
   index built, under one budget of the same length as a plain build. A build
   that leaves an invalid index behind — including one cancelled by that
-  budget — or finds one another backend is still building fails as a
+  budget — or finds one another backend is visibly still building fails as a
   retryable operational failure naming the index and the next step; the
   invalid index, not the cause that produced it, is the outcome the retry
-  acts on, and the next drive recovers the leftover as abandoned. An invalid
+  acts on, and the next drive recovers the leftover as abandoned. A recovery
+  that fails before its build — the proof lock lost to a build still holding
+  the table, or the entry changed between two verification points — fails
+  retryable with the same naming; one that finds the pool a session short is
+  refused permanently, as below. An invalid
   index under the requested name that
   this change can never clear — one on a different table, or one that backs a
   constraint or belongs to a partitioned table — is refused permanently with
   the same naming, as is a budget exhaustion that provably left nothing. A
   parent-level index build on a partitioned table is refused permanently, and
   so is a target connection pool too small to hold the build's sessions at
-  once, since the pool is sized by the target DSN and a retry sees the same
-  pool.
+  once — the recovery holds one more session than the build, so a pool sized
+  to the build alone refuses the recovery — since the pool is sized by the
+  target DSN and a retry sees the same pool.
 - Other operational failures are recorded as retryable when no create-set
   prefix committed and expose a sanitized message; connection and server
   details remain in server logs. A create-set failure after the table commits
