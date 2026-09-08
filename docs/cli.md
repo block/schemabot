@@ -12,7 +12,7 @@ to see what is changing across your fleet.
 | Check an ongoing change | [Follow progress and control the apply](#follow-and-control-a-change) |
 | Build an integration | [Use structured output](#use-the-cli-from-scripts-and-agents) |
 
-The examples use a fictional MySQL database named `shop` in `staging`.
+The examples use a MySQL database named `shop` in `staging`.
 Substitute a database and environment from your server's inventory. The local
 quick start uses `testapp`; it does not create the `shop` database shown here.
 
@@ -187,8 +187,6 @@ findings, each with output examples.
 
 ![CLI status across several databases, a running change, and recent plans](../assets/cli-fleet.gif)
 
-*Fictional fleet, rendered with the CLI's production templates.*
-
 ```console
 $ schemabot status -e staging
 1 active schema change
@@ -299,8 +297,6 @@ database. Specify it when you want to review one target.
 
 ![CLI plan and progress through a completed schema change](../assets/cli-plan-apply.gif)
 
-*Selected plan and progress views, rendered from fictional data with the CLI's production templates.*
-
 ### Apply and verify
 
 Apply the schema directory when you are ready. The CLI generates a fresh
@@ -400,8 +396,6 @@ Keep watching until the state is `Completed`; acceptance alone does not mean
 the swap has finished.
 
 ![CLI progress shows copying, a throttle reason, deferred cutover, and completion](../assets/cli-cutover.gif)
-
-*Fictional copy and cutover sequence using real CLI templates, with time compressed.*
 
 ### Respond to a change that needs attention
 

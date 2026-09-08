@@ -41,8 +41,6 @@ Open a PR with your schema changes, and SchemaBot plans, applies, and verifies t
 
 ![CLI plan and apply workflow, rendered with real CLI templates](./assets/cli-plan-apply.gif)
 
-*Illustrated with fictional data and the CLI's production templates; timing is compressed.*
-
 [Get started with the CLI](./docs/cli.md) · [Explore your database fleet](./docs/schema-intelligence.md)
 
 ## Why SchemaBot

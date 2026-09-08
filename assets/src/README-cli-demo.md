@@ -43,5 +43,4 @@ can be refreshed when CLI templates change.
 
 Review a plan frame, the fleet table, the throttle reason and ETA, the waiting
 state, and the completed state after rendering. Check the GIFs at README
-width as well as their native 1100 × 670 size. Keep the fictional-data label
-visible when changing the presentation.
+width as well as their native 1100 × 670 size. Keep the rendering method and timing choices documented here.
