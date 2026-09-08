@@ -18,7 +18,6 @@
 - [Storage Connection Pool](#storage-connection-pool)
 - [Spirit Run Settings](#spirit-run-settings)
 - [Postgres](#postgres)
-  - [Storage statement budget](#storage-statement-budget)
 - [PlanetScale mTLS](#planetscale-mtls)
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
