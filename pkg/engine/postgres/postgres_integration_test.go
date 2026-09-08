@@ -4,6 +4,8 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"net/url"
 	"testing"
 	"time"
@@ -961,13 +963,14 @@ func TestEngineApplyPartitionedParentConcurrentIndexRefusal(t *testing.T) {
 	assert.Contains(t, progress.ErrorMessage, "cannot build parent-level indexes concurrently")
 }
 
-// TestEngineApplyConcurrentIndexAbandonedInvalidRetryable proves an
-// abandoned invalid index already occupying the target name — on the target
-// table, with no backend building it — fails the build as a retryable
-// operational failure whose detail names the index and the recovery: an
-// operator confirms the entry is still invalid and unowned, drops it, and the
-// drive offers the retry.
-func TestEngineApplyConcurrentIndexAbandonedInvalidRetryable(t *testing.T) {
+// TestEngineApplyConcurrentIndexRecoversAbandonedInvalid proves an abandoned
+// invalid index already occupying the target name — on the target table,
+// with no backend building it — is recovered inside the apply, not handed to
+// an operator: the drive removes the proven-abandoned entry, builds the
+// index, and reports completion only with the index valid and no quarantine
+// debris left on the table. This is the state a re-driven apply meets after
+// an earlier build died mid-flight, so it must converge on its own.
+func TestEngineApplyConcurrentIndexRecoversAbandonedInvalid(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "invalid_index_test")
 	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
 	require.NoError(t, err)
@@ -982,13 +985,142 @@ func TestEngineApplyConcurrentIndexAbandonedInvalidRetryable(t *testing.T) {
 		"CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"))
 	require.NoError(t, err)
 	progress := awaitPostgresProgress(t, eng, "orders")
-	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, engine.StateCompleted, progress.State, "progress: %+v", progress)
+	assert.Equal(t, "completed", progress.Metadata["phase"])
+	assertIndexValidWithoutDebris(t, db, "orders", "orders_ref_idx")
+}
+
+// TestEngineApplyConcurrentIndexRedriveAfterKilledBuild proves the
+// convergence a crashed drive depends on. A concurrent build whose backend
+// is killed after the catalog entry commits leaves its own invalid index
+// under the requested name; that drive fails retryable, naming the index.
+// Re-applying the same statement — what the next drive does — must find the
+// leftover, prove it abandoned, remove it, and build the index to a valid
+// state, with nothing left behind for an operator.
+func TestEngineApplyConcurrentIndexRedriveAfterKilledBuild(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "killed_build_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
+	require.NoError(t, err)
+
+	// An open writer holds a lock the build must wait for after it commits
+	// its invalid catalog entry, so the build is parked at a point where
+	// killing it provably leaves that entry behind.
+	writer, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(writer)
+	writerTx, err := writer.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	// Releases the writer lock if an assertion fails before the explicit
+	// rollback below. This must be a defer, not a t.Cleanup: closing the
+	// conn waits for its open transaction to finish, so the rollback has to
+	// run before the deferred conn close or the test would hang on failure.
+	defer func() {
+		if err := writerTx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			t.Errorf("roll back writer transaction: %v", err)
+		}
+	}()
+	_, err = writerTx.ExecContext(t.Context(), "INSERT INTO public.orders (id, ref) VALUES (1, 'held')")
+	require.NoError(t, err)
+
+	eng := New()
+	statement := "CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders", statement))
+	require.NoError(t, err)
+
+	var builderPID int
+	require.Eventually(t, func() bool {
+		err := db.QueryRowContext(t.Context(), `
+			SELECT a.pid
+			FROM pg_stat_activity a
+			JOIN pg_index i ON i.indexrelid = to_regclass('public.orders_ref_idx')
+			WHERE a.datname = current_database() AND a.pid <> pg_backend_pid()
+			  AND a.query LIKE 'CREATE INDEX CONCURRENTLY%' AND a.state <> 'idle' AND NOT i.indisvalid`).Scan(&builderPID)
+		return err == nil
+	}, postgresApplyDeadline, 10*time.Millisecond, "the build never committed its invalid catalog entry while parked behind the writer")
+	// The bounded form waits for the backend to exit, so the writer's
+	// rollback below cannot race a builder that has not gone yet.
+	var terminated bool
+	err = db.QueryRowContext(t.Context(), "SELECT pg_terminate_backend($1, 5000)", builderPID).Scan(&terminated)
+	require.NoError(t, err)
+	require.True(t, terminated, "the build backend must be gone before the writer releases its lock")
+	require.NoError(t, writerTx.Rollback())
+
+	progress := awaitPostgresProgress(t, eng, "orders")
+	require.Equal(t, engine.StateFailed, progress.State, "progress: %+v", progress)
 	assert.Equal(t, "failed", progress.Metadata["phase"])
-	assert.True(t, progress.Retryable, "an operator can clear the invalid index; the drive must offer the retry")
+	assert.True(t, progress.Retryable, "a killed build's leftover is operational; the drive must offer the retry")
 	assert.Contains(t, progress.ErrorMessage, "orders_ref_idx")
-	assert.Contains(t, progress.ErrorMessage, "abandoned invalid index")
-	assert.Contains(t, progress.ErrorMessage, "no backend building it")
-	assert.Contains(t, progress.ErrorMessage, "drop the invalid index")
+	assert.Contains(t, progress.ErrorMessage, "invalid index")
+
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders", statement))
+	require.NoError(t, err)
+	progress = awaitPostgresProgress(t, eng, "orders")
+	assert.Equal(t, engine.StateCompleted, progress.State, "progress: %+v", progress)
+	assert.Equal(t, "completed", progress.Metadata["phase"])
+	assertIndexValidWithoutDebris(t, db, "orders", "orders_ref_idx")
+}
+
+// TestEngineApplyConcurrentIndexRecoveryFailureIsNotCompletion proves a
+// recovery that clears the abandoned entry but whose build then fails
+// reports the failure, never a completion: the abandoned invalid index is
+// removed, the unique build fails on duplicate rows and leaves its own
+// invalid index under the name, and the apply fails retryable naming that
+// index — while the catalog still shows it invalid, the state a completion
+// would have misreported as the index the schema declares.
+func TestEngineApplyConcurrentIndexRecoveryFailureIsNotCompletion(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "recovery_failure_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "INSERT INTO public.orders (id, ref) VALUES (1, 'ref-collision'), (2, 'ref-collision')")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "CREATE INDEX orders_ref_key ON public.orders (ref)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(),
+		"UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'public.orders_ref_key'::regclass")
+	require.NoError(t, err)
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders",
+		"CREATE UNIQUE INDEX CONCURRENTLY orders_ref_key ON public.orders (ref)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "orders")
+	require.Equal(t, engine.StateFailed, progress.State, "progress: %+v", progress)
+	assert.Equal(t, "failed", progress.Metadata["phase"])
+	assert.True(t, progress.Retryable, "a build that fails after the recovery is operational; the drive must offer the retry")
+	assert.Contains(t, progress.ErrorMessage, "orders_ref_key")
+	assert.Contains(t, progress.ErrorMessage, "invalid index")
+	assert.NotContains(t, progress.ErrorMessage, "ref-collision", "the server's unique-violation text never reaches the operator surface")
+
+	var valid bool
+	err = db.QueryRowContext(t.Context(),
+		`SELECT i.indisvalid FROM pg_index i WHERE i.indexrelid = to_regclass('public.orders_ref_key')`).Scan(&valid)
+	require.NoError(t, err)
+	assert.False(t, valid, "the failed unique build leaves its own invalid index under the name")
+}
+
+// assertIndexValidWithoutDebris checks the named index on public.<table> is
+// catalog-valid and that the recovery left no quarantined entry on the table:
+// a completed report must mean the index the schema declares, and only it.
+// The debris pattern is the quarantine name pg-sprite's recovery gives an
+// entry before dropping it; pg-sprite does not export it, so the literal is
+// pinned here and a rename upstream would make this assertion pass
+// vacuously — the recovery tests' completed state would still hold, but the
+// no-debris half would no longer be proven.
+func assertIndexValidWithoutDebris(t *testing.T, db *sql.DB, table, index string) {
+	t.Helper()
+	var valid bool
+	err := db.QueryRowContext(t.Context(),
+		`SELECT i.indisvalid FROM pg_index i WHERE i.indexrelid = to_regclass($1)`, "public."+index).Scan(&valid)
+	require.NoError(t, err)
+	assert.True(t, valid, "the built index must be catalog-valid, not merely present")
+
+	var debris int
+	err = db.QueryRowContext(t.Context(), `
+		SELECT count(*) FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indexrelid
+		WHERE i.indrelid = to_regclass($1) AND c.relname LIKE 'pgsprite\_abandoned\_%'`, "public."+table).Scan(&debris)
+	require.NoError(t, err)
+	assert.Zero(t, debris, "the recovery must not leave quarantined entries on the table")
 }
 
 // TestEngineApplyConcurrentIndexOnOtherTableRefused proves an invalid index
@@ -1019,7 +1151,8 @@ func TestEngineApplyConcurrentIndexOnOtherTableRefused(t *testing.T) {
 	assert.Contains(t, progress.ErrorMessage, "orders_ref_idx")
 	assert.Contains(t, progress.ErrorMessage, `"shipments"`)
 	assert.Contains(t, progress.ErrorMessage, "re-plan")
-	assert.NotContains(t, progress.ErrorMessage, "drop the invalid index")
+	assert.NotContains(t, progress.ErrorMessage, "retry removes it")
+	assert.NotContains(t, progress.ErrorMessage, "drop")
 }
 
 // TestEngineApplyConcurrentIndexBackingConstraintRefused proves an invalid
@@ -1048,7 +1181,8 @@ func TestEngineApplyConcurrentIndexBackingConstraintRefused(t *testing.T) {
 	assert.Contains(t, progress.ErrorMessage, "orders_ref_idx")
 	assert.Contains(t, progress.ErrorMessage, "constraint's index")
 	assert.Contains(t, progress.ErrorMessage, "an operator must resolve it")
-	assert.NotContains(t, progress.ErrorMessage, "drop the invalid index")
+	assert.NotContains(t, progress.ErrorMessage, "retry removes it")
+	assert.NotContains(t, progress.ErrorMessage, "drop")
 }
 
 // applyRequest builds a single-statement apply request with the same identity

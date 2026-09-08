@@ -52,7 +52,7 @@ type Engine struct {
 	// drive — accept, claim, execute, terminal publish — can be exercised
 	// against an executor the test scripts instead of a target to dial. Nil
 	// selects the real executor.
-	execute func(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64, tracker *progress.Tracker) error
+	execute func(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64, tracker *progress.Tracker, logger *slog.Logger) error
 }
 
 // trackedApply pairs the progress the engine has published for one apply

@@ -224,7 +224,7 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	if execute == nil {
 		execute = executeOptimistic
 	}
-	err := execute(ctx, conn, change, e.tableSizeLimit, tracker)
+	err := execute(ctx, conn, change, e.tableSizeLimit, tracker, logger)
 	if err == nil {
 		publish(progressResult(engine.StateCompleted, "completed", started, change, ""))
 		return
@@ -232,14 +232,14 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 
 	var invalidErr *executor.InvalidIndexError
 	if errors.As(err, &invalidErr) && !invalidErr.Code().Permanent() {
-		// An invalid index an operator can clear — a build's own leftover,
-		// abandoned debris, another backend's build to wait out, or a
-		// builder this role cannot observe — is operational: once it is
-		// cleared a retry can succeed. Checked before the refusal and budget
-		// arms because the verdict wraps the build failure that produced it
-		// (a budget-cancelled build leaves its own invalid index), and that
-		// inner cause must not be read as the outcome — the index the
-		// operator clears is. The permanent verdicts (the name is occupied
+		// An invalid index a retry recovers or an operator clears — a build's
+		// own leftover, abandoned debris, another backend's build to wait
+		// out, or a builder this role cannot observe — is operational: once
+		// it is gone a retry can succeed. Checked before the refusal and
+		// budget arms because the verdict wraps the build failure that
+		// produced it (a budget-cancelled build leaves its own invalid
+		// index), and that inner cause must not be read as the outcome — the
+		// index the retry acts on is. The permanent verdicts (the name is occupied
 		// on another table, or by an index the server will not drop
 		// concurrently) fall through to classifyRefusal: retrying unchanged
 		// reproduces them. The detail is built from the typed identifiers
@@ -264,11 +264,12 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		// because it is published to GitHub.
 		logger.Warn("PostgreSQL schema change refused",
 			"namespace", change.namespace, "table", change.table, "reason", r.reason, "error", err)
-		publish(progressResult(engine.StateFailed, "refused", started, change, r.detail))
+		publish(progressResult(engine.StateFailed, "refused", started, change, recoveryContextDetail(err, r.detail)))
 		return
 	}
 
 	failure := classifyApplyFailure(err, change.table)
+	failure.detail = recoveryContextDetail(err, failure.detail)
 	switch {
 	case failure.committedPrefix:
 		logger.Error("PostgreSQL create set failed after committing a prefix",
@@ -318,33 +319,36 @@ func classifyApplyFailure(err error, table string) applyFailure {
 }
 
 // invalidIndexAdvice renders the operator-facing cause and next step for an
-// invalid-index verdict, matching pg-sprite's own ownership standard: a drop
-// is named only where the executor proved the entry is a failed build's
-// debris on the target table — this build's own leftover, or an abandoned
-// entry with no builder. A build still in flight says wait; an entry on
-// another table, one the server will not drop concurrently, one whose
-// builder this role cannot see, and an unproven verdict get investigation
-// steps, never a statement to run — the index under the name may be healthy
-// or may be exactly what it is meant to be. Only the typed identifiers are
-// interpolated, never the wrapped build or cleanup errors, which may carry
-// raw server text. The two halves leave unsanitized so classifyRefusal can
-// compose a sequence-step clause between them and sanitize the whole; the
-// operational path composes them through invalidIndexDetail.
+// invalid-index verdict, matching pg-sprite's own ownership standard: a
+// removal is named only where the recovery proves the entry is a failed
+// build's debris on the target table before it drops — this build's own
+// leftover, an abandoned entry with no builder, or an entry whose builder
+// this role cannot see, which the recovery settles under the table's lock —
+// and there the retry performs it, so the operator's step is to let the
+// retry run. A build still in flight says wait; an entry on another table,
+// one the server will not drop concurrently, and an unproven verdict get
+// investigation steps, never a statement to run — the index under the name
+// may be healthy or may be exactly what it is meant to be. Only the typed
+// identifiers are interpolated, never the wrapped build or cleanup errors,
+// which may carry raw server text. The two halves leave unsanitized so
+// classifyRefusal can compose a sequence-step clause between them and
+// sanitize the whole; the operational path composes them through
+// invalidIndexDetail.
 func invalidIndexAdvice(invalidErr *executor.InvalidIndexError) (cause, remedy string) {
 	name := fmt.Sprintf("%q.%q", invalidErr.Schema, invalidErr.Index)
 	switch invalidErr.Code() {
 	case executor.CodeInvalidIndexOwnLeftover:
 		return fmt.Sprintf("this build left its own invalid index %s on the target", name),
-			"drop the invalid index, then retry"
+			"the retry removes it and rebuilds the index; drop it yourself only if the retries are exhausted"
 	case executor.CodeInvalidIndexAbandoned:
 		return fmt.Sprintf("an abandoned invalid index %s occupies the name on the target table with no backend building it", name),
-			"confirm it is still invalid with no builder, drop the invalid index, then retry"
+			"the retry removes it and rebuilds the index; drop it yourself only if the retries are exhausted"
 	case executor.CodeInvalidIndexBuildInFlight:
 		return fmt.Sprintf("an invalid index %s occupies the name and backend %d is still building it", name, invalidErr.BuilderPID),
 			"wait for that build to finish or fail, then retry"
 	case executor.CodeInvalidIndexBuilderUnobservable:
 		return fmt.Sprintf("an invalid index %s occupies the name on the target table and the engine role cannot observe whether a backend is building it", name),
-			"check pg_stat_progress_create_index with a role granted pg_read_all_stats before any recovery, then retry"
+			"the retry proves it abandoned under the table's lock, removes it, and rebuilds the index; a build still holding the table stops that retry at its lock budget instead"
 	case executor.CodeInvalidIndexOtherTable:
 		return fmt.Sprintf("an invalid index %s already occupies the name on a different table%s", name, invalidIndexTableSuffix(invalidErr)),
 			"this change cannot claim it — rename the index in the schema file and re-plan, or clear the entry through that table's own change"
@@ -483,8 +487,8 @@ func refusalForCause(err error, table string) *refusal {
 	}
 	// An invalid-index verdict is decided by its own code, never by the build
 	// failure it wraps — a budget-cancelled concurrent build leaves its own
-	// invalid index, and the index the operator clears is the outcome, not
-	// the inner budget exhaustion. Decided before the budget arm so the
+	// invalid index, and the index a retry recovers or an operator clears is
+	// the outcome, not the inner budget exhaustion. Decided before the budget arm so the
 	// nested cause can never shadow the verdict. Only the permanent members
 	// of the family refuse: the name is occupied on another table, or by an
 	// index the server will not drop concurrently, so retrying unchanged
@@ -608,8 +612,9 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		executor.CodeInvalidIndexBuilderUnobservable, executor.CodeInvalidIndexUnproven,
 		executor.CodeExecutionFailed:
 		// Operational outcomes: a bounded lock race, the caller's own
-		// context ending or an external stop, an invalid-index state an
-		// operator clears or waits out, or a failure outside the typed set.
+		// context ending or an external stop, an invalid-index state a retry
+		// recovers or an operator clears or waits out, or a failure outside
+		// the typed set.
 		// A retry can succeed once conditions change, so none is a permanent
 		// refusal.
 		return nil, true
@@ -652,7 +657,7 @@ func tableNotFoundRefusal(table string) *refusal {
 // executeOptimistic runs the planned change through pg-sprite's executors,
 // each feeding the tracker so a concurrent Progress poll reads the step and
 // statement in flight.
-func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64, tracker *progress.Tracker) error {
+func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64, tracker *progress.Tracker, logger *slog.Logger) error {
 	poolCfg, err := spritePoolConfig(conn.dsn, conn.caCertPath)
 	if err != nil {
 		return fmt.Errorf("prepare pg-sprite apply pool for table %q: %w", change.table, err)
@@ -707,15 +712,8 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	}
 	if statement.Kind() == pgstatement.KindCreateIndex && statement.Concurrent() {
 		// A concurrent build cannot run inside a transaction block, so it
-		// must not reach the transactional optimistic executor: pg-sprite's
-		// dedicated index-build executor runs it under the CONCURRENTLY
-		// budget policy and returns a catalog-verified verdict — including
-		// the invalid-index recovery a failed build needs.
-		if _, err := executor.BuildIndexConcurrentlyWithProgress(ctx, pool, change.sql,
-			executor.ConcurrentBudget{Overall: concurrentIndexBudget}, tracker); err != nil {
-			return fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", change.table, err)
-		}
-		return nil
+		// must not reach the transactional optimistic executor.
+		return buildIndexConcurrently(ctx, pool, change, tracker, logger)
 	}
 	// Every other statement runs exactly as reviewed, under the
 	// per-statement and lock limits. The apply never rewrites a statement
@@ -779,6 +777,134 @@ func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, 
 		return fmt.Errorf("execute PostgreSQL CREATE TABLE %q: %w", change.table, err)
 	}
 	return nil
+}
+
+// buildIndexConcurrently runs a CREATE INDEX CONCURRENTLY through pg-sprite's
+// dedicated index-build executor, which runs it outside a transaction block
+// under the CONCURRENTLY budget policy and returns a catalog-verified
+// verdict. When the executor refuses before building because an invalid
+// index occupies the requested name, or sits quarantined on the table, that
+// pg-sprite's recovery can prove abandoned — an earlier build's leftover with
+// no backend behind it, debris an interrupted recovery renamed, or an entry
+// whose builder this role cannot see through the progress view — the build
+// is re-run through pg-sprite's recovery, which removes the entry under a
+// lock-held proof of abandonment and then builds. That is the state a
+// re-driven apply meets after a crash or cancellation mid-build, and it
+// converges without an operator; every verdict the recovery cannot prove —
+// a build in flight, another table's entry, an index the server will not
+// drop concurrently, an unverifiable catalog — is returned as the executor
+// typed it.
+//
+// A leftover this drive's own build produced is not recovered here. Its
+// build just ran under the budget this drive holds, and a rebuild inside
+// the same apply ceiling could only degrade to an external cancellation that
+// names nothing; the failure stays operational and retryable, and the next
+// drive meets the leftover as abandoned debris and recovers it.
+//
+// A recovery that fails without a fresh invalid-index verdict — its proof
+// lock lost to a build still holding the table, a pool with no room for its
+// extra session — is returned as an indexRecoveryError carrying the verdict
+// it acted on, so the operator detail still names the index the retry acts
+// on.
+func buildIndexConcurrently(ctx context.Context, pool *pgxpool.Pool, change nativeApply, tracker *progress.Tracker, logger *slog.Logger) error {
+	_, err := executor.BuildIndexConcurrentlyWithProgress(ctx, pool, change.sql,
+		executor.ConcurrentBudget{Overall: concurrentIndexBudget}, tracker)
+	if err == nil {
+		return nil
+	}
+	var invalidErr *executor.InvalidIndexError
+	if !errors.As(err, &invalidErr) || !abandonedBeforeBuild(invalidErr) {
+		return fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", change.table, err)
+	}
+	logger.Info("PostgreSQL concurrent index build found an abandoned invalid index under the requested name or quarantined on the table; recovering it before the build",
+		"namespace", change.namespace, "table", change.table,
+		"index_schema", invalidErr.Schema, "index", invalidErr.Index, "verdict", invalidErr.Code())
+
+	// The recovery is one envelope — abandonment proof, quarantine drops,
+	// then the build — bounded as a whole by the same budget a plain build
+	// gets, so the ceiling headroom pinned for the build holds for the
+	// recovery too. The executor's served mode would spend that budget once
+	// on the drops and once more on the build; caller-owned mode makes this
+	// deadline the only bound on both, and the build's own catalog verdict
+	// still runs after it on the executor's detached context. Caller-owned
+	// mode runs the drops and the build with no server-side statement
+	// timeout, so this deadline is the only thing that ends them: a
+	// cancellation the server never receives leaves the statement running
+	// on the target until it finishes on its own, bounded only by the lock
+	// timeouts the recovery sets for itself.
+	recoveryCtx, cancel := context.WithTimeout(ctx, concurrentIndexBudget)
+	defer cancel()
+	report, err := executor.RebuildAbandonedIndex(recoveryCtx, pool, change.sql,
+		executor.ConcurrentBudget{CallerOwned: true})
+	if err != nil {
+		return fmt.Errorf("rebuild PostgreSQL index concurrently on table %q: %w", change.table,
+			&indexRecoveryError{verdict: invalidErr, err: err})
+	}
+	logger.Info("PostgreSQL concurrent index build recovered an abandoned invalid index and built the index",
+		"namespace", change.namespace, "table", change.table,
+		"index_schema", invalidErr.Schema, "index", invalidErr.Index,
+		"dropped", len(report.Dropped), "skipped", len(report.Skipped), "duration", report.Duration)
+	return nil
+}
+
+// abandonedBeforeBuild reports whether an invalid-index verdict is one the
+// build refused on before running, over an entry this actor may have
+// pg-sprite's recovery remove: no build failure is wrapped, and the verdict
+// is one of the two the recovery settles on this drive's behalf — an entry
+// proven abandoned on the target table, or one there whose builder this
+// role cannot observe, which the recovery decides under the table's lock
+// rather than through the progress view, so a hidden build still holding
+// the table stops it at the lock budget instead of losing its index. The
+// verdicts are named rather than taken from pg-sprite's Recoverable set:
+// this drive's own leftover is recoverable upstream but stays with the
+// failure that produced it, and the permanent verdicts are never this
+// actor's to clear.
+func abandonedBeforeBuild(invalidErr *executor.InvalidIndexError) bool {
+	if invalidErr.Build != nil {
+		return false
+	}
+	switch invalidErr.Code() {
+	case executor.CodeInvalidIndexAbandoned, executor.CodeInvalidIndexBuilderUnobservable:
+		return true
+	default:
+		return false
+	}
+}
+
+// indexRecoveryError reports that the recovery run over an abandoned invalid
+// index failed before the index was built, keeping the verdict the recovery
+// acted on beside the failure. pg-sprite types a recovery that lost its
+// proof lock or found the pool too small as a budget or pool outcome with no
+// index in it, yet the index under the name is still the state the retry
+// acts on, so the operator detail needs the name from here. The failure
+// stays reachable to errors.As, so a recovery that ends in a fresh
+// invalid-index verdict is classified by that verdict, not by this wrapper.
+type indexRecoveryError struct {
+	verdict *executor.InvalidIndexError
+	err     error
+}
+
+func (e *indexRecoveryError) Error() string {
+	return fmt.Sprintf("recover abandoned invalid index %q.%q before the build: %v", e.verdict.Schema, e.verdict.Index, e.err)
+}
+
+func (e *indexRecoveryError) Unwrap() error { return e.err }
+
+// recoveryContextDetail prefixes an operator-facing detail with the abandoned
+// invalid index a failed recovery was clearing, so a failure typed without
+// the index — a lock budget lost to a build still holding the table, a pool
+// too small for the recovery's extra session — still names the entry the
+// retry acts on. A failure that is itself an invalid-index verdict never
+// reaches here: that arm is decided first and already names the index. The
+// prefix is kept short so the remedy's lead survives the narrowest operator
+// surface, which truncates the detail from the tail.
+func recoveryContextDetail(err error, detail string) string {
+	var recoveryErr *indexRecoveryError
+	if !errors.As(err, &recoveryErr) {
+		return detail
+	}
+	return sanitizeReasonText(fmt.Sprintf("recovering abandoned invalid index %q.%q failed: %s",
+		recoveryErr.verdict.Schema, recoveryErr.verdict.Index, detail))
 }
 
 // Progress reports phase, elapsed time, and statement position for the apply
