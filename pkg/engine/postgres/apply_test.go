@@ -487,6 +487,9 @@ func TestProgressReportsExecutorStepPosition(t *testing.T) {
 	assert.Equal(t, "1", before.Metadata["step"], "before the executor reports, the record keeps the planned first step")
 	assert.Equal(t, "3", before.Metadata["steps_total"])
 	assert.NotContains(t, before.Metadata, "statement")
+	for _, key := range []string{"operation", "server_phase", "attempt", "blocks_done", "blocks_total", "tuples_done", "tuples_total", "lockers_done", "lockers_total"} {
+		assert.NotContains(t, before.Metadata, key)
+	}
 
 	tracker.Start(3, progress.OperationAdmitting)
 	tracker.StartStep(2, progress.OperationBrief, "CREATE INDEX widgets_name_idx\n\tON public.widgets ((first_name || ' ' ||\x00 last_name))")
@@ -537,7 +540,7 @@ func TestPublishProgressKeepsTerminalPositionAsPublished(t *testing.T) {
 	tracker.Finish(errors.New("boom"))
 
 	terminal := progressResult(engine.StateFailed, "failed", time.Now(), change, "detail")
-	require.NoError(t, executorProgressMetadata(t.Context(), tracker, terminal.Metadata))
+	require.NoError(t, executorProgressMetadata(t.Context(), tracker, terminal))
 	eng.publishProgress("task-a", terminal, slog.Default())
 
 	got, err := eng.Progress(t.Context(), &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: "task-a"}})
@@ -833,6 +836,52 @@ type failingRow struct{ err error }
 
 func (r failingRow) Scan(...any) error { return r.err }
 
+type indexProgressRow struct{}
+
+func (indexProgressRow) Scan(dest ...any) error {
+	*(dest[0].(*string)) = "building index"
+	*(dest[1].(*uint64)) = 25
+	*(dest[2].(*uint64)) = 40
+	*(dest[3].(*uint64)) = 12
+	*(dest[4].(*uint64)) = 30
+	*(dest[5].(*uint64)) = 4
+	*(dest[6].(*uint64)) = 2
+	pid := int32(31337)
+	*(dest[7].(**int32)) = &pid
+	return nil
+}
+
+type successfulIndexProgressSession struct{}
+
+func (successfulIndexProgressSession) QueryRow(context.Context, string, ...any) pgx.Row {
+	return indexProgressRow{}
+}
+
+func TestProgressReportsExecutorDetailAndBlockPercent(t *testing.T) {
+	eng := New()
+	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE INDEX widgets_name_idx ON public.widgets (name)", steps: 2}
+	tracker := newTestTracker(t)
+	tracker.Start(2, progress.OperationAdmitting)
+	tracker.StartStep(2, progress.OperationConcurrentIndex, "CREATE INDEX CONCURRENTLY widgets_name_idx ON public.widgets (name)")
+	tracker.SetAttempt(3)
+	tracker.SetConcurrentBuild(successfulIndexProgressSession{}, 42)
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "running", time.Now(), change, ""), tracker, slog.Default())
+
+	got, err := eng.Progress(t.Context(), &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: "task-a"}})
+	require.NoError(t, err)
+	assert.Equal(t, "concurrent-index-build", got.Metadata["operation"])
+	assert.Equal(t, "building index", got.Metadata["server_phase"])
+	assert.Equal(t, "3", got.Metadata["attempt"])
+	assert.Equal(t, "25", got.Metadata["blocks_done"])
+	assert.Equal(t, "40", got.Metadata["blocks_total"])
+	assert.Equal(t, "12", got.Metadata["tuples_done"])
+	assert.Equal(t, "30", got.Metadata["tuples_total"])
+	assert.Equal(t, "2", got.Metadata["lockers_done"])
+	assert.Equal(t, "4", got.Metadata["lockers_total"])
+	assert.NotContains(t, got.Metadata, "current_locker_pid")
+	assert.Equal(t, 62, got.Tables[0].Progress)
+}
+
 // activeBuildTracker returns a tracker mid-way through a concurrent index
 // build whose server-side progress read fails with readErr.
 func activeBuildTracker(t *testing.T, readErr error) (*progress.Tracker, *indexProgressSession) {
@@ -854,7 +903,7 @@ func TestExecutorProgressMetadataKeepsLastKnownPositionOnReadError(t *testing.T)
 	tracker, session := activeBuildTracker(t, readErr)
 	metadata := map[string]string{"step": "1", "steps_total": "1"}
 
-	err := executorProgressMetadata(t.Context(), tracker, metadata)
+	err := executorProgressMetadata(t.Context(), tracker, &engine.ProgressResult{Metadata: metadata})
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, readErr)
@@ -875,7 +924,7 @@ func TestExecutorProgressMetadataReadsOnItsOwnBoundedContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	err := executorProgressMetadata(ctx, tracker, map[string]string{})
+	err := executorProgressMetadata(ctx, tracker, &engine.ProgressResult{Metadata: map[string]string{}})
 
 	require.Error(t, err)
 	require.True(t, session.queried)

@@ -91,6 +91,13 @@ bounded at apply time: each attempt has a 3-second lock budget and a
 statement that exceeds the execution budget is not allowed to continue
 unbounded.
 
+While a statement runs, PostgreSQL progress metadata includes `step`,
+`steps_total`, and the sanitized `statement`. When pg-sprite reports them, it
+also includes `operation`, `server_phase`, `attempt`, `blocks_done`,
+`blocks_total`, `tuples_done`, `tuples_total`, `lockers_done`, and
+`lockers_total`. During an index build with a non-zero block total, table
+progress is the completed-block percentage, clamped from 0 through 100.
+
 A multi-statement plan — several tables changed, or one declarative edit that
 the planner expands into several steps — is not applied atomically. The
 statements execute in order, each committing or failing in its own

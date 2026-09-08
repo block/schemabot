@@ -22,6 +22,7 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 const (
@@ -214,7 +215,7 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	// then carries the tracker's last-known position instead of a fresh
 	// read the reserved session can no longer answer.
 	publish := func(result *engine.ProgressResult) {
-		if err := executorProgressMetadata(ctx, tracker, result.Metadata); err != nil {
+		if err := executorProgressMetadata(ctx, tracker, result); err != nil {
 			logger.Warn("PostgreSQL apply terminal progress reports the last-known executor position",
 				"namespace", change.namespace, "table", change.table, "task_id", key, "error", err)
 		}
@@ -954,7 +955,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	if len(result.Tables) > 0 && result.Tables[0].StartedAt != nil {
 		result.Metadata["elapsed"] = time.Since(*result.Tables[0].StartedAt).Round(time.Millisecond).String()
 	}
-	if err := executorProgressMetadata(ctx, tracker, result.Metadata); err != nil {
+	if err := executorProgressMetadata(ctx, tracker, &result); err != nil {
 		// The poll still answers with the last-known position: a progress
 		// view the engine cannot read this instant is not a reason to tell
 		// the driver its apply is unobservable.
@@ -964,11 +965,15 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	return &result, nil
 }
 
-// executorProgressMetadata folds the tracker's current position into the
-// published metadata: the 1-based step the executor is running, the sequence
-// length it announced, and the statement text of that step. Each key is
+// executorProgressMetadata folds the tracker's current position and operation
+// detail into the published result: the 1-based step the executor is running,
+// the sequence length it announced, the statement text of that step, the
+// operation and server phase, the attempt, and the block, tuple and locker
+// counters the server reports for a concurrent index build. Each key is
 // written only once the executor has reported it, so before execution starts
-// the metadata keeps progressResult's pre-execution position. The statement
+// the metadata keeps progressResult's pre-execution position. When the server
+// reports block counts the table's percent is derived from them; otherwise
+// the percent the result already carries stands. The statement
 // passes through sanitizeStatementText because the metadata is destined for
 // operator-facing single-line rendering and is stored at a bounded width,
 // and the value must satisfy both the moment one starts reading it.
@@ -986,10 +991,11 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 // tracker read fails only when the server's progress view cannot be queried;
 // the snapshot still carries the last-known position, which is written
 // before the error is returned for the caller to log.
-func executorProgressMetadata(ctx context.Context, tracker *progress.Tracker, metadata map[string]string) error {
+func executorProgressMetadata(ctx context.Context, tracker *progress.Tracker, result *engine.ProgressResult) error {
 	if tracker == nil {
 		return nil
 	}
+	metadata, tables := result.Metadata, result.Tables
 	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), executorProgressReadTimeout)
 	defer cancel()
 	snapshot, err := tracker.Progress(readCtx)
@@ -1002,10 +1008,36 @@ func executorProgressMetadata(ctx context.Context, tracker *progress.Tracker, me
 	if statement := sanitizeStatementText(snapshot.Detail.Statement); statement != "" {
 		metadata["statement"] = statement
 	}
+	if snapshot.Detail.Operation != "" {
+		metadata["operation"] = string(snapshot.Detail.Operation)
+	}
+	if snapshot.Detail.ServerPhase != "" {
+		metadata["server_phase"] = snapshot.Detail.ServerPhase
+	}
+	if snapshot.Detail.Attempt > 0 {
+		metadata["attempt"] = strconv.Itoa(snapshot.Detail.Attempt)
+	}
+	if work := snapshot.Detail.Work; work != nil {
+		setProgressCounter(metadata, "blocks_done", work.BlocksDone)
+		setProgressCounter(metadata, "blocks_total", work.BlocksTotal)
+		setProgressCounter(metadata, "tuples_done", work.TuplesDone)
+		setProgressCounter(metadata, "tuples_total", work.TuplesTotal)
+		setProgressCounter(metadata, "lockers_done", work.LockersDone)
+		setProgressCounter(metadata, "lockers_total", work.LockersTotal)
+		if work.BlocksTotal > 0 && len(tables) > 0 {
+			tables[0].Progress = ui.ClampPercent(int(float64(work.BlocksDone) / float64(work.BlocksTotal) * 100))
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("read pg-sprite executor progress: %w", err)
 	}
 	return nil
+}
+
+func setProgressCounter(metadata map[string]string, key string, value uint64) {
+	if value > 0 {
+		metadata[key] = strconv.FormatUint(value, 10)
+	}
 }
 
 // progressIdentity extracts the apply identity that keys engine progress.

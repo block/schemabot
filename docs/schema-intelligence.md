@@ -461,6 +461,10 @@ Table entries identify the DDL and task state. Available metrics depend on the
 engine and execution phase: copying can report rows and percent complete;
 `eta_seconds` is an estimate and may be omitted. Do not interpret an absent ETA
 as zero time remaining. Throttled tasks can include `throttle_reason`.
+PostgreSQL metadata can report the current operation, server phase, attempt,
+statement position, block and tuple counts, and completed and total lockers;
+fields without a reported value are omitted. A PostgreSQL index build with a
+block total derives its table percentage from completed blocks.
 Sharded engines can add per-shard progress, and multi-deployment applies list
 operations with their deployment, target, state, and cutover policy.
 
