@@ -37,6 +37,7 @@ func ValidateLocalConfig(cfg *api.ServerConfig) error {
 
 // LocalOptions controls the foreground host. Ready runs after storage and the
 // operator are initialized; its endpoint contains the actual allocated port.
+// RegisterConfig runs synchronously before Ready and before the operator starts.
 type LocalOptions struct {
 	Address        string
 	Token          string

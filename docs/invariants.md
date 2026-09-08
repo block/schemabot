@@ -1311,25 +1311,25 @@ command discovery and the unowned-command policy (`pkg/webhook/commands.go`).
 
 ### AZ-6: Local hosting preserves its boundaries
 
-The internal local host reserves a numeric loopback listener before storage bootstrap or
-operator startup. Every route, including probes, requires its private credential. Local hosting
-rejects service authentication configuration and GitHub Apps rather than silently changing their
-authorization behavior. Its credential identifies the runtime, not an independently approved human.
+The local host accepts only authenticated loopback traffic. It rejects service authentication
+and GitHub Apps rather than changing their authorization behavior. Its credential identifies
+the runtime, not an independently approved human.
 
-State storage must use an explicit connection and a different database name from each locally
-configured target in the same database family. This conservative name check does not establish
-isolation for dynamically resolved targets. Local hosting never opts into destructive storage
-bootstrap. *Enforced:* `pkg/serve/local.go`, `pkg/auth/local.go`, and
-`pkg/api/storage_isolation.go`; process recovery is covered in `integration/localruntime`.
+State storage must use an explicit connection and a different database name from each configured
+target in the same database family. This name check does not establish isolation for dynamically
+resolved targets. Local hosting never permits destructive storage bootstrap.
 
-Local registration preserves existing targets and durable storage configuration. It validates
-through the shared host guards. A running host serializes additive registrations, persists their
-declarations, and publishes an immutable database snapshot without replacing existing engine clients.
-Existing targets and server settings cannot be replaced through registration. New connection secrets
-remain in memory when declarations use secret references. Startup and stopped-host registration use
-the same lifetime lock; live updates require the signed control channel and an exact configuration
-revision. *Enforced:* `pkg/localsetup/register.go`, `pkg/localruntime/config.go`,
-`pkg/localruntime/host.go`, and `pkg/api/live_databases.go`.
+*Enforced:* `pkg/serve/local.go`, `pkg/auth/local.go`, and `pkg/api/storage_isolation.go`.
+
+### AZ-7: Local registration preserves existing work
+
+Adding a database or environment must preserve existing targets, server settings, durable state,
+and active applies. Every addition passes the local host's safety checks, and concurrent registrations
+must not overwrite one another. The running host must accept configuration changes before they are
+published. Secret references remain references on disk.
+
+*Enforced:* `pkg/localsetup/register.go`, `pkg/localruntime/config.go`,
+`pkg/localruntime/manager.go`, `pkg/localruntime/host.go`, and `pkg/api/live_databases.go`.
 
 ## Structural enforcement
 
