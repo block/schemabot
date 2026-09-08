@@ -845,14 +845,8 @@ classes exclude each other by one mechanism rather than by two that have to be k
 and a row can still be attributed by reading it. A reader's job is to report what is stored,
 including when what is stored is a task that has outlived its apply's verdict (UX-3).
 
-Retryable-apply expiry is the one other path that writes rows it holds no lease on, and it is
-bounded rather than excepted. It settles an apply whose retry budget or recovery freshness has run
-out, selected by `apply_id` under a `FOR UPDATE` on the parent, which serializes it against a driver
-claiming that *apply* and says nothing about one holding only an *operation* lease. Its task writes
-therefore read that operation lease. Its `apply_operations` write reads no lease and cannot: a
-skipped operation there would have no second writer, so gating it would strand the row rather than
-defer the write. That asymmetry is named here rather than left for a reader to discover, because an
-entry that overstates its own coverage is what makes the registry unreliable.
+Retryable-apply expiry writes task rows without holding a lease, and reads the row's operation
+lease before writing so that it excludes a live driver by that same mechanism.
 
 *Enforced:* lease predicates on the driver's apply and task writes
 (`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/applies.go`), the
