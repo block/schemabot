@@ -1,4 +1,4 @@
-//go:build !darwin && !linux && !windows && !freebsd && !openbsd && !netbsd && !dragonfly
+//go:build !darwin && !linux && !windows && !freebsd && !openbsd && !netbsd && !dragonfly && !solaris
 
 package client
 
