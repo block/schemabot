@@ -20,21 +20,22 @@ func TestIDTokenExpiryForGrants(t *testing.T) {
 			name, token, wantErr string
 			expiry               int64
 		}{
+			{name: "far future", token: testIDToken(`{"exp":253402300799}`), expiry: 253402300799},
 			{name: "shorter ID lifetime", token: testIDToken(fmt.Sprintf(`{"exp":%d}`, future)), expiry: future},
 			{name: "missing exp", token: testIDToken(`{}`), wantErr: "positive exp"},
 			{name: "null exp", token: testIDToken(`{"exp":null}`), wantErr: "positive exp"},
 			{name: "zero exp", token: testIDToken(`{"exp":0}`), wantErr: "positive exp"},
 			{name: "negative exp", token: testIDToken(`{"exp":-1}`), wantErr: "positive exp"},
-			{name: "local clock ahead of expiry", token: testIDToken(`{"exp":1}`), expiry: 1},
+			{name: "past expiry is accepted", token: testIDToken(`{"exp":1}`), expiry: 1},
 			{name: "string exp", token: testIDToken(`{"exp":"secret-value"}`), wantErr: "numeric exp"},
 			{name: "fractional exp", token: testIDToken(fmt.Sprintf(`{"exp":%d.5}`, future)), expiry: future},
 			{name: "decimal exp", token: testIDToken(fmt.Sprintf(`{"exp":%d.0}`, future)), expiry: future},
 			{name: "exponent exp", token: testIDToken(fmt.Sprintf(`{"exp":%de0}`, future)), expiry: future},
-			{name: "overflow", token: testIDToken(`{"exp":9223372036854775808}`), wantErr: "supported time range"},
+			{name: "integer conversion range", token: testIDToken(`{"exp":9223372036854775808}`), wantErr: "supported time range"},
 			{name: "invalid JSON", token: testIDToken(`{`), wantErr: "numeric exp"},
 			{name: "invalid encoding", token: "header.%%%.signature", wantErr: "base64url"},
-			{name: "numeric overflow", token: testIDToken(`{"exp":987654321e999}`), wantErr: "numeric exp"},
-			{name: "time overflow", token: testIDToken(`{"exp":9223371974719179008}`), wantErr: "supported time range"},
+			{name: "float parsing range", token: testIDToken(`{"exp":987654321e999}`), wantErr: "numeric exp"},
+			{name: "time representation range", token: testIDToken(`{"exp":9223371974719179008}`), wantErr: "supported time range"},
 			{name: "two segments", token: "header." + base64.RawURLEncoding.EncodeToString([]byte(`{"exp":1234}`)), wantErr: "three JWT segments"},
 			{name: "five segments", token: "a.b.c.d.e", wantErr: "three JWT segments"},
 			{name: "invalid JWT", token: "opaque-token", wantErr: "three JWT segments"},
@@ -223,13 +224,13 @@ func TestRefreshTokenRetention(t *testing.T) {
 	assert.Equal(t, f.refreshedIDExpiry, cfg.Profiles["default"].TokenExpiry)
 }
 
-// Bad cached expiry hints produce an actionable warning without contacting the
-// provider; explicit credentials and other endpoints bypass the cached token.
+// Without a refresh token, bad cached expiry hints produce an actionable warning.
+// Explicit credentials and other endpoints bypass the cached token.
 func TestCachedOIDCTokenBoundaries(t *testing.T) {
 	t.Setenv("SCHEMABOT_TOKEN", "")
 	t.Setenv("SCHEMABOT_ENDPOINT", "")
 	f := newFakeOIDC(t)
-	profile := Profile{Endpoint: "https://schemabot.example", Token: testIDToken(`{}`), TokenExpiry: 1, RefreshToken: "old-refresh", OIDC: &OIDCLogin{Issuer: f.issuer(), ClientID: "cli-client"}}
+	profile := Profile{Endpoint: "https://schemabot.example", Token: testIDToken(`{}`), TokenExpiry: 1, OIDC: &OIDCLogin{Issuer: f.issuer(), ClientID: "cli-client"}}
 	writeConfig(t, &Config{Profiles: map[string]Profile{"default": profile}}, 0o600)
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
@@ -249,4 +250,66 @@ func TestCachedOIDCTokenBoundaries(t *testing.T) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	assert.Zero(t, f.refreshCalls)
+}
+
+// A malformed cached ID token is repaired using the refresh grant, regardless
+// of the old stored expiry. A bad refresh response leaves the old cache intact.
+func TestMalformedCachedTokenRefresh(t *testing.T) {
+	for _, cached := range []int64{0, 1, 253402300799} {
+		for _, validRefresh := range []bool{true, false} {
+			t.Run(fmt.Sprintf("cached=%d/validRefresh=%t", cached, validRefresh), func(t *testing.T) {
+				t.Setenv("SCHEMABOT_TOKEN", "")
+				t.Setenv("SCHEMABOT_ENDPOINT", "")
+				f := newFakeOIDC(t)
+				if !validRefresh {
+					f.refreshedIDToken = testIDToken(`{}`)
+				}
+				profile := Profile{Endpoint: "https://schemabot.example", Token: testIDToken(`{}`), TokenExpiry: cached, RefreshToken: "old-refresh", OIDC: &OIDCLogin{Issuer: f.issuer(), ClientID: "cli-client"}}
+				writeConfig(t, &Config{Profiles: map[string]Profile{"default": profile}}, 0o600)
+				ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+				defer cancel()
+				token, err := ResolveBearerToken(ctx, "", "", "default")
+				if validRefresh {
+					require.NoError(t, err)
+					assert.Equal(t, f.refreshedIDToken, token)
+				} else {
+					require.ErrorContains(t, err, "could not refresh")
+					assert.Equal(t, profile.Token, token)
+				}
+				cfg, err := LoadConfig()
+				require.NoError(t, err)
+				if validRefresh {
+					assert.Equal(t, f.refreshedIDToken, cfg.Profiles["default"].Token)
+					assert.Equal(t, f.refreshedIDExpiry, cfg.Profiles["default"].TokenExpiry)
+					assert.Equal(t, f.refreshToken, cfg.Profiles["default"].RefreshToken)
+				} else {
+					assert.Equal(t, profile, cfg.Profiles["default"])
+				}
+				f.mu.Lock()
+				defer f.mu.Unlock()
+				assert.Equal(t, 1, f.refreshCalls)
+			})
+		}
+	}
+}
+
+// A newly issued token that is already past by the client clock must still be
+// returned and persisted, with a warning that diagnoses clock/provider timing.
+func TestRefreshedTokenPastLocalClock(t *testing.T) {
+	t.Setenv("SCHEMABOT_TOKEN", "")
+	t.Setenv("SCHEMABOT_ENDPOINT", "")
+	f := newFakeOIDC(t)
+	f.refreshedIDToken = testIDToken(`{"exp":1}`)
+	writeConfig(t, &Config{Profiles: map[string]Profile{"default": {Endpoint: "https://schemabot.example", Token: testIDToken(`{"exp":1}`), RefreshToken: "old-refresh", OIDC: &OIDCLogin{Issuer: f.issuer(), ClientID: "cli-client"}}}}, 0o600)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	token, err := ResolveBearerToken(ctx, "", "", "default")
+	require.ErrorContains(t, err, "check the local clock")
+	assert.Contains(t, err.Error(), "provider's ID token lifetime")
+	assert.Equal(t, f.refreshedIDToken, token)
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	assert.Equal(t, f.refreshedIDToken, cfg.Profiles["default"].Token)
+	assert.Equal(t, int64(1), cfg.Profiles["default"].TokenExpiry)
+	assert.Equal(t, f.refreshToken, cfg.Profiles["default"].RefreshToken)
 }

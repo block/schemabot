@@ -98,6 +98,7 @@ func TestResolveBearerToken(t *testing.T) {
 		tok, err := ResolveBearerToken(t.Context(), "", "", "")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "expired")
+		assert.Contains(t, err.Error(), "check the local clock")
 		assert.Equal(t, "stale-token", tok, "stale token is still returned so the command can run and re-login can fix it")
 	})
 }

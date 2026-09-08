@@ -1250,7 +1250,22 @@ A valid token clears the read tier. The write tier additionally requires the tok
 
 The browser login command caches the ID token as the bearer credential. Login and refresh use that token's `exp` claim for the cached `token_expiry`, independently of the access token's `expires_in`. Commands refresh within 60 seconds of the ID token expiry when a refresh token and OIDC settings are available. For OIDC profiles, commands read `exp` from the cached token on every load, so profiles saved by older versions automatically use the correct lifetime without another browser login.
 
-The ID token must have a positive numeric `exp` value in Unix seconds; fractional seconds and exponent notation are supported and truncated to whole seconds for refresh timing. Login or refresh returns an error for a missing, malformed, or out-of-range value; it never falls back to the access token's lifetime. A failed refresh preserves the existing cache and reports a warning. The CLI reads `exp` only to schedule renewal and does not reject login based on its local clock; the server still verifies every bearer token before granting access. Keep the client and server clocks synchronized: a fast client clock can refresh early, and a slow one can delay refresh until the server rejects the credential. Explicit `--token` and `SCHEMABOT_TOKEN` credentials are not refreshed automatically.
+The ID token must have a positive numeric `exp` value in Unix seconds; fractional seconds and exponent notation are supported and truncated to whole seconds for refresh timing. Login and refresh return an error for a missing, malformed, or out-of-range value; neither falls back to the access token's lifetime. An ordinary command that loads a malformed cached ID token attempts to repair the session using the refresh token. If no refresh token is available, or refresh fails, the command warns and preserves the existing cache. The CLI reads `exp` only to schedule renewal and does not reject login based on its local clock; the server still verifies every bearer token before granting access. Keep the client and server clocks synchronized: a fast client clock can cause a refresh and cache rewrite on every command, and a slow one can delay refresh until the server rejects the credential. When a refreshed token is already expired according to the client clock, the CLI saves the rotated session but warns to check the local clock and the provider's ID token lifetime. Explicit `--token` and `SCHEMABOT_TOKEN` credentials are not refreshed automatically.
+
+To enable automatic refresh, configure the profile's public-client settings in `~/.schemabot/config.yaml`:
+
+```yaml
+default_profile: default
+profiles:
+  default:
+    endpoint: "https://schemabot.example.com"
+    oidc:
+      issuer: "https://issuer.example.com"
+      client_id: "schemabot-cli"
+      redirect_port: 8765
+```
+
+The provider must register `http://127.0.0.1:8765/callback` as a redirect URI for that client and allow refresh tokens. Login flags override settings for that login attempt; they do not save the `oidc:` block. Keep the block configured for subsequent commands to refresh automatically.
 
 ### Forward-auth (authenticating proxy)
 
