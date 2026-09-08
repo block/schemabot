@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 
 	"github.com/block/pg-sprite/pkg/dbconn"
@@ -45,8 +46,9 @@ type Engine struct {
 	// accepting a second apply on the same target must not evict the first
 	// one's state while it is still running, or the running apply's driver
 	// would be told its work no longer exists.
-	progress       map[string]*trackedApply
-	tableSizeLimit int64
+	progress                   map[string]*trackedApply
+	tableSizeLimit             int64
+	concurrentIndexMaxDuration time.Duration
 
 	// execute is a test seam standing in for executeOptimistic, so the apply
 	// drive — accept, claim, execute, terminal publish — can be exercised
@@ -71,6 +73,9 @@ type trackedApply struct {
 // ceiling when the server does not configure one.
 const DefaultNativeSafeTableSizeLimitBytes = int64(1 << 30)
 
+// DefaultConcurrentIndexMaxDuration bounds one concurrent index build.
+const DefaultConcurrentIndexMaxDuration = 24 * time.Hour
+
 // New creates a new PostgreSQL engine.
 func New() *Engine {
 	return NewWithTableSizeLimit(DefaultNativeSafeTableSizeLimitBytes)
@@ -83,16 +88,24 @@ func New() *Engine {
 // the plan-time preflight check rejects a non-positive limit before apply,
 // and server config validation rejects it at startup.
 func NewWithTableSizeLimit(tableSizeLimit int64) *Engine {
+	return NewWithOptions(tableSizeLimit, DefaultConcurrentIndexMaxDuration)
+}
+
+// NewWithOptions creates a PostgreSQL engine with its process-wide apply bounds.
+func NewWithOptions(tableSizeLimit int64, concurrentIndexMaxDuration time.Duration) *Engine {
 	if tableSizeLimit == 0 {
 		tableSizeLimit = DefaultNativeSafeTableSizeLimitBytes
 	}
-	return &Engine{tableSizeLimit: tableSizeLimit}
+	if concurrentIndexMaxDuration == 0 {
+		concurrentIndexMaxDuration = DefaultConcurrentIndexMaxDuration
+	}
+	return &Engine{tableSizeLimit: tableSizeLimit, concurrentIndexMaxDuration: concurrentIndexMaxDuration}
 }
 
 // NewForTarget creates a PostgreSQL engine with the target information needed
 // by capabilities whose request does not carry resolved credentials.
-func NewForTarget(tableSizeLimit int64, database string, credentials *engine.Credentials) *Engine {
-	e := NewWithTableSizeLimit(tableSizeLimit)
+func NewForTarget(tableSizeLimit int64, concurrentIndexMaxDuration time.Duration, database string, credentials *engine.Credentials) *Engine {
+	e := NewWithOptions(tableSizeLimit, concurrentIndexMaxDuration)
 	e.pullDatabase = database
 	e.pullCredentials = credentials
 	return e

@@ -955,19 +955,20 @@ func TestRefusalForOutcomeTotalOverExecutorCodes(t *testing.T) {
 	}
 }
 
-// TestConcurrentIndexBudgetLeavesHeadroomUnderApplyCeiling pins the gap the
-// two bounds depend on: the server-side index budget must expire with at
-// least the named headroom to spare before the client-side ceiling cancels
-// the session, so an exhausted build surfaces as the typed budget verdict —
-// and its invalid-index catalog check still gets to run inside the ceiling —
-// rather than as an ambiguous external cancellation. Retuning either bound
-// without keeping the headroom fails here instead of in an apply.
-func TestConcurrentIndexBudgetLeavesHeadroomUnderApplyCeiling(t *testing.T) {
-	// A zero headroom would let the two bounds coincide and race, so the
-	// strict ordering is pinned on its own as well as through the gap.
+// TestBoundedStatementBudgetLeavesHeadroomUnderApplyCeiling pins the ordinary
+// statement budget below the fixed apply ceiling.
+func TestBoundedStatementBudgetLeavesHeadroomUnderApplyCeiling(t *testing.T) {
 	require.Positive(t, concurrentIndexHeadroom)
-	assert.Less(t, concurrentIndexBudget, optimisticApplyCeiling)
-	assert.GreaterOrEqual(t, optimisticApplyCeiling-concurrentIndexBudget, concurrentIndexHeadroom)
+	assert.GreaterOrEqual(t, optimisticApplyCeiling-optimisticStatementLimit, concurrentIndexHeadroom)
+}
+
+// TestConcurrentIndexEnvelopeLeavesVerdictHeadroom pins catalog verdict and
+// terminal classification time outside the caller-owned build bound.
+func TestConcurrentIndexEnvelopeLeavesVerdictHeadroom(t *testing.T) {
+	maxDuration := DefaultConcurrentIndexMaxDuration
+	ceiling := maxDuration + concurrentIndexHeadroom
+	require.Positive(t, concurrentIndexHeadroom)
+	assert.GreaterOrEqual(t, ceiling-maxDuration, concurrentIndexHeadroom)
 }
 
 // TestRetryPathFitsUnderApplyCeiling pins the other execution path against
@@ -1371,6 +1372,22 @@ func TestValidateOptimisticApplyAcceptsCreateSet(t *testing.T) {
 	change, err := validateOptimisticApply(req)
 	require.NoError(t, err)
 	assert.Equal(t, req.Changes[0].TableChanges[0].DDL, change.sql)
+	assert.False(t, change.concurrentIndex)
+}
+
+func TestValidateOptimisticApplyClassifiesConcurrentIndex(t *testing.T) {
+	req := &engine.ApplyRequest{
+		Database: "app",
+		Changes: []engine.SchemaChange{{Namespace: "public", TableChanges: []engine.TableChange{{
+			Table: "widgets",
+			DDL:   "CREATE INDEX CONCURRENTLY widgets_name_idx ON public.widgets (name)",
+		}}}},
+		Credentials: &engine.Credentials{DSN: "postgres://localhost/app"},
+	}
+
+	change, err := validateOptimisticApply(req)
+	require.NoError(t, err)
+	assert.True(t, change.concurrentIndex)
 }
 
 func TestValidateOptimisticApplyRefusesMixedCreateScript(t *testing.T) {

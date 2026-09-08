@@ -37,7 +37,7 @@ func TestEnginePullSchema(t *testing.T) {
 		CREATE TABLE app.events (id bigint PRIMARY KEY, message text NOT NULL)`)
 	require.NoError(t, err)
 
-	eng := NewForTarget(0, "pull_test", &engine.Credentials{DSN: dsn})
+	eng := NewForTarget(0, 0, "pull_test", &engine.Credentials{DSN: dsn})
 	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
 		Database: "pull_test", Type: "postgres", Environment: "test", Namespace: "app",
 	})
@@ -61,7 +61,7 @@ func TestEnginePullSchema(t *testing.T) {
 func TestEnginePullSchemaRejectsMissingSchema(t *testing.T) {
 	dsn, _ := testutil.StartPostgres(t, "pull_missing_test")
 
-	eng := NewForTarget(0, "pull_missing_test", &engine.Credentials{DSN: dsn})
+	eng := NewForTarget(0, 0, "pull_missing_test", &engine.Credentials{DSN: dsn})
 	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "missing"})
 
 	require.Error(t, err)
@@ -79,7 +79,7 @@ func TestEnginePullSchemaAggregatesUnrenderableTables(t *testing.T) {
 		CREATE UNLOGGED TABLE app.delivery_log (id bigint PRIMARY KEY)`)
 	require.NoError(t, err)
 
-	eng := NewForTarget(0, "pull_refusal_test", &engine.Credentials{DSN: dsn})
+	eng := NewForTarget(0, 0, "pull_refusal_test", &engine.Credentials{DSN: dsn})
 	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
 
 	require.Error(t, err)
@@ -101,7 +101,7 @@ func TestEnginePullSchemaRejectsUnmodeledTableObjects(t *testing.T) {
 		COMMENT ON TABLE app.accounts IS 'customer accounts'`)
 	require.NoError(t, err)
 
-	eng := NewForTarget(0, "pull_objects_test", &engine.Credentials{DSN: dsn})
+	eng := NewForTarget(0, 0, "pull_objects_test", &engine.Credentials{DSN: dsn})
 	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
 
 	require.Error(t, err)
@@ -121,7 +121,7 @@ func TestEnginePullSchemaRejectsTableInheritance(t *testing.T) {
 		CREATE TABLE app.child (detail text) INHERITS (app.parent)`)
 	require.NoError(t, err)
 
-	eng := NewForTarget(0, "pull_inheritance_test", &engine.Credentials{DSN: dsn})
+	eng := NewForTarget(0, 0, "pull_inheritance_test", &engine.Credentials{DSN: dsn})
 	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
 
 	require.Error(t, err)
@@ -141,7 +141,7 @@ func TestEnginePullSchemaDiscoversNonReservedSchemas(t *testing.T) {
 		CREATE TABLE shipping.parcels (id bigint PRIMARY KEY)`)
 	require.NoError(t, err)
 
-	eng := NewForTarget(0, "pull_discovery_test", &engine.Credentials{DSN: dsn})
+	eng := NewForTarget(0, 0, "pull_discovery_test", &engine.Credentials{DSN: dsn})
 	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{})
 
 	require.NoError(t, err)
@@ -163,7 +163,7 @@ func TestEnginePullSchemaExcludesPartitionChildren(t *testing.T) {
 		CREATE TABLE app.events_2026 PARTITION OF app.events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')`)
 	require.NoError(t, err)
 
-	eng := NewForTarget(0, "pull_partition_test", &engine.Credentials{DSN: dsn})
+	eng := NewForTarget(0, 0, "pull_partition_test", &engine.Credentials{DSN: dsn})
 	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
 
 	require.Error(t, err)
@@ -183,7 +183,7 @@ func TestEnginePullSchemaExcludesViews(t *testing.T) {
 		CREATE MATERIALIZED VIEW app.account_snapshot AS SELECT id FROM app.accounts`)
 	require.NoError(t, err)
 
-	eng := NewForTarget(0, "pull_views_test", &engine.Credentials{DSN: dsn})
+	eng := NewForTarget(0, 0, "pull_views_test", &engine.Credentials{DSN: dsn})
 	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
 
 	require.NoError(t, err)
@@ -200,7 +200,7 @@ func TestEnginePullSchemaReturnsCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	eng := NewForTarget(0, "pull_cancel_test", &engine.Credentials{DSN: dsn})
+	eng := NewForTarget(0, 0, "pull_cancel_test", &engine.Credentials{DSN: dsn})
 	response, err := eng.PullSchema(ctx, &ternv1.PullSchemaRequest{Namespace: "public"})
 
 	require.ErrorIs(t, err, context.Canceled)

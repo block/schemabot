@@ -75,6 +75,10 @@ conditions:
 - The target role passes the privilege preflight for the planned statement.
   A greenfield create is checked against the schema — the role needs `CREATE`
   on the target schema — because no table exists to state facts about.
+- A `CREATE INDEX CONCURRENTLY` build is caller-owned and bounded by
+  `postgres.concurrent_index_max_duration`, which defaults to 24 hours. Its
+  catalog verdict and terminal classification retain a separate headroom
+  after the build bound expires.
 
 The common supported case is a metadata-only `ALTER TABLE`, such as adding a
 nullable column:
@@ -293,13 +297,14 @@ change or that depend on the target:
   failure includes the provisioning `GRANT` derived by pg-sprite.
 - Exhausting the 30-second statement budget is a permanent native-safety
   refusal. Exhausting the lock budget is retryable after contention clears.
-- A concurrent index build runs under its own 4-minute budget. A build that
+- A concurrent index build runs under the caller-owned
+  `postgres.concurrent_index_max_duration` bound (24 hours by default). A build that
   finds an invalid index already under the requested name or quarantined on
   the table that pg-sprite proves abandoned — a failed build's leftover on
   the target table with no backend building it, one whose builder the engine
   role cannot observe, or quarantine debris an interrupted recovery left —
   recovers it inside the same apply: the proven entry is removed and the
-  index built, under one budget of the same length as a plain build. A build
+  index built under the same envelope as a plain build. A build
   that leaves an invalid index behind — including one cancelled by that
   budget — or finds one another backend is visibly still building fails as a
   retryable operational failure naming the index and the next step; the

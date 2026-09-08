@@ -4578,6 +4578,33 @@ postgres:
 	})
 }
 
+func TestPostgresConcurrentIndexMaxDuration(t *testing.T) {
+	t.Run("unset uses default", func(t *testing.T) {
+		assert.Equal(t, 24*time.Hour, (PostgresConfig{}).ConcurrentIndexMaxDurationOrDefault())
+	})
+
+	t.Run("configured duration", func(t *testing.T) {
+		cfg := PostgresConfig{ConcurrentIndexMaxDuration: "36h"}
+		require.NoError(t, cfg.validate())
+		assert.Equal(t, 36*time.Hour, cfg.ConcurrentIndexMaxDurationOrDefault())
+	})
+
+	for _, value := range []string{"0", "-1s"} {
+		t.Run("refuses "+value, func(t *testing.T) {
+			cfg := PostgresConfig{ConcurrentIndexMaxDuration: value}
+			err := cfg.validate()
+			require.ErrorContains(t, err, "postgres.concurrent_index_max_duration")
+			require.ErrorContains(t, err, "must be positive")
+		})
+	}
+
+	t.Run("refuses invalid duration", func(t *testing.T) {
+		cfg := PostgresConfig{ConcurrentIndexMaxDuration: "tomorrow"}
+		err := cfg.validate()
+		require.ErrorContains(t, err, "is not a valid duration")
+	})
+}
+
 // postgres.statement_timeout bounds ordinary storage queries. Unlike the pool
 // durations, zero is a meaningful setting rather than "use the default": it
 // disables the budget explicitly so the connection states that it has no

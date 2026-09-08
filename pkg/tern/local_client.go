@@ -139,6 +139,9 @@ type LocalConfig struct {
 	// for PostgreSQL native-safe execution. Zero uses the engine default.
 	PostgresNativeSafeTableSizeLimitBytes int64
 
+	// PostgresConcurrentIndexMaxDuration bounds one concurrent index build.
+	PostgresConcurrentIndexMaxDuration time.Duration
+
 	// Metadata holds engine-specific configuration as key-value pairs.
 	// The tern layer does not interpret these — it passes them through to the
 	// engine via Credentials.Metadata and reads specific keys as needed.
@@ -333,7 +336,7 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 			Settings:            spiritSettings,
 		}),
 		planetscaleEngine: psEngine,
-		postgresEngine: postgres.NewForTarget(cfg.PostgresNativeSafeTableSizeLimitBytes, cfg.Database, &engine.Credentials{
+		postgresEngine: postgres.NewForTarget(cfg.PostgresNativeSafeTableSizeLimitBytes, cfg.PostgresConcurrentIndexMaxDuration, cfg.Database, &engine.Credentials{
 			DSN:      cfg.TargetDSN,
 			Metadata: maps.Clone(cfg.Metadata),
 		}),
