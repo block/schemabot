@@ -92,6 +92,7 @@ func (m Manager) Ensure(ctx context.Context) (Connection, error) {
 	}
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
+	lastState := "starting"
 	for {
 		r, err := m.record()
 		if err == nil {
@@ -105,10 +106,11 @@ func (m Manager) Ensure(ctx context.Context) (Connection, error) {
 				}
 				var live Record
 				if err = m.call(ctx, r, string(token), http.MethodGet, "/identity", &live); err == nil {
+					lastState = live.State
 					if live.State == "ready" {
 						return Connection{Record: live, Token: string(token)}, nil
 					}
-					if live.State == "degraded" || live.State == "stopping" {
+					if live.State == "stopping" {
 						return Connection{}, fmt.Errorf("local runtime %s is %s; inspect its status and dependencies before retrying", r.ID, live.State)
 					}
 				}
@@ -126,7 +128,7 @@ func (m Manager) Ensure(ctx context.Context) (Connection, error) {
 		}
 		select {
 		case <-ctx.Done():
-			return Connection{}, fmt.Errorf("waiting for local runtime (startup remains accounted for; inspect its status): %w", ctx.Err())
+			return Connection{}, fmt.Errorf("waiting for local runtime (last state: %s; startup remains accounted for; inspect its status): %w", lastState, ctx.Err())
 		case <-ticker.C:
 		}
 	}

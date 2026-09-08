@@ -50,12 +50,13 @@ func TestMain(m *testing.M) {
 			if err != nil {
 				return err
 			}
+			var healthCalls atomic.Int32
 			server := &http.Server{ReadHeaderTimeout: time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Header.Get("Authorization") != "Bearer "+token {
 					w.WriteHeader(http.StatusUnauthorized)
 					return
 				}
-				if string(data) == "degraded" {
+				if string(data) == "degraded" || (string(data) == "warming" && healthCalls.Add(1) < 3) {
 					w.WriteHeader(http.StatusServiceUnavailable)
 					return
 				}
@@ -148,12 +149,14 @@ func TestRefusesMismatchAndDegraded(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 			}
-			original, err := manager.Status(ctx)
+			inspectCtx, cancelInspect := context.WithTimeout(t.Context(), testDeadline)
+			defer cancelInspect()
+			original, err := manager.Status(inspectCtx)
 			require.NoError(t, err)
 			require.NoError(t, os.WriteFile(filepath.Join(manager.Dir, "runtime.yaml"), []byte("changed"), 0600))
-			_, err = manager.Ensure(ctx)
+			_, err = manager.Ensure(inspectCtx)
 			require.ErrorContains(t, err, "different binary or configuration")
-			after, err := manager.Status(ctx)
+			after, err := manager.Status(inspectCtx)
 			require.NoError(t, err)
 			assert.Equal(t, original.Generation, after.Generation)
 			assert.Equal(t, config, after.State)
@@ -252,4 +255,16 @@ func TestRuntimeUsesOwnDirectory(t *testing.T) {
 	connection, err := manager.Ensure(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, "ready", connection.State)
+}
+
+func TestEnsureWaitsForTransientDegradation(t *testing.T) {
+	manager := testManager(t, "warming")
+	ctx, cancel := context.WithTimeout(t.Context(), testDeadline)
+	defer cancel()
+	connection, err := manager.Ensure(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "ready", connection.State)
+	status, err := manager.Status(ctx)
+	require.NoError(t, err)
+	require.Equal(t, connection.Generation, status.Generation)
 }
