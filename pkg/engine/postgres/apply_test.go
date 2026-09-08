@@ -114,6 +114,56 @@ func TestClassifyRefusal(t *testing.T) {
 			wantNotDetail: []string{"step 1 of 1"},
 		},
 		{
+			name: "create name mismatch names the relations and leaves the table standing",
+			err: fmt.Errorf("execute: %w", &executor.SequenceStepError{
+				Step: 1, Total: 3, Err: &executor.CreateNameMismatchError{
+					Schema: "public", Table: "users",
+					Missing:   []string{"users_pkey", "users_id_seq"},
+					Unclaimed: []string{"users_pkey1", "users_id_seq1"},
+				},
+			}),
+			wantReason: "create-name-mismatch",
+			wantDetail: []string{
+				`the CREATE TABLE for "users" committed`,
+				`"users_pkey", "users_id_seq"`,
+				`owns "users_pkey1", "users_id_seq1" instead`,
+				"step 1 of 3 failed",
+				createNameMismatchRemedy,
+			},
+			wantNotDetail: []string{"after the CREATE TABLE committed"},
+		},
+		{
+			name: "create name mismatch identifiers are sanitized for Markdown",
+			err: &executor.CreateNameMismatchError{
+				Schema: "public", Table: "users",
+				Missing:   []string{"users|pkey"},
+				Unclaimed: []string{"users\npkey1"},
+			},
+			wantReason:    "create-name-mismatch",
+			wantDetail:    []string{`"users/pkey"`, `"users\npkey1"`},
+			wantNotDetail: []string{"|", "\n"},
+		},
+		{
+			name:       "bare create name mismatch code still refuses",
+			err:        fmt.Errorf("execute: %w", executor.ErrCreateNameMismatch),
+			wantReason: "create-name-mismatch",
+			wantDetail: []string{`the CREATE TABLE for "users" committed`, "suffixed name", createNameMismatchRemedy},
+		},
+		{
+			name: "unverified create names refuse because a retry collides with the committed table",
+			err: fmt.Errorf("execute: %w", &executor.SequenceStepError{
+				Step: 1, Total: 2, Err: fmt.Errorf("%w: %w", executor.ErrCreateNamesUnverified, context.Canceled),
+			}),
+			wantReason: "create-names-unverified",
+			wantDetail: []string{
+				`the CREATE TABLE for "users" committed`,
+				"could not be read",
+				"step 1 of 2 failed",
+				"compare the table's constraint-index and sequence names against the schema file, then " + replanRemedy,
+			},
+			wantNotDetail: []string{context.Canceled.Error()},
+		},
+		{
 			name:       "invariant violation fails closed as a refusal",
 			err:        fmt.Errorf("execute: %w", executor.ErrInvariantViolation),
 			wantReason: "engine-invariant-violation",
@@ -934,6 +984,10 @@ func TestRefusalForOutcomeTotalOverExecutorCodes(t *testing.T) {
 		// policy, so re-running it unchanged would only spend the lease
 		// again.
 		executor.CodeBudgetStatementExceeded: "the statement budget is the native-safety lease",
+		// The CREATE TABLE committed before the names read failed, and
+		// SchemaBot's retry re-runs the whole plan rather than the read
+		// alone, so every retry collides with the table this apply created.
+		executor.CodeCreateNamesUnverified: "a retry re-runs the committed CREATE TABLE",
 	}
 	for _, code := range executor.Codes() {
 		t.Run(string(code), func(t *testing.T) {
