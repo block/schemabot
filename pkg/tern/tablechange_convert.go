@@ -29,14 +29,18 @@ import (
 // namespace (flat plan-level lists and per-namespace table sets).
 func storageTableChangeFromEngine(tc engine.TableChange, namespace string) storage.TableChange {
 	return storage.TableChange{
-		Namespace:     namespace,
-		Table:         tc.Table,
-		DDL:           tc.DDL,
-		Operation:     ddl.StatementTypeToOp(tc.Operation),
-		IsUnsafe:      tc.IsUnsafe,
-		UnsafeReason:  tc.UnsafeReason,
-		ExecutionMode: tc.ExecutionMode,
-		ModeReason:    tc.ModeReason,
+		Namespace:        namespace,
+		Table:            tc.Table,
+		DDL:              tc.DDL,
+		Operation:        ddl.StatementTypeToOp(tc.Operation),
+		IsUnsafe:         tc.IsUnsafe,
+		UnsafeReason:     tc.UnsafeReason,
+		ExecutionMode:    tc.ExecutionMode,
+		ModeReason:       tc.ModeReason,
+		EstimatedRows:    tc.EstimatedRows,
+		ShardCount:       tc.ShardCount,
+		LargestShardRows: tc.LargestShardRows,
+		EstimatedBytes:   tc.EstimatedBytes,
 	}
 }
 
@@ -44,14 +48,18 @@ func storageTableChangeFromEngine(tc engine.TableChange, namespace string) stora
 // wire form for plan responses.
 func protoTableChangeFromEngine(tc engine.TableChange, namespace string) *ternv1.TableChange {
 	return &ternv1.TableChange{
-		Namespace:     namespace,
-		TableName:     tc.Table,
-		Ddl:           tc.DDL,
-		ChangeType:    changeTypeToProto(tc.Operation),
-		IsUnsafe:      tc.IsUnsafe,
-		UnsafeReason:  tc.UnsafeReason,
-		ExecutionMode: tc.ExecutionMode,
-		ModeReason:    tc.ModeReason,
+		Namespace:        namespace,
+		TableName:        tc.Table,
+		Ddl:              tc.DDL,
+		ChangeType:       changeTypeToProto(tc.Operation),
+		IsUnsafe:         tc.IsUnsafe,
+		UnsafeReason:     tc.UnsafeReason,
+		ExecutionMode:    tc.ExecutionMode,
+		ModeReason:       tc.ModeReason,
+		EstimatedRows:    tc.EstimatedRows,
+		ShardCount:       int32(tc.ShardCount),
+		LargestShardRows: tc.LargestShardRows,
+		EstimatedBytes:   tc.EstimatedBytes,
 	}
 }
 
@@ -62,13 +70,17 @@ func protoTableChangeFromEngine(tc engine.TableChange, namespace string) *ternv1
 // advisory annotations are copied verbatim from the proto message.
 func StorageTableChangeFromProto(ch *ternv1.TableChange, namespace, table, ddlText, operation string) storage.TableChange {
 	return storage.TableChange{
-		Namespace:     namespace,
-		Table:         table,
-		DDL:           ddlText,
-		Operation:     operation,
-		IsUnsafe:      ch.IsUnsafe,
-		UnsafeReason:  ch.UnsafeReason,
-		ExecutionMode: ch.ExecutionMode,
-		ModeReason:    ch.ModeReason,
+		Namespace:        namespace,
+		Table:            table,
+		DDL:              ddlText,
+		Operation:        operation,
+		IsUnsafe:         ch.IsUnsafe,
+		UnsafeReason:     ch.UnsafeReason,
+		ExecutionMode:    ch.ExecutionMode,
+		ModeReason:       ch.ModeReason,
+		EstimatedRows:    ch.EstimatedRows,
+		ShardCount:       int(ch.ShardCount),
+		LargestShardRows: ch.LargestShardRows,
+		EstimatedBytes:   ch.EstimatedBytes,
 	}
 }

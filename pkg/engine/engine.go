@@ -445,6 +445,12 @@ type LintViolation struct {
 	Severity string // "warning" or "error"
 }
 
+// TableSizeProbeTimeout bounds the plan-time table-size statistics probe.
+// Size estimates are display-only, so a probe that cannot answer within this
+// budget is abandoned and the plan proceeds without sizes — a slow or wedged
+// statistics read must never extend plan latency past this bound.
+const TableSizeProbeTimeout = 5 * time.Second
+
 // TableChange describes a change to a single table within a SchemaChange namespace.
 type TableChange struct {
 	Table     string // Table name
@@ -464,6 +470,30 @@ type TableChange struct {
 	// *can* run but the operator must acknowledge.
 	ExecutionMode string
 	ModeReason    string // Engine's reason for any non-empty ExecutionMode verdict
+
+	// EstimatedRows is the approximate number of rows in the table at plan
+	// time, for display only. Sourced from engine statistics, which may be
+	// stale — never an exact count and never a gate input. An engine that
+	// aggregates a sharded target itself reports the sum across shards; an
+	// engine that emits one SchemaChange per shard reports each shard's own
+	// estimate and the core sums them into the namespace-level view. Nil when
+	// no estimate is available (e.g. the table is being created, or statistics
+	// could not be read).
+	EstimatedRows *int64
+	// EstimatedBytes is the table's approximate on-disk footprint (data plus
+	// indexes) at plan time, for display only. Same sourcing, aggregation, and
+	// nil semantics as EstimatedRows.
+	EstimatedBytes *int64
+	// ShardCount is the number of shards this table change spans. Zero means
+	// there is no shard count to render: the target is not sharded, or its
+	// shard topology could not be read. The two are indistinguishable here, so
+	// a renderer must omit the shard count on zero rather than assert the
+	// table is unsharded.
+	ShardCount int
+	// LargestShardRows is the approximate row count of the largest single
+	// shard, the biggest chunk a shard-at-a-time apply works through at once.
+	// Nil when the target is not sharded or no estimate is available.
+	LargestShardRows *int64
 }
 
 // Execution-mode verdicts recorded on a planned table change. The verdict

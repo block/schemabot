@@ -264,6 +264,12 @@ func tableChangeResponseFromStorage(change storage.TableChange) *apitypes.TableC
 		UnsafeReason:  change.UnsafeReason,
 		ExecutionMode: change.ExecutionMode,
 		ModeReason:    change.ModeReason,
+		// The size estimates persist with the plan, so the stored-plan view
+		// reports the same sizes a freshly planned response does.
+		EstimatedRows:    change.EstimatedRows,
+		ShardCount:       change.ShardCount,
+		LargestShardRows: change.LargestShardRows,
+		EstimatedBytes:   change.EstimatedBytes,
 	}
 }
 

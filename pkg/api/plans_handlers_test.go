@@ -230,6 +230,51 @@ func TestPlanGetHandler(t *testing.T) {
 	assert.Equal(t, "carts", resp.Plan.Shards[0].Changes[0].TableName)
 }
 
+// A stored plan's per-table size estimates survive the read path, so a plan
+// fetched later reports the same sizes as the response that planned it.
+func TestPlanGetHandlerCarriesStoredSizeEstimates(t *testing.T) {
+	rows, largest, sizeBytes := int64(13_100_000), int64(3_400_000), int64(6_200_000_000)
+	plan := &storage.Plan{
+		PlanIdentifier: "plan-sized",
+		Database:       "commerce",
+		DatabaseType:   storage.DatabaseTypeVitess,
+		Environment:    "production",
+		CreatedAt:      time.Now().UTC().Truncate(time.Second),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {Tables: []storage.TableChange{{
+				Table:            "carts",
+				DDL:              "ALTER TABLE `carts` ADD INDEX `idx_note`(`note`);",
+				Operation:        "alter",
+				EstimatedRows:    &rows,
+				LargestShardRows: &largest,
+				EstimatedBytes:   &sizeBytes,
+				ShardCount:       4,
+			}}},
+		},
+	}
+	mux := newPlansTestServer(t, &mockPlanLookupStore{plan: plan})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/plans/plan-sized", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp apitypes.StoredPlanResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+
+	require.NotNil(t, resp.Plan)
+	require.Len(t, resp.Plan.Changes, 1)
+	require.Len(t, resp.Plan.Changes[0].TableChanges, 1)
+	change := resp.Plan.Changes[0].TableChanges[0]
+	require.NotNil(t, change.EstimatedRows)
+	assert.Equal(t, rows, *change.EstimatedRows)
+	require.NotNil(t, change.LargestShardRows)
+	assert.Equal(t, largest, *change.LargestShardRows)
+	require.NotNil(t, change.EstimatedBytes)
+	assert.Equal(t, sizeBytes, *change.EstimatedBytes)
+	assert.Equal(t, 4, change.ShardCount)
+}
+
 // TestPlanGetHandlerDistinguishesMissingFromStorageError verifies the two
 // failure modes stay separate: an unknown plan identifier is a 404, while a
 // storage failure is a 500 and never reads as "plan not found".
