@@ -18,6 +18,10 @@
 > use and is disabled by default. Server operators must explicitly enable
 > [`experimental-strata-enabled`](configuration.md#experimental-integrations).
 
+**Using Vitess or PlanetScale?** SchemaBot’s [Vitess engine](engines.md) provides
+a first-class integration with PlanetScale, so you can manage schema changes
+through the same PR workflow.
+
 Strata is a database type for schema changes that span many MySQL shards behind
 a shared topology. It is declared with `type: strata` and executed remotely by
 Tern over gRPC: SchemaBot sends the plan and apply requests and tracks the
