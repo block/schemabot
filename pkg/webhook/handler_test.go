@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -1230,4 +1231,29 @@ func TestGoSafeOmitsEmptyDeliveryIDFromPanicLog(t *testing.T) {
 	logged := logBuf.String()
 	assert.Contains(t, logged, "goroutine panic")
 	assert.NotContains(t, logged, "delivery_id=")
+}
+
+// Setup comments offer experimental types only when the server opts in.
+func TestSchemaErrorGuidanceUsesServerStrataSetting(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprint(enabled), func(t *testing.T) {
+			client, mux := setupGitHubServer(t)
+			comments := make(chan string, 1)
+			mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+			installClient := ghclient.NewInstallationClient(client, testLogger())
+			h := &Handler{
+				service:   api.New(nil, &api.ServerConfig{ExperimentalStrataEnabled: enabled}, nil, testLogger()),
+				ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+				logger:    testLogger(),
+			}
+			for _, requestErr := range []error{ghclient.ErrNoConfig, ghclient.ErrInvalidConfig} {
+				h.handleSchemaRequestError("octocat/hello-world", 1, 12345, "staging", "", "hubot", "plan", requestErr, false)
+				body := requireComment(t, comments, "setup guidance")
+				assert.Contains(t, body, "`mysql`")
+				assert.Contains(t, body, "`postgres`")
+				assert.Contains(t, body, "`vitess`")
+				assert.Equal(t, enabled, strings.Contains(body, "`strata` (experimental)"))
+			}
+		})
+	}
 }

@@ -11,6 +11,9 @@ import (
 
 // SchemaErrorData contains data for rendering schema request error comments.
 type SchemaErrorData struct {
+	// ExperimentalStrataEnabled is set only from the server configuration.
+	ExperimentalStrataEnabled bool
+
 	// RequestedBy is the GitHub login that issued the command. Empty means the
 	// command was system-triggered (an auto-plan from a pull request update).
 	RequestedBy string
@@ -31,6 +34,14 @@ type SchemaErrorData struct {
 	CommandName        string // "plan" or "apply"
 	ErrorDetail        string
 	AvailableDatabases string
+}
+
+// DatabaseTypeOptions lists supported setup types, with Strata behind server opt-in.
+func (d SchemaErrorData) DatabaseTypeOptions() string {
+	if d.ExperimentalStrataEnabled {
+		return "`mysql`, `postgres`, `vitess`, or `strata` (experimental)"
+	}
+	return "`mysql`, `postgres`, or `vitess`"
 }
 
 // EnvironmentHeader renders the environment header segment: the single
@@ -100,7 +111,7 @@ type: mysql
 ` + "```" + `
 
 - **database** (required): The database name
-- **type** (required): ` + "`vitess`" + ` or ` + "`mysql`" + ``
+- **type** (required): {{.DatabaseTypeOptions}}`
 
 const noConfigNoDatabaseTemplate = "## " + glyph.Info + ` No SchemaBot Configuration Found
 
@@ -117,6 +128,8 @@ Create a ` + "`schemabot.yaml`" + ` file in your schema directory:
 database: your-database-name
 type: mysql
 ` + "```" + `
+
+` + "`type`" + `: {{.DatabaseTypeOptions}}
 
 ### If you already have a config
 Use the ` + "`-d`" + ` flag to specify which database to {{.CommandName}}:
@@ -139,7 +152,9 @@ Create a ` + "`schemabot.yaml`" + ` file in your schema directory:
 ` + "```yaml" + `
 database: {{.DatabaseName}}
 type: mysql
-` + "```" + ``
+` + "```" + `
+
+` + "`type`" + `: {{.DatabaseTypeOptions}}`
 
 const configOutsideAllowedDirsTemplate = "## " + glyph.Attention + ` SchemaBot Configuration Not Authorized
 

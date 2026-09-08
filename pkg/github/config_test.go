@@ -291,7 +291,9 @@ func TestFetchConfigInvalidTypeReportsDeclaredSpelling(t *testing.T) {
 	_, err := ic.FetchConfig(t.Context(), "octocat/hello-world", "schema/schemabot.yaml", "abc123")
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "got 'SQLite'")
+	assert.Contains(t, err.Error(), "unknown type 'SQLite'")
+	assert.Contains(t, err.Error(), "server registration")
+	assert.NotContains(t, err.Error(), "strata")
 }
 
 // TestFindConfigsForPRFilesProbesEachDirectoryOnce exercises discovery for a
