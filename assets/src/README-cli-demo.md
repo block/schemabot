@@ -1,11 +1,11 @@
 # CLI guide animations
 
 These GIFs illustrate three operator workflows using fictional data passed
-through the production Go templates in `pkg/cmd/internal/templates`:
+through the production Go templates and interactive `commands.WatchModel`:
 
-- `cli-plan-apply.gif`: inspect an index plan and follow an apply to completion
-- `cli-fleet.gif`: list changes across databases, inspect one apply, and list plans
-- `cli-cutover.gif`: see a throttle reason, finish copying, defer the swap, and cut over
+- `cli-plan-apply.gif`: inspect an index plan, confirm with yes, and follow an apply to completion
+- `cli-fleet.gif`: list changes, attach to the live watcher, detach with Esc, and list plans
+- `cli-cutover.gif`: see a throttle reason, finish copying, defer the swap, and press Enter to cut over
 
 They are template-based illustrations, not recordings of a live database.
 Commands are typed by the renderer, long operations are compressed, and the
@@ -20,8 +20,12 @@ From the repository root, generate the output with the current templates:
 go run ./pkg/cmd/docdemo/main.go > assets/src/cli-demo.json
 ```
 
-The generator writes a JSON array of scenarios to that file. It makes no
-network requests and does not connect to a database. The Go file has an
+The generator writes a JSON array of scenarios to that file. It uses a
+loopback-only HTTP fixture to feed typed progress responses through
+the real API client and interactive model. It does not connect to a database
+or an external service. The fixture verifies the Enter, Esc, and stop handlers,
+including the target of control requests and disabled controls during cutover.
+The apply confirmation text comes from the command source. The Go file has an
 `ignore` build tag so it is only compiled when explicitly run.
 
 With Playwright, its Chromium browser (or local Chrome), and ImageMagick

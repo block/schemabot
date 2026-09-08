@@ -361,13 +361,7 @@ same underlying change.
 
 ```console
 $ schemabot progress apply-example-73
-┌──────────────────────────────────┐
-│  Apply ID:     apply-example-73  │
-│  Database:     shop              │
-│  Environment:  staging           │
-│  State:        Running           │
-└──────────────────────────────────┘
-
+⣾ Running...
 
   ── shop ──
 
@@ -375,11 +369,17 @@ $ schemabot progress apply-example-73
        ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
        • Rows: 6,000,000 / 10,000,000 · ETA: 8m 0s
        • ℹ️ Throttled: Replication lag exceeds the configured limit
+
+
+
+ESC detach • s stop
 ```
 
 The live view refreshes until completion or a state that needs your decision.
 It includes rows copied, ETA when available, and the reason for throttling.
-Detaching from the watch does not cancel the apply.
+Press **Esc** to detach while copying; the apply keeps running. **s** requests
+a stop for this MySQL example. At deferred cutover, **Enter** requests the
+swap. During cutover, the watcher asks you to wait and disables Esc/stop.
 
 ### Wait for the right moment to swap
 

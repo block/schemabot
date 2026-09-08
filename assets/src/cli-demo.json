@@ -12,32 +12,56 @@
       {
         "seconds": 2,
         "command": "schemabot apply -s ./schema -e staging",
-        "caption": "After you confirm, follow the apply",
-        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 10.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 1,000,000 / 10,000,000 · ETA: 18m 0s\n\n"
+        "caption": "Review the plan and type yes to confirm",
+        "output": "╭─────────────────────────────────────────────╮\n│  MySQL Schema Change Apply                  │\n│                                             │\n│  Database: shop                             │\n│  Schema name: schema                        │\n╰─────────────────────────────────────────────╯\n\n\u001b[1mStaging\u001b[0m\n     ~ orders\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n📋 Plan: 1 table to alter\n\n\nDo you want to apply these changes? Only 'yes' will be accepted: ▌"
+      },
+      {
+        "seconds": 0.3,
+        "command": "",
+        "caption": "",
+        "output": "╭─────────────────────────────────────────────╮\n│  MySQL Schema Change Apply                  │\n│                                             │\n│  Database: shop                             │\n│  Schema name: schema                        │\n╰─────────────────────────────────────────────╯\n\n\u001b[1mStaging\u001b[0m\n     ~ orders\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n📋 Plan: 1 table to alter\n\n\nDo you want to apply these changes? Only 'yes' will be accepted: y▌"
+      },
+      {
+        "seconds": 0.3,
+        "command": "",
+        "caption": "",
+        "output": "╭─────────────────────────────────────────────╮\n│  MySQL Schema Change Apply                  │\n│                                             │\n│  Database: shop                             │\n│  Schema name: schema                        │\n╰─────────────────────────────────────────────╯\n\n\u001b[1mStaging\u001b[0m\n     ~ orders\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n📋 Plan: 1 table to alter\n\n\nDo you want to apply these changes? Only 'yes' will be accepted: ye▌"
+      },
+      {
+        "seconds": 0.8,
+        "command": "",
+        "caption": "",
+        "output": "╭─────────────────────────────────────────────╮\n│  MySQL Schema Change Apply                  │\n│                                             │\n│  Database: shop                             │\n│  Schema name: schema                        │\n╰─────────────────────────────────────────────╯\n\n\u001b[1mStaging\u001b[0m\n     ~ orders\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n📋 Plan: 1 table to alter\n\n\nDo you want to apply these changes? Only 'yes' will be accepted: yes"
+      },
+      {
+        "seconds": 2,
+        "command": "",
+        "caption": "After confirming, follow the apply",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 10.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 1,000,000 / 10,000,000 · ETA: 18m 0s\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
       },
       {
         "seconds": 1,
         "command": "",
         "caption": "",
-        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 3,500,000 / 10,000,000 · ETA: 13m 0s\n\n"
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 3,500,000 / 10,000,000 · ETA: 13m 0s\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
       },
       {
         "seconds": 1,
         "command": "",
         "caption": "",
-        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜ 65.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 6,500,000 / 10,000,000 · ETA: 7m 0s\n\n"
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜ 65.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 6,500,000 / 10,000,000 · ETA: 7m 0s\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
       },
       {
         "seconds": 1,
         "command": "",
         "caption": "",
-        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜ 90.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 9,000,000 / 10,000,000 · ETA: 2m 0s\n\n"
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜ 90.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 9,000,000 / 10,000,000 · ETA: 2m 0s\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
       },
       {
         "seconds": 4,
         "command": "",
         "caption": "The change is complete",
-        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[32mCompleted       \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n"
+        "output": "\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered. Apply ID: apply-example-73\n"
       }
     ]
   },
@@ -58,9 +82,21 @@
         "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 6,000,000 / 10,000,000 · ETA: 8m 0s\n\n"
       },
       {
+        "seconds": 3,
+        "command": "schemabot progress apply-example-73",
+        "caption": "Attach to live progress; ESC detaches",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 6,000,000 / 10,000,000 · ETA: 8m 0s\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
+      },
+      {
+        "seconds": 2,
+        "command": "",
+        "caption": "Press ESC to detach; the apply keeps running",
+        "output": "\nDetached from progress view.\nThe schema change continues running in the background.\n\nTo reattach: schemabot progress apply-example-73\nTo stop:     schemabot stop -e staging apply-example-73\n"
+      },
+      {
         "seconds": 5,
         "command": "schemabot list-plans -e staging",
-        "caption": "Find the plans behind the work",
+        "caption": "After pressing ESC, find recent plans",
         "output": "\u001b[1mRecent plans\u001b[0m\n\n  \u001b[2mPLAN ID          DATABASE  ENV      CHANGES   CREATED         SOURCE\u001b[0m\n  plan-example-42  shop      staging  1 alter   10 minutes ago  acme/store#42\n  plan-example-41  billing   staging  1 create  1 hour ago      acme/billing#18\n  plan-example-40  catalog   staging  1 alter   2 hours ago     acme/store#40\n"
       }
     ]
@@ -73,73 +109,73 @@
         "seconds": 3,
         "command": "schemabot progress apply-example-73",
         "caption": "Follow an apply started with --defer-cutover",
-        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 20.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 2,000,000 / 10,000,000 · ETA: 16m 0s\n\n"
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 20.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 2,000,000 / 10,000,000 · ETA: 16m 0s\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
       },
       {
         "seconds": 0.7,
         "command": "",
         "caption": "",
-        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 3,500,000 / 10,000,000 · ETA: 13m 0s\n\n"
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 3,500,000 / 10,000,000 · ETA: 13m 0s\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
       },
       {
         "seconds": 0.7,
         "command": "",
         "caption": "",
-        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 50.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 5,000,000 / 10,000,000 · ETA: 10m 0s\n\n"
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 50.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 5,000,000 / 10,000,000 · ETA: 10m 0s\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
       },
       {
         "seconds": 0.7,
         "command": "",
         "caption": "",
-        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 6,000,000 / 10,000,000 · ETA: 8m 0s\n\n"
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 6,000,000 / 10,000,000 · ETA: 8m 0s\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
       },
       {
         "seconds": 3,
         "command": "",
         "caption": "See why copying has slowed",
-        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 6,000,000 / 10,000,000 · ETA: 8m 0s\n       • \u001b[2mℹ️ Throttled: Replication lag exceeds the configured limit\u001b[0m\n\n"
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 6,000,000 / 10,000,000 · ETA: 8m 0s\n       • \u001b[2mℹ️ Throttled: Replication lag exceeds the configured limit\u001b[0m\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
       },
       {
         "seconds": 0.7,
         "command": "",
         "caption": "Copying resumes as conditions improve",
-        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 70.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 7,000,000 / 10,000,000 · ETA: 6m 0s\n\n"
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 70.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 7,000,000 / 10,000,000 · ETA: 6m 0s\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
       },
       {
         "seconds": 0.7,
         "command": "",
         "caption": "Copying resumes as conditions improve",
-        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 80.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 8,000,000 / 10,000,000 · ETA: 4m 0s\n\n"
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 80.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 8,000,000 / 10,000,000 · ETA: 4m 0s\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
       },
       {
         "seconds": 0.7,
         "command": "",
         "caption": "Copying resumes as conditions improve",
-        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜ 90.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 9,000,000 / 10,000,000 · ETA: 2m 0s\n\n"
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜ 90.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 9,000,000 / 10,000,000 · ETA: 2m 0s\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
       },
       {
         "seconds": 0.7,
         "command": "",
         "caption": "Copying resumes as conditions improve",
-        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 100.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 10,000,000 / 10,000,000\n\n"
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 100.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 10,000,000 / 10,000,000\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
       },
       {
         "seconds": 3,
         "command": "",
         "caption": "Copy complete; wait for the final swap",
-        "output": "┌─────────────────────────────────────┐\n│  Apply ID:     apply-example-73     │\n│  Database:     shop                 │\n│  Environment:  staging              │\n│  State:        \u001b[33mWaiting for cutover\u001b[0m  │\n└─────────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n"
+        "output": "\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\nRow copy complete. All data has been copied and new writes\ncontinue to be replicated to keep the shadow table in sync.\n\nPress Enter to proceed with cutover (or ESC to detach)\n"
       },
       {
         "seconds": 2,
-        "command": "schemabot cutover -e staging apply-example-73",
-        "caption": "Request the final swap when ready",
-        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mCutting over    \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Cutting over...\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n"
+        "command": "",
+        "caption": "Press Enter to request the final swap",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mCutover triggered, waiting for completion...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\n\u001b[2mCutover in progress - please wait...\u001b[0m\n"
       },
       {
         "seconds": 4,
-        "command": "schemabot status apply-example-73",
-        "caption": "Verify that the apply completed",
-        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[32mCompleted       \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n"
+        "command": "",
+        "caption": "The watcher confirms completion",
+        "output": "\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered. Apply ID: apply-example-73\n"
       }
     ]
   }
