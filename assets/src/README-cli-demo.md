@@ -4,7 +4,7 @@ These GIFs illustrate five operator workflows using fictional data passed
 through the production Go templates and interactive `commands.WatchModel`:
 
 - `cli-plan-apply.gif`: inspect an index plan, confirm with yes, and follow an apply to completion
-- `cli-ops.gif`: move from fleet status to a MySQL change, watch throttling and copying, detach, and follow logs through completion
+- `cli-ops.gif`: move from fleet status to one change’s details, then follow engine logs through throttling, checksum, and cutover
 - `cli-fleet.gif`: list changes, attach to the live watcher, detach with Esc, and list plans
 - `cli-cutover.gif`: see a throttle reason, finish copying, defer the swap, and press Enter to cut over
 - `cli-vitess.gif`: create a deploy request, deploy with Enter, follow four shards, and close the revert window
@@ -52,4 +52,4 @@ to refresh only that GIF. The PlanetScale fixture checks Enter against start
 and skip-revert requests, and checks that **c** sends the stop request used
 by the PlanetScale engine to cancel the deploy request.
 
-The operations animation runs `LogsCmd` against a loopback logs response, including its real follow prompt and colored formatter. The fixture cancels after the initial window; no external logs are fetched. Log messages match the queue and derived-state events in the server.
+The operations animation runs `LogsCmd` against a loopback logs response, including its real follow prompt and colored formatter. The fixture cancels after the initial window; no external logs are fetched. Log messages match the queue event, Spirit runner output, and replica throttler. Selected batches arrive at compressed intervals, with the most recent 14 terminal lines kept in view as the tail scrolls.

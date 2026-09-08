@@ -353,15 +353,38 @@ func applyPrompt() string {
 
 // followLogView uses the actual logs command, API client, and colored formatter.
 // Cancel after the initial fetch so each selected tail view is deterministic.
-func followLogView(completed bool) string {
+func followLogView(count int) string {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	entries := []*apitypes.LogEntry{
-		{ID: 1, ApplyID: "apply-example-73", Level: "info", Message: "Apply queued: apply-example-73", CreatedAt: time.Date(2026, 1, 15, 14, 20, 0, 0, time.UTC)},
-		{ID: 2, ApplyID: "apply-example-73", Level: "info", Message: fmt.Sprintf("Apply state derived from its 1 operation row(s): %s", state.Apply.Running), OldState: state.Apply.Pending, NewState: state.Apply.Running, CreatedAt: time.Date(2026, 1, 15, 14, 20, 5, 0, time.UTC)},
+	// Messages come from the Spirit runner and replica throttler, also checked
+	// against the disposable MySQL CLI run. Only demo IDs and times are synthetic.
+	messages := []struct{ level, message string }{
+		{"info", "Apply queued: apply-example-73"},
+		{"info", "[orders] Starting spirit migration"},
+		{"info", "[orders] acquired advisory lock"},
+		{"info", "[orders] preserved AUTO_INCREMENT value"},
+		{"info", "[orders] create BinlogSyncer"},
+		{"info", "[orders] begin to sync binlog from position"},
+		{"info", "[orders] Connected to server"},
+		{"info", "[orders] scaled write workers up"},
+		{"info", "[orders] scaled read workers up"},
+		{"warn", "[orders] replication delayed, throttling in progress"},
+		{"info", "[orders] approaching the end of the table, synchronously updating statistics"},
+		{"info", "[orders] copy rows complete"},
+		{"info", "[orders] Running ANALYZE TABLE"},
+		{"info", "[orders] starting checksum operation, this will require a table lock"},
+		{"warn", "[orders] table lock(s) acquired"},
+		{"info", "[orders] table unlocked, starting checksum"},
+		{"info", "[orders] checksum passed"},
+		{"warn", "[orders] Attempting final cut over operation"},
+		{"warn", "[orders] final cut over operation complete"},
+		{"info", "[_orders_old] successfully dropped old table"},
+		{"info", "[orders] apply complete"},
+		{"info", "[orders] releasing advisory locks"},
 	}
-	if completed {
-		entries = append(entries, &apitypes.LogEntry{ID: 3, ApplyID: "apply-example-73", Level: "info", Message: fmt.Sprintf("Apply state derived from its 1 operation row(s): %s", state.Apply.Completed), OldState: state.Apply.Running, NewState: state.Apply.Completed, CreatedAt: time.Date(2026, 1, 15, 14, 35, 0, 0, time.UTC)})
+	entries := make([]*apitypes.LogEntry, 0, count)
+	for i, entry := range messages[:count] {
+		entries = append(entries, &apitypes.LogEntry{ID: int64(i + 1), ApplyID: "apply-example-73", Level: entry.level, Message: entry.message, CreatedAt: time.Date(2026, 1, 15, 14, 20+i/2, i%2*15, 0, time.UTC)})
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/api/logs" || r.URL.Query().Get("apply_id") != "apply-example-73" || r.URL.Query().Get("limit") != "50" {
@@ -374,12 +397,18 @@ func followLogView(completed bool) string {
 		cancel()
 	}))
 	defer server.Close()
-	return capture(func() {
+	output := capture(func() {
 		cmd := commands.LogsCmd{ApplyIDArg: "apply-example-73", Limit: 50, Follow: true}
 		if err := cmd.Run(ctx, &commands.Globals{Endpoint: server.URL}); err != nil {
 			panic(err)
 		}
 	})
+	// Keep the most recent terminal lines in view as the tail scrolls.
+	lines := strings.Split(strings.TrimRight(output, "\n"), "\n")
+	if len(lines) > 14 {
+		lines = lines[len(lines)-14:]
+	}
+	return strings.Join(lines, "\n") + "\n"
 }
 
 func main() {
@@ -446,14 +475,15 @@ func main() {
 	demos = append(demos, Demo{Name: "cli-cutover", Title: "Know when to wait. Choose when to swap.", Frames: frames})
 	demos = append(demos, vitessDemo())
 	demos = append(demos, Demo{Name: "cli-ops", Title: "From the fleet to one change.", Frames: []Frame{
-		{4, "schemabot status -e staging", "Find a running change across your databases", status},
-		{3, "schemabot status apply-example-73", "Inspect one change", progress(60, state.Apply.Running, true)},
-		{3, "schemabot progress apply-example-73", "See why copying has slowed", live(60, state.Apply.Running, true, "")},
-		{1.2, "", "Copying resumes as conditions improve", live(80, state.Apply.Running, false, "")},
-		{1.5, "", "Row copy reaches 100%", live(100, state.Apply.Running, false, "")},
-		{1.5, "", "Press ESC to detach; the change keeps running", live(100, state.Apply.Running, false, "esc")},
-		{3, "schemabot logs apply-example-73 -f", "Follow the change in its logs", followLogView(false)},
-		{4, "", "A new log entry confirms completion", followLogView(true)},
+		{2, "schemabot status -e staging", "Find a change across your databases", status},
+		{2, "schemabot status apply-example-73", "Inspect its SQL and current state", progress(60, state.Apply.Running, false)},
+		{1, "schemabot logs apply-example-73 -f", "Follow the engine logs as they arrive", followLogView(5)},
+		{0.6, "", "", followLogView(9)},
+		{0.9, "", "See why copying slows down", followLogView(10)},
+		{0.6, "", "Copying finishes; verification begins", followLogView(14)},
+		{0.6, "", "", followLogView(17)},
+		{0.6, "", "Follow the final cutover", followLogView(20)},
+		{2.5, "", "The engine confirms completion", followLogView(22)},
 	}})
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
