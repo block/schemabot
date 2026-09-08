@@ -20,6 +20,18 @@ server. The table keeps all of its data and can be restored with a single
 `RENAME TABLE` until a background cleaner permanently drops it after the
 retention period (7 days by default).
 
+**Pending drops is opt-in and off by default.** With no `pending_drops` block,
+`DROP TABLE` executes as written and the table is gone, recoverable only from
+the target's own backups.
+
+Enable it only on a deployment whose cleaner can reach the targets it executes
+against. The quarantine and the cleaner are two halves of one feature: the
+quarantine writes tables into `_pending_drops` on the target server, and only
+the cleaner removes them. A deployment that quarantines without reaping leaves
+tables on its targets that nothing will ever delete, which costs the target
+owner disk indefinitely and is worse than the direct drop it replaced. See
+[Cleanup coordination](#cleanup-coordination) for which deployments can reap.
+
 Pending drops applies to MySQL databases executed by the Spirit engine. Vitess
 online DDL has its own native table lifecycle that holds dropped tables before
 purging them, so the PlanetScale engine does not need a SchemaBot-side
@@ -54,6 +66,23 @@ plan: DROP TABLE `users`   RENAME TABLE `app`.`users`
    drops quarantined tables whose timestamp prefix is older than the retention
    period. Tables whose names do not carry a valid timestamp prefix are never
    auto-dropped, because their age is unknown.
+
+**Cancelling a schema change quarantines its copy too.** A cancelled change
+leaves a shadow table holding every row copied so far, and — if it had already
+cut over — the original table it swapped out. Both hold data the change may
+have spent days producing, so both go through the same quarantine as a table an
+operator deleted from a schema file, under the same retention. The metadata
+describing where the copy had got to (the checkpoint tables and the deferred
+cutover sentinel) is dropped outright, because a checkpoint whose shadow table
+is gone describes a copy that no longer exists.
+
+The operational consequence is the one below: **cancelling no longer frees disk
+immediately.** Before the quarantine, cancelling dropped the shadow table and
+returned its space. Now the copy survives until retention expires, and the
+quarantine rename is metadata-only — it does not release the tablespace. An
+operator cancelling a change *because the target is running out of disk* must
+drop the quarantined copy by hand to get the space back, exactly as they would
+to reclaim space from a quarantined `DROP TABLE`.
 
 ## Recovering a dropped table
 
@@ -97,17 +126,21 @@ pass; one bad target never blocks cleanup for the others.
 
 ```yaml
 pending_drops:
-  enabled: true          # default: true
+  enabled: true          # default: false (the quarantine is opt-in)
   cleanup_enabled: true  # default: true when enabled is true
   retention: 168h        # default: 168h (7 days)
   dry_run: false         # default: false
 ```
 
+`enabled: true` is the whole opt-in: it turns on both the quarantine and this
+process's cleaner. Leaving the block out entirely executes `DROP TABLE`
+directly.
+
 Set `cleanup_enabled: false` on frequently redeployed executors when a stable
 operator deployment owns cleanup. Quarantine remains active as long as
-`enabled` is true. Set `dry_run: true` to keep quarantine active while making
-the cleaner log the expired tables it would drop without permanently dropping
-them.
+`enabled` is true, so use this only when another deployment reaps the same
+targets. Set `dry_run: true` to keep quarantine active while making the cleaner
+log the expired tables it would drop without permanently dropping them.
 
 See [Configuration](configuration.md#pending-drops) for field semantics.
 
@@ -115,6 +148,7 @@ See [Configuration](configuration.md#pending-drops) for field semantics.
 
 | Signal | Meaning |
 | --- | --- |
+| `schemabot.drop_table.already_absent_total` | DROP TABLE targets that were already absent when the apply reached them, by database and environment. Expected after a stopped apply resumes, because the DROP phase replays from its first statement. Outside that, the schema files and the target have diverged. |
 | `schemabot.pending_drops.tables_moved_total` | Tables quarantined instead of dropped, by database and environment. |
 | `schemabot.pending_drops.cleanup_dropped_total` | Expired quarantined tables permanently dropped by the cleaner. |
 | `schemabot.pending_drops.cleanup_skipped_total` | Quarantined tables skipped because their names carry no valid timestamp prefix. A sustained nonzero rate means tables are accumulating that an operator must inspect and remove manually. |
@@ -124,6 +158,19 @@ See [Configuration](configuration.md#pending-drops) for field semantics.
 The apply log for a schema change that drops a table records the quarantine
 database and table name, so operators can locate the table for recovery without
 querying `information_schema`.
+
+### Why a process is not reaping
+
+A process that quarantines without reaping is what leaves tables on a target
+forever, so each way the cleaner can decline to start logs its own line at
+startup, naming the consequence:
+
+| Startup log says | Meaning |
+| --- | --- |
+| the quarantine is disabled | Expected. `DROP TABLE` executes as written. Note that disabling the quarantine disables its cleaner too, so tables quarantined before it was turned off stay on the target until someone removes them. |
+| no local MySQL database targets are configured | Expected for a control plane. Every target is routed to the deployment that executes against it and reaps it. The line carries `routed_mysql_targets`, which separates this from a process with no MySQL topology at all. |
+| cleanup is disabled for this process | Safe only while another deployment reaps the same targets. |
+| retention is invalid | Config bug. Logged at error, and blocks reaping until it is fixed. |
 
 ## Limitations
 
@@ -138,5 +185,8 @@ querying `information_schema`.
   until an operator removes the referencing constraints. Plans that drop a
   parent table should drop the referencing tables or constraints in the same
   change.
-- **Disk space**: quarantined tables keep their data, so dropping a large table
-  does not free space until the retention period expires.
+- **Disk space**: quarantined tables keep their data, so neither dropping a
+  large table nor cancelling a schema change part-way through copying one frees
+  space until the retention period expires. The quarantine rename is
+  metadata-only and does not release the tablespace. Reclaiming the space
+  sooner means dropping the quarantined table by hand.

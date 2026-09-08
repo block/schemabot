@@ -22,7 +22,17 @@ E2E_TEST_TIMEOUT ?= 10m
 E2E_TEST_FLAGS ?=
 E2E_GRPC_MD_RUN ?= TestGRPCMultiDeploy
 
-.PHONY: help lint lint-fix setup test test-unit test-e2e test-e2e-grpc test-e2e-grpc-multideploy test-e2e-k8s test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
+# Disable Buildx Bake: Compose delegates `up --build` and `compose build` to a
+# bake subprocess that can lose its stdio pipe (docker/compose#13243), failing
+# the build with `read |0: file already closed`. Every image composed here is
+# COPY-only over prebuilt binaries, so the classic builder costs nothing.
+# Exported so it reaches every compose recipe in this file — e2e, dev and demo
+# targets alike. Scripts invoked directly (not via make) carry their own
+# export. Drop this once that issue is fixed upstream and the flake stops
+# reproducing on CI runners.
+export COMPOSE_BAKE := false
+
+.PHONY: help lint lint-fix setup docs-toc check-docs-toc docs-assets templates check-templates check-terminology test test-unit test-consumer-module test-e2e test-e2e-grpc test-e2e-grpc-multideploy test-e2e-k8s test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
 
 # Multi-line message definitions
 define HELP_HEADER
@@ -129,6 +139,8 @@ help: ## Show this help message
 lint: check-closeandlog check-webhookheaders ## Run all linters (golangci-lint + custom analyzers)
 	@echo "Running golangci-lint..."
 	@docker run --rm -v $$(pwd):/app -w /app golangci/golangci-lint:latest golangci-lint run --timeout=5m
+	@echo "Running golangci-lint (consumer module)..."
+	@docker run --rm -v $$(pwd):/app -w /app/e2e/consumermodule golangci/golangci-lint:latest golangci-lint run --timeout=5m
 
 check-closeandlog: ## Run closeandlog analyzer (flags _ = x.Close() patterns)
 	@echo "Running closeandlog analyzer..."
@@ -152,8 +164,27 @@ clean: ## Clean build artifacts
 	@rm -rf bin/
 	@rm -f coverage.out
 
-docs-toc: ## Regenerate the Table of Contents in docs/*.md
+docs-toc: ## Refresh the Table of Contents in docs files that have TOC markers
 	@python3 scripts/gen-doc-toc.py
+
+check-docs-toc: ## Fail if a Table of Contents behind TOC markers is stale
+	@python3 -B -m unittest discover -s scripts -p 'test_gen_doc_toc.py'
+	@python3 scripts/gen-doc-toc.py --check
+
+docs-assets: templates ## Re-render the PR mock-ups and animations the docs embed (needs gh, Chrome, ImageMagick, Node.js/Playwright)
+	@python3 scripts/prepare-pr-demo.py
+	@python3 scripts/render-pr-mockups.py --prepared
+	@bash scripts/render-pr-demo.sh
+	@python3 scripts/render-animation.py assets/src/pipeline-never-waits.html assets/pipeline-never-waits.gif
+
+templates: build ## Regenerate TEMPLATES.md from the current binary
+	@scripts/update-templates.sh
+
+check-templates: build ## Fail if TEMPLATES.md is stale
+	@scripts/update-templates.sh --check
+
+check-terminology: ## Fail if "schema change" appears hyphenated in prose
+	@scripts/check-terminology.sh
 
 # Generate protobuf code (only if .proto is newer than generated .pb.go)
 proto: ## Generate protobuf code
@@ -387,7 +418,8 @@ test-e2e-grpc: build ## Run gRPC e2e tests in isolated environment
 		fi; \
 		if [ $$i -eq 90 ]; then \
 			echo "Timeout waiting for SchemaBot gRPC e2e environment"; \
-			$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml logs; \
+			mkdir -p e2e-logs; \
+			$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml logs --no-color --timestamps 2>&1 | tee e2e-logs/grpc-containers.log; \
 			$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml down -v; \
 			exit 1; \
 		fi; \
@@ -401,6 +433,11 @@ test-e2e-grpc: build ## Run gRPC e2e tests in isolated environment
 	E2E_TERN_PRODUCTION_MYSQL_DSN="root:testpassword@tcp(localhost:15373)/testapp" \
 	$(GOTEST) -count=1 -v -tags=e2e -timeout=10m ./e2e/grpc/... ; \
 	TEST_EXIT_CODE=$$?; \
+	if [ $$TEST_EXIT_CODE -ne 0 ]; then \
+		echo "Capturing gRPC e2e container logs before teardown..."; \
+		mkdir -p e2e-logs; \
+		$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml logs --no-color --timestamps > e2e-logs/grpc-containers.log 2>&1 || true; \
+	fi; \
 	echo "Tearing down gRPC e2e environment..."; \
 	$(E2E_GRPC_ENV) docker compose -p schemabot-e2e-grpc -f deploy/local/docker-compose.grpc.yml down -v; \
 	exit $$TEST_EXIT_CODE
@@ -438,7 +475,8 @@ test-e2e-grpc-multideploy: build ## Run multi-deployment fan-out gRPC e2e fixtur
 		if [ $$i -eq 90 ]; then \
 			echo "Timeout waiting for multi-deployment SchemaBot gRPC e2e environment"; \
 			echo "(expected until the server supports deployments maps with more than one entry)"; \
-			$(E2E_GRPC_MD_ENV) docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml logs; \
+			mkdir -p e2e-logs; \
+			$(E2E_GRPC_MD_ENV) docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml logs --no-color --timestamps 2>&1 | tee e2e-logs/grpc-multideploy-containers.log; \
 			$(E2E_GRPC_MD_ENV) docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml down -v; \
 			exit 1; \
 		fi; \
@@ -453,6 +491,11 @@ test-e2e-grpc-multideploy: build ## Run multi-deployment fan-out gRPC e2e fixtur
 	E2E_TERN_US_MYSQL_DSN="root:testpassword@tcp(localhost:15373)/testapp" \
 	$(GOTEST) -count=1 -v -tags=e2e -timeout=10m -run '$(E2E_GRPC_MD_RUN)' ./e2e/grpc/... ; \
 	TEST_EXIT_CODE=$$?; \
+	if [ $$TEST_EXIT_CODE -ne 0 ]; then \
+		echo "Capturing multi-deployment gRPC e2e container logs before teardown..."; \
+		mkdir -p e2e-logs; \
+		$(E2E_GRPC_MD_ENV) docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml logs --no-color --timestamps > e2e-logs/grpc-multideploy-containers.log 2>&1 || true; \
+	fi; \
 	echo "Tearing down multi-deployment gRPC e2e environment..."; \
 	$(E2E_GRPC_MD_ENV) docker compose -p schemabot-e2e-grpc-md -f deploy/local/docker-compose.grpc-multideploy.yml down -v; \
 	exit $$TEST_EXIT_CODE
@@ -569,11 +612,18 @@ cli: build ## Install schemabot CLI to /usr/local/bin
 	cp bin/schemabot /usr/local/bin/schemabot
 
 # Run all tests (unit with race detection + integration + e2e)
-test: proto test-unit test-integration test-e2e ## Run all tests
+test: proto test-unit test-consumer-module test-integration test-e2e ## Run all tests
 
 # Run unit tests only (with race detection, no testcontainers)
 test-unit: ## Run unit tests with race detection
 	$(GOTEST) -race ./...
+
+# Verify schemabot's startup surface from a consumer module that pins a newer
+# OpenTelemetry SDK than this repo. Host binaries embedding schemabot resolve
+# their own dependency versions, so this catches conflicts (such as semconv
+# schema URL mismatches) that cannot reproduce inside this module.
+test-consumer-module: ## Run consumer-module startup tests
+	cd e2e/consumermodule && $(GOTEST) -race ./...
 
 # Run integration tests (uses testcontainers for MySQL)
 # Note: -race is omitted because Spirit (upstream) has known data races in

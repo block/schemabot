@@ -10,13 +10,14 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/go-connections/nat"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/network"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -110,8 +111,8 @@ connectors:
 			FileMode:          0o444,
 		}},
 		HostConfigModifier: func(hc *container.HostConfig) {
-			hc.PortBindings = nat.PortMap{
-				"5556/tcp": []nat.PortBinding{{HostIP: "127.0.0.1", HostPort: fmt.Sprintf("%d", hostPort)}},
+			hc.PortBindings = network.PortMap{
+				network.MustParsePort("5556/tcp"): {{HostIP: netip.MustParseAddr("127.0.0.1"), HostPort: fmt.Sprintf("%d", hostPort)}},
 			}
 		},
 		WaitingFor: wait.ForHTTP("/dex/.well-known/openid-configuration").

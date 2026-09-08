@@ -1,6 +1,7 @@
 package api
 
 import (
+	"cmp"
 	"encoding/json"
 	"net/http"
 )
@@ -71,6 +72,12 @@ func (s *Service) handleSettingsSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Settings are deployment-wide, so there is no database to scope a grant
+	// to: admin-only.
+	if !s.authorizeDirectAdminWrite(w, r, "settings_set") {
+		return
+	}
+
 	err := s.storage.Settings().Set(r.Context(), req.Key, req.Value)
 	if err != nil {
 		s.logger.Error("set setting failed", "key", req.Key, "error", err)
@@ -79,7 +86,7 @@ func (s *Service) handleSettingsSet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.logger.Info("setting updated", "key", req.Key, "value", req.Value,
-		"caller", controlOperationCaller(resolveCaller(r.Context(), "")))
+		"caller", cmp.Or(resolveCaller(r.Context(), ""), "unknown"))
 
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"key":   req.Key,

@@ -48,7 +48,7 @@ func FormatShardProgress(shards []ShardProgress) string {
 	const maxCopyingShown = 5
 
 	// Always show failed shards (they need attention). Limit other non-copying
-	// shards to avoid a wall of identical "ready for cutover" lines.
+	// shards to avoid a wall of identical "waiting for cutover" lines.
 	const maxNonCopyingShown = 3
 	for _, s := range shards {
 		if s.Status == state.Task.Failed {
@@ -71,7 +71,7 @@ func FormatShardProgress(shards []ShardProgress) string {
 		}
 	}
 	if waitingCount > maxNonCopyingShown {
-		fmt.Fprintf(&b, indentShardMore+"%s... %d more ready for cutover%s\n",
+		fmt.Fprintf(&b, indentShardMore+"%s... %d more waiting for cutover%s\n",
 			ANSIDim, waitingCount-maxNonCopyingShown, ANSIReset)
 	}
 	if cuttingCount > maxNonCopyingShown {
@@ -121,18 +121,14 @@ func formatShardLine(s ShardProgress) string {
 	case state.Task.Completed:
 		return fmt.Sprintf(indentShardLine+"%s✓ %s%s: %s rows\n", ANSIGreen, s.Shard, ANSIReset, ui.FormatNumber(s.RowsTotal))
 	case state.Task.Running:
-		pct := s.PercentComplete
-		if pct == 0 && s.RowsTotal > 0 {
-			pct = int(s.RowsCopied * 100 / s.RowsTotal)
-		}
-		pct = ui.RowCopyDisplayPercent(pct, s.RowsCopied)
-		detail := fmt.Sprintf("%d%% (%s/%s rows)", pct, ui.FormatNumber(ui.ClampRows(s.RowsCopied, s.RowsTotal)), ui.FormatNumber(s.RowsTotal))
+		detail := fmt.Sprintf("%s (%s/%s rows)", ui.FormatRowCopyPercent(s.PercentComplete, s.RowsCopied, s.RowsTotal),
+			ui.FormatNumber(ui.ClampRows(s.RowsCopied, s.RowsTotal)), ui.FormatNumber(s.RowsTotal))
 		if s.ETASeconds > 0 {
 			detail += fmt.Sprintf(" ETA %s", FormatDurationSeconds(s.ETASeconds))
 		}
 		return fmt.Sprintf(indentShardLine+"%s◉ %s%s: %s\n", ANSICyan, s.Shard, ANSIReset, detail)
 	case state.Task.WaitingForCutover:
-		return fmt.Sprintf(indentShardLine+"%s● %s%s: ready for cutover\n", ANSIYellow, s.Shard, ANSIReset)
+		return fmt.Sprintf(indentShardLine+"%s● %s%s: waiting for cutover\n", ANSIYellow, s.Shard, ANSIReset)
 	case state.Task.CuttingOver:
 		return fmt.Sprintf(indentShardLine+"%s● %s%s: cutting over\n", ANSIYellow, s.Shard, ANSIReset)
 	case state.Task.Pending:
@@ -176,7 +172,7 @@ func FormatShardSummaryParts(c ShardCounts, compact bool) []string {
 		parts = append(parts, fmt.Sprintf("%d complete", c.Complete))
 	}
 	if c.WaitingForCutover > 0 {
-		parts = append(parts, fmt.Sprintf("%d ready for cutover", c.WaitingForCutover))
+		parts = append(parts, fmt.Sprintf("%d waiting for cutover", c.WaitingForCutover))
 	}
 	if c.CuttingOver > 0 {
 		parts = append(parts, fmt.Sprintf("%d cutting over", c.CuttingOver))

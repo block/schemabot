@@ -29,7 +29,7 @@ env:
 
 jobs:
   # See test.yaml for the rationale of this docs-only skip pattern.
-  # On PRs that touch only docs/**, the chart lint and Docker build are
+  # On PRs that touch only markdown, the chart lint and Docker build are
   # skipped. Pushes to main and tags always build (so latest/tagged images
   # are published regardless of the diff content).
   changes:
@@ -46,11 +46,19 @@ jobs:
         continue-on-error: true
         uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # dorny/paths-filter@v3.0.3
         with:
+          # The action's default quantifier ORs the patterns, and '**'
+          # matches every file, so without 'every' this filter reports
+          # code=true on every PR and the docs-only skip never fires.
+          # 'every' ANDs them: skip only Markdown, the docs TOC manifest,
+          # and documentation images. Keep image exclusions scoped to docs/
+          # and assets/ so scripts and Go files there still count as code.
+          predicate-quantifier: 'every'
           filters: |
             code:
               - '**'
               - '!**/*.md'
-              - '!docs/**'
+              - '!docs/.toc-manifest'
+              - '!{docs,assets}/**/*.{svg,png,jpg,jpeg,gif,webp,ico}'
       - name: "Resolve code-change flag"
         id: out
         shell: bash
@@ -109,7 +117,7 @@ jobs:
   build-and-push:
     needs: changes
     runs-on: ubuntu-latest
-    # Skip on PRs that touch only docs/**. Pushes (main and tags) always run
+    # Skip on PRs that touch only markdown. Pushes (main and tags) always run
     # so latest and tagged images are published regardless of diff content.
     if: >-
       github.repository == 'block/schemabot' &&

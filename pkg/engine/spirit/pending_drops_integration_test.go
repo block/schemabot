@@ -62,7 +62,7 @@ func runDDLApply(t *testing.T, eng *Engine, dsn string, ddlStatements []string) 
 	}
 	eng.mu.Unlock()
 
-	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false)
+	eng.executeSchemaChange(t.Context(), host, username, password, database, ddlStatements, false, directPolicy{})
 
 	eng.mu.Lock()
 	defer eng.mu.Unlock()
@@ -254,4 +254,128 @@ func TestEngine_ExecuteSchemaChange_DropTemporaryTableExecutesDirectly(t *testin
 
 	quarantined := listQuarantinedTables(t, db)
 	assert.Empty(t, quarantined, "temporary tables must not create quarantine entries")
+}
+
+// The DROP phase re-runs from its first statement whenever an apply resumes,
+// so on a deployment that drops tables outright the phase must tolerate the
+// tables an earlier attempt already dropped and still drop the ones that
+// remain, rather than failing the apply on the first absent table.
+func TestEngine_ExecuteSchemaChange_DirectDropSkipsAlreadyAbsentTables(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	for _, name := range []string{"resumed_first", "resumed_second"} {
+		_, err := db.ExecContext(t.Context(),
+			fmt.Sprintf("CREATE TABLE `%s` (id INT PRIMARY KEY AUTO_INCREMENT)", name))
+		require.NoError(t, err, "create table %s", name)
+	}
+
+	// Stand in for the earlier attempt: the first table is already dropped
+	// when the phase restarts from the top.
+	_, err := db.ExecContext(t.Context(), "DROP TABLE `resumed_first`")
+	require.NoError(t, err, "pre-drop resumed_first")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger, DisablePendingDrops: true})
+
+	state := runDDLApply(t, eng, dsn, []string{
+		"DROP TABLE `resumed_first`",
+		"DROP TABLE `resumed_second`",
+	})
+	assert.Equal(t, engine.StateCompleted, state)
+
+	var count int
+	err = db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'testdb' AND table_name = 'resumed_second'").Scan(&count)
+	require.NoError(t, err)
+	assert.Equal(t, 0, count, "the statement after the absent table must still run")
+
+	quarantined := listQuarantinedTables(t, db)
+	assert.Empty(t, quarantined, "the direct path must not quarantine anything")
+}
+
+// A multi-table DROP on the direct path drops the tables that are still there
+// and leaves the already-absent ones alone, so a stop partway through a
+// multi-table statement still converges on the planned end state.
+func TestEngine_ExecuteSchemaChange_DirectDropMultiTablePartiallyAbsent(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	_, err := db.ExecContext(t.Context(),
+		"CREATE TABLE `partial_present` (id INT PRIMARY KEY AUTO_INCREMENT)")
+	require.NoError(t, err, "create table")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger, DisablePendingDrops: true})
+
+	state := runDDLApply(t, eng, dsn, []string{"DROP TABLE `partial_absent`, `partial_present`"})
+	assert.Equal(t, engine.StateCompleted, state)
+
+	var count int
+	err = db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'testdb' AND table_name = 'partial_present'").Scan(&count)
+	require.NoError(t, err)
+	assert.Equal(t, 0, count, "the table that was still present must be dropped")
+}
+
+// The direct path forwards drops that carry no base-table data or that already
+// tolerate a missing target: views, temporary tables, and an explicit IF
+// EXISTS. Each must execute as written rather than going through the existence
+// check, which only understands base tables.
+func TestEngine_ExecuteSchemaChange_DirectDropForwardsBypassedStatements(t *testing.T) {
+	tests := []struct {
+		name   string
+		setup  string
+		ddl    string
+		absent string
+	}{
+		{
+			name:   "view",
+			setup:  "CREATE VIEW `direct_view` AS SELECT 1 AS one",
+			ddl:    "DROP VIEW `direct_view`",
+			absent: "direct_view",
+		},
+		{
+			name:   "if exists on a present table",
+			setup:  "CREATE TABLE `direct_if_exists` (id INT PRIMARY KEY AUTO_INCREMENT)",
+			ddl:    "DROP TABLE IF EXISTS `direct_if_exists`",
+			absent: "direct_if_exists",
+		},
+		{
+			name:   "if exists on a missing table",
+			ddl:    "DROP TABLE IF EXISTS `direct_never_existed`",
+			absent: "direct_never_existed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dsn, db := setupTestMySQL(t)
+			cleanupTables(t, db)
+			cleanupPendingDropsDB(t, db)
+
+			if tt.setup != "" {
+				_, err := db.ExecContext(t.Context(), tt.setup)
+				require.NoError(t, err, "setup")
+			}
+
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			eng := New(Config{Logger: logger, DisablePendingDrops: true})
+
+			state := runDDLApply(t, eng, dsn, []string{tt.ddl})
+			assert.Equal(t, engine.StateCompleted, state)
+
+			var count int
+			err := db.QueryRowContext(t.Context(),
+				"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'testdb' AND table_name = ?",
+				tt.absent).Scan(&count)
+			require.NoError(t, err)
+			assert.Equal(t, 0, count, "%s should not exist in testdb", tt.absent)
+
+			quarantined := listQuarantinedTables(t, db)
+			assert.Empty(t, quarantined, "the direct path must not quarantine anything")
+		})
+	}
 }

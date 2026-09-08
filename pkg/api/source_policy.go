@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"path"
 	"strings"
+
+	"github.com/block/schemabot/pkg/storage"
 )
 
 const (
@@ -217,9 +219,11 @@ func validateAllowedRepos(field string, repos []string) error {
 }
 
 func repoAllowed(allowedRepos []string, repo string) bool {
-	repo = strings.TrimSpace(repo)
+	repo = storage.CanonicalKey(strings.TrimSpace(repo))
 	for _, allowed := range allowedRepos {
-		switch strings.TrimSpace(allowed) {
+		// Entries loaded through config are already canonical; folding here
+		// too keeps the match correct for allow-lists built any other way.
+		switch storage.CanonicalKey(strings.TrimSpace(allowed)) {
 		case "*":
 			return true
 		case repo:

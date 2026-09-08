@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -60,9 +61,24 @@ func (s *Service) handleLockAcquire(w http.ResponseWriter, r *http.Request) {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
+	req.Database = storage.CanonicalKey(req.Database)
+	req.DatabaseType = storage.CanonicalKey(req.DatabaseType)
+	req.Repository = storage.CanonicalKey(req.Repository)
+	// The owner is a match token: release and conditional-release compare it
+	// byte-exact against the stored value, so both sides must fold or a
+	// mixed-case spelling (a CLI owner embedding a mixed-case hostname)
+	// could acquire a lock it can never release.
+	req.Owner = storage.CanonicalKey(req.Owner)
 
 	if req.Database == "" || req.DatabaseType == "" || req.Owner == "" {
 		s.writeError(w, http.StatusBadRequest, "database, database_type, and owner are required")
+		return
+	}
+
+	// A named lock is an operator control on the database itself (holding
+	// applies off), in the same family as stop/cancel, so a database's
+	// operator grant covers it. Locks have no environment dimension.
+	if !s.authorizeDirectDatabaseWrite(w, r, "lock_acquire", req.Database) {
 		return
 	}
 
@@ -121,9 +137,26 @@ func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 		s.writeBodyDecodeError(w, err)
 		return
 	}
+	req.Database = storage.CanonicalKey(req.Database)
+	req.DatabaseType = storage.CanonicalKey(req.DatabaseType)
+	// Folded to match the folded spelling stored at acquire; see
+	// handleLockAcquire.
+	req.Owner = storage.CanonicalKey(req.Owner)
 
 	if req.Database == "" || req.DatabaseType == "" {
 		s.writeError(w, http.StatusBadRequest, "database and database_type are required")
+		return
+	}
+
+	// Force release bypasses the lock ownership check, so it is an
+	// administrative override rather than an operator control on the caller's
+	// own database: a database operator grant does not cover it. Normal
+	// release keeps the ownership check, so the operator grant applies.
+	if req.Force {
+		if !s.authorizeDirectForceLockRelease(w, r, req.Database) {
+			return
+		}
+	} else if !s.authorizeDirectDatabaseWrite(w, r, "lock_release", req.Database) {
 		return
 	}
 
@@ -163,7 +196,7 @@ func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 	}
 	if errors.Is(err, storage.ErrLockNotOwned) {
 		metrics.RecordLockOperation(ctx, "release", req.Database, "not_owned")
-		s.writeError(w, http.StatusForbidden, "lock is not owned by you")
+		s.writeErrorCode(w, http.StatusForbidden, apitypes.ErrCodeLockNotOwned, "lock is not owned by you")
 		return
 	}
 	if err != nil {
@@ -179,8 +212,8 @@ func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 
 // handleLockGet handles GET /api/locks/{database}/{dbtype}.
 func (s *Service) handleLockGet(w http.ResponseWriter, r *http.Request) {
-	database := r.PathValue("database")
-	dbType := r.PathValue("dbtype")
+	database := storage.CanonicalKey(r.PathValue("database"))
+	dbType := storage.CanonicalKey(r.PathValue("dbtype"))
 
 	if database == "" || dbType == "" {
 		s.writeError(w, http.StatusBadRequest, "database and dbtype path parameters are required")

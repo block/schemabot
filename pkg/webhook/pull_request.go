@@ -38,19 +38,53 @@ type pullRequestPayload struct {
 	Installation struct {
 		ID int64 `json:"id"`
 	} `json:"installation"`
+	// Changes carries the previous values of fields an "edited" action
+	// modified. GitHub populates changes.base.ref.from only when the PR was
+	// retargeted, which is what separates a retarget from a title or body edit.
+	Changes struct {
+		Base struct {
+			Ref struct {
+				From string `json:"from"`
+			} `json:"ref"`
+		} `json:"base"`
+	} `json:"changes"`
 }
 
 // isAutoPlannablePullRequestAction reports whether a pull_request action
-// triggers auto-plan. The HTTP enqueue path and the durable dispatcher must
-// share this predicate: the dispatcher re-validates fail-closed, so an action
+// triggers auto-plan. The HTTP enqueue path, the durable dispatcher, and the
+// reconciler's inbox coverage query (HasEventForHead) must share this
+// predicate — it derives from storage.AutoPlanPullRequestActions so all three
+// stay in lockstep: the dispatcher re-validates fail-closed, so an action
 // added to only one side would either never enqueue or — worse — enqueue rows
-// the dispatcher silently completes without planning.
+// the dispatcher silently completes without planning, and a coverage mismatch
+// would mask lost deliveries from the reconciler.
 func isAutoPlannablePullRequestAction(action string) bool {
-	switch action {
-	case "opened", "synchronize", "reopened":
-		return true
-	}
-	return false
+	return slices.Contains(storage.AutoPlanPullRequestActions, action)
+}
+
+// isBaseRetarget reports whether an "edited" delivery moved the PR's base
+// branch. A retarget changes which commits the PR proposes, and the diff
+// against the base is what decides which databases the PR touches, so it is a
+// schema-relevant event by construction. A title or body edit arrives under the
+// same action and must not re-plan.
+func isBaseRetarget(p pullRequestPayload) bool {
+	return p.Action == "edited" && p.Changes.Base.Ref.From != ""
+}
+
+// isAutoPlannablePullRequest reports whether a delivery triggers auto-plan.
+// The HTTP enqueue path and the durable dispatcher share it so the dispatcher's
+// fail-closed re-validation cannot disagree with what was enqueued.
+//
+// It deliberately covers more than isAutoPlannablePullRequestAction, and the
+// inbox coverage query (HasEventForHead) keeps using the narrower action list.
+// The two answer different questions. Coverage asks whether a delivery that
+// plans a head reached the inbox, which a SQL "action IN (...)" test can only
+// answer from the action alone — it cannot tell a retarget from a title edit,
+// so admitting "edited" there would let a title edit mask a lost synchronize.
+// Nothing is lost by leaving it out: a retarget does not move the head SHA, so
+// the head it re-plans is already covered by the delivery that introduced it.
+func isAutoPlannablePullRequest(p pullRequestPayload) bool {
+	return isAutoPlannablePullRequestAction(p.Action) || isBaseRetarget(p)
 }
 
 // handlePullRequest processes GitHub pull_request webhook events.
@@ -61,6 +95,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 		h.writeError(w, http.StatusBadRequest, "invalid pull_request payload")
 		return
 	}
+	payload.Repository.FullName = storage.CanonicalKey(payload.Repository.FullName)
 
 	// Repo-level webhook deliveries carry no installation id in the payload; the
 	// dispatcher resolves it and stashes it on the context.
@@ -68,9 +103,9 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 
 	// Route PR actions
 	switch {
-	case isAutoPlannablePullRequestAction(payload.Action):
+	case isAutoPlannablePullRequest(payload):
 		// proceed to auto-plan below
-	case payload.Action == "closed":
+	case payload.Action == storage.PullRequestClosedAction:
 		if h.durableWebhookDispatch {
 			// Enqueue and ACK fast; a leased driver runs cleanup with retries so
 			// a process restart mid-cleanup cannot drop the delivery and leave a
@@ -95,7 +130,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "PR close cleanup queued"})
 			return
 		}
-		h.goSafe(payload.Repository.FullName, payload.PullRequest.Number, installationID, func() {
+		h.goSafe(payload.Repository.FullName, payload.PullRequest.Number, installationID, deliveryID, func() {
 			// One-shot: a failure here (including a lock lookup/release error,
 			// which also skips the check-state delete) is logged and not
 			// retried. That direction is fail-closed — retained locks and
@@ -189,7 +224,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 		return
 	}
 
-	h.goSafe(repo, pr, installationID, func() {
+	h.goSafe(repo, pr, installationID, deliveryID, func() {
 		ctx, cancel, client, err := h.autoPlanBootstrap(context.Background(), repo, installationID)
 		if err != nil {
 			metrics.RecordWebhookEvent(context.Background(), metricApp, "pull_request", payload.Action, repo, "auto_plan_bootstrap_failed")
@@ -208,7 +243,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, metricApp string, w htt
 			"pr", pr,
 			"head_sha", headSHA,
 			"delivery_id", deliveryID,
-			"message", message,
+			"outcome", message,
 		)
 	})
 	h.writeJSON(w, http.StatusOK, map[string]string{"message": "auto-plan started"})
@@ -235,24 +270,35 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 	if action != "synchronize" {
 		return true
 	}
+	comparedHeads := map[string]bool{}
 	if beforeSHA == "" {
-		h.logger.Info("auto-plan will post plan comment because synchronize payload has no previous HEAD SHA",
+		// A synchronize with no before range (synthesized recovery deliveries)
+		// cannot prove the push range schema-neutral, but the tracked plan
+		// comments below can still prove the visible plan fresh — a head that
+		// already carries a current plan must not get a duplicate comment just
+		// because its organic delivery went missing.
+		if len(configs) == 0 {
+			h.logger.Info("auto-plan will post plan comment because synchronize has no previous HEAD SHA and no tracked plan slots to prove freshness",
+				"repo", repo, "pr", pr, "head_sha", headSHA)
+			return true
+		}
+		h.logger.Info("auto-plan synchronize has no previous HEAD SHA; deciding from tracked plan comment freshness",
 			"repo", repo, "pr", pr, "head_sha", headSHA)
-		return true
+	} else {
+		files, err := client.FetchChangedFilesBetween(ctx, repo, beforeSHA, headSHA)
+		if err != nil {
+			h.logger.Warn("auto-plan will post plan comment because changed files could not be compared",
+				"repo", repo, "pr", pr, "before_sha", beforeSHA, "head_sha", headSHA, "error", err)
+			return true
+		}
+		if ghclient.HasSchemaInputFiles(files) {
+			return true
+		}
+		// The synchronize range was just proven schema-neutral. Reuse that
+		// result when the visible plan was rendered at the immediately
+		// preceding head.
+		comparedHeads[beforeSHA] = true
 	}
-	files, err := client.FetchChangedFilesBetween(ctx, repo, beforeSHA, headSHA)
-	if err != nil {
-		h.logger.Warn("auto-plan will post plan comment because changed files could not be compared",
-			"repo", repo, "pr", pr, "before_sha", beforeSHA, "head_sha", headSHA, "error", err)
-		return true
-	}
-	if ghclient.HasSchemaInputFiles(files) {
-		return true
-	}
-
-	// The synchronize range was just proven schema-neutral. Reuse that result
-	// when the visible plan was rendered at the immediately preceding head.
-	comparedHeads := map[string]bool{beforeSHA: true}
 	for _, cfg := range configs {
 		environments, err := h.allowedDatabaseEnvironments(cfg.Config.Database)
 		if err != nil {
@@ -262,7 +308,7 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 			return true
 		}
 		expectedScope := (planCommentSlot{Environments: environments}).environmentScope()
-		comments, err := h.service.Storage().PlanComments().ListUnminimizedForSlot(ctx,
+		comments, err := h.service.Storage().PlanComments().ListUnretiredForSlot(ctx,
 			repo, pr, cfg.Config.Database, string(cfg.Config.GetType()))
 		if err != nil {
 			h.logger.Warn("auto-plan will post plan comment because prior plan comment state could not be read",
@@ -271,9 +317,9 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 			return true
 		}
 		var prior *storage.PlanComment
-		for i := len(comments) - 1; i >= 0; i-- {
-			if comments[i].EnvironmentScope == expectedScope {
-				prior = comments[i]
+		for _, v := range slices.Backward(comments) {
+			if v.EnvironmentScope == expectedScope {
+				prior = v
 				break
 			}
 		}
@@ -286,6 +332,14 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 		}
 
 		planHeadSHA := prior.HeadSHA
+		if planHeadSHA == "" {
+			// A tracked plan comment with no recorded head (a manual plan)
+			// cannot prove freshness for the current head.
+			h.logger.Info("auto-plan will post plan comment because the visible plan has no recorded head SHA",
+				"repo", repo, "pr", pr, "database", cfg.Config.Database,
+				"database_type", cfg.Config.GetType(), "head_sha", headSHA)
+			return true
+		}
 		if planHeadSHA == headSHA || comparedHeads[planHeadSHA] {
 			continue
 		}
@@ -319,20 +373,74 @@ func (h *Handler) shouldPostAutoPlanComment(ctx context.Context, client *ghclien
 // check here (the post re-verifies the head SHA and can no-op during a GitHub
 // outage).
 func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, installationID int64, source string, action string, beforeSHA string, deliveryID string) (string, error) {
+	// Snapshot the base ref before anything is read, so the publish-time check
+	// below covers the whole of discovery. A base that moves mid-discovery
+	// changes which databases the PR touches, which is the case that check
+	// exists to catch — so a base ref that cannot be established is a discovery
+	// failure like any other, not a reason to publish under a weaker guarantee.
+	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
+	if err != nil {
+		h.logger.Error("failed to read the PR for auto-plan; its base branch cannot be re-verified before publishing",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
+		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
+		return "config discovery failed", fmt.Errorf("read %s#%d for auto-plan: %w", repo, pr, err)
+	}
+	baseRef := prInfo.BaseRef
+	if baseRef == "" {
+		missingBase := fmt.Errorf("PR %s#%d reports no base branch", repo, pr)
+		h.logger.Error("PR reports no base branch; a plan's base cannot be re-verified before publishing",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID)
+		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, missingBase)
+		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
+		return "config discovery failed", missingBase
+	}
+
 	// Fetch the changed files once so the same list drives both config discovery
 	// and the server-managed-directory safety check below.
-	files, err := client.FetchPRFiles(ctx, repo, pr)
+	changedFiles, err := client.FetchPRFiles(ctx, repo, pr)
 	if err != nil {
-		h.logger.Error("failed to fetch PR files for auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
+		if errors.Is(err, ghclient.ErrPRFilesIncomplete) {
+			// The schema_visible label records whether the truncated prefix
+			// already shows a schema or config path. Both shapes get the same
+			// cap-specific blocking check — the withheld tail is not
+			// inspectable either way — but the label lets operators see how
+			// many cap hits look schema-related versus pure refactors.
+			metrics.RecordPRFileCapExceeded(ctx, repo, ghclient.HasDiscoveryInputFiles(changedFiles))
+		}
+		h.logConfigDiscoveryFailure("list PR changed files", repo, pr, headSHA, source, deliveryID, err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 		return "config discovery failed", fmt.Errorf("fetch PR files for %s#%d: %w", repo, pr, err)
+	}
+
+	// Narrow the list to what the PR proposes against the default branch before
+	// anything reads it. Every guard below asks a question about the PR's own
+	// schema changes — which databases it touches, whether it drops a config out
+	// from under a managed directory, whether participants must report — and a
+	// file the PR inherited from history it has not caught up with answers none
+	// of them. Failing here is a discovery failure like any other: without the
+	// comparison there is no way to tell an inherited file from a proposed one.
+	files, defaultTipSHA, err := client.PRFilesProposedAgainstDefaultBranch(ctx, repo, headSHA, changedFiles)
+	if err != nil {
+		h.logger.Error("failed to scope PR files to what the PR proposes", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
+		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
+		return "config discovery failed", fmt.Errorf("scope PR files for %s#%d to what it proposes: %w", repo, pr, err)
+	}
+	if len(files) != len(changedFiles) {
+		h.logger.Info("auto-plan scoped to the files the PR proposes against the default branch",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "default_tip_sha", defaultTipSHA,
+			"changed_files", len(changedFiles), "proposed_files", len(files),
+			"source", source, "delivery_id", deliveryID)
 	}
 
 	// Discover all configs matching changed schema files in this PR
 	configs, err := client.FindConfigsForPRFiles(ctx, repo, headSHA, files)
 	if err != nil {
-		h.logger.Error("failed to discover configs for PR", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
+		h.logConfigDiscoveryFailure("resolve schema configs for changed files", repo, pr, headSHA, source, deliveryID, err)
 		h.postConfigDiscoveryFailure(ctx, client, repo, pr, headSHA, err)
+		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 		return "config discovery failed", fmt.Errorf("discover configs for %s#%d: %w", repo, pr, err)
 	}
 
@@ -342,6 +450,10 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	// not silently unmanage a server-owned schema directory.
 	if unmanaged := h.unmanagedServerManagedSchemaChanges(repo, files, configs); len(unmanaged) > 0 {
 		h.failClosedOnUnmanagedSchemaDir(ctx, client, repo, pr, headSHA, source, unmanaged)
+		// This exit posts a blocking aggregate and no plan comment, so an earlier
+		// head's plan comment would otherwise stay expanded beside it, still
+		// offering to apply DDL for a config this head no longer carries.
+		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 		return "schema change under managed directory has no config", nil
 	}
 
@@ -370,12 +482,18 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 
 	// Clean up stale checks from databases no longer in the PR.
 	// Pass the new HEAD SHA so cleanup can create new check runs on the correct commit.
-	h.goSafe(repo, pr, installationID, func() {
+	h.goSafe(repo, pr, installationID, deliveryID, func() {
 		h.cleanupStaleChecks(repo, pr, headSHA, installationID, affectedDatabases)
 	})
 
 	if len(configs) == 0 {
 		h.logger.Info("no schema files in PR, skipping auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID)
+		// No config resolved means no slot to sweep, so the plan comments an
+		// earlier head left behind have nothing to retire them. Every exit below
+		// moves the check on without posting a comment, which would otherwise
+		// leave the PR showing a plan — and its apply prompt — for schema this
+		// head no longer proposes.
+		h.retireStalePlanCommentsForPR(ctx, client, repo, pr, headSHA)
 		// An aggregate participant does not own the required check for the repo —
 		// the leader does — so on a PR that touches none of this deployment's
 		// schema it has nothing to report and stays silent, rather than posting a
@@ -403,7 +521,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		if h.leaderExpectsParticipantsForPR(repo, files) {
 			h.logger.Info("no leader-managed schema in PR but expected participant paths are touched; aggregate gate will block until participants report",
 				"repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID)
-			h.goSafe(repo, pr, installationID, func() {
+			h.goSafe(repo, pr, installationID, deliveryID, func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
 				c, err := h.clientForRepo(repo, installationID)
@@ -422,7 +540,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		// recreated on the new commit. If stale per-database check records exist,
 		// cleanupStaleChecks (above) also updates the aggregate — both converge
 		// to the same result (passing aggregate on new SHA) so the overlap is safe.
-		h.goSafe(repo, pr, installationID, func() {
+		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			c, err := h.clientForRepo(repo, installationID)
@@ -434,6 +552,25 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		})
 		return "no schema files in PR", nil
 	}
+	// Publishing a plan asserts that the inputs it was computed from still
+	// describe the PR. Both can move while discovery runs: a push changes what
+	// the DDL would be applied to, and a retarget changes which commits the PR
+	// proposes and so which databases it touches. Re-read them and discard
+	// rather than publish a plan and a merge-blocking check for a PR that has
+	// moved on — whichever event moved it re-plans on its own.
+	moved, err := h.autoPlanInputsMoved(ctx, client, repo, pr, headSHA, baseRef)
+	if err != nil {
+		h.logger.Error("failed to re-verify the PR before publishing its plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID, "error", err)
+		h.postPlanPublishVerificationFailure(ctx, client, repo, pr, headSHA, err)
+		return "plan publish verification failed", fmt.Errorf("re-verify %s#%d before publishing its plan: %w", repo, pr, err)
+	}
+	if moved {
+		h.logger.Info("discarding auto-plan because the PR moved while it was being discovered; the event that moved it re-plans",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "base_ref", baseRef,
+			"source", source, "delivery_id", deliveryID)
+		return "auto-plan discarded because the PR moved during discovery", nil
+	}
+
 	postPlanComment := shouldPostComment()
 
 	// Launch auto-plan for each discovered config
@@ -443,12 +580,34 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	}
 	for _, cfg := range configs {
 		database := cfg.Config.Database
-		h.goSafe(repo, pr, installationID, func() {
+		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			h.handleMultiEnvPlan(repo, pr, database, tenant, installationID, "", true, postPlanComment, 0)
 		})
 	}
 
 	return "auto-plan started", nil
+}
+
+// autoPlanInputsMoved reports whether the PR changed underneath a plan that is
+// about to be published. An error means the question could not be answered —
+// the caller must not publish on an unverified PR, and durable callers retry
+// the delivery.
+func (h *Handler) autoPlanInputsMoved(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, baseRef string) (bool, error) {
+	fresh, err := client.FetchPullRequestNoCache(ctx, repo, pr)
+	if err != nil {
+		return false, fmt.Errorf("fetch PR %s#%d: %w", repo, pr, err)
+	}
+	if fresh.HeadSHA != headSHA {
+		h.logger.Info("PR head moved while its plan was being discovered",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "current_head_sha", fresh.HeadSHA)
+		return true, nil
+	}
+	if baseRef != "" && fresh.BaseRef != baseRef {
+		h.logger.Info("PR base branch moved while its plan was being discovered",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "base_ref", baseRef, "current_base_ref", fresh.BaseRef)
+		return true, nil
+	}
+	return false, nil
 }
 
 // notifyUnmanagedDiscoveredConfigs posts a PR-visible notice when auto-plan
@@ -529,18 +688,71 @@ func (h *Handler) filterManagedDiscoveredConfigs(ctx context.Context, repo strin
 	return managed
 }
 
+// logConfigDiscoveryFailure logs an auto-plan config-discovery failure at the
+// severity its cause deserves, naming the discovery step that failed. A PR past
+// GitHub's per-PR changed-file cap is deterministic — GitHub reports the same
+// oversized diff the same truncated way on every attempt — so it is a warning
+// about the PR, not a SchemaBot or GitHub error an operator can act on. Every
+// other cause stays an error worth investigating.
+func (h *Handler) logConfigDiscoveryFailure(step, repo string, pr int, headSHA, source, deliveryID string, err error) {
+	attrs := []any{
+		"step", step, "repo", repo, "pr", pr, "head_sha", headSHA,
+		"source", source, "delivery_id", deliveryID, "error", err,
+	}
+	if errors.Is(err, ghclient.ErrPRFilesIncomplete) {
+		h.logger.Warn("auto-plan will not plan this PR because it changes more files than GitHub will report for a single pull request; SchemaBot cannot see the full diff and fails the check closed", attrs...)
+		return
+	}
+	h.logger.Error("auto-plan config discovery failed", attrs...)
+}
+
 func (h *Handler) postConfigDiscoveryFailure(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, discoveryErr error) {
+	// The causes stay apart because operators triage them differently: GitHub
+	// being unavailable is an outage to wait out, a PR past GitHub's per-PR
+	// changed-file cap is a property of the PR that no retry can change, and
+	// anything else is a configuration problem to investigate.
+	block := configDiscoveryFailedBlock
+	discoveryStatus := "error"
+	switch {
+	case errors.Is(discoveryErr, ghclient.ErrPRFilesIncomplete):
+		// A deterministic cap is a block, not an error: reporting it as one
+		// keeps it out of the discovery-error signal.
+		block = prFileCapExceededBlock
+		discoveryStatus = "blocked"
+	case ghclient.IsUnavailableError(discoveryErr):
+		block = githubConfigDiscoveryUnavailableBlock
+	}
 	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 		Operation:  "schema_config_discovery",
+		Repository: repo,
+		Status:     discoveryStatus,
+	})
+
+	h.logger.Info("posting failing aggregate for config discovery failure",
+		"repo", repo, "pr", pr, "head_sha", headSHA,
+		"blocking_reason", block.blockingReason)
+	h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA,
+		h.aggregateMessagesForAllEnvironments(block.message), block)
+}
+
+// postPlanPublishVerificationFailure blocks the aggregate when the PR could not
+// be re-read before its plan was published. The read is the last thing standing
+// between a discovered plan and a merge-blocking check posted for a commit or
+// base branch the PR may no longer have, so a failure to answer it fails closed
+// on the PR rather than only in the logs — the request path has no durable row
+// to retry, and the failures that reach here are the ones retrying does not fix.
+func (h *Handler) postPlanPublishVerificationFailure(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, verifyErr error) {
+	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+		Operation:  "plan_publish_verification",
 		Repository: repo,
 		Status:     "error",
 	})
 
-	block := configDiscoveryFailedBlock
-	if ghclient.IsUnavailableError(discoveryErr) {
+	block := planPublishVerificationFailedBlock
+	if ghclient.IsUnavailableError(verifyErr) {
 		block = githubConfigDiscoveryUnavailableBlock
 	}
-	h.logger.Info("posting failing aggregate for config discovery failure",
+	h.logger.Info("posting failing aggregate for plan publish verification failure",
 		"repo", repo, "pr", pr, "head_sha", headSHA,
 		"blocking_reason", block.blockingReason)
 	h.postFailingAggregatesWithBlock(ctx, client, repo, pr, headSHA,

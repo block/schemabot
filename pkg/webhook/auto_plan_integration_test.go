@@ -18,10 +18,11 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	mysql "github.com/go-sql-driver/mysql"
+	mysql "github.com/block/mysql"
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -228,7 +229,7 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeRefreshesStalePlan(t *testin
 		t.Fatal("timed out waiting for replacement auto-plan comment")
 	}
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
-		comments, err := svc.Storage().PlanComments().ListUnminimizedForSlot(
+		comments, err := svc.Storage().PlanComments().ListUnretiredForSlot(
 			t.Context(), "octocat/hello-world", 1, dbName, "mysql")
 		if !assert.NoError(collect, err) || !assert.NotEmpty(collect, comments) {
 			return
@@ -287,7 +288,7 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeWithoutTrackedPlanPostsComme
 		t.Fatal("timed out waiting for auto-plan comment")
 	}
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
-		comments, err := svc.Storage().PlanComments().ListUnminimizedForSlot(
+		comments, err := svc.Storage().PlanComments().ListUnretiredForSlot(
 			t.Context(), "octocat/hello-world", 1, dbName, "mysql")
 		if !assert.NoError(collect, err) || !assert.NotEmpty(collect, comments) {
 			return
@@ -452,7 +453,7 @@ func TestE2EAutoPlanSourcePolicyBlocksWithFailingAggregate(t *testing.T) {
 	case body := <-result.comments:
 		assert.Contains(t, body, "failed to plan")
 		assert.Contains(t, body, "source policy")
-		assert.Contains(t, body, "repo \"octocat/hello-world\" is not authorized")
+		assert.Contains(t, body, "repo &#34;octocat/hello-world&#34; is not authorized")
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for source policy auto-plan comment")
 	}
@@ -506,6 +507,8 @@ func TestE2EAutoPlanEmptySchemaRootNamesDatabase(t *testing.T) {
 		Status:   new("removed"),
 	}}
 	result := setupFakeGitHubForPlanWithPRFiles(t, mux, map[string]string{}, schemabotConfig, dbName, prFiles)
+	// The file this PR removes is one the default branch still holds.
+	result.baseHolds("schema/" + dbName + "/users.sql")
 
 	h := newE2EHandler(t, svc, client)
 
@@ -594,6 +597,330 @@ func TestE2EReopenedPRAutoPlansCurrentHead(t *testing.T) {
 	assert.Equal(t, checkConclusionActionRequired, check.Conclusion)
 }
 
+// TestE2ERetargetedPRAutoPlansAgainstTheNewBase verifies that moving a PR's
+// base branch re-plans it, and that an ordinary title or body edit does not.
+// The diff against the base decides which databases a PR touches, so a retarget
+// can change that answer — a plan and its merge-blocking check must not outlive
+// the base they were computed against. Both arrive as the same action, so the
+// retarget is told apart by the previous base ref GitHub reports with it.
+func TestE2ERetargetedPRAutoPlansAgainstTheNewBase(t *testing.T) {
+	dbName := "webhook_retarget_autoplan"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	h := newE2EHandler(t, svc, client)
+
+	editedReq := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "edited",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+	editedRR := httptest.NewRecorder()
+	h.ServeHTTP(editedRR, editedReq)
+	require.Equal(t, http.StatusOK, editedRR.Code)
+	assert.Contains(t, editedRR.Body.String(), "pull_request action ignored")
+
+	retargetReq := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:      "edited",
+		headSHA:     "abc123",
+		headRef:     "feature-branch",
+		baseRefFrom: "stacked-parent",
+	}, nil)
+	retargetRR := httptest.NewRecorder()
+	h.ServeHTTP(retargetRR, retargetReq)
+	require.Equal(t, http.StatusOK, retargetRR.Code)
+	assert.Contains(t, retargetRR.Body.String(), "auto-plan started")
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Schema Change Plan")
+		assert.Contains(t, body, "CREATE TABLE")
+		assert.Contains(t, body, dbName)
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for retargeted auto-plan comment")
+	}
+
+	select {
+	case cr := <-result.checkRuns:
+		assert.Equal(t, aggregateCheckName, cr.Name)
+		assert.Equal(t, "abc123", cr.HeadSHA)
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionActionRequired, cr.Conclusion)
+	case <-time.After(webhookIntegrationCheckRunDeadline):
+		t.Fatal("timed out waiting for retargeted auto-plan check run")
+	}
+}
+
+// TestE2EAutoPlanIgnoresSchemaFilesTheDefaultBranchAlreadyHolds verifies that a
+// PR is planned for the schema it proposes, not for everything its changed-file
+// list happens to carry. A branch whose base lags, or briefly points elsewhere,
+// is reported as changing files it only inherited from history — and one
+// inherited schema file is enough to resolve another team's database and block
+// the PR with a plan for schema it never touched. A file the default branch
+// already holds at the same content is not this PR's change, so it resolves no
+// database and the PR is left to merge.
+func TestE2EAutoPlanIgnoresSchemaFilesTheDefaultBranchAlreadyHolds(t *testing.T) {
+	dbName := "webhook_autoplan_inherited_file"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	result.baseHolds("schema/" + dbName + "/users.sql")
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
+
+	select {
+	case cr := <-result.checkRuns:
+		assert.Equal(t, aggregateCheckName, cr.Name)
+		assert.Equal(t, "abc123", cr.HeadSHA)
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionSuccess, cr.Conclusion)
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the passing aggregate check run")
+	}
+
+	select {
+	case body := <-result.comments:
+		t.Fatalf("expected no plan comment for a file the default branch already holds, got: %s", body)
+	case <-time.After(3 * time.Second):
+	}
+}
+
+// TestE2EAutoPlanDiscardsAPlanWhoseBaseMovedDuringDiscovery verifies that a plan
+// is published only for the PR it was computed from. Retargeting a PR changes
+// which commits it proposes and so which databases it touches, and that can land
+// while discovery is still running. Publishing then would post a plan — and a
+// merge-blocking check — describing a base the PR no longer has, so the plan is
+// discarded and the retarget's own delivery plans the PR against its new base.
+func TestE2EAutoPlanDiscardsAPlanWhoseBaseMovedDuringDiscovery(t *testing.T) {
+	dbName := "webhook_autoplan_base_moved"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	// Discovery reads the default branch tip after the base ref was snapshotted
+	// and before the plan would be published, so retargeting the PR from that
+	// read lands the new base squarely in the middle of the flow.
+	var retarget sync.Once
+	moveBaseDuringDiscovery := func() string {
+		retarget.Do(func() { result.BaseRef.Store(new("release-1")) })
+		return "def456"
+	}
+	result.BaseTip.Store(&moveBaseDuringDiscovery)
+
+	h := newE2EHandler(t, svc, client)
+
+	openedReq := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+	openedRR := httptest.NewRecorder()
+	h.ServeHTTP(openedRR, openedReq)
+	require.Equal(t, http.StatusOK, openedRR.Code)
+	assert.Contains(t, openedRR.Body.String(), "auto-plan started")
+
+	require.Eventually(t, func() bool { return result.BaseRef.Load() != nil },
+		webhookIntegrationPollDeadline, 50*time.Millisecond,
+		"discovery never read the default branch tip, so the base never moved under it")
+
+	select {
+	case body := <-result.comments:
+		t.Fatalf("expected no plan comment for a base the PR no longer has, got: %s", body)
+	case <-time.After(3 * time.Second):
+	}
+
+	// The retarget's own delivery plans the PR against the base it now has.
+	retargetReq := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:      "edited",
+		headSHA:     "abc123",
+		headRef:     "feature-branch",
+		baseRefFrom: "main",
+	}, nil)
+	retargetRR := httptest.NewRecorder()
+	h.ServeHTTP(retargetRR, retargetReq)
+	require.Equal(t, http.StatusOK, retargetRR.Code)
+	assert.Contains(t, retargetRR.Body.String(), "auto-plan started")
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Schema Change Plan")
+		assert.Contains(t, body, "CREATE TABLE")
+		assert.Contains(t, body, dbName)
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the plan comment on the retargeted PR")
+	}
+}
+
+// A push lands while discovery is still running, so the DDL a plan computed
+// describes a commit the PR no longer has. Publishing it would post a plan — and
+// a merge-blocking check — for schema that is no longer proposed, so the plan is
+// discarded and the push's own delivery plans the PR at its new head.
+func TestE2EAutoPlanDiscardsAPlanWhoseHeadMovedDuringDiscovery(t *testing.T) {
+	dbName := "webhook_autoplan_head_moved"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	// The head the delivery carries is served to the snapshot read at the top of
+	// discovery; every later read reports the commit that landed under it, which
+	// is what the uncached re-verification before publishing sees.
+	result.HeadSHAs = []string{"abc123", "newsha456"}
+
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
+
+	select {
+	case body := <-result.comments:
+		t.Fatalf("expected no plan comment for a head the PR no longer has, got: %s", body)
+	case <-time.After(3 * time.Second):
+	}
+
+	// The push's own delivery plans the PR at the head it now has.
+	pushReq := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "synchronize",
+		headSHA: "newsha456",
+		headRef: "feature-branch",
+	}, nil)
+	pushRR := httptest.NewRecorder()
+	h.ServeHTTP(pushRR, pushReq)
+	require.Equal(t, http.StatusOK, pushRR.Code)
+	assert.Contains(t, pushRR.Body.String(), "auto-plan started")
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "Schema Change Plan")
+		assert.Contains(t, body, "CREATE TABLE")
+		assert.Contains(t, body, dbName)
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the plan comment on the pushed head")
+	}
+}
+
+// SchemaBot loses access to the PR between the snapshot discovery starts from
+// and the re-read that would confirm the PR still has that head and base. The
+// question a plan is published on cannot be answered, so no plan is published
+// and the aggregate fails closed naming what could not be confirmed — the
+// request path has no durable row to retry, so a failure only in the logs would
+// leave the PR showing nothing at all.
+func TestE2EAutoPlanFailsClosedWhenThePRCannotBeReVerifiedBeforePublishing(t *testing.T) {
+	dbName := "webhook_autoplan_reverify_fails"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	result.FailPRReadsAfterFirstFetch.Store(true)
+
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "auto-plan started")
+
+	select {
+	case cr := <-result.checkRuns:
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionFailure, cr.Conclusion,
+			"a PR that cannot be re-verified must fail the check closed")
+		require.NotNil(t, cr.Output)
+		assert.Equal(t, planPublishVerificationFailedBlock.message, cr.Output.Summary,
+			"the check must name the verification that could not be answered")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the publish-verification failure check run")
+	}
+
+	select {
+	case body := <-result.comments:
+		t.Fatalf("expected no plan comment for a PR that could not be re-verified, got: %s", body)
+	case <-time.After(3 * time.Second):
+	}
+}
+
 func TestE2EAutoPlanWithLintViolations(t *testing.T) {
 	dbName := "webhook_autoplan_lint"
 	svc := setupE2EService(t, dbName)
@@ -666,7 +993,7 @@ func TestE2EAutoPlanNoChangesSkipsComment(t *testing.T) {
 	// Pre-create the table so there are no changes
 	ctx := t.Context()
 	appDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+dbName, 1) + "&multiStatements=true"
-	db, err := sql.Open("mysql", appDSN)
+	db, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx, "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
 	require.NoError(t, err)
@@ -742,7 +1069,7 @@ func TestE2EAutoPlanNoChangesSkipsComment(t *testing.T) {
 		t.Fatal("timed out waiting for the prior head's plan comment to be minimized")
 	}
 	require.Eventually(t, func() bool {
-		return len(unminimizedHeads(t, svc.Storage(), "octocat/hello-world", 1, dbName, "mysql")) == 0
+		return len(unretiredHeads(t, svc.Storage(), "octocat/hello-world", 1, dbName, "mysql")) == 0
 	}, 10*time.Second, 100*time.Millisecond, "the minimized plan comment must be recorded in storage")
 
 	// No comment should be posted — give it a moment to confirm nothing arrives
@@ -985,6 +1312,141 @@ func TestE2EGitHubUnavailableDuringConfigDiscoveryPublishesFailingAggregates(t *
 	}
 }
 
+// TestE2EPRFileCapPublishesFailingAggregatesNamingTheCap verifies what a PR
+// author sees when their PR changes more files than GitHub will report for a
+// single pull request. SchemaBot never plans from a truncated changed-file
+// list — the part GitHub withheld could contain a schema change — so the
+// aggregate fails closed in every configured environment whether or not the
+// reported files include a schema change. The block is distinct from a GitHub
+// outage and from a configuration error, and the check text names the cap and
+// the remedy instead of telling the author to retry a check that will keep
+// returning the same incomplete list, or leaving the author staring at a
+// required check that never reports.
+func TestE2EPRFileCapPublishesFailingAggregatesNamingTheCap(t *testing.T) {
+	scenarios := []struct {
+		name          string
+		schemaFile    string
+		schemaVisible bool
+	}{
+		{name: "schema change visible in reported files", schemaFile: "apps/orders/schema/users.sql", schemaVisible: true},
+		{name: "no schema change visible (refactor shape)", schemaFile: "", schemaVisible: false},
+	}
+	for _, tc := range scenarios {
+		t.Run(tc.name, func(t *testing.T) {
+			metricsReader := newDispatchMetricsReader(t)
+			svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging", "production"})
+
+			mux := http.NewServeMux()
+			server := httptest.NewServer(mux)
+			t.Cleanup(server.Close)
+
+			client := gh.NewClient(nil)
+			client.BaseURL, _ = url.Parse(server.URL + "/")
+
+			// PR metadata is available, so SchemaBot knows the current commit SHA and
+			// can publish the failing aggregates against that SHA.
+			mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(gh.PullRequest{
+					Head: &gh.PullRequestBranch{
+						Ref: new("feature-branch"),
+						SHA: new("abc123"),
+					},
+					Base: &gh.PullRequestBranch{
+						Ref: new("main"),
+						SHA: new("def456"),
+					},
+					User: &gh.User{Login: new("testuser")},
+				})
+			})
+
+			var filePages atomic.Int64
+			servePRFileListPastCap(t, mux, 1, &filePages, tc.schemaFile)
+
+			checkRuns := make(chan checkRunCapture, 10)
+			mux.HandleFunc("POST /repos/octocat/hello-world/check-runs", func(w http.ResponseWriter, r *http.Request) {
+				var body checkRunCapture
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				checkRuns <- body
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": 1})
+			})
+
+			h := newE2EHandler(t, svc, client)
+
+			req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+				action:  "opened",
+				headSHA: "abc123",
+				headRef: "feature-branch",
+			}, nil)
+
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+
+			require.Equal(t, http.StatusOK, rr.Code)
+
+			seen := map[string]bool{}
+			for i := range 2 {
+				select {
+				case cr := <-checkRuns:
+					seen[cr.Name] = true
+					assert.Equal(t, checkStatusCompleted, cr.Status)
+					assert.Equal(t, checkConclusionFailure, cr.Conclusion)
+					assert.Equal(t, "abc123", cr.HeadSHA)
+					assert.Contains(t, cr.Output.Summary, "more files than GitHub will report for a single pull request",
+						"the check must name the cap that stopped the plan")
+					assert.Contains(t, cr.Output.Summary, "smaller PR",
+						"the check must tell the author how to get a plan")
+				case <-time.After(webhookIntegrationCheckRunDeadline):
+					t.Fatalf("timed out waiting for failing aggregate check run %d/2, seen: %v", i+1, seen)
+				}
+			}
+			assert.True(t, seen["SchemaBot (staging)"])
+			assert.True(t, seen["SchemaBot (production)"])
+			assert.Positive(t, filePages.Load(), "auto-plan must have listed PR files before failing closed")
+
+			// Each aggregate stores the file-cap blocking reason, so an operator can
+			// tell this apart from a GitHub outage or a broken SchemaBot configuration.
+			for _, env := range []string{"staging", "production"} {
+				var check *storage.Check
+				var checkErr error
+				require.Eventually(t, func() bool {
+					check, checkErr = svc.Storage().Checks().Get(t.Context(), "octocat/hello-world", 1, env, aggregateSentinel, aggregateSentinel)
+					return checkErr == nil && check != nil
+				}, webhookIntegrationCheckRunDeadline, 100*time.Millisecond, "stored aggregate check should be visible for %s", env)
+				require.NoError(t, checkErr)
+				require.NotNil(t, check)
+				assert.Equal(t, prFileCapExceededBlock.blockingReason, check.BlockingReason)
+				assert.Equal(t, prFileCapExceededBlock.message, check.ErrorMessage)
+			}
+
+			// Both shapes get the same check, so the counter's schema_visible
+			// label is the only place an operator can see how many cap hits look
+			// schema-related versus pure refactors.
+			capPoints := collectCounterPoints(t, metricsReader, "schemabot.github.pr_file_cap_exceeded_total")
+			require.Len(t, capPoints, 1, "the cap must be counted exactly once per auto-plan run")
+			assertStringAttr(t, capPoints[0].Attributes, "repository", "octocat/hello-world")
+			schemaVisible, ok := capPoints[0].Attributes.Value("schema_visible")
+			require.True(t, ok, "the cap counter must carry the schema_visible label")
+			assert.Equal(t, tc.schemaVisible, schemaVisible.AsBool(),
+				"schema_visible must reflect whether the reported prefix showed a schema or config path")
+
+			// Discovery reports the cap as blocked rather than error, keeping a
+			// deterministic property of the PR out of the discovery-error signal
+			// operators watch for outages and broken configuration.
+			var discoveryStatuses []string
+			for _, point := range collectCounterPoints(t, metricsReader, "schemabot.status_check_operations_total") {
+				if operation, found := point.Attributes.Value("operation"); found && operation.AsString() == "schema_config_discovery" {
+					status, hasStatus := point.Attributes.Value("status")
+					require.True(t, hasStatus, "a status-check operation must carry a status")
+					discoveryStatuses = append(discoveryStatuses, status.AsString())
+				}
+			}
+			assert.Equal(t, []string{"blocked"}, discoveryStatuses,
+				"the cap must be reported as blocked, never as a discovery error")
+		})
+	}
+}
+
 // TestE2EGitHubUnavailableDuringAutoPlanDoesNotPublishCheckRun verifies that
 // SchemaBot does not create or store a check run when it cannot verify the
 // current PR commit SHA at all.
@@ -1120,7 +1582,7 @@ func TestE2EAutoPlanWithOnlySchemaBotConfigChangeClearsRollbackCheck(t *testing.
 	cfg, err := mysql.ParseDSN(e2eTargetDSN)
 	require.NoError(t, err)
 	cfg.DBName = dbName
-	db, err := sql.Open("mysql", cfg.FormatDSN())
+	db, err := sql.Open("block-mysql", cfg.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(ctx))
@@ -1241,9 +1703,7 @@ func TestE2EMultiAppAutoPlan(t *testing.T) {
 		"configsha_orders":     ordersConfig,
 	}
 
-	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(gh.Tree{SHA: new("abc123"), Entries: treeEntries, Truncated: new(false)})
-	})
+	registerRepositoryTrees(t, mux, repositoryTreeFixture{headSHA: "abc123", headEntries: treeEntries})
 
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/blobs/", func(w http.ResponseWriter, r *http.Request) {
 		sha := r.URL.Path[len("/repos/octocat/hello-world/git/blobs/"):]
@@ -1545,5 +2005,60 @@ func TestE2EAutoPlanSchemaDirMoveNotBlocked(t *testing.T) {
 	require.NoError(t, err)
 	if check != nil {
 		assert.NotEqual(t, "managed_dir_missing_config", check.BlockingReason, "a clean move must not be blocked as a missing-config change")
+	}
+}
+
+// TestE2EAutoPlanFailsClosedWhenTheBaseBranchCannotBeRead verifies that a plan
+// is never published on a base SchemaBot could not establish. The base branch
+// is snapshotted before discovery so a retarget landing mid-flow can be caught
+// at publish time; without that snapshot the retarget would go unnoticed and
+// the plan would be published against a base the PR no longer has. Being
+// unable to read it is therefore a discovery failure that fails the check
+// closed, not a reason to proceed with only the head verified.
+func TestE2EAutoPlanFailsClosedWhenTheBaseBranchCannotBeRead(t *testing.T) {
+	dbName := "webhook_autoplan_base_unreadable"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+	result.FailFirstPRRead.Store(true)
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case cr := <-result.checkRuns:
+		assert.Equal(t, checkStatusCompleted, cr.Status)
+		assert.Equal(t, checkConclusionFailure, cr.Conclusion,
+			"a base branch that cannot be read must fail the check closed")
+		require.NotNil(t, cr.Output)
+		assert.Equal(t, configDiscoveryFailedBlock.message, cr.Output.Summary,
+			"the check must report a discovery failure, not a plan result")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the discovery-failure check run")
+	}
+
+	select {
+	case body := <-result.comments:
+		t.Fatalf("expected no plan comment when the base branch could not be read, got: %s", body)
+	case <-time.After(3 * time.Second):
 	}
 }

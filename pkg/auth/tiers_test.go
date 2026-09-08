@@ -28,7 +28,7 @@ func TestTierForRequest(t *testing.T) {
 		{http.MethodDelete, "/api/locks", TierWrite},
 	}
 	for _, c := range cases {
-		assert.Equalf(t, c.want, tierForRequest(c.method, c.path), "%s %s", c.method, c.path)
+		assert.Equalf(t, c.want, TierForRequest(c.method, c.path), "%s %s", c.method, c.path)
 	}
 }
 

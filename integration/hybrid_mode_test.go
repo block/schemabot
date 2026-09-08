@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	mysql "github.com/go-sql-driver/mysql"
+	mysql "github.com/block/mysql"
 
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
@@ -51,7 +51,7 @@ func TestHybridMode_LocalAndNamedRemoteTargets(t *testing.T) {
 	// Create two target databases: one for local mode, one for gRPC mode
 	// =========================================================================
 
-	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
+	targetDB, err := sql.Open("block-mysql", targetDSN+"&multiStatements=true")
 	require.NoError(t, err, "open target db")
 	t.Cleanup(func() { utils.CloseAndLog(targetDB) })
 
@@ -92,7 +92,7 @@ func TestHybridMode_LocalAndNamedRemoteTargets(t *testing.T) {
 	// Set up SchemaBot with hybrid config: databases + tern_deployments
 	// =========================================================================
 
-	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	clearStorageDB(t, schemabotDB)
 	schemabotStorage := mysqlstore.New(schemabotDB)
@@ -320,7 +320,7 @@ func TestHybridMode_LocalAndNamedRemoteTargets(t *testing.T) {
 	// Test 8: Verify the actual tables exist in their respective databases
 	// =========================================================================
 
-	localDB, err := sql.Open("mysql", localDSN)
+	localDB, err := sql.Open("block-mysql", localDSN)
 	require.NoError(t, err, "open local target db")
 	t.Cleanup(func() { utils.CloseAndLog(localDB) })
 
@@ -329,7 +329,7 @@ func TestHybridMode_LocalAndNamedRemoteTargets(t *testing.T) {
 	require.NoError(t, err, "local_items table should exist in local database")
 	assert.Equal(t, "local_items", localTableName)
 
-	grpcTargetDB, err := sql.Open("mysql", grpcTargetDSN)
+	grpcTargetDB, err := sql.Open("block-mysql", grpcTargetDSN)
 	require.NoError(t, err, "open grpc target db")
 	t.Cleanup(func() { utils.CloseAndLog(grpcTargetDB) })
 
@@ -388,7 +388,7 @@ func startTernGRPCForDB(t *testing.T, appDSN, dbName string) (string, error) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 
 	// Open Tern storage (reuse the shared tern storage container)
-	storageDB, err := sql.Open("mysql", ternStorageDSN)
+	storageDB, err := sql.Open("block-mysql", ternStorageDSN)
 	if err != nil {
 		return "", fmt.Errorf("open tern storage: %w", err)
 	}
@@ -407,10 +407,11 @@ func startTernGRPCForDB(t *testing.T, appDSN, dbName string) (string, error) {
 	t.Cleanup(func() { utils.CloseAndLog(localClient) })
 
 	// A dispatch queues the apply in Tern storage for the data plane's own
-	// operator; without this loop a dispatched apply would sit pending forever.
-	registerRemoteTern(dbName, localClient)
-	stopOperator := startRemoteTernOperator(storage, logger, "remote-tern-"+dbName)
-	t.Cleanup(stopOperator)
+	// operator; the shared remote-tern operator (started at package setup)
+	// claims it and routes the drive to this client by deployment.
+	if err := registerRemoteTern(storage, logger, dbName, localClient); err != nil {
+		return "", fmt.Errorf("register remote tern %s: %w", dbName, err)
+	}
 
 	// Wrap in gRPC server
 	grpcSrv := grpc.NewServer()

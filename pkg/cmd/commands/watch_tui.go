@@ -12,6 +12,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -24,7 +25,6 @@ type WatchModel struct {
 	environment         string
 	applyID             string // When set, fetches progress by apply ID instead of database/environment
 	allowControlActions bool
-	maxTableNameLen     int
 	deployTriggered     bool
 	cutoverTriggered    bool
 	skipRevertTriggered bool
@@ -32,12 +32,11 @@ type WatchModel struct {
 	stopTriggered       bool
 
 	// State from API
-	state         string
-	tables        []tableProgress
-	operations    []templates.ProgressOperation
-	released      bool // apply-level release latch: a released pause runs degraded, not paused
-	errorMsg      string
-	currentVolume int // Current volume (1-11)
+	state      string
+	tables     []templates.TableProgress
+	operations []templates.ProgressOperation
+	released   bool // apply-level release latch: a released pause runs degraded, not paused
+	errorMsg   string
 
 	// Engine metadata
 	engine           string // "Spirit", "PlanetScale", etc.
@@ -52,37 +51,7 @@ type WatchModel struct {
 	activityLabelFrame int
 	startedAt          time.Time
 	initialized        bool
-	volumeMode         bool // True when in volume adjustment mode
-	volumePending      int  // Pending volume change (0 = none)
-	volumeChanging     bool // True while volume change is in progress
-	consecutiveErrors  int  // Consecutive fetch failures (drives backoff)
-}
-
-// tableProgress represents progress for a single table.
-type tableProgress struct {
-	Name           string
-	Deployment     string
-	Keyspace       string
-	DDL            string
-	ChangeType     string
-	Status         string
-	RowsCopied     int64
-	RowsTotal      int64
-	Percent        int
-	ETASeconds     int64
-	ProgressDetail string
-	IsInstant      bool
-	Shards         []shardProgress
-}
-
-type shardProgress struct {
-	Shard           string
-	Status          string
-	RowsCopied      int64
-	RowsTotal       int64
-	Percent         int
-	ETASeconds      int64
-	CutoverAttempts int
+	consecutiveErrors  int // Consecutive fetch failures (drives backoff)
 }
 
 var activityLabelFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -109,13 +78,12 @@ func isRetryableFetchError(err error) bool {
 
 type progressMsg struct {
 	state       string
-	tables      []tableProgress
+	tables      []templates.TableProgress
 	operations  []templates.ProgressOperation
-	released    bool   // apply-level release latch: a released pause runs degraded, not paused
-	errorMsg    string // Human-readable error message
-	failed      bool   // true when the API call didn't return usable progress data
-	retryable   bool   // when failed, whether the TUI should keep polling
-	volume      int
+	released    bool              // apply-level release latch: a released pause runs degraded, not paused
+	errorMsg    string            // Human-readable error message
+	failed      bool              // true when the API call didn't return usable progress data
+	retryable   bool              // when failed, whether the TUI should keep polling
 	applyID     string            // Populated from progress responses
 	database    string            // Populated from apply-id progress responses
 	environment string            // Populated from apply-id progress responses
@@ -139,12 +107,6 @@ type stopResultMsg struct {
 	message string // Informational message from backend (e.g. "Schema change already completed")
 }
 
-type volumeResultMsg struct {
-	success   bool
-	newVolume int
-	err       error
-}
-
 // NewWatchModel creates a new WatchModel.
 func NewWatchModel(endpoint, database, environment string, allowControlActions bool) WatchModel {
 	s := spinner.New()
@@ -158,7 +120,6 @@ func NewWatchModel(endpoint, database, environment string, allowControlActions b
 		allowControlActions: allowControlActions,
 		spinner:             s,
 		startedAt:           time.Now(),
-		currentVolume:       4, // Default Spirit volume
 	}
 }
 
@@ -177,11 +138,6 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		// During cutover, ignore all keyboard input except q to force quit
 		isCuttingOver := state.IsState(m.state, state.Apply.CuttingOver) || m.cutoverTriggered
-
-		// Handle volume mode inputs
-		if m.volumeMode {
-			return m.handleVolumeKeys(msg)
-		}
 
 		if isEnterKey(msg) {
 			return m.handleEnterKey()
@@ -204,15 +160,9 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			// Stop (Spirit) or cancel (PlanetScale) the schema change
-			if state.IsState(m.state, state.Apply.Running, state.Apply.RunningDegraded, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover) && !m.stopTriggered {
+			if (state.IsRunningApplyState(m.state) || state.IsState(m.state, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover)) && !m.stopTriggered {
 				m.stopTriggered = true
 				return m, m.triggerStop()
-			}
-		case "v":
-			// Enter volume mode (only when running)
-			if state.IsRunningApplyState(m.state) && !isCuttingOver {
-				m.volumeMode = true
-				return m, nil
 			}
 		}
 
@@ -241,10 +191,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pastPending = true
 		}
 
-		// Preserve last known tables during volume change to avoid visual reset
-		if !m.volumeChanging || len(m.tables) == 0 {
-			m.tables = msg.tables
-		}
+		m.tables = msg.tables
 		m.operations = msg.operations
 		m.released = msg.released
 		m.errorMsg = msg.errorMsg
@@ -257,10 +204,6 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.errorMsg = "skip-revert timed out — press Enter to retry"
 		}
 		m.initialized = true
-		// Update volume from API if not pending a change
-		if msg.volume > 0 && m.volumePending == 0 {
-			m.currentVolume = msg.volume
-		}
 		// Populate applyID/database/environment from response
 		if m.applyID == "" && msg.applyID != "" {
 			m.applyID = msg.applyID
@@ -288,13 +231,6 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.metadata != nil && m.metadata["is_instant"] == "true" {
 			for i := range m.tables {
 				m.tables[i].IsInstant = true
-			}
-		}
-
-		// Calculate max table name length for alignment
-		for _, t := range m.tables {
-			if len(t.Name) > m.maxTableNameLen {
-				m.maxTableNameLen = len(t.Name)
 			}
 		}
 
@@ -335,16 +271,6 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.stopTriggered = false
 		}
 		// Continue polling - next tick will fetch updated state
-
-	case volumeResultMsg:
-		m.volumePending = 0      // Clear pending state
-		m.volumeChanging = false // Clear changing state
-		if msg.err != nil {
-			m.errorMsg = msg.err.Error()
-		} else if msg.success {
-			m.currentVolume = msg.newVolume
-			m.errorMsg = "" // Clear any previous error
-		}
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -462,7 +388,7 @@ func formatExitContext(applyID, deployRequestURL, environment string) string {
 	if deployRequestURL != "" {
 		fmt.Fprintf(&b, "  Deploy Request:  %s\n", deployRequestURL)
 	}
-	cmd := fmt.Sprintf("schemabot progress %s", applyID)
+	cmd := fmt.Sprintf("%s progress %s", cliname.Name(), applyID)
 	if environment != "" {
 		cmd += " -e " + environment
 	}

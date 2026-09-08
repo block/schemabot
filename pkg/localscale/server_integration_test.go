@@ -18,8 +18,8 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -554,7 +554,7 @@ func applyBranchDDL(t *testing.T, ctx context.Context, branchName string, ddl ma
 
 	for keyspace, stmts := range ddl {
 		dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s", pw.Username, pw.PlainText, pw.Hostname, keyspace)
-		db, err := sql.Open("mysql", dsn)
+		db, err := sql.Open("block-mysql", dsn)
 		require.NoError(t, err, "open branch MySQL for %s", keyspace)
 		require.NoError(t, db.PingContext(ctx), "ping branch MySQL for %s", keyspace)
 		for _, stmt := range stmts {
@@ -624,6 +624,32 @@ func deploy(t *testing.T, ctx context.Context, number uint64, instantDDL bool) *
 	})
 	require.NoError(t, err, "DeployDeployRequest")
 	return dr
+}
+
+// settleDeploy waits for a deployed deploy request to finish and, when it
+// parks in the revert window, skips the revert. Only one deploy can be active
+// per database, so a test that deploys must settle its deploy request before
+// the next deploy against the shared database can proceed.
+func settleDeploy(t *testing.T, ctx context.Context, number uint64) {
+	t.Helper()
+	settled := waitForDeployState(t, ctx, number, drState.CompletePendingRevert, drState.Complete)
+	if settled.DeploymentState == drState.CompletePendingRevert {
+		_, err := testClient.SkipRevertDeployRequest(ctx, &ps.SkipRevertDeployRequestRequest{
+			Organization: testOrg, Database: testDB, Number: number,
+		})
+		if err != nil {
+			// The revert window can expire between observing complete_pending_revert
+			// and the skip-revert call, in which case the deploy request is already
+			// complete and equally settled. Any other skip-revert failure is real.
+			read, readErr := testClient.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
+				Organization: testOrg, Database: testDB, Number: number,
+			})
+			require.NoError(t, readErr, "GetDeployRequest after SkipRevertDeployRequest failed: %v", err)
+			require.Equal(t, drState.Complete, read.DeploymentState,
+				"SkipRevertDeployRequest failed and deploy request %d did not settle on its own: %v", number, err)
+		}
+		waitForDeployState(t, ctx, number, drState.Complete)
+	}
 }
 
 // testShardedVSchema returns the base sharded VSchema from testdata, optionally

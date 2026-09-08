@@ -32,7 +32,6 @@
 //	Cutover  → Complete the deploy request (maps to vtctldclient OnlineDDL complete)
 //	Revert   → Revert the deploy request during the revert window
 //	SkipRevert → Close the revert window, making changes permanent
-//	Volume   → Throttle/unthrottle the deploy request (maps to vtctldclient OnlineDDL throttle/unthrottle)
 //
 // # Deploy Request States
 //
@@ -145,9 +144,13 @@
 //
 // # Instant DDL
 //
-// PlanetScale auto-detects instant DDL eligibility. When eligible and neither
-// enableRevert nor deferCutover is set, instant DDL is used automatically.
-// Instant DDL completes immediately without a row copy phase.
+// PlanetScale auto-detects instant DDL eligibility. When eligible, instant DDL
+// is used automatically — unless the cutover was deferred (instant DDL swaps
+// the schema the moment the deploy runs, so there is no gate to hold) or the
+// change is unsafe in Spirit's vocabulary (DROP TABLE, DROP COLUMN, and other
+// data-destroying operations — instant DDL has no revert window, so an unsafe
+// change must take the row-copy path to stay revertible). Instant DDL
+// completes immediately without a row copy phase.
 //
 // # VSchema
 //
@@ -291,7 +294,7 @@
 //
 // Throttling:
 //
-//	user_throttle_ratio       User-set throttle ratio (0.0-1.0). Maps to Volume.
+//	user_throttle_ratio       User-set throttle ratio (0.0-1.0).
 //	                          0.85 means 85% throttled.
 //	last_throttled_timestamp  When last throttled on this shard.
 //	component_throttled       Which component caused throttling (e.g. "vplayer").
@@ -384,7 +387,7 @@ import (
 	"sync"
 	"time"
 
-	mysql "github.com/go-sql-driver/mysql"
+	mysql "github.com/block/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
 	"github.com/block/spirit/pkg/utils"
@@ -415,11 +418,22 @@ const (
 	deployRequestPollInterval = 500 * time.Millisecond
 )
 
+// deployValidationWait bounds how long a deploy keeps retrying while
+// PlanetScale is still validating the deploy request, and
+// deployValidationPollInterval paces those retries. Validation runs
+// asynchronously after the deploy request leaves the pending state, so the
+// deploy endpoint can keep rejecting for a while after the request reports
+// ready. Variables rather than constants so tests can compress the wait.
+var (
+	deployValidationWait         = 5 * time.Minute
+	deployValidationPollInterval = 5 * time.Second
+)
+
 // deployState is a shorthand alias for PlanetScale deploy request state constants.
 var deployState = state.DeployRequest
 
 // formatDeployRequestError builds a detailed error message for a failed deploy request,
-// including any lint errors from PlanetScale's validation.
+// including any lint errors from PlanetScale's validation. sadscan:disable kingfisher.planetscale.2
 func formatDeployRequestError(dr *ps.DeployRequest) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "deploy request #%d failed during preparation (state: %s)", dr.Number, dr.DeploymentState)
@@ -478,6 +492,11 @@ type psMetadata struct {
 	// only one that knows it. Map membership drives the baseline diff; the stored
 	// timestamp values are diagnostic only — the earliest-requested tie-break in
 	// discovery reads requested_timestamp from the current rows, not from these.
+	// The set is bounded at capture time: non-terminal contexts are always
+	// included, terminal history only within baselineContextRetention. Old
+	// terminal contexts absent from the baseline are still excluded from
+	// discovery by the requested-at-or-after-deploy check, because Vitess
+	// retries preserve the original requested_timestamp.
 	ExistingMigrationCtxs map[string]MigrationContextTimestamps `json:"existing_migration_contexts,omitempty"`
 }
 
@@ -647,7 +666,7 @@ func (e *Engine) getVtgateDB(ctx context.Context, dsn string) (*sql.DB, error) {
 		return db, nil
 	}
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open vtgate: %w", err)
 	}
@@ -676,6 +695,31 @@ func credOrg(creds *engine.Credentials) string {
 		return creds.Metadata["organization"]
 	}
 	return ""
+}
+
+func credDatabase(creds *engine.Credentials) string {
+	if creds != nil {
+		return creds.Metadata["database"]
+	}
+	return ""
+}
+
+// resolveDatabase returns the PlanetScale database name for a request: the
+// "database" credential metadata when set, otherwise the request's database
+// identifier itself. The two differ when a database is registered under an
+// arbitrary identifier while the PlanetScale database keeps its own name.
+// Each exported engine method rewrites its request's Database with the
+// resolved name, so every PlanetScale API call, error, and log line in the
+// engine names the database as PlanetScale knows it; the debug log ties the
+// resolved name back to the registered identifier when they differ.
+func (e *Engine) resolveDatabase(creds *engine.Credentials, database string) string {
+	resolved := credDatabase(creds)
+	if resolved == "" || resolved == database {
+		return database
+	}
+	e.logger.Debug("using PlanetScale database name from credential metadata",
+		"database", database, "planetscale_database", resolved)
+	return resolved
 }
 
 func credTokenName(creds *engine.Credentials) string {
@@ -714,6 +758,17 @@ func isRetryableMySQLConnectionError(err error) bool {
 // are blocked while the snapshot completes.
 func isSnapshotInProgress(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "schema snapshot is in progress")
+}
+
+// isDeployStillValidatingError reports whether the PlanetScale API rejected a
+// deploy because the deploy request is still running its pre-deploy safety
+// validation ("We're currently validating that these changes are safe to
+// deploy"). The rejection clears on its own once validation completes, so the
+// deploy should be retried rather than failed. Message matching is required:
+// the API returns this rejection with a non-retryable error code, so the
+// SDK's typed codes cannot distinguish it from a permanent rejection.
+func isDeployStillValidatingError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "validating that these changes are safe to deploy")
 }
 
 // isRetryablePSError returns true if the error is a transient PlanetScale

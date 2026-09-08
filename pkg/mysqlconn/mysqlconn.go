@@ -1,27 +1,49 @@
 package mysqlconn
 
 import (
-	"context"
 	"database/sql"
 	"fmt"
-	"log/slog"
 	"time"
 
+	"github.com/block/mysql"
+	"github.com/block/schemabot/pkg/connreload"
 	"github.com/block/spirit/pkg/dbconn"
-	dsndriver "github.com/go-mysql/hotswap-dsn-driver"
-	"github.com/go-sql-driver/mysql"
 )
 
 var openSQL = sql.Open
+
+// Default transport timeouts for SchemaBot-managed MySQL connections, applied
+// whenever the parsed value is unset — a DSN or option must set a positive
+// timeout to override them, and the zero "no timeout" value is deliberately
+// replaced so a managed connection can never be unbounded. The connect
+// timeout bounds the TCP dial only: the Go MySQL driver's handshake and auth
+// exchange run on the caller's context, so a half-open endpoint that accepts
+// the dial but never sends the server greeting unwinds via context
+// cancellation like any other read (the PostgreSQL side differs — pgconn's
+// ConnectTimeout bounds the whole connection process including TLS and auth).
+// The write timeout bounds a single network write; statement text is small,
+// so a write blocked this long means the peer is gone. No read-timeout
+// default is set, deliberately: the Go MySQL driver's read timeout caps a
+// single network read, and a legitimately long-running statement streams no
+// bytes until it completes — for example a large DROP TABLE or a DDL waiting
+// on a metadata lock — so a read timeout would kill it mid-flight. Reads
+// unwind when the caller's context is cancelled (the driver closes the
+// connection on cancellation); a call site that must bound a read on its own
+// sets an explicit context deadline.
+const (
+	defaultConnectTimeout = 30 * time.Second
+	defaultWriteTimeout   = time.Minute
+)
 
 // Option customizes the parsed MySQL config before the DSN is reassembled.
 // Options are applied in ConnectionDSN, so they flow through Open,
 // OpenReloadable, and the credential-reload path alike.
 type Option func(*mysql.Config)
 
-// WithConnectTimeout bounds a single connection attempt (TCP dial plus
-// handshake) by setting the driver's `timeout` DSN parameter. A non-positive
-// duration is ignored, leaving the driver default in place. It does not bound
+// WithConnectTimeout bounds the TCP dial of a single connection attempt by
+// setting the driver's `timeout` DSN parameter; the handshake that follows
+// runs on the caller's context. A non-positive duration is ignored, leaving
+// any DSN-carried value, or the package default, in place. It does not bound
 // query execution — use context deadlines for that.
 func WithConnectTimeout(d time.Duration) Option {
 	return func(cfg *mysql.Config) {
@@ -31,10 +53,20 @@ func WithConnectTimeout(d time.Duration) Option {
 	}
 }
 
-// hotswapDriverName is Daniel Nichter's (https://github.com/daniel-nichter)
-// hot-swap DSN driver, a drop-in replacement for github.com/go-sql-driver/mysql
-// that re-reads credentials on an access-denied error. See OpenReloadable.
-const hotswapDriverName = "mysql-hotswap-dsn"
+// driverName is block/mysql, Block's fork of go-sql-driver/mysql. It registers
+// itself as "block-mysql" rather than "mysql" so that a binary whose dependency
+// graph still reaches upstream can link both without two sql.Register calls
+// colliding under one name. SchemaBot's own graph no longer reaches upstream at
+// all, but the fork's registered name is not SchemaBot's to choose.
+//
+// Every pool in this package dials through this one driver, and that is
+// load-bearing rather than tidy: ConnectionDSN injects tls=rds, and a tls=
+// value is a *name* that only resolves inside the registry of the driver
+// package that registered it. Spirit registers "rds" into block/mysql. A pool
+// opened through any other MySQL driver — as the reloadable pool once was, via
+// a hot-swap driver that embedded upstream — cannot resolve the name and fails
+// to open against an RDS host at all.
+const driverName = "block-mysql"
 
 // Open returns a MySQL connection using the same target-DSN normalization as
 // Spirit. Options customize the DSN (for example WithConnectTimeout) before the
@@ -44,87 +76,73 @@ func Open(dsn string, opts ...Option) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	db, err := openSQL("mysql", connectionDSN)
+	db, err := openSQL(driverName, connectionDSN)
 	if err != nil {
 		return nil, fmt.Errorf("open MySQL connection: %w", err)
 	}
 	return db, nil
 }
 
-// OpenReloadable opens a connection whose credentials survive rotation of the
-// underlying secret. When a new connection is rejected with MySQL error 1045
+// OpenReloadable opens a connection pool whose credentials survive rotation of
+// the underlying secret. When a new connection is refused with MySQL error 1045
 // (access denied) — the signature of a password that was rotated out from under
-// a running pod — the driver calls reload to fetch a freshly resolved DSN
-// (re-reading the mounted secret) and retries, so rotation is transparent and
-// does not require a restart. reload returns the raw DSN; transport settings
-// are re-applied here. A reload error keeps the current credentials so a
-// transient resolve failure cannot wedge the pool with an empty DSN.
+// a running pod — the pool calls reload to fetch a freshly resolved DSN
+// (re-reading the mounted secret) and retries once, so rotation is transparent
+// and does not require a restart. reload returns the raw DSN; transport
+// settings and options are re-applied here. A reload error keeps the current
+// credentials so a transient resolve failure cannot wedge the pool, and starts
+// a short cooldown during which further refused dials skip the reload — the DSN
+// may resolve through a remote secrets backend, and an outage there must not
+// turn every refused dial into a resolve call.
 //
 //	secret rotated ──► new conn ──► 1045 access denied
 //	                                      │
 //	                                      ▼
 //	                    reload: re-resolve DSN (re-read secret)
-//	                                      │ (on error: keep current DSN)
+//	                                      │ (on error: keep current credentials)
 //	                                      ▼
 //	                    retry with fresh credentials ──► success
 //
-// The reload callback is registered process-global on the hot-swap driver and
-// applies to every connection opened with that driver; each OpenReloadable call
-// replaces it. OpenReloadable is the only path that opens with the hot-swap
-// driver, so reserve it for the single long-lived storage pool. Target-database
-// connections use Open, whose credentials come from the apply request rather
-// than the storage secret.
+// Established connections authenticated before the rotation keep working; only
+// new physical connections take the reload path. reload runs only after an
+// access-denied failure — never per connection — so a DSN resolved through a
+// remote secrets backend is not re-fetched on every dial. The callback belongs
+// to this pool alone, so opening two reloadable pools does not have one
+// silently inherit the other's credentials. Reserve OpenReloadable for the
+// single long-lived storage pool; target-database connections use Open, whose
+// credentials come from the apply request rather than the storage secret.
+//
+// The scheduling — how many reloads a burst of refused dials costs, and how a
+// failing secrets backend is backed off — is pkg/connreload's and is shared
+// with the PostgreSQL storage pool; see reloadConfig for the MySQL-specific
+// half.
 func OpenReloadable(dsn string, reload func() (string, error), opts ...Option) (*sql.DB, error) {
-	connectionDSN, err := ConnectionDSN(dsn, opts...)
-	if err != nil {
-		return nil, err
-	}
-	dsndriver.SetHotswapFunc(func(_ context.Context, _ string) string {
-		return reloadConnectionDSN(reload, opts...)
-	})
-	db, err := openSQL(hotswapDriverName, connectionDSN)
+	connector, err := connreload.New(dsn, reloadConfig(reload, opts))
 	if err != nil {
 		return nil, fmt.Errorf("open reloadable MySQL connection: %w", err)
 	}
-	return db, nil
+	return sql.OpenDB(connector), nil
 }
 
-// reloadConnectionDSN resolves a fresh DSN and re-applies transport settings for
-// the hot-swap driver. It returns "" — meaning "keep the current DSN" — when the
-// reload or transport step fails, so a transient error cannot wedge the pool
-// with an empty DSN.
-func reloadConnectionDSN(reload func() (string, error), opts ...Option) string {
-	rawDSN, err := reload()
-	if err != nil {
-		slog.Error("reload storage DSN after access-denied failed; keeping current credentials", "error", err)
-		return ""
-	}
-	reloadedDSN, err := ConnectionDSN(rawDSN, opts...)
-	if err != nil {
-		slog.Error("apply transport settings to reloaded storage DSN failed; keeping current credentials", "error", err)
-		return ""
-	}
-	slog.Info("reloaded storage credentials after access-denied error")
-	return reloadedDSN
-}
-
-// ConnectionDSN returns a MySQL DSN with required transport settings applied,
-// plus any caller-supplied options (for example WithConnectTimeout). Options
-// are applied on every return path so they take effect regardless of whether
-// the DSN also needs RDS TLS enhancement.
+// ConnectionDSN returns a MySQL DSN with required connection settings applied
+// (RDS TLS, client-side parameter interpolation, default transport timeouts),
+// plus any caller-supplied options (for example WithConnectTimeout). Settings
+// and options are applied on every return path so they take effect regardless
+// of whether the DSN also needs RDS TLS enhancement.
 func ConnectionDSN(dsn string, opts ...Option) (string, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
 		return "", fmt.Errorf("parse DSN: %w", err)
 	}
 	// An explicit TLS config or a non-RDS host needs no TLS enhancement; apply
-	// options directly to the parsed config and reassemble.
+	// the required settings and options directly to the parsed config and
+	// reassemble.
 	if cfg.TLSConfig != "" {
-		return applyOptions(dsn, cfg, opts...), nil
+		return requiredSettingsDSN(cfg, opts...), nil
 	}
 	tlsMode, ok := tlsModeForHost(cfg.Addr)
 	if !ok {
-		return applyOptions(dsn, cfg, opts...), nil
+		return requiredSettingsDSN(cfg, opts...), nil
 	}
 	dbConfig := dbconn.NewDBConfig()
 	dbConfig.TLSMode = tlsMode
@@ -132,28 +150,42 @@ func ConnectionDSN(dsn string, opts ...Option) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("enhance RDS DSN with TLS: %w", err)
 	}
-	if len(opts) == 0 {
-		return connectionDSN, nil
-	}
-	// Re-parse the enhanced DSN so options layer on top of the injected TLS
-	// settings rather than discarding them.
+	// Re-parse the enhanced DSN so the required settings and options layer on
+	// top of the injected TLS settings rather than discarding them.
 	enhanced, err := mysql.ParseDSN(connectionDSN)
 	if err != nil {
 		return "", fmt.Errorf("parse enhanced DSN: %w", err)
 	}
-	return applyOptions(connectionDSN, enhanced, opts...), nil
+	return requiredSettingsDSN(enhanced, opts...), nil
 }
 
-// applyOptions runs each option against cfg and returns the reassembled DSN.
-// When no options are supplied it returns raw unchanged, preserving the
-// original DSN string exactly (FormatDSN may otherwise reorder parameters).
-func applyOptions(raw string, cfg *mysql.Config, opts ...Option) string {
-	if len(opts) == 0 {
-		return raw
-	}
+// requiredSettingsDSN applies any caller-supplied options, then default
+// transport timeouts for values still unset, then the settings every
+// SchemaBot-managed MySQL connection needs, and returns the reassembled DSN.
+// Required settings are applied after options so no option can override them;
+// the timeout defaults fill non-positive values, so a positive DSN or option
+// timeout wins while zero ("no timeout") and negative values — which the
+// driver would silently treat as unbounded — are replaced: a managed
+// connection is never unbounded.
+func requiredSettingsDSN(cfg *mysql.Config, opts ...Option) string {
 	for _, opt := range opts {
 		opt(cfg)
 	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = defaultConnectTimeout
+	}
+	if cfg.WriteTimeout <= 0 {
+		cfg.WriteTimeout = defaultWriteTimeout
+	}
+	// Interpolate query parameters client-side instead of using server-side
+	// prepared statements. database/sql prepares, executes once, and closes on
+	// every parameterized query, so server-side preparation buys no statement
+	// reuse — it costs extra round trips and consumes the server-global
+	// max_prepared_stmt_count budget, which other clients of a shared target
+	// can exhaust (MySQL error 1461). The Go MySQL driver escapes interpolated
+	// values and refuses to interpolate under charsets where escaping is
+	// unsafe.
+	cfg.InterpolateParams = true
 	return cfg.FormatDSN()
 }
 

@@ -12,18 +12,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/block/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/mysql"
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
-	"github.com/block/schemabot/pkg/testutil"
 )
 
 // TestOperatorMultiOperationMatrix proves the DORMANT multi-deployment fan-out
@@ -51,7 +47,7 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 	}
 
 	ctx := t.Context()
-	db := startMatrixContainer(t, ctx)
+	db := openMatrixStorage(t)
 	stor := mysqlstore.New(db)
 
 	t.Run("RollingHaltCompletesInOrder", func(t *testing.T) {
@@ -245,7 +241,11 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		resetMatrixTables(t, ctx, db)
 		// A continue rollout that already failed one deployment and still has a
 		// pending sibling, with a queued stop: the stop must halt the pending
-		// sibling and settle the apply rather than starting more deployments.
+		// sibling rather than starting more deployments. The stopped sibling
+		// still holds its deployment, so the rollout holds running_degraded
+		// instead of settling, and the stop request completes anyway — the
+		// operator's next start is what resumes that sibling, and a stop left
+		// pending would refuse it.
 		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
 			applyIdentifier: "matrix-pending-stop",
 			parentState:     state.Apply.RunningDegraded,
@@ -282,9 +282,11 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		assert.Equal(t, state.ApplyOperation.Stopped, opState(t, ctx, stor, seed.opID("region-b")),
 			"the pending sibling must be stopped, not started, under a pending stop")
 		apply := getApply(t, ctx, stor, seed.applyID)
-		assert.Equal(t, state.Apply.Failed, apply.State, "failed + stopped settles the rollout to failed")
-		assert.True(t, stopRequestCompleted(t, ctx, stor, seed.applyID), "the pending stop request must be completed")
-		assert.Equal(t, 1, svc.matrixSummary.count(), "the settled rollout still owes exactly one terminal summary")
+		assert.Equal(t, state.Apply.RunningDegraded, apply.State,
+			"a stopped sibling holds its deployment, so the rollout holds instead of settling")
+		assert.True(t, stopRequestCompleted(t, ctx, stor, seed.applyID),
+			"the stop reached every operation, so its request must be completed rather than left to refuse the resuming start")
+		assert.Equal(t, 0, svc.matrixSummary.count(), "a rollout that has not settled owes no terminal summary")
 	})
 
 	t.Run("ConcurrentSiblingCompletionsPublishOneSummary", func(t *testing.T) {
@@ -408,32 +410,14 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 
 // --- harness ------------------------------------------------------------
 
-func startMatrixContainer(t *testing.T, ctx context.Context) *sql.DB {
+// openMatrixStorage gives the test a schema-bootstrapped storage database on
+// the shared MySQL server and a handle the test owns. The matrix services built
+// over this handle (newMatrixService) are never closed, so the test's cleanup
+// is the handle's only closer; a harness that starts closing its service must
+// open the handle itself instead.
+func openMatrixStorage(t *testing.T) *sql.DB {
 	t.Helper()
-	container, err := mysql.Run(ctx,
-		"mysql:8.0",
-		mysql.WithDatabase("schemabot_test"),
-		mysql.WithUsername("root"),
-		mysql.WithPassword("test"),
-	)
-	require.NoError(t, err, "failed to start mysql")
-	t.Cleanup(func() {
-		if err := testcontainers.TerminateContainer(container); err != nil {
-			t.Logf("failed to terminate container: %v", err)
-		}
-	})
-
-	dsn, err := testutil.ContainerConnectionString(ctx, container, "parseTime=true")
-	require.NoError(t, err, "failed to get connection string")
-
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	require.NoError(t, EnsureSchema(dsn, logger), "failed to ensure schema")
-
-	db, err := sql.Open("mysql", dsn)
-	require.NoError(t, err, "failed to open database")
-	require.NoError(t, db.PingContext(ctx), "failed to ping database")
-	t.Cleanup(func() { utils.CloseAndLog(db) })
-	return db
+	return openStorageDB(t, newStorageDatabaseWithSchema(t).DSN)
 }
 
 // resetMatrixTables clears the rows the matrix touches so each subtest shares one
@@ -658,8 +642,7 @@ func stalenessBackdate(t *testing.T, ctx context.Context, db *sql.DB, applyID in
 func newMatrixService(t *testing.T, stor storage.Storage, clients map[string]tern.Client) *matrixService {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	cfg := &ServerConfig{OperatorClaimOperations: new(true)}
-	svc := New(stor, cfg, clients, logger)
+	svc := New(stor, &ServerConfig{}, clients, logger)
 
 	summary := &matrixSummaryRecorder{}
 	svc.OnApplyTerminalSummary = func(_ context.Context, apply *storage.Apply, tasks []*storage.Task) error {

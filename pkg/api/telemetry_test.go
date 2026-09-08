@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -21,8 +22,10 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata/metricdatatest"
+	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 )
 
 func TestSetupTelemetry(t *testing.T) {
@@ -34,6 +37,29 @@ func TestSetupTelemetry(t *testing.T) {
 
 	require.NotNil(t, tel.MetricsHandler)
 	assert.Nil(t, tel.tracerProvider, "tracerProvider should be nil without OTLP endpoint")
+}
+
+func TestTelemetryResourceToleratesForeignSchemaURL(t *testing.T) {
+	// A host binary embedding this server builds the base resource with its
+	// own SDK, whose semantic-convention schema URL may differ from the one
+	// this module pins. The service-name override must merge cleanly against
+	// any such base instead of failing on a schema URL conflict.
+	base := resource.NewWithAttributes(
+		"https://opentelemetry.io/schemas/1.99.0",
+		attribute.String("host.attr", "host-value"),
+	)
+
+	res, err := telemetryResource(base)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+
+	attrs := make(map[attribute.Key]string)
+	for _, kv := range res.Attributes() {
+		attrs[kv.Key] = kv.Value.Emit()
+	}
+	assert.Equal(t, "schemabot", attrs[semconv.ServiceNameKey], "service-name override must survive the merge")
+	assert.Equal(t, "host-value", attrs["host.attr"], "base resource attributes must survive the merge")
+	assert.Equal(t, "https://opentelemetry.io/schemas/1.99.0", res.SchemaURL(), "the base resource's schema URL is authoritative")
 }
 
 func TestSetupTelemetryWithOTLP(t *testing.T) {
@@ -260,7 +286,7 @@ func TestSchemaBotMetricsIncludeEnvironmentAttribute(t *testing.T) {
 	metrics.RecordLockOperation(t.Context(), "acquire", "mydb", "success")
 	metrics.RecordOperatorResume(t.Context(), "mydb", "pie", "staging", "running")
 	metrics.RecordOperatorResumeFailure(t.Context(), "mydb", "pie", "staging", "no_client")
-	metrics.RecordOperatorClaimFailure(t.Context(), "storage_error")
+	metrics.RecordOperatorClaimFailure(t.Context(), "expire_retryable_error")
 	metrics.RecordOperatorClaimDuration(t.Context(), time.Second, "mydb", "pie", "staging", "running")
 	metrics.RecordSchemaRequestError(t.Context(), "org/repo", "apply", "mydb", "staging", "invalid_config")
 	metrics.RecordGitHubRequest(t.Context(), metrics.GitHubRequestSample{
@@ -717,23 +743,40 @@ func TestRecordOperatorMetrics(t *testing.T) {
 	metrics.RecordOperatorResume(t.Context(), "testdb", "pie", "staging", "running")
 	metrics.RecordOperatorResumeFailure(t.Context(), "testdb", "pie", "staging", "no_client")
 	metrics.RecordOperatorResumeFailure(t.Context(), "testdb", "pie", "staging", "lease_lost")
-	metrics.RecordOperatorClaimFailure(t.Context(), "storage_error")
 	metrics.RecordOperatorClaimFailure(t.Context(), "expire_retryable_error")
 	metrics.RecordOperatorClaimFailure(t.Context(), "missing_lease_token")
 	metrics.RecordOperatorClaimFailure(t.Context(), "operation_parent_not_claimable")
+	metrics.RecordOperatorClaimFailure(t.Context(), "operation_lease_release_error")
+	metrics.RecordOperatorClaimFailure(t.Context(), "stranded_reaper_error")
 	metrics.RecordOperatorClaimDuration(t.Context(), 50*time.Millisecond, "testdb", "pie", "staging", "running")
+	metrics.RecordOperatorStrandedOperationReaped(t.Context(), "testdb", "pie", "staging", state.Apply.Completed)
 
 	var rm metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(t.Context(), &rm))
 
 	names := make(map[string]bool)
 	var sawExpireRetryableError bool
+	var sawStrandedReaperError bool
 	var sawMissingLeaseToken bool
 	var sawLeaseLost bool
 	var sawOperationParentNotClaimable bool
+	var sawOperationLeaseReleaseError bool
+	var sawStrandedParentState bool
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
 			names[m.Name] = true
+			if m.Name == "schemabot.operator.stranded_operations_reaped_total" {
+				sum, ok := m.Data.(metricdata.Sum[int64])
+				require.True(t, ok)
+				for _, dp := range sum.DataPoints {
+					parentState, hasParentState := dp.Attributes.Value(attribute.Key("parent_state"))
+					require.True(t, hasParentState, "a reaped stranded operation must say which parent outcome it mirrored")
+					if parentState.AsString() == state.Apply.Completed {
+						sawStrandedParentState = true
+					}
+				}
+				continue
+			}
 			if m.Name != "schemabot.operator.claim_failures_total" && m.Name != "schemabot.operator.resume_failures_total" {
 				continue
 			}
@@ -745,12 +788,16 @@ func TestRecordOperatorMetrics(t *testing.T) {
 				switch reason.AsString() {
 				case "expire_retryable_error":
 					sawExpireRetryableError = true
+				case "stranded_reaper_error":
+					sawStrandedReaperError = true
 				case "missing_lease_token":
 					sawMissingLeaseToken = true
 				case "lease_lost":
 					sawLeaseLost = true
 				case "operation_parent_not_claimable":
 					sawOperationParentNotClaimable = true
+				case "operation_lease_release_error":
+					sawOperationLeaseReleaseError = true
 				}
 			}
 		}
@@ -764,10 +811,14 @@ func TestRecordOperatorMetrics(t *testing.T) {
 	assert.True(t, names["schemabot.scheduler.resume_failures_total"], "expected deprecated schemabot.scheduler.resume_failures_total alias")
 	assert.True(t, names["schemabot.scheduler.claim_failures_total"], "expected deprecated schemabot.scheduler.claim_failures_total alias")
 	assert.True(t, names["schemabot.scheduler.claim_duration_seconds"], "expected deprecated schemabot.scheduler.claim_duration_seconds alias")
+	assert.True(t, names["schemabot.operator.stranded_operations_reaped_total"], "expected schemabot.operator.stranded_operations_reaped_total")
+	assert.True(t, sawStrandedParentState, "expected the reaped stranded operation to carry its parent's outcome as parent_state")
 	assert.True(t, sawExpireRetryableError, "expected expire_retryable_error claim failure reason to be preserved")
+	assert.True(t, sawStrandedReaperError, "expected stranded_reaper_error claim failure reason to be preserved")
 	assert.True(t, sawMissingLeaseToken, "expected missing_lease_token claim failure reason to be preserved")
 	assert.True(t, sawLeaseLost, "expected lease_lost resume failure reason to be recorded")
 	assert.True(t, sawOperationParentNotClaimable, "expected operation_parent_not_claimable claim failure reason to be preserved, not collapsed to unknown")
+	assert.True(t, sawOperationLeaseReleaseError, "expected operation_lease_release_error claim failure reason to be preserved, not collapsed to unknown")
 }
 
 func TestRecordRemoteDeploymentHealthMetrics(t *testing.T) {
@@ -890,6 +941,9 @@ func (m *mockPlanStore) Get(context.Context, string) (*storage.Plan, error)     
 func (m *mockPlanStore) GetByID(context.Context, int64) (*storage.Plan, error)     { return nil, nil }
 func (m *mockPlanStore) GetByLock(context.Context, int64) ([]*storage.Plan, error) { return nil, nil }
 func (m *mockPlanStore) GetByPR(context.Context, string, int) ([]*storage.Plan, error) {
+	return nil, nil
+}
+func (m *mockPlanStore) List(context.Context, storage.ListPlansOptions) ([]*storage.Plan, error) {
 	return nil, nil
 }
 func (m *mockPlanStore) Delete(context.Context, int64) error           { return nil }

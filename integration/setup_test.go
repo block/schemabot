@@ -21,10 +21,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
@@ -66,15 +65,10 @@ func TestMain(m *testing.M) {
 		}
 	})
 
-	host, err := testutil.ContainerHost(ctx, targetContainer)
+	targetDSN, err = testutil.MySQLDSN(ctx, targetContainer, "target_test", "parseTime=true")
 	if err != nil {
-		log.Fatalf("Failed to get target container host: %v", err)
+		log.Fatalf("Failed to build target DSN: %v", err)
 	}
-	port, err := testutil.ContainerPort(ctx, targetContainer, "3306")
-	if err != nil {
-		log.Fatalf("Failed to get target container port: %v", err)
-	}
-	targetDSN = fmt.Sprintf("root:testpassword@tcp(%s:%d)/target_test?parseTime=true", host, port)
 
 	// Start MySQL container for Tern storage (simulates remote Tern's separate storage)
 	ternStorageContainer, err := startMySQLContainer(ctx, "tern-storage-e2e-mysql", "tern_storage", &schema.MySQLFS)
@@ -87,15 +81,10 @@ func TestMain(m *testing.M) {
 		}
 	})
 
-	ternHost, err := testutil.ContainerHost(ctx, ternStorageContainer)
+	ternStorageDSN, err = testutil.MySQLDSN(ctx, ternStorageContainer, "tern_storage", "parseTime=true")
 	if err != nil {
-		log.Fatalf("Failed to get Tern storage container host: %v", err)
+		log.Fatalf("Failed to build Tern storage DSN: %v", err)
 	}
-	ternPort, err := testutil.ContainerPort(ctx, ternStorageContainer, "3306")
-	if err != nil {
-		log.Fatalf("Failed to get Tern storage container port: %v", err)
-	}
-	ternStorageDSN = fmt.Sprintf("root:testpassword@tcp(%s:%d)/tern_storage?parseTime=true", ternHost, ternPort)
 
 	// Start MySQL container for SchemaBot storage (plans, tasks, applies, locks)
 	schemabotContainer, err := startMySQLContainer(ctx, "schemabot-e2e-mysql", "schemabot_test", &schema.MySQLFS)
@@ -108,15 +97,10 @@ func TestMain(m *testing.M) {
 		}
 	})
 
-	sbHost, err := testutil.ContainerHost(ctx, schemabotContainer)
+	schemabotDSN, err = testutil.MySQLDSN(ctx, schemabotContainer, "schemabot_test", "parseTime=true")
 	if err != nil {
-		log.Fatalf("Failed to get SchemaBot container host: %v", err)
+		log.Fatalf("Failed to build SchemaBot storage DSN: %v", err)
 	}
-	sbPort, err := testutil.ContainerPort(ctx, schemabotContainer, "3306")
-	if err != nil {
-		log.Fatalf("Failed to get SchemaBot container port: %v", err)
-	}
-	schemabotDSN = fmt.Sprintf("root:testpassword@tcp(%s:%d)/schemabot_test?parseTime=true", sbHost, sbPort)
 
 	// Start gRPC server backed by LocalClient with its own storage (simulates remote Tern)
 	grpcAddr, err = startTernGRPC(ctx, targetDSN, ternStorageDSN)
@@ -142,19 +126,8 @@ func TestMain(m *testing.M) {
 }
 
 func startMySQLContainer(ctx context.Context, baseName, dbName string, schemaFS *embed.FS) (testcontainers.Container, error) {
-	req := testcontainers.ContainerRequest{
-		Name:         containerName(baseName),
-		Image:        "mysql:8.0",
-		ExposedPorts: []string{"3306/tcp"},
-		Env: map[string]string{
-			"MYSQL_ROOT_PASSWORD": "testpassword",
-			"MYSQL_DATABASE":      dbName,
-		},
-		WaitingFor: wait.ForAll(
-			wait.ForLog("ready for connections").WithOccurrence(2).WithStartupTimeout(60*time.Second),
-			wait.ForListeningPort("3306/tcp"),
-		),
-	}
+	req := testutil.MySQLContainerRequest("mysql:8.0", dbName)
+	req.Name = containerName(baseName)
 
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: req,
@@ -167,36 +140,22 @@ func startMySQLContainer(ctx context.Context, baseName, dbName string, schemaFS 
 
 	// Apply schema if provided
 	if schemaFS != nil {
-		host, err := testutil.ContainerHost(ctx, container)
+		dsn, err := testutil.MySQLDSN(ctx, container, dbName, "parseTime=true", "multiStatements=true")
 		if err != nil {
 			_ = container.Terminate(ctx)
-			return nil, fmt.Errorf("get container host: %w", err)
+			return nil, fmt.Errorf("build mysql dsn: %w", err)
 		}
-		port, err := testutil.ContainerPort(ctx, container, "3306")
-		if err != nil {
-			_ = container.Terminate(ctx)
-			return nil, fmt.Errorf("get container port: %w", err)
-		}
-		dsn := fmt.Sprintf("root:testpassword@tcp(%s:%d)/%s?parseTime=true&multiStatements=true", host, port, dbName)
 
-		db, err := sql.Open("mysql", dsn)
+		db, err := sql.Open("block-mysql", dsn)
 		if err != nil {
 			_ = container.Terminate(ctx)
 			return nil, fmt.Errorf("open db for schema: %w", err)
 		}
 		defer func() { _ = db.Close() }()
 
-		// Wait for MySQL to be ready to accept connections
-		var pingErr error
-		for range 30 {
-			if pingErr = db.PingContext(ctx); pingErr == nil {
-				break
-			}
-			time.Sleep(500 * time.Millisecond)
-		}
-		if pingErr != nil {
+		if err := testutil.PingMySQL(ctx, db); err != nil {
 			_ = container.Terminate(ctx)
-			return nil, fmt.Errorf("MySQL not ready after 15s: %w", pingErr)
+			return nil, err
 		}
 
 		if err := applySchemaFS(ctx, db, *schemaFS); err != nil {
@@ -268,13 +227,13 @@ func startTernGRPC(ctx context.Context, targetDSN, storageDSN string) (grpcAddre
 	adminCfg.MultiStatements = true
 
 	// Create the target database before starting the remote Tern service.
-	targetDB, err := sql.Open("mysql", adminCfg.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", adminCfg.FormatDSN())
 	if err != nil {
 		return "", fmt.Errorf("open target db: %w", err)
 	}
 	defer utils.CloseAndLog(targetDB)
-	if err := targetDB.PingContext(ctx); err != nil {
-		return "", fmt.Errorf("ping target db: %w", err)
+	if err := testutil.PingMySQL(ctx, targetDB); err != nil {
+		return "", fmt.Errorf("reach target db: %w", err)
 	}
 	if _, err := targetDB.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", quoteIdentifier(databaseName))); err != nil {
 		return "", fmt.Errorf("create target database %s: %w", databaseName, err)
@@ -285,7 +244,7 @@ func startTernGRPC(ctx context.Context, targetDSN, storageDSN string) (grpcAddre
 	clientDSN := clientCfg.FormatDSN()
 
 	// Open Tern storage (separate from SchemaBot storage, simulates production architecture)
-	storageDB, err := sql.Open("mysql", storageDSN)
+	storageDB, err := sql.Open("block-mysql", storageDSN)
 	if err != nil {
 		return "", fmt.Errorf("open storage db: %w", err)
 	}
@@ -304,12 +263,13 @@ func startTernGRPC(ctx context.Context, targetDSN, storageDSN string) (grpcAddre
 	cleanupFuncs = append(cleanupFuncs, func() { _ = localClient.Close() })
 
 	// A dispatch queues the apply in Tern storage for the data plane's own
-	// operator; without this loop a dispatched apply would sit pending forever.
-	// The harness terns share one Tern storage database, so the claim loop
-	// routes each claim to the registered client for its deployment.
-	registerRemoteTern(databaseName, localClient)
-	stopOperator := startRemoteTernOperator(storage, logger, "remote-tern-"+databaseName)
-	cleanupFuncs = append(cleanupFuncs, stopOperator)
+	// operator; without an operator a dispatched apply would sit pending
+	// forever. The shared remote-tern operator claims queued work and routes
+	// each drive to the client registered for its deployment.
+	if err := registerRemoteTern(storage, logger, databaseName, localClient); err != nil {
+		return "", fmt.Errorf("register remote tern %s: %w", databaseName, err)
+	}
+	cleanupFuncs = append(cleanupFuncs, stopRemoteTernOperator)
 
 	// Wrap LocalClient in gRPC server (simulates remote Tern)
 	grpcSrv := grpc.NewServer()

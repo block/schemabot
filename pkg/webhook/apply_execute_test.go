@@ -1,12 +1,31 @@
 package webhook
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 
+	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/stretchr/testify/assert"
 )
+
+func TestApplyExecutionErrorMessage(t *testing.T) {
+	t.Run("unsupported feature is actionable", func(t *testing.T) {
+		err := &api.UnsupportedFeatureError{Database: "orders", DatabaseType: storage.DatabaseTypePostgres, Feature: schema.FeatureDeferredCutover}
+		assert.Equal(t, `database "orders": deferred cutover is not supported for database_type: postgres`, applyExecutionErrorMessage(err))
+	})
+
+	t.Run("lock intent change remains actionable", func(t *testing.T) {
+		assert.Contains(t, applyExecutionErrorMessage(fmt.Errorf("verify lock: %w", storage.ErrLockIntentChanged)), "review the latest plan")
+	})
+
+	t.Run("internal error remains sanitized", func(t *testing.T) {
+		assert.Equal(t, "Failed to execute apply. See SchemaBot server logs for details.", applyExecutionErrorMessage(errors.New("secret DSN")))
+	})
+}
 
 func TestDDLMatchesStoredPlan(t *testing.T) {
 	tests := []struct {
@@ -195,6 +214,56 @@ func TestDDLMatchesStoredPlan(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.wantMatch, ddlMatchesStoredPlan(tt.planResp, tt.storedPlan))
+		})
+	}
+}
+
+// The consent recorded on a pending confirmation only speaks for the apply the
+// operator was actually shown. The lock carries no environment, so a disclosure
+// earned confirming one environment must not disarm the copy gate in another,
+// and a confirmation whose plan cannot be loaded must count as no disclosure at
+// all rather than as consent.
+func TestDisclosureDescribesThisApply(t *testing.T) {
+	tests := []struct {
+		name        string
+		lock        *storage.Lock
+		plan        *storage.Plan
+		environment string
+		want        bool
+	}{
+		{
+			name:        "disclosure shown for this environment is consent",
+			lock:        &storage.Lock{DisclosedCopyDiscard: true, PendingPlanID: "plan-1"},
+			plan:        &storage.Plan{PlanIdentifier: "plan-1", Environment: "staging"},
+			environment: "staging",
+			want:        true,
+		},
+		{
+			name:        "disclosure shown for another environment is not consent",
+			lock:        &storage.Lock{DisclosedCopyDiscard: true, PendingPlanID: "plan-1"},
+			plan:        &storage.Plan{PlanIdentifier: "plan-1", Environment: "staging"},
+			environment: "production",
+			want:        false,
+		},
+		{
+			name:        "no disclosure is not consent",
+			lock:        &storage.Lock{DisclosedCopyDiscard: false, PendingPlanID: "plan-1"},
+			plan:        &storage.Plan{PlanIdentifier: "plan-1", Environment: "staging"},
+			environment: "staging",
+			want:        false,
+		},
+		{
+			name:        "a disclosure whose plan did not load is not consent",
+			lock:        &storage.Lock{DisclosedCopyDiscard: true, PendingPlanID: "plan-1"},
+			plan:        nil,
+			environment: "staging",
+			want:        false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, disclosureDescribesThisApply(tt.lock, tt.plan, tt.environment))
 		})
 	}
 }

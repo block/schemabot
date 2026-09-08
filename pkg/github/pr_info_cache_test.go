@@ -96,6 +96,53 @@ func TestFetchPullRequest_NoCacheFallsThrough(t *testing.T) {
 	assert.Equal(t, int32(3), calls.Load(), "no cache on ctx → every call must hit GitHub")
 }
 
+// A seeded scope answers a fetch for that PR from the caller's own read, so a
+// caller that has to act on a head and then have it verified spends one round
+// trip and both decisions see one value.
+func TestWithPRInfo_SeededScopeServesTheCallersRead(t *testing.T) {
+	server, calls := newPRFakeGitHubServer(t)
+	defer server.Close()
+
+	ic := newPRTestInstallationClient(t, server)
+	seeded := &PullRequestInfo{HeadRef: "feature", HeadSHA: "seeded999", BaseRef: "main", User: "octocat"}
+	ctx := WithPRInfo(t.Context(), "octo/repo", 42, seeded)
+
+	got, err := ic.FetchPullRequest(ctx, "octo/repo", 42)
+	require.NoError(t, err)
+	assert.Equal(t, seeded, got)
+	assert.Equal(t, int32(0), calls.Load(), "the seeded read answers the fetch")
+}
+
+// Seeding one PR must not silence reads of any other, which would hand a
+// caller another PR's head.
+func TestWithPRInfo_OtherPullRequestsStillFetch(t *testing.T) {
+	server, calls := newPRFakeGitHubServer(t)
+	defer server.Close()
+
+	ic := newPRTestInstallationClient(t, server)
+	ctx := WithPRInfo(t.Context(), "octo/repo", 7, &PullRequestInfo{HeadSHA: "seeded999"})
+
+	got, err := ic.FetchPullRequest(ctx, "octo/repo", 42)
+	require.NoError(t, err)
+	assert.Equal(t, "abc123", got.HeadSHA)
+	assert.Equal(t, int32(1), calls.Load())
+}
+
+// A caller with nothing to seed still gets a usable scope rather than one that
+// answers every fetch with a nil head.
+func TestWithPRInfo_NilSeedFallsThroughToGitHub(t *testing.T) {
+	server, calls := newPRFakeGitHubServer(t)
+	defer server.Close()
+
+	ic := newPRTestInstallationClient(t, server)
+	ctx := WithPRInfo(t.Context(), "octo/repo", 42, nil)
+
+	got, err := ic.FetchPullRequest(ctx, "octo/repo", 42)
+	require.NoError(t, err)
+	assert.Equal(t, "abc123", got.HeadSHA)
+	assert.Equal(t, int32(1), calls.Load())
+}
+
 // TestFetchPullRequest_ErrorsAreNotCached verifies that a failed fetch
 // does not poison the request-scoped cache: a subsequent call within the
 // same scope must retry rather than return the stale error.

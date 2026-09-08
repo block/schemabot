@@ -2,9 +2,8 @@ package storage
 
 import (
 	"encoding/json"
-	"fmt"
+	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +16,18 @@ import (
 // in operator-facing progress (the PR comment's retry counter) and enforced by
 // the storage claim/expiry paths.
 const MaxRecoveryAttempts = 10
+
+// ApplyTargetLockWait is how long a claim blocks waiting for another instance
+// to release an apply target's advisory lock. It is the longest a statement on
+// the storage pool legitimately blocks, which makes it the floor any
+// statement budget configured for that pool must stay above: the wait blocks
+// inside a lock acquisition, and statement_timeout bounds a blocked statement
+// as readily as a computing one. A budget below this wait cancels the
+// acquisition with SQLSTATE 57014 before the lock timeout can report the
+// ordinary 55P03 "someone else holds it", turning routine contention into a
+// failure that looks nothing like a lock conflict. Exported so config
+// validation can enforce that floor.
+const ApplyTargetLockWait = 10 * time.Second
 
 // MaxWebhookEventAttempts is the claim budget for webhook inbox rows: how many
 // times FindNext will hand out a given delivery (each claim increments
@@ -94,7 +105,7 @@ type Lock struct {
 	// DatabaseName is the name of the database being locked.
 	DatabaseName string
 
-	// DatabaseType is the type of database: "vitess" or "mysql".
+	// DatabaseType is the type of database (one of the DatabaseType* constants).
 	DatabaseType string
 
 	// Repository is the GitHub repository (owner/repo format).
@@ -118,6 +129,30 @@ type Lock struct {
 	// unlock/lock, or a row written before this column existed). The confirm
 	// path treats empty as "skip the freshness check" rather than fail closed.
 	PendingPlanID string
+
+	// DisclosedCopyDiscard records that the comment this pending confirmation
+	// was posted with told the operator applying would throw away an unfinished
+	// row copy on the target. It is a consent record, and its question is
+	// exactly "were they shown a discard at all?" — not which copy, or how
+	// many. An apply that finds a larger discard set than the one disclosed
+	// therefore still proceeds; narrowing that to the copies actually named
+	// needs the disclosed set persisted, not a flag.
+	//
+	// It travels with PendingPlanID and is written by the same statement, so the
+	// flag always describes the plan the confirm command loads. It is
+	// deliberately not the copy itself: a copy disposition is a reading of the
+	// target that is always re-read at apply time, and only this answer to "did
+	// they know?" has to be durable.
+	//
+	// The lock carries no environment dimension, so the flag alone does not say
+	// which environment the operator was shown. Readers pair it with the pinned
+	// plan's environment before treating it as consent for the apply at hand.
+	//
+	// False for locks acquired outside the PR apply path (rollback, CLI) and for
+	// rows written before this column existed, which is the safe default — an
+	// unrecorded disclosure is treated as no disclosure, so the apply asks again
+	// rather than assuming consent.
+	DisclosedCopyDiscard bool
 
 	// CreatedAt is when the lock was acquired.
 	CreatedAt time.Time
@@ -190,7 +225,7 @@ type Check struct {
 	// Environment is the target environment: "staging" or "production".
 	Environment string
 
-	// DatabaseType is the database type: "vitess" or "mysql".
+	// DatabaseType is the database type (one of the DatabaseType* constants).
 	DatabaseType string
 
 	// DatabaseName is the name of the database.
@@ -330,10 +365,13 @@ type TableChange struct {
 
 	// ExecutionMode records the planner's execution-mode verdict. Empty means
 	// the engine's default path; "blocked" means the engine deterministically
-	// refuses the statement and the apply will fail.
+	// refuses the statement and the apply will fail; "direct" means the
+	// database's direct execution policy routes the refused statement to
+	// native DDL on the target instead.
 	ExecutionMode string `json:"execution_mode,omitempty"`
 
-	// ModeReason records the engine's reason when ExecutionMode is "blocked".
+	// ModeReason records the engine's reason for any non-empty ExecutionMode
+	// verdict.
 	ModeReason string `json:"mode_reason,omitempty"`
 }
 
@@ -343,6 +381,13 @@ type TableChange struct {
 // safe.
 func (tc TableChange) RequiresUnsafeOptIn() bool {
 	return tc.IsUnsafe || strings.EqualFold(tc.Operation, "drop")
+}
+
+// EngineBlocked reports whether the planner marked this change blocked: the
+// engine deterministically refuses the statement, so an apply that includes
+// it is guaranteed to fail.
+func (tc TableChange) EngineBlocked() bool {
+	return strings.EqualFold(tc.ExecutionMode, "blocked")
 }
 
 // UnsafeOptInReason returns the planner-provided unsafe reason, or a generic
@@ -357,6 +402,12 @@ func (tc TableChange) UnsafeOptInReason() string {
 	return "unsafe schema change requires explicit opt-in"
 }
 
+// VSchemaArtifactName is the plan artifact holding a namespace's desired Vitess
+// VSchema. A namespace changes its VSchema exactly when its plan data carries
+// this artifact; it lives here, next to the plan data, so every plane asks that
+// question the same way.
+const VSchemaArtifactName = "vschema.json"
+
 // NamespacePlanData contains plan data for a single namespace. OriginalFiles is
 // captured once for the namespace and applies to every table/artifact change in
 // Tables and Artifacts.
@@ -366,6 +417,19 @@ type NamespacePlanData struct {
 	OriginalFiles         map[string]string `json:"original_files,omitempty"`
 	OriginalFilesCaptured bool              `json:"original_files_captured,omitempty"`
 	Artifacts             map[string]string `json:"artifacts,omitempty"`
+
+	// Metadata is the subset of the engine's plan change-metadata that
+	// apply-time consumers read (see VSchemaPlanMetadata): the safety-gate
+	// keys and the rendered VSchema diff apply-time display shows.
+	Metadata map[string]string `json:"metadata,omitempty"`
+}
+
+// ChangesVSchema reports whether this namespace carries a VSchema change.
+func (n *NamespacePlanData) ChangesVSchema() bool {
+	if n == nil {
+		return false
+	}
+	return n.Artifacts[VSchemaArtifactName] != ""
 }
 
 // ShardPlan records per-shard membership and drift captured at plan time for a
@@ -395,7 +459,7 @@ type Plan struct {
 	// Database is the target database name.
 	Database string
 
-	// DatabaseType is "vitess" or "mysql".
+	// DatabaseType is one of the DatabaseType* constants.
 	DatabaseType string
 
 	// Deployment is the Tern deployment selected by server config at plan time.
@@ -469,6 +533,33 @@ func (p *Plan) FlatDDLChanges() []TableChange {
 	return result
 }
 
+// VSchemaNamespaces returns, in sorted order, every namespace in the plan that
+// changes its VSchema.
+func (p *Plan) VSchemaNamespaces() []string {
+	if p == nil {
+		return nil
+	}
+	var namespaces []string
+	for namespace, nsData := range p.Namespaces {
+		if nsData.ChangesVSchema() {
+			namespaces = append(namespaces, namespace)
+		}
+	}
+	sort.Strings(namespaces)
+	return namespaces
+}
+
+// IsVSchemaOnly reports whether the plan's only change is VSchema: no DDL, and
+// at least one namespace changing its VSchema. Such a plan produces no task
+// rows, so a drive that resolves no tasks for it is doing the right thing
+// rather than acting on an invalid claim.
+func (p *Plan) IsVSchemaOnly() bool {
+	if p == nil {
+		return false
+	}
+	return len(p.FlatDDLChanges()) == 0 && len(p.VSchemaNamespaces()) > 0
+}
+
 // UnsafeDDLChanges returns stored DDL changes that require explicit unsafe
 // opt-in before queueing operator work.
 func (p *Plan) UnsafeDDLChanges() []TableChange {
@@ -487,6 +578,30 @@ func (p *Plan) UnsafeDDLChanges() []TableChange {
 				tc.Namespace = shard.Namespace
 			}
 			appendUnsafe(tc)
+		}
+	}
+	return result
+}
+
+// BlockedChanges returns stored DDL changes carrying the blocked
+// execution-mode verdict, across namespace-level and per-shard changes. A
+// blocked change guarantees the apply fails, so gates use this to reject the
+// apply before queueing operator work.
+func (p *Plan) BlockedChanges() []TableChange {
+	var result []TableChange
+	for _, tc := range p.FlatDDLChanges() {
+		if tc.EngineBlocked() {
+			result = append(result, tc)
+		}
+	}
+	for _, shard := range p.Shards {
+		for _, tc := range shard.Changes {
+			if tc.EngineBlocked() {
+				if tc.Namespace == "" {
+					tc.Namespace = shard.Namespace
+				}
+				result = append(result, tc)
+			}
 		}
 	}
 	return result
@@ -536,7 +651,7 @@ type Apply struct {
 	// Database is the target database name (denormalized from lock for queries).
 	Database string
 
-	// DatabaseType is "vitess" or "mysql" (denormalized from lock for queries).
+	// DatabaseType is one of the DatabaseType* constants (denormalized from lock for queries).
 	DatabaseType string
 
 	// Repository is the GitHub repository (denormalized from lock for GetByPR).
@@ -571,6 +686,17 @@ type Apply struct {
 	// instead of starting a duplicate. Empty (stored as NULL) for applies that
 	// are not created through an idempotent remote dispatch (CLI, local mode).
 	IdempotencyKey string
+
+	// ExpectedOperationKeys is the generation manifest of a deployment-keyed
+	// apply: every operation key the dispatcher declared it will send to this
+	// apply, recorded at creation from the first dispatch and immutable after.
+	// A keyed apply's operations attach one dispatch at a time, so the attached
+	// rows alone cannot prove the generation is complete — the manifest is the
+	// completion authority: the state projection derives completed only when
+	// every listed key has an attached, terminal operation, and an attach for a
+	// key outside the manifest is refused. Empty (stored as NULL) means the
+	// apply carries no manifest and completion derives from attached rows alone.
+	ExpectedOperationKeys []string
 
 	// Engine is the schema change engine: "spirit", "planetscale", etc.
 	Engine string
@@ -616,6 +742,28 @@ type Apply struct {
 	// control-plane skip-revert handler and the data-plane finalizer.
 	RevertSkippedAt *time.Time
 
+	// SupersededBy names the apply that took over this one's unfinished work,
+	// by ApplyIdentifier. Empty means nothing took over.
+	//
+	// It records a handoff that the apply's own state cannot express: a stopped
+	// apply whose copy a later apply adopted or discarded is still stopped, and
+	// once the successor settles nothing else distinguishes it from a stopped
+	// apply nobody touched. Starting it would replay its statements against a
+	// target where that work already happened, so an apply carrying this marker
+	// can never be started — the marker outlives the successor and is never
+	// cleared.
+	//
+	// The refusal is enforced at every surface that can begin the work again:
+	// the control plane rejects a start request up front, a stopped-apply claim
+	// refuses to resume and fails the pending start request with the reason,
+	// and the claim predicate excludes a marked failed_retryable apply from
+	// automatic retry. The remaining claim paths cannot encounter the marker: a
+	// pending dispatch starts work that has never run, and work must have run
+	// before a successor can take it over; an active apply (including one
+	// waiting for a deploy) cannot gain a successor at all, because creation
+	// refuses a second apply for a target that already has a non-terminal one.
+	SupersededBy string
+
 	// UpdatedAt is when the apply was last updated.
 	UpdatedAt time.Time
 }
@@ -630,6 +778,54 @@ func (a *Apply) Lease() ApplyLease {
 		Owner:   a.LeaseOwner,
 		Token:   a.LeaseToken,
 	}
+}
+
+// HasFreshLease reports whether a driver holds this apply's lease with a
+// heartbeat newer than ApplyLeaseStaleAfter. A fresh lease means a live driver
+// owns the apply and its work right now; a stale or absent lease means no
+// driver is heartbeating and the apply is eligible for stale-claim recovery.
+// This mirrors the claim queries' staleness bound: drivers refresh UpdatedAt on
+// every heartbeat, so the row's last write is the liveness signal.
+func (a *Apply) HasFreshLease(now time.Time) bool {
+	if a == nil || a.LeaseOwner == "" {
+		return false
+	}
+	return now.Sub(a.UpdatedAt) < ApplyLeaseStaleAfter
+}
+
+// AllowsOperationKey reports whether an operation with the given key may
+// attach to this apply. An apply without a generation manifest accepts any
+// key (completion derives from attached rows alone, so an extra operation is
+// counted like any other); an apply with a manifest accepts only the keys the
+// dispatcher declared, because an undeclared operation would either never
+// gate completion or signal the two planes disagree about the generation.
+func (a *Apply) AllowsOperationKey(key string) bool {
+	if a == nil || len(a.ExpectedOperationKeys) == 0 {
+		return true
+	}
+	return slices.Contains(a.ExpectedOperationKeys, key)
+}
+
+// MissingExpectedOperationKeys returns the manifest keys with no attached
+// operation row, in the manifest's stored order. An apply without a manifest
+// is missing nothing. The state projection holds an apply's success verdict
+// until this is empty: every operation the dispatcher declared must attach
+// (and then reach a terminal state) before the generation can complete.
+func (a *Apply) MissingExpectedOperationKeys(ops []*ApplyOperation) []string {
+	if a == nil || len(a.ExpectedOperationKeys) == 0 {
+		return nil
+	}
+	attached := make(map[string]bool, len(ops))
+	for _, op := range ops {
+		attached[op.OperationKey] = true
+	}
+	var missing []string
+	for _, key := range a.ExpectedOperationKeys {
+		if !attached[key] {
+			missing = append(missing, key)
+		}
+	}
+	return missing
 }
 
 // IsRollback reports whether this apply reverts a previously applied schema
@@ -763,6 +959,17 @@ type ApplyOperation struct {
 	UpdatedAt time.Time
 }
 
+// IsTasklessVSchemaOnlyWork reports whether this operation is the one work shape
+// that legitimately carries no task rows: a whole-deployment work operation for
+// a VSchema-only plan. Every other task-less work operation is an invalid or
+// stale claim and must fail closed rather than dispatch.
+func (op *ApplyOperation) IsTasklessVSchemaOnlyWork(plan *Plan) bool {
+	if op == nil || op.OperationKind != ApplyOperationKindWork || op.OperationKey != "" {
+		return false
+	}
+	return plan.IsVSchemaOnly()
+}
+
 // Lease returns the ownership token for this apply_operation.
 func (op *ApplyOperation) Lease() OperationLease {
 	if op == nil {
@@ -797,9 +1004,6 @@ type ApplyOptions struct {
 
 	// SkipRevert skips the revert window after completion (Vitess only).
 	SkipRevert bool `json:"skip_revert,omitempty"`
-
-	// Volume controls schema change aggressiveness (1-11).
-	Volume int `json:"volume,omitempty"`
 
 	// Target is the opaque endpoint-discovery target forwarded to Tern.
 	// Defaults to the apply database when empty.
@@ -843,58 +1047,84 @@ const (
 	// 'start': 'start' resumes stopped work and carries no claim-ordering
 	// clause, so it cannot release a paused rollout.
 	ControlOperationRelease ControlOperation = "release"
-	// ControlOperationVolume adjusts the speed/concurrency of a running schema
-	// change. Durable because only the instance driving the apply holds the
-	// engine state for the running schema change, and a volume RPC can land on
-	// any instance sharing the route's storage. The desired level travels in
-	// the request metadata (see VolumeControlRequestMetadata); the driver
-	// retunes the engine at its next progress tick.
-	ControlOperationVolume ControlOperation = "volume"
 )
 
-// MinVolume and MaxVolume bound the volume scale shared by every engine:
-// 1 = maximum throttle (least production impact), 11 = no throttle (fastest).
-const (
-	MinVolume int32 = 1
-	MaxVolume int32 = 11
-)
-
-// VolumeControlRequestMetadata is the JSON payload stored on a volume control
-// request. The row carries the desired level so the driving instance can
-// retune the engine without a synchronous exchange with the requester.
-type VolumeControlRequestMetadata struct {
-	Volume int32 `json:"volume"`
+// Valid reports whether the operation is one SchemaBot recognizes. Control
+// operations cross the control-plane / data-plane boundary as strings, so a
+// value read off the wire is checked here before it reaches storage.
+func (o ControlOperation) Valid() bool {
+	switch o {
+	case ControlOperationStart, ControlOperationStop, ControlOperationCancel,
+		ControlOperationCutover, ControlOperationRevert, ControlOperationSkipRevert,
+		ControlOperationRelease:
+		return true
+	}
+	return false
 }
 
-// EncodeVolumeControlRequestMetadata serializes the desired volume level for
-// storage on a volume control request, rejecting out-of-range levels so an
-// invalid request is refused at write time rather than discovered by the
-// driver.
-func EncodeVolumeControlRequestMetadata(volume int32) ([]byte, error) {
-	if volume < MinVolume || volume > MaxVolume {
-		return nil, fmt.Errorf("volume %d is out of range: must be between %d and %d", volume, MinVolume, MaxVolume)
-	}
-	data, err := json.Marshal(VolumeControlRequestMetadata{Volume: volume})
-	if err != nil {
-		return nil, fmt.Errorf("encode volume control request metadata for level %d: %w", volume, err)
-	}
-	return data, nil
+// retiredControlOperations are operations a previous release recognized that
+// this release removed. Durable rows and data-plane reports naming them can
+// survive an upgrade; no driver services them anymore, so consumers skip them
+// quietly and the terminal sweep settles their leftover pending rows. Remove
+// an entry once no deployment still holds rows for it.
+var retiredControlOperations = []ControlOperation{"volume"}
+
+// Retired reports whether the operation was recognized by a previous release
+// and removed since. A retired operation read from storage or off the wire is
+// leftover pre-upgrade state, not a sign of a newer peer speaking an unknown
+// operation.
+func (o ControlOperation) Retired() bool {
+	return slices.Contains(retiredControlOperations, o)
 }
 
-// DecodeVolumeControlRequestMetadata parses the desired volume level from a
-// volume control request's metadata, validating the shared volume range.
-func DecodeVolumeControlRequestMetadata(metadata []byte) (int32, error) {
-	if len(metadata) == 0 {
-		return 0, fmt.Errorf("volume control request metadata is empty")
+// RetiredControlOperations returns the retired operations, for the terminal
+// sweep that settles their leftover pending rows.
+func RetiredControlOperations() []ControlOperation {
+	return slices.Clone(retiredControlOperations)
+}
+
+// mirroredControlRequestMetadataKey marks a control request row this plane never
+// queued: the row exists only because another plane reported the operation
+// rejected, as happens for an operation this plane only proxies, where the
+// request lives entirely in the serving plane. Such a row has no local
+// lifecycle to reset it,
+// so it is the mirror's to clear when the operation later succeeds. Rows this
+// plane queued itself carry no marker and are only ever cleared by their own
+// request lifecycle.
+const mirroredControlRequestMetadataKey = "mirrored_remote_rejection"
+
+// MirroredControlRequestMetadata returns the metadata stamped on a control
+// request row created solely to carry another plane's rejection.
+func MirroredControlRequestMetadata() []byte {
+	return []byte(`{"` + mirroredControlRequestMetadataKey + `":true}`)
+}
+
+// ForwardingControlRequestCaller is the requester recorded for a control
+// request that reached this plane over the data-plane RPC boundary. The control
+// RPCs carry no operator identity, so this names the path the request arrived
+// on rather than the person who issued it.
+const ForwardingControlRequestCaller = "tern-grpc"
+
+// ControlRequestNamesAnOperator reports whether a requester identifies the
+// operator who issued the command. Only such a value is worth showing in the
+// PR notice, whose whole purpose is telling an operator which of their commands
+// did not take effect.
+func ControlRequestNamesAnOperator(requestedBy string) bool {
+	return requestedBy != "" && requestedBy != ForwardingControlRequestCaller
+}
+
+// IsMirroredRemoteRejection reports whether this row exists only to carry
+// another plane's rejection, so no local request lifecycle will ever clear it.
+func (r *ApplyControlRequest) IsMirroredRemoteRejection() bool {
+	if r == nil || len(r.Metadata) == 0 {
+		return false
 	}
-	var payload VolumeControlRequestMetadata
-	if err := json.Unmarshal(metadata, &payload); err != nil {
-		return 0, fmt.Errorf("decode volume control request metadata: %w", err)
+	var payload map[string]any
+	if err := json.Unmarshal(r.Metadata, &payload); err != nil {
+		return false
 	}
-	if payload.Volume < MinVolume || payload.Volume > MaxVolume {
-		return 0, fmt.Errorf("volume %d in control request metadata is out of range: must be between %d and %d", payload.Volume, MinVolume, MaxVolume)
-	}
-	return payload.Volume, nil
+	marked, _ := payload[mirroredControlRequestMetadataKey].(bool)
+	return marked
 }
 
 // ControlRequestStatus is the durable processing status for a control request.
@@ -947,13 +1177,34 @@ func ApplyOptionsFromMap(options map[string]string) ApplyOptions {
 		Target:       options["target"],
 		Rollback:     options["rollback"] == "true",
 	}
-	if rawVolume := options["volume"]; rawVolume != "" {
-		volume, err := strconv.Atoi(rawVolume)
-		if err == nil && volume >= 1 && volume <= 11 {
-			opts.Volume = volume
-		}
-	}
 	return opts
+}
+
+// GroupsEngineExecution reports whether an apply against databaseType hands the
+// engine every ALTER at once rather than driving one table at a time, given
+// whether its cutover is deferred.
+//
+// Two things depend on the answer and must agree. The drive uses it to pick how
+// it executes, and an engine predicting what an apply will do to unfinished
+// work already on the target uses it to know which stored progress that apply
+// could continue — progress is kept per batch, so the two shapes look in
+// different places. A prediction made for the shape the apply does not use
+// reports work as lost that would in fact be resumed.
+//
+// Grouping is opted into: Vitess groups because a deploy request covers the
+// whole change, and MySQL groups only when the caller asked to defer cutover so
+// every table can swap together. Everything else runs a table at a time.
+//
+// deferCutover must be the decision the drive will act on, not merely the
+// option the operator typed: a drive can defer cutover on its own (an
+// operation parked at a cutover barrier, see effectiveCopyDriveOptions in
+// pkg/tern), and a caller predicting for such an apply has to pass that
+// effective decision or its prediction describes the wrong shape.
+func GroupsEngineExecution(databaseType string, deferCutover bool) bool {
+	if databaseType == DatabaseTypeVitess {
+		return true
+	}
+	return databaseType == DatabaseTypeMySQL && deferCutover
 }
 
 // Map converts typed storage options back into API/proto option strings.
@@ -973,9 +1224,6 @@ func (opts ApplyOptions) Map() map[string]string {
 	}
 	if opts.SkipRevert {
 		options["skip_revert"] = "true"
-	}
-	if opts.Volume > 0 {
-		options["volume"] = strconv.Itoa(opts.Volume)
 	}
 	if opts.Target != "" {
 		options["target"] = opts.Target
@@ -1044,7 +1292,7 @@ type Task struct {
 	// Database is the target database name.
 	Database string
 
-	// DatabaseType is "vitess" or "mysql".
+	// DatabaseType is one of the DatabaseType* constants.
 	DatabaseType string
 
 	// Engine is the schema change engine: "spirit", "planetscale", etc.
@@ -1100,7 +1348,14 @@ type Task struct {
 	// Non-zero only while the task is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
 	ChecksumRowsTotal   int64
-	CutoverAttempts     int // Number of cutover attempts for this shard
+	// Throttled reports that the engine's throttler is pausing this table's
+	// active phase (row copy or checksum verify), so stalled row counts read
+	// as a deliberate pause rather than a hang. Cleared when the pause lifts.
+	Throttled bool
+	// ThrottleReason names the signal pausing the work, for display (e.g.
+	// "replica-lag 5s >= 2s"). Empty when Throttled is false.
+	ThrottleReason  string
+	CutoverAttempts int // Number of cutover attempts for this shard
 
 	// Execution flags
 	IsInstant         bool   // True if INSTANT DDL (no copy needed)
@@ -1134,13 +1389,6 @@ type ApplyComment struct {
 
 	// GitHubCommentID is the GitHub comment ID for editing.
 	GitHubCommentID int64
-
-	// PostedVolume records the apply's volume level at the moment a progress
-	// comment was posted. The observer compares it against the apply's current
-	// level to detect an applied volume change and rotate in a fresh progress
-	// comment. Nil for comment states where the level is not meaningful and
-	// for rows that predate volume tracking — nil never triggers a rotation.
-	PostedVolume *int
 
 	// PostedPhase records the control-operation phase the apply was in when a
 	// progress comment was posted (e.g. reverting, skipping revert, the
@@ -1180,11 +1428,14 @@ type ApplyComment struct {
 }
 
 // PlanComment tracks a plan comment posted on a PR so a newer plan comment for
-// the same database can minimize it on GitHub. Rows are written only when a
+// the same database can retire it on GitHub. Rows are written only when a
 // comment is actually posted — a plan whose comment was suppressed leaves no
-// row. The GitHub comment itself is never edited or deleted through this
-// record; minimizing collapses it in the PR timeline while keeping it
-// expandable as the record of what was shown.
+// row. Retirement takes one of two forms: a comment whose head an apply owns
+// is minimized (collapsed in the PR timeline but still expandable as the
+// record of what was planned for that apply), while a comment no apply ever
+// acted on is deleted from the timeline entirely. The row itself is never
+// deleted, so the identifiers of a deleted comment remain available for
+// triage.
 type PlanComment struct {
 	// ID is the unique identifier (BIGINT AUTO_INCREMENT).
 	ID int64
@@ -1217,9 +1468,16 @@ type PlanComment struct {
 	GitHubNodeID string
 
 	// MinimizedAt is set only after the GitHub minimize call succeeded. Nil
-	// means the comment is still expanded on the PR — including after a failed
+	// means the comment was not minimized — including after a failed
 	// minimize, so the next supersede retries it.
 	MinimizedAt *time.Time
+
+	// DeletedAt is set only after the GitHub delete call succeeded (or
+	// confirmed the comment already gone). Nil means the comment was not
+	// deleted — including after a failed delete, so the next supersede
+	// retries it. A row with both MinimizedAt and DeletedAt nil is still
+	// fully visible on the PR.
+	DeletedAt *time.Time
 
 	// CreatedAt is when the comment was posted.
 	CreatedAt time.Time
@@ -1244,7 +1502,6 @@ const (
 	LogEventCancelRequested     = "cancel_requested"
 	LogEventStartRequested      = "start_requested"
 	LogEventReleaseRequested    = "release_requested"
-	LogEventVolumeRequested     = "volume_requested"
 	LogEventDeployTriggered     = "deploy_triggered"
 	LogEventCutoverTriggered    = "cutover_triggered"
 	LogEventSkipRevertTriggered = "skip_revert_triggered"
@@ -1318,14 +1575,60 @@ const (
 	ProviderGitHub = "github"
 )
 
-// Durable webhook event states.
+// Durable webhook event states. Two states are terminal failures with
+// different recovery semantics:
+//
+//   - WebhookEventFailed: the delivery exhausted its retry budget (or a
+//     reconciler sweep terminalized a wedged row), but a later attempt could
+//     still succeed — the cause was transient or unproven. GitHub Redeliver
+//     reopens it, and when the row is synthesized
+//     (SynthesizedWebhookDeliveryIDPrefix) the reconciler re-synthesizes its
+//     head instead, since no Redeliver lever exists for a synthesized GUID.
+//   - WebhookEventFailedPermanent: the driver proved the delivery can never
+//     succeed for its head (a deterministic failure such as GitHub's per-PR
+//     file-listing cap), so it is dead-lettered. It counts as head coverage in
+//     HasEventForHead regardless of GUID form, which keeps the reconciler from
+//     resurrecting it; only an explicit GitHub Redeliver reopens it.
 const (
 	WebhookEventPending         = "pending"
 	WebhookEventProcessing      = "processing"
 	WebhookEventCompleted       = "completed"
 	WebhookEventFailedRetryable = "failed_retryable"
 	WebhookEventFailed          = "failed"
+	WebhookEventFailedPermanent = "failed_permanent"
+
+	// WebhookEventSuperseded is the terminal state for an auto-plan delivery
+	// discarded at claim time because a newer covering delivery exists for the
+	// same pull request (see WebhookEventStore.SupersedeIfCovered). The row's
+	// work was never performed; the covering successor performs it instead.
+	WebhookEventSuperseded = "superseded"
 )
+
+// SynthesizedWebhookDeliveryIDPrefix marks delivery GUIDs minted by the
+// webhook reconciler for synthesized recovery rows, distinguishing them from
+// organic GitHub delivery GUIDs. The distinction is behavioral, not
+// cosmetic: a terminally failed organic row has a GitHub Redeliver lever, so
+// it still covers its head, while a terminally failed synthesized row has no
+// such lever and must not — the inbox coverage query (HasEventForHead) keys
+// its failed-row exclusion off this prefix.
+const SynthesizedWebhookDeliveryIDPrefix = "recon:"
+
+// AutoPlanPullRequestActions are the pull_request actions that trigger
+// auto-plan for a PR head. This is the single source for every layer that
+// answers "does this delivery plan its head": the webhook enqueue/dispatch
+// predicate and the inbox coverage query (HasEventForHead) both derive from
+// it, so an action added in one place cannot silently diverge from the other —
+// a divergence would either mask lost deliveries from the reconciler or
+// enqueue rows the dispatcher completes without planning.
+var AutoPlanPullRequestActions = []string{"opened", "synchronize", "reopened"}
+
+// PullRequestClosedAction is the pull_request action GitHub delivers when a PR
+// is closed (merged or not). A closed delivery participates asymmetrically in
+// claim-time coalescing (SupersedeIfCovered): a later closed delivery covers
+// older unprocessed auto-plan deliveries — planning a closed PR is pointless —
+// but a closed delivery itself is never superseded, because its cleanup must
+// always run.
+const PullRequestClosedAction = "closed"
 
 // WebhookEventStatesAll lists every canonical webhook inbox state, ordered from
 // earliest to terminal. Use it to enumerate states for metrics and stats so a
@@ -1336,6 +1639,8 @@ var WebhookEventStatesAll = []string{
 	WebhookEventFailedRetryable,
 	WebhookEventCompleted,
 	WebhookEventFailed,
+	WebhookEventFailedPermanent,
+	WebhookEventSuperseded,
 }
 
 // WebhookInboxStats is a point-in-time snapshot of the durable webhook inbox
@@ -1347,8 +1652,12 @@ type WebhookInboxStats struct {
 	CountsByState map[string]int64
 
 	// OldestClaimableAge is how long the oldest ready-to-claim-but-unclaimed row
-	// (pending, or retryable with an elapsed retry window) has been waiting. It
-	// is the inbox's backlog latency; zero when nothing is waiting.
+	// (pending with no future not-before time, or retryable with an elapsed
+	// retry window) has been claimable. Age is measured from when the row
+	// became claimable — the later of receipt and its retry_after — not from
+	// receipt, so a row that spent time deliberately deferred does not report
+	// its grace period as backlog. It is the inbox's backlog latency; zero
+	// when nothing is waiting.
 	OldestClaimableAge time.Duration
 
 	// StuckProcessing is the number of rows wedged in processing with an expired
@@ -1437,6 +1746,12 @@ type WebhookEvent struct {
 	LeaseToken     string
 	LeaseExpiresAt *time.Time
 	RetryAfter     *time.Time
+	// ClaimableSince is when the row became eligible for dispatch: the later
+	// of receipt and its not-before time (retry_after). It is not a column —
+	// FindNext derives it on the returned event because the claim consumes
+	// retry_after, and the dispatcher needs the original eligibility time to
+	// measure dispatch lag without counting a deliberate deferral as backlog.
+	ClaimableSince time.Time
 	LastError      string
 	ReceivedAt     time.Time
 	StartedAt      *time.Time

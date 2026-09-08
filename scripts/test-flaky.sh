@@ -21,6 +21,10 @@
 
 set -euo pipefail
 
+# Disable Buildx Bake on compose builds (needed when run directly, outside
+# make); see the COMPOSE_BAKE export comment in the Makefile.
+export COMPOSE_BAKE=false
+
 TEST_NAME="${1:?Usage: $0 <test-name> [iterations] [package]}"
 ITERATIONS="${2:-5}"
 PACKAGE="${3:-./...}"

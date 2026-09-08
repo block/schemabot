@@ -27,7 +27,7 @@ func TestBuildOnboardWritePlanWritesConfigAndNamespaceFiles(t *testing.T) {
 				},
 			},
 		},
-	})
+	}, nil)
 	require.NoError(t, err)
 	require.NoError(t, plan.checkConflicts(false))
 	require.NoError(t, plan.write())
@@ -62,7 +62,7 @@ func TestBuildOnboardWritePlanWritesVitessKeyspaceArtifacts(t *testing.T) {
 				},
 			},
 		},
-	})
+	}, nil)
 	require.NoError(t, err)
 	require.NoError(t, plan.checkConflicts(false))
 	require.NoError(t, plan.write())
@@ -78,6 +78,58 @@ func TestBuildOnboardWritePlanWritesVitessKeyspaceArtifacts(t *testing.T) {
 	vschema, err := os.ReadFile(filepath.Join(root, "commerce_sharded", "vschema.json"))
 	require.NoError(t, err)
 	assert.JSONEq(t, "{\"sharded\":true}", string(vschema))
+}
+
+// Re-onboarding over an existing schema root must not drop the
+// ignore_namespaces an operator configured: the rewritten schemabot.yaml
+// carries the entries forward and the plan verification excludes the same
+// namespaces a real plan would.
+func TestBuildOnboardWritePlanPreservesIgnoreNamespaces(t *testing.T) {
+	root := t.TempDir()
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Type:        "mysql",
+		Environment: "production",
+		TableCount:  1,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+		},
+	}, []string{"local_fixtures", "fixtures_$ENV"})
+	require.NoError(t, err)
+	require.NoError(t, plan.write())
+
+	config, err := os.ReadFile(filepath.Join(root, "schemabot.yaml"))
+	require.NoError(t, err)
+	assert.Equal(t, "database: orders\ntype: mysql\nignore_namespaces:\n  - local_fixtures\n  - fixtures_$ENV\n", string(config))
+	assert.Equal(t, []string{"local_fixtures", "fixtures_$ENV"}, plan.ignoreNamespaces)
+}
+
+func TestPreservedIgnoreNamespaces(t *testing.T) {
+	t.Run("missing config is a fresh onboarding", func(t *testing.T) {
+		ignores, err := preservedIgnoreNamespaces(t.TempDir())
+		require.NoError(t, err)
+		assert.Nil(t, ignores)
+	})
+
+	t.Run("existing config's entries are preserved", func(t *testing.T) {
+		root := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"),
+			[]byte("database: orders\ntype: mysql\nignore_namespaces:\n  - local_fixtures\n"), 0o644))
+
+		ignores, err := preservedIgnoreNamespaces(root)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"local_fixtures"}, ignores)
+	})
+
+	t.Run("unreadable config is an error, not a silent drop", func(t *testing.T) {
+		root := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"),
+			[]byte(": not yaml"), 0o644))
+
+		_, err := preservedIgnoreNamespaces(root)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "preserve ignore_namespaces")
+	})
 }
 
 func TestOnboardPullNamespacesUseConcreteLiveNamespaces(t *testing.T) {
@@ -131,7 +183,7 @@ func TestOnboardWritePlanRefusesExistingFilesWithoutForce(t *testing.T) {
 		Namespaces: map[string]*apitypes.PulledNamespace{
 			"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 		},
-	})
+	}, nil)
 	require.NoError(t, err)
 
 	err = plan.checkConflicts(false)
@@ -150,7 +202,7 @@ func TestBuildOnboardWritePlanRejectsUnsafeResponsePaths(t *testing.T) {
 		Namespaces: map[string]*apitypes.PulledNamespace{
 			"orders": {Tables: map[string]string{"../users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 		},
-	})
+	}, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "table")
 }
@@ -205,7 +257,7 @@ func TestBuildOnboardWritePlanRejectsInvalidPullResponse(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			plan, err := buildOnboardWritePlan(tt.schemaRoot, tt.resp)
+			plan, err := buildOnboardWritePlan(tt.schemaRoot, tt.resp, nil)
 			require.Error(t, err)
 			assert.Nil(t, plan)
 			assert.Contains(t, err.Error(), tt.want)
@@ -300,7 +352,7 @@ func TestOnboardWritePlanStrayFiles(t *testing.T) {
 		Namespaces: map[string]*apitypes.PulledNamespace{
 			"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 		},
-	})
+	}, nil)
 	require.NoError(t, err)
 
 	// Namespace directory absent (dry run before any write): nothing to scan.
@@ -337,7 +389,7 @@ func TestOnboardWritePlanStrayFilesFlagsVSchemaForVitess(t *testing.T) {
 		Namespaces: map[string]*apitypes.PulledNamespace{
 			"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 		},
-	})
+	}, nil)
 	require.NoError(t, err)
 	require.NoError(t, plan.write())
 

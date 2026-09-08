@@ -52,7 +52,7 @@ func TestCLI_Status_DefaultLimitShowsTwentyMostRecent(t *testing.T) {
 }
 
 // TestCLI_Status_LimitShowsRequestedRecentApplies verifies that --limit changes
-// the recent status window without changing the newest-first ordering.
+// the recent status window without changing the ranking within it.
 func TestCLI_Status_LimitShowsRequestedRecentApplies(t *testing.T) {
 	binPath := buildBinary(t, "schemabot", "./pkg/cmd")
 	endpoint, store := startStatusOnlySchemaBot(t)
@@ -195,7 +195,7 @@ type statusApplySeed struct {
 func startStatusOnlySchemaBot(t *testing.T) (string, *schemabotmysql.Storage) {
 	t.Helper()
 
-	db, err := sql.Open("mysql", schemabotDSN)
+	db, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	clearStorageDB(t, db)
 

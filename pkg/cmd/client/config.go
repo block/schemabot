@@ -11,6 +11,8 @@ import (
 
 	"github.com/block/spirit/pkg/utils"
 	"gopkg.in/yaml.v3"
+
+	"github.com/block/schemabot/pkg/cmd/cliname"
 )
 
 // Config represents the global SchemaBot CLI configuration.
@@ -21,7 +23,10 @@ type Config struct {
 
 // Profile represents a named configuration profile.
 type Profile struct {
-	Endpoint string `yaml:"endpoint"`
+	// LocalRuntime names an explicitly provisioned runtime. Endpoint and credentials
+	// are resolved together; unreachable remote profiles never enable local mode.
+	LocalRuntime string `yaml:"local_runtime,omitempty"`
+	Endpoint     string `yaml:"endpoint"`
 	// Token is the cached Bearer token for this profile's endpoint, written by
 	// `schemabot login`. Scoping it to a profile keeps a token bound to the
 	// server it was issued for, so it is never sent to a different endpoint.
@@ -325,32 +330,52 @@ func ResolveBearerToken(ctx context.Context, tokenFlag, endpointFlag, profileFla
 		return "", nil
 	}
 
-	// Refresh only when the expiry is known and (nearly) reached.
-	if profile.TokenExpiry == 0 || time.Until(time.Unix(profile.TokenExpiry, 0)) > tokenRefreshSkew {
-		return token, nil
+	var expiry time.Time
+	var expiryErr error
+	// OIDC profiles may carry an access-token expiry cached by an older CLI.
+	// Read the actual bearer credential; a malformed hint requests repair via
+	// the refresh grant instead of trusting a stale cached expiry.
+	if profile.OIDC != nil {
+		expiry, expiryErr = idTokenExpiry(token)
+	} else if profile.TokenExpiry != 0 {
+		expiry = time.Unix(profile.TokenExpiry, 0)
+	}
+
+	if expiryErr == nil {
+		if !tokenNeedsRefresh(expiry, time.Now()) {
+			return token, nil
+		}
 	}
 	if profile.RefreshToken == "" || profile.OIDC == nil {
-		return token, fmt.Errorf("token for profile %q is expired or about to expire and cannot be refreshed; run `schemabot login`", profileName)
+		if expiryErr != nil {
+			return token, fmt.Errorf("read cached ID token expiry for profile %q (run `%s login`): %w", profileName, cliname.Name(), expiryErr)
+		}
+		return token, fmt.Errorf("token for profile %q is expired or about to expire according to this computer and cannot be refreshed; check the local clock or run `%s login`", profileName, cliname.Name())
 	}
 
 	result, err := RefreshToken(ctx, LoginConfig{Issuer: profile.OIDC.Issuer, ClientID: profile.OIDC.ClientID}, profile.RefreshToken)
 	if err != nil {
-		return token, fmt.Errorf("could not refresh the token for profile %q (run `schemabot login`): %w", profileName, err)
+		return token, fmt.Errorf("could not refresh the token for profile %q (run `%s login`): %w", profileName, cliname.Name(), err)
 	}
 
 	profile.Token = result.IDToken
-	if result.RefreshToken != "" {
-		profile.RefreshToken = result.RefreshToken
-	}
-	// Always set expiry, clearing it when the provider omits one, so a stale
-	// value can't make every subsequent command refresh immediately.
+	profile.RefreshToken = result.RefreshToken
+	// Persist the new ID token expiry alongside the credential it describes.
 	profile.TokenExpiry = unixExpiry(result.Expiry)
 	cfg.Profiles[profileName] = profile
 	if err := SaveConfig(cfg); err != nil {
 		// The refreshed token is usable for this run even if it could not be saved.
 		return result.IDToken, fmt.Errorf("could not persist the refreshed token for profile %q: %w", profileName, err)
 	}
+	if !result.Expiry.After(time.Now()) {
+		return result.IDToken, fmt.Errorf("refreshed ID token for profile %q is already expired according to this computer; check the local clock and the provider's ID token lifetime", profileName)
+	}
 	return result.IDToken, nil
+}
+
+// tokenNeedsRefresh applies the proactive refresh window to a known expiry.
+func tokenNeedsRefresh(expiry, now time.Time) bool {
+	return !expiry.IsZero() && !expiry.After(now.Add(tokenRefreshSkew))
 }
 
 func trimSlash(s string) string {

@@ -343,7 +343,8 @@ func TestEnforcePRCommandActorAuthorizationComments(t *testing.T) {
 	})
 	h := actorAuthTestHandler(cfg, installClient)
 
-	blocked := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply)
+	blocked, err := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply, false)
+	require.NoError(t, err)
 	assert.True(t, blocked)
 
 	body := requireComment(t, comments, "authorization comment")
@@ -366,7 +367,8 @@ func TestEnforcePRCommandActorAuthorizationUnconfiguredDatabaseComment(t *testin
 	})
 	h := actorAuthTestHandler(cfg, installClient)
 
-	blocked := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "payments", storage.DatabaseTypeMySQL, "", action.Unlock)
+	blocked, err := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "payments", storage.DatabaseTypeMySQL, "", action.Unlock, false)
+	require.NoError(t, err)
 	assert.True(t, blocked)
 
 	body := requireComment(t, comments, "unconfigured-database authorization comment")
@@ -385,8 +387,9 @@ func TestEnforcePRCommandActorAuthorizationTeamLookupErrorComment(t *testing.T) 
 	})
 	h := actorAuthTestHandler(cfg, installClient)
 
-	blocked := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply)
-	assert.True(t, blocked)
+	blocked, err := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply, false)
+	require.Error(t, err)
+	assert.False(t, blocked)
 
 	body := requireComment(t, comments, "authorization failure comment")
 	assert.Contains(t, body, "SchemaBot Authorization Check Failed")
@@ -394,6 +397,23 @@ func TestEnforcePRCommandActorAuthorizationTeamLookupErrorComment(t *testing.T) 
 	assert.Contains(t, body, "No schema change was started")
 	assert.Contains(t, body, "GitHub App can read organization members")
 	assert.NotContains(t, body, "is not authorized")
+}
+
+func TestEnforcePRCommandActorAuthorizationDurableAttemptSuppressesErrorComment(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 2)
+	mux.HandleFunc("GET /orgs/octocat/teams/schema-admins/members", teamMembersHandler(t, http.StatusForbidden))
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		cfg.PRCommandAuthorization.AdminTeams = []string{"octocat/schema-admins"}
+	})
+	h := actorAuthTestHandler(cfg, installClient)
+
+	blocked, err := h.enforcePRCommandActorAuthorization(t.Context(), installClient, "octocat/hello-world", 1, 12345, "mona", "orders", storage.DatabaseTypeMySQL, "staging", action.Apply, true)
+	require.Error(t, err)
+	assert.False(t, blocked)
+	assert.Empty(t, comments, "a durable attempt must not post per-retry evaluation-failure comments")
 }
 
 // TestHandleApplyCommandBlocksUnauthorizedActorBeforePlanning exercises the
@@ -418,6 +438,32 @@ func TestHandleApplyCommandBlocksUnauthorizedActorBeforePlanning(t *testing.T) {
 	body := requireComment(t, comments, "unauthorized apply comment")
 	assert.Contains(t, body, "SchemaBot Command Not Authorized")
 	assert.Contains(t, body, "@mona is not authorized")
+}
+
+// TestHandleApplyCommandResolvesMixedCaseConsumerDatabase proves that a
+// consumer schemabot.yaml declaring the database in a different case than the
+// server key still resolves to the configured database. The command reaches
+// actor authorization (and is denied for an unauthorized actor) instead of
+// being reported as an unconfigured database.
+func TestHandleApplyCommandResolvesMixedCaseConsumerDatabase(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	registerApplyDiscoveryEndpointsDeclaring(t, mux, "orders", "Orders")
+
+	comments := make(chan string, 2)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		cfg.PRCommandAuthorization.AdminUsers = []string{"hubot"}
+	})
+	h := actorAuthTestHandler(cfg, installClient)
+
+	h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "mona", CommandResult{Action: action.Apply})
+
+	body := requireComment(t, comments, "mixed-case consumer database apply comment")
+	assert.Contains(t, body, "SchemaBot Command Not Authorized")
+	assert.Contains(t, body, "@mona is not authorized")
+	assert.NotContains(t, body, "is not configured on this server")
 }
 
 // Apply-scoped control commands are mutating PR comments, so the full webhook
@@ -581,6 +627,7 @@ func TestHandleRollbackConfirmCommandBlocksUnauthorizedActor(t *testing.T) {
 	assert.Contains(t, body, "@mona is not authorized")
 	assert.Contains(t, body, "`schemabot rollback-confirm`")
 	assert.Empty(t, locks.released, "denied rollback-confirm must not release the lock")
+	assert.Empty(t, locks.releasedIfPending, "denied rollback-confirm must not release the pinned rollback lock")
 }
 
 // TestHandleRollbackConfirmCommandAllowsAuthorizedActor verifies that a
@@ -829,18 +876,24 @@ func (s *actorAuthTaskStore) GetByDatabase(_ context.Context, database string) (
 
 // actorAuthLockStore serves locks from a fixed set and records every lock
 // mutation so tests can assert which releases and acquisitions happened.
-// Setting releaseErr makes every Release call fail with that error, simulating
-// a storage outage during lock release.
+// Setting getErr makes every Get call fail with that error, simulating a
+// storage outage during the lock lookup; setting releaseErr does the same for
+// Release, simulating an outage during lock release.
 type actorAuthLockStore struct {
 	storage.LockStore
-	locks         []*storage.Lock
-	acquired      []*storage.Lock
-	released      []string
-	forceReleased []string
-	releaseErr    error
+	locks             []*storage.Lock
+	getErr            error
+	acquired          []*storage.Lock
+	released          []string
+	releasedIfPending []string
+	forceReleased     []string
+	releaseErr        error
 }
 
 func (s *actorAuthLockStore) Get(_ context.Context, database, dbType string) (*storage.Lock, error) {
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
 	for _, lock := range s.locks {
 		if lock.DatabaseName == database && lock.DatabaseType == dbType {
 			return lock, nil
@@ -874,6 +927,14 @@ func (s *actorAuthLockStore) Release(_ context.Context, database, _, _ string) e
 	}
 	s.released = append(s.released, database)
 	return nil
+}
+
+func (s *actorAuthLockStore) ReleaseIfPendingPlanID(_ context.Context, _, _, _, pendingPlanID string) (bool, error) {
+	if s.releaseErr != nil {
+		return false, s.releaseErr
+	}
+	s.releasedIfPending = append(s.releasedIfPending, pendingPlanID)
+	return true, nil
 }
 
 func (s *actorAuthLockStore) ForceRelease(_ context.Context, database, _ string) error {
@@ -1058,15 +1119,24 @@ func teamMembersHandler(t *testing.T, statusCode int, members ...string) http.Ha
 
 func registerApplyDiscoveryEndpoints(t *testing.T, mux *http.ServeMux, database string) {
 	t.Helper()
+	registerApplyDiscoveryEndpointsDeclaring(t, mux, database, database)
+}
 
-	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", database)
+// registerApplyDiscoveryEndpointsDeclaring serves a schema directory named
+// database whose schemabot.yaml declares declaredDatabase, so tests can vary
+// the author's spelling independently of the directory layout.
+func registerApplyDiscoveryEndpointsDeclaring(t *testing.T, mux *http.ServeMux, database, declaredDatabase string) {
+	t.Helper()
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", declaredDatabase)
 	schemaSQL := "CREATE TABLE `users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`))"
 
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
-			"head": map[string]any{"sha": "abc123", "ref": "feature-branch"},
-			"base": map[string]any{"sha": "def456", "ref": "main"},
-			"user": map[string]any{"login": "testuser"},
+			"state": "open",
+			"head":  map[string]any{"sha": "abc123", "ref": "feature-branch"},
+			"base":  map[string]any{"sha": "def456", "ref": "main"},
+			"user":  map[string]any{"login": "testuser"},
 		}))
 	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {

@@ -3,21 +3,21 @@ package api
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
 	"net/http"
-	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	gomysql "github.com/go-sql-driver/mysql"
-
 	"github.com/block/schemabot/pkg/clock"
+	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/ratelimit"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
@@ -138,6 +138,13 @@ type Service struct {
 	checkRunBackfiller CheckRunBackfiller
 	clock              clock.Clock
 
+	// pullPerCallerLimiter and pullPerTargetLimiter bound POST /api/pull. Both
+	// are nil when the endpoint's rate limiting is disabled, which a nil
+	// limiter reads as "admit everything". They are built from the config in
+	// New and rebuilt by SetClock, so a test's fake clock drives them too.
+	pullPerCallerLimiter *ratelimit.Limiter
+	pullPerTargetLimiter *ratelimit.Limiter
+
 	// engineFactories holds engine implementations for database types this build
 	// does not provide natively, registered by an embedding service via
 	// RegisterEngine. Local clients the service builds receive them.
@@ -150,6 +157,30 @@ type Service struct {
 	operatorWake         chan struct{}
 	recoveryWg           sync.WaitGroup
 	operatorPollInterval time.Duration
+	strandedReaperEvery  time.Duration
+	// driversBusy counts this process's operator drivers that currently hold
+	// claimed work; it backs the drivers-busy gauge.
+	driversBusy atomic.Int64
+	// heldClaims tracks the apply leases this process's drivers are currently
+	// driving under, keyed by apply id. Shutdown hands them back explicitly so a
+	// peer driver picks the work up on its next poll, instead of waiting out the
+	// staleness window on a claim this process will never use again.
+	// While heldClaimsDraining is set, a drive that returns leaves its claim
+	// registered: shutdown is collecting the claims to hand back, and a drive
+	// returning into it still leaves its apply active for a peer to pick up.
+	heldClaimsMu       sync.Mutex
+	heldClaims         map[int64]heldClaim
+	heldClaimsDraining bool
+	// heldOperationClaims tracks the operation leases this process's drivers are
+	// currently driving under, keyed by apply_operation id. Every claimed drive
+	// holds one; a single-operation drive holds a parent apply lease as well.
+	// Both have to be handed back for the work to be claimable again, because
+	// the operation claim is what the next poll looks at first.
+	// heldOperationClaimsDraining mirrors heldClaimsDraining for operations.
+	heldOperationClaimsMu       sync.Mutex
+	heldOperationClaims         map[int64]heldOperationClaim
+	heldOperationClaimsDraining bool
+
 	remoteHealthMu       sync.Mutex
 	remoteHealthCancel   context.CancelFunc
 	remoteHealthWg       sync.WaitGroup
@@ -160,6 +191,11 @@ type Service struct {
 	webhookInboxCancel   context.CancelFunc
 	webhookInboxWg       sync.WaitGroup
 	webhookInboxInterval time.Duration
+
+	// Operator stuck-pending apply monitor loop management.
+	stuckPendingMu     sync.Mutex
+	stuckPendingCancel context.CancelFunc
+	stuckPendingWg     sync.WaitGroup
 
 	// Pending drops cleaner loop management.
 	pendingDropsMu     sync.Mutex
@@ -255,7 +291,7 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 	if ternClients == nil {
 		ternClients = make(map[string]tern.Client)
 	}
-	return &Service{
+	s := &Service{
 		storage:              st,
 		config:               config,
 		ternClients:          ternClients,
@@ -263,10 +299,43 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 		logger:               logger,
 		clock:                clock.Real{},
 		operatorPollInterval: OperatorPollInterval,
+		strandedReaperEvery:  StrandedReaperInterval,
 		remoteHealthInterval: RemoteDeploymentHealthCheckInterval,
 		webhookInboxInterval: WebhookInboxMetricsInterval,
 		pendingObservers:     make(map[pendingObserverKey]tern.ProgressObserver),
+		heldClaims:           make(map[int64]heldClaim),
+		heldOperationClaims:  make(map[int64]heldOperationClaim),
 	}
+	s.buildRateLimiters()
+	return s
+}
+
+// buildRateLimiters (re)builds the endpoint limiters from the current config
+// and clock. Both limiters are left nil when the endpoint's rate limiting is
+// disabled, which the request path reads as "not enforced" and returns on
+// before it spends or records anything.
+//
+// Enforcement being off is worth one line at startup: an unbounded pull
+// endpoint is a deliberate choice, and an operator watching a target absorb
+// traffic should be able to tell from the server's own logs whether a budget
+// was ever in play.
+func (s *Service) buildRateLimiters() {
+	if s.config == nil || !s.config.PullRateLimitEnabled() {
+		s.pullPerCallerLimiter = nil
+		s.pullPerTargetLimiter = nil
+		s.logger.Info("pull endpoint rate limiting is disabled; pull requests will not be bounded by a request budget")
+		return
+	}
+	perCaller := s.config.PullPerCallerRateLimit()
+	perTarget := s.config.PullPerTargetRateLimit()
+	s.pullPerCallerLimiter = ratelimit.New(perCaller, s.clock)
+	s.pullPerTargetLimiter = ratelimit.New(perTarget, s.clock)
+	s.logger.Info("pull endpoint rate limiting is enabled",
+		"per_caller_requests_per_minute", perCaller.RequestsPerMinute,
+		"per_caller_burst", perCaller.Burst,
+		"per_target_requests_per_minute", perTarget.RequestsPerMinute,
+		"per_target_burst", perTarget.Burst,
+	)
 }
 
 // RegisterEngine registers an Engine implementation for a database type this
@@ -277,12 +346,23 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 //
 // It validates its inputs so a misconfiguration fails fast at setup rather than
 // as a confusing downstream error (or a panic on a nil factory).
+//
+// A registered type must also map to a registered SQL dialect
+// (schema.DialectForDatabaseType): drift comparison classifies and
+// canonicalizes DDL with the dialect's parser and fails closed on a type
+// whose dialect has no parser, so an engine registered without a dialect
+// mapping could plan but never pass the drift gate. Registration rejects
+// such a type here, at setup, rather than surfacing it as a blocked drift
+// gate on every schema change against that database.
 func (s *Service) RegisterEngine(databaseType string, factory tern.EngineFactory) error {
 	if databaseType == "" {
 		return fmt.Errorf("register engine: database type must not be empty")
 	}
 	if factory == nil {
 		return fmt.Errorf("register engine for database type %q: factory must not be nil", databaseType)
+	}
+	if _, err := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType)); err != nil {
+		return fmt.Errorf("register engine for database type %q: %w", databaseType, err)
 	}
 	s.ternMu.Lock()
 	defer s.ternMu.Unlock()
@@ -300,6 +380,12 @@ func (s *Service) RegisterEngine(databaseType string, factory tern.EngineFactory
 // Production callers should leave the default clock.Real{} in place; tests
 // use clock.NewFake to make timing observable. A nil or typed-nil c is
 // coalesced to clock.Real{} via clock.Default.
+//
+// The endpoint rate limiters are rebuilt on the new clock, which also discards
+// whatever budget they had already spent. That is intentional: swapping the
+// time source out from under a running token bucket would leave it refilling
+// against a clock that no longer moves the way it did when the tokens were
+// taken.
 func (s *Service) SetClock(c clock.Clock) error {
 	s.operatorMu.Lock()
 	defer s.operatorMu.Unlock()
@@ -307,6 +393,7 @@ func (s *Service) SetClock(c clock.Clock) error {
 		return fmt.Errorf("cannot change clock while operator is running")
 	}
 	s.clock = clock.Default(c)
+	s.buildRateLimiters()
 	return nil
 }
 
@@ -401,6 +488,7 @@ func (s *Service) TernClient(deployment, environment string) (tern.Client, error
 	client, err := tern.NewGRPCClient(tern.Config{
 		Address: address,
 		Storage: s.storage,
+		Logger:  s.logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create tern client for %s: %w", key, err)
@@ -518,15 +606,6 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 		}
 	}
 
-	// Register TLS config for PlanetScale MySQL connections if configured
-	var tlsName string
-	if envConfig.TLS != nil {
-		tlsName, err = registerTLSConfig(key, envConfig.TLS)
-		if err != nil {
-			return nil, fmt.Errorf("register TLS for %s: %w", key, err)
-		}
-	}
-
 	// LocalClient uses SchemaBot's storage directly. ServerConfig.Validate
 	// rejects an unparseable or non-positive revert_window_duration at config
 	// load; parsing here fails closed rather than silently falling back to the
@@ -554,8 +633,8 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 		"token_name":   tokenName,
 		"token_value":  tokenValue,
 	}
-	if tlsName != "" {
-		metadata["tls_name"] = tlsName
+	if envConfig.Database != "" {
+		metadata["database"] = envConfig.Database
 	}
 	if revertWindow > 0 {
 		metadata["revert_window_duration"] = revertWindow.String()
@@ -563,21 +642,29 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 	if envConfig.APIURL != "" {
 		metadata["api_url"] = envConfig.APIURL
 	}
-	if !s.config.PendingDropsEnabled() {
-		metadata["pending_drops"] = "false"
-	}
+	// Stated either way rather than only when disabled: a data plane that
+	// predates the opt-in default reads an absent key as "quarantine", so
+	// leaving it out during a rolling deploy would quarantine on a deployment
+	// that has turned the quarantine off.
+	metadata["pending_drops"] = strconv.FormatBool(s.config.PendingDropsEnabled())
 	spiritMetadata, err := s.config.SpiritMetadata()
 	if err != nil {
 		return nil, fmt.Errorf("resolve spirit config for %s: %w", key, err)
 	}
 	maps.Copy(metadata, spiritMetadata)
+	directMetadata, err := envConfig.DirectExecution.EngineMetadata()
+	if err != nil {
+		return nil, fmt.Errorf("resolve direct_execution metadata for %s: %w", key, err)
+	}
+	maps.Copy(metadata, directMetadata)
 	client, err := tern.NewLocalClient(tern.LocalConfig{
-		Database:        database,
-		Type:            dbType,
-		TargetDSN:       targetDSN,
-		Metadata:        metadata,
-		WakeOperator:    s.wakeOperator,
-		EngineFactories: s.engineFactories,
+		Database:                              database,
+		Type:                                  dbType,
+		TargetDSN:                             targetDSN,
+		Metadata:                              metadata,
+		PostgresNativeSafeTableSizeLimitBytes: s.config.Postgres.NativeSafeTableSizeLimit(),
+		WakeOperator:                          s.wakeOperator,
+		EngineFactories:                       s.engineFactories,
 	}, s.storage, s.logger)
 	if err != nil {
 		return nil, fmt.Errorf("create local tern client for %s: %w", key, err)
@@ -625,6 +712,18 @@ func (s *Service) HandlePlan(w http.ResponseWriter, r *http.Request) {
 	s.handlePlan(w, r)
 }
 
+// HandlePlansList is the HTTP handler for GET /api/plans.
+// Returns recent stored plans as summaries, newest first.
+func (s *Service) HandlePlansList(w http.ResponseWriter, r *http.Request) {
+	s.handlePlansList(w, r)
+}
+
+// HandlePlanGet is the HTTP handler for GET /api/plans/{plan_identifier}.
+// Returns one stored plan with its full content.
+func (s *Service) HandlePlanGet(w http.ResponseWriter, r *http.Request) {
+	s.handlePlanGet(w, r)
+}
+
 // HandleApply is the HTTP handler for POST /api/apply.
 func (s *Service) HandleApply(w http.ResponseWriter, r *http.Request) {
 	s.handleApply(w, r)
@@ -643,11 +742,6 @@ func (s *Service) HandleStop(w http.ResponseWriter, r *http.Request) {
 // HandleStart is the HTTP handler for POST /api/start.
 func (s *Service) HandleStart(w http.ResponseWriter, r *http.Request) {
 	s.handleStart(w, r)
-}
-
-// HandleVolume is the HTTP handler for POST /api/volume.
-func (s *Service) HandleVolume(w http.ResponseWriter, r *http.Request) {
-	s.handleVolume(w, r)
 }
 
 // HandleRevert is the HTTP handler for POST /api/revert.
@@ -687,61 +781,77 @@ func (s *Service) limitRequestBody(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// apiRoute pairs a mux pattern with its handler.
+type apiRoute struct {
+	pattern string
+	handler http.HandlerFunc
+}
+
+// apiRoutes is the service's complete route table. ConfigureRoutes registers
+// it; the write-tier authorization sweep test enumerates it, so every
+// mutating route added here must carry a handler-level authorizeDirect*
+// check and a matching sweep fixture proving a scoped operator is denied
+// outside their grant.
+func (s *Service) apiRoutes() []apiRoute {
+	return []apiRoute{
+		// Health endpoints. /livez is process liveness (no dependency checks);
+		// /health is readiness (storage-dependent). See the handler comments
+		// for why the two must not be conflated.
+		{"GET /livez", s.handleLivez},
+		{"GET /health", s.handleHealth},
+		{"GET /tern-health/{deployment}/{environment}", s.handleTernHealth},
+
+		// Config API (for CLI to discover environments)
+		{"GET /api/databases", s.handleDatabaseList},
+		{"GET /api/databases/{database}/environments", s.handleDatabaseEnvironments},
+
+		// Orchestration API
+		{"POST /api/pull", s.handlePullSchema},
+		{"POST /api/plan", s.handlePlan},
+		{"POST /api/apply", s.handleApply},
+		{"GET /api/progress/apply/{apply_id}", s.handleProgressByApplyID},
+		{"GET /api/history/{database}", s.handleDatabaseHistory},
+		{"POST /api/cutover", s.handleCutover},
+		{"POST /api/stop", s.handleStop},
+		{"POST /api/cancel", s.handleCancel},
+		{"POST /api/start", s.handleStart},
+		{"POST /api/release", s.handleRelease},
+		{"POST /api/revert", s.handleRevert},
+		{"POST /api/skip-revert", s.handleSkipRevert},
+		{"POST /api/rollback/plan", s.handleRollbackPlan},
+		{"GET /api/status", s.handleStatus},
+		{"GET /api/plans", s.handlePlansList},
+		{"GET /api/plans/{plan_identifier}", s.handlePlanGet},
+		{"GET /api/logs/{database}", s.handleLogs},
+		{"GET /api/logs", s.handleLogsWithoutDatabase},
+		{"POST /api/webhooks/redrive", s.handleWebhookRedrive},
+		{"POST /api/checks/scan", s.handleChecksScan},
+		{"POST /api/checks/synthesize", s.handleChecksSynthesize},
+		{"POST /api/checks/repos", s.handleChecksRepos},
+
+		// Lock API (database-level locking)
+		{"POST /api/locks/acquire", s.handleLockAcquire},
+		{"DELETE /api/locks", s.handleLockRelease},
+		{"GET /api/locks/{database}/{dbtype}", s.handleLockGet},
+		{"GET /api/locks", s.handleLockList},
+
+		// Settings API
+		{"GET /api/settings", s.handleSettingsList},
+		{"GET /api/settings/{key}", s.handleSettingsGet},
+		{"POST /api/settings", s.handleSettingsSet},
+
+		// GitHub webhook endpoint — registered externally via RegisterWebhook
+	}
+}
+
 // ConfigureRoutes registers all HTTP routes — API and health endpoints —
 // on the given mux.
 // Every route is wrapped with a request body size limit so oversized
 // requests are rejected instead of being buffered into memory.
 func (s *Service) ConfigureRoutes(mux *http.ServeMux) {
-	handle := func(pattern string, handler http.HandlerFunc) {
-		mux.HandleFunc(pattern, s.limitRequestBody(handler))
+	for _, route := range s.apiRoutes() {
+		mux.HandleFunc(route.pattern, s.limitRequestBody(route.handler))
 	}
-
-	// Health endpoints. /livez is process liveness (no dependency checks);
-	// /health is readiness (storage-dependent). See the handler comments for
-	// why the two must not be conflated.
-	handle("GET /livez", s.handleLivez)
-	handle("GET /health", s.handleHealth)
-	handle("GET /tern-health/{deployment}/{environment}", s.handleTernHealth)
-
-	// Config API (for CLI to discover environments)
-	handle("GET /api/databases", s.handleDatabaseList)
-	handle("GET /api/databases/{database}/environments", s.handleDatabaseEnvironments)
-
-	// Orchestration API
-	handle("POST /api/pull", s.handlePullSchema)
-	handle("POST /api/plan", s.handlePlan)
-	handle("POST /api/apply", s.handleApply)
-	handle("GET /api/progress/apply/{apply_id}", s.handleProgressByApplyID)
-	handle("GET /api/history/{database}", s.handleDatabaseHistory)
-	handle("POST /api/cutover", s.handleCutover)
-	handle("POST /api/stop", s.handleStop)
-	handle("POST /api/cancel", s.handleCancel)
-	handle("POST /api/start", s.handleStart)
-	handle("POST /api/release", s.handleRelease)
-	handle("POST /api/volume", s.handleVolume)
-	handle("POST /api/revert", s.handleRevert)
-	handle("POST /api/skip-revert", s.handleSkipRevert)
-	handle("POST /api/rollback/plan", s.handleRollbackPlan)
-	handle("GET /api/status", s.handleStatus)
-	handle("GET /api/logs/{database}", s.handleLogs)
-	handle("GET /api/logs", s.handleLogsWithoutDatabase)
-	handle("POST /api/webhooks/redrive", s.handleWebhookRedrive)
-	handle("POST /api/checks/scan", s.handleChecksScan)
-	handle("POST /api/checks/synthesize", s.handleChecksSynthesize)
-	handle("POST /api/checks/repos", s.handleChecksRepos)
-
-	// Lock API (database-level locking)
-	handle("POST /api/locks/acquire", s.handleLockAcquire)
-	handle("DELETE /api/locks", s.handleLockRelease)
-	handle("GET /api/locks/{database}/{dbtype}", s.handleLockGet)
-	handle("GET /api/locks", s.handleLockList)
-
-	// Settings API
-	handle("GET /api/settings", s.handleSettingsList)
-	handle("GET /api/settings/{key}", s.handleSettingsGet)
-	handle("POST /api/settings", s.handleSettingsSet)
-
-	// GitHub webhook endpoint — registered externally via RegisterWebhook
 }
 
 // Config returns the service's server configuration.
@@ -761,6 +871,7 @@ func (s *Service) Close() error {
 	s.StopOperator()
 	s.StopRemoteDeploymentHealthMonitor()
 	s.StopWebhookInboxMonitor()
+	s.StopOperatorStuckPendingMonitor()
 
 	s.ternMu.Lock()
 	var errs []error
@@ -782,41 +893,4 @@ func (s *Service) Close() error {
 		return fmt.Errorf("close errors: %v", errs)
 	}
 	return nil
-}
-
-// registerTLSConfig registers a named TLS config with the Go MySQL driver.
-// Returns the config name to use in DSN parameters (tls=<name>).
-func registerTLSConfig(name string, cfg *TLSConfig) (string, error) {
-	if cfg.CABundle == "" {
-		return "", fmt.Errorf("tls.ca_bundle is required")
-	}
-
-	caPEM, err := os.ReadFile(cfg.CABundle)
-	if err != nil {
-		return "", fmt.Errorf("read CA bundle %s: %w", cfg.CABundle, err)
-	}
-	rootPool := x509.NewCertPool()
-	if !rootPool.AppendCertsFromPEM(caPEM) {
-		return "", fmt.Errorf("failed to parse CA bundle %s", cfg.CABundle)
-	}
-
-	tlsCfg := &tls.Config{
-		RootCAs:    rootPool,
-		MinVersion: tls.VersionTLS12,
-	}
-
-	// Client certificate is optional (mTLS).
-	if cfg.ClientCert != "" && cfg.ClientKey != "" {
-		cert, err := tls.LoadX509KeyPair(cfg.ClientCert, cfg.ClientKey)
-		if err != nil {
-			return "", fmt.Errorf("load client cert/key: %w", err)
-		}
-		tlsCfg.Certificates = []tls.Certificate{cert}
-	}
-
-	tlsName := "schemabot-" + name
-	if err := gomysql.RegisterTLSConfig(tlsName, tlsCfg); err != nil {
-		return "", fmt.Errorf("register TLS config %s: %w", tlsName, err)
-	}
-	return tlsName, nil
 }

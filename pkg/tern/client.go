@@ -34,6 +34,15 @@ var ErrApplyLeasePresumedLost = errors.New("apply lease presumed lost after hear
 // terminalizes the stale claim rather than retrying it forever.
 var ErrApplyOperationRowMissing = fmt.Errorf("apply_operation row missing: %w", ErrNoTasksForApplyOperation)
 
+// ErrPlanMissingForApplyOperation is returned when a task-less operation's
+// parent apply points at a plan row that is absent. The plan is what decides
+// whether an operation with no tasks is a legitimate VSchema-only drive, so
+// without it the operation can never be dispatched. Like
+// ErrApplyOperationRowMissing it names its own cause while wrapping
+// ErrNoTasksForApplyOperation, so the operator terminalizes the claim instead of
+// re-driving an operation that no retry can advance.
+var ErrPlanMissingForApplyOperation = fmt.Errorf("plan not found for apply operation: %w", ErrNoTasksForApplyOperation)
+
 // ErrApplyTasksNotLoaded is returned by a whole-apply drive that loaded zero
 // tasks for an apply that owns task rows. Such an apply is undriveable, not
 // done: completing it would report success for schema changes that never ran,
@@ -49,6 +58,16 @@ var (
 	// ErrPullSchemaInvalidRequest marks a malformed pull request.
 	ErrPullSchemaInvalidRequest = errors.New("pull schema invalid request")
 )
+
+// SchemaPuller is the optional engine capability that answers PullSchema for
+// database types without a built-in pull path. An engine supplied through
+// LocalConfig.EngineFactories advertises live-schema pull support by
+// implementing it; LocalClient delegates pull requests for its type to the
+// capability and fails closed with ErrPullSchemaUnsupportedType when the
+// engine does not provide it.
+type SchemaPuller interface {
+	PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error)
+}
 
 // Client defines the interface for schema change operations.
 // Uses proto-generated types for type safety.
@@ -88,9 +107,6 @@ type Client interface {
 
 	// Start resumes a stopped schema change.
 	Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error)
-
-	// Volume modifies the schema change speed/concurrency in-flight.
-	Volume(ctx context.Context, req *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error)
 
 	// Revert reverts a completed schema change during the revert window.
 	// Only supported for Vitess (PlanetScale).
@@ -147,4 +163,18 @@ type Client interface {
 
 	// Close releases any resources held by the client.
 	Close() error
+}
+
+// ShutdownHalter is an optional capability for clients whose engines drive
+// schema changes inside this process. A halting client brings that in-process
+// work down so the process can exit without leaving a target held while it has
+// stopped renewing the apply's lease. Clients that delegate to a separate Tern
+// service do not implement it: that service owns its own engines and halts them
+// on its own shutdown.
+type ShutdownHalter interface {
+	// HaltForShutdown brings this client's in-flight schema change work down,
+	// checkpointed so another driver can resume it, and returns once its engine
+	// no longer holds the target. It is not an operator stop: the applies it
+	// halts stay active for reclaim.
+	HaltForShutdown(ctx context.Context) error
 }

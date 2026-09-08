@@ -33,7 +33,6 @@ func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, display 
 		VSchemaChanges:   display.VSchema,
 		DeployRequestURL: display.DeployRequestURL,
 		RevertExpiresAt:  display.RevertExpiresAt,
-		Volume:           apply.GetOptions().Volume,
 		Tenant:           tenant,
 		Rollback:         apply.IsRollback(),
 		DeferCutover:     apply.GetOptions().DeferCutover,
@@ -133,8 +132,9 @@ func tableProgressFromTasks(databaseFallback string, tasks []*storage.Task, shar
 			ETASeconds:          int64(t.ETASeconds),
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
 			ChecksumRowsTotal:   t.ChecksumRowsTotal,
+			Throttled:           t.Throttled,
+			ThrottleReason:      t.ThrottleReason,
 			IsInstant:           t.IsInstant,
-			ReadyToComplete:     templates.TaskStatusReadyForCutover(t.State),
 			ErrorMessage:        t.ErrorMessage,
 			Shards:              shardProgressForTable(shardsByTable, t.ApplyOperationID, t.Namespace, t.TableName),
 		})
@@ -158,6 +158,8 @@ func shardProgressForTable(shardsByTable map[string][]*storage.Task, applyOperat
 			Shard:           r.Shard,
 			Status:          string(r.State),
 			PercentComplete: r.ProgressPercent,
+			RowsCopied:      r.RowsCopied,
+			RowsTotal:       r.RowsTotal,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Shard < out[j].Shard })

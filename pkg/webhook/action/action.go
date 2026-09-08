@@ -12,7 +12,6 @@ const (
 	Start           = "start"
 	Release         = "release"
 	Cutover         = "cutover"
-	Volume          = "volume"
 	Revert          = "revert"
 	SkipRevert      = "skip-revert"
 	Rollback        = "rollback"

@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -119,18 +120,44 @@ func (h *Handler) storeManualPlanCheckRecord(ctx context.Context, client *ghclie
 // drift fails the check closed ahead of the plan's own outcome: a deployment
 // whose live schema no longer matches the reviewed plan (or that could not be
 // confirmed to match) must block the PR even when the primary's diff is clean or
-// empty. A primary plan that reported errors likewise fails; otherwise changes
-// require an apply and an empty diff passes.
-func planCheckConclusion(hasChanges, hasPlanErrors, driftBlocked bool) string {
+// empty. A primary plan that reported errors or a final engine refusal likewise
+// fails. Destructive changes remain action-required: the apply path requires
+// the separate --allow-unsafe acknowledgement before they can proceed.
+func planCheckConclusion(hasChanges, hasPlanErrors, hasFinalRefusal, driftBlocked bool) string {
 	switch {
 	case driftBlocked:
 		return checkConclusionFailure
 	case hasPlanErrors:
 		return checkConclusionFailure
+	case hasFinalRefusal:
+		return checkConclusionFailure
 	case hasChanges:
 		return checkConclusionActionRequired
 	default:
 		return checkConclusionSuccess
+	}
+}
+
+// planRefusalFailsCheck reports whether a plan's engine-blocked changes are
+// final enough to fail the check rather than leave the PR at action-required.
+//
+// A refusal is final when no apply SchemaBot runs can satisfy it, so leaving
+// the PR at action-required would coach an apply that is certain to be
+// refused. PostgreSQL blocks a change it has no authoritative classifier
+// verdict for and a DROP TABLE it never executes — the latter is lifted only
+// by the operator changing the repository or the target and re-planning, never
+// by an apply — and Vitess refuses constructs it cannot execute at all. The
+// MySQL engine also marks a refused statement blocked, but there the verdict
+// previews a direct-execution routing decision that apply time re-resolves
+// against live policy and table size, so a plan blocked at review can still
+// apply cleanly later. Those stay action-required and the apply path does the
+// rejecting.
+func planRefusalFailsCheck(databaseType string, planResp *apitypes.PlanResponse) bool {
+	switch databaseType {
+	case storage.DatabaseTypePostgres, storage.DatabaseTypeVitess:
+		return planResp.HasBlockedChanges()
+	default:
+		return false
 	}
 }
 
@@ -177,7 +204,7 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 	hasChanges := planResp.HasChanges()
 	driftBlocked := drift.blocks()
 
-	conclusion := planCheckConclusion(hasChanges, len(planResp.Errors) > 0, driftBlocked)
+	conclusion := planCheckConclusion(hasChanges, len(planResp.Errors) > 0, planRefusalFailsCheck(schema.Type, planResp), driftBlocked)
 
 	// Review-time drift is a first-class blocking reason, not an overload of the
 	// plan facts: HasChanges stays "the reviewed primary plan has changes", and
@@ -203,7 +230,29 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 		BlockingReason: blockingReason,
 		ChangeSummary:  changeSummary,
 	}
-	if err := h.service.Storage().Checks().UpsertPlanResult(ctx, check, drift.planDriftState()); err != nil {
+	stored, err := h.service.Storage().Checks().UpsertPlanResult(ctx, check, drift.planDriftState())
+	if errors.Is(err, storage.ErrCheckNotFound) {
+		// The PR closed and its check state was cleaned up while this plan ran.
+		// There is no gate left for the result to land on, so the plan itself is
+		// not failed by it.
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "plan_check_recorded",
+			Repository:   repo,
+			Database:     schema.Database,
+			DatabaseType: schema.Type,
+			Environment:  environment,
+			Status:       "target_missing",
+		})
+		h.logger.Info("plan check result discarded: the PR's check state was deleted while the plan ran, so there is no check for it to update",
+			"repo", repo,
+			"pr", pr,
+			"head_sha", headSHA,
+			"environment", environment,
+			"database_type", schema.Type,
+			"database", schema.Database)
+		return headSHA, check, nil
+	}
+	if err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:    "plan_check_recorded",
 			Repository:   repo,
@@ -213,6 +262,30 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 			Status:       "error",
 		})
 		return headSHA, nil, fmt.Errorf("store check state: %w", err)
+	}
+	if !stored {
+		// The guard preserving in-progress apply-owned state refused this write.
+		// That is correct while the apply runs, but it leaves the stored row on
+		// the apply's commit, which the aggregate holds as blocking whenever the
+		// PR head has moved past it (see normalizeStaleContributions). Releasing
+		// it takes a write from a path the guard admits — the manual same-head
+		// no-op recovery below, or a plan that runs once the apply is terminal.
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "plan_check_recorded",
+			Repository:   repo,
+			Database:     schema.Database,
+			DatabaseType: schema.Type,
+			Environment:  environment,
+			Status:       "refused",
+		})
+		h.logger.Warn("plan check result not stored: an in-flight apply owns this check, so the stored row still names the apply's commit and the aggregate holds it as blocking",
+			"repo", repo,
+			"pr", pr,
+			"head_sha", headSHA,
+			"environment", environment,
+			"database_type", schema.Type,
+			"database", schema.Database)
+		return headSHA, check, nil
 	}
 
 	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -232,7 +305,7 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 // (e.g. "5 created, 3 altered · 2 vschema updates") always agrees with the plan
 // comment's summary line. Returns "" when the plan has no changes.
 func summarizePlanChanges(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string) string {
-	commentData := buildPlanCommentData(schema, planResp, environment, "", "")
+	commentData := buildPlanCommentData(schema, planResp, environment, "", "", "")
 	return templates.SummarizeChanges(commentData)
 }
 
@@ -265,7 +338,7 @@ func isApplyNewer(candidate, existing *storage.Apply) bool {
 
 // checkNeedsTerminalReconcile reports whether stored check state is stale
 // relative to the newest apply for its target and must be repaired from that
-// apply's terminal outcome. Two stale shapes exist:
+// apply's terminal outcome. Three stale shapes exist:
 //
 //   - an in_progress row whose newest apply is already terminal: the driver
 //     died between finishing the apply and updating stored check state;
@@ -273,6 +346,9 @@ func isApplyNewer(candidate, existing *storage.Apply) bool {
 //     rollback: the rollback never claimed the row (its claim failed or the
 //     driver crashed before the claim landed), so the row's success predates
 //     the revert and would let the PR merge with the change missing.
+//   - an apply-owned row whose newest apply is a cancelled forward apply: the
+//     terminal outcome requires the row to be re-driven so ownership is
+//     released when the apply history proves that is safe.
 //
 // Successful rows without apply ownership are left alone: releasing ownership
 // is how a deliberate stale-cleanup unblock records its decision, and
@@ -284,9 +360,19 @@ func checkNeedsTerminalReconcile(check *storage.Check, apply *storage.Apply) boo
 	if check.Status == checkStatusInProgress {
 		return true
 	}
-	return check.ApplyID != 0 &&
-		check.Conclusion == checkConclusionSuccess &&
-		isCompletedRollback(apply)
+	if check.ApplyID == 0 {
+		return false
+	}
+	if check.Conclusion == checkConclusionSuccess && isCompletedRollback(apply) {
+		return true
+	}
+	if !state.IsState(apply.State, state.Apply.Cancelled) || apply.IsRollback() {
+		return false
+	}
+	retainedCancellationIsSettled := check.Status == checkStatusCompleted &&
+		check.Conclusion == checkConclusionFailure &&
+		check.BlockingReason == applyCancelledAfterTaskCompletedBlock.blockingReason
+	return !retainedCancellationIsSettled
 }
 
 // reconcileStaleChecks repairs stored check state from authoritative apply
@@ -425,19 +511,48 @@ func isCompletedRollback(a *storage.Apply) bool {
 	return a.IsRollback() && state.IsState(a.State, state.Apply.Completed)
 }
 
+// completedForwardTaskBeforeCancellation returns durable evidence that the
+// cancelled apply or an earlier forward apply changed the same target. Apply
+// rows cannot provide this proof because an apply may be cancelled or failed
+// after one of its independently driven tasks completed.
+func completedForwardTaskBeforeCancellation(applies []*storage.Apply, tasks []*storage.Task, cancelled *storage.Apply) *storage.Task {
+	forwardApplyIDs := make(map[int64]bool)
+	for _, apply := range applies {
+		if apply.ID > cancelled.ID || apply.IsRollback() {
+			continue
+		}
+		if apply.Environment == cancelled.Environment &&
+			apply.DatabaseType == cancelled.DatabaseType &&
+			apply.Database == cancelled.Database {
+			forwardApplyIDs[apply.ID] = true
+		}
+	}
+
+	for _, task := range tasks {
+		if forwardApplyIDs[task.ApplyID] && state.IsState(task.State, state.Task.Completed) {
+			return task
+		}
+	}
+	return nil
+}
+
 // updateCheckRecordForApplyResult updates stored check state after an apply
-// reaches a terminal state. A completed rollback lands action_required; other
-// terminal states map to success or failure. The rollback routing lives here —
-// not in callers — because every terminal path (observer, operator-driven
-// drive, recovery, stale reconciliation) must honor the rollback intent from
-// the durable apply row. The aggregate check is updated separately to reflect
-// the new status on the PR.
+// reaches a terminal state. A completed rollback lands action_required. A
+// cancelled forward apply also lands action_required and releases ownership
+// when apply history proves no schema change reached the target. Other terminal
+// states map to success or failure. This routing lives here — not in callers —
+// because every terminal path (observer, operator-driven drive, recovery, stale
+// reconciliation) must honor the durable apply outcome. The aggregate check is
+// updated separately to reflect the new status on the PR.
 func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo string, pr int, apply *storage.Apply) (bool, error) {
-	// Metrics keep rollback finalization distinct from ordinary apply completion
-	// so operators can alert on the two outcomes separately.
+	// Metrics keep cancellation and rollback finalization distinct from ordinary
+	// apply completion so operators can alert on each outcome separately.
 	operation := "apply_finished"
-	if isCompletedRollback(apply) {
+	switch {
+	case isCompletedRollback(apply):
 		operation = "rollback_finished"
+	case state.IsState(apply.State, state.Apply.Cancelled) && !apply.IsRollback():
+		operation = "apply_cancelled_finished"
 	}
 	recordOutcome := func(status string) {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -478,8 +593,33 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 		return false, nil
 	}
 
+	cancelledForwardApply := state.IsState(apply.State, state.Apply.Cancelled) && !apply.IsRollback()
+	retainCancelledOwnership := false
+	if cancelledForwardApply {
+		applies, getErr := h.service.Storage().Applies().GetByPR(ctx, repo, pr)
+		if getErr != nil {
+			recordOutcome("error")
+			return false, fmt.Errorf("look up apply history before releasing cancelled apply check ownership repo %s pr %d environment %s database_type %s database %s: %w",
+				repo, pr, apply.Environment, apply.DatabaseType, apply.Database, getErr)
+		}
+		tasks, getErr := h.service.Storage().Tasks().GetByPR(ctx, repo, pr)
+		if getErr != nil {
+			recordOutcome("error")
+			return false, fmt.Errorf("look up task history before releasing cancelled apply check ownership repo %s pr %d environment %s database_type %s database %s: %w",
+				repo, pr, apply.Environment, apply.DatabaseType, apply.Database, getErr)
+		}
+		if completedTask := completedForwardTaskBeforeCancellation(applies, tasks, apply); completedTask != nil {
+			retainCancelledOwnership = true
+			h.logger.Info("cancelled apply has a completed forward task; check ownership will remain and reconciliation will stay blocked",
+				append(apply.LogAttrs(), "completed_task_id", completedTask.TaskIdentifier,
+					"completed_task_table", completedTask.TableName, "check_status", check.Status,
+					"check_conclusion", check.Conclusion)...)
+		}
+	}
+
 	var updated bool
-	if isCompletedRollback(apply) {
+	switch {
+	case isCompletedRollback(apply):
 		check.Status = checkStatusCompleted
 		check.Conclusion = checkConclusionActionRequired
 		check.HasChanges = true
@@ -494,7 +634,40 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 			return false, fmt.Errorf("mark stored check state action_required after rollback repo %s pr %d environment %s database_type %s database %s: %w",
 				repo, pr, apply.Environment, apply.DatabaseType, apply.Database, err)
 		}
-	} else {
+	case cancelledForwardApply && retainCancelledOwnership:
+		setCancelledApplyRetainedFailure(check)
+		updated, err = h.service.Storage().Checks().MarkCancelledApplyFailed(ctx, check, apply)
+		if err != nil {
+			recordOutcome("error")
+			return false, fmt.Errorf("retain failed stored check state after partially completed cancelled apply repo %s pr %d environment %s database_type %s database %s: %w",
+				repo, pr, apply.Environment, apply.DatabaseType, apply.Database, err)
+		}
+	case cancelledForwardApply:
+		check.Status = checkStatusCompleted
+		check.Conclusion = checkConclusionActionRequired
+		check.HasChanges = true
+		check.BlockingReason = applyCancelledBlock.blockingReason
+		check.ErrorMessage = applyCancelledBlock.message
+		updated, err = h.service.Storage().Checks().MarkActionRequiredForApply(ctx, check, apply)
+		if err != nil {
+			recordOutcome("error")
+			return false, fmt.Errorf("mark stored check state action_required after cancelled apply repo %s pr %d environment %s database_type %s database %s: %w",
+				repo, pr, apply.Environment, apply.DatabaseType, apply.Database, err)
+		}
+		if !updated {
+			setCancelledApplyRetainedFailure(check)
+			updated, err = h.service.Storage().Checks().MarkCancelledApplyFailed(ctx, check, apply)
+			if err != nil {
+				recordOutcome("error")
+				return false, fmt.Errorf("retain failed stored check state after completed task raced cancelled apply ownership release repo %s pr %d environment %s database_type %s database %s: %w",
+					repo, pr, apply.Environment, apply.DatabaseType, apply.Database, err)
+			}
+			if updated {
+				h.logger.Info("completed forward task appeared before cancelled apply ownership release; check ownership remains and reconciliation stays blocked",
+					append(apply.LogAttrs(), "check_status", check.Status, "check_conclusion", check.Conclusion)...)
+			}
+		}
+	default:
 		var conclusion string
 		switch {
 		case state.IsState(apply.State, state.Apply.Completed) && checkBlockedByRemovedSchemaAfterApply(check):
@@ -525,12 +698,13 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 	if !updated {
 		metrics.RecordCheckOwnershipMiss(ctx, operation, repo, apply.Database, apply.DatabaseType, apply.Deployment, apply.Environment)
 		recordOutcome("skipped")
-		// The two writes skip for different reasons: the rollback write yields
-		// only to an apply newer than the rollback, while the ordinary completion
-		// requires the row to still be owned by this apply.
+		// The action-required writes yield only to a newer apply, while ordinary
+		// completion requires the row to still be owned by this apply.
 		msg := "skipping check state update because stored state no longer belongs to apply"
 		if isCompletedRollback(apply) {
 			msg = "skipping rollback action_required update because a newer apply supersedes the rollback"
+		} else if cancelledForwardApply {
+			msg = "skipping cancelled apply action_required update because a newer apply supersedes the cancellation"
 		}
 		h.logger.Warn(msg,
 			"repo", repo, "pr", pr, "database", apply.Database,
@@ -549,4 +723,12 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 		"blocking_reason", check.BlockingReason)
 	recordOutcome("success")
 	return true, nil
+}
+
+func setCancelledApplyRetainedFailure(check *storage.Check) {
+	check.Status = checkStatusCompleted
+	check.Conclusion = checkConclusionFailure
+	check.HasChanges = true
+	check.BlockingReason = applyCancelledAfterTaskCompletedBlock.blockingReason
+	check.ErrorMessage = applyCancelledAfterTaskCompletedBlock.message
 }

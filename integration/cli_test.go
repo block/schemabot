@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -154,7 +154,7 @@ func TestCLI_OnboardPullsLiveMySQLSchema(t *testing.T) {
 	cfg, err := mysql.ParseDSN(targetDSN)
 	require.NoError(t, err)
 	cfg.DBName = dbName
-	db, err := sql.Open("mysql", cfg.FormatDSN())
+	db, err := sql.Open("block-mysql", cfg.FormatDSN())
 	require.NoError(t, err, "open target database")
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(t.Context()), "ping target database")
@@ -428,7 +428,8 @@ CREATE TABLE accounts (
 		// Should exit with error
 		require.Error(t, err, "expected apply to fail without --allow-unsafe")
 		// Should show unsafe changes message
-		assertContains(t, out, "Unsafe Changes Detected")
+		assertContains(t, out, "Apply blocked")
+		assertContains(t, out, "unsafe change(s) detected")
 		assertContains(t, out, "--allow-unsafe")
 	})
 
@@ -586,7 +587,7 @@ CREATE TABLE items (
 	// Insert rows into the table to make the copy phase take longer
 	t.Run("insert_test_data", func(t *testing.T) {
 		targetDSN := strings.Replace(targetDSN, "/target_test", "/"+dbName, 1)
-		db, err := sql.Open("mysql", targetDSN)
+		db, err := sql.Open("block-mysql", targetDSN)
 		require.NoError(t, err, "open target db")
 		defer utils.CloseAndLog(db)
 
@@ -703,7 +704,7 @@ CREATE TABLE items (
 	// Verify the schema change was applied
 	t.Run("verify_indexes_exist", func(t *testing.T) {
 		targetDSN := strings.Replace(targetDSN, "/target_test", "/"+dbName, 1)
-		db, err := sql.Open("mysql", targetDSN)
+		db, err := sql.Open("block-mysql", targetDSN)
 		require.NoError(t, err, "open target db")
 		defer utils.CloseAndLog(db)
 
@@ -755,7 +756,7 @@ CREATE TABLE items (
 	// before the stop command can intervene.
 	t.Run("insert_test_data", func(t *testing.T) {
 		targetDSN := strings.Replace(targetDSN, "/target_test", "/"+dbName, 1)
-		db, err := sql.Open("mysql", targetDSN)
+		db, err := sql.Open("block-mysql", targetDSN)
 		require.NoError(t, err, "open target db")
 		defer utils.CloseAndLog(db)
 
@@ -869,7 +870,7 @@ func startSchemaBotLocal(t *testing.T) string {
 	t.Helper()
 
 	// Connect to SchemaBot storage and clear stale state from prior tests.
-	db, err := sql.Open("mysql", schemabotDSN)
+	db, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 	clearStorageDB(t, db)
@@ -940,7 +941,7 @@ func startSchemaBotLocalDB(t *testing.T, dbName string) string {
 	t.Helper()
 
 	// Connect to SchemaBot storage and clear stale state from prior tests.
-	db, err := sql.Open("mysql", schemabotDSN)
+	db, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 	clearStorageDB(t, db)
@@ -948,7 +949,7 @@ func startSchemaBotLocalDB(t *testing.T, dbName string) string {
 	storage := mysqlstore.New(db)
 
 	// Create the target database
-	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
+	targetDB, err := sql.Open("block-mysql", targetDSN+"&multiStatements=true")
 	require.NoError(t, err, "open target db connection")
 	t.Cleanup(func() {
 		ctx, cancel := testutil.CleanupContext(30 * time.Second)
@@ -1024,7 +1025,7 @@ func startSchemaBotWithGRPC(t *testing.T) string {
 	t.Helper()
 
 	// Connect to SchemaBot storage and clear stale state from prior tests.
-	db, err := sql.Open("mysql", schemabotDSN)
+	db, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 	clearStorageDB(t, db)
@@ -1167,49 +1168,6 @@ func waitForHTTP(t *testing.T, url string, timeout time.Duration) {
 		},
 		func() string { return "timeout waiting for " + url },
 	)
-}
-
-// TestCLI_Volume tests the volume command validates inputs correctly.
-// Full volume functionality is tested at the engine level in spirit_integration_test.go.
-func TestCLI_Volume(t *testing.T) {
-	binPath := buildBinary(t, "schemabot", "./pkg/cmd")
-
-	t.Run("volume_help", func(t *testing.T) {
-		// Verify help output shows correct usage with positional apply_id
-		out := runCLI(t, binPath, "volume", "--help")
-		assertContains(t, out, "volume")
-		assertContains(t, out, "apply-id")
-		assertContains(t, out, "--volume")
-	})
-
-	t.Run("volume_requires_apply_id", func(t *testing.T) {
-		// Volume without apply_id should fail
-		_, err := runCLIWithError(t, binPath, "volume",
-			"-v", "5",
-			"--endpoint", "http://localhost:9999",
-		)
-		require.Error(t, err, "expected error when apply_id is missing")
-	})
-}
-
-// TestCLI_Volume_NoActiveSchemaChange tests volume when there's nothing to adjust.
-func TestCLI_Volume_NoActiveSchemaChange(t *testing.T) {
-	binPath := buildBinary(t, "schemabot", "./pkg/cmd")
-
-	schemabotAddr := startSchemaBotLocalDB(t, fmt.Sprintf("volumenone_%d", time.Now().UnixNano()))
-
-	endpoint := "http://" + schemabotAddr
-
-	t.Run("volume_with_no_schema_change", func(t *testing.T) {
-		// Volume with a non-existent apply ID should fail
-		_, err := runCLIWithError(t, binPath, "volume",
-			"apply-nonexistent",
-			"-e", "staging",
-			"-v", "5",
-			"--endpoint", endpoint,
-		)
-		require.Error(t, err, "expected error for volume with non-existent apply ID")
-	})
 }
 
 // TestCLI_Rollback tests the rollback command validation.

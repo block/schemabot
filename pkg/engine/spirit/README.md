@@ -11,9 +11,8 @@ Spirit copies table data row-by-row to a new shadow table with the desired schem
 **runningSchemaChange** — Tracks a running schema change: the Spirit runners, affected tables, DDL statements, state, and a cancel function for stopping. Created by `Apply()`, consumed by `Progress()` and control operations.
 
 **Config** — Engine configuration:
-- `TargetChunkTime` (default 500ms): How long each batch of row copies should take
-- `Threads` (default 4): Number of concurrent copier threads
-- `LockWaitTimeout` (default 30s): How long to wait for table locks during cutover
+- `Threads` (default 2): Number of concurrent copier threads
+- `LockWaitTimeout` (default 10s): How long to wait for table locks during the checksum and cutover. Spirit's ForceKill (on by default) clears blocking transactions at 90% of this timeout — except an explicit LOCK TABLES holder or a transaction heavier than `dbconn.TransactionWeightThreshold`, which are left to finish naturally rather than killed — so this is fixed rather than scaled up for heavier changes
 - `DebugLogs`: Enable verbose Spirit debug output
 
 ## How It Works
@@ -53,19 +52,6 @@ Polls Spirit's Progress API and maps Spirit's internal states to engine states:
 
 When `defer_cutover` is set, Spirit pauses after row copy completes and waits for a sentinel table (`_spirit_sentinel`) to be dropped. Calling `Cutover()` drops this sentinel table, signaling Spirit to proceed with the atomic table swap.
 
-### Volume
-
-Adjusts schema change speed by mapping volume levels (1-11) to Spirit settings:
-
-| Volume | Threads | Chunk Time | Lock Wait |
-|--------|---------|------------|-----------|
-| 1      | 1       | 500ms      | 5s        |
-| 3      | 2       | 2s         | 30s       |
-| 5      | 4       | 4s         | 30s       |
-| 11     | 16      | 5s         | 30s       |
-
-Implementation: Stop → reconfigure → Start. Spirit resumes from its checkpoint with the new settings.
-
 ## Checkpoint Error Handling
 
 Two checkpoint-related errors require user intervention:
@@ -80,6 +66,6 @@ Two checkpoint-related errors require user intervention:
 |------|---------|
 | `spirit.go` | Engine type, `Plan()`, `Apply()`, `Progress()` |
 | `execution.go` | `executeSchemaChange()`, Spirit runner setup, error handling |
-| `control.go` | `Stop()`, `Start()`, `Cutover()`, `Volume()`, `Revert()`, `SkipRevert()` |
+| `control.go` | `Stop()`, `Start()`, `Cutover()`, `Revert()`, `SkipRevert()` |
 | `helpers.go` | Schema fetching, DSN parsing, statement classification, internal table detection |
 | `logger.go` | Custom log handler that filters Spirit debug logs and routes to apply log storage |

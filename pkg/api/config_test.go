@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	gomysql "github.com/go-sql-driver/mysql"
+	gomysql "github.com/block/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
@@ -20,7 +20,9 @@ import (
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/pendingdrops"
+	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/routing"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -87,6 +89,53 @@ default_reviewers:
 	assert.Equal(t, "localhost:9090", cfg.TernDeployments["default"]["staging"])
 }
 
+// A Vitess database can be registered under an arbitrary identifier: the
+// per-environment database field names the PlanetScale database the API must
+// address, and the etre resolver can read that name from a configurable entity
+// attribute.
+func TestLoadServerConfig_PlanetScaleDatabaseName(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	content := `
+databases:
+  commerce:
+    type: vitess
+    environments:
+      staging:
+        target: commerce-staging
+        deployment: default
+        organization: acme
+        database: commerce_main
+        token_secret_ref: "name:value"
+tern_deployments:
+  default:
+    staging: "localhost:9090"
+target_resolver:
+  etre:
+    - addr: https://etre.example
+      database_type: vitess
+      entity_type: planetscale_database
+      target_label: dsid
+      vitess:
+        database_attribute: ps_database
+      credentials:
+        password_ref: env:PS_TOKEN
+repos:
+  org/repo: {}
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(content), 0644), "write config file")
+	t.Setenv("SCHEMABOT_CONFIG_FILE", configPath)
+
+	cfg, err := LoadServerConfig()
+	require.NoError(t, err, "LoadServerConfig")
+
+	envConfig := cfg.Databases["commerce"].Environments["staging"]
+	assert.Equal(t, "acme", envConfig.Organization)
+	assert.Equal(t, "commerce_main", envConfig.Database)
+	require.Len(t, cfg.TargetResolver.Etre, 1)
+	assert.Equal(t, "ps_database", cfg.TargetResolver.Etre[0].Vitess.DatabaseAttribute)
+}
+
 func TestLoadServerConfig_NoEnvVar(t *testing.T) {
 	t.Setenv("SCHEMABOT_CONFIG_FILE", "")
 
@@ -126,6 +175,55 @@ repos:
 	assert.Equal(t, 2, len(cfg.TernDeployments))
 	assert.Contains(t, cfg.Repos, "org/repo")
 	assert.False(t, cfg.AreChecksEnabled("org/repo"))
+}
+
+func TestLoadServerConfigFromFileCanonicalizesRepositories(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := `
+databases:
+  testapp:
+    type: mysql
+    allowed_repos:
+      - MixedCase/Sample-Repo
+    environments:
+      staging:
+        target: testapp-staging
+        deployment: default
+tern_deployments:
+  default:
+    staging: tern-staging:9090
+repos:
+  MixedCase/Sample-Repo: {}
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(content), 0644))
+
+	cfg, err := LoadServerConfigFromFile(configPath)
+	require.NoError(t, err)
+	assert.Contains(t, cfg.Repos, "mixedcase/sample-repo")
+	assert.NotContains(t, cfg.Repos, "MixedCase/Sample-Repo")
+	assert.Equal(t, []string{"mixedcase/sample-repo"}, cfg.Databases["testapp"].AllowedRepos)
+}
+
+func TestLoadServerConfigFromFileRejectsCanonicalRepositoryCollision(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := `
+databases:
+  testapp:
+    type: mysql
+    environments:
+      staging:
+        target: testapp-staging
+        deployment: default
+repos:
+  MixedCase/Sample-Repo: {}
+  mixedcase/sample-repo: {}
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(content), 0644))
+
+	_, err := LoadServerConfigFromFile(configPath)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, `"MixedCase/Sample-Repo"`)
+	assert.ErrorContains(t, err, `"mixedcase/sample-repo"`)
 }
 
 func TestLoadServerConfigFromFile_DSNFrom(t *testing.T) {
@@ -666,6 +764,217 @@ func TestServerConfig_Validate(t *testing.T) {
 	}
 }
 
+func TestServerConfig_ValidateIdentifiers(t *testing.T) {
+	validConfig := func() ServerConfig {
+		return ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"orders": {
+					Type: storage.DatabaseTypeMySQL,
+					Environments: map[string]EnvironmentConfig{
+						"staging": {Target: "orders-staging", Deployment: "primary"},
+					},
+				},
+			},
+			TernDeployments: TernConfig{
+				"primary": {"staging": "localhost:9090"},
+			},
+		}
+	}
+
+	tests := []struct {
+		name      string
+		mutate    func(*ServerConfig)
+		wantError string
+	}{
+		{
+			name: "database name",
+			mutate: func(cfg *ServerConfig) {
+				cfg.Databases["Orders"] = cfg.Databases["orders"]
+				delete(cfg.Databases, "orders")
+			},
+			wantError: `database name "Orders" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "environment name",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				database.Environments["Staging"] = database.Environments["staging"]
+				delete(database.Environments, "staging")
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment name "Staging" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "deployment name",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				environment := database.Environments["staging"]
+				environment.Deployment = "Primary"
+				database.Environments["staging"] = environment
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment "staging" deployment name "Primary" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "top-level environment order",
+			mutate: func(cfg *ServerConfig) {
+				cfg.EnvironmentOrder = []string{"Staging"}
+			},
+			wantError: `environment_order environment name "Staging" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "top-level allowed environments",
+			mutate: func(cfg *ServerConfig) {
+				cfg.AllowedEnvironments = []string{"Staging"}
+			},
+			wantError: `allowed_environments environment name "Staging" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "per-database environment order",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				database.EnvironmentOrder = []string{"Staging"}
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment_order environment name "Staging" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "per-database deployment order",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				environment := database.Environments["staging"]
+				environment.DeploymentOrder = []string{"Primary"}
+				database.Environments["staging"] = environment
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment "staging" deployment_order deployment name "Primary" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "deployments map key",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				environment := database.Environments["staging"]
+				environment.Target = ""
+				environment.Deployment = ""
+				environment.Deployments = map[string]DeploymentTarget{"Primary": {Target: "orders-staging"}}
+				database.Environments["staging"] = environment
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment "staging" deployment name "Primary" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "tern deployments map key",
+			mutate: func(cfg *ServerConfig) {
+				cfg.TernDeployments["Primary"] = cfg.TernDeployments["primary"]
+			},
+			wantError: `tern_deployments deployment name "Primary" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "tern deployments environment key",
+			mutate: func(cfg *ServerConfig) {
+				cfg.TernDeployments["primary"]["Staging"] = "localhost:9090"
+			},
+			wantError: `deployment "primary" environment name "Staging" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "empty database name",
+			mutate: func(cfg *ServerConfig) {
+				cfg.Databases[""] = cfg.Databases["orders"]
+				delete(cfg.Databases, "orders")
+			},
+			wantError: `database name "" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "empty environment order entry",
+			mutate: func(cfg *ServerConfig) {
+				cfg.EnvironmentOrder = []string{""}
+			},
+			wantError: `environment_order environment name "" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "empty deployments map key",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				environment := database.Environments["staging"]
+				environment.Target = ""
+				environment.Deployment = ""
+				environment.Deployments = map[string]DeploymentTarget{"": {Target: "orders-staging"}}
+				database.Environments["staging"] = environment
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" environment "staging" deployment name "" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "empty tern deployments name",
+			mutate: func(cfg *ServerConfig) {
+				cfg.TernDeployments[""] = cfg.TernDeployments["primary"]
+			},
+			wantError: `tern_deployments deployment name "" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "accented database name",
+			mutate: func(cfg *ServerConfig) {
+				cfg.Databases["café"] = cfg.Databases["orders"]
+				delete(cfg.Databases, "orders")
+			},
+			wantError: `database name "café" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "leading whitespace",
+			mutate: func(cfg *ServerConfig) {
+				cfg.EnvironmentOrder = []string{" staging"}
+			},
+			wantError: `environment_order environment name " staging" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "trailing whitespace",
+			mutate: func(cfg *ServerConfig) {
+				cfg.AllowedEnvironments = []string{"staging "}
+			},
+			wantError: `allowed_environments environment name "staging " must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "interior space",
+			mutate: func(cfg *ServerConfig) {
+				cfg.EnvironmentOrder = []string{"pre production"}
+			},
+			wantError: `environment_order environment name "pre production" must match ^[a-z0-9][a-z0-9_-]*$`,
+		},
+		{
+			name: "repository key",
+			mutate: func(cfg *ServerConfig) {
+				cfg.Repos = map[string]RepoConfig{"Org/Repo.Name": {}}
+			},
+			wantError: `repos repository key "Org/Repo.Name" must be canonical`,
+		},
+		{
+			name: "allowed repository",
+			mutate: func(cfg *ServerConfig) {
+				database := cfg.Databases["orders"]
+				database.AllowedRepos = []string{"Org/Repo.Name"}
+				cfg.Databases["orders"] = database
+			},
+			wantError: `database "orders" allowed_repos repository "Org/Repo.Name" must be canonical`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			tt.mutate(&cfg)
+			err := cfg.Validate()
+			require.EqualError(t, err, tt.wantError)
+		})
+	}
+
+	t.Run("valid identifiers with digits hyphens and underscores", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.Databases["orders_2-prod"] = cfg.Databases["orders"]
+		delete(cfg.Databases, "orders")
+		require.NoError(t, cfg.Validate())
+	})
+}
+
 // A required_checks entry that names SchemaBot's own aggregate Check Run would
 // be silently unenforced: SchemaBot checks are excluded from the passing-checks
 // gate, so the gate would treat the named check as always satisfied. Config
@@ -819,6 +1128,118 @@ func TestServerConfig_ValidateRejectsNonPositiveRevertWindowDuration(t *testing.
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), `database "mydb" environment "staging" revert_window_duration "`+value+`"`)
 			assert.Contains(t, err.Error(), "must be positive")
+		})
+	}
+}
+
+// Enabling direct_execution without a positive max_table_rows bound is a
+// startup config error: the size gate must never be accidentally unbounded.
+func TestServerConfig_ValidateRejectsDirectExecutionWithoutBound(t *testing.T) {
+	for name, direct := range map[string]*DirectExecutionConfig{
+		"missing bound":  {Enabled: true},
+		"zero bound":     {Enabled: true, MaxTableRows: 0},
+		"negative bound": {Enabled: true, MaxTableRows: -1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: direct},
+						},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" enables direct_execution`)
+			assert.Contains(t, err.Error(), "a positive bound is required")
+		})
+	}
+}
+
+// direct_execution on a non-MySQL database is a startup config error rather
+// than a silently ignored grant: config that looks like it permits direct
+// execution must either take effect or fail loudly.
+func TestServerConfig_ValidateRejectsDirectExecutionOnNonMySQL(t *testing.T) {
+	cfg := ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"mydb": {
+				Type: "vitess",
+				Environments: map[string]EnvironmentConfig{
+					"staging": {
+						DSN:             "root@tcp(localhost)/mydb",
+						DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 1000},
+					},
+				},
+			},
+		},
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `database "mydb" environment "staging" sets direct_execution`)
+	assert.Contains(t, err.Error(), "only supported for mysql databases")
+}
+
+// A malformed direct_execution lock_acquisition_timeout is a startup config error —
+// even on a disabled block — so a bad bound is never silently carried until
+// the policy is enabled. MySQL lock timeouts have second granularity, so the
+// value must be a whole number of seconds of at least 1s.
+func TestServerConfig_ValidateRejectsBadDirectExecutionLockAcquisitionTimeout(t *testing.T) {
+	for name, tc := range map[string]struct {
+		direct  *DirectExecutionConfig
+		wantErr string
+	}{
+		"not a duration":           {&DirectExecutionConfig{Enabled: true, MaxTableRows: 1000, LockAcquisitionTimeout: "ten"}, "is not a valid duration"},
+		"sub-second":               {&DirectExecutionConfig{Enabled: true, MaxTableRows: 1000, LockAcquisitionTimeout: "500ms"}, "must be at least 1s"},
+		"negative":                 {&DirectExecutionConfig{Enabled: true, MaxTableRows: 1000, LockAcquisitionTimeout: "-5s"}, "must be at least 1s"},
+		"fractional seconds":       {&DirectExecutionConfig{Enabled: true, MaxTableRows: 1000, LockAcquisitionTimeout: "1.5s"}, "must be a whole number of seconds"},
+		"malformed while disabled": {&DirectExecutionConfig{Enabled: false, LockAcquisitionTimeout: "bogus"}, "is not a valid duration"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: tc.direct},
+						},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" direct_execution`)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+// A well-formed direct_execution policy on a MySQL database validates, and a
+// disabled block (even without a bound) is accepted as the fail-closed default.
+func TestServerConfig_ValidateAcceptsDirectExecution(t *testing.T) {
+	for name, direct := range map[string]*DirectExecutionConfig{
+		"enabled with bound":        {Enabled: true, MaxTableRows: 500000},
+		"enabled with lock timeout": {Enabled: true, MaxTableRows: 500000, LockAcquisitionTimeout: "5s"},
+		"disabled":                  {Enabled: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: direct},
+						},
+					},
+				},
+			}
+
+			require.NoError(t, cfg.Validate())
 		})
 	}
 }
@@ -1546,8 +1967,8 @@ func TestServerConfig_ResolveDatabaseTargets_DeploymentOrder(t *testing.T) {
 // validateDeploymentOrder must report an empty deployments map key with the
 // same clear error used elsewhere, rather than the confusing
 // "missing deployment \"\"" that fell out of the permutation check. This guards
-// the Validate() path, which calls validateDeploymentOrder before its own
-// empty-key check.
+// the Validate() path, which calls validateDeploymentOrder before the
+// identifier validation rejects the empty key.
 func TestValidateDeploymentOrder_EmptyMapKey(t *testing.T) {
 	err := validateDeploymentOrder(
 		map[string]DeploymentTarget{
@@ -2258,6 +2679,121 @@ database: appdb
 	})
 }
 
+// The storage dialect selects the database family for the whole storage
+// stack: schema bootstrapping, the connection pool, and the storage
+// implementation. Unset defaults to MySQL, matching is case-insensitive, and
+// unknown values fail closed so a typo cannot run the MySQL storage flow
+// against another database family.
+func TestStorageConfig_ResolveDialect(t *testing.T) {
+	tests := []struct {
+		name    string
+		dialect string
+		want    schema.Dialect
+		wantErr string
+	}{
+		{name: "unset defaults to mysql", dialect: "", want: schema.DialectMySQL},
+		{name: "mysql", dialect: "mysql", want: schema.DialectMySQL},
+		{name: "postgres", dialect: "postgres", want: schema.DialectPostgres},
+		{name: "case-insensitive", dialect: "Postgres", want: schema.DialectPostgres},
+		{name: "surrounding whitespace ignored", dialect: " mysql ", want: schema.DialectMySQL},
+		{name: "unknown dialect fails closed", dialect: "oracle", wantErr: `unsupported storage dialect "oracle"`},
+		{name: "near-miss spelling fails closed", dialect: "postgresql", wantErr: `unsupported storage dialect "postgresql"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := StorageConfig{Dialect: tt.dialect}.ResolveDialect()
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// dsn_from assembles a Go MySQL driver DSN, so combining it with a
+// non-MySQL storage dialect is rejected at config validation instead of
+// failing at the first connection attempt with an unparseable DSN.
+func TestServerConfig_ValidateRejectsDSNFromWithPostgresDialect(t *testing.T) {
+	cfg := ServerConfig{
+		Storage: StorageConfig{
+			Dialect: "postgres",
+			DSNFrom: &DSNFromConfig{
+				ConfigRef:   "file:/run/secrets/storage-config.yaml",
+				Username:    "schemabot_user",
+				PasswordRef: "file:/run/secrets/storage-password",
+			},
+		},
+		Databases: map[string]DatabaseConfig{
+			"mydb": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/mydb"},
+				},
+			},
+		},
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "dsn_from builds a MySQL DSN")
+}
+
+// An unknown storage dialect is rejected at config validation, before any
+// connection attempt, so a misconfigured server fails fast at load time.
+func TestServerConfig_ValidateRejectsUnknownStorageDialect(t *testing.T) {
+	cfg := ServerConfig{
+		Storage: StorageConfig{Dialect: "oracle"},
+		Databases: map[string]DatabaseConfig{
+			"mydb": {
+				Type: "mysql",
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "root@tcp(localhost)/mydb"},
+				},
+			},
+		},
+	}
+
+	err := cfg.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `unsupported storage dialect "oracle"`)
+}
+
+// The storage DSN resolves from config first, then the dialect-neutral
+// STORAGE_DSN environment variable, then the legacy MYSQL_DSN name, so a
+// PostgreSQL deployment never has to route its connection string through a
+// variable named for the other family.
+func TestServerConfig_StorageDSNEnvFallback(t *testing.T) {
+	t.Run("config value wins over both env vars", func(t *testing.T) {
+		t.Setenv("STORAGE_DSN", "env-storage-dsn")
+		t.Setenv("MYSQL_DSN", "env-mysql-dsn")
+		cfg := ServerConfig{Storage: StorageConfig{DSN: "config-dsn"}}
+		dsn, err := cfg.StorageDSN()
+		require.NoError(t, err)
+		assert.Equal(t, "config-dsn", dsn)
+	})
+
+	t.Run("STORAGE_DSN wins over MYSQL_DSN when config is unset", func(t *testing.T) {
+		t.Setenv("STORAGE_DSN", "env-storage-dsn")
+		t.Setenv("MYSQL_DSN", "env-mysql-dsn")
+		cfg := ServerConfig{}
+		dsn, err := cfg.StorageDSN()
+		require.NoError(t, err)
+		assert.Equal(t, "env-storage-dsn", dsn)
+	})
+
+	t.Run("MYSQL_DSN is the legacy fallback", func(t *testing.T) {
+		t.Setenv("STORAGE_DSN", "")
+		t.Setenv("MYSQL_DSN", "env-mysql-dsn")
+		cfg := ServerConfig{}
+		dsn, err := cfg.StorageDSN()
+		require.NoError(t, err)
+		assert.Equal(t, "env-mysql-dsn", dsn)
+	})
+}
+
 func TestServerConfig_StorageDSNFromConfig(t *testing.T) {
 	dir := t.TempDir()
 	databaseConfigPath := filepath.Join(dir, "storage.yaml")
@@ -2484,6 +3020,8 @@ func TestServerConfig_IsRepoAllowed(t *testing.T) {
 			},
 		}
 		assert.True(t, cfg.IsRepoAllowed("org/allowed-repo"))
+		assert.True(t, cfg.IsRepoAllowed("ORG/ALLOWED-REPO"))
+		assert.True(t, cfg.IsRepoAllowed("Org/Allowed-Repo"))
 	})
 
 	t.Run("populated repos rejects unlisted repo", func(t *testing.T) {
@@ -2574,6 +3112,23 @@ func TestServerConfig_AreChecksEnabled(t *testing.T) {
 			},
 		}
 		assert.True(t, cfg.AreChecksEnabled("org/repo"))
+	})
+}
+
+func TestServerConfig_DeletesUnactionedPlanComments(t *testing.T) {
+	t.Run("nil config defaults to minimize policy", func(t *testing.T) {
+		var cfg *ServerConfig
+		assert.False(t, cfg.DeletesUnactionedPlanComments())
+	})
+
+	t.Run("unset defaults to minimize policy", func(t *testing.T) {
+		cfg := ServerConfig{}
+		assert.False(t, cfg.DeletesUnactionedPlanComments())
+	})
+
+	t.Run("explicit true opts into the delete policy", func(t *testing.T) {
+		cfg := ServerConfig{DeleteUnactionedPlanComments: true}
+		assert.True(t, cfg.DeletesUnactionedPlanComments())
 	})
 }
 
@@ -2750,69 +3305,6 @@ require_passing_checks: false
 		require.NoError(t, err)
 
 		assert.False(t, cfg.ShouldRequirePassingChecks())
-	})
-}
-
-func TestServerConfig_ShouldClaimOperations(t *testing.T) {
-	t.Run("nil receiver defaults to true", func(t *testing.T) {
-		var cfg *ServerConfig
-		assert.True(t, cfg.ShouldClaimOperations())
-	})
-
-	t.Run("nil field defaults to true", func(t *testing.T) {
-		cfg := &ServerConfig{}
-		assert.True(t, cfg.ShouldClaimOperations())
-	})
-
-	t.Run("explicitly true", func(t *testing.T) {
-		cfg := &ServerConfig{OperatorClaimOperations: new(true)}
-		assert.True(t, cfg.ShouldClaimOperations())
-	})
-
-	t.Run("explicitly false falls back to apply-level claiming", func(t *testing.T) {
-		cfg := &ServerConfig{OperatorClaimOperations: new(false)}
-		assert.False(t, cfg.ShouldClaimOperations())
-	})
-
-	t.Run("YAML omits the key and defaults to true", func(t *testing.T) {
-		dir := t.TempDir()
-		configPath := filepath.Join(dir, "config.yaml")
-		content := `
-databases:
-  testapp:
-    type: mysql
-    environments:
-      staging:
-        dsn: "root@tcp(localhost:3306)/testapp"
-`
-		err := os.WriteFile(configPath, []byte(content), 0644)
-		require.NoError(t, err)
-
-		cfg, err := LoadServerConfigFromFile(configPath)
-		require.NoError(t, err)
-
-		assert.True(t, cfg.ShouldClaimOperations())
-	})
-
-	t.Run("YAML can opt back into apply-level claiming", func(t *testing.T) {
-		dir := t.TempDir()
-		configPath := filepath.Join(dir, "config.yaml")
-		content := `
-databases:
-  testapp:
-    type: mysql
-    environments:
-      staging:
-        dsn: "root@tcp(localhost:3306)/testapp"
-operator_claim_operations: false
-`
-		err := os.WriteFile(configPath, []byte(content), 0644)
-		require.NoError(t, err)
-
-		cfg, err := LoadServerConfigFromFile(configPath)
-		require.NoError(t, err)
-
-		assert.False(t, cfg.ShouldClaimOperations())
 	})
 }
 
@@ -3140,7 +3632,22 @@ func TestServerConfig_ResolveGitHubAppForRepo(t *testing.T) {
 		}
 		_, err := cfg.ResolveGitHubAppForRepo("org-z/unknown")
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "not declared in the repos config")
+		assert.ErrorIs(t, err, ErrRepoNotConfigured)
+		assert.Contains(t, err.Error(), `repository "org-z/unknown"`)
+	})
+
+	t.Run("multi-app declared repo with broken app mapping is not ErrRepoNotConfigured", func(t *testing.T) {
+		// Construct directly (bypassing Validate) to exercise the resolver's
+		// defensive path: a declared repo whose App mapping is broken must not
+		// be classified as unmanaged traffic.
+		cfg := &ServerConfig{
+			Apps:  map[string]GitHubAppConfig{"app-a": validApp},
+			Repos: map[string]RepoConfig{"org/repo": {GitHubApp: "app-gone"}},
+		}
+		_, err := cfg.ResolveGitHubAppForRepo("org/repo")
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrRepoNotConfigured)
+		assert.Contains(t, err.Error(), `unknown github_app "app-gone"`)
 	})
 
 	t.Run("multi-app errors when repo missing github_app", func(t *testing.T) {
@@ -3436,9 +3943,16 @@ repos:
 func TestPendingDropsConfig(t *testing.T) {
 	boolPtr := func(b bool) *bool { return &b }
 
-	t.Run("enabled by default", func(t *testing.T) {
+	t.Run("disabled by default", func(t *testing.T) {
 		cfg := ServerConfig{}
+		assert.False(t, cfg.PendingDropsEnabled())
+		assert.False(t, cfg.PendingDropsCleanupEnabled())
+	})
+
+	t.Run("explicit enable turns on the quarantine and its cleaner together", func(t *testing.T) {
+		cfg := ServerConfig{PendingDrops: PendingDropsConfig{Enabled: boolPtr(true)}}
 		assert.True(t, cfg.PendingDropsEnabled())
+		assert.True(t, cfg.PendingDropsCleanupEnabled())
 	})
 
 	t.Run("explicit disable", func(t *testing.T) {
@@ -3447,14 +3961,18 @@ func TestPendingDropsConfig(t *testing.T) {
 		assert.False(t, cfg.PendingDropsCleanupEnabled())
 	})
 
-	t.Run("cleanup enabled by default", func(t *testing.T) {
-		cfg := ServerConfig{}
-		assert.True(t, cfg.PendingDropsCleanupEnabled())
+	t.Run("cleanup can be disabled without disabling quarantine", func(t *testing.T) {
+		cfg := ServerConfig{PendingDrops: PendingDropsConfig{Enabled: boolPtr(true), CleanupEnabled: boolPtr(false)}}
+		assert.True(t, cfg.PendingDropsEnabled())
+		assert.False(t, cfg.PendingDropsCleanupEnabled())
 	})
 
-	t.Run("cleanup can be disabled without disabling quarantine", func(t *testing.T) {
-		cfg := ServerConfig{PendingDrops: PendingDropsConfig{CleanupEnabled: boolPtr(false)}}
-		assert.True(t, cfg.PendingDropsEnabled())
+	t.Run("cleanup stays off when only the cleaner is enabled", func(t *testing.T) {
+		// Enabling the cleaner without the quarantine would start a reaper for a
+		// deployment that writes no quarantined tables of its own, which is how
+		// one deployment ends up sweeping another's targets.
+		cfg := ServerConfig{PendingDrops: PendingDropsConfig{CleanupEnabled: boolPtr(true)}}
+		assert.False(t, cfg.PendingDropsEnabled())
 		assert.False(t, cfg.PendingDropsCleanupEnabled())
 	})
 
@@ -3494,7 +4012,7 @@ func TestPendingDropsConfig(t *testing.T) {
 					},
 				},
 			},
-			PendingDrops: PendingDropsConfig{Retention: "not-a-duration"},
+			PendingDrops: PendingDropsConfig{Enabled: boolPtr(true), Retention: "not-a-duration"},
 		}
 		err := cfg.Validate()
 		assert.ErrorContains(t, err, "pending_drops.retention")
@@ -3597,6 +4115,76 @@ func TestSupportChannelConfig(t *testing.T) {
 		cfg.SupportChannel = SupportChannelConfig{Name: "#schema-help", URL: "https://example.com/" + strings.Repeat("a", maxSupportChannelURLChars)}
 		err := cfg.Validate()
 		assert.ErrorContains(t, err, "support_channel.url must be at most")
+	})
+}
+
+func TestAgentHintConfig(t *testing.T) {
+	validConfig := func() ServerConfig {
+		return ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"mydb": {
+					Type: "mysql",
+					Environments: map[string]EnvironmentConfig{
+						"staging": {DSN: "root:pass@tcp(localhost:3306)/mydb"},
+					},
+				},
+			},
+		}
+	}
+
+	t.Run("disabled by default", func(t *testing.T) {
+		cfg := validConfig()
+		require.NoError(t, cfg.Validate())
+		assert.Empty(t, cfg.AgentHint)
+	})
+
+	t.Run("valid hint", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AgentHint = "Agents: fetch the SchemaBot command reference by commenting `schemabot help`."
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("hint must fit the comment footer reservation", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AgentHint = strings.Repeat("a", maxAgentHintChars+1)
+		err := cfg.Validate()
+		assert.ErrorContains(t, err, "agent_hint must be at most")
+	})
+
+	t.Run("hint bound counts characters, not bytes", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AgentHint = strings.Repeat("é", maxAgentHintChars)
+		require.NoError(t, cfg.Validate(), "a hint at the limit is accepted whatever its bytes cost")
+
+		cfg.AgentHint = strings.Repeat("é", maxAgentHintChars+1)
+		assert.ErrorContains(t, cfg.Validate(), "agent_hint must be at most")
+	})
+
+	t.Run("hint must be a single line", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AgentHint = "line one\nline two"
+		err := cfg.Validate()
+		assert.ErrorContains(t, err, "agent_hint must be a single line")
+	})
+
+	t.Run("hint must not terminate its HTML comment", func(t *testing.T) {
+		// Both forms end a comment in a spec-compliant parser, so a hint
+		// carrying either would render its tail on the PR page.
+		for _, hint := range []string{
+			"install the skill --> then re-read this PR",
+			"install the skill --!> then re-read this PR",
+		} {
+			cfg := validConfig()
+			cfg.AgentHint = hint
+			assert.ErrorContains(t, cfg.Validate(), "agent_hint must not contain", "hint %q", hint)
+		}
+	})
+
+	t.Run("hint must not have surrounding whitespace", func(t *testing.T) {
+		cfg := validConfig()
+		cfg.AgentHint = " padded "
+		err := cfg.Validate()
+		assert.ErrorContains(t, err, "agent_hint contains leading or trailing whitespace")
 	})
 }
 
@@ -3835,5 +4423,293 @@ spirit:
 		cfg := ServerConfig{Spirit: SpiritConfig{ChecksumYieldTimeout: "-1h"}}
 		_, err := cfg.SpiritMetadata()
 		require.ErrorContains(t, err, "must be positive")
+	})
+}
+
+// The planetscale.mtls block always presents a client identity, so a partial
+// block is rejected at config load rather than producing a worker that starts
+// and then fails or degrades on every Vitess connection it opens.
+func TestValidatePlanetScaleMTLS(t *testing.T) {
+	configWith := func(ps PlanetScaleConfig) *ServerConfig {
+		return &ServerConfig{
+			PlanetScale: ps,
+			Databases: map[string]DatabaseConfig{
+				"mydb": {
+					Type: "mysql",
+					Environments: map[string]EnvironmentConfig{
+						"staging": {DSN: "root@tcp(localhost:3306)/mydb"},
+					},
+				},
+			},
+		}
+	}
+
+	tests := []struct {
+		name    string
+		mtls    *PlanetScaleMTLSConfig
+		wantErr string
+	}{
+		{
+			name: "absent block is valid",
+			mtls: nil,
+		},
+		{
+			name: "complete block is valid",
+			mtls: &PlanetScaleMTLSConfig{
+				CABundle:   "/etc/ssl/certs/ca-certificates.crt",
+				ClientCert: "/etc/secrets/pca/tls.crt",
+				ClientKey:  "/etc/secrets/pca/tls.key",
+			},
+		},
+		{
+			name:    "missing ca_bundle",
+			mtls:    &PlanetScaleMTLSConfig{ClientCert: "/c.crt", ClientKey: "/c.key"},
+			wantErr: "planetscale.mtls.ca_bundle is required",
+		},
+		{
+			name:    "missing client_cert",
+			mtls:    &PlanetScaleMTLSConfig{CABundle: "/ca.crt", ClientKey: "/c.key"},
+			wantErr: "planetscale.mtls.client_cert is required",
+		},
+		{
+			name:    "missing client_key",
+			mtls:    &PlanetScaleMTLSConfig{CABundle: "/ca.crt", ClientCert: "/c.crt"},
+			wantErr: "planetscale.mtls.client_key is required",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := configWith(PlanetScaleConfig{MTLS: tt.mtls}).Validate()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tt.wantErr)
+		})
+	}
+}
+
+// The planetscale.mtls block from the configuration docs decodes through the
+// strict config loader: the yaml tags on PlanetScaleConfig and
+// PlanetScaleMTLSConfig are what real config files exercise, and the loader's
+// KnownFields decoding rejects any key they fail to cover, so this pins the
+// block's on-disk spelling end to end.
+func TestLoadServerConfigPlanetScaleMTLSFromYAML(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+databases:
+  mydb:
+    type: mysql
+    environments:
+      staging:
+        dsn: root@tcp(localhost:3306)/mydb
+planetscale:
+  mtls:
+    ca_bundle: /etc/ssl/certs/ca-certificates.crt
+    client_cert: /etc/secrets/pca/tls.crt
+    client_key: /etc/secrets/pca/tls.key
+`), 0o600))
+
+	cfg, err := LoadServerConfigFromFile(path)
+	require.NoError(t, err)
+	require.Equal(t, &PlanetScaleMTLSConfig{
+		CABundle:   "/etc/ssl/certs/ca-certificates.crt",
+		ClientCert: "/etc/secrets/pca/tls.crt",
+		ClientKey:  "/etc/secrets/pca/tls.key",
+	}, cfg.PlanetScale.MTLS)
+}
+
+func TestLoadServerConfigPostgresNativeSafeTableSizeLimit(t *testing.T) {
+	t.Run("unset uses default", func(t *testing.T) {
+		cfg := PostgresConfig{}
+		assert.Equal(t, int64(1<<30), cfg.NativeSafeTableSizeLimit())
+	})
+
+	t.Run("configured bytes", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(`
+databases:
+  mydb:
+    type: postgres
+    environments:
+      staging:
+        dsn: postgres://localhost/mydb
+postgres:
+  native_safe_table_size_limit_bytes: 4294967296
+`), 0o600))
+
+		cfg, err := LoadServerConfigFromFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, int64(4<<30), cfg.Postgres.NativeSafeTableSizeLimit())
+	})
+
+	t.Run("non-positive fails validation", func(t *testing.T) {
+		limit := int64(0)
+		cfg := ServerConfig{Databases: map[string]DatabaseConfig{
+			"mydb": {
+				Type: storage.DatabaseTypePostgres,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "postgres://localhost/mydb"},
+				},
+			},
+		}}
+		cfg.Postgres.NativeSafeTableSizeLimitBytes = &limit
+
+		err := cfg.Validate()
+		require.ErrorContains(t, err, "postgres.native_safe_table_size_limit_bytes must be positive")
+	})
+
+	t.Run("unparseable fails config load", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(`
+databases:
+  mydb:
+    type: postgres
+    environments:
+      staging:
+        dsn: postgres://localhost/mydb
+postgres:
+  native_safe_table_size_limit_bytes: 4GiB
+`), 0o600))
+
+		_, err := LoadServerConfigFromFile(path)
+		require.ErrorContains(t, err, "parse config file")
+		require.ErrorContains(t, err, "cannot unmarshal")
+	})
+}
+
+// postgres.statement_timeout bounds ordinary storage queries. Unlike the pool
+// durations, zero is a meaningful setting rather than "use the default": it
+// disables the budget explicitly so the connection states that it has no
+// budget instead of inheriting whatever the platform imposed.
+func TestPostgresStatementTimeoutConfig(t *testing.T) {
+	t.Parallel()
+
+	postgresCfg := func(statementTimeout string) ServerConfig {
+		cfg := ServerConfig{Databases: map[string]DatabaseConfig{
+			"mydb": {
+				Type: storage.DatabaseTypePostgres,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "postgres://localhost/mydb"},
+				},
+			},
+		}}
+		cfg.Postgres.StatementTimeout = statementTimeout
+		return cfg
+	}
+
+	t.Run("unset uses the default", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("")
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, DefaultPostgresStatementTimeout, cfg.Postgres.StatementTimeoutOrDefault())
+	})
+
+	t.Run("explicit value wins over the default", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("90s")
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, 90*time.Second, cfg.Postgres.StatementTimeoutOrDefault())
+	})
+
+	t.Run("zero disables the budget rather than selecting the default", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("0")
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, time.Duration(0), cfg.Postgres.StatementTimeoutOrDefault())
+	})
+
+	t.Run("negative fails validation", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("-1s")
+		err := cfg.Validate()
+		require.ErrorContains(t, err, "postgres.statement_timeout")
+		require.ErrorContains(t, err, "must not be negative")
+	})
+
+	t.Run("unparseable fails validation", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("soon")
+		err := cfg.Validate()
+		require.ErrorContains(t, err, `postgres.statement_timeout "soon" is not a valid duration`)
+	})
+
+	// A budget that does not clear the apply target lock wait fires before that
+	// lock's own timeout, so an instance waiting its turn reports a statement
+	// timeout instead of a lock conflict and the contention stops looking like
+	// contention. Startup is the last place that is still visible. The floor
+	// sits above the wait rather than at it, so a budget in the band just over
+	// the wait is refused too: it comes out the right way round only because of
+	// how the acquisition is currently written.
+	t.Run("a value below the floor fails validation", func(t *testing.T) {
+		t.Parallel()
+		for _, tooShort := range []string{"1s", "9999ms", "10s", "10001ms", "14999ms"} {
+			cfg := postgresCfg(tooShort)
+			err := cfg.Validate()
+			require.ErrorContains(t, err, "postgres.statement_timeout")
+			require.ErrorContains(t, err, "must be at least 15s")
+			require.ErrorContains(t, err, "10s apply target lock wait")
+		}
+	})
+
+	t.Run("a value at the floor validates", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("15s")
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, 15*time.Second, cfg.Postgres.StatementTimeoutOrDefault())
+	})
+
+	// Disabling the budget outright is not "a very short budget" — nothing can
+	// cut the lock wait short, so the floor does not apply.
+	t.Run("zero is exempt from the lock wait floor", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("0")
+		require.NoError(t, cfg.Validate())
+	})
+
+	// The default has to clear the floor it is validated against, or the
+	// shipped configuration would be one the server rejects.
+	t.Run("the default clears the lock wait floor", func(t *testing.T) {
+		t.Parallel()
+		assert.GreaterOrEqual(t, DefaultPostgresStatementTimeout, MinPostgresStatementTimeout)
+		assert.Greater(t, MinPostgresStatementTimeout, storage.ApplyTargetLockWait)
+	})
+
+	// statement_timeout is a millisecond integer GUC, so a budget past the
+	// signed 32-bit maximum is not clamped: the backend raises a FATAL while
+	// applying the startup packet and every connection fails at dial. Startup
+	// validation is where the value can still be named.
+	t.Run("a value above what PostgreSQL accepts fails validation", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("600h")
+		err := cfg.Validate()
+		require.ErrorContains(t, err, "postgres.statement_timeout")
+		require.ErrorContains(t, err, "exceeds the")
+	})
+
+	t.Run("the largest accepted value validates", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg(postgresconn.MaxStatementTimeout.String())
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, postgresconn.MaxStatementTimeout, cfg.Postgres.StatementTimeoutOrDefault())
+	})
+
+	t.Run("loads from file", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(`
+databases:
+  mydb:
+    type: postgres
+    environments:
+      staging:
+        dsn: postgres://localhost/mydb
+postgres:
+  statement_timeout: 45s
+`), 0o600))
+
+		cfg, err := LoadServerConfigFromFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, 45*time.Second, cfg.Postgres.StatementTimeoutOrDefault())
 	})
 }

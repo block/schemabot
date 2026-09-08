@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/block/schemabot/pkg/cmd/cliname"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/lint"
 )
 
@@ -69,7 +71,7 @@ func (cmd *FixLintCmd) Run(g *Globals) error {
 
 	// Show unfixable issues
 	if len(result.UnfixableIssues) > 0 {
-		fmt.Printf("❌ %d issue(s) require manual fix:\n", len(result.UnfixableIssues))
+		fmt.Printf(glyph.Failed+" %d issue(s) require manual fix:\n", len(result.UnfixableIssues))
 		for _, issue := range result.UnfixableIssues {
 			loc := issue.Table
 			if issue.Column != "" {
@@ -83,7 +85,7 @@ func (cmd *FixLintCmd) Run(g *Globals) error {
 	if cmd.DryRun && result.TotalFixed > 0 {
 		fmt.Println("Run without --dry-run to apply fixes.")
 	} else if result.TotalFixed > 0 {
-		fmt.Println("Run 'schemabot plan' to see full validation results.")
+		fmt.Printf("Run '%s plan' to see full validation results.\n", cliname.Name())
 	}
 
 	// Exit with error if there are unfixable issues (for CI)

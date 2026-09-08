@@ -167,11 +167,15 @@ type Handler struct {
 	// the count to zero. Nil when no drain is waiting.
 	inProcessWebhookDrained chan struct{}
 
-	webhookReconciler        bool
-	webhookReconcileInterval time.Duration
-	webhookReconcileLookback time.Duration
-	webhookReconcileGrace    time.Duration
-	webhookReconcileMaxPages int
+	webhookReconciler         bool
+	webhookReconcileSynthesis bool
+	webhookReconcileInterval  time.Duration
+	webhookReconcileLookback  time.Duration
+	webhookReconcileGrace     time.Duration
+	webhookReconcileMaxPages  int
+
+	checkSuiteRecovery      bool
+	checkSuiteRecoveryGrace time.Duration
 
 	logger                     *slog.Logger
 	priorEnvCheckMaxAttempts   int
@@ -205,14 +209,40 @@ func WithDurableWebhookDispatch() HandlerOption {
 // WithWebhookReconciler enables the webhook reconciliation loop. It does two
 // things per pass: (1) an active stuck-processing sweep that terminalizes inbox
 // rows wedged past the attempt cap so they emit failures and become
-// redeliverable, and (2) a report-only scan of recently updated open PRs in
-// registered repositories that reports PR heads with no corresponding inbox
-// delivery (no rows are synthesized). Only the missing-delivery scan is
-// report-only. It takes effect alongside WithDurableWebhookDispatch, whose
+// redeliverable, and (2) a scan of recently updated open PRs in registered
+// repositories that detects PR heads with no corresponding inbox delivery. The
+// missing-delivery scan is report-only unless WithWebhookReconcileSynthesis is
+// also set. It takes effect alongside WithDurableWebhookDispatch, whose
 // lifecycle it shares.
 func WithWebhookReconciler() HandlerOption {
 	return func(h *Handler) {
 		h.webhookReconciler = true
+	}
+}
+
+// WithWebhookReconcileSynthesis makes the reconciler's missing-delivery scan
+// enforcing: for each open PR head with no inbox delivery it synthesizes a
+// pull_request-equivalent inbox row (deterministic delivery GUID derived from
+// repo, PR, and head SHA; naturally deduped per head) that the durable
+// dispatcher plans through the ordinary auto-plan flow. Without this option
+// the scan only reports misses. It takes effect only alongside
+// WithWebhookReconciler.
+func WithWebhookReconcileSynthesis() HandlerOption {
+	return func(h *Handler) {
+		h.webhookReconcileSynthesis = true
+	}
+}
+
+// WithCheckSuiteRecovery feeds check_suite.requested deliveries into the
+// durable inbox as a redundant convergence signal: each is enqueued with a
+// not-before time (the recovery grace) and, once claimable, synthesizes a
+// recovery delivery for any open PR still at the suite head whose auto-plan
+// coverage is missing. It takes effect only alongside
+// WithDurableWebhookDispatch; without that, check_suite deliveries are
+// acknowledged and ignored.
+func WithCheckSuiteRecovery() HandlerOption {
+	return func(h *Handler) {
+		h.checkSuiteRecovery = true
 	}
 }
 
@@ -258,6 +288,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 		webhookReconcileLookback:    defaultWebhookReconcileLookback,
 		webhookReconcileGrace:       defaultWebhookReconcileGrace,
 		webhookReconcileMaxPages:    defaultWebhookReconcileMaxPages,
+		checkSuiteRecoveryGrace:     defaultCheckSuiteRecoveryGrace,
 		priorEnvCheckMaxAttempts:    defaultPriorEnvCheckMaxAttempts,
 		priorEnvCheckRetryInterval:  defaultPriorEnvCheckRetryInterval,
 	}
@@ -393,8 +424,145 @@ func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.
 			checkFields()...)
 		return
 	}
-	h.updateAggregateCheck(ctx, ghInstClient, a.Repository, a.PullRequest, checkRecord.HeadSHA)
+	// The stored row names the commit the apply started on, and the terminal
+	// write above re-pins it there. Both decisions left — which commit carries
+	// the outcome, and whether a re-plan is owed — turn on where the PR is now,
+	// so read the head uncached rather than trusting the row.
+	prInfo, err := ghInstClient.FetchPullRequestNoCache(ctx, a.Repository, a.PullRequest)
+	if err != nil {
+		// The outcome still has to land somewhere, and the apply's own commit is
+		// the only one left in hand. The fold makes its own read and publishes
+		// there only while that commit is still the head; if it has moved, the
+		// fold skips and this outcome is not recorded on any commit the PR is
+		// gated on. Name the target so an operator can tell the two apart.
+		h.logger.Warn("terminal apply's aggregate refresh targets the apply's commit and no re-plan is considered: could not read the PR head",
+			append(checkFields(), "check_head_sha", checkRecord.HeadSHA, "error", err)...)
+		h.updateAggregateCheck(ctx, ghInstClient, a.Repository, a.PullRequest, checkRecord.HeadSHA)
+		return
+	}
+
+	h.updateAggregateCheck(publishHeadCtx(ctx, a, prInfo), ghInstClient, a.Repository, a.PullRequest, aggregatePublishSHA(checkRecord, prInfo))
+	h.replanAfterCheckOwnershipRelease(a, checkRecord, prInfo)
 }
+
+// publishHeadCtx scopes the aggregate publish to the head the caller already
+// read, so the fold's own currency check is answered by that read instead of a
+// second one.
+//
+// Two independent reads of a mutable head can disagree, and the fold treats a
+// disagreement as a stale write: it skips the publish and arms a re-fold. That
+// re-fold only runs on an aggregate leader, so on every other repo a terminal
+// outcome caught in the gap is not published anywhere — it is dropped, with a
+// debug line as the only trace. One read closes the gap and costs one round
+// trip instead of two.
+//
+// A head GitHub did not report seeds nothing: an empty head cannot answer the
+// currency check, so the fold reads for itself as it otherwise would.
+func publishHeadCtx(ctx context.Context, a *storage.Apply, prInfo *github.PullRequestInfo) context.Context {
+	if prInfo.HeadSHA == "" {
+		return ctx
+	}
+	return github.WithPRInfo(ctx, a.Repository, a.PullRequest, prInfo)
+}
+
+// aggregatePublishSHA picks the commit a terminal apply's aggregate is
+// published on.
+//
+// The stored row names the commit the apply started on. Publishing there once
+// the PR head has moved puts the outcome on a Check Run GitHub no longer
+// displays or gates, leaving the run an operator is actually looking at showing
+// whatever it last said. It matters most for an apply that ends owing a
+// reconciliation: no re-plan follows that one by design, so the publish is the
+// only chance to state the block on the commit the PR is gated on.
+//
+// The stored commit stays the fallback for a head GitHub did not report,
+// because an empty SHA is one the fold rejects outright rather than compares.
+// It buys a publish only while the stored commit is still the head; past that
+// the fold skips, so the fallback avoids an error rather than guaranteeing an
+// outcome.
+func aggregatePublishSHA(check *storage.Check, prInfo *github.PullRequestInfo) string {
+	if prInfo.HeadSHA == "" {
+		return check.HeadSHA
+	}
+	return prInfo.HeadSHA
+}
+
+// replanAfterCheckOwnershipRelease re-plans a PR whose head moved while an
+// apply held its check.
+//
+// A plan that ran during the apply was refused by the guard preserving
+// in-progress apply-owned state, so the stored row is still recorded against
+// the apply's commit. The aggregate holds a row recorded for another commit as
+// blocking until results land for the current head, and nothing else produces
+// them: a terminal apply writes the row it owned, not a plan for the newer
+// commit. Releasing ownership is the first moment a plan for the current head
+// can be stored, which is why the re-plan belongs here — without it the PR
+// stays gated on a check no path will refresh.
+//
+// Ownership that survives the terminal outcome — a cancelled apply whose
+// completed task history keeps the row claimed — is deliberately left alone: an
+// operator owes that target a reconciliation and a clean plan must not replace
+// the block.
+//
+// prInfo is the caller's uncached read of the PR, shared with the commit the
+// aggregate was just published on so both decisions see one head.
+func (h *Handler) replanAfterCheckOwnershipRelease(a *storage.Apply, check *storage.Check, prInfo *github.PullRequestInfo) {
+	logFields := []any{
+		"apply_id", a.ApplyIdentifier,
+		"repo", a.Repository,
+		"pr", a.PullRequest,
+		"database", a.Database,
+		"database_type", a.DatabaseType,
+		"environment", a.Environment,
+		"check_head_sha", check.HeadSHA,
+		"head_sha", prInfo.HeadSHA,
+		"check_apply_id", check.ApplyID,
+		"pr_state", prInfo.State,
+	}
+	if !replanOwedAfterOwnershipRelease(check, prInfo) {
+		h.logger.Debug("no re-plan after terminal apply: the stored check is still apply-owned, already covers the PR head, or the PR is closed",
+			logFields...)
+		return
+	}
+
+	tenant := ""
+	if config := h.service.Config(); config != nil {
+		tenant = config.Tenant
+	}
+	h.logger.Info("re-planning after a terminal apply released its check: the PR head moved while the apply held it, so no plan result covers the current commit",
+		logFields...)
+	h.goSafe(a.Repository, a.PullRequest, a.InstallationID, "", func() {
+		// System-triggered: no actor to authorize, and no comment — the operator
+		// asked for an apply, not for a plan. The stored check state it writes
+		// is the whole point.
+		h.handleMultiEnvPlan(a.Repository, a.PullRequest, a.Database, tenant, a.InstallationID, "", true, false, 0)
+	})
+}
+
+// replanOwedAfterOwnershipRelease reports whether releasing a check's apply
+// ownership leaves the PR with no plan result for the commit it is gated on.
+//
+// Ownership that survives the terminal outcome — a cancelled apply whose
+// completed task history keeps the row claimed — owes an operator a
+// reconciliation, and a clean plan must not replace that block. A row already
+// on the PR head needs nothing. A closed PR has no gate left to converge.
+func replanOwedAfterOwnershipRelease(check *storage.Check, prInfo *github.PullRequestInfo) bool {
+	return check.ApplyID == 0 &&
+		!prInfo.IsClosed() &&
+		prInfo.HeadSHA != "" &&
+		prInfo.HeadSHA != check.HeadSHA
+}
+
+// errGitHubAppResolution marks factoryForRepo failures. GitHub App resolution
+// is deterministic per deployment config — no configured clients, an unknown
+// repo in multi-App mode — so the same request reproduces the failure until
+// an operator fixes the config. Command cores classifying durability treat it
+// as terminal rather than re-driving. The determinism rests on two facts:
+// the handler's client set is fixed at construction, and the ServerConfig it
+// resolves against has no reload path. If either ever becomes hot-reloadable,
+// a delivery arriving mid-reload could fail transiently, and this terminal
+// classification must be revisited.
+var errGitHubAppResolution = errors.New("GitHub App resolution failed")
 
 // factoryForRepo returns the GitHub App client factory that owns the given
 // repository. In multi-App mode (ServerConfig.Apps is non-empty) the
@@ -404,19 +572,19 @@ func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.
 // repo.
 func (h *Handler) factoryForRepo(repo string) (github.GitHubClientFactory, error) {
 	if h.ghClients.Len() == 0 {
-		return nil, fmt.Errorf("no GitHub App clients configured")
+		return nil, fmt.Errorf("%w: no GitHub App clients configured", errGitHubAppResolution)
 	}
 	appName := defaultAppName
 	if cfg := h.config(); cfg != nil && len(cfg.Apps) > 0 {
 		resolved, err := cfg.ResolveGitHubAppForRepo(repo)
 		if err != nil {
-			return nil, fmt.Errorf("resolve GitHub App for repo %q: %w", repo, err)
+			return nil, fmt.Errorf("%w for repo %q: %w", errGitHubAppResolution, repo, err)
 		}
 		appName = resolved.Name
 	}
 	factory, err := h.ghClients.For(appName)
 	if err != nil {
-		return nil, fmt.Errorf("lookup GitHub App client %q for repo %q: %w", appName, repo, err)
+		return nil, fmt.Errorf("%w: lookup GitHub App client %q for repo %q: %w", errGitHubAppResolution, appName, repo, err)
 	}
 	return factory, nil
 }
@@ -511,7 +679,8 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 			ops = nil
 		}
 		released := releasedForApply(ctx, h.service.Storage(), apply, ops, h.logger)
-		summaryBase := formatApplySummaryComment(apply, ops, released, tasks, resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops), nil, h.deploymentTenant())
+		summaryBase := formatApplySummaryComment(apply, ops, released, tasks, resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops), nil, resolveShardedVSchemaDiffs(ctx, h.service.Storage(), apply, ops), h.deploymentTenant())
+		summaryBase += controlRejectionSection(ctx, h.service.Storage(), h.logger, apply, summaryBase)
 		summaryBody := summaryBase + failureLogsSection(ctx, h.service.Storage(), h.logger, apply, summaryBase)
 		h.postClaimedSummaryComment(ctx, apply, summaryBody)
 	}
@@ -621,7 +790,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	appName, appID, authStatus, ok := h.authenticateWebhook(r, body)
 	if !ok {
 		h.logger.Warn("webhook rejected",
-			"status", authStatus,
+			"auth_status", authStatus,
 			"app_name", appName,
 			"app_id", appID,
 			"delivery_id", r.Header.Get(headerDeliveryID),
@@ -642,7 +811,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// (enforced per handler) is the authorization boundary in that mode.
 	if !h.repoWebhookTargeted(r) {
 		if err := h.verifySignedAppOwnsRepo(repo, appName); err != nil {
-			h.logger.Warn("webhook rejected: signing App does not own repo",
+			// A repo with no config entry at all is routine traffic from an
+			// unmanaged repository (a shared App forwards deliveries for every
+			// repo it is installed on): it logs at debug and counts under its
+			// own repo_not_configured status without the repository attribute,
+			// since unmanaged repo names are unbounded and would blow up the
+			// metric's cardinality — the debug log carries the repo. A declared
+			// repo that fails ownership resolution is config drift or a hostile
+			// install: it stays a warning and counts under app_repo_mismatch
+			// with the repository attribute, so a nonzero app_repo_mismatch is
+			// always an actionable drift signal.
+			rejectionLog := h.logger.Warn
+			rejectionStatus := "app_repo_mismatch"
+			metricRepo := repo
+			if errors.Is(err, api.ErrRepoNotConfigured) {
+				rejectionLog = h.logger.Debug
+				rejectionStatus = "repo_not_configured"
+				metricRepo = ""
+			}
+			rejectionLog("webhook rejected: signing App does not own repo",
 				"app_name", appName,
 				"app_id", appID,
 				"delivery_id", r.Header.Get(headerDeliveryID),
@@ -650,7 +837,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"action", action,
 				"repo", repo,
 				"error", err)
-			metrics.RecordWebhookEvent(r.Context(), metricAppName(appName), eventType, action, repo, "app_repo_mismatch")
+			metrics.RecordWebhookEvent(r.Context(), metricAppName(appName), eventType, action, metricRepo, rejectionStatus)
 			h.writeError(w, http.StatusUnauthorized, "invalid webhook dispatch")
 			return
 		}
@@ -706,10 +893,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch eventType {
 	case "issue_comment":
-		h.handleIssueComment(ctx, metricApp, sw, body)
+		h.handleIssueComment(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
 		recordProcessed()
 	case "check_run":
 		h.handleCheckRun(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
+		recordProcessed()
+	case "check_suite":
+		h.handleCheckSuite(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
 		recordProcessed()
 	case "pull_request":
 		h.handlePullRequest(ctx, metricApp, sw, body, r.Header.Get(headerDeliveryID))
@@ -905,7 +1095,7 @@ func webhookMetadata(body []byte) (action, repo string) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return "", ""
 	}
-	return payload.Action, payload.Repository.FullName
+	return payload.Action, storage.CanonicalKey(payload.Repository.FullName)
 }
 
 // verifyHMAC validates a GitHub-style "sha256=<hex>" signature against the
@@ -929,14 +1119,22 @@ func verifyHMAC(signature string, body, secret []byte) bool {
 }
 
 // recoverPanic recovers from panics in async goroutines, logs the stack trace,
-// and posts an error comment on the PR so the user gets feedback instead of silence.
-// Usage: defer h.recoverPanic(repo, pr, installationID)
-func (h *Handler) recoverPanic(repo string, pr int, installationID int64) {
+// and posts an error comment on the PR so the user gets feedback instead of
+// silence. The comment is a fixed line: a panic value can carry anything that
+// was in scope at the panic site (DSN fragments, hostnames, driver internals),
+// and a PR comment is a public surface — the raw value and stack stay
+// server-side in the log.
+// Usage: defer h.recoverPanic(repo, pr, installationID, deliveryID)
+func (h *Handler) recoverPanic(repo string, pr int, installationID int64, deliveryID string) {
 	if r := recover(); r != nil {
 		stack := debug.Stack()
-		h.logger.Error("goroutine panic", "repo", repo, "pr", pr, "installation_id", installationID, "error", r, "stack", string(stack))
+		attrs := []any{"repo", repo, "pr", pr, "installation_id", installationID}
+		if deliveryID != "" {
+			attrs = append(attrs, "delivery_id", deliveryID)
+		}
+		h.logger.Error("goroutine panic", append(attrs, "error", r, "stack", string(stack))...)
 		h.postComment(repo, pr, installationID,
-			fmt.Sprintf("**Internal error: goroutine panic. This is a bug — please report it.**\n```\n%v\n```", r))
+			"**Internal error while processing this request. This is a bug — please report it.** Details are in the server logs.")
 	}
 }
 
@@ -952,9 +1150,9 @@ func (h *Handler) recoverPanic(repo string, pr int, installationID int64) {
 // (the delayed time.AfterFunc timer case) runs untracked: the drain has
 // committed to a bounded wait and reached empty, so it will not wait for late
 // timers.
-func (h *Handler) goSafe(repo string, pr int, installationID int64, fn func()) {
+func (h *Handler) goSafe(repo string, pr int, installationID int64, deliveryID string, fn func()) {
 	run := func() {
-		defer h.recoverPanic(repo, pr, installationID)
+		defer h.recoverPanic(repo, pr, installationID, deliveryID)
 		fn()
 	}
 

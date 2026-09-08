@@ -4,6 +4,11 @@ import "errors"
 
 // Common storage errors.
 var (
+	// ErrNotImplemented is returned by interface methods that no
+	// implementation supports yet. Callers must treat it as a hard error,
+	// never as an empty result.
+	ErrNotImplemented = errors.New("not implemented")
+
 	// ErrLockHeld is returned when attempting to acquire a lock that is already held.
 	ErrLockHeld = errors.New("lock is already held")
 
@@ -33,12 +38,19 @@ var (
 	// for the same database, type, and environment.
 	ErrActiveApplyExists = errors.New("active apply already exists")
 
-	// ErrApplyNotReappliable is returned when a failed apply cannot be reapplied.
-	ErrApplyNotReappliable = errors.New("apply is not reappliable")
+	// ErrApplyNotActive is returned when a write requires the apply to still be
+	// active (non-terminal) and it is not — e.g. attaching a new operation to
+	// an apply no drive will pick up again.
+	ErrApplyNotActive = errors.New("apply is not active")
 
 	// ErrApplyLeaseLost is returned when an operator-owned write no longer
 	// matches the apply lease token stored by the latest operator claimant.
 	ErrApplyLeaseLost = errors.New("apply lease lost")
+
+	// ErrApplyAlreadySuperseded is returned when a handoff would reassign an
+	// apply's superseded_by marker to a different successor. The marker is
+	// write-once, so a second claimant means the takeover is ambiguous.
+	ErrApplyAlreadySuperseded = errors.New("apply already superseded by another apply")
 
 	// ErrPlanNotFound is returned when a plan does not exist.
 	ErrPlanNotFound = errors.New("plan not found")
@@ -55,6 +67,13 @@ var (
 	// ErrApplyOperationNotFound is returned when an apply_operations child
 	// row does not exist for the given lookup key.
 	ErrApplyOperationNotFound = errors.New("apply operation not found")
+
+	// ErrRemoteApplyDeploymentIDConflict is returned when storing a remote
+	// apply id would correlate one deployment to more than one remote
+	// data-plane apply — either the deployment's operations already disagree
+	// with each other, or the id being stored disagrees with the one they
+	// share. Callers must fail closed rather than pick one.
+	ErrRemoteApplyDeploymentIDConflict = errors.New("deployment already correlates to a different remote apply")
 
 	// ErrApplyOperationExists is returned when an apply_operations row for
 	// (apply_id, deployment, operation_key) is being inserted but already exists.

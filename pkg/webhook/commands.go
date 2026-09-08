@@ -3,9 +3,9 @@ package webhook
 import (
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 )
 
@@ -32,12 +32,6 @@ type CommandSpec struct {
 	// SupportsDB means `-d <db>` is recognized.
 	SupportsDB bool
 
-	// SupportsAutoConfirm means `-y` / `--yes` is recognized. Only apply uses
-	// this today; other commands have the flag silently dropped from the
-	// CommandResult so the dispatcher can post an "unsupported flag" comment
-	// via HasAutoConfirmFlag.
-	SupportsAutoConfirm bool
-
 	// SupportsSkipRevert means `--skip-revert` is recognized.
 	SupportsSkipRevert bool
 
@@ -49,13 +43,6 @@ type CommandSpec struct {
 
 	// SupportsForce means `--force` is recognized.
 	SupportsForce bool
-
-	// SupportsVolumeLevel means `-v <level>` / `--volume <level>` is recognized.
-	// The parser extracts the numeric level into CommandResult.VolumeLevel and
-	// flags a present-but-unparseable value via VolumeLevelError; range
-	// validation stays with the dispatcher so the rejection comment can cite
-	// the valid range.
-	SupportsVolumeLevel bool
 }
 
 // commandSpecs is the registry of all SchemaBot commands. Order does not
@@ -67,7 +54,7 @@ var commandSpecs = []CommandSpec{
 	{Name: action.Plan, RequiresEnv: true, SupportsDB: true},
 	{Name: action.Apply, RequiresEnv: true, SupportsDB: true,
 		SupportsSkipRevert: true, SupportsDeferCutover: true,
-		SupportsAllowUnsafe: true, SupportsAutoConfirm: true},
+		SupportsAllowUnsafe: true},
 	{Name: action.ApplyConfirm, RequiresEnv: true, SupportsDB: true,
 		SupportsSkipRevert: true, SupportsDeferCutover: true, SupportsAllowUnsafe: true},
 	{Name: action.Unlock, SupportsDB: true, SupportsForce: true},
@@ -79,9 +66,24 @@ var commandSpecs = []CommandSpec{
 	{Name: action.Revert, RequiresEnv: true, HasApplyID: true},
 	{Name: action.SkipRevert, RequiresEnv: true, HasApplyID: true},
 	{Name: action.Cutover, RequiresEnv: true, HasApplyID: true},
-	{Name: action.Volume, RequiresEnv: true, HasApplyID: true, SupportsVolumeLevel: true},
 	{Name: action.Rollback, RequiresEnv: true, HasApplyID: true},
 	{Name: action.RollbackConfirm, RequiresEnv: true, SupportsDeferCutover: true},
+}
+
+// CommandNames returns the command word of every registered PR comment
+// command.
+//
+// Exported so the CLI's own command surface can be checked against it: every
+// command a PR comment accepts has to have a CLI equivalent, because both
+// surfaces converge on the same service methods and the CLI is the fallback
+// when GitHub is unavailable. A fallback that covers only part of the surface
+// is not a fallback.
+func CommandNames() []string {
+	names := make([]string, 0, len(commandSpecs))
+	for _, s := range commandSpecs {
+		names = append(names, s.Name)
+	}
+	return names
 }
 
 // specByName indexes commandSpecs for O(1) lookup by command word.
@@ -126,7 +128,6 @@ type CommandParser struct {
 	allowUnsafeRegex     *regexp.Regexp
 	forceRegex           *regexp.Regexp
 	autoConfirmRegex     *regexp.Regexp
-	volumeFlagRegex      *regexp.Regexp
 }
 
 // NewCommandParser creates a new command parser.
@@ -145,14 +146,21 @@ func NewCommandParser() *CommandParser {
 		deferCutoverRegex:    regexp.MustCompile(`(?i)--defer-cutover\b`),
 		allowUnsafeRegex:     regexp.MustCompile(`(?i)--allow-unsafe\b`),
 		forceRegex:           regexp.MustCompile(`(?i)--force\b`),
-		autoConfirmRegex:     regexp.MustCompile(`(?i)(?:--yes\b|-y\b)`),
-		volumeFlagRegex:      regexp.MustCompile(`(?i)(?:^|\s)(?:--volume|-v)(?:[ \t]+([^\s]+))?(?:\s|$)`),
+		autoConfirmRegex:     regexp.MustCompile(`(?i)(?:^|\s)(?:--yes|-y)(?:\s|$)`),
 	}
 }
 
 // CommandResult represents the result of parsing a command.
 type CommandResult struct {
 	Action string
+	// DeliveryID identifies the webhook delivery that carried the command for
+	// logs emitted by asynchronous command work.
+	DeliveryID string
+	// SuppressRetryComments is set by the durable driver so retryable failures
+	// do not post an answer the driver is about to supersede. The driver posts
+	// the single terminal answer after exhaustion; synchronous handling leaves
+	// it false.
+	SuppressRetryComments bool
 	// CommentID is the PR comment that carried this command. Handlers
 	// acknowledge it with a reaction once they commit to acting, so on a
 	// fan-out only the deployments actually doing work acknowledge.
@@ -166,18 +174,10 @@ type CommandResult struct {
 	DeferCutover bool
 	AllowUnsafe  bool
 	Force        bool
-	AutoConfirm  bool
-	// VolumeLevel is the numeric level from `-v` / `--volume` on commands whose
-	// spec opts into SupportsVolumeLevel. Zero means the flag was absent.
-	VolumeLevel int32
-	// VolumeLevelError is true when `-v` / `--volume` is present without a
-	// numeric value, so the dispatcher can post a usage comment instead of
-	// treating the command as flagless.
-	VolumeLevelError bool
-	Found            bool
-	IsHelp           bool
-	IsMention        bool
-	MissingEnv       bool
+	Found        bool
+	IsHelp       bool
+	IsMention    bool
+	MissingEnv   bool
 	// EnvironmentError is true when `-e` is present but its value is not a
 	// valid environment name (for example a flag glued onto the value:
 	// `-e production--allow-unsafe`). The dispatcher posts a usage comment;
@@ -234,24 +234,6 @@ func (p *CommandParser) firstDirectiveLine(body string) (string, bool) {
 	return "", false
 }
 
-// extractVolumeLevel returns the numeric level from `-v` / `--volume` and
-// whether the flag was present but unusable (missing value or non-numeric).
-// An absent flag returns (0, false); range validation is the dispatcher's job.
-func (p *CommandParser) extractVolumeLevel(body string) (int32, bool) {
-	match := p.volumeFlagRegex.FindStringSubmatch(body)
-	if len(match) == 0 {
-		return 0, false
-	}
-	if len(match) < 2 || match[1] == "" {
-		return 0, true
-	}
-	level, err := strconv.ParseInt(match[1], 10, 32)
-	if err != nil {
-		return 0, true
-	}
-	return int32(level), false
-}
-
 func (p *CommandParser) extractTenant(body string) (string, bool) {
 	match := p.tenantFlagRegex.FindStringSubmatch(body)
 	if len(match) == 0 {
@@ -302,7 +284,7 @@ func (p *CommandParser) applySpec(spec CommandSpec, body, tenant string, tenantE
 	}
 	if spec.SupportsDB {
 		if m := p.databaseRegex.FindStringSubmatch(body); len(m) >= 2 {
-			result.Database = m[1]
+			result.Database = storage.CanonicalKey(m[1])
 		}
 	}
 	if spec.SupportsSkipRevert {
@@ -317,19 +299,12 @@ func (p *CommandParser) applySpec(spec CommandSpec, body, tenant string, tenantE
 	if spec.SupportsForce {
 		result.Force = p.forceRegex.MatchString(body)
 	}
-	if spec.SupportsAutoConfirm {
-		result.AutoConfirm = p.autoConfirmRegex.MatchString(body)
-	}
-	if spec.SupportsVolumeLevel {
-		result.VolumeLevel, result.VolumeLevelError = p.extractVolumeLevel(body)
-	}
-
 	// The -e capture takes the whole token (any non-flag word) and validity is
 	// checked separately: a malformed value like `production--allow-unsafe`
 	// must be rejected as a whole, never reinterpreted as an environment plus
 	// a glued-on flag.
 	if m := p.environmentRegex.FindStringSubmatch(body); len(m) >= 2 {
-		env := strings.ToLower(m[1])
+		env := storage.CanonicalKey(m[1])
 		if p.environmentNameRegex.MatchString(env) {
 			result.Environment = env
 		} else {
@@ -353,22 +328,47 @@ func (p *CommandParser) applySpec(spec CommandSpec, body, tenant string, tenantE
 	return result
 }
 
-// HasAutoConfirmFlag reports whether the body contains the `-y` / `--yes`
-// flag, regardless of which command it accompanies. The dispatcher uses this
-// to post an "unsupported flag" comment when an operator pairs `-y` with a
-// command whose spec does not opt into SupportsAutoConfirm.
+// HasAutoConfirmFlag reports whether the command carries the `-y` / `--yes`
+// flag. No comment command takes it: a comment has no prompt to skip, and the
+// gates that stop an apply — direct-execution changes, a discarded copy — stop
+// it because the operator has to see what they are consenting to, which a flag
+// cannot express. The dispatcher uses this to say so rather than accept the
+// flag and ignore it, which would read as consent that was never recorded.
+// This is distinct from the CLI's own `-y` (`--auto-approve`), which skips an
+// interactive terminal prompt that genuinely exists.
+//
+// The answer decides whether a command is rejected, so it is read off the
+// directive line the command was parsed from rather than the whole comment: a
+// reader who mentions the flag in prose, or pastes a CLI example in a fence, is
+// describing it, not passing it.
 func (p *CommandParser) HasAutoConfirmFlag(body string) bool {
-	return p.autoConfirmRegex.MatchString(body)
+	directive, ok := p.firstDirectiveLine(markdownDirectiveText(body))
+	if !ok {
+		return false
+	}
+	return p.autoConfirmRegex.MatchString(directive)
 }
 
-// HasDatabaseFlag reports whether the body contains a `-d <database>` flag,
-// regardless of which command it accompanies.
+// HasDatabaseFlag reports whether the command carries a `-d <database>` flag,
+// regardless of which command it accompanies. Like HasAutoConfirmFlag, the
+// answer decides whether a command is rejected, so it is read off the
+// directive line the command was parsed from: prose or a fenced CLI example
+// mentioning the flag describes it, not passes it.
 func (p *CommandParser) HasDatabaseFlag(body string) bool {
-	return p.databaseRegex.MatchString(body)
+	directive, ok := p.firstDirectiveLine(markdownDirectiveText(body))
+	if !ok {
+		return false
+	}
+	return p.databaseRegex.MatchString(directive)
 }
 
-// HasDeferCutoverFlag reports whether the body contains `--defer-cutover`,
-// regardless of which command it accompanies.
+// HasDeferCutoverFlag reports whether the command carries `--defer-cutover`,
+// regardless of which command it accompanies. Read off the directive line for
+// the same reason as HasDatabaseFlag.
 func (p *CommandParser) HasDeferCutoverFlag(body string) bool {
-	return p.deferCutoverRegex.MatchString(body)
+	directive, ok := p.firstDirectiveLine(markdownDirectiveText(body))
+	if !ok {
+		return false
+	}
+	return p.deferCutoverRegex.MatchString(directive)
 }

@@ -62,12 +62,53 @@ func newFanOutSkipHandler(t *testing.T, cfg *api.ServerConfig) (*Handler, *http.
 	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
 
 	installClient := ghclient.NewInstallationClient(client, testLogger())
+	installClient.SetConfigDirHints(cfg)
 	h := &Handler{
 		service:   api.New(&emptyStorage{}, cfg, nil, testLogger()),
 		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
 		logger:    testLogger(),
 	}
 	return h, mux, comments
+}
+
+// serveTruncatedRepoWithChangedSchemaFile registers a PR whose changed schema
+// file has no reachable config and whose recursive repository tree is
+// truncated. A participant cannot resolve ownership from this local view.
+func serveTruncatedRepoWithChangedSchemaFile(t *testing.T, mux *http.ServeMux) {
+	t.Helper()
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"head": map[string]any{"sha": "abc123", "ref": "feature-branch"},
+			"base": map[string]any{"sha": "def456", "ref": "main"},
+			"user": map[string]any{"login": "testuser"},
+		}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode([]map[string]string{{
+			"filename": "schema/users.sql",
+			"status":   "modified",
+		}}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"truncated": true,
+			"tree":      []any{},
+		}))
+	})
+}
+
+func serveCompleteRootConfigTree(t *testing.T, mux *http.ServeMux) {
+	t.Helper()
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+			"truncated": false,
+			"tree": []map[string]string{{
+				"path": "schemabot.yaml",
+				"type": "blob",
+				"sha":  "config-sha",
+			}},
+		}))
+	})
 }
 
 // serveSchemaConfigForDatabase registers the GitHub content routes config
@@ -137,7 +178,7 @@ func TestUnscopedApplyOnUnregisteredDatabaseStaysSilent(t *testing.T) {
 		h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply, Tenant: "tenant-b"})
 
 		body := requireComment(t, comments, "database-not-configured apply error")
-		assert.Contains(t, body, `database "orders" is not configured on this server`)
+		assert.Contains(t, body, `database &#34;orders&#34; is not configured on this server`)
 	})
 
 	t.Run("non-aggregate repo still reports the error", func(t *testing.T) {
@@ -147,8 +188,149 @@ func TestUnscopedApplyOnUnregisteredDatabaseStaysSilent(t *testing.T) {
 		h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
 
 		body := requireComment(t, comments, "database-not-configured apply error")
-		assert.Contains(t, body, `database "orders" is not configured on this server`)
+		assert.Contains(t, body, `database &#34;orders&#34; is not configured on this server`)
 	})
+}
+
+// A bare `schemabot plan` (no -e) on an aggregate repo fans out to every
+// installed deployment just like its -e sibling. A deployment whose databases
+// registry has no entry for the database discovered from the PR's
+// schemabot.yaml is not the owner under the aggregate contract, so it stays
+// silent instead of posting a "database is not configured on this server"
+// failure comment next to the owning deployment's real plan. A -t-scoped
+// command and a non-aggregate repo still surface the error.
+func TestUnscopedMultiEnvPlanOnUnregisteredDatabaseStaysSilent(t *testing.T) {
+	barePlan := func(h *Handler, databaseName, tenant string) {
+		h.handleMultiEnvPlan("octocat/hello-world", 1, databaseName, tenant, 12345, "hubot", false, true, 0)
+	}
+
+	t.Run("bare plan on aggregate repo stays silent", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		barePlan(h, "", "")
+
+		assert.Empty(t, comments, "non-owning deployment must not post a comment for an unscoped fan-out plan")
+	})
+
+	t.Run("bare plan on participant deployment stays silent", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		barePlan(h, "", "")
+
+		assert.Empty(t, comments, "a participant must not post a plan failure for a database another deployment owns")
+	})
+
+	// Naming the database with -d does not name a deployment: the discovered
+	// config still belongs to whichever deployment registers the database, so a
+	// non-owner defers just as silently as it does for the unscoped form.
+	t.Run("database-scoped bare plan stays silent", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		barePlan(h, "orders", "")
+
+		assert.Empty(t, comments, "a -d-scoped fan-out plan on an unowned database must stay silent")
+	})
+
+	t.Run("tenant-scoped plan still reports the error", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		barePlan(h, "", "tenant-b")
+
+		body := requireComment(t, comments, "database-not-configured plan error")
+		assert.Contains(t, body, `database &#34;orders&#34; is not configured on this server`)
+	})
+
+	t.Run("non-aggregate repo still reports the error", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, nonAggregateConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		barePlan(h, "", "")
+
+		body := requireComment(t, comments, "database-not-configured plan error")
+		assert.Contains(t, body, `database &#34;orders&#34; is not configured on this server`)
+	})
+}
+
+// A database-scoped plan still fans out when it does not name a tenant. If a
+// participant's exhaustive local discovery cannot find that database, only
+// the leader may publish Database Not Found as the fleet-authoritative answer.
+func TestMultiEnvPlanDatabaseNotFoundParticipantDefersToLeader(t *testing.T) {
+	barePlan := func(h *Handler) {
+		h.handleMultiEnvPlan("octocat/hello-world", 1, "orders", "", 12345, "hubot", false, true, 0)
+	}
+
+	t.Run("participant stays silent", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+		serveSchemaConfigForDatabase(t, mux, "inventory")
+		serveCompleteRootConfigTree(t, mux)
+
+		barePlan(h)
+
+		assert.Empty(t, comments, "a participant database discovery miss must defer silently to the leader")
+	})
+
+	t.Run("leader reports database not found", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigForDatabase(t, mux, "inventory")
+		serveCompleteRootConfigTree(t, mux)
+
+		barePlan(h)
+
+		body := requireComment(t, comments, "database-not-found leader plan error")
+		assert.Contains(t, body, "Database Not Found")
+		assert.Contains(t, body, "orders")
+	})
+}
+
+// `apply -d` and `apply-confirm -d` fan out exactly like a database-scoped
+// plan: naming a database does not name a deployment. So a participant whose
+// exhaustive local discovery cannot resolve that database defers, and only the
+// leader publishes Database Not Found as the fleet-authoritative answer —
+// otherwise every participant on the repo posts the same failure beside it.
+func TestDatabaseScopedApplyDatabaseNotFoundParticipantDefersToLeader(t *testing.T) {
+	commands := []struct {
+		name string
+		run  func(*Handler)
+	}{
+		{"apply", func(h *Handler) {
+			h.handleApplyCommand("octocat/hello-world", 1, "staging", "orders", 12345, "hubot",
+				CommandResult{Action: action.Apply})
+		}},
+		{"apply-confirm", func(h *Handler) {
+			h.handleApplyConfirmCommand("octocat/hello-world", 1, "staging", "orders", 12345, "hubot",
+				CommandResult{Action: action.ApplyConfirm})
+		}},
+	}
+
+	for _, command := range commands {
+		t.Run(command.name, func(t *testing.T) {
+			t.Run("participant stays silent", func(t *testing.T) {
+				h, mux, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+				serveSchemaConfigForDatabase(t, mux, "inventory")
+				serveCompleteRootConfigTree(t, mux)
+
+				command.run(h)
+
+				assert.Empty(t, comments, "a participant database discovery miss must defer silently to the leader")
+			})
+
+			t.Run("leader reports database not found", func(t *testing.T) {
+				h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+				serveSchemaConfigForDatabase(t, mux, "inventory")
+				serveCompleteRootConfigTree(t, mux)
+
+				command.run(h)
+
+				body := requireComment(t, comments, "database-not-found leader "+command.name+" error")
+				assert.Contains(t, body, "Database Not Found")
+				assert.Contains(t, body, "orders")
+			})
+		})
+	}
 }
 
 // On an aggregate repo, an unscoped `rollback <apply-id> -e <env>` fans out to
@@ -390,41 +572,6 @@ func TestRollbackMissingApplyIDDefersToLeader(t *testing.T) {
 
 		body := requireComment(t, comments, "missing-apply-id rollback comment")
 		assert.Contains(t, body, "Missing Apply ID")
-	})
-}
-
-// A volume command with a missing or invalid -v level is a usage error every
-// deployment can detect from the comment text alone, so on an unscoped fan-out
-// participants defer the reply to the leader, which posts it exactly once.
-func TestVolumeInvalidLevelDefersToLeader(t *testing.T) {
-	invalidLevel := func(tenant string) CommandResult {
-		return CommandResult{Action: action.Volume, ApplyID: "apply_a1b2c3", Environment: "staging", VolumeLevelError: true, Tenant: tenant}
-	}
-
-	t.Run("participant stays silent on the unscoped usage error", func(t *testing.T) {
-		h, _, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
-
-		h.handleVolumeCommand("octocat/hello-world", 1, 12345, "hubot", invalidLevel(""))
-
-		assert.Empty(t, comments, "a participant must defer the invalid-volume-level reply to the leader")
-	})
-
-	t.Run("leader posts the usage error once", func(t *testing.T) {
-		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
-
-		h.handleVolumeCommand("octocat/hello-world", 1, 12345, "hubot", invalidLevel(""))
-
-		body := requireComment(t, comments, "invalid-volume-level comment")
-		assert.Contains(t, body, "Missing or Invalid Volume Level")
-	})
-
-	t.Run("tenant-scoped command gets the usage error from the addressee", func(t *testing.T) {
-		h, _, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
-
-		h.handleVolumeCommand("octocat/hello-world", 1, 12345, "hubot", invalidLevel("tenant-b"))
-
-		body := requireComment(t, comments, "invalid-volume-level comment")
-		assert.Contains(t, body, "Missing or Invalid Volume Level")
 	})
 }
 

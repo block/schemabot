@@ -7,14 +7,14 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/block/spirit/pkg/statement"
-
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/ddl"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
@@ -31,11 +31,21 @@ const (
 func changeTypeToString(ct ternv1.ChangeType) string {
 	switch ct {
 	case ternv1.ChangeType_CHANGE_TYPE_CREATE:
-		return ddl.StatementTypeToOp(statement.StatementCreateTable)
+		return ddl.StatementTypeToOp(ddl.StatementCreateTable)
 	case ternv1.ChangeType_CHANGE_TYPE_ALTER:
-		return ddl.StatementTypeToOp(statement.StatementAlterTable)
+		return ddl.StatementTypeToOp(ddl.StatementAlterTable)
 	case ternv1.ChangeType_CHANGE_TYPE_DROP:
-		return ddl.StatementTypeToOp(statement.StatementDropTable)
+		return ddl.StatementTypeToOp(ddl.StatementDropTable)
+	case ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX:
+		return ddl.StatementTypeToOp(ddl.StatementCreateIndex)
+	case ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX:
+		return ddl.StatementTypeToOp(ddl.StatementDropIndex)
+	case ternv1.ChangeType_CHANGE_TYPE_RENAME:
+		return ddl.StatementTypeToOp(ddl.StatementRenameTable)
+	case ternv1.ChangeType_CHANGE_TYPE_TRUNCATE:
+		return ddl.StatementTypeToOp(ddl.StatementTruncateTable)
+	case ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW:
+		return ddl.StatementTypeToOp(ddl.StatementCreateView)
 	case ternv1.ChangeType_CHANGE_TYPE_VSCHEMA:
 		return "vschema_update"
 	default:
@@ -105,15 +115,11 @@ func engineName(e ternv1.Engine) string {
 		return "Spirit"
 	case ternv1.Engine_ENGINE_PLANETSCALE:
 		return "PlanetScale"
+	case ternv1.Engine_ENGINE_POSTGRES:
+		return "PostgreSQL"
 	default:
 		return "Unknown"
 	}
-}
-
-const progressTableKeySep = "\x00"
-
-func progressTableKey(namespace, table string) string {
-	return namespace + progressTableKeySep + table
 }
 
 // applyHasMultipleOperations reports whether an apply fanned out to more than
@@ -168,7 +174,6 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 		ErrorCode:    deriveErrorCode(progressState, resp.ErrorMessage),
 		ErrorMessage: resp.ErrorMessage,
 		Summary:      resp.Summary,
-		Volume:       resp.Volume,
 	}
 
 	for _, t := range resp.Tables {
@@ -184,6 +189,8 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 			ETASeconds:          t.EtaSeconds,
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
 			ChecksumRowsTotal:   t.ChecksumRowsTotal,
+			Throttled:           t.Throttled,
+			ThrottleReason:      t.ThrottleReason,
 			IsInstant:           t.IsInstant,
 			ProgressDetail:      t.ProgressDetail,
 			TaskID:              t.TaskId,
@@ -219,6 +226,7 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 func progressOperationResponseFromStorage(op *storage.ApplyOperation) *apitypes.ProgressOperationResponse {
 	resp := &apitypes.ProgressOperationResponse{
 		Deployment:          op.Deployment,
+		OperationKey:        op.OperationKey,
 		ExternalID:          op.ExternalID,
 		ExternalOperationID: op.ExternalOperationID,
 		OperationKind:       op.OperationKind,
@@ -258,7 +266,8 @@ func (s *Service) resolveReleaseLatch(ctx context.Context, apply *storage.Apply,
 	released, err := storage.ReleaseLatched(ctx, s.storage, apply.ID, ops)
 	if err != nil {
 		s.logger.Warn("progress response will treat rollout as unreleased: failed to load release latch",
-			"apply_id", apply.ApplyIdentifier, "database", apply.Database, "environment", apply.Environment, "error", err)
+			append(apply.LogAttrs(),
+				"error", err)...)
 		return false
 	}
 	return released
@@ -289,10 +298,8 @@ func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *stora
 		// Operation rows are observability enrichment, not an apply safety gate.
 		// Serve progress without the enrichment and log the storage uncertainty.
 		s.logger.Warn("progress response will omit per-deployment operations",
-			"apply_id", apply.ApplyIdentifier,
-			"database", apply.Database,
-			"environment", apply.Environment,
-			"error", err)
+			append(apply.LogAttrs(),
+				"error", err)...)
 		return nil, nil, false
 	}
 	return operations, deploymentByOperationID, s.resolveReleaseLatch(ctx, apply, ops)
@@ -324,7 +331,9 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	if shouldServeProgressFromStorage(apply.State) {
 		httpResp, err := s.progressFromLocalStorage(r.Context(), apply)
 		if err != nil {
-			s.logger.Error("failed to read apply progress from storage", append(apply.LogAttrs(), "error", err)...)
+			s.logger.Error("failed to read apply progress from storage",
+				append(apply.LogAttrs(),
+					"error", err)...)
 			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to read tasks: "+err.Error())
 			return
 		}
@@ -338,7 +347,8 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	ops, opsErr := s.storage.ApplyOperations().ListByApply(r.Context(), apply.ID)
 	if opsErr != nil {
 		s.logger.Warn("could not determine apply operation count; serving progress via the single-deployment path",
-			"apply_id", applyID, "database", apply.Database, "environment", apply.Environment, "error", opsErr)
+			append(apply.LogAttrs(),
+				"error", opsErr)...)
 	}
 
 	// A multi-operation apply has no single remote data-plane id — each
@@ -353,7 +363,8 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 		httpResp, err := s.progressFromLocalStorage(r.Context(), apply)
 		if err != nil {
 			s.logger.Warn("failed to read multi-operation apply progress from storage; falling back to the single-deployment path",
-				"apply_id", applyID, "state", apply.State, "error", err)
+				append(apply.LogAttrs(),
+					"error", err)...)
 		} else {
 			s.writeJSON(w, http.StatusOK, httpResp)
 			return
@@ -364,26 +375,32 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	deployment, err := storedDeploymentForApply(apply)
 	if err != nil {
 		s.logger.Error("active apply is missing stored deployment metadata",
-			"apply_id", applyID, "database", apply.Database, "environment", apply.Environment, "error", err)
+			append(apply.LogAttrs(),
+				"error", err)...)
 		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, err.Error())
 		return
 	}
-	s.logger.Debug("progress by apply-id: resolving client", "apply_id", applyID, "database", apply.Database, "deployment", deployment, "environment", apply.Environment)
+	s.logger.Debug("progress by apply-id: resolving client", apply.LogAttrs()...)
 
 	client, err := s.TernClient(deployment, apply.Environment)
 	if err != nil {
 		s.logger.Error("no tern client for active apply — server is misconfigured",
-			"apply_id", applyID, "database", apply.Database, "deployment", deployment, "environment", apply.Environment, "error", err)
+			append(apply.LogAttrs(),
+				"error", err)...)
 		s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeDeploymentNotFound,
 			fmt.Sprintf("no tern client configured for database %q (deployment=%q, environment=%q) — add this database to the server config", apply.Database, deployment, apply.Environment))
 		return
 	}
-	s.logger.Debug("progress by apply-id: got client", "apply_id", applyID, "is_remote", client.IsRemote())
+	s.logger.Debug("progress by apply-id: got client",
+		append(apply.LogAttrs(),
+			"is_remote", client.IsRemote())...)
 
 	if shouldServeRemoteProgressFromStorage(apply, client) {
 		httpResp, err := s.progressFromLocalStorage(r.Context(), queuedRemoteProgressApply(apply))
 		if err != nil {
-			s.logger.Error("failed to read queued remote apply progress from storage", append(apply.LogAttrs(), "error", err)...)
+			s.logger.Error("failed to read queued remote apply progress from storage",
+				append(apply.LogAttrs(),
+					"error", err)...)
 			s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, "failed to read tasks: "+err.Error())
 			return
 		}
@@ -411,10 +428,11 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	}
 	httpResp.ApplyID = apply.ApplyIdentifier
 	httpResp.Database = apply.Database
+	httpResp.DatabaseType = apply.DatabaseType
 	httpResp.Environment = apply.Environment
 	httpResp.Caller = apply.Caller
 	if apply.Repository != "" && apply.PullRequest > 0 {
-		httpResp.PullRequest = fmt.Sprintf("https://github.com/%s/pull/%d", apply.Repository, apply.PullRequest)
+		httpResp.PullRequest = caller.PullRequestURL(apply.Repository, apply.PullRequest)
 	}
 
 	// Re-read the apply record — the tern client's Progress call may have
@@ -444,12 +462,12 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	// doesn't carry task timestamps, but storage has them from engine
 	// progress polling (e.g., SHOW VITESS_MIGRATIONS started_timestamp).
 	if tasks, err := s.storage.Tasks().GetByApplyID(r.Context(), apply.ID); err == nil {
-		taskByTable := make(map[string]*storage.Task, len(tasks))
+		taskIndex := tern.NewStatementIndex[storage.Task](len(tasks))
 		for _, t := range tasks {
-			taskByTable[progressTableKey(t.Namespace, t.TableName)] = t
+			taskIndex.Add(t.Namespace, t.TableName, t.DDL, t)
 		}
 		for _, tpr := range httpResp.Tables {
-			task, ok := taskByTable[progressTableKey(tpr.Keyspace, tpr.TableName)]
+			task, ok := taskIndex.Lookup(tpr.Keyspace, tpr.TableName, tpr.DDL)
 			if ok {
 				if task.StartedAt != nil && tpr.StartedAt == "" {
 					tpr.StartedAt = task.StartedAt.Format(time.RFC3339)
@@ -535,13 +553,13 @@ func (s *Service) overlayStoredDisplayMetadata(ctx context.Context, resp *apityp
 // handleDatabaseHistory handles GET /api/history/{database} requests.
 // Returns all applies for a database, sorted by created_at desc.
 func (s *Service) handleDatabaseHistory(w http.ResponseWriter, r *http.Request) {
-	database := r.PathValue("database")
+	database := storage.CanonicalKey(r.PathValue("database"))
 	if database == "" {
 		s.writeError(w, http.StatusBadRequest, "database is required")
 		return
 	}
 
-	environment := r.URL.Query().Get("environment")
+	environment := storage.CanonicalKey(r.URL.Query().Get("environment"))
 
 	applies, err := s.storage.Applies().GetByDatabase(r.Context(), database, "", environment)
 	if err != nil {
@@ -589,7 +607,7 @@ func (s *Service) handleDatabaseHistory(w http.ResponseWriter, r *http.Request) 
 // handleDatabaseEnvironments returns the list of environments for a database.
 // This is used by the CLI to discover environments when -e flag is not specified.
 func (s *Service) handleDatabaseEnvironments(w http.ResponseWriter, r *http.Request) {
-	database := r.PathValue("database")
+	database := storage.CanonicalKey(r.PathValue("database"))
 	if database == "" {
 		s.writeError(w, http.StatusBadRequest, "database is required")
 		return
@@ -645,7 +663,7 @@ func (s *Service) handleDatabaseEnvironments(w http.ResponseWriter, r *http.Requ
 // server. It intentionally exposes topology metadata only; connection
 // strings, opaque execution targets, and endpoint addresses stay server-side.
 func (s *Service) handleDatabaseList(w http.ResponseWriter, r *http.Request) {
-	databaseType, err := parseDatabaseListTypeFilter(r)
+	databaseType, err := parseDatabaseListTypeFilter(r, s.config)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -660,14 +678,41 @@ func (s *Service) handleDatabaseList(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, resp)
 }
 
-func parseDatabaseListTypeFilter(r *http.Request) (string, error) {
+// parseDatabaseListTypeFilter validates the optional ?type= filter against the
+// types actually present in server config — the one source of truth for the
+// type vocabulary — so typos are still caught while embedder-supplied engine
+// types filter the same way as the built-ins.
+func parseDatabaseListTypeFilter(r *http.Request, config *ServerConfig) (string, error) {
 	databaseType := r.URL.Query().Get("type")
-	switch databaseType {
-	case "", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres:
-		return databaseType, nil
-	default:
-		return "", fmt.Errorf("type must be %q, %q, %q, or %q", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres)
+	if databaseType == "" {
+		return "", nil
 	}
+	configured := configuredDatabaseTypes(config)
+	if slices.Contains(configured, databaseType) {
+		return databaseType, nil
+	}
+	if len(configured) == 0 {
+		return "", fmt.Errorf("type %q matches no configured database type: no databases are configured on this server", databaseType)
+	}
+	return "", fmt.Errorf("type %q matches no configured database type (configured: %s)", databaseType, strings.Join(configured, ", "))
+}
+
+// configuredDatabaseTypes returns the distinct database types present in
+// server config, sorted for deterministic error messages.
+func configuredDatabaseTypes(config *ServerConfig) []string {
+	if config == nil {
+		return nil
+	}
+	seen := make(map[string]bool, len(config.Databases))
+	types := make([]string, 0, len(config.Databases))
+	for _, dbConfig := range config.Databases {
+		if !seen[dbConfig.Type] {
+			seen[dbConfig.Type] = true
+			types = append(types, dbConfig.Type)
+		}
+	}
+	sort.Strings(types)
+	return types
 }
 
 // databaseListResponse builds the sanitized database list, keeping only
@@ -678,13 +723,13 @@ func databaseListResponse(config *ServerConfig, databaseType, name string) (*api
 	if config == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
-	nameFilter := strings.ToLower(name)
+	nameFilter := storage.CanonicalKey(name)
 	databaseNames := make([]string, 0, len(config.Databases))
 	for database, dbConfig := range config.Databases {
 		if databaseType != "" && dbConfig.Type != databaseType {
 			continue
 		}
-		if nameFilter != "" && !strings.Contains(strings.ToLower(database), nameFilter) {
+		if nameFilter != "" && !strings.Contains(storage.CanonicalKey(database), nameFilter) {
 			continue
 		}
 		databaseNames = append(databaseNames, database)
@@ -773,17 +818,25 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	activeOnly, err := parseStatusActiveOnly(r)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	filter := storage.RecentAppliesFilter{
 		Limit:       limit + 1,
-		Environment: r.URL.Query().Get("environment"),
-		Deployment:  r.URL.Query().Get("deployment"),
+		Environment: storage.CanonicalKey(r.URL.Query().Get("environment")),
+		Deployment:  storage.CanonicalKey(r.URL.Query().Get("deployment")),
 	}
 	if failuresOnly {
 		filter.States = []string{state.Apply.Failed, state.Apply.FailedRetryable}
 	}
 	if stateFilter != "" {
 		filter.States = []string{stateFilter}
+	}
+	if activeOnly {
+		filter.ActiveOnly = true
 	}
 	if last > 0 {
 		filter.UpdatedSince = time.Now().Add(-last)
@@ -841,7 +894,7 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	for _, apply := range applies {
 		var opSummary *storage.ApplyOperation
 		if filter.Deployment != "" {
-			opSummary = statusOperationForDeployment(apply, operationsByApply[apply.ID], filter.Deployment)
+			opSummary = s.statusOperationForDeployment(apply, operationsByApply[apply.ID], filter.Deployment)
 		}
 		active := activeApplyResponseFromStorage(apply, opSummary, filter.Deployment)
 		if !failuresOnly && !state.IsTerminalApplyState(active.State) {
@@ -853,7 +906,15 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, resp)
 }
 
-func statusOperationForDeployment(apply *storage.Apply, ops []*storage.ApplyOperation, deployment string) *storage.ApplyOperation {
+// statusOperationForDeployment narrows an apply's operations to the requested
+// deployment for the status list. A single matching operation is returned
+// as-is. Multiple matches (a deployment applied per shard) fold into a
+// synthetic summary row: aggregated state and timestamps, plus the
+// deployment's one shared data-plane apply id as the external id — every
+// operation of a deployment attaches into the same data-plane apply, so the
+// deployment has exactly one. Per-operation external ids stay out of the
+// summary; they belong to the per-shard detail views.
+func (s *Service) statusOperationForDeployment(apply *storage.Apply, ops []*storage.ApplyOperation, deployment string) *storage.ApplyOperation {
 	if apply == nil {
 		return nil
 	}
@@ -879,6 +940,13 @@ func statusOperationForDeployment(apply *storage.Apply, ops []*storage.ApplyOper
 		Deployment: deployment,
 		CreatedAt:  matches[0].CreatedAt,
 		UpdatedAt:  matches[0].UpdatedAt,
+	}
+	externalID, err := storage.DeploymentExternalID(matches, deployment)
+	if err != nil {
+		s.logger.Warn("deployment operations record more than one data-plane apply id; status omits the external id",
+			append(apply.LogAttrs(), "operation_deployment", deployment, "error", err)...)
+	} else {
+		summary.ExternalID = externalID
 	}
 	for _, op := range matches {
 		states = append(states, op.State)
@@ -928,7 +996,13 @@ func activeApplyResponseFromStorage(apply *storage.Apply, op *storage.ApplyOpera
 	}
 	if op != nil {
 		active.Deployment = op.Deployment
-		active.ExternalID = op.ExternalID
+		// A drive that is not operation-scoped records the remote apply id on
+		// the parent apply row, not the operation, so an empty operation-level
+		// id keeps the parent's rather than hiding the deployment's one remote
+		// handle.
+		if op.ExternalID != "" {
+			active.ExternalID = op.ExternalID
+		}
 		active.ExternalOperationID = op.ExternalOperationID
 		active.State = op.State
 		active.ErrorMessage = op.ErrorMessage
@@ -939,10 +1013,6 @@ func activeApplyResponseFromStorage(apply *storage.Apply, op *storage.ApplyOpera
 		if op.CompletedAt != nil {
 			active.CompletedAt = op.CompletedAt.Format("2006-01-02T15:04:05Z07:00")
 		}
-	}
-	opts := storage.ParseApplyOptions(apply.Options)
-	if opts.Volume > 0 {
-		active.Volume = opts.Volume
 	}
 	return active
 }
@@ -962,8 +1032,9 @@ func parseStatusLimit(r *http.Request) (int, error) {
 	return limit, nil
 }
 
-// parseStatusLast parses the optional `last` query parameter bounding the
-// status list to applies updated within the window. Zero means unbounded.
+// parseStatusLast parses the optional `last` query parameter bounding the status
+// list to applies whose latest activity — on the apply row or any of its
+// operations — falls within the window. Zero means unbounded.
 func parseStatusLast(r *http.Request) (time.Duration, error) {
 	raw := r.URL.Query().Get("last")
 	if raw == "" {
@@ -974,6 +1045,21 @@ func parseStatusLast(r *http.Request) (time.Duration, error) {
 		return 0, fmt.Errorf("last must be a positive duration such as 30m or 24h")
 	}
 	return last, nil
+}
+
+// parseStatusActiveOnly parses the optional `active` query parameter restricting
+// the status list to applies that have not reached a terminal state. Callers use
+// it to ask whether a target is busy without paging through settled history.
+func parseStatusActiveOnly(r *http.Request) (bool, error) {
+	raw := r.URL.Query().Get("active")
+	if raw == "" {
+		return false, nil
+	}
+	active, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("active must be a boolean")
+	}
+	return active, nil
 }
 
 func parseStatusFailuresOnly(r *http.Request) (bool, error) {
@@ -1011,51 +1097,32 @@ func parseStatusState(r *http.Request, failuresOnly bool) (string, error) {
 // progressFromLocalStorage builds a ProgressResponse from local apply + task
 // records when there is no active Tern work to poll.
 //
-// If any local task records are stale (non-terminal state on a terminal apply),
-// this method syncs them from a one-time Tern RPC before building the response.
-// Subsequent calls serve entirely from local storage.
+// Reading progress never writes, and never rewrites either: a task row left
+// non-terminal under a settled apply is reported exactly as stored. Repairing
+// it belongs to a driver or to a reaper holding a lease, never to a request
+// goroutine serving a GET, and papering over it here would make a genuinely
+// running table read as finished. A settled apply is not a promise that its
+// tasks have stopped — one failed task settles the apply to failed while its
+// siblings are still copying — so the stored state is the only honest answer,
+// and the reaper is what settles the rows that really are stranded.
 func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.Apply) (*apitypes.ProgressResponse, error) {
 	tasks, err := s.storage.Tasks().GetByApplyID(ctx, apply.ID)
 	if err != nil {
 		return nil, fmt.Errorf("get tasks for apply %d: %w", apply.ID, err)
 	}
 
-	// Check if any tasks are stale (non-terminal and not matching the apply
-	// state). A stopped task on a stopped apply is expected, not stale.
-	stale := false
-	if !state.IsState(apply.State, state.Apply.FailedRetryable) {
-		for _, task := range tasks {
-			if !state.IsTerminalTaskState(task.State) && task.State != apply.State {
-				stale = true
-				break
-			}
-		}
-	}
-
-	// Sync stale tasks from Tern (one-time RPC, no-op on subsequent calls).
-	if stale && apply.ExternalID != "" {
-		if err := s.syncTasksFromTern(ctx, apply, tasks); err != nil {
-			s.logger.Warn("task sync from Tern failed, serving stale data",
-				"apply_id", apply.ApplyIdentifier, "error", err)
-		} else {
-			// Re-read tasks after sync; keep original on failure.
-			if refreshed, err := s.storage.Tasks().GetByApplyID(ctx, apply.ID); err == nil {
-				tasks = refreshed
-			}
-		}
-	}
-
 	// Build response from local records
 	httpResp := &apitypes.ProgressResponse{
-		State:       apply.State,
-		Engine:      apply.Engine,
-		ApplyID:     apply.ApplyIdentifier,
-		Database:    apply.Database,
-		Environment: apply.Environment,
-		Caller:      apply.Caller,
+		State:        apply.State,
+		Engine:       apply.Engine,
+		ApplyID:      apply.ApplyIdentifier,
+		Database:     apply.Database,
+		DatabaseType: apply.DatabaseType,
+		Environment:  apply.Environment,
+		Caller:       apply.Caller,
 	}
 	if apply.Repository != "" && apply.PullRequest > 0 {
-		httpResp.PullRequest = fmt.Sprintf("https://github.com/%s/pull/%d", apply.Repository, apply.PullRequest)
+		httpResp.PullRequest = caller.PullRequestURL(apply.Repository, apply.PullRequest)
 	}
 	if apply.StartedAt != nil {
 		httpResp.StartedAt = apply.StartedAt.Format(time.RFC3339)
@@ -1086,6 +1153,8 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 			PercentComplete:     int32(task.ProgressPercent),
 			ChecksumRowsChecked: task.ChecksumRowsChecked,
 			ChecksumRowsTotal:   task.ChecksumRowsTotal,
+			Throttled:           task.Throttled,
+			ThrottleReason:      task.ThrottleReason,
 			IsInstant:           task.IsInstant,
 			TaskID:              task.TaskIdentifier,
 		}
@@ -1106,70 +1175,9 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	return httpResp, nil
 }
 
-// syncTasksFromTern calls the remote Tern's Progress RPC and syncs the
-// per-table state into local task records. Called once for gRPC-mode applies
-// with stale task state; subsequent reads are served from local storage.
-func (s *Service) syncTasksFromTern(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
-	deployment, err := storedDeploymentForApply(apply)
-	if err != nil {
-		return err
-	}
-	client, err := s.TernClient(deployment, apply.Environment)
-	if err != nil {
-		return fmt.Errorf("get tern client: %w", err)
-	}
-
-	resp, err := client.Progress(ctx, &ternv1.ProgressRequest{
-		ApplyId:     apply.ExternalID,
-		Environment: apply.Environment,
-	})
-	if err != nil {
-		return fmt.Errorf("progress RPC: %w", err)
-	}
-
-	// Build namespace/table → proto progress lookup. Vitess applies commonly
-	// include the same table name in multiple keyspaces.
-	tableProgress := make(map[string]*ternv1.TableProgress, len(resp.Tables))
-	for _, tp := range resp.Tables {
-		tableProgress[progressTableKey(tp.Namespace, tp.TableName)] = tp
-	}
-
-	now := time.Now()
-	var synced int
-	for _, task := range tasks {
-		if state.IsTerminalTaskState(task.State) {
-			continue
-		}
-		tp, ok := tableProgress[progressTableKey(task.Namespace, task.TableName)]
-		if !ok {
-			s.logger.Error("task has no matching table in Tern progress response",
-				"task_id", task.TaskIdentifier, "namespace", task.Namespace, "table", task.TableName, "apply_id", apply.ApplyIdentifier)
-			continue
-		}
-		task.State = state.NormalizeTaskStatus(tp.Status)
-		task.RowsCopied = tp.RowsCopied
-		task.RowsTotal = tp.RowsTotal
-		task.ProgressPercent = int(tp.PercentComplete)
-		task.ChecksumRowsChecked = tp.ChecksumRowsChecked
-		task.ChecksumRowsTotal = tp.ChecksumRowsTotal
-		task.UpdatedAt = now
-		if err := s.storage.Tasks().Update(ctx, task); err != nil {
-			s.logger.Error("sync task failed", append(task.LogAttrs(), "error", err)...)
-			continue
-		}
-		synced++
-	}
-	s.logger.Info("synced stale task records from Tern",
-		"apply_id", apply.ApplyIdentifier, "synced", synced, "total", len(tasks))
-	return nil
-}
-
-// overlayApplyOptions populates volume and options on the response from the apply record.
+// overlayApplyOptions populates the options map on the response from the apply record.
 func overlayApplyOptions(resp *apitypes.ProgressResponse, apply *storage.Apply) {
 	opts := storage.ParseApplyOptions(apply.Options)
-	if opts.Volume > 0 {
-		resp.Volume = int32(opts.Volume)
-	}
 	optMap := make(map[string]string)
 	if opts.DeferCutover {
 		optMap["defer_cutover"] = "true"

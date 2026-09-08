@@ -1,10 +1,12 @@
 package webhook
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
@@ -226,9 +229,93 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment("## MySQL Schema Change Plan\n\nplan summary\n\n---\n\n💡 **To apply** all schema changes from this PR, comment:\n```\nschemabot apply -e staging\n```")
+		body := h.renderPRComment("## MySQL Schema Change Plan\n\nplan summary\n\n---\n\n▶️ **To apply** all schema changes from this PR, comment:\n```\nschemabot apply -e staging\n```")
 
 		assert.NotContains(t, body, "Support:")
+	})
+
+	t.Run("appends to unsafe-changes apply refusals", func(t *testing.T) {
+		cfg := &api.ServerConfig{
+			SupportChannel: api.SupportChannelConfig{
+				Name: "#schema-help",
+				URL:  "https://example.com/schema-help",
+			},
+		}
+		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
+
+		body := h.renderPRComment(templates.PreviewCommentUnsafeBlocked())
+
+		assert.Contains(t, body, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
+	})
+
+	t.Run("appends to unmanaged schema change notices", func(t *testing.T) {
+		cfg := &api.ServerConfig{
+			SupportChannel: api.SupportChannelConfig{
+				Name: "#schema-help",
+				URL:  "https://example.com/schema-help",
+			},
+		}
+		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
+
+		body := h.renderPRComment(templates.RenderUnmanagedSchemaConfigsNotice([]templates.UnmanagedSchemaConfigNoticeData{
+			{SchemaPath: "services/orders/schema", Database: "orders"},
+		}))
+
+		assert.Contains(t, body, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
+	})
+
+	t.Run("does not append to plan comments with unsafe-change advisories", func(t *testing.T) {
+		cfg := &api.ServerConfig{
+			SupportChannel: api.SupportChannelConfig{
+				Name: "#schema-help",
+				URL:  "https://example.com/schema-help",
+			},
+		}
+		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
+
+		body := h.renderPRComment(templates.RenderPlanComment(templates.PlanCommentData{
+			Database:    "orders",
+			SchemaName:  "orders",
+			Environment: "staging",
+			IsMySQL:     true,
+			Changes: []templates.KeyspaceChangeData{{
+				Keyspace:   "orders",
+				Statements: []string{"ALTER TABLE `users` DROP INDEX `idx_email`;"},
+			}},
+			HasUnsafeChanges: true,
+			UnsafeChanges: []templates.UnsafeChangeData{
+				{Table: "users", Reason: "DROP INDEX idx_email"},
+			},
+		}))
+
+		assert.NotContains(t, body, "Support:")
+	})
+}
+
+// The agent hint reaches a plan comment on the plan data the handler builds,
+// the same way the deployment's tenant does, so a deployment that configures
+// none renders the comment it always rendered.
+func TestBuildPlanCommentDataCarriesTheAgentHint(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "orders", Type: "mysql"}
+	planResp := &apitypes.PlanResponse{}
+
+	t.Run("no hint configured", func(t *testing.T) {
+		h := &Handler{service: api.New(nil, &api.ServerConfig{}, nil, testLogger())}
+
+		data := buildPlanCommentData(schema, planResp, "staging", "", "octocat", h.agentHint())
+
+		assert.Empty(t, data.AgentHint)
+		assert.NotContains(t, templates.RenderPlanComment(data), "<!-- 💡 ")
+	})
+
+	t.Run("hint configured", func(t *testing.T) {
+		hint := "Agents: comment `schemabot help` for the command reference."
+		h := &Handler{service: api.New(nil, &api.ServerConfig{AgentHint: hint}, nil, testLogger())}
+
+		data := buildPlanCommentData(schema, planResp, "staging", "", "octocat", h.agentHint())
+
+		assert.Equal(t, hint, data.AgentHint)
+		assert.Contains(t, templates.RenderPlanComment(data), "<!-- 💡 "+hint+" -->")
 	})
 }
 
@@ -247,7 +334,7 @@ func TestHandleSchemaRequestErrorRendersConfigNotAuthorized(t *testing.T) {
 		Database:     "orders",
 		DatabaseType: "mysql",
 		SchemaPath:   "services/orders/schema",
-	})
+	}, false)
 
 	body := requireComment(t, comments, "config-not-authorized comment")
 	assert.Contains(t, body, "SchemaBot Configuration Not Authorized")
@@ -558,8 +645,6 @@ func TestWebhookControlCommandMissingApplyID(t *testing.T) {
 		{name: "cancel", comment: "schemabot cancel -e staging", action: "cancel"},
 		{name: "start", comment: "schemabot start -e staging", action: "start"},
 		{name: "cutover", comment: "schemabot cutover -e staging", action: "cutover"},
-		{name: "volume", comment: "schemabot volume -e staging -v 8", action: "volume"},
-		{name: "volume without level", comment: "schemabot volume -e staging", action: "volume"},
 	}
 
 	for _, tt := range tests {
@@ -583,48 +668,6 @@ func TestWebhookControlCommandMissingApplyID(t *testing.T) {
 				assert.Contains(t, body, "schemabot "+tt.action+" <apply-id> -e <environment>")
 			case <-time.After(2 * time.Second):
 				t.Fatal("timed out waiting for missing apply ID comment")
-			}
-		})
-	}
-}
-
-// TestWebhookVolumeCommandInvalidLevel verifies that a volume command with a
-// missing, non-numeric, or out-of-range -v level posts a usage comment naming
-// the valid range and exact syntax instead of silently dropping the command.
-func TestWebhookVolumeCommandInvalidLevel(t *testing.T) {
-	tests := []struct {
-		name    string
-		comment string
-	}{
-		{name: "missing -v flag", comment: "schemabot volume apply_abc123 -e staging"},
-		{name: "-v without value", comment: "schemabot volume apply_abc123 -e staging -v"},
-		{name: "non-numeric level", comment: "schemabot volume apply_abc123 -e staging -v fast"},
-		{name: "level below range", comment: "schemabot volume apply_abc123 -e staging -v 0"},
-		{name: "level above range", comment: "schemabot volume apply_abc123 -e staging -v 12"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			h, comments, _ := newTestHandler(t)
-
-			req := buildWebhookRequest(t, webhookPayloadOpts{
-				comment: tt.comment,
-				isPR:    true,
-			}, nil)
-
-			rr := httptest.NewRecorder()
-			h.ServeHTTP(rr, req)
-
-			require.Equal(t, http.StatusOK, rr.Code)
-			assert.Contains(t, rr.Body.String(), "volume started")
-
-			select {
-			case body := <-comments:
-				assert.Contains(t, body, "Missing or Invalid Volume Level")
-				assert.Contains(t, body, "schemabot volume <apply-id> -e <environment> -v <level>")
-				assert.Contains(t, body, "between 1 (slowest) and 11 (fastest)")
-			case <-time.After(2 * time.Second):
-				t.Fatal("timed out waiting for invalid volume level comment")
 			}
 		})
 	}
@@ -911,8 +954,8 @@ func TestWebhookPlanWithLintViolations(t *testing.T) {
 
 		rendered := templates.RenderPlanComment(data)
 		assert.Contains(t, rendered, "Lint Warnings")
-		assert.Contains(t, rendered, "[bad_table] Primary key uses signed integer type")
-		assert.Contains(t, rendered, "[users] Column uses utf8 charset")
+		assert.Contains(t, rendered, "- `bad_table`: Primary key uses signed integer type")
+		assert.Contains(t, rendered, "- `users`: Column uses utf8 charset")
 		assert.Contains(t, rendered, "CREATE TABLE")
 	})
 
@@ -943,7 +986,7 @@ func TestWebhookPlanWithLintViolations(t *testing.T) {
 
 		rendered := templates.RenderMultiEnvPlanComment(data)
 		assert.Contains(t, rendered, "Lint Warnings")
-		assert.Contains(t, rendered, "[bad_table] Primary key uses signed integer type")
+		assert.Contains(t, rendered, "- `bad_table`: Primary key uses signed integer type")
 		assert.Contains(t, rendered, "CREATE TABLE")
 		// Identical plans get deduplicated — combined header
 		assert.Contains(t, rendered, "Staging & Production")
@@ -1134,22 +1177,83 @@ func TestWebhookRepoAllowlistPullRequestRejectsUnregistered(t *testing.T) {
 // goSafe recovers it, logs the stack, and posts an error comment on the PR
 // so the user gets feedback instead of silence. This is the recovery wrapper
 // every async command dispatch (apply, plan, rollback, reactions) runs under.
+// The comment is a fixed user-safe line — the panic value can carry internal
+// detail (DSN fragments, hostnames, driver internals) and the PR is a public
+// surface, so the raw value and stack stay server-side in the log.
 func TestGoSafeRecoversPanicAndPostsErrorComment(t *testing.T) {
 	client, mux := setupGitHubServer(t)
 	comments := make(chan string, 1)
 	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
 	installClient := ghclient.NewInstallationClient(client, testLogger())
 
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
 	h := &Handler{
 		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
-		logger:    testLogger(),
+		logger:    logger,
 	}
 
-	h.goSafe("octocat/hello-world", 1, 12345, func() {
-		panic("boom")
+	h.goSafe("octocat/hello-world", 1, 12345, "delivery-panic-1", func() {
+		panic("boom: mysql://user:secret@internal-host/db")
 	})
 
 	body := requireComment(t, comments, "panic recovery comment")
-	assert.Contains(t, body, "Internal error: goroutine panic")
-	assert.Contains(t, body, "boom")
+	assert.Contains(t, body, "Internal error while processing this request")
+	assert.NotContains(t, body, "boom", "the raw panic value must never reach the public PR comment")
+
+	logged := logBuf.String()
+	assert.Contains(t, logged, "goroutine panic")
+	assert.Contains(t, logged, "boom: mysql://user:secret@internal-host/db",
+		"the raw panic value must stay triageable in the server log")
+	assert.Contains(t, logged, "delivery_id=delivery-panic-1",
+		"the webhook delivery must stay traceable in the server log")
+	assert.Contains(t, logged, "recoverPanic", "the stack trace must be logged")
+}
+
+func TestGoSafeOmitsEmptyDeliveryIDFromPanicLog(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 1)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+	h := &Handler{
+		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+		logger:    logger,
+	}
+
+	h.goSafe("octocat/hello-world", 1, 12345, "", func() {
+		panic("boom")
+	})
+
+	requireComment(t, comments, "panic recovery comment")
+	logged := logBuf.String()
+	assert.Contains(t, logged, "goroutine panic")
+	assert.NotContains(t, logged, "delivery_id=")
+}
+
+// Setup comments offer experimental types only when the server opts in.
+func TestSchemaErrorGuidanceUsesServerStrataSetting(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprint(enabled), func(t *testing.T) {
+			client, mux := setupGitHubServer(t)
+			comments := make(chan string, 1)
+			mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+			installClient := ghclient.NewInstallationClient(client, testLogger())
+			h := &Handler{
+				service:   api.New(nil, &api.ServerConfig{ExperimentalStrataEnabled: enabled}, nil, testLogger()),
+				ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+				logger:    testLogger(),
+			}
+			for _, requestErr := range []error{ghclient.ErrNoConfig, ghclient.ErrInvalidConfig} {
+				h.handleSchemaRequestError("octocat/hello-world", 1, 12345, "staging", "", "hubot", "plan", requestErr, false)
+				body := requireComment(t, comments, "setup guidance")
+				assert.Contains(t, body, "`mysql`")
+				assert.Contains(t, body, "`postgres`")
+				assert.Contains(t, body, "`vitess`")
+				assert.Equal(t, enabled, strings.Contains(body, "`strata` (experimental)"))
+			}
+		})
+	}
 }

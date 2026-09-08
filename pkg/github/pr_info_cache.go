@@ -37,6 +37,23 @@ func WithPRInfoCache(ctx context.Context) context.Context {
 	})
 }
 
+// WithPRInfo returns a new context carrying a fresh request-scoped PR-info
+// cache already holding info for (repo, pr), so a FetchPullRequest for that PR
+// within the scope is served from the read the caller already made.
+//
+// Seed the scope when one read has to decide two things — the head a caller
+// acts on, and a later verification of that same head. Left unseeded the two
+// are independent reads of a mutable fact, and a push landing between them
+// makes the second disagree with the first. Callers that want the later read to
+// see a newer head must not seed.
+//
+// A nil info seeds nothing, leaving the scope's fetches to go upstream.
+func WithPRInfo(ctx context.Context, repo string, pr int, info *PullRequestInfo) context.Context {
+	ctx = WithPRInfoCache(ctx)
+	prInfoCacheFromContext(ctx).set(repo, pr, info)
+	return ctx
+}
+
 // prInfoCacheFromContext returns the request-scoped cache attached to ctx,
 // or nil if none has been attached. Returning nil lets FetchPullRequest
 // fall through to a raw fetch for callers (tests, ad-hoc usage) that did

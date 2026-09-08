@@ -17,6 +17,7 @@ import (
 	gh "github.com/google/go-github/v86/github"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/caller"
 	ghclient "github.com/block/schemabot/pkg/github"
 )
 
@@ -104,6 +105,9 @@ const checksSynthesizeMaxPRsPerRequest = 10
 const checksDisabledSkipOutcome = "skipped: Check Runs are disabled for this repository (enable_checks: false)"
 
 func (s *Service) handleChecksSynthesize(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeDirectAdminWrite(w, r, "checks_synthesize") {
+		return
+	}
 	var req ChecksSynthesizeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeBodyDecodeError(w, err)
@@ -209,6 +213,9 @@ type webhookRedriveApp struct {
 }
 
 func (s *Service) handleWebhookRedrive(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeDirectAdminWrite(w, r, "webhook_redrive") {
+		return
+	}
 	var req WebhookRedriveRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeBodyDecodeError(w, err)
@@ -225,6 +232,9 @@ func (s *Service) handleWebhookRedrive(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) handleChecksScan(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeDirectAdminWrite(w, r, "checks_scan") {
+		return
+	}
 	var req ChecksScanRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.writeBodyDecodeError(w, err)
@@ -335,6 +345,9 @@ func executeChecksScan(ctx context.Context, cfg *ServerConfig, req ChecksScanReq
 }
 
 func (s *Service) handleChecksRepos(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeDirectAdminWrite(w, r, "checks_repos") {
+		return
+	}
 	response, err := executeChecksRepos(s.config)
 	if err != nil {
 		s.writeWebhookOpsError(w, err)
@@ -486,15 +499,19 @@ func newWebhookRedriveGitHubClient(app webhookRedriveApp, logger *slog.Logger) (
 	if privateKey == "" {
 		return nil, fmt.Errorf("app %q private key resolved to empty value", app.name)
 	}
-	appsTransport, err := ghinstallation.NewAppsTransport(http.DefaultTransport, app.id, []byte(privateKey))
+	// A crawl issues many list/detail/redeliver calls per run, so the base
+	// transport composes the same layers every other GitHub client here uses:
+	// the metrics transport innermost so each attempt lands in the request
+	// metrics (labeled with the configured app name), wrapped by the shared
+	// secondary-rate-limit handling (bounded sleep on a 403 secondary limit)
+	// rather than issuing bare requests that would trip the limit mid-crawl.
+	baseTransport := ghclient.NewRateLimitedTransport(
+		ghclient.NewMetricsTransport(http.DefaultTransport, 0, func() string { return app.name }))
+	appsTransport, err := ghinstallation.NewAppsTransport(baseTransport, app.id, []byte(privateKey))
 	if err != nil {
 		return nil, fmt.Errorf("create GitHub App transport for app %q: %w", app.name, err)
 	}
-	// A crawl issues many list/detail/redeliver calls per run, so wrap the
-	// transport with the shared secondary-rate-limit handling (bounded sleep
-	// on a 403 secondary limit) that every other GitHub client here uses,
-	// rather than issuing bare requests that would trip the limit mid-crawl.
-	client := gh.NewClient(&http.Client{Transport: ghclient.NewRateLimitedTransport(appsTransport), Timeout: 30 * time.Second})
+	client := gh.NewClient(&http.Client{Transport: appsTransport, Timeout: 30 * time.Second})
 	logger.Info("created GitHub App webhook redrive client", "app_name", app.name, "app_id", app.id)
 	return client, nil
 }
@@ -811,7 +828,7 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 		if len(incomplete) > 0 {
 			result.Stuck = append(result.Stuck, StuckCheckPR{
 				Number:  pr.Number,
-				URL:     fmt.Sprintf("https://github.com/%s/pull/%d", repo, pr.Number),
+				URL:     caller.PullRequestURL(repo, pr.Number),
 				Title:   pr.Title,
 				HeadSHA: pr.HeadSHA,
 				HeadRef: pr.HeadRef,
@@ -823,7 +840,7 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 		}
 		result.Missing = append(result.Missing, MissingCheckPR{
 			Number:                 pr.Number,
-			URL:                    fmt.Sprintf("https://github.com/%s/pull/%d", repo, pr.Number),
+			URL:                    caller.PullRequestURL(repo, pr.Number),
 			Title:                  pr.Title,
 			HeadSHA:                pr.HeadSHA,
 			HeadRef:                pr.HeadRef,

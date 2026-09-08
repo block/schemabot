@@ -1,7 +1,9 @@
 package apitypes
 
 import (
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -253,4 +255,191 @@ func TestPlanResponse_HasBlockedChanges(t *testing.T) {
 			assert.Equal(t, tt.want, tt.resp.HasBlockedChanges())
 		})
 	}
+}
+
+// DirectChanges collects direct-execution verdicts across namespace-level and
+// per-shard changes, and only those.
+func TestPlanResponse_DirectChanges(t *testing.T) {
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{{
+			Namespace: "testdb",
+			TableChanges: []*TableChangeResponse{
+				{TableName: "users", ExecutionMode: "direct", ModeReason: "dropping primary key is not supported; runs as native MySQL DDL on a table with ~40 rows"},
+				{TableName: "orders"},
+				{TableName: "items", ExecutionMode: "blocked"},
+			},
+		}},
+		Shards: []*ShardPlanResponse{{
+			Shard: "-40",
+			Changes: []*TableChangeResponse{
+				{TableName: "mutes", ExecutionMode: "direct"},
+			},
+		}},
+	}
+
+	direct := resp.DirectChanges()
+	require.Len(t, direct, 2)
+	assert.Equal(t, "users", direct[0].TableName)
+	assert.Equal(t, "mutes", direct[1].TableName)
+
+	assert.Empty(t, (&PlanResponse{}).DirectChanges())
+}
+
+// AllChangesDirect holds only when the plan has at least one table change and
+// every one carries the direct verdict — a mixed or empty plan still has
+// engine-driven work, and a VSchema change is never direct.
+func TestPlanResponse_AllChangesDirect(t *testing.T) {
+	direct := func(table string) *TableChangeResponse {
+		return &TableChangeResponse{TableName: table, ExecutionMode: "direct"}
+	}
+	tests := []struct {
+		name string
+		resp *PlanResponse
+		want bool
+	}{
+		{
+			name: "single direct change",
+			resp: &PlanResponse{
+				Changes: []*SchemaChangeResponse{{Namespace: "testdb", TableChanges: []*TableChangeResponse{direct("users")}}},
+			},
+			want: true,
+		},
+		{
+			name: "mixed direct and engine-driven",
+			resp: &PlanResponse{
+				Changes: []*SchemaChangeResponse{{
+					Namespace:    "testdb",
+					TableChanges: []*TableChangeResponse{direct("users"), {TableName: "orders"}},
+				}},
+			},
+			want: false,
+		},
+		{
+			name: "direct namespace change with engine-driven shard change",
+			resp: &PlanResponse{
+				Changes: []*SchemaChangeResponse{{Namespace: "testdb", TableChanges: []*TableChangeResponse{direct("users")}}},
+				Shards:  []*ShardPlanResponse{{Shard: "-40", Changes: []*TableChangeResponse{{TableName: "orders"}}}},
+			},
+			want: false,
+		},
+		{
+			name: "vschema change alongside a direct change",
+			resp: &PlanResponse{
+				Changes: []*SchemaChangeResponse{{
+					Namespace:    "testdb",
+					TableChanges: []*TableChangeResponse{direct("users")},
+					Metadata:     map[string]string{"vschema": "{}"},
+				}},
+			},
+			want: false,
+		},
+		{
+			name: "no changes",
+			resp: &PlanResponse{},
+			want: false,
+		},
+		{
+			name: "nil plan",
+			resp: nil,
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.resp.AllChangesDirect())
+		})
+	}
+}
+
+// DiscardedCopies selects the copies an apply destroys. The caller uses it to
+// decide whether an operator must confirm first, so an adopted copy — where
+// nothing is lost — is the only thing it leaves out.
+func TestPlanResponseDiscardedCopies(t *testing.T) {
+	resp := &PlanResponse{
+		ExistingCopies: []*ExistingCopyResponse{
+			{Namespace: "orders_ks", Disposition: ExistingCopyDiscard, Tables: []string{"orders"}},
+			{Namespace: "products_ks", Disposition: ExistingCopyAdopt, Tables: []string{"products"}},
+		},
+	}
+
+	discarded := resp.DiscardedCopies()
+
+	require.Len(t, discarded, 1)
+	assert.Equal(t, "orders_ks", discarded[0].Namespace)
+}
+
+// A disposition this build does not recognize counts as discarded: the
+// confirmation exists to protect work already done, and an unreadable verdict
+// is not a reason to skip it.
+func TestPlanResponseDiscardedCopiesCountsUnknownDisposition(t *testing.T) {
+	resp := &PlanResponse{
+		ExistingCopies: []*ExistingCopyResponse{
+			{Namespace: "orders_ks", Disposition: "recycle", Tables: []string{"orders"}},
+		},
+	}
+
+	require.Len(t, resp.DiscardedCopies(), 1)
+}
+
+// A clean target has nothing to confirm, so the apply proceeds as it always
+// has.
+func TestPlanResponseDiscardedCopiesEmpty(t *testing.T) {
+	assert.Empty(t, (&PlanResponse{}).DiscardedCopies())
+	assert.Empty(t, (*PlanResponse)(nil).DiscardedCopies())
+}
+
+// A refused request always advertises a wait a client can act on: whole
+// seconds, never zero, and the same value in the message and the field.
+func TestNewRateLimitedResponseAdvertisesAWholeSecondWait(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		retryAfter time.Duration
+		want       int
+	}{
+		{"zero rounds up", 0, 1},
+		{"negative rounds up", -time.Second, 1},
+		{"sub-second rounds up", 500 * time.Millisecond, 1},
+		{"partial second rounds up", 1500 * time.Millisecond, 2},
+		{"whole seconds are kept", 30 * time.Second, 30},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := NewRateLimitedResponse(PullRateLimitTargetReason, tc.retryAfter)
+
+			assert.Equal(t, tc.want, resp.RetryAfterSeconds)
+			assert.Equal(t, ErrCodeRateLimited, resp.ErrorCode)
+			assert.True(t, IsRetryableErrorCode(resp.ErrorCode), "a limited caller should retry rather than fail the command")
+			assert.Equal(t, fmt.Sprintf("%s; retry in %ds", PullRateLimitTargetReason, tc.want), resp.Error)
+		})
+	}
+}
+
+// The two reasons name the budget that ran out, so a limited client can tell
+// whether its own request rate or the load on one database refused it.
+func TestPullRateLimitReasonsNameTheirBudget(t *testing.T) {
+	assert.NotEqual(t, PullRateLimitCallerReason, PullRateLimitTargetReason)
+	assert.Contains(t, PullRateLimitCallerReason, "caller")
+	assert.Contains(t, PullRateLimitTargetReason, "database and environment")
+}
+
+// A retryable refusal answers both questions at once: whether to retry, and
+// how long to wait first. Retrying on the code alone would ignore a delay the
+// server expects a client to observe.
+func TestErrorResponseRetryAfterPairsTheCodeWithTheDelay(t *testing.T) {
+	limited := NewRateLimitedResponse(PullRateLimitCallerReason, 3*time.Second)
+	retry, after := limited.RetryAfter()
+	assert.True(t, retry)
+	assert.Equal(t, 3*time.Second, after)
+
+	// A retryable code with no advertised delay leaves the backoff to the
+	// client rather than implying it may retry immediately in a tight loop.
+	retryable := ErrorResponse{ErrorCode: ErrCodeEngineErrorRetryable}
+	retry, after = retryable.RetryAfter()
+	assert.True(t, retry)
+	assert.Zero(t, after)
+
+	// A permanent failure is never retryable, whatever delay it carries.
+	permanent := ErrorResponse{ErrorCode: ErrCodeNotFound, RetryAfterSeconds: 30}
+	retry, after = permanent.RetryAfter()
+	assert.False(t, retry)
+	assert.Zero(t, after)
 }

@@ -19,12 +19,21 @@ import (
 //
 // When storedPlan is non-nil (auto-confirm path), the re-plan DDL is compared against it.
 // If the DDL differs, execution is downgraded to manual confirmation — a plan comment is
-// posted with a warning and the user must run apply-confirm separately.
+// posted with a warning and the user must run apply-confirm separately. The copy-discard
+// gate below is not scoped that way: it stops an operator's own apply-confirm too,
+// because a copy can appear after the comment they confirmed was posted.
+//
+// disclosedCopyDiscard is what the comment behind this apply told the operator
+// about an unfinished copy on the target, read from the lock's pending
+// confirmation. It is the consent this re-plan is checked against: the plan
+// decided whether to stop, and the same decision is made again here, against the
+// target as it is now.
 func (h *Handler) executeApply(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, schemaResult *ghclient.SchemaRequestResult,
 	environment string, installationID int64, requestedBy string,
 	result CommandResult, storedPlan *storage.Plan, expectedPendingPlanID string,
+	disclosedCopyDiscard bool,
 ) {
 	database := schemaResult.Database
 	dbType := schemaResult.Type
@@ -32,15 +41,20 @@ func (h *Handler) executeApply(
 	// Re-plan for drift detection
 	prNumber := int32(pr)
 	planReq := api.PlanRequest{
-		Database:      schemaResult.Database,
-		Environment:   environment,
-		Type:          schemaResult.Type,
-		SchemaFiles:   schemaResult.SchemaFiles,
-		Repository:    repo,
-		PullRequest:   &prNumber,
-		HeadSHA:       &schemaResult.HeadSHA,
-		SchemaPath:    schemaResult.SchemaPath,
-		SourceTrusted: true,
+		Database:          schemaResult.Database,
+		Environment:       environment,
+		Type:              schemaResult.Type,
+		SchemaFiles:       schemaResult.SchemaFiles,
+		Repository:        repo,
+		PullRequest:       &prNumber,
+		HeadSHA:           &schemaResult.HeadSHA,
+		SchemaPath:        schemaResult.SchemaPath,
+		IgnoredNamespaces: schemaResult.IgnoredNamespaces,
+		SourceTrusted:     true,
+		// This re-plan is what the copy-discard gate below reads, so it has to
+		// predict the apply that is about to run, not the default shape. The
+		// command carrying that decision is already resolved here.
+		GroupedExecution: storage.GroupsEngineExecution(schemaResult.Type, result.DeferCutover),
 	}
 
 	planResp, err := h.executePlanWithTransientRetry(ctx, planReq, repo, pr)
@@ -74,7 +88,17 @@ func (h *Handler) executeApply(
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final stale-schema rejection")
 		return
 	}
-	if rejected := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, freshPRInfo, environment, requestedBy, actionName); rejected {
+	// executeApply runs past the durable hand-off boundary, so a verification
+	// failure and a verified-stale rejection both stop the apply here and
+	// release the observed lock intent; the gate has already logged and
+	// posted the distinction, and the user's recovery is re-issuing the
+	// command.
+	rejected, freshnessErr := h.assertBaseSchemaStillCurrent(ctx, client, repo, pr, installationID, schemaResult, freshPRInfo, environment, requestedBy, actionName)
+	if freshnessErr != nil {
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final base-schema freshness verification failure")
+		return
+	}
+	if rejected {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "final base-schema freshness rejection")
 		return
 	}
@@ -104,7 +128,7 @@ func (h *Handler) executeApply(
 	// Release the lock: no retry of this command can succeed, so holding it
 	// would only force a manual unlock after the schema is rewritten.
 	if planResp.HasBlockedChanges() {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
 		h.logger.Info("apply rejected: re-plan contains engine-blocked changes",
 			"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName)
 		h.postComment(repo, pr, installationID, templates.RenderBlockedChangesApplyRejected(commentData))
@@ -117,16 +141,89 @@ func (h *Handler) executeApply(
 	if storedPlan != nil && !ddlMatchesStoredPlan(planResp, storedPlan) {
 		h.logger.Info("automatic apply downgraded: DDL drift detected",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
-		commentData.IsLocked = true
-		commentData.AutoConfirmDowngradeReason = "Schema changes differ from auto-plan — review and confirm manually"
-		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+			"Schema changes differ from auto-plan — review and confirm manually"); err != nil {
+			h.logger.Error("failed to post the DDL-drift downgrade comment",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+				"environment", environment, "error", err)
+		}
+		return
+	}
+
+	// Direct-execution changes never run from the automatic apply path: the
+	// operator must confirm the blocking, non-revertible native DDL against
+	// the locked plan comment that discloses it, so downgrade to manual
+	// confirmation.
+	if storedPlan != nil && len(planResp.DirectChanges()) > 0 {
+		h.logger.Info("automatic apply downgraded: plan contains direct-execution changes",
+			"repo", repo, "pr", pr, "database", database, "environment", environment)
+		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+			"Plan contains direct-execution changes — review the disclosure and confirm manually"); err != nil {
+			h.logger.Error("failed to post the direct-execution downgrade comment",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+				"environment", environment, "error", err)
+		}
+		return
+	}
+
+	// The copy on the target is read fresh on every plan, so this re-plan can
+	// discover a discard the comment behind this apply never showed: another
+	// apply can start a copy, or an adopted copy's checkpoint can age out,
+	// between the disclosure and this moment. An apply that was allowed to reach
+	// here because nothing was at stake must not become one that destroys hours
+	// of work with nobody asked, so it stops and asks against a comment that
+	// discloses the copy actually at stake.
+	//
+	// A discard the operator was already shown proceeds. They agreed to that
+	// cost, and asking again on every confirm would make the stop unpassable.
+	if discarded := planResp.DiscardedCopies(); len(discarded) > 0 && !disclosedCopyDiscard {
+		h.logger.Info("apply stopped for confirmation: re-plan discards an existing copy the disclosure did not show",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "action", actionName,
+			"plan_id", planResp.PlanID, "discarded_copies", len(discarded))
+		// The disclosure is posted before it is recorded. The record's whole
+		// claim is that the operator was shown the copy, so a post that never
+		// lands must leave no consent behind: the next attempt stops and asks
+		// again rather than dispatching over a disclosure nobody read.
+		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+			msgCopyDiscardDowngrade); err != nil {
+			h.logger.Error("failed to post the comment disclosing the discard, so no consent was recorded",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+				"environment", environment, "plan_id", planResp.PlanID, "error", err)
+			return
+		}
+		if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, expectedPendingPlanID, planResp.PlanID, true); err != nil {
+			// Without the re-pin the confirm command would load the disclosure
+			// that showed no discard and stop again, so say what happened rather
+			// than leaving a confirmation the operator cannot pass.
+			h.logger.Error("failed to re-pin pending confirmation onto the plan that discloses the discard",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+				"environment", environment, "plan_id", planResp.PlanID, "error", err)
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+				"Applying would destroy work in progress on the target. SchemaBot stopped the apply but could not record the confirmation; re-run `schemabot apply -e "+environment+"` to see what is at stake.")
+		}
+		return
+	}
+
+	// --defer-cutover only affects engine-driven statements; an all-direct
+	// plan has no cutover to defer, so reject the flag instead of silently
+	// ignoring it. Only apply-confirm reaches this gate (the apply command
+	// rejects the flag before locking, and an automatic apply whose re-plan
+	// carries direct changes downgrades above), so keep the lock: it still
+	// pins the plan the operator confirmed against, and re-running
+	// apply-confirm without the flag executes it.
+	if result.DeferCutover && planResp.AllChangesDirect() {
+		h.logger.Info("apply rejected: --defer-cutover on an all-direct plan; the pending confirmation is preserved",
+			"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName)
+		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+			fmt.Sprintf(msgDeferCutoverAllDirectConfirm, environment))
 		return
 	}
 
 	// Block unsafe changes on confirm (re-plan may have detected new unsafe changes)
 	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy)
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+		h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
 		h.logger.Info("apply blocked by unsafe changes", "repo", repo, "pr", pr, "database", database, "environment", environment)
 		h.postComment(repo, pr, installationID, templates.RenderUnsafeChangesBlocked(commentData))
 		return
@@ -194,11 +291,7 @@ func (h *Handler) executeApply(
 	if err != nil {
 		h.service.SetPendingObserver(database, "", environment, nil)
 		h.logger.Error("apply execution failed", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
-		message := "Failed to execute apply. See SchemaBot server logs for details."
-		if errors.Is(err, storage.ErrLockIntentChanged) {
-			message = "The pending schema change changed while this command was running. The apply was rejected; review the latest plan and run the command again."
-		}
-		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, message)
+		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyExecutionErrorMessage(err))
 		return
 	}
 
@@ -258,6 +351,91 @@ func (h *Handler) executeApply(
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Apply was accepted, but SchemaBot could not update the required status check: "+err.Error())
 		return
 	}
+}
+
+func applyExecutionErrorMessage(err error) string {
+	if errors.Is(err, storage.ErrLockIntentChanged) {
+		return "The pending schema change changed while this command was running. The apply was rejected; review the latest plan and run the command again."
+	}
+	var featureErr *api.UnsupportedFeatureError
+	if errors.As(err, &featureErr) {
+		return featureErr.Error()
+	}
+	return "Failed to execute apply. See SchemaBot server logs for details."
+}
+
+// postAutoConfirmDowngrade posts the locked plan comment that pauses an
+// automatic apply for manual confirmation. It carries the original command's
+// flags and the lock owner so the coached apply-confirm command re-issues the
+// operator's full intent and the comment shows who holds the lock.
+//
+// The re-plan this downgrade acts on is the first time an automatic apply sees
+// the live database, so it is also the first time it can see a destructive
+// change to a table another pull request owns. The attributed-change disclosure
+// belongs on this comment for the same reason as the direct-execution one: it
+// must sit on the comment the confirmation acts on.
+// It reports whether the comment landed, so a caller that records what the
+// comment disclosed can decline to record it when the operator was shown
+// nothing.
+func (h *Handler) postAutoConfirmDowngrade(
+	ctx context.Context, client *ghclient.InstallationClient,
+	repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult,
+	planResp *apitypes.PlanResponse, environment string, result CommandResult, requestedBy, reason string,
+) error {
+	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
+	commentData.IsLocked = true
+	commentData.LockOwner = fmt.Sprintf("%s#%d", repo, pr)
+	commentData.AllowUnsafe = result.AllowUnsafe
+	commentData.DeferCutover = result.DeferCutover
+	commentData.SkipRevert = result.SkipRevert
+	commentData.AutoConfirmDowngradeReason = reason
+	// An operator who ran apply-confirm themselves paused nothing automatic, so
+	// the comment names what actually stopped: their own apply.
+	commentData.StoppedConfirmedApply = result.Action == action.ApplyConfirm
+	return h.postCommentReportingError(repo, pr, installationID, templates.RenderPlanComment(commentData))
+}
+
+// repinPendingConfirmation moves this PR's apply lock onto the plan whose
+// comment is being posted now, together with what that comment discloses about
+// an unfinished copy on the target. Both move in one storage write, so the
+// record can never describe a plan other than the one apply-confirm loads.
+//
+// A stop that does not re-pin is a stop nobody can pass: the confirm command
+// reads the lock to learn what the operator was shown, so a lock still pointing
+// at the comment that disclosed nothing would stop the same apply again on every
+// attempt.
+// The re-pin is skipped when the lock no longer carries the pending intent this
+// apply observed — a rollback the operator issued while the gate ran owns the
+// lock now, and overwriting its pin would answer "no pending rollback" to the
+// rollback-confirm they are about to send. Declining leaves the copy gate armed,
+// so the next apply-confirm stops and discloses again rather than proceeding on
+// consent that was never recorded.
+func (h *Handler) repinPendingConfirmation(ctx context.Context, repo string, pr int, database, dbType, expectedPendingPlanID, planID string, disclosedCopyDiscard bool) error {
+	lock, err := h.service.Storage().Locks().Get(ctx, database, dbType)
+	if err != nil {
+		return fmt.Errorf("load apply lock for %s (%s) to re-pin the pending confirmation: %w", database, dbType, err)
+	}
+	if lock == nil {
+		return fmt.Errorf("apply lock for %s (%s) is gone, so the pending confirmation cannot be re-pinned", database, dbType)
+	}
+	if lock.PendingPlanID != expectedPendingPlanID {
+		h.logger.Warn("preserved a newer pending intent instead of re-pinning the confirmation onto the disclosing plan",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"expected_pending_plan_id", expectedPendingPlanID, "observed_pending_plan_id", lock.PendingPlanID,
+			"plan_id", planID)
+		return nil
+	}
+
+	return h.service.Storage().Locks().Acquire(ctx, &storage.Lock{
+		DatabaseName:         database,
+		DatabaseType:         dbType,
+		Owner:                fmt.Sprintf("%s#%d", repo, pr),
+		Repository:           repo,
+		PullRequest:          pr,
+		PendingPlanID:        planID,
+		DisclosedCopyDiscard: disclosedCopyDiscard,
+	})
 }
 
 // releaseApplyLockIfIntentUnchanged releases this PR's apply lock after a

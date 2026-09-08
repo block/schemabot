@@ -33,11 +33,26 @@ func (e *Error) Error() string {
 // Call invokes fn, converting a panic into an *Error. A nil return means fn
 // completed normally; a non-nil return is either fn's own error or, when
 // errors.As matches *Error, a contained panic.
-func Call(fn func() error) (err error) {
+func Call(fn func() error) error {
+	recovered, err := Catch(fn)
+	if recovered != nil {
+		return recovered
+	}
+	return err
+}
+
+// Catch invokes fn, keeping fn's own error separate from a contained panic.
+// At most one result is non-nil: when fn panics, recovered carries the panic
+// value and stack; when fn returns, fnErr is whatever fn returned. The
+// separation makes provenance structural — a fn error that merely wraps an
+// *Error is still fn's own error, never mistaken for a panic Catch recovered —
+// so callers that must route the two cases differently need no error
+// inspection at all.
+func Catch(fn func() error) (recovered *Error, fnErr error) {
 	defer func() {
 		if r := recover(); r != nil {
-			err = &Error{Value: r, Stack: debug.Stack()}
+			recovered = &Error{Value: r, Stack: debug.Stack()}
 		}
 	}()
-	return fn()
+	return nil, fn()
 }

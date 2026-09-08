@@ -1,12 +1,18 @@
 package api
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // TestIsInternalControlError verifies that control operation errors are
@@ -35,4 +41,81 @@ func TestIsInternalControlError(t *testing.T) {
 	t.Run("explicit server status is internal", func(t *testing.T) {
 		assert.True(t, IsInternalControlError(controlHTTPErrorf(http.StatusBadGateway, "tern unavailable")))
 	})
+}
+
+// TestIsTerminalControlError verifies the retry disposition durable command
+// processing hinges on: typed terminal errors and operator-actionable
+// rejections must never be re-driven, while untyped internal failures and
+// remote unavailability stay retryable.
+func TestIsTerminalControlError(t *testing.T) {
+	t.Run("typed terminal error is terminal", func(t *testing.T) {
+		assert.True(t, IsTerminalControlError(terminalControlf("plan not found for apply %s", "apply-123")))
+	})
+
+	t.Run("wrapped terminal error stays terminal", func(t *testing.T) {
+		wrapped := fmt.Errorf("rollback command plan: %w", terminalControlf("rollback source plan is invalid"))
+		assert.True(t, IsTerminalControlError(wrapped))
+	})
+
+	t.Run("guardrail conflict is terminal", func(t *testing.T) {
+		assert.True(t, IsTerminalControlError(controlConflictf("apply is in state %q; only completed applies can be rolled back", "running")))
+	})
+
+	t.Run("client-facing status is terminal", func(t *testing.T) {
+		assert.True(t, IsTerminalControlError(controlHTTPErrorf(http.StatusBadRequest, "apply is required")))
+		assert.True(t, IsTerminalControlError(controlHTTPErrorf(http.StatusNotFound, "apply not found: %s", "apply-123")))
+	})
+
+	t.Run("untyped error is not terminal", func(t *testing.T) {
+		assert.False(t, IsTerminalControlError(errors.New("storage unavailable")))
+		assert.False(t, IsTerminalControlError(fmt.Errorf("get rollback source plan: %w", errors.New("connection reset"))))
+	})
+
+	t.Run("remote unavailability is not terminal", func(t *testing.T) {
+		assert.False(t, IsTerminalControlError(&RemoteDeploymentUnavailableError{
+			Deployment: "tenant-a",
+			Target:     "orders-staging",
+			Err:        errors.New("connection refused"),
+		}))
+	})
+
+	t.Run("explicit server status without terminal marker is not terminal", func(t *testing.T) {
+		assert.False(t, IsTerminalControlError(controlHTTPErrorf(http.StatusBadGateway, "tern unavailable")))
+	})
+}
+
+// A failed control operation is triaged from logs alone, so the failure line
+// must carry the apply's full triage attributes — including external_id, the
+// join key to the data plane's logs — alongside the error itself.
+func TestWriteControlError_LogsCarryFullApplyAttrs(t *testing.T) {
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	svc := New(nil, testServerConfig(), nil, logger)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-42",
+		Database:        "appdb",
+		DatabaseType:    "mysql",
+		Deployment:      "east",
+		Environment:     "staging",
+		Repository:      "org/repo",
+		PullRequest:     123,
+		State:           state.Apply.Running,
+		ExternalID:      "remote-apply-7",
+	}
+
+	svc.writeControlError(httptest.NewRecorder(), "stop", apply, errors.New("storage unavailable"))
+
+	lines := decodeLogLines(t, logBuf.Bytes())
+	line := requireLogLine(t, lines, "stop failed")
+	assert.Equal(t, "apply-42", line["apply_id"])
+	assert.Equal(t, "appdb", line["database"])
+	assert.Equal(t, "mysql", line["database_type"])
+	assert.Equal(t, "staging", line["environment"])
+	assert.Equal(t, "org/repo", line["repo"])
+	assert.Equal(t, float64(123), line["pr"])
+	assert.Equal(t, "east", line["deployment"])
+	assert.Equal(t, state.Apply.Running, line["state"])
+	assert.Equal(t, "remote-apply-7", line["external_id"])
+	assert.Contains(t, line, "error")
 }

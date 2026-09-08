@@ -48,7 +48,7 @@ func (s *Server) handleCancelDeployRequest(w http.ResponseWriter, r *http.Reques
 		return newHTTPError(http.StatusInternalServerError, "update deploy state: %v", err)
 	}
 
-	s.writeJSON(w, deployResponse(number, info.branch, dr.InProgressCancel))
+	s.writeJSON(w, deployResponse(number, info.branch, dr.InProgressCancel, info.createdAt))
 	return nil
 }
 
@@ -88,7 +88,7 @@ func (s *Server) handleApplyDeployRequest(w http.ResponseWriter, r *http.Request
 		return newHTTPError(http.StatusInternalServerError, "update deploy state: %v", err)
 	}
 
-	s.writeJSON(w, deployResponse(number, info.branch, dr.InProgressCutover))
+	s.writeJSON(w, deployResponse(number, info.branch, dr.InProgressCutover, info.createdAt))
 	return nil
 }
 
@@ -99,17 +99,21 @@ func (s *Server) handleRevertDeployRequest(w http.ResponseWriter, r *http.Reques
 	}
 	number := ref.number
 
-	var branch, migrationContext, ddlJSON, currentState string
+	var branch, migrationContext, ddlJSON, currentState, createdAtRaw string
 	var vschemaOriginalSQL, schemaBeforeSQL sql.NullString
 	var vschemaReverted bool
 	err = s.metadataDB.QueryRowContext(r.Context(),
-		`SELECT branch, migration_context, ddl_statements, vschema_data_original, vschema_reverted, schema_before, deployment_state
+		`SELECT branch, migration_context, ddl_statements, vschema_data_original, vschema_reverted, schema_before, deployment_state, created_at
 		 FROM localscale_deploy_requests
 		 WHERE org = ? AND database_name = ? AND number = ?`,
 		ref.org, ref.database, number,
-	).Scan(&branch, &migrationContext, &ddlJSON, &vschemaOriginalSQL, &vschemaReverted, &schemaBeforeSQL, &currentState)
+	).Scan(&branch, &migrationContext, &ddlJSON, &vschemaOriginalSQL, &vschemaReverted, &schemaBeforeSQL, &currentState, &createdAtRaw)
 	if err != nil {
 		return newHTTPError(http.StatusNotFound, "deploy request not found: %d", number)
+	}
+	createdAt, err := deployRequestCreatedAt(createdAtRaw)
+	if err != nil {
+		return newHTTPError(http.StatusInternalServerError, "deploy request %d: %v", number, err)
 	}
 
 	if currentState != dr.CompletePendingRevert {
@@ -183,7 +187,7 @@ func (s *Server) handleRevertDeployRequest(w http.ResponseWriter, r *http.Reques
 		return newHTTPError(http.StatusInternalServerError, "update deploy state: %v", err)
 	}
 
-	s.writeJSON(w, deployResponse(number, branch, revertState))
+	s.writeJSON(w, deployResponse(number, branch, revertState, createdAt))
 	return nil
 }
 
@@ -215,42 +219,7 @@ func (s *Server) handleSkipRevertDeployRequest(w http.ResponseWriter, r *http.Re
 	// Drop branch databases — revert window is closed, branch data no longer needed.
 	s.dropBranchDatabases(r.Context(), backend, info.branch)
 
-	s.writeJSON(w, deployResponse(number, info.branch, dr.Complete))
-	return nil
-}
-
-func (s *Server) handleThrottleDeployRequest(w http.ResponseWriter, r *http.Request) error {
-	backend, ref, err := s.resolveDeployAction(r)
-	if err != nil {
-		return err
-	}
-	number := ref.number
-
-	var body struct {
-		ThrottleRatio float64 `json:"throttle_ratio"`
-	}
-	if err := s.decodeJSON(r, &body); err != nil {
-		return err
-	}
-
-	if body.ThrottleRatio < 0 || body.ThrottleRatio > 0.95 {
-		return newHTTPError(http.StatusUnprocessableEntity, "throttle_ratio must be between 0.0 and 0.95, got %f", body.ThrottleRatio)
-	}
-
-	// Store in metadata for query purposes
-	_, err = s.metadataDB.ExecContext(r.Context(),
-		`UPDATE localscale_deploy_requests
-		 SET throttle_ratio = ?
-		 WHERE org = ? AND database_name = ? AND number = ?`,
-		body.ThrottleRatio, ref.org, ref.database, number)
-	if err != nil {
-		return newHTTPError(http.StatusInternalServerError, "update throttle: %v", err)
-	}
-
-	if err := s.applyThrottle(r.Context(), backend, number, body.ThrottleRatio); err != nil {
-		return newHTTPError(http.StatusInternalServerError, "apply throttle: %v", err)
-	}
-	s.writeJSON(w, map[string]string{"status": "ok"})
+	s.writeJSON(w, deployResponse(number, info.branch, dr.Complete, info.createdAt))
 	return nil
 }
 

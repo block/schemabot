@@ -33,17 +33,18 @@ import (
 // TestE2EApplyCreateDualWritesApplyOperationRow verifies the service-level
 // apply create path writes exactly one apply_operations row in the same
 // transaction as the applies row, mirroring the apply's (deployment, target)
-// routing. The operator claim loop is not yet wired to these rows, so the
-// row stays in pending — that's the contract until a subsequent PR lifts
-// the deployments-map gate and introduces the per-row claim loop.
+// routing. The operator claim loop is deliberately not started (skipOperator)
+// so the initial durable state of the dual-write — a pending operation row —
+// can be observed deterministically, without racing an operator claim that
+// would transition it to running.
 func TestE2EApplyCreateDualWritesApplyOperationRow(t *testing.T) {
 	dbName := "webhook_apply_dual_write"
-	svc := setupE2EService(t, dbName)
+	svc := setupE2EServiceOpts(t, dbName, e2eServiceOpts{skipOperator: true})
 	ctx := t.Context()
 
 	// Seed the target so the plan produces a real DDL change.
 	appDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+dbName, 1) + "&multiStatements=true"
-	db, err := sql.Open("mysql", appDSN)
+	db, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx, "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
 	require.NoError(t, err)
@@ -84,7 +85,7 @@ func TestE2EApplyCreateDualWritesApplyOperationRow(t *testing.T) {
 	assert.Equal(t, applyID, op.ApplyID)
 	assert.Equal(t, apply.Deployment, op.Deployment, "operation deployment must match apply deployment")
 	assert.Equal(t, plan.Target, op.Target, "operation target must mirror the plan-time target")
-	assert.Equal(t, state.ApplyOperation.Pending, op.State, "operation row stays pending — no consumer is wired yet")
+	assert.Equal(t, state.ApplyOperation.Pending, op.State, "dual-write must create the operation row in pending — the operator is not running in this test")
 }
 
 func TestE2EWebhookMetrics(t *testing.T) {

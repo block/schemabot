@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // handleHealth reports whether this instance can serve requests right now: it
@@ -36,8 +37,8 @@ func (s *Service) handleLivez(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Service) handleTernHealth(w http.ResponseWriter, r *http.Request) {
-	deployment := r.PathValue("deployment")
-	environment := r.PathValue("environment")
+	deployment := storage.CanonicalKey(r.PathValue("deployment"))
+	environment := storage.CanonicalKey(r.PathValue("environment"))
 
 	client, err := s.TernClient(deployment, environment)
 	if err != nil {

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -83,4 +84,39 @@ func TestApplyOperation_Lease(t *testing.T) {
 
 	var nilOp *ApplyOperation
 	assert.Equal(t, OperationLease{}, nilOp.Lease())
+}
+
+// The process identity is the "<host>/<pid>" prefix of every lease owner
+// string. Only owners written by this process — any claimer suffix — match;
+// other hosts, other pids, and prefix-shaped lookalikes do not.
+func TestLeaseOwnedByThisProcess(t *testing.T) {
+	self := LeaseOwnerProcess()
+	assert.NotEmpty(t, self)
+	assert.Regexp(t, `/[0-9]+$`, self, "the process identity ends at the pid; claimer suffixes are appended by callers")
+
+	assert.True(t, LeaseOwnedByThisProcess(self+"/driver-0"))
+	assert.True(t, LeaseOwnedByThisProcess(self+"/driver-12"))
+	assert.False(t, LeaseOwnedByThisProcess("other-host/4242/driver-0"))
+	assert.False(t, LeaseOwnedByThisProcess(self), "a bare process prefix is not a complete owner string")
+	assert.False(t, LeaseOwnedByThisProcess(self+"1/driver-0"), "a pid sharing a digit prefix is another process")
+	assert.False(t, LeaseOwnedByThisProcess(""))
+}
+
+// A fresh lease means a live driver is heartbeating the apply: the row has an
+// owner and was written within the staleness bound. No owner, a stale
+// heartbeat, or a nil apply all mean no live driver owns the work.
+func TestApplyHasFreshLease(t *testing.T) {
+	now := time.Now()
+
+	fresh := &Apply{LeaseOwner: "host/1/driver-0", UpdatedAt: now.Add(-ApplyLeaseStaleAfter / 2)}
+	assert.True(t, fresh.HasFreshLease(now))
+
+	stale := &Apply{LeaseOwner: "host/1/driver-0", UpdatedAt: now.Add(-2 * ApplyLeaseStaleAfter)}
+	assert.False(t, stale.HasFreshLease(now))
+
+	unleased := &Apply{UpdatedAt: now}
+	assert.False(t, unleased.HasFreshLease(now), "a recent write without an owner is not a lease heartbeat")
+
+	var nilApply *Apply
+	assert.False(t, nilApply.HasFreshLease(now))
 }

@@ -7,6 +7,7 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
@@ -53,7 +54,7 @@ func (m WatchModel) progressView() string {
 	var b strings.Builder
 
 	// Sort tables by status priority (running first, then pending, then completed)
-	tables := make([]tableProgress, len(m.tables))
+	tables := make([]templates.TableProgress, len(m.tables))
 	copy(tables, m.tables)
 	sortTablesByProgress(tables)
 
@@ -66,9 +67,6 @@ func (m WatchModel) progressView() string {
 	// Status line with spinner for active states
 	// Note: spinner.Dot already includes trailing space
 	switch {
-	case m.volumeChanging:
-		// Volume change in progress
-		b.WriteString(m.spinner.View() + fmt.Sprintf("Changing volume to %d...\n", m.volumePending))
 	case m.stopTriggered && !state.IsState(m.state, state.Apply.Stopped, state.Apply.Cancelled):
 		// Stop/cancel has been triggered but state hasn't updated yet
 		if m.isPlanetScale() {
@@ -81,6 +79,12 @@ func (m WatchModel) progressView() string {
 	case state.IsState(m.state, state.Apply.Running) && !m.cutoverTriggered && !m.deployTriggered:
 		b.WriteString(m.spinner.View() + "Running...")
 		b.WriteString("\n")
+	case state.IsState(m.state, state.Apply.CatchingUp) && !m.cutoverTriggered && !m.deployTriggered:
+		b.WriteString(m.spinner.View() + "Catching up on accumulated changes...\n")
+	case state.IsState(m.state, state.Apply.Checksumming) && !m.cutoverTriggered && !m.deployTriggered:
+		b.WriteString(m.spinner.View() + "Checksumming to verify data...\n")
+	case state.IsState(m.state, state.Apply.PostChecksum) && !m.cutoverTriggered && !m.deployTriggered:
+		b.WriteString(m.spinner.View() + "Data verified, applying final changes...\n")
 	case state.IsState(m.state, state.Apply.WaitingForCutover):
 		if m.cutoverTriggered {
 			b.WriteString(m.spinner.View() + "Cutover triggered, waiting for completion...\n")
@@ -185,9 +189,9 @@ func (m WatchModel) progressView() string {
 		b.WriteString(templates.FormatApplyStopped())
 		b.WriteString("\n")
 		if m.applyID != "" {
-			fmt.Fprintf(&b, "Use 'schemabot start -e %s %s' to resume.\n", m.environment, m.applyID)
+			fmt.Fprintf(&b, "Use '%s start -e %s %s' to resume.\n", cliname.Name(), m.environment, m.applyID)
 		} else {
-			fmt.Fprintf(&b, "Use 'schemabot status -d %s -e %s' to find the apply ID.\n", m.database, m.environment)
+			fmt.Fprintf(&b, "Use '%s status -d %s -e %s' to find the apply ID.\n", cliname.Name(), m.database, m.environment)
 		}
 	case isCuttingOver:
 		// During cutover, show minimal footer - no detach/stop allowed
@@ -213,9 +217,9 @@ func (m WatchModel) progressView() string {
 			b.WriteString("Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)\n")
 		} else {
 			if m.applyID != "" {
-				fmt.Fprintf(&b, "To proceed: schemabot start -e %s %s\n", m.environment, m.applyID)
+				fmt.Fprintf(&b, "To proceed: %s start -e %s %s\n", cliname.Name(), m.environment, m.applyID)
 			} else {
-				fmt.Fprintf(&b, "To find the apply ID: schemabot status -d %s -e %s\n", m.database, m.environment)
+				fmt.Fprintf(&b, "To find the apply ID: %s status -d %s -e %s\n", cliname.Name(), m.database, m.environment)
 			}
 			b.WriteString("Watching for deploy... (ESC to detach)\n")
 		}
@@ -227,29 +231,23 @@ func (m WatchModel) progressView() string {
 			b.WriteString("Press Enter to proceed with cutover (or ESC to detach)\n")
 		} else {
 			if m.applyID != "" {
-				fmt.Fprintf(&b, "To proceed: schemabot cutover -e %s %s\n", m.environment, m.applyID)
+				fmt.Fprintf(&b, "To proceed: %s cutover -e %s %s\n", cliname.Name(), m.environment, m.applyID)
 			} else {
-				fmt.Fprintf(&b, "To find the apply ID: schemabot status -d %s -e %s\n", m.database, m.environment)
+				fmt.Fprintf(&b, "To find the apply ID: %s status -d %s -e %s\n", cliname.Name(), m.database, m.environment)
 			}
 			b.WriteString("Watching for cutover... (ESC to detach)\n")
 		}
 	case state.IsState(m.state, state.Apply.Recovering):
 		b.WriteString("\n\n")
 		if pct, ok := recoveringCopyPercent(m.tables); ok {
-			fmt.Fprintf(&b, "SchemaBot is recovering after restart.\nRow copy is in progress (%d%%); once recovery completes, progress returns to the normal row-copy view. (ESC to detach)\n", pct)
+			fmt.Fprintf(&b, "SchemaBot is recovering after restart.\nRow copy is in progress (%s); once recovery completes, progress returns to the normal row-copy view. (ESC to detach)\n", pct)
 		} else {
 			b.WriteString("SchemaBot is recovering after restart.\n")
 			b.WriteString("Cutover will be available once recovery completes. (ESC to detach)\n")
 		}
-	case state.IsState(m.state, state.Apply.Running):
+	case state.IsRunningApplyState(m.state):
 		b.WriteString("\n\n")
-		if m.volumeMode {
-			// Volume mode - show volume adjustment UI
-			b.WriteString(m.formatVolumeMode())
-		} else {
-			// Normal mode - simple footer without volume
-			b.WriteString(m.formatFooter())
-		}
+		b.WriteString(m.formatFooter())
 		b.WriteString("\n")
 	case state.IsSetupPhase(m.state):
 		b.WriteString("\n\n")
@@ -279,67 +277,31 @@ func (m WatchModel) fetchErrorLine() string {
 	return errStyle.Render(label+": "+m.errorMsg) + "\n"
 }
 
-func recoveringCopyPercent(tables []tableProgress) (int, bool) {
-	percent := 100
+// recoveringCopyPercent returns the least-progressed recovering table's copy
+// percent as display text, so the recovery footer never overstates how far
+// the slowest table has come.
+func recoveringCopyPercent(tables []templates.TableProgress) (string, bool) {
+	fraction := 0.0
+	text := ""
 	found := false
 	for _, table := range tables {
-		if state.NormalizeTaskStatus(table.Status) != state.Task.Recovering || table.RowsTotal <= 0 || table.Percent >= 100 {
+		if state.NormalizeTaskStatus(table.Status) != state.Task.Recovering || table.RowsTotal <= 0 || table.PercentComplete >= 100 {
 			continue
 		}
-		percent = min(percent, ui.ClampPercent(table.Percent))
+		if frac := ui.RowCopyFraction(table.PercentComplete, table.RowsCopied, table.RowsTotal); !found || frac < fraction {
+			fraction = frac
+			text = ui.FormatRowCopyPercent(table.PercentComplete, table.RowsCopied, table.RowsTotal)
+		}
 		found = true
 	}
-	return percent, found
+	return text, found
 }
 
-// toTemplateTables converts TUI tableProgress slices to template TableProgress
-// so the shared rendering functions can be used.
-func toTemplateTables(tables []tableProgress) []templates.TableProgress {
-	result := make([]templates.TableProgress, len(tables))
-	for i, t := range tables {
-		// Table-level ETA: the table's own estimate (MySQL/Spirit), or the
-		// slowest shard's for a sharded (Vitess) table.
-		etaSeconds := t.ETASeconds
-		for _, sh := range t.Shards {
-			if sh.ETASeconds > etaSeconds {
-				etaSeconds = sh.ETASeconds
-			}
-		}
-		tp := templates.TableProgress{
-			TableName:       t.Name,
-			Deployment:      t.Deployment,
-			Namespace:       t.Keyspace,
-			DDL:             t.DDL,
-			ChangeType:      t.ChangeType,
-			Status:          state.NormalizeTaskStatus(t.Status),
-			RowsCopied:      t.RowsCopied,
-			RowsTotal:       t.RowsTotal,
-			PercentComplete: t.Percent,
-			ETASeconds:      etaSeconds,
-			ProgressDetail:  t.ProgressDetail,
-			IsInstant:       t.IsInstant,
-		}
-		for _, sh := range t.Shards {
-			tp.Shards = append(tp.Shards, templates.ShardProgress{
-				Shard:      sh.Shard,
-				Status:     state.NormalizeShardStatus(sh.Status),
-				RowsCopied: sh.RowsCopied,
-				RowsTotal:  sh.RowsTotal,
-				ETASeconds: sh.ETASeconds,
-			})
-		}
-		result[i] = tp
-	}
-	return result
-}
-
-// renderTables converts TUI tables to template types and uses the shared
-// FormatNamespacedTables / FormatTableProgress rendering from the CLI templates.
-func (m WatchModel) renderTables(b *strings.Builder, tables []tableProgress) {
-	tplTables := toTemplateTables(tables)
-
+// renderTables renders tables with the shared FormatNamespacedTables /
+// FormatTableProgress rendering from the CLI templates.
+func (m WatchModel) renderTables(b *strings.Builder, tables []templates.TableProgress) {
 	hasNamespaces := false
-	for _, t := range tplTables {
+	for _, t := range tables {
 		if t.Namespace != "" {
 			hasNamespaces = true
 			break
@@ -350,45 +312,28 @@ func (m WatchModel) renderTables(b *strings.Builder, tables []tableProgress) {
 	activityLabelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
 	activityLabel := activityLabelStyle.Render("Finalizing copy " + activityLabelFrames[m.activityLabelFrame%len(activityLabelFrames)])
 	if hasNamespaces {
-		b.WriteString(templates.FormatNamespacedTablesWithActivity(tplTables, activityBar, activityLabel))
+		b.WriteString(templates.FormatNamespacedTablesWithActivity(tables, activityBar, activityLabel))
 	} else {
 		b.WriteString("\n")
-		for _, t := range tplTables {
+		for _, t := range tables {
 			b.WriteString(templates.FormatTableProgressWithActivity(t, activityBar, activityLabel))
 		}
 	}
 }
 
-// formatFooter returns the standard footer (no volume shown by default).
+// formatFooter returns the standard footer.
 func (m WatchModel) formatFooter() string {
 	dimStyle := lipgloss.NewStyle().Faint(true)
 	stopHint := templates.StopKeyHint
 	if m.isPlanetScale() {
 		stopHint = "c cancel"
 	}
-	return dimStyle.Render("ESC detach • " + stopHint + " • v volume")
+	return dimStyle.Render("ESC detach • " + stopHint)
 }
 
 // isPlanetScale returns true if the current apply is using the PlanetScale engine.
 func (m WatchModel) isPlanetScale() bool {
 	return strings.EqualFold(m.engine, "PlanetScale") || strings.EqualFold(m.engine, "planetscale")
-}
-
-// formatVolumeMode returns the footer when in volume adjustment mode.
-func (m WatchModel) formatVolumeMode() string {
-	var b strings.Builder
-	dimStyle := lipgloss.NewStyle().Faint(true)
-
-	// Simple volume display: just the number and a simple bar
-	vol := max(min(m.currentVolume, 11), 1)
-
-	// Simple bar using block characters
-	filled := strings.Repeat("█", vol)
-	empty := strings.Repeat("░", 11-vol)
-
-	fmt.Fprintf(&b, "Volume: %s%s %d/11\n", filled, empty, vol)
-	b.WriteString(dimStyle.Render("↑↓ adjust • 1-9 direct • ESC done"))
-	return b.String()
 }
 
 // elapsed returns a formatted elapsed time string for the status line.
@@ -416,13 +361,13 @@ func (m WatchModel) detachedView() string {
 	}
 	b.WriteString("\n")
 	if m.applyID != "" {
-		fmt.Fprintf(&b, "To reattach: schemabot progress %s\n", m.applyID)
+		fmt.Fprintf(&b, "To reattach: %s progress %s\n", cliname.Name(), m.applyID)
 		if state.IsState(m.state, state.Apply.WaitingForDeploy) {
-			fmt.Fprintf(&b, "To deploy:   schemabot start -e %s %s\n", m.environment, m.applyID)
+			fmt.Fprintf(&b, "To deploy:   %s start -e %s %s\n", cliname.Name(), m.environment, m.applyID)
 		}
-		fmt.Fprintf(&b, "To stop:     schemabot stop -e %s %s\n", m.environment, m.applyID)
+		fmt.Fprintf(&b, "To stop:     %s stop -e %s %s\n", cliname.Name(), m.environment, m.applyID)
 	} else {
-		fmt.Fprintf(&b, "Find apply:  schemabot status -d %s -e %s\n", m.database, m.environment)
+		fmt.Fprintf(&b, "Find apply:  %s status -d %s -e %s\n", cliname.Name(), m.database, m.environment)
 	}
 	return b.String()
 }

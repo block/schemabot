@@ -5,18 +5,14 @@
 //   - Stop/Start: pause and resume copying (with checkpoint preservation)
 //   - Cutover: trigger the final atomic table swap
 //   - Revert/SkipRevert: roll back or skip rollback of completed changes
-//   - Volume: adjust concurrency and chunk timing on the fly
 package spirit
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
-	"math"
 	"strings"
-	"time"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 
 	"github.com/block/spirit/pkg/utils"
 
@@ -31,6 +27,16 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 	e.mu.Lock()
 	rm := e.runningSchemaChange
 	if rm == nil {
+		if d := e.drainedOutcome; d != nil && d.state == engine.StateCompleted {
+			// The change landed and was drained before the stop arrived. The
+			// retained outcome is still this engine's answer for that change,
+			// so the typed rejection has the caller reconcile to the completed
+			// outcome — exactly as it would had the stop raced a tracked
+			// completion.
+			database := d.database
+			e.mu.Unlock()
+			return nil, engine.NewAlreadyCompletedError("stop rejected: the schema change on database %s completed before the stop arrived", database)
+		}
 		// Spirit tracks the change in-process, so with nothing tracked there is
 		// no change this instance could ever stop — retrying cannot make one
 		// appear.
@@ -56,16 +62,18 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 		return nil, engine.NewAlreadyCompletedError("stop rejected: the schema change on database %s completed before the stop arrived", database)
 	}
 
+	logger := e.schemaChangeLogger(rm)
+
 	// Force a checkpoint BEFORE canceling the context.
 	// Spirit only checkpoints every 50s, so without this we could lose progress.
 	if len(runners) > 0 && runners[0] != nil {
-		e.logger.Info("forcing checkpoint before stop",
+		logger.Info("forcing checkpoint before stop",
 			"database", database,
 			"tables", tables,
 		)
 		if err := runners[0].DumpCheckpoint(ctx); err != nil {
 			// Log but don't fail - checkpoint might not be ready yet (early in execution)
-			e.logger.Warn("could not force checkpoint before stop",
+			logger.Warn("could not force checkpoint before stop",
 				"error", err,
 			)
 		}
@@ -79,7 +87,7 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 	rm.state = engine.StateStopped
 	e.mu.Unlock()
 
-	e.logger.Info("stop requested, waiting for goroutine",
+	logger.Info("stop requested, waiting for goroutine",
 		"database", database,
 		"tables", tables,
 	)
@@ -87,7 +95,7 @@ func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.
 	// Wait for the goroutine to complete
 	rm.wg.Wait()
 
-	e.logger.Info("schema change stopped",
+	logger.Info("schema change stopped",
 		"database", database,
 		"tables", tables,
 	)
@@ -104,6 +112,16 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 	e.mu.Lock()
 	rm := e.runningSchemaChange
 	if rm == nil {
+		if d := e.drainedOutcome; d != nil && d.state == engine.StateCompleted {
+			// The change landed and was drained before the cancel arrived. The
+			// retained outcome is still this engine's answer for that change,
+			// so the typed rejection has the caller reconcile to the completed
+			// outcome — exactly as it would had the cancel raced a tracked
+			// completion.
+			database := d.database
+			e.mu.Unlock()
+			return nil, engine.NewAlreadyCompletedError("cancel rejected: the schema change on database %s completed before the cancel arrived", database)
+		}
 		// Spirit tracks the change in-process, so with nothing tracked there is
 		// no change this instance could ever cancel — retrying cannot make one
 		// appear.
@@ -126,13 +144,14 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 	rm.state = engine.StateCancelled
 	e.mu.Unlock()
 
-	e.logger.Info("cancel requested, waiting for goroutine",
+	logger := e.schemaChangeLogger(rm)
+	logger.Info("cancel requested, waiting for goroutine",
 		"database", database,
 		"tables", tables,
 	)
 	rm.wg.Wait()
 
-	e.logger.Info("schema change cancelled",
+	logger.Info("schema change cancelled",
 		"database", database,
 		"tables", tables,
 	)
@@ -151,6 +170,11 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 	}, nil
 }
 
+// dropCancelledArtifacts releases the artifacts of a schema change cancelled
+// while this instance was still running it, using the connection details the
+// runner holds. It disposes of them through the same policy as a cancel that
+// arrives with no runner alive, so how a copy is disposed of never depends on
+// whether the instance that made it happened to survive.
 func (e *Engine) dropCancelledArtifacts(ctx context.Context, rm *runningSchemaChange) error {
 	if rm == nil || rm.host == "" {
 		return fmt.Errorf("cancelled schema change cleanup missing connection details")
@@ -170,22 +194,8 @@ func (e *Engine) dropCancelledArtifacts(ctx context.Context, rm *runningSchemaCh
 	if err := db.PingContext(ctx); err != nil {
 		return fmt.Errorf("connect to database %s to clean up cancelled schema change artifacts: %w", rm.database, err)
 	}
-	for _, tableName := range rm.tables {
-		for _, artifact := range []string{
-			utils.AuxTableName(tableName, "_new"),
-			utils.AuxTableName(tableName, "_old"),
-			utils.CheckpointTableName(tableName),
-		} {
-			if _, err := db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s.%s", quoteIdentifier(rm.database), quoteIdentifier(artifact))); err != nil {
-				return fmt.Errorf("drop cancelled schema change artifact %s.%s: %w", rm.database, artifact, err)
-			}
-		}
-	}
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s._spirit_sentinel", quoteIdentifier(rm.database))); err != nil {
-		return fmt.Errorf("drop cancelled schema change sentinel for database %s: %w", rm.database, err)
-	}
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s._spirit_checkpoint", quoteIdentifier(rm.database))); err != nil {
-		return fmt.Errorf("drop cancelled schema change checkpoint for database %s: %w", rm.database, err)
+	if _, err := e.releaseArtifacts(ctx, db, rm.database, rm.tables); err != nil {
+		return err
 	}
 	return nil
 }
@@ -212,6 +222,7 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 	originalDDLs := rm.originalDDLs
 	combinedStatement := rm.combinedStatement
 	deferCutover := rm.deferCutover
+	directExecPolicy := rm.directPolicy
 	e.mu.Unlock()
 
 	if state == engine.StateRunning {
@@ -230,7 +241,7 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 		return nil, fmt.Errorf("credentials not available for resume")
 	}
 
-	e.logger.Info("resuming schema change",
+	e.schemaChangeLogger(rm).Info("resuming schema change",
 		"database", database,
 		"tables", tables,
 	)
@@ -247,7 +258,7 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 			e.runningSchemaChange.cancelFunc = cancel
 		}
 		e.mu.Unlock()
-		e.resumeSchemaChange(bgCtx, host, username, password, database, originalDDLs, combinedStatement, deferCutover)
+		e.resumeSchemaChange(bgCtx, host, username, password, database, originalDDLs, combinedStatement, deferCutover, directExecPolicy)
 	})
 
 	return &engine.ControlResult{
@@ -326,12 +337,12 @@ func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engi
 	// Drop the sentinel table - Spirit will detect this and proceed with cutover.
 	// Cutover is asynchronous — Spirit performs the table swap in its goroutine.
 	// The caller should poll Progress() for state transitions.
-	_, err = db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s._spirit_sentinel", quoteIdentifier(database)))
+	_, err = db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s.%s", quoteIdentifier(database), quoteIdentifier(deferredCutoverSentinelTable)))
 	if err != nil {
 		return nil, fmt.Errorf("drop sentinel table: %w", err)
 	}
 
-	e.logger.Info("sentinel table dropped, cutover will proceed", "database", database, "stateless", rm == nil)
+	e.schemaChangeLogger(rm).Info("sentinel table dropped, cutover will proceed", "database", database, "stateless", rm == nil)
 
 	return &engine.ControlResult{
 		Accepted:    true,
@@ -371,8 +382,8 @@ func (e *Engine) DeferredCutoverSignalExists(ctx context.Context, req *engine.De
 
 	var count int
 	if err := db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = '_spirit_sentinel'",
-		database,
+		"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+		database, deferredCutoverSentinelTable,
 	).Scan(&count); err != nil {
 		return false, fmt.Errorf("query deferred cutover signal for database %s: %w", database, err)
 	}
@@ -383,349 +394,19 @@ func quoteIdentifier(name string) string {
 	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
 }
 
-// Revert rolls back a completed schema change.
-// Spirit doesn't have built-in revert - this would need to be implemented separately.
+// Revert rolls back a completed schema change. Spirit has no revert window: the
+// change is applied by copying into a shadow table and swapping it in, and once
+// that swap lands there is no engine phase left to undo it from. The decline is
+// deterministic for every schema change on this engine, so it is typed rather
+// than returned as a generic failure, and a caller holding a durable revert
+// request resolves it terminally instead of retrying a rejection that can never
+// succeed.
 func (e *Engine) Revert(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, fmt.Errorf("revert not supported for Spirit engine")
+	return nil, engine.NewUnsupportedOperationError("revert is not supported for MySQL schema changes: the change is copied into a shadow table and swapped in, with no revert window to undo it from; undo it by planning and applying the inverse schema change")
 }
 
-// SkipRevert ends the revert window early.
+// SkipRevert ends the revert window early. Spirit has no revert window to end,
+// so the decline is deterministic and typed for the same reason as Revert.
 func (e *Engine) SkipRevert(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, fmt.Errorf("skip revert not supported for Spirit engine")
-}
-
-// Volume adjusts the schema change speed by stopping, reconfiguring, and restarting.
-// Spirit doesn't support dynamic volume changes, so we stop the schema change,
-// update its settings, and restart from checkpoint. The adjustment is scoped to
-// the running schema change: the engine's configured defaults stay untouched,
-// so the next schema change starts from the defaults again.
-func (e *Engine) Volume(ctx context.Context, req *engine.VolumeRequest) (*engine.VolumeResult, error) {
-	e.mu.Lock()
-	rm := e.runningSchemaChange
-	if rm == nil {
-		e.mu.Unlock()
-		return nil, fmt.Errorf("no active schema change to adjust volume")
-	}
-	cpuHint := e.cpuHint
-	database := rm.database
-	previousVolume := rm.volume
-	if previousVolume == 0 {
-		// No explicit volume was set for this schema change; report the
-		// closest level for the settings it started with.
-		previousVolume = settingsToVolume(rm.threads, rm.targetChunkTime)
-	}
-	currentThreads := rm.threads
-	currentChunkTime := rm.targetChunkTime
-	currentLockTimeout := rm.lockWaitTimeout
-	e.mu.Unlock()
-
-	// Calculate settings from volume level (1-11)
-	newThreads, newChunkTime, newLockTimeout := volumeToSpiritSettings(req.Volume, cpuHint)
-
-	e.logger.Info("adjusting volume",
-		"database", database,
-		"volume", req.Volume,
-		"previous_volume", previousVolume,
-		"new_threads", newThreads,
-		"new_chunk_time", newChunkTime,
-	)
-
-	// When the requested volume maps to the settings the change is already
-	// running with, record the explicit volume and skip the restart.
-	if newThreads == currentThreads && newChunkTime == currentChunkTime && newLockTimeout == currentLockTimeout {
-		e.setSchemaChangeVolume(rm, req.Volume, newThreads, newChunkTime, newLockTimeout)
-		return &engine.VolumeResult{
-			Accepted:       true,
-			PreviousVolume: previousVolume,
-			NewVolume:      req.Volume,
-			Message:        "Volume unchanged - no restart needed",
-		}, nil
-	}
-
-	// Log checkpoint state BEFORE stopping
-	e.logCheckpointState(rm, "before_volume_change", map[string]any{
-		"previous_volume": previousVolume,
-		"new_volume":      req.Volume,
-	})
-
-	// Volume uses Stop to force a checkpoint before restarting with new settings.
-	// Keep the stored stopped state available for Start while reporting the
-	// adjustment as running to progress pollers.
-	e.setVolumeRestartInProgress(rm, true)
-
-	_, err := e.Stop(ctx, &engine.ControlRequest{
-		Database:    req.Database,
-		Credentials: req.Credentials,
-	})
-	if err != nil {
-		e.setVolumeRestartInProgress(rm, false)
-		return nil, fmt.Errorf("stop for volume change: %w", err)
-	}
-
-	// Log checkpoint state AFTER stopping (should be same as before)
-	e.logCheckpointState(rm, "after_stop", nil)
-
-	// Retune the running schema change; the engine's configured defaults stay
-	// untouched so the next schema change starts from the defaults.
-	e.setSchemaChangeVolume(rm, req.Volume, newThreads, newChunkTime, newLockTimeout)
-
-	// Restart the schema change
-	_, err = e.Start(ctx, &engine.ControlRequest{
-		Database:    req.Database,
-		Credentials: req.Credentials,
-	})
-	if err != nil {
-		e.setVolumeRestartInProgress(rm, false)
-		return nil, fmt.Errorf("restart after volume change: %w", err)
-	}
-	e.setVolumeRestartInProgress(rm, false)
-
-	// Log checkpoint state AFTER restart (should still be same - Spirit resumes from checkpoint)
-	e.mu.Lock()
-	rmAfter := e.runningSchemaChange
-	e.mu.Unlock()
-	if rmAfter != nil {
-		e.logCheckpointState(rmAfter, "after_restart", nil)
-	}
-
-	return &engine.VolumeResult{
-		Accepted:       true,
-		PreviousVolume: previousVolume,
-		NewVolume:      req.Volume,
-		Message:        fmt.Sprintf("Volume changed: %d -> %d (%d threads, %v chunks)", previousVolume, req.Volume, newThreads, newChunkTime),
-	}, nil
-}
-
-// setSchemaChangeVolume records the explicit volume and its derived Spirit copy
-// settings on the tracked schema change. The settings end with the change, so a
-// volume set during one schema change never carries into a later one.
-func (e *Engine) setSchemaChangeVolume(rm *runningSchemaChange, volume int32, threads int, chunkTime, lockTimeout time.Duration) {
-	e.mu.Lock()
-	tracked := e.runningSchemaChange == rm
-	if tracked {
-		rm.volume = volume
-		rm.threads = threads
-		rm.targetChunkTime = chunkTime
-		rm.lockWaitTimeout = lockTimeout
-	}
-	e.mu.Unlock()
-	if !tracked {
-		e.logger.Warn("volume adjustment target is no longer the tracked schema change; settings not applied",
-			"database", rm.database,
-			"volume", volume,
-		)
-	}
-}
-
-func (e *Engine) setVolumeRestartInProgress(rm *runningSchemaChange, inProgress bool) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.runningSchemaChange == rm {
-		rm.volumeRestartInProgress = inProgress
-	}
-}
-
-// minThreads is the lower bound for CPU-scaled volumes (6-11).
-// innodb_buffer_pool_instances often returns 1 on small instances, so a floor
-// of 2 prevents CPU-scaled volumes from regressing below volume 2's thread count.
-const minThreads = 2
-
-// maxThreads is the upper bound on copier threads regardless of CPU hint.
-// This prevents swarming the database even if innodb_buffer_pool_instances
-// is set to a very high value.
-const maxThreads = 16
-
-// volumeToSpiritSettings converts a volume level (1-11) to Spirit settings.
-// Volumes 1-5 use fixed thread counts.
-// Volumes 6-11 use CPU-scaled formulas (ceil(cpus/N)) when cpuHint > 0,
-// falling back to fixed thread counts when CPU info is unavailable.
-// Thread counts are always capped at maxThreads.
-// Spirit requires TargetChunkTime to be in range 100ms-5s.
-func volumeToSpiritSettings(volume int32, cpuHint int) (threads int, chunkTime time.Duration, lockTimeout time.Duration) {
-	switch volume {
-	case 1:
-		return 1, 100 * time.Millisecond, 10 * time.Second
-	case 2:
-		return 2, 500 * time.Millisecond, 15 * time.Second
-	case 4:
-		return 4, 2 * time.Second, 60 * time.Second
-	case 5:
-		return 8, 2 * time.Second, 60 * time.Second
-	case 6:
-		return cpuScaledThreads(cpuHint, 16, 8), 5 * time.Second, 60 * time.Second
-	case 7:
-		return cpuScaledThreads(cpuHint, 12, 8), 5 * time.Second, 60 * time.Second
-	case 8:
-		return cpuScaledThreads(cpuHint, 8, 12), 5 * time.Second, 60 * time.Second
-	case 9:
-		return cpuScaledThreads(cpuHint, 6, 12), 5 * time.Second, 60 * time.Second
-	case 10:
-		return cpuScaledThreads(cpuHint, 4, maxThreads), 5 * time.Second, 600 * time.Second
-	case 11:
-		return cpuScaledThreads(cpuHint, 2, maxThreads), 5 * time.Second, 600 * time.Second
-	default: // 3
-		return 2, 2 * time.Second, 30 * time.Second
-	}
-}
-
-// cpuScaledThreads computes ceil(cpuHint/divisor) when CPU info is available,
-// falling back to fallback when cpuHint is 0. Result is clamped to [minThreads, maxThreads].
-func cpuScaledThreads(cpuHint, divisor, fallback int) int {
-	threads := fallback
-	if cpuHint > 0 {
-		threads = int(math.Ceil(float64(cpuHint) / float64(divisor)))
-	}
-	threads = max(threads, minThreads) // must be at least minThreads
-	threads = min(threads, maxThreads) // can't be greater than maxThreads
-	return threads
-}
-
-// settingsToVolume approximates the volume level for a schema change that was
-// never given an explicit volume, mapping its starting Spirit copy settings to
-// the closest level. Volume levels that share derived settings map to the
-// lowest such level. Once an operator sets a volume, the explicit value is
-// stored on the running schema change and this approximation is not used.
-func settingsToVolume(threads int, chunkTime time.Duration) int32 {
-	switch {
-	case threads <= 1:
-		return 1
-	case threads <= 2:
-		if chunkTime <= 1*time.Second {
-			return 2
-		}
-		return 3
-	case threads <= 4:
-		return 4
-	case threads <= 8:
-		if chunkTime <= 2*time.Second {
-			return 5
-		}
-		return 6 // also covers vol 7 (same settings)
-	case threads <= 12:
-		return 8 // also covers vol 9 (same settings)
-	default:
-		return 10 // also covers vol 11 (same settings)
-	}
-}
-
-// queryCPUHint queries innodb_buffer_pool_instances from the target database
-// to infer the number of vCPUs. On RDS/Aurora, this variable is set by AWS to
-// match the instance's vCPU count. On self-managed MySQL 8.4+, the default is
-// dynamically calculated from available_logical_processors / 4.
-// Returns 0 if the query fails or the value can't be determined.
-func (e *Engine) queryCPUHint(ctx context.Context, dsn string) int {
-	db, err := mysqlconn.Open(dsn)
-	if err != nil {
-		e.logger.Debug("queryCPUHint: failed to open", "error", err)
-		return 0
-	}
-	defer utils.CloseAndLog(db)
-
-	if err := db.PingContext(ctx); err != nil {
-		e.logger.Debug("queryCPUHint: failed to ping", "error", err)
-		return 0
-	}
-
-	var instances int
-	if err := db.QueryRowContext(ctx, "SELECT @@innodb_buffer_pool_instances").Scan(&instances); err != nil {
-		e.logger.Debug("queryCPUHint: failed to query", "error", err)
-		return 0
-	}
-
-	if instances <= 0 {
-		return 0
-	}
-
-	e.logger.Info("detected CPU hint from innodb_buffer_pool_instances",
-		"innodb_buffer_pool_instances", instances,
-	)
-	return instances
-}
-
-// logCheckpointState reads Spirit's checkpoint table and logs the checkpoint data.
-// This is useful for debugging to understand what values change during volume adjustments.
-// Spirit stores checkpoint data in _<table>_chkpnt tables with columns:
-// - copier_watermark: position in the copy operation (e.g., "id:12345")
-// - checksum_watermark: position in checksum verification
-// - binlog_name: MySQL binlog file being replayed
-// - binlog_pos: position within the binlog file
-// - statement: the DDL being executed
-func (e *Engine) logCheckpointState(rm *runningSchemaChange, phase string, extra map[string]any) {
-	if rm == nil || rm.host == "" {
-		e.logger.Debug("logCheckpointState: no running schema change or credentials")
-		return
-	}
-
-	// Build DSN for connection.
-	cfg := mysql.NewConfig()
-	cfg.User = rm.username
-	cfg.Passwd = rm.password
-	cfg.Net = "tcp"
-	cfg.Addr = rm.host
-	cfg.DBName = rm.database
-	cfg.InterpolateParams = true
-	dsn := cfg.FormatDSN()
-
-	db, err := mysqlconn.Open(dsn)
-	if err != nil {
-		e.logger.Warn("logCheckpointState: failed to open", "error", err)
-		return
-	}
-	defer utils.CloseAndLog(db)
-
-	if err := db.PingContext(context.Background()); err != nil {
-		e.logger.Warn("logCheckpointState: failed to connect", "error", err)
-		return
-	}
-
-	// Query checkpoint table for each table being changed
-	for _, tableName := range rm.tables {
-		checkpointTable := fmt.Sprintf("_%s_chkpnt", tableName)
-
-		// Check if checkpoint table exists
-		var count int
-		err := db.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
-			rm.database, checkpointTable).Scan(&count)
-		if err != nil || count == 0 {
-			e.logger.Debug("logCheckpointState: no checkpoint table found",
-				"table", tableName,
-				"checkpoint_table", checkpointTable,
-				"phase", phase,
-			)
-			continue
-		}
-
-		// Read checkpoint data
-		var copierWatermark, checksumWatermark, binlogName, statement sql.NullString
-		var binlogPos sql.NullInt64
-
-		query := fmt.Sprintf("SELECT copier_watermark, checksum_watermark, binlog_name, binlog_pos, statement FROM `%s`.`%s` LIMIT 1",
-			rm.database, checkpointTable)
-		err = db.QueryRowContext(context.Background(), query).Scan(&copierWatermark, &checksumWatermark, &binlogName, &binlogPos, &statement)
-		if err != nil {
-			e.logger.Warn("logCheckpointState: failed to read checkpoint",
-				"table", tableName,
-				"checkpoint_table", checkpointTable,
-				"error", err,
-			)
-			continue
-		}
-
-		// Log the checkpoint data
-		logFields := []any{
-			"phase", phase,
-			"table", tableName,
-			"copier_watermark", copierWatermark.String,
-			"checksum_watermark", checksumWatermark.String,
-			"binlog_name", binlogName.String,
-			"binlog_pos", binlogPos.Int64,
-		}
-
-		// Add extra context fields
-		for k, v := range extra {
-			logFields = append(logFields, k, v)
-		}
-
-		e.logger.Info("checkpoint_state", logFields...)
-	}
+	return nil, engine.NewUnsupportedOperationError("skip-revert is not supported for MySQL schema changes: there is no revert window to close, since the change is already permanent once it cuts over")
 }

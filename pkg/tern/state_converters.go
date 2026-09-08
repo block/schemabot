@@ -7,8 +7,6 @@ import (
 	"sort"
 	"time"
 
-	"github.com/block/spirit/pkg/statement"
-
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
@@ -91,6 +89,12 @@ func storageStateToProto(ts string) ternv1.State {
 		return ternv1.State_STATE_PENDING
 	case state.Task.Running:
 		return ternv1.State_STATE_RUNNING
+	case state.Task.CatchingUp:
+		return ternv1.State_STATE_CATCHING_UP
+	case state.Task.Checksumming:
+		return ternv1.State_STATE_CHECKSUMMING
+	case state.Task.PostChecksum:
+		return ternv1.State_STATE_POST_CHECKSUM
 	case state.Task.WaitingForDeploy:
 		return ternv1.State_STATE_WAITING_FOR_DEPLOY
 	case state.Task.WaitingForCutover:
@@ -108,7 +112,7 @@ func storageStateToProto(ts string) ternv1.State {
 	case state.Task.Failed:
 		return ternv1.State_STATE_FAILED
 	case state.Task.FailedRetryable, state.Apply.FailedRetryable:
-		return ternv1.State_STATE_FAILED
+		return ternv1.State_STATE_FAILED_RETRYABLE
 	case state.Task.Stopped:
 		return ternv1.State_STATE_STOPPED
 	case state.Task.Cancelled:
@@ -132,15 +136,25 @@ func storageStateToProto(ts string) ternv1.State {
 	}
 }
 
-// changeTypeToProto converts a Spirit StatementType to the proto ChangeType enum.
-func changeTypeToProto(op statement.StatementType) ternv1.ChangeType {
+// changeTypeToProto converts a ddl.StatementType to the proto ChangeType enum.
+func changeTypeToProto(op ddl.StatementType) ternv1.ChangeType {
 	switch op {
-	case statement.StatementCreateTable:
+	case ddl.StatementCreateTable:
 		return ternv1.ChangeType_CHANGE_TYPE_CREATE
-	case statement.StatementAlterTable:
+	case ddl.StatementCreateIndex:
+		return ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX
+	case ddl.StatementAlterTable:
 		return ternv1.ChangeType_CHANGE_TYPE_ALTER
-	case statement.StatementDropTable:
+	case ddl.StatementDropTable:
 		return ternv1.ChangeType_CHANGE_TYPE_DROP
+	case ddl.StatementDropIndex:
+		return ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX
+	case ddl.StatementRenameTable:
+		return ternv1.ChangeType_CHANGE_TYPE_RENAME
+	case ddl.StatementTruncateTable:
+		return ternv1.ChangeType_CHANGE_TYPE_TRUNCATE
+	case ddl.StatementCreateView:
+		return ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW
 	default:
 		return ternv1.ChangeType_CHANGE_TYPE_OTHER
 	}
@@ -166,11 +180,21 @@ func protoChangeTypeToDDLAction(ct ternv1.ChangeType) string {
 	case ternv1.ChangeType_CHANGE_TYPE_VSCHEMA:
 		return "vschema_update"
 	case ternv1.ChangeType_CHANGE_TYPE_CREATE:
-		return ddl.StatementTypeToOp(statement.StatementCreateTable)
+		return ddl.StatementTypeToOp(ddl.StatementCreateTable)
 	case ternv1.ChangeType_CHANGE_TYPE_ALTER:
-		return ddl.StatementTypeToOp(statement.StatementAlterTable)
+		return ddl.StatementTypeToOp(ddl.StatementAlterTable)
 	case ternv1.ChangeType_CHANGE_TYPE_DROP:
-		return ddl.StatementTypeToOp(statement.StatementDropTable)
+		return ddl.StatementTypeToOp(ddl.StatementDropTable)
+	case ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX:
+		return ddl.StatementTypeToOp(ddl.StatementCreateIndex)
+	case ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX:
+		return ddl.StatementTypeToOp(ddl.StatementDropIndex)
+	case ternv1.ChangeType_CHANGE_TYPE_RENAME:
+		return ddl.StatementTypeToOp(ddl.StatementRenameTable)
+	case ternv1.ChangeType_CHANGE_TYPE_TRUNCATE:
+		return ddl.StatementTypeToOp(ddl.StatementTruncateTable)
+	case ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW:
+		return ddl.StatementTypeToOp(ddl.StatementCreateView)
 	default:
 		return "unknown"
 	}
@@ -201,6 +225,12 @@ func ProtoStateToStorage(ps ternv1.State) string {
 		return state.Apply.Pending
 	case ternv1.State_STATE_RUNNING:
 		return state.Apply.Running
+	case ternv1.State_STATE_CATCHING_UP:
+		return state.Apply.CatchingUp
+	case ternv1.State_STATE_CHECKSUMMING:
+		return state.Apply.Checksumming
+	case ternv1.State_STATE_POST_CHECKSUM:
+		return state.Apply.PostChecksum
 	case ternv1.State_STATE_WAITING_FOR_DEPLOY:
 		return state.Apply.WaitingForDeploy
 	case ternv1.State_STATE_WAITING_FOR_CUTOVER:
@@ -217,6 +247,8 @@ func ProtoStateToStorage(ps ternv1.State) string {
 		return state.Apply.Completed
 	case ternv1.State_STATE_FAILED:
 		return state.Apply.Failed
+	case ternv1.State_STATE_FAILED_RETRYABLE:
+		return state.Apply.FailedRetryable
 	case ternv1.State_STATE_STOPPED:
 		return state.Apply.Stopped
 	case ternv1.State_STATE_CANCELLED:

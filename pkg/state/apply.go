@@ -13,9 +13,19 @@ import "strings"
 // to its lifecycle. Consumers (CLI, TUI, PR templates) handle all states via
 // switch/case with a default fallback for unknown states.
 var Apply = struct {
-	Pending           string
-	Running           string
-	RunningDegraded   string
+	Pending         string
+	Running         string
+	RunningDegraded string
+
+	// Post-copy phases (Spirit): the row copy is done and the engine is
+	// draining its accumulated changeset or verifying the copied data.
+	// These mirror the Task states of the same name so the apply-level
+	// state names the phase the whole apply is in once no table is still
+	// copying rows. All three are running-family (IsRunningApplyState).
+	CatchingUp   string
+	Checksumming string
+	PostChecksum string
+
 	Paused            string
 	Resuming          string
 	WaitingForDeploy  string
@@ -41,9 +51,14 @@ var Apply = struct {
 	CreatingDeployRequest   string
 	ValidatingDeployRequest string
 }{
-	Pending:           "pending",
-	Running:           "running",
-	RunningDegraded:   "running_degraded",
+	Pending:         "pending",
+	Running:         "running",
+	RunningDegraded: "running_degraded",
+
+	CatchingUp:   "catching_up",
+	Checksumming: "checksumming",
+	PostChecksum: "post_checksum",
+
 	Paused:            "paused",
 	Resuming:          "resuming",
 	WaitingForDeploy:  "waiting_for_deploy",
@@ -76,12 +91,32 @@ var Apply = struct {
 //  4. Any task REVERTED → Apply REVERTED
 //  5. All tasks COMPLETED → Apply COMPLETED
 //  6. Any task RECOVERING → Apply RECOVERING
-//  7. Any task CUTTING_OVER → Apply CUTTING_OVER
+//  7. Any task CUTTING_OVER, no task in an earlier active phase (PENDING,
+//     RUNNING, or a post-copy verification phase) → Apply CUTTING_OVER
 //  8. All non-completed tasks WAITING_FOR_CUTOVER → Apply WAITING_FOR_CUTOVER
 //  9. All non-completed tasks WAITING_FOR_DEPLOY → Apply WAITING_FOR_DEPLOY
 //  10. Any task REVERT_WINDOW → Apply REVERT_WINDOW
 //  11. Any task RUNNING → Apply RUNNING
-//  12. Otherwise → Apply PENDING
+//  12. Any task in a post-copy phase or cutting over while any task is still
+//     PENDING → Apply RUNNING
+//  13. Any task CATCHING_UP → Apply CATCHING_UP
+//  14. Any task CHECKSUMMING → Apply CHECKSUMMING
+//  15. Any task POST_CHECKSUM → Apply POST_CHECKSUM
+//  16. Otherwise → Apply PENDING
+//
+// The post-copy phases (13–15) surface the least-advanced active phase, and
+// only once every table has started: while any table is still copying rows —
+// or still queued with its whole copy ahead of it — the apply is Running.
+// Once every table has at least begun and the active ones are draining or
+// verifying, the apply names that phase. The cutover gate (7) resolves
+// least-advanced-first the same way: a drive cuts tables over as each
+// finishes — sequentially, rolling, or across concurrent shards — so a
+// table cutting over ahead of siblings that are still queued, copying, or
+// verifying keeps the apply on that earlier work rather than announcing a
+// cutover most tables have not reached. This keeps the derived state
+// monotone across a multi-table drive — it never has to fall back from
+// cutting_over to an earlier phase when a cutover completes ahead of its
+// siblings.
 //
 // taskStates should be the State field from each Task. Empty slice returns PENDING.
 func DeriveApplyState(taskStates []string) string {
@@ -120,7 +155,7 @@ func DeriveApplyState(taskStates []string) string {
 	if counts[Apply.Recovering] > 0 {
 		return Apply.Recovering
 	}
-	if counts[Apply.CuttingOver] > 0 {
+	if cutoverIsLeastAdvancedActiveWork(counts) {
 		return Apply.CuttingOver
 	}
 	waitingOrCompleted := counts[Apply.WaitingForCutover] + counts[Apply.Completed]
@@ -137,7 +172,49 @@ func DeriveApplyState(taskStates []string) string {
 	if counts[Apply.Running] > 0 {
 		return Apply.Running
 	}
+	if postCopyPhaseWithQueuedWork(counts) {
+		return Apply.Running
+	}
+	if counts[Apply.CatchingUp] > 0 {
+		return Apply.CatchingUp
+	}
+	if counts[Apply.Checksumming] > 0 {
+		return Apply.Checksumming
+	}
+	if counts[Apply.PostChecksum] > 0 {
+		return Apply.PostChecksum
+	}
 	return Apply.Pending
+}
+
+// cutoverIsLeastAdvancedActiveWork reports whether a task is cutting over
+// with no sibling in an earlier active phase — queued, copying, or verifying.
+// A cutover is the last step of a table's work, so surfacing it at the apply
+// level while earlier work is still active would overstate progress and force
+// the derived state to fall back once that cutover completes; it surfaces
+// only when it is the least advanced work left. A parked WAITING_FOR_CUTOVER
+// sibling does not hold a cutover back: it is waiting on a command, not
+// working.
+func cutoverIsLeastAdvancedActiveWork(counts map[string]int) bool {
+	return counts[Apply.CuttingOver] > 0 &&
+		counts[Apply.Pending] == 0 &&
+		counts[Apply.Running] == 0 &&
+		counts[Apply.CatchingUp] == 0 &&
+		counts[Apply.Checksumming] == 0 &&
+		counts[Apply.PostChecksum] == 0
+}
+
+// postCopyPhaseWithQueuedWork reports whether a task is draining, verifying
+// (catching up, checksumming, or post-checksum), or cutting over while
+// another task has not started. Naming the phase at the apply level would
+// overstate progress — the queued tables still have their whole copy ahead —
+// so the apply stays Running until every table has begun.
+func postCopyPhaseWithQueuedWork(counts map[string]int) bool {
+	if counts[Apply.Pending] == 0 {
+		return false
+	}
+	return counts[Apply.CatchingUp] > 0 || counts[Apply.Checksumming] > 0 ||
+		counts[Apply.PostChecksum] > 0 || counts[Apply.CuttingOver] > 0
 }
 
 // RolloutChild is one apply_operation's contribution to the parent apply's
@@ -191,18 +268,20 @@ type RolloutChild struct {
 //
 //   - halt or unrecognized (both flags false): the failure stands and the apply
 //     is failed (fail closed); this dominates every other outcome.
-//   - unreleased pause (PauseOnFailure) with later, not-yet-terminal work to
-//     hold: the apply is held paused so a human can release or stop it.
+//   - unreleased pause (PauseOnFailure) with later work that still holds its
+//     target: the apply is held paused so a human can release or stop it.
 //   - continue, or a released pause (ContinueOnFailure): the failure neither
 //     forces a terminal verdict nor holds the rollout.
 //
 // After classifying every child, in precedence order:
 //
-//   - any fail-closed child → failed;
+//   - any fail-closed child → failed, or running_degraded while a sibling that
+//     already started still holds its target (fail closed decides the verdict,
+//     not when it is recorded);
 //   - else any pause-held child → paused;
-//   - else if every child is terminal → failed (the verdict still reflects the
+//   - else if every child has settled → failed (the verdict still reflects the
 //     failure once the continue/released rollout has settled);
-//   - else → running_degraded (continue/released siblings still in flight).
+//   - else → running_degraded (siblings still holding their targets).
 //
 // An empty child set returns Pending, matching DeriveApplyState.
 func DeriveRolloutApplyState(children []RolloutChild) string {
@@ -219,12 +298,12 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 		return base
 	}
 
-	allTerminal := true
+	allSettled := true
 	hardFail := false
 	pausedHold := false
 	for i, c := range children {
-		if !IsTerminalApplyState(c.State) {
-			allTerminal = false
+		if childHoldsItsTarget(c) {
+			allSettled = false
 		}
 		if !IsState(c.State, Apply.Failed) {
 			continue
@@ -238,7 +317,7 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 		case c.ContinueOnFailure:
 			// continue, or a released pause: does not force a terminal verdict
 			// and does not hold the rollout.
-		case c.PauseOnFailure && hasLaterNonTerminal(children, i):
+		case c.PauseOnFailure && hasLaterUnsettled(children, i):
 			// unreleased pause with later work still to run: hold for a human.
 			pausedHold = true
 		case c.PauseOnFailure:
@@ -251,24 +330,96 @@ func DeriveRolloutApplyState(children []RolloutChild) string {
 		}
 	}
 	if hardFail {
+		// The verdict is decided, but the apply is not over. A fail-closed
+		// policy only refuses new claims; it cancels nothing, so a sibling
+		// that a driver already started keeps writing to its target. Recording
+		// the terminal verdict over it would release the reservation on the
+		// parent's whole target set (OW-5) while one of those targets is
+		// mid-change, and would take stop and cancel away from the operator who
+		// still has live work to stop. Hold the apply until that work settles.
+		// A sibling still pending holds nothing: the same policy is what stops
+		// it from ever starting. A sibling an operator stopped still holds its
+		// target, because it can be started again.
+		if hasStartedUnsettledWork(children) {
+			return Apply.RunningDegraded
+		}
 		return Apply.Failed
 	}
 	if pausedHold {
 		return Apply.Paused
 	}
-	if allTerminal {
+	if allSettled {
 		return Apply.Failed
 	}
 	return Apply.RunningDegraded
 }
 
-// hasLaterNonTerminal reports whether any child after failedIndex (in
-// deployment order) is not yet in a terminal apply state. A pause-held failure
-// only holds the rollout when there is such later work for the operator to
-// release or stop.
-func hasLaterNonTerminal(children []RolloutChild, failedIndex int) bool {
+// childHoldsItsTarget reports whether a child still holds the deployment it was
+// given: its verdict is not final, so a driver may still be writing to that
+// target or may claim it and start writing again.
+//
+// Settled rather than terminal is what draws this line, and the difference is
+// one state. Stopped is terminal for claiming but not settled, because an
+// operator can start it again and a driver will resume writing — which is what
+// its hold says, that it holds the database until it is started or cancelled.
+// A rollout that reads terminal here would release the reservation on its whole
+// target set (OW-5) over a deployment a stopped sibling still owns.
+func childHoldsItsTarget(c RolloutChild) bool {
+	return !IsState(c.State, SettledApplyStates...)
+}
+
+// hasStartedUnsettledWork reports whether any child has moved past pending and
+// still holds its target: work a driver has already begun.
+//
+// This is the line a fail-closed rollout turns on, because the two kinds of
+// sibling differ in whether the policy reaches them. A pending sibling is
+// exactly what the ordered-claim gate holds back, so it will not start while
+// the failure stands and it has touched nothing. A sibling already running,
+// draining, parked at a cutover barrier, awaiting a retry, or stopped by an
+// operator was claimed before the failure, and refusing new claims does not
+// reach back to release it.
+func hasStartedUnsettledWork(children []RolloutChild) bool {
+	for _, c := range children {
+		if childHoldsItsTarget(c) && !IsState(c.State, Apply.Pending) {
+			return true
+		}
+	}
+	return false
+}
+
+// RolloutHeldByResumableChild reports whether a non-terminal projection is held
+// open only by children an operator can start again.
+//
+// Every child has reached a terminal state, so no drive will move the parent on
+// its own, and at least one has not settled: a stopped child still holds its
+// target and resumes writing on start. That shape is indistinguishable from a
+// stranded parent — one whose children all settled while the projection that
+// should have recorded their outcome never ran — from the child rows alone, and
+// the two want opposite handling. A stranded parent needs its state re-derived
+// and its target released. This one is already showing the state it should, and
+// waits on the operator who stopped it.
+func RolloutHeldByResumableChild(derived string, children []RolloutChild) bool {
+	if IsTerminalApplyState(derived) {
+		return false
+	}
+	held := false
+	for _, c := range children {
+		if !IsTerminalApplyState(c.State) {
+			return false
+		}
+		if childHoldsItsTarget(c) {
+			held = true
+		}
+	}
+	return held
+}
+
+// hasLaterUnsettled reports whether any child after failedIndex (in deployment
+// order) still holds its target. A pause-held failure only holds the rollout
+// when there is such later work for the operator to release, start or stop.
+func hasLaterUnsettled(children []RolloutChild, failedIndex int) bool {
 	for later := failedIndex + 1; later < len(children); later++ {
-		if !IsTerminalApplyState(children[later].State) {
+		if childHoldsItsTarget(children[later]) {
 			return true
 		}
 	}
@@ -282,11 +433,12 @@ func normalizeApplyState(raw string) string {
 		return Apply.Pending
 	case "RUNNING":
 		return Apply.Running
-	// Checksumming is a table-level (task) state, not an apply state: while one
-	// or more tables verify their copied data, the apply as a whole is still
-	// running. Fold it into Running for the aggregate derivation.
+	case "CATCHING_UP":
+		return Apply.CatchingUp
 	case "CHECKSUMMING":
-		return Apply.Running
+		return Apply.Checksumming
+	case "POST_CHECKSUM":
+		return Apply.PostChecksum
 	case "RUNNING_DEGRADED":
 		return Apply.RunningDegraded
 	case "PAUSED":
@@ -348,16 +500,40 @@ func IsTerminalApplyState(s string) bool {
 	return ok && info.Terminal
 }
 
+// SettledApplyStates lists the apply states whose outcome can no longer change.
+// It is the terminal set minus Stopped: a stopped apply is terminal but still
+// addressable, so a driver may claim it and resume writing its child rows.
+//
+// Terminal is not settled, and the difference decides who may write. Anything
+// that writes rows belonging to an apply it does not hold a lease on — a reaper
+// closing out stranded children — must gate on settled, so it can never touch
+// rows a driver is about to own.
+//
+// Settled bounds who may write; it does not promise the apply's child rows have
+// stopped moving. One failed task settles its apply to failed while its siblings
+// keep copying, so a reaper gating on this set still needs its own quiescence
+// window before it may touch a child row.
+var SettledApplyStates = []string{
+	Apply.Completed,
+	Apply.Failed,
+	Apply.Cancelled,
+	Apply.Reverted,
+}
+
 // IsRunningApplyState reports whether an apply is in a running-family state:
-// running, or running_degraded (a continue rollout still in flight after a
-// sibling deployment failed). Control gates that mean "the apply is actively
-// running" — cutover readiness, start reconciliation, stop/volume eligibility —
-// must use this so a degraded rollout is not mistaken for a non-running apply.
+// running, running_degraded (a rollout still in flight past a failed sibling,
+// whether it is continuing or halted), or one of the post-copy phases (catching_up,
+// checksumming, post_checksum) where the engine is still actively working the
+// change. Control gates that mean "the apply is actively running" — cutover
+// readiness, start reconciliation, stop eligibility — must use this so
+// a degraded rollout or a table draining its changeset is not mistaken for a
+// non-running apply.
 // This is narrower than "active" (non-terminal): pending, waiting_for_cutover,
 // recovering, and other non-terminal states are not running-family.
 // Accepts any format (proto, uppercase, or canonical lowercase).
 func IsRunningApplyState(s string) bool {
-	return IsState(s, Apply.Running, Apply.RunningDegraded)
+	return IsState(s, Apply.Running, Apply.RunningDegraded,
+		Apply.CatchingUp, Apply.Checksumming, Apply.PostChecksum)
 }
 
 // IsSetupPhase returns true if the apply state is an engine-lifecycle phase

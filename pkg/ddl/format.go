@@ -1,12 +1,11 @@
 package ddl
 
 import (
+	"log/slog"
 	"regexp"
 	"strings"
 
-	"github.com/pingcap/tidb/pkg/parser"
-	"github.com/pingcap/tidb/pkg/parser/ast"
-	"github.com/pingcap/tidb/pkg/parser/format"
+	"github.com/block/schemabot/pkg/schema"
 )
 
 // FormatDDL formats a DDL statement for better readability.
@@ -19,43 +18,71 @@ func FormatDDL(ddl string) string {
 	// Canonicalize first
 	ddl = Canonicalize(ddl)
 
-	upperDDL := strings.ToUpper(ddl)
-
-	var result string
-
-	switch {
-	case strings.HasPrefix(upperDDL, "CREATE TABLE"):
-		// Format CREATE TABLE with line breaks
-		result = lowercaseTypes(formatCreateTable(ddl))
-	case strings.HasPrefix(upperDDL, "ALTER TABLE"):
-		// Format ALTER TABLE with multiple clauses
-		clauses := splitAlterClauses(ddl)
-		if len(clauses) <= 1 {
-			result = lowercaseTypes(ddl)
-		} else {
-			// Extract table header (ALTER TABLE `name`) from first clause
-			tableEnd := findTableNameEnd(clauses[0])
-			tableHeader := strings.TrimSpace(clauses[0][:tableEnd-1]) // -1 to remove trailing space
-			firstClause := strings.TrimSpace(clauses[0][tableEnd:])
-
-			// Format with header on first line, each clause on its own indented line
-			var sb strings.Builder
-			sb.WriteString(tableHeader)
-			sb.WriteString("\n    ")
-			sb.WriteString(firstClause)
-			for i := 1; i < len(clauses); i++ {
-				sb.WriteString(",\n    ")
-				sb.WriteString(clauses[i])
-			}
-			result = lowercaseTypes(sb.String())
-		}
-	default:
-		result = lowercaseTypes(ddl)
-	}
+	result := lowercaseTypes(layoutDDL(ddl))
 
 	// Ensure trailing semicolon
 	result = strings.TrimRight(result, "; ")
 	return result + ";"
+}
+
+// layoutDDL line-breaks a canonicalized statement for readability: a CREATE
+// TABLE gets each column/index and table option on its own line, and a
+// multi-clause ALTER TABLE gets each clause on its own line. The layout is
+// plain string splitting on the statement's own text, so it applies to any
+// dialect's canonical form. Other statement types are returned unchanged.
+func layoutDDL(ddl string) string {
+	upperDDL := strings.ToUpper(ddl)
+
+	switch {
+	case strings.HasPrefix(upperDDL, "CREATE TABLE"):
+		return formatCreateTable(ddl)
+	case strings.HasPrefix(upperDDL, "ALTER TABLE"):
+		clauses := splitAlterClauses(ddl)
+		if len(clauses) <= 1 {
+			return ddl
+		}
+		// Extract table header (ALTER TABLE `name`) from first clause
+		tableEnd := findTableNameEnd(clauses[0])
+		tableHeader := strings.TrimSpace(clauses[0][:tableEnd-1]) // -1 to remove trailing space
+		firstClause := strings.TrimSpace(clauses[0][tableEnd:])
+
+		// Format with header on first line, each clause on its own indented line
+		var sb strings.Builder
+		sb.WriteString(tableHeader)
+		sb.WriteString("\n    ")
+		sb.WriteString(firstClause)
+		for i := 1; i < len(clauses); i++ {
+			sb.WriteString(",\n    ")
+			sb.WriteString(clauses[i])
+		}
+		return sb.String()
+	default:
+		return ddl
+	}
+}
+
+// FormatDDLForDialect formats a DDL statement for display under the dialect's
+// own grammar. The MySQL family gets FormatDDL's full treatment; any other
+// dialect renders its own parser's canonical form with the same line-break
+// layout — so a statement is never canonicalized, or judged unparseable,
+// under another family's grammar — but skips the MySQL-specific lowercasing
+// pass. Like FormatDDL, this is a best-effort display formatter: a statement
+// the dialect's parser rejects — or any statement of a dialect with no
+// registered parser (logged, since it means a database type reached the
+// display layer without a parser) — renders unformatted, with only
+// surrounding whitespace trimmed and a trailing semicolon enforced.
+func FormatDDLForDialect(dialect schema.Dialect, stmt string) string {
+	if dialect == schema.DialectMySQL {
+		return FormatDDL(stmt)
+	}
+	result := strings.TrimSpace(stmt)
+	if p, err := ParserForDialect(dialect); err != nil {
+		slog.Warn("DDL display formatting has no parser for this dialect; statements will render unformatted",
+			"dialect", dialect, "error", err)
+	} else {
+		result = layoutDDL(p.Canonicalize(result))
+	}
+	return strings.TrimRight(result, "; ") + ";"
 }
 
 // dataTypePattern matches SQL data types that should be lowercased.
@@ -137,12 +164,13 @@ func formatCreateTable(ddl string) string {
 
 	// Format table options
 	options := strings.TrimSpace(footer[1:]) // Skip the ")"
+	options, partition := splitPartitionClause(options)
 
 	if len(parts) <= 1 {
 		// Single column — no line-break formatting for columns,
 		// but still format table options if present
-		if options != "" {
-			return header + strings.TrimSpace(body) + ") " + formatTableOptions(options)
+		if options != "" || partition != "" {
+			return header + strings.TrimSpace(body) + ")" + formatFooter(options, partition)
 		}
 		return ddl
 	}
@@ -160,13 +188,49 @@ func formatCreateTable(ddl string) string {
 		sb.WriteString("\n")
 	}
 	sb.WriteString(")")
+	sb.WriteString(formatFooter(options, partition))
 
-	// Format table options: each on its own line (2-space indent, PlanetScale style)
+	return sb.String()
+}
+
+// splitPartitionClause separates the trailing PARTITION BY clause, if any,
+// from a CREATE TABLE options footer. Quoted strings are skipped so a COMMENT
+// mentioning PARTITION BY is not mistaken for the clause.
+func splitPartitionClause(options string) (opts, partition string) {
+	const clause = "PARTITION BY"
+	inQuote := false
+	for i := 0; i+len(clause) <= len(options); i++ {
+		if options[i] == '\'' {
+			inQuote = !inQuote
+			continue
+		}
+		if inQuote {
+			continue
+		}
+		if strings.EqualFold(options[i:i+len(clause)], clause) {
+			return strings.TrimSpace(options[:i]), strings.TrimSpace(options[i:])
+		}
+	}
+	return options, ""
+}
+
+// formatFooter renders what follows the column list's closing parenthesis:
+// table options each on their own line (2-space indent, PlanetScale style),
+// then the PARTITION BY clause on its own line.
+func formatFooter(options, partition string) string {
+	var sb strings.Builder
 	if options != "" {
 		sb.WriteString(" ")
 		sb.WriteString(formatTableOptions(options))
 	}
-
+	if partition != "" {
+		if options != "" {
+			sb.WriteString("\n  ")
+		} else {
+			sb.WriteString(" ")
+		}
+		sb.WriteString(partition)
+	}
 	return sb.String()
 }
 
@@ -364,28 +428,4 @@ func isClauseKeyword(s string) bool {
 // Returns the original statement if parsing fails.
 func Canonicalize(ddl string) string {
 	return defaultParser.Canonicalize(ddl)
-}
-
-// restoreCanonical uses TiDB parser to restore a statement in canonical format.
-func restoreCanonical(ddl string) string {
-	p := parser.New()
-	stmtNodes, _, err := p.Parse(ddl, "", "")
-	if err != nil || len(stmtNodes) == 0 {
-		return ddl
-	}
-
-	node := stmtNodes[0]
-
-	// Only canonicalize CREATE TABLE and DROP TABLE
-	switch node.(type) {
-	case *ast.CreateTableStmt, *ast.DropTableStmt:
-		var sb strings.Builder
-		rCtx := format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)
-		if err := node.Restore(rCtx); err != nil {
-			return ddl
-		}
-		return sb.String()
-	default:
-		return ddl
-	}
 }

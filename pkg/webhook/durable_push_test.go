@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,6 +73,31 @@ func TestDurablePushWebhookQueuesAndAcks(t *testing.T) {
 		t.Fatal("durable request path should not create a GitHub client")
 	default:
 	}
+}
+
+func TestDurablePushWebhookCanonicalizesRepository(t *testing.T) {
+	events := newRecordingWebhookEventStore()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{
+		Repos: map[string]api.RepoConfig{"mixedcase/sample-repo": {}},
+	}, nil, logger)
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+
+	req := buildPushWebhookRequest(t, "refs/heads/main", "MixedCaseSHA", false)
+	body, err := io.ReadAll(req.Body)
+	require.NoError(t, err)
+	req.Body = io.NopCloser(strings.NewReader(strings.ReplaceAll(string(body), "octocat/hello-world", "MixedCase/Sample-Repo")))
+	req.Header.Set(headerDeliveryID, "mixed-case-push")
+	rr := httptest.NewRecorder()
+
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	event, err := events.GetByDeliveryID(t.Context(), storage.ProviderGitHub, "mixed-case-push")
+	require.NoError(t, err)
+	require.NotNil(t, event)
+	assert.Equal(t, "mixedcase/sample-repo", event.Repository)
+	assert.Equal(t, "MixedCaseSHA", event.HeadSHA)
 }
 
 // A non-default-branch push is filtered before enqueue, so no inbox row is
@@ -160,7 +186,7 @@ func TestDurablePushDriverCompletesUnregisteredRepo(t *testing.T) {
 
 // A push row with an empty repo or an empty head SHA is a corrupted/replayed
 // row (the deletion sentinel is an all-zeros SHA, not an empty one), so the
-// driver fails it terminally — even when the corruption also blanks the fields
+// driver dead-letters it — even when the corruption also blanks the fields
 // a routine skip would match, such as the ref and default branch — rather than
 // silently completing it as a non-default-branch or unregistered-repo skip.
 func TestDurablePushDriverFailsMalformedRowTerminally(t *testing.T) {
@@ -210,12 +236,12 @@ func TestDurablePushDriverFailsMalformedRowTerminally(t *testing.T) {
 			h.driveNextDurableWebhook(t.Context(), 0, "test-host/1/webhook-driver-0")
 
 			select {
-			case failure := <-store.failed:
-				require.Nil(t, failure.retryAfter, "a malformed push row must not be retried")
+			case failure := <-store.failedPermanent:
 				require.Contains(t, failure.errMsg, "missing repo or head SHA")
 			default:
-				t.Fatal("expected malformed push delivery to be marked failed")
+				t.Fatal("expected malformed push delivery to be dead-lettered")
 			}
+			require.Empty(t, store.failed, "a malformed push row is deterministic and must not burn retry budget")
 			require.Empty(t, store.completed)
 		})
 	}

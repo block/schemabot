@@ -5,8 +5,6 @@ import (
 	"maps"
 	"strings"
 
-	"github.com/block/spirit/pkg/statement"
-
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -14,8 +12,6 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
 )
-
-const vSchemaArtifactName = "vschema.json"
 
 func pullSchemaResponseFromProto(resp *ternv1.PullSchemaResponse) *apitypes.PullSchemaResponse {
 	return &apitypes.PullSchemaResponse{
@@ -240,7 +236,31 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 		httpResp.Shards = append(httpResp.Shards, apiSP)
 	}
 
+	httpResp.ExistingCopies = existingCopiesFromProto(resp.ExistingCopies)
+
 	return httpResp
+}
+
+// existingCopiesFromProto carries the target's unfinished copies through to the
+// plan response so the operator is told, before applying, whether the apply
+// resumes an existing copy or throws it away and starts over.
+func existingCopiesFromProto(copies []*ternv1.ExistingCopy) []*apitypes.ExistingCopyResponse {
+	var result []*apitypes.ExistingCopyResponse
+	for _, c := range copies {
+		if c == nil {
+			continue
+		}
+		result = append(result, &apitypes.ExistingCopyResponse{
+			Namespace:   c.Namespace,
+			Disposition: c.Disposition,
+			Reason:      c.Reason,
+			Tables:      c.Tables,
+			AgeSeconds:  c.AgeSeconds,
+			Statement:   c.Statement,
+			Running:     c.Running,
+		})
+	}
+	return result
 }
 
 // protoChangesToNamespaces converts proto SchemaChanges to storage namespace plan data.
@@ -272,10 +292,11 @@ func protoChangesToNamespaces(changes []*ternv1.SchemaChange, schemaFiles map[st
 				nsData.OriginalFiles = map[string]string{}
 			}
 		}
-		if sc.Metadata["vschema_changed"] == "true" {
+		nsData.Metadata = storage.VSchemaPlanMetadata(sc.Metadata)
+		if sc.Metadata[storage.PlanMetadataVSchemaChanged] == "true" {
 			if nsFiles := schemaFiles[ns]; nsFiles != nil {
-				if vschema := nsFiles.Files[vSchemaArtifactName]; vschema != "" {
-					nsData.Artifacts = map[string]string{vSchemaArtifactName: vschema}
+				if vschema := nsFiles.Files[storage.VSchemaArtifactName]; vschema != "" {
+					nsData.Artifacts = map[string]string{storage.VSchemaArtifactName: vschema}
 				}
 			}
 		}
@@ -341,11 +362,21 @@ func protoShardPlansToStorage(shards []*ternv1.ShardPlan) ([]storage.ShardPlan, 
 func protoChangeTypeToOperation(ct ternv1.ChangeType) string {
 	switch ct {
 	case ternv1.ChangeType_CHANGE_TYPE_CREATE:
-		return ddl.StatementTypeToOp(statement.StatementCreateTable)
+		return ddl.StatementTypeToOp(ddl.StatementCreateTable)
 	case ternv1.ChangeType_CHANGE_TYPE_ALTER:
-		return ddl.StatementTypeToOp(statement.StatementAlterTable)
+		return ddl.StatementTypeToOp(ddl.StatementAlterTable)
 	case ternv1.ChangeType_CHANGE_TYPE_DROP:
-		return ddl.StatementTypeToOp(statement.StatementDropTable)
+		return ddl.StatementTypeToOp(ddl.StatementDropTable)
+	case ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX:
+		return ddl.StatementTypeToOp(ddl.StatementCreateIndex)
+	case ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX:
+		return ddl.StatementTypeToOp(ddl.StatementDropIndex)
+	case ternv1.ChangeType_CHANGE_TYPE_RENAME:
+		return ddl.StatementTypeToOp(ddl.StatementRenameTable)
+	case ternv1.ChangeType_CHANGE_TYPE_TRUNCATE:
+		return ddl.StatementTypeToOp(ddl.StatementTruncateTable)
+	case ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW:
+		return ddl.StatementTypeToOp(ddl.StatementCreateView)
 	case ternv1.ChangeType_CHANGE_TYPE_VSCHEMA:
 		return "vschema_update"
 	default:
@@ -359,12 +390,22 @@ func changeTypeToProto(op string) ternv1.ChangeType {
 		return ternv1.ChangeType_CHANGE_TYPE_VSCHEMA
 	}
 	switch ddl.OpToStatementType(op) {
-	case statement.StatementCreateTable:
+	case ddl.StatementCreateTable:
 		return ternv1.ChangeType_CHANGE_TYPE_CREATE
-	case statement.StatementAlterTable:
+	case ddl.StatementAlterTable:
 		return ternv1.ChangeType_CHANGE_TYPE_ALTER
-	case statement.StatementDropTable:
+	case ddl.StatementDropTable:
 		return ternv1.ChangeType_CHANGE_TYPE_DROP
+	case ddl.StatementCreateIndex:
+		return ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX
+	case ddl.StatementDropIndex:
+		return ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX
+	case ddl.StatementRenameTable:
+		return ternv1.ChangeType_CHANGE_TYPE_RENAME
+	case ddl.StatementTruncateTable:
+		return ternv1.ChangeType_CHANGE_TYPE_TRUNCATE
+	case ddl.StatementCreateView:
+		return ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW
 	default:
 		return ternv1.ChangeType_CHANGE_TYPE_OTHER
 	}

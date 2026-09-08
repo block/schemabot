@@ -21,8 +21,8 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -49,7 +49,7 @@ func TestMain(m *testing.M) {
 
 	dsn := os.Getenv("E2E_TESTAPP_STAGING_DSN")
 	if dsn != "" {
-		db, err := sql.Open("mysql", dsn)
+		db, err := sql.Open("block-mysql", dsn)
 		if err == nil {
 			// Find all tables that are NOT base fixtures
 			rows, err := db.QueryContext(context.Background(), `
@@ -116,7 +116,7 @@ func TestLocal_SchemaBot_Health(t *testing.T) {
 func TestLocal_SchemaBot_SchemaApplied(t *testing.T) {
 	dsn := mysqlDSN(t)
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "connect to MySQL")
 	defer utils.CloseAndLog(db)
 
@@ -142,7 +142,7 @@ func TestLocal_SchemaBot_SchemaApplied(t *testing.T) {
 func TestLocal_Demo_TestAppTablesCreated(t *testing.T) {
 	// Skip this test if demo tables don't exist (requires 'make demo' first)
 	stagingDSN := testappStagingDSN(t)
-	db, err := sql.Open("mysql", stagingDSN)
+	db, err := sql.Open("block-mysql", stagingDSN)
 	if err != nil {
 		t.Skip("Cannot connect to staging database")
 	}
@@ -170,7 +170,7 @@ func TestLocal_Demo_TestAppTablesCreated(t *testing.T) {
 	})
 
 	t.Run("production", func(t *testing.T) {
-		prodDB, err := sql.Open("mysql", productionDSN)
+		prodDB, err := sql.Open("block-mysql", productionDSN)
 		require.NoError(t, err, "connect to production MySQL")
 		defer utils.CloseAndLog(prodDB)
 
@@ -330,7 +330,7 @@ CREATE TABLE %s (
 	out := e2eutil.RunCLIInDir(t, binPath, schemaDir, "plan", "-e", "staging", "--endpoint", endpoint)
 	e2eutil.AssertContains(t, out, "DROP COLUMN")
 	e2eutil.AssertContains(t, out, "legacy_field")
-	// Unsafe changes should be shown with ⛔ (not ⚠️ lint warning)
+	// Unsafe changes at plan time await consent, shown with ⚠️
 	e2eutil.AssertContains(t, out, "Unsafe Changes Detected")
 }
 
@@ -575,7 +575,8 @@ CREATE TABLE %s (
 	require.Error(t, err, "expected apply to fail without --allow-unsafe for DROP INDEX")
 
 	// Verify the output contains expected messages
-	e2eutil.AssertContains(t, out, "Unsafe Changes Detected")
+	e2eutil.AssertContains(t, out, "Apply blocked")
+	e2eutil.AssertContains(t, out, "unsafe change(s) detected")
 	e2eutil.AssertContains(t, out, "DROP INDEX")
 	e2eutil.AssertContains(t, out, "--allow-unsafe")
 	// Should also show the plan
@@ -680,7 +681,8 @@ CREATE TABLE %s (
 	require.Error(t, err, "expected apply to fail without --allow-unsafe for DROP TABLE")
 
 	// Verify the output contains expected messages
-	e2eutil.AssertContains(t, out, "Unsafe Changes Detected")
+	e2eutil.AssertContains(t, out, "Apply blocked")
+	e2eutil.AssertContains(t, out, "unsafe change(s) detected")
 	e2eutil.AssertContains(t, out, "DROP TABLE")
 	e2eutil.AssertContains(t, out, "--allow-unsafe")
 }
@@ -1007,7 +1009,11 @@ func TestLocal_StopStart_MultiTable_ResumeAll(t *testing.T) {
 	endpoint := schemabotURL(t)
 	ensureNoActiveChange(t, endpoint)
 
-	// Create 3 tables with enough rows for Spirit to take measurable time
+	// Create 3 tables. Only the first table needs enough rows for Spirit to
+	// take measurable time — the stop below must land while its copy is in
+	// flight. The later tables are stopped while still pending (0% progress),
+	// which is the scenario under test, so they stay small to keep the
+	// sequential resume within the completion wait.
 	table1 := uniqueTableName("resume_alpha")
 	table2 := uniqueTableName("resume_beta")
 	table3 := uniqueTableName("resume_gamma")
@@ -1017,7 +1023,7 @@ func TestLocal_StopStart_MultiTable_ResumeAll(t *testing.T) {
 
 	db := openTestappStaging(t)
 
-	for _, tbl := range []string{table1, table2, table3} {
+	for i, tbl := range []string{table1, table2, table3} {
 		_, err := db.ExecContext(t.Context(), fmt.Sprintf(`
 			CREATE TABLE %s (
 				id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -1027,10 +1033,14 @@ func TestLocal_StopStart_MultiTable_ResumeAll(t *testing.T) {
 			)
 		`, tbl))
 		require.NoErrorf(t, err, "create table %s", tbl)
+		rowCount := 500000
+		if i > 0 {
+			rowCount = 1000
+		}
 		seedTestRows(t, db, tbl,
 			"name, amount",
 			"CONCAT('item_', seq), FLOOR(1 + RAND() * 10000)",
-			50000)
+			rowCount)
 	}
 
 	// Build schema dir with indexes on all 3 tables
@@ -1091,7 +1101,7 @@ CREATE TABLE %s (
 		e2eutil.AssertContains(t, startOut, "resumed")
 	})
 
-	// Wait for everything to complete (3 tables × 50K rows each, sequential)
+	// Wait for all three tables to finish their sequential copies
 	waitForApplyState(t, endpoint, applyID, state.Apply.Completed, 60*time.Second)
 
 	// Verify ALL 3 indexes exist
@@ -1106,99 +1116,6 @@ CREATE TABLE %s (
 		out := e2eutil.RunCLIInDir(t, binPath, schemaDir, "plan", "-s", ".", "-e", "staging", "--endpoint", endpoint)
 		assertNotContains(t, out, "ADD INDEX")
 	})
-}
-
-// =============================================================================
-// Volume Tests
-// =============================================================================
-
-func TestLocal_Volume_Help(t *testing.T) {
-	binPath := buildCLI(t)
-	out := runCLI(t, binPath, "volume", "--help")
-	e2eutil.AssertContains(t, out, "apply-id")
-	e2eutil.AssertContains(t, out, "--volume")
-}
-
-func TestLocal_Volume_InvalidLevel(t *testing.T) {
-	binPath := buildCLI(t)
-
-	// Volume is rejected before the CLI contacts the API.
-	_, err := runCLIWithError(t, binPath, "volume", "apply-fake", "-e", "staging", "-v", "0", "--endpoint", "http://localhost:9999")
-	require.Error(t, err, "expected error for volume=0")
-
-	_, err = runCLIWithError(t, binPath, "volume", "apply-fake", "-e", "staging", "-v", "12", "--endpoint", "http://localhost:9999")
-	require.Error(t, err, "expected error for volume=12")
-}
-
-func TestLocal_Volume_NoActiveChange(t *testing.T) {
-	binPath := buildCLI(t)
-	endpoint := schemabotURL(t)
-
-	_, err := runCLIWithError(t, binPath, "volume", "apply-nonexistent", "-e", "staging", "-v", "5", "--endpoint", endpoint)
-	if err == nil {
-		t.Log("volume with no active change didn't error - may be acceptable if there's a leftover state")
-	}
-}
-
-func TestLocal_Volume_DuringApply(t *testing.T) {
-	binPath := buildCLI(t)
-	endpoint := schemabotURL(t)
-	ensureNoActiveChange(t, endpoint)
-
-	tableName := uniqueTableName("vol_metrics")
-	defer dropTestTable(t, tableName)
-
-	db := openTestappStaging(t)
-
-	_, err := db.ExecContext(t.Context(), fmt.Sprintf(`
-		CREATE TABLE %s (
-			id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-			name VARCHAR(255) NOT NULL,
-			value DECIMAL(20, 4),
-			recorded_at DATETIME DEFAULT CURRENT_TIMESTAMP
-		)
-	`, tableName))
-	require.NoError(t, err, "create table")
-
-	seedTestRows(t, db, tableName,
-		"name, value",
-		"CONCAT('metric_', seq), FLOOR(100 + RAND() * 10000)",
-		10000)
-
-	schemaDir := newSchemaDir(t)
-	writeExistingTablesSchema(t, schemaDir)
-
-	e2eutil.WriteFile(t, filepath.Join(schemaDir, tableName+".sql"), fmt.Sprintf(`
-CREATE TABLE %s (
-    id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    name VARCHAR(255) NOT NULL,
-    value DECIMAL(20, 4),
-    recorded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_name (name),
-    INDEX idx_recorded (recorded_at)
-);
-`, tableName))
-
-	out := e2eutil.RunCLIInDir(t, binPath, schemaDir, "apply", "-s", ".", "-e", "staging", "--endpoint", endpoint, "-y", "--defer-cutover", "--watch=false", "-o", "json")
-	applyID := extractApplyID(t, out)
-
-	waitForTableInProgress(t, binPath, schemaDir, endpoint, applyID, tableName, 10*time.Second)
-	testutil.WaitForAnyState(t, endpoint, applyID, []string{state.Apply.Running, state.Apply.WaitingForCutover, state.Apply.Completed}, 10*time.Second)
-
-	// Try volume adjustment while copy is in progress (not when waiting for cutover)
-	// Volume adjustment during "Waiting for cutover" stops but can't restart properly
-	prog, _ := testutil.FetchProgress(endpoint, applyID)
-	if prog != nil && prog.State == state.Apply.Running {
-		volumeOut, volumeErr := e2eutil.RunCLIWithErrorInDir(t, binPath, schemaDir, "volume", applyID, "-e", "staging", "-v", "8", "--endpoint", endpoint, "--watch=false")
-		if volumeErr == nil {
-			t.Logf("Volume adjustment succeeded: %s", volumeOut)
-		} else {
-			t.Logf("Volume adjustment skipped or failed: %v (output: %s)", volumeErr, volumeOut)
-		}
-	}
-
-	// Complete the apply using the cleanup helper which handles all states
-	ensureNoActiveChange(t, endpoint)
 }
 
 // =============================================================================
@@ -1304,7 +1221,7 @@ func TestLocal_Demo_FullValidation(t *testing.T) {
 	require.Equalf(t, http.StatusOK, resp.StatusCode, "SchemaBot health check failed")
 
 	schemabotDSN := mysqlDSN(t)
-	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "connect to schemabot MySQL")
 	defer utils.CloseAndLog(schemabotDB)
 
@@ -1320,7 +1237,7 @@ func TestLocal_Demo_FullValidation(t *testing.T) {
 	}
 
 	stagingDSN := testappStagingDSN(t)
-	stagingDB, err := sql.Open("mysql", stagingDSN)
+	stagingDB, err := sql.Open("block-mysql", stagingDSN)
 	require.NoError(t, err, "connect to staging MySQL")
 	defer utils.CloseAndLog(stagingDB)
 
@@ -1342,7 +1259,7 @@ func TestLocal_Demo_FullValidation(t *testing.T) {
 		}
 
 		productionDSN := testappProductionDSN(t)
-		productionDB, err := sql.Open("mysql", productionDSN)
+		productionDB, err := sql.Open("block-mysql", productionDSN)
 		require.NoError(t, err, "connect to production MySQL")
 		defer utils.CloseAndLog(productionDB)
 

@@ -30,12 +30,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/block/schemabot/pkg/ddl"
 	localscaleschema "github.com/block/schemabot/pkg/localscale/schema"
@@ -117,6 +118,14 @@ type Server struct {
 	// goroutines with artificial delays to exit promptly during shutdown.
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
+
+	// ready reports whether the managed clusters finished coming up. The HTTP
+	// listener has to start before that work completes, because the readiness
+	// check itself queries the cluster through it — so /health answers for the
+	// cluster, not for the listener, and callers that gate on it (container wait
+	// strategies, compose healthchecks, kubelet probes) do not start work
+	// against a cluster that cannot serve it yet.
+	ready atomic.Bool
 
 	// Artificial delays for realistic demo rendering.
 	branchCreationDelay   time.Duration
@@ -229,7 +238,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 			vtgateDBs := make(map[string]*sql.DB)
 			for _, ks := range dbCfg.Keyspaces {
 				dsn := fmt.Sprintf("root@tcp(%s)/%s", mc.vtgateMySQLAddr, ks.Name)
-				db, err := sql.Open("mysql", dsn)
+				db, err := sql.Open("block-mysql", dsn)
 				if err != nil {
 					closeDatabaseBackend(vtctld, vtgateDBs)
 					return nil, fmt.Errorf("connect to vtgate keyspace %s (%s/%s): %w", ks.Name, orgName, dbName, err)
@@ -243,7 +252,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 			}
 
 			// Create unscoped vtgate DB pool (no default keyspace) for shard-targeted connections.
-			unscopedDB, err := sql.Open("mysql", fmt.Sprintf("root@tcp(%s)/", mc.vtgateMySQLAddr))
+			unscopedDB, err := sql.Open("block-mysql", fmt.Sprintf("root@tcp(%s)/", mc.vtgateMySQLAddr))
 			if err != nil {
 				closeDatabaseBackend(vtctld, vtgateDBs)
 				return nil, fmt.Errorf("connect unscoped vtgate for %s/%s: %w", orgName, dbName, err)
@@ -440,12 +449,13 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 
 	// Wait for Vitess's online DDL executor to be ready in each keyspace.
 	// The executor requires per-shard sidecar databases to be initialized before
-	// it can process migrations. By waiting here, /health only returns 200 after
-	// DDL submissions will succeed.
+	// it can process DDL. Marking the server ready only after this is what makes
+	// /health mean "DDL submissions will succeed" rather than "the port is open".
 	if err := s.waitForOnlineDDLReady(ctx); err != nil {
 		s.Close()
 		return nil, fmt.Errorf("wait for online DDL readiness: %w", err)
 	}
+	s.ready.Store(true)
 
 	cfg.Logger.Info("localscale server started", "url", s.baseURL)
 	success = true
@@ -790,7 +800,7 @@ func (s *Server) vitessSchemaChangeDiagnostics(ctx context.Context) ([]string, e
 					status := colMap["migration_status"]
 					switch status {
 					case state.Vitess.Complete, state.Vitess.Failed, state.Vitess.Cancelled:
-						s.logger.Debug("terminal Vitess schema change omitted from reset diagnostics", "keyspace", keyspace, "uuid", colMap["uuid"], "status", status)
+						s.logger.Debug("terminal Vitess schema change omitted from reset diagnostics", "keyspace", keyspace, "uuid", colMap["uuid"], "vitess_status", status)
 						continue
 					}
 					result = append(result, fmt.Sprintf("keyspace=%s uuid=%s status=%s context=%s message=%s",
@@ -1334,6 +1344,10 @@ func (s *Server) handleError(fn func(http.ResponseWriter, *http.Request) error) 
 func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// Health endpoint
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+		if !s.ready.Load() {
+			http.Error(w, "managed clusters are still starting", http.StatusServiceUnavailable)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	})
 
@@ -1370,7 +1384,6 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/deploy-requests/{number}/apply-deploy", s.handleError(s.handleApplyDeployRequest))
 	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/deploy-requests/{number}/revert", s.handleError(s.handleRevertDeployRequest))
 	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/deploy-requests/{number}/skip-revert", s.handleError(s.handleSkipRevertDeployRequest))
-	mux.HandleFunc("PUT /v1/organizations/{org}/databases/{db}/deploy-requests/{number}/throttle", s.handleError(s.handleThrottleDeployRequest))
 
 	// Deploy request CRUD endpoints
 	mux.HandleFunc("GET /v1/organizations/{org}/databases/{db}/deploy-requests/{number}", s.handleError(s.handleGetDeployRequest))

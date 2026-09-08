@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"golang.org/x/net/html"
+
+	"github.com/block/schemabot/pkg/apitypes"
 )
 
 // authTransport injects a Bearer token on outbound requests when one is
@@ -37,16 +39,21 @@ var webhookOpsHTTPClient = &http.Client{Timeout: 15 * time.Minute, Transport: au
 // sourced from an environment variable or file does not break the header.
 func SetAuthToken(token string) {
 	authTransport.token = strings.TrimSpace(token)
+	authTransport.origin = ""
 }
 
 // bearerTransport sets "Authorization: Bearer <token>" on each request when a
 // token is configured and the header is not already set.
 type bearerTransport struct {
-	base  http.RoundTripper
-	token string
+	base   http.RoundTripper
+	token  string
+	origin string
 }
 
 func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.origin != "" && req.URL.Scheme+"://"+req.URL.Host != t.origin {
+		return nil, fmt.Errorf("refusing to forward local runtime credentials to another endpoint")
+	}
 	if t.token != "" && req.Header.Get("Authorization") == "" {
 		if err := guardInsecureToken(req.URL); err != nil {
 			return nil, err
@@ -88,10 +95,22 @@ type APIError struct {
 	Status    int    // HTTP status code (e.g., 404, 500)
 	ErrorCode string // Error code from API response (e.g., "not_found", "storage_error")
 	Message   string
+
+	// RetryAfterSeconds is the delay the server asked the client to wait, set
+	// only on responses that advertise one. Read it through RetryAfter rather
+	// than on its own, so a retry is never scheduled without it.
+	RetryAfterSeconds int
 }
 
 func (e *APIError) Error() string {
 	return e.Message
+}
+
+// RetryAfter reports whether this request should be retried and how long to
+// wait first, so a caller automating against the API gets both facts from one
+// call instead of retrying on the code and ignoring the delay.
+func (e *APIError) RetryAfter() (retry bool, after time.Duration) {
+	return apitypes.ErrorResponse{ErrorCode: e.ErrorCode, RetryAfterSeconds: e.RetryAfterSeconds}.RetryAfter()
 }
 
 // IsNotFound reports whether the error is a 404 from the API.
@@ -266,17 +285,18 @@ func stripHTMLTags(s string) string {
 }
 
 // parseAPIError builds an APIError from a non-200 HTTP response, extracting
-// the error_code if present in the JSON body.
+// the error_code and any advertised retry delay from the JSON body. The delay
+// is read from the body rather than the Retry-After header because this client
+// keeps error bodies and discards responses.
 func parseAPIError(statusCode int, body []byte) *APIError {
 	apiErr := &APIError{
 		Status:  statusCode,
 		Message: FormatAPIError(statusCode, body),
 	}
-	var resp struct {
-		ErrorCode string `json:"error_code"`
-	}
-	if json.Unmarshal(body, &resp) == nil && resp.ErrorCode != "" {
+	var resp apitypes.ErrorResponse
+	if json.Unmarshal(body, &resp) == nil {
 		apiErr.ErrorCode = resp.ErrorCode
+		apiErr.RetryAfterSeconds = resp.RetryAfterSeconds
 	}
 	return apiErr
 }
@@ -345,3 +365,6 @@ func FormatAPIError(statusCode int, body []byte) string {
 	}
 	return fmt.Sprintf("HTTP %d: %s", statusCode, bodyStr)
 }
+
+// SetLocalAuth binds the private runtime credential to its verified endpoint.
+func SetLocalAuth(token, endpoint string) { SetAuthToken(token); authTransport.origin = endpoint }

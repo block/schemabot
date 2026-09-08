@@ -326,7 +326,8 @@ func TestHandleRollbackConfirmAlreadyRolledBackReleasesLock(t *testing.T) {
 	assert.Contains(t, body, "`orders`")
 	assert.Contains(t, body, "Lock released")
 	assert.NotContains(t, body, "failed to release")
-	assert.Equal(t, []string{"orders"}, locks.released)
+	assert.Equal(t, []string{rollbackPendingPlanID("rollback-plan-noop")}, locks.releasedIfPending,
+		"the release must be conditioned on the pinned rollback plan so a superseding same-owner intent stays intact")
 }
 
 // TestHandleRollbackConfirmAlreadyRolledBackLockReleaseFails verifies that
@@ -352,7 +353,7 @@ func TestHandleRollbackConfirmAlreadyRolledBackLockReleaseFails(t *testing.T) {
 	assert.Contains(t, body, "schemabot unlock")
 	assert.Contains(t, body, "schemabot unlock -d orders --force")
 	assert.NotContains(t, body, "Lock released")
-	assert.Empty(t, locks.released, "failed release must not be recorded as released")
+	assert.Empty(t, locks.releasedIfPending, "failed release must not be recorded as released")
 
 	logs := logBuf.String()
 	assert.Contains(t, logs, "failed to release the database lock")

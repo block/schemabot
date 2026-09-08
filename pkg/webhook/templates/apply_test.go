@@ -32,6 +32,9 @@ func TestRenderApplyBlockedByCLILockUsesValidUnlockCommand(t *testing.T) {
 
 	assert.Contains(t, rendered, "schemabot unlock -d example-db --force")
 	assert.NotContains(t, rendered, "schemabot unlock -d example-db -e staging --force")
+	assert.Contains(t, rendered, "**Locked by**: `cli:testuser`")
+	assert.NotContains(t, rendered, "example.local",
+		"the lock owner's machine is internal detail and stays out of PR markdown")
 }
 
 func TestRenderApplyCommentsIncludeEnvironmentInTitle(t *testing.T) {
@@ -51,7 +54,7 @@ func TestRenderApplyCommentsIncludeEnvironmentInTitle(t *testing.T) {
 		rendered := RenderApplyBlockedByPriorEnv("testapp", "production", "staging", "has pending changes", "Apply staging first")
 		firstLine, _, _ := strings.Cut(rendered, "\n")
 
-		assert.Equal(t, "## ❌ Apply Blocked — Production", firstLine)
+		assert.Equal(t, "## ⛔ Apply Blocked — Production", firstLine)
 	})
 }
 
@@ -65,7 +68,7 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "drop column",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\""},
 			},
 			want:   "the dropped column",
 			wantOK: true,
@@ -73,7 +76,7 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "multiple drop columns",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`; Unsafe operation detected: DROP COLUMN `legacy_code`"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\"; Unsafe operation detected: \"DROP COLUMN `legacy_code`\""},
 			},
 			want:   "any dropped columns",
 			wantOK: true,
@@ -81,7 +84,7 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "drop table",
 			changes: []UnsafeChangeData{
-				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+				{Table: "archived_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
 			},
 			want:   "the dropped table",
 			wantOK: true,
@@ -89,8 +92,8 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "multiple drop tables",
 			changes: []UnsafeChangeData{
-				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
-				{Table: "legacy_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+				{Table: "archived_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
+				{Table: "legacy_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
 			},
 			want:   "any dropped tables",
 			wantOK: true,
@@ -98,8 +101,8 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "drop column and table",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`"},
-				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\""},
+				{Table: "archived_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
 			},
 			want:   "the dropped table and column",
 			wantOK: true,
@@ -107,8 +110,8 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "multiple drop columns and one drop table",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`; Unsafe operation detected: DROP COLUMN `legacy_code`"},
-				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\"; Unsafe operation detected: \"DROP COLUMN `legacy_code`\""},
+				{Table: "archived_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
 			},
 			want:   "the dropped table and any dropped columns",
 			wantOK: true,
@@ -116,9 +119,9 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "multiple drop tables and one drop column",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`"},
-				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
-				{Table: "legacy_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\""},
+				{Table: "archived_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
+				{Table: "legacy_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
 			},
 			want:   "any dropped tables and the dropped column",
 			wantOK: true,
@@ -126,9 +129,9 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "multiple drop columns and tables",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`; Unsafe operation detected: DROP COLUMN `legacy_code`"},
-				{Table: "archived_orders", Reason: "Unsafe operation detected: DROP TABLE"},
-				{Table: "legacy_orders", Reason: "Unsafe operation detected: DROP TABLE"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\"; Unsafe operation detected: \"DROP COLUMN `legacy_code`\""},
+				{Table: "archived_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
+				{Table: "legacy_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
 			},
 			want:   "any dropped tables or columns",
 			wantOK: true,
@@ -136,7 +139,7 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 		{
 			name: "other unsafe change",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: MODIFY COLUMN"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"MODIFY COLUMN\""},
 			},
 			wantOK: false,
 		},
@@ -150,6 +153,85 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+// A table that has finished copying drains the changes that accumulated on the
+// source during the copy. It is a table-level state: the apply header stays
+// "In Progress" while the per-table line and summary name the catch-up phase,
+// since on a busy table it can run for hours — a plain full bar would read as
+// a copy that is quietly done.
+func TestRenderApplyStatusComment_CatchingUp(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       "running",
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: "catching_up", RowsCopied: 1466232, RowsTotal: 1466232, PercentComplete: 100},
+			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: "pending"},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "## Schema Change Status", "apply stays in progress; catching up is table-level")
+	assert.Contains(t, result, "**`orders`**")
+	assert.Contains(t, result, "⏩ Catching up on accumulated changes...")
+	assert.Contains(t, result, "Rows copied: 1,466,232")
+	assert.Contains(t, result, "1 catching up")
+}
+
+// The raw Spirit phase names reach the renderer when a stored task predates
+// normalization; each drain renders its own named phase, not an unknown
+// state.
+func TestRenderApplyStatusComment_DrainPhasesFromRawSpiritState(t *testing.T) {
+	for raw, wantLine := range map[string]string{
+		"applyChangeset": "⏩ Catching up on accumulated changes...",
+		"postChecksum":   "⏩ Data verified, applying final changes...",
+	} {
+		data := ApplyStatusCommentData{
+			Database:    "testapp",
+			Environment: "staging",
+			RequestedBy: "aparajon",
+			State:       "running",
+			Engine:      "Spirit",
+			Tables: []TableProgressData{
+				{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: raw, RowsCopied: 1466232, RowsTotal: 1466232, PercentComplete: 100},
+			},
+		}
+
+		result := RenderApplyStatusComment(data)
+
+		assert.Contains(t, result, wantLine, "raw state %q should render its drain phase", raw)
+	}
+}
+
+// After the checksum passes, the engine drains the changes that accumulated
+// during the verify. It is a table-level state: the apply header stays
+// "In Progress" while the per-table line names the post-checksum drain — and
+// never rewinds to an indeterminate checksum that already finished.
+func TestRenderApplyStatusComment_PostChecksum(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       "running",
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: "post_checksum", RowsCopied: 1466232, RowsTotal: 1466232, PercentComplete: 100},
+			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: "pending"},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "## Schema Change Status", "apply stays in progress; the post-checksum drain is table-level")
+	assert.Contains(t, result, "**`orders`**")
+	assert.Contains(t, result, "⏩ Data verified, applying final changes...")
+	assert.Contains(t, result, "Rows copied: 1,466,232")
+	assert.Contains(t, result, "1 catching up")
+	assert.NotContains(t, result, "Checksumming to verify data")
 }
 
 // A table that has finished copying enters the checksum phase, where the engine
@@ -173,9 +255,88 @@ func TestRenderApplyStatusComment_Checksumming(t *testing.T) {
 
 	assert.Contains(t, result, "## Schema Change Status", "apply stays in progress; checksumming is table-level")
 	assert.Contains(t, result, "**`orders`**")
-	assert.Contains(t, result, "🔍 Checksumming to verify data (21%)")
+	assert.Contains(t, result, "🔍 Checksumming to verify data (21.92%)")
 	assert.Contains(t, result, "Rows verified: 321,450 / 1,466,232")
 	assert.Contains(t, result, "1 checksumming")
+}
+
+// A table slowed by the engine's throttler carries a "(throttled)" annotation
+// on its header line — right where the eye checks progress — with the trigger
+// explained in a tooltip bullet, so a slow bar reads as deliberate backpressure
+// (e.g. thread pressure) rather than a hang. The reason is sanitized at the
+// engine boundary, and the annotation renders only on active tables — a
+// throttled flag on a terminal table would be stale. Composite reasons join
+// their tips, and a reason with an unrecognized signal renders raw with no tip.
+func TestRenderApplyStatusComment_Throttled(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       "running",
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: "running",
+				RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
+				Throttled: true, ThrottleReason: "redo-aware 4 > 3"},
+			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: "pending"},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "45.00% (throttled)",
+		"the annotation lands on the header line next to the percent")
+	assert.Contains(t, result, "- ℹ️ _Throttled: redo-aware 4 > 3 · backing off while the database's active threads exceed its budget ([docs](https://github.com/block/schemabot/blob/main/docs/throttle.md))_",
+		"the reason renders as a tooltip bullet with its tip and the doc link")
+
+	data.Tables[0].ThrottleReason = "redo-aware 4 > 3; commit-latency 112.4ms >= 100ms"
+	composite := RenderApplyStatusComment(data)
+	assert.Contains(t, composite, "- ℹ️ _Throttled: redo-aware 4 > 3; commit-latency 112.4ms >= 100ms · backing off while the database's active threads exceed its budget; backing off while database writes commit slowly ([docs](https://github.com/block/schemabot/blob/main/docs/throttle.md))_",
+		"concurrently-throttling signals join their tips in reason order")
+
+	data.Tables[0].ThrottleReason = "commit-latency 112.4ms >= `100ms` [gradual]"
+	escapedWithTip := RenderApplyStatusComment(data)
+	assert.Contains(t, escapedWithTip, "- ℹ️ _Throttled: commit-latency 112.4ms >= \\`100ms\\` \\[gradual\\] · backing off while database writes commit slowly ([docs](https://github.com/block/schemabot/blob/main/docs/throttle.md))_",
+		"a recognized reason is escaped before its tip is appended")
+
+	data.Tables[0].ThrottleReason = ""
+	noReason := RenderApplyStatusComment(data)
+	assert.Contains(t, noReason, "45.00% (throttled)")
+	assert.NotContains(t, noReason, "ℹ️ Throttled", "no tooltip without a reason")
+
+	data.Tables[0].Throttled = false
+	notThrottled := RenderApplyStatusComment(data)
+	assert.NotContains(t, notThrottled, "(throttled)")
+	assert.NotContains(t, notThrottled, "Throttled")
+
+	data.Tables[0].Throttled = true
+	data.Tables[0].ThrottleReason = "signal_a 1_000ms >= `500ms` [gradual]"
+	escaped := RenderApplyStatusComment(data)
+	assert.Contains(t, escaped, "- ℹ️ _Throttled: signal\\_a 1\\_000ms >= \\`500ms\\` \\[gradual\\]_",
+		"markdown delimiters in an unrecognized reason are escaped and render with no tip")
+}
+
+// A throttled checksum verify carries the same header annotation and tooltip
+// alongside the verify progress, since the checksum is the other phase the
+// engine's throttler paces.
+func TestRenderApplyStatusComment_ThrottledChecksumming(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       "running",
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: "checksumming",
+				ChecksumRowsChecked: 321450, ChecksumRowsTotal: 1466232,
+				Throttled: true, ThrottleReason: "threads-running 21 > 18"},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "🔍 Checksumming to verify data (21.92%) (throttled)")
+	assert.Contains(t, result, "- ℹ️ _Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget ([docs](https://github.com/block/schemabot/blob/main/docs/throttle.md))_")
 }
 
 func TestUnsafeDropIndexUsageTargets(t *testing.T) {
@@ -190,7 +351,7 @@ func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 		{
 			name: "drop index",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP INDEX `idx_customers_email`"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\""},
 			},
 			wantActionTarget:    "an index",
 			wantInvisibleTarget: "the dropped index",
@@ -200,7 +361,7 @@ func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 		{
 			name: "multiple drop indexes",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP INDEX `idx_customers_email`; Unsafe operation detected: DROP INDEX `idx_customers_phone`"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\"; Unsafe operation detected: \"DROP INDEX `idx_customers_phone`\""},
 			},
 			wantActionTarget:    "indexes",
 			wantInvisibleTarget: "any dropped indexes",
@@ -210,7 +371,7 @@ func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 		{
 			name: "drop index with drop column",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`; Unsafe operation detected: DROP INDEX `idx_customers_email`"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\"; Unsafe operation detected: \"DROP INDEX `idx_customers_email`\""},
 			},
 			wantActionTarget:    "an index",
 			wantInvisibleTarget: "the dropped index",
@@ -220,7 +381,7 @@ func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 		{
 			name: "other unsafe change",
 			changes: []UnsafeChangeData{
-				{Table: "customers", Reason: "Unsafe operation detected: MODIFY COLUMN"},
+				{Table: "customers", Reason: "Unsafe operation detected: \"MODIFY COLUMN\""},
 			},
 			wantOK: false,
 		},
@@ -254,7 +415,7 @@ func TestRenderUnsafeChangesBlockedIncludesDropIndexGuidance(t *testing.T) {
 		},
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "customers", Reason: "Unsafe operation detected: DROP COLUMN `nickname`; Unsafe operation detected: DROP INDEX `idx_customers_email`"},
+			{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\"; Unsafe operation detected: \"DROP INDEX `idx_customers_email`\""},
 		},
 	})
 
@@ -279,7 +440,7 @@ func TestRenderUnsafeChangesBlockedUsesPluralMySQLDropIndexGuidance(t *testing.T
 		},
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "customers", Reason: "Unsafe operation detected: DROP INDEX `idx_customers_email`; Unsafe operation detected: DROP INDEX `idx_customers_phone`"},
+			{Table: "customers", Reason: "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\"; Unsafe operation detected: \"DROP INDEX `idx_customers_phone`\""},
 		},
 	})
 
@@ -302,7 +463,7 @@ func TestRenderUnsafeChangesBlockedDoesNotMentionInvisibleIndexesForVitess(t *te
 		},
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "customers", Reason: "Unsafe operation detected: DROP INDEX `idx_customers_email`"},
+			{Table: "customers", Reason: "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\""},
 		},
 	})
 
@@ -337,7 +498,7 @@ func TestRenderApplyStatusComment_Running(t *testing.T) {
 	assert.NotContains(t, result, "**Last updated**")
 	// Progress summary
 	assert.Contains(t, result, "📊 1/3 complete")
-	assert.Contains(t, result, "1 running (45%)")
+	assert.Contains(t, result, "1 running (45.00%)")
 	assert.Contains(t, result, "1 queued")
 	assert.Contains(t, result, "**`users`**")
 
@@ -347,49 +508,13 @@ func TestRenderApplyStatusComment_Running(t *testing.T) {
 	assert.Contains(t, result, "🟩") // green bar for completed
 
 	assert.Contains(t, result, "**`users`**")
-	assert.Contains(t, result, "45%")
+	assert.Contains(t, result, "45.00%")
 	assert.Contains(t, result, "🟦") // blue bar for running
 	assert.Contains(t, result, "45,000 / 100,000")
 	assert.Contains(t, result, "ETA: 3m 15s")
 
 	assert.Contains(t, result, "**`products`**")
 	assert.Contains(t, result, "Queued")
-}
-
-// TestRenderApplyStatusComment_Volume verifies that a running apply with a
-// volume level set on its stored options shows the level compactly on the
-// Status line, and that an apply without a level (engine default) renders no
-// volume text at all.
-func TestRenderApplyStatusComment_Volume(t *testing.T) {
-	newData := func(applyState, tableStatus string, volume int) ApplyStatusCommentData {
-		return ApplyStatusCommentData{
-			Database:    "testapp",
-			Environment: "staging",
-			RequestedBy: "aparajon",
-			State:       applyState,
-			Engine:      "Spirit",
-			Volume:      volume,
-			Tables: []TableProgressData{
-				{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: tableStatus, RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45},
-			},
-		}
-	}
-
-	t.Run("running apply with volume shows level on the status line", func(t *testing.T) {
-		result := RenderApplyStatusComment(newData("running", "running", 8))
-		assert.Contains(t, result, "**Status**: In Progress | Volume: 8/11")
-	})
-
-	t.Run("running apply without volume renders no volume text", func(t *testing.T) {
-		result := RenderApplyStatusComment(newData("running", "running", 0))
-		assert.Contains(t, result, "**Status**: In Progress")
-		assert.NotContains(t, result, "Volume")
-	})
-
-	t.Run("stopped apply with volume renders no volume text", func(t *testing.T) {
-		result := RenderApplyStatusComment(newData("stopped", "stopped", 8))
-		assert.NotContains(t, result, "Volume")
-	})
 }
 
 // A Vitess/PlanetScale apply labels its namespace group "Keyspace" (not "Schema"),
@@ -485,24 +610,35 @@ func TestRenderApplyStatusComment_VSchema(t *testing.T) {
 func TestRenderApplyStatusComment_ShardSummary(t *testing.T) {
 	withTemplateTimestamp(t, "2026-06-16 19:42:00 UTC")
 
-	// Inline: ≤8 shards list each shard's status; only the copying shard shows a percent.
+	// Inline: ≤8 shards list each shard's status; only the copying shard shows a
+	// percent, and glyphs that aren't self-evident carry the bucketed form's word.
 	inline := RenderApplyStatusComment(ApplyStatusCommentData{
 		Database: "shop", Environment: "staging", State: "running", Engine: "Vitess",
 		Tables: []TableProgressData{{
 			TableName: "users", Status: "running", PercentComplete: 50,
 			Shards: []ShardProgressData{
-				{Shard: "-80", Status: "completed", PercentComplete: 100},
+				{Shard: "-40", Status: "completed", PercentComplete: 100},
+				{Shard: "40-80", Status: "running"},
 				{Shard: "80-c0", Status: "running", PercentComplete: 45},
-				{Shard: "c0-", Status: "waiting_for_cutover", PercentComplete: 100},
+				{Shard: "c0-e0", Status: "failed"},
+				{Shard: "e0-", Status: "waiting_for_cutover", PercentComplete: 100},
 			},
 		}},
 	})
 	assert.Contains(t, inline, "shards:")
-	assert.Contains(t, inline, "✓ -80")
+	// A completed shard's glyph is self-evident — bare, no word before the
+	// separator.
+	assert.Contains(t, inline, "✓ -40 ·")
 	assert.Contains(t, inline, "◐ 80-c0 45%")
-	// A shard ready for cutover shows ● and no percent (it is no longer copying).
-	assert.Contains(t, inline, "● c0-")
-	assert.NotContains(t, inline, "● c0- 100%")
+	// A copying shard that has not reported progress yet reads "copying"
+	// instead of a misleading 0%.
+	assert.Contains(t, inline, "◐ 40-80 copying")
+	assert.NotContains(t, inline, "◐ 40-80 0%")
+	assert.Contains(t, inline, "✗ c0-e0 failed")
+	// A shard waiting for cutover reads "ready" with no percent (it is no
+	// longer copying).
+	assert.Contains(t, inline, "● e0- ready")
+	assert.NotContains(t, inline, "● e0- 100%")
 
 	// Collapsed: >8 shards bucket by state and name the slowest copier.
 	many := make([]ShardProgressData, 0, 12)
@@ -621,7 +757,12 @@ func TestRenderApplyStatusComment_DeployRequestLink(t *testing.T) {
 	assert.NotContains(t, RenderApplyStatusComment(base), "Deploy request:")
 }
 
-func TestRenderApplyStatusComment_RowCopyDisplaysOnePercentAfterCopyStarts(t *testing.T) {
+// A copy that has begun but not yet reached 1% shows the true fraction
+// computed from the row counts — in the running summary and on the table's
+// progress line — so early progress on a huge table reads as the small
+// fraction it is instead of a rounded-up 1%. The bar still lights its first
+// segment so the copy reads as started.
+func TestRenderApplyStatusComment_SubPercentRowCopyShowsFraction(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:    "testapp",
 		Environment: "staging",
@@ -636,8 +777,8 @@ func TestRenderApplyStatusComment_RowCopyDisplaysOnePercentAfterCopyStarts(t *te
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "1 running (1%)")
-	assert.Contains(t, result, "**`orders`**: "+ui.ProgressBarRowCopy(1)+" 1%")
+	assert.Contains(t, result, "1 running (0.19%)")
+	assert.Contains(t, result, "**`orders`**: "+ui.ProgressBarRowCopy(1)+" 0.19%")
 	assert.Contains(t, result, "Rows: 3,000 / 1,604,159")
 	assert.NotContains(t, result, " 0%")
 }
@@ -791,17 +932,114 @@ func TestRenderApplyStatusComment_Failed(t *testing.T) {
 
 	assert.Contains(t, result, "## Schema Change Status — Staging")
 	assert.Contains(t, result, "**Status**: Failed")
-	assert.Contains(t, result, "⚠️ **Error:**")
+	assert.Contains(t, result, "❌ **Error:**")
 	assert.Contains(t, result, "lock wait timeout exceeded")
 	assert.Contains(t, result, "🟥") // red bar for failed table
 	assert.Contains(t, result, "❌ Failed")
-	assert.Contains(t, result, "⊘ Cancelled (not started)")
+	assert.Contains(t, result, "🚫 Cancelled (not started)")
 	// Progress summary
 	assert.Contains(t, result, "📊 1/3 complete")
 	assert.Contains(t, result, "1 failed")
 	assert.Contains(t, result, "1 cancelled")
 	assert.Contains(t, result, "To retry:")
 	assert.Contains(t, result, "schemabot apply -e staging")
+}
+
+// A schema change the engine rejected before copying a single row (e.g. a
+// failed preflight check) must not render a progress bar: a red 0% bar reads
+// as a copy that started and stalled, when in fact nothing ran. The row reads
+// as a failed check instead.
+func TestRenderApplyStatusComment_FailedBeforeRowCopyHasNoProgressBar(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "qa",
+		State:       state.Apply.Failed,
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{
+				TableName: "profiles",
+				DDL:       "ALTER TABLE `profiles` MODIFY COLUMN `consent_version` enum('V1','V2') NULL",
+				Status:    state.Task.Failed,
+			},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "**`profiles`**: ❌ Failed (before row copy started)")
+	assert.NotContains(t, result, "🟥", "no red bar segments for a copy that never started")
+	assert.NotContains(t, result, "⬜", "no empty bar segments for a copy that never started")
+}
+
+// An instant DDL change has no row copy phase, so its failure renders a plain
+// failed label — no progress bar, and no mention of row copy.
+func TestRenderApplyStatusComment_FailedInstantDDLHasPlainLabel(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "qa",
+		State:       state.Apply.Failed,
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{
+				TableName: "profiles",
+				DDL:       "ALTER TABLE `profiles` ADD COLUMN `nickname` VARCHAR(64) NULL",
+				Status:    state.Task.Failed,
+				IsInstant: true,
+			},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "**`profiles`**: ❌ Failed\n")
+	assert.NotContains(t, result, "(before row copy started)", "instant DDL has no row copy phase to reference")
+	assert.NotContains(t, result, "🟥")
+	assert.NotContains(t, result, "⬜")
+}
+
+// A failure after row copy made progress keeps the red progress bar: the bar
+// truthfully shows how far the copy got before the engine gave up.
+func TestRenderApplyStatusComment_FailedAfterCopyProgressKeepsBar(t *testing.T) {
+	tests := []struct {
+		name  string
+		table TableProgressData
+	}{
+		{
+			name: "percent reported",
+			table: TableProgressData{
+				TableName:       "users",
+				Status:          state.Task.Failed,
+				PercentComplete: 30,
+				RowsCopied:      300,
+				RowsTotal:       1000,
+			},
+		},
+		{
+			name: "rows copied but percent still zero",
+			table: TableProgressData{
+				TableName:  "users",
+				Status:     state.Task.Failed,
+				RowsCopied: 42,
+				RowsTotal:  1000000,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := ApplyStatusCommentData{
+				Database:    "testapp",
+				Environment: "staging",
+				State:       state.Apply.Failed,
+				Tables:      []TableProgressData{tt.table},
+			}
+
+			result := RenderApplyStatusComment(data)
+
+			assert.Contains(t, result, "❌ Failed")
+			assert.NotContains(t, result, "(before row copy started)")
+			assert.Contains(t, result, "🟥", "failed bar shows the progress the copy actually made")
+		})
+	}
 }
 
 func TestTerminalStatusAndSummaryCommentTitlesAreDistinct(t *testing.T) {
@@ -820,6 +1058,66 @@ func TestTerminalStatusAndSummaryCommentTitlesAreDistinct(t *testing.T) {
 
 	assert.Equal(t, "## Schema Change Status — Staging", statusTitle)
 	assert.Equal(t, "## ❌ Schema Change Failed — Staging", summaryTitle)
+}
+
+// A failed table surfaces its own error below its row when that error adds
+// detail beyond the apply-level error block, so an operator reading a
+// multi-table failure can attribute each failure to its table. A table whose
+// error is identical to the apply-level message is not repeated below the row
+// — the block above the table list already carries it.
+func TestRenderApplyStatusComment_FailedTableErrorLine(t *testing.T) {
+	render := func(applyError, tableError string, percentComplete int) string {
+		return RenderApplyStatusComment(ApplyStatusCommentData{
+			Database:     "testapp",
+			Environment:  "staging",
+			State:        state.Apply.Failed,
+			Engine:       "Spirit",
+			ApplyID:      "apply-abc123",
+			ErrorMessage: applyError,
+			Tables: []TableProgressData{{
+				TableName:       "users",
+				DDL:             "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+				Status:          state.Task.Failed,
+				PercentComplete: percentComplete,
+				ErrorMessage:    tableError,
+			}},
+		})
+	}
+
+	t.Run("table error distinct from apply error renders below the row", func(t *testing.T) {
+		result := render("1 of 2 tables failed", "preflight enumReorder check failed", 35)
+		assert.Contains(t, result, "> ❌ **Error:** 1 of 2 tables failed")
+		assert.Contains(t, result, "> ❌ Last error: preflight enumReorder check failed")
+	})
+
+	t.Run("table error identical to apply error is not repeated", func(t *testing.T) {
+		result := render("preflight enumReorder check failed", "preflight enumReorder check failed", 35)
+		assert.Contains(t, result, "> ❌ **Error:** preflight enumReorder check failed")
+		assert.NotContains(t, result, "> ❌ Last error:")
+		assert.Equal(t, 1, strings.Count(result, "preflight enumReorder check failed"))
+	})
+
+	t.Run("table without an error renders no error line", func(t *testing.T) {
+		result := render("apply-level failure", "", 35)
+		assert.NotContains(t, result, "> ❌ Last error:")
+	})
+
+	t.Run("table error differing only by whitespace is not repeated", func(t *testing.T) {
+		result := render("preflight enumReorder check failed", "preflight enumReorder check failed\n", 35)
+		assert.NotContains(t, result, "> ❌ Last error:")
+	})
+
+	t.Run("all-whitespace table error renders no error line", func(t *testing.T) {
+		result := render("apply-level failure", "  \n", 35)
+		assert.NotContains(t, result, "> ❌ Last error:")
+	})
+
+	t.Run("pre-copy failure renders error line without a progress bar", func(t *testing.T) {
+		result := render("1 of 2 tables failed", "preflight enumReorder check failed", 0)
+		assert.Contains(t, result, "**`users`**: ❌ Failed (before row copy started)")
+		assert.Contains(t, result, "> ❌ Last error: preflight enumReorder check failed")
+		assert.NotContains(t, result, "0%")
+	})
 }
 
 // A retryable failure is operator-recovery state, not a user-facing outcome:
@@ -867,6 +1165,44 @@ func TestRenderApplyStatusComment_FailedRetryable(t *testing.T) {
 	assert.Contains(t, result, "schemabot stop apply-abc123 -e staging")
 	assert.NotContains(t, result, "transient")
 	assert.NotContains(t, result, "schemabot apply -e staging")
+}
+
+// A remote data plane retries its failures on its own: the stored apply stays
+// active through the pause, so only the task rows carry it. The comment must
+// still read as Retrying — status line, table detail, and retry footer — but
+// without an attempt count, because the data plane's attempt number does not
+// cross the wire and the stored redispatch count is not it.
+func TestRenderApplyStatusComment_RemoteRetryablePauseDerivesRetryingFromTasks(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       state.Apply.Running,
+		Engine:      "Spirit",
+		ApplyID:     "apply-abc123",
+		Tables: []TableProgressData{
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: state.Task.Completed},
+			{
+				TableName:       "users",
+				DDL:             "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+				Status:          state.Task.FailedRetryable,
+				PercentComplete: 35,
+				ErrorMessage:    "failed to execute chunklet insert: Error 1041 (HY000): Out of memory",
+			},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "**Status**: Retrying")
+	assert.NotContains(t, result, "**Status**: In Progress")
+	assert.Contains(t, result, "🔄 Interrupted — retrying automatically\n")
+	assert.NotContains(t, result, "(attempt")
+	assert.Contains(t, result, "> ⚠️ Last error: failed to execute chunklet insert: Error 1041 (HY000): Out of memory")
+	assert.Contains(t, result, "1 retrying")
+	assert.Contains(t, result, "SchemaBot retries automatically and marks it failed if retries are exhausted")
+	assert.Contains(t, result, "schemabot stop apply-abc123 -e staging")
+	assert.NotContains(t, result, "To stop this schema change:")
 }
 
 // A retryable apply that has already been redispatched shows how much of the
@@ -972,12 +1308,15 @@ func TestRenderApplyStatusComment_Stopped(t *testing.T) {
 	assert.Contains(t, result, "## Schema Change Status — Staging")
 	assert.Contains(t, result, "**Status**: Stopped")
 	assert.Contains(t, result, "🟧") // orange bar for stopped
-	assert.Contains(t, result, "⏹️ Stopped at 72%")
+	assert.Contains(t, result, "⏹️ Stopped at 72.00%")
 	assert.Contains(t, result, "72,000 / 100,000")
 	// Progress summary
 	assert.Contains(t, result, "📊 1/2 complete")
 	assert.Contains(t, result, "1 stopped")
-	assert.Contains(t, result, "remote apply remote-123 remained stopped after start grace period 30s")
+	// The heading already says the apply is stopped, so the error is context
+	// with the attention glyph, not a fresh failure.
+	assert.Contains(t, result, "> ⚠️ **Error:** remote apply remote-123 remained stopped after start grace period 30s")
+	assert.NotContains(t, result, "❌")
 	assert.Contains(t, result, "schemabot start")
 }
 
@@ -1066,7 +1405,7 @@ func TestRenderApplyStatusComment_WaitingForCutoverAutomatic(t *testing.T) {
 		State:       state.Apply.WaitingForCutover,
 		Engine:      "PlanetScale",
 		Tables: []TableProgressData{
-			{TableName: "orders", Status: state.Task.WaitingForCutover, ReadyToComplete: true},
+			{TableName: "orders", Status: state.Task.WaitingForCutover},
 		},
 	}
 
@@ -1094,7 +1433,9 @@ func TestRenderApplyStatusComment_Recovering(t *testing.T) {
 
 	assert.Contains(t, result, "Recovering")
 	assert.Contains(t, result, "1 recovering")
-	assert.Contains(t, result, "Recovering state...")
+	// Recovery runs on its own — blue in-progress bar, not the yellow
+	// operator-attention bar.
+	assert.Contains(t, result, ui.ProgressBarActivity()+" Recovering state...")
 	assert.Contains(t, result, "Cutover will be available once recovery completes")
 	assert.NotContains(t, result, "schemabot cutover")
 }
@@ -1113,9 +1454,9 @@ func TestRenderApplyStatusComment_RecoveringCopyingRows(t *testing.T) {
 
 	result := RenderApplyStatusComment(data)
 
-	assert.Contains(t, result, "Row copy in progress (42%)")
+	assert.Contains(t, result, "Row copy in progress (42.00%)")
 	assert.Contains(t, result, "Rows: 420 / 1,000 · ETA: 2m")
-	assert.Contains(t, result, "Row copy is in progress (42%)")
+	assert.Contains(t, result, "Row copy is in progress (42.00%)")
 	assert.Contains(t, result, "progress returns to the normal row-copy view")
 	assert.Contains(t, result, "Recovering after restart")
 	assert.NotContains(t, result, "Cutover will be available once recovery completes")
@@ -1137,7 +1478,10 @@ func TestRenderApplyStatusComment_CuttingOver(t *testing.T) {
 	result := RenderApplyStatusComment(data)
 
 	assert.Contains(t, result, "Cutting Over")
-	assert.Contains(t, result, "Cutting over...")
+	// Cutover is automatic work: it renders the blue in-progress bar. Yellow
+	// is reserved for states where the operator holds the next move.
+	assert.Contains(t, result, ui.ProgressBarActivity()+" 🔄 Cutting over...")
+	assert.NotContains(t, result, ui.ProgressBarWaitingCutover()+" 🔄 Cutting over...")
 }
 
 func TestRenderApplyStatusComment_NoTables(t *testing.T) {
@@ -1200,6 +1544,23 @@ func TestRenderApplySummaryComment_StartedAtUsesApplyStart(t *testing.T) {
 
 	assert.Contains(t, result, "*Started at 2026-06-16 19:42:00 UTC*")
 	assert.NotContains(t, result, "*Started at 2026-06-16 20:00:00 UTC*")
+}
+
+// The duration is decoration: valid timestamps render it, and a completed
+// timestamp earlier than the started timestamp (bad data, clock skew) drops it
+// rather than rendering a negative duration.
+func TestRenderApplySummaryComment_Duration(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.Failed,
+		StartedAt:   "2026-06-16T19:42:00Z",
+		CompletedAt: "2026-06-16T19:59:00Z",
+	}
+	assert.Contains(t, RenderApplySummaryComment(data), "**Duration**: 17m")
+
+	data.CompletedAt = "2026-06-16T19:00:00Z"
+	assert.NotContains(t, RenderApplySummaryComment(data), "**Duration**:")
 }
 
 func TestRenderPRCommandNotAuthorized(t *testing.T) {
@@ -1297,9 +1658,8 @@ func TestApplyStatusFromProgress(t *testing.T) {
 	assert.Equal(t, "users", data.Tables[0].TableName)
 	assert.Equal(t, int64(5000), data.Tables[0].RowsCopied)
 	assert.Equal(t, 50, data.Tables[0].PercentComplete)
-	assert.False(t, data.Tables[0].ReadyToComplete, "a copying table is not ready for cutover")
 	assert.Equal(t, "orders", data.Tables[1].TableName)
-	assert.True(t, data.Tables[1].ReadyToComplete, "a table parked at the cutover barrier renders as ready")
+	assert.Equal(t, state.Task.WaitingForCutover, data.Tables[1].Status)
 }
 
 func TestPreviewCommentApplyProgress(t *testing.T) {
@@ -1310,7 +1670,7 @@ func TestPreviewCommentApplyProgress(t *testing.T) {
 	assert.Contains(t, result, "**`orders`**")
 	assert.Contains(t, result, "**`users`**")
 	assert.Contains(t, result, "**`products`**")
-	assert.Contains(t, result, "62%")
+	assert.Contains(t, result, "62.38%")
 	assert.Contains(t, result, "Queued")
 }
 
@@ -1347,7 +1707,7 @@ func TestPreviewCommentApplyStopped(t *testing.T) {
 
 	assert.Contains(t, result, "Schema Change Status")
 	assert.Contains(t, result, "**Status**: Stopped")
-	assert.Contains(t, result, "Stopped at 72%")
+	assert.Contains(t, result, "Stopped at 72.00%")
 	assert.Contains(t, result, "schemabot start")
 }
 
@@ -1400,18 +1760,24 @@ func TestPreviewCommentSummaryCompleted(t *testing.T) {
 	assert.NotContains(t, result, "### ")
 	assert.Contains(t, result, "**`orders`**")
 	assert.Contains(t, result, "```sql")
+	// On a successful apply the header already says every table completed —
+	// per-table Completed labels would be noise.
+	assert.NotContains(t, result, "— Completed")
 }
 
 func TestPreviewCommentSummaryFailed(t *testing.T) {
 	result := PreviewCommentSummaryFailed()
 
 	assert.Contains(t, result, "Schema Change Failed")
-	assert.Contains(t, result, "unsafe warning")
+	// The error line says what an operator should do about the failure, and
+	// names the code so they can search for it.
+	assert.Contains(t, result, "A row had no value for a column that has no default")
+	assert.Contains(t, result, "(error 1364)")
 	assert.Contains(t, result, "1 of 3 tables completed before failure.")
 	// Single namespace — no header, but table entries present
 	assert.NotContains(t, result, "### ")
-	assert.Contains(t, result, "**`users`** — Failed at 30%")
-	assert.Contains(t, result, "**`orders`**")
+	assert.Contains(t, result, "**`users`** — Failed at 30.00%")
+	assert.Contains(t, result, "**`orders`** — Completed", "on a failed apply, the reader must be able to tell which tables made it")
 	assert.Contains(t, result, "**`products`** — Cancelled")
 }
 
@@ -1422,8 +1788,8 @@ func TestPreviewCommentSummaryStopped(t *testing.T) {
 	assert.Contains(t, result, "1 of 2 tables completed before stop.")
 	// Single namespace — no header
 	assert.NotContains(t, result, "### ")
-	assert.Contains(t, result, "**`users`** — Stopped at 72%")
-	assert.Contains(t, result, "**`orders`**")
+	assert.Contains(t, result, "**`users`** — Stopped at 72.00%")
+	assert.Contains(t, result, "**`orders`** — Completed", "on a stopped apply, the reader must be able to tell which tables made it")
 	// A stopped change is resumable.
 	assert.Contains(t, result, "schemabot start")
 }
@@ -1433,8 +1799,68 @@ func TestPreviewCommentSummaryCancelled(t *testing.T) {
 
 	assert.Contains(t, result, "🚫 Schema Change Cancelled")
 	assert.Contains(t, result, "cannot be resumed")
+	assert.Contains(t, result, "**`orders`** — Completed", "on a cancelled apply, the reader must be able to tell which tables made it")
+	assert.Contains(t, result, "**`users`** — Cancelled")
 	// A cancelled change is permanent — no resume affordance.
 	assert.NotContains(t, result, "schemabot start")
+}
+
+// A terminal summary can carry a table whose task never reached a terminal
+// status (e.g. the driver died mid-copy). The row must still show a visible
+// outcome label — a bare table name reads as success.
+func TestRenderApplySummaryComment_NonTerminalTableStatusLabeled(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		RequestedBy: "aparajon",
+		State:       state.Apply.Failed,
+		Engine:      "Spirit",
+		Tables: []TableProgressData{
+			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: state.Task.Completed},
+			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)", Status: state.Task.Failed},
+			{TableName: "sessions", DDL: "ALTER TABLE `sessions` ADD INDEX `idx_expires_at` (`expires_at`)", Status: state.Task.Running},
+		},
+	}
+
+	result := RenderApplySummaryComment(data)
+
+	assert.Contains(t, result, "**`orders`** — Completed")
+	assert.Contains(t, result, "**`users`** — Failed")
+	assert.Contains(t, result, "**`sessions`** — Running")
+}
+
+// A table left mid-apply is named by where it was left, not by the internal
+// state constant. The revert-window case matters most: the change is already
+// applied and only the window is still open, which an operator reading a
+// terminal record must not have to infer.
+func TestRenderApplySummaryComment_NonTerminalTableOutcomeVocabulary(t *testing.T) {
+	cases := []struct {
+		status string
+		label  string
+	}{
+		{state.Task.RevertWindow, "**`orders`** — Completed (revert window open)"},
+		{state.Task.PostChecksum, "**`orders`** — Data verified, not cut over"},
+		{state.Task.FailedRetryable, "**`orders`** — Interrupted"},
+		{state.Task.CuttingOver, "**`orders`** — Cutting over"},
+		{state.Task.Pending, "**`orders`** — Pending"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.status, func(t *testing.T) {
+			result := RenderApplySummaryComment(ApplyStatusCommentData{
+				Database:    "testapp",
+				Environment: "staging",
+				RequestedBy: "aparajon",
+				State:       state.Apply.Failed,
+				Engine:      "Spirit",
+				Tables: []TableProgressData{
+					{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: tc.status},
+				},
+			})
+
+			assert.Contains(t, result, tc.label)
+		})
+	}
 }
 
 // The terminal summary for a cancelled (permanent) change must not offer resume
@@ -1623,7 +2049,7 @@ func TestRenderApplyBlockedByNonPassingChecks(t *testing.T) {
 
 	result := RenderApplyBlockedByNonPassingChecks("staging", notPassing)
 
-	assert.Contains(t, result, "## ❌ Apply Blocked")
+	assert.Contains(t, result, "## ⛔ Apply Blocked")
 	assert.Contains(t, result, "— Staging")
 	assert.Contains(t, result, "Cannot apply while PR checks are not passing")
 	assert.Contains(t, result, "| Check | Status |")
@@ -1652,7 +2078,7 @@ func TestRenderApplyBlockedByNonPassingChecks_EmptyList(t *testing.T) {
 	for _, notPassing := range [][]BlockingCheck{nil, {}} {
 		result := RenderApplyBlockedByNonPassingChecks("staging", notPassing)
 
-		assert.Contains(t, result, "## ❌ Apply Blocked")
+		assert.Contains(t, result, "## ⛔ Apply Blocked")
 		assert.Contains(t, result, "— Staging")
 		assert.Contains(t, result, "Cannot apply while PR checks are not passing.")
 		assert.Contains(t, result, "Get the checks passing — fix failures and re-run cancelled or stale checks — then retry:\n```\nschemabot apply -e staging\n```",
@@ -1665,16 +2091,17 @@ func TestRenderApplyBlockedByNonPassingChecks_EmptyList(t *testing.T) {
 }
 
 func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
-	t.Run("generic error is shown verbatim with retry block", func(t *testing.T) {
+	t.Run("generic error posts sanitized copy with retry block", func(t *testing.T) {
 		err := errors.New("get combined commit status: 500 Internal Server Error")
 
 		result := RenderApplyBlockedByCheckStatusError("staging", err, nil)
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "— Staging")
-		assert.Contains(t, result, "Unable to verify PR check statuses")
-		assert.Contains(t, result, "get combined commit status: 500 Internal Server Error")
-		assert.Contains(t, result, "Resolve the issue and retry:\n```\nschemabot apply -e staging\n```",
+		assert.Contains(t, result, "Unable to verify PR check statuses; see server logs for details.")
+		assert.NotContains(t, result, "500 Internal Server Error",
+			"raw error text must never render in PR markdown")
+		assert.Contains(t, result, "Retry:\n```\nschemabot apply -e staging\n```",
 			"retry command must be inside a fenced code block immediately after the retry copy")
 	})
 
@@ -1715,63 +2142,44 @@ func TestRenderApplyBlockedByCheckStatusError(t *testing.T) {
 		assert.NotContains(t, result, "Grant or accept those permissions")
 	})
 
-	t.Run("nil error skips empty fence and uses concise retry copy", func(t *testing.T) {
+	t.Run("nil error renders the same sanitized copy", func(t *testing.T) {
 		result := RenderApplyBlockedByCheckStatusError("staging", nil, nil)
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "— Staging")
-		assert.Contains(t, result, "Unable to verify PR check statuses.")
+		assert.Contains(t, result, "Unable to verify PR check statuses; see server logs for details.")
 		assert.Contains(t, result, "Retry:\n```\nschemabot apply -e staging\n```",
 			"retry command must be inside a fenced code block immediately after the retry copy")
-		assert.NotContains(t, result, "```\n```",
-			"nil-error branch should not emit an empty fenced code block")
-		assert.NotContains(t, result, "Resolve the issue and retry:",
-			"nil-error branch should not reference an issue that was not surfaced")
 	})
 }
 
 func TestRenderApplyBlockedByPriorEnvCheckError(t *testing.T) {
-	t.Run("renders reason and wrapped error verbatim", func(t *testing.T) {
-		err := errors.New("404 Not Found")
-
-		result := RenderApplyBlockedByPriorEnvCheckError("staging", "fetch PR details", err)
+	t.Run("renders reason with sanitized detail", func(t *testing.T) {
+		result := RenderApplyBlockedByPriorEnvCheckError("staging", "fetch PR details")
 
 		assert.Contains(t, result, "## ❌ Apply Blocked")
 		assert.Contains(t, result, "Could not verify staging status: failed to fetch PR details. Retry the apply command.")
-		assert.Contains(t, result, "_Error: 404 Not Found_")
+		assert.Contains(t, result, "_See server logs for details._")
 	})
 
 	t.Run("each reason variant produces matching body", func(t *testing.T) {
-		err := errors.New("boom")
-
 		for _, reason := range []string{"create GitHub client", "fetch PR details", "query check runs"} {
-			result := RenderApplyBlockedByPriorEnvCheckError("production", reason, err)
+			result := RenderApplyBlockedByPriorEnvCheckError("production", reason)
 			assert.Contains(t, result, "Could not verify production status: failed to "+reason+". Retry the apply command.")
 		}
 	})
 
-	t.Run("nil error renders <nil>", func(t *testing.T) {
-		result := RenderApplyBlockedByPriorEnvCheckError("staging", "query check runs", nil)
+	t.Run("full body is stable", func(t *testing.T) {
+		expected := "## ❌ Apply Blocked\n\nCould not verify staging status: failed to create GitHub client. Retry the apply command.\n\n_See server logs for details._\n" + supportChannelOfferMarker + "\n"
 
-		assert.Contains(t, result, "## ❌ Apply Blocked")
-		assert.Contains(t, result, "_Error: <nil>_")
-	})
-
-	t.Run("output matches prior inline rendering byte-for-byte", func(t *testing.T) {
-		err := errors.New("rate limited")
-		priorEnv := "staging"
-		reason := "create GitHub client"
-
-		expected := "## ❌ Apply Blocked\n\nCould not verify " + priorEnv + " status: failed to " + reason + ". Retry the apply command.\n\n_Error: " + err.Error() + "_"
-
-		assert.Equal(t, expected, RenderApplyBlockedByPriorEnvCheckError(priorEnv, reason, err))
+		assert.Equal(t, expected, RenderApplyBlockedByPriorEnvCheckError("staging", "create GitHub client"))
 	})
 }
 
 func TestRenderApplyBlockedByMissingPriorEnvCheck(t *testing.T) {
 	result := RenderApplyBlockedByMissingPriorEnvCheck("staging")
 
-	assert.Contains(t, result, "## ❌ Apply Blocked")
+	assert.Contains(t, result, "## ⛔ Apply Blocked")
 	assert.Contains(t, result, "could not find a completed `staging` check")
 	assert.Contains(t, result, "schemabot plan -e staging")
 	assert.Contains(t, result, "apply `staging`")
@@ -1781,13 +2189,34 @@ func TestRenderApplyBlockedByMissingPriorEnvCheck(t *testing.T) {
 func TestRenderApplyBlockedByUntrustedPriorEnvCheck(t *testing.T) {
 	result := RenderApplyBlockedByUntrustedPriorEnvCheck("staging", "SchemaBot (staging)", []string{"schemabot-staging"})
 
-	assert.Contains(t, result, "## ❌ Apply Blocked")
+	assert.Contains(t, result, "## ⛔ Apply Blocked")
 	assert.Contains(t, result, "`SchemaBot (staging)`")
 	assert.Contains(t, result, "- `schemabot-staging`")
 	assert.Contains(t, result, "does not trust")
 	assert.Contains(t, result, "trusted-check-app-slugs")
 	assert.Contains(t, result, "Re-running `schemabot plan -e staging` will not resolve this")
 	assert.NotContains(t, result, "could not find a completed")
+}
+
+// An environment missing from the promotion order is a configuration refusal:
+// SchemaBot cannot place it in the staging-first sequence, and retrying
+// unchanged refuses again, so the heading carries the refusal glyph and the
+// body names the fix (add the environment to environment_order).
+func TestRenderApplyBlockedByUnlistedEnvironment(t *testing.T) {
+	result := RenderApplyBlockedByUnlistedEnvironment("canary", []string{"staging", "production"})
+
+	assert.Contains(t, result, "## ⛔ Apply Blocked — Canary")
+	assert.Contains(t, result, "`canary` is not in the configured promotion order")
+	assert.Contains(t, result, "Configured promotion order: `staging` → `production`")
+	assert.Contains(t, result, "Add `canary` to `environment_order`")
+
+	t.Run("empty promotion order omits the order line", func(t *testing.T) {
+		result := RenderApplyBlockedByUnlistedEnvironment("canary", nil)
+
+		assert.Contains(t, result, "## ⛔ Apply Blocked — Canary")
+		assert.NotContains(t, result, "Configured promotion order")
+		assert.Contains(t, result, "Add `canary` to `environment_order`")
+	})
 }
 
 func TestRenderApplyBlockedByInProgressChecks(t *testing.T) {
@@ -1874,7 +2303,7 @@ func TestRenderApplyBlockedByInProgressChecks_EmptyList(t *testing.T) {
 	}
 }
 
-func TestRenderApplyStatusComment_WaitingForCutover_ReadyNotReady(t *testing.T) {
+func TestRenderApplyStatusComment_WaitingForCutover_MixedReadiness(t *testing.T) {
 	data := ApplyStatusCommentData{
 		ApplyID:      "apply-abc123",
 		Database:     "testapp",
@@ -1882,9 +2311,9 @@ func TestRenderApplyStatusComment_WaitingForCutover_ReadyNotReady(t *testing.T) 
 		State:        state.Apply.WaitingForCutover,
 		DeferCutover: true,
 		Tables: []TableProgressData{
-			{TableName: "users", Status: state.Task.WaitingForCutover, ReadyToComplete: true, DDL: "ALTER TABLE users ADD INDEX idx_email (email)"},
-			{TableName: "orders", Status: state.Task.WaitingForCutover, ReadyToComplete: true, DDL: "ALTER TABLE orders ADD INDEX idx_status (status)"},
-			{TableName: "items", Status: state.Task.WaitingForCutover, ReadyToComplete: false, DDL: "ALTER TABLE items ADD INDEX idx_price (price_cents)"},
+			{TableName: "users", Status: state.Task.WaitingForCutover, DDL: "ALTER TABLE users ADD INDEX idx_email (email)"},
+			{TableName: "orders", Status: state.Task.WaitingForCutover, DDL: "ALTER TABLE orders ADD INDEX idx_status (status)"},
+			{TableName: "items", Status: state.Task.Running, PercentComplete: 60, DDL: "ALTER TABLE items ADD INDEX idx_price (price_cents)"},
 		},
 	}
 
@@ -1893,12 +2322,11 @@ func TestRenderApplyStatusComment_WaitingForCutover_ReadyNotReady(t *testing.T) 
 	// Header
 	assert.Contains(t, result, "Waiting for Cutover")
 
-	// Cutover summary shows ready/waiting counts
+	// Cutover summary counts parked tables as ready, still-copying as waiting
 	assert.Contains(t, result, "2/3")
 	assert.Contains(t, result, "waiting on 1")
 
-	// Per-table: ready tables show checkmark, non-ready show plain waiting
-	assert.Contains(t, result, "Ready for cutover")
+	// Per-table: parked tables render as waiting for cutover
 	assert.Contains(t, result, "Waiting for cutover")
 
 	// Footer has cutover command
@@ -1912,8 +2340,8 @@ func TestRenderApplyStatusComment_WaitingForCutover_AllReady(t *testing.T) {
 		Environment: "staging",
 		State:       state.Apply.WaitingForCutover,
 		Tables: []TableProgressData{
-			{TableName: "users", Status: state.Task.WaitingForCutover, ReadyToComplete: true},
-			{TableName: "orders", Status: state.Task.WaitingForCutover, ReadyToComplete: true},
+			{TableName: "users", Status: state.Task.WaitingForCutover},
+			{TableName: "orders", Status: state.Task.WaitingForCutover},
 		},
 	}
 
@@ -1921,6 +2349,31 @@ func TestRenderApplyStatusComment_WaitingForCutover_AllReady(t *testing.T) {
 
 	assert.Contains(t, result, "2/2")
 	assert.NotContains(t, result, "waiting on")
+}
+
+// A multi-table progress summary buckets every table: statuses without a
+// dedicated counter (waiting for deploy, the revert family) fold into an
+// "in other states" part instead of disappearing from the summary line, and
+// tables parked at the cutover barrier count through the shared readiness
+// predicate.
+func TestRenderApplyStatusComment_ProgressSummaryCountsOtherStates(t *testing.T) {
+	data := ApplyStatusCommentData{
+		Database:    "testapp",
+		Environment: "staging",
+		State:       state.Apply.Running,
+		Tables: []TableProgressData{
+			{TableName: "orders", Status: state.Task.Completed},
+			{TableName: "users", Status: state.Task.WaitingForCutover},
+			{TableName: "products", Status: state.Task.WaitingForDeploy},
+			{TableName: "carts", Status: state.Task.RevertWindow},
+		},
+	}
+
+	result := RenderApplyStatusComment(data)
+
+	assert.Contains(t, result, "📊 1/4 complete")
+	assert.Contains(t, result, "1 waiting for cutover")
+	assert.Contains(t, result, "2 in other states")
 }
 
 func TestRenderApplyStatusComment_RevertWindow(t *testing.T) {

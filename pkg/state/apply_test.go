@@ -103,19 +103,63 @@ func TestDeriveApplyState_AnyRunning(t *testing.T) {
 	}
 }
 
-// Checksumming is a table-level state, not an apply state: while tables verify
-// their copied data the apply as a whole is still running, so it derives to
-// RUNNING rather than a distinct apply state.
-func TestDeriveApplyState_ChecksummingDerivesRunning(t *testing.T) {
-	testCases := [][]string{
-		{"checksumming"},
-		{"CHECKSUMMING"},
-		{"RUNNING", "checksumming"},
-		{"COMPLETED", "checksumming", "PENDING"},
+// The post-copy phases surface at the apply level as the least-advanced
+// active phase, and only once every table has started: while any table is
+// still copying rows — or still queued with its whole copy ahead of it — the
+// apply is Running. Any table still copying dominates a more-advanced
+// sibling's phase.
+func TestDeriveApplyState_PostCopyPhases(t *testing.T) {
+	testCases := []struct {
+		states   []string
+		expected string
+	}{
+		{[]string{"catching_up"}, Apply.CatchingUp},
+		{[]string{"CATCHING_UP"}, Apply.CatchingUp},
+		{[]string{"checksumming"}, Apply.Checksumming},
+		{[]string{"CHECKSUMMING"}, Apply.Checksumming},
+		{[]string{"post_checksum"}, Apply.PostChecksum},
+		{[]string{"POST_CHECKSUM"}, Apply.PostChecksum},
+		// A table still copying dominates any sibling's post-copy phase.
+		{[]string{"RUNNING", "catching_up"}, Apply.Running},
+		{[]string{"RUNNING", "checksumming"}, Apply.Running},
+		{[]string{"RUNNING", "post_checksum"}, Apply.Running},
+		// The least-advanced phase wins across mixed drains.
+		{[]string{"catching_up", "checksumming"}, Apply.CatchingUp},
+		{[]string{"checksumming", "post_checksum"}, Apply.Checksumming},
+		// A queued sibling keeps the apply Running: its whole copy is still
+		// ahead, so naming a sibling's drain phase would overstate progress.
+		{[]string{"checksumming", "PENDING"}, Apply.Running},
+		{[]string{"catching_up", "PENDING"}, Apply.Running},
+		{[]string{"post_checksum", "PENDING"}, Apply.Running},
+		{[]string{"COMPLETED", "checksumming", "PENDING"}, Apply.Running},
+		{[]string{"COMPLETED", "catching_up", "PENDING"}, Apply.Running},
+		{[]string{"COMPLETED", "post_checksum", "PENDING"}, Apply.Running},
+		// A completed sibling alone does not mask the active phase.
+		{[]string{"COMPLETED", "checksumming"}, Apply.Checksumming},
+		{[]string{"COMPLETED", "catching_up"}, Apply.CatchingUp},
+		{[]string{"COMPLETED", "post_checksum"}, Apply.PostChecksum},
+		// A cutover is a table's last step, so a sibling still draining or
+		// verifying holds the apply on that earlier phase — least-advanced
+		// active work wins, and the apply never falls back from cutting_over
+		// when the cutover completes ahead of its siblings.
+		{[]string{"CUTTING_OVER", "post_checksum"}, Apply.PostChecksum},
+		{[]string{"CUTTING_OVER", "catching_up"}, Apply.CatchingUp},
+		{[]string{"COMPLETED", "CUTTING_OVER", "checksumming"}, Apply.Checksumming},
+		// A sibling that is still queued or still copying keeps a cutover from
+		// surfacing the same way: a drive cuts tables over as each finishes —
+		// sequentially, rolling, or across concurrent shards — so the apply
+		// stays Running until every table has finished its copy.
+		{[]string{"CUTTING_OVER", "PENDING"}, Apply.Running},
+		{[]string{"COMPLETED", "CUTTING_OVER", "PENDING"}, Apply.Running},
+		{[]string{"CUTTING_OVER", "RUNNING", "PENDING"}, Apply.Running},
+		{[]string{"CUTTING_OVER", "RUNNING"}, Apply.Running},
+		{[]string{"COMPLETED", "CUTTING_OVER", "RUNNING"}, Apply.Running},
+		// Pending tasks with no active sibling stay Pending, not Running.
+		{[]string{"PENDING", "PENDING"}, Apply.Pending},
 	}
 
-	for _, states := range testCases {
-		assert.Equal(t, Apply.Running, DeriveApplyState(states), "input: %v", states)
+	for _, tc := range testCases {
+		assert.Equal(t, tc.expected, DeriveApplyState(tc.states), "input: %v", tc.states)
 	}
 }
 
@@ -141,6 +185,10 @@ func TestDeriveApplyState_WaitingAndCompleted(t *testing.T) {
 	assert.Equal(t, Apply.WaitingForCutover, DeriveApplyState(states))
 }
 
+// A cutover surfaces at the apply level only once it is the least advanced
+// active work; the earlier-phase sibling cases live in
+// TestDeriveApplyState_PostCopyPhases. A parked WAITING_FOR_CUTOVER sibling
+// does not hold a cutover back: it is waiting on a command, not working.
 func TestDeriveApplyState_CuttingOver(t *testing.T) {
 	testCases := [][]string{
 		{"CUTTING_OVER"},
@@ -235,10 +283,14 @@ func TestIsTerminalApplyState(t *testing.T) {
 }
 
 // TestIsRunningApplyState pins the running-family set that control gates key
-// off: running and running_degraded are running-family; other non-terminal
-// states (pending, waiting_for_cutover, recovering) are not.
+// off: running, running_degraded, and the post-copy phases (catching_up,
+// checksumming, post_checksum) are running-family; other non-terminal states
+// (pending, waiting_for_cutover, recovering) are not.
 func TestIsRunningApplyState(t *testing.T) {
-	for _, s := range []string{Apply.Running, Apply.RunningDegraded, "RUNNING", "STATE_RUNNING_DEGRADED", "running_degraded"} {
+	for _, s := range []string{
+		Apply.Running, Apply.RunningDegraded, "RUNNING", "STATE_RUNNING_DEGRADED", "running_degraded",
+		Apply.CatchingUp, Apply.Checksumming, Apply.PostChecksum, "CATCHING_UP", "STATE_POST_CHECKSUM",
+	} {
 		assert.Truef(t, IsRunningApplyState(s), "%s should be running-family", s)
 	}
 	for _, s := range []string{
@@ -364,6 +416,9 @@ func TestIsSetupPhase(t *testing.T) {
 func TestNormalizeApplyState_NewStates(t *testing.T) {
 	assert.Equal(t, Apply.ValidatingBranch, normalizeApplyState("VALIDATING_BRANCH"))
 	assert.Equal(t, Apply.ValidatingDeployRequest, normalizeApplyState("VALIDATING_DEPLOY_REQUEST"))
+	assert.Equal(t, Apply.CatchingUp, normalizeApplyState("CATCHING_UP"))
+	assert.Equal(t, Apply.Checksumming, normalizeApplyState("CHECKSUMMING"))
+	assert.Equal(t, Apply.PostChecksum, normalizeApplyState("POST_CHECKSUM"))
 }
 
 func TestInitialActiveApplyState(t *testing.T) {
@@ -442,8 +497,12 @@ func TestDeriveRolloutApplyState_NoFailureMatchesBase(t *testing.T) {
 
 // TestDeriveRolloutApplyState_FailurePolicy is the truth table for the failed
 // base case: continue holds the apply active until siblings settle, while halt
-// and unrecognized policies fail closed to the failed verdict. The pause policy
-// has its own truth table in TestDeriveRolloutApplyState_PausePolicy.
+// and unrecognized policies fail closed to the failed verdict. Failing closed
+// decides the verdict, not when it is recorded — a fail-closed policy refuses
+// new claims and cancels nothing, so a sibling that a driver already started still
+// holds the apply degraded, while a sibling that is only pending holds nothing.
+// The pause policy has its own truth table in
+// TestDeriveRolloutApplyState_PausePolicy.
 func TestDeriveRolloutApplyState_FailurePolicy(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -461,9 +520,14 @@ func TestDeriveRolloutApplyState_FailurePolicy(t *testing.T) {
 			want:     Apply.RunningDegraded,
 		},
 		{
-			name:     "continue failure with all siblings terminal settles failed",
+			name:     "continue failure with all siblings settled settles failed",
 			children: []RolloutChild{rc(Apply.Failed, true), rc(Apply.Completed, true)},
 			want:     Apply.Failed,
+		},
+		{
+			name:     "continue failure with stopped sibling holds running_degraded",
+			children: []RolloutChild{rc(Apply.Failed, true), rc(Apply.Stopped, true)},
+			want:     Apply.RunningDegraded,
 		},
 		{
 			name:     "continue failure with another failed continue sibling settles failed",
@@ -485,6 +549,54 @@ func TestDeriveRolloutApplyState_FailurePolicy(t *testing.T) {
 			children: []RolloutChild{rc(Apply.Failed, true), rc(Apply.Completed, true), rc(Apply.Pending, true)},
 			want:     Apply.RunningDegraded,
 		},
+		{
+			name:     "halt failure with running sibling holds running_degraded",
+			children: []RolloutChild{rc(Apply.Failed, false), rc(Apply.Running, false)},
+			want:     Apply.RunningDegraded,
+		},
+		{
+			name:     "halt failure with sibling parked at the cutover barrier holds running_degraded",
+			children: []RolloutChild{rc(Apply.Failed, false), rc(Apply.WaitingForCutover, false)},
+			want:     Apply.RunningDegraded,
+		},
+		{
+			name:     "halt failure with retrying sibling holds running_degraded",
+			children: []RolloutChild{rc(Apply.Failed, false), rc(Apply.FailedRetryable, false)},
+			want:     Apply.RunningDegraded,
+		},
+		{
+			name:     "halt failure with running and pending siblings holds running_degraded",
+			children: []RolloutChild{rc(Apply.Failed, false), rc(Apply.Running, false), rc(Apply.Pending, false)},
+			want:     Apply.RunningDegraded,
+		},
+		{
+			name:     "halt failure settles failed once the started sibling completes",
+			children: []RolloutChild{rc(Apply.Failed, false), rc(Apply.Completed, false), rc(Apply.Pending, false)},
+			want:     Apply.Failed,
+		},
+		{
+			name:     "halt failure with stopped sibling holds running_degraded",
+			children: []RolloutChild{rc(Apply.Failed, false), rc(Apply.Stopped, false)},
+			want:     Apply.RunningDegraded,
+		},
+		{
+			name:     "halt failure with cancelled sibling settles failed",
+			children: []RolloutChild{rc(Apply.Failed, false), rc(Apply.Cancelled, false)},
+			want:     Apply.Failed,
+		},
+		{
+			name:     "halt failure with a continue sibling still running holds running_degraded",
+			children: []RolloutChild{rc(Apply.Failed, false), rc(Apply.Running, true)},
+			want:     Apply.RunningDegraded,
+		},
+		{
+			name: "invalid both-flags failure holds running_degraded while a sibling works",
+			children: []RolloutChild{
+				{State: Apply.Failed, ContinueOnFailure: true, PauseOnFailure: true},
+				rc(Apply.Running, true),
+			},
+			want: Apply.RunningDegraded,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -493,9 +605,63 @@ func TestDeriveRolloutApplyState_FailurePolicy(t *testing.T) {
 	}
 }
 
+// A fail-closed rollout holds its verdict open while any sibling still holds the
+// deployment it was given, and the line is settled rather than terminal. Every
+// state in the registry is classified against that rule here, so a state added
+// later cannot inherit an answer: a pending sibling has touched nothing, a
+// sibling whose verdict is final has released its target, and everything else
+// keeps the parent's reservation alive — including stopped, which is terminal
+// for claiming but resumable, so a driver may write to that target again.
+func TestDeriveRolloutApplyState_HaltHoldsWhileASiblingHoldsItsTarget(t *testing.T) {
+	for sibling := range applyMetadata {
+		t.Run(sibling, func(t *testing.T) {
+			want := Apply.Failed
+			if !IsState(sibling, SettledApplyStates...) && !IsState(sibling, Apply.Pending) {
+				want = Apply.RunningDegraded
+			}
+			children := []RolloutChild{rc(Apply.Failed, false), rc(sibling, false)}
+			assert.Equal(t, want, DeriveRolloutApplyState(children),
+				"a halted rollout with a %s sibling", sibling)
+		})
+	}
+}
+
+// A held-open rollout and a stranded parent present the same way to the
+// recovery claim — a non-terminal apply over children that have all reached a
+// terminal state — and only the settled line tells them apart. Every state in
+// the registry is classified against that rule here, so a state added later
+// cannot inherit an answer: a child that has not reached a terminal state means
+// a drive can still move the parent, a child that settled has released its
+// target, and a terminal-but-resumable child is the one that holds the rollout
+// open for an operator's start.
+func TestRolloutHeldByResumableChild(t *testing.T) {
+	for child := range applyMetadata {
+		t.Run(child, func(t *testing.T) {
+			want := IsTerminalApplyState(child) && !IsState(child, SettledApplyStates...)
+			children := []RolloutChild{rc(Apply.Failed, true), rc(child, true)}
+			assert.Equal(t, want, RolloutHeldByResumableChild(Apply.RunningDegraded, children),
+				"a held-open rollout with a %s child", child)
+		})
+	}
+}
+
+// A rollout that reached a terminal state is never held open, whatever its
+// children look like: the verdict is recorded and the target released, so the
+// recovery claim has nothing to reconsider.
+func TestRolloutHeldByResumableChildIgnoresTerminalRollouts(t *testing.T) {
+	children := []RolloutChild{rc(Apply.Failed, true), rc(Apply.Stopped, true)}
+	for derived := range applyMetadata {
+		if !IsTerminalApplyState(derived) {
+			continue
+		}
+		assert.False(t, RolloutHeldByResumableChild(derived, children),
+			"a %s rollout is not held open", derived)
+	}
+}
+
 // TestDeriveRolloutApplyState_PausePolicy is the truth table for on_failure=pause.
 // An unreleased pause failure holds the apply paused while later siblings still
-// have work to do, settles failed once nothing is left to hold, and — once
+// hold their targets, settles failed once nothing is left to hold, and — once
 // released — behaves exactly like continue. Children are in deployment order.
 func TestDeriveRolloutApplyState_PausePolicy(t *testing.T) {
 	cases := []struct {
@@ -519,8 +685,13 @@ func TestDeriveRolloutApplyState_PausePolicy(t *testing.T) {
 			want:     Apply.Failed,
 		},
 		{
-			name:     "pause failure with later sibling stopped (stop chosen over release) settles failed",
+			name:     "pause failure with later sibling stopped holds paused",
 			children: []RolloutChild{rcPause(Apply.Failed), rcPause(Apply.Stopped)},
+			want:     Apply.Paused,
+		},
+		{
+			name:     "pause failure with later sibling cancelled settles failed",
+			children: []RolloutChild{rcPause(Apply.Failed), rcPause(Apply.Cancelled)},
 			want:     Apply.Failed,
 		},
 		{
@@ -554,6 +725,11 @@ func TestDeriveRolloutApplyState_PausePolicy(t *testing.T) {
 			want:     Apply.Failed,
 		},
 		{
+			name:     "halt failure dominating a pause-held sibling still holds while later work runs",
+			children: []RolloutChild{rcPause(Apply.Failed), rc(Apply.Failed, false), rcPause(Apply.Running)},
+			want:     Apply.RunningDegraded,
+		},
+		{
 			name: "invalid both-flags failure fails closed rather than continuing",
 			children: []RolloutChild{
 				{State: Apply.Failed, ContinueOnFailure: true, PauseOnFailure: true},
@@ -566,5 +742,24 @@ func TestDeriveRolloutApplyState_PausePolicy(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			assert.Equal(t, tc.want, DeriveRolloutApplyState(tc.children))
 		})
+	}
+}
+
+// Settled is the terminal set minus Stopped, and the gap is load-bearing: a
+// stopped apply is terminal but re-claimable, so anything that writes rows
+// belonging to an apply it does not hold must gate on settled, never on
+// terminal.
+func TestSettledApplyStatesExcludeStopped(t *testing.T) {
+	settled := func(s string) bool { return IsState(s, SettledApplyStates...) }
+
+	for _, s := range SettledApplyStates {
+		assert.True(t, IsTerminalApplyState(s), "%s is settled so it must also be terminal", s)
+	}
+
+	assert.True(t, IsTerminalApplyState(Apply.Stopped), "stopped is terminal for claiming")
+	assert.False(t, settled(Apply.Stopped), "stopped is re-claimable, so its verdict is not final")
+
+	for _, s := range []string{Apply.Running, Apply.Pending, Apply.Resuming, Apply.FailedRetryable} {
+		assert.False(t, settled(s), "%s is not settled", s)
 	}
 }

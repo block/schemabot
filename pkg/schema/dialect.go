@@ -8,11 +8,16 @@ import "strings"
 // underlying database family, not of the engine that drives it.
 type Dialect string
 
+// Feature identifies behavior that is not available on every database family.
+type Feature string
+
 const (
 	// DialectMySQL covers MySQL and every MySQL-protocol engine (Vitess, Strata).
 	DialectMySQL Dialect = "mysql"
 	// DialectPostgres covers PostgreSQL targets.
 	DialectPostgres Dialect = "postgres"
+
+	FeatureDeferredCutover Feature = "deferred cutover"
 )
 
 // DialectForDatabaseType maps a database_type to its database family for
@@ -31,6 +36,17 @@ func DialectForDatabaseType(databaseType string) Dialect {
 		return DialectPostgres
 	default:
 		return Dialect(strings.ToLower(databaseType))
+	}
+}
+
+// SupportsFeature reports whether a database type supports a dialect-specific
+// feature. Unknown database types fail closed.
+func SupportsFeature(databaseType string, feature Feature) bool {
+	switch feature {
+	case FeatureDeferredCutover:
+		return databaseType == "mysql" || databaseType == "vitess"
+	default:
+		return false
 	}
 }
 
@@ -58,17 +74,23 @@ var systemSchemasByDialect = map[Dialect]map[string]struct{}{
 		"tmp":                {},
 		"topo":               {},
 	},
-	// The Postgres set is provisional: it covers the always-present system
-	// schemas and RDS/Aurora's rdsadmin, but the managed-extension schemas
-	// (aws_commons, aws_s3, aws_lambda, aws_ml, ...) are deliberately not
-	// enumerated yet. It must be finalized when Postgres pull discovery is
-	// implemented so extension-owned schemas are not surfaced as pullable user
-	// namespaces.
+	// The Postgres set covers the always-present system schemas, RDS/Aurora's
+	// administrative schemas (rdsadmin, rds_tools), and the schemas owned by
+	// RDS/Aurora managed extensions: aws_commons (shared helper types),
+	// aws_s3/aws_lambda/aws_ml (AWS service integrations), and apg_plan_mgmt
+	// (Aurora query plan management). Extension-owned schemas are
+	// database-managed, so they must never surface as pullable user namespaces.
 	DialectPostgres: {
 		"information_schema": {},
 		"pg_catalog":         {},
 		"pg_toast":           {},
 		"rdsadmin":           {},
+		"rds_tools":          {},
+		"aws_commons":        {},
+		"aws_s3":             {},
+		"aws_lambda":         {},
+		"aws_ml":             {},
+		"apg_plan_mgmt":      {},
 	},
 }
 

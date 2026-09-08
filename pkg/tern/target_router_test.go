@@ -135,10 +135,6 @@ func (c *targetRouterRecordingClient) Start(context.Context, *ternv1.StartReques
 	return &ternv1.StartResponse{Accepted: true}, nil
 }
 
-func (c *targetRouterRecordingClient) Volume(context.Context, *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error) {
-	return &ternv1.VolumeResponse{Accepted: true}, nil
-}
-
 func (c *targetRouterRecordingClient) Revert(context.Context, *ternv1.RevertRequest) (*ternv1.RevertResponse, error) {
 	return &ternv1.RevertResponse{Accepted: true}, nil
 }

@@ -229,7 +229,7 @@ func (p *branchProxy) closeClientConns() {
 
 func (p *branchProxy) handleConn(clientConn net.Conn) {
 	// Open a dedicated upstream connection for this client.
-	upstreamDB, err := sql.Open("mysql", p.upstreamDSN)
+	upstreamDB, err := sql.Open("block-mysql", p.upstreamDSN)
 	if err != nil {
 		p.logger.Error("proxy: open upstream", "error", err)
 		utils.CloseAndLog(clientConn)

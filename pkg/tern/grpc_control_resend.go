@@ -62,8 +62,12 @@ func (g *remoteControlSendGate) recordSend(controlReqID int64, now time.Time) (f
 	return !seen
 }
 
-// clear forgets a control request once it is completed or failed, so the map
-// does not accumulate entries for resolved requests.
+// clear forgets a control request once it is completed or failed. This is not
+// only map hygiene: there is one request row per apply and operation, and
+// re-requesting an operation reuses that row, so a resolved request's entry
+// would still be keyed to the id a re-issued command arrives under. Without
+// this the operator's next stop or cancel for the same apply would be throttled
+// behind the resolved one instead of transmitting immediately.
 func (g *remoteControlSendGate) clear(controlReqID int64) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -77,17 +81,19 @@ func (g *remoteControlSendGate) clear(controlReqID int64) {
 // remoteControlStaleThreshold — at that point the data plane is not consuming
 // an accepted command and an operator must check its logs for the failing
 // consume.
-func logRemoteControlResend(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, now time.Time) {
+// The logger is expected to carry the apply's identity attributes already
+// bound, so each line appends only the mutable snapshot.
+func logRemoteControlResend(ctx context.Context, logger *slog.Logger, apply *storage.Apply, controlReq *storage.ApplyControlRequest, now time.Time) {
 	pendingFor := now.Sub(controlReq.CreatedAt)
-	attrs := append(apply.LogAttrs(),
+	attrs := append(apply.MutableLogAttrs(),
 		"operation", string(controlReq.Operation),
 		"requested_by", controlReq.RequestedBy,
 		"pending_for", pendingFor.Round(time.Second),
 	)
 	if pendingFor >= remoteControlStaleThreshold {
 		metrics.RecordRemoteControlRequestStale(ctx, string(controlReq.Operation), apply.Database, apply.Deployment, apply.Environment)
-		slog.Warn("remote control request accepted but still unconsumed by the data plane; driver keeps re-sending and polling — check data-plane logs for the failing consume", attrs...)
+		logger.Warn("remote control request accepted but still unconsumed by the data plane; driver keeps re-sending and polling — check data-plane logs for the failing consume", attrs...)
 		return
 	}
-	slog.Info("re-sent pending remote control request to the data plane", attrs...)
+	logger.Info("re-sent pending remote control request to the data plane", attrs...)
 }

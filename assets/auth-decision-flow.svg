@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="948" height="474" viewBox="0 0 948 474" role="img" aria-labelledby="title desc" font-family="Helvetica, Arial, sans-serif">
+<title id="title">How API access is checked</title>
+<desc id="desc">With API authentication enabled, first verify the caller or return 401. Read requests need read access. Write requests need admin access or, under forward-auth, permission for the target database and environment. Missing permissions return 403. Authorization permits the request to continue; change safety checks still apply.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M2 1L8 5L2 9" fill="none" stroke="#8d949e" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></marker></defs>
+<rect width="948" height="474" fill="#fff"/>
+<text x="24" y="36" font-size="22" fill="#1c1e21" font-weight="600" text-anchor="start">How API access is checked</text>
+<rect x="309" y="64" width="330" height="64" rx="10" fill="#edf3ff" stroke="#b8cef1"/>
+<text x="474" y="90" font-size="16" fill="#1c1e21" font-weight="600" text-anchor="middle">Verify the caller</text>
+<text x="474" y="112" font-size="13" fill="#474e57" font-weight="400" text-anchor="middle">OIDC token or trusted proxy</text>
+<path d="M639 96 H687" fill="none" stroke="#8d949e" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="705" y="92" font-size="15" fill="#b42318" font-weight="600" text-anchor="start">401</text>
+<text x="705" y="113" font-size="12" fill="#474e57" font-weight="400" text-anchor="start">Identity could not be verified</text>
+<path d="M474 128 V152 H164 V194" fill="none" stroke="#8d949e" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M474 128 V194" fill="none" stroke="#8d949e" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M474 128 V152 H784 V194" fill="none" stroke="#8d949e" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="24" y="202" width="280" height="104" rx="10" fill="#f8f9fa" stroke="#dadde1"/>
+<text x="164" y="219" font-size="10.5" fill="#68707c" font-weight="600" text-anchor="middle">READ REQUEST</text>
+<text x="164" y="244" font-size="16" fill="#1c1e21" font-weight="600" text-anchor="middle">Read access</text>
+<text x="164" y="269" font-size="13" fill="#474e57" font-weight="400" text-anchor="middle">Valid identity; forward-auth can</text>
+<text x="164" y="290" font-size="13" fill="#474e57" font-weight="400" text-anchor="middle">also restrict reads by group</text>
+<rect x="334" y="202" width="280" height="104" rx="10" fill="#f8f9fa" stroke="#dadde1"/>
+<text x="474" y="219" font-size="10.5" fill="#68707c" font-weight="600" text-anchor="middle">WRITE REQUEST</text>
+<text x="474" y="244" font-size="16" fill="#1c1e21" font-weight="600" text-anchor="middle">Admin access</text>
+<text x="474" y="269" font-size="13" fill="#474e57" font-weight="400" text-anchor="middle">An admin group grants access</text>
+<text x="474" y="290" font-size="13" fill="#474e57" font-weight="400" text-anchor="middle">across the deployment</text>
+<rect x="644" y="202" width="280" height="104" rx="10" fill="#f8f9fa" stroke="#dadde1"/>
+<text x="784" y="219" font-size="10.5" fill="#68707c" font-weight="600" text-anchor="middle">WRITE REQUEST · FORWARD-AUTH</text>
+<text x="784" y="244" font-size="16" fill="#1c1e21" font-weight="600" text-anchor="middle">Scoped access</text>
+<text x="784" y="269" font-size="13" fill="#474e57" font-weight="400" text-anchor="middle">Your group must match the database</text>
+<text x="784" y="290" font-size="13" fill="#474e57" font-weight="400" text-anchor="middle">and an allowed environment</text>
+<rect x="144" y="332" width="660" height="48" rx="10" fill="#edf7ef" stroke="#bcdac3"/>
+<text x="474" y="361" font-size="15" fill="#23733b" font-weight="600" text-anchor="middle">Permission granted → continue the request</text>
+<path d="M164 306 V327" fill="none" stroke="#8d949e" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M474 306 V327" fill="none" stroke="#8d949e" stroke-width="1.5" marker-end="url(#arrow)"/>
+<path d="M784 306 V327" fill="none" stroke="#8d949e" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="474" y="414" font-size="13" fill="#b42318" font-weight="400" text-anchor="middle">Missing the required permission? 403 Forbidden</text>
+<text x="474" y="453" font-size="14" fill="#474e57" font-weight="400" text-anchor="middle">Access permits the request to continue; schema change safety checks still apply.</text>
+</svg>

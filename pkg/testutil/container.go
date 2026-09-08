@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/go-connections/nat"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 )
@@ -30,11 +29,11 @@ func ContainerHost(ctx context.Context, c testcontainers.Container) (string, err
 func ContainerPort(ctx context.Context, c testcontainers.Container, port string) (int, error) {
 	var result int
 	_, err := retryContainerOp(ctx, "MappedPort", func() (string, error) {
-		p, err := c.MappedPort(ctx, nat.Port(port))
+		p, err := c.MappedPort(ctx, port)
 		if err != nil {
 			return "", err
 		}
-		result = p.Int()
+		result = int(p.Num())
 		return "", nil
 	})
 	return result, err
@@ -47,8 +46,8 @@ func ContainerEndpoint(ctx context.Context, c testcontainers.Container, proto st
 	})
 }
 
-// ContainerConnectionString returns the connection string for a MySQL container,
-// retrying on transient Docker failures.
+// ContainerConnectionString returns the connection string for a database
+// container, retrying on transient Docker failures.
 func ContainerConnectionString(ctx context.Context, c interface {
 	ConnectionString(context.Context, ...string) (string, error)
 }, args ...string) (string, error) {

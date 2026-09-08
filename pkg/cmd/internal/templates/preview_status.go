@@ -16,6 +16,12 @@ func previewStatesOutput() {
 		"STATE_CUTTING_OVER",
 		state.Apply.Completed,
 		state.Apply.Failed,
+		state.Apply.Stopped,
+		state.Apply.Cancelled,
+		state.Apply.RevertWindow,
+		state.Apply.SkippingRevert,
+		state.Apply.Reverting,
+		state.Apply.Reverted,
 		"STATE_IDLE",
 		"STATE_NO_ACTIVE_CHANGE",
 	}
@@ -37,9 +43,9 @@ func previewStatusListOutput() {
 				Environment: "staging",
 				State:       state.Apply.Running,
 				Engine:      "Spirit",
+				Caller:      "github:octocat@acme/shop#412",
 				StartedAt:   previewTime.Add(-15 * time.Minute).Format(time.RFC3339),
 				UpdatedAt:   previewTime.Add(-30 * time.Second).Format(time.RFC3339),
-				Volume:      4,
 			},
 			{
 				ApplyID:     "apply_def456",
@@ -47,9 +53,9 @@ func previewStatusListOutput() {
 				Environment: "production",
 				State:       state.Apply.WaitingForCutover,
 				Engine:      "Spirit",
+				Caller:      "cli:jdoe@macbook.local",
 				StartedAt:   previewTime.Add(-45 * time.Minute).Format(time.RFC3339),
 				UpdatedAt:   previewTime.Add(-1 * time.Minute).Format(time.RFC3339),
-				Volume:      6,
 			},
 			{
 				ApplyID:     "apply_ghi789",
@@ -57,6 +63,7 @@ func previewStatusListOutput() {
 				Environment: "staging",
 				State:       state.Apply.Stopped,
 				Engine:      "Spirit",
+				Caller:      "github:hubot@acme/analytics#87",
 				StartedAt:   previewTime.Add(-2 * time.Hour).Format(time.RFC3339),
 				UpdatedAt:   previewTime.Add(-30 * time.Minute).Format(time.RFC3339),
 			},
@@ -80,13 +87,14 @@ func previewStatusDeploymentOutput() {
 		Applies: []ActiveApplyData{
 			{
 				ApplyID:             "apply-multi-a1b2c3d4",
+				ExternalID:          "remote-apply-us-east-001",
 				ExternalOperationID: "remote-op-us-east-001",
 				Database:            "orders-db",
 				Environment:         "production",
 				Deployment:          "us-east",
 				State:               state.Apply.WaitingForCutover,
 				Engine:              "Spirit",
-				Caller:              "octocat",
+				Caller:              "github:octocat@acme/shop#412",
 				StartedAt:           previewTime.Add(-8 * time.Minute).Format(time.RFC3339),
 				UpdatedAt:           previewTime.Add(-30 * time.Second).Format(time.RFC3339),
 			},
@@ -103,14 +111,37 @@ func previewStatusDeploymentOutput() {
 		Applies: []ActiveApplyData{
 			{
 				ApplyID:     "apply-sharded-d5e6f7g8",
+				ExternalID:  "remote-apply-us-east-002",
 				Database:    "inventory-db",
 				Environment: "production",
 				Deployment:  "us-east",
 				State:       state.Apply.Running,
 				Engine:      "Spirit",
-				Caller:      "octocat",
+				Caller:      "github:octocat@acme/shop#412",
 				StartedAt:   previewTime.Add(-4 * time.Minute).Format(time.RFC3339),
 				UpdatedAt:   previewTime.Add(-20 * time.Second).Format(time.RFC3339),
+			},
+		},
+	})
+
+	fmt.Println()
+	fmt.Println("No data-plane apply id recorded:")
+	fmt.Println()
+	WriteStatusList(StatusListData{
+		ActiveCount:    1,
+		ShowExternalID: true,
+		Deployment:     "us-east",
+		Applies: []ActiveApplyData{
+			{
+				ApplyID:     "apply-pending-l3m4n5o6",
+				Database:    "payments-db",
+				Environment: "production",
+				Deployment:  "us-east",
+				State:       state.Apply.Pending,
+				Engine:      "Spirit",
+				Caller:      "github:octocat@acme/shop#412",
+				StartedAt:   previewTime.Add(-1 * time.Minute).Format(time.RFC3339),
+				UpdatedAt:   previewTime.Add(-10 * time.Second).Format(time.RFC3339),
 			},
 		},
 	})
@@ -125,7 +156,7 @@ func previewStatusHistoryOutput() {
 				Environment: "staging",
 				State:       state.Apply.Completed,
 				Engine:      "Spirit",
-				Caller:      "cli",
+				Caller:      "cli:jdoe@macbook.local",
 				StartedAt:   previewTime.Add(-1 * time.Hour).Format(time.RFC3339),
 				CompletedAt: previewTime.Add(-45 * time.Minute).Format(time.RFC3339),
 			},
@@ -134,7 +165,7 @@ func previewStatusHistoryOutput() {
 				Environment: "staging",
 				State:       state.Apply.Running,
 				Engine:      "Spirit",
-				Caller:      "PR 42",
+				Caller:      "github:octocat@acme/shop#42",
 				StartedAt:   previewTime.Add(-15 * time.Minute).Format(time.RFC3339),
 			},
 			{
@@ -142,7 +173,7 @@ func previewStatusHistoryOutput() {
 				Environment: "production",
 				State:       state.Apply.Failed,
 				Engine:      "Spirit",
-				Caller:      "PR 42",
+				Caller:      "github:octocat@acme/shop#42",
 				StartedAt:   previewTime.Add(-3 * time.Hour).Format(time.RFC3339),
 				CompletedAt: previewTime.Add(-2*time.Hour - 30*time.Minute).Format(time.RFC3339),
 				Error:       "lock timeout exceeded",
@@ -152,7 +183,7 @@ func previewStatusHistoryOutput() {
 				Environment: "production",
 				State:       state.Apply.Completed,
 				Engine:      "Spirit",
-				Caller:      "cli",
+				Caller:      "cli:jdoe@macbook.local",
 				StartedAt:   previewTime.Add(-24 * time.Hour).Format(time.RFC3339),
 				CompletedAt: previewTime.Add(-23*time.Hour - 30*time.Minute).Format(time.RFC3339),
 			},

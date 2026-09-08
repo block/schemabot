@@ -157,3 +157,71 @@ func TestProtoShardPlansToStorageCarriesPerShardChanges(t *testing.T) {
 	assert.Equal(t, "ALTER TABLE `mutes` ADD INDEX (`created_at`)", got[0].Changes[0].DDL)
 	assert.Equal(t, "alter", got[0].Changes[0].Operation)
 }
+
+// A VSchema-only plan carries no table DDL, so it is shaped as one
+// deployment-scoped task-less group_finalizer — never a work operation with no
+// tasks, which would have nothing to drive.
+func TestBuildApplyOperationGroupsVSchemaOnlyPlanBuildsFinalizer(t *testing.T) {
+	plan := &storage.Plan{
+		Database: "cdb-resolute",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"cdb_resolute_001": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"tables": {}}`}},
+		},
+	}
+
+	groups, shardedFanout, err := buildApplyOperationGroups(plan, nil, pershardTargets(), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	require.NoError(t, err)
+	assert.False(t, shardedFanout)
+	require.Len(t, groups, 1)
+	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, groups[0].Operation.OperationKind)
+	assert.Equal(t, "group_finalizer", groups[0].Operation.OperationKey)
+	assert.Empty(t, groups[0].Tasks)
+}
+
+// A VSchema-only plan changing several namespaces still gets a single
+// deployment-scoped finalizer whose drive applies every namespace's VSchema in
+// one engine apply: a branch-based engine stands up one branch covering the
+// whole deployment and validates every keyspace in it, so per-namespace
+// operations would each validate keyspaces whose VSchema they never applied.
+func TestBuildApplyOperationGroupsVSchemaOnlyPlanMultiNamespaceSingleFinalizer(t *testing.T) {
+	plan := &storage.Plan{
+		Database: "cdb-resolute",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			pershardNamespace:  {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded": true}`}},
+			"cdb_resolute_001": {Artifacts: map[string]string{storage.VSchemaArtifactName: `{"tables": {}}`}},
+		},
+	}
+
+	groups, shardedFanout, err := buildApplyOperationGroups(plan, nil, pershardTargets(), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	require.NoError(t, err)
+	assert.False(t, shardedFanout)
+	require.Len(t, groups, 1)
+	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, groups[0].Operation.OperationKind)
+	assert.Equal(t, "group_finalizer", groups[0].Operation.OperationKey)
+	assert.Empty(t, groups[0].Tasks)
+}
+
+// A plan with table DDL and no per-shard changes keeps the whole-deployment
+// work shape: one operation per target carrying the plan's tasks.
+func TestBuildApplyOperationGroupsTableDDLKeepsWorkShape(t *testing.T) {
+	mutesDDL := "ALTER TABLE `mutes` ADD INDEX (`created_at`)"
+	plan := &storage.Plan{
+		Database: "cdb-resolute",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			pershardNamespace: {
+				Tables:    []storage.TableChange{{Namespace: pershardNamespace, Table: "mutes", DDL: mutesDDL, Operation: "alter"}},
+				Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded": true}`},
+			},
+		},
+	}
+	taskChanges := plan.FlatDDLChanges()
+	require.Len(t, taskChanges, 1)
+
+	groups, shardedFanout, err := buildApplyOperationGroups(plan, taskChanges, pershardTargets(), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	require.NoError(t, err)
+	assert.False(t, shardedFanout)
+	require.Len(t, groups, 1)
+	assert.Equal(t, storage.ApplyOperationKindWork, groups[0].Operation.OperationKind)
+	require.Len(t, groups[0].Tasks, 1)
+	assert.Equal(t, mutesDDL, groups[0].Tasks[0].DDL)
+}

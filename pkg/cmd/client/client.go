@@ -19,8 +19,10 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // ResolveEndpoint returns the endpoint to use, checking in order:
@@ -117,6 +119,7 @@ func ChecksRepos(ctx context.Context, endpoint string) (*apitypes.ChecksReposRes
 type PullSchemaOptions struct {
 	Namespaces    []string
 	CatalogDetail string
+	Lint          bool
 }
 
 // CallPullSchemaAPI fetches live schema files for a database/environment pair.
@@ -132,6 +135,7 @@ func CallPullSchemaAPIWithOptions(endpoint, database, dbType, environment string
 		Environment:   environment,
 		Namespaces:    opts.Namespaces,
 		CatalogDetail: opts.CatalogDetail,
+		Lint:          opts.Lint,
 	}
 	var result apitypes.PullSchemaResponse
 	if err := doPostInto(endpoint, "/api/pull", req, &result); err != nil {
@@ -142,26 +146,50 @@ func CallPullSchemaAPIWithOptions(endpoint, database, dbType, environment string
 
 // CallPlanAPI calls the plan API by reading .sql files from schemaDir.
 // Files are grouped by namespace: subdirectories become namespace keys,
-// flat files use the directory name as the namespace.
-func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string, pr int) (*apitypes.PlanResponse, error) {
-	schemaFiles, err := ReadSchemaFiles(schemaDir, environment)
+// flat files use the directory name as the namespace. Namespaces listed in
+// ignoreNamespaces are excluded from the plan request. The second return
+// value lists the namespaces actually removed by ignoreNamespaces so callers
+// can disclose the exclusion alongside the plan.
+//
+// groupedExecution says whether the apply this plan is for hands the engine
+// every ALTER at once or one table at a time. It only affects what the plan
+// predicts about work already on the target; a caller that has not chosen yet
+// passes false, the shape an apply runs without asking for anything else.
+func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string, pr int, ignoreNamespaces []string, groupedExecution bool) (*apitypes.PlanResponse, []string, error) {
+	schemaFiles, ignored, err := ReadSchemaFiles(schemaDir, environment, ignoreNamespaces)
 	if err != nil {
-		return nil, fmt.Errorf("read schema files: %w", err)
+		return nil, nil, fmt.Errorf("read schema files: %w", err)
 	}
 	if len(schemaFiles) == 0 {
-		return nil, fmt.Errorf("no .sql files found in %s", schemaDir)
+		if len(ignored) > 0 {
+			return nil, ignored, fmt.Errorf("no .sql files found in %s after excluding ignored namespaces %v", schemaDir, ignored)
+		}
+		return nil, nil, fmt.Errorf("no .sql files found in %s", schemaDir)
 	}
-	return CallPlanAPIWithFiles(endpoint, database, dbType, environment, schemaFiles, repo, pr)
+	resp, err := postPlanRequest(endpoint, database, dbType, environment, schemaFiles, repo, pr, ignored, groupedExecution)
+	if err != nil {
+		return nil, ignored, err
+	}
+	return resp, ignored, nil
 }
 
 // CallPlanAPIWithFiles calls the plan API with pre-loaded, namespace-grouped schema files.
 func CallPlanAPIWithFiles(endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int) (*apitypes.PlanResponse, error) {
+	return postPlanRequest(endpoint, database, dbType, environment, schemaFiles, repo, pr, nil, false)
+}
+
+// postPlanRequest posts a plan request. ignoredNamespaces names the
+// namespaces removed from schemaFiles before the call — the server needs
+// them to refuse engine shapes that cannot honor the exclusion.
+func postPlanRequest(endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int, ignoredNamespaces []string, groupedExecution bool) (*apitypes.PlanResponse, error) {
 	req := apitypes.PlanRequest{
-		Database:    database,
-		Type:        dbType,
-		Environment: environment,
-		SchemaFiles: schemaFiles,
-		Repository:  repo,
+		Database:          database,
+		Type:              dbType,
+		Environment:       environment,
+		SchemaFiles:       schemaFiles,
+		Repository:        repo,
+		IgnoredNamespaces: ignoredNamespaces,
+		GroupedExecution:  groupedExecution,
 	}
 	if pr != 0 {
 		prVal := int32(pr)
@@ -259,14 +287,26 @@ func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSch
 	query := url.Values{}
 	query.Set("environment", environment)
 	query.Set("limit", "1000")
+	// Ask only for applies still holding a target. This runs on every apply and
+	// rollback preflight, and the answer never depends on settled history, so
+	// scanning it would make every schema change pay for the environment's whole
+	// past to learn whether one database is busy.
+	query.Set("active", "true")
 	if err := doGetInto(endpoint, "/api/status?"+query.Encode(), &result); err != nil {
 		return nil, err
 	}
 
+	// The server stores and returns canonical keys, and the operator's flags
+	// arrive in whatever case they were typed, so fold both sides before
+	// comparing or a busy database slips past the preflight on a case mismatch.
+	database = storage.CanonicalKey(database)
+	environment = storage.CanonicalKey(environment)
 	for _, apply := range result.Applies {
-		if apply.Database != database || apply.Environment != environment {
+		if storage.CanonicalKey(apply.Database) != database || storage.CanonicalKey(apply.Environment) != environment {
 			continue
 		}
+		// The server already excluded terminal states; re-checking here keeps the
+		// answer correct if this ever reads a response that was not filtered.
 		if state.IsTerminalApplyState(apply.State) {
 			continue
 		}
@@ -283,13 +323,17 @@ func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSch
 // The environment parameter enables $ENV substitution in namespace names.
 // If non-empty, any "$ENV" in directory names or the default namespace is
 // replaced with the environment value (e.g., "bikeshare_$ENV" → "bikeshare_staging").
-func ReadSchemaFiles(dir string, environment string) (map[string]*apitypes.SchemaFiles, error) {
+//
+// Namespaces listed in ignoreNamespaces (schemabot.yaml ignore_namespaces) are
+// excluded from the result. The second return value lists the namespace keys
+// actually removed by ignoreNamespaces, sorted.
+func ReadSchemaFiles(dir string, environment string, ignoreNamespaces []string) (map[string]*apitypes.SchemaFiles, []string, error) {
 	// Collect all files as relativePath → content
 	rawFiles := make(map[string]string)
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	for _, entry := range entries {
@@ -305,7 +349,7 @@ func ReadSchemaFiles(dir string, environment string) (map[string]*apitypes.Schem
 			// Read schema files inside the subdirectory
 			subEntries, err := os.ReadDir(filepath.Join(dir, entry.Name()))
 			if err != nil {
-				return nil, fmt.Errorf("read subdirectory %s: %w", entry.Name(), err)
+				return nil, nil, fmt.Errorf("read subdirectory %s: %w", entry.Name(), err)
 			}
 			for _, sub := range subEntries {
 				if sub.IsDir() {
@@ -319,7 +363,7 @@ func ReadSchemaFiles(dir string, environment string) (map[string]*apitypes.Schem
 				relPath := path.Join(entry.Name(), sub.Name())
 				content, err := os.ReadFile(filepath.Join(dir, entry.Name(), sub.Name()))
 				if err != nil {
-					return nil, fmt.Errorf("read %s: %w", relPath, err)
+					return nil, nil, fmt.Errorf("read %s: %w", relPath, err)
 				}
 				rawFiles[relPath] = string(content)
 			}
@@ -330,16 +374,16 @@ func ReadSchemaFiles(dir string, environment string) (map[string]*apitypes.Schem
 		}
 		content, err := os.ReadFile(filepath.Join(dir, entry.Name()))
 		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", entry.Name(), err)
+			return nil, nil, fmt.Errorf("read %s: %w", entry.Name(), err)
 		}
 		rawFiles[entry.Name()] = string(content)
 	}
 
 	// Group by namespace using the shared helper.
 	// For flat files, the directory name is the database name.
-	grouped, err := schema.GroupFilesByNamespace(rawFiles, filepath.Base(dir), environment)
+	grouped, ignored, err := schema.GroupFilesByNamespace(rawFiles, filepath.Base(dir), environment, ignoreNamespaces)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Convert schema.SchemaFiles → apitypes.SchemaFiles
@@ -347,7 +391,7 @@ func ReadSchemaFiles(dir string, environment string) (map[string]*apitypes.Schem
 	for ns, nsFiles := range grouped {
 		result[ns] = &apitypes.SchemaFiles{Files: nsFiles.Files}
 	}
-	return result, nil
+	return result, ignored, nil
 }
 
 func isSchemaFile(name string) bool {
@@ -372,16 +416,6 @@ func CallStartAPI(endpoint, environment, applyID string) (*apitypes.StartRespons
 // CallReleaseAPI calls the release API and returns the typed result.
 func CallReleaseAPI(endpoint, environment, applyID string) (*apitypes.ReleaseResponse, error) {
 	return callControlAPI[apitypes.ReleaseResponse](endpoint, "/api/release", environment, applyID)
-}
-
-// CallVolumeAPI calls the volume API and returns the typed result.
-func CallVolumeAPI(endpoint, environment, applyID string, volume int) (*apitypes.VolumeResponse, error) {
-	req := apitypes.VolumeRequest{Environment: environment, Volume: int32(volume), ApplyID: applyID}
-	var result apitypes.VolumeResponse
-	if err := doPostInto(endpoint, "/api/volume", req, &result); err != nil {
-		return nil, err
-	}
-	return &result, nil
 }
 
 // CallRevertAPI calls the revert API and returns the typed result.
@@ -421,8 +455,8 @@ type LockInfo struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
-// GenerateCLIOwner generates an owner identifier for CLI-based locks.
-// Format: "cli:username@hostname"
+// GenerateCLIOwner generates an owner identifier for CLI-based locks and the
+// caller attribution on CLI-driven requests: "cli:<user>@<host>".
 func GenerateCLIOwner() string {
 	username := "unknown"
 	if u, err := user.Current(); err == nil {
@@ -434,7 +468,29 @@ func GenerateCLIOwner() string {
 		hostname = h
 	}
 
-	return fmt.Sprintf("cli:%s@%s", username, hostname)
+	return cliOwner(username, hostname)
+}
+
+// cliOwner renders a CLI owner in the canonical spelling the lock API stores.
+// The lock API folds every caller-supplied owner before persisting or matching
+// it, so the CLI must fold the same value: an operator whose hostname or
+// username carries uppercase characters would otherwise compare unequal to
+// their own stored lock, and the pre-apply lock check would report the
+// database as locked by someone else.
+//
+// The same string is also the caller attribution on CLI-driven requests, which
+// the server does not fold. The hostname half is free — hostnames are
+// case-insensitive — and an authenticated server records the verified subject
+// in place of the claimed username, so nothing of the identity is lost there.
+// A server running without API auth records the claimed username lowercased:
+// a cosmetic loss on a display-only field, in exchange for an ownership
+// predicate that agrees with the one the lock is stored under.
+//
+// The fold belongs here rather than in caller.FormatCLI because the server
+// renders verified subjects through that same formatter, and a verified
+// identity must reach storage in the spelling its provider issued.
+func cliOwner(username, hostname string) string {
+	return storage.CanonicalKey(caller.FormatCLI(username, hostname))
 }
 
 // AcquireLock attempts to acquire a lock on a database.
@@ -509,7 +565,10 @@ func ReleaseLock(endpoint, database, dbType, owner string) error {
 	if err != nil {
 		var apiErr *APIError
 		if errors.As(err, &apiErr) {
-			if apiErr.Status == http.StatusForbidden {
+			// A 403 can also be an authorization denial naming the groups
+			// that would grant access, so only the ownership error code maps
+			// to ErrLockNotOwned; other denials surface the server's message.
+			if apiErr.Status == http.StatusForbidden && apiErr.ErrorCode == apitypes.ErrCodeLockNotOwned {
 				return ErrLockNotOwned
 			}
 			if apiErr.Status == http.StatusNotFound {
@@ -575,9 +634,13 @@ type StatusOptions struct {
 	// State restricts the list to one apply state; empty means all states.
 	State  string
 	Failed bool
-	// Last bounds the list to applies updated within this window; zero means
-	// unbounded.
+	// Last bounds the list to applies whose latest activity — on the apply or any
+	// of its operations — falls within this window; zero means unbounded.
 	Last time.Duration
+	// Active restricts the list to applies that have not reached a terminal
+	// state, so a caller asking whether a target is busy does not page through
+	// settled history.
+	Active bool
 }
 
 // GetStatus fetches recent schema changes.
@@ -604,6 +667,9 @@ func GetStatus(endpoint string, opts ...StatusOptions) (*apitypes.StatusResponse
 		if opts[0].Last > 0 {
 			values.Set("last", opts[0].Last.String())
 		}
+		if opts[0].Active {
+			values.Set("active", "true")
+		}
 		if encoded := values.Encode(); encoded != "" {
 			requestPath += "?" + encoded
 		}
@@ -614,12 +680,71 @@ func GetStatus(endpoint string, opts ...StatusOptions) (*apitypes.StatusResponse
 	return &result, nil
 }
 
+// PlansOptions filters the stored-plan listing.
+type PlansOptions struct {
+	Limit       int
+	Database    string
+	Environment string
+	// Repository restricts the listing to plans generated for PRs in that
+	// repository (owner/name).
+	Repository string
+	// PullRequest restricts the listing to plans generated for that PR
+	// number; the server requires Repository alongside it.
+	PullRequest int
+	// Last bounds the listing to plans created within this window; zero means
+	// unbounded.
+	Last time.Duration
+}
+
+// GetPlans retrieves recent stored plans as summaries, newest first.
+func GetPlans(endpoint string, opts PlansOptions) (*apitypes.PlansResponse, error) {
+	var result apitypes.PlansResponse
+	values := url.Values{}
+	if opts.Limit > 0 {
+		values.Set("limit", strconv.Itoa(opts.Limit))
+	}
+	if opts.Database != "" {
+		values.Set("database", opts.Database)
+	}
+	if opts.Environment != "" {
+		values.Set("environment", opts.Environment)
+	}
+	if opts.Repository != "" {
+		values.Set("repository", opts.Repository)
+	}
+	if opts.PullRequest > 0 {
+		values.Set("pull_request", strconv.Itoa(opts.PullRequest))
+	}
+	if opts.Last > 0 {
+		values.Set("last", opts.Last.String())
+	}
+	requestPath := "/api/plans"
+	if encoded := values.Encode(); encoded != "" {
+		requestPath += "?" + encoded
+	}
+	if err := doGetInto(endpoint, requestPath, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// GetStoredPlan retrieves one stored plan with its full content.
+func GetStoredPlan(endpoint, planID string) (*apitypes.StoredPlanResponse, error) {
+	var result apitypes.StoredPlanResponse
+	if err := doGetInto(endpoint, "/api/plans/"+url.PathEscape(planID), &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 type LogEntry = apitypes.LogEntry
 
 // GetLogs retrieves apply logs for a database.
 // If applyID is provided, it fetches logs for that specific apply.
 // Otherwise, it fetches logs for the most recent apply in the environment.
-func GetLogs(endpoint, database, environment, applyID string, limit int) ([]*LogEntry, error) {
+// The response carries the newest limit entries plus whether older ones exist
+// beyond the window.
+func GetLogs(endpoint, database, environment, applyID string, limit int) (*apitypes.LogsResponse, error) {
 	if database == "" && applyID == "" {
 		return nil, fmt.Errorf("database or apply_id is required")
 	}
@@ -643,13 +768,11 @@ func GetLogs(endpoint, database, environment, applyID string, limit int) ([]*Log
 		path += "?" + encoded
 	}
 
-	var result struct {
-		Logs []*LogEntry `json:"logs"`
-	}
+	var result apitypes.LogsResponse
 	if err := doGetInto(endpoint, path, &result); err != nil {
 		return nil, err
 	}
-	return result.Logs, nil
+	return &result, nil
 }
 
 func GetDeploymentLogs(endpoint, applyID, deployment string, limit int) (*apitypes.DeploymentLogsResponse, error) {

@@ -19,7 +19,7 @@ func TestSequentialEngineApplyRequest_PropagatesShard(t *testing.T) {
 		TableName: "mutes", Shard: "-40", DDL: "ALTER TABLE `mutes` ADD INDEX `created_at` (`created_at`)",
 	}
 
-	req := sequentialEngineApplyRequest(task, nil, nil)
+	req := sequentialEngineApplyRequest(task, nil, nil, nil)
 
 	require.Equal(t, []string{"-40"}, req.TargetShards, "the task's shard must reach the engine as a single target shard")
 	require.Len(t, req.Changes, 1)
@@ -37,7 +37,7 @@ func TestSequentialEngineApplyRequest_NonShardedUnchanged(t *testing.T) {
 		TableName: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
 	}
 
-	req := sequentialEngineApplyRequest(task, nil, nil)
+	req := sequentialEngineApplyRequest(task, nil, nil, nil)
 
 	assert.Empty(t, req.TargetShards, "a non-sharded task targets no shard")
 	require.Len(t, req.Changes, 1)

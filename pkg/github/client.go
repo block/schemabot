@@ -665,6 +665,24 @@ func (ic *InstallationClient) EditIssueComment(ctx context.Context, repo string,
 	return nil
 }
 
+// DeleteIssueComment removes an existing PR/issue comment from the timeline.
+// A comment GitHub no longer has (404) counts as deleted: retirement sweeps
+// retry failed deletes, and a retry after a crash — or after a human removed
+// the comment first — must converge instead of failing forever.
+func (ic *InstallationClient) DeleteIssueComment(ctx context.Context, repo string, commentID int64) error {
+	owner, repoName := splitRepo(repo)
+	resp, err := ic.client.Issues.DeleteComment(ctx, owner, repoName, commentID)
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
+			ic.logger.Info("issue comment already gone on GitHub; treating delete as complete",
+				"repo", repo, "comment_id", commentID)
+			return nil
+		}
+		return fmt.Errorf("delete issue comment %d: %w", commentID, err)
+	}
+	return nil
+}
+
 // MinimizeComment collapses a PR comment in the GitHub timeline as outdated.
 // The comment stays expandable — minimizing hides it from the default view
 // without editing or deleting the record. GitHub exposes this only through
@@ -946,6 +964,12 @@ const maxGitHubPRFiles = 3000
 const maxGitHubCompareFiles = 300
 
 // FetchPRFiles gets the list of files changed in a PR.
+//
+// When the PR changes more files than GitHub will report (ErrPRFilesIncomplete),
+// the returned slice still carries the visible prefix of the listing alongside
+// the error. That prefix must never be planned from — the withheld tail could
+// hold a schema change — but callers may inspect it to describe the cap, e.g.
+// whether the PR visibly touches schema at all.
 func (ic *InstallationClient) FetchPRFiles(ctx context.Context, repo string, pr int) ([]PRFile, error) {
 	owner, repoName := splitRepo(repo)
 	opts := &gh.ListOptions{PerPage: 100}
@@ -979,7 +1003,7 @@ func (ic *InstallationClient) FetchPRFiles(ctx context.Context, repo string, pr 
 			})
 		}
 		if len(allFiles) >= maxGitHubPRFiles {
-			return nil, fmt.Errorf("list PR files for %s#%d reached GitHub API limit: %w", repo, pr, ErrPRFilesIncomplete)
+			return allFiles, fmt.Errorf("list PR files for %s#%d reached GitHub API limit: %w", repo, pr, ErrPRFilesIncomplete)
 		}
 		if readResult.resp.NextPage == 0 {
 			break
@@ -1086,6 +1110,97 @@ func (ic *InstallationClient) SchemaPathsChangedSinceMergeBase(ctx context.Conte
 		}
 	}
 	return false, baseTipSHA, nil
+}
+
+// PRFilesProposedAgainstDefaultBranch narrows a pull request's changed files to
+// the ones it actually proposes, and returns the pinned default branch tip the
+// narrowing was measured against for operator logs.
+//
+// GitHub computes a pull request's file list against its base branch, so a
+// branch whose base lags — or briefly points at the wrong branch, as a stacked
+// pull request's does while it is being restacked — carries files that belong
+// to the history it has not caught up with, not to the change under review.
+// Discovery treats one changed schema file as enough to make a pull request
+// that database's pull request, so an inherited file is enough to plan a
+// database the author never touched.
+//
+// A file is kept when its object at headSHA differs from the object at the
+// default branch tip, which is what "this pull request proposes it" means: if
+// the content already matches what the default branch declares, merging changes
+// nothing for that file. The default branch is the right yardstick because it
+// is the one SchemaBot already privileges — the post-merge reconcile runs for
+// it alone, and a registered repository cannot be pointed at another ref.
+//
+// The result is always a subset of files, so this can only ever narrow
+// discovery: it cannot surface a database that was not already discovered.
+// Only the files discovery keys on are compared, so a pull request that touches
+// no schema costs no API calls.
+func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Context, repo, headSHA string, files []PRFile) (proposed []PRFile, defaultTipSHA string, err error) {
+	if !HasDiscoveryInputFiles(files) {
+		return files, "", nil
+	}
+
+	owner, repoName := splitRepo(repo)
+	repository, err := retryGitHubUnavailableRead(ctx, ic.logger, "resolve repository default branch", []any{"repo", repo}, func(ctx context.Context) (*gh.Repository, error) {
+		repository, _, err := ic.client.Repositories.Get(ctx, owner, repoName)
+		if err != nil {
+			return nil, fmt.Errorf("get repository: %w", classifyGitHubAPIError(err))
+		}
+		return repository, nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	defaultBranch := repository.GetDefaultBranch()
+	if defaultBranch == "" {
+		return nil, "", fmt.Errorf("repository %s reports no default branch", repo)
+	}
+
+	// Pin the tip up front so a commit landing on the default branch mid-pass
+	// cannot leave some files compared against one commit and some against the
+	// next.
+	tip, err := retryGitHubUnavailableRead(ctx, ic.logger, "resolve default branch tip", []any{"repo", repo, "default_branch", defaultBranch}, func(ctx context.Context) (*gh.Reference, error) {
+		ref, _, err := ic.client.Git.GetRef(ctx, owner, repoName, "heads/"+defaultBranch)
+		if err != nil {
+			return nil, fmt.Errorf("get ref heads/%s: %w", defaultBranch, classifyGitHubAPIError(err))
+		}
+		return ref, nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	defaultTipSHA = tip.GetObject().GetSHA()
+	if defaultTipSHA == "" {
+		return nil, "", fmt.Errorf("ref heads/%s for %s resolved to no commit", defaultBranch, repo)
+	}
+
+	// One cache serves both refs: it is keyed by tree SHA, and the two refs
+	// share the subtrees they have in common.
+	levelCache := make(map[string][]TreeEntry)
+	proposed = make([]PRFile, 0, len(files))
+	for _, file := range files {
+		if !isDiscoveryInputFile(file.Filename) {
+			proposed = append(proposed, file)
+			continue
+		}
+		headObjectSHA, headObjectType, headFound, err := ic.resolveGitObjectSHA(ctx, repo, headSHA, file.Filename, levelCache)
+		if err != nil {
+			return nil, defaultTipSHA, fmt.Errorf("resolve %s at head %s: %w", file.Filename, headSHA, err)
+		}
+		defaultObjectSHA, defaultObjectType, defaultFound, err := ic.resolveGitObjectSHA(ctx, repo, defaultTipSHA, file.Filename, levelCache)
+		if err != nil {
+			return nil, defaultTipSHA, fmt.Errorf("resolve %s at default branch tip %s: %w", file.Filename, defaultTipSHA, err)
+		}
+
+		switch {
+		case headFound != defaultFound:
+			// Added by this pull request, or deleted by it.
+			proposed = append(proposed, file)
+		case headFound && (headObjectSHA != defaultObjectSHA || headObjectType != defaultObjectType):
+			proposed = append(proposed, file)
+		}
+	}
+	return proposed, defaultTipSHA, nil
 }
 
 // CheckRunOptions contains options for creating or updating a GitHub Check Run.

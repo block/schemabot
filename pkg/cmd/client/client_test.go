@@ -13,6 +13,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/caller"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 func TestCallPullSchemaAPI(t *testing.T) {
@@ -39,10 +41,11 @@ func TestCallPullSchemaAPI(t *testing.T) {
 	result, err := CallPullSchemaAPIWithOptions(server.URL, "orders", "mysql", "production", PullSchemaOptions{
 		Namespaces:    []string{"orders_production", "orders_audit_production"},
 		CatalogDetail: "detailed",
+		Lint:          true,
 	})
 	require.NoError(t, err)
 
-	assert.Equal(t, apitypes.PullSchemaRequest{Database: "orders", Type: "mysql", Environment: "production", Namespaces: []string{"orders_production", "orders_audit_production"}, CatalogDetail: "detailed"}, gotReq)
+	assert.Equal(t, apitypes.PullSchemaRequest{Database: "orders", Type: "mysql", Environment: "production", Namespaces: []string{"orders_production", "orders_audit_production"}, CatalogDetail: "detailed", Lint: true}, gotReq)
 	require.NotNil(t, result)
 	assert.Equal(t, "orders", result.Database)
 	assert.Equal(t, "mysql", result.Type)
@@ -157,6 +160,48 @@ func TestGetStatusWithOptions(t *testing.T) {
 	assert.Empty(t, gotFailed)
 }
 
+// The apply/rollback preflight asks only for applies still holding a target, so
+// deciding whether one database is busy never depends on settled history.
+func TestCheckActiveSchemaChangeRequestsActiveOnly(t *testing.T) {
+	var gotActive, gotEnvironment string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotActive = r.URL.Query().Get("active")
+		gotEnvironment = r.URL.Query().Get("environment")
+		w.Header().Set("Content-Type", "application/json")
+		_, err := w.Write([]byte(`{"active_count":1,"limit":1000,"applies":[` +
+			`{"apply_id":"apply-busy","database":"orders","environment":"staging","state":"running"}]}`))
+		require.NoError(t, err)
+	}))
+	t.Cleanup(server.Close)
+
+	active, err := CheckActiveSchemaChange(server.URL, "orders", "staging")
+	require.NoError(t, err)
+	require.NotNil(t, active)
+	assert.Equal(t, "apply-busy", active.ApplyID)
+	assert.Equal(t, "running", active.State)
+	assert.Equal(t, "true", gotActive)
+	assert.Equal(t, "staging", gotEnvironment)
+}
+
+// The preflight compares the operator's flags against stored keys, which the
+// server returns canonically, so a database or environment typed in a different
+// case must still find the busy apply rather than report the database idle.
+func TestCheckActiveSchemaChangeFoldsKeysBeforeComparing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, err := w.Write([]byte(`{"active_count":1,"limit":1000,"applies":[` +
+			`{"apply_id":"apply-busy","database":"orders","environment":"staging","state":"running"}]}`))
+		assert.NoError(t, err)
+	}))
+	t.Cleanup(server.Close)
+
+	active, err := CheckActiveSchemaChange(server.URL, "Orders", "Staging")
+	require.NoError(t, err)
+	require.NotNil(t, active)
+	assert.Equal(t, "apply-busy", active.ApplyID)
+	assert.Equal(t, "running", active.State)
+}
+
 func TestReadSchemaFiles_RegularDirectories(t *testing.T) {
 	dir := t.TempDir()
 
@@ -167,7 +212,7 @@ func TestReadSchemaFiles_RegularDirectories(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "ks_sharded"), 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "ks_sharded", "orders.sql"), []byte("CREATE TABLE orders (id INT)"), 0o644))
 
-	result, err := ReadSchemaFiles(dir, "")
+	result, _, err := ReadSchemaFiles(dir, "", nil)
 	require.NoError(t, err)
 
 	require.Contains(t, result, "ks_unsharded")
@@ -188,7 +233,7 @@ func TestReadSchemaFiles_SymlinkedDirectories(t *testing.T) {
 	symlinkDir := filepath.Join(dir, "ks_symlink")
 	require.NoError(t, os.Symlink(realDir, symlinkDir))
 
-	result, err := ReadSchemaFiles(dir, "")
+	result, _, err := ReadSchemaFiles(dir, "", nil)
 	require.NoError(t, err)
 
 	// Both the real directory and the symlink should be read
@@ -214,7 +259,7 @@ func TestReadSchemaFiles_MixedRealAndSymlinked(t *testing.T) {
 	require.NoError(t, os.Symlink(shardedDir, filepath.Join(dir, "commerce_sharded_001")))
 	require.NoError(t, os.Symlink(shardedDir, filepath.Join(dir, "commerce_sharded_002")))
 
-	result, err := ReadSchemaFiles(dir, "")
+	result, _, err := ReadSchemaFiles(dir, "", nil)
 	require.NoError(t, err)
 
 	// All four keyspaces should be present
@@ -237,11 +282,124 @@ func TestReadSchemaFiles_SkipsNonSchemaFiles(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "mydb", "README.md"), []byte("ignore me"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "mydb", "vschema.json"), []byte("{}"), 0o644))
 
-	result, err := ReadSchemaFiles(dir, "")
+	result, _, err := ReadSchemaFiles(dir, "", nil)
 	require.NoError(t, err)
 
 	require.Contains(t, result, "mydb")
 	assert.Contains(t, result["mydb"].Files, "users.sql")
 	assert.Contains(t, result["mydb"].Files, "vschema.json")
 	assert.NotContains(t, result["mydb"].Files, "README.md")
+}
+
+func TestReadSchemaFiles_IgnoreNamespaces(t *testing.T) {
+	dir := t.TempDir()
+
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "ks_unsharded"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "ks_unsharded", "users.sql"), []byte("CREATE TABLE users (id INT)"), 0o644))
+
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "local_fixtures"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "local_fixtures", "widgets.sql"), []byte("CREATE TABLE widgets (id INT)"), 0o644))
+
+	result, removed, err := ReadSchemaFiles(dir, "", []string{"local_fixtures"})
+	require.NoError(t, err)
+
+	require.Contains(t, result, "ks_unsharded")
+	assert.NotContains(t, result, "local_fixtures")
+	assert.Equal(t, []string{"local_fixtures"}, removed)
+}
+
+// A flat-layout schema directory has exactly one namespace — the directory
+// name itself — so ignoring it removes every schema file. The plan call must
+// fail with an error naming the exclusion rather than planning an empty
+// desired state, which on a live database would read as "drop everything".
+func TestCallPlanAPI_IgnoreSoleFlatNamespace(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "orders")
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "users.sql"), []byte("CREATE TABLE users (id INT)"), 0o644))
+
+	_, ignored, err := CallPlanAPI("http://unreachable.invalid", "orders", "mysql", "development", dir, "", 0, []string{"orders"}, false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "after excluding ignored namespaces")
+	assert.Contains(t, err.Error(), "orders")
+	assert.Equal(t, []string{"orders"}, ignored)
+}
+
+// The namespaces removed by ignore_namespaces must reach the server on the
+// plan request: their files are already absent from schema_files, and the
+// server needs the ignored list to refuse engine shapes that cannot honor
+// the exclusion.
+func TestCallPlanAPI_SendsIgnoredNamespaces(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "payments"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "payments", "users.sql"), []byte("CREATE TABLE users (id INT)"), 0o644))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "local_fixtures"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "local_fixtures", "widgets.sql"), []byte("CREATE TABLE widgets (id INT)"), 0o644))
+
+	var gotReq apitypes.PlanRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "/api/plan", r.URL.Path)
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&gotReq))
+
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(apitypes.PlanResponse{}))
+	}))
+	t.Cleanup(server.Close)
+
+	_, ignored, err := CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, []string{"local_fixtures"}, false)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"local_fixtures"}, ignored)
+	assert.Equal(t, []string{"local_fixtures"}, gotReq.IgnoredNamespaces)
+	require.Contains(t, gotReq.SchemaFiles, "payments")
+	assert.NotContains(t, gotReq.SchemaFiles, "local_fixtures")
+}
+
+// A plan made for an apply that will hand the engine every ALTER at once has
+// to say so on the request. The grouping decides what the engine predicts
+// about a copy already on the target, so a plan that leaves it off describes a
+// different apply than the one the operator is about to run.
+func TestCallPlanAPI_SendsGroupedExecution(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "payments"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "payments", "users.sql"), []byte("CREATE TABLE users (id INT)"), 0o644))
+
+	var gotReq apitypes.PlanRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&gotReq))
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(apitypes.PlanResponse{}))
+	}))
+	t.Cleanup(server.Close)
+
+	_, _, err := CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, nil, true)
+	require.NoError(t, err)
+	assert.True(t, gotReq.GroupedExecution, "the grouping the apply will use reaches the server")
+
+	gotReq = apitypes.PlanRequest{}
+	_, _, err = CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, nil, false)
+	require.NoError(t, err)
+	assert.False(t, gotReq.GroupedExecution, "a caller that has not chosen leaves the plan on the ungrouped default")
+}
+
+// A CLI owner is the ownership token the lock API matches byte-exactly against
+// the folded spelling it stored at acquire. An operator on a host whose name
+// carries uppercase characters must still recognize their own lock, so the
+// owner is generated already folded.
+func TestGenerateCLIOwnerIsCanonical(t *testing.T) {
+	t.Run("uppercase hostname and username fold", func(t *testing.T) {
+		owner := cliOwner("JDoe", "MacBook.local")
+		assert.Equal(t, "cli:jdoe@macbook.local", owner)
+		assert.Equal(t, storage.CanonicalKey(owner), owner, "owner matches the spelling the lock API stores")
+
+		user, host, ok := caller.SplitCLI(owner)
+		require.True(t, ok, "folding keeps the owner CLI-shaped")
+		assert.Equal(t, "jdoe", user)
+		assert.Equal(t, "macbook.local", host)
+	})
+
+	t.Run("generated owner is already folded", func(t *testing.T) {
+		owner := GenerateCLIOwner()
+		assert.Equal(t, storage.CanonicalKey(owner), owner)
+	})
 }

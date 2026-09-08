@@ -7,10 +7,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
-	"github.com/block/spirit/pkg/statement"
 )
 
 // PlanDiff is the read-only producer for review-time drift detection: it must
@@ -102,7 +102,7 @@ func shardedAlterPlan() *engine.PlanResult {
 				Shard:     engine.Shard{Name: "-80"},
 				TableChanges: []engine.TableChange{{
 					Table:     "users",
-					Operation: statement.StatementAlterTable,
+					Operation: ddl.StatementAlterTable,
 					DDL:       "ALTER TABLE `users` ADD INDEX (`created_at`)",
 				}},
 			},
@@ -111,7 +111,7 @@ func shardedAlterPlan() *engine.PlanResult {
 				Shard:     engine.Shard{Name: "80-"},
 				TableChanges: []engine.TableChange{{
 					Table:     "users",
-					Operation: statement.StatementAlterTable,
+					Operation: ddl.StatementAlterTable,
 					DDL:       "ALTER TABLE `users` ADD INDEX (`updated_at`)",
 				}},
 			},

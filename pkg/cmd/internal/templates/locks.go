@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/block/schemabot/pkg/cmd/cliname"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -30,7 +32,7 @@ func WriteLockReleased(database, dbType string) {
 
 // WriteLockForceReleased writes the force release message.
 func WriteLockForceReleased(database, dbType, previousOwner string) {
-	fmt.Printf("⚠️  Force released lock for %s (%s)\n", database, dbType)
+	fmt.Printf(glyph.Attention+"  Force released lock for %s (%s)\n", database, dbType)
 	fmt.Printf("   Previous owner: %s\n", previousOwner)
 }
 
@@ -47,7 +49,7 @@ type LockConflictData struct {
 // WriteLockConflict writes the lock conflict error message.
 func WriteLockConflict(data LockConflictData) {
 	fmt.Println()
-	fmt.Println("❌ Apply Blocked: Database Locked")
+	fmt.Println(glyph.Refused + " Apply blocked: database locked")
 	fmt.Println()
 
 	// Show a table of lock info
@@ -66,8 +68,8 @@ func WriteLockConflict(data LockConflictData) {
 	fmt.Println()
 	fmt.Println("Options:")
 	fmt.Println("  • Wait for the current schema change to complete")
-	fmt.Println("  • Ask the lock owner to release: schemabot unlock")
-	fmt.Printf("  • Force unlock: schemabot unlock -d %s --force\n", data.Database)
+	fmt.Printf("  • Ask the lock owner to release: %s unlock -d %s\n", cliname.Name(), data.Database)
+	fmt.Printf("  • Force unlock: %s unlock -d %s --force\n", cliname.Name(), data.Database)
 	fmt.Println()
 }
 
@@ -94,8 +96,8 @@ func WriteLocksList(locks []LockData) {
 	}
 
 	fmt.Println("To release a lock:")
-	fmt.Println("  schemabot unlock -d <database> -t <type>")
-	fmt.Println("  schemabot unlock -d <database> -t <type> --force  # override ownership")
+	fmt.Printf("  %s unlock -d <database> -t <type>\n", cliname.Name())
+	fmt.Printf("  %s unlock -d <database> -t <type> --force  # override ownership\n", cliname.Name())
 }
 
 // WriteNoLockFound writes the message when a lock doesn't exist.
@@ -110,7 +112,7 @@ func WriteNoLockFound(database, dbType string) {
 // the wrong namespace — point them at the lock that actually exists.
 func WriteLockExistsUnderOtherType(database, requestedType, foundType string) {
 	fmt.Printf("No lock found for %s (%s), but a %s lock exists for this database.\n", database, requestedType, foundType)
-	fmt.Printf("Release it with: schemabot unlock -d %s -t %s\n", database, foundType)
+	fmt.Printf("Release it with: %s unlock -d %s -t %s\n", cliname.Name(), database, foundType)
 }
 
 // WriteLockTypeScanFailed writes the message when the check for locks under
@@ -123,7 +125,7 @@ func WriteLockTypeScanFailed(err error) {
 // WriteUnlockNotOwned writes the message when trying to unlock without ownership.
 func WriteUnlockNotOwned(database, dbType, currentOwner string) {
 	fmt.Println()
-	fmt.Println("⚠️  Cannot release lock")
+	fmt.Println(glyph.Attention + "  Cannot release lock")
 	fmt.Println()
 	fmt.Printf("  Database:      %s (%s)\n", database, dbType)
 	fmt.Printf("  Current owner: %s\n", currentOwner)

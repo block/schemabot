@@ -68,10 +68,12 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -79,10 +81,10 @@ import (
 	"testing"
 	"time"
 
+	mysql "github.com/block/mysql"
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
@@ -112,30 +114,20 @@ func TestMain(m *testing.M) {
 		log.Fatalf("Failed to start target MySQL: %v", err)
 	}
 
-	host, err := testutil.ContainerHost(ctx, targetContainer)
+	e2eTargetDSN, err = testutil.MySQLDSN(ctx, targetContainer, "target_test", "parseTime=true")
 	if err != nil {
-		log.Fatalf("Failed to get target host: %v", err)
+		log.Fatalf("Failed to build target DSN: %v", err)
 	}
-	port, err := testutil.ContainerPort(ctx, targetContainer, "3306")
-	if err != nil {
-		log.Fatalf("Failed to get target port: %v", err)
-	}
-	e2eTargetDSN = fmt.Sprintf("root:testpassword@tcp(%s:%d)/target_test?parseTime=true", host, port)
 
 	sbContainer, err := startE2EMySQLContainer(ctx, "webhook-schemabot-mysql", "schemabot_test", &schema.MySQLFS)
 	if err != nil {
 		log.Fatalf("Failed to start SchemaBot MySQL: %v", err)
 	}
 
-	sbHost, err := testutil.ContainerHost(ctx, sbContainer)
+	e2eSchemabotDSN, err = testutil.MySQLDSN(ctx, sbContainer, "schemabot_test", "parseTime=true")
 	if err != nil {
-		log.Fatalf("Failed to get schemabot host: %v", err)
+		log.Fatalf("Failed to build SchemaBot storage DSN: %v", err)
 	}
-	sbPort, err := testutil.ContainerPort(ctx, sbContainer, "3306")
-	if err != nil {
-		log.Fatalf("Failed to get schemabot port: %v", err)
-	}
-	e2eSchemabotDSN = fmt.Sprintf("root:testpassword@tcp(%s:%d)/schemabot_test?parseTime=true", sbHost, sbPort)
 
 	code := m.Run()
 
@@ -159,50 +151,120 @@ func setupE2EService(t *testing.T, appDBName string) *api.Service {
 // state transitions).
 func setupE2EServiceWithStorage(t *testing.T, appDBName string, wrapStorage func(storage.Storage) storage.Storage) *api.Service {
 	t.Helper()
+	return setupE2EServiceOpts(t, appDBName, e2eServiceOpts{wrapStorage: wrapStorage})
+}
+
+// e2eServiceOpts customizes setupE2EServiceOpts beyond the defaults.
+type e2eServiceOpts struct {
+	// wrapStorage wraps the service's storage so a test can observe every
+	// storage write the handler and observers perform.
+	wrapStorage func(storage.Storage) storage.Storage
+	// engineMetadata is forwarded to the LocalClient, enabling per-database
+	// engine policies (e.g. direct execution) for the test's plans and
+	// applies.
+	engineMetadata map[string]string
+	// skipOperator leaves the operator claim loop stopped so a test can
+	// observe the initial durable state of queued work (e.g. a pending
+	// apply_operations row) without racing an operator claim.
+	skipOperator bool
+	// databaseType and targetDSN let integration scenarios exercise another
+	// built-in engine while retaining the same API, storage, and operator path.
+	// For MySQL, a non-empty targetDSN overrides the default database-scoped
+	// DSN — e.g. a namespace-free DSN for scenarios where the namespace
+	// selects the database.
+	databaseType string
+	targetDSN    string
+	// preserveDurableState skips the stale-data cleanup so a second service
+	// instance can adopt durable work queued by a previous instance — the
+	// restart fixtures' crash/recovery seam. Only the first instance of a
+	// test may clean; a recovering instance must see the queued rows.
+	preserveDurableState bool
+}
+
+// namespaceFreeTargetDSN returns the shared MySQL target's DSN with no
+// database selected — the shape where each namespace's directory name selects
+// the database it is planned against.
+func namespaceFreeTargetDSN(t *testing.T) string {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(e2eTargetDSN)
+	require.NoError(t, err)
+	cfg.DBName = ""
+	return cfg.FormatDSN()
+}
+
+// setupE2EServiceOpts creates a real api.Service with a LocalClient for the
+// given database, customized by opts.
+func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *api.Service {
+	t.Helper()
 	ctx := t.Context()
+	databaseType := opts.databaseType
+	if databaseType == "" {
+		databaseType = storage.DatabaseTypeMySQL
+	}
+	appDSN := opts.targetDSN
 
-	// Create the app database on the target
-	targetDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
-	require.NoError(t, err)
-	_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+appDBName+"`")
-	require.NoError(t, err)
-	_ = targetDB.Close()
+	if databaseType == storage.DatabaseTypeMySQL {
+		// Create the app database on the target.
+		targetDB, err := sql.Open("block-mysql", e2eTargetDSN+"&multiStatements=true")
+		require.NoError(t, err)
+		_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+appDBName+"`")
+		require.NoError(t, err)
+		_ = targetDB.Close()
 
-	t.Cleanup(func() {
-		db, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
-		if err == nil {
-			_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+appDBName+"`")
-			_ = db.Close()
+		t.Cleanup(func() {
+			db, err := sql.Open("block-mysql", e2eTargetDSN+"&multiStatements=true")
+			if err == nil {
+				_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+appDBName+"`")
+				_ = db.Close()
+			}
+		})
+
+		if appDSN == "" {
+			cfg, err := mysql.ParseDSN(e2eTargetDSN)
+			require.NoError(t, err)
+			cfg.DBName = appDBName
+			appDSN = cfg.FormatDSN()
 		}
-	})
-
-	appDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+appDBName, 1)
+	}
+	require.NotEmpty(t, appDSN, "target DSN is required for database type %s", databaseType)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = schemabotDB.Close() })
 
 	st := storage.Storage(mysqlstore.New(schemabotDB))
-	if wrapStorage != nil {
-		st = wrapStorage(st)
+	if opts.wrapStorage != nil {
+		st = opts.wrapStorage(st)
 	}
 
-	// Clean up any stale data from previous test runs (shared storage DB)
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE database_name = ?", appDBName)
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM checks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM locks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
-	// Delete child apply_operations rows before their parent applies rows so the
-	// operator claim loop cannot re-claim orphan operations whose parent lookup
-	// returns nil.
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE ao FROM apply_operations ao JOIN applies a ON a.id = ao.apply_id WHERE a.repository = 'octocat/hello-world' AND a.pull_request = 1")
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM applies WHERE repository = 'octocat/hello-world' AND pull_request = 1")
-	_, _ = schemabotDB.ExecContext(ctx, "DELETE FROM plans WHERE database_name = ?", appDBName)
+	if !opts.preserveDurableState {
+		// Clean up any stale data from previous test runs (shared storage DB).
+		// A failed delete must stop the test here: leftover rows surface later
+		// as misleading assertion failures. Child apply_operations rows are
+		// deleted before their parent applies rows so the operator claim loop
+		// cannot re-claim orphan operations whose parent lookup returns nil.
+		for _, cleanup := range []struct {
+			query string
+			args  []any
+		}{
+			{"DELETE FROM checks WHERE database_name = ?", []any{appDBName}},
+			{"DELETE FROM checks WHERE repository = 'octocat/hello-world' AND pull_request = 1", nil},
+			{"DELETE FROM locks WHERE repository = 'octocat/hello-world' AND pull_request = 1", nil},
+			{"DELETE ao FROM apply_operations ao JOIN applies a ON a.id = ao.apply_id WHERE a.repository = 'octocat/hello-world' AND a.pull_request = 1", nil},
+			{"DELETE FROM applies WHERE repository = 'octocat/hello-world' AND pull_request = 1", nil},
+			{"DELETE FROM plans WHERE database_name = ?", []any{appDBName}},
+		} {
+			_, err := schemabotDB.ExecContext(ctx, cleanup.query, cleanup.args...)
+			require.NoError(t, err, "stale-data cleanup: %s", cleanup.query)
+		}
+	}
 
 	localClient, err := tern.NewLocalClient(tern.LocalConfig{
 		Database:  appDBName,
-		Type:      "mysql",
+		Type:      databaseType,
 		TargetDSN: appDSN,
+		Metadata:  opts.engineMetadata,
 	}, st, logger)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = localClient.Close() })
@@ -211,7 +273,7 @@ func setupE2EServiceWithStorage(t *testing.T, appDBName string, wrapStorage func
 		Drivers: 1,
 		Databases: map[string]api.DatabaseConfig{
 			appDBName: {
-				Type: "mysql",
+				Type: databaseType,
 				Environments: map[string]api.EnvironmentConfig{
 					"staging": {DSN: appDSN},
 				},
@@ -225,7 +287,10 @@ func setupE2EServiceWithStorage(t *testing.T, appDBName string, wrapStorage func
 	require.NoError(t, svc.SetOperatorPollInterval(100*time.Millisecond))
 	// Webhook E2E helpers use the real service lifecycle. Local applies are
 	// durably queued by ExecuteApply, then dispatched by operator drivers.
-	svc.StartOperator(ctx)
+	// Tests that assert on pre-claim durable state opt out via skipOperator.
+	if !opts.skipOperator {
+		svc.StartOperator(ctx)
+	}
 	t.Cleanup(func() { _ = svc.Close() })
 
 	return svc
@@ -306,6 +371,28 @@ type planFlowResult struct {
 	// "closed" before issuing the webhook request.
 	PRState atomic.Pointer[string]
 
+	// FailCommentPost makes every comment POST fail, so tests can exercise the
+	// paths that must not record durable state describing a comment the
+	// operator never received.
+	FailCommentPost atomic.Bool
+
+	// baseFiles is what the default branch holds, as repository path to blob
+	// SHA. It starts as the schema directory carrying the config at a blob of
+	// its own, so resolving a PR's schema file at the default branch tip walks
+	// the same directory levels a real repository has, and none of the PR's own
+	// files are found there. Tests add to it through baseHolds to model a
+	// changed-file list that carries a file the PR does not propose.
+	baseFiles atomic.Pointer[map[string]string]
+
+	// headTreeEntries is the repository at head, as the fixture described it.
+	headTreeEntries []*gh.TreeEntry
+
+	// BaseRef overrides the base branch served by /pulls/1. Nil (the default)
+	// serves "main". Tests that model a PR being retargeted install the new ref,
+	// optionally partway through a flow so the base a plan was computed against
+	// differs from the base it would be published on.
+	BaseRef atomic.Pointer[string]
+
 	// PRMerged marks the PR served by /pulls/1 as merged. GitHub reports a
 	// merged PR with state "closed" and merged true, so tests exercising the
 	// merged-PR rejection copy set this together with PRState "closed".
@@ -318,6 +405,28 @@ type planFlowResult struct {
 	// before issuing the webhook request. Nil preserves the default
 	// "no checks → passing" behavior.
 	CheckStatusNodes atomic.Pointer[func() []checkStatusNode]
+
+	// FailFirstPRRead makes the first /pulls/1 request answer with a 403 and
+	// serves every later one. Auto-plan reads the PR to snapshot its base
+	// branch before discovery, so this models a failure to establish which
+	// base a plan would be computed against, while leaving the reads that post
+	// the resulting check run working. The status has to be one the client
+	// treats as a semantic answer rather than an availability failure: a 5xx
+	// is retried, and the retry would serve the request and hide the failure
+	// the test is asking for.
+	FailFirstPRRead atomic.Bool
+
+	// FailPRReadsAfterFirstFetch makes /pulls/1 serve only its first request and
+	// answer every later one with a 403. Auto-plan snapshots the PR once at the
+	// top of discovery and re-reads it uncached before publishing, so this models
+	// SchemaBot losing access to the PR in between — the publish-time
+	// re-verification cannot be answered and the plan must not be published. The
+	// status is the non-retryable kind on purpose: the client already retries an
+	// availability failure, so what reaches that re-verification is a failure
+	// retrying does not fix.
+	FailPRReadsAfterFirstFetch atomic.Bool
+
+	prReadRequests atomic.Int64
 
 	// FailPRFilesAfterFirstFetch makes /pulls/1/files serve only its first
 	// request and answer every later one with a 503. Config discovery fetches
@@ -457,10 +566,186 @@ func registerCheckStatusRESTHandlersForAnyRef(mux *http.ServeMux, nodes func() [
 }
 
 // setupFakeGitHubForPlan sets up a fake GitHub server for plan flows.
-// schemaSQL maps filename -> content. Files are placed under schema/{namespace}/.
+// schemaSQL maps filename -> content. Plain filenames are placed under
+// schema/{namespace}/; filenames containing a "/" are placed under schema/
+// as-is, so a test can lay out multiple namespace subdirectories.
 // namespace is the MySQL schema name (required).
 func setupFakeGitHubForPlan(t *testing.T, mux *http.ServeMux, schemaSQL map[string]string, schemabotConfig, ns string) *planFlowResult {
 	return setupFakeGitHubForPlanWithPRFiles(t, mux, schemaSQL, schemabotConfig, ns, nil)
+}
+
+// baseHolds adds the given repository paths to what the default branch already
+// carries: each at the blob head has for it when head has it too — a file the
+// PR's changed-file list carries but that merging it would not change — and at
+// a blob of its own otherwise, which is what a file the PR deletes looks like.
+func (r *planFlowResult) baseHolds(paths ...string) {
+	held := make(map[string]string, len(paths))
+	if existing := r.baseFiles.Load(); existing != nil {
+		maps.Copy(held, *existing)
+	}
+	for _, path := range paths {
+		held[path] = "basesha~" + path
+		for _, entry := range r.headTreeEntries {
+			if entry.GetPath() == path {
+				held[path] = entry.GetSHA()
+			}
+		}
+	}
+	r.baseFiles.Store(&held)
+}
+
+// baseTreeEntries is the repository as the default branch holds it.
+func (r *planFlowResult) baseTreeEntries() []*gh.TreeEntry {
+	held := r.baseFiles.Load()
+	if held == nil {
+		return nil
+	}
+	entries := make([]*gh.TreeEntry, 0, len(*held))
+	for path, blobSHA := range *held {
+		entries = append(entries, &gh.TreeEntry{Path: new(path), Type: new("blob"), SHA: new(blobSHA)})
+	}
+	slices.SortFunc(entries, func(a, b *gh.TreeEntry) int { return strings.Compare(a.GetPath(), b.GetPath()) })
+	return entries
+}
+
+// Synthesized tree identifiers for directories below a root level, one prefix
+// per branch so the head and the default branch resolve through distinct nodes.
+// Directory separators are encoded so an identifier stays one URL path segment,
+// as a real tree SHA is.
+const (
+	headSubtreeSHAPrefix = "subtree~"
+	baseSubtreeSHAPrefix = "basetree~"
+)
+
+// repositoryTreeFixture describes a repository to the tree endpoints at the two
+// commits a plan flow reads: the PR head, and the default branch tip that
+// discovery scopes the PR's changed files against. Both are given as the flat
+// path lists a recursive tree read returns.
+type repositoryTreeFixture struct {
+	headSHA     string
+	headEntries []*gh.TreeEntry
+	// baseEntries is what the default branch holds. Nil means it holds none of
+	// the head's files, so every changed file is the PR's own proposal.
+	baseEntries func() []*gh.TreeEntry
+	// defaultTip is the commit the default branch resolves to. Nil serves the
+	// PR's base commit, so the base branch appears unmoved.
+	defaultTip func() string
+}
+
+func (f repositoryTreeFixture) base() []*gh.TreeEntry {
+	if f.baseEntries == nil {
+		return nil
+	}
+	return f.baseEntries()
+}
+
+func (f repositoryTreeFixture) tip() string {
+	if f.defaultTip == nil {
+		return "def456"
+	}
+	return f.defaultTip()
+}
+
+// shallowTreeLevel serves one directory level. treeSHA is either a commit (a
+// root level) or a synthesized subtree identifier, and which commit it belongs
+// to decides which entry list the level is built from. A commit the fixture
+// does not name as the default branch tip is a head commit, so a test that
+// advances the PR head needs no fixture of its own.
+func (f repositoryTreeFixture) shallowTreeLevel(treeSHA string) []*gh.TreeEntry {
+	if encoded, isBase := strings.CutPrefix(treeSHA, baseSubtreeSHAPrefix); isBase {
+		return treeLevelFrom(f.base(), strings.ReplaceAll(encoded, "~", "/"), baseSubtreeSHAPrefix)
+	}
+	if encoded, isHead := strings.CutPrefix(treeSHA, headSubtreeSHAPrefix); isHead {
+		return treeLevelFrom(f.headEntries, strings.ReplaceAll(encoded, "~", "/"), headSubtreeSHAPrefix)
+	}
+	if treeSHA == f.tip() {
+		return treeLevelFrom(f.base(), "", baseSubtreeSHAPrefix)
+	}
+	return treeLevelFrom(f.headEntries, "", headSubtreeSHAPrefix)
+}
+
+// registerRepositoryTrees serves the repository reads a plan flow makes: the
+// default branch and its tip, and the git trees at head and at that tip. A
+// shallow read walks one directory level at a time; a recursive read wants the
+// whole tree flat. Both hit the same path, so serve what was asked for: the
+// recursive form is what config discovery reads, and the level form is what the
+// path resolvers walk.
+func registerRepositoryTrees(t *testing.T, mux *http.ServeMux, fixture repositoryTreeFixture) {
+	t.Helper()
+
+	mux.HandleFunc("GET /repos/octocat/hello-world", func(w http.ResponseWriter, _ *http.Request) {
+		require.NoError(t, json.NewEncoder(w).Encode(gh.Repository{DefaultBranch: new("main")}))
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
+		tip := fixture.tip()
+		require.NoError(t, json.NewEncoder(w).Encode(gh.Reference{
+			Ref:    new("refs/heads/main"),
+			Object: &gh.GitObject{Type: new("commit"), SHA: &tip},
+		}))
+	})
+
+	serveTree := func(w http.ResponseWriter, r *http.Request, sha string) {
+		entries := fixture.headEntries
+		if r.URL.Query().Get("recursive") == "" {
+			entries = fixture.shallowTreeLevel(sha)
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(gh.Tree{
+			SHA:       &sha,
+			Entries:   entries,
+			Truncated: new(false),
+		}))
+	}
+	// Go 1.22 ServeMux gives precedence to the more specific exact path, so the
+	// head commit keeps its own route and every other SHA falls through to the
+	// prefix — a test that advances the head needs no fixture per commit.
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/"+fixture.headSHA, func(w http.ResponseWriter, r *http.Request) {
+		serveTree(w, r, fixture.headSHA)
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/", func(w http.ResponseWriter, r *http.Request) {
+		serveTree(w, r, r.URL.Path[len("/repos/octocat/hello-world/git/trees/"):])
+	})
+}
+
+// treeLevelFrom returns the entries directly under dir, minting subtree
+// identifiers for deeper directories with subtreePrefix.
+func treeLevelFrom(entries []*gh.TreeEntry, dir, subtreePrefix string) []*gh.TreeEntry {
+	pathPrefix := ""
+	if dir != "" {
+		pathPrefix = dir + "/"
+	}
+	var level []*gh.TreeEntry
+	seen := map[string]bool{}
+	for _, entry := range entries {
+		rest, under := strings.CutPrefix(entry.GetPath(), pathPrefix)
+		if !under || rest == "" {
+			continue
+		}
+		segment, deeper, isDir := strings.Cut(rest, "/")
+		if seen[segment] {
+			continue
+		}
+		seen[segment] = true
+		if isDir && deeper != "" {
+			level = append(level, &gh.TreeEntry{
+				Path: new(segment),
+				Type: new("tree"),
+				SHA:  new(subtreePrefix + strings.ReplaceAll(pathPrefix+segment, "/", "~")),
+			})
+			continue
+		}
+		level = append(level, &gh.TreeEntry{Path: new(segment), Type: new("blob"), SHA: new(entry.GetSHA())})
+	}
+	return level
+}
+
+// schemaFixturePath resolves a schemaSQL key to its repository path: plain
+// filenames live under the namespace subdirectory, keys with a "/" already
+// name their namespace subdirectory.
+func schemaFixturePath(ns, name string) string {
+	if strings.Contains(name, "/") {
+		return "schema/" + name
+	}
+	return "schema/" + ns + "/" + name
 }
 
 func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaSQL map[string]string, schemabotConfig, ns string, prFiles []*gh.CommitFile) *planFlowResult {
@@ -475,12 +760,29 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 	// PR info — head SHA can shift across calls via result.HeadSHAs (default
 	// preserves the historical "abc123" for every existing test).
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, r *http.Request) {
+		read := result.prReadRequests.Add(1)
+		if result.FailFirstPRRead.Load() && read == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"Resource not accessible by integration"}`))
+			return
+		}
+		if result.FailPRReadsAfterFirstFetch.Load() && read > 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"Resource not accessible by integration"}`))
+			return
+		}
 		sha := result.nextHeadSHA()
 		prState := "open"
 		if override := result.PRState.Load(); override != nil {
 			prState = *override
 		}
 		merged := result.PRMerged.Load()
+		baseRef := "main"
+		if override := result.BaseRef.Load(); override != nil {
+			baseRef = *override
+		}
 		_ = json.NewEncoder(w).Encode(gh.PullRequest{
 			State:  &prState,
 			Merged: &merged,
@@ -489,27 +791,13 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 				SHA: &sha,
 			},
 			Base: &gh.PullRequestBranch{
-				Ref: new("main"),
+				Ref: &baseRef,
 				SHA: new("def456"),
 			},
 			User: &gh.User{Login: new("testuser")},
 		})
 	})
 
-	// Base-branch freshness endpoints. By default the base ref still points
-	// at the PR's base commit, which is therefore also the merge base of the
-	// default head — the schema tree cannot differ from itself, so the
-	// base-schema freshness gate lets applies proceed.
-	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
-		tip := "def456"
-		if provider := result.BaseTip.Load(); provider != nil {
-			tip = (*provider)()
-		}
-		_ = json.NewEncoder(w).Encode(gh.Reference{
-			Ref:    new("refs/heads/main"),
-			Object: &gh.GitObject{Type: new("commit"), SHA: &tip},
-		})
-	})
 	registerFreshBaseComparison(t, mux, "abc123")
 
 	// PR changed files — report schema files changed (in namespace subdir)
@@ -525,7 +813,7 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 		var files []*gh.CommitFile
 		for name := range schemaSQL {
 			files = append(files, &gh.CommitFile{
-				Filename: new("schema/" + ns + "/" + name),
+				Filename: new(schemaFixturePath(ns, name)),
 				Status:   new("added"),
 			})
 		}
@@ -555,48 +843,38 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 		blobIndex++
 		blobContents[sha] = content
 		treeEntries = append(treeEntries, &gh.TreeEntry{
-			Path: new("schema/" + ns + "/" + name),
+			Path: new(schemaFixturePath(ns, name)),
 			Mode: new("100644"),
 			Type: new("blob"),
 			SHA:  new(sha),
 			Size: new(len(content)),
 		})
 	}
+	result.headTreeEntries = treeEntries
 
-	// Git tree (recursive). The exact-SHA handler preserves the historical
-	// "abc123" behavior for tests that only exercise one head; the prefix
-	// fallback serves the same tree for any other SHA so tests that simulate
-	// HEAD advancing (e.g. the cross-delivery freshness checks) don't need a
-	// custom fixture per SHA. Go 1.22 ServeMux gives precedence to the more
-	// specific exact path, so existing tests are unaffected.
-	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(gh.Tree{
-			SHA:       new("abc123"),
-			Entries:   treeEntries,
-			Truncated: new(false),
-		})
-	})
-	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/", func(w http.ResponseWriter, r *http.Request) {
-		sha := r.URL.Path[len("/repos/octocat/hello-world/git/trees/"):]
-		if sha == "def456" {
-			// The base commit's shallow root tree. The base-schema freshness
-			// gate walks this level looking for the managed "schema"
-			// directory entry; serving it as a real tree entry exercises the
-			// gate's path resolution rather than the path-absent shortcut.
-			_ = json.NewEncoder(w).Encode(gh.Tree{
-				SHA: &sha,
-				Entries: []*gh.TreeEntry{
-					{Path: new("schema"), Type: new("tree"), SHA: new("schema-tree-base")},
-				},
-				Truncated: new(false),
-			})
-			return
-		}
-		_ = json.NewEncoder(w).Encode(gh.Tree{
-			SHA:       &sha,
-			Entries:   treeEntries,
-			Truncated: new(false),
-		})
+	// The default branch already has the schema directory and the config in it,
+	// at a blob of its own. Resolving one of the PR's schema files at the default
+	// branch tip then descends the directory levels a real repository has instead
+	// of stopping at an empty root, and still finds none of the PR's own files
+	// there — so every changed file remains the PR's own proposal.
+	if schemabotConfig != "" {
+		result.baseFiles.Store(&map[string]string{"schema/schemabot.yaml": "baseconfigsha001"})
+	}
+
+	// The repository at both commits a plan flow reads. By default the default
+	// branch tip is the PR's own base commit, so the base branch appears
+	// unmoved — the schema tree cannot differ from itself, and the base-schema
+	// freshness gate lets applies proceed.
+	registerRepositoryTrees(t, mux, repositoryTreeFixture{
+		headSHA:     "abc123",
+		headEntries: treeEntries,
+		baseEntries: result.baseTreeEntries,
+		defaultTip: func() string {
+			if provider := result.BaseTip.Load(); provider != nil {
+				return (*provider)()
+			}
+			return "def456"
+		},
 	})
 
 	// Blob content
@@ -633,6 +911,12 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		result.comments <- body.Body
+		if result.FailCommentPost.Load() {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"message":"Server Error"}`))
+			return
+		}
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": 99})
 	})
@@ -717,7 +1001,7 @@ func setupE2EServiceMultiEnv(t *testing.T, appDBName string) *api.Service {
 	t.Helper()
 	ctx := t.Context()
 
-	targetDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+	targetDB, err := sql.Open("block-mysql", e2eTargetDSN+"&multiStatements=true")
 	require.NoError(t, err)
 
 	stagingDB := appDBName + "_staging"
@@ -730,7 +1014,7 @@ func setupE2EServiceMultiEnv(t *testing.T, appDBName string) *api.Service {
 	_ = targetDB.Close()
 
 	t.Cleanup(func() {
-		db, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+		db, err := sql.Open("block-mysql", e2eTargetDSN+"&multiStatements=true")
 		if err == nil {
 			_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+stagingDB+"`")
 			_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+productionDB+"`")
@@ -742,7 +1026,7 @@ func setupE2EServiceMultiEnv(t *testing.T, appDBName string) *api.Service {
 	productionDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+productionDB, 1)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = schemabotDB.Close() })
 
@@ -792,19 +1076,8 @@ func setupE2EServiceMultiEnv(t *testing.T, appDBName string) *api.Service {
 }
 
 func startE2EMySQLContainer(ctx context.Context, baseName, dbName string, schemaFS *embed.FS) (testcontainers.Container, error) {
-	req := testcontainers.ContainerRequest{
-		Name:         e2eContainerName(baseName),
-		Image:        "mysql:8.0",
-		ExposedPorts: []string{"3306/tcp"},
-		Env: map[string]string{
-			"MYSQL_ROOT_PASSWORD": "testpassword",
-			"MYSQL_DATABASE":      dbName,
-		},
-		WaitingFor: wait.ForAll(
-			wait.ForLog("ready for connections").WithOccurrence(2).WithStartupTimeout(60*time.Second),
-			wait.ForListeningPort("3306/tcp"),
-		),
-	}
+	req := testutil.MySQLContainerRequest("mysql:8.0", dbName)
+	req.Name = e2eContainerName(baseName)
 
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: req,
@@ -816,35 +1089,21 @@ func startE2EMySQLContainer(ctx context.Context, baseName, dbName string, schema
 	}
 
 	if schemaFS != nil {
-		host, err := testutil.ContainerHost(ctx, container)
+		dsn, err := testutil.MySQLDSN(ctx, container, dbName, "parseTime=true", "multiStatements=true")
 		if err != nil {
 			_ = container.Terminate(ctx)
-			return nil, fmt.Errorf("get container host: %w", err)
+			return nil, fmt.Errorf("build mysql dsn: %w", err)
 		}
-		port, err := testutil.ContainerPort(ctx, container, "3306")
-		if err != nil {
-			_ = container.Terminate(ctx)
-			return nil, fmt.Errorf("get container port: %w", err)
-		}
-		dsn := fmt.Sprintf("root:testpassword@tcp(%s:%d)/%s?parseTime=true&multiStatements=true", host, port, dbName)
-		db, err := sql.Open("mysql", dsn)
+		db, err := sql.Open("block-mysql", dsn)
 		if err != nil {
 			_ = container.Terminate(ctx)
 			return nil, fmt.Errorf("open db: %w", err)
 		}
 		defer func() { _ = db.Close() }()
 
-		// Wait for MySQL to be ready to accept connections
-		var pingErr error
-		for range 30 {
-			if pingErr = db.PingContext(ctx); pingErr == nil {
-				break
-			}
-			time.Sleep(500 * time.Millisecond)
-		}
-		if pingErr != nil {
+		if err := testutil.PingMySQL(ctx, db); err != nil {
 			_ = container.Terminate(ctx)
-			return nil, fmt.Errorf("MySQL not ready after 15s: %w", pingErr)
+			return nil, err
 		}
 
 		if err := applyEmbeddedSchema(db, *schemaFS); err != nil {
@@ -914,7 +1173,7 @@ func setupE2EServiceWithAllowedEnvs(t *testing.T, allowedEnvs []string) *api.Ser
 func setupE2EServiceWithConfig(t *testing.T, serverConfig *api.ServerConfig) *api.Service {
 	t.Helper()
 
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = schemabotDB.Close() })
 

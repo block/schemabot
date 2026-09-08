@@ -35,7 +35,7 @@ func TestBuildPlanCommentData_CarriesPerShardChanges(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
 
 	require.Len(t, data.Changes, 1)
 	require.Len(t, data.Changes[0].Shards, 2, "per-shard changes are threaded into the keyspace")
@@ -62,12 +62,13 @@ func TestBuildPlanCommentData_PerShardUnsafe(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
 
 	assert.True(t, data.HasUnsafeChanges)
 	require.Len(t, data.UnsafeChanges, 1)
 	assert.Equal(t, "mutes", data.UnsafeChanges[0].Table)
 	assert.Equal(t, []string{"40-80"}, data.UnsafeChanges[0].Shards, "the unsafe change is scoped to the drifted shard")
+	assert.Equal(t, 2, data.UnsafeChanges[0].TotalShards, "coverage is stated against every planned shard")
 }
 
 // A shard that already matches the desired schema while siblings change is
@@ -87,7 +88,7 @@ func TestBuildPlanCommentData_CarriesSatisfiedShard(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
 
 	require.Len(t, data.Changes, 1)
 	require.Len(t, data.Changes[0].Shards, 2, "the satisfied shard is carried, not dropped")
@@ -116,7 +117,7 @@ func TestBuildPlanCommentData_MalformedShardSurfacesError(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
 
 	require.Len(t, data.Changes, 1)
 	require.Len(t, data.Changes[0].Shards, 1, "the malformed shard is not carried into the rendered shards")
@@ -145,14 +146,14 @@ func TestBuildPlanCommentData_UnsafeChangesPopulated(t *testing.T) {
 			}},
 		}},
 		LintResults: []*apitypes.LintViolationResponse{{
-			Message:  "Index 'idx_status' should be made invisible before dropping",
+			Message:  `Index "idx_status" should be made invisible before dropping`,
 			Table:    "orders",
 			Linter:   "invisible_index_before_drop",
 			Severity: "error",
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
 
 	assert.True(t, data.HasUnsafeChanges, "expected HasUnsafeChanges=true when plan contains unsafe table changes")
 	require.Len(t, data.UnsafeChanges, 1)
@@ -177,12 +178,59 @@ func TestBuildPlanCommentData_TableDropIsUnsafeWithoutEngineFlag(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
 
 	assert.True(t, data.HasUnsafeChanges)
 	require.Len(t, data.UnsafeChanges, 1)
 	assert.Equal(t, "users", data.UnsafeChanges[0].Table)
 	assert.Equal(t, "DROP TABLE removes all data", data.UnsafeChanges[0].Reason)
+}
+
+// A namespace whose plan carries recorded VSchema deletions and mutations —
+// with no unsafe table changes at all — must still surface every recorded
+// entry in the PR plan comment's unsafe-changes section, attributed to the
+// namespace's vschema.json, so the operator sees the full blast radius before
+// acknowledging with --allow-unsafe.
+func TestBuildPlanCommentData_VSchemaDeletionsAndMutationsPopulated(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{
+		Database: "testdb",
+		Type:     "vitess",
+	}
+
+	deletionsMeta, err := apitypes.EncodeVSchemaDeletions([]apitypes.VSchemaDeletion{{
+		Kind:   "vindex",
+		Name:   "email_lookup",
+		Reason: "removes lookup vindex \"email_lookup\": rows in its backing table go stale",
+	}})
+	require.NoError(t, err)
+	mutationsMeta, err := apitypes.EncodeVSchemaMutations([]apitypes.VSchemaMutation{{
+		Kind:   "vindex_type",
+		Name:   "user_idx",
+		Reason: "vindex \"user_idx\" changes type from \"hash\" to \"xxhash\": every row's keyspace id is computed differently the moment the VSchema is applied",
+	}})
+	require.NoError(t, err)
+
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "testapp_sharded",
+			Metadata: map[string]string{
+				apitypes.VSchemaChangedMetadataKey:   "true",
+				apitypes.VSchemaDeletionsMetadataKey: deletionsMeta,
+				apitypes.VSchemaMutationsMetadataKey: mutationsMeta,
+			},
+		}},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+
+	assert.True(t, data.HasUnsafeChanges, "expected HasUnsafeChanges=true when plan records VSchema deletions and mutations")
+	require.Len(t, data.UnsafeChanges, 2)
+	assert.Equal(t, "testapp_sharded/vschema.json", data.UnsafeChanges[0].Table)
+	assert.Contains(t, data.UnsafeChanges[0].Reason, "email_lookup")
+	assert.Contains(t, data.UnsafeChanges[0].Reason, "go stale")
+	assert.Equal(t, "testapp_sharded/vschema.json", data.UnsafeChanges[1].Table)
+	assert.Contains(t, data.UnsafeChanges[1].Reason, "user_idx")
+	assert.Contains(t, data.UnsafeChanges[1].Reason, "changes type")
 }
 
 func TestBuildPlanCommentData_NoUnsafeChanges(t *testing.T) {
@@ -205,7 +253,7 @@ func TestBuildPlanCommentData_NoUnsafeChanges(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
 
 	assert.False(t, data.HasUnsafeChanges)
 	assert.Empty(t, data.UnsafeChanges)
@@ -241,7 +289,7 @@ func TestBuildPlanCommentData_MixedSafeAndUnsafe(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
 
 	assert.True(t, data.HasUnsafeChanges)
 	require.Len(t, data.UnsafeChanges, 1)
@@ -266,7 +314,7 @@ func TestRenderPlanComment_ShowsUnsafeWarning(t *testing.T) {
 
 	rendered := templates.RenderPlanComment(data)
 
-	assert.Contains(t, rendered, "**Issues**: **1** unsafe change detected")
+	assert.Contains(t, rendered, "**Issues**: 1 unsafe change detected")
 	assert.Contains(t, rendered, "`orders`")
 	assert.Contains(t, rendered, "DROP INDEX without making invisible first")
 }
@@ -295,9 +343,9 @@ func TestRenderPlanComment_UnsafeWarningSummaryCountsChanges(t *testing.T) {
 
 	rendered := templates.RenderPlanComment(data)
 
-	assert.Contains(t, rendered, "⚠️ **Issues**: **2** unsafe changes detected")
-	assert.Contains(t, rendered, "- `orders`: DROP INDEX without making invisible first")
-	assert.Contains(t, rendered, "- `customers`: DROP COLUMN is destructive")
+	assert.Contains(t, rendered, "⚠️ **Issues**: 2 unsafe changes detected")
+	assert.Contains(t, rendered, "1. `orders`: DROP INDEX without making invisible first")
+	assert.Contains(t, rendered, "2. `customers`: DROP COLUMN is destructive")
 }
 
 func TestRenderPlanComment_TenantScopedHints(t *testing.T) {
@@ -693,10 +741,11 @@ func TestRenderMultiEnvPlanComment_CollapsesDDL(t *testing.T) {
 	data := templates.MultiEnvPlanCommentData{
 		Database:     "testdb",
 		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Environments: []string{"staging", "production"},
 		Plans: map[string]*templates.PlanCommentData{
-			"staging":    {Database: "testdb", Environment: "staging", IsMySQL: true, Changes: changes},
-			"production": {Database: "testdb", Environment: "production", IsMySQL: true, Changes: changes},
+			"staging":    {Database: "testdb", Environment: "staging", IsMySQL: true, DatabaseType: "mysql", Changes: changes},
+			"production": {Database: "testdb", Environment: "production", IsMySQL: true, DatabaseType: "mysql", Changes: changes},
 		},
 		Errors: map[string]string{},
 	}
@@ -727,10 +776,11 @@ func TestRenderMultiEnvPlanComment_SingleChangeInline(t *testing.T) {
 	data := templates.MultiEnvPlanCommentData{
 		Database:     "testdb",
 		IsMySQL:      true,
+		DatabaseType: "mysql",
 		Environments: []string{"staging", "production"},
 		Plans: map[string]*templates.PlanCommentData{
-			"staging":    {Database: "testdb", Environment: "staging", IsMySQL: true, Changes: changes},
-			"production": {Database: "testdb", Environment: "production", IsMySQL: true, Changes: changes},
+			"staging":    {Database: "testdb", Environment: "staging", IsMySQL: true, DatabaseType: "mysql", Changes: changes},
+			"production": {Database: "testdb", Environment: "production", IsMySQL: true, DatabaseType: "mysql", Changes: changes},
 		},
 		Errors: map[string]string{},
 	}
@@ -757,11 +807,11 @@ func TestRenderMultiEnvPlanComment_CollapseSummarySingular(t *testing.T) {
 	data := templates.MultiEnvPlanCommentData{
 		Database:     "testks",
 		IsMySQL:      false,
-		DatabaseType: "PlanetScale",
+		DatabaseType: "vitess",
 		Environments: []string{"staging", "production"},
 		Plans: map[string]*templates.PlanCommentData{
-			"staging":    {Database: "testks", Environment: "staging", IsMySQL: false, DatabaseType: "PlanetScale", Changes: changes},
-			"production": {Database: "testks", Environment: "production", IsMySQL: false, DatabaseType: "PlanetScale", Changes: changes},
+			"staging":    {Database: "testks", Environment: "staging", IsMySQL: false, DatabaseType: "vitess", Changes: changes},
+			"production": {Database: "testks", Environment: "production", IsMySQL: false, DatabaseType: "vitess", Changes: changes},
 		},
 		Errors: map[string]string{},
 	}
@@ -837,11 +887,120 @@ func TestRenderUnsafeChangesBlocked_UsedByApplyFlow(t *testing.T) {
 
 	rendered := templates.RenderUnsafeChangesBlocked(data)
 
-	assert.Contains(t, rendered, "⛔ 1 Unsafe Change Detected")
+	assert.Contains(t, rendered, "**⛔ Apply rejected**: 1 unsafe change detected")
 	assert.Contains(t, rendered, "`users`")
 	assert.Contains(t, rendered, "DROP TABLE removes all data")
 	assert.Contains(t, rendered, "--allow-unsafe")
 	assert.Contains(t, rendered, "schemabot apply -e staging --allow-unsafe")
+}
+
+// A table can carry several lint violations in one engine-joined reason
+// string. The blocking comment must render each violation as its own nested
+// bullet — not one run-on line — and the header must count the violations
+// the list shows.
+func TestRenderUnsafeChangesBlocked_SplitsJoinedReasonsIntoBullets(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"CREATE TABLE `uploads` (`uid` varchar(64) NOT NULL, PRIMARY KEY(`uid`))"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []templates.UnsafeChangeData{{
+			Table:  "uploads",
+			Reason: `Column "expires_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.; Column "created_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.; Primary key column "uid" has type "varchar"`,
+		}},
+	}
+
+	rendered := templates.RenderUnsafeChangesBlocked(data)
+
+	assert.Contains(t, rendered, "**⛔ Apply rejected**: 3 unsafe changes detected")
+	assert.Contains(t, rendered, "1. `uploads`: Column `expires_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.\n")
+	assert.Contains(t, rendered, "2. `uploads`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.\n")
+	assert.Contains(t, rendered, "3. `uploads`: Primary key column `uid` has type `varchar`\n")
+	assert.NotContains(t, rendered, "instead.; ")
+}
+
+// The plan comment's unsafe-issues section renders the same engine-joined
+// reasons, so it splits them the same way and counts individual violations
+// in its header.
+func TestRenderPlanComment_SplitsJoinedUnsafeReasonsIntoBullets(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"ALTER TABLE `orders` DROP COLUMN `legacy`"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []templates.UnsafeChangeData{
+			{
+				Table:  "orders",
+				Reason: `[ERROR] unsafe: DROP COLUMN removes data; [ERROR] has_timestamp: Column "created_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.`,
+			},
+			{Table: "users", Reason: "DROP TABLE removes all data"},
+		},
+	}
+
+	rendered := templates.RenderPlanComment(data)
+
+	assert.Contains(t, rendered, "3 unsafe changes detected")
+	assert.Contains(t, rendered, "1. `orders`: DROP COLUMN removes data\n")
+	assert.Contains(t, rendered, "2. `orders`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.\n")
+	assert.Contains(t, rendered, "3. `users`: DROP TABLE removes all data\n")
+	assert.NotContains(t, rendered, "data; ")
+}
+
+// An engine can report an unsafe change without a parseable reason. The
+// blocking comment still lists the table — with the engine's change type as
+// the explanation, matching the CLI — and the header counts it as one finding.
+func TestRenderUnsafeChangesBlocked_EmptyReasonListsChangeTypeAndCountsOnce(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"DROP TABLE `users`"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []templates.UnsafeChangeData{
+			{Table: "users", Reason: "", ChangeType: "drop"},
+			{Table: "orders", Reason: "DROP TABLE removes all data"},
+		},
+	}
+
+	rendered := templates.RenderUnsafeChangesBlocked(data)
+
+	assert.Contains(t, rendered, "**⛔ Apply rejected**: 2 unsafe changes detected")
+	assert.Contains(t, rendered, "1. `users`: drop\n")
+	assert.Contains(t, rendered, "2. `orders`: DROP TABLE removes all data\n")
+}
+
+// A change with neither a reason nor a change type still gets a line in the
+// plan comment's unsafe-issues section — a bare table entry, no dangling
+// colon — and still counts once in the header.
+func TestRenderPlanComment_EmptyUnsafeReasonListsBareTableAndCountsOnce(t *testing.T) {
+	data := templates.PlanCommentData{
+		Database:    "testdb",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []templates.KeyspaceChangeData{{
+			Keyspace:   "testdb",
+			Statements: []string{"DROP TABLE `users`"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges:    []templates.UnsafeChangeData{{Table: "users", Reason: ""}},
+	}
+
+	rendered := templates.RenderPlanComment(data)
+
+	assert.Contains(t, rendered, "1 unsafe change detected")
+	assert.Contains(t, rendered, "1. `users`\n")
+	assert.NotContains(t, rendered, "1. `users`:")
 }
 
 func TestRenderUnsafeChangesBlocked_CustomDatabaseTypeHeader(t *testing.T) {

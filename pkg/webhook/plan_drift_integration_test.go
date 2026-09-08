@@ -20,7 +20,7 @@ import (
 	"os"
 	"testing"
 
-	mysql "github.com/go-sql-driver/mysql"
+	mysql "github.com/block/mysql"
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -68,7 +68,7 @@ type deploymentSpec struct {
 // leaks the handle.
 func openDriftDB(t *testing.T, dsn string) *sql.DB {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 	require.NoError(t, db.PingContext(t.Context()))
@@ -143,7 +143,7 @@ func setupE2EReviewDriftService(t *testing.T, dbName string, specs []deploymentS
 		// by the time cleanup runs, which would otherwise leave databases behind.
 		t.Cleanup(func() {
 			dropCtx := context.WithoutCancel(t.Context())
-			db, err := sql.Open("mysql", adminDSN)
+			db, err := sql.Open("block-mysql", adminDSN)
 			if err != nil {
 				t.Logf("drift cleanup: open admin db to drop %s: %v", physicalDB, err)
 				return

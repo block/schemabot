@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/schema"
 )
 
 func protoAlterUsersEmail() *ternv1.TableChange {
@@ -47,7 +48,7 @@ func TestCompareChangeSets_NonShardedMatch(t *testing.T) {
 		}},
 	}}}
 
-	diff, err := CompareChangeSets(baseline, candidate)
+	diff, err := CompareChangeSets(schema.DialectMySQL, baseline, candidate)
 	require.NoError(t, err)
 	assert.True(t, diff.Empty(), "canonically identical change sets should match: %+v", diff)
 }
@@ -58,7 +59,7 @@ func TestCompareChangeSets_MissingChange(t *testing.T) {
 	baseline := protoNonShardedSet(protoAlterUsersEmail())
 	candidate := protoNonShardedSet()
 
-	diff, err := CompareChangeSets(baseline, candidate)
+	diff, err := CompareChangeSets(schema.DialectMySQL, baseline, candidate)
 	require.NoError(t, err)
 	require.False(t, diff.Empty())
 	require.Len(t, diff.MissingFromCandidate, 1)
@@ -73,7 +74,7 @@ func TestCompareChangeSets_UnexpectedChange(t *testing.T) {
 	baseline := protoNonShardedSet(protoAlterUsersEmail())
 	candidate := protoNonShardedSet(protoAlterUsersEmail(), protoAlterUsersPhone())
 
-	diff, err := CompareChangeSets(baseline, candidate)
+	diff, err := CompareChangeSets(schema.DialectMySQL, baseline, candidate)
 	require.NoError(t, err)
 	require.Len(t, diff.UnexpectedInCandidate, 1)
 	assert.Equal(t, "users", diff.UnexpectedInCandidate[0].Table)
@@ -87,7 +88,7 @@ func TestCompareChangeSets_SameTableDifferentDDL(t *testing.T) {
 	baseline := protoNonShardedSet(protoAlterUsersEmail())
 	candidate := protoNonShardedSet(protoAlterUsersPhone())
 
-	diff, err := CompareChangeSets(baseline, candidate)
+	diff, err := CompareChangeSets(schema.DialectMySQL, baseline, candidate)
 	require.NoError(t, err)
 	require.Len(t, diff.MissingFromCandidate, 1)
 	require.Len(t, diff.UnexpectedInCandidate, 1)
@@ -113,7 +114,7 @@ func TestCompareChangeSets_ShardedMatch(t *testing.T) {
 		Shards:  shard(),
 	}
 
-	diff, err := CompareChangeSets(baseline, candidate)
+	diff, err := CompareChangeSets(schema.DialectMySQL, baseline, candidate)
 	require.NoError(t, err)
 	assert.True(t, diff.Empty(), "identical sharded change sets should match: %+v", diff)
 }
@@ -137,7 +138,7 @@ func TestCompareChangeSets_ShardDriftCaughtDespiteCollapsedParity(t *testing.T) 
 		},
 	}
 
-	diff, err := CompareChangeSets(baseline, candidate)
+	diff, err := CompareChangeSets(schema.DialectMySQL, baseline, candidate)
 	require.NoError(t, err)
 	require.False(t, diff.Empty(), "per-shard drift must be caught despite identical collapsed views")
 	require.Len(t, diff.MissingFromCandidate, 1)
@@ -168,7 +169,7 @@ func TestCompareChangeSets_MixedShardedAndUnsharded(t *testing.T) {
 	baseline := build("ALTER TABLE `orders` ADD COLUMN `total` int")
 	candidate := build("ALTER TABLE `orders` ADD COLUMN `discount` int")
 
-	diff, err := CompareChangeSets(baseline, candidate)
+	diff, err := CompareChangeSets(schema.DialectMySQL, baseline, candidate)
 	require.NoError(t, err)
 	require.Len(t, diff.MissingFromCandidate, 1)
 	require.Len(t, diff.UnexpectedInCandidate, 1)
@@ -185,7 +186,7 @@ func TestCompareChangeSets_VSchemaParity(t *testing.T) {
 	}}}
 	candidate := ChangeSet{Changes: []*ternv1.SchemaChange{{Namespace: "testapp"}}}
 
-	diff, err := CompareChangeSets(baseline, candidate)
+	diff, err := CompareChangeSets(schema.DialectMySQL, baseline, candidate)
 	require.NoError(t, err)
 	require.Equal(t, []string{"testapp"}, diff.MissingVSchema)
 	assert.Empty(t, diff.UnexpectedVSchema)
@@ -202,7 +203,7 @@ func TestCompareChangeSets_UnparseableDDLFailsClosed(t *testing.T) {
 		Namespace:  "testapp",
 	})
 
-	_, err := CompareChangeSets(baseline, candidate)
+	_, err := CompareChangeSets(schema.DialectMySQL, baseline, candidate)
 	require.Error(t, err)
 }
 
@@ -213,7 +214,7 @@ func TestCompareChangeSets_EmptyShardNameFailsClosed(t *testing.T) {
 		{Shard: "", Namespace: "testapp", Changes: []*ternv1.TableChange{protoAlterUsersEmail()}},
 	}}
 
-	_, err := CompareChangeSets(baseline, candidate)
+	_, err := CompareChangeSets(schema.DialectMySQL, baseline, candidate)
 	require.Error(t, err)
 }
 
@@ -226,7 +227,7 @@ func TestCompareChangeSets_InconsistentShardShapeFailsClosed(t *testing.T) {
 		Shards:  []*ternv1.ShardPlan{{Shard: "-80", Namespace: "testapp"}},
 	}
 
-	_, err := CompareChangeSets(baseline, candidate)
+	_, err := CompareChangeSets(schema.DialectMySQL, baseline, candidate)
 	require.Error(t, err)
 }
 
@@ -244,7 +245,7 @@ func TestCompareChangeSets_VSchemaTableChangeFailsClosed(t *testing.T) {
 		}},
 	}}}
 
-	_, err := CompareChangeSets(baseline, candidate)
+	_, err := CompareChangeSets(schema.DialectMySQL, baseline, candidate)
 	require.Error(t, err)
 }
 
@@ -258,7 +259,7 @@ func TestCompareChangeSets_OneSideShardedDiverges(t *testing.T) {
 	}
 	collapsedOnly := protoNonShardedSet(protoAlterUsersEmail())
 
-	diff, err := CompareChangeSets(sharded, collapsedOnly)
+	diff, err := CompareChangeSets(schema.DialectMySQL, sharded, collapsedOnly)
 	require.NoError(t, err)
 	require.False(t, diff.Empty(), "sharded-vs-collapsed for the same namespace must diverge")
 	require.Len(t, diff.MissingFromCandidate, 1)
@@ -278,11 +279,82 @@ func TestCompareChangeSets_DuplicateShardRowsAsymmetricDiverges(t *testing.T) {
 		{Shard: "-80", Namespace: "testapp", Changes: []*ternv1.TableChange{protoAlterUsersEmail()}},
 	}}
 
-	diff, err := CompareChangeSets(baseline, candidate)
+	diff, err := CompareChangeSets(schema.DialectMySQL, baseline, candidate)
 	require.NoError(t, err)
 	require.False(t, diff.Empty(), "asymmetric duplicate shard rows must diverge")
 	require.Len(t, diff.MissingFromCandidate, 1)
 	assert.Equal(t, "-80", diff.MissingFromCandidate[0].Shard)
+}
+
+// A PostgreSQL deployment's change set is compared under the PostgreSQL
+// grammar: DDL that differs only in formatting and identifier quoting matches
+// cleanly, and DDL the MySQL parser cannot read is still comparable. The same
+// DDL judged under the MySQL dialect fails closed instead of producing a
+// meaningless comparison.
+func TestCompareChangeSets_PostgresDialect(t *testing.T) {
+	baseline := ChangeSet{Changes: []*ternv1.SchemaChange{{
+		Namespace: "buzz",
+		TableChanges: []*ternv1.TableChange{{
+			TableName:  "users",
+			Ddl:        "CREATE TABLE users (id uuid PRIMARY KEY, created_at timestamptz NOT NULL DEFAULT now())",
+			ChangeType: ternv1.ChangeType_CHANGE_TYPE_CREATE,
+			Namespace:  "buzz",
+		}},
+	}}}
+	candidate := ChangeSet{Changes: []*ternv1.SchemaChange{{
+		Namespace: "buzz",
+		TableChanges: []*ternv1.TableChange{{
+			TableName: "users",
+			Ddl: `CREATE TABLE "users" (
+				"id"         uuid        PRIMARY KEY,
+				"created_at" timestamptz NOT NULL DEFAULT now()
+			)`,
+			ChangeType: ternv1.ChangeType_CHANGE_TYPE_CREATE,
+			Namespace:  "buzz",
+		}},
+	}}}
+
+	diff, err := CompareChangeSets(schema.DialectPostgres, baseline, candidate)
+	require.NoError(t, err)
+	assert.True(t, diff.Empty(), "formatting-equivalent PostgreSQL DDL must match: %+v", diff)
+
+	_, err = CompareChangeSets(schema.DialectMySQL, baseline, candidate)
+	require.Error(t, err, "PostgreSQL DDL judged under the MySQL grammar must fail closed")
+}
+
+// A dialect with no registered parser gives the comparison no grammar to
+// canonicalize with, so it fails closed instead of guessing — even when both
+// change sets are empty and would trivially match.
+func TestCompareChangeSets_UnregisteredDialectFailsClosed(t *testing.T) {
+	_, err := CompareChangeSets(schema.Dialect("oracle"), ChangeSet{}, ChangeSet{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `no statement parser registered for dialect "oracle"`)
+}
+
+// PostgreSQL-only constructs the MySQL parser cannot read are comparable under
+// the PostgreSQL dialect, and a genuine difference still surfaces as drift.
+func TestCompareChangeSets_PostgresOnlyConstructDiverges(t *testing.T) {
+	index := func(cols string) ChangeSet {
+		return ChangeSet{Changes: []*ternv1.SchemaChange{{
+			Namespace: "buzz",
+			TableChanges: []*ternv1.TableChange{{
+				TableName:  "users",
+				Ddl:        "CREATE INDEX CONCURRENTLY idx_users ON users (" + cols + ")",
+				ChangeType: ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX,
+				Namespace:  "buzz",
+			}},
+		}}}
+	}
+
+	diff, err := CompareChangeSets(schema.DialectPostgres, index("email"), index("email"))
+	require.NoError(t, err)
+	assert.True(t, diff.Empty())
+
+	diff, err = CompareChangeSets(schema.DialectPostgres, index("email"), index("phone"))
+	require.NoError(t, err)
+	require.False(t, diff.Empty(), "different index columns must diverge")
+	require.Len(t, diff.MissingFromCandidate, 1)
+	require.Len(t, diff.UnexpectedInCandidate, 1)
 }
 
 // VSchema parity is symmetric: a namespace the candidate changes the vschema for
@@ -294,7 +366,7 @@ func TestCompareChangeSets_VSchemaUnexpectedDirection(t *testing.T) {
 		Metadata:  map[string]string{"vschema_changed": "true"},
 	}}}
 
-	diff, err := CompareChangeSets(baseline, candidate)
+	diff, err := CompareChangeSets(schema.DialectMySQL, baseline, candidate)
 	require.NoError(t, err)
 	require.Equal(t, []string{"testapp"}, diff.UnexpectedVSchema)
 	assert.Empty(t, diff.MissingVSchema)

@@ -1130,20 +1130,17 @@ func TestE2EPassingAggregateOnSQLWithoutSchemabotYAML(t *testing.T) {
 	})
 
 	// Git tree — has the .sql file but no schemabot.yaml anywhere
-	mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/abc123", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(gh.Tree{
-			SHA: new("abc123"),
-			Entries: []*gh.TreeEntry{
-				{
-					Path: new("legacy-service/schema/users.sql"),
-					Mode: new("100644"),
-					Type: new("blob"),
-					SHA:  new("blobsha001"),
-					Size: new(100),
-				},
+	registerRepositoryTrees(t, mux, repositoryTreeFixture{
+		headSHA: "abc123",
+		headEntries: []*gh.TreeEntry{
+			{
+				Path: new("legacy-service/schema/users.sql"),
+				Mode: new("100644"),
+				Type: new("blob"),
+				SHA:  new("blobsha001"),
+				Size: new(100),
 			},
-			Truncated: new(false),
-		})
+		},
 	})
 
 	// Capture check runs
@@ -1316,6 +1313,41 @@ func TestE2EFailingAggregateOnPlanError(t *testing.T) {
 		assert.Equal(t, "completed", cr.Status)
 		assert.Equal(t, "failure", cr.Conclusion)
 	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for failing aggregate check run")
+	}
+}
+
+// A failing aggregate's summary carries error text that can contain internal
+// endpoints, control sequences, and markup. The publish path must sanitize
+// that text before it reaches the GitHub Check Run, so the visible summary
+// never leaks infrastructure detail, renders injected HTML, or forms Markdown
+// links, images, or code spans that could carry a payload. Emphasis-style
+// formatting is left intact: it can restyle text but not inject content.
+func TestE2EFailingAggregateSanitizesErrorSummary(t *testing.T) {
+	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging"})
+	ctx := t.Context()
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+	checkRuns := setupFakeGitHubHeadAndCheckRuns(t, mux, "abc123")
+
+	h := newE2EHandler(t, svc, client)
+	installClient := ghclient.NewInstallationClient(client, h.logger)
+	h.postFailingAggregates(ctx, installClient, "octocat/hello-world", 1, "abc123", map[string]string{
+		"staging": "plan failed:\n\x1b[31mdial tcp db-primary.internal:3306: connect & retry <5s>",
+	})
+
+	select {
+	case cr := <-checkRuns:
+		assert.Equal(t, "SchemaBot (staging)", cr.Name)
+		require.NotNil(t, cr.Output)
+		assert.Equal(t, "Plan failed", cr.Output.Title)
+		assert.Equal(t, "plan failed: dial tcp &#91;endpoint redacted&#93;: connect &amp; retry &lt;5s&gt;", cr.Output.Summary)
+	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for failing aggregate check run")
 	}
 }

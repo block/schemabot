@@ -1,14 +1,72 @@
 package planetscale
 
 import (
+	"log/slog"
+	"os"
 	"testing"
 	"time"
 
+	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/state"
 )
+
+// An eligible change whose cutover the operator deferred is deployed with a row
+// copy, so it is still copying and waiting at the gate while the deploy request
+// keeps reporting it as eligible. Progress must report what the deployment ran
+// as, not what it could have run as — reading eligibility here tells the
+// operator their change already swapped instantly while it is holding for them.
+func TestProgress_InstantIsReportedFromTheDeploymentNotItsEligibility(t *testing.T) {
+	tests := []struct {
+		name        string
+		instantDDL  bool
+		wantInstant bool
+	}{
+		{name: "eligible but deployed with a row copy", instantDDL: false, wantInstant: false},
+		{name: "deployed instantly", instantDDL: true, wantInstant: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &resumeDeployClient{
+				recovered: &ps.DeployRequest{
+					DeploymentState: deployState.InProgress,
+					Deployment: &ps.Deployment{
+						InstantDDLEligible: true,
+						InstantDDL:         tt.instantDDL,
+					},
+				},
+			}
+			e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
+				func(_, _ string) (psclient.PSClient, error) { return client, nil })
+
+			meta := &psMetadata{BranchName: "schemabot-testdb-prog", DeployRequestID: 71}
+			encoded, err := encodePSMetadata(meta)
+			require.NoError(t, err)
+
+			result, err := e.Progress(t.Context(), &engine.ProgressRequest{
+				Database:    "testdb",
+				ResumeState: &engine.ResumeState{Metadata: encoded},
+				Credentials: &engine.Credentials{Metadata: map[string]string{
+					"organization": "org",
+					"token_name":   "token",
+					"token_value":  "secret",
+				}},
+			})
+
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			if tt.wantInstant {
+				assert.Equal(t, "true", result.Metadata["is_instant"])
+			} else {
+				assert.NotContains(t, result.Metadata, "is_instant")
+			}
+		})
+	}
+}
 
 func TestAggregateShardProgress(t *testing.T) {
 	t.Run("two shards one table", func(t *testing.T) {
@@ -68,6 +126,20 @@ func TestAggregateShardProgress(t *testing.T) {
 		assert.Equal(t, state.Vitess.Failed, tables[0].State)
 	})
 
+	t.Run("uppercase status canonicalized before table state resolution", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: "RUNNING"},
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: "FAILED"},
+		}
+
+		tables, _ := aggregateShardProgress(rows)
+		require.Len(t, tables, 1)
+		assert.Equal(t, state.Vitess.Failed, tables[0].State)
+		require.Len(t, tables[0].Shards, 2)
+		assert.Equal(t, state.Vitess.Running, tables[0].Shards[0].State)
+		assert.Equal(t, state.Vitess.Failed, tables[0].Shards[1].State)
+	})
+
 	t.Run("ready_to_complete derived state", func(t *testing.T) {
 		rows := []vitessMigrationRow{
 			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: "running", ReadyToComplete: true},
@@ -79,6 +151,78 @@ func TestAggregateShardProgress(t *testing.T) {
 		assert.Equal(t, state.Vitess.ReadyToComplete, tables[0].State)
 		// Shards should show derived state
 		assert.Equal(t, state.Vitess.ReadyToComplete, tables[0].Shards[0].State)
+	})
+
+	t.Run("queued shard ready to complete", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: state.Vitess.Queued, ReadyToComplete: true},
+		}
+
+		tables, _ := aggregateShardProgress(rows)
+		require.Len(t, tables, 1)
+		require.Len(t, tables[0].Shards, 1)
+		assert.Equal(t, state.Vitess.ReadyToComplete, tables[0].Shards[0].State)
+	})
+
+	t.Run("queued and running shards all ready to complete", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: state.Vitess.Queued, ReadyToComplete: true},
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: state.Vitess.Running, ReadyToComplete: true},
+		}
+
+		tables, _ := aggregateShardProgress(rows)
+		require.Len(t, tables, 1)
+		assert.Equal(t, state.Vitess.ReadyToComplete, tables[0].State)
+	})
+
+	t.Run("not-ready queued shard keeps table queued", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: state.Vitess.Queued, ReadyToComplete: true},
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: state.Vitess.Queued},
+		}
+
+		tables, _ := aggregateShardProgress(rows)
+		require.Len(t, tables, 1)
+		assert.Equal(t, state.Vitess.Queued, tables[0].State)
+	})
+
+	t.Run("requested and ready shards ready to complete", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: state.Vitess.Requested, ReadyToComplete: true},
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "80-", Table: "orders", Status: state.Vitess.Ready, ReadyToComplete: true},
+		}
+
+		tables, _ := aggregateShardProgress(rows)
+		require.Len(t, tables, 1)
+		require.Len(t, tables[0].Shards, 2)
+		assert.Equal(t, state.Vitess.ReadyToComplete, tables[0].Shards[0].State)
+		assert.Equal(t, state.Vitess.ReadyToComplete, tables[0].Shards[1].State)
+		assert.Equal(t, state.Vitess.ReadyToComplete, tables[0].State)
+	})
+
+	t.Run("terminal shard ignores stale ready flag", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: state.Vitess.Failed, ReadyToComplete: true},
+		}
+
+		tables, _ := aggregateShardProgress(rows)
+		require.Len(t, tables, 1)
+		require.Len(t, tables[0].Shards, 1)
+		assert.Equal(t, state.Vitess.Failed, tables[0].Shards[0].State)
+		assert.Equal(t, state.Vitess.Failed, tables[0].State)
+	})
+
+	t.Run("cancelled shard ignores stale ready flag", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationUUID: "uuid-1", Keyspace: "commerce", Shard: "-80", Table: "orders", Status: state.Vitess.Cancelled, ReadyToComplete: true},
+		}
+
+		tables, _ := aggregateShardProgress(rows)
+		require.Len(t, tables, 1)
+		require.Len(t, tables[0].Shards, 1)
+		assert.Equal(t, state.Vitess.Cancelled, tables[0].Shards[0].State)
+		// Worst-state table aggregation folds cancelled into failed.
+		assert.Equal(t, state.Vitess.Failed, tables[0].State)
 	})
 
 	t.Run("multiple tables", func(t *testing.T) {
@@ -216,11 +360,16 @@ func TestShardLess(t *testing.T) {
 
 // SHOW VITESS_MIGRATIONS retains completed historical rows, so an empty-baseline
 // rediscovery on resume sees both this apply's in-flight change and unrelated
-// finished changes. Selection must attach only to a non-terminal context: a
-// freshly deployed change is queued or running, while old completed history is
-// terminal and must be ignored so progress never renders the wrong change's
-// finished state while the real deploy is mid-flight.
+// finished changes. Selection must attach only to a non-terminal context whose
+// requested_timestamp is at or after the deploy: a freshly deployed change is
+// queued or running and requested after the deploy was created, while old
+// history — terminal, or resurrected as non-terminal by a Vitess retry that
+// preserves its original requested_timestamp — must be ignored so progress
+// never renders the wrong change's state while the real deploy is mid-flight.
 func TestSelectSchemaChangeContext(t *testing.T) {
+	deployCreatedAt := time.Date(2026, 6, 23, 10, 0, 5, 0, time.UTC)
+	afterDeploy := time.Date(2026, 6, 23, 10, 0, 7, 0, time.UTC)
+
 	t.Run("attaches to the in-flight context, ignoring completed history", func(t *testing.T) {
 		rows := []vitessMigrationRow{
 			// Completed history from prior, unrelated schema changes.
@@ -228,11 +377,11 @@ func TestSelectSchemaChangeContext(t *testing.T) {
 			{MigrationContext: "singularity:old-add-email", Keyspace: "commerce", Shard: "80-", Status: state.Vitess.Complete},
 			{MigrationContext: "singularity:old-drop-index", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Cancelled},
 			// This apply's in-flight change.
-			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running},
-			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "80-", Status: state.Vitess.Queued},
+			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running, RequestedAt: &afterDeploy},
+			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "80-", Status: state.Vitess.Queued, RequestedAt: &afterDeploy},
 		}
 
-		got, candidates := selectSchemaChangeContext(rows, map[string]MigrationContextTimestamps{}, time.Time{})
+		got, candidates := selectSchemaChangeContext(rows, map[string]MigrationContextTimestamps{}, deployCreatedAt)
 
 		assert.Equal(t, "singularity:new-change", got)
 		assert.Equal(t, []string{"singularity:new-change"}, candidates)
@@ -253,14 +402,51 @@ func TestSelectSchemaChangeContext(t *testing.T) {
 
 	t.Run("a context with one running shard is in flight even if others completed", func(t *testing.T) {
 		rows := []vitessMigrationRow{
-			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Complete},
-			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "80-", Status: state.Vitess.Running},
+			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Complete, RequestedAt: &afterDeploy},
+			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "80-", Status: state.Vitess.Running, RequestedAt: &afterDeploy},
+		}
+
+		got, candidates := selectSchemaChangeContext(rows, map[string]MigrationContextTimestamps{}, deployCreatedAt)
+
+		assert.Equal(t, "singularity:new-change", got)
+		assert.Equal(t, []string{"singularity:new-change"}, candidates)
+	})
+
+	t.Run("a sole in-flight candidate requested before the deploy stays ambiguous", func(t *testing.T) {
+		// A pre-deploy change resurrected by a Vitess retry re-enters SHOW
+		// VITESS_MIGRATIONS as non-terminal with its original requested
+		// timestamp preserved. It must not be claimed as this deploy's work.
+		beforeDeploy := time.Date(2026, 6, 22, 15, 0, 0, 0, time.UTC)
+		rows := []vitessMigrationRow{
+			{MigrationContext: "singularity:resurrected-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Queued, RequestedAt: &beforeDeploy},
+		}
+
+		got, candidates := selectSchemaChangeContext(rows, map[string]MigrationContextTimestamps{}, deployCreatedAt)
+
+		assert.Empty(t, got, "a candidate requested before the deploy cannot be this apply's change")
+		assert.Equal(t, []string{"singularity:resurrected-change"}, candidates)
+	})
+
+	t.Run("a sole in-flight candidate without a requested timestamp stays ambiguous", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationContext: "singularity:untimed-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running},
+		}
+
+		got, candidates := selectSchemaChangeContext(rows, map[string]MigrationContextTimestamps{}, deployCreatedAt)
+
+		assert.Empty(t, got, "a candidate with no requested timestamp cannot prove it is this apply's change")
+		assert.Equal(t, []string{"singularity:untimed-change"}, candidates)
+	})
+
+	t.Run("a zero deploy creation time anchors nothing and stays ambiguous", func(t *testing.T) {
+		rows := []vitessMigrationRow{
+			{MigrationContext: "singularity:some-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running, RequestedAt: &afterDeploy},
 		}
 
 		got, candidates := selectSchemaChangeContext(rows, map[string]MigrationContextTimestamps{}, time.Time{})
 
-		assert.Equal(t, "singularity:new-change", got)
-		assert.Equal(t, []string{"singularity:new-change"}, candidates)
+		assert.Empty(t, got, "without the deploy's creation time no candidate can be proven to be this apply's change")
+		assert.Equal(t, []string{"singularity:some-change"}, candidates)
 	})
 
 	t.Run("multiple in-flight candidates are ambiguous", func(t *testing.T) {
@@ -278,11 +464,11 @@ func TestSelectSchemaChangeContext(t *testing.T) {
 	t.Run("baseline contexts are never candidates", func(t *testing.T) {
 		rows := []vitessMigrationRow{
 			{MigrationContext: "singularity:pre-existing", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running},
-			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running},
+			{MigrationContext: "singularity:new-change", Keyspace: "commerce", Shard: "-80", Status: state.Vitess.Running, RequestedAt: &afterDeploy},
 		}
 		baseline := map[string]MigrationContextTimestamps{"singularity:pre-existing": {}}
 
-		got, candidates := selectSchemaChangeContext(rows, baseline, time.Time{})
+		got, candidates := selectSchemaChangeContext(rows, baseline, deployCreatedAt)
 
 		assert.Equal(t, "singularity:new-change", got)
 		assert.Equal(t, []string{"singularity:new-change"}, candidates)
@@ -321,6 +507,39 @@ func TestSelectSchemaChangeContext(t *testing.T) {
 
 		assert.Empty(t, got, "no candidate requested at/after the deploy means none can be claimed as this apply's")
 		assert.Len(t, candidates, 2)
+	})
+}
+
+// The pre-deploy context baseline is persisted into durable engine resume
+// state on every apply, while SHOW VITESS_MIGRATIONS retains every schema
+// change ever run against the target. Baseline membership must therefore stay
+// bounded: live (non-terminal) work is always remembered, but terminal history
+// is kept only while recent — an aged-out terminal context that a Vitess retry
+// later resurrects is excluded from discovery by its preserved
+// requested_timestamp instead.
+func TestBaselineContextRow(t *testing.T) {
+	cutoff := time.Date(2026, 6, 22, 10, 0, 0, 0, time.UTC)
+	oldTime := time.Date(2024, 3, 1, 8, 0, 0, 0, time.UTC)
+	recentTime := time.Date(2026, 6, 23, 9, 0, 0, 0, time.UTC)
+
+	t.Run("non-terminal rows always qualify regardless of age", func(t *testing.T) {
+		row := vitessMigrationRow{MigrationContext: "singularity:stalled", Status: state.Vitess.Running, RequestedAt: &oldTime}
+		assert.True(t, baselineContextRow(row, cutoff))
+	})
+
+	t.Run("recently completed terminal rows qualify", func(t *testing.T) {
+		row := vitessMigrationRow{MigrationContext: "singularity:just-finished", Status: state.Vitess.Complete, RequestedAt: &oldTime, CompletedAt: &recentTime}
+		assert.True(t, baselineContextRow(row, cutoff), "the most recent timestamp decides recency, not the oldest")
+	})
+
+	t.Run("old terminal rows are dropped", func(t *testing.T) {
+		row := vitessMigrationRow{MigrationContext: "singularity:ancient", Status: state.Vitess.Complete, RequestedAt: &oldTime, StartedAt: &oldTime, CompletedAt: &oldTime}
+		assert.False(t, baselineContextRow(row, cutoff))
+	})
+
+	t.Run("terminal rows without timestamps are kept because their age cannot be proven", func(t *testing.T) {
+		row := vitessMigrationRow{MigrationContext: "singularity:untimed", Status: state.Vitess.Cancelled}
+		assert.True(t, baselineContextRow(row, cutoff))
 	})
 }
 

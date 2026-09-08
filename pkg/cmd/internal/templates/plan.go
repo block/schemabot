@@ -10,6 +10,9 @@ import (
 	"golang.org/x/text/language"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/cmd/cliname"
+	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -197,8 +200,9 @@ func WriteSQLChanges(changes []DDLChange) {
 	for _, change := range combined {
 		// Table name line: "     ~ tablename:"
 		fmt.Printf(indentTable+"%s%s\n", progressSymbol(change.ChangeType), change.TableName)
-		// DDL indented below
-		fmt.Print(formatProgressDDL(change.DDL))
+		// DDL indented below. The plan view reconstructs statements under
+		// MySQL grammar (combineAlterStatements), so it renders MySQL-pinned.
+		fmt.Print(formatProgressDDLForDialect(schema.DialectMySQL, change.DDL))
 		fmt.Println()
 	}
 }
@@ -419,17 +423,18 @@ func WriteOptions(deferCutover bool, skipRevert bool) {
 	}
 }
 
-// WriteLintViolations writes lint violations if any.
+// WriteLintViolations writes advisory lint findings, mirroring the unsafe
+// changes list shape: a count in the header and "table: message" items.
 func WriteLintViolations(warnings []apitypes.LintViolationResponse) {
 	if len(warnings) == 0 {
 		return
 	}
-	fmt.Println("⚠️  Lint Warnings:")
+	fmt.Printf("\U0001f4a1 Lint Warnings (%d):\n", len(warnings))
 	for _, w := range warnings {
 		if w.Table != "" {
-			fmt.Printf("  - [%s] %s\n", w.Table, w.Message)
+			fmt.Printf("  • %s: %s\n", w.Table, w.Message)
 		} else {
-			fmt.Printf("  - %s\n", w.Message)
+			fmt.Printf("  • %s\n", w.Message)
 		}
 	}
 	fmt.Println()
@@ -456,29 +461,50 @@ func WriteErrors(errors []string) {
 	fmt.Println()
 }
 
+// WriteIgnoredNamespaces disclosure: the plan was built from a deliberately
+// partial desired state, so a reader can distinguish "this namespace has no
+// changes" from "this namespace was withheld by config". Unmatched entries are
+// configured exclusions that removed nothing (typo, case mismatch, or stale
+// entry) — the namespaces they name are fully reconciled.
+func WriteIgnoredNamespaces(ignored, unmatched []string) {
+	if len(ignored) > 0 {
+		fmt.Printf(glyph.Info+"  Namespaces excluded by ignore_namespaces: %s\n", strings.Join(ignored, ", "))
+	}
+	for _, entry := range unmatched {
+		fmt.Printf(glyph.Attention+"  ignore_namespaces entry %q matched no namespace and excluded nothing\n", entry)
+	}
+	if len(ignored) > 0 || len(unmatched) > 0 {
+		fmt.Println()
+	}
+}
+
 // UnsafeChange is a type alias for the shared unsafe change type.
 type UnsafeChange = apitypes.UnsafeChange
 
 // WriteUnsafeChangesWarning writes a warning about unsafe changes (for plan output).
+// At plan time nothing has been refused yet — the changes await consent, so the
+// heading carries Attention, matching the PR plan comment and list-plans.
 func WriteUnsafeChangesWarning(changes []UnsafeChange) {
 	if len(changes) == 0 {
 		return
 	}
-	fmt.Println("⛔ Unsafe Changes Detected:")
+	fmt.Println(glyph.Attention + " Unsafe Changes Detected:")
 	writeUnsafeChangesList(changes)
 	fmt.Println()
 }
 
 // WriteUnsafeChangesBlocked writes the unsafe changes list and instruction to re-run with --allow-unsafe.
+// The apply was refused, so Refused attaches to the refusal itself — the heading
+// names the blocked apply, not the unsafeness of the changes.
 func WriteUnsafeChangesBlocked(changes []UnsafeChange, database, environment, schemaDir string) {
 	if len(changes) > 0 {
-		fmt.Println("⛔ Unsafe Changes Detected:")
+		fmt.Printf(glyph.Refused+" Apply blocked: %d unsafe change(s) detected\n", countUnsafeFindings(changes))
 		writeUnsafeChangesList(changes)
 		fmt.Println()
 	}
-	fmt.Println("🚨 To proceed with these destructive changes, re-run with --allow-unsafe:")
+	fmt.Println(glyph.Escalation + " To proceed with these destructive changes, re-run with --allow-unsafe:")
 	fmt.Println()
-	fmt.Printf("  schemabot apply -s %s -e %s --allow-unsafe\n", schemaDir, environment)
+	fmt.Printf("  %s apply -s %s -e %s --allow-unsafe\n", cliname.Name(), schemaDir, environment)
 	fmt.Println()
 }
 
@@ -488,30 +514,46 @@ func WriteUnsafeWarningAllowed(changes []UnsafeChange) {
 		return
 	}
 	fmt.Println()
-	fmt.Println("🚨 Unsafe Changes (--allow-unsafe enabled)")
+	fmt.Println(glyph.Escalation + " Unsafe Changes (--allow-unsafe enabled)")
 	fmt.Println()
-	fmt.Println("The following changes will permanently delete data:")
+	fmt.Println("The following unsafe changes will be applied:")
 	writeUnsafeChangesList(changes)
 	fmt.Println()
 }
 
-// writeUnsafeChangesList writes the list of unsafe changes, splitting multi-reason entries.
+// writeUnsafeChangesList writes the unsafe changes one numbered line per
+// finding, the same list shape as the PR plan comment, so a heading's count
+// always equals the number of lines below it and a finding can be referenced
+// by its number.
 func writeUnsafeChangesList(changes []UnsafeChange) {
+	n := 0
 	for _, c := range changes {
-		reason := ui.CleanLintReason(c.Reason)
-		if reason != "" {
-			// Split multiple reasons (joined by "; " in the engine)
-			reasons := strings.Split(reason, "; ")
-			if len(reasons) > 1 {
-				fmt.Printf("  • %s:\n", c.Table)
-				for _, r := range reasons {
-					fmt.Printf("      - %s\n", r)
-				}
-			} else {
-				fmt.Printf("  • %s: %s\n", c.Table, reason)
-			}
-		} else {
-			fmt.Printf("  • %s: %s\n", c.Table, c.ChangeType)
+		reasons := ui.LintReasons(c.Reason)
+		if len(reasons) == 0 {
+			n++
+			fmt.Printf("  %d. %s: %s\n", n, c.Table, c.ChangeType)
+			continue
+		}
+		for _, r := range reasons {
+			n++
+			fmt.Printf("  %d. %s: %s\n", n, c.Table, r)
 		}
 	}
+}
+
+// countUnsafeFindings sums the individual findings across changes so the
+// apply-blocked heading counts exactly what the list below shows; a change
+// with no parseable reason still counts once. The PR comment's
+// countUnsafeFindings in pkg/webhook/templates mirrors this; the two must
+// agree so the CLI and PR comment report the same count for the same plan.
+func countUnsafeFindings(changes []UnsafeChange) int {
+	n := 0
+	for _, c := range changes {
+		if reasons := ui.LintReasons(c.Reason); len(reasons) > 0 {
+			n += len(reasons)
+		} else {
+			n++
+		}
+	}
+	return n
 }

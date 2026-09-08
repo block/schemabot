@@ -50,6 +50,7 @@ func (h *Handler) handleMergeGroup(ctx context.Context, metricApp string, w http
 		h.writeError(w, http.StatusBadRequest, "invalid merge_group payload")
 		return
 	}
+	payload.Repository.FullName = storage.CanonicalKey(payload.Repository.FullName)
 
 	// GitHub sends "checks_requested" when a PR joins the queue and "destroyed"
 	// when it leaves. Only checks_requested needs a check run on the new SHA.
@@ -183,7 +184,7 @@ func (h *Handler) enqueueDurableMergeGroup(ctx context.Context, payload mergeGro
 		DeliveryID: deliveryID,
 		Event:      "merge_group",
 		Action:     payload.Action,
-		Repository: payload.Repository.FullName,
+		Repository: storage.CanonicalKey(payload.Repository.FullName),
 		HeadSHA:    payload.MergeGroup.HeadSHA,
 		TenantID:   strconv.FormatInt(installationID, 10),
 		Payload:    body,
@@ -209,15 +210,15 @@ func (h *Handler) processDurableMergeGroup(ctx context.Context, event *storage.W
 		return false, nil
 	}
 
-	repo := payload.Repository.FullName
+	repo := storage.CanonicalKey(payload.Repository.FullName)
 	headSHA := payload.MergeGroup.HeadSHA
 	if repo == "" || headSHA == "" {
 		return false, fmt.Errorf("durable merge_group delivery %s missing repo or head SHA", event.DeliveryID)
 	}
 
-	installationID := h.durableInstallationID(ctx, event, payload.Installation.ID)
-	if installationID == 0 {
-		return false, fmt.Errorf("durable merge_group delivery %s missing installation ID", event.DeliveryID)
+	installationID, err := durableInstallationID(event)
+	if err != nil {
+		return false, err
 	}
 
 	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {
@@ -304,11 +305,13 @@ func (h *Handler) postPassingAggregateChecks(ctx context.Context, client *ghclie
 				"repo", repo, "head_sha", headSHA, "check_name", target.name,
 				"operation", content.operation, "error", findErr)
 		}
+		action := "created"
 		switch {
 		case findErr == nil && existing != nil:
 			if err := client.UpdateCheckRun(ctx, repo, existing.ID, opts); err != nil {
 				return fmt.Errorf("update %s check %q on %s@%s: %w", content.operation, target.name, repo, headSHA, err)
 			}
+			action = "updated"
 		default:
 			if _, err := client.CreateCheckRun(ctx, repo, headSHA, opts); err != nil {
 				return fmt.Errorf("create %s check %q on %s@%s: %w", content.operation, target.name, repo, headSHA, err)
@@ -320,9 +323,10 @@ func (h *Handler) postPassingAggregateChecks(ctx context.Context, client *ghclie
 			Environment: target.environment,
 			Status:      "success",
 		})
-		h.logger.Info("passing aggregate check posted",
+		h.logger.Info("posted passing aggregate",
 			"repo", repo, "head_sha", headSHA, "check_name", target.name,
-			"environment", target.environment, "operation", content.operation)
+			"environment", target.environment, "action", action,
+			"operation", content.operation)
 	}
 	return nil
 }

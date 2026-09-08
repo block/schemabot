@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -17,7 +18,9 @@ import (
 // newNoActiveChangeClient builds a MySQL client whose engine always reports no
 // running schema change — the exact response Spirit gives whenever it has no
 // active runner, which is true both after a crash and while a task is
-// intentionally paused.
+// intentionally paused. The tasks' parent apply defaults to a running apply
+// with no lease, so no live driver claims authority over the tasks; tests that
+// exercise apply state or lease ownership replace the applies store.
 func newNoActiveChangeClient(database string, tasks []*storage.Task) *LocalClient {
 	return &LocalClient{
 		config: LocalConfig{
@@ -25,8 +28,9 @@ func newNoActiveChangeClient(database string, tasks []*storage.Task) *LocalClien
 			Type:     storage.DatabaseTypeMySQL,
 		},
 		storage: &exactProgressStorage{
-			tasks: &exactProgressTaskStore{tasks: tasks},
-			logs:  &mockApplyLogStore{},
+			applies: &mockApplyStore{apply: unleasedRunningApply(database)},
+			tasks:   &exactProgressTaskStore{tasks: tasks},
+			logs:    &mockApplyLogStore{},
 		},
 		spiritEngine: &fakeControlEngine{
 			progressResult: &engine.ProgressResult{
@@ -38,11 +42,25 @@ func newNoActiveChangeClient(database string, tasks []*storage.Task) *LocalClien
 	}
 }
 
+// unleasedRunningApply builds a running parent apply with no lease — the shape
+// of an apply whose driver has released or lost its claim, so the conflict
+// check's engine probe (not a live drive) is the best available signal.
+func unleasedRunningApply(database string) *storage.Apply {
+	return &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-under-test",
+		Database:        database,
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		State:           state.Apply.Running,
+	}
+}
+
 // A stopped task keeps its Spirit checkpoint and is resumable via Start. When an
 // unrelated Apply runs on the same database, the engine reports no active work
 // for that database — but the stopped task must stay stopped so its checkpoint
-// and the operator's ability to resume are preserved, and the new apply must be
-// refused rather than running over paused work.
+// and the operator's ability to resume are preserved. Its apply is still
+// claimable here, so a driver will reach the task on its own and the new apply
+// is refused rather than running over work someone is about to drive.
 func TestConflictCheckPreservesStoppedTask(t *testing.T) {
 	stopped := &storage.Task{
 		ID:             1,
@@ -54,14 +72,14 @@ func TestConflictCheckPreservesStoppedTask(t *testing.T) {
 	}
 	client := newNoActiveChangeClient("testdb", []*storage.Task{stopped})
 
-	resolved := client.tryResolveStaleTask(t.Context(), stopped, "testdb")
+	resolved := client.tryResolveStaleTask(t.Context(), stopped, unleasedRunningApply("testdb"), "testdb")
 	assert.False(t, resolved, "stopped task must not be resolved as stale")
 	assert.Equal(t, state.Task.Stopped, stopped.State, "stopped task must remain resumable")
 	assert.Empty(t, stopped.ErrorMessage, "no abandoned-task error should be written to a stopped task")
 	assert.Nil(t, stopped.CompletedAt)
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan, "")
+	_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
 	require.Error(t, err, "a new apply must be refused while a stopped task holds the database")
 	assert.Contains(t, err.Error(), "schema change already in progress")
 	assert.Equal(t, state.Task.Stopped, stopped.State)
@@ -83,14 +101,14 @@ func TestConflictCheckPreservesRetryableTask(t *testing.T) {
 	}
 	client := newNoActiveChangeClient("testdb", []*storage.Task{retryable})
 
-	resolved := client.tryResolveStaleTask(t.Context(), retryable, "testdb")
+	resolved := client.tryResolveStaleTask(t.Context(), retryable, unleasedRunningApply("testdb"), "testdb")
 	assert.False(t, resolved, "retryable task must not be resolved as stale")
 	assert.Equal(t, state.Task.FailedRetryable, retryable.State, "retryable task must remain retryable")
 	assert.Equal(t, "engine connection reset", retryable.ErrorMessage, "original retry error must be preserved")
 	assert.Nil(t, retryable.CompletedAt)
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan, "")
+	_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
 	require.Error(t, err, "a new apply must be refused while a retryable task holds the database")
 	assert.Contains(t, err.Error(), "schema change already in progress")
 	assert.Equal(t, state.Task.FailedRetryable, retryable.State)
@@ -126,7 +144,7 @@ func TestConflictCheckHandlesProgressError(t *testing.T) {
 	}
 
 	require.NotPanics(t, func() {
-		resolved := client.tryResolveStaleTask(t.Context(), running, "testdb")
+		resolved := client.tryResolveStaleTask(t.Context(), running, unleasedRunningApply("testdb"), "testdb")
 		assert.False(t, resolved, "task must not be resolved when the engine progress call errors")
 	})
 	assert.Equal(t, state.Task.Running, running.State, "task state must be left untouched on progress error")
@@ -154,7 +172,7 @@ func TestConflictCheckFailsAbandonedInFlightTask(t *testing.T) {
 			}
 			client := newNoActiveChangeClient("testdb", []*storage.Task{running})
 
-			resolved := client.tryResolveStaleTask(t.Context(), running, "testdb")
+			resolved := client.tryResolveStaleTask(t.Context(), running, unleasedRunningApply("testdb"), "testdb")
 			assert.True(t, resolved, "abandoned in-flight task must be resolved")
 			assert.Equal(t, state.Task.Failed, running.State, "abandoned in-flight task must be failed")
 			assert.Contains(t, running.ErrorMessage, "server may have crashed")
@@ -184,8 +202,9 @@ func TestConflictCheckIsPerShard(t *testing.T) {
 	client := &LocalClient{
 		config: LocalConfig{Database: "cdb_resolute", Type: storage.DatabaseTypeMySQL},
 		storage: &exactProgressStorage{
-			tasks: &exactProgressTaskStore{tasks: []*storage.Task{activeShard}},
-			logs:  &mockApplyLogStore{},
+			applies: &mockApplyStore{apply: unleasedRunningApply("cdb_resolute")},
+			tasks:   &exactProgressTaskStore{tasks: []*storage.Task{activeShard}},
+			logs:    &mockApplyLogStore{},
 		},
 		spiritEngine: &fakeControlEngine{
 			progressResult: &engine.ProgressResult{State: engine.StateRunning, Message: "Copying rows"},
@@ -200,12 +219,14 @@ func TestConflictCheckIsPerShard(t *testing.T) {
 	// which this test does not need to exercise.
 
 	// A different shard is not a conflict — it runs concurrently.
-	assert.Empty(t, client.findBlockingTask(t.Context(), tasks, plan, "40-80"),
+	blockingOtherShard, _ := client.findBlockingTask(t.Context(), tasks, plan, "", "40-80", 0, newConflictScanMemo())
+	assert.False(t, blockingOtherShard.blocks(),
 		"an active task on shard -40 must not block an apply on shard 40-80")
 	assert.Equal(t, state.Task.Running, activeShard.State, "the other shard's task is left running")
 
 	// The same shard still conflicts.
-	assert.Equal(t, "task-shard-neg40", client.findBlockingTask(t.Context(), tasks, plan, "-40"),
+	blockingSameShard, _ := client.findBlockingTask(t.Context(), tasks, plan, "", "-40", 0, newConflictScanMemo())
+	assert.Equal(t, "task-shard-neg40", blockingSameShard.taskIdentifier,
 		"an active task on shard -40 must block another apply on shard -40")
 }
 
@@ -237,7 +258,7 @@ func TestConflictCheckCancelsOrphanedPendingTask(t *testing.T) {
 			}}
 
 			plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-			err := client.checkActiveTaskConflict(t.Context(), plan, "")
+			_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
 			require.NoError(t, err, "an orphaned pending task must not refuse a new apply")
 			assert.Equal(t, state.Task.Cancelled, orphan.State, "the orphaned task must be cancelled")
 			assert.Contains(t, orphan.ErrorMessage, "orphaned")
@@ -266,7 +287,7 @@ func TestConflictCheckPreservesPendingTaskOfActiveApply(t *testing.T) {
 	}}
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan, "")
+	_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
 	require.Error(t, err, "a pending task of an active apply must refuse a new apply")
 	assert.Contains(t, err.Error(), "schema change already in progress")
 	assert.Equal(t, state.Task.Pending, pending.State, "the pending task must be left untouched")
@@ -292,7 +313,7 @@ func TestConflictCheckKeepsPendingTaskOnApplyLookupUncertainty(t *testing.T) {
 		client.storage.(*exactProgressStorage).applies = &mockApplyStore{apply: nil}
 
 		plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-		err := client.checkActiveTaskConflict(t.Context(), plan, "")
+		_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
 		require.Error(t, err, "a pending task with a missing apply row must keep blocking")
 		assert.Equal(t, state.Task.Pending, pending.State)
 		assert.Nil(t, pending.CompletedAt)
@@ -312,7 +333,7 @@ func TestConflictCheckKeepsPendingTaskOnApplyLookupUncertainty(t *testing.T) {
 		client.storage.(*exactProgressStorage).applies = &erroringApplyStore{err: errors.New("storage down")}
 
 		plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-		err := client.checkActiveTaskConflict(t.Context(), plan, "")
+		_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
 		require.Error(t, err, "a pending task must keep blocking when its apply cannot be loaded")
 		assert.Equal(t, state.Task.Pending, pending.State)
 		assert.Nil(t, pending.CompletedAt)
@@ -357,7 +378,7 @@ func TestConflictCheckKeepsOrphanWhenCancellationWriteFails(t *testing.T) {
 	}}
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan, "")
+	_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
 	require.Error(t, err, "the orphan must keep blocking when its cancellation cannot be written")
 	assert.Contains(t, err.Error(), "schema change already in progress")
 	assert.Equal(t, state.Task.Pending, orphan.State, "the task must be restored to pending for a clean retry")
@@ -376,6 +397,147 @@ func (s *updateFailingTaskStore) Update(context.Context, *storage.Task) error {
 	return s.updateErr
 }
 
+// While a live driver holds the apply's lease (fresh heartbeat), the local
+// engine probe says nothing about that driver's work — Spirit progress is
+// in-memory and per-process. The conflict check must leave the task alone and
+// refuse the new apply, whether the local engine memory happens to report a
+// terminal state from an older run on the same database or has no memory of
+// the database at all (which would otherwise read as abandoned work).
+func TestConflictCheckLeavesActivelyDrivenTask(t *testing.T) {
+	engineMemories := map[string]*engine.ProgressResult{
+		"terminal memory of an older run": {State: engine.StateCompleted, Message: "Complete"},
+		"no memory of the database":       {State: engine.StatePending, Message: "No active schema change"},
+	}
+	for name, memory := range engineMemories {
+		t.Run(name, func(t *testing.T) {
+			running := &storage.Task{
+				ID:             11,
+				ApplyID:        111,
+				TaskIdentifier: "task-driven-elsewhere",
+				Database:       "testdb",
+				DatabaseType:   storage.DatabaseTypeMySQL,
+				TableName:      "users",
+				State:          state.Task.Running,
+			}
+			client := newNoActiveChangeClient("testdb", []*storage.Task{running})
+			stor := client.storage.(*exactProgressStorage)
+			stor.applies = &mockApplyStore{apply: &storage.Apply{
+				ID: 111, ApplyIdentifier: "apply-driven", Database: "testdb",
+				DatabaseType: storage.DatabaseTypeMySQL, State: state.Apply.Running,
+				LeaseOwner: "other-host/4242/driver-0", LeaseToken: "token-live",
+				UpdatedAt: time.Now(),
+			}}
+			client.spiritEngine = &fakeControlEngine{progressResult: memory}
+
+			plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+			_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
+			require.Error(t, err, "a task with an actively driven apply must refuse a new apply")
+			assert.Contains(t, err.Error(), "schema change already in progress")
+			assert.Equal(t, state.Task.Running, running.State, "the driven task must be left untouched")
+			assert.Empty(t, running.ErrorMessage)
+			assert.Nil(t, running.CompletedAt)
+		})
+	}
+}
+
+// When the apply's lease has gone stale but was last held by another process,
+// a terminal report from the local engine is this process's memory of an older
+// run on the same database — not the completing driver's own report. The task
+// must keep blocking so driver stale-claim recovery settles it with real state.
+func TestConflictCheckRefusesForeignTerminalReport(t *testing.T) {
+	running := &storage.Task{
+		ID:             12,
+		ApplyID:        121,
+		TaskIdentifier: "task-foreign-lease",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	client := newNoActiveChangeClient("testdb", []*storage.Task{running})
+	stor := client.storage.(*exactProgressStorage)
+	stor.applies = &mockApplyStore{apply: &storage.Apply{
+		ID: 121, ApplyIdentifier: "apply-foreign", Database: "testdb",
+		DatabaseType: storage.DatabaseTypeMySQL, State: state.Apply.Running,
+		LeaseOwner: "other-host/4242/driver-0", LeaseToken: "token-stale",
+		UpdatedAt: time.Now().Add(-2 * storage.ApplyLeaseStaleAfter),
+	}}
+	client.spiritEngine = &fakeControlEngine{
+		progressResult: &engine.ProgressResult{State: engine.StateCompleted, Message: "Complete"},
+	}
+
+	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+	_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
+	require.Error(t, err, "another process's task must not be stamped from this process's engine memory")
+	assert.Contains(t, err.Error(), "schema change already in progress")
+	assert.Equal(t, state.Task.Running, running.State, "the task must be left for driver recovery")
+	assert.Nil(t, running.CompletedAt)
+}
+
+// A terminal report is trusted when the stale lease was last held by this
+// process: the engine memory is the completing driver's own record (e.g. the
+// drive finished but the final storage write was lost), so the task is settled
+// with the engine's state and the new apply is admitted.
+func TestConflictCheckStampsOwnProcessTerminalReport(t *testing.T) {
+	running := &storage.Task{
+		ID:             13,
+		ApplyID:        131,
+		TaskIdentifier: "task-own-lease",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.Running,
+	}
+	client := newNoActiveChangeClient("testdb", []*storage.Task{running})
+	stor := client.storage.(*exactProgressStorage)
+	stor.applies = &mockApplyStore{apply: &storage.Apply{
+		ID: 131, ApplyIdentifier: "apply-own", Database: "testdb",
+		DatabaseType: storage.DatabaseTypeMySQL, State: state.Apply.Running,
+		LeaseOwner: storage.LeaseOwnerProcess() + "/driver-0", LeaseToken: "token-own",
+		UpdatedAt: time.Now().Add(-2 * storage.ApplyLeaseStaleAfter),
+	}}
+	client.spiritEngine = &fakeControlEngine{
+		progressResult: &engine.ProgressResult{State: engine.StateCompleted, Message: "Complete"},
+	}
+
+	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+	_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
+	require.NoError(t, err, "this process's own terminal report must settle the task and admit the new apply")
+	assert.Equal(t, state.Task.Completed, running.State, "the task must carry the engine's terminal state")
+	assert.NotNil(t, running.CompletedAt)
+}
+
+// Crash recovery survives ownership gating: when the stale lease belongs to a
+// process that crashed (a restarted process has a new pid, so even the same pod
+// counts as another process) and the engine has no active work, the abandoned
+// in-flight task is still failed so it stops blocking the database.
+func TestConflictCheckFailsAbandonedTaskWithStaleForeignLease(t *testing.T) {
+	running := &storage.Task{
+		ID:             14,
+		ApplyID:        141,
+		TaskIdentifier: "task-crashed-owner",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "events",
+		State:          state.Task.Running,
+	}
+	client := newNoActiveChangeClient("testdb", []*storage.Task{running})
+	stor := client.storage.(*exactProgressStorage)
+	stor.applies = &mockApplyStore{apply: &storage.Apply{
+		ID: 141, ApplyIdentifier: "apply-crashed", Database: "testdb",
+		DatabaseType: storage.DatabaseTypeMySQL, State: state.Apply.Running,
+		LeaseOwner: "crashed-host/4242/driver-0", LeaseToken: "token-crashed",
+		UpdatedAt: time.Now().Add(-2 * storage.ApplyLeaseStaleAfter),
+	}}
+
+	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+	_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
+	require.NoError(t, err, "an abandoned task under a crashed process's stale lease must be failed and unblock")
+	assert.Equal(t, state.Task.Failed, running.State)
+	assert.Contains(t, running.ErrorMessage, "server may have crashed")
+	assert.NotNil(t, running.CompletedAt)
+}
+
 // Once an abandoned in-flight task has been failed, it no longer blocks the
 // database, so a new apply is admitted.
 func TestConflictCheckAdmitsApplyAfterFailingAbandonedTask(t *testing.T) {
@@ -390,7 +552,656 @@ func TestConflictCheckAdmitsApplyAfterFailingAbandonedTask(t *testing.T) {
 	client := newNoActiveChangeClient("testdb", []*storage.Task{running})
 
 	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
-	err := client.checkActiveTaskConflict(t.Context(), plan, "")
+	_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "", "", 0)
 	require.NoError(t, err, "new apply should proceed once the abandoned task is failed")
 	assert.Equal(t, state.Task.Failed, running.State)
+}
+
+// The refusal an apply gets when another holds the database is the whole of what
+// an operator sees when their apply dies on arrival, so it has to name what is
+// being changed, the apply to act on, and what frees the database. A stopped
+// apply holds the database by design, so a refusal naming only the task leaves
+// an operator with an identifier they cannot act on and no indication that a
+// decision is owed.
+func TestBlockingTaskDescribesTheApplyAndItsResolution(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		blocking blockingTask
+		want     []string
+	}{
+		{
+			name: "a stopped apply holds its database until an operator decides its fate",
+			blocking: blockingTask{
+				taskIdentifier: "task-holding",
+				table:          "xfers",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.Stopped},
+			},
+			want: []string{"table xfers", "task-holding", "stopped", "started or cancelled"},
+		},
+		{
+			name: "a running apply releases its database on its own, unless it parks for cutover",
+			blocking: blockingTask{
+				taskIdentifier: "task-holding",
+				table:          "xfers",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.Running},
+			},
+			want: []string{
+				"table xfers", "task-holding", "running",
+				"releases the database when it finishes", "unless it parks for cutover",
+			},
+		},
+		{
+			name: "a post-copy phase is still the running family",
+			blocking: blockingTask{
+				taskIdentifier: "task-holding",
+				table:          "xfers",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.CatchingUp},
+			},
+			want: []string{"releases the database when it finishes"},
+		},
+		{
+			name: "a sharded change names the shard, since only that shard is held",
+			blocking: blockingTask{
+				taskIdentifier: "task-holding",
+				table:          "xfers",
+				shard:          "-40",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.Running},
+			},
+			want: []string{"table xfers shard -40", "task-holding"},
+		},
+		{
+			name: "a multi-table atomic change records no table, so the task names it",
+			blocking: blockingTask{
+				taskIdentifier: "task-holding",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.Running},
+			},
+			want: []string{"task task-holding is held by a schema change"},
+		},
+		{
+			name: "a sharded multi-table change still names the shard it holds",
+			blocking: blockingTask{
+				taskIdentifier: "task-holding",
+				shard:          "-40",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.Running},
+			},
+			want: []string{"shard -40 (task task-holding)"},
+		},
+		{
+			name: "a retryable failure rests holding its database, so a decision is owed",
+			blocking: blockingTask{
+				taskIdentifier: "task-holding",
+				table:          "xfers",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.FailedRetryable},
+			},
+			want: []string{"table xfers", "task-holding", "failed_retryable", "retried or cancelled"},
+		},
+		{
+			name: "an apply parked at the cutover barrier holds its database until cut over",
+			blocking: blockingTask{
+				taskIdentifier: "task-holding",
+				table:          "xfers",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.WaitingForCutover},
+			},
+			want: []string{"table xfers", "task-holding", "waiting_for_cutover", "cut over or cancelled"},
+		},
+		{
+			name: "an apply in its revert window rests holding its database, so a decision is owed",
+			blocking: blockingTask{
+				taskIdentifier: "task-holding",
+				table:          "xfers",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.RevertWindow},
+			},
+			want: []string{
+				"table xfers", "task-holding", "revert_window",
+				"reverted or skip-reverted",
+			},
+		},
+		{
+			name: "a revert already under way finishes on its own",
+			blocking: blockingTask{
+				taskIdentifier: "task-holding",
+				table:          "xfers",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.Reverting},
+			},
+			want: []string{"reverting", "releases the database when the revert finishes"},
+		},
+		{
+			name: "finalizing skip-revert finishes on its own too",
+			blocking: blockingTask{
+				taskIdentifier: "task-holding",
+				table:          "xfers",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.SkippingRevert},
+			},
+			want: []string{"skipping_revert", "releases the database when the revert finishes"},
+		},
+		{
+			name: "an apply that could not be loaded still reports what it blocks on",
+			blocking: blockingTask{
+				taskIdentifier: "task-holding",
+				table:          "xfers",
+			},
+			want: []string{"table xfers", "task-holding", "could not be loaded"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			described := tc.blocking.describe()
+			for _, want := range tc.want {
+				assert.Contains(t, described, want)
+			}
+		})
+	}
+}
+
+// The refusal is a composed sentence an operator reads out of a CLI error, so
+// its shape is part of what is being delivered: the table leads, the task
+// identifier stays attached as the CLI handle, the apply and its state follow,
+// and the resolution hangs off a semicolon. Pinning both branches exactly
+// catches an edit that reorders the parts, drops the parenthesised handle, or
+// loses the separator — all of which every substring assertion still passes.
+func TestBlockingTaskComposesTheWholeRefusal(t *testing.T) {
+	held := blockingTask{
+		taskIdentifier: "task-holding",
+		table:          "xfers",
+		shard:          "-40",
+		apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.Stopped},
+	}
+	assert.Equal(t,
+		"table xfers shard -40 (task task-holding) is held by a schema change (stopped); "+
+			"it holds the database until it is started or cancelled",
+		held.describe())
+
+	unloadable := blockingTask{
+		taskIdentifier: "task-holding",
+		table:          "xfers",
+	}
+	assert.Equal(t,
+		"table xfers (task task-holding) is held by a schema change that could not be loaded",
+		unloadable.describe())
+}
+
+// The engine's apply identifier resolves only inside the engine: an operator who
+// pastes it into the control-plane CLI is refused. The refusal names the pull
+// request that owns the holding change instead, which is a handle on both sides.
+func TestBlockingTaskNamesTheHolderNotTheEngineIdentifier(t *testing.T) {
+	byPR := blockingTask{
+		taskIdentifier: "task-holding",
+		table:          "xfers",
+		apply: &storage.Apply{
+			ApplyIdentifier: "apply-holding",
+			State:           state.Apply.Stopped,
+			Repository:      "acme/payments",
+			PullRequest:     4821,
+			Caller:          "webhook:acme/payments#4821",
+		},
+	}
+	described := byPR.describe()
+	assert.Contains(t, described, "is held by a schema change (stopped) on acme/payments#4821")
+	assert.NotContains(t, described, "apply-holding",
+		"the engine's identifier does not resolve on the control plane, so it must not be offered as the handle")
+
+	// A change with no pull request is named by whoever started it.
+	byCaller := blockingTask{
+		taskIdentifier: "task-holding",
+		table:          "xfers",
+		apply: &storage.Apply{
+			ApplyIdentifier: "apply-holding",
+			State:           state.Apply.Running,
+			Caller:          "cli:dana@laptop",
+		},
+	}
+	assert.Contains(t, byCaller.describe(), "is held by a schema change (running) started by cli:dana@laptop")
+
+	// Provenance the dispatch never recorded leaves the work and the state to
+	// describe the conflict on their own.
+	anonymous := blockingTask{
+		taskIdentifier: "task-holding",
+		table:          "xfers",
+		apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.Stopped},
+	}
+	assert.Contains(t, anonymous.describe(), "is held by a schema change (stopped);")
+}
+
+// A state whose next move is not certain gets no resolution line rather than a
+// guess, so an operator is never pointed at an action the apply will not honour.
+func TestBlockingTaskOffersNoResolutionForAnUncertainState(t *testing.T) {
+	blocking := blockingTask{
+		taskIdentifier: "task-holding",
+		apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: state.Apply.CuttingOver},
+	}
+
+	assert.Empty(t, state.Hold(blocking.apply.State), "cutting over has no operator action to offer")
+	assert.Contains(t, blocking.describe(), state.Apply.CuttingOver, "the state is still named")
+}
+
+// The structured conflict is what a caller renders instead of the engine's own
+// error text, so it must carry every fact that refusal turns on. The holding
+// apply's engine identifier travels with them as a correlation key: a caller
+// that dispatched this work recorded that identifier against its own apply, and
+// resolving it is how the refusal names a handle an operator can use instead of
+// one the control-plane CLI refuses. The engine's own prose still names none.
+func TestBlockingTaskConflictCarriesTheFactsAndTheCorrelationKey(t *testing.T) {
+	blocking := blockingTask{
+		taskIdentifier: "task-holding",
+		table:          "xfers",
+		shard:          "-40",
+		apply: &storage.Apply{
+			ApplyIdentifier: "apply-holding",
+			State:           "STATE_STOPPED",
+			Repository:      "acme/payments",
+			PullRequest:     4821,
+			Caller:          "webhook:acme/payments#4821",
+		},
+	}
+
+	conflict := blocking.conflict()
+	require.NotNil(t, conflict)
+	assert.Equal(t, "xfers", conflict.Table)
+	assert.Equal(t, "-40", conflict.Shard)
+	assert.Equal(t, state.Apply.Stopped, conflict.BlockingState,
+		"the proto-formatted state is normalized so a caller can key on it directly")
+	assert.Equal(t, "acme/payments", conflict.Repository)
+	assert.Equal(t, int32(4821), conflict.PullRequest)
+	assert.Equal(t, "webhook:acme/payments#4821", conflict.Caller)
+	assert.Equal(t, "apply-holding", conflict.HolderExternalId,
+		"the caller needs the engine's identifier to find its own record of this work")
+	assert.NotContains(t, blocking.describe(), "apply-holding",
+		"the engine's identifier is a lookup key, never something the engine renders")
+
+	// Nothing to report when no task blocks.
+	assert.Nil(t, blockingTask{}.conflict())
+
+	// A task whose apply could not be loaded still blocks — the check fails
+	// closed — but nothing about the holder is proven, so there is nothing to
+	// render beyond the sanitized error the caller already has.
+	assert.Nil(t, blockingTask{taskIdentifier: "task-holding", table: "xfers"}.conflict())
+}
+
+// Every other resting state clears by starting, retrying, or cutting over — or
+// by cancelling. The revert window is the exception: the change has already cut
+// over, so stop and cancel are permanently rejected there, and offering cancel
+// would point an operator at a command the control path refuses.
+func TestBlockingTaskOffersNoCancelInsideTheRevertWindow(t *testing.T) {
+	for _, applyState := range []string{
+		state.Apply.RevertWindow, state.Apply.Reverting, state.Apply.SkippingRevert,
+	} {
+		t.Run(applyState, func(t *testing.T) {
+			blocking := blockingTask{
+				taskIdentifier: "task-holding",
+				table:          "xfers",
+				apply:          &storage.Apply{ApplyIdentifier: "apply-holding", State: applyState},
+			}
+
+			assert.NotEmpty(t, state.Hold(applyState), "the revert phase names what clears the database")
+			assert.NotContains(t, blocking.describe(), "cancel",
+				"cancel is rejected once a change has cut over, so the refusal must not offer it")
+		})
+	}
+}
+
+// restingStoppedTask builds a stopped task and the stopped apply that owns it —
+// a copy left resting on the target, with its checkpoint intact and no driver
+// on its way. The task carries the environment and operation linkage a real
+// dispatch stamps, so a release can attribute its work to a dispatch for the
+// same environment and target.
+func restingStoppedTask() (*storage.Task, *storage.Apply) {
+	operationID := int64(11)
+	task := &storage.Task{
+		ID:               1,
+		TaskIdentifier:   "task-stopped",
+		Database:         "testdb",
+		DatabaseType:     storage.DatabaseTypeMySQL,
+		Namespace:        "testdb",
+		TableName:        "users",
+		Environment:      "production",
+		ApplyOperationID: &operationID,
+		State:            state.Task.Stopped,
+	}
+	apply := &storage.Apply{
+		ID:              1,
+		ApplyIdentifier: "apply-holding-testdb",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		State:           state.Apply.Stopped,
+	}
+	return task, apply
+}
+
+// restingTaskPlan is the plan a dispatch meeting the resting task's own target
+// carries: same database, same type, and the target the task's operation row
+// records.
+func restingTaskPlan() *storage.Plan {
+	return &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL, Target: "target-a"}
+}
+
+// restingTaskClient builds a client whose only task is the given resting one,
+// with the control requests the store should report against its apply. The
+// operation store carries the task's operation row naming its target, so
+// attribution reads resolve the way they do against a real dispatch's rows.
+func restingTaskClient(task *storage.Task, apply *storage.Apply, controlRequests storage.ControlRequestStore) *LocalClient {
+	return &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
+		storage: &exactProgressStorage{
+			applies:         &mockApplyStore{apply: apply},
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            &mockApplyLogStore{},
+			controlRequests: controlRequests,
+			applyOperations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+				11: {ID: 11, ApplyID: apply.ID, Target: "target-a"},
+			}},
+		},
+		spiritEngine: &fakeControlEngine{
+			progressResult: &engine.ProgressResult{State: engine.StateRunning, Message: "Copying rows"},
+		},
+		logger: slog.Default(),
+	}
+}
+
+// storageWithoutControlRequests is a storage that has no control request store
+// at all, the way a partially-wired storage implementation reports one.
+type storageWithoutControlRequests struct {
+	*exactProgressStorage
+}
+
+func (s *storageWithoutControlRequests) ControlRequests() storage.ControlRequestStore { return nil }
+
+// unreadableControlRequestStore fails every pending-request read, standing in
+// for a storage outage while the conflict check is deciding.
+type unreadableControlRequestStore struct {
+	storage.ControlRequestStore
+}
+
+func (s *unreadableControlRequestStore) GetPending(context.Context, int64, storage.ControlOperation) (*storage.ApplyControlRequest, error) {
+	return nil, errors.New("control request read failed")
+}
+
+// A stopped apply's task rests on the target with its checkpoint intact, and no
+// driver claims it until a person asks. It therefore stops holding the database
+// at the moment of the stop, so an unrelated apply proceeds instead of being
+// refused for as long as the stopped copy sits there. The resting task itself is
+// left exactly as it was, so starting it later still resumes from its
+// checkpoint.
+func TestConflictCheckReleasesRestingStoppedTask(t *testing.T) {
+	stopped, holdingApply := restingStoppedTask()
+	client := restingTaskClient(stopped, holdingApply, nil)
+	plan := restingTaskPlan()
+
+	blocking, released := client.findBlockingTask(t.Context(), []*storage.Task{stopped}, plan, "production", "", 0, newConflictScanMemo())
+	assert.False(t, blocking.blocks(), "a resting stopped task no longer holds the database")
+
+	require.Len(t, released, 1, "the released holder is named so the dispatch can record a takeover of its copy")
+	assert.Equal(t, "apply-holding-testdb", released[0].applyIdentifier)
+	assert.Equal(t, int64(1), released[0].applyID)
+	assert.Equal(t, "users", released[0].table, "the table decides whether the dispatch meets the resting copy")
+	assert.Equal(t, "testdb", released[0].namespace)
+
+	_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "production", "", 0)
+	require.NoError(t, err, "a new apply proceeds past a resting stopped task")
+
+	assert.Equal(t, state.Task.Stopped, stopped.State, "the resting task stays resumable")
+	assert.Empty(t, stopped.ErrorMessage, "releasing the hold must not write a failure onto the task")
+	assert.Nil(t, stopped.CompletedAt)
+}
+
+// A database name is shared by namesakes: this deployment's staging and
+// production databases both file task rows under it. A dispatch for one
+// environment still proceeds past the other environment's resting copy — the
+// hold is released either way — but it takes over none of that work, because
+// the superseded marker permanently refuses start on the holder and must never
+// land on a namesake's apply.
+func TestConflictCheckDoesNotHandOverANamesakeEnvironmentsWork(t *testing.T) {
+	stopped, holdingApply := restingStoppedTask()
+	client := restingTaskClient(stopped, holdingApply, nil)
+	plan := restingTaskPlan()
+
+	blocking, released := client.findBlockingTask(t.Context(), []*storage.Task{stopped}, plan, "staging", "", 0, newConflictScanMemo())
+
+	assert.False(t, blocking.blocks(), "a namesake's resting task does not hold this dispatch's database")
+	assert.Empty(t, released, "a namesake environment's work is not this dispatch's to take over")
+	assert.Equal(t, state.Task.Stopped, stopped.State, "the namesake's task is left exactly as it was")
+}
+
+// Environment and database type alone do not settle whose work a task row is —
+// two targets can share both along with the database name — so the holder's
+// target is resolved through its operation row. A dispatch for a different
+// target proceeds, but marks nothing.
+func TestConflictCheckDoesNotHandOverAnotherTargetsWork(t *testing.T) {
+	stopped, holdingApply := restingStoppedTask()
+	client := restingTaskClient(stopped, holdingApply, nil)
+	plan := restingTaskPlan()
+	plan.Target = "target-b"
+
+	blocking, released := client.findBlockingTask(t.Context(), []*storage.Task{stopped}, plan, "production", "", 0, newConflictScanMemo())
+
+	assert.False(t, blocking.blocks(), "another target's resting task does not hold this dispatch's database")
+	assert.Empty(t, released, "another target's work is not this dispatch's to take over")
+}
+
+// When the read that would attribute a released holder's work to a target
+// fails, the dispatch still proceeds — the hold is provably released — but the
+// takeover is not recorded: an unattributable holder must not be permanently
+// refused on a guess, and its marker stays available to the dispatch that can
+// prove the work is its own.
+func TestConflictCheckDoesNotHandOverUnattributableWork(t *testing.T) {
+	stopped, holdingApply := restingStoppedTask()
+	client := restingTaskClient(stopped, holdingApply, nil)
+	client.storage.(*exactProgressStorage).applyOperations = &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{}}
+	plan := restingTaskPlan()
+
+	blocking, released := client.findBlockingTask(t.Context(), []*storage.Task{stopped}, plan, "production", "", 0, newConflictScanMemo())
+
+	assert.False(t, blocking.blocks(), "the release does not depend on attribution, only the takeover does")
+	assert.Empty(t, released, "work that cannot be attributed to this dispatch is not taken over")
+}
+
+// countingControlRequestStore counts pending-request reads so a test can pin
+// how many times a conflict check consults the control requests.
+type countingControlRequestStore struct {
+	*testControlRequestStore
+	pendingReads int
+}
+
+func (s *countingControlRequestStore) GetPending(ctx context.Context, applyID int64, operation storage.ControlOperation) (*storage.ApplyControlRequest, error) {
+	s.pendingReads++
+	return s.testControlRequestStore.GetPending(ctx, applyID, operation)
+}
+
+// The conflict check retries to absorb engine staleness, but the resting
+// decision is storage-only and cannot change within the check, so it is
+// decided once: the apply's control requests are read a single time no matter
+// how many attempts the check makes before refusing the dispatch.
+func TestConflictCheckDecidesTheRestingHoldOnce(t *testing.T) {
+	stopped, holdingApply := restingStoppedTask()
+	requests := &countingControlRequestStore{testControlRequestStore: &testControlRequestStore{
+		requests: []*storage.ApplyControlRequest{{
+			ID:        1,
+			ApplyID:   holdingApply.ID,
+			Operation: storage.ControlOperationStart,
+			Status:    storage.ControlRequestPending,
+		}},
+	}}
+	client := restingTaskClient(stopped, holdingApply, requests)
+	plan := restingTaskPlan()
+
+	_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "production", "", 0)
+
+	require.Error(t, err, "a pending start keeps the database held through every attempt")
+	assert.Equal(t, 1, requests.pendingReads,
+		"the resting decision is made once per check, not once per retry attempt")
+}
+
+// An operator command that a driver has not delivered yet means a driver is
+// still on its way to the stopped apply: a start resumes its copy and a cancel
+// reclaims it. Either way the database stays held until the command lands, and
+// the refusal names the apply an operator acts on rather than the task alone.
+func TestConflictCheckKeepsRestingTaskAwaitingAnOperatorCommand(t *testing.T) {
+	for _, operation := range []storage.ControlOperation{storage.ControlOperationStart, storage.ControlOperationCancel} {
+		t.Run(string(operation), func(t *testing.T) {
+			stopped, holdingApply := restingStoppedTask()
+			client := restingTaskClient(stopped, holdingApply, &testControlRequestStore{
+				requests: []*storage.ApplyControlRequest{{
+					ID:        1,
+					ApplyID:   holdingApply.ID,
+					Operation: operation,
+					Status:    storage.ControlRequestPending,
+				}},
+			})
+			plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+
+			blocking, _ := client.findBlockingTask(t.Context(), []*storage.Task{stopped}, plan, "", "", 0, newConflictScanMemo())
+
+			require.True(t, blocking.blocks(), "a %s a driver has not delivered keeps the database held", operation)
+			assert.Equal(t, "task-stopped", blocking.taskIdentifier)
+			assert.Equal(t, "users", blocking.table, "the refusal names the table being changed")
+			assert.Equal(t, "apply-holding-testdb", blocking.applyIdentifier(),
+				"the refusal names the apply an operator acts on, not only the task")
+			assert.Equal(t, state.Apply.Stopped, blocking.applyStateName())
+			assert.Contains(t, blocking.describe(), "table users",
+				"the table an operator recognizes leads the refusal")
+		})
+	}
+}
+
+// A stopped apply whose lease is still fresh is being settled by a live driver
+// right now, so its task keeps holding the database until that driver is done
+// with it.
+func TestConflictCheckKeepsRestingTaskUnderAFreshLease(t *testing.T) {
+	stopped, holdingApply := restingStoppedTask()
+	holdingApply.LeaseOwner = "driver-settling-the-stop"
+	holdingApply.UpdatedAt = time.Now()
+	client := restingTaskClient(stopped, holdingApply, nil)
+	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+
+	blocking, _ := client.findBlockingTask(t.Context(), []*storage.Task{stopped}, plan, "", "", 0, newConflictScanMemo())
+
+	require.True(t, blocking.blocks(), "a live driver's stopped apply keeps holding the database")
+	assert.Equal(t, "apply-holding-testdb", blocking.applyIdentifier())
+}
+
+// Releasing the hold requires proving no driver is coming. When the apply's
+// control requests cannot be read that proof is unavailable, so the task keeps
+// blocking rather than admitting a new apply on an unverified assumption.
+func TestConflictCheckKeepsRestingTaskWhenControlRequestsAreUnreadable(t *testing.T) {
+	stopped, holdingApply := restingStoppedTask()
+	client := restingTaskClient(stopped, holdingApply, &unreadableControlRequestStore{})
+	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+
+	blocking, _ := client.findBlockingTask(t.Context(), []*storage.Task{stopped}, plan, "", "", 0, newConflictScanMemo())
+
+	require.True(t, blocking.blocks(), "an unreadable control request keeps the database held")
+	assert.Equal(t, "apply-holding-testdb", blocking.applyIdentifier())
+}
+
+// A storage with no control request store cannot say whether a command is
+// waiting for a driver, and an unanswerable question is not a "no". The task
+// keeps blocking rather than being released on a check that never ran.
+func TestConflictCheckKeepsRestingTaskWhenControlRequestsAreUnconfigured(t *testing.T) {
+	stopped, holdingApply := restingStoppedTask()
+	client := restingTaskClient(stopped, holdingApply, nil)
+	client.storage = &storageWithoutControlRequests{exactProgressStorage: client.storage.(*exactProgressStorage)}
+	plan := &storage.Plan{Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL}
+
+	require.NotPanics(t, func() {
+		blocking, _ := client.findBlockingTask(t.Context(), []*storage.Task{stopped}, plan, "", "", 0, newConflictScanMemo())
+		require.True(t, blocking.blocks(), "an unconfigured control request store keeps the database held")
+		assert.Equal(t, "apply-holding-testdb", blocking.applyIdentifier())
+	})
+}
+
+// strandedRetryableTask is the shape a stop leaves behind when it settles the
+// apply row but its task writes are refused: the apply says stopped, the task
+// still carries the engine failure that paused it, and no driver will ever
+// claim the task again because a terminal apply is never claimable.
+func strandedRetryableTask() (*storage.Task, *storage.Apply) {
+	task, apply := restingStoppedTask()
+	task.TaskIdentifier = "task-stranded"
+	task.State = state.Task.FailedRetryable
+	task.ErrorMessage = "error writing checkpoint: too many connections"
+	return task, apply
+}
+
+// A task waiting for a driver under a stopped apply is stranded: the stop
+// decided the outcome, but the task row never moved, so start cannot resume it
+// and the takeover path cannot release it. Settling it into the state the stop
+// meant to write puts it back on both paths at once — the copy on the target
+// stays resumable, and the dispatch that meets it takes it over instead of
+// being refused by it for as long as the row sits there.
+func TestConflictCheckSettlesStrandedTaskIntoTheStopItMissed(t *testing.T) {
+	stranded, holdingApply := strandedRetryableTask()
+	client := restingTaskClient(stranded, holdingApply, nil)
+	plan := restingTaskPlan()
+
+	blocking, released := client.findBlockingTask(t.Context(), []*storage.Task{stranded}, plan, "production", "", 0, newConflictScanMemo())
+	assert.False(t, blocking.blocks(), "a stranded task settled into the stop no longer holds the database")
+
+	require.Len(t, released, 1, "the settled holder is named so the dispatch can record a takeover of its copy")
+	assert.Equal(t, "apply-holding-testdb", released[0].applyIdentifier)
+	assert.Equal(t, "users", released[0].table)
+
+	assert.Equal(t, state.Task.Stopped, stranded.State, "the stranded task settles to the stop's own resting state")
+	assert.Equal(t, "error writing checkpoint: too many connections", stranded.ErrorMessage,
+		"the engine failure that paused the copy is why it stopped where it did, so it is preserved")
+	assert.Nil(t, stranded.CompletedAt, "a resumable task has not completed")
+
+	_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "production", "", 0)
+	require.NoError(t, err, "a new apply proceeds past a settled stranded task")
+}
+
+// An apply that ended for good decided against its remaining work, so a task
+// still waiting for a driver under it is cancelled rather than left resumable:
+// there is no outcome left for a start to resume toward.
+func TestConflictCheckCancelsStrandedTaskOfAnEndedApply(t *testing.T) {
+	for _, applyState := range []string{
+		state.Apply.Completed,
+		state.Apply.Failed,
+		state.Apply.Cancelled,
+	} {
+		t.Run(applyState, func(t *testing.T) {
+			stranded, holdingApply := strandedRetryableTask()
+			holdingApply.State = applyState
+			client := restingTaskClient(stranded, holdingApply, nil)
+			plan := restingTaskPlan()
+
+			_, _, err := client.checkActiveTaskConflict(t.Context(), plan, "production", "", 0)
+			require.NoError(t, err, "a stranded task of an ended apply must not refuse a new apply")
+			assert.Equal(t, state.Task.Cancelled, stranded.State)
+			assert.Contains(t, stranded.ErrorMessage, "orphaned")
+			assert.NotNil(t, stranded.CompletedAt)
+		})
+	}
+}
+
+// A retryable task under a still-claimable apply is work a driver will pick up
+// unprompted. The settlement must not touch it: cancelling or stopping live
+// work would race the driver that is about to retry it.
+func TestConflictCheckLeavesRetryableTaskOfAClaimableApply(t *testing.T) {
+	stranded, holdingApply := strandedRetryableTask()
+	holdingApply.State = state.Apply.Running
+	client := restingTaskClient(stranded, holdingApply, nil)
+
+	blocking, released := client.findBlockingTask(t.Context(), []*storage.Task{stranded}, restingTaskPlan(), "production", "", 0, newConflictScanMemo())
+
+	require.True(t, blocking.blocks(), "a retryable task of a claimable apply still holds the database")
+	assert.Empty(t, released)
+	assert.Equal(t, state.Task.FailedRetryable, stranded.State, "the task is left for its driver to retry")
+}
+
+// The settlement only stops the task blocking once it is durably written.
+// Reporting it settled on a refused write would admit a new apply while storage
+// still records the stranded task as active work — the same divergence that
+// stranded it in the first place.
+func TestConflictCheckKeepsStrandedTaskWhenSettlementWriteFails(t *testing.T) {
+	stranded, holdingApply := strandedRetryableTask()
+	client := restingTaskClient(stranded, holdingApply, nil)
+	stor := client.storage.(*exactProgressStorage)
+	stor.tasks = &updateFailingTaskStore{
+		exactProgressTaskStore: stor.tasks.(*exactProgressTaskStore),
+		updateErr:              errors.New("storage down"),
+	}
+
+	_, _, err := client.checkActiveTaskConflict(t.Context(), restingTaskPlan(), "production", "", 0)
+	require.Error(t, err, "the stranded task must keep blocking when its settlement cannot be written")
+	assert.Contains(t, err.Error(), "schema change already in progress")
+	assert.Equal(t, state.Task.FailedRetryable, stranded.State, "the task is restored for a clean retry")
+	assert.Equal(t, "error writing checkpoint: too many connections", stranded.ErrorMessage)
+	assert.Nil(t, stranded.CompletedAt)
 }

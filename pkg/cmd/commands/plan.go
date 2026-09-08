@@ -13,8 +13,10 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -46,7 +48,7 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 		return fmt.Errorf("resolve endpoint: %w", err)
 	}
 	if ep == "" {
-		errMsg := "no endpoint configured (run 'schemabot configure' to set up a profile)"
+		errMsg := fmt.Sprintf("no endpoint configured (run '%s configure' to set up a profile)", cliname.Name())
 		if cmd.JSON {
 			return client.ExitWithJSON("invalid_request", errMsg)
 		}
@@ -78,11 +80,12 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 
 	// Collect results for all environments
 	allResults := make(map[string]*apitypes.PlanResponse)
+	ignoredByEnv := make(map[string][]string)
 	for _, env := range environments {
 		var result *apitypes.PlanResponse
 		err := withLoading("Generating schema change plan...", !cmd.JSON, func() error {
 			var planErr error
-			result, planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, env, cfg.SchemaDir, cmd.Repository, cmd.PullRequest)
+			result, ignoredByEnv[env], planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, env, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.IgnoreNamespaces, false)
 			return planErr
 		})
 		if err != nil {
@@ -99,6 +102,20 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 
 	if cmd.JSON {
 		return writeJSON(allResults)
+	}
+
+	// Disclose config-driven exclusions once per distinct resolution — the
+	// lists only differ between environments when entries use $ENV.
+	disclosed := make(map[string]bool)
+	for _, env := range environments {
+		ignored := ignoredByEnv[env]
+		unmatched := schema.UnmatchedIgnoreEntries(cfg.IgnoreNamespaces, env, ignored)
+		key := strings.Join(ignored, ",") + "|" + strings.Join(unmatched, ",")
+		if disclosed[key] {
+			continue
+		}
+		disclosed[key] = true
+		templates.WriteIgnoredNamespaces(ignored, unmatched)
 	}
 
 	// Human-readable output for all environments
@@ -199,7 +216,7 @@ func writeEnvPlan(result *apitypes.PlanResponse) {
 
 // writePlanBody writes the plan body (errors, changes, unsafe warnings, lint, summary).
 // Used by both writeEnvPlan (plan command) and OutputPlanResult (apply command).
-// When isApply is true, the ⛔ unsafe warning is skipped (apply shows its own 🚨 warning).
+// When isApply is true, the ⚠️ unsafe warning is skipped (apply shows its own 🚨 warning).
 func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 	// Check for errors
 	if len(result.Errors) > 0 {
@@ -278,14 +295,14 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 		templates.WriteNamespaceChanges(nsChanges, !isVitess, result.Database)
 	}
 
-	// Check for unsafe changes and show with ⛔ (error level)
+	// Check for unsafe changes and show with ⚠️ (attention — the changes await consent)
 	// Skip in apply context — apply shows its own 🚨 warning via WriteUnsafeWarningAllowed
 	unsafeChanges := result.UnsafeChanges()
 	if len(unsafeChanges) > 0 && !isApply {
 		templates.WriteUnsafeChangesWarning(unsafeChanges)
 	}
 
-	// Show non-unsafe lint violations with ⚠️
+	// Show advisory (non-error) lint violations
 	lintViolations := result.LintNonErrors()
 	if len(lintViolations) > 0 {
 		templates.WriteLintViolations(lintViolations)

@@ -2,8 +2,9 @@ package templates
 
 import (
 	"fmt"
-	"strings"
 	"time"
+
+	"github.com/block/schemabot/pkg/cmd/cliname"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
@@ -299,9 +300,10 @@ func previewVitessInstantDDLOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "users", Namespace: "myapp_sharded",
-				DDL:       "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
-				Status:    state.Apply.Completed,
-				IsInstant: true,
+				ChangeType: "alter",
+				DDL:        "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
+				Status:     state.Apply.Completed,
+				IsInstant:  true,
 			},
 		},
 	}
@@ -670,11 +672,12 @@ func previewVitessManyKeyspacesOutput() {
 	for i := 1; i <= 32; i++ {
 		ks := fmt.Sprintf("commerce_%03d", i)
 		tables = append(tables, TableProgress{
-			TableName: "transactions",
-			Namespace: ks,
-			DDL:       "ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL",
-			Status:    state.Apply.Completed,
-			IsInstant: true,
+			TableName:  "transactions",
+			Namespace:  ks,
+			ChangeType: "alter",
+			DDL:        "ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL",
+			Status:     state.Apply.Completed,
+			IsInstant:  true,
 		})
 	}
 
@@ -798,7 +801,7 @@ func previewWaitingForCutoverOutput() {
 	fmt.Println("Row copy complete. All data has been copied and new writes")
 	fmt.Println("continue to be replicated to keep the shadow table in sync.")
 	fmt.Println()
-	fmt.Println("To proceed: schemabot cutover -e staging <apply_id>")
+	fmt.Printf("To proceed: %s cutover -e staging <apply_id>\n", cliname.Name())
 	fmt.Println("Watching for cutover... (Ctrl+C to detach)")
 }
 
@@ -896,12 +899,12 @@ func previewStoppedOutput() {
 		},
 	}
 	WriteProgress(data)
-	fmt.Println("\nStopped. Use 'schemabot start -e staging <apply_id>' to resume from checkpoint.")
+	fmt.Printf("\nStopped. Use '%s start -e staging <apply_id>' to resume from checkpoint.\n", cliname.Name())
 }
 
 func previewApplyWatchOutput() {
 	fmt.Println("Apply watch mode: Running with footer controls")
-	fmt.Println("(schemabot apply -s ./schema -e staging)")
+	fmt.Printf("(%s apply -s ./schema -e staging)\n", cliname.Name())
 	fmt.Println()
 
 	// In-progress state
@@ -950,7 +953,7 @@ func previewApplyWatchOutput() {
 
 func previewApplyStoppedOutput() {
 	fmt.Println("Apply watch mode: Stopped by user")
-	fmt.Println("(user ran schemabot stop)")
+	fmt.Printf("(user ran %s stop)\n", cliname.Name())
 	fmt.Println()
 
 	data := ProgressData{
@@ -974,7 +977,7 @@ func previewApplyStoppedOutput() {
 	WriteProgress(data)
 
 	fmt.Printf("%s\n", FormatApplyStopped())
-	fmt.Println("Use 'schemabot start -e staging <apply_id>' to resume.")
+	fmt.Printf("Use '%s start -e staging <apply_id>' to resume.\n", cliname.Name())
 }
 
 // =============================================================================
@@ -982,7 +985,7 @@ func previewApplyStoppedOutput() {
 // =============================================================================
 
 func previewStopCommandOutput() {
-	fmt.Println("Stop command: User runs 'schemabot stop -e staging <apply_id>'")
+	fmt.Printf("Stop command: User runs '%s stop -e staging <apply_id>'\n", cliname.Name())
 	fmt.Println()
 
 	WriteStopSuccess(StopData{
@@ -1019,7 +1022,7 @@ func previewStopCommandOutput() {
 }
 
 func previewStartCommandOutput() {
-	fmt.Println("Start command: User runs 'schemabot start -e staging <apply_id>'")
+	fmt.Printf("Start command: User runs '%s start -e staging <apply_id>'\n", cliname.Name())
 	fmt.Println()
 
 	WriteStartSuccess(StartData{
@@ -1056,51 +1059,4 @@ func previewStartCommandOutput() {
 	WriteProgress(data)
 
 	fmt.Println(FormatWatchFooter())
-}
-
-func previewVolumeBarOutput() {
-	fmt.Println("Volume bar: Visual representation at different levels")
-	fmt.Println()
-
-	fmt.Println("Volume levels 1-11:")
-	fmt.Println()
-
-	for _, vol := range []int{1, 4, 7, 11} {
-		filled := strings.Repeat("█", vol)
-		empty := strings.Repeat("░", 11-vol)
-		fmt.Printf("  Volume: %s%s %d/11\n", filled, empty, vol)
-	}
-	fmt.Println()
-
-	fmt.Println("--- Standard footer (volume hidden by default): ---")
-	fmt.Println()
-	fmt.Println(FormatWatchFooter())
-}
-
-func previewVolumeModeOutput() {
-	fmt.Println("Volume mode: Interactive volume adjustment")
-	fmt.Println("(Press 'v' during apply to enter volume mode)")
-	fmt.Println()
-
-	// Helper to render simple volume mode
-	renderVolumeMode := func(vol int) {
-		filled := strings.Repeat("█", vol)
-		empty := strings.Repeat("░", 11-vol)
-		fmt.Printf("Volume: %s%s %d/11\n", filled, empty, vol)
-		fmt.Printf("%s↑↓ adjust • 1-9 direct • ESC done%s\n", ANSIDim, ANSIReset)
-	}
-
-	fmt.Println("--- In volume mode (default 4): ---")
-	fmt.Println()
-	renderVolumeMode(4)
-
-	fmt.Println()
-	fmt.Println("--- After adjusting to 8: ---")
-	fmt.Println()
-	renderVolumeMode(8)
-
-	fmt.Println()
-	fmt.Println("--- After adjusting to 2: ---")
-	fmt.Println()
-	renderVolumeMode(2)
 }

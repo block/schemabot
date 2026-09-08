@@ -7,6 +7,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -48,7 +49,7 @@ func tuiOperationsForPresentation(ops []templates.ProgressOperation, released bo
 }
 
 func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model presentation.Apply) {
-	if state.IsState(model.State, state.Apply.Running, state.Apply.RunningDegraded, state.Apply.Pending, state.Apply.WaitingForCutover, state.Apply.CuttingOver, state.Apply.Recovering) {
+	if state.IsRunningApplyState(model.State) || state.IsState(model.State, state.Apply.Pending, state.Apply.WaitingForCutover, state.Apply.CuttingOver, state.Apply.Recovering) {
 		b.WriteString(m.spinner.View() + model.Label + m.elapsed() + "\n")
 	} else {
 		b.WriteString(model.Label + "\n")
@@ -59,9 +60,9 @@ func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model present
 	if model.FirstFailure != nil {
 		errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 		if model.FirstFailure.Error != "" {
-			fmt.Fprintf(b, "%s\n", errStyle.Render(fmt.Sprintf("⚠ First failure: %s — %s", model.FirstFailure.Deployment, model.FirstFailure.Error)))
+			fmt.Fprintf(b, "%s\n", errStyle.Render(fmt.Sprintf(glyph.Failed+" First failure: %s — %s", model.FirstFailure.Deployment, model.FirstFailure.Error)))
 		} else {
-			fmt.Fprintf(b, "%s\n", errStyle.Render(fmt.Sprintf("⚠ First failure: %s", model.FirstFailure.Deployment)))
+			fmt.Fprintf(b, "%s\n", errStyle.Render(fmt.Sprintf(glyph.Failed+" First failure: %s", model.FirstFailure.Deployment)))
 		}
 	}
 	if m.applyID != "" {
@@ -134,10 +135,10 @@ func externalIDForTUIDeployment(ops []templates.ProgressOperation, deployment st
 	return ""
 }
 
-func tablesForDeployment(tables []tableProgress, deployment string) []tableProgress {
-	deploymentTables := make([]tableProgress, 0, len(tables))
+func tablesForDeployment(tables []templates.TableProgress, deployment string) []templates.TableProgress {
+	deploymentTables := make([]templates.TableProgress, 0, len(tables))
 	for _, table := range tables {
-		if table.Deployment == deployment && table.Name != "" {
+		if table.Deployment == deployment && table.TableName != "" {
 			deploymentTables = append(deploymentTables, table)
 		}
 	}

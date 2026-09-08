@@ -161,7 +161,7 @@ func TestLogEmitter_EmitTableStateChange(t *testing.T) {
 			status:     state.Apply.Recovering,
 			pct:        42,
 			wantMsg:    "Row copy in progress during restart recovery",
-			wantFields: []string{"table=users", "progress=42%", "rows=420/1,000", "eta=\"2m 0s\""},
+			wantFields: []string{"table=users", "progress=42.00%", "rows=420/1,000", "eta=\"2m 0s\""},
 		},
 		{
 			name:       "cutting over",
@@ -234,7 +234,7 @@ func TestLogEmitter_EmitProgressHeartbeat(t *testing.T) {
 
 		assert.Contains(t, plain, "Copying rows")
 		assert.Contains(t, plain, "table=orders")
-		assert.Contains(t, plain, "progress=45%")
+		assert.Contains(t, plain, "progress=45.00%")
 		assert.Contains(t, plain, "rows=99,450/221,000")
 		assert.Contains(t, plain, "5m 30s")
 	})
@@ -257,12 +257,12 @@ func TestLogEmitter_EmitProgressHeartbeat(t *testing.T) {
 		plain := stripANSI(output)
 
 		assert.Contains(t, plain, "table=products")
-		assert.Contains(t, plain, "progress=20%")
+		assert.Contains(t, plain, "progress=20.00%")
 		assert.Contains(t, plain, "rows=10,000/50,000")
 		assert.Contains(t, plain, "eta=")
 	})
 
-	t.Run("clamps percent to 100", func(t *testing.T) {
+	t.Run("rows override an overshooting whole-number percent", func(t *testing.T) {
 		e := &logEmitter{}
 		ts := &tableLogState{}
 		tbl := &apitypes.TableProgressResponse{
@@ -277,7 +277,7 @@ func TestLogEmitter_EmitProgressHeartbeat(t *testing.T) {
 		})
 		plain := stripANSI(output)
 
-		assert.Contains(t, plain, "progress=100%")
+		assert.Contains(t, plain, "progress=96.09%")
 	})
 
 	t.Run("estimate exceeded shows finalizing copy progress", func(t *testing.T) {

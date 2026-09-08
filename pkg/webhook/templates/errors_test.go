@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -197,4 +198,65 @@ func TestRenderInvalidEnv(t *testing.T) {
 		assert.Contains(t, body, "`sta ging`")
 		assert.NotContains(t, body, "``")
 	})
+}
+
+// The generic command-failure comment renders untrusted engine and
+// infrastructure error text: internal endpoints are redacted, HTML markup is
+// escaped so it renders as text, and a multi-line error stays inside the
+// blockquote instead of escaping into comment markup.
+func TestRenderGenericErrorSanitizesDetail(t *testing.T) {
+	body := RenderGenericError(SchemaErrorData{
+		Timestamp:   "2026-07-16 18:56:00",
+		CommandName: "plan",
+		ErrorDetail: "dial tcp db-primary.internal:3306: connection refused\n# not a heading",
+	})
+
+	assert.NotContains(t, body, "db-primary.internal", "internal endpoints are redacted")
+	assert.Contains(t, body, "> dial tcp [endpoint redacted]: connection refused\n> # not a heading",
+		"a multi-line error stays inside the blockquote")
+
+	body = RenderGenericError(SchemaErrorData{
+		Timestamp:   "2026-07-16 18:56:00",
+		CommandName: "plan",
+		ErrorDetail: "unexpected <img src=x> in output",
+	})
+	assert.Contains(t, body, "&lt;img src=x&gt;", "HTML markup is escaped")
+	assert.NotContains(t, body, "<img", "raw markup never reaches the comment")
+}
+
+func TestSetupGuidanceExperimentalStrata(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		for _, database := range []string{"", "example"} {
+			data := SchemaErrorData{ExperimentalStrataEnabled: enabled, DatabaseName: database}
+			for _, body := range []string{RenderNoConfig(data), RenderInvalidConfig(data)} {
+				assert.Contains(t, body, "`mysql`")
+				assert.Contains(t, body, "`postgres`")
+				assert.Contains(t, body, "`vitess`")
+				if enabled {
+					assert.Contains(t, body, "`strata` (experimental)")
+				} else {
+					assert.NotContains(t, body, "strata")
+				}
+			}
+		}
+	}
+}
+
+func TestInvalidConfigDatabaseTypeLine(t *testing.T) {
+	for _, tc := range []struct {
+		enabled bool
+		want    string
+	}{
+		{false, "- **type** (required): `mysql`, `postgres`, or `vitess`"},
+		{true, "- **type** (required): `mysql`, `postgres`, `vitess`, or `strata` (experimental)"},
+	} {
+		body := RenderInvalidConfig(SchemaErrorData{ExperimentalStrataEnabled: tc.enabled})
+		var got string
+		for line := range strings.SplitSeq(body, "\n") {
+			if strings.HasPrefix(line, "- **type**") {
+				got = line
+			}
+		}
+		assert.Equal(t, tc.want, got)
+	}
 }

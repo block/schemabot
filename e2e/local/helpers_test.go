@@ -83,7 +83,7 @@ func newSchemaDir(t *testing.T) string {
 func openTestappStaging(t *testing.T) *sql.DB {
 	t.Helper()
 	dsn := testappStagingDSN(t)
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "open testapp staging db")
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 	return db
@@ -298,7 +298,7 @@ func clearSchemaBotStateImpl() {
 	if schemabotDSN == "" {
 		return
 	}
-	db, err := sql.Open("mysql", schemabotDSN)
+	db, err := sql.Open("block-mysql", schemabotDSN)
 	if err != nil {
 		return
 	}
@@ -326,7 +326,7 @@ func clearSchemaBotStateImpl() {
 func markApplyHeartbeatStale(t *testing.T, applyID string) {
 	t.Helper()
 
-	db, err := sql.Open("mysql", mysqlDSN(t))
+	db, err := sql.Open("block-mysql", mysqlDSN(t))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(t.Context()))
@@ -398,7 +398,7 @@ func uniqueTableName(prefix string) string {
 func createTestTable(t *testing.T, tableName, ddlStmt string) {
 	t.Helper()
 	dsn := testappStagingDSN(t)
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "open db")
 	defer utils.CloseAndLog(db)
 
@@ -406,7 +406,7 @@ func createTestTable(t *testing.T, tableName, ddlStmt string) {
 	require.NoErrorf(t, err, "create table %s", tableName)
 
 	t.Cleanup(func() {
-		db2, err := sql.Open("mysql", dsn)
+		db2, err := sql.Open("block-mysql", dsn)
 		if err != nil {
 			return
 		}
@@ -426,7 +426,7 @@ func createTestTable(t *testing.T, tableName, ddlStmt string) {
 func dropTestTable(t *testing.T, tableName string) {
 	t.Helper()
 	dsn := testappStagingDSN(t)
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	if err != nil {
 		return
 	}
@@ -440,7 +440,7 @@ func dropTestTable(t *testing.T, tableName string) {
 func writeBaseFixtureSchemas(t *testing.T, schemaDir string) {
 	t.Helper()
 	dsn := testappStagingDSN(t)
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	if err != nil {
 		return
 	}
@@ -459,7 +459,7 @@ func writeBaseFixtureSchemas(t *testing.T, schemaDir string) {
 func writeExistingTablesSchema(t *testing.T, schemaDir string) {
 	t.Helper()
 	dsn := testappStagingDSN(t)
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	if err != nil {
 		return
 	}
@@ -512,6 +512,9 @@ func seedTestRows(t *testing.T, db *sql.DB, tableName string, columns string, va
 	}
 	if rowCount > 10000 {
 		seqGen += `, (SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) e`
+	}
+	if rowCount > 100000 {
+		seqGen += `, (SELECT 0 UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) f`
 	}
 	seqGen += `, (SELECT @row := 0) r) nums`
 

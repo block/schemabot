@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	mysql "github.com/go-sql-driver/mysql"
+	mysql "github.com/block/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
 	"github.com/block/spirit/pkg/table"
@@ -49,7 +49,11 @@ func vschemaDiffsFromChanges(changes []engine.SchemaChange) []vschemaKeyspaceDif
 // Apply starts executing a schema change plan.
 // Creates a PlanetScale branch, applies DDL via MySQL connection to the branch,
 // then creates and starts a deploy request.
-func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
+func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *engine.ApplyResult, retErr error) {
+	r := *req
+	r.Database = e.resolveDatabase(req.Credentials, req.Database)
+	req = &r
+
 	e.logger.Info("applying plan",
 		"plan_id", req.PlanID,
 		"database", req.Database,
@@ -80,17 +84,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		return e.resumeApply(ctx, client, org, req)
 	}
 
-	// emitEvent logs a lifecycle event and sends it to the caller for apply_logs recording.
-	emitEvent := func(event engine.ApplyEvent) {
-		attrs := []any{"database", req.Database}
-		for k, v := range event.Metadata {
-			attrs = append(attrs, k, v)
-		}
-		e.logger.Info(event.Message, attrs...)
-		if req.OnEvent != nil {
-			req.OnEvent(event)
-		}
-	}
+	emitEvent := e.eventEmitter(req)
 
 	// Track in-flight apply metadata for progress queries during setup.
 	migCtx := ""
@@ -127,6 +121,34 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	existingBranch := req.Options["branch"]
 	var branchName string
 	branchStart := time.Now()
+
+	// A branch SchemaBot creates exists only to carry this apply's DDL into a
+	// deploy request. Once that deploy request exists it owns the teardown
+	// (AutoDeleteBranch); until then nothing does, so an apply that fails while
+	// preparing the branch would strand it. Branches are quota'd, and the
+	// failures in this window are the ordinary ones — DDL the engine refuses —
+	// so the strand accumulates until branch creation itself starts failing for
+	// unrelated schema changes. ownedBranch names the branch this apply is
+	// responsible for; it is cleared once the deploy request takes ownership,
+	// and it is never set for an operator-supplied branch, which SchemaBot does
+	// not own.
+	//
+	// A create-deploy-request response lost to a timeout leaves ownedBranch set
+	// even though the deploy request may exist server-side. Deleting the branch
+	// is still the right cleanup there, not a hazard: deploying is a separate,
+	// later call that only runs after the create succeeded client-side, so the
+	// orphan carries no running schema change, and the apply records the deploy
+	// request identifier only after a successful response, so no retry will
+	// ever drive it. Should the API refuse to delete a branch while its deploy
+	// request is open, the refusal surfaces on the cleanup's error path with
+	// the identifiers for manual reclamation.
+	ownedBranch := ""
+	defer func() {
+		if retErr == nil || ownedBranch == "" {
+			return
+		}
+		e.deleteOwnedBranch(ctx, client, org, req.Database, ownedBranch, retErr)
+	}()
 
 	if existingBranch != "" {
 		// Reuse existing branch: wait for ready, refresh schema from main, wait again
@@ -187,6 +209,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		if err != nil {
 			return nil, fmt.Errorf("create branch: %w", err)
 		}
+		ownedBranch = branchName
 
 		// Wait for branch to be ready
 		if err := e.waitForBranchReady(ctx, client, org, req.Database, branchName); err != nil {
@@ -280,15 +303,9 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	if err != nil {
 		return nil, fmt.Errorf("create deploy request: %w", err)
 	}
-	emitEvent(engine.ApplyEvent{
-		Message: fmt.Sprintf("Deploy request #%d created, validating...", dr.Number),
-		Metadata: map[string]string{
-			"deploy_request_id":  fmt.Sprintf("%d", dr.Number),
-			"deploy_request_url": dr.HtmlURL,
-			"branch":             branchName,
-		},
-		NewState: state.Apply.ValidatingDeployRequest,
-	})
+	// The deploy request now owns the branch's teardown.
+	ownedBranch = ""
+	emitEvent(deployRequestCreatedEvent(dr, branchName))
 	persistState(&psMetadata{
 		BranchName:            branchName,
 		DeployRequestID:       dr.Number,
@@ -319,10 +336,11 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// Determine instant DDL eligibility. Prefer instant when PlanetScale reports
 	// it as eligible — instant DDL modifies metadata only (no row copy), so it
 	// completes immediately and has no revert window regardless of skip_revert.
-	// Instant DDL is orthogonal to defer flags — the mechanism (instant vs row copy)
-	// is independent of when the deploy executes.
+	// Because there is no revert window, an unsafe change always takes the
+	// row-copy path instead.
 	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
-	useInstant := instantEligible
+	unsafe, unsafeReason := e.changesContainUnsafe(req.Changes, req.Database)
+	useInstant := useInstantDDL(dr, deferCutover, unsafe)
 
 	// Log the raw deploy request fields for debugging instant DDL detection.
 	if dr.Deployment != nil {
@@ -347,18 +365,24 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		"use_instant", useInstant,
 		"defer_cutover", deferCutover,
 		"defer_deploy", deferDeploy,
+		"unsafe", unsafe,
 		"deploy_state", dr.DeploymentState,
 	)
 
-	// Log when --defer-cutover has no effect for instant DDL
-	if deferCutover && useInstant {
-		e.logger.Info("--defer-cutover has no effect for instant DDL",
-			"database", req.Database,
-			"deploy_request", dr.Number,
-		)
-		emitEvent(engine.ApplyEvent{
-			Message: "Note: --defer-cutover has no effect for instant DDL",
-		})
+	if instantEligible && !useInstant {
+		if unsafe {
+			e.logger.Info("declining instant DDL because the change is unsafe — the row copy keeps a revert window",
+				"database", req.Database,
+				"deploy_request", dr.Number,
+				"reason", unsafeReason,
+			)
+		} else {
+			e.logger.Info("declining instant DDL so the deferred cutover has a gate to hold",
+				"database", req.Database,
+				"deploy_request", dr.Number,
+			)
+		}
+		emitEvent(rowCopyDeclineEvent(unsafe, unsafeReason))
 	}
 
 	drElapsed := time.Since(drStart).Round(time.Second)
@@ -375,13 +399,19 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		},
 	})
 
+	if deferCutover {
+		if err := e.verifyCutoverHeld(ctx, client, org, req.Database, dr.Number); err != nil {
+			return nil, err
+		}
+	}
+
 	// Deferred deploy: don't call DeployDeployRequest yet. The user will review
 	// the deploy request diff on PlanetScale and trigger via `schemabot cutover`.
 	if deferDeploy {
 		e.logger.Info("deferring deploy — user must trigger via cutover",
 			"database", req.Database,
 			"deploy_request", dr.Number,
-			"instant_eligible", useInstant,
+			"use_instant", useInstant,
 		)
 		meta, encErr := encodePSMetadata(&psMetadata{
 			BranchName:            branchName,
@@ -410,38 +440,11 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	}
 
 	// Deploy (starts the schema change). PlanetScale may still be validating
-	// the deploy request even after reporting "ready", so retry on transient
-	// validation errors.
-	drNumber := dr.Number
-	var deployErr error
-	for attempt := range maxRetries {
-		if attempt > 0 {
-			delay := retryDelay(attempt, deployErr)
-			e.logger.Warn("retrying deploy request", "deploy_request", drNumber, "attempt", attempt+1, "delay", delay.Round(time.Millisecond), "error", deployErr)
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(delay):
-			}
-		}
-		dr, deployErr = client.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
-			Organization: org,
-			Database:     req.Database,
-			Number:       drNumber,
-			InstantDDL:   useInstant,
-		})
-		if deployErr == nil {
-			break
-		}
-		if strings.Contains(deployErr.Error(), "approved") {
-			return nil, fmt.Errorf("deploy request #%d could not be deployed: PlanetScale deploy request approvals are not supported — disable 'Require administrator approval for deploy requests' in the PlanetScale database settings", drNumber)
-		}
-		if !isRetryablePSError(deployErr) {
-			return nil, fmt.Errorf("deploy deploy request #%d: %w", drNumber, deployErr)
-		}
-	}
-	if deployErr != nil {
-		return nil, fmt.Errorf("deploy deploy request #%d (after %d attempts): %w", drNumber, maxRetries, deployErr)
+	// the deploy request even after it leaves the pending state, and transient
+	// API errors may occur; deployDeployRequest absorbs both.
+	dr, err = e.deployDeployRequest(ctx, client, org, req.Database, dr.Number, useInstant)
+	if err != nil {
+		return nil, err
 	}
 
 	emitEvent(engine.ApplyEvent{
@@ -597,7 +600,7 @@ func (e *Engine) applyKeyspaceChangesOnce(ctx context.Context, sc engine.SchemaC
 	}
 	dsn := mysqlCfg.FormatDSN()
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	if err != nil {
 		return fmt.Errorf("open branch connection for %s: %w", sc.Namespace, err)
 	}
@@ -708,6 +711,37 @@ func (e *Engine) diffBranchForResume(ctx context.Context, client psclient.PSClie
 	return changes, nil
 }
 
+// eventEmitter returns a closure that logs a lifecycle event and sends it to
+// the caller for apply_logs recording.
+func (e *Engine) eventEmitter(req *engine.ApplyRequest) func(engine.ApplyEvent) {
+	return func(event engine.ApplyEvent) {
+		attrs := []any{"database", req.Database}
+		for k, v := range event.Metadata {
+			attrs = append(attrs, k, v)
+		}
+		e.logger.Info(event.Message, attrs...)
+		if req.OnEvent != nil {
+			req.OnEvent(event)
+		}
+	}
+}
+
+// rowCopyDeclineEvent is the operator-facing event for an instant-eligible
+// change that takes the row-copy path instead. It states the trade the decline
+// bought, since the operator otherwise sees only that an eligible change took
+// the slow path. Unsafety outranks the deferred cutover as the stated reason:
+// it declines instant DDL even when nothing was deferred.
+func rowCopyDeclineEvent(unsafe bool, unsafeReason string) engine.ApplyEvent {
+	if unsafe {
+		return engine.ApplyEvent{
+			Message: fmt.Sprintf("Deploying with a row copy rather than instant DDL: %s. The row copy keeps a revert window open to undo the change.", unsafeReason),
+		}
+	}
+	return engine.ApplyEvent{
+		Message: "Deploying with a row copy rather than instant DDL: instant DDL swaps the schema as soon as the deploy runs, and this cutover was deferred.",
+	}
+}
+
 // resumeApply resumes a schema change after restart.
 // Handles two crash scenarios:
 //   - Branch exists, no deploy request: diff branch against desired schema, apply remaining DDL, then create and deploy the deploy request
@@ -718,16 +752,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		return nil, fmt.Errorf("decode resume state: %w", err)
 	}
 
-	emitEvent := func(event engine.ApplyEvent) {
-		attrs := []any{"database", req.Database}
-		for k, v := range event.Metadata {
-			attrs = append(attrs, k, v)
-		}
-		e.logger.Info(event.Message, attrs...)
-		if req.OnEvent != nil {
-			req.OnEvent(event)
-		}
-	}
+	emitEvent := e.eventEmitter(req)
 
 	e.logger.Info("resuming apply",
 		"branch", meta.BranchName,
@@ -790,6 +815,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	// Create deploy request
 	main := mainBranch(req.Credentials)
 	deferDeploy := req.Options["defer_deploy"] == "true"
+	deferCutover := req.Options["defer_cutover"] == "true"
 
 	dr, err := e.createDeployRequest(ctx, client, org, req.Database, meta.BranchName, main, true)
 	if err != nil {
@@ -806,9 +832,33 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		return noChangesApplyResult("no changes detected on resume"), nil
 	}
 
-	// Deploy — prefer instant when eligible (no row copy, no revert window needed).
+	if deferCutover {
+		if err := e.verifyCutoverHeld(ctx, client, org, req.Database, dr.Number); err != nil {
+			return nil, err
+		}
+	}
+
+	// Deploy — prefer instant when eligible, unless the cutover was deferred or
+	// the change is unsafe, both of which need the row-copy path (the gate to
+	// hold, and the revert window to undo the change).
 	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
-	useInstant := instantEligible
+	unsafe, unsafeReason := e.changesContainUnsafe(req.Changes, req.Database)
+	useInstant := useInstantDDL(dr, deferCutover, unsafe)
+	if instantEligible && !useInstant {
+		if unsafe {
+			e.logger.Info("declining instant DDL on resume because the change is unsafe — the row copy keeps a revert window",
+				"database", req.Database,
+				"deploy_request", dr.Number,
+				"reason", unsafeReason,
+			)
+		} else {
+			e.logger.Info("declining instant DDL on resume so the deferred cutover has a gate to hold",
+				"database", req.Database,
+				"deploy_request", dr.Number,
+			)
+		}
+		emitEvent(rowCopyDeclineEvent(unsafe, unsafeReason))
+	}
 
 	meta.DeployRequestID = dr.Number
 	meta.DeployRequestURL = dr.HtmlURL
@@ -856,9 +906,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	// context can be identified once Vitess creates migrations for this deploy.
 	existingContexts := e.captureExistingContexts(ctx, client, req.Database, req.Credentials)
 
-	dr, err = client.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
-		Organization: org, Database: req.Database, Number: dr.Number, InstantDDL: useInstant,
-	})
+	dr, err = e.deployDeployRequest(ctx, client, org, req.Database, dr.Number, useInstant)
 	if err != nil {
 		return nil, fmt.Errorf("deploy on resume: %w", err)
 	}
@@ -930,19 +978,62 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 	// resumes racing here could both decide to deploy. That read→call window is
 	// self-correcting: the provider accepts at most one deploy and rejects the
 	// loser, so a duplicate schema change is never started.
-	if deployRequestNeedsResumeDeploy(dr, meta) {
+	deferDeploy := req.Options["defer_deploy"] == "true"
+	deferCutover := req.Options["defer_cutover"] == "true"
+
+	if deployRequestNeedsResumeDeploy(dr, meta, deferDeploy) {
+		// The cutover setting is settled when the deploy request is created and no
+		// later call can change it, so a recovered request has to be verified here
+		// for the same reason the fresh path verifies before deploying: this drive
+		// cannot know how the request it inherited was created. Deploying one whose
+		// cutover the backend still owns would let the schema swap itself, which is
+		// what the operator deferring the cutover asked to prevent.
+		if deferCutover {
+			if err := e.verifyCutoverHeld(ctx, client, org, req.Database, dr.Number); err != nil {
+				return nil, err
+			}
+		}
+
+		// The instant decision is re-taken against the deferral this drive was
+		// given and the safety of the changes, rather than read straight out of
+		// recovered metadata. Instant DDL swaps the schema as the deploy runs, so
+		// running one while the operator holds the cutover hands them a gate with
+		// nothing left behind it, and running an unsafe one leaves no revert
+		// window to undo the change — and the metadata was written by a drive
+		// whose decision inputs this one cannot confirm. The stored decision is
+		// only ever narrowed here: a deploy that was never going to be instant
+		// stays that way.
+		unsafe, unsafeReason := e.changesContainUnsafe(req.Changes, req.Database)
+		useInstant := meta.IsInstant && !deferCutover && !unsafe
+		if meta.IsInstant && !useInstant {
+			if unsafe {
+				e.logger.Info("declining instant DDL on the recovered deploy request because the change is unsafe — the row copy keeps a revert window",
+					"database", req.Database, "deploy_request", dr.Number, "reason", unsafeReason)
+			} else {
+				e.logger.Info("declining instant DDL on the recovered deploy request so the deferred cutover has a gate to hold",
+					"database", req.Database, "deploy_request", dr.Number)
+			}
+			e.eventEmitter(req)(rowCopyDeclineEvent(unsafe, unsafeReason))
+			// Re-encode so stored state carries the narrowed decision: metadata
+			// persisted with the stale IsInstant would let a later consumer of the
+			// stored value (a deferred Start, a subsequent resume) widen back to
+			// instant after this drive declined it.
+			meta.IsInstant = useInstant
+			if updatedMeta, err = encodePSMetadata(meta); err != nil {
+				return nil, fmt.Errorf("encode narrowed metadata for deploy request #%d: %w", dr.Number, err)
+			}
+		}
+
 		e.logger.Info("deploying recovered deploy request that was never started",
-			"database", req.Database, "deploy_request", dr.Number, "branch", meta.BranchName, "instant_ddl", meta.IsInstant)
+			"database", req.Database, "deploy_request", dr.Number, "branch", meta.BranchName, "instant_ddl", useInstant)
 
 		// Capture the migration_context baseline before deploying so the new
 		// Vitess context can be identified after Vitess creates migrations.
 		existingContexts := e.captureExistingContexts(ctx, client, req.Database, req.Credentials)
 
-		deployed, deployErr := client.DeployDeployRequest(ctx, &ps.PerformDeployRequest{
-			Organization: org, Database: req.Database, Number: dr.Number, InstantDDL: meta.IsInstant,
-		})
+		deployed, deployErr := e.deployDeployRequest(ctx, client, org, req.Database, dr.Number, useInstant)
 		if deployErr != nil {
-			return nil, fmt.Errorf("deploy recovered deploy request #%d on resume: %w", dr.Number, deployErr)
+			return nil, fmt.Errorf("recovered deploy request on resume: %w", deployErr)
 		}
 		dr = deployed
 
@@ -1011,8 +1102,12 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 // the driver crashed between creating the deploy request and deploying it. A
 // deferred deploy is left for the operator-triggered deploy, and a request that
 // already has a DeployedAt timestamp is in flight and must not be re-deployed.
-func deployRequestNeedsResumeDeploy(dr *ps.DeployRequest, meta *psMetadata) bool {
-	return dr.DeploymentState == deployState.Ready && !meta.DeferredDeploy && dr.DeployedAt == nil
+// The deferral is read from both the stored metadata and the operator's request:
+// the metadata flag is persisted only after the deploy request is created, so a
+// crash inside that window leaves a deferred apply whose stored metadata does not
+// yet say so, and the request the operator made is what settles it.
+func deployRequestNeedsResumeDeploy(dr *ps.DeployRequest, meta *psMetadata, deferDeploy bool) bool {
+	return dr.DeploymentState == deployState.Ready && !meta.DeferredDeploy && !deferDeploy && dr.DeployedAt == nil
 }
 
 // resolveResumeSchemaChangeContext rediscovers the Vitess migration_context after a

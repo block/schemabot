@@ -9,38 +9,13 @@
 - [Cross-Deployment Trust Model](#cross-deployment-trust-model)
 - [Published Checks](#published-checks)
 - [Managed Schema Configs](#managed-schema-configs)
-  - [Onboarding a schema directory](#onboarding-a-schema-directory)
 - [Internal Records](#internal-records)
 - [Lifecycle](#lifecycle)
-  - [Pull Request Events](#pull-request-events)
-  - [Merge Queue Events](#merge-queue-events)
-  - [Auto-Plan](#auto-plan)
-  - [Apply](#apply)
-  - [Rollback](#rollback)
-  - [Unlock And Close](#unlock-and-close)
 - [Check States](#check-states)
 - [Blocking Reasons](#blocking-reasons)
 - [Operator Guidance](#operator-guidance)
-  - [Backfilling missing Check Runs](#backfilling-missing-check-runs)
 - [SHA Handling](#sha-handling)
 - [Edge Cases](#edge-cases)
-  - [PR opened](#pr-opened)
-  - [PR touches no managed schema files](#pr-touches-no-managed-schema-files)
-  - [Config discovery fails](#config-discovery-fails)
-  - [GitHub unavailable](#github-unavailable)
-  - [New commit pushed](#new-commit-pushed)
-  - [New commit pushed while an apply is in progress](#new-commit-pushed-while-an-apply-is-in-progress)
-  - [PR closed](#pr-closed)
-  - [PR reopened](#pr-reopened)
-  - [Manual plan](#manual-plan)
-  - [Apply requested](#apply-requested)
-  - [Apply confirmed](#apply-confirmed)
-  - [Auto-confirm apply](#auto-confirm-apply)
-  - [Rollback requested](#rollback-requested)
-  - [Rollback confirmed](#rollback-confirmed)
-  - [Unlock](#unlock)
-  - [Schema changes but no configured environments are allowed](#schema-changes-but-no-configured-environments-are-allowed)
-  - [Stale in-progress check](#stale-in-progress-check)
 - [Stale Check Reconciliation](#stale-check-reconciliation)
 - [Race Safety](#race-safety)
 - [Environment Ordering](#environment-ordering)
@@ -219,8 +194,11 @@ See [namespaces](./namespaces.md) for the schema directory and namespace layout.
 
 ### Onboarding a schema directory
 
-To onboard an existing declarative schema directory, add a `schemabot.yaml` file
-next to the SQL files or namespace subdirectories it owns:
+`schemabot onboard` generates a schema directory from a live pull — `schemabot.yaml`,
+namespace subdirectories, and one `.sql` file per table — so onboarding usually starts
+there rather than with hand-written files. To onboard an existing declarative schema
+directory, add a `schemabot.yaml` file next to the SQL files or namespace
+subdirectories it owns:
 
 ```yaml
 database: widgets
@@ -240,8 +218,9 @@ configured environment, and publishes the normal aggregate check for the
 discovered database.
 
 On the happy path, where the live database already matches the declarative
-schema files, the aggregate check completes successfully with a clear no-op
-summary:
+schema files (for PostgreSQL, that also means no live table is left
+undeclared — see [Blocked plans](postgresql.md#blocked-plans)), the
+aggregate check completes successfully with a clear no-op summary:
 
 ```text
 SchemaBot (staging) — Schema up to date
@@ -274,7 +253,7 @@ because the PR does not affect a managed schema directory.
 
 ## Internal Records
 
-The `checks` MySQL table stores one internal record per
+The `checks` storage table stores one internal record per
 `repository`, `pull_request`, `environment`, `database_type`, and `database_name`.
 Aggregate check records use the same unique key, with `_aggregate` as a
 sentinel for `database_type` and `database_name`.
@@ -330,6 +309,7 @@ SchemaBot listens to these GitHub `pull_request` webhook actions:
 | `synchronize` | PR head changed, usually from a pushed commit or force-push. | Treat the new head SHA as the source of truth, auto-plan affected configs, clean up stale records, and publish checks on the new SHA. |
 | `reopened` | Closed PR was reopened. | Re-discover configs and auto-plan the current head. Stored rows deleted on close are not restored. |
 | `closed` | PR was closed or merged. | Release locks held by the PR and delete internal check records. In-flight applies continue in Tern. |
+| `edited` | PR metadata changed. | Auto-plan **only when the edit retargeted the base branch**. A retarget changes which commits the PR proposes, and so which databases it touches; a title or body edit arrives under the same action and is ignored. |
 
 Other `pull_request` actions are ignored by the check-run lifecycle.
 
@@ -544,6 +524,7 @@ Run output remains human-readable and may change.
 | `rollback_completed` | Per-database row | A rollback succeeded, so the target environment no longer contains the PR's desired schema. |
 | `github_schema_config_discovery_unavailable` | Aggregate row | SchemaBot knew the PR head SHA, but GitHub was unavailable while SchemaBot inspected changed files or repository contents. |
 | `schema_config_discovery_failed` | Aggregate row | SchemaBot could reach GitHub, but could not determine the managed schema configuration or schema files. |
+| `pr_file_cap_exceeded` | Aggregate row | The PR changes more files than GitHub will report for a single pull request, so SchemaBot's changed-file list is incomplete. Unlike the reasons above this is a property of the PR itself, so it clears only when the PR is split — not by retrying. |
 | `no_allowed_configured_environments` | Aggregate row | Schema files changed, but none of the database's server-configured environments are allowed for this deployment. |
 
 Generic plan and apply errors can still publish `completed` / `failure` without
@@ -558,6 +539,11 @@ the failed SchemaBot check to trigger SchemaBot discovery and auto-plan again
 for the current PR head. SchemaBot ignores Check Run re-run events for older
 commits after the PR head has moved, so stale re-runs cannot publish status for
 the current branch protection gate.
+
+Re-run does not help a check blocked with `pr_file_cap_exceeded`. GitHub returns
+the same truncated changed-file list every time, so the check fails closed again;
+the PR has to be split before SchemaBot can plan it. The check output says so
+rather than offering a retry.
 
 Use these PR comment commands for normal retry paths:
 
@@ -647,9 +633,12 @@ proof the PR is safe to re-plan. The CLI additionally holds any missing-check
 PR whose head carries an uncompleted Check Run of any age, because that run
 may belong to a started apply the scanning instance cannot see.
 
-For repositories where several deployments coordinate one shared check
-through a leader/participant aggregate configuration, the same scoping
-applies: a backfill creates only the deployment's own check. Run against a
+Several deployments can coordinate one shared check through a
+leader/participant aggregate configuration: one deployment (the leader) owns
+the single required Check Run and folds the participants' results into it,
+while each participant publishes an informational check of its own. In that
+configuration the same scoping applies: a backfill creates only the
+deployment's own check. Run against a
 participant, it recreates the participant check the leader folds; run against
 the leader, it replays the role-aware auto-plan flow, whose fold fails closed
 on expected participants that have not reported. A missing participant check
@@ -894,11 +883,14 @@ Completion is conditional on ownership: the watcher can only update the row if
 the row still represents that `apply_id` and no newer apply exists for the same
 PR/environment/database.
 
-### Auto-confirm apply
+### Automatic apply
 
-`schemabot apply -y` still verifies that the stored plan is current. If the PR
-head changed or the re-plan DDL differs from the stored plan, SchemaBot
-downgrades to manual confirmation and leaves the check in `action_required`.
+An automatic apply verifies that the stored plan is still current before it
+runs. If the PR head changed, the re-plan DDL differs from the stored plan, or
+the plan would discard an unfinished copy on the target, SchemaBot downgrades to
+manual confirmation and leaves the check in `action_required`. There is no
+comment flag that skips this: `-y` belongs to the CLI, where it skips an
+interactive prompt.
 
 ### Rollback requested
 
@@ -1109,8 +1101,9 @@ Common breakglass capabilities:
   -e <environment>`, `schemabot progress <apply-id>`, and `schemabot logs
   <apply-id>`.
 - Control active work with `schemabot stop <apply-id>`, `schemabot start
-  <apply-id>`, `schemabot cutover <apply-id>`, `schemabot revert <apply-id>`,
-  and `schemabot skip-revert <apply-id>`.
+  <apply-id>`, `schemabot cancel <apply-id>`, `schemabot cutover <apply-id>`,
+  `schemabot revert <apply-id>`, `schemabot skip-revert <apply-id>`, and
+  `schemabot release <apply-id>`.
 - Apply or roll back directly with `schemabot apply -s <schema-dir> -e
   <environment>` and `schemabot rollback <apply-id>`.
 - Inspect and release locks with `schemabot locks`, `schemabot unlock -d

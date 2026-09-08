@@ -94,6 +94,7 @@ type reconcileFixture struct {
 	apply           *storage.Apply
 	task            *storage.Task
 	engine          *fakeControlEngine
+	storage         *exactProgressStorage
 	controlRequests *testControlRequestStore
 	logs            *mockApplyLogStore
 }
@@ -119,17 +120,18 @@ func newReconcileFixture(fakeEngine *fakeControlEngine, requests ...*storage.App
 	}
 	controlRequests := &testControlRequestStore{requests: requests}
 	logs := &mockApplyLogStore{}
+	store := &exactProgressStorage{
+		applies:         &exactProgressApplyStore{apply: apply},
+		tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+		logs:            logs,
+		controlRequests: controlRequests,
+	}
 	client := &LocalClient{
 		config: LocalConfig{
 			Database: "testdb",
 			Type:     storage.DatabaseTypeMySQL,
 		},
-		storage: &exactProgressStorage{
-			applies:         &exactProgressApplyStore{apply: apply},
-			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
-			logs:            logs,
-			controlRequests: controlRequests,
-		},
+		storage:      store,
 		spiritEngine: fakeEngine,
 		logger:       slog.Default(),
 	}
@@ -138,6 +140,7 @@ func newReconcileFixture(fakeEngine *fakeControlEngine, requests ...*storage.App
 		apply:           apply,
 		task:            task,
 		engine:          fakeEngine,
+		storage:         store,
 		controlRequests: controlRequests,
 		logs:            logs,
 	}
@@ -256,6 +259,39 @@ func TestReconcileEngineTerminalTruth_ProgressErrorFallsThroughToCommand(t *test
 	require.NoError(t, err)
 	require.NotNil(t, controlReq)
 	assert.Equal(t, storage.ControlRequestPending, controlReq.Status)
+}
+
+// Persisted engine resume state is how a change is addressed, on every database
+// type — the progress read that decides whether an already-landed outcome may be
+// adopted must carry it, or it answers for a different change (or for none) and
+// the drive kills work the engine had already finished.
+func TestReconcileEngineTerminalTruth_ProgressReadCarriesPersistedResumeState(t *testing.T) {
+	fx := newReconcileFixture(
+		&fakeControlEngine{
+			externallyAuthoritative: true,
+			progressResult:          &engine.ProgressResult{State: engine.StateCompleted},
+		},
+		pendingReconcileRequest(321, storage.ControlOperationCancel),
+	)
+	operationID := int64(77)
+	fx.task.ApplyOperationID = &operationID
+	fx.storage.applyOperations = &exactProgressApplyOperationStore{
+		data: &storage.EngineResumeState{
+			ApplyOperationID: operationID,
+			MigrationContext: "task-reconcile",
+			Metadata:         `{"deploy_request_id":42}`,
+		},
+	}
+
+	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(t.Context(), fx.apply, []*storage.Task{fx.task})
+	require.NoError(t, err)
+	assert.True(t, handled)
+	require.NotNil(t, fx.engine.progressReq)
+	require.NotNil(t, fx.engine.progressReq.ResumeState, "the progress read must address the change through its persisted resume state")
+	assert.Equal(t, "task-reconcile", fx.engine.progressReq.ResumeState.MigrationContext)
+	assert.Equal(t, `{"deploy_request_id":42}`, fx.engine.progressReq.ResumeState.Metadata)
+	assert.Equal(t, state.Apply.Completed, fx.apply.State)
+	assert.Equal(t, state.Task.Completed, fx.task.State)
 }
 
 // An instance-local engine's progress says nothing about work a previous

@@ -4,12 +4,18 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	spiritstatus "github.com/block/spirit/pkg/status"
+
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -70,6 +76,624 @@ func TestPollTaskToCompletion_ThreadsResumeState(t *testing.T) {
 	assert.Equal(t, "shard-meta", eng.gotResumeState.Metadata, "the engine's resume-state metadata is threaded into Progress")
 }
 
+// phaseSequenceEngine scripts one ProgressResult per poll, modelling a Spirit
+// runner advancing through its post-copy phases. The last result repeats once
+// the script is exhausted.
+type phaseSequenceEngine struct {
+	engine.Engine
+	results []*engine.ProgressResult
+	calls   int
+}
+
+func (e *phaseSequenceEngine) Name() string { return "phase-sequence" }
+
+func (e *phaseSequenceEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	i := e.calls
+	if i >= len(e.results) {
+		i = len(e.results) - 1
+	}
+	e.calls++
+	return e.results[i], nil
+}
+
+func spiritRunningResult(tableState string) *engine.ProgressResult {
+	return &engine.ProgressResult{
+		State:  engine.StateRunning,
+		Tables: []engine.TableProgress{{Table: "mutes", State: tableState}},
+	}
+}
+
+// stateRecordingTaskStore records every persisted task state so a test can
+// assert the exact sequence of stored states across polls.
+type stateRecordingTaskStore struct {
+	*exactProgressTaskStore
+	states []string
+}
+
+func (s *stateRecordingTaskStore) Update(_ context.Context, t *storage.Task) error {
+	s.states = append(s.states, t.State)
+	return nil
+}
+
+// A sequential (non-atomic) drive runs one Spirit runner per DDL, and the
+// stored task is the single render surface for the CLI and the PR comment. The
+// poll must refine a running task into the engine-reported post-copy phase —
+// catching up, checksumming, post-checksum — and hold the displayed endgame
+// monotonic through engine phases that map back to plain running (index
+// restore, table analyze), so an operator watching a default apply sees the
+// same phase names an atomic apply shows.
+func TestPollTaskToCompletion_RefinesPostCopyPhases(t *testing.T) {
+	task := &storage.Task{
+		ID: 1, ApplyID: 1, TaskIdentifier: "task-1",
+		Database: "appdb", DatabaseType: storage.DatabaseTypeMySQL,
+		TableName: "mutes", State: state.Task.Running,
+	}
+	apply := &storage.Apply{
+		ID: 1, ApplyIdentifier: "apply-1", Database: "appdb",
+		DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging",
+	}
+	taskStore := &stateRecordingTaskStore{
+		exactProgressTaskStore: &exactProgressTaskStore{tasks: []*storage.Task{task}},
+	}
+	eng := &phaseSequenceEngine{results: []*engine.ProgressResult{
+		spiritRunningResult(spiritstatus.CopyRows.String()),
+		spiritRunningResult(spiritstatus.ApplyChangeset.String()),
+		spiritRunningResult(spiritstatus.RestoreSecondaryIndexes.String()),
+		spiritRunningResult(spiritstatus.Checksum.String()),
+		spiritRunningResult(spiritstatus.PostChecksum.String()),
+		{State: engine.StateCompleted},
+	}}
+	client := &LocalClient{
+		config:       LocalConfig{Database: "appdb", Type: storage.DatabaseTypeMySQL},
+		spiritEngine: eng,
+		storage: &exactProgressStorage{
+			tasks:           taskStore,
+			controlRequests: &testControlRequestStore{},
+			logs:            &mockApplyLogStore{},
+		},
+		logger: slog.Default(),
+	}
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskContinue, action)
+	assert.Equal(t, state.Task.Completed, task.State)
+	assert.Equal(t, []string{
+		state.Task.Running,      // copyRows
+		state.Task.CatchingUp,   // applyChangeset refines the running task
+		state.Task.CatchingUp,   // restoreSecondaryIndexes maps to running; monotonic guard holds the phase
+		state.Task.Checksumming, // checksum
+		state.Task.PostChecksum, // postChecksum
+		state.Task.Completed,
+	}, taskStore.states)
+}
+
+// A drive claim that reattaches to an engine's durable checkpoint must surface
+// that in the apply timeline exactly once, even though the engine reports the
+// resume flag on every subsequent poll — so an operator reading the timeline
+// can tell a resumed copy from a fresh start without the event repeating on
+// every tick. Drive the sequential poll against an engine that reports a
+// resumed copy across several polls and assert a single timeline event.
+func TestPollTaskToCompletion_LogsResumeOnce(t *testing.T) {
+	task := &storage.Task{
+		ID: 1, ApplyID: 1, TaskIdentifier: "task-1",
+		Database: "appdb", DatabaseType: storage.DatabaseTypeMySQL,
+		TableName: "mutes", State: state.Task.Running,
+	}
+	apply := &storage.Apply{
+		ID: 1, ApplyIdentifier: "apply-1", Database: "appdb",
+		DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging",
+	}
+	resumedResult := func(engineState engine.State) *engine.ProgressResult {
+		return &engine.ProgressResult{
+			State:                 engineState,
+			ResumedFromCheckpoint: true,
+			Tables:                []engine.TableProgress{{Table: "mutes", State: spiritstatus.CopyRows.String()}},
+		}
+	}
+	logs := &mockApplyLogStore{}
+	eng := &phaseSequenceEngine{results: []*engine.ProgressResult{
+		resumedResult(engine.StateRunning),
+		resumedResult(engine.StateRunning),
+		resumedResult(engine.StateCompleted),
+	}}
+	client := &LocalClient{
+		config:       LocalConfig{Database: "appdb", Type: storage.DatabaseTypeMySQL},
+		spiritEngine: eng,
+		storage: &exactProgressStorage{
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			controlRequests: &testControlRequestStore{},
+			logs:            logs,
+		},
+		logger: slog.Default(),
+	}
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskContinue, action)
+	assert.Equal(t, state.Task.Completed, task.State)
+	resumeEvents := 0
+	for _, entry := range logs.logs {
+		if strings.Contains(entry.Message, "resumed from checkpoint") {
+			resumeEvents++
+		}
+	}
+	assert.Equal(t, 1, resumeEvents, "the resume flag on every poll records one timeline event per drive claim")
+}
+
+// lostWorkEngine scripts progress results like phaseSequenceEngine and answers
+// re-plans with a fixed result, modelling an engine whose in-flight work
+// vanished: progress reports no active schema change while the target's true
+// state is whatever the re-plan reports.
+type lostWorkEngine struct {
+	phaseSequenceEngine
+	planResult *engine.PlanResult
+	planCalls  int
+}
+
+func (e *lostWorkEngine) Plan(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
+	e.planCalls++
+	return e.planResult, nil
+}
+
+// A pending engine report only signals lost work when the stored task is
+// genuinely in flight. Resting states — stopped, failed_retryable — have no
+// active engine work by design, and terminal states are never re-verified, so
+// a pending report for them must not trigger settlement.
+func TestEngineReportsLostWork(t *testing.T) {
+	cases := []struct {
+		name        string
+		storedState string
+		engineState string
+		want        bool
+	}{
+		{"running task with pending engine report is lost work", state.Task.Running, state.Task.Pending, true},
+		{"cutting-over task with pending engine report is lost work", state.Task.CuttingOver, state.Task.Pending, true},
+		{"failed_retryable is a resting state, not divergence", state.Task.FailedRetryable, state.Task.Pending, false},
+		{"stopped is a resting state, not divergence", state.Task.Stopped, state.Task.Pending, false},
+		{"pending stored task has not dispatched work yet", state.Task.Pending, state.Task.Pending, false},
+		{"completed task is terminal, never re-verified", state.Task.Completed, state.Task.Pending, false},
+		{"running engine report is not lost work", state.Task.Running, state.Task.Running, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, engineReportsLostWork(tc.storedState, tc.engineState))
+		})
+	}
+}
+
+// lostWorkPollFixture builds a running sequential task, its apply, and a
+// LocalClient polling the given engine with a fast poll interval, so lost-work
+// scenarios can drive many polls without waiting out the real poll cadence.
+// trustBudget sets how long the drive keeps trusting an engine reporting no
+// active schema change: a tiny budget reaches target verification, and a large
+// one proves a short pending run is tolerated. The re-plan's target plan row is
+// served by a scripted plan store.
+func lostWorkPollFixture(eng engine.Engine, trustBudget time.Duration) (*LocalClient, *storage.Apply, *storage.Task, *stateRecordingTaskStore) {
+	return lostWorkPollFixtureInState(eng, trustBudget, state.Task.Running)
+}
+
+// lostWorkPollFixtureInState is lostWorkPollFixture with the task's stored
+// state chosen by the caller, for the states whose settlement rules differ.
+func lostWorkPollFixtureInState(eng engine.Engine, trustBudget time.Duration, taskState string) (*LocalClient, *storage.Apply, *storage.Task, *stateRecordingTaskStore) {
+	task := &storage.Task{
+		ID: 1, ApplyID: 1, PlanID: 7, TaskIdentifier: "task-1",
+		Database: "appdb", DatabaseType: storage.DatabaseTypeStrata,
+		Namespace: "appdb_sharded", TableName: "orders", Shard: "-40",
+		Environment: "staging", State: taskState,
+	}
+	apply := &storage.Apply{
+		ID: 1, PlanID: 7, ApplyIdentifier: "apply-1", Database: "appdb",
+		DatabaseType: storage.DatabaseTypeStrata, Environment: "staging",
+	}
+	taskStore := &stateRecordingTaskStore{
+		exactProgressTaskStore: &exactProgressTaskStore{tasks: []*storage.Task{task}},
+	}
+	client := &LocalClient{
+		config:       LocalConfig{Database: "appdb", Type: storage.DatabaseTypeStrata},
+		customEngine: eng,
+		storage: &exactProgressStorage{
+			tasks:           taskStore,
+			controlRequests: &testControlRequestStore{},
+			logs:            &mockApplyLogStore{},
+			plans:           &scriptedPlanStore{plan: &storage.Plan{ID: 7, SchemaFiles: schema.SchemaFiles{}}},
+		},
+		logger:                              slog.Default(),
+		taskPollIntervalOverride:            time.Millisecond,
+		lostEngineWorkPendingBudgetOverride: trustBudget,
+	}
+	return client, apply, task, taskStore
+}
+
+// lostWorkTrustBudgetReached is a trust budget small enough that a few fast
+// polls exhaust it, so a test reaches the target-verification path.
+const lostWorkTrustBudgetReached = 5 * time.Millisecond
+
+// lostWorkTrustBudgetAmple is a trust budget no test can exhaust, so a short
+// run of pending reports is provably tolerated rather than tolerated by luck.
+const lostWorkTrustBudgetAmple = time.Hour
+
+// An engine can complete a schema change and then lose all record of it — after
+// that, every progress poll reports no active schema change while durable
+// storage still says the task is running. Once the tolerated staleness window
+// is exhausted the drive must verify the target directly: a target that
+// already has the desired schema means the change landed and only its outcome
+// was lost, so the task completes instead of polling forever and holding the
+// database's active-apply slot.
+func TestPollTaskToCompletion_LostEngineWorkTargetConverged(t *testing.T) {
+	eng := &lostWorkEngine{
+		phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+			{State: engine.StateRunning},
+			{State: engine.StatePending},
+		}},
+		// The re-plan reports no remaining change for the table: the target
+		// already has the desired schema.
+		planResult: &engine.PlanResult{NoChanges: true},
+	}
+	client, apply, task, _ := lostWorkPollFixture(eng, lostWorkTrustBudgetReached)
+	// A whole-namespace task, which is the scope a re-plan of the reviewed
+	// schema set speaks for and therefore the scope its silence can settle.
+	task.Shard = ""
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskContinue, action, "a converged target settles the task through the normal completed flow")
+	assert.Equal(t, state.Task.Completed, task.State)
+	assert.Equal(t, 100, task.ProgressPercent)
+	require.NotNil(t, task.CompletedAt)
+	assert.GreaterOrEqual(t, eng.planCalls, 1, "the drive verifies the target schema before completing")
+	assert.GreaterOrEqual(t, eng.calls, 3, "a single pending report never settles the task; the engine is polled again first")
+}
+
+// An engine that never had (or irrecoverably lost) the work reports no active
+// schema change forever while the target still needs the change. The drive
+// must not fail the task permanently — nothing about the target is broken —
+// and must not poll forever: it marks the task retryable so a fresh claim
+// re-drives the schema change.
+func TestPollTaskToCompletion_LostEngineWorkTargetNotConverged(t *testing.T) {
+	eng := &lostWorkEngine{
+		phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+			{State: engine.StatePending},
+		}},
+		// The re-plan still contains this task's (namespace, shard, table):
+		// the target does not have the desired schema yet.
+		planResult: &engine.PlanResult{Changes: []engine.SchemaChange{{
+			Namespace: "appdb_sharded",
+			Shard:     engine.Shard{Name: "-40"},
+			TableChanges: []engine.TableChange{{
+				Table: "orders",
+				DDL:   "ALTER TABLE `orders` ADD COLUMN `note` VARCHAR(255)",
+			}},
+		}}},
+	}
+	client, apply, task, _ := lostWorkPollFixture(eng, lostWorkTrustBudgetReached)
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskFailed, action)
+	assert.Equal(t, state.Task.FailedRetryable, task.State, "a lost change the target still needs is retryable, never permanently failed")
+	assert.Contains(t, task.ErrorMessage, "orders")
+	assert.Contains(t, task.ErrorMessage, "still needs the change")
+	assert.Nil(t, task.CompletedAt, "a retryable task carries no completion timestamp")
+}
+
+// Re-planning the reviewed schema set describes whole namespaces, so its
+// silence about a table says nothing about any one shard of it. A task tagged
+// with the shard it ran on — the shape a shard-scoped dispatch creates — is
+// therefore never completed from that silence: it rests retryable for a fresh
+// claim, because reporting a shard's change as made is the one direction a
+// schema read must not be guessed in.
+func TestPollTaskToCompletion_LostEngineWorkNeverCompletesAShardTaskOnWholeNamespaceReplan(t *testing.T) {
+	eng := &lostWorkEngine{
+		phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+			{State: engine.StatePending},
+		}},
+		// A converged whole-namespace re-plan: no engine's plan of the reviewed
+		// schema set carries a shard, so nothing here speaks for shard -40.
+		planResult: &engine.PlanResult{NoChanges: true},
+	}
+	client, apply, task, _ := lostWorkPollFixture(eng, lostWorkTrustBudgetReached)
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskFailed, action)
+	assert.Equal(t, state.Task.FailedRetryable, task.State, "an unattributable shard rests retryable, never completed")
+	assert.Nil(t, task.CompletedAt, "a retryable task carries no completion timestamp")
+	assert.NotEqual(t, 100, task.ProgressPercent, "an unsettled shard never renders a finished bar")
+	assert.Contains(t, task.ErrorMessage, "-40", "the reason names the shard the target could not be verified for")
+}
+
+// When the engine reports no active schema change and the target plan cannot
+// be read either, neither side can answer what happened to the work. The drive
+// must not spin between the two forever: each failed verification counts
+// against the same bounded error budget as a failed poll, and exhausting it
+// rests the task retryable for a fresh claim to re-drive — never permanently
+// failed, because nothing proved the target is broken.
+func TestPollTaskToCompletion_LostEngineWorkVerificationErrorsAreBounded(t *testing.T) {
+	eng := &lostWorkEngine{
+		phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+			{State: engine.StatePending},
+		}},
+		planResult: &engine.PlanResult{NoChanges: true},
+	}
+	client, apply, task, _ := lostWorkPollFixture(eng, lostWorkTrustBudgetReached)
+	client.storage.(*exactProgressStorage).plans = &scriptedPlanStore{err: fmt.Errorf("storage read failed")}
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskFailed, action)
+	assert.Equal(t, state.Task.FailedRetryable, task.State, "an unverifiable target is retryable, never permanently failed")
+	assert.Nil(t, task.CompletedAt, "a retryable task carries no completion timestamp")
+	assert.Contains(t, task.ErrorMessage, "could not be verified")
+	assert.Contains(t, task.ErrorMessage, "consecutive errors")
+	assert.Equal(t, 0, eng.planCalls, "a failed plan read settles nothing; the engine re-plan is never reached")
+}
+
+// A freshly restarted engine can serve a stale snapshot that omits in-flight
+// work for a few polls before it catches up. A short run of pending reports
+// inside the tolerated window must self-heal: the drive keeps polling, never
+// distrusts the engine, and the task completes through the normal flow.
+func TestPollTaskToCompletion_StaleEngineSnapshotSelfHeals(t *testing.T) {
+	results := []*engine.ProgressResult{
+		{State: engine.StatePending},
+		{State: engine.StatePending},
+		{State: engine.StatePending},
+		{State: engine.StateRunning},
+		{State: engine.StateCompleted},
+	}
+	eng := &lostWorkEngine{
+		phaseSequenceEngine: phaseSequenceEngine{results: results},
+		planResult:          &engine.PlanResult{NoChanges: true},
+	}
+	client, apply, task, taskStore := lostWorkPollFixture(eng, lostWorkTrustBudgetAmple)
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskContinue, action)
+	assert.Equal(t, state.Task.Completed, task.State)
+	assert.Equal(t, 0, eng.planCalls, "a self-healing stale snapshot never triggers target verification")
+	assert.NotContains(t, taskStore.states, state.Task.FailedRetryable)
+	assert.NotContains(t, taskStore.states, state.Task.Failed)
+}
+
+// Once a schema change has cut over, the live schema matches the reviewed
+// target whether or not the revert that was undoing it ever ran — so a task in
+// its revert phase can never be settled by reading the target. An engine that
+// loses a revert must leave the task retryable for a fresh claim to re-drive;
+// completing it would report the apply as a successful schema change while the
+// change it was reverting is still in place.
+func TestPollTaskToCompletion_LostEngineWorkNeverCompletesARevertPhaseTask(t *testing.T) {
+	eng := &lostWorkEngine{
+		phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+			{State: engine.StatePending},
+		}},
+		// A converged target is exactly what a post-cutover re-plan reports, and
+		// it must not be read as the revert having finished.
+		planResult: &engine.PlanResult{NoChanges: true},
+	}
+	client, apply, task, _ := lostWorkPollFixtureInState(eng, lostWorkTrustBudgetReached, state.Task.Reverting)
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskFailed, action)
+	assert.Equal(t, state.Task.FailedRetryable, task.State, "a lost revert is retryable, never a completed schema change")
+	assert.Nil(t, task.CompletedAt, "a retryable task carries no completion timestamp")
+	assert.Contains(t, task.ErrorMessage, "revert phase")
+	assert.Equal(t, 0, eng.planCalls, "the target schema is never consulted for a revert-phase task")
+}
+
+// A task parked at an operator gate — a held cutover, a deferred deploy, an
+// open revert window — is motionless by design for as long as the operator
+// takes to act. The stall watchdog must stay quiet for those states, so the
+// warning keeps meaning "this task should be moving and is not".
+func TestPollTaskToCompletion_StallWatchdogStaysQuietAtAnOperatorGate(t *testing.T) {
+	var results []*engine.ProgressResult
+	for range 60 {
+		results = append(results, &engine.ProgressResult{State: engine.StateWaitingForCutover})
+	}
+	results = append(results, &engine.ProgressResult{State: engine.StateCompleted})
+	eng := &phaseSequenceEngine{results: results}
+
+	task := &storage.Task{
+		ID: 1, ApplyID: 1, TaskIdentifier: "task-1",
+		Database: "appdb", DatabaseType: storage.DatabaseTypeMySQL,
+		TableName: "mutes", State: state.Task.Running,
+	}
+	apply := &storage.Apply{
+		ID: 1, ApplyIdentifier: "apply-1", Database: "appdb",
+		DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging",
+	}
+	handler := &recordingLogHandler{}
+	client := &LocalClient{
+		config:       LocalConfig{Database: "appdb", Type: storage.DatabaseTypeMySQL},
+		spiritEngine: eng,
+		storage: &exactProgressStorage{
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			controlRequests: &testControlRequestStore{},
+			logs:            &mockApplyLogStore{},
+		},
+		logger:                        slog.New(handler),
+		taskPollIntervalOverride:      time.Millisecond,
+		taskStallWarnIntervalOverride: 20 * time.Millisecond,
+	}
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskContinue, action)
+	assert.Equal(t, state.Task.Completed, task.State)
+	for _, msg := range handler.messages(slog.LevelWarn) {
+		assert.NotContains(t, msg, "stall-warning interval", "a task waiting on an operator is not stalled")
+	}
+}
+
+// The lost-work trust budget is a clock, not a poll counter: a shorter poll
+// cadence must not shorten how long an engine is trusted, and the first pending
+// report of a run only starts the clock.
+func TestLostEngineWorkTrackerSpendsABudgetOfTimeNotPolls(t *testing.T) {
+	base := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	tracker := lostEngineWorkTracker{budget: time.Minute}
+
+	pendingFor, exhausted := tracker.observePending(base)
+	assert.Zero(t, pendingFor)
+	assert.False(t, exhausted, "the first pending report only starts the clock")
+
+	// Many polls inside the budget never exhaust it, however fast they arrive.
+	for i := 1; i <= 100; i++ {
+		_, exhausted = tracker.observePending(base.Add(time.Duration(i) * time.Millisecond))
+		require.False(t, exhausted, "a fast poll cadence must not shorten the budget")
+	}
+
+	pendingFor, exhausted = tracker.observePending(base.Add(time.Minute))
+	assert.True(t, exhausted, "a full budget of pending reports stops trusting the engine")
+	assert.Equal(t, time.Minute, pendingFor)
+
+	// One healthy report buys a fresh budget.
+	tracker.reset()
+	_, exhausted = tracker.observePending(base.Add(2 * time.Minute))
+	assert.False(t, exhausted, "movement resets the budget")
+}
+
+// recordingLogHandler collects slog records so a test can assert on the
+// warnings a drive emits.
+type recordingLogHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *recordingLogHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *recordingLogHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r.Clone())
+	return nil
+}
+
+func (h *recordingLogHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *recordingLogHandler) WithGroup(string) slog.Handler      { return h }
+
+func (h *recordingLogHandler) messages(level slog.Level) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []string
+	for _, r := range h.records {
+		if r.Level == level {
+			out = append(out, r.Message)
+		}
+	}
+	return out
+}
+
+func (h *recordingLogHandler) recordsAt(level slog.Level) []slog.Record {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []slog.Record
+	for _, r := range h.records {
+		if r.Level == level {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// A task can legitimately sit in one state for a long time (a slow copy, a
+// throttled engine), but an operator reading the logs must be able to tell a
+// slow task from a wedged one. When the stored state and progress fields show
+// no movement for a full stall-warning interval the drive emits a warning —
+// purely observational: it never changes the task's state, and the task still
+// completes normally once the engine finishes.
+func TestPollTaskToCompletion_StallWatchdogWarnsWithoutChangingState(t *testing.T) {
+	var results []*engine.ProgressResult
+	for range 60 {
+		results = append(results, spiritRunningResult(spiritstatus.CopyRows.String()))
+	}
+	results = append(results, &engine.ProgressResult{State: engine.StateCompleted})
+	eng := &phaseSequenceEngine{results: results}
+
+	task := &storage.Task{
+		ID: 1, ApplyID: 1, TaskIdentifier: "task-1",
+		Database: "appdb", DatabaseType: storage.DatabaseTypeMySQL,
+		TableName: "mutes", State: state.Task.Running,
+	}
+	apply := &storage.Apply{
+		ID: 1, ApplyIdentifier: "apply-1", Database: "appdb",
+		DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging",
+	}
+	taskStore := &stateRecordingTaskStore{
+		exactProgressTaskStore: &exactProgressTaskStore{tasks: []*storage.Task{task}},
+	}
+	handler := &recordingLogHandler{}
+	client := &LocalClient{
+		config:       LocalConfig{Database: "appdb", Type: storage.DatabaseTypeMySQL},
+		spiritEngine: eng,
+		storage: &exactProgressStorage{
+			tasks:           taskStore,
+			controlRequests: &testControlRequestStore{},
+			logs:            &mockApplyLogStore{},
+		},
+		logger:                        slog.New(handler),
+		taskPollIntervalOverride:      time.Millisecond,
+		taskStallWarnIntervalOverride: 20 * time.Millisecond,
+	}
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskContinue, action)
+	assert.Equal(t, state.Task.Completed, task.State, "the watchdog is observational; the task still completes normally")
+	stallWarns := 0
+	throttleAttrSeen := false
+	for _, r := range handler.recordsAt(slog.LevelWarn) {
+		if !strings.Contains(r.Message, "stall-warning interval") {
+			continue
+		}
+		stallWarns++
+		r.Attrs(func(a slog.Attr) bool {
+			if a.Key == "throttled" {
+				throttleAttrSeen = true
+			}
+			return true
+		})
+	}
+	assert.GreaterOrEqual(t, stallWarns, 1, "a motionless task past the interval is warned about")
+	assert.True(t, throttleAttrSeen, "the stall warning carries the engine's throttle state so triage can tell a throttled task from a wedged one")
+	assert.NotContains(t, taskStore.states, state.Task.FailedRetryable, "the watchdog never changes task state")
+	assert.NotContains(t, taskStore.states, state.Task.Failed, "the watchdog never changes task state")
+}
+
+// The stall watchdog warns once per interval, not once per poll, and any
+// movement in the observed state or progress fields resets both the stall
+// clock and the warning latch.
+func TestTaskStallWatchdogWarnsOncePerInterval(t *testing.T) {
+	base := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	w := taskStallWatchdog{interval: time.Minute}
+	running := taskProgressSnapshot{state: state.Task.Running, rowsCopied: 10}
+
+	_, warn := w.observe(base, running)
+	assert.False(t, warn, "the first observation only arms the watchdog")
+
+	_, warn = w.observe(base.Add(30*time.Second), running)
+	assert.False(t, warn, "no warning inside the interval")
+
+	stalledFor, warn := w.observe(base.Add(61*time.Second), running)
+	assert.True(t, warn, "a full motionless interval warns")
+	assert.GreaterOrEqual(t, stalledFor, time.Minute)
+
+	_, warn = w.observe(base.Add(90*time.Second), running)
+	assert.False(t, warn, "the warning does not repeat until another full interval passes")
+
+	stalledFor, warn = w.observe(base.Add(122*time.Second), running)
+	assert.True(t, warn, "a second full interval warns again")
+	assert.GreaterOrEqual(t, stalledFor, 2*time.Minute)
+
+	advanced := running
+	advanced.rowsCopied = 500
+	_, warn = w.observe(base.Add(123*time.Second), advanced)
+	assert.False(t, warn, "progress movement resets the stall clock")
+
+	_, warn = w.observe(base.Add(150*time.Second), advanced)
+	assert.False(t, warn, "the reset clock starts a fresh interval")
+}
+
 // permanentProgressErrorEngine always fails Progress with a permanent error.
 type permanentProgressErrorEngine struct{ engine.Engine }
 
@@ -106,4 +730,61 @@ func TestPollTaskToCompletion_PermanentErrorFailsFast(t *testing.T) {
 
 	assert.Equal(t, taskFailed, action)
 	assert.Equal(t, state.Task.Failed, task.State, "a permanent progress error fails the task without exhausting the retry budget")
+}
+
+// syncRegistrationEngine declares its work registration synchronous, the way an
+// in-process engine that publishes tracked state before Apply returns does.
+type syncRegistrationEngine struct {
+	lostWorkEngine
+}
+
+func (e *syncRegistrationEngine) RegistersWorkSynchronously() bool { return true }
+
+// An engine that registers accepted work before Apply returns has no phase in
+// which it reports pending for healthy work it has not begun. For such an
+// engine the first pending report about an in-flight task is already proof the
+// work is gone, so the drive verifies the target immediately instead of
+// spending a trust budget it does not need.
+func TestPollTaskToCompletion_SynchronousEngineNeedsNoTrustBudget(t *testing.T) {
+	eng := &syncRegistrationEngine{
+		lostWorkEngine: lostWorkEngine{
+			phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+				{State: engine.StateRunning},
+				{State: engine.StatePending},
+			}},
+			planResult: &engine.PlanResult{NoChanges: true},
+		},
+	}
+	// No budget override: the engine's own declaration decides the budget.
+	client, apply, task, _ := lostWorkPollFixture(eng, 0)
+	// The subject here is the budget, so the task takes the whole-namespace
+	// scope a converged re-plan can settle.
+	task.Shard = ""
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskContinue, action)
+	assert.Equal(t, state.Task.Completed, task.State)
+	assert.Equal(t, 1, eng.planCalls, "the target is verified once, on the first pending report")
+	assert.Equal(t, 2, eng.calls, "no poll is spent waiting out a phase this engine does not have")
+}
+
+// The trust budget is a property of the engine, not a global constant: an
+// engine that provisions after accepting work needs time before a pending
+// report means anything, while one that registers synchronously needs none. A
+// test override outranks both so a test can reach the verification path
+// quickly.
+func TestLostEngineWorkPendingBudgetFollowsTheEngine(t *testing.T) {
+	provisioning := &phaseSequenceEngine{}
+	synchronous := &syncRegistrationEngine{}
+
+	client := &LocalClient{}
+	assert.Equal(t, defaultLostEngineWorkPendingBudget, client.lostEngineWorkPendingBudget(provisioning),
+		"an engine that has not declared itself is assumed to provision after accepting work")
+	assert.Zero(t, client.lostEngineWorkPendingBudget(synchronous),
+		"a synchronous engine has no pending-but-healthy phase to wait out")
+
+	overridden := &LocalClient{lostEngineWorkPendingBudgetOverride: lostWorkTrustBudgetReached}
+	assert.Equal(t, lostWorkTrustBudgetReached, overridden.lostEngineWorkPendingBudget(provisioning))
+	assert.Equal(t, lostWorkTrustBudgetReached, overridden.lostEngineWorkPendingBudget(synchronous))
 }

@@ -11,9 +11,12 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -25,7 +28,7 @@ type ApplyCmd struct {
 	PullRequest  int           `help:"Pull request number (optional, for tracking)" name:"pull-request"`
 	AutoApprove  bool          `short:"y" help:"Skip confirmation prompt" name:"auto-approve"`
 	Watch        bool          `short:"w" help:"Watch progress until completion" default:"true" negatable:""`
-	DeferCutover bool          `help:"Defer cutover until manual trigger (use 'schemabot cutover')" name:"defer-cutover"`
+	DeferCutover bool          `help:"Defer cutover until manual trigger (use '${cli_name} cutover')" name:"defer-cutover"`
 	DeferDeploy  bool          `help:"Defer deploy until manual trigger (holds at waiting_for_deploy)" name:"defer-deploy"`
 	SkipRevert   bool          `help:"Skip revert window after completion (Vitess only)" name:"skip-revert"`
 	Branch       string        `help:"Reuse existing PlanetScale branch (syncs with main, skips branch creation)" name:"branch"`
@@ -70,7 +73,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	if err != nil {
 		// Ignore status preflight errors; apply is still guarded server-side.
 	} else if active != nil && active.State != "" {
-		progressCmd := fmt.Sprintf("schemabot status %s", active.ApplyID)
+		progressCmd := fmt.Sprintf("%s status %s", cliname.Name(), active.ApplyID)
 		var stateMsg string
 		switch {
 		case state.IsState(active.State, state.Apply.WaitingForDeploy):
@@ -92,7 +95,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 			fmt.Println(stateMsg)
 			fmt.Println()
 			if state.IsState(active.State, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover) {
-				fmt.Printf("To trigger cutover:  schemabot cutover -e %s %s\n", cmd.Environment, active.ApplyID)
+				fmt.Printf("To trigger cutover:  %s cutover -e %s %s\n", cliname.Name(), cmd.Environment, active.ApplyID)
 			}
 			fmt.Printf("To watch and manage: %s\n", progressCmd)
 			return fmt.Errorf("schema change already in progress")
@@ -101,13 +104,19 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	// Step 1: Generate plan
 	var planResult *apitypes.PlanResponse
+	var ignoredNamespaces []string
 	err = withLoading("Generating schema change plan...", cmd.Output != OutputFormatJSON, func() error {
 		var planErr error
-		planResult, planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, cmd.Environment, cfg.SchemaDir, cmd.Repository, cmd.PullRequest)
+		planResult, ignoredNamespaces, planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, cmd.Environment, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.IgnoreNamespaces,
+			storage.GroupsEngineExecution(cfg.Type, cmd.DeferCutover))
 		return planErr
 	})
 	if err != nil {
 		return err
+	}
+	if cmd.Output != OutputFormatJSON {
+		templates.WriteIgnoredNamespaces(ignoredNamespaces,
+			schema.UnmatchedIgnoreEntries(cfg.IgnoreNamespaces, cmd.Environment, ignoredNamespaces))
 	}
 
 	// Validate engine-specific options
@@ -140,7 +149,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	}
 
 	// Check for unsafe changes
-	if planResult.HasErrors() && !cmd.AllowUnsafe {
+	if len(planResult.UnsafeChanges()) > 0 && !cmd.AllowUnsafe {
 		return blockUnsafeApply(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir)
 	}
 
@@ -172,7 +181,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	OutputPlanResult(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, true)
 
 	// Show unsafe warning if --allow-unsafe was used
-	if planResult.HasErrors() && cmd.AllowUnsafe {
+	if cmd.AllowUnsafe {
 		templates.WriteUnsafeWarningAllowed(planResult.UnsafeChanges())
 	}
 
@@ -276,7 +285,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 // Three modes are available:
 //
 //   - interactive (default): Full-screen TUI with progress bars, spinners, and
-//     keyboard controls (stop, volume, cutover). Requires a TTY. Provides a
+//     keyboard controls (stop, cutover). Requires a TTY. Provides a
 //     rich, real-time view of progress. Best when a human is watching — local
 //     development, production operations, etc.
 //
@@ -708,7 +717,7 @@ func watchApplyProgressLog(endpoint, applyID string, heartbeatInterval time.Dura
 			case state.IsState(curState, state.Apply.RevertWindow):
 				revertWindowStart = time.Now()
 				lastRevertHeartbeat = time.Now()
-				log.emit("msg", "Revert window open — run 'schemabot revert' to undo or 'schemabot skip-revert' to finalize")
+				log.emit("msg", fmt.Sprintf("Revert window open — run '%s revert' to undo or '%s skip-revert' to finalize", cliname.Name(), cliname.Name()))
 			}
 			lastGlobalState = globalNorm
 		}
@@ -818,7 +827,7 @@ func (e *logEmitter) emitTableStateChange(tbl *apitypes.TableProgressResponse, t
 		kvs := tableKVs(recoveringLogMessage(tbl), tbl, ts)
 		if tbl.RowsTotal > 0 && tbl.PercentComplete < 100 {
 			kvs = append(kvs,
-				"progress", fmt.Sprintf("%d%%", min(int(tbl.PercentComplete), 100)),
+				"progress", ui.FormatRowCopyPercent(int(tbl.PercentComplete), tbl.RowsCopied, tbl.RowsTotal),
 				"rows", fmt.Sprintf("%s/%s", ui.FormatNumber(ui.ClampRows(tbl.RowsCopied, tbl.RowsTotal)), ui.FormatNumber(tbl.RowsTotal)),
 			)
 			if tbl.ETASeconds > 0 {
@@ -833,8 +842,8 @@ func (e *logEmitter) emitTableStateChange(tbl *apitypes.TableProgressResponse, t
 		e.emit(kvs...)
 	case state.Apply.Stopped:
 		kvs := tableKVs("Table stopped", tbl, ts)
-		if tbl.PercentComplete > 0 {
-			kvs = append(kvs, "progress", fmt.Sprintf("%d%%", min(int(tbl.PercentComplete), 100)))
+		if tbl.PercentComplete > 0 || tbl.RowsCopied > 0 {
+			kvs = append(kvs, "progress", ui.FormatRowCopyPercent(int(tbl.PercentComplete), tbl.RowsCopied, tbl.RowsTotal))
 		}
 		e.emit(kvs...)
 	default:
@@ -865,9 +874,8 @@ func (e *logEmitter) emitProgressHeartbeat(tbl *apitypes.TableProgressResponse, 
 			"rows_copied", fmt.Sprintf("%s so far", ui.FormatNumber(tbl.RowsCopied)),
 		)
 	} else {
-		pct := ui.ClampPercent(int(tbl.PercentComplete))
 		kvs = append(kvs,
-			"progress", fmt.Sprintf("%d%%", pct),
+			"progress", ui.FormatRowCopyPercent(int(tbl.PercentComplete), tbl.RowsCopied, tbl.RowsTotal),
 			"rows", fmt.Sprintf("%s/%s", ui.FormatNumber(ui.ClampRows(tbl.RowsCopied, tbl.RowsTotal)), ui.FormatNumber(tbl.RowsTotal)),
 		)
 		if tbl.ETASeconds > 0 {

@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/alecthomas/kong"
 
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/commands"
 )
 
@@ -39,7 +41,6 @@ type CLI struct {
 	Cancel     commands.CancelCmd     `cmd:"" help:"Cancel a schema change permanently"`
 	Start      commands.StartCmd      `cmd:"" help:"Resume a stopped schema change"`
 	Release    commands.ReleaseCmd    `cmd:"" help:"Release a rollout paused after an on_failure=pause failure"`
-	Volume     commands.VolumeCmd     `cmd:"" help:"Adjust schema change speed (1-11)"`
 	Revert     commands.RevertCmd     `cmd:"" help:"Revert a completed schema change during the revert window"`
 	SkipRevert commands.SkipRevertCmd `cmd:"" name:"skip-revert" help:"Skip the revert window, finalizing the schema change"`
 	Rollback   commands.RollbackCmd   `cmd:"" help:"Rollback to the previous schema state"`
@@ -48,6 +49,7 @@ type CLI struct {
 	Locks      commands.LocksCmd      `cmd:"" help:"List all active database locks"`
 	Logs       commands.LogsCmd       `cmd:"" help:"View apply logs"`
 	Status     commands.StatusCmd     `cmd:"" help:"Show schema change status"`
+	Plans      commands.PlansCmd      `cmd:"" name:"list-plans" help:"List recently generated schema change plans"`
 	Preview    commands.PreviewCmd    `cmd:"" help:"Preview CLI output templates (for development)"`
 	FixLint    commands.FixLintCmd    `cmd:"" name:"fix-lint" help:"Auto-fix lint issues in schema files"`
 	Configure  commands.ConfigureCmd  `cmd:"" help:"Configure CLI settings (endpoint, profiles)"`
@@ -55,16 +57,27 @@ type CLI struct {
 	Settings   commands.SettingsCmd   `cmd:"" help:"View or update schema change settings"`
 	Webhooks   commands.WebhooksCmd   `cmd:"" help:"Manage GitHub App webhook deliveries"`
 	Checks     commands.ChecksCmd     `cmd:"" help:"Manage SchemaBot Check Runs on PRs"`
+	Storage    commands.StorageCmd    `cmd:"" help:"Operate directly on SchemaBot's storage database"`
+	Local      commands.LocalCmd      `cmd:"" hidden:"" help:"Internal local runtime host"`
 	Serve      commands.ServeCmd      `cmd:"" help:"Start the SchemaBot HTTP API server"`
 }
 
 func main() {
+	// Render command hints — and kong's own usage text — with the tool name a
+	// wrapper passes via --cli-name, so wrapper-invoked runs print commands
+	// that work as pasted. Scanned from the raw args because kong's usage name
+	// must be fixed before kong parses; an absent flag keeps the default.
+	cliname.Set(cliname.FromArgs(os.Args[1:]))
+
 	var cli CLI
 	ctx := kong.Parse(&cli,
-		kong.Name("schemabot"),
+		kong.Name(cliname.Name()),
 		kong.Description("Declarative schema GitOps orchestrator"),
 		kong.UsageOnError(),
-		kong.Vars{"version": fmt.Sprintf("%s (commit: %s)", version, commit)},
+		kong.Vars{
+			"version":  fmt.Sprintf("%s (commit: %s)", version, commit),
+			"cli_name": cliname.Name(),
+		},
 	)
 
 	cli.Version = version
@@ -77,20 +90,41 @@ func main() {
 	// Bound the resolution so a slow or unreachable issuer during a token refresh
 	// can't hang the CLI at startup. Cancel as soon as it returns rather than via
 	// defer, since the os.Exit below would skip a deferred cancel.
-	authCtx, cancelAuth := context.WithTimeout(context.Background(), 30*time.Second)
-	token, err := client.ResolveBearerToken(authCtx, cli.Token, cli.Endpoint, cli.Profile)
-	cancelAuth()
-	if err != nil {
-		// Per ResolveBearerToken's contract: an empty token with an error is a hard
-		// failure; a non-empty token with an error is a non-fatal warning (the
-		// returned token is still usable and re-login can fix it).
-		if token == "" {
-			fmt.Fprintf(os.Stderr, "\033[31mError: %v\033[0m\n", err)
-			os.Exit(1)
+	// Hosting a local runtime does not use a remote profile or its credentials.
+	var localEndpoint string
+	if !strings.HasPrefix(ctx.Command(), "local ") {
+		if usesLocalRuntime(ctx.Command()) {
+			localCtx, cancelLocal := context.WithTimeout(context.Background(), 30*time.Second)
+			connection, err := client.ResolveLocalConnection(localCtx, cli.Endpoint, cli.Profile, cli.Token, version)
+			cancelLocal()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			if connection != nil {
+				localEndpoint = connection.Endpoint
+				cli.Endpoint = connection.Endpoint
+				cli.Token = connection.Token
+			}
 		}
-		fmt.Fprintf(os.Stderr, "\033[33mWarning: %v\033[0m\n", err)
+		authCtx, cancelAuth := context.WithTimeout(context.Background(), 30*time.Second)
+		token, err := client.ResolveBearerToken(authCtx, cli.Token, cli.Endpoint, cli.Profile)
+		cancelAuth()
+		if err != nil {
+			// Per ResolveBearerToken's contract: an empty token with an error is a hard
+			// failure; a non-empty token with an error is a non-fatal warning (the
+			// returned token is still usable and re-login can fix it).
+			if token == "" {
+				fmt.Fprintf(os.Stderr, "\033[31mError: %v\033[0m\n", err)
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stderr, "\033[33mWarning: %v\033[0m\n", err)
+		}
+		client.SetAuthToken(token)
+		if localEndpoint != "" {
+			client.SetLocalAuth(token, localEndpoint)
+		}
 	}
-	client.SetAuthToken(token)
 
 	// Cancel long-running commands on Ctrl+C / SIGTERM. The first signal
 	// cancels the context so in-flight requests stop and the command can print
@@ -121,7 +155,7 @@ func main() {
 	}()
 	ctx.BindTo(runCtx, (*context.Context)(nil))
 
-	err = ctx.Run(&cli.Globals)
+	err := ctx.Run(&cli.Globals)
 	// Release the watcher and stop intercepting signals now that the command
 	// is done; explicit rather than deferred, since the os.Exit below would
 	// skip a deferred call.
@@ -134,5 +168,19 @@ func main() {
 			fmt.Fprintf(os.Stderr, "\033[31mError: %v\033[0m\n", err)
 		}
 		os.Exit(1)
+	}
+}
+
+// Only commands that use the schema API may implicitly start a selected runtime.
+func usesLocalRuntime(command string) bool {
+	parts := strings.Fields(command)
+	if len(parts) == 0 {
+		return false
+	}
+	switch parts[0] {
+	case "plan", "onboard", "pull", "apply", "progress", "cutover", "stop", "cancel", "start", "release", "revert", "skip-revert", "rollback", "databases", "unlock", "locks", "logs", "status", "list-plans":
+		return true
+	default:
+		return false
 	}
 }

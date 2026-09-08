@@ -6,6 +6,7 @@ CREATE TABLE `locks` (
   `pull_request` int unsigned NOT NULL,
   `owner` varchar(255) NOT NULL,
   `pending_plan_id` varchar(255) NOT NULL DEFAULT '',
+  `disclosed_copy_discard` tinyint(1) NOT NULL DEFAULT '0',
   `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   `updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),

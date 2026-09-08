@@ -18,8 +18,12 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // Globals holds flags shared by all commands.
@@ -27,6 +31,10 @@ type Globals struct {
 	Endpoint string `help:"SchemaBot API endpoint (overrides profile)"`
 	Profile  string `help:"Configuration profile"`
 	Token    string `help:"Bearer token for authenticating to an auth-enabled server (or set SCHEMABOT_TOKEN)"`
+	// CLIName is declared so kong accepts the flag at any position; main.go
+	// consumes the value from the raw args before parsing, since it feeds
+	// kong's own usage text.
+	CLIName string `name:"cli-name" hidden:"" help:"Tool name rendered in command hints (for CLI wrappers)"`
 
 	// Build info (set by main.go from ldflags)
 	Version string `kong:"-"`
@@ -64,10 +72,16 @@ func (cf *ControlFlags) RequireApplyID() error {
 var ErrSilent = errors.New("silent error")
 
 // CLIConfig represents the schemabot.yaml configuration file for CLI commands.
+// Database and Type are row-identity keys: LoadCLIConfig folds them with
+// storage.CanonicalKey so the CLI names the same identity the server stores,
+// whatever case the file was written in.
 type CLIConfig struct {
-	Database  string `yaml:"database"`
-	Type      string `yaml:"type"`
-	SchemaDir string `yaml:"-"` // Set by LoadCLIConfig, not from YAML
+	Database string `yaml:"database"`
+	Type     string `yaml:"type"`
+	// IgnoreNamespaces lists namespace subdirectories of the schema root that
+	// SchemaBot must not reconcile against the live database.
+	IgnoreNamespaces []string `yaml:"ignore_namespaces"`
+	SchemaDir        string   `yaml:"-"` // Set by LoadCLIConfig, not from YAML
 }
 
 // LoadCLIConfig loads configuration from schemabot.yaml in the given directory.
@@ -82,7 +96,7 @@ func LoadCLIConfig(dir string) (*CLIConfig, error) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			absDir, _ := filepath.Abs(dir)
-			return nil, fmt.Errorf("schemabot.yaml not found in %s\n\nUse -s to specify the schema directory:\n  schemabot plan -s ./path/to/schema\n  schemabot apply -s ./path/to/schema -e staging", absDir)
+			return nil, fmt.Errorf("schemabot.yaml not found in %s\n\nUse -s to specify the schema directory:\n  %s plan -s ./path/to/schema\n  %s apply -s ./path/to/schema -e staging", absDir, cliname.Name(), cliname.Name())
 		}
 		return nil, fmt.Errorf("read config file: %w", err)
 	}
@@ -93,9 +107,14 @@ func LoadCLIConfig(dir string) (*CLIConfig, error) {
 	if err := decoder.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("parse config file: %w", err)
 	}
+	cfg.Database = storage.CanonicalKey(cfg.Database)
+	cfg.Type = storage.CanonicalKey(cfg.Type)
 
 	if cfg.Database == "" {
 		return nil, fmt.Errorf("schemabot.yaml: database is required")
+	}
+	if err := schema.ValidateIgnoreNamespaces(cfg.IgnoreNamespaces); err != nil {
+		return nil, fmt.Errorf("schemabot.yaml: %w", err)
 	}
 	// Schema files are in the same directory as schemabot.yaml
 	cfg.SchemaDir = dir
@@ -113,7 +132,7 @@ func resolveEndpoint(endpoint, profile string) (string, error) {
 		return "", fmt.Errorf("resolve endpoint: %w", err)
 	}
 	if ep == "" {
-		return "", fmt.Errorf("no endpoint configured (run 'schemabot configure' to set up a profile)")
+		return "", fmt.Errorf("no endpoint configured (run '%s configure' to set up a profile)", cliname.Name())
 	}
 	return ep, nil
 }
@@ -171,10 +190,7 @@ var (
 	loadingSpinnerInterval           = 100 * time.Millisecond
 	loadingSpinnerFrames             = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	loadingSpinnerWriter   io.Writer = os.Stderr
-	loadingSpinnerTerminal           = func() bool {
-		info, err := os.Stderr.Stat()
-		return err == nil && info.Mode()&os.ModeCharDevice != 0
-	}
+	loadingSpinnerTerminal           = func() bool { return ui.IsTerminal(os.Stderr) }
 )
 
 func withLoading(message string, show bool, fn func() error) error {
@@ -348,11 +364,6 @@ type releaseResponseWrapper struct{ r *apitypes.ReleaseResponse }
 func (w releaseResponseWrapper) IsAccepted() bool        { return w.r.Accepted }
 func (w releaseResponseWrapper) GetErrorMessage() string { return w.r.ErrorMessage }
 
-type volumeResponseWrapper struct{ r *apitypes.VolumeResponse }
-
-func (w volumeResponseWrapper) IsAccepted() bool        { return w.r.Accepted }
-func (w volumeResponseWrapper) GetErrorMessage() string { return w.r.ErrorMessage }
-
 // checkAccepted checks that an API response has accepted=true.
 // Returns a formatted error using the operation name if not accepted.
 func checkAccepted(result acceptedResponse, operation string) error {
@@ -479,9 +490,9 @@ func buildApplyOptions(planResult *apitypes.PlanResponse, deferCutover, deferDep
 // printWatchInstructions prints the "To watch and manage" hint.
 func printWatchInstructions(applyID, database, environment string) {
 	if applyID != "" {
-		fmt.Printf("To watch and manage: schemabot progress %s\n", applyID)
+		fmt.Printf("To watch and manage: %s progress %s\n", cliname.Name(), applyID)
 	} else {
-		fmt.Printf("To watch and manage: schemabot status -d %s -e %s\n", database, environment)
+		fmt.Printf("To watch and manage: %s status -d %s -e %s\n", cliname.Name(), database, environment)
 	}
 }
 
@@ -492,7 +503,7 @@ type applyChangeCounts struct {
 	vschemaUpdates int
 }
 
-func countTableProgressChanges(tables []tableProgress) applyChangeCounts {
+func countTableProgressChanges(tables []templates.TableProgress) applyChangeCounts {
 	var counts applyChangeCounts
 	for _, table := range tables {
 		counts.add(table.ChangeType)

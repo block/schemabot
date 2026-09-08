@@ -279,13 +279,6 @@ func (c *RoutingClient) Start(ctx context.Context, req *ternv1.StartRequest) (*t
 	}, Client.Start)
 }
 
-// Volume modifies the schema change speed/concurrency in-flight.
-func (c *RoutingClient) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error) {
-	return routeApply(ctx, c, req, "volume", func(r *ternv1.VolumeRequest, applyID, environment string) {
-		r.ApplyId, r.Environment = applyID, environment
-	}, Client.Volume)
-}
-
 // Revert reverts a completed schema change during the revert window.
 func (c *RoutingClient) Revert(ctx context.Context, req *ternv1.RevertRequest) (*ternv1.RevertResponse, error) {
 	return routeApply(ctx, c, req, "revert", func(r *ternv1.RevertRequest, applyID, environment string) {

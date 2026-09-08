@@ -93,11 +93,11 @@ func TestRenderMultiDeploymentApplyComment_FailedHalt(t *testing.T) {
 	assert.Contains(t, out, "schemabot apply -e production")
 	assert.NotContains(t, out, "schemabot revert")
 	assert.Contains(t, out, "- ❌ us — failed")
-	assert.Contains(t, out, "- ⏸ au — halted — us failed")
-	assert.Contains(t, out, "<details open>\n<summary>⏸ au — halted — us failed</summary>")
+	assert.Contains(t, out, "- ⏸️ au — halted — us failed")
+	assert.Contains(t, out, "<details open>\n<summary>⏸️ au — halted — us failed</summary>")
 	// With no error detail on the failed operation, the first-failure line names
 	// the deployment without a reason.
-	assert.Contains(t, out, "> ⚠️ **First failure:** <code>us</code>\n")
+	assert.Contains(t, out, "> ❌ **First failure:** <code>us</code>\n")
 }
 
 func TestRenderMultiDeploymentApplyComment_UsesOneRenderTimestamp(t *testing.T) {
@@ -183,7 +183,7 @@ func TestRenderMultiDeploymentApplyComment_FirstFailureSurfacesError(t *testing.
 	assert.NotContains(t, out, "Schema Change Failed")
 	// A later deployment is still running while siblings have failed.
 	assert.Contains(t, out, "- 🔄 au — running table copy")
-	assert.Contains(t, out, "> ⚠️ **First failure:** <code>us</code> — Error 1061: Duplicate key name idx\n")
+	assert.Contains(t, out, "> ❌ **First failure:** <code>us</code> — Error 1061: Duplicate key name idx\n")
 	// Only the earliest failure is lifted to the header.
 	assert.NotContains(t, out, "First failure:** <code>eu</code>")
 }
@@ -217,7 +217,7 @@ func TestRenderMultiDeploymentApplySummaryComment_FirstFailureSurfacesError(t *t
 		Environment: "production",
 	})
 
-	assert.Contains(t, out, "> ⚠️ **First failure:** <code>us</code> — boom &lt;script&gt;\n")
+	assert.Contains(t, out, "> ❌ **First failure:** <code>us</code> — boom &lt;script&gt;\n")
 }
 
 // A deployment name with HTML-significant characters is escaped inside the
@@ -233,7 +233,7 @@ func TestRenderMultiDeploymentApplyComment_FirstFailureEscapesName(t *testing.T)
 		Environment: "production",
 	})
 
-	assert.Contains(t, out, "> ⚠️ **First failure:** <code>us&amp;ca</code> — boom\n")
+	assert.Contains(t, out, "> ❌ **First failure:** <code>us&amp;ca</code> — boom\n")
 }
 
 // Each deployment's <details> body is rendered by the single-deployment renderer,
@@ -417,6 +417,109 @@ func TestRenderMultiDeploymentApplySummaryComment_FailedDeploymentSummary(t *tes
 	assert.Contains(t, out, "To retry:")
 }
 
+// When the first deployment's engine rejects the change before copying a
+// single row (e.g. a failed preflight check) and halts the rest of the
+// rollout, the failed deployment's detail must not render a 0% progress bar —
+// nothing ran, so the row reads as a failed check, not a stalled copy.
+func TestRenderMultiDeploymentApplyComment_PreflightFailureHasNoProgressBar(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("apse2", so.Failed),
+		rollingOp("euwe1", so.Pending),
+		rollingOp("usea1", so.Pending),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "qa",
+		Details: map[string]ApplyStatusCommentData{
+			"apse2": {
+				Database:    "profiles_db",
+				Environment: "qa",
+				State:       state.Apply.Failed,
+				Tables: []TableProgressData{
+					{TableName: "profiles", Status: state.Task.Failed},
+				},
+			},
+		},
+	})
+
+	assert.Contains(t, out, "**`profiles`**: ❌ Failed (before row copy started)")
+	assert.NotContains(t, out, "🟥")
+	assert.NotContains(t, out, "⬜")
+}
+
+// A deployment held by an earlier sibling's failure is "halted" — a derived
+// presentation; its persisted operation state is still pending. The <details>
+// body's Status line must carry the derived status so it agrees with its own
+// <summary> line, never the raw-state "Starting" gloss.
+func TestRenderMultiDeploymentApplyComment_HaltedDetailUsesDerivedStatus(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("apse2", so.Failed),
+		rollingOp("euwe1", so.Pending),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "qa",
+		Details: map[string]ApplyStatusCommentData{
+			"apse2": {Database: "app_db", Environment: "qa", State: state.Apply.Failed},
+			"euwe1": {Database: "app_db", Environment: "qa", State: state.Apply.Pending},
+		},
+	})
+
+	assert.Contains(t, out, "**Status**: ⏸️ Halted — apse2 failed")
+	assert.NotContains(t, out, "**Status**: Starting")
+	// The failed deployment keeps its raw-state gloss.
+	assert.Contains(t, out, "**Status**: Failed")
+}
+
+// Pending deployments that are genuinely still coming — next in order, or
+// waiting on an earlier copy — also carry their derived status in the body, so
+// the body never shows the raw-state "Starting" gloss for a deployment that
+// has not been claimed.
+func TestRenderMultiDeploymentApplyComment_PendingDetailUsesDerivedStatus(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("eu", so.Running),
+		rollingOp("us", so.Pending),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "staging",
+		Details: map[string]ApplyStatusCommentData{
+			"eu": {Database: "app_db", Environment: "staging", State: state.Apply.Running},
+			"us": {Database: "app_db", Environment: "staging", State: state.Apply.Pending},
+		},
+	})
+
+	assert.Contains(t, out, "**Status**: ⏳ Waiting for eu")
+	assert.NotContains(t, out, "**Status**: Starting")
+	// The running deployment keeps its raw-state gloss and suffix behavior.
+	assert.Contains(t, out, "**Status**: In Progress")
+}
+
+// A derived-status label interpolates deployment names, and the detail body
+// lives inside raw <details> HTML — a name carrying markup must be escaped in
+// the body's Status line, matching the <summary> line's escaping.
+func TestRenderMultiDeploymentApplyComment_DerivedStatusEscapesLabel(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		rollingOp("eu<b>", so.Running),
+		rollingOp("us", so.Pending),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "staging",
+		Details: map[string]ApplyStatusCommentData{
+			"eu<b>": {Database: "app_db", Environment: "staging", State: state.Apply.Running},
+			"us":    {Database: "app_db", Environment: "staging", State: state.Apply.Pending},
+		},
+	})
+
+	assert.Contains(t, out, "**Status**: ⏳ Waiting for eu&lt;b&gt;")
+	assert.NotContains(t, out, "**Status**: ⏳ Waiting for eu<b>")
+}
+
 // A deployment in an unrecognized engine state still renders a summary line and
 // section without a leading space where the glyph would be.
 func TestRenderMultiDeploymentApplyComment_UnknownStateNoGlyph(t *testing.T) {
@@ -482,4 +585,23 @@ func TestRenderMultiDeploymentApplyComment_Rollback(t *testing.T) {
 	})
 	assert.Contains(t, summary, "## ⏪ Rollback Complete")
 	assert.NotContains(t, summary, "Schema Change Applied")
+}
+
+// A failed deployment's raw engine error can carry internal endpoints and
+// newlines. The lifted first-failure line must redact endpoints and stay on one
+// Markdown line so the error cannot escape the blockquote.
+func TestRenderMultiDeploymentApplyComment_FirstFailureErrorSanitized(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		firstFailingOp("us", so.Failed, "dial tcp db-primary.internal:3306: refused\nsecond line"),
+		continuingOp("eu", so.Running),
+	})
+	out := RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model:       model,
+		ApplyID:     "apply-123",
+		Environment: "production",
+	})
+
+	assert.NotContains(t, out, "db-primary.internal", "internal endpoints are redacted")
+	assert.Contains(t, out, "> ❌ **First failure:** <code>us</code> — dial tcp [endpoint redacted]: refused second line\n",
+		"the first-failure line stays on one line")
 }

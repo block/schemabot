@@ -67,6 +67,24 @@ var rollbackCompletedBlock = checkBlockReason{
 	message:        "Schema changes were rolled back in this environment; apply the PR schema changes again, or reconcile the PR and live schema before this check can pass.",
 }
 
+// applyCancelledBlock is used after a forward apply is cancelled before it
+// changes the target environment. The check remains blocked until a plan
+// confirms whether the PR still requests the schema change.
+var applyCancelledBlock = checkBlockReason{
+	blockingReason: "apply_cancelled",
+	message:        "The apply was cancelled before completion; re-plan and re-apply if the schema change is still wanted, or remove it and re-run `schemabot plan` to converge this check.",
+}
+
+// applyCancelledAfterTaskCompletedBlock is used when a forward task for the
+// target completed before a forward apply was cancelled — under the cancelled
+// apply itself, or under an earlier one. Either way the completed task is
+// durable evidence that the target may have changed, so planning alone cannot
+// release the apply-owned merge gate.
+var applyCancelledAfterTaskCompletedBlock = checkBlockReason{
+	blockingReason: "apply_cancelled_after_task_completed",
+	message:        "Part of this PR's schema change completed in this environment before the apply was cancelled; reconcile the PR and live schema before this check can pass.",
+}
+
 // githubConfigDiscoveryUnavailableBlock is used when GitHub is unavailable
 // while SchemaBot is discovering which managed schema changes exist. The
 // aggregate check must fail closed until SchemaBot can read PR metadata and
@@ -83,6 +101,31 @@ var githubConfigDiscoveryUnavailableBlock = checkBlockReason{
 var configDiscoveryFailedBlock = checkBlockReason{
 	blockingReason: "schema_config_discovery_failed",
 	message:        "SchemaBot failed this check closed because it could not determine the managed schema configuration for this PR. Review the SchemaBot configuration and retry the check.",
+}
+
+// planPublishVerificationFailedBlock is used when the PR cannot be re-read to
+// confirm a plan is being published for the head commit and base branch it was
+// computed from. Publishing on an unverified PR is what that re-read exists to
+// prevent, so the aggregate check fails closed instead. GitHub's own retries
+// are already exhausted by the time this reason is reached, so it stands for
+// the failures retrying does not fix — revoked App permissions, a PR that is
+// gone, a response that cannot be read — which nothing else on the PR surfaces.
+var planPublishVerificationFailedBlock = checkBlockReason{
+	blockingReason: "plan_publish_verification_failed",
+	message:        "SchemaBot failed this check closed because it could not confirm this PR still has the commit and base branch its plan was computed from. Check SchemaBot's access to this repository, then retry the check.",
+}
+
+// prFileCapExceededBlock is used when a PR changes more files than GitHub will
+// report for a single pull request, so SchemaBot's changed-file list is
+// incomplete. Planning from a partial diff could miss a schema change entirely,
+// so the aggregate fails closed. Unlike a GitHub outage this is a property of
+// the PR itself — retrying returns the same truncated list — so the message
+// tells the author how to get a plan instead of asking them to retry the check.
+var prFileCapExceededBlock = checkBlockReason{
+	blockingReason: "pr_file_cap_exceeded",
+	message: "SchemaBot cannot determine whether this PR contains managed schema changes: the PR changes more files than GitHub will report for a single pull request, so the changed-file list SchemaBot reads is incomplete. " +
+		"SchemaBot fails this check closed rather than planning from a partial diff, and retrying the check returns the same incomplete list. " +
+		"Split this PR so GitHub reports the full changed-file list — if it carries schema changes, move them into their own smaller PR and SchemaBot will plan them there.",
 }
 
 // managedDirMissingConfigBlock is used when a PR changes schema files under a

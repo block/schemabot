@@ -52,6 +52,7 @@ func (h *Handler) handlePush(ctx context.Context, metricApp string, w http.Respo
 		h.writeError(w, http.StatusBadRequest, "invalid push payload")
 		return
 	}
+	payload.Repository.FullName = storage.CanonicalKey(payload.Repository.FullName)
 
 	repo := payload.Repository.FullName
 	headSHA := payload.After
@@ -190,7 +191,7 @@ func (h *Handler) enqueueDurablePush(ctx context.Context, payload pushPayload, b
 		Provider:   storage.ProviderGitHub,
 		DeliveryID: deliveryID,
 		Event:      "push",
-		Repository: payload.Repository.FullName,
+		Repository: storage.CanonicalKey(payload.Repository.FullName),
 		HeadSHA:    payload.After,
 		TenantID:   strconv.FormatInt(installationID, 10),
 		Payload:    body,
@@ -211,7 +212,7 @@ func (h *Handler) processDurablePush(ctx context.Context, event *storage.Webhook
 		return false, fmt.Errorf("decode durable push delivery %s: %w", event.DeliveryID, err)
 	}
 
-	repo := payload.Repository.FullName
+	repo := storage.CanonicalKey(payload.Repository.FullName)
 	headSHA := payload.After
 
 	// The deletion sentinel is an all-zeros SHA, not an empty one; an empty
@@ -235,9 +236,9 @@ func (h *Handler) processDurablePush(ctx context.Context, event *storage.Webhook
 		return false, nil
 	}
 
-	installationID := h.durableInstallationID(ctx, event, payload.Installation.ID)
-	if installationID == 0 {
-		return false, fmt.Errorf("durable push delivery %s missing installation ID", event.DeliveryID)
+	installationID, err := durableInstallationID(event)
+	if err != nil {
+		return false, err
 	}
 
 	if h.service != nil && !h.service.Config().IsRepoAllowed(repo) {

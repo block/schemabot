@@ -37,6 +37,21 @@ environments:
 	assert.Contains(t, err.Error(), "field environments not found")
 }
 
+func TestSchemabotConfigParsesIgnoreNamespaces(t *testing.T) {
+	yamlData := `
+database: testdb
+type: vitess
+ignore_namespaces:
+  - local_fixtures
+  - fixtures_$ENV
+`
+	var config SchemabotConfig
+	decoder := yaml.NewDecoder(strings.NewReader(yamlData))
+	decoder.KnownFields(true)
+	require.NoError(t, decoder.Decode(&config))
+	assert.Equal(t, []string{"local_fixtures", "fixtures_$ENV"}, config.IgnoreNamespaces)
+}
+
 func TestHasSchemaInputFiles(t *testing.T) {
 	t.Parallel()
 
@@ -247,6 +262,38 @@ func TestFindAllConfigsForPRDiscoversChangedConfigFile(t *testing.T) {
 	require.Len(t, configs, 1)
 	assert.Equal(t, "widgets", configs[0].Config.Database)
 	assert.Equal(t, "apps/widgets/schema", configs[0].SchemaDir)
+}
+
+// TestFetchConfigCanonicalizesIdentityKeys covers a consumer repository whose
+// schemabot.yaml spells the database and dialect in mixed case. The parsed
+// config must carry the canonical (lowercase) identity so it matches the
+// server's config key and the identity stored on every row, and the dialect
+// must still pass type validation.
+func TestFetchConfigCanonicalizesIdentityKeys(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/schema/schemabot.yaml", "database: Payments\ntype: Postgres\n")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	config, err := ic.FetchConfig(t.Context(), "octocat/hello-world", "schema/schemabot.yaml", "abc123")
+
+	require.NoError(t, err)
+	assert.Equal(t, "payments", config.Database)
+	assert.Equal(t, DatabaseTypePostgres, config.Type)
+}
+
+// An unsupported type is reported with the spelling the author wrote, so the
+// error points at the exact text to fix rather than its folded form.
+func TestFetchConfigInvalidTypeReportsDeclaredSpelling(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/schema/schemabot.yaml", "database: payments\ntype: SQLite\n")
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	_, err := ic.FetchConfig(t.Context(), "octocat/hello-world", "schema/schemabot.yaml", "abc123")
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown type 'SQLite'")
+	assert.Contains(t, err.Error(), "server registration")
+	assert.NotContains(t, err.Error(), "strata")
 }
 
 // TestFindConfigsForPRFilesProbesEachDirectoryOnce exercises discovery for a
@@ -476,6 +523,31 @@ func TestFindAllConfigsForPRFailsClosedOnIncompletePRFileList(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrPRFilesIncomplete)
 	assert.False(t, errors.Is(err, ErrNoConfig))
+}
+
+// A PR over the cap still yields the prefix GitHub did report, returned
+// alongside the sentinel. No caller may plan from that prefix — it is a partial
+// diff — but it is the only evidence of what the PR touches, so the cap report
+// uses it to tell whether any schema or config file was even visible.
+func TestFetchPRFilesReturnsTheVisiblePrefixWithTheCapSentinel(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+
+	files := make([]*gh.CommitFile, maxGitHubPRFiles)
+	for i := range files {
+		files[i] = &gh.CommitFile{Filename: new("docs/readme.md"), Status: new("modified")}
+	}
+	files[0] = &gh.CommitFile{Filename: new("apps/widgets/schema/main/users.sql"), Status: new("modified")}
+	registerPullRequestFiles(t, mux, files)
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	visible, err := ic.FetchPRFiles(t.Context(), "octocat/hello-world", 1)
+
+	require.ErrorIs(t, err, ErrPRFilesIncomplete)
+	require.Len(t, visible, maxGitHubPRFiles,
+		"the cap report needs the files GitHub did list, not an empty slice")
+	assert.Equal(t, "apps/widgets/schema/main/users.sql", visible[0].Filename)
+	assert.True(t, HasDiscoveryInputFiles(visible),
+		"a schema file inside the visible prefix must be detectable from what the sentinel returns")
 }
 
 func TestFetchSchemaFilesOptimizedWalksSchemaDirectoryOnly(t *testing.T) {

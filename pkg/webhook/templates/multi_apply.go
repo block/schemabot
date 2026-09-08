@@ -5,8 +5,10 @@ import (
 	"html"
 	"strings"
 
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // MultiDeploymentApplyData is the input to the multi-deployment apply comment.
@@ -160,11 +162,12 @@ func writeAggregateFirstFailure(sb *strings.Builder, failure *presentation.Deplo
 		return
 	}
 	name := html.EscapeString(failure.Deployment)
-	if failure.Error == "" {
-		fmt.Fprintf(sb, "\n> ⚠️ **First failure:** <code>%s</code>\n", name)
+	msg := SanitizeInlineError(failure.Error)
+	if msg == "" {
+		fmt.Fprintf(sb, "\n> "+glyph.Failed+" **First failure:** <code>%s</code>\n", name)
 		return
 	}
-	fmt.Fprintf(sb, "\n> ⚠️ **First failure:** <code>%s</code> — %s\n", name, html.EscapeString(failure.Error))
+	fmt.Fprintf(sb, "\n> "+glyph.Failed+" **First failure:** <code>%s</code> — %s\n", name, html.EscapeString(msg))
 }
 
 // writeAggregateNextAction renders the single suggested operator action derived
@@ -237,11 +240,33 @@ func writeDeploymentDetailSections(sb *strings.Builder, data MultiDeploymentAppl
 		}
 		fmt.Fprintf(sb, "\n<details%s>\n<summary>%s — %s</summary>\n\n", openAttr, deploymentTag(d), html.EscapeString(d.Label))
 		if detail, ok := data.Details[d.Deployment]; ok {
+			detail.DerivedStatus = siblingDerivedStatus(d)
 			sb.WriteString(stripLeadingHeading(renderDetail(detail)))
 		} else {
 			sb.WriteString("_No details available yet._\n")
 		}
 		sb.WriteString("\n</details>\n")
+	}
+}
+
+// siblingDerivedStatus returns the <details> body status for a deployment whose
+// presentation is derived from its earlier siblings: queued, waiting, halted,
+// or paused. The raw operation state for all four is pending, which the
+// single-deployment renderer glosses as "Starting" — contradicting the
+// <summary> line for a deployment that is in fact held by an earlier failure.
+// Every other presentation returns "" and keeps the raw-state gloss.
+func siblingDerivedStatus(d presentation.Deployment) string {
+	switch d.Presentation {
+	case presentation.StateQueuedNext, presentation.StateWaiting, presentation.StateHalted, presentation.StatePaused:
+		// The label interpolates deployment names; escape it like the
+		// <summary> line does so a name cannot inject markup into the body.
+		label := html.EscapeString(ui.CapitalizeFirst(d.Label))
+		if d.Emoji == "" {
+			return label
+		}
+		return d.Emoji + " " + label
+	default:
+		return ""
 	}
 }
 

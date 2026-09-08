@@ -7,6 +7,9 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 // The drift summary names diverged deployments so the check's Change column
@@ -61,14 +64,112 @@ func TestSummarizeReviewDrift_BoundedAndSanitized(t *testing.T) {
 // Review-time drift fails the plan check closed even when the reviewed primary
 // plan is a clean no-op, taking precedence over the plan's own outcome.
 func TestPlanCheckConclusion_DriftFailsClosed(t *testing.T) {
-	assert.Equal(t, checkConclusionFailure, planCheckConclusion(false, false, true),
+	assert.Equal(t, checkConclusionFailure, planCheckConclusion(false, false, false, true),
 		"drift must block even a clean no-op primary plan")
-	assert.Equal(t, checkConclusionFailure, planCheckConclusion(true, false, true),
+	assert.Equal(t, checkConclusionFailure, planCheckConclusion(true, false, false, true),
 		"drift must block a plan that also has changes")
-	assert.Equal(t, checkConclusionFailure, planCheckConclusion(false, true, false),
+	assert.Equal(t, checkConclusionFailure, planCheckConclusion(false, true, false, false),
 		"a primary plan with errors fails closed")
-	assert.Equal(t, checkConclusionActionRequired, planCheckConclusion(true, false, false),
-		"changes without drift require an apply")
-	assert.Equal(t, checkConclusionSuccess, planCheckConclusion(false, false, false),
+	assert.Equal(t, checkConclusionFailure, planCheckConclusion(true, false, true, false),
+		"a final engine refusal fails the plan check")
+	assert.Equal(t, checkConclusionActionRequired, planCheckConclusion(true, false, false, false),
+		"changes with no final refusal retain the existing action-required policy")
+	assert.Equal(t, checkConclusionSuccess, planCheckConclusion(false, false, false, false),
 		"a clean no-op plan with no drift passes")
+}
+
+// An engine that refuses a statement outright leaves the operator no apply to
+// run, so the PR must not be mergeable. Vitess refuses constructs it cannot
+// execute at all and PostgreSQL blocks a change it has no classifier verdict
+// for; both are properties of the statement, so the plan check fails. A MySQL
+// block previews a routing decision that apply time re-resolves against live
+// table size and policy, so it stays action-required.
+func TestPlanRefusalFailsCheck_FinalRefusalsOnly(t *testing.T) {
+	blocked := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "commerce",
+			TableChanges: []*apitypes.TableChangeResponse{{
+				TableName:     "orders",
+				DDL:           "ALTER TABLE `orders` ADD CONSTRAINT `fk_orders_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)",
+				ExecutionMode: "blocked",
+				ModeReason:    "foreign key constraints are not supported",
+			}},
+		}},
+	}
+
+	assert.True(t, planRefusalFailsCheck(storage.DatabaseTypeVitess, blocked),
+		"a Vitess refusal cannot be lifted by a re-plan, so it fails the check")
+	assert.True(t, planRefusalFailsCheck(storage.DatabaseTypePostgres, blocked),
+		"a PostgreSQL refusal fails the check")
+	assert.False(t, planRefusalFailsCheck(storage.DatabaseTypeMySQL, blocked),
+		"a MySQL block is re-resolved at apply time, so the check stays action-required")
+
+	unblocked := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "commerce",
+			TableChanges: []*apitypes.TableChangeResponse{{
+				TableName: "orders",
+				DDL:       "ALTER TABLE `orders` ADD COLUMN `note` varchar(255) DEFAULT NULL",
+			}},
+		}},
+	}
+	assert.False(t, planRefusalFailsCheck(storage.DatabaseTypeVitess, unblocked),
+		"an ordinary Vitess change is not a refusal")
+}
+
+// A single-deployment database has nothing to compare, so the preview is nil and
+// no drift section is rendered on its plan comment.
+func TestDeploymentDriftPreview_NilForSingleDeployment(t *testing.T) {
+	rollup := api.PlanRollup{
+		Entries: []api.DeploymentRollupEntry{{Deployment: "primary", Class: api.DeploymentMatch}},
+		Clean:   true,
+	}
+	assert.Nil(t, deploymentDriftPreview(rollup))
+}
+
+// A clean multi-deployment rollup becomes preview data flagged clean and
+// computed, with the primary marked and every deployment classified as a match.
+func TestDeploymentDriftPreview_CleanMultiDeployment(t *testing.T) {
+	rollup := api.PlanRollup{
+		Entries: []api.DeploymentRollupEntry{
+			{Deployment: "eu", Class: api.DeploymentMatch},
+			{Deployment: "au", Class: api.DeploymentMatch},
+		},
+		Clean: true,
+	}
+	preview := deploymentDriftPreview(rollup)
+	assert.NotNil(t, preview)
+	assert.True(t, preview.Computed)
+	assert.True(t, preview.Clean)
+	assert.Len(t, preview.Deployments, 2)
+	assert.True(t, preview.Deployments[0].Primary)
+	assert.False(t, preview.Deployments[1].Primary)
+	assert.Equal(t, "match", preview.Deployments[1].Class)
+}
+
+// A diverged deployment carries a compact change-count detail; an errored
+// deployment carries a sanitized error detail so the preview names why each
+// deployment is blocking.
+func TestDeploymentDriftPreview_DivergedAndErroredDetails(t *testing.T) {
+	rollup := api.PlanRollup{
+		Entries: []api.DeploymentRollupEntry{
+			{Deployment: "eu", Class: api.DeploymentMatch},
+			{Deployment: "au", Class: api.DeploymentDiverged, Diff: tern.ChangeSetDiff{
+				UnexpectedInCandidate: []tern.ChangeSetDiffItem{{Table: "users"}},
+				MissingFromCandidate:  []tern.ChangeSetDiffItem{{Table: "orders"}, {Table: "items"}},
+			}},
+			{Deployment: "us", Class: api.DeploymentErrored, Err: assert.AnError},
+		},
+		Clean: false,
+	}
+	preview := deploymentDriftPreview(rollup)
+	assert.False(t, preview.Clean)
+	assert.Equal(t, "diverged", preview.Deployments[1].Class)
+	assert.Contains(t, preview.Deployments[1].Detail, "1 unexpected")
+	assert.Contains(t, preview.Deployments[1].Detail, "2 missing")
+	assert.Equal(t, "errored", preview.Deployments[2].Class)
+	// The raw diff error stays out of the PR markdown: the preview carries only
+	// the sanitized detail, and the underlying error text is not leaked.
+	assert.Equal(t, erroredDriftDetail, preview.Deployments[2].Detail)
+	assert.NotContains(t, preview.Deployments[2].Detail, assert.AnError.Error())
 }

@@ -1,9 +1,10 @@
 package inventory
 
 import (
+	"net/url"
 	"testing"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -107,14 +108,15 @@ func TestMySQLConnectionAssemblerDatabaseType(t *testing.T) {
 }
 
 // Vitess connects through the PlanetScale API, so the assembler emits a
-// metadata-only target: organization from the endpoint attributes, the service
-// token from credentials, and the API URL from configuration. No DSN.
+// metadata-only target: organization and database name from the endpoint
+// attributes, the service token from credentials, and the API URL from
+// configuration. No DSN.
 func TestVitessConnectionAssemblerBuildsMetadataTarget(t *testing.T) {
 	a := VitessConnectionAssembler{APIURL: "https://localscale.test"}
 
 	dsn, meta, err := a.Assemble(
 		"",
-		map[string]string{MetadataOrganization: "acme"},
+		map[string]string{MetadataOrganization: "acme", DefaultDatabaseAttribute: "acme_main"},
 		&Credentials{Metadata: map[string]string{
 			MetadataTokenName:  "tok-id",
 			MetadataTokenValue: "tok-secret",
@@ -124,6 +126,7 @@ func TestVitessConnectionAssemblerBuildsMetadataTarget(t *testing.T) {
 	assert.Empty(t, dsn, "Vitess targets carry connection details in metadata, not a DSN")
 	assert.Equal(t, map[string]string{
 		MetadataOrganization: "acme",
+		MetadataDatabase:     "acme_main",
 		MetadataTokenName:    "tok-id",
 		MetadataTokenValue:   "tok-secret",
 		MetadataAPIURL:       "https://localscale.test",
@@ -139,7 +142,7 @@ func TestVitessConnectionAssemblerNoVtgateDSNWithoutMySQLUsername(t *testing.T) 
 
 	dsn, meta, err := a.Assemble(
 		"vtgate.example:3306",
-		map[string]string{MetadataOrganization: "acme"},
+		map[string]string{MetadataOrganization: "acme", DefaultDatabaseAttribute: "acme_main"},
 		&Credentials{Metadata: map[string]string{MetadataTokenName: "id", MetadataTokenValue: "secret"}},
 	)
 	require.NoError(t, err)
@@ -156,7 +159,7 @@ func TestVitessConnectionAssemblerBuildsVtgateDSN(t *testing.T) {
 
 	dsn, meta, err := a.Assemble(
 		"vtgate.example",
-		map[string]string{MetadataOrganization: "acme"},
+		map[string]string{MetadataOrganization: "acme", DefaultDatabaseAttribute: "acme_main"},
 		&Credentials{
 			Username: "ddl-user",
 			Password: "ddl-pass",
@@ -184,11 +187,38 @@ func TestVitessConnectionAssemblerCustomOrganizationAttribute(t *testing.T) {
 
 	_, meta, err := a.Assemble(
 		"",
-		map[string]string{"ps_org": "acme"},
+		map[string]string{"ps_org": "acme", DefaultDatabaseAttribute: "acme_main"},
 		&Credentials{Metadata: map[string]string{MetadataTokenName: "id", MetadataTokenValue: "secret"}},
 	)
 	require.NoError(t, err)
 	assert.Equal(t, "acme", meta[MetadataOrganization])
+}
+
+// A custom database attribute lets the resolver surface the PlanetScale
+// database name under a label other than the default.
+func TestVitessConnectionAssemblerCustomDatabaseAttribute(t *testing.T) {
+	a := VitessConnectionAssembler{DatabaseAttribute: "ps_database"}
+
+	_, meta, err := a.Assemble(
+		"",
+		map[string]string{MetadataOrganization: "acme", "ps_database": "acme_main"},
+		&Credentials{Metadata: map[string]string{MetadataTokenName: "id", MetadataTokenValue: "secret"}},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "acme_main", meta[MetadataDatabase])
+}
+
+// The PlanetScale database name attribute is required: without it every API
+// call would fall back to addressing the database by its registered
+// identifier, which is an arbitrary routing key rather than a PlanetScale name. sadscan:disable kingfisher.planetscale.2
+func TestVitessConnectionAssemblerRequiresDatabase(t *testing.T) {
+	_, _, err := VitessConnectionAssembler{}.Assemble(
+		"",
+		map[string]string{MetadataOrganization: "acme"},
+		&Credentials{Metadata: map[string]string{MetadataTokenName: "id", MetadataTokenValue: "secret"}},
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), DefaultDatabaseAttribute)
 }
 
 // Configured Metadata is merged after the resolved fields so deployments can
@@ -198,7 +228,7 @@ func TestVitessConnectionAssemblerMergesConfiguredMetadata(t *testing.T) {
 
 	_, meta, err := a.Assemble(
 		"",
-		map[string]string{MetadataOrganization: "acme"},
+		map[string]string{MetadataOrganization: "acme", DefaultDatabaseAttribute: "acme_main"},
 		&Credentials{Metadata: map[string]string{MetadataTokenName: "id", MetadataTokenValue: "secret"}},
 	)
 	require.NoError(t, err)
@@ -224,7 +254,7 @@ func TestVitessConnectionAssemblerRequiresOrganization(t *testing.T) {
 func TestVitessConnectionAssemblerRequiresToken(t *testing.T) {
 	_, _, err := VitessConnectionAssembler{}.Assemble(
 		"",
-		map[string]string{MetadataOrganization: "acme"},
+		map[string]string{MetadataOrganization: "acme", DefaultDatabaseAttribute: "acme_main"},
 		&Credentials{Metadata: map[string]string{MetadataTokenName: "id"}},
 	)
 	require.Error(t, err)
@@ -242,7 +272,7 @@ func TestVitessConnectionAssemblerSecretAPIURLOverridesConfig(t *testing.T) {
 
 	_, meta, err := a.Assemble(
 		"",
-		map[string]string{MetadataOrganization: "acme"},
+		map[string]string{MetadataOrganization: "acme", DefaultDatabaseAttribute: "acme_main"},
 		&Credentials{Metadata: map[string]string{
 			MetadataTokenName:  "id",
 			MetadataTokenValue: "secret",
@@ -294,4 +324,251 @@ func TestDecodePlanetScaleSecretRejectsBadInput(t *testing.T) {
 	_, err = DecodePlanetScaleSecret(`{"token":"missing-separator"}`)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "name=value")
+}
+
+// The PostgreSQL assembler emits one libpq URL carrying the database name —
+// unlike MySQL, where the request supplies the schema per operation — with
+// verify-full TLS and the resolved CA reference in metadata.
+func TestPostgresConnectionAssemblerBuildsLibpqURL(t *testing.T) {
+	configured := map[string]string{"extra": "field"}
+	a := PostgresConnectionAssembler{DefaultPort: "5432", Metadata: configured}
+
+	dsn, meta, err := a.Assemble(
+		"orders.cluster-abc.us-east-1.rds.amazonaws.com",
+		map[string]string{PostgresDBNameAttribute: "orders"},
+		&Credentials{Username: "pgsprite_engine", Password: "s3cret"},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "postgresql://pgsprite_engine:s3cret@orders.cluster-abc.us-east-1.rds.amazonaws.com:5432/orders?sslmode=verify-full", dsn) // sadscan:disable np.postgres.1
+	assert.Equal(t, map[string]string{
+		"extra":               "field",
+		MetadataPostgresCARef: PostgresCARefEmbeddedRDSGlobal,
+	}, meta)
+	// The assembler is a shared value type: the caller's map must not gain the
+	// resolved CA reference.
+	assert.Equal(t, map[string]string{"extra": "field"}, configured)
+}
+
+// DNS names are case-insensitive: an uppercase RDS endpoint resolves the same
+// embedded-bundle default instead of failing as a non-RDS host, and the
+// assembled DSN carries the lowercased host so the data plane's own
+// case-sensitive RDS check agrees with the CA decision made here.
+func TestPostgresConnectionAssemblerRDSHostCaseInsensitive(t *testing.T) {
+	a := PostgresConnectionAssembler{DefaultPort: "5432"}
+
+	dsn, meta, err := a.Assemble(
+		"ORDERS.CLUSTER-ABC.US-EAST-1.RDS.AMAZONAWS.COM",
+		map[string]string{PostgresDBNameAttribute: "orders"},
+		&Credentials{Username: "ddl", Password: "secret"},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, PostgresCARefEmbeddedRDSGlobal, meta[MetadataPostgresCARef])
+	assert.Contains(t, dsn, "@orders.cluster-abc.us-east-1.rds.amazonaws.com:5432/")
+}
+
+// Stray surrounding whitespace on a host is a config typo, not a different
+// host: it is trimmed rather than surfacing later as a misleading CA or DSN
+// parse error. Embedded structural characters, by contrast, can never be part
+// of a real host and are rejected with an error that names the malformed host.
+func TestPostgresConnectionAssemblerNormalizesAndRejectsMalformedHost(t *testing.T) {
+	a := PostgresConnectionAssembler{DefaultPort: "5432"}
+	creds := &Credentials{Username: "ddl", Password: "secret"}
+	dbname := map[string]string{PostgresDBNameAttribute: "orders"}
+
+	_, meta, err := a.Assemble("  db.example.rds.amazonaws.com \n", dbname, creds)
+	require.NoError(t, err)
+	assert.Equal(t, PostgresCARefEmbeddedRDSGlobal, meta[MetadataPostgresCARef])
+
+	for _, host := range []string{
+		"evil.example@db.example.rds.amazonaws.com",
+		"db.example .rds.amazonaws.com",
+		"db.example.rds.amazonaws.com/extra",
+		"db.example.rds.amazonaws.com?sslmode=disable",
+		"db.example.rds.amazonaws.com#frag",
+	} {
+		_, _, err := a.Assemble(host, dbname, creds)
+		require.Error(t, err, "host %q must be rejected", host)
+		assert.Contains(t, err.Error(), "invalid characters")
+	}
+}
+
+// A comma in the host would smuggle a multi-host libpq DSN through single-host
+// validation: pgx dials the hosts in order while the RDS check matches the end
+// of the whole string, so the TLS policy could be decided by a host that is
+// never dialed. Rejected regardless of ordering.
+func TestPostgresConnectionAssemblerRejectsMultiHost(t *testing.T) {
+	a := PostgresConnectionAssembler{DefaultPort: "5432"}
+	creds := &Credentials{Username: "ddl", Password: "secret"}
+	dbname := map[string]string{PostgresDBNameAttribute: "orders"}
+
+	for _, host := range []string{
+		"attacker.example,db.example.rds.amazonaws.com",
+		"db.example.rds.amazonaws.com,attacker.example",
+	} {
+		_, _, err := a.Assemble(host, dbname, creds)
+		require.Error(t, err, "host %q must be rejected", host)
+		assert.Contains(t, err.Error(), "single host")
+	}
+}
+
+// A database name containing "/" is the one character net/url would pass
+// through unescaped — it would add path segments instead of naming a database
+// — so it is rejected, as is a whitespace-only name.
+func TestPostgresConnectionAssemblerRejectsMalformedDBName(t *testing.T) {
+	a := PostgresConnectionAssembler{DefaultPort: "5432"}
+	creds := &Credentials{Username: "ddl", Password: "secret"}
+
+	_, _, err := a.Assemble(
+		"db.example.rds.amazonaws.com",
+		map[string]string{PostgresDBNameAttribute: "orders/evil"},
+		creds,
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `must not contain "/"`)
+
+	_, _, err = a.Assemble(
+		"db.example.rds.amazonaws.com",
+		map[string]string{PostgresDBNameAttribute: "   "},
+		creds,
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `requires the "dbname" endpoint attribute`)
+}
+
+// Credentials and database names are escaped through net/url, so characters
+// that are structural in a URL cannot corrupt the DSN or leak into the wrong
+// component.
+func TestPostgresConnectionAssemblerEscapesComponents(t *testing.T) {
+	a := PostgresConnectionAssembler{DefaultPort: "5432"}
+
+	dsn, _, err := a.Assemble(
+		"db.example.rds.amazonaws.com",
+		map[string]string{PostgresDBNameAttribute: "orders db"},
+		&Credentials{Username: "user@corp", Password: "p@ss/word:1?&"},
+	)
+	require.NoError(t, err)
+
+	u, err := url.Parse(dsn)
+	require.NoError(t, err)
+	assert.Equal(t, "user@corp", u.User.Username())
+	password, set := u.User.Password()
+	require.True(t, set)
+	assert.Equal(t, "p@ss/word:1?&", password)
+	assert.Equal(t, "/orders db", u.Path)
+	assert.Equal(t, "verify-full", u.Query().Get("sslmode"))
+}
+
+func TestPostgresConnectionAssemblerKeepsExistingPort(t *testing.T) {
+	a := PostgresConnectionAssembler{DefaultPort: "5432"}
+
+	dsn, _, err := a.Assemble(
+		"db.example.rds.amazonaws.com:6432",
+		map[string]string{PostgresDBNameAttribute: "orders"},
+		&Credentials{Username: "ddl", Password: "secret"},
+	)
+	require.NoError(t, err)
+	u, err := url.Parse(dsn)
+	require.NoError(t, err)
+	assert.Equal(t, "db.example.rds.amazonaws.com:6432", u.Host)
+}
+
+// sslmode is a closed allowlist: verify-full passes through, anything weaker is
+// rejected rather than silently downgrading transport security.
+func TestPostgresConnectionAssemblerSSLModeAllowlist(t *testing.T) {
+	verified := PostgresConnectionAssembler{Params: map[string]string{"sslmode": "verify-full"}}
+	dsn, _, err := verified.Assemble(
+		"db.example.rds.amazonaws.com:5432",
+		map[string]string{PostgresDBNameAttribute: "orders"},
+		&Credentials{Username: "ddl", Password: "secret"},
+	)
+	require.NoError(t, err)
+	assert.Contains(t, dsn, "sslmode=verify-full")
+
+	for _, mode := range []string{"require", "prefer", "verify-ca", "disable"} {
+		weak := PostgresConnectionAssembler{Params: map[string]string{"sslmode": mode}}
+		_, _, err := weak.Assemble(
+			"db.example.rds.amazonaws.com:5432",
+			map[string]string{PostgresDBNameAttribute: "orders"},
+			&Credentials{Username: "ddl", Password: "secret"},
+		)
+		require.Error(t, err, "sslmode %q must be rejected", mode)
+		assert.Contains(t, err.Error(), "verify-full")
+	}
+}
+
+// Params other than sslmode are rejected: arbitrary libpq parameters could
+// weaken transport security or smuggle TLS material outside the CA reference.
+func TestPostgresConnectionAssemblerRejectsUnknownParams(t *testing.T) {
+	a := PostgresConnectionAssembler{Params: map[string]string{"sslrootcert": "/tmp/ca.pem"}}
+
+	_, _, err := a.Assemble(
+		"db.example.rds.amazonaws.com:5432",
+		map[string]string{PostgresDBNameAttribute: "orders"},
+		&Credentials{Username: "ddl", Password: "secret"},
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `support only "sslmode"`)
+}
+
+// A file: CA reference names a mounted PEM bundle by absolute path; relative
+// paths and unknown forms are rejected.
+func TestPostgresConnectionAssemblerCARefForms(t *testing.T) {
+	fileRef := PostgresConnectionAssembler{CARef: "file:/etc/ssl/private-ca.pem"}
+	_, meta, err := fileRef.Assemble(
+		"proxy.internal.example:5432",
+		map[string]string{PostgresDBNameAttribute: "orders"},
+		&Credentials{Username: "ddl", Password: "secret"},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "file:/etc/ssl/private-ca.pem", meta[MetadataPostgresCARef])
+
+	relative := PostgresConnectionAssembler{CARef: "file:relative/ca.pem"}
+	_, _, err = relative.Assemble(
+		"proxy.internal.example:5432",
+		map[string]string{PostgresDBNameAttribute: "orders"},
+		&Credentials{Username: "ddl", Password: "secret"},
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must be absolute")
+
+	unknown := PostgresConnectionAssembler{CARef: "system"}
+	_, _, err = unknown.Assemble(
+		"proxy.internal.example:5432",
+		map[string]string{PostgresDBNameAttribute: "orders"},
+		&Credentials{Username: "ddl", Password: "secret"},
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "embedded:rds-global")
+}
+
+// A non-RDS host with no configured CA reference fails closed: the ambient
+// trust store is never an implicit fallback.
+func TestPostgresConnectionAssemblerRequiresCAForNonRDSHost(t *testing.T) {
+	a := PostgresConnectionAssembler{DefaultPort: "5432"}
+
+	_, _, err := a.Assemble(
+		"proxy.internal.example",
+		map[string]string{PostgresDBNameAttribute: "orders"},
+		&Credentials{Username: "ddl", Password: "secret"},
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "verified CA is required")
+}
+
+func TestPostgresConnectionAssemblerRequiredInputs(t *testing.T) {
+	a := PostgresConnectionAssembler{DefaultPort: "5432"}
+	creds := &Credentials{Username: "ddl", Password: "secret"}
+	dbname := map[string]string{PostgresDBNameAttribute: "orders"}
+
+	_, _, err := a.Assemble("", dbname, creds)
+	assert.ErrorContains(t, err, "requires a host")
+
+	_, _, err = a.Assemble("db.example.rds.amazonaws.com", dbname, nil)
+	assert.ErrorContains(t, err, "requires credentials")
+
+	_, _, err = a.Assemble("db.example.rds.amazonaws.com", dbname, &Credentials{Password: "secret"})
+	assert.ErrorContains(t, err, "requires a username")
+
+	_, _, err = a.Assemble("db.example.rds.amazonaws.com", nil, creds)
+	assert.ErrorContains(t, err, `requires the "dbname" endpoint attribute`)
 }

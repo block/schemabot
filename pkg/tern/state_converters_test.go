@@ -6,12 +6,37 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// Every DDL operation with a dedicated proto change type survives the
+// storage-op → proto → storage-op round trip exactly, so a remote deployment
+// rebuilding a plan from a dispatch stores the same operation the planner
+// classified. Index operations must keep their own change types: collapsing
+// them into table create/drop would make a DROP INDEX materialize as a table
+// drop and trip the fail-closed unsafe opt-in gate.
+func TestChangeTypeProtoRoundTrip(t *testing.T) {
+	for _, op := range []string{
+		ddl.StatementTypeToOp(ddl.StatementCreateTable),
+		ddl.StatementTypeToOp(ddl.StatementAlterTable),
+		ddl.StatementTypeToOp(ddl.StatementDropTable),
+		ddl.StatementTypeToOp(ddl.StatementCreateIndex),
+		ddl.StatementTypeToOp(ddl.StatementDropIndex),
+		ddl.StatementTypeToOp(ddl.StatementRenameTable),
+		ddl.StatementTypeToOp(ddl.StatementTruncateTable),
+		ddl.StatementTypeToOp(ddl.StatementCreateView),
+		"vschema_update",
+	} {
+		assert.Equal(t, op, protoChangeTypeToDDLAction(ddlActionToProtoChangeType(op)),
+			"round-trip failed for op %q", op)
+	}
+	assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_OTHER, ddlActionToProtoChangeType("unknown"))
+}
 
 // The reverting state round-trips across the engine, task, and proto boundaries
 // so a revert in progress is reported end-to-end as "reverting" rather than
@@ -22,6 +47,37 @@ func TestRevertingStateConversions(t *testing.T) {
 	assert.Equal(t, ternv1.State_STATE_REVERTING, storageStateToProto(state.Apply.Reverting))
 	assert.Equal(t, state.Apply.Reverting, ProtoStateToStorage(ternv1.State_STATE_REVERTING))
 	assert.False(t, isTerminalProtoState(ternv1.State_STATE_REVERTING), "reverting is in-flight, not terminal")
+}
+
+// A retryable pause round-trips across the wire as its own state so the
+// polling plane can tell "parked for the serving plane's own retry" apart from
+// a settled failure without inspecting per-table statuses.
+func TestFailedRetryableStateConversions(t *testing.T) {
+	assert.Equal(t, ternv1.State_STATE_FAILED_RETRYABLE, storageStateToProto(state.Task.FailedRetryable))
+	assert.Equal(t, ternv1.State_STATE_FAILED_RETRYABLE, storageStateToProto(state.Apply.FailedRetryable))
+	assert.Equal(t, state.Apply.FailedRetryable, ProtoStateToStorage(ternv1.State_STATE_FAILED_RETRYABLE))
+	assert.False(t, isTerminalProtoState(ternv1.State_STATE_FAILED_RETRYABLE), "a retryable pause is in-flight, not terminal")
+	assert.True(t, isTerminalProtoState(ternv1.State_STATE_FAILED), "a settled failure stays terminal")
+}
+
+// The post-copy phases round-trip across the task and proto boundaries so a
+// drain or verify in progress is reported end-to-end as its phase rather than
+// collapsing to pending on the wire.
+func TestPostCopyPhaseStateConversions(t *testing.T) {
+	cases := []struct {
+		task  string
+		apply string
+		proto ternv1.State
+	}{
+		{state.Task.CatchingUp, state.Apply.CatchingUp, ternv1.State_STATE_CATCHING_UP},
+		{state.Task.Checksumming, state.Apply.Checksumming, ternv1.State_STATE_CHECKSUMMING},
+		{state.Task.PostChecksum, state.Apply.PostChecksum, ternv1.State_STATE_POST_CHECKSUM},
+	}
+	for _, tc := range cases {
+		assert.Equal(t, tc.proto, storageStateToProto(tc.task))
+		assert.Equal(t, tc.apply, ProtoStateToStorage(tc.proto))
+		assert.False(t, isTerminalProtoState(tc.proto), "%s is in-flight, not terminal", tc.task)
+	}
 }
 
 // A null namespace value in the proto map (e.g. JSON `{"default": null}`)
@@ -187,7 +243,7 @@ func TestPSDisplayMetadataStorageBlobEmpty(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, blob)
 
-	blob, err = PSDisplayMetadataStorageBlob(map[string]string{"volume": "2"})
+	blob, err = PSDisplayMetadataStorageBlob(map[string]string{"not_a_display_key": "2"})
 	require.NoError(t, err)
 	assert.Empty(t, blob)
 }

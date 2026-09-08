@@ -27,6 +27,11 @@ func TestChangeTypeRoundTrip(t *testing.T) {
 		ternv1.ChangeType_CHANGE_TYPE_CREATE,
 		ternv1.ChangeType_CHANGE_TYPE_ALTER,
 		ternv1.ChangeType_CHANGE_TYPE_DROP,
+		ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX,
+		ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX,
+		ternv1.ChangeType_CHANGE_TYPE_RENAME,
+		ternv1.ChangeType_CHANGE_TYPE_TRUNCATE,
+		ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW,
 		ternv1.ChangeType_CHANGE_TYPE_VSCHEMA,
 		ternv1.ChangeType_CHANGE_TYPE_OTHER,
 	} {
@@ -203,6 +208,58 @@ func TestProtoChangesToNamespacesPreservesOriginalFiles(t *testing.T) {
 	assert.True(t, nsData.OriginalFilesCaptured)
 }
 
+// TestProtoChangesToNamespacesPersistsVSchemaMetadata verifies the gRPC
+// plan-persistence path stores the apply-time VSchema change-metadata — the
+// changed flag, the recorded deletions and mutations the unsafe gate reads,
+// and the rendered diff apply-time display shows — while dropping other
+// engine metadata, matching what the local persistence path stores for the
+// same change so apply-time consumers read either identically.
+func TestProtoChangesToNamespacesPersistsVSchemaMetadata(t *testing.T) {
+	deletions := `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`
+	mutations := `[{"kind":"vindex_type","name":"user_idx","reason":"changing vindex user_idx type re-computes keyspace ids"}]`
+	namespaces, err := protoChangesToNamespaces([]*ternv1.SchemaChange{{
+		Namespace: "commerce",
+		Metadata: map[string]string{
+			"vschema_changed":   "true",
+			"vschema_deletions": deletions,
+			"vschema_mutations": mutations,
+			"vschema":           "rendered diff for display",
+			"branch":            "engine-internal detail",
+		},
+	}}, map[string]*ternv1.SchemaFiles{
+		"commerce": {Files: map[string]string{"vschema.json": `{"tables":{"users":{}}}`}},
+	})
+
+	require.NoError(t, err)
+	require.Contains(t, namespaces, "commerce")
+	nsData := namespaces["commerce"]
+	assert.Equal(t, map[string]string{
+		storage.PlanMetadataVSchemaChanged:   "true",
+		storage.PlanMetadataVSchemaDeletions: deletions,
+		storage.PlanMetadataVSchemaMutations: mutations,
+		storage.PlanMetadataVSchemaDiff:      "rendered diff for display",
+	}, nsData.Metadata)
+	assert.JSONEq(t, `{"tables":{"users":{}}}`, nsData.Artifacts["vschema.json"])
+}
+
+// TestProtoChangesToNamespacesNoMetadataWithoutVSchemaWork verifies a DDL-only
+// change persists no VSchema change-metadata, so the stored plan's
+// unsafe-VSchema gate has nothing to inspect for it.
+func TestProtoChangesToNamespacesNoMetadataWithoutVSchemaWork(t *testing.T) {
+	namespaces, err := protoChangesToNamespaces([]*ternv1.SchemaChange{{
+		Namespace: "commerce",
+		TableChanges: []*ternv1.TableChange{{
+			TableName:  "users",
+			Ddl:        "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+			ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+		}},
+	}}, nil)
+
+	require.NoError(t, err)
+	require.Contains(t, namespaces, "commerce")
+	assert.Nil(t, namespaces["commerce"].Metadata)
+}
+
 func TestProtoChangesToNamespacesRejectsDuplicateNamespaces(t *testing.T) {
 	_, err := protoChangesToNamespaces([]*ternv1.SchemaChange{
 		{Namespace: "commerce"},
@@ -280,4 +337,55 @@ func TestValidateSchemaFiles_MissingRejected(t *testing.T) {
 	require.Error(t, err)
 	assert.Empty(t, warning)
 	assert.Contains(t, err.Error(), "schema_files is required")
+}
+
+// Every namespace holding an unfinished copy is carried through to the plan
+// response. A plan spanning several namespaces reports one entry per
+// namespace, and dropping any of them would leave an operator consenting to
+// destroy work they were never shown.
+func TestPlanResponseFromProto_CarriesEveryExistingCopy(t *testing.T) {
+	resp := &ternv1.PlanResponse{
+		ExistingCopies: []*ternv1.ExistingCopy{
+			{
+				Namespace:   "orders_ks",
+				Disposition: "discard",
+				Reason:      "statement_differs",
+				Tables:      []string{"orders"},
+				AgeSeconds:  11520,
+				Statement:   "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`)",
+			},
+			{
+				Namespace:   "products_ks",
+				Disposition: "adopt",
+				Tables:      []string{"products"},
+				AgeSeconds:  60,
+				Running:     true,
+			},
+		},
+	}
+
+	result := planResponseFromProto(resp)
+
+	require.Len(t, result.ExistingCopies, 2)
+	assert.Equal(t, "orders_ks", result.ExistingCopies[0].Namespace)
+	assert.Equal(t, "discard", result.ExistingCopies[0].Disposition)
+	assert.Equal(t, "statement_differs", result.ExistingCopies[0].Reason)
+	assert.Equal(t, []string{"orders"}, result.ExistingCopies[0].Tables)
+	assert.Equal(t, int64(11520), result.ExistingCopies[0].AgeSeconds)
+	assert.Equal(t, "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`)", result.ExistingCopies[0].Statement,
+		"the statement the copy was started for is what a discard disclosure compares the plan against")
+	assert.False(t, result.ExistingCopies[0].Running,
+		"a copy the deployment did not mark as running stays unmarked")
+	assert.Equal(t, "products_ks", result.ExistingCopies[1].Namespace)
+	assert.Equal(t, "adopt", result.ExistingCopies[1].Disposition)
+	assert.True(t, result.ExistingCopies[1].Running,
+		"whether the copy is still being made survives the wire, or every disclosure reads as left behind")
+}
+
+// A plan against a clean target carries no copy disclosure, so the plan
+// response is unchanged from what it has always been.
+func TestPlanResponseFromProto_NoExistingCopiesOnCleanTarget(t *testing.T) {
+	result := planResponseFromProto(&ternv1.PlanResponse{})
+
+	assert.Empty(t, result.ExistingCopies)
 }

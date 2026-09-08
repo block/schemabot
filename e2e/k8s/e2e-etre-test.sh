@@ -26,7 +26,7 @@ done
 
 if ! minikube status > /dev/null 2>&1; then
     echo "Starting minikube..."
-    minikube start --driver=docker --cpus=4 --memory=4096
+    minikube start --driver=docker --container-runtime=docker --cpus=4 --memory=4096
 fi
 
 # --- Build images into minikube's docker daemon ---

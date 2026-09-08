@@ -57,6 +57,9 @@ deploy/aws-multi-env/*/config.yaml
 # Lint logs
 lint-error.logs
 
+# E2E container logs captured on failure
+e2e-logs/
+
 # Logs
 /logs
 *.log
@@ -100,3 +103,7 @@ terraform.rc
 
 # CLI tool configs
 .bk.yaml
+
+# Python tooling caches
+__pycache__/
+*.pyc

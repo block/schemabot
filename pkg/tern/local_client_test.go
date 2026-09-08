@@ -11,14 +11,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/block/spirit/pkg/statement"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/psclient"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -33,6 +35,112 @@ func TestPulledSchemaFileContentValidatesDDL(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "parse pulled schema for database orders table broken_users")
+}
+
+func TestMaterializedTableChangeOperation(t *testing.T) {
+	t.Run("Postgres fallback", func(t *testing.T) {
+		parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+		require.NoError(t, err)
+
+		op, err := materializedTableChangeOperation(parser, &ternv1.TableChange{
+			TableName: "t",
+			Ddl:       "CREATE TABLE t (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), created_at timestamptz)",
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, "create", op)
+	})
+
+	t.Run("Postgres create set fallback", func(t *testing.T) {
+		parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+		require.NoError(t, err)
+
+		op, err := materializedTableChangeOperation(parser, &ternv1.TableChange{
+			TableName: "t",
+			Ddl:       "CREATE TABLE t (id bigint, v text); CREATE INDEX t_v_idx ON t (v)",
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, ddl.StatementTypeToOp(ddl.StatementCreateTable), op)
+	})
+
+	t.Run("MySQL fallback", func(t *testing.T) {
+		parser, err := ddl.ParserForDialect(schema.DialectMySQL)
+		require.NoError(t, err)
+
+		op, err := materializedTableChangeOperation(parser, &ternv1.TableChange{
+			TableName: "t",
+			Ddl:       "CREATE TABLE `t` (`id` bigint NOT NULL) ENGINE=InnoDB",
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, "create", op)
+	})
+
+	t.Run("MySQL single-statement fallbacks retain their operations", func(t *testing.T) {
+		parser, err := ddl.ParserForDialect(schema.DialectMySQL)
+		require.NoError(t, err)
+
+		tests := []struct {
+			ddl    string
+			wantOp string
+		}{
+			{ddl: "TRUNCATE TABLE `t`", wantOp: "truncate"},
+			{ddl: "CREATE INDEX `i` ON `t` (`v`)", wantOp: "create_index"},
+		}
+		for _, tc := range tests {
+			op, err := materializedTableChangeOperation(parser, &ternv1.TableChange{TableName: "t", Ddl: tc.ddl})
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantOp, op)
+		}
+	})
+
+	t.Run("proto change type is authoritative", func(t *testing.T) {
+		op, err := materializedTableChangeOperation(nil, &ternv1.TableChange{
+			TableName:  "t",
+			Ddl:        "not valid SQL",
+			ChangeType: ternv1.ChangeType_CHANGE_TYPE_TRUNCATE,
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, "truncate", op)
+	})
+
+	t.Run("empty DDL with unrecognized type", func(t *testing.T) {
+		op, err := materializedTableChangeOperation(nil, &ternv1.TableChange{TableName: "t"})
+
+		require.Error(t, err)
+		assert.Empty(t, op)
+		assert.ErrorContains(t, err, "unrecognized change type and no DDL to classify")
+	})
+
+	t.Run("DDL outside the shared vocabulary is rejected", func(t *testing.T) {
+		parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+		require.NoError(t, err)
+
+		op, err := materializedTableChangeOperation(parser, &ternv1.TableChange{
+			TableName: "t",
+			Ddl:       "CREATE MATERIALIZED VIEW mv AS SELECT 1",
+		})
+
+		require.Error(t, err)
+		assert.Empty(t, op)
+		assert.ErrorContains(t, err, "outside the shared DDL vocabulary")
+	})
+
+	t.Run("DML is rejected", func(t *testing.T) {
+		parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+		require.NoError(t, err)
+
+		op, err := materializedTableChangeOperation(parser, &ternv1.TableChange{
+			TableName: "t",
+			Ddl:       "INSERT INTO t (id) VALUES (1)",
+		})
+
+		require.Error(t, err)
+		assert.Empty(t, op)
+		assert.ErrorContains(t, err, "not a DDL statement")
+	})
 }
 
 func TestLocalClientLogsValidationAndConversion(t *testing.T) {
@@ -63,9 +171,9 @@ func TestLocalClientLogsValidationAndConversion(t *testing.T) {
 	assert.Equal(t, "pending", resp.Logs[0].OldState)
 	assert.Equal(t, "running", resp.Logs[0].NewState)
 
-	_, err = client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Limit: maxLogsLimit + 1})
+	_, err = client.Logs(t.Context(), &ternv1.LogsRequest{ApplyId: "apply-a", Limit: MaxLogsLimit + 1})
 	require.NoError(t, err)
-	assert.Equal(t, maxLogsLimit, logs.recentLimit)
+	assert.Equal(t, MaxLogsLimit, logs.recentLimit)
 }
 
 type pullSchemaPSClient struct {
@@ -132,7 +240,7 @@ func TestLocalClient_PullSchemaLoadsVitessKeyspaceWithVSchemaArtifact(t *testing
 	ns := resp.Namespaces["commerce_sharded"]
 	require.NotNil(t, ns)
 	assert.Equal(t, "CREATE TABLE `users` (`id` bigint NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci\n", ns.Tables["users"])
-	assert.JSONEq(t, "{\"sharded\":true,\"tables\":{\"users\":{}}}", ns.Artifacts[vSchemaArtifactName])
+	assert.JSONEq(t, "{\"sharded\":true,\"tables\":{\"users\":{}}}", ns.Artifacts[storage.VSchemaArtifactName])
 	assert.Equal(t, "commerce_sharded", ns.NamespaceCatalog.Name)
 	assert.Equal(t, storage.DatabaseTypeVitess, ns.NamespaceCatalog.Engine)
 	assert.Equal(t, int32(1), ns.NamespaceCatalog.TableCount)
@@ -186,6 +294,50 @@ func TestLocalClient_PullSchemaDiscoversVitessKeyspaces(t *testing.T) {
 	require.Len(t, psClient.schemaReqs, 2)
 	assert.Equal(t, "commerce", psClient.schemaReqs[0].Keyspace)
 	assert.Equal(t, "commerce_sharded", psClient.schemaReqs[1].Keyspace)
+}
+
+// The database a target is registered under is an arbitrary routing key; when
+// the target metadata carries the PlanetScale database name, every PlanetScale
+// API call in the pull addresses that name, while the response stays keyed to
+// the registered identifier.
+func TestLocalClient_PullSchemaAddressesPlanetScaleDatabaseFromMetadata(t *testing.T) {
+	psClient := &pullSchemaPSClient{
+		keyspaces: []*ps.Keyspace{{Name: "commerce_sharded"}},
+		schemas: map[string][]*ps.Diff{
+			"commerce_sharded": {{Name: "users", Raw: "CREATE TABLE `users` (`id` bigint NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"}},
+		},
+		vschemas: map[string]*ps.VSchema{
+			"commerce_sharded": {Raw: "{\"sharded\":true}"},
+		},
+	}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "commerce",
+			Type:     storage.DatabaseTypeVitess,
+			Metadata: map[string]string{
+				"organization": "test-org",
+				"database":     "commerce_main",
+			},
+		},
+		psClientFunc: func(_, _ string) (psclient.PSClient, error) { return psClient, nil },
+		logger:       slog.Default(),
+	}
+
+	resp, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database:    "commerce",
+		Type:        storage.DatabaseTypeVitess,
+		Environment: "production",
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.NotNil(t, psClient.listReq)
+	assert.Equal(t, "commerce_main", psClient.listReq.Database)
+	require.Len(t, psClient.schemaReqs, 1)
+	assert.Equal(t, "commerce_main", psClient.schemaReqs[0].Database)
+	require.Len(t, psClient.vschemaReqs, 1)
+	assert.Equal(t, "commerce_main", psClient.vschemaReqs[0].Database)
+	assert.Contains(t, resp.Namespaces, "commerce_sharded")
 }
 
 func TestLocalClient_PullSchemaRejectsInvalidVitessDDL(t *testing.T) {
@@ -385,7 +537,6 @@ type fakeControlEngine struct {
 	cancelErr               error
 	startCount              int
 	cutoverCount            int
-	volumeCount             int
 	cutoverResult           *engine.ControlResult
 	cutoverErr              error
 	progressReq             *engine.ProgressRequest
@@ -394,6 +545,8 @@ type fakeControlEngine struct {
 	planResult              *engine.PlanResult
 	applyResult             *engine.ApplyResult
 	applyErr                error
+	revertErr               error
+	skipRevertErr           error
 	externallyAuthoritative bool
 }
 
@@ -458,16 +611,17 @@ func (e *fakeControlEngine) Cutover(context.Context, *engine.ControlRequest) (*e
 }
 
 func (e *fakeControlEngine) Revert(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	if e.revertErr != nil {
+		return nil, e.revertErr
+	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
 func (e *fakeControlEngine) SkipRevert(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	if e.skipRevertErr != nil {
+		return nil, e.skipRevertErr
+	}
 	return &engine.ControlResult{Accepted: true}, nil
-}
-
-func (e *fakeControlEngine) Volume(context.Context, *engine.VolumeRequest) (*engine.VolumeResult, error) {
-	e.volumeCount++
-	return &engine.VolumeResult{Accepted: true}, nil
 }
 
 type exactProgressStorage struct {
@@ -490,7 +644,10 @@ func (s *exactProgressStorage) ApplyLogs() storage.ApplyLogStore {
 	return &mockApplyLogStore{}
 }
 func (s *exactProgressStorage) ControlRequests() storage.ControlRequestStore {
-	return s.controlRequests
+	if s.controlRequests != nil {
+		return s.controlRequests
+	}
+	return &testControlRequestStore{}
 }
 func (s *exactProgressStorage) ApplyOperations() storage.ApplyOperationStore {
 	return s.applyOperations
@@ -618,6 +775,17 @@ func (s *testControlRequestStore) GetByOperation(_ context.Context, applyID int6
 	return nil, nil
 }
 
+func (s *testControlRequestStore) ListSettled(_ context.Context, applyID int64) ([]*storage.ApplyControlRequest, error) {
+	var settled []*storage.ApplyControlRequest
+	for _, req := range s.requests {
+		if req.ApplyID != applyID || req.Status == storage.ControlRequestPending {
+			continue
+		}
+		settled = append(settled, cloneTestControlRequest(req))
+	}
+	return settled, nil
+}
+
 func (s *testControlRequestStore) CompletePending(_ context.Context, applyID int64, operation storage.ControlOperation) error {
 	for _, req := range s.requests {
 		if req.ApplyID == applyID && req.Operation == operation && req.Status == storage.ControlRequestPending {
@@ -635,6 +803,36 @@ func (s *testControlRequestStore) FailPending(_ context.Context, applyID int64, 
 		}
 	}
 	return nil
+}
+
+// RecordRemoteFailure mirrors the store's contract: a pending row is a live
+// request this plane has not forwarded yet, so a settled report describes a
+// superseded attempt and is ignored; anything else takes the remote reason.
+func (s *testControlRequestStore) RecordRemoteFailure(_ context.Context, req *storage.ApplyControlRequest) (bool, error) {
+	for _, existing := range s.requests {
+		if existing.ApplyID != req.ApplyID || existing.Operation != req.Operation {
+			continue
+		}
+		if existing.Status == storage.ControlRequestPending {
+			return false, nil
+		}
+		if existing.Status == storage.ControlRequestFailed &&
+			existing.ErrorMessage == req.ErrorMessage &&
+			existing.RequestedBy == req.RequestedBy {
+			return false, nil
+		}
+		existing.Status = storage.ControlRequestFailed
+		existing.ErrorMessage = req.ErrorMessage
+		if req.RequestedBy != "" {
+			existing.RequestedBy = req.RequestedBy
+		}
+		return true, nil
+	}
+	stored := cloneTestControlRequest(req)
+	stored.ID = int64(len(s.requests) + 1)
+	stored.Status = storage.ControlRequestFailed
+	s.requests = append(s.requests, stored)
+	return true, nil
 }
 
 func cloneTestControlRequest(req *storage.ApplyControlRequest) *storage.ApplyControlRequest {
@@ -662,6 +860,28 @@ func TestLocalClient_Apply_RequiresEnvironmentField(t *testing.T) {
 	require.ErrorContains(t, err, "environment is required")
 }
 
+// A database-scoped MySQL target DSN diffs the whole database as one unit, so
+// a namespace withheld via ignore_namespaces would leave its live tables with
+// no declaring file and the diff would plan them as DROP TABLE — the inverse
+// of "ignore". The plan must refuse this combination up front rather than
+// emit a destructive plan.
+func TestPlanWithEngine_RefusesIgnoredNamespacesOnDatabaseScopedMySQLDSN(t *testing.T) {
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: "user:pass@tcp(localhost:3306)/testdb",
+	}, nil, slog.Default())
+	require.NoError(t, err)
+
+	_, err = client.planWithEngine(t.Context(), &ternv1.PlanRequest{
+		Database:          "testdb",
+		IgnoredNamespaces: []string{"local_fixtures"},
+	}, "testdb", schema.SchemaFiles{"testdb": {Files: map[string]string{"users.sql": "CREATE TABLE users (id INT)"}}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ignore_namespaces is not supported for MySQL targets whose DSN names a database")
+	assert.Contains(t, err.Error(), "local_fixtures")
+}
+
 func TestRejectUnsafeDDLChangesWithoutOptIn(t *testing.T) {
 	changes := []storage.TableChange{{
 		Namespace:    "testdb",
@@ -677,6 +897,44 @@ func TestRejectUnsafeDDLChangesWithoutOptIn(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "DROP COLUMN removes data")
 	assert.NoError(t, rejectUnsafeDDLChangesWithoutOptIn("plan-unsafe", changes, storage.ApplyOptions{AllowUnsafe: true}))
+}
+
+// TestRejectUnsafeVSchemaChangesWithoutOptIn verifies dispatch admission
+// re-checks the stored plan's VSchema disclosures: a recorded deletion is
+// refused without opt-in even though a VSchema-only scope carries no table
+// DDL, opt-in admits it, and an additive VSchema change queues freely.
+func TestRejectUnsafeVSchemaChangesWithoutOptIn(t *testing.T) {
+	unsafePlan := &storage.Plan{
+		PlanIdentifier: "plan-vschema-unsafe",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"payments": {
+				Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`},
+				Metadata: map[string]string{
+					storage.PlanMetadataVSchemaChanged:   "true",
+					storage.PlanMetadataVSchemaDeletions: `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`,
+				},
+			},
+		},
+	}
+
+	err := rejectUnsafeVSchemaChangesWithoutOptIn(unsafePlan, storage.ApplyOptions{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `unsafe VSchema change in namespace "payments"`)
+	assert.Contains(t, err.Error(), "removing vindex email_idx changes query routing")
+	assert.Contains(t, err.Error(), "allow_unsafe=true")
+
+	assert.NoError(t, rejectUnsafeVSchemaChangesWithoutOptIn(unsafePlan, storage.ApplyOptions{AllowUnsafe: true}))
+
+	additivePlan := &storage.Plan{
+		PlanIdentifier: "plan-vschema-additive",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"payments": {
+				Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded":true}`},
+				Metadata:  map[string]string{storage.PlanMetadataVSchemaChanged: "true"},
+			},
+		},
+	}
+	assert.NoError(t, rejectUnsafeVSchemaChangesWithoutOptIn(additivePlan, storage.ApplyOptions{}))
 }
 
 func TestLocalClient_ProgressRequiresApplyID(t *testing.T) {
@@ -1073,15 +1331,15 @@ func TestGroupedResumeChangesGroupsTasksByNamespace(t *testing.T) {
 	require.Len(t, changes[0].TableChanges, 2)
 	assert.Equal(t, "users", changes[0].TableChanges[0].Table)
 	assert.Equal(t, tasks[0].DDL, changes[0].TableChanges[0].DDL)
-	assert.Equal(t, statement.StatementAlterTable, changes[0].TableChanges[0].Operation)
+	assert.Equal(t, ddl.StatementAlterTable, changes[0].TableChanges[0].Operation)
 	assert.Equal(t, "orders", changes[0].TableChanges[1].Table)
 	assert.Equal(t, tasks[1].DDL, changes[0].TableChanges[1].DDL)
-	assert.Equal(t, statement.StatementCreateTable, changes[0].TableChanges[1].Operation)
+	assert.Equal(t, ddl.StatementCreateTable, changes[0].TableChanges[1].Operation)
 	assert.Equal(t, "billing", changes[1].Namespace)
 	require.Len(t, changes[1].TableChanges, 1)
 	assert.Equal(t, "invoices", changes[1].TableChanges[0].Table)
 	assert.Equal(t, tasks[2].DDL, changes[1].TableChanges[0].DDL)
-	assert.Equal(t, statement.StatementAlterTable, changes[1].TableChanges[0].Operation)
+	assert.Equal(t, ddl.StatementAlterTable, changes[1].TableChanges[0].Operation)
 }
 
 // A resumed grouped apply rebuilds the engine changes from the stored DDL
@@ -1099,7 +1357,7 @@ func TestGroupedResumeChangesPreservesDDL(t *testing.T) {
 	require.Len(t, changes[0].TableChanges, 1)
 	assert.Equal(t, "users", changes[0].TableChanges[0].Table)
 	assert.Equal(t, tasks[0].DDL, changes[0].TableChanges[0].DDL)
-	assert.Equal(t, statement.StatementAlterTable, changes[0].TableChanges[0].Operation)
+	assert.Equal(t, ddl.StatementAlterTable, changes[0].TableChanges[0].Operation)
 	for _, tc := range changes[0].TableChanges {
 		assert.NotEmpty(t, tc.DDL, "resume changes must not contain an empty-DDL table change")
 	}
@@ -1122,11 +1380,11 @@ func TestGroupedResumeChangesPreservesMultiNamespaceScopedTasks(t *testing.T) {
 	require.Len(t, commerce.TableChanges, 1)
 	assert.Equal(t, "users", commerce.TableChanges[0].Table)
 	assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", commerce.TableChanges[0].DDL)
-	assert.Equal(t, statement.StatementAlterTable, commerce.TableChanges[0].Operation)
+	assert.Equal(t, ddl.StatementAlterTable, commerce.TableChanges[0].Operation)
 	routing := byNamespace["routing"]
 	require.Len(t, routing.TableChanges, 1)
 	assert.Equal(t, "lookup", routing.TableChanges[0].Table)
-	assert.Equal(t, statement.StatementAlterTable, routing.TableChanges[0].Operation)
+	assert.Equal(t, ddl.StatementAlterTable, routing.TableChanges[0].Operation)
 }
 
 func TestTaskTargetShardsReturnsSortedUniqueShardSelector(t *testing.T) {
@@ -1377,6 +1635,73 @@ func TestLocalClient_ProcessPendingStopSettlesCompletedEngineChange(t *testing.T
 	require.NoError(t, err)
 	assert.Nil(t, controlReq, "the durable stop request must complete so the operator stops re-running the stop")
 	assert.True(t, hasLogMessageContaining(logs.logs, "Stop arrived after the schema change completed on the engine; apply recorded as completed (1 tasks completed, 0 already terminal) (caller: github:alice)"))
+}
+
+// Settling a completed-on-engine control operation is only real once the
+// task's completed state durably lands. When the task store refuses the write
+// — here a lease-guarded update that lost the drive's lease to a peer driver —
+// the settle must fail closed instead of resolving the durable cancel request
+// and terminalizing the apply over a task row that durably stays non-terminal.
+// The request stays pending so a later claim redoes the settle under a current
+// lease, and the durable log records no transition the task row does not carry.
+func TestLocalClient_ProcessPendingCancelFailsClosedWhenSettleWriteRefused(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              323,
+		ApplyIdentifier: "apply-cancel-settle-refused",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.ValidatingDeployRequest,
+	}
+	task := &storage.Task{
+		ID:             656,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-cancel-settle-refused",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		TableName:      "users",
+		State:          state.Task.WaitingForDeploy,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "github:alice",
+	}}}
+	fakeEngine := &fakeControlEngine{
+		cancelErr: engine.NewAlreadyCompletedError("cancel deploy request #121 rejected: the deploy request completed before the cancel arrived"),
+	}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		config: LocalConfig{
+			Database: "testdb",
+			Type:     storage.DatabaseTypeMySQL,
+		},
+		storage: &exactProgressStorage{
+			applies: &exactProgressApplyStore{apply: apply},
+			tasks: &updateFailingTaskStore{
+				exactProgressTaskStore: &exactProgressTaskStore{tasks: []*storage.Task{task}},
+				updateErr:              storage.ErrApplyLeaseLost,
+			},
+			logs:            logs,
+			controlRequests: controlRequests,
+		},
+		spiritEngine: fakeEngine,
+		logger:       slog.Default(),
+	}
+
+	_, err := client.processPendingCancelControlRequest(t.Context(), apply)
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+	assert.ErrorContains(t, err, task.TaskIdentifier)
+	assert.False(t, state.IsState(apply.State, state.Apply.Completed),
+		"the apply must not settle completed over a refused task write, got %s", apply.State)
+	assert.Nil(t, apply.CompletedAt)
+	controlReq, reqErr := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, reqErr)
+	require.NotNil(t, controlReq, "the durable cancel request must stay pending so a later claim redoes the settle")
+	assert.Equal(t, storage.ControlRequestPending, controlReq.Status)
+	assert.Empty(t, logs.logs, "the durable log must not claim a transition the task row does not carry")
 }
 
 func TestLocalClient_ProcessPendingStopControlRequestContinuesToQueuedStart(t *testing.T) {
@@ -1994,6 +2319,38 @@ func TestLocalClient_ProcessPendingCutoverControlRequestRetriesWhenCutoverNotRea
 	assert.True(t, hasLogMessageContaining(logs.logs, "Cutover triggered (caller: cli:alice)"))
 }
 
+// A drive claim that reattaches to the engine's durable checkpoint records one
+// timeline event, so an operator can tell a resumed copy from a fresh start.
+// The engine reports the resume flag on every subsequent poll; the per-drive
+// latch keeps the timeline to one event per claim.
+func TestLocalClient_LogEngineResumeOnce(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-resume",
+		Database:        "testdb",
+		Environment:     "staging",
+	}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		storage: &exactProgressStorage{logs: logs},
+		logger:  slog.Default(),
+	}
+
+	var latch bool
+	client.logEngineResumeOnce(t.Context(), slog.Default(), apply, false, &latch)
+	assert.Empty(t, logs.logs, "a fresh start records no resume event")
+	assert.False(t, latch)
+
+	client.logEngineResumeOnce(t.Context(), slog.Default(), apply, true, &latch)
+	require.Len(t, logs.logs, 1)
+	assert.Equal(t, storage.LogEventInfo, logs.logs[0].EventType)
+	assert.Equal(t, storage.LogLevelInfo, logs.logs[0].Level)
+	assert.Contains(t, logs.logs[0].Message, "resumed from checkpoint")
+
+	client.logEngineResumeOnce(t.Context(), slog.Default(), apply, true, &latch)
+	assert.Len(t, logs.logs, 1, "the flag on every later poll produces one event per drive claim")
+}
+
 // The drive's auto-cutover records one trigger in the timeline per drive and
 // retries quietly while the engine backend stages the cutover. A rejection
 // that outlives the staging window records a one-time timeline error and
@@ -2331,6 +2688,36 @@ func TestProgressTableStatusNormalizesEngineStateAndKeepsStoredStateAhead(t *tes
 			expected:         state.Task.Completed,
 		},
 		{
+			name:             "catch-up advances a running table",
+			storedTaskState:  state.Task.Running,
+			engineTableState: state.Task.CatchingUp,
+			expected:         state.Task.CatchingUp,
+		},
+		{
+			name:             "checksum advances the catch-up phase",
+			storedTaskState:  state.Task.CatchingUp,
+			engineTableState: state.Task.Checksumming,
+			expected:         state.Task.Checksumming,
+		},
+		{
+			name:             "stale catch-up poll does not regress a checksummed table",
+			storedTaskState:  state.Task.Checksumming,
+			engineTableState: state.Task.CatchingUp,
+			expected:         state.Task.Checksumming,
+		},
+		{
+			name:             "post-checksum drain advances the checksum phase",
+			storedTaskState:  state.Task.Checksumming,
+			engineTableState: state.Task.PostChecksum,
+			expected:         state.Task.PostChecksum,
+		},
+		{
+			name:             "stale checksum poll does not regress a post-checksum table",
+			storedTaskState:  state.Task.PostChecksum,
+			engineTableState: state.Task.Checksumming,
+			expected:         state.Task.PostChecksum,
+		},
+		{
 			name:             "stopped engine state can advance active stored state",
 			storedTaskState:  state.Task.Running,
 			engineTableState: state.Task.Stopped,
@@ -2377,6 +2764,36 @@ func TestProgressTableStatusNormalizesEngineStateAndKeepsStoredStateAhead(t *tes
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			assert.Equal(t, tc.expected, taskStateWithNoBackwardProgress(tc.storedTaskState, tc.engineTableState))
+		})
+	}
+}
+
+// Per-table engine states refine a generic running task into the post-copy
+// phase they represent, so the stored task — the single render surface for the
+// CLI and the PR comment — names the phase instead of a serene complete copy.
+// "completed" must never refine the task: for Spirit it means only that the
+// table's row copy finished, not that the table cut over.
+func TestTablePhaseTaskState(t *testing.T) {
+	tests := []struct {
+		name       string
+		tableState string
+		wantPhase  string
+		wantOK     bool
+	}{
+		{name: "applyChangeset", tableState: "applyChangeset", wantPhase: state.Task.CatchingUp, wantOK: true},
+		{name: "postChecksum", tableState: "postChecksum", wantPhase: state.Task.PostChecksum, wantOK: true},
+		{name: "checksum", tableState: "checksum", wantPhase: state.Task.Checksumming, wantOK: true},
+		{name: "cutOver", tableState: "cutOver", wantPhase: state.Task.CuttingOver, wantOK: true},
+		{name: "already normalized", tableState: state.Task.CatchingUp, wantPhase: state.Task.CatchingUp, wantOK: true},
+		{name: "copyRows", tableState: "copyRows", wantOK: false},
+		{name: "completed", tableState: "completed", wantOK: false},
+		{name: "empty", tableState: "", wantOK: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			phase, ok := tablePhaseTaskState(tc.tableState)
+			assert.Equal(t, tc.wantOK, ok)
+			assert.Equal(t, tc.wantPhase, phase)
 		})
 	}
 }
@@ -2998,7 +3415,7 @@ func TestHandleAtomicProgressTickReleasesAtCutoverBarrier(t *testing.T) {
 // resolved without a vtgate DSN), the drive surfaces it once per apply at Warn —
 // always visible in Datadog without enabling debug logging. It fires once (not
 // per poll), stays silent during setup states, and stays silent for transient
-// reasons (schema-change context still being discovered, shard rows not yet
+// reasons (schema change context still being discovered, shard rows not yet
 // registered) that can self-heal on a later poll.
 func TestHandleAtomicProgressTickPerShardUnavailableWarn(t *testing.T) {
 	newApply := func() *storage.Apply {
@@ -3085,15 +3502,20 @@ type capturedLog struct {
 }
 
 // captureHandler is a minimal slog.Handler that records every emitted record so
-// tests can assert on level, message, and attributes.
+// tests can assert on level, message, and attributes — including attrs bound
+// with Logger.With, so tests can prove bound-logger inheritance.
 type captureHandler struct {
 	records *[]capturedLog
+	bound   []slog.Attr
 }
 
 func (h captureHandler) Enabled(context.Context, slog.Level) bool { return true }
 
 func (h captureHandler) Handle(_ context.Context, r slog.Record) error {
-	attrs := make(map[string]any, r.NumAttrs())
+	attrs := make(map[string]any, len(h.bound)+r.NumAttrs())
+	for _, a := range h.bound {
+		attrs[a.Key] = a.Value.Any()
+	}
 	r.Attrs(func(a slog.Attr) bool {
 		attrs[a.Key] = a.Value.Any()
 		return true
@@ -3102,8 +3524,24 @@ func (h captureHandler) Handle(_ context.Context, r slog.Record) error {
 	return nil
 }
 
-func (h captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
-func (h captureHandler) WithGroup(string) slog.Handler      { return h }
+func (h captureHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	h.bound = append(slices.Clip(h.bound), attrs...)
+	return h
+}
+func (h captureHandler) WithGroup(string) slog.Handler { return h }
+
+// requireCapturedLog returns the first captured record with the given message,
+// failing the test when none exists.
+func requireCapturedLog(t *testing.T, records []capturedLog, msg string) capturedLog {
+	t.Helper()
+	for _, rec := range records {
+		if rec.msg == msg {
+			return rec
+		}
+	}
+	t.Fatalf("expected a log record with message %q; got %d records", msg, len(records))
+	return capturedLog{}
+}
 
 // A canonical, positive revert_window_duration in metadata is honored, while an
 // empty value falls back to the engine default. A malformed or non-positive
@@ -3136,7 +3574,7 @@ func TestLocalClient_RevertWindowDuration(t *testing.T) {
 				logger: slog.New(captureHandler{records: &records}),
 			}
 
-			got := client.revertWindowDuration()
+			got := client.revertWindowDuration(client.logger.With("database", client.config.Database))
 			assert.Equal(t, tc.want, got)
 
 			var warnings []capturedLog
@@ -3486,6 +3924,34 @@ func TestNewLocalClientBuiltinEngineIgnoresRegistry(t *testing.T) {
 	assert.NotNil(t, c.getEngine())
 }
 
+func TestNewLocalClientUsesPostgresEngine(t *testing.T) {
+	metadata := map[string]string{"cluster": "aurora-postgres"}
+	c, err := NewLocalClient(LocalConfig{
+		Database:  "orders",
+		Type:      storage.DatabaseTypePostgres,
+		TargetDSN: "postgres://localhost:5432/orders",
+		Metadata:  metadata,
+	}, nil, slog.Default())
+	require.NoError(t, err)
+
+	assert.Equal(t, storage.EnginePostgres, c.getEngine().Name())
+	assert.Equal(t, "postgres://localhost:5432/orders", c.credentials().DSN)
+	assert.Equal(t, metadata, c.credentials().Metadata)
+	assert.Equal(t, ternv1.Engine_ENGINE_POSTGRES, c.protoEngine())
+}
+
+func TestNewLocalClientConfiguresPostgresTableSizeLimit(t *testing.T) {
+	c, err := NewLocalClient(LocalConfig{
+		Database:                              "orders",
+		Type:                                  storage.DatabaseTypePostgres,
+		PostgresNativeSafeTableSizeLimitBytes: 4 << 30,
+	}, nil, slog.Default())
+	require.NoError(t, err)
+	eng, ok := c.getEngine().(*postgresengine.Engine)
+	require.True(t, ok)
+	assert.Equal(t, int64(4<<30), eng.TableSizeLimit())
+}
+
 // A type with no built-in engine and no registered factory fails closed.
 func TestNewLocalClientErrorsWhenEngineUnregistered(t *testing.T) {
 	_, err := NewLocalClient(LocalConfig{Database: "db", Type: "customengine"}, nil, slog.Default())
@@ -3539,6 +4005,139 @@ type namedEngine struct {
 }
 
 func (e namedEngine) Name() string { return e.name }
+
+// fakeSchemaPullEngine is a registered engine that implements the SchemaPuller
+// capability, standing in for an embedder-supplied engine that answers pull.
+type fakeSchemaPullEngine struct {
+	engine.Engine
+	pullReq  *ternv1.PullSchemaRequest
+	pullResp *ternv1.PullSchemaResponse
+	pullErr  error
+}
+
+func (e *fakeSchemaPullEngine) Name() string { return storage.EngineStrata }
+
+func (e *fakeSchemaPullEngine) PullSchema(_ context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+	e.pullReq = req
+	return e.pullResp, e.pullErr
+}
+
+func newCustomEngineClient(t *testing.T, dbType string, eng engine.Engine) *LocalClient {
+	t.Helper()
+	client, err := NewLocalClient(LocalConfig{
+		Database: "orders",
+		Type:     dbType,
+		EngineFactories: map[string]EngineFactory{
+			dbType: func(LocalConfig, *slog.Logger) (engine.Engine, error) { return eng, nil },
+		},
+	}, nil, slog.Default())
+	require.NoError(t, err)
+	return client
+}
+
+// A pull for a database type without a built-in pull path is answered by the
+// registered engine's SchemaPuller capability, with the request forwarded
+// intact and the engine's response returned as-is.
+func TestLocalClient_PullSchemaDelegatesToEngineCapability(t *testing.T) {
+	fake := &fakeSchemaPullEngine{
+		pullResp: &ternv1.PullSchemaResponse{
+			Database:    "orders",
+			Type:        storage.DatabaseTypeStrata,
+			Environment: "staging",
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			},
+			TableCount: 1,
+		},
+	}
+	client := newCustomEngineClient(t, storage.DatabaseTypeStrata, fake)
+
+	resp, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database:    "orders",
+		Type:        storage.DatabaseTypeStrata,
+		Environment: "staging",
+		Namespace:   "orders",
+	})
+
+	require.NoError(t, err)
+	assert.Same(t, fake.pullResp, resp)
+	require.NotNil(t, fake.pullReq)
+	assert.Equal(t, "orders", fake.pullReq.Database)
+	assert.Equal(t, "orders", fake.pullReq.Namespace)
+}
+
+// A registered engine without the SchemaPuller capability fails closed with
+// the typed sentinel the gRPC server maps to codes.Unimplemented.
+func TestLocalClient_PullSchemaEngineWithoutCapabilityUnsupported(t *testing.T) {
+	client := newCustomEngineClient(t, storage.DatabaseTypeStrata, &fakeControlEngine{})
+
+	_, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "orders"})
+
+	require.ErrorIs(t, err, ErrPullSchemaUnsupportedType)
+	assert.Contains(t, err.Error(), "engine does not support schema pull")
+}
+
+// A PostgreSQL pull reaches the built-in engine rather than the MySQL-shaped
+// pull path or the unsupported-capability fallback.
+func TestLocalClient_PullSchemaPostgresReachesEngine(t *testing.T) {
+	client, err := NewLocalClient(LocalConfig{
+		Database: "orders",
+		Type:     storage.DatabaseTypePostgres,
+	}, nil, slog.Default())
+	require.NoError(t, err)
+
+	_, err = client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "orders"})
+
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrPullSchemaUnsupportedType)
+	assert.Contains(t, err.Error(), "DSN credentials are required")
+}
+
+// A request whose type disagrees with the client's configured type is a
+// malformed request, reported as such even when the configured type would
+// otherwise be delegated or unsupported.
+func TestLocalClient_PullSchemaTypeMismatchBeforeDelegation(t *testing.T) {
+	client := newCustomEngineClient(t, storage.DatabaseTypeStrata, &fakeControlEngine{})
+
+	_, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database: "orders",
+		Type:     storage.DatabaseTypeMySQL,
+	})
+
+	require.ErrorIs(t, err, ErrPullSchemaInvalidRequest)
+}
+
+// An engine that implements the capability but fails its pull surfaces the
+// failure as an ordinary error with database context — never as the
+// unsupported-type sentinel, which would misreport an engine defect as a
+// missing capability.
+func TestLocalClient_PullSchemaEngineErrorIsNotUnsupported(t *testing.T) {
+	client := newCustomEngineClient(t, storage.DatabaseTypeStrata, &fakeSchemaPullEngine{
+		pullErr: errors.New("topo server unreachable"),
+	})
+
+	_, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "orders"})
+
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrPullSchemaUnsupportedType)
+	assert.ErrorContains(t, err, "topo server unreachable")
+	assert.ErrorContains(t, err, "orders")
+}
+
+// An engine that returns neither a response nor an error is a broken
+// capability; the client fails closed instead of handing callers a nil pull.
+// The failure is an internal error, never the unsupported-type sentinel: the
+// engine does implement the capability, so a broken contract must stay loud
+// rather than read as an expected 501.
+func TestLocalClient_PullSchemaEngineNilResponseFailsClosed(t *testing.T) {
+	client := newCustomEngineClient(t, storage.DatabaseTypeStrata, &fakeSchemaPullEngine{})
+
+	_, err := client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "orders"})
+
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrPullSchemaUnsupportedType)
+	assert.Contains(t, err.Error(), "nil response")
+}
 
 // The reported proto engine reflects the engine actually backing the client, so
 // a registered engine is not misreported as the Spirit default.
@@ -3663,6 +4262,8 @@ func TestLocalClient_ProgressRendersNonShardedTableFromStoredTask(t *testing.T) 
 		ETASeconds:          90,
 		ChecksumRowsChecked: 10,
 		ChecksumRowsTotal:   1000,
+		Throttled:           true,
+		ThrottleReason:      "replica-lag 12s > 10s",
 	}
 	client := &LocalClient{
 		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
@@ -3685,5 +4286,82 @@ func TestLocalClient_ProgressRendersNonShardedTableFromStoredTask(t *testing.T) 
 	assert.Equal(t, int64(90), tp.EtaSeconds, "ETA comes from the stored task row")
 	assert.Equal(t, int64(10), tp.ChecksumRowsChecked)
 	assert.Equal(t, int64(1000), tp.ChecksumRowsTotal)
+	assert.True(t, tp.Throttled, "throttle state comes from the stored task row")
+	assert.Equal(t, "replica-lag 12s > 10s", tp.ThrottleReason)
 	assert.Empty(t, tp.Shards, "a non-sharded table has no per-shard breakdown")
+}
+
+// Progress serves each table's own failure reason from its stored task row, so
+// a multi-table apply where one table failed (for example an engine preflight
+// rejection) reports the error on exactly that table — the control plane and
+// the PR comment can attribute the failure to the right table instead of
+// showing a bare failed row.
+func TestLocalClient_ProgressCarriesPerTableErrorMessage(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              43,
+		ApplyIdentifier: "apply-table-error",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Engine:          storage.EngineSpirit,
+		State:           state.Apply.Failed,
+	}
+	failedTask := &storage.Task{
+		ID:             8,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-users",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		TableName:      "users",
+		State:          state.Task.Failed,
+		DDLAction:      "alter",
+		ErrorMessage:   "engine preflight: enumReorder check failed for table users",
+	}
+	completedTask := &storage.Task{
+		ID:             9,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-orders",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		TableName:      "orders",
+		State:          state.Task.Completed,
+		DDLAction:      "alter",
+	}
+	// An earlier table's failure ends the sequential apply, so a table still
+	// pending is cancelled rather than run.
+	blockedTask := &storage.Task{
+		ID:             10,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-payments",
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		TableName:      "payments",
+		State:          state.Task.Cancelled,
+		DDLAction:      "alter",
+	}
+	client := &LocalClient{
+		config: LocalConfig{Database: "testdb", Type: storage.DatabaseTypeMySQL},
+		storage: &exactProgressStorage{
+			applies: &exactProgressApplyStore{apply: apply},
+			tasks:   &exactProgressTaskStore{tasks: []*storage.Task{failedTask, completedTask, blockedTask}},
+		},
+		logger: slog.Default(),
+	}
+
+	progress, err := client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: apply.ApplyIdentifier, Environment: "staging"})
+	require.NoError(t, err)
+	require.Len(t, progress.Tables, 3)
+
+	byTable := make(map[string]*ternv1.TableProgress, len(progress.Tables))
+	for _, tp := range progress.Tables {
+		byTable[tp.TableName] = tp
+	}
+	require.Contains(t, byTable, "users")
+	require.Contains(t, byTable, "orders")
+	require.Contains(t, byTable, "payments")
+	assert.Equal(t, "engine preflight: enumReorder check failed for table users", byTable["users"].ErrorMessage)
+	assert.Empty(t, byTable["orders"].ErrorMessage, "a table that did not fail carries no error")
+	assert.Empty(t, byTable["payments"].ErrorMessage,
+		"a table cancelled because an earlier table's failure ended the apply has no error of its own, so the root-cause table stays identifiable")
 }

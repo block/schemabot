@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/tern"
 )
 
@@ -87,6 +88,12 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedDeployments []str
 
 	baseline := tern.ChangeSet{Changes: diffs[0].Changes, Shards: diffs[0].Shards}
 
+	// The primary's database type selects the grammar every comparison in this
+	// rollup classifies and canonicalizes DDL with. An unregistered dialect makes
+	// the self-comparison below error, so a primary whose type maps to no known
+	// grammar fails the rollup closed rather than being parsed by a guess.
+	baselineDialect := schema.DialectForDatabaseType(diffs[0].DatabaseType)
+
 	// The baseline is usable only when the primary neither errored in the producer
 	// nor carries malformed content. A self-comparison surfaces malformed or
 	// unparseable change content that would otherwise let a single-deployment
@@ -95,7 +102,7 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedDeployments []str
 	// content is provably empty, so it never false-diverges a legitimate baseline.
 	baselineCause := diffs[0].Err
 	if baselineCause == nil {
-		if _, err := tern.CompareChangeSets(baseline, baseline); err != nil {
+		if _, err := tern.CompareChangeSets(baselineDialect, baseline, baseline); err != nil {
 			baselineCause = err
 		}
 	}
@@ -133,8 +140,20 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedDeployments []str
 			entry.Class = DeploymentErrored
 			entry.Err = fmt.Errorf("primary reviewed plan is not a usable baseline, cannot confirm deployment matches the reviewed changes: %w", baselineCause)
 			clean = false
+		case schema.DialectForDatabaseType(d.DatabaseType) != baselineDialect:
+			// Change sets canonicalized under different grammars cannot be compared:
+			// a match under the wrong parser proves nothing. A deployment whose
+			// dialect differs from the primary's blocks rather than being judged by
+			// the primary's grammar. This is defense in depth: the production
+			// producer stamps one database's single configured type onto every
+			// deployment, so a mixed-dialect rollup only reaches here through a
+			// producer bug or a hand-built result.
+			entry.Class = DeploymentErrored
+			entry.Err = fmt.Errorf("deployment database type %q (dialect %q) differs from the primary's %q (dialect %q); cannot compare change sets across dialects",
+				d.DatabaseType, schema.DialectForDatabaseType(d.DatabaseType), diffs[0].DatabaseType, baselineDialect)
+			clean = false
 		default:
-			diff, err := tern.CompareChangeSets(baseline, tern.ChangeSet{Changes: d.Changes, Shards: d.Shards})
+			diff, err := tern.CompareChangeSets(baselineDialect, baseline, tern.ChangeSet{Changes: d.Changes, Shards: d.Shards})
 			switch {
 			case err != nil:
 				entry.Class = DeploymentErrored

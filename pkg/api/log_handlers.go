@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -20,11 +21,11 @@ import (
 // GET /api/logs/{database}?environment=staging&limit=50
 // GET /api/logs/{database}?apply_id=apply_abc123&limit=50
 func (s *Service) handleLogs(w http.ResponseWriter, r *http.Request) {
-	database := r.PathValue("database")
-	environment := r.URL.Query().Get("environment")
+	database := storage.CanonicalKey(r.PathValue("database"))
+	environment := storage.CanonicalKey(r.URL.Query().Get("environment"))
 	applyID := r.URL.Query().Get("apply_id")
 	limitStr := r.URL.Query().Get("limit")
-	deployment := r.URL.Query().Get("deployment")
+	deployment := storage.CanonicalKey(r.URL.Query().Get("deployment"))
 
 	if database == "" {
 		s.writeError(w, http.StatusBadRequest, "database is required")
@@ -39,7 +40,7 @@ func (s *Service) handleLogs(w http.ResponseWriter, r *http.Request) {
 func (s *Service) handleLogsWithoutDatabase(w http.ResponseWriter, r *http.Request) {
 	applyID := r.URL.Query().Get("apply_id")
 	limitStr := r.URL.Query().Get("limit")
-	deployment := r.URL.Query().Get("deployment")
+	deployment := storage.CanonicalKey(r.URL.Query().Get("deployment"))
 
 	if applyID == "" {
 		s.writeError(w, http.StatusBadRequest, "apply_id is required")
@@ -107,13 +108,14 @@ func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, datab
 
 	logs, err := s.storage.ApplyLogs().List(r.Context(), storage.ApplyLogFilter{
 		ApplyID: apply.ID,
-		Limit:   limit,
+		Limit:   logFetchLimit(limit),
 	})
 	if err != nil {
-		s.logger.Error("failed to get logs", "apply_id", apply.ID, "error", err)
+		s.logger.Error("failed to get logs", append(apply.LogAttrs(), "error", err)...)
 		s.writeError(w, http.StatusInternalServerError, "failed to get logs")
 		return
 	}
+	logs, truncated := clampLogWindow(logs, limit)
 
 	// Convert to response format
 	logEntries := make([]map[string]any, len(logs))
@@ -139,9 +141,36 @@ func (s *Service) handleLogsCommon(w http.ResponseWriter, r *http.Request, datab
 	}
 
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"logs":     logEntries,
-		"apply_id": apply.ApplyIdentifier,
+		"logs":      logEntries,
+		"apply_id":  apply.ApplyIdentifier,
+		"truncated": truncated,
 	})
+}
+
+// logFetchLimit is how many entries to read for a requested window of limit
+// entries. Reads take one extra entry so a full window can report that older
+// entries exist beyond it: an operator triaging an apply needs to know the
+// lifecycle they are looking at is partial, not that nothing else happened.
+// A window at the edge of the wire limit cannot be over-fetched, and is
+// reported untruncated rather than approximated. Data-plane reads are further
+// capped by the remote's own per-read maximum (tern.MaxLogsLimit), which
+// would clamp the extra entry away; handleDeploymentLogs narrows its window
+// below that cap before building the request so the extra entry survives it.
+func logFetchLimit(limit int) int {
+	if limit <= 0 || limit >= math.MaxInt32 {
+		return limit
+	}
+	return limit + 1
+}
+
+// clampLogWindow trims an over-fetched read down to limit and reports whether
+// older entries were left behind. Reads are ordered oldest to newest, so the
+// entries beyond the window are at the front.
+func clampLogWindow[T any](logs []T, limit int) ([]T, bool) {
+	if limit <= 0 || len(logs) <= limit {
+		return logs, false
+	}
+	return logs[len(logs)-limit:], true
 }
 
 type deploymentLogFetch struct {
@@ -153,25 +182,55 @@ type deploymentLogFetch struct {
 func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, apply *storage.Apply, deployment string, limit int) {
 	ops, err := s.storage.ApplyOperations().ListByApply(r.Context(), apply.ID)
 	if err != nil {
-		s.logger.Error("failed to list apply operations for data-plane logs", append(apply.LogAttrs(), "operation", "read_deployment_logs", "operation_deployment", deployment, "error", err)...)
+		s.logger.Error("failed to list apply operations for data-plane logs",
+			append(apply.LogAttrs(),
+				"operation", "read_deployment_logs", "operation_deployment", deployment, "error", err)...)
 		s.writeError(w, http.StatusInternalServerError, "failed to list apply operations")
 		return
 	}
-	fetches := make(map[string]*deploymentLogFetch)
 	matched := false
+	for _, op := range ops {
+		if op.Deployment == deployment {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("deployment %q has no operations for apply %q", deployment, apply.ApplyIdentifier))
+		return
+	}
+	client, err := s.TernClient(deployment, apply.Environment)
+	if err != nil {
+		s.logger.Error("failed to resolve deployment for data-plane logs",
+			append(apply.LogAttrs(),
+				"operation", "read_deployment_logs", "operation_deployment", deployment, "error", err)...)
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("cannot resolve deployment %q; check server logs", deployment))
+		return
+	}
+	if !client.IsRemote() {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("deployment %q is local-only; omit --deployment to read control-plane logs", deployment))
+		return
+	}
+	fetches := make(map[string]*deploymentLogFetch)
 	for _, op := range ops {
 		if op.Deployment != deployment {
 			continue
 		}
-		matched = true
-		externalID := op.ExternalID
+		// The deployment is proven remote above, so the operation's recorded
+		// remote apply id — including one living only in the legacy engine
+		// resume context carrier — is a data-plane apply id, not engine resume
+		// state.
+		externalID := op.RemoteApplyID()
 		if externalID == "" && len(ops) == 1 {
 			externalID = apply.ExternalID
 		}
 		if externalID == "" {
-			// An operation without a remote apply id ran on the control plane;
-			// its logs live in control-plane storage, not behind this fan-out.
-			s.logger.Debug("skipping operation without a remote apply id for data-plane logs", append(apply.LogAttrs(), "operation", "read_deployment_logs", "operation_deployment", deployment, "operation_key", op.OperationKey, "target", op.Target)...)
+			// An operation without a remote apply id has not been dispatched to
+			// the data plane; its logs live in control-plane storage, not behind
+			// this fan-out.
+			s.logger.Debug("skipping operation without a remote apply id for data-plane logs",
+				append(apply.LogAttrs(),
+					"operation", "read_deployment_logs", "operation_deployment", deployment, "operation_key", op.OperationKey, "target", op.Target)...)
 			continue
 		}
 		key := op.Target + "\x00" + externalID
@@ -182,22 +241,8 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 		}
 		fetch.operations = append(fetch.operations, &apitypes.LogOperationProvenance{OperationKey: op.OperationKey, Target: op.Target, OperationKind: op.OperationKind})
 	}
-	if !matched {
-		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("deployment %q has no operations for apply %q", deployment, apply.ApplyIdentifier))
-		return
-	}
 	if len(fetches) == 0 {
 		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("deployment %q has no remote operation logs; omit --deployment to read control-plane logs", deployment))
-		return
-	}
-	client, err := s.TernClient(deployment, apply.Environment)
-	if err != nil {
-		s.logger.Error("failed to resolve deployment for data-plane logs", append(apply.LogAttrs(), "operation", "read_deployment_logs", "operation_deployment", deployment, "error", err)...)
-		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("cannot resolve deployment %q; check server logs", deployment))
-		return
-	}
-	if !client.IsRemote() {
-		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("deployment %q is local-only; omit --deployment to read control-plane logs", deployment))
 		return
 	}
 	result := &apitypes.DeploymentLogsResponse{ApplyID: apply.ApplyIdentifier, Deployment: deployment, Sources: []*apitypes.DeploymentLogSource{}, Errors: []*apitypes.DeploymentLogError{}}
@@ -206,7 +251,19 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	requestLimit := int32(min(int64(limit), math.MaxInt32))
+	// The data plane serves at most tern.MaxLogsLimit entries per read and
+	// silently serves the cap to larger requests, which would swallow the
+	// over-fetch probe: the probe entry is exactly the one clamped away, and a
+	// partial window at the cap would read as the complete history. Narrow the
+	// window so the probe survives the cap — the last entry of a cap-sized
+	// window is the price of never reporting a partial lifecycle as complete.
+	if limit >= tern.MaxLogsLimit {
+		s.logger.Debug("narrowing the data-plane log window below the remote read cap so a partial window is still reported partial",
+			append(apply.LogAttrs(),
+				"operation", "read_deployment_logs", "operation_deployment", deployment, "requested_limit", limit, "window", tern.MaxLogsLimit-1)...)
+		limit = tern.MaxLogsLimit - 1
+	}
+	requestLimit := int32(min(int64(logFetchLimit(limit)), math.MaxInt32))
 	for _, key := range keys {
 		fetch := fetches[key]
 		resp, fetchErr := client.Logs(r.Context(), &ternv1.LogsRequest{ApplyId: fetch.externalID, Target: fetch.target, Database: apply.Database, Type: apply.DatabaseType, Environment: apply.Environment, Limit: requestLimit})
@@ -215,8 +272,9 @@ func (s *Service) handleDeploymentLogs(w http.ResponseWriter, r *http.Request, a
 			result.Errors = append(result.Errors, deploymentLogError(fetch, fetchErr))
 			continue
 		}
-		source := &apitypes.DeploymentLogSource{ExternalID: fetch.externalID, Operations: fetch.operations, Logs: []*apitypes.LogEntry{}}
-		for _, log := range resp.Logs {
+		remoteLogs, truncated := clampLogWindow(resp.Logs, limit)
+		source := &apitypes.DeploymentLogSource{ExternalID: fetch.externalID, Operations: fetch.operations, Logs: []*apitypes.LogEntry{}, Truncated: truncated}
+		for _, log := range remoteLogs {
 			entry, convertErr := deploymentLogEntry(fetch.externalID, log)
 			if convertErr != nil {
 				s.recordDeploymentLogFailure(apply, deployment, fetch, convertErr)

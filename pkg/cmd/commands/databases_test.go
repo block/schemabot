@@ -103,15 +103,3 @@ func TestWriteDatabaseListEmptyWithNameFilter(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "No databases match --name \"omnibus\".\n", out.String())
 }
-
-func TestValidateDatabaseListType(t *testing.T) {
-	assert.NoError(t, validateDatabaseListType(""))
-	assert.NoError(t, validateDatabaseListType("mysql"))
-	assert.NoError(t, validateDatabaseListType("vitess"))
-	assert.NoError(t, validateDatabaseListType("strata"))
-	assert.NoError(t, validateDatabaseListType("postgres"))
-
-	err := validateDatabaseListType("cockroach")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "--type must be")
-}

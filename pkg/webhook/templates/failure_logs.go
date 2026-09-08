@@ -111,14 +111,22 @@ func formatLogEntryLine(entry LogEntryData) string {
 // sanitizeLogText makes untrusted log text safe inside the section's fenced
 // code block. Engine log messages pass through verbatim, so they can carry
 // newlines (which would break the one-line-per-entry format and the size
-// accounting) or a ``` sequence (which would close the fence and let the rest
-// of the text render as comment markup). Newlines collapse to spaces; backtick
-// runs are split with a space until no fence marker remains.
+// accounting), a ``` sequence (which would close the fence and let the rest
+// of the text render as comment markup), ANSI or bidi control characters
+// (which visually reorder or recolor the rendered text), or connection
+// endpoints (which leak internal infrastructure the error block above
+// already redacts). Newlines collapse to spaces; control characters are
+// stripped before the fence check so that removing them cannot join
+// backticks into a new fence; backtick runs are then split with a space
+// until no fence marker remains; endpoints are redacted with the same rules
+// as the comment error sanitizer.
 func sanitizeLogText(text string) string {
 	text = strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(text)
+	text = stripControlText(text)
 	for strings.Contains(text, "```") {
 		text = strings.ReplaceAll(text, "```", "`` `")
 	}
+	text = redactConnectionDetails(text)
 	return text
 }
 

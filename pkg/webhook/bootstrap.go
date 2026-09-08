@@ -18,6 +18,12 @@ const commandTimeout = 2 * time.Minute
 // and the request-scoped PR-info cache, then creates a per-installation
 // GitHub client.
 //
+// The parent context scopes the command's lifetime beyond its own timeout:
+// fire-and-forget request-path handlers pass context.Background() because
+// their work must outlive the acknowledged HTTP request, while the durable
+// driver passes its run context so shutdown or lease loss cancels in-flight
+// command work instead of leaving it racing a reclaimed delivery.
+//
 // The PR-info cache wrapping is mandatory: command handlers call
 // FetchPullRequest from multiple places (config discovery, review gate,
 // checks gate, etc.) and the cache dedupes those calls within a single
@@ -28,8 +34,8 @@ const commandTimeout = 2 * time.Minute
 // returned cancel func is a no-op. The caller is responsible for
 // handler-specific error reporting (HTTP response, PR comment, log line)
 // because that contract varies between handlers.
-func (h *Handler) commandBootstrap(repo string, installationID int64) (context.Context, context.CancelFunc, *ghclient.InstallationClient, error) {
-	ctx, cancel := h.commandContext(commandTimeout)
+func (h *Handler) commandBootstrap(parent context.Context, repo string, installationID int64) (context.Context, context.CancelFunc, *ghclient.InstallationClient, error) {
+	ctx, cancel := h.commandContext(parent, commandTimeout)
 	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
 		cancel()
@@ -42,8 +48,8 @@ func (h *Handler) commandBootstrap(repo string, installationID int64) (context.C
 // plus the request-scoped PR-info cache. Use this for handlers that do not
 // need a GitHub client up front (e.g. handleUnlockCommand does its work
 // directly against storage and only creates a client later, conditionally).
-func (h *Handler) commandContext(timeout time.Duration) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+func (h *Handler) commandContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	ctx = ghclient.WithPRInfoCache(ctx)
 	return ctx, cancel
 }

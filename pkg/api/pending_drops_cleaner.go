@@ -18,13 +18,29 @@ import (
 const PendingDropsCleanupInterval = 6 * time.Hour
 
 // StartPendingDropsCleaner starts the background loop that permanently drops
-// expired quarantined tables from local-mode MySQL databases. It does not
-// start when cleanup is disabled for this process or when no local MySQL
+// expired quarantined tables from local-mode MySQL databases. It declines to
+// start when the quarantine is off, when cleanup is disabled for this process,
+// when the configured retention cannot be parsed, or when no local MySQL
 // targets are configured (gRPC-mode targets are cleaned by the deployment that
-// executes the schema changes).
+// executes the schema changes). Each cause logs its own line.
 func (s *Service) StartPendingDropsCleaner(ctx context.Context) {
+	// The ways cleanup can be off mean different things to an operator and need
+	// different responses, so they are reported separately rather than through
+	// the single PendingDropsCleanupEnabled predicate. Each message states its
+	// own consequence: quarantining without reaping is what makes tables
+	// accumulate on a target, so the reason a process is not reaping is the
+	// thing an operator needs to see.
+	if !s.config.PendingDropsEnabled() {
+		// Disabling the quarantine disables its cleaner with it, and this loop
+		// is the only reaper, so tables quarantined while it was on are left
+		// where they are. Saying "nothing to reap" would be false for a
+		// deployment that turned the quarantine off with tables outstanding.
+		s.logger.Info("pending drops cleaner not started because the quarantine is disabled; DROP TABLE executes as written, and any tables quarantined before it was disabled are not reaped")
+		return
+	}
+
 	if !s.config.PendingDropsCleanupEnabled() {
-		s.logger.Info("pending drops cleaner not started because cleanup is disabled for this process")
+		s.logger.Info("pending drops cleaner not started because cleanup is disabled for this process; another deployment must reap this deployment's targets or quarantined tables will accumulate on them")
 		return
 	}
 
@@ -36,8 +52,16 @@ func (s *Service) StartPendingDropsCleaner(ctx context.Context) {
 		return
 	}
 
-	if !s.hasPendingDropsLocalTargets() {
-		s.logger.Info("pending drops cleaner not started because no local MySQL database targets are configured")
+	local, routed := s.pendingDropsTargetCounts()
+	if local == 0 {
+		// A control plane that routes every target over gRPC executes nothing
+		// itself, so it has nothing to reap and this is its expected state.
+		// The counts separate that from a process that executes against
+		// targets it never configured, which quarantines tables no cleaner
+		// will reach.
+		s.logger.Info("pending drops cleaner not started because no local MySQL database targets are configured; the deployment that executes against each target reaps it",
+			"routed_mysql_targets", routed,
+		)
 		return
 	}
 
@@ -121,18 +145,37 @@ func (s *Service) runPendingDropsCleanupPass(ctx context.Context, retention time
 	return nil
 }
 
-func (s *Service) hasPendingDropsLocalTargets() bool {
+// pendingDropsTargetCounts returns how many configured MySQL database targets
+// this process executes against itself (local) and how many it routes to
+// another deployment (routed). Only local targets are reapable from here; the
+// routed count tells an operator whether a process with no local targets is a
+// control plane whose deployments reap their own targets, or a process with no
+// MySQL topology at all.
+//
+// A multi-deployment environment routes to each of its deployments, so it
+// contributes one target per deployment: the count is of execution targets,
+// which is what has to be reaped somewhere, not of environments. An
+// environment configured with neither a local DSN nor any routing executes
+// nowhere and is counted as neither; Validate() rejects that shape before
+// startup, so it is only reachable for an embedder that skips validation, and
+// counting it as routed would claim a deployment reaps it when none does.
+func (s *Service) pendingDropsTargetCounts() (local, routed int) {
 	for _, dbConfig := range s.config.Databases {
 		if dbConfig.Type != storage.DatabaseTypeMySQL {
 			continue
 		}
 		for _, envConfig := range dbConfig.Environments {
-			if envConfig.HasLocalDSN() {
-				return true
+			switch {
+			case envConfig.HasLocalDSN():
+				local++
+			case len(envConfig.Deployments) > 0:
+				routed += len(envConfig.Deployments)
+			case envConfig.Target != "" || envConfig.Deployment != "":
+				routed++
 			}
 		}
 	}
-	return false
+	return local, routed
 }
 
 // pendingDropsTargets resolves the local-mode MySQL databases the cleaner

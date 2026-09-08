@@ -46,6 +46,12 @@ func TestRepoAllowed(t *testing.T) {
 			want:         true,
 		},
 		{
+			name:         "uppercase allow-list entry matches canonical request",
+			allowedRepos: []string{"Octocat/Hello-World"},
+			repository:   "octocat/hello-world",
+			want:         true,
+		},
+		{
 			name:         "similar repo name is blocked",
 			allowedRepos: []string{"octocat/hello-world"},
 			repository:   "octocat/hello-world-archive",

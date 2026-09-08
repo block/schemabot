@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/e2eutil"
 )
 
@@ -37,6 +38,22 @@ func TestLoadCLIConfig_WithoutEnvironments(t *testing.T) {
 	assert.Equal(t, "mysql", cfg.Type)
 }
 
+// TestLoadCLIConfig_CanonicalizesIdentityKeys covers a schemabot.yaml that
+// spells the database and dialect in mixed case: the CLI must name the same
+// canonical identity the server stores so plan, lock, and apply requests
+// address the configured database rather than an unknown one.
+func TestLoadCLIConfig_CanonicalizesIdentityKeys(t *testing.T) {
+	dir := t.TempDir()
+	content := "database: Payments\ntype: Postgres\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte(content), 0644))
+
+	cfg, err := LoadCLIConfig(dir)
+	require.NoError(t, err)
+
+	assert.Equal(t, "payments", cfg.Database)
+	assert.Equal(t, "postgres", cfg.Type)
+}
+
 func TestLoadCLIConfig_RejectsDeployment(t *testing.T) {
 	dir := t.TempDir()
 	content := "database: mydb\ntype: mysql\ndeployment: us-west\n"
@@ -50,7 +67,7 @@ func TestLoadCLIConfig_RejectsDeployment(t *testing.T) {
 }
 
 func TestApplyChangeCountsSummary(t *testing.T) {
-	tables := []tableProgress{
+	tables := []templates.TableProgress{
 		{ChangeType: "CREATE"},
 		{ChangeType: "CHANGE_TYPE_CREATE"},
 		{ChangeType: "ALTER"},
@@ -64,11 +81,32 @@ func TestApplyChangeCountsSummary(t *testing.T) {
 }
 
 func TestApplyChangeCountsSummaryVSchemaOnly(t *testing.T) {
-	tables := []tableProgress{{ChangeType: "vschema_update"}}
+	tables := []templates.TableProgress{{ChangeType: "vschema_update"}}
 
 	assert.Equal(t, "Changes: 1 VSchema update.", countTableProgressChanges(tables).summary())
 }
 
 func TestApplyChangeCountsSummaryEmpty(t *testing.T) {
 	assert.Empty(t, countTableProgressChanges(nil).summary())
+}
+
+func TestLoadCLIConfig_ParsesIgnoreNamespaces(t *testing.T) {
+	dir := t.TempDir()
+	content := "database: mydb\ntype: vitess\nignore_namespaces:\n  - local_fixtures\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte(content), 0644))
+
+	cfg, err := LoadCLIConfig(dir)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"local_fixtures"}, cfg.IgnoreNamespaces)
+}
+
+func TestLoadCLIConfig_RejectsIgnoreNamespacePaths(t *testing.T) {
+	dir := t.TempDir()
+	content := "database: mydb\ntype: vitess\nignore_namespaces:\n  - schema/local_fixtures\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte(content), 0644))
+
+	cfg, err := LoadCLIConfig(dir)
+	require.Error(t, err)
+	assert.Nil(t, cfg)
+	assert.Contains(t, err.Error(), "not a path")
 }

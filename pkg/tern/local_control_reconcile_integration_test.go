@@ -111,7 +111,7 @@ func TestLocalClient_DriveAdoptsEngineTerminalTruthBeforeConsumingCancel(t *test
 
 	apply := dispatchApplyAwaitingDeployWithPendingCancel(t, stor, client)
 
-	driveNextQueuedApply(t, stor, client)
+	driveQueuedApply(t, stor, client, apply.ApplyIdentifier)
 
 	settled, err := stor.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
@@ -133,7 +133,7 @@ func TestLocalClient_DriveAdoptsEngineTerminalTruthBeforeConsumingCancel(t *test
 	assert.Contains(t, recorded, "Progress", "the drive must read the engine's authoritative state")
 	assert.NotContains(t, recorded, "Cancel", "the doomed cancel must never reach the engine")
 
-	reclaimed, err := stor.Applies().FindNextApply(ctx, "test-reclaim-"+t.Name())
+	reclaimed, err := stor.Applies().ClaimApplyByID(ctx, apply.ID, "test-reclaim-"+t.Name())
 	require.NoError(t, err)
 	assert.Nil(t, reclaimed, "a completed apply must not be claimable again")
 }
@@ -158,7 +158,7 @@ func TestLocalClient_DriveConsumesCancelWhenEngineReportsLiveWork(t *testing.T) 
 
 	apply := dispatchApplyAwaitingDeployWithPendingCancel(t, stor, client)
 
-	driveNextQueuedApply(t, stor, client)
+	driveQueuedApply(t, stor, client, apply.ApplyIdentifier)
 
 	settled, err := stor.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
@@ -198,7 +198,7 @@ func TestLocalClient_DriveConsumesCancelWhenEngineProgressUnreadable(t *testing.
 
 	apply := dispatchApplyAwaitingDeployWithPendingCancel(t, stor, client)
 
-	driveNextQueuedApply(t, stor, client)
+	driveQueuedApply(t, stor, client, apply.ApplyIdentifier)
 
 	settled, err := stor.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)

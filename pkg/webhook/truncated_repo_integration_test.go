@@ -220,7 +220,7 @@ func setupFakeGitHubForPlanOnTruncatedRepoWithPRState(t *testing.T, mux *http.Se
 // `schemabot plan -e staging` to recover. The command must recreate the
 // aggregate check as passing on the current head and say so in a comment —
 // even in a repository whose recursive tree listing GitHub truncates, since
-// converging the checks for a no-schema-changes PR requires no whole-repo
+// converging the checks for a PR with no schema changes requires no whole-repo
 // config scan.
 func TestE2EPlanCommandOnNoSchemaChangesPRRecreatesPassingCheck(t *testing.T) {
 	dbName := "webhook_truncated_repo_converge"
@@ -253,7 +253,7 @@ func TestE2EPlanCommandOnNoSchemaChangesPRRecreatesPassingCheck(t *testing.T) {
 		assert.NotContains(t, body, "truncated repository tree")
 		assert.NotContains(t, body, "Plan Failed")
 	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for no-managed-schema-changes comment")
+		t.Fatal(`timed out waiting for the "No Managed Schema Changes" comment`)
 	}
 
 	select {

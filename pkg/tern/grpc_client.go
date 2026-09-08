@@ -103,6 +103,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -139,6 +140,7 @@ type GRPCClient struct {
 	client  ternv1.TernClient
 	address string          // dial address for logging/debugging
 	storage storage.Storage // SchemaBot's storage for apply/task management
+	logger  *slog.Logger    // base logger; drives bind apply identity via applyLogger
 
 	// Observer support — same pattern as LocalClient.
 	// For GRPCClient, the observer is notified by the local progress poller,
@@ -150,6 +152,10 @@ type GRPCClient struct {
 	// controlSendGate throttles retransmission of pending stop/cancel control
 	// requests to the data plane (see remoteControlResendInterval).
 	controlSendGate remoteControlSendGate
+
+	// unrecognizedStatuses reports remote-reported statuses with no task-state
+	// mapping at the drive's ingest points. Zero value is ready.
+	unrecognizedStatuses unrecognizedStatusReporter
 }
 
 // Compile-time check that GRPCClient implements Client.
@@ -163,6 +169,10 @@ type Config struct {
 	// Storage is SchemaBot's storage for apply/task management.
 	// Required for ResumeApply to work.
 	Storage storage.Storage
+
+	// Logger is the base logger for drive-path logs. Defaults to
+	// slog.Default() when nil.
+	Logger *slog.Logger
 }
 
 // retryServiceConfig enables client-side retries for idempotent RPCs.
@@ -192,7 +202,7 @@ type Config struct {
 // the remote-deployment outage monitor, which must observe an outage promptly
 // rather than ride it out.
 //
-// State-changing RPCs (Apply, Cutover, Stop, Cancel, Start, Volume, Revert,
+// State-changing RPCs (Apply, Cutover, Stop, Cancel, Start, Revert,
 // SkipRevert) are intentionally not retried here: re-sending them could
 // duplicate work or advance an apply twice, and the operator's durable
 // queue already owns redelivery for dispatch failures.
@@ -252,7 +262,28 @@ func NewGRPCClient(config Config) (*GRPCClient, error) {
 		client:  ternv1.NewTernClient(conn),
 		address: config.Address,
 		storage: config.Storage,
+		logger:  config.Logger,
 	}, nil
+}
+
+// applyLogger returns a drive-scoped logger with the apply's identity
+// attributes bound, so every line of the drive inherits apply_id, database,
+// database_type, environment, and — when set — repo/pr/caller without
+// hand-listing them per call. Mutable attributes (state, deployment,
+// external_id) stay per-call via Apply.MutableLogAttrs. Falls back to
+// slog.Default() when no base logger was configured.
+func (c *GRPCClient) applyLogger(apply *storage.Apply) *slog.Logger {
+	return c.baseLogger().With(apply.IdentityLogAttrs()...)
+}
+
+// baseLogger returns the configured service logger, falling back to
+// slog.Default() when none was configured. It is for sites that must log
+// before an apply row is loaded, where no identity can be bound yet.
+func (c *GRPCClient) baseLogger() *slog.Logger {
+	if c.logger == nil {
+		return slog.Default()
+	}
+	return c.logger
 }
 
 // IsRemote returns true — GRPCClient delegates to a separate Tern service
@@ -305,7 +336,26 @@ func (c *GRPCClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*te
 }
 
 func (c *GRPCClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
-	return c.client.PullSchema(ctx, req)
+	resp, err := c.client.PullSchema(ctx, req)
+	if err != nil && remotePullSchemaUnsupported(err) {
+		return nil, fmt.Errorf("remote data plane does not support pull schema for database %s: %w: %w", req.GetDatabase(), ErrPullSchemaUnsupportedType, err)
+	}
+	return resp, err
+}
+
+// remotePullSchemaUnsupported reports whether a remote PullSchema failure is
+// the data plane's own unsupported-type verdict, so the caller can re-derive
+// ErrPullSchemaUnsupportedType and classify local and remote pulls the same
+// way. The tern server maps that sentinel to codes.Unimplemented with the
+// sentinel text in the status message, so both must match here: the code alone
+// also arrives from infrastructure — a proxy mapping an HTTP 404, or a data
+// plane too old to serve the RPC — and says nothing about the database type.
+func remotePullSchemaUnsupported(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	return st.Code() == codes.Unimplemented && strings.Contains(st.Message(), ErrPullSchemaUnsupportedType.Error())
 }
 
 func (c *GRPCClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
@@ -363,10 +413,10 @@ func (c *GRPCClient) clearObserver(applyID int64) {
 func (c *GRPCClient) logApplyEvent(ctx context.Context, applyID int64, taskID *int64, level, eventType, message string, oldState, newState string) {
 	logStore := c.storage.ApplyLogs()
 	if logStore == nil {
-		slog.Error("missing apply log store for gRPC apply event",
-			"apply_id", applyID,
+		c.baseLogger().ErrorContext(ctx, "missing apply log store for gRPC apply event",
+			"apply_row_id", applyID,
 			"event", eventType,
-			"message", message)
+			"event_message", message)
 		return
 	}
 	log := &storage.ApplyLog{
@@ -381,10 +431,10 @@ func (c *GRPCClient) logApplyEvent(ctx context.Context, applyID int64, taskID *i
 		CreatedAt: time.Now(),
 	}
 	if err := logStore.Append(ctx, log); err != nil {
-		slog.Error("failed to log gRPC apply event",
-			"apply_id", applyID,
+		c.baseLogger().ErrorContext(ctx, "failed to log gRPC apply event",
+			"apply_row_id", applyID,
 			"event", eventType,
-			"message", message,
+			"event_message", message,
 			"error", err)
 	}
 }
@@ -430,7 +480,7 @@ func (c *GRPCClient) pollAndNotifyObserver(applyID int64) {
 	if !errors.As(err, &pollPanic) {
 		// The poll loop returns nothing, so only a contained panic reaches here
 		// today; keep the signal if that invariant changes.
-		slog.Error("observer poll failed; progress and terminal notifications for this apply are stopped", "error", err)
+		c.baseLogger().Error("observer poll failed; progress and terminal notifications for this apply are stopped", "error", err)
 		c.clearObserver(applyID)
 		return
 	}
@@ -444,7 +494,7 @@ func (c *GRPCClient) pollAndNotifyObserver(applyID int64) {
 	if apply, lookupErr := c.storage.Applies().Get(context.Background(), applyID); lookupErr == nil && apply != nil {
 		attrs = append(apply.LogAttrs(), attrs...)
 	}
-	slog.Error("observer poll panicked; progress and terminal notifications for this apply are stopped", attrs...)
+	c.baseLogger().Error("observer poll panicked; progress and terminal notifications for this apply are stopped", attrs...)
 	metrics.RecordRecoveredPanic(context.Background(), "observer_poll")
 	c.clearObserver(applyID)
 }
@@ -479,7 +529,7 @@ func (c *GRPCClient) notifyObserverUntilTerminal(applyID int64) {
 		// tick, so log at Warn rather than Error.
 		apply, err := c.storage.Applies().Get(context.Background(), applyID)
 		if err != nil {
-			slog.Warn("observer poll: failed to load apply; will retry on next tick",
+			c.baseLogger().Warn("observer poll: failed to load apply; will retry on next tick",
 				append(identArgs(), "error", err)...)
 			continue
 		}
@@ -487,7 +537,7 @@ func (c *GRPCClient) notifyObserverUntilTerminal(applyID int64) {
 			// The row is gone rather than transiently unreadable, so it will
 			// never reappear — stop polling instead of spinning and warning
 			// every tick for an apply that no longer exists.
-			slog.Warn("observer poll: apply not found; stopping poll", identArgs()...)
+			c.baseLogger().Warn("observer poll: apply not found; stopping poll", identArgs()...)
 			c.clearObserver(applyID)
 			return
 		}
@@ -495,12 +545,8 @@ func (c *GRPCClient) notifyObserverUntilTerminal(applyID int64) {
 
 		tasks, err := c.storage.Tasks().GetByApplyID(context.Background(), applyID)
 		if err != nil {
-			slog.Warn("observer poll: failed to load tasks; will retry on next tick",
-				"apply_id", apply.ApplyIdentifier,
-				"external_id", apply.ExternalID,
-				"database", apply.Database,
-				"environment", apply.Environment,
-				"error", err)
+			c.applyLogger(apply).Warn("observer poll: failed to load tasks; will retry on next tick",
+				append(apply.MutableLogAttrs(), "error", err)...)
 			continue
 		}
 
@@ -538,14 +584,10 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 	if controlReq == nil {
 		return nil
 	}
+	logger := c.applyLogger(apply)
 	if cutoverRequestResolvedByApplyState(apply.State) {
-		slog.Info("completing pending gRPC cutover request for resolved apply",
-			"apply_id", apply.ApplyIdentifier,
-			"external_id", apply.ExternalID,
-			"database", apply.Database,
-			"environment", apply.Environment,
-			"requested_by", controlRequestCaller(controlReq),
-			"state", apply.State)
+		logger.InfoContext(ctx, "completing pending gRPC cutover request for resolved apply",
+			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered,
 			fmt.Sprintf("Pending remote cutover request completed for resolved apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		return completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover)
@@ -558,13 +600,8 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		return fmt.Errorf("process pending gRPC cutover for apply %s: %s", apply.ApplyIdentifier, message)
 	}
 	if state.IsState(apply.State, state.Apply.Recovering) {
-		slog.Info("pending gRPC cutover request is waiting for recovery to complete",
-			"apply_id", apply.ApplyIdentifier,
-			"external_id", apply.ExternalID,
-			"database", apply.Database,
-			"environment", apply.Environment,
-			"requested_by", controlRequestCaller(controlReq),
-			"state", apply.State)
+		logger.InfoContext(ctx, "pending gRPC cutover request is waiting for recovery to complete",
+			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
 		return nil
 	}
 	readyForCutover, err := applyReadyForCutoverRequest(ctx, c.storage, apply)
@@ -572,19 +609,14 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		return fmt.Errorf("check cutover readiness for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if !readyForCutover {
-		slog.Info("pending gRPC cutover request is waiting for cutover-ready state",
-			"apply_id", apply.ApplyIdentifier,
-			"external_id", apply.ExternalID,
-			"database", apply.Database,
-			"environment", apply.Environment,
-			"requested_by", controlRequestCaller(controlReq),
-			"state", apply.State)
+		logger.InfoContext(ctx, "pending gRPC cutover request is waiting for cutover-ready state",
+			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
 		return nil
 	}
 	remoteID := scope.remoteApplyID(apply)
 	if remoteID == "" {
 		message := "remote apply id is not available"
-		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, message); err != nil {
+		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, message, remoteID); err != nil {
 			return err
 		}
 		return fmt.Errorf("process pending gRPC cutover for apply %s: %s", apply.ApplyIdentifier, message)
@@ -595,16 +627,17 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		message := "schema change has a pending stop request; cutover is blocked until stop is processed"
 		return fmt.Errorf("process pending gRPC cutover for apply %s: %s", apply.ApplyIdentifier, message)
 	}
-	if err := markApplyCuttingOverForControlRequest(ctx, c.storage, apply); err != nil {
+	if err := markApplyCuttingOverForControlRequest(ctx, c.storage, apply, logger); err != nil {
 		return err
 	}
 	resp, err := c.client.Cutover(ctx, &ternv1.CutoverRequest{
 		ApplyId:     remoteID,
 		Environment: apply.Environment,
+		Caller:      controlReq.RequestedBy,
 	})
 	if err != nil {
 		errorMessage := fmt.Sprintf("remote cutover failed: %v", err)
-		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); failErr != nil {
+		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage, remoteID); failErr != nil {
 			return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %w; fail pending cutover request: %w", apply.ApplyIdentifier, remoteID, err, failErr)
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError,
@@ -612,8 +645,8 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
 	}
 	if resp == nil {
-		errorMessage := "not accepted"
-		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
+		errorMessage := "the data plane returned neither a response nor an error"
+		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage, remoteID); err != nil {
 			return err
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError,
@@ -621,11 +654,8 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 		return fmt.Errorf("request remote gRPC cutover for apply %s remote %s: %s", apply.ApplyIdentifier, remoteID, errorMessage)
 	}
 	if !resp.Accepted {
-		errorMessage := "not accepted"
-		if resp.ErrorMessage != "" {
-			errorMessage = resp.ErrorMessage
-		}
-		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
+		errorMessage := controlRefusalMessage(storage.ControlOperationCutover, resp.ErrorMessage)
+		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage, remoteID); err != nil {
 			return err
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError,
@@ -637,13 +667,8 @@ func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, ap
 	if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover); err != nil {
 		return err
 	}
-	slog.Info("pending gRPC cutover request accepted and completed",
-		"apply_id", apply.ApplyIdentifier,
-		"external_id", apply.ExternalID,
-		"database", apply.Database,
-		"environment", apply.Environment,
-		"requested_by", controlRequestCaller(controlReq),
-		"state", apply.State)
+	logger.InfoContext(ctx, "pending gRPC cutover request accepted and completed",
+		append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
 	return nil
 }
 
@@ -683,15 +708,18 @@ func (c *GRPCClient) processPendingSkipRevertControlRequest(ctx context.Context,
 		return fmt.Errorf("process pending skip-revert for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if !resp.Accepted {
+		c.applyLogger(apply).WarnContext(ctx, "skip-revert was not accepted by the data plane",
+			append(apply.MutableLogAttrs(), "remote_apply_id", remoteID, "error_message", resp.ErrorMessage)...)
 		message := "skip-revert was not accepted by the data plane"
 		if resp.ErrorMessage != "" {
 			message = fmt.Sprintf("skip-revert was not accepted: %s", resp.ErrorMessage)
 		}
-		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationSkipRevert, message)
+		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationSkipRevert, message, remoteID)
 	}
 	if apply.Engine == storage.EnginePlanetScale {
 		if err := c.storage.Applies().SetRevertSkipped(ctx, apply.ID, time.Now()); err != nil {
-			slog.Warn("failed to record skip-revert on apply", "apply_id", apply.ApplyIdentifier, "error", err)
+			c.applyLogger(apply).WarnContext(ctx, "failed to record skip-revert on apply",
+				append(apply.MutableLogAttrs(), "error", err)...)
 		}
 	}
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered,
@@ -727,11 +755,13 @@ func (c *GRPCClient) processPendingRevertControlRequest(ctx context.Context, app
 		return fmt.Errorf("process pending revert for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if !resp.Accepted {
+		c.applyLogger(apply).WarnContext(ctx, "revert was not accepted by the data plane",
+			append(apply.MutableLogAttrs(), "remote_apply_id", remoteID, "error_message", resp.ErrorMessage)...)
 		message := "revert was not accepted by the data plane"
 		if resp.ErrorMessage != "" {
 			message = fmt.Sprintf("revert was not accepted: %s", resp.ErrorMessage)
 		}
-		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationRevert, message)
+		return failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationRevert, message, remoteID)
 	}
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventRevertTriggered,
 		fmt.Sprintf("Revert triggered by user%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
@@ -744,14 +774,72 @@ func (c *GRPCClient) processPendingRevertControlRequest(ctx context.Context, app
 // request is completed by the operator once the projection CAS derives the
 // parent terminal, so completing it from the drive would resolve the
 // apply-level stop early while sibling operations are still live.
-func logOperationDriveLeavesParentStop(apply *storage.Apply, scope applyTaskScope) {
-	slog.Info("operation-only drive leaving apply-level stop request for operator projection",
-		append(apply.LogAttrs(), "apply_operation_id", scope.applyOperationID, "remote_apply_id", scope.remoteApplyID(apply))...)
+// The logger is expected to carry the apply's identity attributes already
+// bound, so each line appends only the mutable snapshot.
+func logOperationDriveLeavesParentStop(logger *slog.Logger, apply *storage.Apply, scope applyTaskScope) {
+	logger.Info("operation-only drive leaving apply-level stop request for operator projection",
+		append(apply.MutableLogAttrs(), "apply_operation_id", scope.applyOperationID, "remote_apply_id", scope.remoteApplyID(apply))...)
 }
 
-func logOperationDriveLeavesParentCancel(apply *storage.Apply, scope applyTaskScope) {
-	slog.Info("operation-only drive leaving apply-level cancel request for operator projection",
-		append(apply.LogAttrs(), "apply_operation_id", scope.applyOperationID, "remote_apply_id", scope.remoteApplyID(apply))...)
+func logOperationDriveLeavesParentCancel(logger *slog.Logger, apply *storage.Apply, scope applyTaskScope) {
+	logger.Info("operation-only drive leaving apply-level cancel request for operator projection",
+		append(apply.MutableLogAttrs(), "apply_operation_id", scope.applyOperationID, "remote_apply_id", scope.remoteApplyID(apply))...)
+}
+
+// failRefusedControlRequest resolves a pending stop or cancel that the data
+// plane answered with an explicit refusal. The data plane stores stop and cancel
+// durably on first receipt, so a refusal is its decision rather than a delivery
+// failure: re-sending can only collect the same refusal on every later claim,
+// while the schema change keeps running and the operator's command never
+// resolves. Failing it with the stated reason ends that loop.
+//
+// The refusal means the operation did not take effect, so this reports the
+// request as not handled, and it drops the resolved request's send-gate entry
+// so a re-issued command transmits at once. There is one control request row
+// per apply and operation, and re-requesting reuses that row rather than
+// inserting a new one, so the send gate would otherwise still hold the failed
+// request's timestamp under the same id and throttle the operator's next stop
+// or cancel for the rest of the interval.
+//
+// An operation-only drive owns only its operation and never the shared
+// apply-level request, so it leaves the request pending for the operator
+// projection to resolve, and says so in its own line rather than reusing the
+// caller's — a drive that reported the same sentence twice per tick would read
+// as two drives. It records the transmission on its way out: the request stays
+// pending by design there, so without the record every later tick would re-send
+// a command already refused. It reports the request as not handled for the same
+// reason the resolving branch does, which matters more here: an operation-only
+// drive returning handled would stand its whole drive step down over a refusal
+// that changed nothing.
+func (c *GRPCClient) failRefusedControlRequest(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, scope applyTaskScope, remoteID, errorMessage string) (bool, error) {
+	message := controlRefusalMessage(operation, errorMessage)
+	if scope.suppressesDirectParentApplyWrites() {
+		logger.WarnContext(ctx, "the data plane refused the pending control request; this operation-only drive leaves the shared apply-level request for the operator projection and keeps driving",
+			append(apply.MutableLogAttrs(),
+				"operation", string(operation),
+				"requested_by", controlRequestCaller(controlReq),
+				"apply_operation_id", scope.applyOperationID,
+				"remote_apply_id", remoteID,
+				"error_message", message)...)
+		c.controlSendGate.recordSend(controlReq.ID, time.Now())
+		return false, nil
+	}
+	logger.WarnContext(ctx, "the data plane refused the pending control request; the schema change continues and settles on its own",
+		append(apply.MutableLogAttrs(),
+			"operation", string(operation),
+			"requested_by", controlRequestCaller(controlReq),
+			"remote_apply_id", remoteID,
+			"error_message", message)...)
+	// The durable record is rewritten for the operator by failPendingControlRequests;
+	// the apply log lands on the same PR timeline, so it is rewritten here too rather
+	// than naming a remote identifier that resolves to nothing on the control plane.
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, eventType,
+		fmt.Sprintf("Pending %s request rejected by the data plane: %s%s", operation, apply.OperatorFacingMessage(message, remoteID), callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
+	if err := failPendingControlRequests(ctx, c.storage, apply, operation, message, remoteID); err != nil {
+		return true, fmt.Errorf("request remote gRPC %s for apply %s remote %s: refused with %q; fail pending %s request: %w", operation, apply.ApplyIdentifier, remoteID, message, operation, err)
+	}
+	c.controlSendGate.clear(controlReq.ID)
+	return false, nil
 }
 
 func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (bool, error) {
@@ -762,6 +850,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 	if controlReq == nil {
 		return false, nil
 	}
+	logger := c.applyLogger(apply)
 	if scope.suppressesDirectParentApplyWrites() {
 		// An operation-only drive must not complete the apply-level stop
 		// request: the operator projection owns it and completes it once the
@@ -779,40 +868,30 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		}
 		if state.IsTerminalApplyState(storedApply.State) {
 			*apply = *storedApply
-			logOperationDriveLeavesParentStop(apply, scope)
+			logOperationDriveLeavesParentStop(logger, apply, scope)
 			return true, nil
 		}
-	} else if completed, err := completePendingStopIfStoredApplyResolved(ctx, c.storage, apply); err != nil {
+	} else if completed, err := completePendingRequestIfStoredApplyResolved(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 		return true, err
 	} else if completed {
-		slog.Info("completing pending gRPC stop request for resolved apply",
-			"apply_id", apply.ApplyIdentifier,
-			"external_id", apply.ExternalID,
-			"database", apply.Database,
-			"environment", apply.Environment,
-			"requested_by", controlRequestCaller(controlReq),
-			"state", apply.State)
+		logger.InfoContext(ctx, "completing pending gRPC stop request for resolved apply",
+			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
 			fmt.Sprintf("Pending remote stop request completed for resolved apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
-		if hasPendingStart, startErr := hasPendingStartControlRequest(ctx, c.storage, apply); startErr != nil {
+		if pendingStart, startErr := pendingStartControlRequest(ctx, c.storage, apply); startErr != nil {
 			return true, startErr
-		} else if hasPendingStart {
+		} else if pendingStart != nil {
 			return false, nil
 		}
 		return true, nil
 	}
 	if state.IsTerminalApplyState(apply.State) {
 		if scope.suppressesDirectParentApplyWrites() {
-			logOperationDriveLeavesParentStop(apply, scope)
+			logOperationDriveLeavesParentStop(logger, apply, scope)
 			return true, nil
 		}
-		slog.Info("completing pending gRPC stop request for terminal apply",
-			"apply_id", apply.ApplyIdentifier,
-			"external_id", apply.ExternalID,
-			"database", apply.Database,
-			"environment", apply.Environment,
-			"requested_by", controlRequestCaller(controlReq),
-			"state", apply.State)
+		logger.InfoContext(ctx, "completing pending gRPC stop request for terminal apply",
+			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
 			fmt.Sprintf("Pending remote stop request completed for terminal apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
@@ -823,26 +902,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 	}
 	remoteID := scope.remoteApplyID(apply)
 	if remoteID == "" {
-		if scope.usesOperationRemoteResume() {
-			// A multi-operation apply has one stop request shared by every
-			// deployment. Stopping this undispatched operation must not
-			// terminalize the parent or complete the apply-level request:
-			// sibling deployments with their own remote apply id still need to
-			// observe the durable stop. Stop only this operation and leave the
-			// request pending for the siblings.
-			if err := c.stopUndispatchedApplyOperation(ctx, apply, controlRequestCaller(controlReq), scope); err != nil {
-				return true, err
-			}
-			logOperationDriveLeavesParentStop(apply, scope)
-			return true, nil
-		}
-		if err := c.stopUndispatchedApply(ctx, apply, controlRequestCaller(controlReq), scope); err != nil {
-			return true, err
-		}
-		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
-			return true, err
-		}
-		return true, nil
+		return c.settleUndispatchedControlRequest(ctx, apply, controlReq, scope, stopUndispatchedTerminalization(apply.DatabaseType), logOperationDriveLeavesParentStop)
 	}
 
 	// The data plane stores the stop durably on first receipt and its own
@@ -852,6 +912,7 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		resp, err := c.client.Stop(ctx, &ternv1.StopRequest{
 			ApplyId:     remoteID,
 			Environment: apply.Environment,
+			Caller:      controlReq.RequestedBy,
 		})
 		if err != nil {
 			if completed, completeErr := c.completeRemoteStopFromTerminalProgress(ctx, apply, controlReq, scope); completeErr == nil && completed {
@@ -861,32 +922,28 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 			}
 			return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
 		}
-		if resp == nil || !resp.Accepted {
-			errorMessage := "not accepted"
-			if resp != nil && resp.ErrorMessage != "" {
-				errorMessage = resp.ErrorMessage
-			}
-			return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: %s", apply.ApplyIdentifier, remoteID, errorMessage)
+		if resp == nil {
+			return true, fmt.Errorf("request remote gRPC stop for apply %s remote %s: the data plane returned neither a response nor an error", apply.ApplyIdentifier, remoteID)
+		}
+		if !resp.Accepted {
+			return c.failRefusedControlRequest(ctx, logger, apply, storage.ControlOperationStop, storage.LogEventStopRequested, controlReq, scope, remoteID, resp.ErrorMessage)
 		}
 		if c.controlSendGate.recordSend(controlReq.ID, now) {
 			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
 				fmt.Sprintf("Remote stop accepted for apply %s%s", remoteID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		} else {
-			logRemoteControlResend(ctx, apply, controlReq, now)
+			logRemoteControlResend(ctx, logger, apply, controlReq, now)
 		}
 	}
 
-	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
-		ApplyId:     remoteID,
-		Environment: apply.Environment,
-	})
+	progress, err := c.controlPathProgress(ctx, apply, remoteID)
 	if err != nil {
 		return true, fmt.Errorf("sync remote gRPC stop for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
 	}
 	if progress.State == ternv1.State_STATE_NO_ACTIVE_CHANGE {
 		return true, fmt.Errorf("sync remote gRPC stop for apply %s remote %s: no active schema change", apply.ApplyIdentifier, remoteID)
 	}
-	remoteState := ProtoStateToStorage(progress.State)
+	remoteState := remoteProgressApplyState(progress.State, progress.Tables)
 	if remoteState == "" {
 		return true, fmt.Errorf("sync remote gRPC stop for apply %s remote %s: unmapped remote state %s", apply.ApplyIdentifier, remoteID, remoteApplyStateDescription(progress.State))
 	}
@@ -895,9 +952,9 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 	if apply.StartedAt == nil && !state.IsState(remoteState, state.Apply.Pending) {
 		apply.StartedAt = &now
 	}
-	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, false)
+	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, progress.Tables, false)
 	apply.UpdatedAt = now
-	if isTerminalProtoState(progress.State) {
+	if remoteProgressIsTerminal(progress.State, progress.Tables) {
 		if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now, scope); err != nil {
 			return true, err
 		}
@@ -909,16 +966,16 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 		// apply and let a later stop pass treat the parent as terminal.
 		if scope.suppressesDirectParentApplyWrites() {
 			apply.State, apply.StartedAt, apply.UpdatedAt = priorState, priorStartedAt, priorUpdatedAt
-			logOperationDriveLeavesParentStop(apply, scope)
+			logOperationDriveLeavesParentStop(logger, apply, scope)
 			return true, nil
 		}
 		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 			return true, err
 		}
 		c.controlSendGate.clear(controlReq.ID)
-		if hasPendingStart, startErr := hasPendingStartControlRequest(ctx, c.storage, apply); startErr != nil {
+		if pendingStart, startErr := pendingStartControlRequest(ctx, c.storage, apply); startErr != nil {
 			return true, startErr
-		} else if hasPendingStart {
+		} else if pendingStart != nil {
 			return false, nil
 		}
 		return true, nil
@@ -934,13 +991,10 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 	if _, err := c.persistParentApply(ctx, apply, scope, "sync nonterminal gRPC stop"); err != nil {
 		return true, fmt.Errorf("sync nonterminal remote gRPC stop state for %s: %w", apply.ApplyIdentifier, err)
 	}
-	slog.Info("remote gRPC stop request accepted and remains pending for remote apply owner",
-		"apply_id", apply.ApplyIdentifier,
-		"external_id", apply.ExternalID,
-		"database", apply.Database,
-		"environment", apply.Environment,
-		"requested_by", controlRequestCaller(controlReq),
-		"remote_state", remoteState)
+	logger.InfoContext(ctx, "remote gRPC stop request accepted and remains pending for remote apply owner",
+		append(apply.MutableLogAttrs(),
+			"requested_by", controlRequestCaller(controlReq),
+			"remote_state", remoteState)...)
 	return false, nil
 }
 
@@ -952,9 +1006,10 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 	if controlReq == nil {
 		return false, nil
 	}
+	logger := c.applyLogger(apply)
 	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
 		if scope.suppressesDirectParentApplyWrites() {
-			logOperationDriveLeavesParentCancel(apply, scope)
+			logOperationDriveLeavesParentCancel(logger, apply, scope)
 			return true, nil
 		}
 		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
@@ -965,7 +1020,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 	}
 	remoteID := scope.remoteApplyID(apply)
 	if remoteID == "" {
-		return true, fmt.Errorf("cancel gRPC apply %s: remote apply id is not available", apply.ApplyIdentifier)
+		return c.settleUndispatchedControlRequest(ctx, apply, controlReq, scope, cancelUndispatchedTerminalization(), logOperationDriveLeavesParentCancel)
 	}
 	// The data plane stores the cancel durably on first receipt and its own
 	// driver consumes it, so retransmission is redelivery insurance on a bounded
@@ -973,7 +1028,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 	// cancels and the apply log with duplicate accept events while the remote
 	// works (or fails) to consume the first one.
 	if now := time.Now(); c.controlSendGate.shouldSend(controlReq.ID, now) {
-		resp, err := c.client.Cancel(ctx, &ternv1.CancelRequest{ApplyId: remoteID, Environment: apply.Environment})
+		resp, err := c.client.Cancel(ctx, &ternv1.CancelRequest{ApplyId: remoteID, Environment: apply.Environment, Caller: controlReq.RequestedBy})
 		if err != nil {
 			if completed, completeErr := c.completeRemoteCancelFromTerminalProgress(ctx, apply, controlReq, scope); completeErr == nil && completed {
 				return true, nil
@@ -982,42 +1037,48 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 			}
 			return true, fmt.Errorf("request remote gRPC cancel for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
 		}
-		if resp == nil || !resp.Accepted {
-			errorMessage := "not accepted"
-			if resp != nil && resp.ErrorMessage != "" {
-				errorMessage = resp.ErrorMessage
-			}
-			return true, fmt.Errorf("request remote gRPC cancel for apply %s remote %s: %s", apply.ApplyIdentifier, remoteID, errorMessage)
+		if resp == nil {
+			return true, fmt.Errorf("request remote gRPC cancel for apply %s remote %s: the data plane returned neither a response nor an error", apply.ApplyIdentifier, remoteID)
+		}
+		if !resp.Accepted {
+			return c.failRefusedControlRequest(ctx, logger, apply, storage.ControlOperationCancel, storage.LogEventCancelRequested, controlReq, scope, remoteID, resp.ErrorMessage)
 		}
 		if c.controlSendGate.recordSend(controlReq.ID, now) {
 			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested,
 				fmt.Sprintf("Remote cancel accepted for apply %s%s", remoteID, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		} else {
-			logRemoteControlResend(ctx, apply, controlReq, now)
+			logRemoteControlResend(ctx, logger, apply, controlReq, now)
 		}
 	}
-	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{ApplyId: remoteID, Environment: apply.Environment})
+	progress, err := c.controlPathProgress(ctx, apply, remoteID)
 	if err != nil {
 		return true, fmt.Errorf("sync remote gRPC cancel for apply %s remote %s: %w", apply.ApplyIdentifier, remoteID, err)
 	}
 	if progress.State == ternv1.State_STATE_NO_ACTIVE_CHANGE {
 		return true, fmt.Errorf("sync remote gRPC cancel for apply %s remote %s: no active schema change", apply.ApplyIdentifier, remoteID)
 	}
-	remoteState := ProtoStateToStorage(progress.State)
+	remoteState := remoteProgressApplyState(progress.State, progress.Tables)
 	if remoteState == "" {
 		return true, fmt.Errorf("sync remote gRPC cancel for apply %s remote %s: unmapped remote state %s", apply.ApplyIdentifier, remoteID, remoteApplyStateDescription(progress.State))
 	}
 	now := time.Now()
 	priorState, priorStartedAt, priorUpdatedAt := apply.State, apply.StartedAt, apply.UpdatedAt
-	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, false)
+	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, progress.Tables, false)
 	apply.UpdatedAt = now
-	if isTerminalProtoState(progress.State) {
+	// A stopped remote is not a cancel outcome: the data plane accepts Cancel
+	// for stopped applies and its own driver consumes the durable request, so
+	// completing here would consume a deliverable cancel while the remote is
+	// merely stopped — the stored apply would freeze at stopped after the
+	// remote cancels. Keep the request pending and sync the stopped snapshot
+	// below; a later drive reconciles once the remote settles. (Mirrors
+	// completeRemoteCancelFromTerminalProgress.)
+	if remoteProgressIsTerminal(progress.State, progress.Tables) && progress.State != ternv1.State_STATE_STOPPED {
 		if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now, scope); err != nil {
 			return true, err
 		}
 		if scope.suppressesDirectParentApplyWrites() {
 			apply.State, apply.StartedAt, apply.UpdatedAt = priorState, priorStartedAt, priorUpdatedAt
-			logOperationDriveLeavesParentCancel(apply, scope)
+			logOperationDriveLeavesParentCancel(logger, apply, scope)
 			return true, nil
 		}
 		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
@@ -1026,10 +1087,96 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 		c.controlSendGate.clear(controlReq.ID)
 		return true, nil
 	}
+	storedTasks, err := c.loadApplyTasks(ctx, apply, scope)
+	if err != nil {
+		return true, fmt.Errorf("load tasks to sync remote gRPC cancel for %s: %w", apply.ApplyIdentifier, err)
+	}
+	if err := c.syncStoredTasksFromRemoteTasks(ctx, apply, storedTasks, progress.Tables, now); err != nil {
+		return true, err
+	}
 	if _, err := c.persistParentApply(ctx, apply, scope, "sync nonterminal gRPC cancel"); err != nil {
 		return true, fmt.Errorf("sync nonterminal remote gRPC cancel state for %s: %w", apply.ApplyIdentifier, err)
 	}
+	logger.InfoContext(ctx, "remote gRPC cancel request accepted and remains pending for remote apply owner",
+		append(apply.MutableLogAttrs(),
+			"requested_by", controlRequestCaller(controlReq),
+			"remote_state", remoteState)...)
 	return false, nil
+}
+
+// settleUndispatchedControlRequest settles a pending stop or cancel for an apply
+// that carries no remote apply id.
+//
+// Nothing remote exists to address exactly when
+// undispatchedControlRequestSettlesLocally holds: either the dispatch path
+// would treat this drive as a first dispatch — the same predicate dispatch
+// itself trusts to mean no remote apply was ever created — or the dispatch
+// state is stopped, which with no recorded remote apply id proves the work was
+// stopped before it was ever dispatched. In both shapes the request is
+// satisfied in control-plane storage alone and the operator's command
+// completes: there is nothing to orphan.
+//
+// Every other shape is the ambiguous one — a dispatch may have created a remote
+// apply whose response was lost. Settling locally would report the change
+// stopped or cancelled while it kept running on the target, and because that
+// leaves the apply terminal, nothing would ever revisit it to find out. So this
+// reports the request unhandled and lets the drive continue to the dispatch
+// ambiguity guard, which fails the apply closed and fails the pending stop and
+// cancel requests with the same ambiguity message, so the operator sees the
+// rejection rather than a command no later claim would ever answer. The guard
+// is where this apply was headed regardless — a pending request must not be
+// what routes around it.
+//
+// The request must never be answered with an error here: it stays pending across
+// the error, so every later claim would abort at this same point and the apply
+// would occupy a driver on every poll without ever resolving.
+func (c *GRPCClient) settleUndispatchedControlRequest(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, scope applyTaskScope, terminalization undispatchedTerminalization, leaveParentRequestPending func(*slog.Logger, *storage.Apply, applyTaskScope)) (bool, error) {
+	logger := c.applyLogger(apply)
+	caller := controlRequestCaller(controlReq)
+	if !undispatchedControlRequestSettlesLocally(apply, scope) {
+		logger.WarnContext(ctx, "leaving pending gRPC control request to the dispatch ambiguity guard; remote dispatch state is ambiguous so the request cannot be satisfied locally",
+			append(apply.MutableLogAttrs(),
+				"control_operation", terminalization.controlOperation,
+				"requested_by", caller,
+				"dispatch_state", scope.dispatchState(apply))...)
+		return false, nil
+	}
+	if scope.usesOperationRemoteResume() {
+		// A multi-operation apply has one request shared by every deployment.
+		// Settling this undispatched operation must not terminalize the parent or
+		// complete the apply-level request: sibling deployments with their own
+		// remote apply id still need to observe the durable command.
+		if err := c.terminalizeUndispatchedApplyOperation(ctx, apply, caller, scope, terminalization); err != nil {
+			return true, err
+		}
+		leaveParentRequestPending(logger, apply, scope)
+		return true, nil
+	}
+	if err := c.terminalizeUndispatchedApply(ctx, apply, caller, scope, terminalization); err != nil {
+		return true, err
+	}
+	if err := completePendingControlRequests(ctx, c.storage, apply, terminalization.controlOperation); err != nil {
+		return true, err
+	}
+	c.controlSendGate.clear(controlReq.ID)
+	return true, nil
+}
+
+// controlPathProgress polls remote progress on behalf of a control-request path
+// and mirrors any control rejections the response carries. A cancel or stop that
+// reconciles a terminal remote ends the drive, so the regular poll loop never
+// runs again: a rejection the data plane settled after the last regular poll
+// reaches the operator only if it is mirrored from here.
+func (c *GRPCClient) controlPathProgress(ctx context.Context, apply *storage.Apply, remoteID string) (*ternv1.ProgressResponse, error) {
+	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
+		ApplyId:     remoteID,
+		Environment: apply.Environment,
+	})
+	if err != nil {
+		return nil, err
+	}
+	c.mirrorRemoteControlRejections(ctx, apply, remoteID, progress.SettledControlRequests)
+	return progress, nil
 }
 
 func (c *GRPCClient) processPendingCancelOrStopControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (bool, error) {
@@ -1040,25 +1187,23 @@ func (c *GRPCClient) processPendingCancelOrStopControlRequest(ctx context.Contex
 }
 
 func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, scope applyTaskScope) (bool, error) {
+	logger := c.applyLogger(apply)
 	// Route the remote apply id through the scope: an operation-scoped drive
 	// tracks its remote apply on the operation, not on the parent apply's
 	// ExternalID.
 	remoteID := scope.remoteApplyID(apply)
-	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
-		ApplyId:     remoteID,
-		Environment: apply.Environment,
-	})
+	progress, err := c.controlPathProgress(ctx, apply, remoteID)
 	if err != nil {
-		slog.Warn("remote gRPC stop error could not be reconciled from progress",
-			append(apply.LogAttrs(),
+		logger.WarnContext(ctx, "remote gRPC stop error could not be reconciled from progress",
+			append(apply.MutableLogAttrs(),
 				"remote_apply_id", remoteID,
 				"requested_by", controlRequestCaller(controlReq),
 				"error", err)...)
 		return false, nil
 	}
-	if progress.State == ternv1.State_STATE_NO_ACTIVE_CHANGE || !isTerminalProtoState(progress.State) {
-		slog.Warn("remote gRPC stop error found nonterminal progress; durable stop request remains pending for operator retry",
-			append(apply.LogAttrs(),
+	if progress.State == ternv1.State_STATE_NO_ACTIVE_CHANGE || !remoteProgressIsTerminal(progress.State, progress.Tables) {
+		logger.WarnContext(ctx, "remote gRPC stop error found nonterminal progress; durable stop request remains pending for operator retry",
+			append(apply.MutableLogAttrs(),
 				"remote_apply_id", remoteID,
 				"requested_by", controlRequestCaller(controlReq),
 				"remote_state", progress.State.String(),
@@ -1074,7 +1219,7 @@ func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context,
 	if apply.StartedAt == nil && !state.IsState(remoteState, state.Apply.Pending) {
 		apply.StartedAt = &now
 	}
-	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, false)
+	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, progress.Tables, false)
 	apply.ErrorMessage = remoteProgressErrorMessage(apply.State, progress.ErrorMessage, apply.ErrorMessage)
 	apply.UpdatedAt = now
 	if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now, scope); err != nil {
@@ -1088,7 +1233,7 @@ func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context,
 	// stop pass treat the parent as terminal.
 	if scope.suppressesDirectParentApplyWrites() {
 		apply.State, apply.StartedAt, apply.UpdatedAt, apply.ErrorMessage = priorState, priorStartedAt, priorUpdatedAt, priorErrorMessage
-		logOperationDriveLeavesParentStop(apply, scope)
+		logOperationDriveLeavesParentStop(logger, apply, scope)
 		return true, nil
 	}
 	if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
@@ -1110,25 +1255,23 @@ func (c *GRPCClient) completeRemoteStopFromTerminalProgress(ctx context.Context,
 // remote that is still active — or stopped, since stopped remotes remain
 // cancellable — keeps the durable request pending for the next drive to retry.
 func (c *GRPCClient) completeRemoteCancelFromTerminalProgress(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, scope applyTaskScope) (bool, error) {
+	logger := c.applyLogger(apply)
 	// Route the remote apply id through the scope: an operation-scoped drive
 	// tracks its remote apply on the operation, not on the parent apply's
 	// ExternalID.
 	remoteID := scope.remoteApplyID(apply)
-	progress, err := c.client.Progress(ctx, &ternv1.ProgressRequest{
-		ApplyId:     remoteID,
-		Environment: apply.Environment,
-	})
+	progress, err := c.controlPathProgress(ctx, apply, remoteID)
 	if err != nil {
-		slog.Warn("remote gRPC cancel error could not be reconciled from progress",
-			append(apply.LogAttrs(),
+		logger.WarnContext(ctx, "remote gRPC cancel error could not be reconciled from progress",
+			append(apply.MutableLogAttrs(),
 				"remote_apply_id", remoteID,
 				"requested_by", controlRequestCaller(controlReq),
 				"error", err)...)
 		return false, nil
 	}
-	if progress.State == ternv1.State_STATE_NO_ACTIVE_CHANGE || !isTerminalProtoState(progress.State) {
-		slog.Warn("remote gRPC cancel error found nonterminal progress; durable cancel request remains pending for operator retry",
-			append(apply.LogAttrs(),
+	if progress.State == ternv1.State_STATE_NO_ACTIVE_CHANGE || !remoteProgressIsTerminal(progress.State, progress.Tables) {
+		logger.WarnContext(ctx, "remote gRPC cancel error found nonterminal progress; durable cancel request remains pending for operator retry",
+			append(apply.MutableLogAttrs(),
 				"remote_apply_id", remoteID,
 				"requested_by", controlRequestCaller(controlReq),
 				"remote_state", progress.State.String(),
@@ -1141,8 +1284,8 @@ func (c *GRPCClient) completeRemoteCancelFromTerminalProgress(ctx context.Contex
 	// deliverable cancel and let a pending start resume a change the user
 	// cancelled. Keep the durable request pending for retry.
 	if progress.State == ternv1.State_STATE_STOPPED {
-		slog.Warn("remote gRPC cancel error found stopped progress; stopped remotes remain cancellable so the durable cancel request remains pending for retry",
-			append(apply.LogAttrs(),
+		logger.WarnContext(ctx, "remote gRPC cancel error found stopped progress; stopped remotes remain cancellable so the durable cancel request remains pending for retry",
+			append(apply.MutableLogAttrs(),
 				"remote_apply_id", remoteID,
 				"requested_by", controlRequestCaller(controlReq))...)
 		return false, nil
@@ -1156,7 +1299,7 @@ func (c *GRPCClient) completeRemoteCancelFromTerminalProgress(ctx context.Contex
 	if apply.StartedAt == nil && !state.IsState(remoteState, state.Apply.Pending) {
 		apply.StartedAt = &now
 	}
-	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, false)
+	apply.State = applyStateFromRemoteProgress(apply.State, remoteState, progress.Tables, false)
 	apply.ErrorMessage = remoteProgressErrorMessage(apply.State, progress.ErrorMessage, apply.ErrorMessage)
 	apply.UpdatedAt = now
 	if err := c.reconcileTerminalRemoteProgress(ctx, apply, progress.Tables, now, scope); err != nil {
@@ -1170,7 +1313,7 @@ func (c *GRPCClient) completeRemoteCancelFromTerminalProgress(ctx context.Contex
 	// cancel pass treat the parent as terminal.
 	if scope.suppressesDirectParentApplyWrites() {
 		apply.State, apply.StartedAt, apply.UpdatedAt, apply.ErrorMessage = priorState, priorStartedAt, priorUpdatedAt, priorErrorMessage
-		logOperationDriveLeavesParentCancel(apply, scope)
+		logOperationDriveLeavesParentCancel(logger, apply, scope)
 		return true, nil
 	}
 	if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
@@ -1182,126 +1325,165 @@ func (c *GRPCClient) completeRemoteCancelFromTerminalProgress(ctx context.Contex
 	return true, nil
 }
 
-func (c *GRPCClient) stopUndispatchedApply(ctx context.Context, apply *storage.Apply, caller string, scope applyTaskScope) error {
-	now := time.Now()
-	taskState := state.Task.Stopped
-	applyState := state.Apply.Stopped
-	if stopTerminatesChange(apply.DatabaseType) {
-		taskState = state.Task.Cancelled
-		applyState = state.Apply.Cancelled
+// undispatchedTerminalization describes how a drive settles work that was never
+// dispatched to the data plane. A control operation that arrives before dispatch
+// is satisfied entirely in control-plane storage — there is no remote apply to
+// address — so each operation supplies the states it terminalizes to and the
+// vocabulary its operator-facing log lines use.
+type undispatchedTerminalization struct {
+	taskState      string
+	applyState     string
+	operationState string
+	logEvent       string
+	// verb reads in "Remote apply <verb> before dispatch".
+	verb string
+	// controlOperation names the durable request being settled. It is the
+	// noun, so operator text reads "pending apply <controlOperation> request"
+	// where the verb would read as a state.
+	controlOperation storage.ControlOperation
+}
+
+// stopUndispatchedTerminalization is how a stop settles undispatched work. A
+// stop is resumable on database types that can pause a change and terminal on
+// those that cannot, so the states follow stopTerminatesChange.
+func stopUndispatchedTerminalization(databaseType string) undispatchedTerminalization {
+	terminalization := undispatchedTerminalization{
+		taskState:        state.Task.Stopped,
+		applyState:       state.Apply.Stopped,
+		operationState:   state.ApplyOperation.Stopped,
+		logEvent:         storage.LogEventStopRequested,
+		verb:             "stopped",
+		controlOperation: storage.ControlOperationStop,
 	}
+	if stopTerminatesChange(databaseType) {
+		terminalization.taskState = state.Task.Cancelled
+		terminalization.applyState = state.Apply.Cancelled
+		terminalization.operationState = state.ApplyOperation.Cancelled
+	}
+	return terminalization
+}
+
+// cancelUndispatchedTerminalization is how a cancel settles undispatched work.
+// A cancel is terminal on every database type, so it does not vary.
+func cancelUndispatchedTerminalization() undispatchedTerminalization {
+	return undispatchedTerminalization{
+		taskState:        state.Task.Cancelled,
+		applyState:       state.Apply.Cancelled,
+		operationState:   state.ApplyOperation.Cancelled,
+		logEvent:         storage.LogEventCancelRequested,
+		verb:             "cancelled",
+		controlOperation: storage.ControlOperationCancel,
+	}
+}
+
+// terminalizeUndispatchedApply settles a whole apply that never reached the data
+// plane: its tasks and the apply row move to the control operation's terminal
+// states in control-plane storage alone. Already-terminal tasks are left as they
+// are, so a partially settled apply is not rewritten.
+func (c *GRPCClient) terminalizeUndispatchedApply(ctx context.Context, apply *storage.Apply, caller string, scope applyTaskScope, terminalization undispatchedTerminalization) error {
+	now := time.Now()
 	tasks, err := c.loadApplyTasks(ctx, apply, scope)
 	if err != nil {
-		return fmt.Errorf("load tasks for undispatched stop %s: %w", apply.ApplyIdentifier, err)
+		return fmt.Errorf("load tasks for undispatched %s %s: %w", terminalization.controlOperation, apply.ApplyIdentifier, err)
 	}
+	logger := c.applyLogger(apply)
 	for _, task := range tasks {
 		if state.IsTerminalTaskState(task.State) {
-			slog.Info("leaving terminal gRPC task unchanged during undispatched stop",
-				"apply_id", apply.ApplyIdentifier,
+			logger.InfoContext(ctx, "leaving terminal gRPC task unchanged while settling an undispatched control request",
 				"task_id", task.TaskIdentifier,
 				"table", task.TableName,
-				"task_state", task.State)
+				"task_state", task.State,
+				"control_operation", terminalization.controlOperation)
 			continue
 		}
-		task.State = taskState
-		if state.IsState(taskState, state.Task.Cancelled) {
+		task.State = terminalization.taskState
+		if state.IsState(terminalization.taskState, state.Task.Cancelled) {
 			task.CompletedAt = &now
 		}
 		task.UpdatedAt = now
 		if err := c.storage.Tasks().Update(ctx, task); err != nil {
-			return fmt.Errorf("update task %s for undispatched stop %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+			return fmt.Errorf("update task %s for undispatched %s %s: %w", task.TaskIdentifier, terminalization.controlOperation, apply.ApplyIdentifier, err)
 		}
 	}
 	oldState := apply.State
-	apply.State = applyState
+	apply.State = terminalization.applyState
 	apply.CompletedAt = nil
-	if state.IsState(applyState, state.Apply.Cancelled) {
+	if state.IsState(terminalization.applyState, state.Apply.Cancelled) {
 		apply.CompletedAt = &now
 	}
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		return fmt.Errorf("update undispatched stopped gRPC apply %s: %w", apply.ApplyIdentifier, err)
+		return fmt.Errorf("update undispatched %s gRPC apply %s: %w", terminalization.controlOperation, apply.ApplyIdentifier, err)
 	}
-	c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote apply stopped before dispatch: %s%s", apply.State, callerApplyLogSuffix(caller)), oldState)
+	c.logApplyStateTransition(ctx, apply, storage.LogLevelInfo, fmt.Sprintf("Remote apply %s before dispatch: %s%s", terminalization.verb, apply.State, callerApplyLogSuffix(caller)), oldState)
 	return nil
 }
 
-// stopUndispatchedApplyOperation stops a single undispatched operation of a
-// multi-operation apply. It terminalizes only this operation's tasks and the
-// operation row, never the parent apply, and never completes the apply-level
-// stop request: that request is shared across deployments and must remain
-// pending so sibling operations with their own remote apply id still observe
-// the stop.
-func (c *GRPCClient) stopUndispatchedApplyOperation(ctx context.Context, apply *storage.Apply, caller string, scope applyTaskScope) error {
+// terminalizeUndispatchedApplyOperation settles a single undispatched operation
+// of a multi-operation apply. It terminalizes only this operation's tasks and
+// the operation row, never the parent apply, and never completes the
+// apply-level control request: that request is shared across deployments and
+// must remain pending so sibling operations with their own remote apply id
+// still observe it.
+func (c *GRPCClient) terminalizeUndispatchedApplyOperation(ctx context.Context, apply *storage.Apply, caller string, scope applyTaskScope, terminalization undispatchedTerminalization) error {
 	if !scope.usesOperationRemoteResume() {
-		return fmt.Errorf("undispatched operation stop for apply %s requires multi-operation scope", apply.ApplyIdentifier)
+		return fmt.Errorf("undispatched operation %s for apply %s requires multi-operation scope", terminalization.controlOperation, apply.ApplyIdentifier)
 	}
 	op := scope.operation
 	now := time.Now()
-	taskState := state.Task.Stopped
-	operationState := state.ApplyOperation.Stopped
-	if stopTerminatesChange(apply.DatabaseType) {
-		taskState = state.Task.Cancelled
-		operationState = state.ApplyOperation.Cancelled
-	}
 	tasks, err := c.loadApplyTasks(ctx, apply, scope)
 	if err != nil {
-		return fmt.Errorf("load tasks for undispatched operation stop %s apply_operation %d: %w", apply.ApplyIdentifier, op.ID, err)
+		return fmt.Errorf("load tasks for undispatched operation %s %s apply_operation %d: %w", terminalization.controlOperation, apply.ApplyIdentifier, op.ID, err)
 	}
+	logger := c.applyLogger(apply)
 	for _, task := range tasks {
 		if state.IsTerminalTaskState(task.State) {
-			slog.Info("leaving terminal gRPC task unchanged during undispatched operation stop",
-				"apply_id", apply.ApplyIdentifier,
+			logger.InfoContext(ctx, "leaving terminal gRPC task unchanged while settling an undispatched operation's control request",
 				"apply_operation_id", op.ID,
 				"deployment", op.Deployment,
 				"task_id", task.TaskIdentifier,
 				"table", task.TableName,
-				"task_state", task.State)
+				"task_state", task.State,
+				"control_operation", terminalization.controlOperation)
 			continue
 		}
-		task.State = taskState
-		if state.IsState(taskState, state.Task.Cancelled) {
+		task.State = terminalization.taskState
+		if state.IsState(terminalization.taskState, state.Task.Cancelled) {
 			task.CompletedAt = &now
 		}
 		task.UpdatedAt = now
 		if err := c.storage.Tasks().Update(ctx, task); err != nil {
-			return fmt.Errorf("update task %s for undispatched operation stop %s apply_operation %d: %w", task.TaskIdentifier, apply.ApplyIdentifier, op.ID, err)
+			return fmt.Errorf("update task %s for undispatched operation %s %s apply_operation %d: %w", task.TaskIdentifier, terminalization.controlOperation, apply.ApplyIdentifier, op.ID, err)
 		}
 	}
 	oldState := op.State
-	if state.IsState(operationState, state.ApplyOperation.Cancelled) {
-		if err := c.storage.ApplyOperations().MarkTerminal(ctx, op.ID, operationState); err != nil {
+	if state.IsState(terminalization.operationState, state.ApplyOperation.Cancelled) {
+		if err := c.storage.ApplyOperations().MarkTerminal(ctx, op.ID, terminalization.operationState); err != nil {
 			return fmt.Errorf("mark undispatched gRPC apply_operation %d cancelled for apply %s: %w", op.ID, apply.ApplyIdentifier, err)
 		}
 		op.CompletedAt = &now
 	} else {
-		if err := c.storage.ApplyOperations().UpdateState(ctx, op.ID, operationState); err != nil {
-			return fmt.Errorf("mark undispatched gRPC apply_operation %d stopped for apply %s: %w", op.ID, apply.ApplyIdentifier, err)
+		if err := c.storage.ApplyOperations().UpdateState(ctx, op.ID, terminalization.operationState); err != nil {
+			return fmt.Errorf("mark undispatched gRPC apply_operation %d %s for apply %s: %w", op.ID, terminalization.controlOperation, apply.ApplyIdentifier, err)
 		}
 		op.CompletedAt = nil
 	}
-	op.State = operationState
+	op.State = terminalization.operationState
 	op.UpdatedAt = now
-	slog.Info("stopped undispatched multi-operation gRPC apply operation; apply-level stop request remains pending for siblings",
-		"apply_id", apply.ApplyIdentifier,
+	logger.InfoContext(ctx, "settled undispatched multi-operation gRPC apply operation; apply-level control request remains pending for siblings",
 		"apply_operation_id", op.ID,
 		"deployment", op.Deployment,
-		"database", apply.Database,
-		"environment", apply.Environment,
 		"requested_by", caller,
+		"control_operation", terminalization.controlOperation,
 		"old_operation_state", oldState,
-		"new_operation_state", operationState)
-	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
-		fmt.Sprintf("Remote apply operation %d (deployment %s) stopped before dispatch: %s%s; pending apply stop request remains for sibling operations", op.ID, op.Deployment, operationState, callerApplyLogSuffix(caller)), "", "")
+		"new_operation_state", terminalization.operationState)
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, terminalization.logEvent,
+		fmt.Sprintf("Remote apply operation %d (deployment %s) %s before dispatch: %s%s; pending apply %s request remains for sibling operations", op.ID, op.Deployment, terminalization.verb, terminalization.operationState, callerApplyLogSuffix(caller), terminalization.controlOperation), "", "")
 	return nil
 }
 
 func (c *GRPCClient) Start(ctx context.Context, req *ternv1.StartRequest) (*ternv1.StartResponse, error) {
 	return c.client.Start(ctx, req)
-}
-
-func (c *GRPCClient) Volume(ctx context.Context, req *ternv1.VolumeRequest) (*ternv1.VolumeResponse, error) {
-	return c.client.Volume(ctx, req)
 }
 
 func (c *GRPCClient) Revert(ctx context.Context, req *ternv1.RevertRequest) (*ternv1.RevertResponse, error) {
@@ -1339,6 +1521,27 @@ type applyTaskScope struct {
 	// operation of a multi-op apply shares apply.Deployment, so the operation
 	// count is the authoritative signal for routing the remote apply id per op.
 	multiOperation bool
+
+	// operationLeaseOnly is true when the drive was claimed under an operation
+	// lease with no parent apply lease, which is how the operator claims any
+	// operation — including the sole operation of a single-operation apply.
+	// Such a drive owns its operation row and nothing else: storage refuses a
+	// direct parent write from that context, and the rollout projection moves
+	// the parent state instead. Operation count cannot stand in for this, and a
+	// drive that assumes it can write the parent because it counted one
+	// operation loses every parent write to the storage guard.
+	operationLeaseOnly bool
+
+	// tasklessOperation is true when the claimed operation carries no task rows,
+	// so nothing derives its terminal state but this drive.
+	tasklessOperation bool
+
+	// deploymentOperationKeys is the full operation-key set of the claimed
+	// operation's deployment, captured from the parent's operation rows at claim
+	// load. Deployment-keyed dispatches send it as the generation manifest so
+	// the data plane knows the whole generation from the first dispatch. Empty
+	// for whole-apply scopes.
+	deploymentOperationKeys []string
 }
 
 func wholeApplyTaskScope() applyTaskScope {
@@ -1349,48 +1552,84 @@ func (s applyTaskScope) isOperationScoped() bool {
 	return s.applyOperationID > 0
 }
 
-// usesOperationRemoteResume reports whether the remote apply id for this drive
-// lives on the claimed operation rather than the parent applies.external_id.
-// Only multi-operation drives do; single-operation and whole-apply drives keep
+// usesOperationRemoteResume reports whether this drive owns only its claimed
+// operation, so the remote apply id lives on that operation row rather than on
+// the parent applies.external_id. Every operation-lease-only drive does,
+// whatever the operation count: a drive that cannot write the parent cannot
+// persist a remote apply id there either, and one that tries loses the id and
+// dispatches the work a second time on the next claim. Whole-apply drives keep
 // using the parent external_id.
 func (s applyTaskScope) usesOperationRemoteResume() bool {
-	return s.multiOperation && s.operation != nil
+	return (s.multiOperation || s.operationLeaseOnly) && s.operation != nil
 }
 
 // suppressesDirectParentApplyWrites reports whether this drive must not write
 // the parent applies row (state, heartbeat) or run parent-level side effects
-// (parent stop-request completion, active-apply metrics). Multi-operation drives
-// own only their operation: the parent applies.state is moved solely by the
-// operation-authorized projection CAS in the operator. Single-operation and
-// whole-apply drives keep writing the parent directly.
+// (parent stop-request completion, active-apply metrics). An operation-scoped
+// drive owns only its operation: the parent applies.state is moved solely by the
+// operation-authorized projection CAS in the operator. Whole-apply drives keep
+// writing the parent directly.
 func (s applyTaskScope) suppressesDirectParentApplyWrites() bool {
 	return s.usesOperationRemoteResume()
 }
 
-// finalizerOperationScope reports whether this drive owns a task-less
-// group_finalizer operation. Such an operation has no task rows, so the
-// operator's task-derived operation→parent projection can never move its
-// operation row off pending: the terminal remote state (completion or failure)
-// would be lost. A finalizer drive must therefore persist its own operation
-// row's terminal state, mirroring LocalClient.driveGroupFinalizer.
-func (s applyTaskScope) finalizerOperationScope() bool {
-	return s.usesOperationRemoteResume() &&
-		s.operation != nil &&
-		s.operation.OperationKind == storage.ApplyOperationKindGroupFinalizer
+// tasklessOperationScope reports whether this drive owns an operation with no
+// task rows: a group_finalizer, or a work operation whose plan changes only
+// VSchemas. The operator's task-derived operation→parent projection can never
+// move such an operation row off pending, so the terminal remote state
+// (completion or failure) would be lost and the parent would stay non-terminal
+// with its target blocked. A drive that owns one must therefore persist its own
+// operation row's terminal state, mirroring the local drive.
+func (s applyTaskScope) tasklessOperationScope() bool {
+	return s.isOperationScoped() && s.tasklessOperation
 }
 
 // remoteApplyID resolves the remote Tern apply id sent on this drive's
-// Progress/Stop/Start/Cutover calls. Multi-operation drives read the claimed
-// operation's external_id (which may be empty before dispatch); everything
-// else reads the parent external_id.
+// Progress/Stop/Start/Cutover calls. Operation-owning drives read the claimed
+// operation's recorded remote apply id (which may be empty before dispatch);
+// whole-apply drives read the parent external_id.
 func (s applyTaskScope) remoteApplyID(apply *storage.Apply) string {
 	if s.usesOperationRemoteResume() {
-		if s.operation.ExternalID != "" {
-			return s.operation.ExternalID
+		if id := s.operation.RemoteApplyID(); id != "" {
+			return id
 		}
-		return s.operation.EngineResumeContext
+		// A sole operation's remote apply id is unambiguously its own, so a drive
+		// that finds one recorded on the parent resumes it rather than dispatching
+		// the work again. A multi-operation apply gets nothing here: the parent id
+		// there belongs to whichever deployment dispatched last, and polling a
+		// sibling's remote apply would report another deployment's outcome as this
+		// one's.
+		if !s.multiOperation {
+			return apply.ExternalID
+		}
+		return ""
 	}
 	return apply.ExternalID
+}
+
+// generationOperationKeys returns the generation manifest a deployment-keyed
+// dispatch carries: every operation key this deployment will send to the
+// shared remote apply under the dispatch's idempotency key, the dispatch's own
+// key included. It is non-empty exactly when the dispatch is deployment-keyed
+// (usesOperationRemoteResume, mirroring remoteApplyIdempotencyKey): those are
+// the dispatches that arrive one operation at a time, so the data plane needs
+// the whole expected set to know when the shared apply's generation is
+// complete. Whole-apply dispatches carry none — the dispatch is the whole
+// generation.
+//
+// A deliberate retry (the operation's own attempt above zero) declares only
+// its own key, mirroring its operation-scoped idempotency key: the retry's
+// remote apply receives exactly this one operation, and declaring the whole
+// deployment set would hold that apply open forever for siblings that are
+// never redispatched.
+func (s applyTaskScope) generationOperationKeys() []string {
+	if !s.usesOperationRemoteResume() {
+		return nil
+	}
+	if s.operation.Attempt > 0 {
+		return []string{s.operation.OperationKey}
+	}
+	return s.deploymentOperationKeys
 }
 
 // dispatchState returns the state that governs the dispatch / ambiguity
@@ -1431,41 +1670,80 @@ func (c *GRPCClient) loadOperationApplyTaskScope(ctx context.Context, apply *sto
 		return applyTaskScope{}, fmt.Errorf("list operations for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	found := false
+	deploymentOperationKeys := make([]string, 0, len(ops))
 	for _, op := range ops {
 		if op.ID == applyOperationID {
 			found = true
-			break
+		}
+		if op.Deployment == operation.Deployment {
+			deploymentOperationKeys = append(deploymentOperationKeys, op.OperationKey)
 		}
 	}
 	if !found {
 		return applyTaskScope{}, fmt.Errorf("apply_operation %d is not part of apply %s operation set", applyOperationID, apply.ApplyIdentifier)
 	}
+	slices.Sort(deploymentOperationKeys)
 	return applyTaskScope{
-		applyOperationID: applyOperationID,
-		operation:        operation,
-		multiOperation:   len(ops) > 1,
+		applyOperationID:        applyOperationID,
+		operation:               operation,
+		multiOperation:          len(ops) > 1,
+		operationLeaseOnly:      operationLeaseOnly(ctx),
+		deploymentOperationKeys: deploymentOperationKeys,
 	}, nil
+}
+
+// operationLeaseOnly reports whether the calling drive holds an operation lease
+// and no parent apply lease, which is the storage rule for whether it may write
+// the parent applies row. Reading it from the lease context keeps the drive's
+// idea of what it owns identical to the one storage enforces, so a drive never
+// attempts a write that is guaranteed to come back as a lost lease.
+func operationLeaseOnly(ctx context.Context) bool {
+	if _, hasOperationLease := storage.OperationLeaseFromContext(ctx); !hasOperationLease {
+		return false
+	}
+	_, hasApplyLease := storage.ApplyLeaseFromContext(ctx)
+	return !hasApplyLease
 }
 
 // remoteApplyIdempotencyKey derives the deduplication key the control plane
 // stamps on every remote Apply dispatch. The key is stable across a re-dispatch
 // of the same generation — so an ambiguous dispatch whose response was lost is
-// reused rather than duplicated — but rotates when the work is deliberately
-// retried. Multi-operation drives key on the claimed operation's identity and
-// its own attempt, so a sibling operation's retry (which advances the shared
-// parent apply.Attempt but not this operation's) never rotates this operation's
-// key; whole-apply and single-operation drives key on the parent apply.Attempt,
-// which advances only on that apply's own failed_retryable claim. The tuple is
-// hashed so the stored key stays within the column width and is free of
-// delimiter collisions between variable-length identifiers.
+// reused rather than duplicated — and rotates when the dispatched work is
+// deliberately retried.
+//
+// Operation-scoped drives key generation zero on the deployment, not the
+// individual operation: every sibling operation a deployment dispatches in its
+// first generation carries the same key, so the data plane lands them on one
+// remote apply — the first dispatch creates it, each sibling attaches its own
+// operation, and the data plane tells the dispatches apart by the operation
+// key it derives from each request's shape. The generation is the operation's
+// own attempt, never the shared apply.Attempt: the parent counter advances
+// when any sibling operation of any deployment is redispatched (it feeds the
+// apply's retry budget), so keying on it would let one deployment's genuine
+// retry rotate the key under another deployment's orphaned dispatch and
+// duplicate its remote apply.
+//
+// A deliberate retry (the operation's own attempt above zero) keys on the
+// operation as well: a retry redispatches only its own operation — siblings
+// that succeeded stay on the generation-zero apply and are never sent again —
+// so a deployment-shared retry key would land the retry on a remote apply
+// whose declared generation includes work that can never arrive, and its
+// completion gate would hold it open forever. An operation-scoped key gives
+// each retried operation its own remote apply that completes on its own work.
+//
+// Whole-apply drives key on the parent apply alone and rotate on its attempt.
+// The tuple is hashed so the stored key stays within the column width and is
+// free of delimiter collisions between variable-length identifiers.
 func remoteApplyIdempotencyKey(apply *storage.Apply, scope applyTaskScope) string {
 	parts := []string{
 		"schemabot-remote-apply-v1",
 		apply.ApplyIdentifier,
 	}
 	if scope.usesOperationRemoteResume() {
-		parts = append(parts, "operation", scope.operation.Deployment, scope.operation.OperationKey,
-			strconv.Itoa(scope.operation.Attempt))
+		parts = append(parts, "deployment", scope.operation.Deployment, strconv.Itoa(scope.operation.Attempt))
+		if scope.operation.Attempt > 0 {
+			parts = append(parts, "operation", scope.operation.OperationKey)
+		}
 	} else {
 		parts = append(parts, "whole", strconv.Itoa(apply.Attempt))
 	}
@@ -1473,12 +1751,42 @@ func remoteApplyIdempotencyKey(apply *storage.Apply, scope applyTaskScope) strin
 	return "schemabot:v1:" + hex.EncodeToString(sum[:])
 }
 
+// verifyDispatchOperationKeyEcho checks an accepted ApplyResponse against the
+// operation key the dispatched request's shape derives to. Deployment-keyed
+// dispatches share one remote apply across sibling operations, so the apply id
+// alone no longer proves the response addresses this dispatch's operation — the
+// data plane echoes the operation key it resolved, and the control plane
+// re-derives the same key from the request it sent (both planes share the
+// derivation helpers). A mismatch means the response's ids belong to some other
+// operation of the shared apply — most often a data plane too old to attach
+// sibling operations, which aliases every sibling dispatch to the apply's
+// first operation and echoes no key at all — so the dispatch must fail closed
+// instead of persisting another operation's remote ids.
+func verifyDispatchOperationKeyEcho(plan *storage.Plan, req *ternv1.ApplyRequest, resp *ternv1.ApplyResponse) error {
+	scope, err := deriveDispatchScope(plan, req)
+	if err != nil {
+		return fmt.Errorf("derive dispatch scope for operation key echo check: %w", err)
+	}
+	expectedKey, _, err := operationIdentityForDispatch(scope)
+	if err != nil {
+		return fmt.Errorf("derive expected operation key for echo check: %w", err)
+	}
+	if resp.OperationKey != expectedKey {
+		return fmt.Errorf("remote apply %q echoed operation key %q, expected %q: the response does not address this dispatch's operation (data plane may predate sibling-operation attach)", resp.ApplyId, resp.OperationKey, expectedKey)
+	}
+	return nil
+}
+
 // persistRemoteApplyID stores the remote Tern apply id returned by dispatch.
 // Single-operation drives keep it on the parent applies.external_id (mutated in
 // place so the caller's Applies().Update persists it). Multi-operation drives
 // write it to the claimed operation's external_id and never touch the parent
 // external_id, refusing to overwrite a different existing id so one deployment
-// can't clobber another deployment's remote apply id.
+// can't clobber another deployment's remote apply id. Because deployment-keyed
+// dispatch attaches every sibling operation into the deployment's one
+// data-plane apply, all operations of a deployment must record the same remote
+// apply id — an id that disagrees with the deployment's recorded id is refused
+// fail-closed rather than giving one deployment two remote applies.
 func (c *GRPCClient) persistRemoteApplyID(ctx context.Context, apply *storage.Apply, scope applyTaskScope, remoteID, remoteOperationID string) error {
 	if remoteID == "" {
 		return fmt.Errorf("refusing to persist empty remote apply id for apply %s", apply.ApplyIdentifier)
@@ -1495,17 +1803,42 @@ func (c *GRPCClient) persistRemoteApplyID(ctx context.Context, apply *storage.Ap
 	if current.ApplyID != apply.ID {
 		return fmt.Errorf("apply_operation %d belongs to apply %d, not %s (%d)", op.ID, current.ApplyID, apply.ApplyIdentifier, apply.ID)
 	}
-	currentRemoteID := current.ExternalID
-	if currentRemoteID == "" {
-		currentRemoteID = current.EngineResumeContext
-	}
+	currentRemoteID := current.RemoteApplyID()
 	if currentRemoteID != "" && currentRemoteID != remoteID {
+		// The same fail-closed class the deployment guard below counts: storing
+		// this id would correlate the operation — and so its deployment — to a
+		// second remote apply.
+		c.applyLogger(apply).ErrorContext(ctx, "dispatch returned a remote apply id that disagrees with the one this operation already recorded; refusing to overwrite it",
+			append(apply.MutableLogAttrs(),
+				"apply_operation_id", op.ID,
+				"operation_deployment", current.Deployment,
+				"operation_key", current.OperationKey,
+				"recorded_remote_apply_id", currentRemoteID,
+				"refused_remote_apply_id", remoteID)...)
+		metrics.RecordRemoteApplyDeploymentIDConflict(ctx, apply.Database, apply.Environment, current.Deployment)
 		return fmt.Errorf("apply_operation %d already has remote apply id %q; refusing to overwrite with %q", op.ID, currentRemoteID, remoteID)
+	}
+	if err := c.guardDeploymentRemoteApplyID(ctx, apply, current, remoteID); err != nil {
+		return err
 	}
 	if remoteOperationID != "" && current.ExternalOperationID != "" && current.ExternalOperationID != remoteOperationID {
 		return fmt.Errorf("apply_operation %d already has remote apply_operation id %q; refusing to overwrite with %q", op.ID, current.ExternalOperationID, remoteOperationID)
 	}
-	if err := c.storage.ApplyOperations().SaveExternalID(ctx, op.ID, remoteID); err != nil {
+	if err := c.storage.ApplyOperations().SaveExternalID(ctx, apply.ID, op.ID, remoteID); err != nil {
+		// The store re-verifies the deployment invariant under row locks inside
+		// the writing transaction, so a sibling dispatch that persisted between
+		// the guard's read above and this write still cannot give the deployment
+		// a second remote apply — it is refused here instead.
+		if errors.Is(err, storage.ErrRemoteApplyDeploymentIDConflict) {
+			c.applyLogger(apply).ErrorContext(ctx, "a concurrent sibling dispatch recorded a different remote apply id for the deployment; refusing to give one deployment two remote applies",
+				append(apply.MutableLogAttrs(),
+					"apply_operation_id", op.ID,
+					"operation_deployment", current.Deployment,
+					"operation_key", current.OperationKey,
+					"refused_remote_apply_id", remoteID,
+					"error", err)...)
+			metrics.RecordRemoteApplyDeploymentIDConflict(ctx, apply.Database, apply.Environment, current.Deployment)
+		}
 		return fmt.Errorf("store remote apply id for apply_operation %d: %w", op.ID, err)
 	}
 	op.ExternalID = remoteID
@@ -1515,14 +1848,63 @@ func (c *GRPCClient) persistRemoteApplyID(ctx context.Context, apply *storage.Ap
 		}
 		op.ExternalOperationID = remoteOperationID
 	}
-	slog.InfoContext(ctx, "stored remote gRPC apply identifiers for operation",
-		"apply_id", apply.ApplyIdentifier,
+	c.applyLogger(apply).InfoContext(ctx, "stored remote gRPC apply identifiers for operation",
 		"apply_operation_id", op.ID,
-		"deployment", op.Deployment,
+		"operation_deployment", op.Deployment,
 		"operation_key", op.OperationKey,
 		"operation_kind", op.OperationKind,
 		"external_id", remoteID,
 		"external_operation_id", remoteOperationID)
+	return nil
+}
+
+// guardDeploymentRemoteApplyID refuses to record a remote apply id that would
+// give the operation's deployment a second data-plane apply. It resolves the
+// remote apply id the deployment's sibling operations already recorded and
+// fails closed on any disagreement — either among the siblings themselves
+// (the planes diverged before this dispatch) or between the siblings and the
+// id this dispatch returned. Sibling deployments of the same apply are
+// exempt: they own their own remote applies.
+//
+// This read is unlocked, so it exists for precise triage logging on the
+// common divergence shapes; the authoritative check is the store's, which
+// re-verifies the same invariant under row locks inside the writing
+// transaction so concurrent sibling persists serialize.
+func (c *GRPCClient) guardDeploymentRemoteApplyID(ctx context.Context, apply *storage.Apply, current *storage.ApplyOperation, remoteID string) error {
+	siblings, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return fmt.Errorf("list operations of apply %s before storing remote apply id for deployment %q: %w", apply.ApplyIdentifier, current.Deployment, err)
+	}
+	peers := make([]*storage.ApplyOperation, 0, len(siblings))
+	for _, sib := range siblings {
+		if sib.ID == current.ID {
+			continue
+		}
+		peers = append(peers, sib)
+	}
+	sharedID, err := storage.DeploymentRemoteApplyID(peers, current.Deployment)
+	if err != nil {
+		c.applyLogger(apply).ErrorContext(ctx, "deployment's operations already record more than one remote apply id; refusing to store another until the planes agree",
+			append(apply.MutableLogAttrs(),
+				"apply_operation_id", current.ID,
+				"operation_deployment", current.Deployment,
+				"operation_key", current.OperationKey,
+				"refused_remote_apply_id", remoteID,
+				"error", err)...)
+		metrics.RecordRemoteApplyDeploymentIDConflict(ctx, apply.Database, apply.Environment, current.Deployment)
+		return fmt.Errorf("deployment %q of apply %s already correlates to more than one remote apply; refusing to store %q for apply_operation %d until the planes agree: %w", current.Deployment, apply.ApplyIdentifier, remoteID, current.ID, err)
+	}
+	if sharedID != "" && sharedID != remoteID {
+		c.applyLogger(apply).ErrorContext(ctx, "dispatch returned a remote apply id that disagrees with the deployment's recorded remote apply; refusing to give one deployment two remote applies",
+			append(apply.MutableLogAttrs(),
+				"apply_operation_id", current.ID,
+				"operation_deployment", current.Deployment,
+				"operation_key", current.OperationKey,
+				"deployment_remote_apply_id", sharedID,
+				"refused_remote_apply_id", remoteID)...)
+		metrics.RecordRemoteApplyDeploymentIDConflict(ctx, apply.Database, apply.Environment, current.Deployment)
+		return fmt.Errorf("deployment %q of apply %s already correlates to remote apply %q; refusing to record a second remote apply %q for apply_operation %d", current.Deployment, apply.ApplyIdentifier, sharedID, remoteID, current.ID)
+	}
 	return nil
 }
 
@@ -1538,10 +1920,11 @@ func (c *GRPCClient) mirrorRemoteDisplayMetadata(ctx context.Context, apply *sto
 	if c.storage == nil || apply == nil || apply.Engine != storage.EnginePlanetScale {
 		return lastBlob
 	}
+	logger := c.applyLogger(apply)
 	blob, err := PSDisplayMetadataStorageBlob(md)
 	if err != nil {
-		slog.Warn("comment may omit engine display metadata: failed to encode remote display metadata",
-			"apply_id", apply.ApplyIdentifier, "error", err)
+		logger.Warn("comment may omit engine display metadata: failed to encode remote display metadata",
+			"error", err)
 		return lastBlob
 	}
 	if blob == "" || blob == lastBlob {
@@ -1554,8 +1937,8 @@ func (c *GRPCClient) mirrorRemoteDisplayMetadata(ctx context.Context, apply *sto
 	// apply after a restart. The mirror is best-effort — skip and retry next poll.
 	op, err := c.operationForDisplayMirror(ctx, apply, scope)
 	if err != nil || op == nil {
-		slog.Warn("comment may omit engine display metadata: could not load apply_operation to preserve resume context",
-			"apply_id", apply.ApplyIdentifier, "error", err)
+		logger.Warn("comment may omit engine display metadata: could not load apply_operation to preserve resume context",
+			"error", err)
 		return lastBlob
 	}
 	if err := c.storage.ApplyOperations().SaveEngineResumeState(ctx, op.ID, &storage.EngineResumeState{
@@ -1563,39 +1946,147 @@ func (c *GRPCClient) mirrorRemoteDisplayMetadata(ctx context.Context, apply *sto
 		MigrationContext: op.EngineResumeContext,
 		Metadata:         blob,
 	}); err != nil {
-		slog.Warn("comment may omit engine display metadata: failed to persist to control-plane operation",
-			"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", err)
+		logger.Warn("comment may omit engine display metadata: failed to persist to control-plane operation",
+			"apply_operation_id", op.ID, "error", err)
 		return lastBlob
 	}
 	return blob
 }
 
-// mirrorRemoteVolume copies the volume level the data plane reports on a
-// progress response onto the in-memory apply options, so the poll's regular
-// parent-apply persistence records it. Volume changes are applied by the
-// data-plane driver against its own apply row, and the control plane only
-// learns the resulting level from progress responses — the PR comment and the
-// control-plane progress API both read the level from the control-plane apply
-// options. Returns true when the stored level changed so the caller can log
-// the transition.
-func mirrorRemoteVolume(apply *storage.Apply, remoteVolume int32) bool {
-	if remoteVolume == 0 {
-		// The data plane reports 0 when no volume level was ever set on the
-		// apply; there is nothing to mirror.
-		return false
+// mirrorRemoteControlRejections records, on the control plane, the control
+// requests the data plane accepted and then failed. Accepting a control RPC
+// only means the request was queued: the engine call happens later on the data
+// plane's own driver tick, and until it is mirrored here a rejection lives
+// solely in the data plane's storage and logs — the operator who issued the
+// command is told it succeeded and never learns the effect did not land.
+//
+// The data plane reports the same settled request on every poll until the
+// operator retries the operation, so a mirror that fails is retried on the next
+// tick rather than aborting the drive, and a mirror that succeeds is surfaced
+// exactly once (RecordRemoteFailure reports whether the stored row changed).
+//
+// remoteID is the remote identifier this drive addressed. The data plane's
+// message names its own apply, which is meaningless to the operator reading the
+// PR — and on an operation-scoped drive the parent apply's ExternalID is empty,
+// so the remote identifier is only redactable when it is passed in here.
+func (c *GRPCClient) mirrorRemoteControlRejections(ctx context.Context, apply *storage.Apply, remoteID string, settled []*ternv1.SettledControlRequest) {
+	if c.storage == nil || apply == nil || len(settled) == 0 {
+		return
 	}
-	if remoteVolume < storage.MinVolume || remoteVolume > storage.MaxVolume {
-		slog.Warn("remote progress reported an out-of-range volume level; keeping the stored level",
-			append(apply.LogAttrs(), "remote_volume", remoteVolume)...)
-		return false
+	logger := c.applyLogger(apply)
+	controlStore := c.storage.ControlRequests()
+	if controlStore == nil {
+		logger.Warn("control request store is not available; remote control rejections will not reach the operator",
+			apply.MutableLogAttrs()...)
+		return
 	}
-	opts := apply.GetOptions()
-	if opts.Volume == int(remoteVolume) {
-		return false
+	for _, entry := range settled {
+		if entry == nil {
+			continue
+		}
+		operation := storage.ControlOperation(entry.Operation)
+		if operation.Retired() {
+			// A data plane on a previous release reports its settled retired
+			// requests on every poll until the apply finishes; there is nothing
+			// left to mirror for an operation this release removed, and the
+			// entry recurs for the life of the drive, so it logs at debug.
+			logger.Debug("data plane reported a settled control request for a retired operation; nothing to mirror",
+				append(apply.MutableLogAttrs(), "operation", entry.Operation, "status", entry.Status)...)
+			continue
+		}
+		if !operation.Valid() {
+			logger.Warn("data plane reported a settled control request for an unrecognized operation; it will not reach the operator",
+				append(apply.MutableLogAttrs(), "operation", entry.Operation, "status", entry.Status)...)
+			continue
+		}
+		if entry.Status == string(storage.ControlRequestCompleted) {
+			c.retireMirroredControlRejection(ctx, apply, controlStore, operation)
+			continue
+		}
+		if entry.Status != string(storage.ControlRequestFailed) {
+			// Only a failure needs mirroring, and completion is handled above. A
+			// newer data plane reporting some other terminal status would drop the
+			// request here, so name it rather than skipping silently.
+			logger.Warn("data plane reported a settled control request in an unrecognized status; it will not reach the operator",
+				append(apply.MutableLogAttrs(),
+					"operation", entry.Operation,
+					"status", entry.Status,
+					"settled_at", entry.SettledAt)...)
+			continue
+		}
+		message := remoteControlRejectionMessage(entry)
+		changed, err := controlStore.RecordRemoteFailure(ctx, &storage.ApplyControlRequest{
+			ApplyID:      apply.ID,
+			Operation:    operation,
+			ErrorMessage: apply.OperatorFacingMessage(message, remoteID),
+			RequestedBy:  entry.RequestedBy,
+		})
+		if err != nil {
+			logger.Warn("failed to record remote control rejection; the operator will not see it until a later poll mirrors it",
+				append(apply.MutableLogAttrs(),
+					"operation", entry.Operation,
+					"settled_at", entry.SettledAt,
+					"error", err)...)
+			continue
+		}
+		if !changed {
+			continue
+		}
+		logger.Warn("data plane rejected an accepted control command",
+			append(apply.MutableLogAttrs(),
+				"operation", entry.Operation,
+				"requested_by", entry.RequestedBy,
+				"settled_at", entry.SettledAt,
+				"error_message", message)...)
+		metrics.RecordRemoteControlRequestRejected(ctx, entry.Operation, apply.Engine, apply.Database, apply.Deployment, apply.Environment)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventError,
+			fmt.Sprintf("%s was accepted but not applied: %s%s", remoteControlOperationLabel(operation), message,
+				callerApplyLogSuffix(entry.RequestedBy)), "", "")
 	}
-	opts.Volume = int(remoteVolume)
-	apply.SetOptions(opts)
-	return true
+}
+
+// retireMirroredControlRejection clears a rejection this plane mirrored once the
+// data plane reports the same operation succeeded. The mirrored row is this
+// plane's only record of that failure, so nothing else resets it: without this
+// the operator re-issues the command, it works, and the PR keeps warning that
+// it did not.
+func (c *GRPCClient) retireMirroredControlRejection(
+	ctx context.Context,
+	apply *storage.Apply,
+	controlStore storage.ControlRequestStore,
+	operation storage.ControlOperation,
+) {
+	changed, err := controlStore.ClearRemoteFailure(ctx, apply.ID, operation)
+	if err != nil {
+		c.applyLogger(apply).Warn("failed to clear a mirrored control rejection the data plane has since completed; the notice stays until a later poll clears it",
+			append(apply.MutableLogAttrs(), "operation", string(operation), "error", err)...)
+		return
+	}
+	if !changed {
+		return
+	}
+	c.applyLogger(apply).Info("data plane completed a control command it had previously rejected; clearing the mirrored rejection",
+		append(apply.MutableLogAttrs(), "operation", string(operation))...)
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition,
+		fmt.Sprintf("%s succeeded on a later attempt; the earlier rejection no longer applies", remoteControlOperationLabel(operation)), "", "")
+}
+
+// remoteControlRejectionMessage renders the reason the data plane gave, falling
+// back to a fixed line so a rejection is never recorded without one.
+func remoteControlRejectionMessage(entry *ternv1.SettledControlRequest) string {
+	if entry.ErrorMessage != "" {
+		return entry.ErrorMessage
+	}
+	return "the data plane reported no reason; see the data plane logs"
+}
+
+// remoteControlOperationLabel renders a control operation for an operator-facing
+// apply log line.
+func remoteControlOperationLabel(operation storage.ControlOperation) string {
+	if operation == "" {
+		return "Control command"
+	}
+	return strings.ToUpper(string(operation)[:1]) + strings.ReplaceAll(string(operation)[1:], "_", "-")
 }
 
 // operationForDisplayMirror loads the apply_operation whose
@@ -1676,37 +2167,61 @@ func (c *GRPCClient) ResumeApplyOperation(ctx context.Context, apply *storage.Ap
 	// apply rather than failing closed on the empty task set, mirroring
 	// LocalClient.ResumeApplyOperation's finalizer branch.
 	if scope.operation != nil && scope.operation.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+		scope.tasklessOperation = true
 		return c.dispatchRemoteGroupFinalizer(ctx, apply, scope)
 	}
-	// Fail closed before any dispatch or state mutation: a work operation that
-	// resolves to no tasks is an invalid or stale claim. The shared resume path
-	// would otherwise mark the whole parent apply failed (dispatchPendingApply
-	// and the remote-failure sites set applies.state regardless of scope), which
-	// is wrong when only this operation's lookup came back empty. Mirrors
-	// LocalClient.ResumeApplyOperation.
 	tasks, err := c.loadApplyTasks(ctx, apply, scope)
 	if err != nil {
 		return err
 	}
 	if len(tasks) == 0 {
-		return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrNoTasksForApplyOperation)
+		// A whole-deployment work operation for a VSchema-only plan carries no
+		// tasks by design — the change is the namespace VSchema, which is never
+		// modelled as a task row. Dispatch it as a VSchema-only apply, which the
+		// data plane applies via its own task-less VSchema-only path, mirroring
+		// LocalClient.ResumeApplyOperation.
+		plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+		if err != nil {
+			return fmt.Errorf("load plan %d for task-less apply_operation %d (apply %s): %w", apply.PlanID, applyOperationID, apply.ApplyIdentifier, err)
+		}
+		// A missing plan row is its own cause, separate from a claim that resolved
+		// to the wrong operation, so name it rather than reporting a stale claim.
+		if plan == nil {
+			return fmt.Errorf("plan %d for task-less apply_operation %d (apply %s): %w", apply.PlanID, applyOperationID, apply.ApplyIdentifier, ErrPlanMissingForApplyOperation)
+		}
+		// Fail closed before any dispatch or state mutation on every other
+		// task-less work shape: it is an invalid or stale claim. The shared resume
+		// path would otherwise mark the whole parent apply failed
+		// (dispatchPendingApply and the remote-failure sites set applies.state
+		// regardless of scope), which is wrong when only this operation's lookup
+		// came back empty.
+		if !scope.operation.IsTasklessVSchemaOnlyWork(plan) {
+			return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrNoTasksForApplyOperation)
+		}
+		scope.tasklessOperation = true
+		return c.dispatchRemoteVSchemaOnly(ctx, apply, scope, plan, plan.VSchemaNamespaces(), tasklessWorkDispatchKind)
 	}
 	return c.resumeApply(ctx, apply, scope)
 }
 
+// The two task-less operation shapes a remote drive dispatches as a VSchema-only
+// apply, named for the operator-facing error text each produces.
+const (
+	groupFinalizerDispatchKind = "group_finalizer"
+	tasklessWorkDispatchKind   = "VSchema-only"
+)
+
 // dispatchRemoteGroupFinalizer drives a task-less group_finalizer apply_operation
 // over gRPC. It is the remote counterpart to LocalClient.driveGroupFinalizer:
-// the control plane cannot run the engine, so it dispatches the namespace's
-// VSchema as a VSchema-only apply (no DDL, no target shards) to the data plane,
-// which applies it via its task-less VSchema-only path
-// (isTasklessVSchemaOnlyPlan); records the remote apply id on the operation; and
-// polls to completion. Carrying both a VSchema change and the plan's schema
-// files lets the remote drive it whether it has the plan locally or materializes
-// it from the dispatch.
+// the control plane cannot run the engine, so it dispatches the operation's
+// VSchema scope to the data plane, which applies it via its task-less
+// VSchema-only path. A namespace-scoped finalizer (from a sharded fan-out)
+// dispatches its one namespace; a deployment-scoped finalizer (a VSchema-only
+// apply) dispatches every VSchema-changed namespace in the plan as one apply.
 func (c *GRPCClient) dispatchRemoteGroupFinalizer(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
 	op := scope.operation
 	namespace := namespaceFromFinalizerKey(op.OperationKey)
-	if namespace == "" {
+	if namespace == "" && op.OperationKey != finalizerDeploymentScopedKey {
 		return fmt.Errorf("group_finalizer apply_operation %d (apply %s): malformed operation key %q", op.ID, apply.ApplyIdentifier, op.OperationKey)
 	}
 	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
@@ -1714,14 +2229,38 @@ func (c *GRPCClient) dispatchRemoteGroupFinalizer(ctx context.Context, apply *st
 		return fmt.Errorf("load plan %d for group_finalizer apply_operation %d (apply %s): %w", apply.PlanID, op.ID, apply.ApplyIdentifier, err)
 	}
 	if plan == nil {
-		return fmt.Errorf("plan %d not found for group_finalizer apply_operation %d (apply %s)", apply.PlanID, op.ID, apply.ApplyIdentifier)
+		return fmt.Errorf("plan %d for group_finalizer apply_operation %d (apply %s): %w", apply.PlanID, op.ID, apply.ApplyIdentifier, ErrPlanMissingForApplyOperation)
 	}
-	// Fail closed if the namespace carries no VSchema artifact, mirroring the
-	// local finalizer drive.
+	// Fail closed if the operation's scope carries no VSchema artifact,
+	// mirroring the local finalizer drive.
 	if _, err := finalizerVSchemaChanges(plan, namespace); err != nil {
 		return fmt.Errorf("group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
 	}
+	namespaces := []string{namespace}
+	if namespace == "" {
+		namespaces = plan.VSchemaNamespaces()
+	}
+	return c.dispatchRemoteVSchemaOnly(ctx, apply, scope, plan, namespaces, groupFinalizerDispatchKind)
+}
 
+// dispatchRemoteVSchemaOnly dispatches the given namespaces' VSchema to the data
+// plane as a VSchema-only apply (no DDL, no target shards), records the remote
+// apply id on the operation, and polls to completion. Carrying both a VSchema
+// change and the plan's schema files lets the remote drive it whether it has the
+// plan locally or materializes it from the dispatch.
+//
+// It serves both task-less operation shapes: a group_finalizer, which applies
+// one namespace's VSchema once its sibling shard work completes, and a
+// whole-deployment work operation for a VSchema-only plan, which applies every
+// VSchema-changing namespace in one dispatch because an
+// externally-authoritative engine deploys the whole branch as one operation.
+// The caller has already established that the operation is one of those shapes
+// and that the plan carries the VSchema; kind names the shape in error text.
+func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *storage.Apply, scope applyTaskScope, plan *storage.Plan, namespaces []string, kind string) error {
+	op := scope.operation
+	if len(namespaces) == 0 {
+		return fmt.Errorf("%s apply_operation %d (apply %s): plan %d carries no VSchema namespace to dispatch", kind, op.ID, apply.ApplyIdentifier, apply.PlanID)
+	}
 	// Dispatch only if this operation has not already been dispatched. On resume
 	// the recorded remote apply id lets us poll the existing remote apply instead
 	// of starting a duplicate.
@@ -1734,44 +2273,150 @@ func (c *GRPCClient) dispatchRemoteGroupFinalizer(ctx context.Context, apply *st
 		if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
 			return err
 		}
-		resp, err := c.client.Apply(ctx, &ternv1.ApplyRequest{
+		changes := make([]*ternv1.TableChange, 0, len(namespaces))
+		for _, namespace := range namespaces {
+			// Carry the namespace's persisted VSchema change-metadata so a
+			// deployment materializing the plan from this dispatch runs the
+			// same apply-time safety gates as one reading its own stored plan.
+			var meta map[string]string
+			if nsData := plan.Namespaces[namespace]; nsData != nil {
+				meta = storage.VSchemaPlanMetadata(nsData.Metadata)
+			}
+			changes = append(changes, &ternv1.TableChange{
+				Namespace:  namespace,
+				TableName:  "VSchema: " + namespace,
+				ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA,
+				Metadata:   meta,
+			})
+		}
+		req := &ternv1.ApplyRequest{
 			PlanId:      plan.PlanIdentifier,
 			Options:     options,
 			Database:    apply.Database,
 			Type:        apply.DatabaseType,
-			DdlChanges:  []*ternv1.TableChange{{Namespace: namespace, TableName: "VSchema: " + namespace, ChangeType: ternv1.ChangeType_CHANGE_TYPE_VSCHEMA}},
+			DdlChanges:  changes,
 			SchemaFiles: schemaFilesToProto(plan.SchemaFiles),
 			Environment: apply.Environment,
 			Target:      target,
 			Caller:      apply.Caller,
 			// No TargetShards: the VSchema is namespace-level, not per shard.
-			IdempotencyKey: remoteApplyIdempotencyKey(apply, scope),
-		})
+			IdempotencyKey:          remoteApplyIdempotencyKey(apply, scope),
+			GenerationOperationKeys: scope.generationOperationKeys(),
+		}
+		resp, err := c.client.Apply(ctx, req)
 		if err != nil {
 			if isAmbiguousRemoteApplyDispatchError(err) {
-				return fmt.Errorf("group_finalizer apply_operation %d (apply %s) has ambiguous remote dispatch outcome: %w", op.ID, apply.ApplyIdentifier, err)
+				return fmt.Errorf("%s apply_operation %d (apply %s) has ambiguous remote dispatch outcome: %w", kind, op.ID, apply.ApplyIdentifier, err)
 			}
 			if markErr := c.markRemoteApplyFailed(ctx, apply, nil, err.Error(), isRetryableRemoteApplyError(err), scope); markErr != nil {
-				return fmt.Errorf("mark group_finalizer apply_operation %d failed after remote apply error: %w", op.ID, markErr)
+				return fmt.Errorf("mark %s apply_operation %d failed after remote apply error: %w", kind, op.ID, markErr)
 			}
-			return fmt.Errorf("dispatch group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
+			return fmt.Errorf("dispatch %s apply_operation %d (apply %s): %w", kind, op.ID, apply.ApplyIdentifier, err)
 		}
 		if resp == nil || !resp.Accepted || resp.ApplyId == "" {
-			errMsg := "remote group_finalizer apply was not accepted"
-			if resp != nil && resp.ErrorMessage != "" {
-				errMsg = resp.ErrorMessage
-			}
+			holderApplyID := c.resolveConflictHolderApplyID(ctx, apply, resp.GetConflict())
+			errMsg := remoteApplyRejectionMessage(resp, holderApplyID, fmt.Sprintf("remote %s apply was not accepted", kind))
 			if markErr := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); markErr != nil {
-				return fmt.Errorf("mark group_finalizer apply_operation %d failed: %w", op.ID, markErr)
+				return fmt.Errorf("mark %s apply_operation %d failed: %w", kind, op.ID, markErr)
 			}
-			return fmt.Errorf("dispatch group_finalizer apply_operation %d (apply %s): %s", op.ID, apply.ApplyIdentifier, errMsg)
+			return fmt.Errorf("dispatch %s apply_operation %d (apply %s): %s", kind, op.ID, apply.ApplyIdentifier, errMsg)
+		}
+		if echoErr := verifyDispatchOperationKeyEcho(plan, req, resp); echoErr != nil {
+			c.applyLogger(apply).ErrorContext(ctx, "remote dispatch response does not address this operation; refusing its remote ids and failing the operation closed",
+				append(apply.MutableLogAttrs(),
+					"apply_operation_id", op.ID,
+					"operation_deployment", op.Deployment,
+					"operation_key", op.OperationKey,
+					"kind", kind,
+					"remote_apply_id", resp.ApplyId,
+					"error", echoErr)...)
+			metrics.RecordRemoteApplyKeyEchoMismatch(ctx, apply.Database, apply.Environment)
+			if markErr := c.markRemoteApplyFailed(ctx, apply, nil, echoErr.Error(), false, scope); markErr != nil {
+				return fmt.Errorf("mark %s apply_operation %d failed after operation key echo mismatch: %w", kind, op.ID, markErr)
+			}
+			return fmt.Errorf("dispatch %s apply_operation %d (apply %s): %w", kind, op.ID, apply.ApplyIdentifier, echoErr)
 		}
 		if err := c.persistRemoteApplyID(ctx, apply, scope, resp.ApplyId, resp.ApplyOperationId); err != nil {
-			return fmt.Errorf("store remote apply id for group_finalizer apply_operation %d: %w", op.ID, err)
+			return fmt.Errorf("store remote apply id for %s apply_operation %d: %w", kind, op.ID, err)
 		}
 	}
 
-	return c.pollForCompletion(ctx, apply, false, scope, false)
+	started, err := c.startStoppedTasklessRemoteApply(ctx, apply, scope, kind)
+	if err != nil {
+		return err
+	}
+	return c.pollForCompletion(ctx, apply, started, scope, false)
+}
+
+// startStoppedTasklessRemoteApply resumes a task-less operation the operator
+// stopped and has since asked to start again, reporting whether the remote was
+// started. A task-less operation has no task rows, so the drive owns its state
+// in both directions: nothing else asks the data plane to resume it. Without
+// this the poll below reads the same stopped state on every claim, the start
+// request stays pending, the operation is re-claimed forever, and only a cancel
+// frees the target.
+func (c *GRPCClient) startStoppedTasklessRemoteApply(ctx context.Context, apply *storage.Apply, scope applyTaskScope, kind string) (bool, error) {
+	op := scope.operation
+	if op == nil || !state.IsState(op.State, state.Apply.Stopped) {
+		return false, nil
+	}
+	startReq, err := pendingStartControlRequest(ctx, c.storage, apply)
+	if err != nil {
+		return false, fmt.Errorf("check pending start for stopped %s apply_operation %d (apply %s): %w", kind, op.ID, apply.ApplyIdentifier, err)
+	}
+	if startReq == nil {
+		// The operator has not asked for it back. Polling reports the stored
+		// stopped state without touching the target.
+		c.applyLogger(apply).DebugContext(ctx, "stopped task-less operation has no pending start request; leaving it stopped",
+			append(apply.MutableLogAttrs(), "apply_operation_id", op.ID, "kind", kind)...)
+		return false, nil
+	}
+	if deferred, err := c.completePendingStopBeforeRemoteStart(ctx, apply, scope); err != nil || deferred {
+		return false, err
+	}
+
+	remoteID := scope.remoteApplyID(apply)
+	logger := c.applyLogger(apply)
+	// Only start what the data plane still holds stopped. A start racing the
+	// drive that recorded the stop would otherwise restart an apply the data
+	// plane has already resumed, or one it has since failed.
+	resp, err := c.client.Progress(ctx, &ternv1.ProgressRequest{ApplyId: remoteID, Environment: apply.Environment})
+	if err != nil {
+		return false, fmt.Errorf("check stopped %s apply_operation %d (remote apply %s) before start: %w", kind, op.ID, remoteID, err)
+	}
+	remoteState := ProtoStateToStorage(resp.State)
+	if !state.IsState(remoteState, state.Apply.Stopped) {
+		logger.InfoContext(ctx, "data plane no longer holds the task-less operation stopped; polling its current state instead of starting it",
+			append(apply.MutableLogAttrs(),
+				"apply_operation_id", op.ID, "kind", kind,
+				"remote_apply_id", remoteID, "remote_state", resp.State.String())...)
+		return false, nil
+	}
+	if _, err := c.client.Start(ctx, &ternv1.StartRequest{ApplyId: remoteID, Environment: apply.Environment, Caller: startReq.RequestedBy}); err != nil {
+		message := fmt.Sprintf("Remote start failed for the %s operation; it stays stopped and the command can be re-issued", kind)
+		logger.WarnContext(ctx, "remote start failed for a stopped task-less operation; leaving it stopped for operator retry",
+			append(apply.MutableLogAttrs(),
+				"apply_operation_id", op.ID, "kind", kind,
+				"remote_apply_id", remoteID, "error", err)...)
+		c.logApplyWarning(ctx, apply, message)
+		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message, remoteID); failErr != nil {
+			return false, failErr
+		}
+		return false, fmt.Errorf("start stopped %s apply_operation %d (remote apply %s): %w", kind, op.ID, remoteID, err)
+	}
+	// The operation row still reads stopped, and it is the only thing the
+	// operator's projection can derive the parent from. Move it back to running
+	// so a resumed operation does not keep presenting as stopped.
+	if err := c.storage.ApplyOperations().UpdateState(ctx, op.ID, state.Apply.Running); err != nil {
+		return false, fmt.Errorf("update resumed %s apply_operation %d to running: %w", kind, op.ID, err)
+	}
+	op.State = state.Apply.Running
+	logger.InfoContext(ctx, "started a stopped task-less operation on the operator's request",
+		append(apply.MutableLogAttrs(),
+			"apply_operation_id", op.ID, "kind", kind, "remote_apply_id", remoteID)...)
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStartRequested,
+		fmt.Sprintf("Remote %s operation started by operator", kind), "", "")
+	return true, nil
 }
 
 // ResumeApplyOperationCutover drives a single barrier-parked apply_operation
@@ -1838,6 +2483,30 @@ func (c *GRPCClient) ResumeApplyOperationCutover(ctx context.Context, apply *sto
 	return c.pollForCompletion(ctx, apply, false, scope, false)
 }
 
+// operationCutoverCaller names the operator whose cutover this ordered drive is
+// carrying out. The deployment-ordered claim, not the durable request, is what
+// routes the swap here, so the requester has to be read back from the
+// apply-level cutover request the operator queued. Attribution must never cost
+// the swap: an unreadable or already-settled request yields an empty caller,
+// which the data plane records as the forwarding path.
+func (c *GRPCClient) operationCutoverCaller(ctx context.Context, apply *storage.Apply) string {
+	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationCutover)
+	if err != nil {
+		c.applyLogger(apply).WarnContext(ctx, "could not read the cutover request's operator; the data plane will record the forwarding path instead",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return ""
+	}
+	if controlReq == nil {
+		// Expected whenever the request settled before this operation's claim
+		// reached the swap — a sibling operation's drive resolving it, or a
+		// recovery claim re-driving a cutover already sent.
+		c.applyLogger(apply).DebugContext(ctx, "no pending cutover request names an operator; the data plane will record the forwarding path",
+			apply.MutableLogAttrs()...)
+		return ""
+	}
+	return controlReq.RequestedBy
+}
+
 // triggerRemoteOperationCutover preflights the exact remote state for an ordered
 // cutover drive and, only when the operation is still parked at the barrier,
 // issues the remote Cutover RPC. The claim moves the operation row to
@@ -1863,13 +2532,15 @@ func (c *GRPCClient) triggerRemoteOperationCutover(ctx context.Context, apply *s
 		message := fmt.Sprintf("remote apply %s returned no active schema change during cutover preflight", remoteID)
 		return false, c.failMissingRemoteApply(ctx, apply, message, nil, scope)
 	}
-	remoteState := ProtoStateToStorage(resp.State)
+	remoteState := remoteProgressApplyState(resp.State, resp.Tables)
 	if remoteState == "" {
 		return false, fmt.Errorf("preflight remote cutover for apply_operation %d (apply %s): unmapped remote state %s", scope.applyOperationID, apply.ApplyIdentifier, remoteApplyStateDescription(resp.State))
 	}
 	// Remote already terminal: reconcile from this poll and stop. Do not re-send
-	// Cutover.
-	if isTerminalProtoState(resp.State) {
+	// Cutover. A retryable pause is not terminal: it falls through to the
+	// not-parked branch below and the operator retries once the data plane's
+	// own recovery brings the copy back to the barrier.
+	if remoteProgressIsTerminal(resp.State, resp.Tables) {
 		now := time.Now()
 		apply.State = remoteState
 		apply.ErrorMessage = remoteProgressErrorMessage(apply.State, resp.ErrorMessage, apply.ErrorMessage)
@@ -1902,16 +2573,16 @@ func (c *GRPCClient) triggerRemoteOperationCutover(ctx context.Context, apply *s
 	cutoverResp, err := c.client.Cutover(ctx, &ternv1.CutoverRequest{
 		ApplyId:     remoteID,
 		Environment: apply.Environment,
+		Caller:      c.operationCutoverCaller(ctx, apply),
 	})
 	if err != nil {
 		return false, fmt.Errorf("request remote cutover for apply_operation %d (apply %s) remote %s: %w", scope.applyOperationID, apply.ApplyIdentifier, remoteID, err)
 	}
-	if cutoverResp == nil || !cutoverResp.Accepted {
-		message := "not accepted"
-		if cutoverResp != nil && cutoverResp.ErrorMessage != "" {
-			message = cutoverResp.ErrorMessage
-		}
-		return false, fmt.Errorf("request remote cutover for apply_operation %d (apply %s) remote %s: %s", scope.applyOperationID, apply.ApplyIdentifier, remoteID, message)
+	if cutoverResp == nil {
+		return false, fmt.Errorf("request remote cutover for apply_operation %d (apply %s) remote %s: the data plane returned neither a response nor an error", scope.applyOperationID, apply.ApplyIdentifier, remoteID)
+	}
+	if !cutoverResp.Accepted {
+		return false, fmt.Errorf("request remote cutover for apply_operation %d (apply %s) remote %s: %s", scope.applyOperationID, apply.ApplyIdentifier, remoteID, controlRefusalMessage(storage.ControlOperationCutover, cutoverResp.ErrorMessage))
 	}
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCutoverTriggered,
 		fmt.Sprintf("Remote ordered cutover accepted for apply %s operation %d (remote %s)", apply.ApplyIdentifier, scope.applyOperationID, remoteID), "", "")
@@ -1931,6 +2602,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 	if apply == nil {
 		return fmt.Errorf("apply is required")
 	}
+	logger := c.applyLogger(apply)
 	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
 		return err
 	}
@@ -1945,6 +2617,20 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 		errMsg := fmt.Sprintf("gRPC apply %s is %s without a remote apply id; remote dispatch state is ambiguous", apply.ApplyIdentifier, scope.dispatchState(apply))
 		if err := c.markRemoteApplyFailed(ctx, apply, nil, errMsg, false, scope); err != nil {
 			return fmt.Errorf("%s; persist failure state: %w", errMsg, err)
+		}
+		// A failed apply is never claimed again, so a stop or cancel left
+		// pending here would stay unanswered forever and a re-issued command
+		// would be refused as already requested. Fail the requests with the
+		// same ambiguity message the apply carries. An operation-only drive
+		// leaves the shared apply-level requests pending: sibling deployments
+		// still need to observe them, and the operator projection settles them
+		// once the parent apply derives terminal.
+		if !scope.suppressesDirectParentApplyWrites() {
+			for _, operation := range []storage.ControlOperation{storage.ControlOperationStop, storage.ControlOperationCancel} {
+				if err := failPendingControlRequests(ctx, c.storage, apply, operation, errMsg); err != nil {
+					return fmt.Errorf("%s; fail pending %s control request: %w", errMsg, operation, err)
+				}
+			}
 		}
 		return errors.New(errMsg)
 	}
@@ -2006,30 +2692,55 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 		if err == nil {
 			if resp.State == ternv1.State_STATE_NO_ACTIVE_CHANGE {
 				message := fmt.Sprintf("remote apply %s returned no active schema change for exact apply_id during stopped-state check", apply.ExternalID)
-				slog.Warn("remote gRPC stopped-state check returned no active schema change; operator will not request remote start",
-					"apply_id", apply.ApplyIdentifier,
-					"external_id", apply.ExternalID,
-					"database", apply.Database,
-					"environment", apply.Environment,
-					"stored_state", apply.State)
+				logger.Warn("remote gRPC stopped-state check returned no active schema change; operator will not request remote start",
+					apply.MutableLogAttrs()...)
 				return c.failMissingStoppedRemoteApply(ctx, apply, message, nil, scope)
 			}
 			remoteState := ProtoStateToStorage(resp.State)
 			if remoteState == "" {
 				message := fmt.Sprintf("Remote stopped-state check returned unmapped state %s; operator will not request remote start", remoteApplyStateDescription(resp.State))
-				slog.Warn("remote gRPC stopped-state check returned unmapped state; operator will not request remote start",
-					"apply_id", apply.ApplyIdentifier,
-					"external_id", apply.ExternalID,
-					"database", apply.Database,
-					"environment", apply.Environment,
-					"remote_state", resp.State.String(),
-					"remote_state_number", int32(resp.State),
-					"stored_state", apply.State)
+				logger.Warn("remote gRPC stopped-state check returned unmapped state; operator will not request remote start",
+					append(apply.MutableLogAttrs(),
+						"remote_state", resp.State.String(),
+						"remote_state_number", int32(resp.State))...)
 				c.logApplyWarning(ctx, apply, message)
 				return fmt.Errorf("check stopped gRPC apply %s before start: unmapped remote state %s", apply.ApplyIdentifier, remoteApplyStateDescription(resp.State))
 			}
+			if remoteApplyPausedForDataPlaneRetry(resp.State, resp.Tables) {
+				// The data plane is retrying the apply on its own; it is
+				// neither stopped (startable) nor settled (reconcilable).
+				if startRequested {
+					// Settle the start request durably instead of leaving it
+					// pending: repeating this check every claim would write a
+					// warning per cycle, and the answer will not change — the
+					// data plane resumes without a start.
+					message := "The schema change is already retrying automatically; there is nothing to start"
+					logger.Info("remote gRPC stopped-state check found a data-plane retryable pause; rejecting the start request as unneeded",
+						apply.MutableLogAttrs()...)
+					if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message, remoteID); failErr != nil {
+						return failErr
+					}
+				}
+				if state.IsState(apply.State, state.Apply.Stopped) {
+					// A stored stop with a remote that is self-retrying is
+					// contradictory; exit without adopting any state and let a
+					// later claim re-check once the data plane settles.
+					message := "Remote apply is paused for a data-plane retry while the stored apply reads stopped; operator will re-check on a later claim"
+					logger.Warn("remote gRPC stopped-state check found a data-plane retryable pause on a stopped stored apply; operator will re-check on a later claim",
+						apply.MutableLogAttrs()...)
+					c.logApplyWarning(ctx, apply, message)
+					return fmt.Errorf("check stopped gRPC apply %s before start: remote apply is paused for a data-plane retry", apply.ApplyIdentifier)
+				}
+				// The stored apply is active: hold the drive and poll through
+				// the pause like any other in-flight snapshot.
+				return c.pollForCompletion(ctx, apply, false, scope,
+					shouldReleaseAtCutoverBarrier(apply, scope.multiOperation, scope.operation))
+			}
 			apply.State = remoteState
 			apply.ErrorMessage = remoteProgressErrorMessage(apply.State, resp.ErrorMessage, apply.ErrorMessage)
+			// The pause guard above already returned for a retryable pause, so
+			// a terminal proto state here is a settled verdict — no table
+			// refinement left to apply.
 			if isTerminalProtoState(resp.State) && !state.IsState(remoteState, state.Apply.Stopped) {
 				now := time.Now()
 				if apply.StartedAt == nil && !state.IsState(remoteState, state.Apply.Pending) {
@@ -2050,18 +2761,26 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 				return fmt.Errorf("check stopped gRPC apply %s before start: %w", apply.ApplyIdentifier, err)
 			}
 			message := fmt.Sprintf("Remote stopped-state check failed before operator start: %v", err)
-			slog.Warn("remote gRPC stopped-state check failed; operator will not request remote start",
-				"apply_id", apply.ApplyIdentifier,
-				"external_id", apply.ExternalID,
-				"database", apply.Database,
-				"environment", apply.Environment,
-				"error", err)
+			logger.Warn("remote gRPC stopped-state check failed; operator will not request remote start",
+				append(apply.MutableLogAttrs(), "error", err)...)
 			c.logApplyWarning(ctx, apply, message)
 			return fmt.Errorf("check stopped gRPC apply %s before start: %w", apply.ApplyIdentifier, err)
 		}
 
 		// Only call Start if Tern confirms the apply is actually stopped.
 		if state.IsState(apply.State, state.Apply.Stopped) {
+			// A stopped apply with no pending start was claimed only to
+			// deliver a pending control request (see ClaimApplyByID), and the
+			// remote confirming stopped means that request has not taken
+			// effect there yet. Exit without starting — a remote start here
+			// would resume a copy the operator asked to discard. A later
+			// claim re-checks once the lease goes stale or the request is
+			// re-issued.
+			if !startRequested {
+				logger.Info("stopped gRPC apply has no pending start request; drive exits without requesting a remote start",
+					apply.MutableLogAttrs()...)
+				return nil
+			}
 			if deferred, err := c.completePendingStopBeforeRemoteStart(ctx, apply, scope); err != nil || deferred {
 				return err
 			}
@@ -2071,12 +2790,8 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 			})
 			if err != nil {
 				message := fmt.Sprintf("remote start failed for remote apply %s: %v", remoteID, err)
-				slog.Warn("remote gRPC start failed; storing stopped state for operator retry",
-					"apply_id", apply.ApplyIdentifier,
-					"remote_apply_id", remoteID,
-					"database", apply.Database,
-					"environment", apply.Environment,
-					"error", err)
+				logger.Warn("remote gRPC start failed; storing stopped state for operator retry",
+					append(apply.MutableLogAttrs(), "remote_apply_id", remoteID, "error", err)...)
 				c.logApplyWarning(ctx, apply, message)
 				apply.State = state.Apply.Stopped
 				apply.ErrorMessage = message
@@ -2084,7 +2799,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 					return fmt.Errorf("persist stopped gRPC apply %s after start failure: %w", apply.ApplyIdentifier, reconcileErr)
 				}
 				if startRequested {
-					if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message); failErr != nil {
+					if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message, remoteID); failErr != nil {
 						return failErr
 					}
 				}
@@ -2140,39 +2855,28 @@ func (c *GRPCClient) completePendingStopBeforeRemoteStart(ctx context.Context, a
 	if controlReq == nil {
 		return false, nil
 	}
+	logger := c.applyLogger(apply)
 	if scope.suppressesDirectParentApplyWrites() {
-		logOperationDriveLeavesParentStop(apply, scope)
-		slog.Info("operation-only drive deferring remote start until apply-level stop resolves",
-			"apply_id", apply.ApplyIdentifier,
-			"apply_operation_id", scope.applyOperationID,
-			"remote_apply_id", scope.remoteApplyID(apply),
-			"database", apply.Database,
-			"environment", apply.Environment,
-			"requested_by", controlRequestCaller(controlReq),
-			"state", apply.State)
+		logOperationDriveLeavesParentStop(logger, apply, scope)
+		logger.InfoContext(ctx, "operation-only drive deferring remote start until apply-level stop resolves",
+			append(apply.MutableLogAttrs(),
+				"apply_operation_id", scope.applyOperationID,
+				"remote_apply_id", scope.remoteApplyID(apply),
+				"requested_by", controlRequestCaller(controlReq))...)
 		return true, nil
 	}
 	if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 		return false, fmt.Errorf("complete pending stop before starting stopped gRPC apply %s: %w", apply.ApplyIdentifier, err)
 	}
-	slog.Info("completed pending gRPC stop request before starting stopped remote apply",
-		"apply_id", apply.ApplyIdentifier,
-		"external_id", apply.ExternalID,
-		"database", apply.Database,
-		"environment", apply.Environment,
-		"requested_by", controlRequestCaller(controlReq),
-		"state", apply.State)
+	logger.InfoContext(ctx, "completed pending gRPC stop request before starting stopped remote apply",
+		append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested,
 		fmt.Sprintf("Pending remote stop request completed before start%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 	return false, nil
 }
 
-func hasPendingStartControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply) (bool, error) {
-	controlReq, err := pendingControlRequest(ctx, store, apply, storage.ControlOperationStart)
-	if err != nil {
-		return false, err
-	}
-	return controlReq != nil, nil
+func pendingStartControlRequest(ctx context.Context, store storage.Storage, apply *storage.Apply) (*storage.ApplyControlRequest, error) {
+	return pendingControlRequest(ctx, store, apply, storage.ControlOperationStart)
 }
 
 // waitForPendingStopBeforeStart blocks a pending start until the apply-level
@@ -2181,6 +2885,7 @@ func hasPendingStartControlRequest(ctx context.Context, store storage.Storage, a
 // stop (the operator projection owns it), so it stops its own operation's
 // remote work and leaves both the stop and start pending for the operator.
 func (c *GRPCClient) waitForPendingStopBeforeStart(ctx context.Context, apply *storage.Apply, scope applyTaskScope, startControlReq *storage.ApplyControlRequest) (bool, error) {
+	logger := c.applyLogger(apply)
 	loggedWait := false
 	for {
 		stopReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop)
@@ -2206,28 +2911,21 @@ func (c *GRPCClient) waitForPendingStopBeforeStart(ctx context.Context, apply *s
 				return false, nil
 			}
 			if !handled {
-				logOperationDriveLeavesParentStop(apply, scope)
+				logOperationDriveLeavesParentStop(logger, apply, scope)
 			}
-			slog.Info("operation-only drive deferring pending gRPC start until apply-level stop resolves",
-				"apply_id", apply.ApplyIdentifier,
-				"apply_operation_id", scope.applyOperationID,
-				"remote_apply_id", scope.remoteApplyID(apply),
-				"database", apply.Database,
-				"environment", apply.Environment,
-				"requested_by", controlRequestCaller(startControlReq),
-				"stop_requested_by", controlRequestCaller(stillPending),
-				"state", apply.State)
+			logger.InfoContext(ctx, "operation-only drive deferring pending gRPC start until apply-level stop resolves",
+				append(apply.MutableLogAttrs(),
+					"apply_operation_id", scope.applyOperationID,
+					"remote_apply_id", scope.remoteApplyID(apply),
+					"requested_by", controlRequestCaller(startControlReq),
+					"stop_requested_by", controlRequestCaller(stillPending))...)
 			return true, nil
 		}
 		if !loggedWait {
-			slog.Info("pending gRPC start request is waiting for pending stop request to finish",
-				"apply_id", apply.ApplyIdentifier,
-				"external_id", apply.ExternalID,
-				"database", apply.Database,
-				"environment", apply.Environment,
-				"requested_by", controlRequestCaller(startControlReq),
-				"stop_requested_by", controlRequestCaller(stopReq),
-				"state", apply.State)
+			logger.InfoContext(ctx, "pending gRPC start request is waiting for pending stop request to finish",
+				append(apply.MutableLogAttrs(),
+					"requested_by", controlRequestCaller(startControlReq),
+					"stop_requested_by", controlRequestCaller(stopReq))...)
 			loggedWait = true
 		}
 		if _, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); err != nil {
@@ -2252,14 +2950,10 @@ func (c *GRPCClient) processPendingStartControlRequest(ctx context.Context, appl
 	if stopReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
 		return fmt.Errorf("check pending stop before pending gRPC start for apply %s: %w", apply.ApplyIdentifier, err)
 	} else if stopReq != nil {
-		slog.Info("pending gRPC start request is waiting for pending stop request to finish",
-			"apply_id", apply.ApplyIdentifier,
-			"external_id", apply.ExternalID,
-			"database", apply.Database,
-			"environment", apply.Environment,
-			"requested_by", controlRequestCaller(controlReq),
-			"stop_requested_by", controlRequestCaller(stopReq),
-			"state", apply.State)
+		c.applyLogger(apply).InfoContext(ctx, "pending gRPC start request is waiting for pending stop request to finish",
+			append(apply.MutableLogAttrs(),
+				"requested_by", controlRequestCaller(controlReq),
+				"stop_requested_by", controlRequestCaller(stopReq))...)
 		return nil
 	}
 	if !state.IsState(apply.State, state.Apply.WaitingForDeploy) {
@@ -2268,7 +2962,7 @@ func (c *GRPCClient) processPendingStartControlRequest(ctx context.Context, appl
 	remoteID := scope.remoteApplyID(apply)
 	if remoteID == "" {
 		message := fmt.Sprintf("gRPC apply %s is waiting for deploy without a remote apply id; start dispatch state is ambiguous", apply.ApplyIdentifier)
-		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message); err != nil {
+		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message, remoteID); err != nil {
 			return err
 		}
 		return errors.New(message)
@@ -2279,13 +2973,11 @@ func (c *GRPCClient) processPendingStartControlRequest(ctx context.Context, appl
 	})
 	if err != nil {
 		message := fmt.Sprintf("remote deferred deploy start failed for remote apply %s: %v", remoteID, err)
-		slog.Warn("remote gRPC deferred deploy start failed; storing start request failure",
-			"apply_id", apply.ApplyIdentifier,
-			"remote_apply_id", remoteID,
-			"database", apply.Database,
-			"environment", apply.Environment,
-			"error", err)
-		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message); failErr != nil {
+		c.applyLogger(apply).WarnContext(ctx, "remote gRPC deferred deploy start failed; storing start request failure",
+			append(apply.MutableLogAttrs(),
+				"remote_apply_id", remoteID,
+				"error", err)...)
+		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message, remoteID); failErr != nil {
 			return failErr
 		}
 		return fmt.Errorf("start gRPC deferred deploy %s: %w", apply.ApplyIdentifier, err)
@@ -2329,6 +3021,21 @@ func shouldDispatchQueuedRemoteApply(apply *storage.Apply, scope applyTaskScope)
 	// against, where a shared external_id could have been lost after a real
 	// dispatch.
 	return scope.usesOperationRemoteResume() && state.IsState(dispatchState, state.Apply.Running)
+}
+
+// undispatchedControlRequestSettlesLocally reports whether a pending stop or
+// cancel that addresses no remote apply id can be satisfied in control-plane
+// storage alone. Two shapes qualify. When the dispatch path would treat this
+// drive as a first dispatch, nothing remote was ever created. When the
+// dispatch state is stopped, the same fact is proven from the other side: a
+// remote apply id is persisted before an apply or operation can be recorded
+// stopped and is never cleared, so a stopped one without an id was stopped
+// before dispatch and has no remote work to address.
+func undispatchedControlRequestSettlesLocally(apply *storage.Apply, scope applyTaskScope) bool {
+	if shouldDispatchQueuedRemoteApply(apply, scope) {
+		return true
+	}
+	return scope.remoteApplyID(apply) == "" && state.IsState(scope.dispatchState(apply), state.Apply.Stopped)
 }
 
 func hasAmbiguousRemoteDispatchState(apply *storage.Apply, scope applyTaskScope) bool {
@@ -2406,19 +3113,21 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		return err
 	}
 
-	resp, err := c.client.Apply(ctx, &ternv1.ApplyRequest{
-		PlanId:         plan.PlanIdentifier,
-		Options:        options,
-		Database:       apply.Database,
-		Type:           apply.DatabaseType,
-		DdlChanges:     tasksToProtoTableChanges(tasks),
-		SchemaFiles:    schemaFilesToProto(plan.SchemaFiles),
-		Environment:    apply.Environment,
-		Target:         target,
-		Caller:         apply.Caller,
-		TargetShards:   targetShards,
-		IdempotencyKey: remoteApplyIdempotencyKey(apply, scope),
-	})
+	req := &ternv1.ApplyRequest{
+		PlanId:                  plan.PlanIdentifier,
+		Options:                 options,
+		Database:                apply.Database,
+		Type:                    apply.DatabaseType,
+		DdlChanges:              tasksToProtoTableChanges(tasks),
+		SchemaFiles:             schemaFilesToProto(plan.SchemaFiles),
+		Environment:             apply.Environment,
+		Target:                  target,
+		Caller:                  apply.Caller,
+		TargetShards:            targetShards,
+		IdempotencyKey:          remoteApplyIdempotencyKey(apply, scope),
+		GenerationOperationKeys: scope.generationOperationKeys(),
+	}
+	resp, err := c.client.Apply(ctx, req)
 	if err != nil {
 		if isAmbiguousRemoteApplyDispatchError(err) {
 			return fmt.Errorf("apply queued gRPC apply %s has ambiguous remote dispatch outcome: %w", apply.ApplyIdentifier, err)
@@ -2436,10 +3145,8 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		return fmt.Errorf("apply queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
 	}
 	if !resp.Accepted {
-		errMsg := resp.ErrorMessage
-		if errMsg == "" {
-			errMsg = "remote apply was not accepted"
-		}
+		holderApplyID := c.resolveConflictHolderApplyID(ctx, apply, resp.GetConflict())
+		errMsg := remoteApplyRejectionMessage(resp, holderApplyID, "remote apply was not accepted")
 		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, errMsg, false, scope); markErr != nil {
 			return fmt.Errorf("mark queued gRPC apply %s failed after rejection: %w", apply.ApplyIdentifier, markErr)
 		}
@@ -2451,6 +3158,17 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 			return fmt.Errorf("mark queued gRPC apply %s failed after missing remote apply id: %w", apply.ApplyIdentifier, markErr)
 		}
 		return fmt.Errorf("apply queued gRPC apply %s: %s", apply.ApplyIdentifier, errMsg)
+	}
+	if echoErr := verifyDispatchOperationKeyEcho(plan, req, resp); echoErr != nil {
+		c.applyLogger(apply).ErrorContext(ctx, "remote dispatch response does not address this operation; refusing its remote ids and failing the apply closed",
+			append(apply.MutableLogAttrs(),
+				"remote_apply_id", resp.ApplyId,
+				"error", echoErr)...)
+		metrics.RecordRemoteApplyKeyEchoMismatch(ctx, apply.Database, apply.Environment)
+		if markErr := c.markRemoteApplyFailed(ctx, apply, tasks, echoErr.Error(), false, scope); markErr != nil {
+			return fmt.Errorf("mark queued gRPC apply %s failed after operation key echo mismatch: %w", apply.ApplyIdentifier, markErr)
+		}
+		return fmt.Errorf("apply queued gRPC apply %s: %w", apply.ApplyIdentifier, echoErr)
 	}
 
 	oldApplyState := apply.State
@@ -2669,10 +3387,12 @@ func storedTerminalApplyBlocksRemoteTransition(storedApply *storage.Apply, allow
 	return true
 }
 
-func logSkippedRemoteApplyTransition(operation string, remoteApply, storedApply *storage.Apply, status storedApplyTransitionStatus, err error) {
+// logSkippedRemoteApplyTransition expects a logger already bound to the remote
+// apply's identity attributes, so it appends only the transition-specific
+// fields.
+func logSkippedRemoteApplyTransition(ctx context.Context, logger *slog.Logger, operation string, remoteApply, storedApply *storage.Apply, status storedApplyTransitionStatus, err error) {
 	fields := []any{
 		"operation", operation,
-		"apply_id", remoteApply.ApplyIdentifier,
 		"external_id", remoteApply.ExternalID,
 		"reason", status,
 	}
@@ -2683,46 +3403,41 @@ func logSkippedRemoteApplyTransition(operation string, remoteApply, storedApply 
 	switch status {
 	case storedApplyTransitionReloadFailed:
 		fields = append(fields, "error", err)
-		slog.Error("skipping remote gRPC apply state transition", fields...)
+		logger.ErrorContext(ctx, "skipping remote gRPC apply state transition", fields...)
 	case storedApplyTransitionMissing:
-		slog.Warn("skipping remote gRPC apply state transition", fields...)
+		logger.WarnContext(ctx, "skipping remote gRPC apply state transition", fields...)
 	case storedApplyTransitionAlreadyTerminal:
-		slog.Debug("skipping remote gRPC apply state transition", fields...)
+		logger.DebugContext(ctx, "skipping remote gRPC apply state transition", fields...)
 	default:
-		slog.Warn("skipping remote gRPC apply state transition", fields...)
+		logger.WarnContext(ctx, "skipping remote gRPC apply state transition", fields...)
 	}
 }
 
 // completeApplyStartRequestForScope completes the apply-level start control
-// request unless this is an operation-scoped multi-op drive. In a multi-op
-// drive the start request is shared across sibling operations; one operation
-// starting must not complete the shared start request, or stopped siblings
-// would become unclaimable before they resume. The rollout projection completes
-// it once the aggregate settles.
+// request unless the drive owns only its operation. The start request lives on
+// the parent and is shared across sibling operations; one operation starting
+// must not complete it, or stopped siblings would become unclaimable before they
+// resume. The rollout projection completes it once the aggregate settles.
 func (c *GRPCClient) completeApplyStartRequestForScope(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
 	if scope.usesOperationRemoteResume() {
-		slog.Debug("skipping apply-level start request completion during multi-operation drive; shared start request is owned by the rollout projection",
-			"apply_id", apply.ApplyIdentifier,
+		c.applyLogger(apply).DebugContext(ctx, "skipping apply-level start request completion during operation-scoped drive; parent start request is owned by the rollout projection",
 			"apply_operation_id", scope.applyOperationID,
-			"deployment", scope.operation.Deployment,
-			"environment", apply.Environment)
+			"operation_deployment", scope.operation.Deployment)
 		return nil
 	}
 	return completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart)
 }
 
-// persistParentApply writes the parent applies row unless the drive is a
-// multi-operation operation-only drive, in which case the parent state is owned
-// by the operator's projection CAS and the direct write is skipped. It reports
-// whether the write happened so callers can gate parent-level side effects
-// (state-transition logs, active-apply metrics) on an actual persist.
+// persistParentApply writes the parent applies row unless the drive owns only
+// its operation, in which case the parent state is owned by the operator's
+// projection CAS and the direct write is skipped. It reports whether the write
+// happened so callers can gate parent-level side effects (state-transition logs,
+// active-apply metrics) on an actual persist.
 func (c *GRPCClient) persistParentApply(ctx context.Context, apply *storage.Apply, scope applyTaskScope, action string) (bool, error) {
 	if scope.suppressesDirectParentApplyWrites() {
-		slog.Debug("skipping direct parent apply write during multi-operation drive; parent state is owned by the rollout projection",
-			"apply_id", apply.ApplyIdentifier,
+		c.applyLogger(apply).DebugContext(ctx, "skipping direct parent apply write during operation-scoped drive; parent state is owned by the rollout projection",
 			"apply_operation_id", scope.applyOperationID,
-			"deployment", scope.operation.Deployment,
-			"environment", apply.Environment,
+			"operation_deployment", scope.operation.Deployment,
 			"action", action)
 		return false, nil
 	}
@@ -2732,8 +3447,8 @@ func (c *GRPCClient) persistParentApply(ctx context.Context, apply *storage.Appl
 	return true, nil
 }
 
-// heartbeatScopedDrive refreshes the lease keeping a long drive claimed. A
-// multi-operation drive heartbeats its own operation row (it holds no parent
+// heartbeatScopedDrive refreshes the lease keeping a long drive claimed. An
+// operation-scoped drive heartbeats its own operation row (it holds no parent
 // apply lease); every other drive heartbeats the parent applies row.
 func (c *GRPCClient) heartbeatScopedDrive(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
 	if scope.suppressesDirectParentApplyWrites() {
@@ -2751,20 +3466,22 @@ func (c *GRPCClient) heartbeatScopedDrive(ctx context.Context, apply *storage.Ap
 // once. A transient failure inside the window returns nil so the drive keeps
 // polling and the heartbeat is retried on the next tick. The remote Tern keeps
 // executing either way; the next claimant reattaches to it.
-func driveEndingHeartbeatFailure(apply *storage.Apply, hbErr error, lastSuccess time.Time) error {
+// The logger is expected to carry the apply's identity attributes already
+// bound, so each line appends only the mutable snapshot.
+func driveEndingHeartbeatFailure(logger *slog.Logger, apply *storage.Apply, hbErr error, lastSuccess time.Time) error {
 	if errors.Is(hbErr, storage.ErrApplyLeaseLost) {
-		slog.Warn("gRPC drive heartbeat lost the lease; current owner will stop driving and writing apply state",
-			append(apply.LogAttrs(), "error", hbErr)...)
+		logger.Warn("gRPC drive heartbeat lost the lease; current owner will stop driving and writing apply state",
+			append(apply.MutableLogAttrs(), "error", hbErr)...)
 		return fmt.Errorf("heartbeat gRPC apply %s: %w", apply.ApplyIdentifier, hbErr)
 	}
 	if time.Since(lastSuccess) >= storage.ApplyLeaseStaleAfter {
-		slog.Warn("gRPC drive heartbeat has failed for the full lease staleness window; a peer driver can reclaim the work, so this owner will stop driving and writing apply state",
-			append(apply.LogAttrs(), "last_successful_heartbeat", lastSuccess, "error", hbErr)...)
+		logger.Warn("gRPC drive heartbeat has failed for the full lease staleness window; a peer driver can reclaim the work, so this owner will stop driving and writing apply state",
+			append(apply.MutableLogAttrs(), "last_successful_heartbeat", lastSuccess, "error", hbErr)...)
 		return fmt.Errorf("heartbeat gRPC apply %s: %w (heartbeats failing since %s): %w",
 			apply.ApplyIdentifier, ErrApplyLeasePresumedLost, lastSuccess.UTC().Format(time.RFC3339), hbErr)
 	}
-	slog.Warn("gRPC drive heartbeat failed; will retry",
-		append(apply.LogAttrs(), "error", hbErr)...)
+	logger.Warn("gRPC drive heartbeat failed; will retry",
+		append(apply.MutableLogAttrs(), "error", hbErr)...)
 	return nil
 }
 
@@ -2777,9 +3494,10 @@ func (c *GRPCClient) markStoppedRemoteApplyFailed(ctx context.Context, remoteApp
 }
 
 func (c *GRPCClient) markRemoteApplyFailedWithOptions(ctx context.Context, remoteApply *storage.Apply, storedTasks []*storage.Task, message string, retryable, allowStoppedStoredApply bool, scope applyTaskScope) error {
+	logger := c.applyLogger(remoteApply)
 	storedApply, transitionStatus, err := c.reloadStoredApplyForRemoteTransition(ctx, remoteApply, allowStoppedStoredApply)
 	if transitionStatus != storedApplyTransitionReady {
-		logSkippedRemoteApplyTransition("mark remote gRPC apply failed", remoteApply, storedApply, transitionStatus, err)
+		logSkippedRemoteApplyTransition(ctx, logger, "mark remote gRPC apply failed", remoteApply, storedApply, transitionStatus, err)
 		if err != nil {
 			return err
 		}
@@ -2803,8 +3521,7 @@ func (c *GRPCClient) markRemoteApplyFailedWithOptions(ctx context.Context, remot
 	}
 	for _, storedTask := range storedTasks {
 		if state.IsTerminalTaskState(storedTask.State) {
-			slog.Info("leaving terminal gRPC task unchanged after remote apply failure",
-				"apply_id", storedApply.ApplyIdentifier,
+			logger.InfoContext(ctx, "leaving terminal gRPC task unchanged after remote apply failure",
 				"task_id", storedTask.TaskIdentifier,
 				"table", storedTask.TableName,
 				"task_state", storedTask.State,
@@ -2824,26 +3541,24 @@ func (c *GRPCClient) markRemoteApplyFailedWithOptions(ctx context.Context, remot
 		}
 	}
 
-	// A multi-operation drive records only its operation's task failures here.
+	// An operation-scoped drive records only its operation's task failures here.
 	// The operator derives the failed operation row from those tasks and moves
 	// the parent applies.state via the projection CAS; the driver must not write
 	// the parent failure or run its parent-level side effects.
 	if scope.suppressesDirectParentApplyWrites() {
-		// A task-less group_finalizer has no task rows to carry the failure, so the
+		// A task-less operation has no task rows to carry the failure, so the
 		// operator could never derive its failed operation row. Mark it failed
 		// directly on a non-retryable failure; a retryable failure is left
 		// non-terminal so the operator re-drives the operation (and re-polls the
 		// existing remote apply).
-		if scope.finalizerOperationScope() && !retryable {
+		if scope.tasklessOperationScope() && !retryable {
 			if err := c.storage.ApplyOperations().MarkFailed(ctx, scope.applyOperationID, message); err != nil {
-				return fmt.Errorf("mark group_finalizer apply_operation %d failed after remote apply failure: %w", scope.applyOperationID, err)
+				return fmt.Errorf("mark task-less apply_operation %d failed after remote apply failure: %w", scope.applyOperationID, err)
 			}
 		}
-		slog.Debug("recorded operation task failures during multi-operation drive; parent failure is owned by the rollout projection",
-			"apply_id", storedApply.ApplyIdentifier,
+		logger.DebugContext(ctx, "recorded operation task failures during operation-scoped drive; parent failure is owned by the rollout projection",
 			"apply_operation_id", scope.applyOperationID,
-			"deployment", scope.operation.Deployment,
-			"environment", storedApply.Environment,
+			"operation_deployment", scope.operation.Deployment,
 			"failure_task_state", taskState)
 		return nil
 	}
@@ -2893,6 +3608,7 @@ func (c *GRPCClient) failMissingStoppedRemoteApply(ctx context.Context, remoteAp
 }
 
 func (c *GRPCClient) reconcileTerminalRemoteProgress(ctx context.Context, remoteApply *storage.Apply, remoteTasks []*ternv1.TableProgress, now time.Time, scope applyTaskScope) error {
+	logger := c.applyLogger(remoteApply)
 	// reloadStoredApplyForRemoteTransition may overwrite remoteApply with the
 	// stored row when it finds an already-terminal stored apply. Keep the remote
 	// Progress result available for the stopped-row exception below.
@@ -2908,7 +3624,7 @@ func (c *GRPCClient) reconcileTerminalRemoteProgress(ctx context.Context, remote
 	}
 
 	if transitionStatus != storedApplyTransitionReady {
-		logSkippedRemoteApplyTransition("persist remote terminal apply", remoteApply, storedApply, transitionStatus, err)
+		logSkippedRemoteApplyTransition(ctx, logger, "persist remote terminal apply", remoteApply, storedApply, transitionStatus, err)
 		if err != nil {
 			return err
 		}
@@ -2919,7 +3635,7 @@ func (c *GRPCClient) reconcileTerminalRemoteProgress(ctx context.Context, remote
 					return fmt.Errorf("check pending stop after terminal remote progress for apply %s: %w", storedApply.ApplyIdentifier, err)
 				}
 				if controlReq != nil {
-					logOperationDriveLeavesParentStop(storedApply, scope)
+					logOperationDriveLeavesParentStop(logger, storedApply, scope)
 				}
 				return nil
 			}
@@ -2943,7 +3659,45 @@ func (c *GRPCClient) reconcileTerminalRemoteProgress(ctx context.Context, remote
 	if err := c.reconcileStoredTasksForTerminalRemoteApply(ctx, storedApply, remoteApply, storedTasks, now); err != nil {
 		return err
 	}
+	if err := c.stampRemoteApplyErrorOnFailedTasks(ctx, storedApply, remoteApply, storedTasks, now); err != nil {
+		return err
+	}
 	return c.persistTerminalStateFromRemote(ctx, storedApply, remoteApply, now, scope)
+}
+
+// stampRemoteApplyErrorOnFailedTasks copies a failed remote apply's error
+// message onto its failed stored task rows that carry no error of their own.
+// The per-table reason normally arrives on the remote TableProgress snapshot
+// and is adopted by syncStoredTasksFromRemoteTasks, but it can be absent — a
+// data plane on an older proto omits the field, and a failure that never
+// reached a specific table (for example an engine preflight rejection) has no
+// per-table text to report. Such a task persists as failed with an empty
+// ErrorMessage even though the remote apply carries the actionable reason. The
+// stored task row is what the operator derives the operation row from, so an
+// empty task error would otherwise become an empty operation — and PR-comment
+// — failure reason. A task that already carries its own, more specific error
+// keeps it.
+func (c *GRPCClient) stampRemoteApplyErrorOnFailedTasks(ctx context.Context, storedApply, remoteApply *storage.Apply, storedTasks []*storage.Task, now time.Time) error {
+	if !state.IsState(remoteApply.State, state.Apply.Failed) || remoteApply.ErrorMessage == "" {
+		return nil
+	}
+	logger := c.applyLogger(storedApply)
+	for _, storedTask := range storedTasks {
+		if !state.IsState(storedTask.State, state.Task.Failed) || storedTask.ErrorMessage != "" {
+			continue
+		}
+		storedTask.ErrorMessage = remoteApply.ErrorMessage
+		storedTask.UpdatedAt = now
+		if err := c.storage.Tasks().Update(ctx, storedTask); err != nil {
+			return fmt.Errorf("stamp remote apply error on failed task %s for %s: %w", storedTask.TaskIdentifier, storedApply.ApplyIdentifier, err)
+		}
+		logger.InfoContext(ctx, "stamped remote apply failure reason on failed task that carried no error",
+			append(storedApply.MutableLogAttrs(),
+				"task_id", storedTask.TaskIdentifier,
+				"table", storedTask.TableName,
+				"error_message", remoteApply.ErrorMessage)...)
+	}
+	return nil
 }
 
 func storedStoppedApplyCanAdoptRemoteTerminalState(storedApply, remoteApply *storage.Apply) bool {
@@ -2953,24 +3707,22 @@ func storedStoppedApplyCanAdoptRemoteTerminalState(storedApply, remoteApply *sto
 }
 
 func (c *GRPCClient) persistTerminalStateFromRemote(ctx context.Context, storedApply, remoteApply *storage.Apply, now time.Time, scope applyTaskScope) error {
-	// A multi-operation drive owns only its operation. The terminal task states
+	// An operation-scoped drive owns only its operation. The terminal task states
 	// were already synced by the caller; the operation row is derived from those
 	// tasks by the operator, which then moves the parent applies.state via the
 	// projection CAS and completes any parent control requests. The driver must
 	// not write the parent row or run its parent-level side effects here.
 	if scope.suppressesDirectParentApplyWrites() {
-		// A task-less group_finalizer has no task rows for the operator to derive
-		// the operation row from, so persist its terminal state directly here.
-		if scope.finalizerOperationScope() {
-			if err := c.persistFinalizerOperationTerminalState(ctx, scope.applyOperationID, remoteApply.State, remoteApply.ErrorMessage); err != nil {
+		// A task-less operation has no task rows for the operator to derive the
+		// operation row from, so persist its terminal state directly here.
+		if scope.tasklessOperationScope() {
+			if err := c.persistTasklessOperationTerminalState(ctx, scope.applyOperationID, remoteApply.State, remoteApply.ErrorMessage); err != nil {
 				return err
 			}
 		}
-		slog.Debug("skipping parent terminal write during multi-operation drive; operation tasks are resolved and parent state is owned by the rollout projection",
-			"apply_id", storedApply.ApplyIdentifier,
+		c.applyLogger(storedApply).DebugContext(ctx, "skipping parent terminal write during operation-scoped drive; operation tasks are resolved and parent state is owned by the rollout projection",
 			"apply_operation_id", scope.applyOperationID,
-			"deployment", scope.operation.Deployment,
-			"environment", storedApply.Environment,
+			"operation_deployment", scope.operation.Deployment,
 			"remote_state", remoteApply.State)
 		return nil
 	}
@@ -3001,23 +3753,40 @@ func (c *GRPCClient) persistTerminalStateFromRemote(ctx context.Context, storedA
 	return nil
 }
 
-// persistFinalizerOperationTerminalState reflects a remote terminal state onto a
-// task-less group_finalizer operation row. Because such an operation carries no
-// task rows, the operator's task-derived projection can never move it: the drive
-// owns its terminal transition, mirroring LocalClient.driveGroupFinalizer
-// (MarkCompleted on success, MarkFailed on failure). Non-completed/non-failed
-// terminal states (stopped/cancelled) stay owned by the operator's stop/cancel
-// handling, so the drive leaves the operation row untouched for those.
-func (c *GRPCClient) persistFinalizerOperationTerminalState(ctx context.Context, applyOperationID int64, terminalState, errMsg string) error {
+// persistTasklessOperationTerminalState reflects a remote terminal state onto a
+// task-less operation row. Because such an operation carries no task rows, the
+// operator's task-derived projection can never move it: the drive owns its
+// terminal transition, mirroring the local drive. Every terminal state is
+// written, not just completion and failure — a stop or cancel that lands on a
+// task-less operation has no task rows for the operator's stop handling to move
+// either, so leaving one of those unwritten would hold the operation row and its
+// parent apply running forever with the target blocked.
+func (c *GRPCClient) persistTasklessOperationTerminalState(ctx context.Context, applyOperationID int64, terminalState, errMsg string) error {
+	opStore := c.storage.ApplyOperations()
 	switch {
 	case state.IsState(terminalState, state.Apply.Completed):
-		if err := c.storage.ApplyOperations().MarkCompleted(ctx, applyOperationID); err != nil {
-			return fmt.Errorf("mark group_finalizer apply_operation %d completed from remote terminal state: %w", applyOperationID, err)
+		if err := opStore.MarkCompleted(ctx, applyOperationID); err != nil {
+			return fmt.Errorf("mark task-less apply_operation %d completed from remote terminal state: %w", applyOperationID, err)
 		}
 	case state.IsState(terminalState, state.Apply.Failed):
-		if err := c.storage.ApplyOperations().MarkFailed(ctx, applyOperationID, errMsg); err != nil {
-			return fmt.Errorf("mark group_finalizer apply_operation %d failed from remote terminal state: %w", applyOperationID, err)
+		if err := opStore.MarkFailed(ctx, applyOperationID, errMsg); err != nil {
+			return fmt.Errorf("mark task-less apply_operation %d failed from remote terminal state: %w", applyOperationID, err)
 		}
+	case state.IsState(terminalState, state.Apply.Stopped):
+		// Stopped is terminal but resumable, so mirror the state and leave
+		// completed_at nil — the same convention the operator's own operation
+		// writer uses, so a later start finds a row it can resume.
+		if err := opStore.UpdateState(ctx, applyOperationID, terminalState); err != nil {
+			return fmt.Errorf("update task-less apply_operation %d to stopped from remote terminal state: %w", applyOperationID, err)
+		}
+	case state.IsTerminalApplyState(terminalState):
+		// cancelled / reverted — non-resumable, so stamp completed_at.
+		if err := opStore.MarkTerminal(ctx, applyOperationID, terminalState); err != nil {
+			return fmt.Errorf("mark task-less apply_operation %d terminal state %q from remote: %w", applyOperationID, terminalState, err)
+		}
+	default:
+		c.baseLogger().WarnContext(ctx, "task-less apply_operation reached the terminal writer with a non-terminal remote state; operation left claimable",
+			"apply_operation_id", applyOperationID, "remote_state", terminalState)
 	}
 	return nil
 }
@@ -3047,9 +3816,85 @@ func remoteProgressErrorMessage(applyState, remoteErrorMessage, existingErrorMes
 	return ""
 }
 
+// remoteApplyPausedForDataPlaneRetry reports whether a remote progress
+// snapshot is a retryable pause rather than a final verdict: the data plane's
+// own recovery will claim another attempt, so the control plane must keep
+// polling instead of terminalizing — a terminal verdict here would orphan a
+// live remote apply that can still cut over. A current data plane says so
+// directly with STATE_FAILED_RETRYABLE. A data plane from before that wire
+// state reports the pause as STATE_FAILED and reveals the retryable truth only
+// on the per-table status strings, so a STATE_FAILED snapshot with a table
+// still in failed_retryable is also a pause.
+func remoteApplyPausedForDataPlaneRetry(protoState ternv1.State, remoteTasks []*ternv1.TableProgress) bool {
+	if protoState == ternv1.State_STATE_FAILED_RETRYABLE {
+		return true
+	}
+	if protoState != ternv1.State_STATE_FAILED {
+		return false
+	}
+	for _, remoteTask := range remoteTasks {
+		if remoteTask == nil {
+			continue
+		}
+		if state.IsState(state.NormalizeTaskStatus(remoteTask.Status), state.Task.FailedRetryable) {
+			return true
+		}
+	}
+	return false
+}
+
+// remoteProgressIsTerminal reports whether a remote progress snapshot settles
+// the apply. It refines isTerminalProtoState with the pause check: a snapshot
+// that is really a retryable pause is not terminal. A STATE_FAILED snapshot
+// with no retryable table (for example a dispatch-level failure that never
+// created tasks, or exhausted retries) stays terminal — the guard only holds
+// the drive open when the snapshot proves the data plane will retry.
+func remoteProgressIsTerminal(protoState ternv1.State, remoteTasks []*ternv1.TableProgress) bool {
+	return isTerminalProtoState(protoState) && !remoteApplyPausedForDataPlaneRetry(protoState, remoteTasks)
+}
+
+// remoteProgressApplyState maps a remote progress snapshot to the stored apply
+// state it represents: a snapshot that is a retryable pause maps to
+// failed_retryable, not failed, even when an older data plane reported the
+// pause as STATE_FAILED. Like ProtoStateToStorage it returns "" for an
+// unmapped state.
+func remoteProgressApplyState(protoState ternv1.State, remoteTasks []*ternv1.TableProgress) string {
+	mapped := ProtoStateToStorage(protoState)
+	if mapped == "" {
+		return ""
+	}
+	if remoteApplyPausedForDataPlaneRetry(protoState, remoteTasks) {
+		return state.Apply.FailedRetryable
+	}
+	return mapped
+}
+
+// remoteTaskResumedFromRetryablePause reports whether a remote task status
+// shows the data plane actively driving the task again after a retryable
+// pause. A stored failed_retryable task normally pins its state so a stale
+// engine poll cannot hide an operator-written pause, but the remote Progress
+// response reads the data plane's durable rows: an actively driving status
+// after a pause means a recovery attempt really re-claimed the task, and the
+// mirror must follow it. Pending does not count — the data plane parks
+// requeued tasks there before a recovery claims them — and terminal statuses
+// flow through taskStateWithNoBackwardProgress, which already admits them.
+func remoteTaskResumedFromRetryablePause(remoteTaskState string) bool {
+	return !state.IsTerminalTaskState(remoteTaskState) &&
+		!state.IsState(remoteTaskState,
+			state.Task.FailedRetryable,
+			state.Task.Stopped,
+			state.Task.Pending)
+}
+
 // syncStoredTasksFromRemoteTasks mirrors the per-task table progress fields
 // returned by remote Tern. It only copies the remote task snapshot; terminal
 // remote applies are persisted only after those copied task states are resolved.
+//
+// Every stored task row is written on every call, even when no field moved:
+// the operator reads tasks.updated_at as the drive's liveness signal
+// (ApplyDriveStallAfter) and cancels a drive whose rows stop advancing, so
+// the write must stay unconditional — including through parked states such as
+// deferred cutovers and revert windows, where nothing changes tick to tick.
 func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 	ctx context.Context,
 	storedApply *storage.Apply,
@@ -3057,24 +3902,36 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 	remoteTasks []*ternv1.TableProgress,
 	now time.Time,
 ) error {
-	remoteTaskIndex := indexProtoTableProgress(remoteTasks)
+	logger := c.applyLogger(storedApply)
+	remoteTaskIndex := IndexProtoTableProgress(remoteTasks)
 	missingProgressTasks := 0
 	for _, storedTask := range storedTasks {
-		remoteTask, ok := protoProgressForTask(remoteTaskIndex, storedTask)
+		remoteTask, ok := remoteTaskIndex.ForTask(storedTask)
 		if !ok {
 			missingProgressTasks++
 			continue
 		}
 		oldTaskState := storedTask.State
+		c.unrecognizedStatuses.observeTaskStatus(ctx, logger, storedTask, remoteTask.Status)
 		remoteTaskState := state.NormalizeTaskStatus(remoteTask.Status)
-		if state.IsState(remoteTaskState, state.Task.Stopped) {
+		switch {
+		case state.IsState(remoteTaskState, state.Task.Stopped):
 			storedTask.State = remoteTaskState
-		} else {
+		case state.IsState(storedTask.State, state.Task.FailedRetryable) &&
+			state.RecognizedTaskStatus(remoteTask.Status) &&
+			remoteTaskResumedFromRetryablePause(remoteTaskState):
+			// The data plane owns recovery of its retryable failures: the
+			// stored pause must follow the remote's new attempt instead of
+			// pinning "Retrying" on the operator surfaces while the data
+			// plane is actively copying. Un-pinning needs positive evidence:
+			// an unrecognized remote status normalizes to running as a
+			// fail-open default, which is no proof the row left its pause.
+			storedTask.State = remoteTaskState
+		default:
 			storedTask.State = taskStateWithNoBackwardProgress(storedTask.State, remoteTaskState)
 		}
 		if !state.IsState(storedTask.State, remoteTaskState) {
-			slog.Debug("keeping stored gRPC task state because remote progress reported earlier state",
-				"apply_id", storedApply.ApplyIdentifier,
+			logger.DebugContext(ctx, "keeping stored gRPC task state because remote progress reported earlier state",
 				"external_id", storedApply.ExternalID,
 				"task_id", storedTask.TaskIdentifier,
 				"table", storedTask.TableName,
@@ -3082,8 +3939,7 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 				"remote_task_state", remoteTaskState)
 		}
 		if remoteTaskOmittedRowTotals(storedTask, remoteTask) {
-			slog.Debug("keeping stored gRPC task row-copy progress because remote progress omitted row totals",
-				"apply_id", storedApply.ApplyIdentifier,
+			logger.DebugContext(ctx, "keeping stored gRPC task row-copy progress because remote progress omitted row totals",
 				"external_id", storedApply.ExternalID,
 				"task_id", storedTask.TaskIdentifier,
 				"namespace", storedTask.Namespace,
@@ -3100,6 +3956,25 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 			storedTask.ETASeconds = int(remoteTask.EtaSeconds)
 			storedTask.ChecksumRowsChecked = remoteTask.ChecksumRowsChecked
 			storedTask.ChecksumRowsTotal = remoteTask.ChecksumRowsTotal
+		}
+		// Throttle state is a point-in-time signal, not cumulative progress:
+		// it is mirrored on every tick — including ticks whose row totals are
+		// kept — so a lifted throttle clears promptly instead of lingering on
+		// the PR comment. The reason travels only with an active throttle and
+		// is bounded here because the remote data plane's reason is untrusted
+		// input for the operator surfaces that render it.
+		storedTask.Throttled = remoteTask.Throttled
+		storedTask.ThrottleReason = ""
+		if remoteTask.Throttled {
+			storedTask.ThrottleReason = engine.SanitizeThrottleReason(remoteTask.ThrottleReason)
+		}
+		// Adopt the remote task's own failure reason (for example an engine
+		// preflight rejection) so the operation row derived from the stored task
+		// carries a per-table error. An empty remote error never clears a stored
+		// one: a data plane running an older proto omits the field entirely, and
+		// the stored message may have been stamped from the apply-level error.
+		if remoteTask.ErrorMessage != "" {
+			storedTask.ErrorMessage = remoteTask.ErrorMessage
 		}
 		if state.IsState(storedTask.State, state.Task.Completed) && storedTask.ProgressPercent != 100 {
 			storedTask.ProgressPercent = 100
@@ -3123,12 +3998,8 @@ func (c *GRPCClient) syncStoredTasksFromRemoteTasks(
 		c.syncShardProgressFromRemote(ctx, storedApply, storedTask, remoteTask.Shards, now)
 	}
 	if missingProgressTasks > 0 {
-		slog.Warn("remote gRPC progress omitted stored tasks",
-			"apply_id", storedApply.ApplyIdentifier,
-			"external_id", storedApply.ExternalID,
-			"database", storedApply.Database,
-			"environment", storedApply.Environment,
-			"missing_count", missingProgressTasks)
+		logger.WarnContext(ctx, "remote gRPC progress omitted stored tasks",
+			append(storedApply.MutableLogAttrs(), "missing_count", missingProgressTasks)...)
 	}
 	return nil
 }
@@ -3152,20 +4023,21 @@ func (c *GRPCClient) syncShardProgressFromRemote(ctx context.Context, storedAppl
 	if len(shards) == 0 {
 		return
 	}
+	logger := c.applyLogger(storedApply)
 	_, hasOpLease := storage.OperationLeaseFromContext(ctx)
 	_, hasApplyLease := storage.ApplyLeaseFromContext(ctx)
 	if !hasOpLease && !hasApplyLease {
 		// This path is reached only from the lease-held drive, so no lease means
 		// per-shard progress will silently not persist — surface it for triage.
-		slog.Warn("skipping remote per-shard progress encode: no lease on reconcile context",
-			append(storedApply.LogAttrs(), "table", storedTask.TableName)...)
+		logger.WarnContext(ctx, "skipping remote per-shard progress encode: no lease on reconcile context",
+			append(storedApply.MutableLogAttrs(), "table", storedTask.TableName)...)
 		return
 	}
 	// Per-shard rows hang off the table's apply_operation; a sharded task without
 	// one is unexpected and leaves the per-shard view empty.
 	if storedTask.ApplyOperationID == nil {
-		slog.Warn("skipping remote per-shard progress encode: stored task has no apply_operation_id",
-			append(storedApply.LogAttrs(), "table", storedTask.TableName)...)
+		logger.WarnContext(ctx, "skipping remote per-shard progress encode: stored task has no apply_operation_id",
+			append(storedApply.MutableLogAttrs(), "table", storedTask.TableName)...)
 		return
 	}
 	// A shard-scoped drive task (per-shard work operation) is itself the
@@ -3174,18 +4046,19 @@ func (c *GRPCClient) syncShardProgressFromRemote(ctx context.Context, storedAppl
 	// rows for shards the operation does not own. Only table-level tasks
 	// (shard == "") mirror a per-shard breakdown.
 	if storedTask.Shard != "" {
-		slog.Warn("skipping remote per-shard progress encode: stored task is scoped to a single shard and owns no breakdown",
-			append(storedApply.LogAttrs(), "table", storedTask.TableName, "task_shard", storedTask.Shard)...)
+		logger.WarnContext(ctx, "skipping remote per-shard progress encode: stored task is scoped to a single shard and owns no breakdown",
+			append(storedApply.MutableLogAttrs(), "table", storedTask.TableName, "task_shard", storedTask.Shard)...)
 		return
 	}
 	for _, sh := range shards {
 		// An empty shard would collide with the unsharded single-shard sentinel,
 		// so the entry cannot be stored as a per-shard row.
 		if sh.Shard == "" {
-			slog.Warn("skipping remote per-shard progress entry with an empty shard name",
-				append(storedApply.LogAttrs(), "table", storedTask.TableName)...)
+			logger.WarnContext(ctx, "skipping remote per-shard progress entry with an empty shard name",
+				append(storedApply.MutableLogAttrs(), "table", storedTask.TableName)...)
 			continue
 		}
+		c.unrecognizedStatuses.observeShardStatus(ctx, logger, storedTask, sh.Shard, sh.Status)
 		shardState := state.NormalizeShardStatus(sh.Status)
 		// The proto carries row totals, not a percent; derive it the way the read
 		// model does and clamp (row counts can momentarily exceed the total).
@@ -3197,7 +4070,7 @@ func (c *GRPCClient) syncShardProgressFromRemote(ctx context.Context, storedAppl
 			pct = 100
 		}
 		shardTask := &storage.Task{
-			TaskIdentifier:   newTaskIdentifier(),
+			TaskIdentifier:   engine.NewTaskID(),
 			ApplyID:          storedTask.ApplyID,
 			ApplyOperationID: storedTask.ApplyOperationID,
 			PlanID:           storedTask.PlanID,
@@ -3227,12 +4100,12 @@ func (c *GRPCClient) syncShardProgressFromRemote(ctx context.Context, storedAppl
 				// further shard would fail the same way. The lost lease may be the
 				// operation lease (fan-out drive) or the apply lease (single-operation
 				// drive), since UpsertShardProgress accepts either.
-				slog.Debug("stopping remote per-shard progress encode: drive lease lost",
-					append(storedApply.LogAttrs(), "table", storedTask.TableName, "shard", sh.Shard)...)
+				logger.DebugContext(ctx, "stopping remote per-shard progress encode: drive lease lost",
+					append(storedApply.MutableLogAttrs(), "table", storedTask.TableName, "shard", sh.Shard)...)
 				return
 			}
-			slog.Error("failed to encode remote per-shard progress into control-plane storage",
-				append(storedApply.LogAttrs(),
+			logger.ErrorContext(ctx, "failed to encode remote per-shard progress into control-plane storage",
+				append(storedApply.MutableLogAttrs(),
 					"apply_operation_id", *storedTask.ApplyOperationID,
 					"namespace", storedTask.Namespace, "table", storedTask.TableName, "shard", sh.Shard,
 					"error", err)...)
@@ -3248,6 +4121,7 @@ func (c *GRPCClient) syncShardProgressFromRemote(ctx context.Context, storedAppl
 // already-terminal remote forever). A storage failure is still returned so the
 // operator retries that genuinely-transient case.
 func (c *GRPCClient) reconcileStoredTasksForTerminalRemoteApply(ctx context.Context, storedApply, remoteApply *storage.Apply, storedTasks []*storage.Task, now time.Time) error {
+	logger := c.applyLogger(storedApply)
 	terminalTaskState, ok := terminalTaskStateForApply(remoteApply.State)
 	if !ok {
 		return fmt.Errorf("reconcile stored tasks for %s: remote apply state %q is not terminal", storedApply.ApplyIdentifier, remoteApply.State)
@@ -3272,8 +4146,7 @@ func (c *GRPCClient) reconcileStoredTasksForTerminalRemoteApply(ctx context.Cont
 		if err := c.storage.Tasks().Update(ctx, storedTask); err != nil {
 			return fmt.Errorf("reconcile lagging task %s to %s for terminal remote gRPC apply %s: %w", storedTask.TaskIdentifier, resolvedState, storedApply.ApplyIdentifier, err)
 		}
-		slog.Warn("reconciled lagging stored task to terminal remote gRPC apply state",
-			"apply_id", storedApply.ApplyIdentifier,
+		logger.WarnContext(ctx, "reconciled lagging stored task to terminal remote gRPC apply state",
 			"external_id", storedApply.ExternalID,
 			"remote_apply_state", remoteApply.State,
 			"task_id", storedTask.TaskIdentifier,
@@ -3329,12 +4202,34 @@ func storedTaskResolvedForTerminalRemoteApply(remoteApplyState, storedTaskState 
 // progress into task state first, then derives apply state from stored tasks.
 // gRPC mode receives an apply state directly from the remote data plane, so the
 // control plane needs the same no-backward policy at the apply row boundary.
-func applyStateFromRemoteProgress(storedApplyState, remoteApplyState string, allowStoppedStoredApply bool) string {
+//
+// remoteTasks is the same report's per-table progress. It backs the one case
+// where the no-backward rank yields to the remote: a stored cutting_over that
+// the report contradicts with a table still in an earlier active phase (see
+// storedCutoverContradictedByEarlierActiveWork).
+func applyStateFromRemoteProgress(storedApplyState, remoteApplyState string, remoteTasks []*ternv1.TableProgress, allowStoppedStoredApply bool) string {
 	if remoteApplyState == "" {
 		return storedApplyState
 	}
 	if state.IsTerminalApplyState(remoteApplyState) {
 		return remoteApplyState
+	}
+	// A remote retryable pause parks the apply between data-plane recovery
+	// attempts. The stored apply must not adopt it while a live drive holds
+	// the row: failed_retryable is immediately claimable (no stale-lease
+	// requirement), so persisting it mid-drive would invite a second driver
+	// onto the same apply. The task rows carry the pause for operator
+	// surfaces; the drive keeps polling until the data plane settles.
+	if state.IsState(remoteApplyState, state.Apply.FailedRetryable) {
+		// The in-memory apply can still carry its pre-claim snapshot: the
+		// claim moves the row to running but hands the driver the pre-claim
+		// state. Echoing a parked snapshot back would persist an immediately
+		// claimable state onto a leased row, so normalize it to the running
+		// state the claim already wrote.
+		if state.IsState(storedApplyState, state.Apply.FailedRetryable, state.Apply.Pending) {
+			return state.Apply.Running
+		}
+		return storedApplyState
 	}
 	if allowStoppedStoredApply && state.IsState(storedApplyState, state.Apply.Stopped) {
 		return remoteApplyState
@@ -3345,10 +4240,40 @@ func applyStateFromRemoteProgress(storedApplyState, remoteApplyState string, all
 	if state.IsState(storedApplyState, state.Apply.FailedRetryable) {
 		return storedApplyState
 	}
+	if storedCutoverContradictedByEarlierActiveWork(storedApplyState, remoteTasks) {
+		return remoteApplyState
+	}
 	if applyProgressRank(remoteApplyState) < applyProgressRank(storedApplyState) {
 		return storedApplyState
 	}
 	return remoteApplyState
+}
+
+// storedCutoverContradictedByEarlierActiveWork reports whether the stored
+// apply state says cutting_over while the remote report still shows a table
+// in an earlier active phase — queued, copying, or verifying. A cutover
+// surfaces at the apply level only when it is the least advanced work left,
+// so this pairing never describes a live drive: the stored value is a sample
+// of one table's cutover that the drive has since moved past, and the report
+// carrying the earlier-phase table is the corrected state — it wins over the
+// no-backward rank instead of being discarded as a regression. A parked
+// WAITING_FOR_CUTOVER table is not a contradiction: a cutover legitimately
+// proceeds while a sibling waits at the barrier for its own command.
+func storedCutoverContradictedByEarlierActiveWork(storedApplyState string, remoteTasks []*ternv1.TableProgress) bool {
+	if !state.IsState(storedApplyState, state.Apply.CuttingOver) {
+		return false
+	}
+	for _, remoteTask := range remoteTasks {
+		if remoteTask == nil {
+			continue
+		}
+		if state.IsState(state.NormalizeTaskStatus(remoteTask.Status),
+			state.Task.Pending, state.Task.Running,
+			state.Task.CatchingUp, state.Task.Checksumming, state.Task.PostChecksum) {
+			return true
+		}
+	}
+	return false
 }
 
 func applyProgressRank(applyState string) int {
@@ -3369,16 +4294,22 @@ func applyProgressRank(applyState string) int {
 		return 6
 	case state.Apply.Running:
 		return 7
-	case state.Apply.WaitingForCutover:
+	case state.Apply.CatchingUp:
 		return 8
-	case state.Apply.CuttingOver:
+	case state.Apply.Checksumming:
 		return 9
-	case state.Apply.RevertWindow:
+	case state.Apply.PostChecksum:
 		return 10
-	case state.Apply.SkippingRevert:
+	case state.Apply.WaitingForCutover:
 		return 11
-	case state.Apply.Reverting:
+	case state.Apply.CuttingOver:
 		return 12
+	case state.Apply.RevertWindow:
+		return 13
+	case state.Apply.SkippingRevert:
+		return 14
+	case state.Apply.Reverting:
+		return 15
 	default:
 		return 0
 	}
@@ -3396,6 +4327,7 @@ func applyProgressRank(applyState string) int {
 // single-operation / whole-apply drives (which keep waiting for a manual
 // cutover unchanged).
 func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply, allowStoppedAfterStart bool, scope applyTaskScope, releaseAtCutoverBarrier bool) error {
+	logger := c.applyLogger(apply)
 	ticker := time.NewTicker(grpcProgressPollInterval)
 	defer ticker.Stop()
 
@@ -3404,6 +4336,7 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 
 	consecutiveProgressErrors := 0
 	loggedStoppedAfterStart := false
+	loggedRetryablePause := false
 	var stoppedAfterStartDeadline time.Time
 	var lastDisplayBlob string
 	lastHeartbeatSuccess := time.Now()
@@ -3425,46 +4358,30 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				// fallout, not lease trouble.
 				return ctx.Err()
 			}
-			if stopErr := driveEndingHeartbeatFailure(apply, err, lastHeartbeatSuccess); stopErr != nil {
+			if stopErr := driveEndingHeartbeatFailure(logger, apply, err, lastHeartbeatSuccess); stopErr != nil {
 				return stopErr
 			}
 		case <-ticker.C:
 			if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); err != nil {
-				slog.Warn("pending gRPC stop request processing failed; current apply owner will exit for operator retry",
-					"apply_id", apply.ApplyIdentifier,
-					"external_id", apply.ExternalID,
-					"database", apply.Database,
-					"environment", apply.Environment,
-					"error", err)
+				logger.Warn("pending gRPC stop request processing failed; current apply owner will exit for operator retry",
+					append(apply.MutableLogAttrs(), "error", err)...)
 				return err
 			} else if handled {
 				return nil
 			}
 			if err := c.processPendingCutoverControlRequest(ctx, apply, scope); err != nil {
-				slog.Warn("pending gRPC cutover request processing failed; current apply owner will exit for operator retry",
-					"apply_id", apply.ApplyIdentifier,
-					"external_id", apply.ExternalID,
-					"database", apply.Database,
-					"environment", apply.Environment,
-					"error", err)
+				logger.Warn("pending gRPC cutover request processing failed; current apply owner will exit for operator retry",
+					append(apply.MutableLogAttrs(), "error", err)...)
 				return err
 			}
 			if err := c.processPendingSkipRevertControlRequest(ctx, apply, scope.remoteApplyID(apply)); err != nil {
-				slog.Warn("pending gRPC skip-revert request processing failed; current apply owner will exit for operator retry",
-					"apply_id", apply.ApplyIdentifier,
-					"external_id", apply.ExternalID,
-					"database", apply.Database,
-					"environment", apply.Environment,
-					"error", err)
+				logger.Warn("pending gRPC skip-revert request processing failed; current apply owner will exit for operator retry",
+					append(apply.MutableLogAttrs(), "error", err)...)
 				return err
 			}
 			if err := c.processPendingRevertControlRequest(ctx, apply, scope.remoteApplyID(apply)); err != nil {
-				slog.Warn("pending gRPC revert request processing failed; current apply owner will exit for operator retry",
-					"apply_id", apply.ApplyIdentifier,
-					"external_id", apply.ExternalID,
-					"database", apply.Database,
-					"environment", apply.Environment,
-					"error", err)
+				logger.Warn("pending gRPC revert request processing failed; current apply owner will exit for operator retry",
+					append(apply.MutableLogAttrs(), "error", err)...)
 				return err
 			}
 
@@ -3487,14 +4404,11 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 					return fmt.Errorf("poll remote apply %s for %s: %w", apply.ExternalID, apply.ApplyIdentifier, err)
 				}
 				consecutiveProgressErrors++
-				slog.Warn("remote gRPC progress poll failed",
-					"apply_id", apply.ApplyIdentifier,
-					"external_id", apply.ExternalID,
-					"database", apply.Database,
-					"environment", apply.Environment,
-					"consecutive_errors", consecutiveProgressErrors,
-					"max_consecutive_errors", maxGRPCProgressPollErrorStreak,
-					"error", err)
+				logger.Warn("remote gRPC progress poll failed",
+					append(apply.MutableLogAttrs(),
+						"consecutive_errors", consecutiveProgressErrors,
+						"max_consecutive_errors", maxGRPCProgressPollErrorStreak,
+						"error", err)...)
 				if consecutiveProgressErrors >= maxGRPCProgressPollErrorStreak {
 					message := fmt.Sprintf("remote progress polling failed after %d consecutive errors for remote apply %s: %v",
 						consecutiveProgressErrors, apply.ExternalID, err)
@@ -3522,17 +4436,13 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			// must return a concrete state; unknown states are unsafe to reconcile.
 			now := time.Now()
 			oldApplyState := apply.State
-			newState := ProtoStateToStorage(resp.State)
+			newState := remoteProgressApplyState(resp.State, resp.Tables)
 			if newState == "" {
 				message := fmt.Sprintf("Remote progress returned unmapped apply state %s; operator will retry without changing stored state", remoteApplyStateDescription(resp.State))
-				slog.Warn("remote gRPC progress returned unmapped apply state; operator will retry without changing stored state",
-					"apply_id", apply.ApplyIdentifier,
-					"external_id", apply.ExternalID,
-					"database", apply.Database,
-					"environment", apply.Environment,
-					"remote_state", resp.State.String(),
-					"remote_state_number", int32(resp.State),
-					"stored_state", apply.State)
+				logger.Warn("remote gRPC progress returned unmapped apply state; operator will retry without changing stored state",
+					append(apply.MutableLogAttrs(),
+						"remote_state", resp.State.String(),
+						"remote_state_number", int32(resp.State))...)
 				c.logApplyWarning(ctx, apply, message)
 				return fmt.Errorf("poll remote gRPC apply %s: unmapped remote state %s", apply.ApplyIdentifier, remoteApplyStateDescription(resp.State))
 			}
@@ -3540,6 +4450,15 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				apply.StartedAt = &now
 			}
 			remoteApplyState := newState
+			if state.IsState(remoteApplyState, state.Apply.FailedRetryable) {
+				if !loggedRetryablePause {
+					logger.Info("remote gRPC apply paused for data-plane retry; drive keeps polling and will not terminalize",
+						append(apply.MutableLogAttrs(), "remote_error", resp.ErrorMessage)...)
+					loggedRetryablePause = true
+				}
+			} else {
+				loggedRetryablePause = false
+			}
 			if allowStoppedAfterStart && state.IsState(remoteApplyState, state.Apply.Stopped) {
 				if terminalTaskState, ok := terminalApplyStateFromRemoteTaskProgress(resp.Tables); ok {
 					remoteApplyState = terminalTaskState
@@ -3550,57 +4469,38 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 					stoppedAfterStartDeadline = now.Add(grpcStoppedAfterStartGracePeriod)
 				}
 				if !loggedStoppedAfterStart {
-					slog.Info("remote gRPC apply still stopped after start accepted; operator will keep polling",
-						"apply_id", apply.ApplyIdentifier,
-						"external_id", apply.ExternalID,
-						"database", apply.Database,
-						"environment", apply.Environment,
-						"stored_state", apply.State,
-						"deadline", stoppedAfterStartDeadline)
+					logger.Info("remote gRPC apply still stopped after start accepted; operator will keep polling",
+						append(apply.MutableLogAttrs(), "deadline", stoppedAfterStartDeadline)...)
 					loggedStoppedAfterStart = true
 				}
 				if !now.Before(stoppedAfterStartDeadline) {
 					message := fmt.Sprintf("remote apply %s remained stopped after start grace period %s", apply.ExternalID, grpcStoppedAfterStartGracePeriod)
-					slog.Warn("remote gRPC apply remained stopped after start grace period; storing stopped state",
-						"apply_id", apply.ApplyIdentifier,
-						"external_id", apply.ExternalID,
-						"database", apply.Database,
-						"environment", apply.Environment,
-						"stored_state", apply.State,
-						"grace_period", grpcStoppedAfterStartGracePeriod)
+					logger.Warn("remote gRPC apply remained stopped after start grace period; storing stopped state",
+						append(apply.MutableLogAttrs(), "grace_period", grpcStoppedAfterStartGracePeriod)...)
 					c.logApplyWarning(ctx, apply, message)
 					apply.State = state.Apply.Stopped
 					apply.ErrorMessage = message
 					if err := c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, now, scope); err != nil {
 						return fmt.Errorf("persist stopped gRPC apply %s after start grace period: %w", apply.ApplyIdentifier, err)
 					}
-					if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message); err != nil {
+					if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, message, remoteID); err != nil {
 						return err
 					}
 					return fmt.Errorf("start accepted for gRPC apply %s but %s", apply.ApplyIdentifier, message)
 				}
 				continue
 			}
-			newState = applyStateFromRemoteProgress(apply.State, remoteApplyState, allowStoppedAfterStart)
+			newState = applyStateFromRemoteProgress(apply.State, remoteApplyState, resp.Tables, allowStoppedAfterStart)
 			if !state.IsState(newState, remoteApplyState) {
-				slog.Debug("keeping stored gRPC apply state because remote progress reported earlier state",
-					"apply_id", apply.ApplyIdentifier,
-					"external_id", apply.ExternalID,
-					"database", apply.Database,
-					"environment", apply.Environment,
-					"stored_state", apply.State,
-					"remote_state", remoteApplyState)
+				logger.Debug("keeping stored gRPC apply state because remote progress reported earlier state",
+					append(apply.MutableLogAttrs(), "remote_state", remoteApplyState)...)
 			}
 			apply.State = newState
 			apply.ErrorMessage = remoteProgressErrorMessage(apply.State, resp.ErrorMessage, apply.ErrorMessage)
 			apply.UpdatedAt = now
-			if mirrorRemoteVolume(apply, resp.Volume) {
-				slog.Info("mirrored remote volume level onto control-plane apply options",
-					append(apply.LogAttrs(), "volume", resp.Volume)...)
-			}
+			c.mirrorRemoteControlRejections(ctx, apply, remoteID, resp.SettledControlRequests)
 
-			terminal := isTerminalProtoState(resp.State)
-			if terminal {
+			if remoteProgressIsTerminal(resp.State, resp.Tables) {
 				return c.reconcileTerminalRemoteProgress(ctx, apply, resp.Tables, now, scope)
 			}
 			storedTasks, err := c.loadApplyTasks(ctx, apply, scope)
@@ -3624,13 +4524,8 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 			// the operation row at waiting_for_cutover and frees it for the
 			// deployment-ordered cutover claim to pick up.
 			if releaseAtCutoverBarrier && state.IsState(apply.State, state.Apply.WaitingForCutover) {
-				slog.Info("operation parked at cutover barrier; exiting remote copy drive",
-					"apply_id", apply.ApplyIdentifier,
-					"external_id", apply.ExternalID,
-					"database", apply.Database,
-					"environment", apply.Environment,
-					"deployment", apply.Deployment,
-					"operation_state", apply.State)
+				logger.Info("operation parked at cutover barrier; exiting remote copy drive",
+					apply.MutableLogAttrs()...)
 				return nil
 			}
 		}

@@ -44,7 +44,7 @@ func TestRemoteApplyID_ControlOperations(t *testing.T) {
 	ternGRPCAddr := grpcAddr
 
 	// 2. Create SchemaBot with real MySQL storage + GRPCClient.
-	schemabotDB, err := sql.Open("mysql", schemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
 
@@ -155,7 +155,7 @@ func TestRemoteApplyID_ControlOperations(t *testing.T) {
 
 	// 8. Verify the table was actually created.
 	testdbDSN := strings.Replace(targetDSN, "/target_test", "/testdb", 1)
-	appDB, err := sql.Open("mysql", testdbDSN)
+	appDB, err := sql.Open("block-mysql", testdbDSN)
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(appDB) })
 

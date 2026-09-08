@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -206,7 +207,7 @@ func startManagedCluster(ctx context.Context, keyspaces []KeyspaceConfig, logger
 // on the managed cluster's mysqld. vttest's init_db.sql only grants vt_dba@'localhost'
 // (socket-only), so we need a separate user for TCP access (branch proxy upstream).
 func createManagedTCPUser(mysqlDSNBase string, logger *slog.Logger) error {
-	db, err := sql.Open("mysql", mysqlDSNBase)
+	db, err := sql.Open("block-mysql", mysqlDSNBase)
 	if err != nil {
 		return fmt.Errorf("connect to mysqld: %w", err)
 	}
@@ -242,6 +243,15 @@ func buildShards(count int) []*vttestpb.Shard {
 		shards[i] = &vttestpb.Shard{Name: r}
 	}
 	return shards
+}
+
+// shardSidecarDBName is the sidecar database a shard's tablets use when the
+// cluster runs with per-shard sidecars. It mirrors the naming vtcombo writes
+// into the keyspace's topo record, so callers can address a shard's sidecar
+// without asking the cluster for it.
+func shardSidecarDBName(keyspace, shard string) string {
+	safeShard := strings.NewReplacer("-", "_", "/", "_").Replace(shard)
+	return fmt.Sprintf("_vt_%s_%s", keyspace, safeShard)
 }
 
 // startManagedClusters starts all managed clusters in parallel for fast startup.
@@ -328,7 +338,7 @@ func startManagedClusters(
 // and returns a *sql.DB connected to it.
 func createManagedMetadataDB(ctx context.Context, mysqlDSNBase string) (*sql.DB, string, error) {
 	// Connect without database to create it.
-	rootDB, err := sql.Open("mysql", mysqlDSNBase)
+	rootDB, err := sql.Open("block-mysql", mysqlDSNBase)
 	if err != nil {
 		return nil, "", fmt.Errorf("connect to mysqld for metadata: %w", err)
 	}
@@ -344,7 +354,7 @@ func createManagedMetadataDB(ctx context.Context, mysqlDSNBase string) (*sql.DB,
 
 	// Connect to the localscale database.
 	dsn := mysqlDSNBase + "localscale"
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	if err != nil {
 		return nil, "", fmt.Errorf("connect to localscale database: %w", err)
 	}

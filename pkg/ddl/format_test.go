@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/block/schemabot/pkg/schema"
 )
 
 func TestFormatDDL(t *testing.T) {
@@ -92,6 +94,69 @@ func TestFormatDDL(t *testing.T) {
 			name:     "input with semicolon not doubled",
 			input:    "ALTER TABLE `t` ADD INDEX `idx`(`col`);",
 			expected: "ALTER TABLE `t` ADD INDEX `idx`(`col`);",
+		},
+		{
+			name: "CREATE TABLE with options and PARTITION BY LIST",
+			input: "CREATE TABLE `t` (`id` bigint NOT NULL AUTO_INCREMENT, `run_partition_id` bigint NOT NULL, " +
+				"PRIMARY KEY (`run_partition_id`,`id`), KEY `idx_id` (`id`)) " +
+				"ENGINE = InnoDB, CHARSET utf8mb4, COLLATE utf8mb4_0900_ai_ci " +
+				"PARTITION BY LIST (`run_partition_id`) (PARTITION p_seed VALUES IN (0))",
+			expected: "CREATE TABLE `t` (\n" +
+				"    `id` bigint NOT NULL AUTO_INCREMENT,\n" +
+				"    `run_partition_id` bigint NOT NULL,\n" +
+				"    PRIMARY KEY(`run_partition_id`, `id`),\n" +
+				"    INDEX `idx_id`(`id`)\n" +
+				") ENGINE InnoDB,\n" +
+				"  CHARSET utf8mb4,\n" +
+				"  COLLATE utf8mb4_0900_ai_ci\n" +
+				"  PARTITION BY LIST (`run_partition_id`) (PARTITION `p_seed` VALUES IN (0));",
+		},
+		{
+			name:  "CREATE TABLE with PARTITION BY HASH and no other options",
+			input: "CREATE TABLE `t2` (`id` bigint NOT NULL, `k` bigint NOT NULL) PARTITION BY HASH (`k`) PARTITIONS 8",
+			expected: "CREATE TABLE `t2` (\n" +
+				"    `id` bigint NOT NULL,\n" +
+				"    `k` bigint NOT NULL\n" +
+				") PARTITION BY HASH (`k`) PARTITIONS 8;",
+		},
+		{
+			name:  "single column CREATE TABLE with PARTITION BY",
+			input: "CREATE TABLE `t3` (`id` BIGINT NOT NULL) ENGINE=InnoDB PARTITION BY HASH (`id`) PARTITIONS 4",
+			expected: "CREATE TABLE `t3` (`id` bigint NOT NULL) ENGINE InnoDB\n" +
+				"  PARTITION BY HASH (`id`) PARTITIONS 4;",
+		},
+		{
+			name:     "COMMENT containing PARTITION BY is not split",
+			input:    "CREATE TABLE `t4` (`id` BIGINT NOT NULL) ENGINE=InnoDB COMMENT='do not PARTITION BY hand'",
+			expected: "CREATE TABLE `t4` (`id` bigint NOT NULL) ENGINE InnoDB,\n  COMMENT 'do not PARTITION BY hand';",
+		},
+		{
+			name:  "non-ASCII COMMENT before PARTITION BY",
+			input: "CREATE TABLE `t5` (`id` BIGINT NOT NULL) ENGINE=InnoDB COMMENT='ılık ıslak' PARTITION BY HASH (`id`) PARTITIONS 2",
+			expected: "CREATE TABLE `t5` (`id` bigint NOT NULL) ENGINE InnoDB,\n" +
+				"  COMMENT 'ılık ıslak'\n" +
+				"  PARTITION BY HASH (`id`) PARTITIONS 2;",
+		},
+		{
+			name: "PARTITION BY RANGE with multiple definitions stays on one line",
+			input: "CREATE TABLE `events` (`id` bigint NOT NULL AUTO_INCREMENT, `created_at` datetime(3) NOT NULL, " +
+				"PRIMARY KEY (`created_at`,`id`), KEY `idx_id` (`id`)) " +
+				"ENGINE = InnoDB, CHARSET utf8mb4 " +
+				"PARTITION BY RANGE (TO_DAYS(`created_at`)) (" +
+				"PARTITION p2026_01 VALUES LESS THAN (TO_DAYS('2026-02-01'))," +
+				"PARTITION p2026_02 VALUES LESS THAN (TO_DAYS('2026-03-01'))," +
+				"PARTITION pmax VALUES LESS THAN (MAXVALUE))",
+			expected: "CREATE TABLE `events` (\n" +
+				"    `id` bigint NOT NULL AUTO_INCREMENT,\n" +
+				"    `created_at` datetime(3) NOT NULL,\n" +
+				"    PRIMARY KEY(`created_at`, `id`),\n" +
+				"    INDEX `idx_id`(`id`)\n" +
+				") ENGINE InnoDB,\n" +
+				"  CHARSET utf8mb4\n" +
+				"  PARTITION BY RANGE (TO_DAYS(`created_at`)) " +
+				"(PARTITION `p2026_01` VALUES LESS THAN (TO_DAYS('2026-02-01'))," +
+				"PARTITION `p2026_02` VALUES LESS THAN (TO_DAYS('2026-03-01'))," +
+				"PARTITION `pmax` VALUES LESS THAN (MAXVALUE));",
 		},
 	}
 
@@ -210,10 +275,123 @@ func TestCanonicalize(t *testing.T) {
 			input:    "DROP TABLE users",
 			expected: "DROP TABLE `users`",
 		},
+		// Canonicalization is a spelling of the statement, not a judgement
+		// about it: it quotes identifiers, uppercases keywords and collapses
+		// whitespace, and otherwise reprints the parse tree as written. An
+		// expression therefore keeps whatever parentheses it arrived with,
+		// including ones a user would call redundant — whether two spellings
+		// mean the same table is decided when the schemas are diffed, not
+		// here.
+		//
+		// That spelling is worth pinning because it is load-bearing twice
+		// over. A plan comment must never show a generated column or DEFAULT
+		// expression that differs from the one being applied. And the drift
+		// guard uses the canonical form as a comparison key
+		// (canonicalDDLForDrift), holding a form produced at plan time
+		// against one recomputed at apply time — a gap that can span a
+		// deploy. A silent change to canonical spelling, a parser that begins
+		// folding redundant parentheses away say, would put every in-flight
+		// dispatch out of agreement with its own recomputation and fail
+		// closed on someone's schema change. Pinned here, that change fails
+		// in CI instead.
+		{
+			name:     "generated column keeps its expression",
+			input:    "CREATE TABLE t (a INT, b INT AS (a * 2) STORED)",
+			expected: "CREATE TABLE `t` (`a` INT,`b` INT GENERATED ALWAYS AS(`a`*2) STORED)",
+		},
+		{
+			name:     "generated column keeps redundant parentheses",
+			input:    "CREATE TABLE t (a INT, b INT GENERATED ALWAYS AS ((a * 2)) VIRTUAL)",
+			expected: "CREATE TABLE `t` (`a` INT,`b` INT GENERATED ALWAYS AS((`a`*2)) VIRTUAL)",
+		},
+		{
+			name:     "parenthesized DEFAULT expression stays an expression",
+			input:    "CREATE TABLE t (a INT DEFAULT (1 + 2))",
+			expected: "CREATE TABLE `t` (`a` INT DEFAULT (1+2))",
+		},
+		{
+			name:     "nested parentheses in a DEFAULT expression are preserved",
+			input:    "CREATE TABLE t (a INT DEFAULT ((1 + 2)))",
+			expected: "CREATE TABLE `t` (`a` INT DEFAULT ((1+2)))",
+		},
+		{
+			name:     "function call in a DEFAULT expression keeps its call syntax",
+			input:    "CREATE TABLE t (a CHAR(36) DEFAULT (uuid()))",
+			expected: "CREATE TABLE `t` (`a` CHAR(36) DEFAULT (UUID()))",
+		},
+		// The two statement kinds are spelled by different code. Canonicalize
+		// branches before the parser: an ALTER is reconstructed from Spirit's
+		// normalized Alter field, while CREATE and DROP go through TiDB's
+		// Restore. The cases above therefore pin only one of the two, and the
+		// ALTER path is the one carrying more risk — a schema change on an
+		// existing table is an ALTER, so it is the shape that dominates what
+		// the drift guard compares, and its spelling moves with the Spirit
+		// dependency rather than with anything in this repository.
+		{
+			name:     "ALTER adding a generated column spells out GENERATED ALWAYS",
+			input:    "ALTER TABLE t ADD COLUMN b INT AS (a * 2) STORED",
+			expected: "ALTER TABLE `t` ADD COLUMN `b` INT GENERATED ALWAYS AS(`a`*2) STORED",
+		},
+		{
+			name:     "ALTER keeps redundant parentheses in a generated column",
+			input:    "ALTER TABLE t ADD COLUMN b INT GENERATED ALWAYS AS ((a * 2)) VIRTUAL",
+			expected: "ALTER TABLE `t` ADD COLUMN `b` INT GENERATED ALWAYS AS((`a`*2)) VIRTUAL",
+		},
+		{
+			name:     "ALTER keeps a parenthesized DEFAULT expression",
+			input:    "ALTER TABLE t ADD COLUMN c INT DEFAULT ((1 + 2))",
+			expected: "ALTER TABLE `t` ADD COLUMN `c` INT DEFAULT ((1+2))",
+		},
+		{
+			name:     "ALTER modifying a generated column keeps its expression",
+			input:    "ALTER TABLE t MODIFY COLUMN b BIGINT AS (a * 2) STORED",
+			expected: "ALTER TABLE `t` MODIFY COLUMN `b` BIGINT GENERATED ALWAYS AS(`a`*2) STORED",
+		},
+		{
+			name:     "ALTER keeps an expression in every clause",
+			input:    "ALTER TABLE t ADD COLUMN b INT AS (a * 2) STORED, ADD COLUMN c INT DEFAULT (1 + 2)",
+			expected: "ALTER TABLE `t` ADD COLUMN `b` INT GENERATED ALWAYS AS(`a`*2) STORED, ADD COLUMN `c` INT DEFAULT (1+2)",
+		},
+		{
+			name:     "schema-qualified ALTER keeps its expression",
+			input:    "ALTER TABLE d.t ADD COLUMN b INT AS (a * 2) STORED",
+			expected: "ALTER TABLE `d`.`t` ADD COLUMN `b` INT GENERATED ALWAYS AS(`a`*2) STORED",
+		},
+		{
+			// DROP CONSTRAINT and DROP CHECK are not synonyms: MySQL resolves
+			// the first against the table's CHECK, FOREIGN KEY and UNIQUE
+			// constraints and the second against check constraints alone. The
+			// engine submits this canonical text rather than what the author
+			// wrote, so folding the two spellings together sends the server a
+			// statement it rejects.
+			name:     "ALTER dropping a named constraint keeps the CONSTRAINT spelling",
+			input:    "ALTER TABLE t DROP CONSTRAINT uq_name",
+			expected: "ALTER TABLE `t` DROP CONSTRAINT `uq_name`",
+		},
+		{
+			name:     "ALTER dropping a check constraint keeps the CHECK spelling",
+			input:    "ALTER TABLE t DROP CHECK chk_positive",
+			expected: "ALTER TABLE `t` DROP CHECK `chk_positive`",
+		},
 		{
 			name:     "invalid SQL returns original",
 			input:    "not valid sql",
 			expected: "not valid sql",
+		},
+		{
+			name:     "multi-statement CREATE input returned unchanged",
+			input:    "CREATE TABLE users (id INT); CREATE TABLE orders (id INT)",
+			expected: "CREATE TABLE users (id INT); CREATE TABLE orders (id INT)",
+		},
+		{
+			name:     "multi-statement DROP input returned unchanged",
+			input:    "DROP TABLE users; DROP TABLE orders",
+			expected: "DROP TABLE users; DROP TABLE orders",
+		},
+		{
+			name:     "multi-statement ALTER input returned unchanged",
+			input:    "alter table orders add index idx (col); drop table users",
+			expected: "alter table orders add index idx (col); drop table users",
 		},
 	}
 
@@ -259,4 +437,63 @@ func TestSplitAlterClauses(t *testing.T) {
 			assert.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+func TestFormatDDLForDialect(t *testing.T) {
+	t.Run("mysql dialect gets full FormatDDL treatment", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectMySQL,
+			"ALTER TABLE `users` ADD COLUMN `email` VARCHAR(255), DROP COLUMN `old_field`")
+		assert.Equal(t, "ALTER TABLE `users`\n"+
+			"    ADD COLUMN `email` varchar(255),\n"+
+			"    DROP COLUMN `old_field`;", got)
+	})
+
+	t.Run("postgres dialect renders its own canonical form", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectPostgres,
+			"alter   table users\n  add column session_id uuid")
+		assert.Equal(t, "ALTER TABLE users ADD COLUMN session_id uuid;", got)
+	})
+
+	t.Run("postgres types are never mangled under the MySQL grammar", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectPostgres,
+			"CREATE TABLE sessions (id uuid PRIMARY KEY, payload jsonb, created_at timestamptz)")
+		assert.Contains(t, got, "uuid")
+		assert.Contains(t, got, "jsonb")
+		assert.NotContains(t, got, "`")
+	})
+
+	t.Run("postgres CREATE TABLE is line-broken like the MySQL layout", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectPostgres,
+			"CREATE TABLE sessions (id uuid PRIMARY KEY, payload jsonb, created_at timestamptz)")
+		assert.Equal(t, "CREATE TABLE sessions (\n"+
+			"    id uuid PRIMARY KEY,\n"+
+			"    payload jsonb,\n"+
+			"    created_at timestamptz\n"+
+			");", got)
+	})
+
+	t.Run("postgres multi-clause ALTER renders one clause per line", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectPostgres,
+			"alter table users add column a integer, add column b text")
+		assert.Equal(t, "ALTER TABLE users\n"+
+			"    ADD COLUMN a int,\n"+
+			"    ADD COLUMN b text;", got)
+	})
+
+	t.Run("postgres DROP COLUMN keeps the explicit COLUMN keyword", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectPostgres,
+			"ALTER TABLE public.users DROP COLUMN legacy")
+		assert.Equal(t, "ALTER TABLE public.users DROP COLUMN legacy;", got)
+	})
+
+	t.Run("statement the dialect parser rejects renders as-is", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.DialectPostgres, "THIS IS NOT SQL")
+		assert.Equal(t, "THIS IS NOT SQL;", got)
+	})
+
+	t.Run("dialect with no registered parser renders as-is", func(t *testing.T) {
+		got := FormatDDLForDialect(schema.Dialect("customengine"),
+			"CREATE TABLE t (id INT);")
+		assert.Equal(t, "CREATE TABLE t (id INT);", got)
+	})
 }

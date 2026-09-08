@@ -103,6 +103,12 @@ func (c *LocalClient) reconcileEngineTerminalTruthBeforeCommands(ctx context.Con
 		return false, err
 	}
 	metrics.RecordEngineTerminalTruthReconcile(ctx, apply.Database, apply.Deployment, apply.Environment, "adopted_"+applyState)
+	// A multi-operation drive owns only its operation: once the operator's
+	// projection settles the parent terminal from the adopted task states, it
+	// also completes the mooted pending commands and posts the terminal summary.
+	if suppressParentApplyWrites(ctx) {
+		return true, nil
+	}
 	// The adopted terminal state moots the pending commands: the sweep
 	// completes the pending stop, and the pending cancel too for every adopted
 	// state (none of them is stopped, the one state that keeps a cancel
@@ -157,26 +163,27 @@ func firstTaskWithLiveEngineWork(tasks []*storage.Task) *storage.Task {
 }
 
 // readEngineProgressForTask reads the engine's authoritative view of the change
-// the task addresses. It mirrors buildControlRequest's addressing: Vitess
-// targets are addressed through the persisted engine resume state (the deploy
-// request identifier lives there), other targets by credentials alone.
+// the task addresses. The read carries the persisted engine resume state for
+// every database type, because that state is how an engine is addressed at all:
+// one engine finds its deploy request through it, another keys its in-process
+// progress on it, and one that needs neither ignores it. Withholding it from
+// some types would have this read answer for a different change — or for none —
+// and the caller would then decline to adopt a terminal outcome that had in
+// fact already landed.
 func (c *LocalClient) readEngineProgressForTask(ctx context.Context, eng engine.Engine, task *storage.Task) (*engine.ProgressResult, error) {
 	creds, err := c.credentialsForTask(task)
 	if err != nil {
 		return nil, fmt.Errorf("resolve credentials for task %s: %w", task.TaskIdentifier, err)
 	}
-	req := &engine.ProgressRequest{
+	resumeState, err := c.loadStoredEngineResumeState(ctx, task, "progress")
+	if err != nil {
+		return nil, fmt.Errorf("load engine resume state for task %s: %w", task.TaskIdentifier, err)
+	}
+	res, err := eng.Progress(ctx, &engine.ProgressRequest{
 		Database:    c.config.Database,
 		Credentials: creds,
-	}
-	if c.config.Type == storage.DatabaseTypeVitess {
-		resumeState, err := c.loadEngineResumeState(ctx, task)
-		if err != nil {
-			return nil, fmt.Errorf("load engine resume state for task %s: %w", task.TaskIdentifier, err)
-		}
-		req.ResumeState = resumeState
-	}
-	res, err := eng.Progress(ctx, req)
+		ResumeState: resumeState,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("read engine progress for task %s: %w", task.TaskIdentifier, err)
 	}
@@ -217,6 +224,15 @@ func (c *LocalClient) adoptEngineTerminalTruth(ctx context.Context, apply *stora
 	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
 		c.logger.Info("engine terminal-truth reconcile found the apply already terminal; keeping its outcome",
 			append(apply.LogAttrs(), "engine_state", string(progress.State), "requested_by", requestedBy)...)
+		return nil
+	}
+	// A multi-operation drive owns only its operation: the tasks settled above
+	// carry the adopted outcome, the operator derives the operation row from
+	// them and projects the parent, so the parent terminal write is the
+	// operator's to make.
+	if suppressParentApplyWrites(ctx) {
+		c.logger.Info("operation drive adopted the engine's terminal outcome onto its tasks; operator derives the operation row and projects the parent",
+			append(apply.LogAttrs(), "engine_state", string(progress.State), "adopted_state", applyState, "requested_by", requestedBy)...)
 		return nil
 	}
 	previousState := apply.State
