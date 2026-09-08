@@ -183,3 +183,63 @@ func TestToEngineWarnings(t *testing.T) {
 	assert.Equal(t, "email", warnings[0].Column)
 	assert.Equal(t, "orders", warnings[1].Table)
 }
+
+// A declared column written as `boolean NOT NULL DEFAULT FALSE` is stored by
+// MySQL as `tinyint(1) NOT NULL DEFAULT '0'`, so the planner has to read the
+// keyword and the integer as the same default. Reading them as different is the
+// worst shape of planner bug in front of a live database: every plan emits an
+// ALTER that re-stores the value it already holds, the ALTER succeeds, and the
+// next plan emits it again — a schema that never converges and a merge gate
+// that never clears on its own.
+func TestPlanChangesBooleanKeywordDefaultConverges(t *testing.T) {
+	tests := []struct {
+		name     string
+		declared string
+		live     string
+	}{
+		{
+			name:     "FALSE against the stored 0",
+			declared: "`flag` boolean NOT NULL DEFAULT FALSE",
+			live:     "`flag` tinyint(1) NOT NULL DEFAULT '0'",
+		},
+		{
+			name:     "TRUE against the stored 1",
+			declared: "`flag` boolean NOT NULL DEFAULT TRUE",
+			live:     "`flag` tinyint(1) NOT NULL DEFAULT '1'",
+		},
+		{
+			name:     "a nullable column declared with the keyword",
+			declared: "`flag` boolean DEFAULT FALSE",
+			live:     "`flag` tinyint(1) DEFAULT '0'",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			current := []table.TableSchema{{Name: "widgets", Schema: booleanDefaultTable(tt.live)}}
+			desired := []table.TableSchema{{Name: "widgets", Schema: booleanDefaultTable(tt.declared)}}
+
+			plan, err := PlanChanges(current, desired, nil, New().SpiritConfig())
+			require.NoError(t, err)
+			assert.False(t, plan.HasChanges())
+			assert.Empty(t, plan.Statements())
+		})
+	}
+
+	t.Run("a default that really did change still plans an alter", func(t *testing.T) {
+		current := []table.TableSchema{{Name: "widgets", Schema: booleanDefaultTable("`flag` tinyint(1) NOT NULL DEFAULT '1'")}}
+		desired := []table.TableSchema{{Name: "widgets", Schema: booleanDefaultTable("`flag` boolean NOT NULL DEFAULT FALSE")}}
+
+		plan, err := PlanChanges(current, desired, nil, New().SpiritConfig())
+		require.NoError(t, err)
+		require.True(t, plan.HasChanges())
+		require.Len(t, plan.Statements(), 1)
+		assert.Contains(t, plan.Statements()[0], "MODIFY COLUMN `flag`")
+	})
+}
+
+// booleanDefaultTable renders a one-column table around the column definition
+// under test, so each case states only the default it is about.
+func booleanDefaultTable(column string) string {
+	return "CREATE TABLE `widgets` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, " + column +
+		", PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+}
