@@ -71,7 +71,7 @@ func TestMain(m *testing.M) {
 
 	code := m.Run()
 
-	_ = testDB.Close()
+	utils.CloseAndLog(testDB)
 	_ = container.Terminate(ctx)
 	os.Exit(code)
 }

@@ -94,6 +94,7 @@ import (
 	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/testutil"
 	"github.com/block/spirit/pkg/statement"
+	"github.com/block/spirit/pkg/utils"
 )
 
 var (
@@ -209,13 +210,13 @@ func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *a
 		require.NoError(t, err)
 		_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+appDBName+"`")
 		require.NoError(t, err)
-		_ = targetDB.Close()
+		utils.CloseAndLog(targetDB)
 
 		t.Cleanup(func() {
 			db, err := sql.Open("block-mysql", e2eTargetDSN+"&multiStatements=true")
 			if err == nil {
 				_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+appDBName+"`")
-				_ = db.Close()
+				utils.CloseAndLog(db)
 			}
 		})
 
@@ -231,7 +232,7 @@ func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *a
 
 	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = schemabotDB.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
 
 	st := storage.Storage(mysqlstore.New(schemabotDB))
 	if opts.wrapStorage != nil {
@@ -267,7 +268,7 @@ func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *a
 		Metadata:  opts.engineMetadata,
 	}, st, logger)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = localClient.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(localClient) })
 
 	serverConfig := &api.ServerConfig{
 		Drivers: 1,
@@ -291,7 +292,7 @@ func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *a
 	if !opts.skipOperator {
 		svc.StartOperator(ctx)
 	}
-	t.Cleanup(func() { _ = svc.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(svc) })
 
 	return svc
 }
@@ -1011,14 +1012,14 @@ func setupE2EServiceMultiEnv(t *testing.T, appDBName string) *api.Service {
 	require.NoError(t, err)
 	_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+productionDB+"`")
 	require.NoError(t, err)
-	_ = targetDB.Close()
+	utils.CloseAndLog(targetDB)
 
 	t.Cleanup(func() {
 		db, err := sql.Open("block-mysql", e2eTargetDSN+"&multiStatements=true")
 		if err == nil {
 			_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+stagingDB+"`")
 			_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+productionDB+"`")
-			_ = db.Close()
+			utils.CloseAndLog(db)
 		}
 	})
 
@@ -1028,7 +1029,7 @@ func setupE2EServiceMultiEnv(t *testing.T, appDBName string) *api.Service {
 
 	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = schemabotDB.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
 
 	st := mysqlstore.New(schemabotDB)
 
@@ -1044,7 +1045,7 @@ func setupE2EServiceMultiEnv(t *testing.T, appDBName string) *api.Service {
 		TargetDSN: stagingDSN,
 	}, st, logger)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = stagingClient.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(stagingClient) })
 
 	productionClient, err := tern.NewLocalClient(tern.LocalConfig{
 		Database:  appDBName,
@@ -1052,7 +1053,7 @@ func setupE2EServiceMultiEnv(t *testing.T, appDBName string) *api.Service {
 		TargetDSN: productionDSN,
 	}, st, logger)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = productionClient.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(productionClient) })
 
 	serverConfig := &api.ServerConfig{
 		Databases: map[string]api.DatabaseConfig{
@@ -1070,7 +1071,7 @@ func setupE2EServiceMultiEnv(t *testing.T, appDBName string) *api.Service {
 		appDBName + "/staging":    stagingClient,
 		appDBName + "/production": productionClient,
 	}, logger)
-	t.Cleanup(func() { _ = svc.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(svc) })
 
 	return svc
 }
@@ -1099,7 +1100,7 @@ func startE2EMySQLContainer(ctx context.Context, baseName, dbName string, schema
 			_ = container.Terminate(ctx)
 			return nil, fmt.Errorf("open db: %w", err)
 		}
-		defer func() { _ = db.Close() }()
+		defer utils.CloseAndLog(db)
 
 		if err := testutil.PingMySQL(ctx, db); err != nil {
 			_ = container.Terminate(ctx)
@@ -1175,7 +1176,7 @@ func setupE2EServiceWithConfig(t *testing.T, serverConfig *api.ServerConfig) *ap
 
 	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = schemabotDB.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
 
 	st := mysqlstore.New(schemabotDB)
 
@@ -1186,7 +1187,7 @@ func setupE2EServiceWithConfig(t *testing.T, serverConfig *api.ServerConfig) *ap
 		"DELETE FROM locks WHERE repository = 'octocat/hello-world' AND pull_request = 1")
 
 	svc := api.New(st, serverConfig, nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
-	t.Cleanup(func() { _ = svc.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(svc) })
 
 	return svc
 }

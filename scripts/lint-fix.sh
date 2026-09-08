@@ -150,18 +150,16 @@ if [ "$HAS_CONSUMER_MODULE" -gt 0 ]; then
 fi
 
 # Run closeandlog analyzer on staged packages to flag _ = x.Close() patterns.
-# Mirrors the build-tag matrix used for golangci-lint above.
+# Mirrors the build-tag matrix used for golangci-lint above. The build tags go
+# through GOFLAGS rather than `go run -tags=...`: that flag selects the files
+# compiled into the checker, while the tags the checker must analyze under are
+# the ones its package loader sees, and singlechecker's own -tags flag is a no-op.
 run_closeandlog() {
     local build_tags="$1"
     shift
     local packages=("$@")
-    local tag_flag=""
 
-    if [ -n "$build_tags" ]; then
-        tag_flag="-tags=$build_tags"
-    fi
-
-    if ! go run $tag_flag ./cmd/closeandlog-check "${packages[@]}" 2>&1; then
+    if ! GOFLAGS=${build_tags:+-tags=$build_tags} go run ./cmd/closeandlog-check "${packages[@]}" 2>&1; then
         echo ""
         echo "closeandlog: use utils.CloseAndLog(x) instead of discarding Close() errors."
         echo "See: https://github.com/block/spirit/blob/main/pkg/utils/close.go"
@@ -174,10 +172,20 @@ if [ -n "$PKG_FILES" ]; then
     echo "Running closeandlog analyzer..."
     run_closeandlog "" $CLOSEANDLOG_PKGS
     run_closeandlog "integration" $CLOSEANDLOG_PKGS
+    run_closeandlog "e2e" $CLOSEANDLOG_PKGS
 fi
 
-# e2e packages are test-only (_test.go) so singlechecker can't analyze them.
-# The e2e tests reuse the same patterns caught by the default + integration runs.
+# The integration/ and e2e/ directories are test-only packages that the pkg
+# patterns above never reach, so each is checked under the tag that builds it.
+if [ "$HAS_INTEGRATION_DIR" -gt 0 ]; then
+    echo "Running closeandlog analyzer (integration/)..."
+    run_closeandlog "integration" ./integration/...
+fi
+
+if [ "$HAS_E2E" -gt 0 ]; then
+    echo "Running closeandlog analyzer (e2e/)..."
+    run_closeandlog "e2e" ./e2e/...
+fi
 
 # Run webhookheaders analyzer when any pkg/webhook/ source (excluding templates)
 # is staged. Flags inline `## ...` markdown headers that should live in
@@ -217,6 +225,7 @@ run_severityglyphs() {
         tag_flag="-tags=$build_tags"
     fi
 
+    # `go list` takes the tags as a flag; the analyzer takes them via GOFLAGS.
     # Fail closed: if go list can't resolve the staged packages, the analyzer
     # can't vouch for them, so block the commit rather than silently skipping.
     local listed
@@ -234,7 +243,7 @@ run_severityglyphs() {
         return 0
     fi
 
-    if ! go run ./cmd/severityglyphs-check $tag_flag $packages 2>&1; then
+    if ! GOFLAGS=${build_tags:+-tags=$build_tags} go run ./cmd/severityglyphs-check $packages 2>&1; then
         echo ""
         echo "severityglyphs: use the pkg/glyph constants (glyph.Escalation, glyph.Refused,"
         echo "glyph.Failed, glyph.Attention, glyph.Info) instead of literal severity glyphs."

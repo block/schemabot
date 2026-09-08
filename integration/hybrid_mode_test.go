@@ -432,7 +432,7 @@ func startTernGRPCForDB(t *testing.T, appDSN, dbName string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("create grpc client: %w", err)
 	}
-	defer func() { _ = conn.Close() }()
+	defer utils.CloseAndLog(conn)
 
 	readyCtx, readyCancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer readyCancel()

@@ -27,6 +27,7 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
+	"github.com/block/spirit/pkg/utils"
 )
 
 // planCommentFakeGitHub captures comment creates (returning REST id and
@@ -204,10 +205,9 @@ func setupPlanCommentHandler(t *testing.T, repo string, deleteUnactioned bool) (
 
 	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
-	// Redundant close for early-exit leak safety: svc.Close below owns the
-	// handle (the store is built over it), so this close is expected to see an
-	// already-closed DB and must discard the error.
-	t.Cleanup(func() { _ = schemabotDB.Close() })
+	// Early-exit leak guard: svc.Close below owns the handle (the store is
+	// built over it). Closing an already-closed pool is a no-op.
+	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
 	st := mysqlstore.New(schemabotDB)
 
 	for _, stmt := range []string{
@@ -226,7 +226,7 @@ func setupPlanCommentHandler(t *testing.T, repo string, deleteUnactioned bool) (
 
 	cfg := &api.ServerConfig{DeleteUnactionedPlanComments: deleteUnactioned}
 	svc := api.New(st, cfg, map[string]tern.Client{}, logger)
-	t.Cleanup(func() { _ = svc.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(svc) })
 
 	return NewHandler(svc, factory, nil, logger), st, fake
 }

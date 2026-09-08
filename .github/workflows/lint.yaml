@@ -140,6 +140,11 @@ jobs:
       - name: webhookheaders analyzer
         if: needs.changes.outputs.code == 'true' && matrix.name == 'default'
         run: make check-webhookheaders
+      # The target runs its own default/integration/e2e tag matrix, so it is
+      # pinned to one matrix leg rather than repeated per leg.
+      - name: closeandlog analyzer
+        if: needs.changes.outputs.code == 'true' && matrix.name == 'default'
+        run: make check-closeandlog
 
   # Stable rollup for the lint matrix so a single check name can gate a merge,
   # mirroring the E2E/LocalScale/K8s rollups in test.yaml. The golangci matrix

@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/spirit/pkg/utils"
 )
 
 // appPrimaryKeyColumns returns the app table's primary-key column names in
@@ -26,13 +27,13 @@ func appPrimaryKeyColumns(t *testing.T, dbName, tableName string) []string {
 	t.Helper()
 	db, err := sql.Open("block-mysql", driftDSN(t, dbName))
 	require.NoError(t, err)
-	defer func() { _ = db.Close() }()
+	defer utils.CloseAndLog(db)
 	rows, err := db.QueryContext(t.Context(), `
 		SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY'
 		ORDER BY ORDINAL_POSITION`, dbName, tableName)
 	require.NoError(t, err, "query PK columns")
-	defer func() { _ = rows.Close() }()
+	defer utils.CloseAndLog(rows)
 	var cols []string
 	for rows.Next() {
 		var col string

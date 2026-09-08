@@ -242,7 +242,7 @@ func TestE2EApplyCommentLifecycle(t *testing.T) {
 
 	serverConfig := &api.ServerConfig{}
 	svc := api.New(st, serverConfig, map[string]tern.Client{}, logger)
-	t.Cleanup(func() { _ = svc.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(svc) })
 
 	h := NewHandler(svc, factory, nil, logger)
 
@@ -814,10 +814,9 @@ func setupApplyCommentFixture(t *testing.T, p applyCommentFixtureParams) *applyC
 
 	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
-	// svc.Close below owns closing the store's DB; this early-failure safety
-	// close is redundant once svc exists, so discard its guaranteed
-	// already-closed error.
-	t.Cleanup(func() { _ = schemabotDB.Close() })
+	// svc.Close below owns closing the store's DB; this close only covers an
+	// early failure before svc exists. Closing an already-closed pool is a no-op.
+	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
 
 	st := mysqlstore.New(schemabotDB)
 
@@ -897,7 +896,7 @@ func setupApplyCommentFixture(t *testing.T, p applyCommentFixtureParams) *applyC
 	factory := &fakeClientFactory{client: installClient}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	svc := api.New(st, &api.ServerConfig{}, map[string]tern.Client{}, logger)
-	t.Cleanup(func() { _ = svc.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(svc) })
 
 	return &applyCommentFixture{
 		st:      st,
@@ -2609,9 +2608,9 @@ func TestE2EReconcileMissingSummaryCommentsRepairsStoppedApply(t *testing.T) {
 
 	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
-	// Redundant early-exit closer: svc owns the storage (and this handle) and
-	// closes it below, so discard the guaranteed already-closed error.
-	t.Cleanup(func() { _ = schemabotDB.Close() })
+	// Early-exit leak guard: svc owns the storage (and this handle) and closes
+	// it below. Closing an already-closed pool is a no-op.
+	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
 	st := mysqlstore.New(schemabotDB)
 
 	apply := seedReconcileScenario(t, st, schemabotDB, "org/reconcile-stopped", "e2e_reconcile_stopped_db", state.Apply.Stopped, state.Task.Stopped)
@@ -2651,9 +2650,9 @@ func TestE2EReconcileMissingSummaryCommentsRespectsFreshClaim(t *testing.T) {
 
 	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
-	// Redundant early-exit closer: svc owns the storage (and this handle) and
-	// closes it below, so discard the guaranteed already-closed error.
-	t.Cleanup(func() { _ = schemabotDB.Close() })
+	// Early-exit leak guard: svc owns the storage (and this handle) and closes
+	// it below. Closing an already-closed pool is a no-op.
+	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
 	st := mysqlstore.New(schemabotDB)
 
 	apply := seedReconcileScenario(t, st, schemabotDB, "org/reconcile-claimed", "e2e_reconcile_claimed_db", state.Apply.Completed, state.Task.Completed)
@@ -2748,7 +2747,7 @@ func TestE2EApplyCommentUpsertOnResume(t *testing.T) {
 
 	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = schemabotDB.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
 
 	st := mysqlstore.New(schemabotDB)
 
@@ -2801,7 +2800,7 @@ func TestE2EApplyCommentUpsertOnResume(t *testing.T) {
 
 	serverConfig := &api.ServerConfig{}
 	svc := api.New(st, serverConfig, map[string]tern.Client{}, logger)
-	t.Cleanup(func() { _ = svc.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(svc) })
 
 	h := NewHandler(svc, factory, nil, logger)
 
@@ -2989,7 +2988,7 @@ func TestE2ECommentObserverSkipsTerminalSideEffectsAfterLeaseLoss(t *testing.T) 
 func TestE2EEditTrackedCommentNotFound(t *testing.T) {
 	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = schemabotDB.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
 
 	st := mysqlstore.New(schemabotDB)
 
@@ -2999,7 +2998,7 @@ func TestE2EEditTrackedCommentNotFound(t *testing.T) {
 
 	serverConfig := &api.ServerConfig{}
 	svc := api.New(st, serverConfig, map[string]tern.Client{}, logger)
-	t.Cleanup(func() { _ = svc.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(svc) })
 
 	_ = NewHandler(svc, factory, nil, logger)
 

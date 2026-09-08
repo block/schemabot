@@ -75,7 +75,7 @@ func TestMain(m *testing.M) {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	_ = db.Close()
+	utils.CloseAndLog(db)
 
 	// Note: Storage schema (tasks, plans, etc.) is NOT applied here.
 	// This avoids test interference when Plan/Apply runs - Spirit's differ
@@ -512,7 +512,7 @@ func TestLocalClient_NewLocalClient(t *testing.T) {
 	assert.NoError(t, err, "unexpected error")
 	assert.NotNil(t, client, "expected client but got nil")
 	if client != nil {
-		_ = client.Close()
+		utils.CloseAndLog(client)
 	}
 }
 
@@ -3815,7 +3815,7 @@ func TestLocalClient_Apply_SequentialNamespaceMatchesTask(t *testing.T) {
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx, "CREATE TABLE users (id INT PRIMARY KEY)")
 	require.NoError(t, err)
-	_ = db.Close()
+	utils.CloseAndLog(db)
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	stor := createStorage(t, dsn)

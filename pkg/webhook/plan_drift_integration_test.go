@@ -30,6 +30,7 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
+	"github.com/block/spirit/pkg/utils"
 )
 
 const driftEnv = "production"
@@ -70,7 +71,7 @@ func openDriftDB(t *testing.T, dsn string) *sql.DB {
 	t.Helper()
 	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(db) })
 	require.NoError(t, db.PingContext(t.Context()))
 	return db
 }
@@ -148,7 +149,7 @@ func setupE2EReviewDriftService(t *testing.T, dbName string, specs []deploymentS
 				t.Logf("drift cleanup: open admin db to drop %s: %v", physicalDB, err)
 				return
 			}
-			defer func() { _ = db.Close() }()
+			defer utils.CloseAndLog(db)
 			_, err = db.ExecContext(dropCtx, "DROP DATABASE IF EXISTS `"+physicalDB+"`")
 			assert.NoError(t, err, "drift cleanup: drop physical database %s", physicalDB)
 		})
@@ -167,7 +168,7 @@ func setupE2EReviewDriftService(t *testing.T, dbName string, specs []deploymentS
 			TargetDSN: physicalDSN,
 		}, st, logger)
 		require.NoError(t, err)
-		t.Cleanup(func() { _ = client.Close() })
+		t.Cleanup(func() { utils.CloseAndLog(client) })
 
 		deployments[spec.name] = api.DeploymentTarget{Target: dbName + "-" + spec.name + "-target"}
 		order = append(order, spec.name)
@@ -192,7 +193,7 @@ func setupE2EReviewDriftService(t *testing.T, dbName string, specs []deploymentS
 	}
 
 	svc := api.New(st, serverConfig, ternClients, logger)
-	t.Cleanup(func() { _ = svc.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(svc) })
 	return svc
 }
 

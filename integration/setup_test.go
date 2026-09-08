@@ -113,7 +113,7 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		log.Fatalf("Failed to create gRPC client: %v", err)
 	}
-	cleanupFuncs = append(cleanupFuncs, func() { _ = grpcClient.Close() })
+	cleanupFuncs = append(cleanupFuncs, func() { utils.CloseAndLog(grpcClient) })
 
 	code := m.Run()
 
@@ -151,7 +151,7 @@ func startMySQLContainer(ctx context.Context, baseName, dbName string, schemaFS 
 			_ = container.Terminate(ctx)
 			return nil, fmt.Errorf("open db for schema: %w", err)
 		}
-		defer func() { _ = db.Close() }()
+		defer utils.CloseAndLog(db)
 
 		if err := testutil.PingMySQL(ctx, db); err != nil {
 			_ = container.Terminate(ctx)
@@ -249,7 +249,7 @@ func startTernGRPC(ctx context.Context, targetDSN, storageDSN string) (grpcAddre
 		return "", fmt.Errorf("open storage db: %w", err)
 	}
 	storage := mysqlstore.New(storageDB)
-	cleanupFuncs = append(cleanupFuncs, func() { _ = storageDB.Close() })
+	cleanupFuncs = append(cleanupFuncs, func() { utils.CloseAndLog(storageDB) })
 
 	// Create LocalClient backed by Tern storage
 	localClient, err := tern.NewLocalClient(tern.LocalConfig{
@@ -260,7 +260,7 @@ func startTernGRPC(ctx context.Context, targetDSN, storageDSN string) (grpcAddre
 	if err != nil {
 		return "", fmt.Errorf("create local client: %w", err)
 	}
-	cleanupFuncs = append(cleanupFuncs, func() { _ = localClient.Close() })
+	cleanupFuncs = append(cleanupFuncs, func() { utils.CloseAndLog(localClient) })
 
 	// A dispatch queues the apply in Tern storage for the data plane's own
 	// operator; without an operator a dispatched apply would sit pending
@@ -291,7 +291,7 @@ func startTernGRPC(ctx context.Context, targetDSN, storageDSN string) (grpcAddre
 	if err != nil {
 		return "", fmt.Errorf("create gRPC client: %w", err)
 	}
-	defer func() { _ = conn.Close() }()
+	defer utils.CloseAndLog(conn)
 	readyCtx, readyCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer readyCancel()
 	conn.Connect()

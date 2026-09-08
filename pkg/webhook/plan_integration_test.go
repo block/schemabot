@@ -29,6 +29,7 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
+	"github.com/block/spirit/pkg/utils"
 )
 
 func TestE2EPlanWithChanges(t *testing.T) {
@@ -408,7 +409,7 @@ func TestE2EPlanNoChanges(t *testing.T) {
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx, "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
 	require.NoError(t, err)
-	_ = db.Close()
+	utils.CloseAndLog(db)
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -742,7 +743,7 @@ func TestE2EMultiEnvPlanDifferentChanges(t *testing.T) {
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx, "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
 	require.NoError(t, err)
-	_ = db.Close()
+	utils.CloseAndLog(db)
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -805,13 +806,13 @@ func TestE2EPlanUsesServerSideTarget(t *testing.T) {
 	require.NoError(t, err)
 	_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+dbName+"`")
 	require.NoError(t, err)
-	_ = targetDB.Close()
+	utils.CloseAndLog(targetDB)
 
 	t.Cleanup(func() {
 		db, err := sql.Open("block-mysql", e2eTargetDSN+"&multiStatements=true")
 		if err == nil {
 			_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+dbName+"`")
-			_ = db.Close()
+			utils.CloseAndLog(db)
 		}
 	})
 
@@ -820,7 +821,7 @@ func TestE2EPlanUsesServerSideTarget(t *testing.T) {
 
 	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = schemabotDB.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
 
 	st := mysqlstore.New(schemabotDB)
 
@@ -835,7 +836,7 @@ func TestE2EPlanUsesServerSideTarget(t *testing.T) {
 		TargetDSN: appDSN,
 	}, st, logger)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = localClient.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(localClient) })
 
 	// The tern client is registered under "team-a/staging", so plan must use
 	// the deployment stored in databases.<db>.environments.staging.
@@ -861,7 +862,7 @@ func TestE2EPlanUsesServerSideTarget(t *testing.T) {
 	svc := api.New(st, serverConfig, map[string]tern.Client{
 		"team-a/staging": localClient,
 	}, logger)
-	t.Cleanup(func() { _ = svc.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(svc) })
 
 	// Set up fake GitHub API
 	mux := http.NewServeMux()

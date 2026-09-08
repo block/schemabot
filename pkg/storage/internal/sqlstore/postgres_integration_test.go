@@ -19,6 +19,7 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/storagetest"
 	"github.com/block/schemabot/pkg/testutil"
+	"github.com/block/spirit/pkg/utils"
 )
 
 type postgresHarness struct {
@@ -44,7 +45,7 @@ func TestPostgresStorageParity(t *testing.T) {
 	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_parity")
 	db, err := postgresconn.Open(dsn)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(db) })
 	require.NoError(t, db.PingContext(t.Context()))
 	applyPostgresTestSchema(t, fixtureDB)
 
@@ -576,7 +577,7 @@ func TestPostgresApplyOperationLeaseGuards(t *testing.T) {
 	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_op_guards")
 	db, err := postgresconn.Open(dsn)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(db) })
 	require.NoError(t, db.PingContext(t.Context()))
 	applyPostgresTestSchema(t, fixtureDB)
 
@@ -736,7 +737,7 @@ func TestPostgresReapStrandedActiveDefersToTheOperationLease(t *testing.T) {
 	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_reap_lease")
 	db, err := postgresconn.Open(dsn)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(db) })
 	require.NoError(t, db.PingContext(t.Context()))
 	applyPostgresTestSchema(t, fixtureDB)
 
@@ -805,7 +806,7 @@ func TestPostgresReapStrandedRetryableDefersToTheOperationLease(t *testing.T) {
 	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_reap_retry_lease")
 	db, err := postgresconn.Open(dsn)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(db) })
 	require.NoError(t, db.PingContext(t.Context()))
 	applyPostgresTestSchema(t, fixtureDB)
 
@@ -874,7 +875,7 @@ func TestPostgresFindNextApplyOperationCrashRecoveryAdmitsOneDriverPerWindow(t *
 	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_crash_recovery_window")
 	db, err := postgresconn.Open(dsn)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() { utils.CloseAndLog(db) })
 	require.NoError(t, db.PingContext(t.Context()))
 	applyPostgresTestSchema(t, fixtureDB)
 

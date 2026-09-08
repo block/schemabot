@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/utils"
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -31,7 +32,7 @@ func seedPKSwapTargetTable(t *testing.T, dbName string) {
 	t.Helper()
 	db, err := sql.Open("block-mysql", driftDSN(t, dbName))
 	require.NoError(t, err)
-	defer func() { _ = db.Close() }()
+	defer utils.CloseAndLog(db)
 	_, err = db.ExecContext(t.Context(), "CREATE TABLE `users` (\n"+
 		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n"+
 		"  `tenant_id` bigint unsigned NOT NULL,\n"+

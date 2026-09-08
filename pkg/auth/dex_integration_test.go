@@ -24,6 +24,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/block/schemabot/pkg/auth"
+	"github.com/block/spirit/pkg/utils"
 )
 
 // This exercises the OIDC authorizer end-to-end against a real Dex container:
@@ -50,7 +51,7 @@ func reserveHostPort(t *testing.T) int {
 	t.Helper()
 	l, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	defer func() { _ = l.Close() }()
+	defer utils.CloseAndLog(l)
 	return l.Addr().(*net.TCPAddr).Port
 }
 
