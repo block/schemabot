@@ -416,6 +416,16 @@ func (s *exactProgressApplyStore) Update(_ context.Context, apply *storage.Apply
 	return nil
 }
 
+// WithExclusiveTarget runs the work with the target uncontended, the case these
+// fixtures exercise. Contention is a storage decision, covered where the real
+// store enforces it.
+func (s *exactProgressApplyStore) WithExclusiveTarget(ctx context.Context, _ *storage.Apply, fn func(context.Context) error) error {
+	if s.err != nil {
+		return s.err
+	}
+	return fn(ctx)
+}
+
 func (s *exactProgressApplyStore) UpdateDerivedState(_ context.Context, _ int64, expectedState, newState, errorMessage string, startedAt, completedAt *time.Time) (bool, error) {
 	if s.err != nil {
 		return false, s.err

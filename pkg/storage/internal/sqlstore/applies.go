@@ -2314,6 +2314,64 @@ func (s *applyStore) CheckLease(ctx context.Context, lease storage.ApplyLease) e
 	return ensureApplyLeaseStillOwned(ctx, s.db, lease)
 }
 
+// WithExclusiveTarget runs fn under the apply target's advisory lock, having
+// first refused to run it at all if another active apply owns the target. The
+// lock, held for the whole of fn, is what fn relies on; the re-check only
+// decides whether fn runs. It excludes SchemaBot's own applies and nothing
+// else, so fn stays responsible for anything a schema change run from outside
+// SchemaBot could own.
+func (s *applyStore) WithExclusiveTarget(ctx context.Context, apply *storage.Apply, fn func(context.Context) error) error {
+	if apply == nil {
+		return fmt.Errorf("apply is required to hold its target exclusively")
+	}
+	if fn == nil {
+		return fmt.Errorf("work function is required to hold apply %d's target exclusively", apply.ID)
+	}
+
+	database, dbType, environment, deployment, err := applyTargetForUpdate(ctx, s.db, apply)
+	if err != nil {
+		return err
+	}
+	if !hasApplyTarget(database, dbType, environment) {
+		return fmt.Errorf("apply %d (%s) is missing target metadata for an exclusive target hold", apply.ID, apply.ApplyIdentifier)
+	}
+
+	conn, lockName, err := acquireApplyTargetLockConn(ctx, s.db, s.locker, database, dbType, environment)
+	if err != nil {
+		return err
+	}
+	defer releaseApplyTargetLockConn(ctx, s.locker, conn, lockName, "hold apply target")
+
+	// The re-check runs in its own transaction, which is finished before fn
+	// starts: it only reads, so it ends by rollback and writes nothing to
+	// commit. The advisory lock, not an open transaction, is what keeps a
+	// competing apply out for the duration, and fn touches the target database
+	// rather than storage, so holding a storage transaction open across it
+	// would pin a connection for as long as the target work takes.
+	if err := s.checkTargetUnclaimed(ctx, conn, apply, database, dbType, environment, deployment); err != nil {
+		return err
+	}
+
+	return fn(ctx)
+}
+
+// checkTargetUnclaimed reports whether any active apply other than this one
+// owns the target, as ErrActiveApplyExists.
+func (s *applyStore) checkTargetUnclaimed(ctx context.Context, conn *rebindConn, apply *storage.Apply, database, dbType, environment, deployment string) error {
+	tx, err := conn.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
+	if err != nil {
+		return fmt.Errorf("begin exclusive target check for apply %d: %w", apply.ID, err)
+	}
+	defer rollbackTx(ctx, tx, "hold apply target")
+
+	deployments, err := operationDeploymentsForApply(ctx, tx, apply.ID)
+	if err != nil {
+		return err
+	}
+	deployments = append(deployments, deployment)
+	return checkNoActiveApplyForTargets(ctx, tx, s.dialect, database, dbType, environment, deployments, apply.ID)
+}
+
 // ExpireRetryable transitions failed_retryable applies that exhausted their
 // retry budget or recovery freshness window to permanent failed. Returns the
 // applies updated.

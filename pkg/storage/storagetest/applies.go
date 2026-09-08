@@ -1,6 +1,8 @@
 package storagetest
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -473,7 +475,71 @@ func TestApplies(t *testing.T, h Harness) {
 		assert.Equal(t, state.Apply.Running, persisted.State)
 	})
 
+	// Work that touches the target database itself runs only while no other
+	// active apply owns that target, so a cancel reclaiming its leftovers can
+	// never destroy a live apply's copy of the same tables.
+	t.Run("WithExclusiveTarget", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_exclusive_target_db", storage.DatabaseTypeMySQL)
+		cancelled := CreateApplyWithStateEnvDeployment(t, store, lock,
+			"apply_exclusive_cancelled", 921, state.Apply.Stopped, "staging", "primary")
+
+		ran := 0
+		require.NoError(t, store.Applies().WithExclusiveTarget(ctx, cancelled, func(context.Context) error {
+			ran++
+			return nil
+		}))
+		assert.Equal(t, 1, ran, "an unclaimed target runs the work")
+
+		sentinel := errors.New("target work failed")
+		require.ErrorIs(t, store.Applies().WithExclusiveTarget(ctx, cancelled, func(context.Context) error {
+			return sentinel
+		}), sentinel, "the work's own error reaches the caller unchanged")
+
+		successor := CreateApplyWithStateEnvDeployment(t, store, lock,
+			"apply_exclusive_successor", 922, state.Apply.Running, "staging", "primary")
+		ran = 0
+		require.ErrorIs(t, store.Applies().WithExclusiveTarget(ctx, cancelled, func(context.Context) error {
+			ran++
+			return nil
+		}), storage.ErrActiveApplyExists)
+		assert.Zero(t, ran, "the work must not run while another apply owns the target")
+
+		successor.State = state.Apply.Completed
+		require.NoError(t, store.Applies().Update(ctx, successor))
+		require.NoError(t, store.Applies().WithExclusiveTarget(ctx, cancelled, func(context.Context) error {
+			ran++
+			return nil
+		}))
+		assert.Equal(t, 1, ran, "a settled successor frees the target again")
+
+		// The check is for other applies: an apply's own active state must not
+		// refuse its own hold, or a running apply could never touch its target.
+		selfLock := CreateLock(t, store, "apply_exclusive_self_db", storage.DatabaseTypeMySQL)
+		self := CreateApplyWithStateEnvDeployment(t, store, selfLock,
+			"apply_exclusive_self", 923, state.Apply.Running, "staging", "primary")
+		ran = 0
+		require.NoError(t, store.Applies().WithExclusiveTarget(ctx, self, func(context.Context) error {
+			ran++
+			return nil
+		}))
+		assert.Equal(t, 1, ran)
+
+		require.Error(t, store.Applies().WithExclusiveTarget(ctx, nil, func(context.Context) error { return nil }))
+		require.Error(t, store.Applies().WithExclusiveTarget(ctx, cancelled, nil))
+	})
+
 	dbErrorTests := map[string]func(t *testing.T, store storage.ApplyStore) error{
+		"WithExclusiveTarget_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			return store.WithExclusiveTarget(t.Context(), &storage.Apply{
+				ID:           1,
+				Database:     "apply_exclusive_target_db",
+				DatabaseType: storage.DatabaseTypeMySQL,
+				Environment:  "staging",
+				Deployment:   "primary",
+			}, func(context.Context) error { return nil })
+		},
 		"Create_DBError": func(t *testing.T, store storage.ApplyStore) error {
 			_, err := store.Create(t.Context(), &storage.Apply{})
 			return err

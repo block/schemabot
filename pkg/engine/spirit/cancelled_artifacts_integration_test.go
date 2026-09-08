@@ -240,9 +240,7 @@ func TestEngine_ReleaseCancelledArtifacts_NothingToRelease(t *testing.T) {
 
 // A release reclaims artifacts for the tables it was given and leaves every
 // other table on the target alone — the live tables it was not asked about, and
-// the artifacts belonging to a different table's schema change. Only the
-// schema-level artifacts, which no single table owns, are reclaimed regardless
-// of which table was named.
+// the artifacts belonging to a different table's schema change.
 func TestEngine_ReleaseCancelledArtifacts_LeavesUnnamedTablesAlone(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)
@@ -292,6 +290,9 @@ func TestEngine_ReleaseCancelledArtifacts_LeavesUnnamedTablesAlone(t *testing.T)
 // nobody thought to check for fails here: near-misses of the artifact naming,
 // another table's artifacts, and a timestamped copy from a run that was told to
 // keep it all have to survive.
+//
+// Another table's artifacts are also what holds back the schema-scoped pair, so
+// they survive here too and are reported as retained rather than reclaimed.
 func TestEngine_ReleaseCancelledArtifacts_ChangesNothingElseInTheSchema(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)
@@ -314,12 +315,14 @@ func TestEngine_ReleaseCancelledArtifacts_ChangesNothingElseInTheSchema(t *testi
 		// A run told to keep the table it swapped out names it with a
 		// timestamp, which no derivation a release performs reproduces.
 		utils.OldTableNameWithTimestamp(target, "20260101_000000"),
+		// Another table's artifacts mean the schema is not idle, so the pair
+		// belonging to whichever schema change owns it stays where it is.
+		sharedCheckpointTable,
+		deferredCutoverSentinelTable,
 	}
 	reclaimed := []string{
 		utils.NewTableName(target),
 		utils.CheckpointTableName(target),
-		sharedCheckpointTable,
-		deferredCutoverSentinelTable,
 	}
 
 	releaseTestCleanup(t, db, append(append([]string{}, decoys...), reclaimed...)...)
@@ -329,7 +332,7 @@ func TestEngine_ReleaseCancelledArtifacts_ChangesNothingElseInTheSchema(t *testi
 	before := tablesIn(t, db, "testdb")
 
 	eng := New(Config{})
-	_, err := eng.ReleaseCancelledArtifacts(t.Context(), &engine.ReleaseArtifactsRequest{
+	result, err := eng.ReleaseCancelledArtifacts(t.Context(), &engine.ReleaseArtifactsRequest{
 		Database:    "testdb",
 		Tables:      []string{target},
 		Credentials: &engine.Credentials{DSN: dsn},
@@ -339,6 +342,10 @@ func TestEngine_ReleaseCancelledArtifacts_ChangesNothingElseInTheSchema(t *testi
 	assert.ElementsMatch(t, decoys, tablesIn(t, db, "testdb"),
 		"a release must change nothing in the schema but the artifacts of the table it was given")
 	assert.Len(t, before, len(decoys)+len(reclaimed), "every seeded table must have existed to begin with")
+	assert.ElementsMatch(t, []string{
+		"testdb." + sharedCheckpointTable,
+		"testdb." + deferredCutoverSentinelTable,
+	}, result.Retained, "what a release leaves behind must be reported, not left silent")
 }
 
 // A release refused for want of a table list must be refused before it reaches
@@ -450,4 +457,77 @@ func TestEngine_ReleaseCancelledArtifacts_RepeatedTableReleasedOnce(t *testing.T
 	quarantined := listQuarantinedTables(t, db)
 	require.Len(t, quarantined, 1)
 	assert.Equal(t, 5, quarantinedRowCount(t, db, quarantined[0]), "the copied rows must survive")
+}
+
+// The schema-scoped artifacts are shared by every schema change in the schema,
+// and one of them is the gate a deferred cutover waits on. Reclaiming them on a
+// cancelled change's behalf would release the cutover a live change is still
+// waiting on, so while the schema holds an artifact the cancelled change's own
+// tables do not account for, they are retained and reported. The cancelled
+// change's own artifacts are reclaimed either way, and once the residue is gone
+// the same release reclaims the shared pair too.
+func TestEngine_ReleaseCancelledArtifacts_RetainsSharedMetadataWhileTheSchemaIsBusy(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	const cancelled = "orders"
+	const live = "customers"
+	seeded := []string{
+		cancelled,
+		utils.NewTableName(cancelled),
+		utils.CheckpointTableName(cancelled),
+		live,
+		utils.NewTableName(live),
+		utils.CheckpointTableName(live),
+		sharedCheckpointTable,
+		deferredCutoverSentinelTable,
+	}
+	releaseTestCleanup(t, db, seeded...)
+	for _, name := range seeded {
+		seedArtifact(t, db, name, 1)
+	}
+
+	eng := New(Config{})
+	req := &engine.ReleaseArtifactsRequest{
+		Database:    "testdb",
+		Tables:      []string{cancelled},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	result, err := eng.ReleaseCancelledArtifacts(t.Context(), req)
+	require.NoError(t, err, "ReleaseCancelledArtifacts()")
+
+	assert.ElementsMatch(t, []string{
+		"testdb." + sharedCheckpointTable,
+		"testdb." + deferredCutoverSentinelTable,
+	}, result.Retained)
+	assert.NotEmpty(t, result.RetainedReason,
+		"an operator reclaiming these by hand has to be told why they are still there")
+	for _, survivor := range []string{sharedCheckpointTable, deferredCutoverSentinelTable} {
+		assert.True(t, tableExists(t, db, survivor),
+			"%s may belong to the live schema change, so it must survive", survivor)
+	}
+
+	// Retention is scoped to what another schema change could own. Everything
+	// derived from the cancelled change's own tables is still reclaimed.
+	assert.Equal(t, []string{"testdb." + utils.CheckpointTableName(cancelled)}, result.Discarded)
+	require.Len(t, result.Preserved, 1)
+	assert.Equal(t, "testdb."+utils.NewTableName(cancelled), result.Preserved[0].Source)
+
+	for _, name := range []string{utils.NewTableName(live), utils.CheckpointTableName(live)} {
+		_, err := db.ExecContext(t.Context(), fmt.Sprintf("DROP TABLE %s", quoteIdentifier(name)))
+		require.NoError(t, err, "drop %s", name)
+	}
+	seedArtifact(t, db, utils.CheckpointTableName(cancelled), 1)
+
+	result, err = eng.ReleaseCancelledArtifacts(t.Context(), req)
+	require.NoError(t, err, "ReleaseCancelledArtifacts() against an idle schema")
+	assert.Empty(t, result.Retained, "nothing is retained once no other change's artifacts remain")
+	assert.Empty(t, result.RetainedReason)
+	assert.ElementsMatch(t, []string{
+		"testdb." + utils.CheckpointTableName(cancelled),
+		"testdb." + sharedCheckpointTable,
+		"testdb." + deferredCutoverSentinelTable,
+	}, result.Discarded)
 }
