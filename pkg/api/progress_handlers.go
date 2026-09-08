@@ -615,8 +615,8 @@ func (s *Service) handleDatabaseEnvironments(w http.ResponseWriter, r *http.Requ
 
 	environments, err := s.config.DatabaseEnvironments(database)
 	if err != nil {
-		available := make([]string, 0, len(s.config.Databases))
-		for name := range s.config.Databases {
+		available := make([]string, 0, len(s.config.DatabaseConfigs()))
+		for name := range s.config.DatabaseConfigs() {
 			available = append(available, name)
 		}
 		sort.Strings(available)
@@ -635,8 +635,8 @@ func (s *Service) handleDatabaseEnvironments(w http.ResponseWriter, r *http.Requ
 	}
 
 	if len(environments) == 0 {
-		available := make([]string, 0, len(s.config.Databases))
-		for name := range s.config.Databases {
+		available := make([]string, 0, len(s.config.DatabaseConfigs()))
+		for name := range s.config.DatabaseConfigs() {
 			available = append(available, name)
 		}
 		sort.Strings(available)
@@ -703,9 +703,9 @@ func configuredDatabaseTypes(config *ServerConfig) []string {
 	if config == nil {
 		return nil
 	}
-	seen := make(map[string]bool, len(config.Databases))
-	types := make([]string, 0, len(config.Databases))
-	for _, dbConfig := range config.Databases {
+	seen := make(map[string]bool, len(config.DatabaseConfigs()))
+	types := make([]string, 0, len(config.DatabaseConfigs()))
+	for _, dbConfig := range config.DatabaseConfigs() {
 		if !seen[dbConfig.Type] {
 			seen[dbConfig.Type] = true
 			types = append(types, dbConfig.Type)
@@ -724,8 +724,8 @@ func databaseListResponse(config *ServerConfig, databaseType, name string) (*api
 		return nil, fmt.Errorf("server config is nil")
 	}
 	nameFilter := storage.CanonicalKey(name)
-	databaseNames := make([]string, 0, len(config.Databases))
-	for database, dbConfig := range config.Databases {
+	databaseNames := make([]string, 0, len(config.DatabaseConfigs()))
+	for database, dbConfig := range config.DatabaseConfigs() {
 		if databaseType != "" && dbConfig.Type != databaseType {
 			continue
 		}
@@ -738,7 +738,7 @@ func databaseListResponse(config *ServerConfig, databaseType, name string) (*api
 
 	resp := &apitypes.DatabaseListResponse{Databases: make([]*apitypes.DatabaseResponse, 0, len(databaseNames))}
 	for _, database := range databaseNames {
-		dbConfig := config.Databases[database]
+		dbConfig := config.DatabaseConfigs()[database]
 		environments, err := config.DatabaseEnvironments(database)
 		if err != nil {
 			return nil, fmt.Errorf("list database environments for database %q: %w", database, err)

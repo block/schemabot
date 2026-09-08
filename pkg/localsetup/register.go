@@ -23,9 +23,8 @@ type Registration struct {
 	Storage     api.StorageConfig
 }
 
-// Register atomically extends the runtime configuration while the runtime is
-// stopped. An identical registration is safe to repeat, including while it is
-// running. It does not connect to or create databases, start an executor, or
+// Register atomically extends the runtime configuration. A running host
+// publishes additions without replacing existing clients or interrupting applies. It does not connect to or create databases, start an executor, or
 // apply changes to the target.
 func Register(m localruntime.Manager, r Registration) (bool, error) {
 	requested := api.ServerConfig{
@@ -36,6 +35,10 @@ func Register(m localruntime.Manager, r Registration) (bool, error) {
 	}
 	if err := serve.ValidateLocalConfig(&requested); err != nil {
 		return false, err
+	}
+	resolved, err := r.Connection.ResolveDSN()
+	if err != nil {
+		return false, fmt.Errorf("resolve new database connection")
 	}
 	return m.UpdateConfig(func(data []byte) ([]byte, error) {
 		cfg := requested
@@ -85,5 +88,5 @@ func Register(m localruntime.Manager, r Registration) (bool, error) {
 			return nil, fmt.Errorf("validate generated runtime configuration: %w", err)
 		}
 		return data, nil
-	})
+	}, map[string]map[string]string{r.Database: {r.Environment: resolved}})
 }

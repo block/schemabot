@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -139,6 +140,57 @@ func TestSupervisorEngines(t *testing.T) {
 			schema, err := os.ReadFile(filepath.Join(schemaRoot, namespace, "widgets.sql"))
 			require.NoError(t, err)
 			assert.Contains(t, string(schema), "widgets")
+			registrationCtx, cancelRegistration := context.WithTimeout(t.Context(), runtimeDeadline)
+			defer cancelRegistration()
+			// Exported after startup: the running child cannot inherit this variable.
+			t.Setenv("LIVE_NEW_TARGET", targetDSN)
+			addition := localsetup.Registration{Database: "billing", Environment: "development", Engine: engine, Storage: api.StorageConfig{DSN: storageDSN, Dialect: engine}, Connection: api.EnvironmentConfig{DSN: "env:LIVE_NEW_TARGET"}}
+			if engine == "mysql" {
+				// Hold a real online copy at cutover while another database is added.
+				execSQL(t, db, "INSERT INTO widgets (id,name) VALUES (1,'keep me')")
+				for i := range 19 {
+					execSQL(t, db, fmt.Sprintf("INSERT INTO widgets (id,name) SELECT id + %d,name FROM widgets", 1<<i))
+				}
+				var onlinePlan apitypes.PlanResponse
+				request(t, connection.Endpoint, http.MethodPost, "/api/plan", connection.Token, apitypes.PlanRequest{Database: "app", Environment: "development", Type: engine, SchemaFiles: map[string]*apitypes.SchemaFiles{namespace: {Files: map[string]string{"widgets.sql": "CREATE TABLE widgets (id bigint NOT NULL PRIMARY KEY, name text NOT NULL, INDEX idx_name (name(10)));"}}}}, http.StatusOK, &onlinePlan)
+				require.Empty(t, onlinePlan.Errors)
+				require.Len(t, onlinePlan.Changes, 1)
+				var onlineApply apitypes.ApplyResponse
+				request(t, connection.Endpoint, http.MethodPost, "/api/apply", connection.Token, apitypes.ApplyRequest{PlanID: onlinePlan.PlanID, Environment: "development", Options: map[string]string{"defer_cutover": "true", "skip_revert": "true"}}, http.StatusOK, &onlineApply)
+				require.True(t, onlineApply.Accepted, onlineApply.ErrorMessage)
+				waitSupervisedApply(t, connection, onlineApply.ApplyID, state.Apply.WaitingForCutover)
+				changed, err = localsetup.Register(manager, addition)
+				require.NoError(t, err)
+				require.True(t, changed)
+				waitSupervisedApply(t, connection, onlineApply.ApplyID, state.Apply.WaitingForCutover)
+				var control apitypes.ControlResponse
+				request(t, connection.Endpoint, http.MethodPost, "/api/cutover", connection.Token, apitypes.ControlRequest{ApplyID: onlineApply.ApplyID, Environment: "development"}, http.StatusOK, &control)
+				require.True(t, control.Accepted, control.ErrorMessage)
+				waitSupervisedApply(t, connection, onlineApply.ApplyID, state.Apply.Completed)
+				var kept int
+				require.NoError(t, db.QueryRowContext(registrationCtx, "SELECT COUNT(*) FROM widgets WHERE name='keep me'").Scan(&kept))
+				require.Equal(t, 524288, kept)
+			} else {
+				changed, err = localsetup.Register(manager, addition)
+				require.NoError(t, err)
+				require.True(t, changed)
+			}
+			updated, err := manager.Ensure(registrationCtx)
+			require.NoError(t, err)
+			require.Equal(t, connection.Generation, updated.Generation)
+			require.Equal(t, connection.PID, updated.PID)
+			changed, err = localsetup.Register(manager, addition)
+			require.NoError(t, err)
+			require.False(t, changed)
+			saved, err := runtimehost.ReadPrivate(filepath.Join(dir, "runtime.yaml"))
+			require.NoError(t, err)
+			require.Contains(t, string(saved), "env:LIVE_NEW_TARGET")
+			var catalog apitypes.DatabaseListResponse
+			request(t, connection.Endpoint, http.MethodGet, "/api/databases", connection.Token, nil, http.StatusOK, &catalog)
+			require.Len(t, catalog.Databases, 2)
+			var billingPlan apitypes.PlanResponse
+			request(t, connection.Endpoint, http.MethodPost, "/api/plan", connection.Token, apitypes.PlanRequest{Database: "billing", Environment: "development", Type: engine, SchemaFiles: map[string]*apitypes.SchemaFiles{namespace: {Files: map[string]string{"widgets.sql": "CREATE TABLE widgets (id bigint NOT NULL PRIMARY KEY, name text NOT NULL);"}}}}, http.StatusOK, &billingPlan)
+			require.Empty(t, billingPlan.Errors)
 			stopCtx, cancelStop := context.WithTimeout(t.Context(), runtimeDeadline)
 			defer cancelStop()
 			require.NoError(t, manager.Stop(stopCtx))
@@ -175,4 +227,13 @@ func supervisorDatabase(t *testing.T, engine string) (string, string, *sql.DB) {
 	storageDSN, err := testutil.MySQLDSN(t.Context(), container, "runtime_state", "parseTime=true")
 	require.NoError(t, err)
 	return storageDSN, dsn, db
+}
+
+func waitSupervisedApply(t *testing.T, connection runtimehost.Connection, applyID, wanted string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		var progress apitypes.ProgressResponse
+		request(t, connection.Endpoint, http.MethodGet, "/api/progress/apply/"+applyID, connection.Token, nil, http.StatusOK, &progress)
+		return state.IsState(progress.State, wanted)
+	}, runtimeDeadline, 100*time.Millisecond)
 }
