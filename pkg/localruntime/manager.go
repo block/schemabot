@@ -72,7 +72,7 @@ func (m Manager) Ensure(ctx context.Context) (Connection, error) {
 	if err := privateDirectory(m.Dir); err != nil {
 		return Connection{}, err
 	}
-	config, err := ReadPrivate(filepath.Join(m.Dir, "runtime.yaml"))
+	_, err := ReadPrivate(filepath.Join(m.Dir, "runtime.yaml"))
 	if err != nil {
 		return Connection{}, fmt.Errorf("read runtime configuration: %w", err)
 	}
@@ -87,7 +87,7 @@ func (m Manager) Ensure(ctx context.Context) (Connection, error) {
 	if available {
 		// Setup may have published a registration after the initial read. The
 		// startup lease makes this snapshot authoritative until the child exits.
-		config, err = ReadPrivate(filepath.Join(m.Dir, "runtime.yaml"))
+		config, err := ReadPrivate(filepath.Join(m.Dir, "runtime.yaml"))
 		if err != nil {
 			utils.CloseAndLog(lease)
 			return Connection{}, fmt.Errorf("read runtime configuration: %w", err)
