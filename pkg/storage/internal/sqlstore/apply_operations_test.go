@@ -5,6 +5,7 @@ package sqlstore
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
@@ -456,6 +457,20 @@ func TestApplyOperationStore_EngineResumeState(t *testing.T) {
 	require.NotNil(t, operation)
 	assert.Equal(t, "ctx-123", operation.EngineResumeContext)
 	assert.JSONEq(t, initial.Metadata, operation.EngineResumeMetadata)
+
+	progressMetadata := map[string]string{
+		"phase":       "copying",
+		"step":        "3",
+		"steps_total": "8",
+		"statement":   "ALTER TABLE `orders` ADD COLUMN `status` varchar(32)",
+	}
+	require.NoError(t, store.ApplyOperations().SaveProgressMetadata(ctx, operationID, progressMetadata))
+	operation, err = store.ApplyOperations().Get(ctx, operationID)
+	require.NoError(t, err)
+	require.NotNil(t, operation)
+	var storedProgressMetadata map[string]string
+	require.NoError(t, json.Unmarshal([]byte(operation.ProgressMetadata), &storedProgressMetadata))
+	assert.Equal(t, progressMetadata, storedProgressMetadata)
 
 	updated := &storage.EngineResumeState{
 		ApplyOperationID: operationID,

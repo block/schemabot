@@ -463,6 +463,8 @@ engine and execution phase: copying can report rows and percent complete;
 as zero time remaining. Throttled tasks can include `throttle_reason`.
 Sharded engines can add per-shard progress, and multi-deployment applies list
 operations with their deployment, target, state, and cutover policy.
+The top-level `metadata` object carries the engine's latest position fields,
+such as `phase`, `step`, `steps_total`, and `statement`, when available.
 
 <details>
 <summary>Request and response example</summary>
@@ -480,6 +482,12 @@ Response excerpt (illustrative values):
   "environment": "production",
   "engine": "spirit",
   "state": "running",
+  "metadata": {
+    "phase": "copying",
+    "step": "3",
+    "steps_total": "8",
+    "statement": "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)"
+  },
   "tables": [
     {
       "table_name": "orders",

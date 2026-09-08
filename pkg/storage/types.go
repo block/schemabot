@@ -951,6 +951,9 @@ type ApplyOperation struct {
 	// replays them but does not interpret them for control/progress calls.
 	EngineResumeContext  string
 	EngineResumeMetadata string
+	// ProgressMetadata is the latest engine progress display metadata encoded as
+	// JSON. It is durable read-model state and is not replayed into the engine.
+	ProgressMetadata string
 
 	// CreatedAt is when the child row was inserted (typically at apply create).
 	CreatedAt time.Time

@@ -329,6 +329,8 @@ type atomicPollState struct {
 	// engine could not report per-shard/row-copy progress, so the warning is
 	// emitted once per apply rather than on every poll.
 	warnedPerShardUnavailable bool
+
+	lastProgressMetadata map[string]string
 }
 
 // operationLeaseOnlyDrive reports the operation lease of a drive that holds an
@@ -537,6 +539,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 
 	var consecutiveErrors int
 	var resumeEventLogged bool
+	var lastProgressMetadata map[string]string
 	lostWork := lostEngineWorkTracker{budget: c.lostEngineWorkPendingBudget(eng)}
 	watchdog := taskStallWatchdog{interval: c.taskStallWarnInterval()}
 
@@ -649,6 +652,12 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 
 			consecutiveErrors = 0
 			c.logEngineResumeOnce(ctx, logger, apply, result.ResumedFromCheckpoint, &resumeEventLogged)
+			var saveErr error
+			lastProgressMetadata, saveErr = c.persistProgressMetadataIfChanged(ctx, task, lastProgressMetadata, result.Metadata)
+			if saveErr != nil {
+				logger.Warn("failed to persist engine progress metadata; the drive will retry on the next poll",
+					append(task.LogAttrs(), "error", saveErr)...)
+			}
 
 			task.State = taskStateWithNoBackwardProgress(prevState, engineTaskState)
 			task.UpdatedAt = now

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -349,6 +350,38 @@ func applyOperationIDForTask(task *storage.Task) (int64, error) {
 	return *task.ApplyOperationID, nil
 }
 
+func (c *LocalClient) saveProgressMetadata(ctx context.Context, task *storage.Task, metadata map[string]string) error {
+	operationID, err := applyOperationIDForTask(task)
+	if err != nil {
+		return fmt.Errorf("resolve apply operation for task %s: %w", task.TaskIdentifier, err)
+	}
+	if err := c.storage.ApplyOperations().SaveProgressMetadata(ctx, operationID, metadata); err != nil {
+		return fmt.Errorf("save progress metadata for task %s: %w", task.TaskIdentifier, err)
+	}
+	return nil
+}
+
+func (c *LocalClient) saveApplyProgressMetadata(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, metadata map[string]string) error {
+	operationID, err := c.applyOperationIDForApplyTasks(ctx, apply, tasks)
+	if err != nil {
+		return fmt.Errorf("resolve apply operation for progress metadata: %w", err)
+	}
+	if err := c.storage.ApplyOperations().SaveProgressMetadata(ctx, operationID, metadata); err != nil {
+		return fmt.Errorf("save progress metadata for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return nil
+}
+
+func (c *LocalClient) persistProgressMetadataIfChanged(ctx context.Context, task *storage.Task, previous, current map[string]string) (map[string]string, error) {
+	if maps.Equal(previous, current) {
+		return previous, nil
+	}
+	if err := c.saveProgressMetadata(ctx, task, current); err != nil {
+		return previous, err
+	}
+	return maps.Clone(current), nil
+}
+
 // tasksForOperation returns the subset of tasks belonging to the given
 // apply_operation. It is nil-safe: a nil task or one without an
 // apply_operation_id is skipped. Callers use it to scope an apply-wide task set
@@ -676,6 +709,17 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			return true
 		}
 		return false
+	}
+	var saveErr error
+	if !maps.Equal(ps.lastProgressMetadata, result.Metadata) {
+		saveErr = c.saveApplyProgressMetadata(ctx, apply, tasks, result.Metadata)
+		if saveErr == nil {
+			ps.lastProgressMetadata = maps.Clone(result.Metadata)
+		}
+	}
+	if saveErr != nil {
+		logger.Warn("failed to persist engine progress metadata; the drive will retry on the next poll",
+			append(apply.MutableLogAttrs(), "error", saveErr)...)
 	}
 	now := time.Now()
 	newState := taskStateFromProgressResult(result)

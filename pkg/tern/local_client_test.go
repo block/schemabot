@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -655,11 +657,41 @@ func (s *exactProgressStorage) ApplyOperations() storage.ApplyOperationStore {
 
 type exactProgressApplyOperationStore struct {
 	storage.ApplyOperationStore
-	data    *storage.EngineResumeState
-	ops     []*storage.ApplyOperation
-	err     error
-	saveErr error
-	saved   *storage.EngineResumeState
+	data           *storage.EngineResumeState
+	ops            []*storage.ApplyOperation
+	err            error
+	saveErr        error
+	saved          *storage.EngineResumeState
+	progressWrites int
+}
+
+func (s *exactProgressApplyOperationStore) Get(_ context.Context, operationID int64) (*storage.ApplyOperation, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	for _, op := range s.ops {
+		if op.ID == operationID {
+			return op, nil
+		}
+	}
+	if s.data != nil && s.data.ApplyOperationID == operationID {
+		return &storage.ApplyOperation{ID: operationID, EngineResumeContext: s.data.MigrationContext, EngineResumeMetadata: s.data.Metadata}, nil
+	}
+	return nil, nil
+}
+
+func (s *exactProgressApplyOperationStore) SaveProgressMetadata(_ context.Context, operationID int64, metadata map[string]string) error {
+	s.progressWrites++
+	for _, op := range s.ops {
+		if op.ID == operationID {
+			encoded, err := json.Marshal(metadata)
+			if err != nil {
+				return fmt.Errorf("encode progress metadata: %w", err)
+			}
+			op.ProgressMetadata = string(encoded)
+		}
+	}
+	return nil
 }
 
 func (s *exactProgressApplyOperationStore) ListByApply(context.Context, int64) ([]*storage.ApplyOperation, error) {
@@ -691,6 +723,48 @@ func (s *exactProgressApplyOperationStore) GetEngineResumeState(context.Context,
 		return nil, storage.ErrEngineResumeStateNotFound
 	}
 	return s.data, nil
+}
+
+func TestPersistProgressMetadataOnlyWhenChanged(t *testing.T) {
+	operationID := int64(17)
+	store := &exactProgressApplyOperationStore{ops: []*storage.ApplyOperation{{ID: operationID}}}
+	client := &LocalClient{
+		storage: &exactProgressStorage{applyOperations: store},
+		logger:  slog.Default(),
+	}
+	task := &storage.Task{TaskIdentifier: "task-progress", ApplyOperationID: &operationID}
+	metadata := map[string]string{"phase": "copying", "step": "2"}
+
+	previous, err := client.persistProgressMetadataIfChanged(t.Context(), task, nil, metadata)
+	require.NoError(t, err)
+	assert.Equal(t, 1, store.progressWrites)
+	previous, err = client.persistProgressMetadataIfChanged(t.Context(), task, previous, maps.Clone(metadata))
+	require.NoError(t, err)
+	assert.Equal(t, 1, store.progressWrites)
+	metadata["step"] = "3"
+	_, err = client.persistProgressMetadataIfChanged(t.Context(), task, previous, metadata)
+	require.NoError(t, err)
+	assert.Equal(t, 2, store.progressWrites)
+}
+
+func TestLoadStoredProgressMetadataMergesVitessResumeFieldsLast(t *testing.T) {
+	operationID := int64(18)
+	store := &exactProgressApplyOperationStore{ops: []*storage.ApplyOperation{{
+		ID:                   operationID,
+		ProgressMetadata:     `{"phase":"copying","branch_name":"progress-branch"}`,
+		EngineResumeMetadata: `{"branch_name":"resume-branch","deploy_request_url":"https://example.com/request"}`,
+	}}}
+	client := &LocalClient{
+		config:  LocalConfig{Type: storage.DatabaseTypeVitess},
+		storage: &exactProgressStorage{applyOperations: store},
+		logger:  slog.Default(),
+	}
+	task := &storage.Task{TaskIdentifier: "task-read-progress", ApplyOperationID: &operationID}
+
+	metadata := client.loadStoredProgressMetadata(t.Context(), task)
+	assert.Equal(t, "copying", metadata["phase"])
+	assert.Equal(t, "resume-branch", metadata["branch_name"])
+	assert.Equal(t, "https://example.com/request", metadata["deploy_request_url"])
 }
 
 func TestApplyCancelHandleDoesNotCancelNewerOwner(t *testing.T) {
