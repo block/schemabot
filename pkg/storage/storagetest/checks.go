@@ -855,6 +855,44 @@ func TestChecks(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		assert.Equal(t, "in_progress", got.Status, "the in-flight apply-owned row is untouched")
 		assert.Equal(t, int64(424242), got.ApplyID)
+
+		// A finished apply's row is still apply-owned: its result is what the
+		// apply wrote about the live database, and a re-plan failure must not
+		// erase the owner and overwrite it.
+		settled := seed(104, "head-settled", "completed", 515151)
+		flipped, err = flip(settled)
+		require.NoError(t, err)
+		assert.False(t, flipped)
+		got, err = store.Checks().Get(ctx, "org/repo", 104, "staging", storage.DatabaseTypeMySQL, "db_block")
+		require.NoError(t, err)
+		assert.Equal(t, "success", got.Conclusion, "the apply's own result is preserved")
+		assert.Equal(t, int64(515151), got.ApplyID, "ownership is not cleared")
+
+		// A row already blocked for review-time deployment drift keeps that
+		// reason: the reviewed plan's block outranks a re-plan failure, and the
+		// caller is told the gate is closed rather than that the flip failed.
+		drifted := seed(105, "head-drift", "completed", 0)
+		drifted.Conclusion = "action_required"
+		drifted.BlockingReason = storage.ReviewTimeDeploymentDriftBlockingReason
+		require.NoError(t, store.Checks().Upsert(ctx, drifted))
+		flipped, err = flip(drifted)
+		require.NoError(t, err)
+		assert.True(t, flipped, "the row blocks merge after the call")
+		got, err = store.Checks().Get(ctx, "org/repo", 105, "staging", storage.DatabaseTypeMySQL, "db_block")
+		require.NoError(t, err)
+		assert.Equal(t, storage.ReviewTimeDeploymentDriftBlockingReason, got.BlockingReason,
+			"the drift block is not laundered into a re-plan failure")
+
+		// Redelivery: the same flip applied twice reports the gate closed both
+		// times, so a caller on a dialect that reports changed rows does not
+		// read the second call as a lost block.
+		repeated := seed(106, "head-repeat", "completed", 0)
+		flipped, err = flip(repeated)
+		require.NoError(t, err)
+		require.True(t, flipped)
+		flipped, err = flip(repeated)
+		require.NoError(t, err)
+		assert.True(t, flipped, "a redelivered flip still reports the gate closed")
 	})
 
 	t.Run("Upsert_DBError", func(t *testing.T) {

@@ -219,7 +219,11 @@ func (s *mergeGateRequestStore) PendingForTarget(ctx context.Context, environmen
 }
 
 // Heartbeat extends the lease on a claimed request. Returns
-// ErrMergeGateLeaseLost when the lease token is stale.
+// ErrMergeGateLeaseLost when the lease token is stale, and when the request is
+// no longer processing: a terminal write retains the lease token so its own
+// retry stays idempotent, so a token match alone is not evidence the drive is
+// still live. A successful heartbeat means this driver still owns an
+// in-flight request, which is the only thing its caller can act on.
 func (s *mergeGateRequestStore) Heartbeat(ctx context.Context, id int64, leaseToken string, leaseDuration time.Duration) error {
 	if leaseToken == "" {
 		return fmt.Errorf("merge gate lease token is required")
@@ -230,12 +234,35 @@ func (s *mergeGateRequestStore) Heartbeat(ctx context.Context, id int64, leaseTo
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE merge_gate_requests
 		SET lease_expires_at = `+s.dialect.RelativeTime(TimestampPrecisionMicrosecond, AfterCurrentTime, ParameterIntervalAmount(), IntervalMicrosecond)+`, updated_at = NOW()
-		WHERE id = ? AND lease_token = ?
-	`, leaseDuration.Microseconds(), id, leaseToken)
+		WHERE id = ? AND lease_token = ? AND state = ?
+	`, leaseDuration.Microseconds(), id, leaseToken, storage.MergeGateProcessing)
 	if err != nil {
 		return fmt.Errorf("heartbeat merge gate request %d: %w", id, err)
 	}
-	return s.mergeGateLeaseResult(ctx, result, id, leaseToken)
+	return s.mergeGateActiveLeaseResult(ctx, result, id, leaseToken, "heartbeat")
+}
+
+// Release hands a claimed request back to the queue without consuming the
+// attempt it was claimed under. A driver that is shutting down, or that lost
+// the target before doing any work, releases rather than failing: the request
+// is not the thing that went wrong, and burning its attempt budget on a
+// process lifecycle event is how a fan-out that would have succeeded reaches
+// the attempt cap and stops being claimed at all.
+func (s *mergeGateRequestStore) Release(ctx context.Context, id int64, leaseToken string) error {
+	if leaseToken == "" {
+		return fmt.Errorf("merge gate lease token is required")
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE merge_gate_requests
+		SET state = ?, attempts = GREATEST(attempts - 1, 0),
+			lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+			retry_after = NULL, updated_at = NOW()
+		WHERE id = ? AND lease_token = ? AND state = ?
+	`, storage.MergeGatePending, id, leaseToken, storage.MergeGateProcessing)
+	if err != nil {
+		return fmt.Errorf("release merge gate request %d: %w", id, err)
+	}
+	return s.mergeGateActiveLeaseResult(ctx, result, id, leaseToken, "release")
 }
 
 // MarkCompleted marks a claimed request terminal-successful.
@@ -276,14 +303,60 @@ func (s *mergeGateRequestStore) CompletePendingCoalesced(ctx context.Context, id
 // MarkFailed marks a claimed request failed. A non-nil retryAfter keeps it
 // retryable after that time; nil makes the failure terminal. Idempotent for
 // the same lease token, on the same rationale as MarkCompleted.
+//
+// A retryable failure at the attempt cap is recorded terminally instead. The
+// claim predicate only takes a failed row while it is under the cap, so a
+// capped row left retryable is one no processor will ever claim again and no
+// sweep will ever resolve: it would sit failed with a retry time that never
+// arrives, indistinguishable from work still queued.
 func (s *mergeGateRequestStore) MarkFailed(ctx context.Context, id int64, leaseToken string, errMsg string, retryAfter *time.Time) error {
+	if retryAfter != nil {
+		result, err := s.db.ExecContext(ctx, `
+			UPDATE merge_gate_requests
+			SET state = ?, last_error = ?, retry_after = ?, updated_at = NOW()
+			WHERE id = ? AND lease_token = ? AND attempts < ?
+		`, storage.MergeGateFailed, nullString(errMsg), *retryAfter, id, leaseToken, storage.MaxMergeGateAttempts)
+		if err != nil {
+			return fmt.Errorf("mark merge gate request %d failed retryable: %w", id, err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("read merge gate request %d retryable failure rows affected: %w", id, err)
+		}
+		if rows > 0 {
+			return nil
+		}
+
+		// Zero rows carries three different meanings, and only one of them
+		// means this request should be failed terminally. Read the row to tell
+		// them apart: under changed-rows semantics a retry that rewrites the
+		// failure it already recorded also reports zero, and terminalizing
+		// that row would end a fan-out that is still owed its remaining
+		// attempts.
+		var attempts int
+		var currentToken sql.NullString
+		err = s.db.QueryRowContext(ctx, `SELECT attempts, lease_token FROM merge_gate_requests WHERE id = ?`, id).Scan(&attempts, &currentToken)
+		if errors.Is(err, sql.ErrNoRows) {
+			return storage.ErrMergeGateNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("verify merge gate request %d attempts after retryable failure: %w", id, err)
+		}
+		if !currentToken.Valid || currentToken.String != leaseToken {
+			return storage.ErrMergeGateLeaseLost
+		}
+		if attempts < storage.MaxMergeGateAttempts {
+			return nil
+		}
+	}
+
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE merge_gate_requests
-		SET state = ?, last_error = ?, retry_after = ?,
-			completed_at = CASE WHEN ? THEN COALESCE(completed_at, NOW()) ELSE completed_at END,
+		SET state = ?, last_error = ?, retry_after = NULL,
+			completed_at = COALESCE(completed_at, NOW()),
 			updated_at = NOW()
 		WHERE id = ? AND lease_token = ?
-	`, storage.MergeGateFailed, nullString(errMsg), retryAfter, retryAfter == nil, id, leaseToken)
+	`, storage.MergeGateFailed, nullString(errMsg), id, leaseToken)
 	if err != nil {
 		return fmt.Errorf("mark merge gate request %d failed: %w", id, err)
 	}
@@ -355,6 +428,33 @@ func (s *mergeGateRequestStore) mergeGateLeaseResult(ctx context.Context, result
 		return fmt.Errorf("verify merge gate request %d lease token: %w", id, err)
 	}
 	if currentToken.Valid && currentToken.String == leaseToken {
+		return nil
+	}
+	return storage.ErrMergeGateLeaseLost
+}
+
+// mergeGateActiveLeaseResult resolves a write that requires the request to
+// still be processing under this driver's lease. Unlike mergeGateLeaseResult
+// it does not treat a retained token as success: a terminal write keeps the
+// token, so only a row still in the processing state proves the drive is live.
+func (s *mergeGateRequestStore) mergeGateActiveLeaseResult(ctx context.Context, result sql.Result, id int64, leaseToken, operation string) error {
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read merge gate request %d %s rows affected: %w", id, operation, err)
+	}
+	if rows > 0 {
+		return nil
+	}
+	var currentToken sql.NullString
+	var currentState string
+	err = s.db.QueryRowContext(ctx, `SELECT lease_token, state FROM merge_gate_requests WHERE id = ?`, id).Scan(&currentToken, &currentState)
+	if errors.Is(err, sql.ErrNoRows) {
+		return storage.ErrMergeGateNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("verify merge gate request %d lease for %s: %w", id, operation, err)
+	}
+	if currentToken.Valid && currentToken.String == leaseToken && currentState == storage.MergeGateProcessing {
 		return nil
 	}
 	return storage.ErrMergeGateLeaseLost

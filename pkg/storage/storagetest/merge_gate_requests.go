@@ -1,7 +1,9 @@
 package storagetest
 
 import (
+	"fmt"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,10 +16,12 @@ import (
 
 // TestMergeGateRequests runs the behavioral parity suite for
 // storage.MergeGateRequestStore: per-apply recording idempotence and required
-// fields, FIFO claim ordering with lease rotation, expired-lease reclaim under
-// the attempt cap, retryable versus terminal failure, lease-guarded
-// completion and heartbeat, same-target coalescing, the outbox sweep over
-// completed applies with no request, and the stuck-processing sweep.
+// fields, FIFO claim ordering with lease rotation, claim exclusivity under
+// concurrent drivers, expired-lease reclaim under the attempt cap, retryable
+// versus terminal failure including terminalization at the cap, attempt-
+// refunding release, lease-guarded completion and heartbeat, same-target
+// coalescing, the outbox sweep over completed applies with no request, and the
+// stuck-processing sweep.
 func TestMergeGateRequests(t *testing.T, h Harness) {
 	// record records a pending request for a synthetic completed apply. Each
 	// request needs its own applies row because apply_id is the idempotency
@@ -294,6 +298,143 @@ func TestMergeGateRequests(t *testing.T, h Harness) {
 		assert.Nil(t, none, "a terminal failure must never be reclaimed")
 	})
 
+	// A retryable failure recorded on the final attempt is stored terminally.
+	// The claim predicate only reclaims a failed row under the attempt cap, so
+	// a row left retryable at the cap would be one nothing ever claims again
+	// and nothing ever resolves — queued forever by its stored state, dead in
+	// practice.
+	t.Run("MarkFailedTerminalizesAtAttemptCap", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		req := driveToCapExhausted(t, store, "apply_cap_fail", "db_cap_fail", 46, time.Hour)
+		claimed, err := store.MergeGateRequests().GetByApplyID(ctx, req.ApplyID)
+		require.NoError(t, err)
+		require.Equal(t, storage.MaxMergeGateAttempts, claimed.Attempts)
+
+		past := time.Now().UTC().Add(-time.Hour)
+		require.NoError(t, store.MergeGateRequests().MarkFailed(ctx, claimed.ID, claimed.LeaseToken, "final attempt failed", &past))
+
+		got, err := store.MergeGateRequests().GetByApplyID(ctx, req.ApplyID)
+		require.NoError(t, err)
+		assert.Equal(t, storage.MergeGateFailed, got.State)
+		assert.Equal(t, "final attempt failed", got.LastError)
+		assert.Nil(t, got.RetryAfter, "a failure at the attempt cap is not retryable")
+		assert.NotNil(t, got.CompletedAt, "a failure at the attempt cap is terminal")
+
+		none, err := store.MergeGateRequests().ClaimNext(ctx, "driver-b", time.Minute)
+		require.NoError(t, err)
+		assert.Nil(t, none)
+	})
+
+	// A driver standing down without deciding the request's outcome hands it
+	// back and refunds the attempt: a rolling deploy must not spend a request's
+	// attempt budget, or a fan-out that would have succeeded reaches the cap on
+	// process lifecycle events alone.
+	t.Run("ReleaseRefundsAttempt", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		req := record(t, store, "apply_release_1", "staging", "db_release", 47)
+		claimed := claimExpecting(t, store, req.ID)
+		require.Equal(t, 1, claimed.Attempts)
+
+		require.NoError(t, store.MergeGateRequests().Release(ctx, claimed.ID, claimed.LeaseToken))
+
+		released, err := store.MergeGateRequests().GetByApplyID(ctx, req.ApplyID)
+		require.NoError(t, err)
+		assert.Equal(t, storage.MergeGatePending, released.State)
+		assert.Equal(t, 0, released.Attempts, "the released attempt is refunded")
+		assert.Empty(t, released.LeaseOwner)
+		assert.Empty(t, released.LeaseToken)
+		assert.Nil(t, released.LeaseExpiresAt)
+
+		reclaimed := claimExpecting(t, store, req.ID)
+		assert.Equal(t, 1, reclaimed.Attempts, "the reclaim starts from the refunded count")
+
+		err = store.MergeGateRequests().Release(ctx, claimed.ID, "stale-token")
+		assert.ErrorIs(t, err, storage.ErrMergeGateLeaseLost)
+
+		require.NoError(t, store.MergeGateRequests().MarkCompleted(ctx, reclaimed.ID, reclaimed.LeaseToken))
+		err = store.MergeGateRequests().Release(ctx, reclaimed.ID, reclaimed.LeaseToken)
+		assert.ErrorIs(t, err, storage.ErrMergeGateLeaseLost, "a finished request cannot be handed back")
+
+		err = store.MergeGateRequests().Release(ctx, reclaimed.ID+9999, "any")
+		assert.ErrorIs(t, err, storage.ErrMergeGateNotFound)
+	})
+
+	// Several drivers poll the same queue at once. The claim is exclusive: no
+	// request is ever handed to two drivers, because two drivers fanning out
+	// the same target would each re-plan every PR gated on it and race to write
+	// the resulting check state.
+	//
+	// Exclusivity is the property under test, not exhaustiveness. Concurrent
+	// claimants skip each other's locked rows, so a single round of polls can
+	// leave a claimable request behind; the processor polls in a loop, and the
+	// serial drain below stands in for the next pass. What must never happen
+	// is the same request coming back twice.
+	t.Run("ClaimNextIsExclusiveUnderConcurrency", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		const requests = 4
+		for i := range requests {
+			record(t, store, "apply_contend_"+strconv.Itoa(i), "staging", "db_contend", 480+i)
+		}
+
+		var mu sync.Mutex
+		claimedBy := make(map[int64]string)
+		var claimErrs []error
+
+		// Every claim, concurrent or serial, goes through here so a request
+		// handed out twice fails the test wherever the duplicate came from.
+		claim := func(owner string) (bool, error) {
+			claimed, err := store.MergeGateRequests().ClaimNext(ctx, owner, time.Minute)
+			if err != nil {
+				return false, err
+			}
+			if claimed == nil {
+				return false, nil
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if previous, taken := claimedBy[claimed.ID]; taken {
+				return false, fmt.Errorf("request %d claimed by both %s and %s", claimed.ID, previous, owner)
+			}
+			claimedBy[claimed.ID] = owner
+			return true, nil
+		}
+
+		// More drivers than requests, so the losers exercise the empty-queue
+		// path in the same round.
+		const drivers = requests + 2
+		var wg sync.WaitGroup
+		for i := range drivers {
+			owner := "driver-" + strconv.Itoa(i)
+			wg.Go(func() {
+				if _, err := claim(owner); err != nil {
+					mu.Lock()
+					claimErrs = append(claimErrs, err)
+					mu.Unlock()
+				}
+			})
+		}
+		wg.Wait()
+		require.Empty(t, claimErrs)
+		require.NotEmpty(t, claimedBy, "contending drivers must not all come away empty")
+
+		// Drain what the contended round skipped. Each request appears exactly
+		// once across both phases.
+		for range requests {
+			claimed, err := claim("driver-drain")
+			require.NoError(t, err)
+			if !claimed {
+				break
+			}
+		}
+		assert.Len(t, claimedBy, requests, "every request is claimed exactly once")
+	})
+
 	// Completion is lease-guarded and idempotent — a retry with the retained
 	// token is a no-op, while a stale token (the row was reclaimed) reports
 	// lease loss instead of overwriting the new owner's run.
@@ -334,6 +475,26 @@ func TestMergeGateRequests(t *testing.T, h Harness) {
 
 		err = store.MergeGateRequests().Heartbeat(ctx, claimed.ID, "stale-token", time.Minute)
 		assert.ErrorIs(t, err, storage.ErrMergeGateLeaseLost)
+	})
+
+	// A terminal write keeps the lease token so its own retry stays idempotent,
+	// which makes a token match alone a poor liveness signal. A heartbeat on a
+	// finished request reports lease loss, so a driver whose fan-out already
+	// resolved cannot read a successful heartbeat as permission to keep going.
+	t.Run("HeartbeatRejectsFinishedRequest", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		req := record(t, store, "apply_heartbeat_2", "staging", "db_heartbeat_done", 62)
+		claimed := claimExpecting(t, store, req.ID)
+
+		require.NoError(t, store.MergeGateRequests().MarkCompleted(ctx, claimed.ID, claimed.LeaseToken))
+
+		err := store.MergeGateRequests().Heartbeat(ctx, claimed.ID, claimed.LeaseToken, time.Hour)
+		assert.ErrorIs(t, err, storage.ErrMergeGateLeaseLost)
+
+		err = store.MergeGateRequests().Heartbeat(ctx, claimed.ID+9999, "any", time.Minute)
+		assert.ErrorIs(t, err, storage.ErrMergeGateNotFound)
 	})
 
 	// Several applies complete on the same target while a fan-out is queued.
@@ -474,6 +635,10 @@ func TestMergeGateRequests(t *testing.T, h Harness) {
 
 	t.Run("Heartbeat_DBError", func(t *testing.T) {
 		require.Error(t, h.NewUnreachableStorage(t).MergeGateRequests().Heartbeat(t.Context(), 1, "token", time.Minute))
+	})
+
+	t.Run("Release_DBError", func(t *testing.T) {
+		require.Error(t, h.NewUnreachableStorage(t).MergeGateRequests().Release(t.Context(), 1, "token"))
 	})
 
 	t.Run("MarkCompleted_DBError", func(t *testing.T) {

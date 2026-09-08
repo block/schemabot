@@ -536,9 +536,18 @@ type MergeGateRequestStore interface {
 
 	// Heartbeat extends the lease on a claimed request so a fan-out that spans
 	// many PRs can outlive the initial lease without being reclaimed
-	// mid-flight. Returns ErrMergeGateLeaseLost when the lease token is
-	// stale.
+	// mid-flight. Returns ErrMergeGateLeaseLost when the lease token is stale
+	// or the request is no longer processing, so a successful heartbeat is
+	// evidence the drive it belongs to is still live.
 	Heartbeat(ctx context.Context, id int64, leaseToken string, leaseDuration time.Duration) error
+
+	// Release returns a claimed request to the pending queue and refunds the
+	// attempt it was claimed under, for a driver that is standing down without
+	// having decided the request's outcome — a shutdown, or a precondition
+	// that disappeared before any fan-out work began. Returns
+	// ErrMergeGateLeaseLost when the lease token is stale or the request is no
+	// longer processing.
+	Release(ctx context.Context, id int64, leaseToken string) error
 
 	// MarkCompleted marks a claimed request terminal-successful. Returns
 	// ErrMergeGateLeaseLost when the lease token is stale.
@@ -551,7 +560,9 @@ type MergeGateRequestStore interface {
 	CompletePendingCoalesced(ctx context.Context, id int64) (bool, error)
 
 	// MarkFailed marks a claimed request failed. A non-nil retryAfter keeps it
-	// retryable after that time; nil makes the failure terminal. Returns
+	// retryable after that time; nil makes the failure terminal. A retryable
+	// failure recorded at MaxMergeGateAttempts is stored terminally instead,
+	// since the claim predicate would never take that row again. Returns
 	// ErrMergeGateLeaseLost when the lease token is stale.
 	MarkFailed(ctx context.Context, id int64, leaseToken string, errMsg string, retryAfter *time.Time) error
 
@@ -560,6 +571,13 @@ type MergeGateRequestStore interface {
 	// row. The applies table is the outbox: a pod crash between an apply's
 	// terminal write and its merge gate recording loses the in-line record, and
 	// this sweep is how the processor backfills it.
+	//
+	// Scope: completed applies only. An apply that failed part-way through a
+	// multi-operation change has mutated the target schema without reaching
+	// the completed state, so this sweep does not backfill it — the schema
+	// that other PRs are gated against has moved, and no request exists to
+	// re-plan them. Recovering that case needs an operator to reconcile the
+	// environment, which is why it is deliberately not automated here.
 	FindCompletedAppliesMissingRequest(ctx context.Context, lookback time.Duration) ([]*Apply, error)
 
 	// TerminateStuckProcessing marks as terminally failed every processing row
