@@ -307,19 +307,23 @@ func TestLeaseHeldApplyKeepsLeaseAuthoritative(t *testing.T) {
 	assert.False(t, owner.Valid, "a lease-held apply must not record a progress-comment authority")
 
 	// A stale observer whose captured lease was rotated away must skip while
-	// the row is held by another driver — the lease stays authoritative.
+	// the row is held by another driver — the lease stays authoritative. The
+	// rotation is permanent for the stale observer, so it warns once, latches
+	// supersession, and keeps any later checks in the same callback at debug.
 	staleLogger := &capturingLogger{}
 	stale := newObserver(storage.ApplyLease{ApplyID: apply.ID, Owner: "old-driver", Token: "rotated-away"}, staleLogger)
 	stale.OnProgress(apply, fx.tasks)
 
 	requireNoGitHubCalls(t, capture)
-	var loggedSkip bool
-	for _, entry := range staleLogger.errors {
-		if entry.msg == "observer: apply lease no longer owns apply; skipping GitHub side effect" {
-			loggedSkip = true
+	assert.True(t, stale.Superseded(), "a rotated-away lease must latch supersession")
+	var supersededWarns int
+	for _, entry := range staleLogger.warnings {
+		if entry.msg == "observer: apply lease superseded by a newer owner; this observer stops publishing GitHub side effects" {
+			supersededWarns++
 		}
 	}
-	assert.True(t, loggedSkip, "the stale observer must log its skipped edit")
+	assert.Equal(t, 1, supersededWarns, "the stale observer must log its skipped edit exactly once")
+	assert.Empty(t, staleLogger.errors, "an expected handover is not an error")
 }
 
 // The observer's tick works from a poller snapshot that can predate a
