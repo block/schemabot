@@ -22,7 +22,7 @@ var initVariable = regexp.MustCompile(`^env:[A-Za-z_][A-Za-z0-9_]*$`)
 type initField struct{ label, hint, value string }
 
 // The wizard edits a private draft. Only explicit confirmation copies it back;
-// initialize remains the sole registration and verification path (AZ-6).
+// initialize remains the sole registration and verification path (AZ-7, AZ-8, AZ-9).
 type initWizard struct {
 	connectionSummary                        string
 	hasExistingSchema                        bool

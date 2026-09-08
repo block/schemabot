@@ -1,6 +1,7 @@
 package schema
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -341,9 +342,22 @@ func TestGroupFilesByNamespaceEmptyDeclaration(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, grouped, "public")
 	require.Empty(t, grouped["public"].Files)
-	// User edits are SQL again; nothing other than the exact declaration is skipped.
+	// User SQL after the marker must never be skipped.
 	edited := EmptyNamespaceDeclaration + "CREATE TABLE users (id bigint);"
 	grouped, _, err = GroupFilesByNamespace(map[string]string{"public/schema.sql": edited}, "app", "development", nil)
 	require.NoError(t, err)
 	require.Equal(t, edited, grouped["public"].Files["schema.sql"])
+}
+
+func TestEmptyNamespaceDeclarationSurvivesEditorWhitespace(t *testing.T) {
+	for _, content := range []string{strings.TrimSpace(EmptyNamespaceDeclaration), strings.ReplaceAll(EmptyNamespaceDeclaration, "\n", "\r\n"), EmptyNamespaceDeclaration + " \t\n"} {
+		grouped, _, err := GroupFilesByNamespace(map[string]string{"public/schema.sql": content}, "app", "development", nil)
+		require.NoError(t, err)
+		require.Contains(t, grouped, "public")
+		require.Empty(t, grouped["public"].Files)
+	}
+	content := EmptyNamespaceDeclaration + "\r\nCREATE TABLE users (id bigint);"
+	grouped, _, err := GroupFilesByNamespace(map[string]string{"public/schema.sql": content}, "app", "development", nil)
+	require.NoError(t, err)
+	require.Equal(t, content, grouped["public"].Files["schema.sql"])
 }

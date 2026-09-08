@@ -91,9 +91,11 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if existing, ok := cfg.Profiles[profile]; ok && !reflect.DeepEqual(existing, client.Profile{LocalRuntime: cmd.Runtime}) {
 		return nil, fmt.Errorf("profile %q already has a different connection; choose another --profile", profile)
 	}
-	if _, err := initSchemaReuse(cmd.SchemaDir); err != nil {
+	reuse, err := initSchemaReuse(cmd.SchemaDir)
+	if err != nil {
 		return nil, err
 	}
+	cmd.ReuseSchema = cmd.ReuseSchema || reuse
 	root, err := filepath.Abs(cmd.SchemaDir)
 	if err != nil {
 		return nil, err
@@ -192,9 +194,16 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 // Reuse only an exact prior result. Never merge imported files into a user's
 // edited desired state or silently remove files outside the imported scope.
 func publishInitSchema(stage, root string) error {
-	publishErr := renameInitSchema(stage, root)
+	return publishInitSchemaWithRename(stage, root, renameInitSchema)
+}
+
+func publishInitSchemaWithRename(stage, root string, rename func(string, string) error) error {
+	publishErr := rename(stage, root)
 	if publishErr == nil {
 		return nil
+	}
+	if !errors.Is(publishErr, fs.ErrExist) {
+		return fmt.Errorf("publish schema directory without replacing existing files: %w", publishErr)
 	}
 	if info, err := os.Lstat(root); err == nil && info.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("schema import cannot reuse symlinks: %s", root)
@@ -206,7 +215,7 @@ func publishInitSchema(stage, root string) error {
 		if err := removeEmptyInitDir(root); err != nil {
 			return fmt.Errorf("schema directory changed before publication: %w", err)
 		}
-		return renameInitSchema(stage, root)
+		return rename(stage, root)
 	}
 	existing, err := initSchemaSnapshot(root)
 	if err != nil {

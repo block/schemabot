@@ -74,7 +74,8 @@ $ schemabot init --non-interactive --json --type mysql \
 {"database":"shop","environment":"development","profile":"default","schema_dir":"/project/schema","plan_id":"plan-example","tables":1,"verified":true}
 ```
 
-Paths and plan IDs vary. Add `--reuse-schema` to verify existing desired files. Select a named
+Paths and plan IDs vary. Existing schema directories with a valid `schemabot.yaml` are verified and
+reused automatically, including with flags. `--reuse-schema` is also accepted. Select a named
 connection with `--profile`; existing profiles and the default connection are preserved.
 
 Missing inputs are explicit and exit unsuccessfully:

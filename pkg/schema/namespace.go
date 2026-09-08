@@ -92,7 +92,7 @@ func GroupFilesByNamespace(files map[string]string, defaultNamespace string, env
 		if result[namespace] == nil {
 			result[namespace] = &Namespace{Files: make(map[string]string)}
 		}
-		if content == EmptyNamespaceDeclaration {
+		if strings.TrimSpace(content) == strings.TrimSpace(EmptyNamespaceDeclaration) {
 			continue
 		}
 		result[namespace].Files[filename] = content

@@ -86,7 +86,8 @@ func (m Manager) Ensure(ctx context.Context) (Connection, error) {
 	}
 	if available {
 		// Setup may have published a registration after the initial read. The
-		// startup lease makes this snapshot authoritative until the child exits.
+		// startup lease prevents registration from superseding this snapshot
+		// before the child takes ownership.
 		config, err := ReadPrivate(filepath.Join(m.Dir, "runtime.yaml"))
 		if err != nil {
 			utils.CloseAndLog(lease)
@@ -105,7 +106,7 @@ func (m Manager) Ensure(ctx context.Context) (Connection, error) {
 		r, err := m.record()
 		if err == nil {
 			if r.Binary != binary {
-				return Connection{}, fmt.Errorf("local runtime %s uses a different binary or configuration; finish active work and stop it before restarting", r.ID)
+				return Connection{}, fmt.Errorf("local runtime %s uses a different binary; finish active work and stop it before restarting", r.ID)
 			}
 			if r.Control != "" {
 				token, readErr := ReadPrivate(filepath.Join(m.Dir, "token"))
@@ -121,7 +122,7 @@ func (m Manager) Ensure(ctx context.Context) (Connection, error) {
 					if live.Config != digest(current) {
 						// A registration can publish between identity and file reads.
 						// Wait for a matching snapshot, never restart the live host.
-						live.State = "configuration differs from its saved registration"
+						live.State = "configuration_mismatch"
 					}
 					lastState = live.State
 					if live.State == "ready" {

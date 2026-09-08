@@ -124,12 +124,15 @@ func TestInitEngines(t *testing.T) {
 			require.NoError(t, os.WriteFile(schemaPath, edited, 0600))
 			output, err = run(args...)
 			require.Error(t, err, string(output))
-			require.Contains(t, string(output), "existing files were preserved")
+			require.Contains(t, string(output), "still produce schema changes")
 			after, err := os.ReadFile(schemaPath)
 			require.NoError(t, err)
 			require.Equal(t, edited, after)
-			// Explicit reuse accepts harmless formatting/comments without replacing files.
+			// Existing schema files are verified automatically, preserving harmless comments.
 			require.NoError(t, os.Remove(filepath.Join(root, namespace, "notes.sql")))
+			output, err = run(args...)
+			require.NoError(t, err, string(output))
+			// The explicit flag remains supported for scripted callers.
 			output, err = run(append(slices.Clone(args), "--reuse-schema")...)
 			require.NoError(t, err, string(output))
 			after, err = os.ReadFile(schemaPath)
