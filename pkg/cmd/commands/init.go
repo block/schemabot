@@ -3,6 +3,7 @@ package commands
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -169,9 +170,16 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 // Reuse only an exact prior result. Never merge imported files into a user's
 // edited desired state or silently remove files outside the imported scope.
 func publishInitSchema(stage, root string) error {
-	publishErr := renameInitSchema(stage, root)
+	return publishInitSchemaWithRename(stage, root, renameInitSchema)
+}
+
+func publishInitSchemaWithRename(stage, root string, rename func(string, string) error) error {
+	publishErr := rename(stage, root)
 	if publishErr == nil {
 		return nil
+	}
+	if !errors.Is(publishErr, fs.ErrExist) {
+		return fmt.Errorf("publish schema directory without replacing existing files: %w", publishErr)
 	}
 	existing, err := initSchemaSnapshot(root)
 	if err != nil {

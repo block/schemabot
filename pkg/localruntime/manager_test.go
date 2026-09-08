@@ -160,7 +160,7 @@ func TestRefusesMismatchAndDegraded(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, os.WriteFile(filepath.Join(manager.Dir, "runtime.yaml"), []byte("changed"), 0600))
 			_, err = manager.Ensure(inspectCtx)
-			require.ErrorContains(t, err, "configuration differs")
+			require.ErrorContains(t, err, "configuration_mismatch")
 			statusCtx, cancelStatus := context.WithTimeout(t.Context(), testDeadline)
 			defer cancelStatus()
 			after, err := manager.Status(statusCtx)
@@ -217,7 +217,7 @@ func TestIdentityAndCrashRecovery(t *testing.T) {
 	changed := manager
 	changed.Binary = changedBinary
 	_, err = changed.Ensure(ctx)
-	require.ErrorContains(t, err, "different binary or configuration")
+	require.ErrorContains(t, err, "different binary")
 	same, err := manager.Status(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, connection.Generation, same.Generation)
