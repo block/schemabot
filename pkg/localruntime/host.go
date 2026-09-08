@@ -1,9 +1,12 @@
 package localruntime
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -18,7 +21,7 @@ import (
 // Run owns the inherited lifetime lock until the hosted server fully closes.
 // The control listener starts before storage bootstrap and remains available
 // during dependency outages. The callback uses the normal server lifecycle.
-func Run(ctx context.Context, dir, generation string, run func(context.Context, string, string, func(string) error) error) error {
+func Run(ctx context.Context, dir, generation string, run func(context.Context, string, string, func(string, PrepareConfig) error) error) error {
 	if err := privateDirectory(dir); err != nil {
 		return err
 	}
@@ -68,6 +71,8 @@ func Run(ctx context.Context, dir, generation string, run func(context.Context, 
 	childCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var mu sync.Mutex
+	var updateMu sync.Mutex
+	var prepareConfig PrepareConfig
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /identity", func(w http.ResponseWriter, req *http.Request) {
 		mu.Lock()
@@ -97,12 +102,61 @@ func Run(ctx context.Context, dir, generation string, run func(context.Context, 
 		}
 	})
 	mux.HandleFunc("POST /stop", func(w http.ResponseWriter, req *http.Request) {
+		updateMu.Lock()
+		defer updateMu.Unlock()
 		mu.Lock()
 		r.State = "stopping"
 		mu.Unlock()
 		cancel()
 		if err := writeControl(w, req, string(token), nil); err != nil {
 			slog.Error("acknowledge runtime shutdown", "error", err)
+		}
+	})
+	mux.HandleFunc("POST /config", func(w http.ResponseWriter, req *http.Request) {
+		updateMu.Lock()
+		defer updateMu.Unlock()
+		mu.Lock()
+		snapshot := r
+		prepare := prepareConfig
+		mu.Unlock()
+		if snapshot.State != "ready" || prepare == nil {
+			http.Error(w, "registration is not ready", http.StatusServiceUnavailable)
+			return
+		}
+		var update ConfigUpdate
+		if err := json.NewDecoder(req.Body).Decode(&update); err != nil {
+			http.Error(w, "invalid registration", http.StatusBadRequest)
+			return
+		}
+		if update.Expected != snapshot.Config {
+			http.Error(w, "configuration changed", http.StatusConflict)
+			return
+		}
+		if len(update.Config) > 1<<20 {
+			http.Error(w, "configuration too large", http.StatusBadRequest)
+			return
+		}
+		publish, err := prepare(update.Config, update.Resolved)
+		if err != nil {
+			http.Error(w, "registration conflicts with the running configuration", http.StatusBadRequest)
+			return
+		}
+		if err := writeAtomic(filepath.Join(dir, "runtime.yaml"), update.Config); err != nil {
+			http.Error(w, "cannot save registration", http.StatusInternalServerError)
+			return
+		}
+		publish()
+		mu.Lock()
+		r.Config = digest(update.Config)
+		snapshot = r
+		mu.Unlock()
+		// The signed live identity is authoritative while the process holds its lease.
+		// A stale on-disk manifest cannot change the executing configuration.
+		if err := writeJSON(filepath.Join(dir, "manifest.json"), snapshot); err != nil {
+			slog.Error("save runtime identity after registration", "error", err)
+		}
+		if err := writeControl(w, req, string(token), nil); err != nil {
+			slog.Error("acknowledge registration", "error", err)
 		}
 	})
 	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -114,12 +168,18 @@ func Run(ctx context.Context, dir, generation string, run func(context.Context, 
 			http.Error(w, "runtime generation mismatch", http.StatusConflict)
 			return
 		}
+		body, err := io.ReadAll(io.LimitReader(req.Body, 3<<20+1))
+		if err != nil || len(body) > 3<<20 || digest(body) != req.Header.Get("X-Runtime-Body") {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		req.Body = io.NopCloser(bytes.NewReader(body))
 		mux.ServeHTTP(w, req)
 	})
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second, IdleTimeout: 10 * time.Second}
 	serveErr := make(chan error, 1)
 	go func() { err := server.Serve(listener); serveErr <- err; cancel() }()
-	runErr := run(childCtx, filepath.Join(dir, "active.yaml"), string(token), func(endpoint string) error {
+	runErr := run(childCtx, filepath.Join(dir, "active.yaml"), string(token), func(endpoint string, prepare PrepareConfig) error {
 		if err := loopback(endpoint); err != nil {
 			return err
 		}
@@ -128,6 +188,7 @@ func Run(ctx context.Context, dir, generation string, run func(context.Context, 
 		if r.State == "stopping" {
 			return fmt.Errorf("runtime stopped during startup")
 		}
+		prepareConfig = prepare
 		r.State = "ready"
 		r.Endpoint = endpoint
 		return writeJSON(filepath.Join(dir, "manifest.json"), r)

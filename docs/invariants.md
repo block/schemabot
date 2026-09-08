@@ -1323,10 +1323,13 @@ bootstrap. *Enforced:* `pkg/serve/local.go`, `pkg/auth/local.go`, and
 `pkg/api/storage_isolation.go`; process recovery is covered in `integration/localruntime`.
 
 Local registration preserves existing targets and durable storage configuration. It validates
-through the shared host guards and publishes configuration atomically under the runtime's lifetime
-lock. An identical registration is reusable; new registrations require a stopped runtime. Startup
-reads its configuration again under that same lock so it cannot start with a superseded snapshot.
-*Enforced:* `pkg/localsetup/register.go` and `pkg/localruntime/manager.go`.
+through the shared host guards. A running host serializes additive registrations, persists their
+declarations, and publishes an immutable database snapshot without replacing existing engine clients.
+Existing targets and server settings cannot be replaced through registration. New connection secrets
+remain in memory when declarations use secret references. Startup and stopped-host registration use
+the same lifetime lock; live updates require the signed control channel and an exact configuration
+revision. *Enforced:* `pkg/localsetup/register.go`, `pkg/localruntime/config.go`,
+`pkg/localruntime/host.go`, and `pkg/api/live_databases.go`.
 
 Local profile registration never replaces a different connection or changes the default profile.
 CLI configuration saves are atomic and reject a stale loaded revision, so a concurrent setup or
