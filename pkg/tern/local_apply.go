@@ -58,8 +58,12 @@ func (c *LocalClient) checkActiveTaskConflict(ctx context.Context, plan *storage
 			return blockingTask{}, released, nil
 		}
 
-		// Retry: 10 attempts with 100ms sleep gives 1 second total wait.
-		// Handles the race where storage is updated but Spirit hasn't fully finished.
+		// Retry a bounded number of times with a short sleep between
+		// attempts, to ride out the window where storage is updated but the
+		// engine has not fully finished. The sleep is the floor of each
+		// attempt, not its length: an attempt that probes a running apply
+		// waits on the engine's progress read, so the loop's worst case is
+		// the attempt count times that read's own bound.
 		if attempt < 9 {
 			c.logger.Debug("found potentially stale active task, retrying",
 				"task_id", blocking.taskIdentifier, "table", blocking.table, "shard", blocking.shard,
@@ -576,8 +580,8 @@ func (c *LocalClient) pendingDriverRequest(ctx context.Context, apply *storage.A
 // storage believes is in-flight, the task is updated in storage and no longer blocks.
 // Resting tasks (Stopped, FailedRetryable) are left untouched.
 //
-// The engine probe is in-memory and database-scoped: it reports this process's
-// last run on the database, not the task's actual cross-process state. The
+// The engine probe answers from this process's own memory of the work: it
+// reports what this process ran, not the task's actual cross-process state. The
 // task's parent apply lease decides whether that memory is authoritative — a
 // fresh lease means a live driver owns the work and the task keeps blocking,
 // and a terminal report is only trusted when the last lease belongs to this
@@ -597,12 +601,17 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 		return false
 	}
 
-	// The raw target credentials (no namespace mapping) are safe here only
-	// because Spirit's Progress is purely in-memory and never queries by
-	// request database or connection schema. An engine whose Progress inspects
-	// the database must resolve credentials per task (credentialsForTask)
-	// before this probe, or under schema overrides it would address the
-	// canonical name instead of the physical schema.
+	// The raw target credentials (no namespace mapping) are correct here
+	// because per-namespace resolution only exists for MySQL, whose engine
+	// never connects from a Progress request — Spirit's progress is purely
+	// in-memory. For every other database type credentialsForTask is the
+	// identity: the target-level credentials are the task's credentials, so
+	// an engine whose Progress does connect from them (PlanetScale builds an
+	// API client; PostgreSQL reads only through the session its own executor
+	// already holds) addresses exactly what the apply itself addressed. Were
+	// MySQL's engine ever to connect from these credentials, this probe would
+	// have to resolve them per task first, or under schema overrides it
+	// would address the canonical name instead of the physical schema.
 	//
 	// The task identifier rides along for engines that key progress by apply
 	// identity (postgres): a probe about work the engine is still running

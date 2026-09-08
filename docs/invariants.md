@@ -1127,7 +1127,8 @@ empty handling on recovery load paths (`pkg/api/operator.go`).
 
 Automatic cleanup acts only where the record provably carries no engine work, as with a `pending`
 task, which has no checkpoint by construction. Anything uncertain keeps blocking for an operator.
-*Enforced:* narrow eligibility conditions on every self-heal path (`pkg/api/reaper.go`).
+*Enforced:* narrow eligibility conditions on every self-heal path (`pkg/api/reaper.go`,
+`pkg/engine/postgres/apply.go`).
 
 ### RC-5: A terminal summary is never lost, and never silently duplicated
 

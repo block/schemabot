@@ -3,8 +3,10 @@
 # here loses its TOC markers, so a TOC can't be dropped silently: to
 # remove one on purpose, delete the marker block and run `make docs-toc`
 # so the removal shows up here as a reviewable change.
+docs/ai-agents.md
 docs/apply-lifecycle.md
 docs/architecture.md
+docs/auth.md
 docs/check-runs.md
 docs/configuration.md
 docs/direct-execution.md

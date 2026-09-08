@@ -17,6 +17,18 @@ import (
 // the storage claim/expiry paths.
 const MaxRecoveryAttempts = 10
 
+// ApplyTargetLockWait is how long a claim blocks waiting for another instance
+// to release an apply target's advisory lock. It is the longest a statement on
+// the storage pool legitimately blocks, which makes it the floor any
+// statement budget configured for that pool must stay above: the wait blocks
+// inside a lock acquisition, and statement_timeout bounds a blocked statement
+// as readily as a computing one. A budget below this wait cancels the
+// acquisition with SQLSTATE 57014 before the lock timeout can report the
+// ordinary 55P03 "someone else holds it", turning routine contention into a
+// failure that looks nothing like a lock conflict. Exported so config
+// validation can enforce that floor.
+const ApplyTargetLockWait = 10 * time.Second
+
 // MaxWebhookEventAttempts is the claim budget for webhook inbox rows: how many
 // times FindNext will hand out a given delivery (each claim increments
 // attempts) before the row stops being claimable. It bounds the blast radius
