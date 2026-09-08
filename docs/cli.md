@@ -552,7 +552,7 @@ Prefer structured output when another program consumes the result:
 
 | Commands | JSON option |
 |---|---|
-| `databases`, `status`, `list-plans`, `logs`, `locks`, `plan` | `--json` |
+| `databases`, `status`, `list-plans`, `logs`, `plan` | `--json` |
 | `pull` | `-o json` |
 
 For example:
