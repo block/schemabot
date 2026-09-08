@@ -1334,11 +1334,12 @@ login cannot silently erase a newer registration. *Enforced:* `pkg/cmd/client/lo
 and `pkg/cmd/client/config.go`.
 
 Initialization verifies a baseline using staged schema files before publishing them. It never
-applies to the target, replaces an existing schema directory, or treats a different existing
+applies to the target, replaces a non-empty schema directory, or treats a different existing
 profile as consent to reroute it. Identical imported files may be reused for a retry. Failed setup
 retains the runtime and its state so a retry does not invent a second execution authority.
 *Enforced:* `pkg/cmd/commands/init.go` `pkg/cmd/commands/init_publish_darwin.go`, and
-`pkg/cmd/commands/init_publish_linux.go`.
+`pkg/cmd/commands/init_publish_linux.go`, `pkg/cmd/commands/init_empty_dir_unix.go`, and
+`pkg/cmd/commands/init_publish_other.go`.
 
 ## Structural enforcement
 

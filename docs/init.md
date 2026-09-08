@@ -34,7 +34,8 @@ Before setting up a runtime, SchemaBot reads the target catalog to discover name
 result is selected automatically; multiple results appear in a searchable list. Use Space to
 select namespaces and Enter to continue. MySQL stays within the database named in the DSN;
 PostgreSQL lists accessible application schemas. No results or a failed connection stops here
-with a chance to retry or edit the connection. Discovery uses only the application connection. State metadata is initialized only after the final review.
+with a chance to retry, edit the connection, or press `m` to enter namespaces manually.
+Explicit `--namespace` flags also bypass discovery. Discovery uses only the application connection. State metadata is initialized only after the final review.
 
 Use Shift+Tab from the review to edit any decision, or Escape to cancel. Explicit
 `--namespace` flags keep their supplied scope and bypass discovery.

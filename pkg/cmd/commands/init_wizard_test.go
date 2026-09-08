@@ -60,6 +60,7 @@ func TestInitWizardReviewExistingFilesAndCancel(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte("existing"), 0600))
 	m := newInitWizard(&InitCmd{SchemaDir: root}, "default", io.Discard)
 	m.step = len(m.fields)
+	m.loadField()
 	require.Contains(t, strings.Join(strings.Fields(m.View()), " "), "verify them and keep your edits")
 	wizardKey(m, tea.KeyEsc)
 	require.False(t, m.confirmed)
@@ -241,6 +242,10 @@ func TestInitConnectionSummaryRedactsCredentials(t *testing.T) {
 			require.NotContains(t, got, "secret")
 			require.NotContains(t, got, "demo")
 			require.NotContains(t, got, "sslmode")
+			if !strings.Contains(tt.dsn, "%invalid") {
+				require.Contains(t, got, "localhost")
+				require.Contains(t, got, `Database: "shop"`)
+			}
 		})
 	}
 	t.Setenv("WIZARD_TEST_DSN", "postgres://user:secret@localhost/shop%1B%5B2J?sslmode=disable")
@@ -314,4 +319,81 @@ func TestInitWizardRejectsTrailingNamespaceBeforeReview(t *testing.T) {
 	require.Equal(t, 5, m.step)
 	require.NotEmpty(t, m.err)
 	require.False(t, m.confirmed)
+}
+
+func TestInitExplicitNamespacesRoundTrip(t *testing.T) {
+	for _, names := range [][]string{{"sales", "west"}, {"sales,west"}} {
+		m := newInitWizard(&InitCmd{Namespaces: names}, "default", io.Discard)
+		m.step = 5
+		m.loadField()
+		require.Empty(t, m.validate())
+		require.Equal(t, names, m.namespaceChoices(names))
+	}
+}
+
+func TestInitCatalogNamesCannotControlTerminal(t *testing.T) {
+	name := "a\x1b[2Jb"
+	m := newInitWizard(&InitCmd{}, "default", io.Discard)
+	m.step = 5
+	m.loadField()
+	m.generation = 1
+	m.Update(initNamespacesMsg{generation: 1, names: []string{name, "public"}})
+	require.NotContains(t, m.namespaceView(), name)
+	require.Contains(t, m.namespaceView(), `\x1b`)
+	m.Update(initNamespacesMsg{generation: 1, names: []string{name}})
+	require.NotContains(t, m.notice, name)
+	require.NotContains(t, m.View(), name)
+}
+
+func TestInitManualNamespaceFallback(t *testing.T) {
+	m := newInitWizard(&InitCmd{}, "default", io.Discard)
+	m.step = 5
+	m.err = "discovery failed"
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("m")})
+	require.True(t, m.explicitNamespaces)
+	m.input.SetValue("sales, west")
+	require.Empty(t, m.validate())
+	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, []string{"sales", "west"}, m.namespaceChoices(nil))
+}
+
+func TestInitCopyBackPreservesConnectionsAndDoesNotInitialize(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"), []byte("database: shop\ntype: postgres\n"), 0600))
+	original := InitCmd{Namespaces: []string{"sales", "west"}}
+	m := newInitWizard(&original, "default", io.Discard)
+	values := []string{"postgres", "shop", "development", "env:APP", "env:STATE", "sales, west", root, "chosen"}
+	for i, v := range values {
+		m.fields[i].value = v
+	}
+	g := Globals{}
+	require.ErrorIs(t, m.copyToCommand(&original, &g), ErrSilent)
+	require.Empty(t, original.DSN)
+	m.confirmed = true
+	require.NoError(t, m.copyToCommand(&original, &g))
+	require.Equal(t, "postgres", original.Type)
+	require.Equal(t, "shop", original.Database)
+	require.Equal(t, "development", original.Environment)
+	require.Equal(t, "env:APP", original.DSN)
+	require.Equal(t, "env:STATE", original.StorageDSN)
+	require.Equal(t, []string{"sales", "west"}, original.Namespaces)
+	require.Equal(t, root, original.SchemaDir)
+	require.Equal(t, "chosen", g.Profile)
+	require.True(t, original.ReuseSchema)
+	require.NoDirExists(t, filepath.Join(home, ".schemabot"))
+}
+
+func TestInitRejectsUnrelatedFilesBeforeReview(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, "README.md"), []byte("keep"), 0600))
+	m := newInitWizard(&InitCmd{SchemaDir: root}, "default", io.Discard)
+	m.step = len(m.fields)
+	wizardKey(m, tea.KeyEnter)
+	require.False(t, m.confirmed)
+	require.Equal(t, 6, m.step)
+	require.Contains(t, m.err, "schemabot.yaml")
+	require.Contains(t, m.err, root)
+	require.NotContains(t, m.err, ".schemabot-init-")
 }

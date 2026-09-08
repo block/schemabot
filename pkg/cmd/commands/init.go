@@ -91,6 +91,9 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if existing, ok := cfg.Profiles[profile]; ok && !reflect.DeepEqual(existing, client.Profile{LocalRuntime: cmd.Runtime}) {
 		return nil, fmt.Errorf("profile %q already has a different connection; choose another --profile", profile)
 	}
+	if _, err := initSchemaReuse(cmd.SchemaDir); err != nil {
+		return nil, err
+	}
 	root, err := filepath.Abs(cmd.SchemaDir)
 	if err != nil {
 		return nil, err
@@ -143,7 +146,7 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 	}
 	client.SetLocalAuth(connection.Token, connection.Endpoint)
 	cmd.reportProgress("Reading your live schema...")
-	pulled, err := client.CallPullSchemaAPI(connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, namespaces...)
+	pulled, err := client.CallPullSchemaAPIWithContext(ctx, connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, client.PullSchemaOptions{Namespaces: namespaces})
 	if err != nil {
 		return nil, fmt.Errorf("import live schema: %w", err)
 	}
@@ -163,7 +166,7 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 		}
 	}
 	cmd.reportProgress("Checking that your schema files match...")
-	baseline, _, err := client.CallPlanAPI(connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, stage, "", 0, ignored, false)
+	baseline, _, err := client.CallPlanAPIWithContext(ctx, connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, stage, "", 0, ignored, false)
 	if err != nil {
 		return nil, fmt.Errorf("verify baseline: %w", err)
 	}
