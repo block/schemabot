@@ -37,9 +37,13 @@ Open a PR with your schema changes, and SchemaBot plans, applies, and verifies t
 
 [Walk through each step](./docs/pre-merge-workflow.md#the-pr-workflow-step-by-step) at your own pace
 
-**The interactive CLI.** The same power from your terminal: plan, apply, and watch schema changes live:
+**From your terminal.** Review the SQL, apply the change, and follow it to completion.
 
-![SchemaBot CLI Demo](./assets/cli-demo.gif)
+![CLI plan and apply workflow, rendered with real CLI templates](./assets/cli-plan-apply.gif)
+
+*Illustrated with fictional data and the CLI's production templates; timing is compressed.*
+
+[Get started with the CLI](./docs/cli.md) · [Explore your database fleet](./docs/schema-intelligence.md)
 
 ## Why SchemaBot
 
@@ -67,31 +71,7 @@ CREATE TABLE users (
 
 **2. Open a PR.** SchemaBot diffs your files against the live database and comments the exact DDL it will run. Review it like any code.
 
-**3. Apply.** Comment `schemabot apply -e staging`, then `-e production`, or run the same from the CLI. Changes run online, with live progress:
-
-```
-$ schemabot plan -s ./schema -e staging
-
-╭─────────────────────────────────────────────╮
-│  MySQL Schema Change Plan                   │
-│                                             │
-│  Database: testapp                          │
-│  Environment: staging                       │
-│  Schema name: testapp                       │
-╰─────────────────────────────────────────────╯
-
-     ~ users
-       ALTER TABLE `users` ADD COLUMN `email` varchar(255) NOT NULL;
-
-📋 Plan: 1 table to alter
-
-$ schemabot apply -s ./schema -e staging -y
-
-  users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜ 65% (1,742,301/2,680,463 rows) ETA 2m 10s
-         ALTER TABLE `users` ADD COLUMN `email` varchar(255) NOT NULL
-
-  users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-```
+**3. Apply.** Comment `schemabot apply -e staging`, then `-e production`, or follow the [CLI walkthrough](./docs/cli.md#plan-and-apply-a-change). Review the plan, confirm the change, and watch its progress.
 
 **4. Merge when green.** The required check passes only when the live schema matches your files. Applied, verified, merged, in that order.
 
