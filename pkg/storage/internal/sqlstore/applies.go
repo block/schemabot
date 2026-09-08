@@ -2314,16 +2314,68 @@ func (s *applyStore) CheckLease(ctx context.Context, lease storage.ApplyLease) e
 	return ensureApplyLeaseStillOwned(ctx, s.db, lease)
 }
 
-// ExpireRetryable transitions failed_retryable applies that exhausted their
-// retry budget or recovery freshness window to permanent failed. Returns the
-// applies updated.
-func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.RetryableApplyExpiration, error) {
+// retryableExpiryLockName is the advisory lock that elects one instance to
+// expire retryable applies per pass. Instance-wide for the same reason as the
+// reaper's other sweeps: the pass scans every target's applies, so there is
+// nothing to scope it to. It is a separate lock so the sweeps never serialize on
+// each other.
+const retryableExpiryLockName = "schemabot_retryable_expiry"
+
+// retryableExpirySweep identifies the retryable-apply expiry sweep to the shared
+// election wrapper.
+var retryableExpirySweep = strandedSweep{
+	lockName: retryableExpiryLockName,
+	busy:     storage.ErrRetryableExpiryBusy,
+	subject:  "expired retryable applies",
+}
+
+// ExpireRetryable elects one instance per pass and expires under the lock. See
+// storage.ApplyStore for the contract.
+func (s *applyStore) ExpireRetryable(ctx context.Context, limit int) ([]*storage.RetryableApplyExpiration, error) {
+	return reapUnderElection(ctx, s.db, s.locker, retryableExpirySweep,
+		func(ctx context.Context) ([]*storage.RetryableApplyExpiration, error) {
+			return s.expireRetryable(ctx, limit)
+		})
+}
+
+// expireRetryable transitions failed_retryable applies that exhausted their
+// retry budget or recovery freshness window to permanent failed, without
+// electing an instance. ExpireRetryable is the entry point that holds the lock;
+// this is separate so the expiry itself can be exercised on its own.
+func (s *applyStore) expireRetryable(ctx context.Context, limit int) ([]*storage.RetryableApplyExpiration, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("expire retryable applies: limit must be positive, got %d", limit)
+	}
+
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, fmt.Errorf("begin expire retryable applies transaction: %w", err)
 	}
 	defer rollbackTx(ctx, tx, "expire retryable applies")
 
+	// An apply is taken whole or not at all, and only when no driver holds an
+	// operation under it. The FOR UPDATE below takes the parent row, which
+	// serializes this against an apply-level claim but says nothing about an
+	// operation-level one: a driver holding only an operation lease never bumps
+	// the parent, so under fan-out the parent sits failed_retryable on one
+	// deployment's spent retry budget while a sibling deployment drives
+	// underneath it, and both selection arms reach it there — the budget arm as
+	// soon as the last redispatch consumes it, the freshness arm whenever that
+	// sibling's copy outlives the window, which is likeliest on exactly the
+	// tables that take longest.
+	//
+	// Writing that sibling's rows would be unrecoverable rather than merely
+	// wrong. A terminal stored task is the durable final answer the drive
+	// reconciles forward from (ST-4), so the live drive never moves it back: the
+	// healthy deployment settles failed on a verdict no driver wrote.
+	//
+	// Passing over the apply costs nothing but a pass. This runs as a sweep, so
+	// an apply it declines is offered again on the next one, once that drive has
+	// ended or its lease has gone stale.
+	undrivenApply, undrivenApplyArgs := undrivenApplyGate(s.dialect)
+
+	// Oldest first, so a backlog drains in the order it accumulated rather than
+	// leaving the same tail unexpired every pass.
 	rows, err := tx.QueryContext(ctx, `
 		SELECT `+applyColumns+`
 		FROM applies
@@ -2331,8 +2383,12 @@ func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.RetryableA
 			attempt >= ?
 			OR updated_at < `+s.dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime, ParameterIntervalAmount(), IntervalDay)+`
 		)
+			AND `+undrivenApply+`
+		ORDER BY updated_at
+		LIMIT ?
 		FOR UPDATE
-	`, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays)
+	`, append([]any{state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays},
+		append(undrivenApplyArgs, limit)...)...)
 	if err != nil {
 		return nil, fmt.Errorf("query expired retryable applies: %w", err)
 	}
@@ -2358,38 +2414,10 @@ func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.RetryableA
 		})
 	}
 
-	// Both task writes below take only rows whose operation no driver is part-way
-	// through driving. The FOR UPDATE above locks the parent applies row, which
-	// serializes this against an apply-level claim but says nothing about an
-	// operation-level one: a driver holding only an operation lease never bumps
-	// the parent, so under fan-out the parent sits failed_retryable on one
-	// deployment's spent retry budget while a sibling deployment drives
-	// underneath it, and both selection arms reach it there — the budget arm as
-	// soon as the last redispatch consumes it, the freshness arm whenever that
-	// sibling's copy outlives the window, which is likeliest on exactly the
-	// tables that take longest.
-	//
-	// Writing that sibling's rows would be unrecoverable rather than merely
-	// wrong. A terminal stored task is the durable final answer the drive
-	// reconciles forward from (ST-4), so the live drive never moves it back: the
-	// healthy deployment settles failed on a verdict no driver wrote.
-	//
-	// This is expiry's only pass at the apply — the write below takes it out of
-	// failed_retryable and its own selection never matches it again — so the gate
-	// is undrivenOperationGate rather than the reaper's unleasedOperationGate.
-	// The reaper's reading of the lease would shield an ordinary single-deployment
-	// apply for a staleness window after its last drive settled, and here that is
-	// not a deferral but the write not happening at all, leaving the apply's own
-	// tables reporting a retry that has already been given up on.
-	//
-	// A live sibling's rows are still the sibling's to finish, and if that drive
-	// dies the two task sweeps close them out against the verdict written below,
-	// which is a settled state and so their precondition (RC-1, RC-2). The sweeps
-	// mirror the parent's verdict rather than drawing the cancel/fail distinction
-	// below, so a pending row held by a live sibling settles failed rather than
-	// cancelled — coarser attribution, on a table queued under a deployment that
-	// was genuinely running.
-	undrivenOperation, undrivenOperationArgs := undrivenOperationGate(s.dialect)
+	// The writes below carry no gate of their own. The selection above admitted
+	// only applies with no operation a driver is part-way through driving, and
+	// the FOR UPDATE it took holds that parent for the rest of this transaction,
+	// so every row reached from here belongs to an apply the pass took whole.
 
 	// A pending task never started: it was blocked behind the failure that made
 	// the apply retryable, so expiring the apply cancels it — mirroring how a
@@ -2398,13 +2426,11 @@ func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.RetryableA
 	// work.
 	cancelArgs := []any{state.Task.Cancelled, state.Task.Pending}
 	cancelArgs = append(cancelArgs, applyIDs...)
-	cancelArgs = append(cancelArgs, undrivenOperationArgs...)
 	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE tasks
 		SET state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
 		WHERE state = ? AND apply_id IN (%s)
-			AND %s
-	`, placeholders(len(applyIDs)), undrivenOperation), cancelArgs...)
+	`, placeholders(len(applyIDs))), cancelArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("cancel pending tasks for expired retryable applies: %w", err)
 	}
@@ -2412,13 +2438,11 @@ func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.RetryableA
 	taskArgs := []any{state.Task.Failed}
 	taskArgs = append(taskArgs, stringArgs(state.TerminalTaskStates)...)
 	taskArgs = append(taskArgs, applyIDs...)
-	taskArgs = append(taskArgs, undrivenOperationArgs...)
 	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE tasks
 		SET state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
 		WHERE state NOT IN (%s) AND apply_id IN (%s)
-			AND %s
-	`, placeholders(len(state.TerminalTaskStates)), placeholders(len(applyIDs)), undrivenOperation), taskArgs...)
+	`, placeholders(len(state.TerminalTaskStates)), placeholders(len(applyIDs))), taskArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("expire retryable tasks: %w", err)
 	}
@@ -2433,15 +2457,6 @@ func (s *applyStore) ExpireRetryable(ctx context.Context) ([]*storage.RetryableA
 	// rollout has already failed. Only failed_retryable rows are flipped — a
 	// successor parked at waiting_for_cutover is a healthy deployment that must
 	// still be allowed to cut over, so it is left untouched.
-	//
-	// This one carries no lease gate, unlike the task writes above, and the
-	// asymmetry is deliberate. A skipped failed_retryable operation would have no
-	// second writer: the operation reaper sweeps only pending rows, and this pass
-	// never revisits the apply because the write below takes it out of
-	// failed_retryable. It would sit there permanently, holding the very
-	// deployment-order gate this write exists to release. Task rows have the two
-	// task sweeps behind them, so skipping one defers the write rather than
-	// dropping it.
 	opArgs := append([]any{state.ApplyOperation.Failed, state.ApplyOperation.FailedRetryable}, applyIDs...)
 	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE apply_operations

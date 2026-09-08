@@ -158,6 +158,7 @@ type Service struct {
 	recoveryWg           sync.WaitGroup
 	operatorPollInterval time.Duration
 	strandedReaperEvery  time.Duration
+	retryableExpiryEvery time.Duration
 	// driversBusy counts this process's operator drivers that currently hold
 	// claimed work; it backs the drivers-busy gauge.
 	driversBusy atomic.Int64
@@ -300,6 +301,7 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 		clock:                clock.Real{},
 		operatorPollInterval: OperatorPollInterval,
 		strandedReaperEvery:  StrandedReaperInterval,
+		retryableExpiryEvery: RetryableExpiryInterval,
 		remoteHealthInterval: RemoteDeploymentHealthCheckInterval,
 		webhookInboxInterval: WebhookInboxMetricsInterval,
 		pendingObservers:     make(map[pendingObserverKey]tern.ProgressObserver),

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"os"
 	"sync"
@@ -230,106 +229,6 @@ func TestResumeClaimedApply_DriveLogsCarryApplyIdentity(t *testing.T) {
 	assert.Equal(t, state.Apply.Pending, resumedLine["previous_state"])
 	assert.NotContains(t, resumedLine, "state",
 		"mutable state must not be frozen into the bound drive logger")
-}
-
-// expiringApplyStore serves the expiry maintenance pass a fixed outcome — a set
-// of retryable-apply expirations, or a storage failure — so the pass can be
-// exercised without a database. It counts its calls so a test can tell whether
-// the claim ladder reached its first rung at all.
-type expiringApplyStore struct {
-	storage.ApplyStore
-	expirations []*storage.RetryableApplyExpiration
-	expireErr   error
-	calls       int
-}
-
-func (s *expiringApplyStore) ExpireRetryable(ctx context.Context) ([]*storage.RetryableApplyExpiration, error) {
-	s.calls++
-	if s.expireErr != nil {
-		return nil, s.expireErr
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	return s.expirations, nil
-}
-
-// Expiry is what makes a retryable failure permanent, so it belongs in the
-// apply's own log stream: that stream is what the CLI and the PR summary
-// render, and an apply whose last entry is a paused attempt reads as one that
-// went terminal for no stated reason.
-func TestExpireRetryableApplies_RecordsWhyRecoveryStoppedInTheApplyLog(t *testing.T) {
-	apply := &storage.Apply{
-		ID:              42,
-		ApplyIdentifier: "apply-42",
-		Database:        "appdb",
-		Environment:     "staging",
-		State:           state.Apply.Failed,
-		Attempt:         storage.MaxRecoveryAttempts,
-	}
-	applyLogs := &capturingApplyLogStore{}
-	svc := New(&mockStorageWithApplyStores{
-		applies: &expiringApplyStore{expirations: []*storage.RetryableApplyExpiration{
-			{Apply: apply, Reason: storage.RetryableExpirationAttemptBudget},
-		}},
-		applyLogs: applyLogs,
-	}, testServerConfig(), nil, slog.Default())
-
-	svc.expireRetryableApplies(t.Context(), 1)
-
-	require.Len(t, applyLogs.logs, 1)
-	entry := applyLogs.logs[0]
-	assert.Equal(t, storage.LogLevelError, entry.Level)
-	assert.Equal(t, int64(42), entry.ApplyID)
-	assert.Contains(t, entry.Message,
-		fmt.Sprintf("%d of %d attempts", storage.MaxRecoveryAttempts, storage.MaxRecoveryAttempts))
-	assert.Contains(t, entry.Message, string(storage.RetryableExpirationAttemptBudget))
-	assert.Equal(t, state.Apply.FailedRetryable, entry.OldState)
-	assert.Equal(t, state.Apply.Failed, entry.NewState)
-}
-
-// A retryable-apply expiry is a control-plane lifecycle transition an operator
-// triages from logs alone, so the expiry line must carry the apply's full
-// triage attributes — including external_id, the join key to the data plane's
-// logs — plus the expiry-specific attempt and reason.
-func TestExpireRetryableApplies_LogsCarryFullApplyAttrs(t *testing.T) {
-	var logBuf bytes.Buffer
-	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	apply := &storage.Apply{
-		ID:              42,
-		ApplyIdentifier: "apply-42",
-		Database:        "appdb",
-		DatabaseType:    "mysql",
-		Deployment:      "east",
-		Environment:     "staging",
-		Repository:      "org/repo",
-		PullRequest:     123,
-		State:           state.Apply.Failed,
-		Attempt:         3,
-		ExternalID:      "remote-apply-7",
-	}
-	svc := New(&mockStorageWithApplyStores{
-		applies: &expiringApplyStore{expirations: []*storage.RetryableApplyExpiration{
-			{Apply: apply, Reason: storage.RetryableExpirationAttemptBudget},
-		}},
-	}, testServerConfig(), nil, logger)
-
-	svc.expireRetryableApplies(t.Context(), 1)
-
-	lines := decodeLogLines(t, logBuf.Bytes())
-	line := requireLogLine(t, lines, "operator: retryable apply expired")
-	assert.Equal(t, "apply-42", line["apply_id"])
-	assert.Equal(t, "appdb", line["database"])
-	assert.Equal(t, "mysql", line["database_type"])
-	assert.Equal(t, "staging", line["environment"])
-	assert.Equal(t, "org/repo", line["repo"])
-	assert.Equal(t, float64(123), line["pr"])
-	assert.Equal(t, "east", line["deployment"])
-	assert.Equal(t, state.Apply.Failed, line["state"])
-	assert.Equal(t, "remote-apply-7", line["external_id"])
-	assert.Equal(t, float64(3), line["attempt"])
-	assert.Equal(t, string(storage.RetryableExpirationAttemptBudget), line["reason"])
-	assert.Equal(t, float64(1), line["driver"])
 }
 
 // decodeLogLines parses newline-delimited slog JSON output into one map per line.
@@ -2010,11 +1909,14 @@ func TestReconcileUnclaimableParent_RetainsLeaseWhenParentUnknown(t *testing.T) 
 
 // claimLadderOperationStore drives the operation-level claim ladder over a
 // single operation row: the cutover probe finds nothing, and the operation
-// claim leases the row while it is claimable — or panics when configured, to
-// model a fault in the claim machinery itself.
+// claim leases the row while it is claimable — or fails, when a configured
+// storage error or the caller's own cancelled context says so, or panics, to
+// model a fault in the claim machinery itself. It counts its calls so a test
+// can tell whether a tick reached the ladder at all.
 type claimLadderOperationStore struct {
 	*recoverOperationStore
 	claims     int
+	claimErr   error
 	claimPanic string
 }
 
@@ -2022,10 +1924,16 @@ func (s *claimLadderOperationStore) FindNextApplyOperationCutover(context.Contex
 	return nil, nil
 }
 
-func (s *claimLadderOperationStore) FindNextApplyOperation(_ context.Context, owner string) (*storage.ApplyOperation, error) {
+func (s *claimLadderOperationStore) FindNextApplyOperation(ctx context.Context, owner string) (*storage.ApplyOperation, error) {
 	s.claims++
 	if s.claimPanic != "" {
 		panic(s.claimPanic)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if s.claimErr != nil {
+		return nil, s.claimErr
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2039,21 +1947,15 @@ func (s *claimLadderOperationStore) FindNextApplyOperation(_ context.Context, ow
 }
 
 // operationClaimApplyStore serves the apply-side calls the operation-level
-// claim ladder makes around an operation claim: the retryable-expiry pass, the
-// stop-reconciliation probe, the parent claim, and the post-drive
-// reload/derivation.
+// claim ladder makes around an operation claim: the stop-reconciliation probe,
+// the parent claim, and the post-drive reload/derivation.
 type operationClaimApplyStore struct {
 	storage.ApplyStore
 	mu             sync.Mutex
 	apply          *storage.Apply
-	expireErr      error
 	stopProbePanic string
 	stopProbes     int
 	updateCalled   bool
-}
-
-func (s *operationClaimApplyStore) ExpireRetryable(context.Context) ([]*storage.RetryableApplyExpiration, error) {
-	return nil, s.expireErr
 }
 
 func (s *operationClaimApplyStore) FindNextApplyForStopReconciliation(context.Context, string) (*storage.Apply, error) {
@@ -2108,21 +2010,6 @@ func (s *operationClaimApplyStore) UpdateDerivedState(_ context.Context, _ int64
 	s.apply.State = newState
 	s.apply.ErrorMessage = errorMessage
 	return true, nil
-}
-
-// Retryable-apply expiry is best-effort maintenance: a storage failure there
-// must not stop a driver from claiming operation work in the same tick, or a
-// transient expiry error would starve every queued apply behind it.
-func TestRecoverApplies_ExpiryErrorDoesNotBlockOperationClaim(t *testing.T) {
-	applies := &operationClaimApplyStore{expireErr: errors.New("storage unavailable")}
-	ops := &claimLadderOperationStore{recoverOperationStore: &recoverOperationStore{}}
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	svc := New(&mockStorageWithApplyStores{applies: applies, operations: ops}, testServerConfig(), nil, logger)
-
-	svc.recoverApplies(t.Context(), 1)
-
-	assert.Equal(t, 1, ops.claims,
-		"FindNextApplyOperation must run even when ExpireRetryable fails")
 }
 
 // A panic in the operation claim machinery itself (outside the engine drive)
