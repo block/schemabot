@@ -1,0 +1,146 @@
+[
+  {
+    "name": "cli-plan-apply",
+    "title": "Review the plan. Follow the change.",
+    "frames": [
+      {
+        "seconds": 4,
+        "command": "schemabot plan -s ./schema -e staging",
+        "caption": "See the DDL before running it",
+        "output": "╭─────────────────────────────────────────────╮\n│  MySQL Schema Change Plan                   │\n│                                             │\n│  Database: shop                             │\n│  Schema name: schema                        │\n╰─────────────────────────────────────────────╯\n\n\u001b[1mStaging\u001b[0m\n     ~ orders\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n📋 Plan: 1 table to alter\n\n"
+      },
+      {
+        "seconds": 2,
+        "command": "schemabot apply -s ./schema -e staging",
+        "caption": "After you confirm, follow the apply",
+        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 10.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 1,000,000 / 10,000,000 · ETA: 18m 0s\n\n"
+      },
+      {
+        "seconds": 1,
+        "command": "",
+        "caption": "",
+        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 3,500,000 / 10,000,000 · ETA: 13m 0s\n\n"
+      },
+      {
+        "seconds": 1,
+        "command": "",
+        "caption": "",
+        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜ 65.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 6,500,000 / 10,000,000 · ETA: 7m 0s\n\n"
+      },
+      {
+        "seconds": 1,
+        "command": "",
+        "caption": "",
+        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜ 90.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 9,000,000 / 10,000,000 · ETA: 2m 0s\n\n"
+      },
+      {
+        "seconds": 4,
+        "command": "",
+        "caption": "The change is complete",
+        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[32mCompleted       \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n"
+      }
+    ]
+  },
+  {
+    "name": "cli-fleet",
+    "title": "From the fleet to one change.",
+    "frames": [
+      {
+        "seconds": 5,
+        "command": "schemabot status -e staging",
+        "caption": "See changes across databases",
+        "output": "\u001b[1m1 active schema change\u001b[0m\n\u001b[2m4 total: 2 Completed · 1 Failed · 1 Running\u001b[0m\n\n  \u001b[2mAPPLY ID          DATABASE  ENV      STATE      STARTED         SOURCE\u001b[0m\n  apply-example-73  shop      staging  \u001b[36mRunning  \u001b[0m  10 minutes ago  https://github.com/acme/store/pull/42\n  apply-example-72  billing   staging  \u001b[32mCompleted\u001b[0m  1 hour ago      https://github.com/acme/billing/pull/18\n  apply-example-71  catalog   staging  \u001b[31mFailed   \u001b[0m  2 hours ago     https://github.com/acme/store/pull/40\n  apply-example-70  accounts  staging  \u001b[32mCompleted\u001b[0m  3 hours ago     https://github.com/acme/accounts/pull/12\n\n\u001b[2mUse 'schemabot status \u003capply_id\u003e' to view details\u001b[0m\n"
+      },
+      {
+        "seconds": 4,
+        "command": "schemabot status apply-example-73",
+        "caption": "Inspect one running change",
+        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 6,000,000 / 10,000,000 · ETA: 8m 0s\n\n"
+      },
+      {
+        "seconds": 5,
+        "command": "schemabot list-plans -e staging",
+        "caption": "Find the plans behind the work",
+        "output": "\u001b[1mRecent plans\u001b[0m\n\n  \u001b[2mPLAN ID          DATABASE  ENV      CHANGES   CREATED         SOURCE\u001b[0m\n  plan-example-42  shop      staging  1 alter   10 minutes ago  acme/store#42\n  plan-example-41  billing   staging  1 create  1 hour ago      acme/billing#18\n  plan-example-40  catalog   staging  1 alter   2 hours ago     acme/store#40\n"
+      }
+    ]
+  },
+  {
+    "name": "cli-cutover",
+    "title": "Know when to wait. Choose when to swap.",
+    "frames": [
+      {
+        "seconds": 3,
+        "command": "schemabot progress apply-example-73",
+        "caption": "Follow an apply started with --defer-cutover",
+        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 20.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 2,000,000 / 10,000,000 · ETA: 16m 0s\n\n"
+      },
+      {
+        "seconds": 0.7,
+        "command": "",
+        "caption": "",
+        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 3,500,000 / 10,000,000 · ETA: 13m 0s\n\n"
+      },
+      {
+        "seconds": 0.7,
+        "command": "",
+        "caption": "",
+        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 50.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 5,000,000 / 10,000,000 · ETA: 10m 0s\n\n"
+      },
+      {
+        "seconds": 0.7,
+        "command": "",
+        "caption": "",
+        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 6,000,000 / 10,000,000 · ETA: 8m 0s\n\n"
+      },
+      {
+        "seconds": 3,
+        "command": "",
+        "caption": "See why copying has slowed",
+        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 6,000,000 / 10,000,000 · ETA: 8m 0s\n       • \u001b[2mℹ️ Throttled: Replication lag exceeds the configured limit\u001b[0m\n\n"
+      },
+      {
+        "seconds": 0.7,
+        "command": "",
+        "caption": "Copying resumes as conditions improve",
+        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 70.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 7,000,000 / 10,000,000 · ETA: 6m 0s\n\n"
+      },
+      {
+        "seconds": 0.7,
+        "command": "",
+        "caption": "Copying resumes as conditions improve",
+        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 80.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 8,000,000 / 10,000,000 · ETA: 4m 0s\n\n"
+      },
+      {
+        "seconds": 0.7,
+        "command": "",
+        "caption": "Copying resumes as conditions improve",
+        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜ 90.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 9,000,000 / 10,000,000 · ETA: 2m 0s\n\n"
+      },
+      {
+        "seconds": 0.7,
+        "command": "",
+        "caption": "Copying resumes as conditions improve",
+        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 100.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 10,000,000 / 10,000,000\n\n"
+      },
+      {
+        "seconds": 3,
+        "command": "",
+        "caption": "Copy complete; wait for the final swap",
+        "output": "┌─────────────────────────────────────┐\n│  Apply ID:     apply-example-73     │\n│  Database:     shop                 │\n│  Environment:  staging              │\n│  State:        \u001b[33mWaiting for cutover\u001b[0m  │\n└─────────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n"
+      },
+      {
+        "seconds": 2,
+        "command": "schemabot cutover -e staging apply-example-73",
+        "caption": "Request the final swap when ready",
+        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mCutting over    \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Cutting over...\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n"
+      },
+      {
+        "seconds": 4,
+        "command": "schemabot status apply-example-73",
+        "caption": "Verify that the apply completed",
+        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[32mCompleted       \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n"
+      }
+    ]
+  }
+]
