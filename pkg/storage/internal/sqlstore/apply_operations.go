@@ -1936,46 +1936,22 @@ func unleasedOperationGate(d Dialect) string {
 		)`, freshLeaseAfter)
 }
 
-// undrivenApplyGate renders the NOT EXISTS admitting only applies with no
-// operation a driver is part-way through driving, and returns its positional
-// arguments alongside the clause. It is the apply-granular counterpart of
-// unleasedOperationGate: that gate excludes one task row by its own operation's
-// lease, this one excludes a whole apply by any operation under it.
-//
-// Whole-apply is the granularity a writer needs when it settles an apply and its
-// rows together. Skipping the rows a live drive holds while writing the apply's
-// own verdict would settle the parent over children the writer just declined to
-// touch, so the two have to be decided as one, and the decision has to be made
-// where the parent is selected.
-//
-// The lease terms are unleasedOperationGate's, read the same way, plus the
-// occupying-state filter that gate deliberately omits — which here is the same
-// filter the claim path itself applies (freshLeaseCountSQL), so this admits an
-// apply exactly where a driver would be allowed to take its operations.
-//
-// The filter is load-bearing rather than a relaxation. A drive that settles its
-// operation into a resumable state writes that state under its lease and leaves
-// the lease in place, so for a full staleness window afterwards the row reads
-// exactly like a live drive's, and a single-deployment apply that has just used
-// its last attempt is in that window every time. Reading the lease alone would
-// hold every such apply — the ordinary shape of the work this exists to
-// terminalize — for a staleness window before its verdict could land.
-//
-// An apply with no operations is admitted. Nothing holds a lease over it, so
-// there is nothing here to exclude it by.
-func undrivenApplyGate(d Dialect) (string, []any) {
+// undrivenApplyGate admits only applies without any fresh operation lease.
+// State does not prove a lease is idle: a newly claimed retry keeps its
+// failed_retryable state while the operation-only driver starts. A finished
+// drive's leftover lease must be released or go stale before expiry too.
+// The candidate scan uses this gate for efficiency; lockUndrivenApply repeats
+// it while holding every operation row to exclude claims and heartbeats.
+func undrivenApplyGate(d Dialect) string {
 	freshLeaseAfter := d.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
 		LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
-	drivingStates := claimableApplyStates()
-
 	return fmt.Sprintf(`NOT EXISTS (
 			SELECT 1
 			FROM apply_operations lease_holder
 			WHERE lease_holder.apply_id = applies.id
 				AND lease_holder.lease_owner <> ''
-				AND lease_holder.state IN (%s)
 				AND lease_holder.updated_at >= %s
-		)`, placeholders(len(drivingStates)), freshLeaseAfter), stringArgs(drivingStates)
+		)`, freshLeaseAfter)
 }
 
 // ReapStranded elects one reaper per pass and reaps under the lock. See

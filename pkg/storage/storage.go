@@ -807,7 +807,10 @@ type ApplyStore interface {
 	// An apply is taken whole or not at all, and only when no driver is part-way
 	// through driving an operation under it. An apply it passes over is offered
 	// again on the next pass, so a live drive keeps its own rows and loses
-	// nothing but the interval.
+	// nothing but the interval. The pass locks the parent and every operation,
+	// then rechecks leases before writing. A fresh lease excludes expiry even
+	// in failed_retryable: a new retry still carries that state. Leases left
+	// behind by finished drives must be released or go stale first.
 	//
 	// One instance expires per pass, guarded by an advisory lock;
 	// ErrRetryableExpiryBusy reports that another instance holds it. The lock is

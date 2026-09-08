@@ -2372,7 +2372,7 @@ func (s *applyStore) expireRetryable(ctx context.Context, limit int) ([]*storage
 	// Passing over the apply costs nothing but a pass. This runs as a sweep, so
 	// an apply it declines is offered again on the next one, once that drive has
 	// ended or its lease has gone stale.
-	undrivenApply, undrivenApplyArgs := undrivenApplyGate(s.dialect)
+	undrivenApply := undrivenApplyGate(s.dialect)
 
 	// Oldest first, so a backlog drains in the order it accumulated rather than
 	// leaving the same tail unexpired every pass.
@@ -2387,8 +2387,7 @@ func (s *applyStore) expireRetryable(ctx context.Context, limit int) ([]*storage
 		ORDER BY updated_at
 		LIMIT ?
 		FOR UPDATE
-	`, append([]any{state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays},
-		append(undrivenApplyArgs, limit)...)...)
+	`, state.Apply.FailedRetryable, maxRecoveryAttempts, retryableRecoveryFreshnessDays, limit)
 	if err != nil {
 		return nil, fmt.Errorf("query expired retryable applies: %w", err)
 	}
@@ -2404,6 +2403,29 @@ func (s *applyStore) expireRetryable(ctx context.Context, limit int) ([]*storage
 		return nil, nil
 	}
 
+	// The selection is only a candidate scan: operation-only drivers never
+	// claim the parent. Lock their rows too and recheck leases so a claim or
+	// heartbeat that won after the scan causes the whole apply to be deferred.
+	// AttachOperationWithTasks locks the parent, so no new sibling can attach
+	// while we establish and hold this complete set of operation locks.
+	eligible := make([]*storage.Apply, 0, len(applies))
+	for _, apply := range applies {
+		undriven, err := s.lockUndrivenApply(ctx, tx, apply.ID)
+		if err != nil {
+			return nil, err
+		}
+		if undriven {
+			eligible = append(eligible, apply)
+		}
+	}
+	applies = eligible
+	if len(applies) == 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("commit deferred expire retryable applies: %w", err)
+		}
+		return nil, nil
+	}
+
 	applyIDs := make([]any, 0, len(applies))
 	expirations := make([]*storage.RetryableApplyExpiration, 0, len(applies))
 	for _, apply := range applies {
@@ -2414,33 +2436,9 @@ func (s *applyStore) expireRetryable(ctx context.Context, limit int) ([]*storage
 		})
 	}
 
-	// The writes below carry no gate of their own, because no driver can be
-	// driving under these applies while this transaction runs. Three separate
-	// things have to hold for that, and it is worth naming all three: the
-	// FOR UPDATE above is the weakest of them, and on its own would not be
-	// enough — it locks applies, while an operation claim locks apply_operations
-	// and never reads the parent row.
-	//
-	// A drive that is already under way is excluded by the selection, which
-	// admits only applies with no operation a driver is part-way through
-	// driving.
-	//
-	// A drive that has not started yet cannot start, because starting one means
-	// passing ClaimApplyByID, and the applies this selection matches are exactly
-	// the ones that claim refuses. The two predicates are complements term for
-	// term: expiry takes attempt >= maxRecoveryAttempts OR a lapsed freshness
-	// window, and the claim's retryable clause requires attempt <
-	// maxRecoveryAttempts AND a live one. failed_retryable is also absent from
-	// claimableApplyStates(), so the claim's stale-lease clause cannot reach one
-	// either. That disjointness is the load-bearing property here, and it is
-	// pinned as a pair rather than per side — see
-	// TestApplyStore_ExpireRetryableAndTheParentClaimNeverAdmitTheSameApply.
-	//
-	// The FOR UPDATE is the backstop under both. ClaimApplyByID reads the same
-	// row FOR UPDATE SKIP LOCKED, so for as long as this transaction runs the
-	// parent claim skips the row and refuses regardless of predicate, and a
-	// driver that had already taken an operation row releases that lease instead
-	// of driving it (reconcileUnclaimableParent).
+	// Both the parent and every operation are now locked, and the lease gate
+	// was rechecked after taking those locks. Claims and heartbeats cannot
+	// change operation ownership until these writes commit (OW-8, ST-4).
 
 	// A pending task never started: it was blocked behind the failure that made
 	// the apply retryable, so expiring the apply cancels it — mirroring how a
@@ -2509,6 +2507,48 @@ func (s *applyStore) expireRetryable(ctx context.Context, limit int) ([]*storage
 		apply.UpdatedAt = now
 	}
 	return expirations, nil
+}
+
+// lockUndrivenApply requires the parent row to be locked by tx. It admits the
+// apply only after locking its complete operation set and rechecking leases.
+// SKIP LOCKED avoids waiting for a claim that holds an operation and needs the
+// parent to consume retry budget: waiting here would invert that lock order.
+func (s *applyStore) lockUndrivenApply(ctx context.Context, tx *rebindTx, applyID int64) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id FROM apply_operations
+		WHERE apply_id = ? ORDER BY id
+		FOR UPDATE SKIP LOCKED
+	`, applyID)
+	if err != nil {
+		return false, fmt.Errorf("lock operations for retryable expiry of apply %d: %w", applyID, err)
+	}
+	locked := 0
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			utils.CloseAndLog(rows)
+			return false, fmt.Errorf("scan operation for retryable expiry of apply %d: %w", applyID, err)
+		}
+		locked++
+	}
+	err = rows.Err()
+	utils.CloseAndLog(rows)
+	if err != nil {
+		return false, fmt.Errorf("read operations for retryable expiry of apply %d: %w", applyID, err)
+	}
+	var total int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM apply_operations WHERE apply_id = ?`, applyID).Scan(&total); err != nil {
+		return false, fmt.Errorf("count operations for retryable expiry of apply %d: %w", applyID, err)
+	}
+	if locked != total {
+		return false, nil
+	}
+	gate := undrivenApplyGate(s.dialect)
+	var undriven bool
+	if err := tx.QueryRowContext(ctx, `SELECT `+gate+` FROM applies WHERE id = ?`, applyID).Scan(&undriven); err != nil {
+		return false, fmt.Errorf("recheck operation leases for retryable expiry of apply %d: %w", applyID, err)
+	}
+	return undriven, nil
 }
 
 func retryableExpirationReason(apply *storage.Apply) storage.RetryableExpirationReason {
