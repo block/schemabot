@@ -5,6 +5,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"net/url"
 	"testing"
 	"time"
@@ -622,6 +623,9 @@ func TestEngineApplyNativeSafe(t *testing.T) {
 	assert.Equal(t, 100, progress.Progress)
 	assert.Equal(t, "completed", progress.Metadata["phase"])
 	assert.Equal(t, "1", progress.Metadata["step"])
+	assert.Equal(t, "1", progress.Metadata["steps_total"])
+	assert.Equal(t, "ALTER TABLE public.users ADD COLUMN email text", progress.Metadata["statement"],
+		"the terminal position names the statement the executor ran")
 
 	var exists bool
 	err = db.QueryRowContext(t.Context(), `SELECT EXISTS (
@@ -682,6 +686,9 @@ func TestEngineApplyGreenfieldCreateSet(t *testing.T) {
 	assert.True(t, result.Accepted)
 	progress := awaitPostgresProgress(t, eng, "widgets")
 	assert.Equal(t, engine.StateCompleted, progress.State)
+	assert.Equal(t, "3", progress.Metadata["step"], "a completed create set reports its last step, not the first")
+	assert.Equal(t, "3", progress.Metadata["steps_total"])
+	assert.Contains(t, progress.Metadata["statement"], "CREATE INDEX widgets_id_idx")
 
 	rows, err := db.QueryContext(t.Context(), "SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND tablename = 'widgets' ORDER BY indexname")
 	require.NoError(t, err)
@@ -754,6 +761,9 @@ func TestEngineApplyCreateSetCommittedPrefixNotRetryable(t *testing.T) {
 	assert.Equal(t, "failed", progress.Metadata["phase"])
 	assert.False(t, progress.Retryable, "the CREATE TABLE committed; a retry cannot succeed, so the drive must not offer one")
 	assert.Equal(t, `step 2 of 2 failed after the CREATE TABLE for "widgets" committed; re-plan against the current schema`, progress.ErrorMessage)
+	assert.Equal(t, "2", progress.Metadata["step"], "the position names the step that failed")
+	assert.Equal(t, "2", progress.Metadata["steps_total"])
+	assert.Contains(t, progress.Metadata["statement"], "CREATE INDEX widgets_name_idx")
 
 	var exists bool
 	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT to_regclass('public.widgets') IS NOT NULL").Scan(&exists))
@@ -1000,6 +1010,15 @@ func TestEngineApplyConcurrentIndexRedriveAfterKilledBuild(t *testing.T) {
 	defer utils.CloseAndLog(writer)
 	writerTx, err := writer.BeginTx(t.Context(), nil)
 	require.NoError(t, err)
+	// Releases the writer lock if an assertion fails before the explicit
+	// rollback below. This must be a defer, not a t.Cleanup: closing the
+	// conn waits for its open transaction to finish, so the rollback has to
+	// run before the deferred conn close or the test would hang on failure.
+	defer func() {
+		if err := writerTx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+			t.Errorf("roll back writer transaction: %v", err)
+		}
+	}()
 	_, err = writerTx.ExecContext(t.Context(), "INSERT INTO public.orders (id, ref) VALUES (1, 'held')")
 	require.NoError(t, err)
 
@@ -1014,11 +1033,16 @@ func TestEngineApplyConcurrentIndexRedriveAfterKilledBuild(t *testing.T) {
 			SELECT a.pid
 			FROM pg_stat_activity a
 			JOIN pg_index i ON i.indexrelid = to_regclass('public.orders_ref_idx')
-			WHERE a.query LIKE 'CREATE INDEX CONCURRENTLY%' AND a.state <> 'idle' AND NOT i.indisvalid`).Scan(&builderPID)
+			WHERE a.datname = current_database() AND a.pid <> pg_backend_pid()
+			  AND a.query LIKE 'CREATE INDEX CONCURRENTLY%' AND a.state <> 'idle' AND NOT i.indisvalid`).Scan(&builderPID)
 		return err == nil
 	}, postgresApplyDeadline, 10*time.Millisecond, "the build never committed its invalid catalog entry while parked behind the writer")
-	_, err = db.ExecContext(t.Context(), "SELECT pg_terminate_backend($1)", builderPID)
+	// The bounded form waits for the backend to exit, so the writer's
+	// rollback below cannot race a builder that has not gone yet.
+	var terminated bool
+	err = db.QueryRowContext(t.Context(), "SELECT pg_terminate_backend($1, 5000)", builderPID).Scan(&terminated)
 	require.NoError(t, err)
+	require.True(t, terminated, "the build backend must be gone before the writer releases its lock")
 	require.NoError(t, writerTx.Rollback())
 
 	progress := awaitPostgresProgress(t, eng, "orders")
@@ -1036,9 +1060,52 @@ func TestEngineApplyConcurrentIndexRedriveAfterKilledBuild(t *testing.T) {
 	assertIndexValidWithoutDebris(t, db, "orders", "orders_ref_idx")
 }
 
+// TestEngineApplyConcurrentIndexRecoveryFailureIsNotCompletion proves a
+// recovery that clears the abandoned entry but whose build then fails
+// reports the failure, never a completion: the abandoned invalid index is
+// removed, the unique build fails on duplicate rows and leaves its own
+// invalid index under the name, and the apply fails retryable naming that
+// index — while the catalog still shows it invalid, the state a completion
+// would have misreported as the index the schema declares.
+func TestEngineApplyConcurrentIndexRecoveryFailureIsNotCompletion(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "recovery_failure_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "INSERT INTO public.orders (id, ref) VALUES (1, 'ref-collision'), (2, 'ref-collision')")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "CREATE INDEX orders_ref_key ON public.orders (ref)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(),
+		"UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'public.orders_ref_key'::regclass")
+	require.NoError(t, err)
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders",
+		"CREATE UNIQUE INDEX CONCURRENTLY orders_ref_key ON public.orders (ref)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "orders")
+	require.Equal(t, engine.StateFailed, progress.State, "progress: %+v", progress)
+	assert.Equal(t, "failed", progress.Metadata["phase"])
+	assert.True(t, progress.Retryable, "a build that fails after the recovery is operational; the drive must offer the retry")
+	assert.Contains(t, progress.ErrorMessage, "orders_ref_key")
+	assert.Contains(t, progress.ErrorMessage, "invalid index")
+	assert.NotContains(t, progress.ErrorMessage, "ref-collision", "the server's unique-violation text never reaches the operator surface")
+
+	var valid bool
+	err = db.QueryRowContext(t.Context(),
+		`SELECT i.indisvalid FROM pg_index i WHERE i.indexrelid = to_regclass('public.orders_ref_key')`).Scan(&valid)
+	require.NoError(t, err)
+	assert.False(t, valid, "the failed unique build leaves its own invalid index under the name")
+}
+
 // assertIndexValidWithoutDebris checks the named index on public.<table> is
 // catalog-valid and that the recovery left no quarantined entry on the table:
 // a completed report must mean the index the schema declares, and only it.
+// The debris pattern is the quarantine name pg-sprite's recovery gives an
+// entry before dropping it; pg-sprite does not export it, so the literal is
+// pinned here and a rename upstream would make this assertion pass
+// vacuously — the recovery tests' completed state would still hold, but the
+// no-debris half would no longer be proven.
 func assertIndexValidWithoutDebris(t *testing.T, db *sql.DB, table, index string) {
 	t.Helper()
 	var valid bool
@@ -1085,6 +1152,7 @@ func TestEngineApplyConcurrentIndexOnOtherTableRefused(t *testing.T) {
 	assert.Contains(t, progress.ErrorMessage, `"shipments"`)
 	assert.Contains(t, progress.ErrorMessage, "re-plan")
 	assert.NotContains(t, progress.ErrorMessage, "retry removes it")
+	assert.NotContains(t, progress.ErrorMessage, "drop")
 }
 
 // TestEngineApplyConcurrentIndexBackingConstraintRefused proves an invalid
@@ -1114,6 +1182,7 @@ func TestEngineApplyConcurrentIndexBackingConstraintRefused(t *testing.T) {
 	assert.Contains(t, progress.ErrorMessage, "constraint's index")
 	assert.Contains(t, progress.ErrorMessage, "an operator must resolve it")
 	assert.NotContains(t, progress.ErrorMessage, "retry removes it")
+	assert.NotContains(t, progress.ErrorMessage, "drop")
 }
 
 // applyRequest builds a single-statement apply request with the same identity
