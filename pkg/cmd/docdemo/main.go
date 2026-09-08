@@ -357,25 +357,25 @@ func followLogView(completed bool) string {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	entries := []*apitypes.LogEntry{
-		{ID: 1, ApplyID: "apply-example-84", Level: "info", Message: "Apply queued: apply-example-84", CreatedAt: time.Date(2026, 1, 15, 14, 20, 0, 0, time.UTC)},
-		{ID: 2, ApplyID: "apply-example-84", Level: "info", Message: fmt.Sprintf("Apply state derived from its 1 operation row(s): %s", state.Apply.Running), OldState: state.Apply.Pending, NewState: state.Apply.Running, CreatedAt: time.Date(2026, 1, 15, 14, 20, 5, 0, time.UTC)},
+		{ID: 1, ApplyID: "apply-example-73", Level: "info", Message: "Apply queued: apply-example-73", CreatedAt: time.Date(2026, 1, 15, 14, 20, 0, 0, time.UTC)},
+		{ID: 2, ApplyID: "apply-example-73", Level: "info", Message: fmt.Sprintf("Apply state derived from its 1 operation row(s): %s", state.Apply.Running), OldState: state.Apply.Pending, NewState: state.Apply.Running, CreatedAt: time.Date(2026, 1, 15, 14, 20, 5, 0, time.UTC)},
 	}
 	if completed {
-		entries = append(entries, &apitypes.LogEntry{ID: 3, ApplyID: "apply-example-84", Level: "info", Message: fmt.Sprintf("Apply state derived from its 1 operation row(s): %s", state.Apply.Completed), OldState: state.Apply.Running, NewState: state.Apply.Completed, CreatedAt: time.Date(2026, 1, 15, 14, 35, 0, 0, time.UTC)})
+		entries = append(entries, &apitypes.LogEntry{ID: 3, ApplyID: "apply-example-73", Level: "info", Message: fmt.Sprintf("Apply state derived from its 1 operation row(s): %s", state.Apply.Completed), OldState: state.Apply.Running, NewState: state.Apply.Completed, CreatedAt: time.Date(2026, 1, 15, 14, 35, 0, 0, time.UTC)})
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/api/logs" || r.URL.Query().Get("apply_id") != "apply-example-84" || r.URL.Query().Get("limit") != "50" {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/logs" || r.URL.Query().Get("apply_id") != "apply-example-73" || r.URL.Query().Get("limit") != "50" {
 			panic("unexpected logs request")
 		}
 		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(apitypes.LogsResponse{ApplyID: "apply-example-84", Logs: entries}); err != nil {
+		if err := json.NewEncoder(w).Encode(apitypes.LogsResponse{ApplyID: "apply-example-73", Logs: entries}); err != nil {
 			panic(err)
 		}
 		cancel()
 	}))
 	defer server.Close()
 	return capture(func() {
-		cmd := commands.LogsCmd{ApplyIDArg: "apply-example-84", Limit: 50, Follow: true}
+		cmd := commands.LogsCmd{ApplyIDArg: "apply-example-73", Limit: 50, Follow: true}
 		if err := cmd.Run(ctx, &commands.Globals{Endpoint: server.URL}); err != nil {
 			panic(err)
 		}
@@ -445,14 +445,14 @@ func main() {
 	frames = append(frames, Frame{3, "", "Copy complete; wait for the final swap", live(100, state.Apply.WaitingForCutover, false, "")}, Frame{2, "", "Press Enter to request the final swap", live(100, state.Apply.WaitingForCutover, false, "enter")}, Frame{4, "", "The watcher confirms completion", live(100, state.Apply.Completed, false, "")})
 	demos = append(demos, Demo{Name: "cli-cutover", Title: "Know when to wait. Choose when to swap.", Frames: frames})
 	demos = append(demos, vitessDemo())
-	demos = append(demos, Demo{Name: "cli-ops", Title: "From the fleet to one change.", Height: 740, Frames: []Frame{
-		{4, "schemabot status -e staging", "Find a running change across your databases", strings.ReplaceAll(status, "apply-example-73", "apply-example-84")},
-		{3, "schemabot progress apply-example-84", "Follow the deploy request across four shards", vitess(state.Apply.Running, []int{25, 15, 10, 5}, false)},
-		{1.2, "", "Each shard reports its own rows and ETA", vitess(state.Apply.Running, []int{65, 45, 35, 20}, false)},
-		{1.2, "", "", vitess(state.Apply.Running, []int{100, 80, 65, 45}, false)},
-		{1.2, "", "", vitess(state.Apply.Running, []int{100, 100, 100, 95}, false)},
-		{2, "", "Every shard reaches 100%", vitess(state.Apply.Running, []int{100, 100, 100, 100}, false)},
-		{3, "schemabot logs apply-example-84 -f", "After detaching with ESC, follow the change in its logs", followLogView(false)},
+	demos = append(demos, Demo{Name: "cli-ops", Title: "From the fleet to one change.", Frames: []Frame{
+		{4, "schemabot status -e staging", "Find a running change across your databases", status},
+		{3, "schemabot status apply-example-73", "Inspect one change", progress(60, state.Apply.Running, true)},
+		{3, "schemabot progress apply-example-73", "See why copying has slowed", live(60, state.Apply.Running, true, "")},
+		{1.2, "", "Copying resumes as conditions improve", live(80, state.Apply.Running, false, "")},
+		{1.5, "", "Row copy reaches 100%", live(100, state.Apply.Running, false, "")},
+		{1.5, "", "Press ESC to detach; the change keeps running", live(100, state.Apply.Running, false, "esc")},
+		{3, "schemabot logs apply-example-73 -f", "Follow the change in its logs", followLogView(false)},
 		{4, "", "A new log entry confirms completion", followLogView(true)},
 	}})
 	enc := json.NewEncoder(os.Stdout)

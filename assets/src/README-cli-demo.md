@@ -4,7 +4,7 @@ These GIFs illustrate five operator workflows using fictional data passed
 through the production Go templates and interactive `commands.WatchModel`:
 
 - `cli-plan-apply.gif`: inspect an index plan, confirm with yes, and follow an apply to completion
-- `cli-ops.gif`: move from fleet status to per-shard progress, completion, and the real logs follow command
+- `cli-ops.gif`: move from fleet status to a MySQL change, watch throttling and copying, detach, and follow logs through completion
 - `cli-fleet.gif`: list changes, attach to the live watcher, detach with Esc, and list plans
 - `cli-cutover.gif`: see a throttle reason, finish copying, defer the swap, and press Enter to cut over
 - `cli-vitess.gif`: create a deploy request, deploy with Enter, follow four shards, and close the revert window

@@ -10,6 +10,7 @@ to see what is changing across your fleet.
 | See what is in a database | [Read the live schema](#read-the-live-schema) |
 | Make a schema change | [Plan and apply a change](#plan-and-apply-a-change) |
 | Check an ongoing change | [Follow progress and control the apply](#follow-and-control-a-change) |
+| Follow a PlanetScale deploy request | [Watch progress across shards](#planetscale-progress-across-every-shard) |
 | Build an integration | [Use structured output](#use-the-cli-from-scripts-and-agents) |
 
 The examples use a MySQL database named `shop` in `staging`.
@@ -397,7 +398,7 @@ the swap has finished.
 
 ![CLI progress shows copying, a throttle reason, deferred cutover, and completion](../assets/cli-cutover.gif)
 
-### Follow a Vitess deploy request across shards
+### PlanetScale: progress across every shard
 
 For a Vitess database using PlanetScale, the CLI follows the deploy request
 from creation through deployment and its revert window. This example uses
