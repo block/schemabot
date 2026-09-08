@@ -411,6 +411,51 @@ func followLogView(count int) string {
 	return strings.Join(lines, "\n") + "\n"
 }
 
+func fleetInventory() string {
+	response := apitypes.DatabaseListResponse{}
+	for _, name := range []string{"accounts", "analytics", "billing", "catalog", "inventory", "notifications", "search", "shop"} {
+		response.Databases = append(response.Databases, &apitypes.DatabaseResponse{Database: name, Type: "mysql", Environments: []*apitypes.DatabaseEnvironmentResponse{{Environment: "staging"}, {Environment: "production"}}})
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/databases" {
+			panic("unexpected inventory request")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			panic(err)
+		}
+	}))
+	defer server.Close()
+	return capture(func() {
+		if err := (&commands.DatabasesCmd{}).Run(&commands.Globals{Endpoint: server.URL}); err != nil {
+			panic(err)
+		}
+	})
+}
+
+func busyFleet(now time.Time) []string {
+	data := t.StatusListData{ActiveCount: 24, Limit: 20, HasMore: true, StateCounts: map[string]int{state.Apply.Completed: 462, state.Apply.Running: 24, state.Apply.Failed: 9, state.Apply.Stopped: 5}}
+	names := []string{"shop", "billing", "catalog", "accounts", "inventory", "search", "analytics", "notifications"}
+	for i := 0; i < 20; i++ {
+		phase := state.Apply.Completed
+		if i < 3 {
+			phase = state.Apply.Running
+		}
+		if i == 5 {
+			phase = state.Apply.Failed
+		}
+		if i == 8 {
+			phase = state.Apply.Stopped
+		}
+		data.Applies = append(data.Applies, t.ActiveApplyData{ApplyID: fmt.Sprintf("apply-example-%02d", 73-i), Database: names[i%len(names)], Environment: "staging", State: phase, Caller: fmt.Sprintf("github:alex@acme/store#%d", 42-i), StartedAt: now.Add(-time.Duration(10+i*25) * time.Minute).Format(time.RFC3339)})
+	}
+	output := capture(func() { t.WriteStatusList(data) })
+	if !strings.Contains(output, "500 total:") || !strings.Contains(output, "20 most recent") {
+		panic("fleet summary missing")
+	}
+	return strings.Split(strings.TrimRight(output, "\n"), "\n")
+}
+
 func main() {
 	t.SetPreviewMode()
 	time.Local = time.UTC
@@ -474,9 +519,18 @@ func main() {
 	frames = append(frames, Frame{3, "", "Copy complete; wait for the final swap", live(100, state.Apply.WaitingForCutover, false, "")}, Frame{2, "", "Press Enter to request the final swap", live(100, state.Apply.WaitingForCutover, false, "enter")}, Frame{4, "", "The watcher confirms completion", live(100, state.Apply.Completed, false, "")})
 	demos = append(demos, Demo{Name: "cli-cutover", Title: "Know when to wait. Choose when to swap.", Frames: frames})
 	demos = append(demos, vitessDemo())
-	demos = append(demos, Demo{Name: "cli-ops", Title: "From the fleet to one change.", Frames: []Frame{
-		{2, "schemabot status -e staging", "Find a change across your databases", status},
-		{2, "schemabot status apply-example-73", "Inspect its SQL and current state", progress(60, state.Apply.Running, false)},
+	fleetLines := busyFleet(now)
+	pull := capture(func() {
+		t.WritePullSchema(&apitypes.PullSchemaResponse{Database: "shop", Type: "mysql", Environment: "staging", TableCount: 1, Namespaces: map[string]*apitypes.PulledNamespace{"shop": {Lint: []*apitypes.LintViolationResponse{{Table: "orders", Column: "created_at", Severity: "warning", Linter: "zero_date", Message: `column "created_at" with type "datetime" has a zero default value`}}, Tables: map[string]string{"orders": "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `status` varchar(32) NOT NULL,\n  `created_at` datetime NOT NULL DEFAULT '0000-00-00 00:00:00',\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"}}}})
+	})
+	pullLines := strings.Split(strings.TrimRight(pull, "\n"), "\n")
+	demos = append(demos, Demo{Name: "cli-ops", Title: "Know your database fleet.", Frames: []Frame{
+		{2, "schemabot databases", "See the databases and environments in your fleet", fleetInventory()},
+		{2, "schemabot pull -d shop -e staging --table orders --lint", "Spot lint findings in the live schema", strings.Join(pullLines[:15], "\n")},
+		{1.5, "", "Inspect the table behind the finding", strings.Join(pullLines[len(pullLines)-15:], "\n")},
+		{2, "schemabot status -e staging", "500 changes; the latest 20 at a glance", strings.Join(fleetLines[:15], "\n")},
+		{0.8, "", "Scroll through the latest changes", strings.Join(fleetLines[8:23], "\n")},
+		{1.2, "", "", strings.Join(fleetLines[len(fleetLines)-15:], "\n")},
 		{1, "schemabot logs apply-example-73 -f", "Follow the engine logs as they arrive", followLogView(5)},
 		{0.6, "", "", followLogView(9)},
 		{0.9, "", "See why copying slows down", followLogView(10)},

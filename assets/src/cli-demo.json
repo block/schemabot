@@ -272,19 +272,43 @@
   },
   {
     "name": "cli-ops",
-    "title": "From the fleet to one change.",
+    "title": "Know your database fleet.",
     "frames": [
       {
         "seconds": 2,
-        "command": "schemabot status -e staging",
-        "caption": "Find a change across your databases",
-        "output": "\u001b[1m1 active schema change\u001b[0m\n\u001b[2m4 total: 2 Completed · 1 Failed · 1 Running\u001b[0m\n\n  \u001b[2mAPPLY ID          DATABASE  ENV      STATE      STARTED         SOURCE\u001b[0m\n  apply-example-73  shop      staging  \u001b[36mRunning  \u001b[0m  10 minutes ago  https://github.com/acme/store/pull/42\n  apply-example-72  billing   staging  \u001b[32mCompleted\u001b[0m  1 hour ago      https://github.com/acme/billing/pull/18\n  apply-example-71  catalog   staging  \u001b[31mFailed   \u001b[0m  2 hours ago     https://github.com/acme/store/pull/40\n  apply-example-70  accounts  staging  \u001b[32mCompleted\u001b[0m  3 hours ago     https://github.com/acme/accounts/pull/12\n\n\u001b[2mUse 'schemabot status \u003capply_id\u003e' to view details\u001b[0m\n"
+        "command": "schemabot databases",
+        "caption": "See the databases and environments in your fleet",
+        "output": "DATABASE       TYPE   ENVIRONMENTS         DEPLOYMENTS\naccounts       mysql  staging, production  -\nanalytics      mysql  staging, production  -\nbilling        mysql  staging, production  -\ncatalog        mysql  staging, production  -\ninventory      mysql  staging, production  -\nnotifications  mysql  staging, production  -\nsearch         mysql  staging, production  -\nshop           mysql  staging, production  -\n"
       },
       {
         "seconds": 2,
-        "command": "schemabot status apply-example-73",
-        "caption": "Inspect its SQL and current state",
-        "output": "┌──────────────────────────────────┐\n│  Apply ID:     apply-example-73  │\n│  Database:     shop              │\n│  Environment:  staging           │\n│  State:        \u001b[36mRunning         \u001b[0m  │\n└──────────────────────────────────┘\n\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 6,000,000 / 10,000,000 · ETA: 8m 0s\n\n"
+        "command": "schemabot pull -d shop -e staging --table orders --lint",
+        "caption": "Spot lint findings in the live schema",
+        "output": "┌─────────────────────────┐\n│  Database:     shop     │\n│  Type:         mysql    │\n│  Environment:  staging  │\n│  Tables:       1        │\n└─────────────────────────┘\n\n-- Namespace `shop` — 1 table\n-- Lint: 1 violation\n--   [warning] orders: column \"created_at\" with type \"datetime\" has a zero default value\n\nCREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `status` varchar(32) NOT NULL,\n  `created_at` datetime NOT NULL DEFAULT '0000-00-00 00:00:00',"
+      },
+      {
+        "seconds": 1.5,
+        "command": "",
+        "caption": "Inspect the table behind the finding",
+        "output": "│  Type:         mysql    │\n│  Environment:  staging  │\n│  Tables:       1        │\n└─────────────────────────┘\n\n-- Namespace `shop` — 1 table\n-- Lint: 1 violation\n--   [warning] orders: column \"created_at\" with type \"datetime\" has a zero default value\n\nCREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `status` varchar(32) NOT NULL,\n  `created_at` datetime NOT NULL DEFAULT '0000-00-00 00:00:00',\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+      },
+      {
+        "seconds": 2,
+        "command": "schemabot status -e staging",
+        "caption": "500 changes; the latest 20 at a glance",
+        "output": "\u001b[1m24 active schema changes\u001b[0m\n\u001b[2m500 total: 462 Completed · 24 Running · 9 Failed · 5 Stopped\u001b[0m\n\n  \u001b[2mAPPLY ID          DATABASE       ENV      STATE      STARTED         SOURCE\u001b[0m\n  apply-example-73  shop           staging  \u001b[36mRunning  \u001b[0m  10 minutes ago  https://github.com/acme/store/pull/42\n  apply-example-72  billing        staging  \u001b[36mRunning  \u001b[0m  35 minutes ago  https://github.com/acme/store/pull/41\n  apply-example-71  catalog        staging  \u001b[36mRunning  \u001b[0m  1 hour ago      https://github.com/acme/store/pull/40\n  apply-example-70  accounts       staging  \u001b[32mCompleted\u001b[0m  1 hour ago      https://github.com/acme/store/pull/39\n  apply-example-69  inventory      staging  \u001b[32mCompleted\u001b[0m  1 hour ago      https://github.com/acme/store/pull/38\n  apply-example-68  search         staging  \u001b[31mFailed   \u001b[0m  2 hours ago     https://github.com/acme/store/pull/37\n  apply-example-67  analytics      staging  \u001b[32mCompleted\u001b[0m  2 hours ago     https://github.com/acme/store/pull/36\n  apply-example-66  notifications  staging  \u001b[32mCompleted\u001b[0m  3 hours ago     https://github.com/acme/store/pull/35\n  apply-example-65  shop           staging  \u001b[38;5;208mStopped  \u001b[0m  3 hours ago     https://github.com/acme/store/pull/34\n  apply-example-64  billing        staging  \u001b[32mCompleted\u001b[0m  3 hours ago     https://github.com/acme/store/pull/33\n  apply-example-63  catalog        staging  \u001b[32mCompleted\u001b[0m  4 hours ago     https://github.com/acme/store/pull/32"
+      },
+      {
+        "seconds": 0.8,
+        "command": "",
+        "caption": "Scroll through the latest changes",
+        "output": "  apply-example-69  inventory      staging  \u001b[32mCompleted\u001b[0m  1 hour ago      https://github.com/acme/store/pull/38\n  apply-example-68  search         staging  \u001b[31mFailed   \u001b[0m  2 hours ago     https://github.com/acme/store/pull/37\n  apply-example-67  analytics      staging  \u001b[32mCompleted\u001b[0m  2 hours ago     https://github.com/acme/store/pull/36\n  apply-example-66  notifications  staging  \u001b[32mCompleted\u001b[0m  3 hours ago     https://github.com/acme/store/pull/35\n  apply-example-65  shop           staging  \u001b[38;5;208mStopped  \u001b[0m  3 hours ago     https://github.com/acme/store/pull/34\n  apply-example-64  billing        staging  \u001b[32mCompleted\u001b[0m  3 hours ago     https://github.com/acme/store/pull/33\n  apply-example-63  catalog        staging  \u001b[32mCompleted\u001b[0m  4 hours ago     https://github.com/acme/store/pull/32\n  apply-example-62  accounts       staging  \u001b[32mCompleted\u001b[0m  4 hours ago     https://github.com/acme/store/pull/31\n  apply-example-61  inventory      staging  \u001b[32mCompleted\u001b[0m  5 hours ago     https://github.com/acme/store/pull/30\n  apply-example-60  search         staging  \u001b[32mCompleted\u001b[0m  5 hours ago     https://github.com/acme/store/pull/29\n  apply-example-59  analytics      staging  \u001b[32mCompleted\u001b[0m  6 hours ago     https://github.com/acme/store/pull/28\n  apply-example-58  notifications  staging  \u001b[32mCompleted\u001b[0m  6 hours ago     https://github.com/acme/store/pull/27\n  apply-example-57  shop           staging  \u001b[32mCompleted\u001b[0m  6 hours ago     https://github.com/acme/store/pull/26\n  apply-example-56  billing        staging  \u001b[32mCompleted\u001b[0m  7 hours ago     https://github.com/acme/store/pull/25\n  apply-example-55  catalog        staging  \u001b[32mCompleted\u001b[0m  7 hours ago     https://github.com/acme/store/pull/24"
+      },
+      {
+        "seconds": 1.2,
+        "command": "",
+        "caption": "",
+        "output": "  apply-example-65  shop           staging  \u001b[38;5;208mStopped  \u001b[0m  3 hours ago     https://github.com/acme/store/pull/34\n  apply-example-64  billing        staging  \u001b[32mCompleted\u001b[0m  3 hours ago     https://github.com/acme/store/pull/33\n  apply-example-63  catalog        staging  \u001b[32mCompleted\u001b[0m  4 hours ago     https://github.com/acme/store/pull/32\n  apply-example-62  accounts       staging  \u001b[32mCompleted\u001b[0m  4 hours ago     https://github.com/acme/store/pull/31\n  apply-example-61  inventory      staging  \u001b[32mCompleted\u001b[0m  5 hours ago     https://github.com/acme/store/pull/30\n  apply-example-60  search         staging  \u001b[32mCompleted\u001b[0m  5 hours ago     https://github.com/acme/store/pull/29\n  apply-example-59  analytics      staging  \u001b[32mCompleted\u001b[0m  6 hours ago     https://github.com/acme/store/pull/28\n  apply-example-58  notifications  staging  \u001b[32mCompleted\u001b[0m  6 hours ago     https://github.com/acme/store/pull/27\n  apply-example-57  shop           staging  \u001b[32mCompleted\u001b[0m  6 hours ago     https://github.com/acme/store/pull/26\n  apply-example-56  billing        staging  \u001b[32mCompleted\u001b[0m  7 hours ago     https://github.com/acme/store/pull/25\n  apply-example-55  catalog        staging  \u001b[32mCompleted\u001b[0m  7 hours ago     https://github.com/acme/store/pull/24\n  apply-example-54  accounts       staging  \u001b[32mCompleted\u001b[0m  8 hours ago     https://github.com/acme/store/pull/23\n\n\u001b[2mShowing the 20 most recent schema changes. Use --limit N to show more.\u001b[0m\n\u001b[2mUse 'schemabot status \u003capply_id\u003e' to view details\u001b[0m"
       },
       {
         "seconds": 1,

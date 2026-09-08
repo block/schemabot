@@ -42,7 +42,7 @@ Open a PR with your schema changes, and SchemaBot plans, applies, and verifies t
 
 <img src="./assets/cli-plan-apply.gif" width="800" alt="Plan and apply a schema change through the CLI">
 
-**From the fleet to one change.** Find a running change, inspect its details, and follow its logs.
+**Know your database fleet.** Explore live schemas, spot lint issues, and follow changes through their logs.
 
 <img src="./assets/cli-ops.gif" width="800" alt="Inspect fleet status, follow one change, and read its logs">
 
