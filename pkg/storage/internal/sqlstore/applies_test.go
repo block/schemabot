@@ -3433,6 +3433,85 @@ func TestApplyStore_ExpireRetryable_TakesTheOldestUpToTheLimit(t *testing.T) {
 //
 // Declining costs the apply a pass, not the expiry: expiry is a sweep, so once
 // the lease goes stale the next pass takes the apply and its rows together.
+// Expiry writes an apply's task and operation rows without gating each write on
+// a lease, which is only safe because no driver can start a drive under an apply
+// expiry is taking. The selection excludes a drive already under way; what
+// excludes one that has not started is that starting means passing
+// ClaimApplyByID, and the two predicates are exact complements — expiry wants a
+// spent budget or a lapsed freshness window, the claim wants a live budget and a
+// live window.
+//
+// That pairing is the property, so it is pinned as a pair. Testing either side
+// alone would still pass if someone widened one predicate and left the other
+// where it was, which is precisely the change that would let a driver start
+// under an apply this sweep is about to settle.
+func TestApplyStore_ExpireRetryableAndTheParentClaimNeverAdmitTheSameApply(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	// One database each: the one-active-apply guard admits a single active apply
+	// per target, and failed_retryable is active.
+	retryable := func(name string, planID int64) *storage.Apply {
+		lock := createTestLock(t, store, name+"_db", storage.DatabaseTypeMySQL)
+		return createTestApplyWithStateAndEnv(t, store, lock, name, planID, state.Apply.FailedRetryable, "staging")
+	}
+	spendBudget := func(apply *storage.Apply) {
+		_, err := testDB.ExecContext(ctx, `UPDATE applies SET attempt = ? WHERE id = ?`, maxRecoveryAttempts, apply.ID)
+		require.NoError(t, err)
+	}
+	lapseFreshness := func(apply *storage.Apply) {
+		_, err := testDB.ExecContext(ctx, `
+			UPDATE applies SET updated_at = NOW() - INTERVAL ? DAY WHERE id = ?
+		`, retryableRecoveryFreshnessDays+1, apply.ID)
+		require.NoError(t, err)
+	}
+
+	budgetSpent := retryable("apply_disjoint_budget", 540)
+	spendBudget(budgetSpent)
+
+	windowLapsed := retryable("apply_disjoint_window", 541)
+	lapseFreshness(windowLapsed)
+
+	both := retryable("apply_disjoint_both", 542)
+	spendBudget(both)
+	lapseFreshness(both)
+
+	// The control: still inside both budget and window, so it is the one apply
+	// here that recovery should redispatch rather than expire.
+	recoverable := retryable("apply_disjoint_recoverable", 543)
+
+	for _, apply := range []*storage.Apply{budgetSpent, windowLapsed, both} {
+		claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+		require.NoError(t, err)
+		assert.Nil(t, claimed, "an apply expiry will take must not be claimable for a drive: %s", apply.ApplyIdentifier)
+	}
+
+	expired, err := store.Applies().ExpireRetryable(ctx, 10)
+	require.NoError(t, err)
+
+	expiredIDs := make([]string, 0, len(expired))
+	for _, expiration := range expired {
+		expiredIDs = append(expiredIDs, expiration.Apply.ApplyIdentifier)
+	}
+	assert.ElementsMatch(t,
+		[]string{budgetSpent.ApplyIdentifier, windowLapsed.ApplyIdentifier, both.ApplyIdentifier},
+		expiredIDs,
+		"expiry takes every apply the parent claim refuses, and only those")
+
+	persisted, err := store.Applies().Get(ctx, recoverable.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.FailedRetryable, persisted.State,
+		"an apply recovery can still redispatch is not expiry's to settle")
+
+	// Claimable all along, so the three refusals above were the predicate
+	// disagreeing with expiry rather than the fixture being unclaimable.
+	claimed, err := store.Applies().ClaimApplyByID(ctx, recoverable.ID, "operator-a")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "the apply expiry passed over is exactly the one a driver may take")
+}
+
 func TestApplyStore_ExpireRetryable_DeclinesAnApplyWhoseOperationADriverHolds(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
