@@ -18,9 +18,10 @@ async function main() {
 
   try {
     for (const demo of demos) {
+      if (process.argv[2] && demo.name !== process.argv[2]) continue;
       const tmp = fs.mkdtempSync(path.join(os.tmpdir(), demo.name + '-'));
       const page = await browser.newPage({
-        viewport: { width: 1100, height: 670 },
+        viewport: { width: 1100, height: demo.height || 670 },
         deviceScaleFactor: 1,
       });
       await page.goto(pathToFileURL(path.join(root, 'assets/src/cli-demo.html')).href);

@@ -178,5 +178,96 @@
         "output": "\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered. Apply ID: apply-example-73\n"
       }
     ]
+  },
+  {
+    "height": 740,
+    "name": "cli-vitess",
+    "title": "One deploy request. Progress across every shard.",
+    "frames": [
+      {
+        "seconds": 3,
+        "command": "schemabot plan -s ./schema -e staging",
+        "caption": "Review the change for the commerce keyspace",
+        "output": "╭─────────────────────────────────────────────╮\n│  Vitess Schema Change Plan                  │\n│                                             │\n│  Database: shop                             │\n╰─────────────────────────────────────────────╯\n\n\u001b[1mStaging\u001b[0m\n\n  \u001b[1m── commerce ──\u001b[0m\n\n     ~ orders\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n📋 Plan: 1 table to alter\n\n"
+      },
+      {
+        "seconds": 2,
+        "command": "schemabot apply -s ./schema -e staging --defer-deploy",
+        "caption": "Review the plan before creating the deploy request",
+        "output": "╭─────────────────────────────────────────────╮\n│  Vitess Schema Change Apply                 │\n│                                             │\n│  Database: shop                             │\n╰─────────────────────────────────────────────╯\n\n\u001b[1mStaging\u001b[0m\n\n  \u001b[1m── commerce ──\u001b[0m\n\n     ~ orders\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n📋 Plan: 1 table to alter\n\n\nDo you want to apply these changes? Only 'yes' will be accepted: ▌"
+      },
+      {
+        "seconds": 0.8,
+        "command": "",
+        "caption": "Type yes to confirm",
+        "output": "╭─────────────────────────────────────────────╮\n│  Vitess Schema Change Apply                 │\n│                                             │\n│  Database: shop                             │\n╰─────────────────────────────────────────────╯\n\n\u001b[1mStaging\u001b[0m\n\n  \u001b[1m── commerce ──\u001b[0m\n\n     ~ orders\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n📋 Plan: 1 table to alter\n\n\nDo you want to apply these changes? Only 'yes' will be accepted: yes"
+      },
+      {
+        "seconds": 4,
+        "command": "",
+        "caption": "Deploy request ready after apply --defer-deploy",
+        "output": "\n\nDeploy request created: https://app.planetscale.com/acme/shop/deploy-requests/42\n\nPress Enter to deploy or proceed via the PlanetScale console (ESC to detach)\n"
+      },
+      {
+        "seconds": 1.5,
+        "command": "",
+        "caption": "Press Enter to deploy",
+        "output": "\n\n\u001b[38;5;205m⣾ \u001b[0mDeploying...\n"
+      },
+      {
+        "seconds": 1.4,
+        "command": "",
+        "caption": "Each shard reports its own progress, rows, and ETA",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n  Deploy Request:  https://app.planetscale.com/acme/shop/deploy-requests/42\n\n  \u001b[1m── commerce ──\u001b[0m\n\n     ~ orders: 🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 13.75%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 550,000 / 4,000,000 · ETA: 4m 45s\n       • \u001b[2mShards: 4 (4 copying)\u001b[0m\n           \u001b[36m◉ -40\u001b[0m: 25.00% (250,000/1,000,000 rows) ETA 3m 45s\n           \u001b[36m◉ 40-80\u001b[0m: 15.00% (150,000/1,000,000 rows) ETA 4m 15s\n           \u001b[36m◉ 80-c0\u001b[0m: 10.00% (100,000/1,000,000 rows) ETA 4m 30s\n           \u001b[36m◉ c0-\u001b[0m: 5.00% (50,000/1,000,000 rows) ETA 4m 45s\n\n\n\u001b[2mESC detach • c cancel\u001b[0m\n"
+      },
+      {
+        "seconds": 1.4,
+        "command": "",
+        "caption": "Each shard reports its own progress, rows, and ETA",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n  Deploy Request:  https://app.planetscale.com/acme/shop/deploy-requests/42\n\n  \u001b[1m── commerce ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 41.25%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 1,650,000 / 4,000,000 · ETA: 4m 0s\n       • \u001b[2mShards: 4 (4 copying)\u001b[0m\n           \u001b[36m◉ -40\u001b[0m: 65.00% (650,000/1,000,000 rows) ETA 1m 45s\n           \u001b[36m◉ 40-80\u001b[0m: 45.00% (450,000/1,000,000 rows) ETA 2m 45s\n           \u001b[36m◉ 80-c0\u001b[0m: 35.00% (350,000/1,000,000 rows) ETA 3m 15s\n           \u001b[36m◉ c0-\u001b[0m: 20.00% (200,000/1,000,000 rows) ETA 4m 0s\n\n\n\u001b[2mESC detach • c cancel\u001b[0m\n"
+      },
+      {
+        "seconds": 1.4,
+        "command": "",
+        "caption": "Each shard reports its own progress, rows, and ETA",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n  Deploy Request:  https://app.planetscale.com/acme/shop/deploy-requests/42\n\n  \u001b[1m── commerce ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 72.50%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 2,900,000 / 4,000,000 · ETA: 2m 45s\n       • \u001b[2mShards: 4 (1 complete, 3 copying)\u001b[0m\n           \u001b[32m✓ -40\u001b[0m: 1,000,000 rows\n           \u001b[36m◉ 40-80\u001b[0m: 80.00% (800,000/1,000,000 rows) ETA 1m 0s\n           \u001b[36m◉ 80-c0\u001b[0m: 65.00% (650,000/1,000,000 rows) ETA 1m 45s\n           \u001b[36m◉ c0-\u001b[0m: 45.00% (450,000/1,000,000 rows) ETA 2m 45s\n\n\n\u001b[2mESC detach • c cancel\u001b[0m\n"
+      },
+      {
+        "seconds": 1.4,
+        "command": "",
+        "caption": "Each shard reports its own progress, rows, and ETA",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n  Deploy Request:  https://app.planetscale.com/acme/shop/deploy-requests/42\n\n  \u001b[1m── commerce ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜ 90.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 3,600,000 / 4,000,000 · ETA: 1m 30s\n       • \u001b[2mShards: 4 (2 complete, 2 copying)\u001b[0m\n           \u001b[32m✓ -40\u001b[0m: 1,000,000 rows\n           \u001b[32m✓ 40-80\u001b[0m: 1,000,000 rows\n           \u001b[36m◉ 80-c0\u001b[0m: 90.00% (900,000/1,000,000 rows) ETA 30s\n           \u001b[36m◉ c0-\u001b[0m: 70.00% (700,000/1,000,000 rows) ETA 1m 30s\n\n\n\u001b[2mESC detach • c cancel\u001b[0m\n"
+      },
+      {
+        "seconds": 1.4,
+        "command": "",
+        "caption": "Each shard reports its own progress, rows, and ETA",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n  Deploy Request:  https://app.planetscale.com/acme/shop/deploy-requests/42\n\n  \u001b[1m── commerce ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜ 98.75%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 3,950,000 / 4,000,000 · ETA: 15s\n       • \u001b[2mShards: 4 (3 complete, 1 copying)\u001b[0m\n           \u001b[32m✓ -40\u001b[0m: 1,000,000 rows\n           \u001b[32m✓ 40-80\u001b[0m: 1,000,000 rows\n           \u001b[32m✓ 80-c0\u001b[0m: 1,000,000 rows\n           \u001b[36m◉ c0-\u001b[0m: 95.00% (950,000/1,000,000 rows) ETA 15s\n\n\n\u001b[2mESC detach • c cancel\u001b[0m\n"
+      },
+      {
+        "seconds": 1.4,
+        "command": "",
+        "caption": "Each shard reports its own progress, rows, and ETA",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n  Deploy Request:  https://app.planetscale.com/acme/shop/deploy-requests/42\n\n  \u001b[1m── commerce ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 100.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 4,000,000 / 4,000,000\n       • \u001b[2mShards: 4 (4 complete)\u001b[0m\n           \u001b[32m✓ -40\u001b[0m: 1,000,000 rows\n           \u001b[32m✓ 40-80\u001b[0m: 1,000,000 rows\n           \u001b[32m✓ 80-c0\u001b[0m: 1,000,000 rows\n           \u001b[32m✓ c0-\u001b[0m: 1,000,000 rows\n\n\n\u001b[2mESC detach • c cancel\u001b[0m\n"
+      },
+      {
+        "seconds": 5,
+        "command": "",
+        "caption": "Deployed; the revert window remains open",
+        "output": "  Deploy Request:  https://app.planetscale.com/acme/shop/deploy-requests/42\n\n  \u001b[1m── commerce ──\u001b[0m\n\n     ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Complete (revert window open)\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\nSchema change deployed. Revert window is open.\n\nPress Enter to skip revert or ESC to detach\n"
+      },
+      {
+        "seconds": 1.5,
+        "command": "",
+        "caption": "Press Enter when ready to close the revert window",
+        "output": "  Deploy Request:  https://app.planetscale.com/acme/shop/deploy-requests/42\n\n  \u001b[1m── commerce ──\u001b[0m\n\n     ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Complete (revert window open)\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\n\u001b[38;5;205m⣾ \u001b[0mFinalizing — closing revert window... (0s)\n"
+      },
+      {
+        "seconds": 3,
+        "command": "",
+        "caption": "The watcher confirms completion",
+        "output": "\n  \u001b[1m── commerce ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered. Apply ID: apply-example-84\n"
+      }
+    ]
   }
 ]

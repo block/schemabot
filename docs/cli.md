@@ -397,6 +397,53 @@ the swap has finished.
 
 ![CLI progress shows copying, a throttle reason, deferred cutover, and completion](../assets/cli-cutover.gif)
 
+### Follow a Vitess deploy request across shards
+
+For a Vitess database using PlanetScale, the CLI follows the deploy request
+from creation through deployment and its revert window. This example uses
+`shop` registered as a Vitess database, `type: vitess` in `schema/schemabot.yaml`,
+and table files under `schema/commerce/` for the `commerce` keyspace.
+
+![CLI creates a PlanetScale deploy request, deploys with Enter, follows four shards, and closes the revert window](../assets/cli-vitess.gif)
+
+Use `--defer-deploy` to review the deploy request before starting deployment.
+The animation confirms the apply with `yes`, then uses **Enter** at the deploy
+prompt. During copying, **Esc** detaches and **c** cancels the deploy request
+permanently; PlanetScale cancellation cannot be resumed.
+
+You can attach to the same apply later. Each shard reports its own progress,
+rows, and ETA, so you can see which shard is still working:
+
+```console
+$ schemabot progress apply-example-84
+⣾ Running...
+  Deploy Request:  https://app.planetscale.com/acme/shop/deploy-requests/42
+
+  ── commerce ──
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 72.50%
+       ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
+       • Rows: 2,900,000 / 4,000,000 · ETA: 2m 45s
+       • Shards: 4 (1 complete, 3 copying)
+           ✓ -40: 1,000,000 rows
+           ◉ 40-80: 80.00% (800,000/1,000,000 rows) ETA 1m 0s
+           ◉ 80-c0: 65.00% (650,000/1,000,000 rows) ETA 1m 45s
+           ◉ c0-: 45.00% (450,000/1,000,000 rows) ETA 2m 45s
+
+
+ESC detach • c cancel
+```
+
+Per-shard rows and ETA require a server-side SQL connection to vtgate, where
+SchemaBot reads migration progress. Without that connection, the CLI reports
+the deploy-request state instead.
+
+After deployment, the watcher shows the open revert window. **Esc** leaves
+that window open; **Enter** closes it when you are ready to finalize. The
+animation takes the latter path. To undo the deployment while its window is
+open, use the [revert operation](engines.md); closing the window gives up
+that option. The deploy-request URL stays visible during the live workflow.
+
 ### Respond to a change that needs attention
 
 Pick the operation for the current state and engine:

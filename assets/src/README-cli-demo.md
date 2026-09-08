@@ -1,11 +1,12 @@
 # CLI guide animations
 
-These GIFs illustrate three operator workflows using fictional data passed
+These GIFs illustrate four operator workflows using fictional data passed
 through the production Go templates and interactive `commands.WatchModel`:
 
 - `cli-plan-apply.gif`: inspect an index plan, confirm with yes, and follow an apply to completion
 - `cli-fleet.gif`: list changes, attach to the live watcher, detach with Esc, and list plans
 - `cli-cutover.gif`: see a throttle reason, finish copying, defer the swap, and press Enter to cut over
+- `cli-vitess.gif`: create a deploy request, deploy with Enter, follow four shards, and close the revert window
 
 They are template-based illustrations, not recordings of a live database.
 Commands are typed by the renderer, long operations are compressed, and the
@@ -43,4 +44,9 @@ can be refreshed when CLI templates change.
 
 Review a plan frame, the fleet table, the throttle reason and ETA, the waiting
 state, and the completed state after rendering. Check the GIFs at README
-width as well as their native 1100 × 670 size. Keep the rendering method and timing choices documented here.
+width as well as their native size (1100 × 670, or 1100 × 740 for the shard view). Keep the rendering method and timing choices documented here.
+
+Pass a scenario name, such as `cli-vitess`, as the renderer’s first argument
+to refresh only that GIF. The PlanetScale fixture checks Enter against start
+and skip-revert requests, and checks that **c** sends the stop request used
+by the PlanetScale engine to cancel the deploy request.

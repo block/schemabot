@@ -37,6 +37,7 @@ type Frame struct {
 	Output  string  `json:"output"`
 }
 type Demo struct {
+	Height int     `json:"height,omitempty"`
 	Name   string  `json:"name"`
 	Title  string  `json:"title"`
 	Frames []Frame `json:"frames"`
@@ -177,6 +178,144 @@ func live(p int, phase string, throttled bool, key string) string {
 	return view
 }
 
+// vitess renders PlanetScale deploy requests and shard progress with the same
+// watcher used by the CLI. Enter is exercised through its real control handler.
+func vitess(phase string, percentages []int, enter bool) string {
+	response := apitypes.ProgressResponse{
+		ApplyID: "apply-example-84", Database: "shop", Environment: "staging", Engine: "PlanetScale", State: phase,
+		Metadata: map[string]string{"deploy_request_url": "https://app.planetscale.com/acme/shop/deploy-requests/42"},
+	}
+	table := &apitypes.TableProgressResponse{TableName: "orders", Keyspace: "commerce", ChangeType: "alter", DDL: ddl, Status: phase}
+	for i, p := range percentages {
+		status := state.Task.Running
+		eta := int64(100-p) * 3
+		if p == 100 {
+			status = state.Task.Completed
+			eta = 0
+		}
+		table.Shards = append(table.Shards, &apitypes.ShardProgressResponse{
+			Shard: []string{"-40", "40-80", "80-c0", "c0-"}[i], Status: status,
+			RowsCopied: int64(p) * 10000, RowsTotal: 1000000, PercentComplete: int32(p), ETASeconds: eta,
+		})
+		table.RowsCopied += int64(p) * 10000
+		table.RowsTotal += 1000000
+		if eta > table.ETASeconds {
+			table.ETASeconds = eta
+		}
+	}
+	if table.RowsTotal > 0 {
+		table.PercentComplete = int32(table.RowsCopied * 100 / table.RowsTotal)
+	}
+	response.Tables = []*apitypes.TableProgressResponse{table}
+	expected := "/api/start"
+	if phase == state.Apply.Running {
+		expected = "/api/stop"
+	}
+	if phase == state.Apply.RevertWindow {
+		expected = "/api/skip-revert"
+	}
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/progress/apply/") {
+			if err := json.NewEncoder(w).Encode(response); err != nil {
+				panic(err)
+			}
+			return
+		}
+		if r.Method != http.MethodPost || r.URL.Path != expected {
+			panic("unexpected Vitess control: " + r.Method + " " + r.URL.Path)
+		}
+		var request apitypes.ControlRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			panic(err)
+		}
+		if request.ApplyID != response.ApplyID || request.Environment != response.Environment {
+			panic("wrong Vitess control target")
+		}
+		requests++
+		if err := json.NewEncoder(w).Encode(apitypes.ControlResponse{Accepted: true}); err != nil {
+			panic(err)
+		}
+	}))
+	defer server.Close()
+	model := commands.NewWatchModel(server.URL, "shop", "staging", true)
+	batch := model.Init()().(tea.BatchMsg)
+	updated, _ := model.Update(batch[0]())
+	if enter {
+		var cmd tea.Cmd
+		updated, cmd = updated.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		if cmd == nil {
+			panic("Vitess Enter control missing")
+		}
+		updated, _ = updated.Update(cmd())
+		if requests != 1 {
+			panic("expected one Vitess control request")
+		}
+	}
+	if phase == state.Apply.Running {
+		cancelled, cmd := updated.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+		if cmd == nil {
+			panic("c did not request cancellation")
+		}
+		cancelled, _ = cancelled.Update(cmd())
+		if requests != 1 || !strings.Contains(cancelled.View(), "Cancelling...") {
+			panic("PlanetScale cancellation handler failed")
+		}
+	}
+	view := updated.View()
+	if strings.Contains(view, "Error:") || strings.Contains(view, "Loading...") {
+		panic(view)
+	}
+	if !enter && phase == state.Apply.WaitingForDeploy && !strings.Contains(view, "Press Enter to deploy") {
+		panic("deploy prompt missing")
+	}
+	if !enter && phase == state.Apply.RevertWindow && !strings.Contains(view, "Press Enter to skip revert") {
+		panic("revert prompt missing")
+	}
+	if phase == state.Apply.Running {
+		if !strings.Contains(view, "c cancel") {
+			panic("PlanetScale cancel control missing")
+		}
+		for _, shard := range []string{"-40", "40-80", "80-c0", "c0-"} {
+			if !strings.Contains(view, shard) {
+				panic("shard missing: " + shard)
+			}
+		}
+	}
+	return view
+}
+
+func vitessDemo() Demo {
+	renderPlan := func(apply bool) string {
+		return capture(func() {
+			t.WritePlanHeader(t.PlanHeaderData{Database: "shop", SchemaName: "schema", IsApply: apply})
+			t.WriteEnvironmentHeader("staging")
+			changes := []t.DDLChange{{TableName: "orders", ChangeType: "alter", DDL: ddl}}
+			t.WriteNamespaceChanges([]t.NamespaceChange{{Namespace: "commerce", Changes: changes}}, false, "shop")
+			t.WritePlanSummary(changes)
+		})
+	}
+	plan := renderPlan(false)
+	confirm := renderPlan(true) + applyPrompt()
+	frames := []Frame{
+		{3, "schemabot plan -s ./schema -e staging", "Review the change for the commerce keyspace", plan},
+		{2, "schemabot apply -s ./schema -e staging --defer-deploy", "Review the plan before creating the deploy request", confirm + "▌"},
+		{0.8, "", "Type yes to confirm", confirm + "yes"},
+		{4, "", "Deploy request ready after apply --defer-deploy", vitess(state.Apply.WaitingForDeploy, nil, false)},
+		{1.5, "", "Press Enter to deploy", vitess(state.Apply.WaitingForDeploy, nil, true)},
+	}
+	for _, p := range [][]int{{25, 15, 10, 5}, {65, 45, 35, 20}, {100, 80, 65, 45}, {100, 100, 90, 70}, {100, 100, 100, 95}, {100, 100, 100, 100}} {
+		frames = append(frames, Frame{1.4, "", "Each shard reports its own progress, rows, and ETA", vitess(state.Apply.Running, p, false)})
+	}
+	frames = append(frames,
+		Frame{5, "", "Deployed; the revert window remains open", vitess(state.Apply.RevertWindow, nil, false)},
+		Frame{1.5, "", "Press Enter when ready to close the revert window", vitess(state.Apply.RevertWindow, nil, true)},
+		Frame{3, "", "The watcher confirms completion", vitess(state.Apply.Completed, nil, false)},
+	)
+	return Demo{Name: "cli-vitess", Title: "One deploy request. Progress across every shard.", Height: 740, Frames: frames}
+}
+
 // Read the confirmation text from the actual apply command so this fixture
 // fails when the command stops using that prompt rather than silently drifting.
 func applyPrompt() string {
@@ -272,6 +411,7 @@ func main() {
 	}
 	frames = append(frames, Frame{3, "", "Copy complete; wait for the final swap", live(100, state.Apply.WaitingForCutover, false, "")}, Frame{2, "", "Press Enter to request the final swap", live(100, state.Apply.WaitingForCutover, false, "enter")}, Frame{4, "", "The watcher confirms completion", live(100, state.Apply.Completed, false, "")})
 	demos = append(demos, Demo{Name: "cli-cutover", Title: "Know when to wait. Choose when to swap.", Frames: frames})
+	demos = append(demos, vitessDemo())
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(demos); err != nil {
