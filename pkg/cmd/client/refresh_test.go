@@ -15,7 +15,7 @@ func TestRefreshToken(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, f.refreshedIDToken, result.IDToken)
 		assert.Equal(t, f.refreshToken, result.RefreshToken)
-		assert.False(t, result.Expiry.IsZero())
+		assert.Equal(t, f.refreshedIDExpiry, result.Expiry.Unix())
 	})
 
 	t.Run("validates required input before any network call", func(t *testing.T) {
@@ -64,7 +64,7 @@ func TestResolveBearerToken(t *testing.T) {
 			DefaultProfile: "default",
 			Profiles: map[string]Profile{"default": {
 				Endpoint:     "https://schemabot.example",
-				Token:        "stale-token",
+				Token:        testIDToken(`{"exp":1}`),
 				RefreshToken: "old-refresh-token",
 				TokenExpiry:  time.Now().Add(-time.Hour).Unix(),
 				OIDC:         &OIDCLogin{Issuer: f.issuer(), ClientID: "cli-client"},
@@ -81,7 +81,7 @@ func TestResolveBearerToken(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, f.refreshedIDToken, reloaded.Profiles["default"].Token)
 		assert.Equal(t, f.refreshToken, reloaded.Profiles["default"].RefreshToken)
-		assert.Greater(t, reloaded.Profiles["default"].TokenExpiry, time.Now().Unix())
+		assert.Equal(t, f.refreshedIDExpiry, reloaded.Profiles["default"].TokenExpiry)
 	})
 
 	t.Run("expired token with no refresh token returns stale token and a warning", func(t *testing.T) {

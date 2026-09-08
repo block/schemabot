@@ -327,8 +327,24 @@ func ResolveBearerToken(ctx context.Context, tokenFlag, endpointFlag, profileFla
 		return "", nil
 	}
 
+	var expiry time.Time
+	if profile.TokenExpiry != 0 {
+		expiry = time.Unix(profile.TokenExpiry, 0)
+	}
+
+	// OIDC profiles may carry an access-token expiry cached by an older CLI.
+	// Derive the refresh hint from the actual bearer token on every load, so
+	// either lifetime mismatch is corrected without requiring another login.
+	if profile.OIDC != nil {
+		parsedExpiry, err := idTokenExpiry(token)
+		if err != nil {
+			return token, fmt.Errorf("read cached ID token expiry for profile %q (run `%s login`): %w", profileName, cliname.Name(), err)
+		}
+		expiry = parsedExpiry
+	}
+
 	// Refresh only when the expiry is known and (nearly) reached.
-	if profile.TokenExpiry == 0 || time.Until(time.Unix(profile.TokenExpiry, 0)) > tokenRefreshSkew {
+	if !tokenNeedsRefresh(expiry, time.Now()) {
 		return token, nil
 	}
 	if profile.RefreshToken == "" || profile.OIDC == nil {
@@ -352,6 +368,12 @@ func ResolveBearerToken(ctx context.Context, tokenFlag, endpointFlag, profileFla
 		return result.IDToken, fmt.Errorf("could not persist the refreshed token for profile %q: %w", profileName, err)
 	}
 	return result.IDToken, nil
+}
+
+// tokenNeedsRefresh treats an unknown expiry as an unmanaged credential and
+// includes the refresh boundary so a command need not wait for another second.
+func tokenNeedsRefresh(expiry, now time.Time) bool {
+	return !expiry.IsZero() && !expiry.After(now.Add(tokenRefreshSkew))
 }
 
 func trimSlash(s string) string {

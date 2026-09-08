@@ -30,27 +30,35 @@ type fakeOIDC struct {
 	refreshCalls int
 	lastMethod   string // code_challenge_method seen at the authz endpoint
 
-	// Knobs for negative cases.
+	// Provider response knobs are configured before the first request and then
+	// remain immutable; only request observations above need the mutex.
 	stateOverride string // when set, echo this state instead of the request's
 	authError     string // when set, redirect with ?error=<authError>
 
-	accessExpires    int
-	idToken          string
-	refreshedIDToken string // id_token returned for the refresh_token grant
-	accessToken      string
-	refreshToken     string
-	omitIDToken      bool // when true, the token response omits the id_token
+	idExpiry          int64
+	refreshedIDExpiry int64
+	omitRefreshToken  bool
+	accessExpires     int
+	idToken           string
+	refreshedIDToken  string // id_token returned for the refresh_token grant
+	accessToken       string
+	refreshToken      string
+	omitIDToken       bool // when true, the token response omits the id_token
 }
 
 func newFakeOIDC(t *testing.T) *fakeOIDC {
 	t.Helper()
+	idExpiry := time.Now().Add(2 * time.Hour).Unix()
+	refreshedIDExpiry := time.Now().Add(3 * time.Hour).Unix()
 	f := &fakeOIDC{
-		challenges:       map[string]string{},
-		accessExpires:    3600,
-		idToken:          testIDToken(fmt.Sprintf(`{"exp":%d}`, time.Now().Add(2*time.Hour).Unix())),
-		refreshedIDToken: testIDToken(fmt.Sprintf(`{"exp":%d}`, time.Now().Add(3*time.Hour).Unix())),
-		accessToken:      "test-access-token",
-		refreshToken:     "test-refresh-token",
+		idExpiry:          idExpiry,
+		refreshedIDExpiry: refreshedIDExpiry,
+		challenges:        map[string]string{},
+		accessExpires:     3600,
+		idToken:           testIDToken(fmt.Sprintf(`{"exp":%d}`, idExpiry)),
+		refreshedIDToken:  testIDToken(fmt.Sprintf(`{"exp":%d}`, refreshedIDExpiry)),
+		accessToken:       "test-access-token",
+		refreshToken:      "test-refresh-token",
 	}
 
 	mux := http.NewServeMux()
@@ -119,6 +127,9 @@ func (f *fakeOIDC) handleToken(w http.ResponseWriter, r *http.Request) {
 			"token_type":    "Bearer",
 			"refresh_token": f.refreshToken,
 			"expires_in":    f.accessExpires,
+		}
+		if f.omitRefreshToken {
+			delete(body, "refresh_token")
 		}
 		if !f.omitIDToken {
 			body["id_token"] = f.refreshedIDToken
@@ -200,7 +211,7 @@ func TestLogin(t *testing.T) {
 	assert.Equal(t, f.idToken, result.IDToken)
 	assert.Equal(t, "test-access-token", result.AccessToken)
 	assert.Equal(t, "test-refresh-token", result.RefreshToken)
-	assert.False(t, result.Expiry.IsZero(), "token expiry should be populated from the ID token")
+	assert.Equal(t, f.idExpiry, result.Expiry.Unix())
 
 	// The flow must use PKCE with S256; the token endpoint already rejected any
 	// verifier that didn't hash to the challenge, so reaching here proves the
