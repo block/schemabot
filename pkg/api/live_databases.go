@@ -24,6 +24,17 @@ func (c *ServerConfig) DatabaseConfigs() map[string]DatabaseConfig {
 	return c.Databases
 }
 
+// withDatabaseSnapshot pins database lookups for one operation, including helper calls.
+func (c *ServerConfig) withDatabaseSnapshot() *ServerConfig {
+	if c == nil || c.liveDatabases == nil {
+		return c
+	}
+	snapshot := *c
+	snapshot.Databases = c.DatabaseConfigs()
+	snapshot.liveDatabases = nil
+	return &snapshot
+}
+
 // EnableLocalRegistration is called before the local server starts any goroutines.
 func (c *ServerConfig) EnableLocalRegistration() {
 	c.liveDatabases = &liveDatabaseRegistry{}

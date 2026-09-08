@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/block/spirit/pkg/utils"
 
@@ -115,8 +116,23 @@ func (cmd *LocalManagedCmd) Run(ctx context.Context, g *Globals) error {
 		if err != nil {
 			return err
 		}
+		// RunLocal registers the updater before Ready. Synchronize the handoff so
+		// callbacks remain safe if server startup later moves between goroutines.
+		var mu sync.Mutex
 		var prepare localruntime.PrepareConfig
-		return runLocalServer(ctx, cfg, token, "127.0.0.1:0", g, func(endpoint string) error { return ready(endpoint, prepare) }, func(p localruntime.PrepareConfig) { prepare = p })
+		return runLocalServer(ctx, cfg, token, "127.0.0.1:0", g, func(endpoint string) error {
+			mu.Lock()
+			p := prepare
+			mu.Unlock()
+			if p == nil {
+				return fmt.Errorf("local registration must be initialized before readiness")
+			}
+			return ready(endpoint, p)
+		}, func(p localruntime.PrepareConfig) {
+			mu.Lock()
+			defer mu.Unlock()
+			prepare = p
+		})
 	})
 }
 
