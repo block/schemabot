@@ -17,6 +17,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -89,9 +90,19 @@ func (e *Engine) releaseArtifacts(ctx context.Context, db *sql.DB, database stri
 	if err != nil {
 		return nil, fmt.Errorf("find cancelled schema change copy in database %s: %w", database, err)
 	}
-	metadata, err := existingTables(ctx, db, database, metadataArtifacts(tables))
+	metadata, err := existingTables(ctx, db, database, perTableMetadataArtifacts(tables))
 	if err != nil {
 		return nil, fmt.Errorf("find cancelled schema change metadata in database %s: %w", database, err)
+	}
+
+	shared, retained, err := e.disposeOfSchemaScopedArtifacts(ctx, db, database, tables)
+	if err != nil {
+		return nil, err
+	}
+	metadata = append(metadata, shared...)
+	if len(retained) > 0 {
+		result.Retained = retained
+		result.RetainedReason = schemaBusyRetentionReason
 	}
 
 	if e.disablePendingDrops {
@@ -124,8 +135,50 @@ func (e *Engine) releaseArtifacts(ctx context.Context, db *sql.DB, database stri
 		"tables", tables,
 		"preserved", len(result.Preserved),
 		"discarded", len(result.Discarded),
+		"retained", len(result.Retained),
 		"quarantine_enabled", !e.disablePendingDrops)
 	return result, nil
+}
+
+// schemaBusyRetentionReason is what an operator is told when the shared tables
+// were left alone. It names the condition rather than the tables, because the
+// tables are already listed beside it and the condition is what has to change
+// before reclaiming them by hand is safe.
+const schemaBusyRetentionReason = "another schema change has work in this schema, and the shared checkpoint and deferred cutover sentinel belong to whichever change owns them"
+
+// disposeOfSchemaScopedArtifacts decides the fate of the two tables no single
+// schema change owns, returning the ones to reclaim and the ones to leave
+// alone. They are reclaimed only where the schema holds nothing this release
+// cannot account for, because reclaiming the sentinel releases the deferred
+// cutover of whichever change is waiting on it.
+func (e *Engine) disposeOfSchemaScopedArtifacts(ctx context.Context, db *sql.DB, database string, tables []string) (reclaim, retain []string, err error) {
+	present, err := existingTables(ctx, db, database, schemaScopedArtifacts())
+	if err != nil {
+		return nil, nil, fmt.Errorf("find shared cancelled schema change metadata in database %s: %w", database, err)
+	}
+	if len(present) == 0 {
+		return nil, nil, nil
+	}
+
+	unaccounted, err := unaccountedArtifacts(ctx, db, database, tables)
+	if err != nil {
+		return nil, nil, fmt.Errorf("find other schema changes' artifacts in database %s: %w", database, err)
+	}
+	if len(unaccounted) == 0 {
+		return present, nil, nil
+	}
+
+	e.logger.Warn("retaining a cancelled schema change's shared metadata: another schema change has work in this schema",
+		"database", database,
+		"tables", tables,
+		"retained", present,
+		"unaccounted_artifacts", unaccounted)
+
+	retain = make([]string, 0, len(present))
+	for _, name := range present {
+		retain = append(retain, database+"."+name)
+	}
+	return nil, retain, nil
 }
 
 // Artifact name shapes. Spirit derives an artifact name by wrapping a table
@@ -236,18 +289,86 @@ func dataBearingArtifacts(tables []string) []string {
 	return names
 }
 
-// metadataArtifacts names the tables that describe a copy rather than hold one.
-// The per-table checkpoints are joined by the two schema-level tables, which
-// belong to the schema change rather than to any one of its tables — and so are
-// named whatever tables it touched. Those two are the whole reason a release
-// needs the schema to itself: they are the only artifacts here that a schema
-// change other than the cancelled one can own.
-func metadataArtifacts(tables []string) []string {
-	names := make([]string, 0, len(tables)+2)
+// perTableMetadataArtifacts names the per-table checkpoints, which describe a
+// copy rather than hold one. Each is derived from a table the caller named, so
+// no schema change other than the cancelled one can own it.
+func perTableMetadataArtifacts(tables []string) []string {
+	names := make([]string, 0, len(tables))
 	for _, table := range tables {
 		names = append(names, utils.CheckpointTableName(table))
 	}
-	return append(names, sharedCheckpointTable, deferredCutoverSentinelTable)
+	return names
+}
+
+// schemaScopedArtifacts names the two tables that belong to the schema change
+// rather than to any one of its tables, and so are named whatever tables it
+// touched. They are the only artifacts a release can reach that a schema change
+// other than the cancelled one can own, which is why they are the ones the
+// release gives up on the moment the schema shows another change's work.
+func schemaScopedArtifacts() []string {
+	return []string{sharedCheckpointTable, deferredCutoverSentinelTable}
+}
+
+func isSchemaScopedArtifact(name string) bool {
+	return name == sharedCheckpointTable || name == deferredCutoverSentinelTable
+}
+
+// unaccountedArtifacts names the artifacts in database that the caller's tables
+// do not derive, so their presence means a schema change other than the
+// cancelled one has work in this schema. The schema-scoped tables are excluded:
+// they are what the answer decides the fate of, and they are owned by no
+// particular change.
+//
+// This is what stands between a release and a cutover it was never asked to
+// perform. The deferred-cutover sentinel carries no owner and no timestamp —
+// it is one empty table, shared, and created with IF NOT EXISTS — so it cannot
+// be attributed by reading it. What can be attributed is the rest of the
+// schema: a change reaches a deferred cutover only after copying, and it writes
+// its shadow table and its checkpoint before it creates the sentinel, so a
+// change that could be waiting on that sentinel has always left one of those
+// behind by the time a release looks.
+//
+// It errs toward leaving things alone. An artifact abandoned by some earlier
+// change reads the same as a live one and retains the shared tables too, which
+// costs an operator two tables to remove by hand and costs a live schema change
+// nothing.
+func unaccountedArtifacts(ctx context.Context, db *sql.DB, database string, tables []string) ([]string, error) {
+	accountedFor := make(map[string]bool)
+	for _, name := range dataBearingArtifacts(tables) {
+		accountedFor[name] = true
+	}
+	for _, name := range perTableMetadataArtifacts(tables) {
+		accountedFor[name] = true
+	}
+
+	// Every artifact name starts with the prefix, and `_` is a single-character
+	// wildcard in LIKE, so it is escaped rather than passed through as one.
+	rows, err := db.QueryContext(ctx, `
+		SELECT table_name FROM information_schema.tables
+		WHERE table_schema = ? AND table_name LIKE ? ESCAPE '!'`,
+		database, "!"+artifactPrefix+"%")
+	if err != nil {
+		return nil, fmt.Errorf("query information_schema for artifacts in %s: %w", database, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	var unaccounted []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("scan artifact name in %s: %w", database, err)
+		}
+		if accountedFor[name] || isSchemaScopedArtifact(name) || !isReleasableArtifactName(name) {
+			continue
+		}
+		unaccounted = append(unaccounted, name)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read artifact names in %s: %w", database, err)
+	}
+
+	sort.Strings(unaccounted)
+	return unaccounted, nil
 }
 
 // existingTables returns the subset of candidates that exist in database,

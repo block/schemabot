@@ -6,6 +6,11 @@
 // target's own tables, so a copy another apply is actively writing carries the
 // same names as one nobody owns any more. The apply-target lock, and the
 // active-apply re-check under it, is what tells the two apart.
+//
+// That covers the schema changes SchemaBot runs. It does not cover one started
+// outside SchemaBot against the same schema, so the engine keeps its own guard
+// over the artifacts such a change could own and reports what it declined to
+// reclaim. This file surfaces that report rather than treating it as success.
 package tern
 
 import (
@@ -102,16 +107,29 @@ func (c *LocalClient) releaseNamespaceArtifacts(ctx context.Context, eng engine.
 	if len(result.Preserved) == 0 && len(result.Discarded) == 0 {
 		c.logger.Info("cancelled schema change left no artifacts on the target",
 			append(apply.LogAttrs(), "namespace", namespace, "tables", artifacts.tables)...)
-		return nil
+	} else {
+		c.logger.Info("reclaimed cancelled schema change artifacts",
+			append(apply.LogAttrs(),
+				"namespace", namespace,
+				"preserved", len(result.Preserved),
+				"discarded", len(result.Discarded))...)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
+			releasedArtifactsMessage(result), "", "")
 	}
 
-	c.logger.Info("reclaimed cancelled schema change artifacts",
-		append(apply.LogAttrs(),
-			"namespace", namespace,
-			"preserved", len(result.Preserved),
-			"discarded", len(result.Discarded))...)
-	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
-		releasedArtifactsMessage(result), "", "")
+	if len(result.Retained) > 0 {
+		// A retained artifact is not a failed release: the tables the cancelled
+		// schema change owns outright were still reclaimed. It is disk an
+		// operator has to reclaim by hand, which they will only do if something
+		// tells them it is there.
+		c.logger.Warn("cancelled schema change's shared metadata was left on the target",
+			append(apply.LogAttrs(),
+				"namespace", namespace,
+				"retained", result.Retained,
+				"reason", result.RetainedReason)...)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
+			retainedArtifactsMessage(result), "", "")
+	}
 	return nil
 }
 
@@ -127,6 +145,17 @@ func releasedArtifactsMessage(result *engine.ReleaseArtifactsResult) string {
 		destinations = append(destinations, fmt.Sprintf("%s is recoverable at %s", artifact.Source, artifact.Destination))
 	}
 	return fmt.Sprintf("Reclaimed the cancelled schema change's copy: %s", strings.Join(destinations, ", "))
+}
+
+// retainedArtifactsMessage names what the release deliberately left behind and
+// why, in the terms an operator acts on: these are the schema's shared tables,
+// so reclaiming them is a decision that needs someone who knows the schema is
+// idle. Naming them is what makes that a task rather than a surprise later.
+func retainedArtifactsMessage(result *engine.ReleaseArtifactsResult) string {
+	return fmt.Sprintf("Left %s in place because %s: %s",
+		pluralizeTables(len(result.Retained)),
+		result.RetainedReason,
+		strings.Join(result.Retained, ", "))
 }
 
 func pluralizeTables(count int) string {

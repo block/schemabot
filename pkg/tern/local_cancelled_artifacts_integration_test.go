@@ -42,7 +42,7 @@ func newSpiritControlClient(t *testing.T, dsn string, stor storage.Storage) *Loc
 // it stopped partway through copying rows.
 func seedAbandonedCopy(t *testing.T, dsn, table string, rows int) {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "open target to seed the abandoned copy")
 	defer spiritutils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(t.Context()))
@@ -51,7 +51,7 @@ func seedAbandonedCopy(t *testing.T, dsn, table string, rows int) {
 	// so only this artifact's own entries are cleared from it.
 	cleanupCtx := context.WithoutCancel(t.Context())
 	t.Cleanup(func() {
-		cleanupDB, err := sql.Open("mysql", dsn)
+		cleanupDB, err := sql.Open("block-mysql", dsn)
 		if err != nil {
 			return
 		}
@@ -94,7 +94,7 @@ func seedAbandonedCopy(t *testing.T, dsn, table string, rows int) {
 // targetTableExists reports whether a table is present in the target schema.
 func targetTableExists(t *testing.T, dsn, table string) bool {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer spiritutils.CloseAndLog(db)
 
@@ -111,7 +111,7 @@ func targetTableExists(t *testing.T, dsn, table string) bool {
 // rather than read wholesale.
 func quarantinedCopies(t *testing.T, dsn, artifact string) map[string]int {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer spiritutils.CloseAndLog(db)
 
@@ -186,7 +186,7 @@ func startContendingApply(t *testing.T, stor storage.Storage, dsn string, target
 	require.NoError(t, err)
 	contender.ID = id
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer spiritutils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(ctx))
@@ -330,4 +330,105 @@ func TestLocalClient_CancelLeavesArtifactsWhileAnotherApplyOwnsTheTarget(t *test
 	require.NoError(t, err)
 	assert.Equal(t, 1, countLogMessagesContaining(logs, "another schema change is running against the same target"),
 		"the operator must find why the copy outlived the cancel")
+}
+
+// seedTargetTables creates tables on the target and removes them afterwards, so
+// a test can stand up residue left by work SchemaBot did not start.
+func seedTargetTables(t *testing.T, dsn string, names ...string) {
+	t.Helper()
+	db, err := sql.Open("block-mysql", dsn)
+	require.NoError(t, err, "open target to seed tables")
+	defer spiritutils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(t.Context()))
+
+	cleanupCtx := context.WithoutCancel(t.Context())
+	t.Cleanup(func() {
+		cleanupDB, err := sql.Open("block-mysql", dsn)
+		if err != nil {
+			return
+		}
+		defer spiritutils.CloseAndLog(cleanupDB)
+		for _, name := range names {
+			_, _ = cleanupDB.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `"+name+"`")
+		}
+	})
+
+	for _, name := range names {
+		_, err := db.ExecContext(t.Context(),
+			fmt.Sprintf("CREATE TABLE `%s` (id INT PRIMARY KEY AUTO_INCREMENT)", name))
+		require.NoError(t, err, "create %s", name)
+	}
+}
+
+// The apply-target lock excludes SchemaBot's own applies and nothing else. A
+// schema change run against the same schema from outside SchemaBot holds no
+// apply for the re-check to find, so the artifacts every change in the schema
+// shares cannot be attributed to the cancelled one, and one of them is the gate
+// a deferred cutover waits on. The cancel reclaims what its own tables account
+// for and reports the shared pair as left behind, rather than releasing a
+// cutover nobody asked to release.
+func TestLocalClient_CancelRetainsSharedArtifactsWhileTheSchemaIsBusy(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	stor := createStorage(t, dsn)
+	defer spiritutils.CloseAndLog(stor)
+	client := newSpiritControlClient(t, dsn, stor)
+
+	apply := dispatchQueuedApply(t, stor, client, []storage.TableChange{{
+		Namespace: "testdb",
+		Table:     "stranded_users",
+		DDL:       "ALTER TABLE `stranded_users` ADD COLUMN stranded_note VARCHAR(255)",
+		Operation: "alter",
+	}})
+	stopApplyAndTasks(t, stor, apply)
+	seedAbandonedCopy(t, dsn, "stranded_users", 3)
+
+	// The shared checkpoint and the deferred cutover sentinel, plus the residue
+	// of a schema change SchemaBot never started. The engine owns these names;
+	// they are spelled out here because a test in this package is a second
+	// reader of the same target, not a caller of the engine's derivations.
+	const sharedCheckpoint = "_spirit_checkpoint"
+	const cutoverSentinel = "_spirit_sentinel"
+	outsiderCopy := spiritutils.NewTableName("outsider_users")
+	seedTargetTables(t, dsn, sharedCheckpoint, cutoverSentinel, outsiderCopy)
+
+	cancelResp, err := client.Cancel(ctx, &ternv1.CancelRequest{
+		ApplyId:     apply.ApplyIdentifier,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err)
+	require.True(t, cancelResp.Accepted)
+
+	driveCancelForStoppedApply(t, stor, client, apply.ID)
+
+	settled, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, state.Apply.Cancelled, settled.State,
+		"retaining a shared artifact must never block the cancel")
+
+	assert.False(t, targetTableExists(t, dsn, spiritutils.NewTableName("stranded_users")),
+		"the cancelled schema change's own copy is still reclaimed")
+	assert.Len(t, quarantinedCopies(t, dsn, spiritutils.NewTableName("stranded_users")), 1,
+		"its rows are still preserved")
+
+	for _, survivor := range []string{sharedCheckpoint, cutoverSentinel, outsiderCopy} {
+		assert.True(t, targetTableExists(t, dsn, survivor),
+			"%s may belong to the schema change SchemaBot did not start", survivor)
+	}
+
+	logs, err := stor.ApplyLogs().GetByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, countLogMessagesContaining(logs, "testdb."+cutoverSentinel),
+		"an operator reclaiming the shared tables by hand must find them named")
+	assert.Equal(t, 1, countLogMessagesContaining(logs, "is recoverable at"),
+		"the copy that was reclaimed must still be findable")
 }
