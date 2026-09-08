@@ -1024,7 +1024,11 @@ func executorProgressMetadata(ctx context.Context, tracker *progress.Tracker, re
 		setProgressCounter(metadata, "tuples_total", work.TuplesTotal)
 		setProgressCounter(metadata, "lockers_done", work.LockersDone)
 		setProgressCounter(metadata, "lockers_total", work.LockersTotal)
-		if work.BlocksTotal > 0 && len(tables) > 0 {
+		// Block counters describe a build in flight, so they only refine a
+		// running result's percent. A terminal result's percent is decided by
+		// its state; a stale build snapshot must not pull a completed apply
+		// below 100.
+		if work.BlocksTotal > 0 && len(tables) > 0 && !result.State.IsTerminal() {
 			tables[0].Progress = ui.ClampPercent(int(float64(work.BlocksDone) / float64(work.BlocksTotal) * 100))
 		}
 	}

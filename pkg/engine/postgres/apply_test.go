@@ -882,6 +882,25 @@ func TestProgressReportsExecutorDetailAndBlockPercent(t *testing.T) {
 	assert.Equal(t, 62, got.Tables[0].Progress)
 }
 
+// TestExecutorProgressMetadataKeepsTerminalPercent proves a terminal result's
+// percent is decided by its state: a tracker still answering with a partial
+// build position folds its counters into the metadata but never pulls a
+// completed apply below 100.
+func TestExecutorProgressMetadataKeepsTerminalPercent(t *testing.T) {
+	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE INDEX widgets_name_idx ON public.widgets (name)", steps: 2}
+	tracker := newTestTracker(t)
+	tracker.Start(2, progress.OperationAdmitting)
+	tracker.StartStep(2, progress.OperationConcurrentIndex, "CREATE INDEX CONCURRENTLY widgets_name_idx ON public.widgets (name)")
+	tracker.SetConcurrentBuild(successfulIndexProgressSession{}, 42)
+	terminal := progressResult(engine.StateCompleted, "completed", time.Now(), change, "")
+
+	require.NoError(t, executorProgressMetadata(t.Context(), tracker, terminal))
+
+	assert.Equal(t, 100, terminal.Tables[0].Progress)
+	assert.Equal(t, "25", terminal.Metadata["blocks_done"])
+	assert.Equal(t, "40", terminal.Metadata["blocks_total"])
+}
+
 // activeBuildTracker returns a tracker mid-way through a concurrent index
 // build whose server-side progress read fails with readErr.
 func activeBuildTracker(t *testing.T, readErr error) (*progress.Tracker, *indexProgressSession) {
