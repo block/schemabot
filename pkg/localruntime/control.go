@@ -18,7 +18,7 @@ func signature(token, message string) string {
 }
 
 func requestMessage(req *http.Request) string {
-	return "request\n" + req.Method + "\n" + req.URL.Path + "\n" + req.Header.Get("X-Runtime-Generation") + "\n" + req.Header.Get("X-Runtime-Nonce")
+	return "request\n" + req.Method + "\n" + req.URL.Path + "\n" + req.Header.Get("X-Runtime-Generation") + "\n" + req.Header.Get("X-Runtime-Nonce") + "\n" + req.Header.Get("X-Runtime-Body")
 }
 
 func validSignature(token, message, provided string) bool {

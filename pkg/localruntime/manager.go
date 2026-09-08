@@ -1,6 +1,7 @@
 package localruntime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -103,7 +104,7 @@ func (m Manager) Ensure(ctx context.Context) (Connection, error) {
 	for {
 		r, err := m.record()
 		if err == nil {
-			if r.Config != digest(config) || r.Binary != binary {
+			if r.Binary != binary {
 				return Connection{}, fmt.Errorf("local runtime %s uses a different binary or configuration; finish active work and stop it before restarting", r.ID)
 			}
 			if r.Control != "" {
@@ -113,6 +114,15 @@ func (m Manager) Ensure(ctx context.Context) (Connection, error) {
 				}
 				var live Record
 				if err = m.call(ctx, r, string(token), http.MethodGet, "/identity", &live); err == nil {
+					current, readErr := ReadPrivate(filepath.Join(m.Dir, "runtime.yaml"))
+					if readErr != nil {
+						return Connection{}, readErr
+					}
+					if live.Config != digest(current) {
+						// A registration can publish between identity and file reads.
+						// Wait for a matching snapshot, never restart the live host.
+						live.State = "configuration differs from its saved registration"
+					}
 					lastState = live.State
 					if live.State == "ready" {
 						return Connection{Record: live, Token: string(token)}, nil
@@ -279,10 +289,14 @@ func loopback(endpoint string) error {
 var controlClient = &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil}, CheckRedirect: func(*http.Request, []*http.Request) error { return fmt.Errorf("runtime redirects are not allowed") }}
 
 func (m Manager) call(ctx context.Context, r Record, token, method, path string, result *Record) error {
+	return m.callBody(ctx, r, token, method, path, result, nil)
+}
+
+func (m Manager) callBody(ctx context.Context, r Record, token, method, path string, result *Record, payload []byte) error {
 	if err := loopback(r.Control); err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, method, r.Control+path, nil)
+	req, err := http.NewRequestWithContext(ctx, method, r.Control+path, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -292,12 +306,16 @@ func (m Manager) call(ctx context.Context, r Record, token, method, path string,
 	}
 	req.Header.Set("X-Runtime-Generation", r.Generation)
 	req.Header.Set("X-Runtime-Nonce", nonce)
+	req.Header.Set("X-Runtime-Body", digest(payload))
 	req.Header.Set("X-Runtime-Signature", signature(token, requestMessage(req)))
 	resp, err := controlClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict && path == "/config" {
+		return errConfigChanged
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("runtime control refused request (%d)", resp.StatusCode)
 	}
@@ -312,7 +330,7 @@ func (m Manager) call(ctx context.Context, r Record, token, method, path string,
 		if err := json.Unmarshal(data, result); err != nil {
 			return err
 		}
-		if result.ID != r.ID || result.Generation != r.Generation || result.Binary != r.Binary || result.Config != r.Config {
+		if result.ID != r.ID || result.Generation != r.Generation || result.Binary != r.Binary {
 			return fmt.Errorf("runtime identity mismatch")
 		}
 		if result.Endpoint != "" {
