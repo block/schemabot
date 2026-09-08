@@ -67,7 +67,7 @@ func (m *initWizard) acceptNamespaces(msg initNamespacesMsg) tea.Cmd {
 		}
 		m.fields[5].value = m.names[0]
 		m.selected[m.names[0]] = true
-		m.notice = fmt.Sprintf("Found %s. We’ll use that.", m.names[0])
+		m.notice = fmt.Sprintf("Found %s. We’ll use that.", initTerminalText(m.names[0]))
 		return m.advance()
 	}
 	m.fields[5].value = ""
@@ -87,6 +87,14 @@ func (m *initWizard) namespaceKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if len(m.names) == 0 {
+		if msg.String() == "m" {
+			m.explicitNamespaces = true
+			m.fields[5].value = ""
+			m.fields[5].hint = "Enter the namespaces you want to manage, separated by commas."
+			m.err = ""
+			m.loadField()
+			return m, nil
+		}
 		if msg.String() == "enter" {
 			return m, tea.Batch(m.discoverNamespaces(), m.spinner.Tick)
 		}
@@ -134,7 +142,7 @@ func (m *initWizard) namespaceView() string {
 		return m.spinner.View() + " Connecting and finding your namespaces…\n\nYou can cancel while we connect.\n"
 	}
 	if len(m.names) == 0 {
-		return "enter try again · shift+tab edit connection · esc cancel\n"
+		return "enter try again · m enter namespaces manually · shift+tab back\n"
 	}
 	var b strings.Builder
 	b.WriteString(m.input.View() + "\n\n")
@@ -153,7 +161,7 @@ func (m *initWizard) namespaceView() string {
 		if m.selected[names[i]] {
 			check = "✓"
 		}
-		line := fmt.Sprintf("%s [%s] %s", cursor, check, names[i])
+		line := fmt.Sprintf("%s [%s] %s", cursor, check, initTerminalText(names[i]))
 		if i == m.cursor {
 			line = m.spinner.Style.Bold(true).Render(line)
 		}

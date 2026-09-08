@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/cmd/client"
@@ -23,6 +24,9 @@ type initField struct{ label, hint, value string }
 // The wizard edits a private draft. Only explicit confirmation copies it back;
 // initialize remains the sole registration and verification path (AZ-6).
 type initWizard struct {
+	connectionSummary                        string
+	hasExistingSchema                        bool
+	originalNamespaces                       []string
 	checkingConnection, connectionChecked    bool
 	check                                    func(context.Context, string, string) error
 	fields                                   []initField
@@ -61,6 +65,7 @@ func newInitWizard(cmd *InitCmd, profile string, output io.Writer) *initWizard {
 		{"Schema directory", "Choose a home for your schema files. This is where you’ll make changes.", value(cmd.SchemaDir, "schema")},
 		{"Connection profile", "Give this connection a profile name so you can use it again.", profile},
 	}}
+	m.originalNamespaces = slices.Clone(cmd.Namespaces)
 	m.spinner = spinner.New()
 	m.spinner.Spinner = spinner.Dot
 	m.spinner.Style = m.renderer.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#0969DA", Dark: "#79C0FF"})
@@ -72,20 +77,22 @@ func newInitWizard(cmd *InitCmd, profile string, output io.Writer) *initWizard {
 	return m
 }
 func (m *initWizard) Init() tea.Cmd {
-	if m.step == 5 && !m.explicitNamespaces {
-		m.input.SetValue("")
-		return tea.Batch(m.discoverNamespaces(), m.spinner.Tick)
-	}
 	return textinput.Blink
 }
 func (m *initWizard) loadField() {
+	m.scroll = 0
 	m.connectionChecked = false
 	if m.step >= len(m.fields) {
+		entries, err := os.ReadDir(m.fields[6].value)
+		m.hasExistingSchema = err == nil && len(entries) > 0
 		m.input.Blur()
 		return
 	}
 	m.input.Placeholder = ""
 	m.input.SetValue(m.fields[m.step].value)
+	if m.step == 3 || m.step == 4 {
+		m.connectionSummary = initConnectionSummary(m.fields[0].value, m.input.Value())
+	}
 	if m.step == 5 && !m.explicitNamespaces {
 		m.input.SetValue("")
 		m.input.Placeholder = "Search namespaces"
@@ -114,10 +121,13 @@ func (m *initWizard) validate() string {
 			return "This variable is empty. Choose one you’ve already set, or restart setup after setting it."
 		}
 	case 5:
-		if _, err := onboardPullNamespaces(strings.Split(v, ",")); err != nil {
+		if _, err := onboardPullNamespaces(initNamespaceInput(v, m.originalNamespaces)); err != nil {
 			return err.Error()
 		}
 	case 6:
+		if _, err := initSchemaReuse(v); err != nil {
+			return err.Error()
+		}
 		if info, err := os.Stat(v); err == nil && !info.IsDir() {
 			return "There’s a file at that path. Choose a folder for your schema files."
 		} else if err != nil && !os.IsNotExist(err) {
@@ -156,6 +166,13 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.namespaceKey(msg)
 		}
 		switch msg.String() {
+		case "pgup", "pgdown":
+			if msg.String() == "pgup" {
+				m.scroll = max(0, m.scroll-max(1, m.height-4))
+			} else {
+				m.scroll += max(1, m.height-4)
+			}
+			return m, nil
 		case "ctrl+c", "esc":
 			m.cancelled = true
 			if m.cancelDiscovery != nil {
@@ -202,6 +219,12 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "enter":
 			if m.step == len(m.fields) {
+				if _, err := initSchemaReuse(m.fields[6].value); err != nil {
+					m.step = 6
+					m.loadField()
+					m.err = err.Error()
+					return m, nil
+				}
 				m.confirmed = true
 				return m, tea.Quit
 			}
@@ -228,6 +251,9 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.input, c = m.input.Update(msg)
 		if m.input.Value() != before {
 			m.connectionChecked = false
+			if m.step == 3 || m.step == 4 {
+				m.connectionSummary = initConnectionSummary(m.fields[0].value, m.input.Value())
+			}
 			m.err = ""
 		}
 		return m, c
@@ -272,7 +298,7 @@ func (m *initWizard) contentView() string {
 		default:
 			b.WriteString(m.input.View() + "\n\n")
 			if m.step == 3 || m.step == 4 {
-				b.WriteString(wrap.Render(initConnectionSummary(m.fields[0].value, m.input.Value())) + "\n\n")
+				b.WriteString(wrap.Render(m.connectionSummary) + "\n\n")
 				b.WriteString(muted.Render("Credentials stay in your environment.") + "\n\n")
 				if m.checkingConnection {
 					b.WriteString(m.spinner.View() + " Checking connection…\n\n")
@@ -306,13 +332,13 @@ func (m *initWizard) contentView() string {
 		}
 		b.WriteString(bold.Render("Your database") + "\n")
 		b.WriteString(wrap.Render(m.fields[1].value+" · "+m.fields[0].value+" · "+m.fields[2].value) + "\n")
-		b.WriteString(wrap.Render("Namespaces: "+m.fields[5].value) + "\n\n")
+		b.WriteString(wrap.Render("Namespaces: "+initTerminalText(m.fields[5].value)) + "\n\n")
 		b.WriteString(bold.Render("Your schema files") + "\n")
 		b.WriteString(wrap.Render(m.fields[6].value+" · profile "+m.fields[7].value) + "\n\n")
 		b.WriteString(bold.Render("Connections") + "\n")
 		b.WriteString(wrap.Render("Application: "+m.fields[3].value) + "\n")
 		b.WriteString(wrap.Render("SchemaBot state: "+m.fields[4].value) + "\n")
-		if entries, err := os.ReadDir(m.fields[6].value); err == nil && len(entries) > 0 {
+		if m.hasExistingSchema {
 			b.WriteString("\nYou already have schema files here. We’ll verify them and keep your edits.\n")
 		}
 		b.WriteString("\n" + wrap.Render("We’ll prepare SchemaBot’s state and verify your schema files. We won’t change your application’s schema.") + "\n\n")
@@ -325,10 +351,10 @@ func (m *initWizard) View() string {
 	content := m.contentView()
 	wrap := m.renderer.NewStyle().Width(m.width)
 	lines := strings.Split(content, "\n")
-	if m.step == len(m.fields) && len(lines) > m.height-2 {
+	if len(lines) > m.height-2 {
 		available := m.height - 4
 		offset := min(m.scroll, len(lines)-available)
-		content = strings.Join(lines[offset:offset+available], "\n") + "\n" + wrap.Render("  ↑/↓ scroll · enter connect · shift+tab edit · esc cancel")
+		content = strings.Join(lines[offset:offset+available], "\n") + "\n" + wrap.Render("  pgup/pgdown scroll · enter continue · esc cancel")
 	}
 	return "\n" + content + "\n"
 }
@@ -352,6 +378,17 @@ func (cmd *InitCmd) promptInputs(ctx context.Context, input io.Reader, output io
 	if !m.confirmed {
 		return ErrSilent
 	}
+	return m.copyToCommand(cmd, g)
+}
+
+func (m *initWizard) copyToCommand(cmd *InitCmd, g *Globals) error {
+	if !m.confirmed {
+		return ErrSilent
+	}
+	reuse, err := initSchemaReuse(m.fields[6].value)
+	if err != nil {
+		return err
+	}
 	cmd.Type = m.fields[0].value
 	cmd.Database = m.fields[1].value
 	cmd.Environment = m.fields[2].value
@@ -360,8 +397,6 @@ func (cmd *InitCmd) promptInputs(ctx context.Context, input io.Reader, output io
 	cmd.Namespaces = m.namespaceChoices(cmd.Namespaces)
 	cmd.SchemaDir = m.fields[6].value
 	g.Profile = m.fields[7].value
-	if entries, err := os.ReadDir(cmd.SchemaDir); err == nil && len(entries) > 0 {
-		cmd.ReuseSchema = true
-	}
+	cmd.ReuseSchema = reuse
 	return nil
 }

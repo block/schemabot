@@ -61,11 +61,15 @@ func (m *initWizard) checkConnection() tea.Cmd {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ctx, m.cancelDiscovery = context.WithCancel(ctx)
+	if m.cancelDiscovery != nil {
+		m.cancelDiscovery()
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	m.cancelDiscovery = cancel
 	engine, dsn := m.fields[0].value, os.Getenv(strings.TrimPrefix(strings.TrimSpace(m.input.Value()), "env:"))
 	check := m.check
 	if check == nil {
 		check = localsetup.CheckConnection
 	}
-	return func() tea.Msg { return initConnectionMsg{generation, check(ctx, engine, dsn)} }
+	return func() tea.Msg { defer cancel(); return initConnectionMsg{generation, check(ctx, engine, dsn)} }
 }

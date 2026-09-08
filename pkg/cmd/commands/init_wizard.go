@@ -53,6 +53,5 @@ func (cmd *InitCmd) collectInputsWithTerminalState(ctx context.Context, g *Globa
 	if err := cmd.promptInputs(ctx, os.Stdin, os.Stdout, g); err != nil {
 		return err
 	}
-	cmd.interactive = true
 	return nil
 }
