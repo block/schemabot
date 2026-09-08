@@ -28,7 +28,7 @@ func TestUpdateConfigRefusesActiveChanges(t *testing.T) {
 		data[0] = 'X'
 		return data, nil
 	})
-	require.ErrorContains(t, err, "runtime is active")
+	require.ErrorContains(t, err, "configuration changes require validated registration")
 	after, err := ReadPrivate(filepath.Join(m.Dir, "runtime.yaml"))
 	require.NoError(t, err)
 	require.Equal(t, original, after)
