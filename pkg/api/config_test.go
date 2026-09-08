@@ -4603,6 +4603,12 @@ func TestPostgresConcurrentIndexMaxDuration(t *testing.T) {
 		err := cfg.validate()
 		require.ErrorContains(t, err, "is not a valid duration")
 	})
+
+	t.Run("refuses duration above engine maximum", func(t *testing.T) {
+		cfg := PostgresConfig{ConcurrentIndexMaxDuration: "2562047h47m"}
+		err := cfg.validate()
+		require.ErrorContains(t, err, "exceeds the largest bound the engine can honor")
+	})
 }
 
 // postgres.statement_timeout bounds ordinary storage queries. Unlike the pool

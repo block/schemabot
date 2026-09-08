@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -969,6 +970,13 @@ func TestConcurrentIndexEnvelopeLeavesVerdictHeadroom(t *testing.T) {
 	ceiling := maxDuration + concurrentIndexHeadroom
 	require.Positive(t, concurrentIndexHeadroom)
 	assert.GreaterOrEqual(t, ceiling-maxDuration, concurrentIndexHeadroom)
+}
+
+func TestConcurrentIndexMaximumFitsApplyCeiling(t *testing.T) {
+	assert.Equal(t, time.Duration(math.MaxInt64), MaxConcurrentIndexMaxDuration+concurrentIndexHeadroom)
+
+	engine := NewWithOptions(0, MaxConcurrentIndexMaxDuration+1)
+	assert.Equal(t, MaxConcurrentIndexMaxDuration, engine.concurrentIndexMaxDuration)
 }
 
 // TestRetryPathFitsUnderApplyCeiling pins the other execution path against

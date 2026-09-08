@@ -139,7 +139,9 @@ type LocalConfig struct {
 	// for PostgreSQL native-safe execution. Zero uses the engine default.
 	PostgresNativeSafeTableSizeLimitBytes int64
 
-	// PostgresConcurrentIndexMaxDuration bounds one concurrent index build.
+	// PostgresConcurrentIndexMaxDuration bounds one PostgreSQL concurrent index
+	// build, including abandoned-index recovery when an invalid leftover index
+	// must be rebuilt. Zero uses the engine default.
 	PostgresConcurrentIndexMaxDuration time.Duration
 
 	// Metadata holds engine-specific configuration as key-value pairs.

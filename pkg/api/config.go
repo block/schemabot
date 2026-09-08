@@ -1363,6 +1363,9 @@ func (c PostgresConfig) validate() error {
 		if d <= 0 {
 			return fmt.Errorf("postgres.concurrent_index_max_duration %q must be positive (omit it to use the default)", c.ConcurrentIndexMaxDuration)
 		}
+		if d > postgresengine.MaxConcurrentIndexMaxDuration {
+			return fmt.Errorf("postgres.concurrent_index_max_duration %q exceeds the largest bound the engine can honor (%s)", c.ConcurrentIndexMaxDuration, postgresengine.MaxConcurrentIndexMaxDuration)
+		}
 	}
 	// Zero is a meaningful setting here, unlike the pool durations: it disables
 	// the budget explicitly instead of selecting the default.

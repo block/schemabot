@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"math"
 	"slices"
 	"sort"
 	"strings"
@@ -76,6 +77,10 @@ const DefaultNativeSafeTableSizeLimitBytes = int64(1 << 30)
 // DefaultConcurrentIndexMaxDuration bounds one concurrent index build.
 const DefaultConcurrentIndexMaxDuration = 24 * time.Hour
 
+// MaxConcurrentIndexMaxDuration is the largest bound the engine can honor
+// because the apply ceiling adds headroom on top of it and must not overflow.
+const MaxConcurrentIndexMaxDuration = time.Duration(math.MaxInt64) - concurrentIndexHeadroom
+
 // New creates a new PostgreSQL engine.
 func New() *Engine {
 	return NewWithTableSizeLimit(DefaultNativeSafeTableSizeLimitBytes)
@@ -98,6 +103,10 @@ func NewWithOptions(tableSizeLimit int64, concurrentIndexMaxDuration time.Durati
 	}
 	if concurrentIndexMaxDuration == 0 {
 		concurrentIndexMaxDuration = DefaultConcurrentIndexMaxDuration
+	}
+	// Keep the apply ceiling within the time.Duration range after adding headroom.
+	if concurrentIndexMaxDuration > MaxConcurrentIndexMaxDuration {
+		concurrentIndexMaxDuration = MaxConcurrentIndexMaxDuration
 	}
 	return &Engine{tableSizeLimit: tableSizeLimit, concurrentIndexMaxDuration: concurrentIndexMaxDuration}
 }
