@@ -400,10 +400,8 @@ func newDrainedOutcome(rm *runningSchemaChange) *drainedOutcome {
 				tp.Progress = 100
 				// A completed change copied everything, so the copied count is
 				// ground truth: reconcile the estimated total to it the way the
-				// live path does, and drop the detail line whose mid-copy
-				// percentage would contradict the completed bar.
+				// live path does.
 				tp.RowsTotal = tp.RowsCopied
-				tp.ProgressDetail = ""
 			}
 			tables = append(tables, tp)
 		}
@@ -971,10 +969,6 @@ func buildSpiritTableProgress(prog status.Progress, spiritState status.State, dd
 			// Clamp to 100 — concurrent inserts can push RowsCopied past the estimate.
 			tp.Progress = min(int(float64(st.RowsCopied)/float64(st.RowsTotal)*100), 100)
 			tp.ETASeconds = etaSeconds
-		}
-		if tp.RowsTotal > 0 {
-			tp.ProgressDetail = fmt.Sprintf("%d/%d %d%% copyRows",
-				tp.RowsCopied, tp.RowsTotal, tp.Progress)
 		}
 		// Spirit reports a single runner-wide checksum estimate (rows verified so
 		// far / total to verify), populated only during the verify phase and zero

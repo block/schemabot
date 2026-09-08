@@ -867,10 +867,9 @@ func TestFormatTableProgress_SubPercentRowCopyShowsFraction(t *testing.T) {
 	assert.NotContains(t, output, " 0%")
 }
 
-// A Spirit row-copy reports its detail string and a structured ETA. The CLI
-// renders the ETA from the structured field (the same source and FormatETA the
-// PR comment uses), so the two surfaces show an identical "Rows … · ETA …" line
-// even though the detail string itself no longer carries the ETA.
+// A row copy renders its ETA from the structured field (the same source and
+// FormatETA the PR comment uses), so the two surfaces show an identical
+// "Rows … · ETA …" line.
 func TestFormatTableProgress_RowCopyShowsStructuredETA(t *testing.T) {
 	tp := TableProgress{
 		TableName:       "users",
@@ -880,7 +879,6 @@ func TestFormatTableProgress_RowCopyShowsStructuredETA(t *testing.T) {
 		RowsTotal:       100_000,
 		PercentComplete: 45,
 		ETASeconds:      340,
-		ProgressDetail:  "45000/100000 45% copyRows",
 	}
 
 	output := FormatTableProgress(tp)
@@ -915,38 +913,22 @@ func TestFormatTableProgress_FailedRetryableKeepsProgress(t *testing.T) {
 }
 
 func TestFormatTableProgress_EstimateExceeded(t *testing.T) {
-	t.Run("structured progress", func(t *testing.T) {
-		tp := TableProgress{
-			TableName:       "users",
-			ChangeType:      "alter",
-			Status:          state.Apply.Running,
-			RowsCopied:      145000,
-			RowsTotal:       100000,
-			PercentComplete: 145,
-		}
+	tp := TableProgress{
+		TableName:       "users",
+		ChangeType:      "alter",
+		Status:          state.Apply.Running,
+		RowsCopied:      145000,
+		RowsTotal:       100000,
+		PercentComplete: 145,
+	}
 
-		output := FormatTableProgress(tp)
-		assert.Contains(t, output, ui.ProgressBarActivity()+" Finalizing copy")
-		assert.Contains(t, output, "Rows copied: 145,000 so far")
-		assert.Contains(t, output, ui.EstimateExceededTooltip)
-		assert.NotContains(t, output, "145%")
-		assert.NotContains(t, output, "100%")
-		assert.NotContains(t, output, "100,000 / 100,000")
-	})
-
-	t.Run("parsed Spirit progress", func(t *testing.T) {
-		tp := TableProgress{
-			TableName:      "users",
-			ChangeType:     "alter",
-			Status:         state.Apply.Running,
-			ProgressDetail: "145000/100000 100% copyRows ETA TBD",
-		}
-
-		output := FormatTableProgress(tp)
-		assert.Contains(t, output, ui.ProgressBarActivity()+" Finalizing copy")
-		assert.Contains(t, output, "Rows copied: 145,000 so far")
-		assert.NotContains(t, output, "100%")
-	})
+	output := FormatTableProgress(tp)
+	assert.Contains(t, output, ui.ProgressBarActivity()+" Finalizing copy")
+	assert.Contains(t, output, "Rows copied: 145,000 so far")
+	assert.Contains(t, output, ui.EstimateExceededTooltip)
+	assert.NotContains(t, output, "145%")
+	assert.NotContains(t, output, "100%")
+	assert.NotContains(t, output, "100,000 / 100,000")
 }
 
 func TestFormatVSchemaStatus(t *testing.T) {

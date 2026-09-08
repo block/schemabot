@@ -1,21 +1,12 @@
 package templates
 
 import (
-	"math"
-	"regexp"
-	"strconv"
-
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 )
-
-// spiritProgressPattern matches the row-copy prefix of a Spirit progress
-// string, e.g. "71436/221193 32.30% copyRows". The ETA is carried separately as
-// a structured field, so it is not parsed out of this string.
-var spiritProgressPattern = regexp.MustCompile(`(\d+)/(\d+)\s+([\d.]+)%\s+(\w+)`)
 
 // ProgressData contains data for rendering schema change progress.
 type ProgressData struct {
@@ -78,7 +69,6 @@ type TableProgress struct {
 	Throttled      bool
 	ThrottleReason string
 	IsInstant      bool
-	ProgressDetail string // e.g., Spirit: "12.5% copyRows ETA 1h 30m"
 	Shards         []ShardProgress
 }
 
@@ -103,39 +93,6 @@ type ShardCounts struct {
 	Queued            int
 	Failed            int
 	Cancelled         int
-}
-
-// SpiritProgressInfo contains parsed Spirit progress information.
-type SpiritProgressInfo struct {
-	RowsCopied int64
-	RowsTotal  int64
-	Percent    int
-	State      string // "copyRows", "checksum", etc.
-}
-
-// ParseSpiritProgress parses a Spirit progress string like "71436/221193 32.30% copyRows ETA TBD"
-// Returns nil if the string cannot be parsed.
-func ParseSpiritProgress(progress string) *SpiritProgressInfo {
-	if progress == "" {
-		return nil
-	}
-
-	matches := spiritProgressPattern.FindStringSubmatch(progress)
-	if len(matches) < 5 {
-		return nil
-	}
-
-	rowsCopied, _ := strconv.ParseInt(matches[1], 10, 64)
-	rowsTotal, _ := strconv.ParseInt(matches[2], 10, 64)
-	percentFloat, _ := strconv.ParseFloat(matches[3], 64)
-	state := matches[4]
-
-	return &SpiritProgressInfo{
-		RowsCopied: rowsCopied,
-		RowsTotal:  rowsTotal,
-		Percent:    int(math.Round(percentFloat)),
-		State:      state,
-	}
 }
 
 // Display-only task states. These are not persisted apply states (see pkg/applystate)
@@ -198,18 +155,6 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			Throttled:           tbl.Throttled,
 			ThrottleReason:      tbl.ThrottleReason,
 			IsInstant:           tbl.IsInstant,
-			ProgressDetail:      tbl.ProgressDetail,
-		}
-		// When a table carries an engine progress string, it is fresher than
-		// the stored copy fields, so prefer it and keep the percent, the rows
-		// line, and anything aggregated from them in agreement. The live
-		// progress API sends ProgressDetail empty (the drive loop does not
-		// persist it to the task record), so this override only takes effect
-		// for responses that populate the field, such as log preview fixtures.
-		if info := ParseSpiritProgress(tp.ProgressDetail); info != nil {
-			tp.PercentComplete = info.Percent
-			tp.RowsCopied = info.RowsCopied
-			tp.RowsTotal = info.RowsTotal
 		}
 		for _, sh := range tbl.Shards {
 			pct := int(sh.PercentComplete)
