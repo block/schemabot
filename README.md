@@ -14,9 +14,9 @@
 
 <p align="center">
   <a href="./docs/vision.md">Vision</a> ·
-  <a href="#quick-start">Quick start</a> ·
   <a href="#the-pr-workflow">PR workflow</a> ·
   <a href="#from-your-terminal">CLI</a> ·
+  <a href="#quick-start">Quick start</a> ·
   <a href="#docs">Docs</a>
 </p>
 
