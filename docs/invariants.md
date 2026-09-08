@@ -52,6 +52,7 @@
   - [OW-6: There is one way to claim work](#ow-6-there-is-one-way-to-claim-work)
   - [OW-7: Ownership uncertainty fails closed](#ow-7-ownership-uncertainty-fails-closed)
   - [OW-8: Only drivers and elected reapers write apply and task rows](#ow-8-only-drivers-and-elected-reapers-write-apply-and-task-rows)
+  - [OW-9: Only drivers and elected reapers write to the target database](#ow-9-only-drivers-and-elected-reapers-write-to-the-target-database)
 - [Control operations (CO)](#control-operations-co)
   - [CO-1: Durable before acknowledged](#co-1-durable-before-acknowledged)
   - [CO-2: Every command resolves; none wedges](#co-2-every-command-resolves-none-wedges)
@@ -857,6 +858,36 @@ what makes the registry unreliable.
 reaper's task sweeps (`unleasedOperationGate`,
 `pkg/storage/internal/sqlstore/apply_operations.go`), and a read path that builds progress from
 stored rows without writing them (`pkg/api/progress_handlers.go`).
+
+### OW-9: Only drivers and elected reapers write to the target database
+
+OW-8 governs SchemaBot's own rows. The same two writer classes govern the databases SchemaBot
+changes: a target is written by the driver holding the claim on the apply that write belongs to, or
+by an elected reaper acting for an apply no driver is coming back for. A component that concludes
+such a write is needed while holding neither records a durable request and leaves the write to a
+driver (CO-1).
+
+The asymmetry that OW-8 rests on is sharper here. A wrong row is repairable by the next writer that
+holds the lease; a dropped table is not, and nothing about the target afterwards records who decided
+to drop it. So the exclusion a destructive target write depends on is a mechanism the caller holds
+for as long as the write runs, never a property it observed before starting. An observation is true
+only of the instant it was made, and the interval between that instant and the write's last
+statement is exactly where a second writer arrives. A contract for such a write therefore names the
+mechanism the caller must hold, because a contract that names the property invites a caller to
+satisfy it with a read.
+
+Those mechanisms are SchemaBot's, and they bind SchemaBot's applies. A schema change run against the
+same target from outside SchemaBot holds none of them and is visible to none of them. Where a
+destructive write could reach an object such a change may own, the write is declined and the object
+reported as retained, for an operator to reclaim once they know the target is idle. Declining costs
+disk; guessing costs another writer's work, and the registry cannot promise the first writer class
+above while any write is deciding ownership by inference.
+
+*Enforced:* the claim every drive runs under (OW-1); the apply-target lock held across a destructive
+target write, which excludes SchemaBot's applies and says so (`WithExclusiveTarget`,
+`pkg/storage/internal/sqlstore/applies.go`); and the engine-side guard that retains rather than
+reclaims what a schema change SchemaBot did not start could own
+(`pkg/engine/spirit/cancelled_artifacts.go`).
 
 ## Control operations (CO)
 

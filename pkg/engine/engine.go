@@ -216,15 +216,22 @@ type CancelledArtifactReleaser interface {
 	// is kept somewhere recoverable where the deployment offers one; the
 	// metadata describing where the copy had got to is always discarded.
 	//
-	// Callers must establish that no live schema change is running anywhere in
-	// the target schema before calling — not merely none on the tables the
-	// request names. The engine's table names are derived from the target's own
-	// table names, so an apply running against the same tables uses the same
-	// names; and an engine's artifacts can include schema-scoped ones shared by
-	// every schema change in the schema, one of which can be a cutover gate.
-	// Reclaiming that gate on a cancelled change's behalf releases the cutover a
-	// live change is still waiting on. The engine cannot see that change and
-	// will not check for it.
+	// Callers must hold the mechanisms that keep another writer off the target
+	// for as long as the release runs — the claim on the apply being cancelled,
+	// and the apply-target lock that keeps a second apply off that target.
+	// Having read that nothing was running is not the same thing: the read is
+	// true of the instant it happened, and the release destroys tables for
+	// however long it takes after that.
+	//
+	// Those mechanisms cover the schema changes the caller can see. They do not
+	// cover one started outside it, so the engine defends the artifacts that a
+	// schema change other than the cancelled one can own: the schema-scoped
+	// ones, shared by every schema change in the schema, one of which can be a
+	// cutover gate. Reclaiming that gate on a cancelled change's behalf releases
+	// the cutover a live change is still waiting on. Where the schema holds an
+	// artifact the request's tables do not account for, those shared artifacts
+	// are retained rather than reclaimed, and reported as retained. Artifacts
+	// derived from the request's own tables are always reclaimed.
 	//
 	// Tables must not be empty. Every schema change names at least one table, so
 	// an empty list is a lost one, and the schema-scoped artifacts above would
@@ -242,12 +249,13 @@ type ReleaseArtifactsRequest struct {
 	Credentials *Credentials
 }
 
-// ReleaseArtifactsResult reports what a release reclaimed, so a caller can tell
-// an operator where their copy went. Both are empty when the schema change left
-// nothing behind, which is the ordinary outcome for a cancel that arrives
-// before any copying started.
+// ReleaseArtifactsResult reports what a release reclaimed and what it left
+// alone, so a caller can tell an operator where their copy went and what is
+// still on the target. All three are empty when the schema change left nothing
+// behind, which is the ordinary outcome for a cancel that arrives before any
+// copying started.
 //
-// Every table in either field is named in full, as schema.table, so an operator
+// Every table in every field is named in full, as schema.table, so an operator
 // reading one release can act on any line of it without having to supply the
 // schema from context — including the lines naming tables that left the schema
 // the release ran against.
@@ -256,6 +264,14 @@ type ReleaseArtifactsResult struct {
 	Preserved []PreservedArtifact
 	// Discarded names each table that was removed outright.
 	Discarded []string
+	// Retained names each artifact the release deliberately left on the target
+	// because another schema change may own it, with RetainedReason saying what
+	// the engine saw. An operator reclaims these by hand once they know the
+	// schema is idle; a release never guesses on their behalf.
+	Retained []string
+	// RetainedReason states why Retained was left alone, in terms an operator
+	// can act on. Empty when Retained is empty.
+	RetainedReason string
 }
 
 // PreservedArtifact records where a cancelled schema change's copied data was

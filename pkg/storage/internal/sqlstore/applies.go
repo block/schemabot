@@ -2314,8 +2314,12 @@ func (s *applyStore) CheckLease(ctx context.Context, lease storage.ApplyLease) e
 	return ensureApplyLeaseStillOwned(ctx, s.db, lease)
 }
 
-// WithExclusiveTarget runs fn under the apply target's advisory lock, and only
-// when no active apply other than this one owns the target.
+// WithExclusiveTarget runs fn under the apply target's advisory lock, having
+// first refused to run it at all if another active apply owns the target. The
+// lock, held for the whole of fn, is what fn relies on; the re-check only
+// decides whether fn runs. It excludes SchemaBot's own applies and nothing
+// else, so fn stays responsible for anything a schema change run from outside
+// SchemaBot could own.
 func (s *applyStore) WithExclusiveTarget(ctx context.Context, apply *storage.Apply, fn func(context.Context) error) error {
 	if apply == nil {
 		return fmt.Errorf("apply is required to hold its target exclusively")
