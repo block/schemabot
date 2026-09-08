@@ -767,6 +767,23 @@ func TestLoadStoredProgressMetadataMergesVitessResumeFieldsLast(t *testing.T) {
 	assert.Equal(t, "https://example.com/request", metadata["deploy_request_url"])
 }
 
+func TestLoadStoredProgressMetadataReturnsEmptyMapForNull(t *testing.T) {
+	operationID := int64(19)
+	store := &exactProgressApplyOperationStore{ops: []*storage.ApplyOperation{{
+		ID:               operationID,
+		ProgressMetadata: "null",
+	}}}
+	client := &LocalClient{
+		storage: &exactProgressStorage{applyOperations: store},
+		logger:  slog.Default(),
+	}
+	task := &storage.Task{TaskIdentifier: "task-read-null-progress", ApplyOperationID: &operationID}
+
+	metadata := client.loadStoredProgressMetadata(t.Context(), task)
+	assert.NotNil(t, metadata)
+	assert.Empty(t, metadata)
+}
+
 func TestApplyCancelHandleDoesNotCancelNewerOwner(t *testing.T) {
 	client := &LocalClient{}
 	oldCtx, oldCancel := context.WithCancel(t.Context())

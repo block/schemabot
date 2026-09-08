@@ -472,6 +472,16 @@ func TestApplyOperationStore_EngineResumeState(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(operation.ProgressMetadata), &storedProgressMetadata))
 	assert.Equal(t, progressMetadata, storedProgressMetadata)
 
+	require.NoError(t, store.ApplyOperations().SaveProgressMetadata(ctx, operationID, nil))
+	operation, err = store.ApplyOperations().Get(ctx, operationID)
+	require.NoError(t, err)
+	require.NotNil(t, operation)
+	assert.Equal(t, `{}`, operation.ProgressMetadata)
+	storedProgressMetadata = nil
+	require.NoError(t, json.Unmarshal([]byte(operation.ProgressMetadata), &storedProgressMetadata))
+	assert.NotNil(t, storedProgressMetadata)
+	assert.Empty(t, storedProgressMetadata)
+
 	updated := &storage.EngineResumeState{
 		ApplyOperationID: operationID,
 		MigrationContext: "ctx-456",

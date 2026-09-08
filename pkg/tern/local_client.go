@@ -3281,6 +3281,9 @@ func (c *LocalClient) loadStoredProgressMetadata(ctx context.Context, task *stor
 				"task_id", task.TaskIdentifier, "apply_operation_id", operationID, "error", err)
 			metadata = make(map[string]string)
 		}
+		if metadata == nil {
+			metadata = make(map[string]string)
+		}
 	}
 	if c.config.Type == storage.DatabaseTypeVitess && op.EngineResumeMetadata != "" {
 		display, err := PSDisplayMetadata(op.EngineResumeMetadata)

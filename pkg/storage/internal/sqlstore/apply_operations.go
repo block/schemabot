@@ -714,10 +714,13 @@ func (s *applyOperationStore) GetEngineResumeState(ctx context.Context, operatio
 	}, nil
 }
 
-// SaveProgressMetadata stores the engine's latest progress display metadata on
-// the operation that owns the execution. The operation write guard preserves
-// OW-2 by rejecting writes from a displaced driver.
+// SaveProgressMetadata stores the engine's latest progress display metadata as
+// a JSON object on the operation that owns the execution. The operation write
+// guard preserves OW-2 by rejecting writes from a displaced driver.
 func (s *applyOperationStore) SaveProgressMetadata(ctx context.Context, operationID int64, metadata map[string]string) error {
+	if metadata == nil {
+		metadata = make(map[string]string)
+	}
 	encoded, err := json.Marshal(metadata)
 	if err != nil {
 		return fmt.Errorf("encode progress metadata for apply_operation %d: %w", operationID, err)
