@@ -141,9 +141,13 @@ active. SchemaBot signals that build's backend through its pg-sprite progress
 tracker; the engine role must be able to observe and signal the backend, which
 requires membership in `pg_signal_backend` when PostgreSQL does not otherwise
 permit it. If the build has already finished or its backend is no longer
-running, cancel has no effect and the apply continues to the build's actual
-verdict. If the backend is not observable, the request is refused with the
-privilege remedy rather than claiming a cancellation that might not land.
+running, the cancel is declined: the durable request resolves as not applied,
+and the apply continues to the build's actual verdict rather than being
+recorded complete on the strength of one finished step. If the backend is not
+observable, the request is refused with the privilege remedy rather than
+claiming a cancellation that might not land. A progress read that fails at the
+moment of the cancel does not decline it; the engine proceeds on the tracker's
+last-known step and lets the signal attempt report the outcome.
 
 Stop remains unsupported. A concurrent build has no resumable midpoint, so a
 stop would be a permanent cancel under a misleading name; non-concurrent

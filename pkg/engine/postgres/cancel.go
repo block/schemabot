@@ -26,12 +26,18 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 		e.mu.Unlock()
 		return nil, engine.NewUnsupportedOperationError("cancel is supported for PostgreSQL concurrent index builds only: no running concurrent index build is tracked for this apply")
 	}
-	tracker := tracked.tracker
+	tracker, logger := tracked.tracker, tracked.logger
 	e.mu.Unlock()
 
+	// The tracker answers with its last-known snapshot even when the
+	// server-side progress read fails, and that snapshot is enough to decide
+	// whether a concurrent index build is the active step. CancelBuild makes
+	// its own observability check and reports the typed outcome, so a
+	// progress read failure is not on its own a reason to decline the cancel.
 	snapshot, err := tracker.Progress(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("inspect PostgreSQL apply %q before cancel: %w", key, err)
+		logger.Warn("PostgreSQL cancel proceeds on the last-known executor position",
+			"task_id", key, "error", err)
 	}
 	if snapshot.Detail.Operation != progress.OperationConcurrentIndex || !snapshot.Detail.Active {
 		return nil, engine.NewUnsupportedOperationError("cancel is supported for PostgreSQL concurrent index builds only: the active step is %q", snapshot.Detail.Operation)
@@ -46,7 +52,11 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 		e.mu.Unlock()
 		switch {
 		case errors.Is(err, progress.ErrNoActiveBuild), errors.Is(err, progress.ErrBuildNotRunning):
-			return nil, engine.NewAlreadyCompletedError("cancel arrived after the PostgreSQL concurrent index build step finished")
+			// Only the build step has finished; the apply itself is still
+			// running toward the build's verdict. Declining the request keeps
+			// the apply's outcome with its driver instead of reporting the
+			// whole schema change complete on the strength of one step.
+			return nil, engine.NewUnsupportedOperationError("cancel arrived after the PostgreSQL concurrent index build step finished; the apply continues to the build's verdict")
 		case errors.Is(err, progress.ErrBuildUnobservable):
 			return nil, engine.NewUnsupportedOperationError("cancel PostgreSQL concurrent index build refused: grant the engine role pg_signal_backend so it can observe and signal the build backend")
 		default:

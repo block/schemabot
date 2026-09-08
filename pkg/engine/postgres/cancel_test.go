@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"testing"
 
 	"github.com/block/pg-sprite/pkg/progress"
@@ -13,13 +14,14 @@ import (
 )
 
 type fakeBuildTracker struct {
-	snapshot  progress.Snapshot
-	cancelErr error
-	cancelled bool
+	snapshot    progress.Snapshot
+	progressErr error
+	cancelErr   error
+	cancelled   bool
 }
 
 func (f *fakeBuildTracker) Progress(context.Context) (progress.Snapshot, error) {
-	return f.snapshot, nil
+	return f.snapshot, f.progressErr
 }
 
 func (f *fakeBuildTracker) CancelBuild(context.Context) error {
@@ -29,7 +31,7 @@ func (f *fakeBuildTracker) CancelBuild(context.Context) error {
 
 func trackedCancelEngine(tracker buildTracker) *Engine {
 	return &Engine{progress: map[string]*trackedApply{
-		"apply-1": {result: &engine.ProgressResult{State: engine.StateRunning}, tracker: tracker},
+		"apply-1": {result: &engine.ProgressResult{State: engine.StateRunning}, tracker: tracker, logger: slog.New(slog.DiscardHandler)},
 	}}
 }
 
@@ -64,16 +66,35 @@ func TestCancelRefusesNonConcurrentStep(t *testing.T) {
 	assert.False(t, tracker.cancelled)
 }
 
+// TestCancelProceedsWhenProgressReadFails covers a cancel issued while the
+// tracker's server-side progress read is failing: the last-known snapshot still
+// identifies an active concurrent index build, so the cancel reaches the build
+// instead of being declined for a transient read failure.
+func TestCancelProceedsWhenProgressReadFails(t *testing.T) {
+	tracker := &fakeBuildTracker{snapshot: concurrentSnapshot(), progressErr: errors.New("progress view unreadable")}
+	eng := trackedCancelEngine(tracker)
+
+	result, err := eng.Cancel(t.Context(), cancelRequest())
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	assert.True(t, tracker.cancelled)
+	assert.True(t, eng.progress["apply-1"].cancelRequested)
+}
+
+// TestCancelMapsTrackerSentinels pins how each pg-sprite cancel sentinel
+// resolves. A build that has already finished declines the cancel as
+// unsupported rather than reporting the apply complete: only the build step is
+// over, and the apply is still running toward that build's verdict. An
+// unobservable build declines with the privilege remedy.
 func TestCancelMapsTrackerSentinels(t *testing.T) {
 	tests := []struct {
-		name            string
-		err             error
-		alreadyFinished bool
-		unsupported     bool
+		name     string
+		err      error
+		contains string
 	}{
-		{name: "no active build", err: progress.ErrNoActiveBuild, alreadyFinished: true},
-		{name: "build not running", err: progress.ErrBuildNotRunning, alreadyFinished: true},
-		{name: "build unobservable", err: progress.ErrBuildUnobservable, unsupported: true},
+		{name: "no active build", err: progress.ErrNoActiveBuild, contains: "the apply continues to the build's verdict"},
+		{name: "build not running", err: progress.ErrBuildNotRunning, contains: "the apply continues to the build's verdict"},
+		{name: "build unobservable", err: progress.ErrBuildUnobservable, contains: "pg_signal_backend"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -84,11 +105,9 @@ func TestCancelMapsTrackerSentinels(t *testing.T) {
 
 			assert.Nil(t, result)
 			require.Error(t, err)
-			assert.Equal(t, tc.alreadyFinished, engine.IsAlreadyCompleted(err))
-			assert.Equal(t, tc.unsupported, engine.IsUnsupportedOperation(err))
-			if tc.unsupported {
-				assert.Contains(t, err.Error(), "pg_signal_backend")
-			}
+			assert.True(t, engine.IsUnsupportedOperation(err))
+			assert.False(t, engine.IsAlreadyCompleted(err))
+			assert.Contains(t, err.Error(), tc.contains)
 			assert.False(t, eng.progress["apply-1"].cancelRequested)
 		})
 	}
