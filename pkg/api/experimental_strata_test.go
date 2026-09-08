@@ -92,3 +92,11 @@ func TestExperimentalStrataInvalidTypeGuidance(t *testing.T) {
 		require.Equal(t, enabled, strings.Contains(err.Error(), "strata (experimental)"))
 	}
 }
+
+// Resolver errors identify the entry that needs the server opt-in.
+func TestExperimentalStrataResolverErrorLocation(t *testing.T) {
+	cfg := &ServerConfig{TargetResolver: TargetResolverConfig{Etre: []EtreConfig{
+		{DatabaseType: "mysql"}, {DatabaseType: "strata"},
+	}}}
+	require.EqualError(t, cfg.ValidateExperimentalStrata(), "target_resolver.etre[1]: Strata is experimental; set experimental-strata-enabled: true in the server configuration to enable it")
+}

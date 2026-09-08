@@ -1628,24 +1628,24 @@ func (c *ServerConfig) ValidateExperimentalStrata() error {
 	if c.ExperimentalStrataEnabled {
 		return nil
 	}
-	check := func(kind, name, databaseType string) error {
+	check := func(location, databaseType string) error {
 		if strings.ToLower(strings.TrimSpace(databaseType)) == storage.DatabaseTypeStrata {
-			return fmt.Errorf("%s %q: Strata is experimental; set experimental-strata-enabled: true in the server configuration to enable it", kind, name)
+			return fmt.Errorf("%s: Strata is experimental; set experimental-strata-enabled: true in the server configuration to enable it", location)
 		}
 		return nil
 	}
 	for name, db := range c.Databases {
-		if err := check("database", name, db.Type); err != nil {
+		if err := check(fmt.Sprintf("database %q", name), db.Type); err != nil {
 			return err
 		}
 	}
 	for name, target := range c.TargetResolver.Targets {
-		if err := check("target", name, target.DatabaseType); err != nil {
+		if err := check(fmt.Sprintf("target %q", name), target.DatabaseType); err != nil {
 			return err
 		}
 	}
-	for _, resolver := range c.TargetResolver.Etre {
-		if err := check("target_resolver.etre", resolver.DatabaseType, resolver.DatabaseType); err != nil {
+	for index, resolver := range c.TargetResolver.Etre {
+		if err := check(fmt.Sprintf("target_resolver.etre[%d]", index), resolver.DatabaseType); err != nil {
 			return err
 		}
 	}
