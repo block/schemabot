@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -154,7 +154,7 @@ func TestCLI_OnboardPullsLiveMySQLSchema(t *testing.T) {
 	cfg, err := mysql.ParseDSN(targetDSN)
 	require.NoError(t, err)
 	cfg.DBName = dbName
-	db, err := sql.Open("mysql", cfg.FormatDSN())
+	db, err := sql.Open("block-mysql", cfg.FormatDSN())
 	require.NoError(t, err, "open target database")
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(t.Context()), "ping target database")
@@ -587,7 +587,7 @@ CREATE TABLE items (
 	// Insert rows into the table to make the copy phase take longer
 	t.Run("insert_test_data", func(t *testing.T) {
 		targetDSN := strings.Replace(targetDSN, "/target_test", "/"+dbName, 1)
-		db, err := sql.Open("mysql", targetDSN)
+		db, err := sql.Open("block-mysql", targetDSN)
 		require.NoError(t, err, "open target db")
 		defer utils.CloseAndLog(db)
 
@@ -704,7 +704,7 @@ CREATE TABLE items (
 	// Verify the schema change was applied
 	t.Run("verify_indexes_exist", func(t *testing.T) {
 		targetDSN := strings.Replace(targetDSN, "/target_test", "/"+dbName, 1)
-		db, err := sql.Open("mysql", targetDSN)
+		db, err := sql.Open("block-mysql", targetDSN)
 		require.NoError(t, err, "open target db")
 		defer utils.CloseAndLog(db)
 
@@ -756,7 +756,7 @@ CREATE TABLE items (
 	// before the stop command can intervene.
 	t.Run("insert_test_data", func(t *testing.T) {
 		targetDSN := strings.Replace(targetDSN, "/target_test", "/"+dbName, 1)
-		db, err := sql.Open("mysql", targetDSN)
+		db, err := sql.Open("block-mysql", targetDSN)
 		require.NoError(t, err, "open target db")
 		defer utils.CloseAndLog(db)
 
@@ -870,7 +870,7 @@ func startSchemaBotLocal(t *testing.T) string {
 	t.Helper()
 
 	// Connect to SchemaBot storage and clear stale state from prior tests.
-	db, err := sql.Open("mysql", schemabotDSN)
+	db, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 	clearStorageDB(t, db)
@@ -941,7 +941,7 @@ func startSchemaBotLocalDB(t *testing.T, dbName string) string {
 	t.Helper()
 
 	// Connect to SchemaBot storage and clear stale state from prior tests.
-	db, err := sql.Open("mysql", schemabotDSN)
+	db, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 	clearStorageDB(t, db)
@@ -949,7 +949,7 @@ func startSchemaBotLocalDB(t *testing.T, dbName string) string {
 	storage := mysqlstore.New(db)
 
 	// Create the target database
-	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
+	targetDB, err := sql.Open("block-mysql", targetDSN+"&multiStatements=true")
 	require.NoError(t, err, "open target db connection")
 	t.Cleanup(func() {
 		ctx, cancel := testutil.CleanupContext(30 * time.Second)
@@ -1025,7 +1025,7 @@ func startSchemaBotWithGRPC(t *testing.T) string {
 	t.Helper()
 
 	// Connect to SchemaBot storage and clear stale state from prior tests.
-	db, err := sql.Open("mysql", schemabotDSN)
+	db, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 	clearStorageDB(t, db)

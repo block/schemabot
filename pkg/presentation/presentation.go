@@ -181,8 +181,8 @@ type StateCount struct {
 type Apply struct {
 	// State is the aggregate apply state derived from the child operation states
 	// via state.DeriveRolloutApplyState — the same policy-aware projection that
-	// backs applies.state, so a continue rollout still in flight past a failed
-	// sibling shows running_degraded here too rather than a premature failed.
+	// backs applies.state, so a rollout still in flight past a failed sibling
+	// shows running_degraded here too rather than a premature failed.
 	State string
 
 	// Label is the operator-facing aggregate status (e.g. "waiting for cutover").
@@ -245,7 +245,7 @@ func Derive(ops []Operation) Apply {
 		State:        aggState,
 		Label:        aggregateLabel(aggState),
 		Counts:       summaryCounts(deployments),
-		NextAction:   nextAction(aggState, deployments),
+		NextAction:   nextAction(aggState, deployments, hasFailClosedFailure(ops)),
 		FirstFailure: firstFailure(deployments),
 		Deployments:  deployments,
 	}
@@ -480,13 +480,48 @@ func aggregateLabel(s string) string {
 	}
 }
 
+// failsClosed reports whether a terminal failure of this deployment forces the
+// rollout's verdict rather than being absorbed by the deployment's own
+// on_failure policy. Continue and pause absorb it; halt and any unrecognized
+// policy fail closed, as does the invalid combination of both flags, so a
+// caller bug cannot loosen what an operator is told by winning the continue
+// branch. This mirrors the policy precedence in state.DeriveRolloutApplyState,
+// which decides the aggregate state the same failure produces.
+func (o Operation) failsClosed() bool {
+	if o.ContinueOnFailure && o.PauseOnFailure {
+		return true
+	}
+	return !o.continuesPastFailure() && !o.pausesOnFailure()
+}
+
+// hasFailClosedFailure reports whether a terminally failed deployment is fail
+// closed under its own policy. Such a failure is already the rollout's verdict
+// and nothing that has not started will start, so it is what an operator should
+// be pointed at even while a sibling that was already running keeps the
+// aggregate degraded. A continuing or pause-held rollout is a different
+// situation — it still has work ahead of it — so there the aggregate leads.
+func hasFailClosedFailure(ops []Operation) bool {
+	for _, op := range ops {
+		if !state.IsState(op.State, state.ApplyOperation.Failed) {
+			continue
+		}
+		if op.failsClosed() {
+			return true
+		}
+	}
+	return false
+}
+
 // nextAction derives the aggregate's suggested operator action from the
 // aggregate state and the per-deployment presentations, in operator-priority
 // order: a failure to review, then a stop to resume, then an available cutover.
-func nextAction(aggState string, deps []Deployment) NextAction {
-	// A failed rollout is fail-closed: review the failure before anything else,
-	// even if an earlier deployment is sitting ready for cutover.
-	if aggState == state.Apply.Failed {
+func nextAction(aggState string, deps []Deployment, failClosed bool) NextAction {
+	// A fail-closed rollout: review the failure before anything else, even if an
+	// earlier deployment is sitting ready for cutover. The aggregate can still
+	// read running while that verdict settles, because refusing new claims does
+	// not stop a sibling that a driver already started, so the failure rather
+	// than the aggregate is what says there is nothing left to wait for.
+	if aggState == state.Apply.Failed || failClosed {
 		if d, ok := firstWithState(deps, state.ApplyOperation.Failed); ok {
 			return NextAction{Kind: NextActionReviewFailure, Deployment: d.Deployment}
 		}

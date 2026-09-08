@@ -26,6 +26,7 @@
 - [Storage Connection Pool](#storage-connection-pool)
 - [Spirit Run Settings](#spirit-run-settings)
 - [Postgres](#postgres)
+  - [Storage statement budget](#storage-statement-budget)
 - [PlanetScale mTLS](#planetscale-mtls)
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
@@ -46,7 +47,7 @@
   - [Tenant-scoped command routing](#tenant-scoped-command-routing)
   - [How it works](#how-it-works)
   - [Auto-plan behavior](#auto-plan-behavior)
-  - [Plan comment minimization](#plan-comment-minimization)
+  - [Plan comment retirement](#plan-comment-retirement)
 - [Multi-App Routing](#multi-app-routing)
   - [How dispatch works](#how-dispatch-works)
 - [Secret Resolution](#secret-resolution)
@@ -142,6 +143,12 @@ With the `config_paths` example above, SchemaBot reads:
 environment entry.
 
 ### PostgreSQL `dsn_from` targets
+
+`target_resolver` is the data-plane connection resolver: a server exposing the
+gRPC listener (started with `GRPC_PORT` set) receives an opaque execution
+target over gRPC and resolves it to a connection through this inventory, rather
+than routing logical database names through the control plane's `databases`
+table.
 
 `dsn_from` on a `target_resolver` target supports `type: postgres` in addition
 to `mysql`. The assembled DSN is a libpq URL that always names one database and
@@ -611,7 +618,7 @@ databases:
     type: mysql
     environments:
       staging:
-        dsn_secret_ref: "..."
+        dsn: "file:/run/secrets/payments-staging-dsn"
         direct_execution:
           enabled: true           # default: false
           max_table_rows: 100000  # required (positive) when enabled
@@ -778,12 +785,14 @@ over gRPC run with that deployment's engine settings.
 ## Postgres
 
 The `postgres:` block sets the largest table on which the PostgreSQL engine
-will execute native-safe DDL. The limit is expressed in bytes and defaults to
+will execute native-safe DDL, and the statement budget SchemaBot's own storage
+connections run under. The size limit is expressed in bytes and defaults to
 1 GiB:
 
 ```yaml
 postgres:
   native_safe_table_size_limit_bytes: 4294967296
+  statement_timeout: 30s
 ```
 
 The ceiling is SchemaBot's own conservatism about how much work to attempt
@@ -806,9 +815,30 @@ The server fails startup validation when
 
 The ceiling is process-wide: every PostgreSQL database this server drives
 shares the same value, and a database cannot override it in its own metadata.
-These settings only apply where this server constructs the PostgreSQL engine
+The ceiling only applies where this server constructs the PostgreSQL engine
 itself — local-mode PostgreSQL databases. Databases routed to a remote
 deployment over gRPC run with that deployment's engine settings.
+
+### Storage statement budget
+
+```yaml
+postgres:
+  statement_timeout: 30s   # default; "0" removes the limit
+```
+
+Time limit for a single query against SchemaBot's own storage database, on the
+long-lived pool and on the startup bootstrap alike. It applies in every mode,
+unlike the ceiling above. Must be at least `15s` or the server refuses to start:
+a query can spend up to 10 seconds waiting for another instance's lock, the
+limit counts waiting as well as working, and the floor leaves the wait room to
+end on its own. A negative value or an unparseable
+duration is refused too. The limit is set when the connection opens, so a
+transaction pooler in front of storage discards it — point SchemaBot at a
+session pooler or directly at the database.
+
+Schema changes are unaffected. They run under limits pg-sprite sets on the
+target database. The bootstrap raises the limit for its own schema DDL, where
+an index build legitimately outruns a query.
 
 ## PlanetScale mTLS
 
@@ -1144,7 +1174,7 @@ merge base, or either tree.
 
 ## Review Gate
 
-SchemaBot can block `apply` and `apply-confirm` until the PR has a satisfying review. This prevents unapproved schema changes from being applied to any environment.
+When `review_policy.enabled` is true, SchemaBot blocks `apply` and `apply-confirm` until the PR has a qualifying approval. This is a server-instance setting: it applies to the environments served by that instance. Other instances can configure their review gate separately.
 
 ```yaml
 review_policy:
@@ -1197,12 +1227,14 @@ Approval is checked at the time of `schemabot apply` and `schemabot apply-confir
 
 ## Authentication
 
+This section is the YAML reference. For setup instructions, working examples, and help with denied requests, start with the [authentication guide](auth.md).
+
 By default (`auth.type: none` or unset) the SchemaBot API is unauthenticated — every request is allowed, which suits local development and deployments where the network is the only boundary. Setting `auth.type` turns on per-request authentication and a two-tier authorization model:
 
 - **Read tier** — visibility: `status`, `progress`, `logs`, `locks` (list), history, database discovery, and `pull` (read a live schema).
 - **Write tier** — anything that stages or makes a change: `plan`, `apply`, controls (`stop`/`start`/`cutover`/`revert`/`skip-revert`/`rollback`), `unlock`, and settings mutation. `plan` is a write because it stages a change against a database.
 
-Any unclassified `/api` route is treated as write (fail-closed). The `/webhook` and health endpoints are exempt — webhooks authenticate themselves via HMAC. Prometheus metrics are served on a dedicated listener (see [Metrics](#metrics)), not on the API port. Two authenticators are available.
+Any unclassified `/api` route is treated as write (fail-closed). For the hosted server, `/webhook` and health endpoints are exempt — webhooks authenticate themselves via HMAC. The internal local host instead requires its private credential on every route, including probes; see [AZ-6](invariants.md#az-6-local-hosting-preserves-its-boundaries). Prometheus metrics are served on a dedicated listener (see [Metrics](#metrics)), not on the API port. Two authenticators are available.
 
 ### OIDC (Bearer tokens)
 
@@ -1217,6 +1249,25 @@ auth:
 ```
 
 A valid token clears the read tier. The write tier additionally requires the token's groups to include an admin team from `pr_command_authorization.admin_teams`. Machine callers pass a token via `--token` / `SCHEMABOT_TOKEN`; a group-less service token (client-credentials grant) gets read access.
+
+The browser login command caches the ID token as the bearer credential. Login and refresh use that token's `exp` claim for the cached `token_expiry`, independently of the access token's `expires_in`. Commands refresh within 60 seconds of the ID token expiry when a refresh token and OIDC settings are available. For OIDC profiles, commands read `exp` from the cached token on every load, so profiles saved by older versions automatically use the correct lifetime without another browser login.
+
+The ID token must have a positive numeric `exp` value in Unix seconds; fractional seconds and exponent notation are supported and truncated to whole seconds for refresh timing. Login and refresh return an error for a missing, malformed, or out-of-range value; neither falls back to the access token's lifetime. An ordinary command that loads a malformed cached ID token attempts to repair the session using the refresh token. If no refresh token is available, or refresh fails, the command warns and preserves the existing cache. The CLI reads `exp` only to schedule renewal and does not reject login based on its local clock; the server still verifies every bearer token before granting access. Keep the client and server clocks synchronized: a fast client clock can cause a refresh and cache rewrite on every command, and a slow one can delay refresh until the server rejects the credential. When a refreshed token is already expired according to the client clock, the CLI saves the rotated session but warns to check the local clock and the provider's ID token lifetime. Explicit `--token` and `SCHEMABOT_TOKEN` credentials are not refreshed automatically.
+
+To enable automatic refresh, configure the profile's public-client settings in `~/.schemabot/config.yaml`:
+
+```yaml
+default_profile: default
+profiles:
+  default:
+    endpoint: "https://schemabot.example.com"
+    oidc:
+      issuer: "https://issuer.example.com"
+      client_id: "schemabot-cli"
+      redirect_port: 8765
+```
+
+The provider must register `http://127.0.0.1:8765/callback` as a redirect URI for that client and allow refresh tokens. Login flags override settings for that login attempt; they do not save the `oidc:` block. Keep the block configured for subsequent commands to refresh automatically.
 
 ### Forward-auth (authenticating proxy)
 
@@ -1522,7 +1573,7 @@ others. Operators can still direct help to a specific deployment with
 
 - **Tenant scoping:** When `tenant` is set, work commands must include a matching
   `--tenant` or `-t` target. Tenant scoping is a webhook ownership filter, not a
-  schema-change state field; untargeted help and invalid-command responses
+  schema change state field; untargeted help and invalid-command responses
   continue through the unscoped-command routing.
 
 - **Per-environment aggregate checks:** Each instance creates its own aggregate check run scoped to its environments (e.g., `SchemaBot (staging)`, `SchemaBot (production)`) instead of the default `SchemaBot` aggregate. Configure branch protection to require both aggregates. Set `github.check-name` when independent SchemaBot gates need distinct visible names; every instance in the same promotion chain should use the same base name.
@@ -1648,7 +1699,9 @@ Operator commands inherit this scoping: a Check Run scan or backfill resolves ea
 
 ## Secret Resolution
 
-DSN values support secret resolution prefixes:
+Database DSNs and GitHub credentials (`private-key` and `webhook-secret`)
+support these secret resolution prefixes. Choose the source that fits your
+hosting setup; neither credential requires a particular source:
 
 | Prefix | Example | Description |
 |---|---|---|

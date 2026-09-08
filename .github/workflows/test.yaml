@@ -15,7 +15,7 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 jobs:
-  # Detect whether the change touches anything other than *.md / docs/**.
+  # Detect whether the change touches any non-markdown file.
   # PRs that touch only docs skip the heavy jobs below; pushes (main/tags)
   # always run. Fails open: if detection fails, treat as code change.
   changes:
@@ -33,11 +33,19 @@ jobs:
         continue-on-error: true
         uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # dorny/paths-filter@v3.0.3
         with:
+          # The action's default quantifier ORs the patterns, and '**'
+          # matches every file, so without 'every' this filter reports
+          # code=true on every PR and the docs-only skip never fires.
+          # 'every' ANDs them: skip only Markdown, the docs TOC manifest,
+          # and documentation images. Keep image exclusions scoped to docs/
+          # and assets/ so scripts and Go files there still count as code.
+          predicate-quantifier: 'every'
           filters: |
             code:
               - '**'
               - '!**/*.md'
-              - '!docs/**'
+              - '!docs/.toc-manifest'
+              - '!{docs,assets}/**/*.{svg,png,jpg,jpeg,gif,webp,ico}'
       - name: "Resolve code-change and coverage flags"
         id: out
         shell: bash

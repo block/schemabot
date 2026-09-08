@@ -47,10 +47,7 @@ const (
 	retryableRecoveryFreshnessDays = 1
 )
 
-const (
-	applyTargetLockWait           = 10 * time.Second
-	applyTargetLockReleaseTimeout = 5 * time.Second
-)
+const applyTargetLockReleaseTimeout = 5 * time.Second
 
 // applyStore implements storage.ApplyStore using MySQL.
 type applyStore struct {
@@ -149,13 +146,11 @@ func terminalApplyStates() []string {
 // rollout is over and nothing will claim its rows again. It is
 // terminalApplyStates minus stopped, which is terminal for claiming but
 // resumable — a stopped apply's rows belong to its resume path.
+//
+// Defined in pkg/state so the storage gate and every read-side consumer share
+// one definition of settled and cannot drift apart.
 func settledApplyStates() []string {
-	return []string{
-		state.Apply.Completed,
-		state.Apply.Failed,
-		state.Apply.Cancelled,
-		state.Apply.Reverted,
-	}
+	return state.SettledApplyStates
 }
 
 func isActiveApplyState(applyState string) bool {
@@ -258,14 +253,14 @@ func acquireApplyTargetLockConn(ctx context.Context, db *rebindDB, locker namedl
 	}
 
 	lockName := applyTargetLockName(database, dbType, environment)
-	acquired, err := locker.Acquire(ctx, conn.lockerConn(), lockName, applyTargetLockWait)
+	acquired, err := locker.Acquire(ctx, conn.lockerConn(), lockName, storage.ApplyTargetLockWait)
 	if err != nil {
 		slog.WarnContext(ctx, "failed to acquire apply target lock",
 			"database", database,
 			"database_type", dbType,
 			"environment", environment,
 			"lock", lockName,
-			"wait", applyTargetLockWait,
+			"wait", storage.ApplyTargetLockWait,
 			"error", err)
 		closeApplyTargetLockConn(ctx, conn, lockName, "acquire apply target lock")
 		return nil, "", fmt.Errorf("acquire apply target lock for %s/%s/%s: %w", database, dbType, environment, err)
@@ -276,7 +271,7 @@ func acquireApplyTargetLockConn(ctx context.Context, db *rebindDB, locker namedl
 			"database_type", dbType,
 			"environment", environment,
 			"lock", lockName,
-			"wait", applyTargetLockWait)
+			"wait", storage.ApplyTargetLockWait)
 		closeApplyTargetLockConn(ctx, conn, lockName, "acquire apply target lock")
 		return nil, "", fmt.Errorf("timed out waiting for apply target lock for %s/%s/%s", database, dbType, environment)
 	}

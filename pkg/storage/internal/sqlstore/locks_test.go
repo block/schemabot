@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/block/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -26,7 +26,7 @@ func TestLockStore_Acquire_SameOwnerConcurrent(t *testing.T) {
 	const drivers = 16
 	stores := make([]*Storage, drivers)
 	for i := range drivers {
-		db, openErr := sql.Open("mysql", testDSNChangedRows)
+		db, openErr := sql.Open("block-mysql", testDSNChangedRows)
 		require.NoError(t, openErr)
 		db.SetMaxOpenConns(1)
 		db.SetMaxIdleConns(1)
@@ -83,7 +83,7 @@ func TestLockStore_Acquire_RefreshSameOwnerValueAlreadyMatches(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 
-	db, err := sql.Open("mysql", testDSNChangedRows)
+	db, err := sql.Open("block-mysql", testDSNChangedRows)
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		require.NoError(t, db.Close())
@@ -267,7 +267,7 @@ func TestLockStore_UpdateSameSecondSucceeds(t *testing.T) {
 
 	// Pin to a single connection so the frozen session timestamp persists across
 	// the seed INSERT, the touch UPDATE, and the re-read.
-	db, err := sql.Open("mysql", testDSNChangedRows)
+	db, err := sql.Open("block-mysql", testDSNChangedRows)
 	require.NoError(t, err)
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
@@ -305,7 +305,7 @@ func TestLockStore_UpdateSameSecondSucceeds(t *testing.T) {
 }
 
 func TestStorage_Close(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 
 	store := NewMySQL(db)
@@ -326,7 +326,7 @@ func TestStorage_Ping(t *testing.T) {
 }
 
 func TestStorage_Ping_Error(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 

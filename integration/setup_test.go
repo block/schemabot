@@ -21,8 +21,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/testcontainers/testcontainers-go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
@@ -146,7 +146,7 @@ func startMySQLContainer(ctx context.Context, baseName, dbName string, schemaFS 
 			return nil, fmt.Errorf("build mysql dsn: %w", err)
 		}
 
-		db, err := sql.Open("mysql", dsn)
+		db, err := sql.Open("block-mysql", dsn)
 		if err != nil {
 			_ = container.Terminate(ctx)
 			return nil, fmt.Errorf("open db for schema: %w", err)
@@ -227,7 +227,7 @@ func startTernGRPC(ctx context.Context, targetDSN, storageDSN string) (grpcAddre
 	adminCfg.MultiStatements = true
 
 	// Create the target database before starting the remote Tern service.
-	targetDB, err := sql.Open("mysql", adminCfg.FormatDSN())
+	targetDB, err := sql.Open("block-mysql", adminCfg.FormatDSN())
 	if err != nil {
 		return "", fmt.Errorf("open target db: %w", err)
 	}
@@ -244,7 +244,7 @@ func startTernGRPC(ctx context.Context, targetDSN, storageDSN string) (grpcAddre
 	clientDSN := clientCfg.FormatDSN()
 
 	// Open Tern storage (separate from SchemaBot storage, simulates production architecture)
-	storageDB, err := sql.Open("mysql", storageDSN)
+	storageDB, err := sql.Open("block-mysql", storageDSN)
 	if err != nil {
 		return "", fmt.Errorf("open storage db: %w", err)
 	}

@@ -25,7 +25,7 @@ import (
 	"regexp"
 	"strconv"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 )
 
 // Generic is what an unrecognized failure reports. It says where the reason is
@@ -126,9 +126,10 @@ func codeScanRegion(msg string) string {
 // this package owns. err is read for its error code and is never carried into
 // the result, so callers are free to pass an error wrapping anything.
 func Reason(err error) string {
-	var mysqlErr *mysql.MySQLError
-	if errors.As(err, &mysqlErr) {
-		return render(int(mysqlErr.Number))
+	// Number, not a type assertion: a target error can arrive from either
+	// linked driver. See number.go.
+	if number, ok := Number(err); ok {
+		return render(int(number))
 	}
 	// Context errors are classified ahead of the connection probes below,
 	// because both probes would otherwise claim them. An exceeded deadline

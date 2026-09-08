@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -403,7 +403,7 @@ func TestWebhookEventStore_HeartbeatTreatsUnchangedMatchingLeaseAsSuccess(t *tes
 	clearTables(t)
 	ctx := t.Context()
 
-	db, err := sql.Open("mysql", testDSNChangedRows)
+	db, err := sql.Open("block-mysql", testDSNChangedRows)
 	require.NoError(t, err)
 	require.NoError(t, db.PingContext(ctx))
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
@@ -435,7 +435,7 @@ func TestWebhookEventStore_TerminalWritesAreIdempotentOnRetry(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 
-	db, err := sql.Open("mysql", testDSNChangedRows)
+	db, err := sql.Open("block-mysql", testDSNChangedRows)
 	require.NoError(t, err)
 	require.NoError(t, db.PingContext(ctx))
 	t.Cleanup(func() { require.NoError(t, db.Close()) })

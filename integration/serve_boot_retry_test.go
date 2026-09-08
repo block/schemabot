@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"

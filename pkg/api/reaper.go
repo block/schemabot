@@ -63,6 +63,14 @@ import (
 // guarded and idempotent, so concurrent reapers would be correct; they would just
 // each pay the full scan to settle rows the first one already handled.
 //
+// What keeps a reaper off a driver's rows is the lease, not the election and not
+// the quiescence windows. Every sweep takes only rows whose lease is absent or
+// stale by the claim path's own reckoning, which is the same test a driver
+// applies before taking work from a peer — so the two writer classes exclude each
+// other by one mechanism rather than by two that have to be kept in agreement.
+// The windows sit on top of that, deciding when a row is worth looking at rather
+// than whether it is safe to write.
+//
 // The retryable-task sweep reaps dead retryable tasks: failed_retryable task
 // rows under a settled parent apply. A failed_retryable task promises a retry that
 // only the parent's recovery path can dispatch, so once the parent settles the
@@ -136,6 +144,7 @@ func (s *Service) runStrandedReaperPass(ctx context.Context) {
 	var sweeps sync.WaitGroup
 	sweeps.Go(func() { s.reapStrandedOperations(ctx) })
 	sweeps.Go(func() { s.reapStrandedRetryableTasks(ctx) })
+	sweeps.Go(func() { s.reapStrandedActiveTasks(ctx) })
 	sweeps.Wait()
 }
 
@@ -159,6 +168,11 @@ var (
 		busy:          storage.ErrStrandedTaskReaperBusy,
 		subject:       "stranded retryable tasks",
 		failureReason: "stranded_task_reaper_error",
+	}
+	strandedActiveTaskSweep = reapSweep{
+		busy:          storage.ErrStrandedActiveTaskReaperBusy,
+		subject:       "stranded active tasks",
+		failureReason: "stranded_active_task_reaper_error",
 	}
 )
 
@@ -230,4 +244,34 @@ func (s *Service) reapStrandedRetryableTasks(ctx context.Context) {
 	}
 
 	s.recordSweepOutcome(ctx, strandedRetryableTaskSweep, len(reaped), err)
+}
+
+// reapStrandedActiveTasks settles task rows left in an active state under a
+// settled, quiescent parent apply, mirroring the parent's outcome onto them.
+// These are the rows that make a completed apply render a table still copying:
+// their driver recorded the verdict on the parent and exited without closing
+// them. Only a lease-class writer can correct them — a reader cannot, because
+// correcting them is a write, and because a reader cannot tell a stranded row
+// from a sibling still copying under an apply that a failed task already
+// settled. The operation lease is what tells those apart.
+//
+// Settlements are logged, not counted, for the same reason as the retryable
+// sweep's: they are the rare residue of a driver that stopped mid-write, so a
+// rate would read zero for weeks.
+func (s *Service) reapStrandedActiveTasks(ctx context.Context) {
+	reaped, err := s.storage.Tasks().ReapStrandedActive(ctx, strandedReaperBatch)
+
+	// Report what landed before handling the error. A failed pass still returns
+	// the rows it settled before failing, and those writes are committed — an
+	// operator asking who changed a settled apply's task rows must find them.
+	for _, settled := range reaped {
+		parent, task := settled.Parent, settled.Task
+		s.logger.Info("operator: reaped a stranded active task to its parent apply's recorded outcome",
+			append(parent.LogAttrs(),
+				"task_id", task.TaskIdentifier,
+				"table", task.TableName,
+				"task_state", task.State)...)
+	}
+
+	s.recordSweepOutcome(ctx, strandedActiveTaskSweep, len(reaped), err)
 }

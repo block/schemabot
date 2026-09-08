@@ -34,7 +34,7 @@ const (
 	Escalation = "🚨"
 
 	// Refused marks an operation that is not proceeding because SchemaBot or
-	// the schema-change engine refused it: an engine-blocked change, a
+	// the schema change engine refused it: an engine-blocked change, a
 	// rejected apply, an apply blocked on a merged or closed PR. The operator
 	// should read the reason; the change or the situation must change before
 	// a retry can succeed.

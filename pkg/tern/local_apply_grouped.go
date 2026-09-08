@@ -421,7 +421,9 @@ func classifyOperationTasks(tasks []*storage.Task) (operationID int64, usesModel
 // Under on_failure "continue" a terminal-failed sibling does not terminalize the
 // apply while other siblings are still in flight: the apply is held running until
 // the rollout settles, then takes the failed verdict. Every other policy fails
-// closed and a failed sibling terminalizes the apply immediately.
+// closed on the verdict, and still holds the apply while a sibling that a driver
+// already started still holds its target, since refusing new claims does not
+// stop it.
 //
 // Invariant: applies.state is the rollout projection over all operations of the
 // apply, not only the operation this drive is executing. The current
@@ -763,7 +765,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// Surface once, at Warn, when a sharded engine reached an active state but
 	// could not report per-shard/row-copy progress for a reason that persists for
 	// the whole apply (a missing vtgate DSN). Only the persistent reason warns:
-	// the transient reasons (schema-change context still being discovered, shard
+	// the transient reasons (schema change context still being discovered, shard
 	// rows not yet registered at copy start) can self-heal on a later poll, so a
 	// one-shot warning for them would be a false alarm that latches forever; they
 	// stay visible in the engine's per-poll Debug. Warn (not Debug) so the
@@ -870,8 +872,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		} else if pending != nil {
 			logger.Info("skip-revert requested by user; closing revert window", "requested_by", controlRequestCaller(pending))
 			if _, err := eng.SkipRevert(ctx, controlReq); err != nil {
-				// Leave the request pending so the next drive tick retries.
-				logger.Error("skip-revert (control request) failed; will retry", "error", err)
+				c.resolveOrRetryRevertPhaseRequest(ctx, logger, apply, storage.ControlOperationSkipRevert, storage.LogEventSkipRevertTriggered, pending, err)
 			} else {
 				c.markRevertSkipped(ctx, apply)
 				ps.revertSkipped = true
@@ -895,8 +896,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		} else if pending != nil {
 			logger.Info("revert requested by user; reverting schema change", "requested_by", controlRequestCaller(pending))
 			if _, err := eng.Revert(ctx, controlReq); err != nil {
-				// Leave the request pending so the next drive tick retries.
-				logger.Error("revert (control request) failed; will retry", "error", err)
+				c.resolveOrRetryRevertPhaseRequest(ctx, logger, apply, storage.ControlOperationRevert, storage.LogEventRevertTriggered, pending, err)
 			} else {
 				revertedByControlRequest = true
 				if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationRevert); err != nil {
@@ -1312,6 +1312,33 @@ func (c *LocalClient) markRevertSkipped(ctx context.Context, apply *storage.Appl
 	if err := c.storage.Applies().SetRevertSkipped(ctx, apply.ID, time.Now()); err != nil {
 		logger.Warn("failed to record skip-revert on apply", append(apply.MutableLogAttrs(), "error", err)...)
 	}
+}
+
+// resolveOrRetryRevertPhaseRequest disposes of a revert-phase control operation
+// the engine refused. A refusal the engine issues for its whole database type is
+// issued identically on every later claim, so the request is resolved with the
+// engine's reason; any other failure leaves it pending for the next drive tick
+// to retry. Neither outcome advances the revert window: a refusal declines the
+// operator's command rather than carrying it out, so the window runs to its own
+// deadline either way.
+func (c *LocalClient) resolveOrRetryRevertPhaseRequest(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, opErr error) {
+	declined, declineErr := c.failPendingRequestForUnsupportedOperation(ctx, logger, apply, operation, eventType, controlReq, opErr)
+	if declineErr != nil {
+		logger.Error("could not resolve an engine-declined control request; it stays pending and the next drive claim collects the same decline",
+			"operation", string(operation),
+			"requested_by", controlRequestCaller(controlReq),
+			"error", declineErr)
+		return
+	}
+	if declined {
+		// failPendingRequestForUnsupportedOperation logs the rejection and
+		// records it on the apply's timeline for the operator who asked.
+		return
+	}
+	logger.Error("control request failed; the next drive claim retries it",
+		"operation", string(operation),
+		"requested_by", controlRequestCaller(controlReq),
+		"error", opErr)
 }
 
 // revertWindowDuration returns the configured revert window duration, falling

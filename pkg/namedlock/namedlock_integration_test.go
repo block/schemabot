@@ -17,7 +17,7 @@ import (
 
 	"github.com/block/schemabot/pkg/testutil"
 
-	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/block/mysql"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -97,7 +97,7 @@ type lockerCase struct {
 // the DSNs.
 func lockerCases() []lockerCase {
 	return []lockerCase{
-		{name: "mysql", locker: MySQL{}, driver: "mysql", dsn: mysqlDSN},
+		{name: "mysql", locker: MySQL{}, driver: "block-mysql", dsn: mysqlDSN},
 		{name: "postgres", locker: Postgres{}, driver: "pgx", dsn: postgresDSN},
 	}
 }

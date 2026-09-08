@@ -9,7 +9,7 @@
 - [Spirit runner lifecycle](#spirit-runner-lifecycle)
 - [Engine layer](#engine-layer)
 - [How Spirit phases surface as task states](#how-spirit-phases-surface-as-task-states)
-- [Tern layer — drive writes, readers read stored](#tern-layer-drive-writes-readers-read-stored)
+- [Tern layer — drive writes, readers read stored](#tern-layer--drive-writes-readers-read-stored)
 - [What gets persisted in storage](#what-gets-persisted-in-storage)
 - [Polling modes (atomic vs sequential)](#polling-modes-atomic-vs-sequential)
   - [Atomic mode (`--defer-cutover`)](#atomic-mode---defer-cutover)
@@ -38,7 +38,7 @@ runner.Progress()     Progress()          Progress()             handleProgressB
 ```
 
 Each layer adds, transforms, or merges data. Understanding which values are live
-(read from Spirit's in-memory state) vs persisted (read from MySQL storage) is
+(read from Spirit's in-memory state) vs persisted (read from SchemaBot storage) is
 key to debugging stale-progress issues.
 
 ## What Spirit exposes
@@ -306,7 +306,7 @@ Defined in `pkg/cmd/internal/templates/progress.go`.
 | Color | Emoji | Meaning | Used when |
 |-------|-------|---------|-----------|
 | Blue  | `🟦`  | In progress | Engine actively working: copying rows, cutting over, recovering state |
-| Yellow | `🟨` | Waiting | Waiting for cutover (the operator holds the next move) |
+| Yellow | `🟨` | Not final | Waiting for cutover, revert window open, reverting, skipping revert, or retrying after a recoverable failure |
 | Green | `🟩`  | Complete | Table finished successfully |
 | Orange | `🟧` | Stopped | Stopped mid-progress (partially complete) |
 | Red   | `🟥`  | Failed | Table failed |

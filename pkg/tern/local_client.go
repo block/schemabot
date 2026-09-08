@@ -99,10 +99,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/statement"
 	spirittable "github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
 	"github.com/block/schemabot/pkg/ddl"
@@ -435,7 +435,7 @@ func (c *LocalClient) Close() error {
 }
 
 // HaltForShutdown brings this client's engine down when the engine runs its
-// schema-change work in this process, so the process can exit without leaving
+// schema change work in this process, so the process can exit without leaving
 // the target held by work no lease is being renewed for.
 func (c *LocalClient) HaltForShutdown(ctx context.Context) error {
 	eng := c.getEngine()

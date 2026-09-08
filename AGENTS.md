@@ -46,8 +46,30 @@ CI mirrors local dev — every CI test job runs make targets, not bespoke comman
 ## Git
 
 - **Always verify the active branch before starting work.** The deployed code may be on a feature branch (e.g., a worktree), not `main`. Before implementing, check which branch has the code you're building on: `git log --oneline <branch> -- <relevant-file>`. Never branch from `main` for features that depend on unreleased work — branch from (or commit directly to) the active development branch.
+- **Branch names must describe the work.** Use `<your-handle>/<short-topic>` — the topic being the change itself, in words a reviewer recognizes (`.../reaper-lease-gate`, `.../pull-api-rate-limit`). A branch name is a permanent label: it is what shows up in the PR list, in CI job names, in `git log --graph`, and in every link back to the work months later. Generated or placeholder names (`claude/intelligent-moser-4a453a`, `feature-1`, `patch-2`, a bare ticket id) say nothing, so every reader has to open the diff to find out what the branch is. When a tool creates the branch for you, rename it before the first push (`git branch -m <new-name>`); if it has already been pushed, push the new name and delete the old remote branch.
 - **Never bypass pre-commit hooks.** Do not use `--no-verify` or `core.hooksPath=/dev/null`. If the hook fails, fix the issue.
-- **PR summaries should be concise** — a short paragraph or bullet list highlighting key changes and why, not low-level implementation details. When a change affects flow, architecture, state transitions, or concurrency, include a small ASCII diagram if it makes the behavior easier to review; omit diagrams when they would add noise. Do not include test plans, checklists, or verification details. Never reference internal company details (specific database names, staging environments, team names, internal URLs, deployment hostnames, org names, or test repo names) in PR titles or descriptions — this is a public OSS repo.
+- **PR summaries should be concise** — a short paragraph or bullet list highlighting key changes and why, not low-level implementation details. Do not include test plans, checklists, or verification details. Never reference internal company details (specific database names, staging environments, team names, internal URLs, deployment hostnames, org names, or test repo names) in PR titles or descriptions — this is a public OSS repo.
+- **Every PR summary carries an ASCII diagram when the change has a shape to show.** Any change to flow, architecture, state transitions, concurrency, lifecycle, or ownership gets one, so a reviewer sees the new behavior without reconstructing it from the diff. Skip it when the change has no such shape — a comment, a test, a copy edit, a dependency bump — or when the shape is small enough that one sentence states it in full, such as a one-line predicate change. Beyond that, "the prose covers it" is not a reason to skip: a flow that takes a paragraph to describe is one the reviewer needs to see.
+- **Show before and after when the change rewrites behavior rather than adding it.** Complex state changes and reworked logic are where the contrast carries the point: an after-diagram alone leaves the reviewer to hold the old behavior in their head and spot the difference themselves, which is exactly the step where a reviewer misses that a transition moved or a branch went away. Label the two, and draw them to the same shape and node order so the difference between them is the only thing that stands out:
+
+  ```
+  Before                     After
+
+  ┌───────────┐              ┌───────────┐
+  │  running  │              │  running  │
+  └─────┬─────┘              └─────┬─────┘
+        │ cancel                   │ cancel
+        ▼                          ▼
+  ┌───────────┐              ┌───────────┐
+  │ cancelled │              │ releasing │
+  └───────────┘              └─────┬─────┘
+                                   │ copy quarantined
+                                   ▼
+                             ┌───────────┐
+                             │ cancelled │
+                             └───────────┘
+  ```
+- **Align the diagram in a second pass.** Put every diagram in a fenced code block (outside one, Markdown collapses the whitespace the alignment depends on), then re-read the finished block as a grid and fix the columns: box borders and corners line up column-for-column, a box is as wide as its widest content, and every connector meets the edge it points at. Ragged box lines are harder to read than no diagram, and they are invisible while writing one — checking is a separate pass over the rendered result, not something to trust to the first draft.
 - **UX changes show the rendered result, collapsed.** When a PR changes what users see (PR comments, check summaries, CLI output), embed the new rendering in the PR summary inside collapsed `<details>` blocks — one per scenario, using the TEMPLATES.md preview output where one exists — so reviewers see the actual UX without checking out the branch. Links to TEMPLATES.md anchors are not a substitute; the rendering belongs in the summary itself.
 - **Agent PR disclosures belong at the bottom.** When an agent writes or updates a PR summary/body, put the agent disclosure line after the summary content, not at the top.
 - **Do not create PRs automatically.** Wait for the user to explicitly ask before running `gh pr create`. Pushing a branch is fine; creating the PR is a separate decision.
@@ -96,16 +118,65 @@ The hook uses `--new-from-rev` to only flag issues introduced by the current bra
 
 ## Guidelines
 
+**Database integrity comes first, for every database.** SchemaBot runs in front of everything from a vibe-coded weekend experiment to a tier-0 production system, and it treats them all the same way: the integrity of the database behind it outranks convenience, speed, and feature scope. Do not frame anything, in code, docs, or review, in terms of "databases that matter" or shortcuts that are "fine for a small database". Every database matters, and a change that would be unsafe in front of production is unsafe everywhere. When a tradeoff pits integrity against anything else, integrity wins.
+
+**Keep the schema intelligence guide in sync with the API.** When changing the request or response payloads, field semantics, filters, limits, or availability of `GET /api/databases`, `POST /api/pull`, `GET /api/status`, `GET /api/history/{database}`, `GET /api/plans`, `GET /api/plans/{plan_id}`, `GET /api/progress/apply/{apply_id}`, `GET /api/logs`, `GET /api/logs/{database}`, or `GET /api/locks`, update [docs/schema-intelligence.md](docs/schema-intelligence.md) in the same PR. Update the affected explanations and request/response examples, including catalog, lint, and deployment-specific payloads. Changes to the corresponding CLI commands or rendering must also update the guide's command/output examples. Every command example must have matching visible output; use fictional values and the actual response types or CLI formatters.
+
 **Terminology:** NEVER use the word "migration" in code, comments, CLI output, or error messages. ALWAYS use "schema change" instead.
+
+**"schema change" is never hyphenated.** In prose — PR comments, check summaries, CLI output, error messages, docs, code comments — write "schema change", never "schema-change".
+
+This holds **including where it modifies a noun**: "the schema change engine", not "the schema-change engine". That is a deliberate departure from the usual compound-adjective rule, which would hyphenate it. "schema change" is a fixed term in this product and it does not split, so do not "correct" the unhyphenated attributive form back — in either direction, in review or in a docs pass.
+
+Constructions that only read correctly when hyphenated are rewritten rather than hyphenated:
+
+| Write | Not |
+|---|---|
+| a logger scoped to this schema change | a schema-change-scoped logger |
+| a PR with no schema changes | a no-schema-changes PR |
+| restarts part-way through a schema change | restarts mid-schema-change |
+
+The rule is about prose only. Identifiers keep whatever form they need: file and script names (`scripts/generate-schema-change.sh`), CLI subcommands, external URLs, generated markdown anchors, and test fixture values are left alone. So is the literal inside a longer word: `VSchema-changed` is a different term and is not a hit.
+
+`make check-terminology` (`scripts/check-terminology.sh`) enforces this in CI on every PR, docs-only ones included. It strips URLs and anchor targets, matches only at a word boundary, and allowlists the identifiers above by value, so a new legitimate hyphenated identifier means extending that allowlist, not weakening the rule.
 
 **Driver terminology:** A *driver* is the operator worker that claims an apply via `FOR UPDATE SKIP LOCKED`, holds its lease (`LeaseOwner` / `LeaseToken`), and *drives* it to a terminal state. Use *driver* (noun) and *drive* (verb) — not *worker* — in new code, comments, logs, docs, and tests for the lease-holding goroutine and the work it performs. This is distinct from the **Go MySQL driver** (`github.com/go-sql-driver/mysql`, `database/sql/driver`): always refer to that as the "Go MySQL driver" or "SQL driver" and keep it import-qualified so the two senses never collide.
 
 **OSS-ready code:** Never reference internal company names or proprietary details in code or comments.
 
+### Runtime Invariants
+
+[docs/invariants.md](docs/invariants.md) is the canonical registry of the MUST-statements that make SchemaBot safe in front of tier-0 databases. It is organized into families — merge gating (MG), apply state machine (ST), ownership and leases (OW), control operations (CO), operator surfaces (UX), recovery (RC), review and validation (RV), authorization (AZ), and availability (AV) — and each entry states the rule, what breaks if it is violated, and where it is enforced. Every entry describes shipped behavior, not intent.
+
+**Before changing safety-relevant code, read the invariants that govern it.** Anything touching check state, apply state transitions, lease claims, control requests, reconciliation, DDL classification, authorization, or the drive loop is governed by at least one entry. Find them first — the failure mode of these paths is not a wrong answer, it is a confidently wrong one that unblocks a merge or half-changes a database, and a change that reads correct in isolation can still dissolve an invariant that spans two files.
+
+**Cite the invariant by ID** in the PR summary and in review findings, so a reviewer can check the change against the stated rule instead of re-deriving it. "This preserves MG-5" and "this violates CO-2 — the failed request is retried forever" are both reviewable claims; "this is safe" is not.
+
+When a change interacts with an invariant, one of these is true, and the PR should say which:
+
+- **It upholds it.** Nothing further is needed beyond a test that would fail if it stopped holding.
+- **It extends the enforcement** to a new engine, dialect, or path. The invariant text usually needs no change — check whether its *Enforced:* line still names where enforcement lives.
+- **It establishes a new invariant.** Add the entry in the same PR. Give it the next ID in its family, state the rule and an *Enforced:* line naming where enforcement actually lives, and prefer a completeness test over the relevant registry to a hand-maintained list, so the next regression fails CI instead of review. Add a *Breaks if violated:* line where the consequence is not obvious from the rule; most entries do not need one and do not have one.
+- **It weakens or removes one.** This is a deliberate safety decision, never a side effect. Say so explicitly at the top of the PR summary with the reasoning, and update or delete the entry in the same PR — an invariant the code no longer honors is worse than no entry at all, because reviewers rely on the registry being true.
+- **It moves the enforcement without changing it.** Renaming, moving, splitting, or merging a file or package named in an `*Enforced:*` line is not a behavior change, but it makes the registry wrong. Update the citation in the same PR. This is the likeliest way an entry rots, precisely because nothing about the change looks safety-relevant, so it is the case least likely to prompt anyone to open the registry.
+
+**An enforcement pointer can be wrong in two ways, and only one of them is obvious.** It can dangle, naming a file that no longer exists. It can also resolve cleanly to the wrong file, when enforcement moved and the old file stayed behind, or when the pointer was mistaken to begin with. The first is mechanical. The second needs someone to ask whether the named file actually contains the mechanism the entry describes, which is the question worth asking whenever you touch a pointer: not "does this path exist" but "is this still where the rule is enforced".
+
+**Reviewing:** check the diff against the invariants its blast radius touches, not only against the ticket. An invariant broken silently is the most expensive class of defect here, since the registry is what future reviewers will trust. If a PR summary claims an invariant holds, verify the claim in the code rather than accepting it.
+
+**An entry is a principle, not a case log.** Before adding text to an entry, ask whether the rule as written already covers your case. It usually does, which means the disposition is *upholds* and at most the `*Enforced:*` line changes. Keep instances of the rule, rationale, carve-outs, and coding conventions out of entry text: reasoning belongs in the PR summary, and rules about writing code belong in this file. Entries are a few sentences, so an addition that runs to a paragraph is a case rather than a principle.
+
+**An invariant is a rule every engine holds to.** State it without naming a dialect, an engine, a SQL state, or a configuration key. Engines belong in the sentences that say *how each one upholds the rule*, and in the *Enforced:* line — never in the rule itself. AV-9 is the shape: the rule is that the startup bootstrap never destroys SchemaBot's own storage, and MySQL and PostgreSQL then appear only as the two different mechanisms that achieve it.
+
+This interlocks with the paragraph below, and running the two together is the test worth applying before adding any entry: **state the rule engine-agnostically and ask whether it is true on every engine today.** If it is not — because only one dialect implements it — then the agnostic form is aspirational and the entry does not go in. Rewriting it truthfully is the other half of the trap, because the honest version is a page of one dialect's mechanism in a registry that carries none. An entry that fails both ways is not an invariant yet, however real the behavior is. Per-dialect behavior belongs where it can be stated precisely and checked: the option's documentation, a comment where the value is defined, and a test over the validation that enforces it.
+
+Do not add aspirational entries. If the behavior is not enforced in shipped code, it belongs in a design doc or a TODO, not in the registry. Process-level engineering rules (how we write and review code) belong in this file, not there.
+
 ### PR Self-Review Bar
 
 Before handing a PR to the user, review it the way an operator will experience it during an incident:
 
+- **Invariants first.** Identify which entries in [docs/invariants.md](docs/invariants.md) the change touches and state, per *Runtime Invariants* above, whether it upholds, extends, establishes, or weakens each one.
 - **Safety gates first.** GitHub Check Runs are a tier-0 SchemaBot safety feature. Any code that creates, stores, reconciles, or aggregates check state must fail closed. Storage uncertainty, GitHub API uncertainty, ownership ambiguity, or in-flight apply ambiguity must never be converted into a passing check.
 - **Check Run vs stored check state.** Use precise terms. A GitHub Check Run is the visible object on the PR commit. Stored check state is SchemaBot's database record used to decide what Check Run to create or update. Comments, logs, tests, and docs should make clear which one is being changed.
 - **TOCTOU review.** For async flows, webhooks, reconciliation, and background watchers, ask what happens if the latest commit on the PR branch changes, another pod writes first, an apply starts or finishes concurrently, or a rollback changes the target schema. Use conditional storage updates, ownership identifiers, and final state reloads where stale workers could otherwise overwrite newer state.
@@ -174,6 +245,19 @@ All SQL statements processed by SchemaBot **must be parseable by the dialect's r
 - **Do not** add fallback logic (e.g., `strings.Split(content, ";")`) when the parser fails. If a statement cannot be parsed, that is an error that must be surfaced to the caller.
 - **Do not** silently skip unparseable statements with patterns like `if err != nil { continue }` unless the error is an expected type-filtering condition (e.g., `ParseCreateTable` returning an error for an `ALTER TABLE` statement).
 - Schema files are expected to contain DDL valid for their target dialect. If the dialect's parser cannot handle a valid construct, that is a bug to fix in the parser dependency (the TiDB parser / Spirit, or libpg_query), not something to work around with string splitting.
+
+### Upstream First: Fix the Engine, Not the Consumer
+
+The rule above is one instance of a general one. **When a change reaches into a dependency's territory, first ask whether the fix belongs in the dependency.** Parser semantics, DDL diffing and canonicalization, schema introspection, progress and checkpoint state, and anything that has to know how an engine works internally are the domain of [`block/spirit`](https://github.com/block/spirit) and [`block/pg-sprite`](https://github.com/block/pg-sprite), not of SchemaBot. Both are ours to change. A fix that lands upstream fixes every consumer, gets the engine's own test suite behind it, and stays correct when the engine evolves. A fix that lands here has to re-derive the engine's behavior from the outside and breaks the next time the engine changes it.
+
+Prefer the upstream change whenever it makes consumption simpler: a new exported function or option, a typed error instead of an error string to match on, a field on a status or result struct instead of a value to infer, a hook where SchemaBot currently peeks. Shortcuts that reach around the dependency are brittle by construction and are the last resort, not the first draft:
+
+- parsing the engine's log lines or error text to recover a fact the engine already knows
+- re-implementing part of its parser, differ, or introspection on our side, or string-manipulating DDL it already parses
+- copying a private helper out of it instead of asking for it to be exported
+- inferring engine state from side effects (table names, sentinel rows, timing) instead of from an API
+
+When the upstream fix is right but cannot wait for a release, land the smallest workaround here with a comment stating what upstream capability retires it, and open the upstream change in the same sitting so the workaround has an expiry. The Vitess fork (see *Vitess Dependency*) follows the same rule for the code we carry on top of upstream Vitess.
 
 ## AWS Infrastructure
 

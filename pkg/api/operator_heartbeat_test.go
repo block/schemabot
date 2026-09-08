@@ -97,7 +97,7 @@ func TestOperationDriveStalled(t *testing.T) {
 		Environment:     "staging",
 		State:           state.Apply.Running,
 	}
-	stalledStart := time.Now().Add(-2 * ApplyDriveStallAfter)
+	stalledStart := time.Now().Add(-2 * storage.ApplyDriveStallAfter)
 
 	t.Run("a drive younger than the stall window is never stalled", func(t *testing.T) {
 		// The stale task row is a previous claim's leftover: a young drive gets

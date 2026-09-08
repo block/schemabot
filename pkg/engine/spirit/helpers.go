@@ -6,8 +6,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/statement"
-	"github.com/go-sql-driver/mysql"
 
 	"github.com/block/schemabot/pkg/schema"
 )

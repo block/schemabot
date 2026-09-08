@@ -13,7 +13,20 @@ linters:
     - bodyclose       # unclosed HTTP response bodies
     - usetesting      # enforce t.Context() over context.Background() in tests
     - unparam         # unused/constant function parameters and results
+    - depguard        # banned imports (see settings)
   settings:
+    # SchemaBot links exactly one MySQL driver. The deny list is what keeps that
+    # true: nothing about a second one fails to compile, and the way it breaks
+    # is silent (see pkg/mysqlerr.Number), so the invariant needs an enforcer
+    # rather than a comment.
+    depguard:
+      rules:
+        main:
+          deny:
+            - pkg: github.com/go-sql-driver/mysql
+              desc: 'import github.com/block/mysql instead (registered as driver name "block-mysql"). Two MySQL drivers in one binary define two field-identical but distinct *mysql.MySQLError types, and errors.As against one returns false for the other, so a classifier keeps compiling and silently stops recognizing deadlocks. Read codes through pkg/mysqlerr.'
+            - pkg: github.com/go-mysql/hotswap-dsn-driver
+              desc: 'use mysqlconn.OpenReloadable, which reloads credentials per pool on block/mysql. That driver embeds upstream go-sql-driver/mysql and cannot be pointed at the fork.'
     errcheck:
       exclude-functions:
         - (io.Closer).Close          # bodyclose linter handles HTTP resp.Body; other Close() checked by closeandlog analyzer

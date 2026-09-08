@@ -70,6 +70,22 @@ var commandSpecs = []CommandSpec{
 	{Name: action.RollbackConfirm, RequiresEnv: true, SupportsDeferCutover: true},
 }
 
+// CommandNames returns the command word of every registered PR comment
+// command.
+//
+// Exported so the CLI's own command surface can be checked against it: every
+// command a PR comment accepts has to have a CLI equivalent, because both
+// surfaces converge on the same service methods and the CLI is the fallback
+// when GitHub is unavailable. A fallback that covers only part of the surface
+// is not a fallback.
+func CommandNames() []string {
+	names := make([]string, 0, len(commandSpecs))
+	for _, s := range commandSpecs {
+		names = append(names, s.Name)
+	}
+	return names
+}
+
 // specByName indexes commandSpecs for O(1) lookup by command word.
 var specByName = func() map[string]CommandSpec {
 	m := make(map[string]CommandSpec, len(commandSpecs))

@@ -21,6 +21,7 @@ import (
 type fakePlanStore struct {
 	storage.PlanStore
 	getFn     func(planIdentifier string) (*storage.Plan, error)
+	getByIDFn func(id int64) (*storage.Plan, error)
 	createID  int64
 	createErr error
 	created   *storage.Plan
@@ -28,6 +29,10 @@ type fakePlanStore struct {
 
 func (f *fakePlanStore) Get(_ context.Context, planIdentifier string) (*storage.Plan, error) {
 	return f.getFn(planIdentifier)
+}
+
+func (f *fakePlanStore) GetByID(_ context.Context, id int64) (*storage.Plan, error) {
+	return f.getByIDFn(id)
 }
 
 func (f *fakePlanStore) Create(_ context.Context, plan *storage.Plan) (int64, error) {

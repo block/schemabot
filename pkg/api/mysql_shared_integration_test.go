@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
+	mysqldriver "github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/mysql"
@@ -106,7 +106,7 @@ func startSharedMySQL(ctx context.Context) (*mysql.MySQLContainer, string, error
 
 // pingMySQL opens a throwaway pool on dsn and runs the bounded readiness ping.
 func pingMySQL(ctx context.Context, dsn string) error {
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	if err != nil {
 		return fmt.Errorf("open shared mysql: %w", err)
 	}
@@ -142,7 +142,7 @@ func newStorageDatabase(t *testing.T) storageDatabase {
 	rootDSN := sharedMySQLDSN(t)
 	name := fmt.Sprintf("api_test_%d", storageDatabaseSeq.Add(1))
 
-	admin, err := sql.Open("mysql", rootDSN)
+	admin, err := sql.Open("block-mysql", rootDSN)
 	require.NoError(t, err, "open shared mysql")
 	defer utils.CloseAndLog(admin)
 	_, err = admin.ExecContext(ctx, fmt.Sprintf("CREATE DATABASE `%s`", name))
@@ -173,7 +173,7 @@ func newStorageDatabaseWithSchema(t *testing.T) storageDatabase {
 // handle instead so the handle has a single owner.
 func openStorageDB(t *testing.T, dsn string) *sql.DB {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "open storage database")
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 	require.NoError(t, testutil.PingMySQL(t.Context(), db), "ping storage database")

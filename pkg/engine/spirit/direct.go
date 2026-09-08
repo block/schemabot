@@ -15,15 +15,16 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
+	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -268,8 +269,10 @@ const erLockWaitTimeout = 1205
 // the session's bounded lock_wait_timeout expired while the statement queued
 // behind existing lock holders.
 func isLockWaitTimeout(err error) bool {
-	var mysqlErr *mysql.MySQLError
-	return errors.As(err, &mysqlErr) && mysqlErr.Number == erLockWaitTimeout
+	// Read through mysqlerr rather than asserting a driver type: two MySQL
+	// drivers are linked and their error types are not interchangeable. See
+	// pkg/mysqlerr/number.go.
+	return mysqlerr.Is(err, erLockWaitTimeout)
 }
 
 // directStatementProgress tracks one direct-routed statement's lifecycle for
@@ -358,7 +361,7 @@ func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB,
 		decision := e.resolveRefusedMode(ctx, target, policy, database, table, reason)
 		if decision.mode != engine.ExecutionModeDirect {
 			metrics.RecordDirectExecution(ctx, database, decision.outcome)
-			// A refusal reason is the schema-change engine's own account of why
+			// A refusal reason is the schema change engine's own account of why
 			// it will not run the statement, and SchemaBot's bound and
 			// row-count context appended to it. It is not target output: the
 			// engine's checks interpolate only the column and type names the
@@ -366,8 +369,12 @@ func (e *Engine) routeAlterStatements(ctx context.Context, target *lazyTargetDB,
 			// on this pull request. That is what makes it publishable here,
 			// and it is why a new refusal path has to be read before it is
 			// marked rather than assumed to match this one.
+			//
+			// It names the schema change engine in full because failureReason
+			// publishes this message verbatim as the apply's failure reason,
+			// with no sentence around it to establish which engine is meant.
 			if !policy.Enabled {
-				return alterRouting{}, engine.OperatorErrorf(nil, "Statement on table %q is not supported by the schema-change engine and direct execution is not enabled for this database: %s", table, reason)
+				return alterRouting{}, engine.OperatorErrorf(nil, "Statement on table %q is not supported by the schema change engine and direct execution is not enabled for this database: %s", table, reason)
 			}
 			return alterRouting{}, engine.OperatorErrorf(nil, "Statement on table %q cannot run directly: %s", table, decision.modeReason)
 		}

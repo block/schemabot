@@ -387,7 +387,7 @@ import (
 	"sync"
 	"time"
 
-	mysql "github.com/go-sql-driver/mysql"
+	mysql "github.com/block/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
 	"github.com/block/spirit/pkg/utils"
@@ -433,7 +433,7 @@ var (
 var deployState = state.DeployRequest
 
 // formatDeployRequestError builds a detailed error message for a failed deploy request,
-// including any lint errors from PlanetScale's validation.
+// including any lint errors from PlanetScale's validation. sadscan:disable kingfisher.planetscale.2
 func formatDeployRequestError(dr *ps.DeployRequest) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "deploy request #%d failed during preparation (state: %s)", dr.Number, dr.DeploymentState)
@@ -666,7 +666,7 @@ func (e *Engine) getVtgateDB(ctx context.Context, dsn string) (*sql.DB, error) {
 		return db, nil
 	}
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open vtgate: %w", err)
 	}

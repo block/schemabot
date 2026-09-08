@@ -287,7 +287,7 @@ func TestCanonicalDDLForDrift_FailsClosed(t *testing.T) {
 	})
 
 	t.Run("DML is rejected", func(t *testing.T) {
-		// DML has no place in a schema-change drift comparison. It must fail
+		// DML has no place in a schema change drift comparison. It must fail
 		// closed instead of canonicalizing it as if it were DDL, and the error
 		// names the remedy's cause: the statement should not be in the change.
 		_, err := canonicalDDLForDrift(parser, "INSERT INTO `users` (`id`) VALUES (1)")

@@ -554,6 +554,10 @@ func (s *capturingApplyStore) ExpireRetryable(context.Context) ([]*storage.Retry
 	return nil, nil
 }
 
+// queuedOperationLeaseToken is the token this double rotates onto the operation
+// row it leases out, standing in for the real store's generated token.
+const queuedOperationLeaseToken = "op-lease-token"
+
 // queuedOperationClaimStore serves the operation-level claim ladder over the
 // operation rows a dual-write captured in a capturingApplyStore. The cutover
 // probe always finds nothing, so every operator tick falls through to the
@@ -561,9 +565,10 @@ func (s *capturingApplyStore) ExpireRetryable(context.Context) ([]*storage.Retry
 // signal per tick — and leases the first captured row exactly once.
 type queuedOperationClaimStore struct {
 	storage.ApplyOperationStore
-	applies *capturingApplyStore
-	mu      sync.Mutex
-	claimed bool
+	applies    *capturingApplyStore
+	mu         sync.Mutex
+	claimed    bool
+	leaseOwner string
 }
 
 func (s *queuedOperationClaimStore) capturedOperation() *storage.ApplyOperation {
@@ -599,8 +604,9 @@ func (s *queuedOperationClaimStore) FindNextApplyOperation(_ context.Context, ow
 		return nil, nil
 	}
 	s.claimed = true
+	s.leaseOwner = owner
 	op.LeaseOwner = owner
-	op.LeaseToken = "op-lease-token"
+	op.LeaseToken = queuedOperationLeaseToken
 	return op, nil
 }
 
@@ -609,15 +615,31 @@ func (s *queuedOperationClaimStore) FindNextApplyOperation(_ context.Context, ow
 func (s *queuedOperationClaimStore) ReleaseClaim(_ context.Context, lease storage.OperationLease) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.claimed || lease.Token != "op-lease-token" {
+	if !s.claimed || lease.Token != queuedOperationLeaseToken {
 		return false, nil
 	}
 	s.claimed = false
+	s.leaseOwner = ""
 	return true, nil
 }
 
+// Get returns the row with whatever lease the claim rotated onto it, the way
+// the real store persists it: a driver re-reads the row to confirm its
+// operation lease survived the separate transaction that claims the parent
+// apply, and a double that dropped the lease on read would look to that driver
+// like a peer had rotated it away.
 func (s *queuedOperationClaimStore) Get(context.Context, int64) (*storage.ApplyOperation, error) {
-	return s.capturedOperation(), nil
+	op := s.capturedOperation()
+	if op == nil {
+		return nil, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.claimed {
+		op.LeaseOwner = s.leaseOwner
+		op.LeaseToken = queuedOperationLeaseToken
+	}
+	return op, nil
 }
 
 func (s *queuedOperationClaimStore) ListByApply(context.Context, int64) ([]*storage.ApplyOperation, error) {
@@ -639,6 +661,7 @@ type capturingTaskStore struct {
 	mu           sync.Mutex
 	tasks        []*storage.Task
 	createCalls  int
+	updateCalls  int
 	failOnCreate int
 	err          error
 }
@@ -658,6 +681,10 @@ func (s *capturingTaskStore) Create(_ context.Context, task *storage.Task) (int6
 	return int64(len(s.tasks)), nil
 }
 
+func (s *capturingTaskStore) ReapStrandedActive(context.Context, int) ([]*storage.ReapedTask, error) {
+	return nil, nil
+}
+
 func (s *capturingTaskStore) ReapStrandedRetryable(context.Context, int) ([]*storage.ReapedTask, error) {
 	return nil, nil
 }
@@ -665,6 +692,7 @@ func (s *capturingTaskStore) ReapStrandedRetryable(context.Context, int) ([]*sto
 func (s *capturingTaskStore) Update(_ context.Context, task *storage.Task) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.updateCalls++
 	for i, storedTask := range s.tasks {
 		if storedTask.ID == task.ID || storedTask.TaskIdentifier == task.TaskIdentifier {
 			s.tasks[i] = task
@@ -4056,6 +4084,36 @@ func TestProgressByApplyIDActivePathToleratesOperationStorageError(t *testing.T)
 	assert.Equal(t, state.Apply.Running, resp.State)
 }
 
+// A task row can sit in an active state under an apply that has already reached
+// a verdict: a driver settled the apply and exited without closing the row, or
+// one failed task settled the apply while its siblings kept copying. The reader
+// cannot tell those apart, so it reports every task exactly as stored and never
+// writes. Repairing a genuinely stranded row belongs to a writer that can hold
+// a lease and wait out the parent's quiescence window, and a GET does neither.
+func TestProgressFromLocalStorageReportsActiveTaskUnderTerminalApplyVerbatim(t *testing.T) {
+	terminalStates := []string{state.Apply.Completed, state.Apply.Failed, state.Apply.Cancelled, state.Apply.Reverted, state.Apply.Stopped}
+	for _, applyState := range terminalStates {
+		t.Run(applyState, func(t *testing.T) {
+			apply := &storage.Apply{ID: 40, ApplyIdentifier: "apply_stranded", Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging", Engine: storage.EngineSpirit, State: applyState, ExternalID: "remote-apply"}
+			tasks := &capturingTaskStore{tasks: []*storage.Task{
+				{ApplyID: apply.ID, TaskIdentifier: "task_users", TableName: "users", Namespace: "testdb", DDLAction: "alter", State: state.Task.Running, ProgressPercent: 42, Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL, Engine: storage.EngineSpirit, Environment: "staging"},
+			}}
+			svc := New(&mockStorageWithApplyStores{tasks: tasks, operations: &staticApplyOperationStore{}},
+				testServerConfig(), nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+			resp, err := svc.progressFromLocalStorage(t.Context(), apply)
+
+			require.NoError(t, err)
+			require.Len(t, resp.Tables, 1)
+			assert.Equal(t, state.Task.Running, resp.Tables[0].Status, "the task's stored state is reported as stored, never rewritten to the apply's verdict")
+			assert.Equal(t, int32(42), resp.Tables[0].PercentComplete)
+			assert.Equal(t, "users", resp.Tables[0].TableName)
+			assert.Equal(t, state.Task.Running, tasks.tasks[0].State, "stored task row must be untouched by a read")
+			assert.Zero(t, tasks.updateCalls, "reading progress must not write task rows")
+		})
+	}
+}
+
 func TestProgressFromLocalStorageSingleDeploymentOmitsOperationFields(t *testing.T) {
 	apply := &storage.Apply{ID: 20, ApplyIdentifier: "apply_single", Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging", Engine: storage.EngineSpirit, State: state.Apply.Completed}
 	svc := New(&mockStorageWithApplyStores{
@@ -6714,6 +6772,73 @@ func TestControlRejectionsNameTheOperatorApplyID(t *testing.T) {
 		for _, log := range stores.applyLogs.logs {
 			assert.NotContains(t, log.Message, remoteID, "no apply log line names the remote id")
 		}
+	})
+
+	// Cancel is queued durably and then attempted immediately, exactly as stop
+	// is. A rejected immediate attempt leaves the durable request pending for
+	// the owning drive, so the apply log is the only place an operator learns
+	// why nothing happened yet — and it reads in their terms.
+	t.Run("a rejected immediate cancel is logged against the operator apply id", func(t *testing.T) {
+		mock := &mockTernClient{
+			isRemote: true,
+			cancelResp: &ternv1.CancelResponse{
+				Accepted:     false,
+				ErrorMessage: "Schema change " + remoteID + " is already cutting over",
+			},
+		}
+		apply := activeTestApply(operatorID)
+		apply.ExternalID = remoteID
+		tasks := []*storage.Task{{
+			ID:             31,
+			TaskIdentifier: "task-cancel-relay",
+			ApplyID:        apply.ID,
+			State:          state.Task.Running,
+		}}
+		svc, stores := newControlTestServiceWithStores(mock, apply, tasks)
+
+		w := postControl(t, svc, "/api/cancel", operatorID)
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		require.NotNil(t, mock.cancelReq, "the queued cancel is followed by an immediate attempt")
+		assert.Equal(t, remoteID, mock.cancelReq.ApplyId, "the data plane is still addressed by its own id")
+
+		require.True(t, hasApplyLogMessageContaining(stores.applyLogs.logs, "Immediate cancel attempt was not accepted"),
+			"the apply log must record why the cancel request is still pending")
+		require.True(t, hasApplyLogMessageContaining(stores.applyLogs.logs, "is already cutting over"),
+			"the apply log carries the reason the attempt was refused")
+		for _, log := range stores.applyLogs.logs {
+			assert.NotContains(t, log.Message, remoteID, "no apply log line names the remote id")
+		}
+
+		pending, err := stores.controls.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+		require.NoError(t, err)
+		require.NotNil(t, pending, "a refused immediate attempt leaves the durable request for the owning drive")
+	})
+
+	// A refusal is not obliged to carry a reason. The log line still has to read
+	// as a sentence rather than trailing a colon into nothing.
+	t.Run("a rejected immediate cancel with no reason logs a complete sentence", func(t *testing.T) {
+		mock := &mockTernClient{cancelResp: &ternv1.CancelResponse{Accepted: false}}
+		apply := activeTestApply(operatorID)
+		apply.ExternalID = remoteID
+		tasks := []*storage.Task{{
+			ID:             32,
+			TaskIdentifier: "task-cancel-relay-silent",
+			ApplyID:        apply.ID,
+			State:          state.Task.Running,
+		}}
+		svc, stores := newControlTestServiceWithStores(mock, apply, tasks)
+
+		w := postControl(t, svc, "/api/cancel", operatorID)
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+		var logged string
+		for _, log := range stores.applyLogs.logs {
+			if strings.Contains(log.Message, "Immediate cancel attempt was not accepted") {
+				logged = log.Message
+			}
+		}
+		require.NotEmpty(t, logged, "the apply log must record the refused attempt even with no reason")
+		assert.NotContains(t, logged, "pending:", "with no reason there is nothing to introduce with a colon")
 	})
 }
 

@@ -296,8 +296,13 @@ func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSch
 		return nil, err
 	}
 
+	// The server stores and returns canonical keys, and the operator's flags
+	// arrive in whatever case they were typed, so fold both sides before
+	// comparing or a busy database slips past the preflight on a case mismatch.
+	database = storage.CanonicalKey(database)
+	environment = storage.CanonicalKey(environment)
 	for _, apply := range result.Applies {
-		if apply.Database != database || apply.Environment != environment {
+		if storage.CanonicalKey(apply.Database) != database || storage.CanonicalKey(apply.Environment) != environment {
 			continue
 		}
 		// The server already excluded terminal states; re-checking here keeps the

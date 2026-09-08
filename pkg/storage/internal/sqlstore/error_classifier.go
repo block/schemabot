@@ -4,7 +4,7 @@ import (
 	"errors"
 	"strings"
 
-	gomysql "github.com/go-sql-driver/mysql"
+	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -36,17 +36,19 @@ func NewMySQLErrorClassifier() ErrorClassifier {
 	return mysqlErrorClassifier{}
 }
 
+// The codes are read through mysqlerr.Number rather than by asserting a
+// driver's error type. Asserting a type is what silently broke here before: the
+// credential-reloading storage pool went through a hot-swap DSN driver that
+// embedded upstream go-sql-driver, so it returned a *mysql.MySQLError of a type
+// no errors.As against block/mysql's could match — and the failure mode was
+// every deadlock from that pool classified as non-retryable, not an error
+// anyone would see. See mysqlerr.Number.
 func (mysqlErrorClassifier) IsRetryableConflict(err error) bool {
-	var mysqlErr *gomysql.MySQLError
-	if !errors.As(err, &mysqlErr) {
-		return false
-	}
-	return mysqlErr.Number == mysqlErrDeadlock || mysqlErr.Number == mysqlErrLockWaitTimeout
+	return mysqlerr.Is(err, mysqlErrDeadlock, mysqlErrLockWaitTimeout)
 }
 
 func (mysqlErrorClassifier) IsDuplicateKey(err error) bool {
-	var mysqlErr *gomysql.MySQLError
-	if errors.As(err, &mysqlErr) && mysqlErr.Number == mysqlErrDuplicateKey {
+	if mysqlerr.Is(err, mysqlErrDuplicateKey) {
 		return true
 	}
 	// Defend against driver errors flattened to strings with %v in a call path.

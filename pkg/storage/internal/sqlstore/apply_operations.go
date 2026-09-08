@@ -1077,11 +1077,34 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 	//         and recent — a fresh bounded retry; and
 	//       * parent already claimed into an active state but its lease has gone
 	//         stale — crash recovery, with no budget gate (the attempt was already
-	//         admitted and counted when the parent was claimed).
+	//         admitted and counted when the parent was claimed), and gated on this
+	//         operation row's OWN heartbeat as well as the parent's.
 	//     Claiming a failed_retryable parent transitions it to running and refreshes
 	//     applies.updated_at (see persistApplyClaim), so once a driver owns the
 	//     retry neither sub-condition matches and peers back off instead of
 	//     churning on a row another driver is actively driving.
+	//
+	//     The parent's heartbeat alone cannot carry the crash-recovery
+	//     sub-condition, which is why it also gates on this row's updated_at.
+	//     The operation claim and the parent claim are separate transactions —
+	//     a driver leases the row here, then acquires the parent lease in
+	//     ApplyStore.ClaimApplyByID several round trips later — so the parent
+	//     stays stale for the whole gap, and every peer polling inside it would
+	//     otherwise lease the same row and rotate its token. The driver that
+	//     went on to win the parent lease would then hold a superseded
+	//     operation token, and its first operation-scoped write would be
+	//     refused with ErrApplyLeaseLost, ending the drive before it did
+	//     anything. Because the peer that loses the parent claim releases its
+	//     operation lease (backdating updated_at past the window, see
+	//     ReleaseClaim), the row starts every staleness window released and
+	//     stale, so that race would re-run identically each window and the
+	//     apply could never terminalize. Gating on this row's own heartbeat —
+	//     which this claim refreshes in the same transaction, exactly as the
+	//     stale-active clause does — admits one driver per window. The
+	//     deliberate-redispatch sub-condition needs no such gate: it is
+	//     resolved by the parent claim's guarded failed_retryable -> running
+	//     transition, and a heartbeat gate there would stall every retry for a
+	//     full staleness window.
 	//
 	// There is intentionally no "pending + pending start request" clause to
 	// match ApplyStore.ClaimApplyByID's pending-start clause. That apply-level
@@ -1248,6 +1271,11 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 							OR (
 								a.state IN (%s)
 								AND a.updated_at < %s
+								-- Names no column of a, but belongs to this arm
+								-- alone: hoisted out of the EXISTS it would gate
+								-- deliberate redispatch too and stall every retry
+								-- for a staleness window.
+								AND apply_operations.updated_at < %s
 							)
 						)
 				)
@@ -1256,7 +1284,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		ORDER BY created_at, id
 		LIMIT 1
 		FOR UPDATE SKIP LOCKED
-	`, applyOperationColumns, terminalStatePlaceholders, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, retryFreshnessCutoff, activeStatePlaceholders, staleClaimCutoff), queryArgs...)
+	`, applyOperationColumns, terminalStatePlaceholders, activeStatePlaceholders, staleClaimCutoff, activeStatePlaceholders, retryFreshnessCutoff, activeStatePlaceholders, staleClaimCutoff, staleClaimCutoff), queryArgs...)
 
 	ad, err := scanApplyOperationInto(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1859,6 +1887,53 @@ func strandedParentGate(d Dialect, correlation string, quiescence time.Duration)
 				AND a.state IN (%s)
 				AND a.updated_at < %s
 		)`, correlation, placeholders(len(parentStates)), quiescentBefore), args
+}
+
+// unleasedOperationGate renders the NOT EXISTS admitting only task rows whose
+// operation no driver currently holds.
+//
+// This is what separates a reaper from a driver by the same mechanism drivers
+// are separated from each other, rather than by a timing argument. A driver
+// takes an operation lease to work an operation and heartbeats it for as long as
+// it lives, and the claim path treats a lease whose heartbeat is older than
+// storage.ApplyLeaseStaleAfter as re-claimable. Reading the lease the same way
+// means a reaper writes a row only where a driver would be allowed to take it.
+//
+// What that buys is a window, not an impossibility. The gate is a plain
+// NOT EXISTS with no row lock, and the claim path locks apply_operations rather
+// than tasks, so a driver claiming just after the reaper's UPDATE commits is not
+// excluded by anything here. The residual race is the width of one autocommit
+// statement; without the gate it was the width of the whole scan-to-write gap,
+// which is seconds. Both sweeps assert the gate in the guarded write as well as
+// the scan so that gap is not what the write rests on.
+//
+// It reads the lease slightly more strictly than the claim path does, in both
+// directions that matter. It requires an owner, which the claim path's steal arm
+// does not test, so an operation the operation reaper released with a fresh
+// stamp is correctly unowned rather than mistaken for held. It omits the
+// occupying-state filter that freshLeaseCountSQL carries, so a heartbeated lease
+// holds the row whatever state its operation is in. Both departures make the
+// reaper more reluctant to write than a driver is to claim, which is the safe
+// direction when the write is a terminal verdict.
+//
+// It matters most under fan-out, where a live sibling drive holds only an
+// operation lease: the parent apply can be settled and quiet while that drive
+// works, so no gate on the parent sees it, and the lease is the only signal
+// that does not depend on the drive having recently mirrored the row.
+//
+// A task with no operation is admitted. Nothing holds a lease over it, so there
+// is nothing here to exclude it by, and it is left to the caller's other gates.
+func unleasedOperationGate(d Dialect) string {
+	freshLeaseAfter := d.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+
+	return fmt.Sprintf(`NOT EXISTS (
+			SELECT 1
+			FROM apply_operations lease_holder
+			WHERE lease_holder.id = tasks.apply_operation_id
+				AND lease_holder.lease_owner <> ''
+				AND lease_holder.updated_at >= %s
+		)`, freshLeaseAfter)
 }
 
 // ReapStranded elects one reaper per pass and reaps under the lock. See

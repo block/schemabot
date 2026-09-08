@@ -555,6 +555,8 @@ type fakeControlEngine struct {
 	planResult              *engine.PlanResult
 	applyResult             *engine.ApplyResult
 	applyErr                error
+	revertErr               error
+	skipRevertErr           error
 	externallyAuthoritative bool
 }
 
@@ -619,10 +621,16 @@ func (e *fakeControlEngine) Cutover(context.Context, *engine.ControlRequest) (*e
 }
 
 func (e *fakeControlEngine) Revert(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	if e.revertErr != nil {
+		return nil, e.revertErr
+	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
 func (e *fakeControlEngine) SkipRevert(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	if e.skipRevertErr != nil {
+		return nil, e.skipRevertErr
+	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
@@ -3417,7 +3425,7 @@ func TestHandleAtomicProgressTickReleasesAtCutoverBarrier(t *testing.T) {
 // resolved without a vtgate DSN), the drive surfaces it once per apply at Warn —
 // always visible in Datadog without enabling debug logging. It fires once (not
 // per poll), stays silent during setup states, and stays silent for transient
-// reasons (schema-change context still being discovered, shard rows not yet
+// reasons (schema change context still being discovered, shard rows not yet
 // registered) that can self-heal on a later poll.
 func TestHandleAtomicProgressTickPerShardUnavailableWarn(t *testing.T) {
 	newApply := func() *storage.Apply {

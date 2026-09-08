@@ -727,3 +727,211 @@ func clearPostgresTables(t *testing.T, db *sql.DB) {
 		require.NoError(t, err)
 	}
 }
+
+// The stranded-active sweep defers to the operation lease on PostgreSQL exactly
+// as it does on MySQL. The gate is rendered SQL rather than Go, so it has to be
+// exercised on each dialect: the row here is stale by every window the sweep
+// applies, leaving the lease as the only thing that can keep it.
+func TestPostgresReapStrandedActiveDefersToTheOperationLease(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_reap_lease")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+
+	h := postgresHarness{db: db, dsn: dsn}
+	store := h.NewStorage(t)
+
+	// A settled parent, quiet long enough that no window on it protects anything.
+	var applyID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, options, error_message, updated_at)
+		VALUES ('apply-reap-lease', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', $1, '{}',
+			'target rejected the schema change', NOW() - make_interval(secs => $2))
+		RETURNING id`, state.Apply.Failed,
+		int64((strandedActiveParentQuiescence+time.Minute).Seconds())).Scan(&applyID))
+
+	// The operation a driver is holding, heartbeated as of now.
+	var opID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO apply_operations (apply_id, deployment, operation_key, state, lease_owner, lease_token)
+		VALUES ($1, 'region-a', 'op-1', $2, 'driver', 'op-token')
+		RETURNING id`, applyID, state.ApplyOperation.Running).Scan(&opID))
+
+	_, err = db.ExecContext(t.Context(), `
+		INSERT INTO tasks (task_identifier, apply_id, apply_operation_id, plan_id, database_name,
+			database_type, engine, repository, pull_request, environment, state, table_name, ddl,
+			ddl_action, options, updated_at)
+		VALUES ('task-reap-lease', $1, $2, 1, 'testdb', 'mysql', 'spirit', 'org/repo', 7, 'staging', $3,
+			'users', 'ALTER TABLE users ADD COLUMN email varchar(255)', 'ALTER', '{}',
+			NOW() - make_interval(secs => $4))`,
+		applyID, opID, state.Task.Running,
+		int64((strandedActiveTaskQuiescence + time.Minute).Seconds()))
+	require.NoError(t, err)
+
+	taskState := func(t *testing.T) string {
+		t.Helper()
+		var got string
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			`SELECT state FROM tasks WHERE task_identifier = 'task-reap-lease'`).Scan(&got))
+		return got
+	}
+
+	reaped, err := store.Tasks().ReapStrandedActive(t.Context(), 10)
+	require.NoError(t, err)
+	assert.Empty(t, reaped, "a driver holds the operation, so the row is not the reaper's to write")
+	assert.Equal(t, state.Task.Running, taskState(t))
+
+	// The driver goes away without releasing: its heartbeat ages past the point
+	// where a peer would take the operation from it.
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
+		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), opID)
+	require.NoError(t, err)
+
+	reaped, err = store.Tasks().ReapStrandedActive(t.Context(), 10)
+	require.NoError(t, err)
+	require.Len(t, reaped, 1, "a lease a peer could reclaim no longer speaks for the row")
+	assert.Equal(t, state.Task.Failed, taskState(t))
+}
+
+// The stranded-retryable sweep renders the same lease gate, and its own SQL is
+// rendered separately from the active sweep's, so PostgreSQL has to execute it
+// too. A failed_retryable row under a long-settled parent is the reaper's only
+// once no driver holds the operation the retry would run under.
+func TestPostgresReapStrandedRetryableDefersToTheOperationLease(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_reap_retry_lease")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+
+	h := postgresHarness{db: db, dsn: dsn}
+	store := h.NewStorage(t)
+
+	var applyID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, options, error_message, updated_at)
+		VALUES ('apply-reap-retry-lease', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', $1, '{}',
+			'', NOW() - make_interval(secs => $2))
+		RETURNING id`, state.Apply.Completed,
+		int64((strandedRetryableQuiescence+time.Minute).Seconds())).Scan(&applyID))
+
+	// The operation a driver is holding, heartbeated as of now.
+	var opID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO apply_operations (apply_id, deployment, operation_key, state, lease_owner, lease_token)
+		VALUES ($1, 'region-a', 'op-1', $2, 'driver', 'op-token')
+		RETURNING id`, applyID, state.ApplyOperation.Running).Scan(&opID))
+
+	_, err = db.ExecContext(t.Context(), `
+		INSERT INTO tasks (task_identifier, apply_id, apply_operation_id, plan_id, database_name,
+			database_type, engine, repository, pull_request, environment, state, table_name, ddl,
+			ddl_action, options, error_message)
+		VALUES ('task-reap-retry-lease', $1, $2, 1, 'testdb', 'mysql', 'spirit', 'org/repo', 7, 'staging', $3,
+			'users', 'ALTER TABLE users ADD COLUMN email varchar(255)', 'ALTER', '{}', 'copy failed')`,
+		applyID, opID, state.Task.FailedRetryable)
+	require.NoError(t, err)
+
+	taskState := func(t *testing.T) string {
+		t.Helper()
+		var got string
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			`SELECT state FROM tasks WHERE task_identifier = 'task-reap-retry-lease'`).Scan(&got))
+		return got
+	}
+
+	reaped, err := store.Tasks().ReapStrandedRetryable(t.Context(), 10)
+	require.NoError(t, err)
+	assert.Empty(t, reaped, "a driver holds the operation, so the retry promise is not the reaper's to retire")
+	assert.Equal(t, state.Task.FailedRetryable, taskState(t))
+
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
+		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), opID)
+	require.NoError(t, err)
+
+	reaped, err = store.Tasks().ReapStrandedRetryable(t.Context(), 10)
+	require.NoError(t, err)
+	require.Len(t, reaped, 1, "a lease a peer could reclaim no longer speaks for the row")
+	assert.Equal(t, state.Task.Failed, taskState(t))
+}
+
+// Recovering a crashed retry admits one driver per staleness window on
+// PostgreSQL as it does on MySQL. The gate is a rendered interval comparison,
+// not Go, so each dialect has to execute it. Leasing the operation and claiming
+// its parent apply are separate transactions, and the parent stays
+// active-and-stale for the whole gap between them: without the operation's own
+// heartbeat in the predicate, every peer polling inside that gap re-leases the
+// same row and rotates its token. The row must still hand off promptly, so a
+// driver that releases the claim leaves it takeable on the very next poll
+// rather than after another window.
+func TestPostgresFindNextApplyOperationCrashRecoveryAdmitsOneDriverPerWindow(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_crash_recovery_window")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+
+	h := postgresHarness{db: db, dsn: dsn}
+	store := h.NewStorage(t)
+	ops := store.ApplyOperations()
+
+	staleSeconds := int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds())
+
+	// A parent apply claimed for a retry, then crashed: active, budget
+	// remaining, and no longer heartbeating.
+	var applyID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, attempt, options, updated_at)
+		VALUES ('apply-crash-recovery-window', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit',
+			$1, $2, '{}', NOW() - make_interval(secs => $3))
+		RETURNING id`, state.Apply.Running, maxRecoveryAttempts-1, staleSeconds).Scan(&applyID))
+
+	// The crashed driver stopped heartbeating the operation too.
+	var opID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO apply_operations (apply_id, deployment, operation_key, state)
+		VALUES ($1, 'region-a', 'op-1', $2)
+		RETURNING id`, applyID, state.ApplyOperation.FailedRetryable).Scan(&opID))
+	_, err = db.ExecContext(t.Context(),
+		`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
+		staleSeconds, opID)
+	require.NoError(t, err)
+
+	first, err := ops.FindNextApplyOperation(t.Context(), "driver-a")
+	require.NoError(t, err)
+	require.NotNil(t, first, "the first driver must recover the crashed retry")
+	require.Equal(t, opID, first.ID)
+
+	// driver-a holds the operation lease but has not reached ClaimApplyByID yet,
+	// so the parent apply is still active and stale.
+	second, err := ops.FindNextApplyOperation(t.Context(), "driver-b")
+	require.NoError(t, err)
+	assert.Nil(t, second, "a peer polling between the operation claim and the parent claim must not re-lease the recovering operation")
+
+	persisted, err := ops.Get(t.Context(), opID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, "driver-a", persisted.LeaseOwner, "the recovering driver keeps the operation lease")
+	assert.Equal(t, first.LeaseToken, persisted.LeaseToken, "the recovering driver's lease token must not be rotated out from under it")
+
+	// The driver that cannot acquire the parent apply hands the operation back,
+	// and the peer holding the parent takes it without waiting out a window.
+	released, err := ops.ReleaseClaim(t.Context(), first.Lease())
+	require.NoError(t, err)
+	require.True(t, released)
+
+	reclaimed, err := ops.FindNextApplyOperation(t.Context(), "parent-holder")
+	require.NoError(t, err)
+	require.NotNil(t, reclaimed, "a released crash-recovery row must be claimable on the next poll without aging")
+	assert.Equal(t, opID, reclaimed.ID)
+	assert.Equal(t, "parent-holder", reclaimed.LeaseOwner)
+	assert.Equal(t, state.ApplyOperation.FailedRetryable, reclaimed.State, "the handoff must not change the row's state")
+}

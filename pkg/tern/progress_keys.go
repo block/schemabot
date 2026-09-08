@@ -18,7 +18,7 @@ func progressStatementKey(namespace, table, ddl string) string {
 	return progressTableKey(namespace, table) + progressTableKeySep + strings.TrimSpace(ddl)
 }
 
-// StatementIndex matches entries that describe schema-change work on a table —
+// StatementIndex matches entries that describe schema change work on a table —
 // stored tasks, an engine's progress, a remote data plane's progress — across
 // the boundary between them.
 //

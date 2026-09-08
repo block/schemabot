@@ -226,7 +226,7 @@ func shardedChangeIsSingular(data ShardedApplyData) bool {
 	tables := make(map[string]struct{})
 	for _, ks := range data.Keyspaces {
 		for _, c := range ks.Cells {
-			tables[ks.Keyspace+"\x00"+c.Table] = struct{}{}
+			tables[tableKey(ks.Keyspace, c.Table)] = struct{}{}
 		}
 	}
 	return len(tables)+len(data.VSchemaChanges) == 1

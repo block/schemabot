@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="948" height="500" viewBox="0 0 948 500" role="img" aria-labelledby="title desc" font-family="Helvetica, Arial, sans-serif">
+<title id="title">The fleet, understood.</title>
+<desc id="desc">Managed databases across regions feed live schemas, recorded changes, and active progress through SchemaBot’s read API to tools and agents. The caller can find schema patterns, trace changes, and watch rollouts without write access.</desc>
+<rect width="948" height="500" fill="#fff"/>
+<text x="24" y="36" font-size="22" fill="#1c1e21" font-weight="600" text-anchor="start">The fleet, understood.</text>
+<text x="24" y="63" font-size="13" fill="#474e57" font-weight="400" text-anchor="start">Many databases. One place to ask.</text>
+<text x="24" y="104" font-size="10.5" fill="#68707c" font-weight="600" text-anchor="start">YOUR FLEET</text>
+<text x="374" y="104" font-size="10.5" fill="#3578e5" font-weight="600" text-anchor="start">SCHEMABOT</text>
+<text x="661" y="104" font-size="10.5" fill="#68707c" font-weight="600" text-anchor="start">YOUR TOOLS AND AGENTS</text>
+<rect x="24" y="120" width="278" height="83" rx="10" fill="#f8f9fa" stroke="#dadde1"/>
+<text x="40" y="143" font-size="12" fill="#1c1e21" font-weight="600" text-anchor="start">Americas</text>
+<path d="M42 160 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="50" cy="160" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M42 169 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M66 160 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="74" cy="160" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M66 169 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M90 160 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="98" cy="160" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M90 169 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M114 160 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#3578e5"/><ellipse cx="122" cy="160" rx="8" ry="3" fill="#fff" stroke="#3578e5"/><path d="M114 169 a8 3 0 0 0 16 0" fill="none" stroke="#3578e5"/>
+<path d="M138 160 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="146" cy="160" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M138 169 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M162 160 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="170" cy="160" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M162 169 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M186 160 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="194" cy="160" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M186 169 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M210 160 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="218" cy="160" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M210 169 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M234 160 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="242" cy="160" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M234 169 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M258 160 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="266" cy="160" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M258 169 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M302 161 H340" fill="none" stroke="#c7d3e5" stroke-width="1.5"/>
+<circle cx="304.00" cy="161" r="2.8" fill="#3578e5"/>
+<rect x="24" y="217" width="278" height="83" rx="10" fill="#f8f9fa" stroke="#dadde1"/>
+<text x="40" y="240" font-size="12" fill="#1c1e21" font-weight="600" text-anchor="start">Europe</text>
+<path d="M42 257 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="50" cy="257" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M42 266 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M66 257 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="74" cy="257" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M66 266 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M90 257 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="98" cy="257" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M90 266 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M114 257 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="122" cy="257" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M114 266 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M138 257 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="146" cy="257" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M138 266 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M162 257 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="170" cy="257" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M162 266 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M186 257 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#009400"/><ellipse cx="194" cy="257" rx="8" ry="3" fill="#fff" stroke="#009400"/><path d="M186 266 a8 3 0 0 0 16 0" fill="none" stroke="#009400"/>
+<path d="M210 257 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="218" cy="257" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M210 266 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M234 257 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="242" cy="257" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M234 266 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M258 257 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="266" cy="257" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M258 266 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M302 258 H340" fill="none" stroke="#c7d3e5" stroke-width="1.5"/>
+<circle cx="312.33" cy="258" r="2.8" fill="#009400"/>
+<rect x="24" y="314" width="278" height="83" rx="10" fill="#f8f9fa" stroke="#dadde1"/>
+<text x="40" y="337" font-size="12" fill="#1c1e21" font-weight="600" text-anchor="start">Asia Pacific</text>
+<path d="M42 354 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="50" cy="354" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M42 363 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M66 354 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#b7791f"/><ellipse cx="74" cy="354" rx="8" ry="3" fill="#fff" stroke="#b7791f"/><path d="M66 363 a8 3 0 0 0 16 0" fill="none" stroke="#b7791f"/>
+<path d="M90 354 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="98" cy="354" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M90 363 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M114 354 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="122" cy="354" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M114 363 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M138 354 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="146" cy="354" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M138 363 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M162 354 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="170" cy="354" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M162 363 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M186 354 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="194" cy="354" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M186 363 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M210 354 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="218" cy="354" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M210 363 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M234 354 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="242" cy="354" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M234 363 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M258 354 v18 a8 3 0 0 0 16 0 v-18" fill="#ffffff" stroke="#abb3be"/><ellipse cx="266" cy="354" rx="8" ry="3" fill="#fff" stroke="#abb3be"/><path d="M258 363 a8 3 0 0 0 16 0" fill="none" stroke="#abb3be"/>
+<path d="M302 355 H340" fill="none" stroke="#c7d3e5" stroke-width="1.5"/>
+<circle cx="320.67" cy="355" r="2.8" fill="#b7791f"/>
+<path d="M340 161 L340 355" fill="none" stroke="#c7d3e5" stroke-width="1.5"/>
+<path d="M340 258 L374 258" fill="none" stroke="#c7d3e5" stroke-width="1.5"/>
+<rect x="374" y="120" width="238" height="277" rx="14" fill="#f1f6fe" stroke="#3578e5"/>
+<text x="493" y="147" font-size="14" fill="#1c1e21" font-weight="600" text-anchor="middle">Read API</text>
+<rect x="388" y="157" width="210" height="63" rx="9" fill="#fff" stroke="#c5d7f3"/>
+<circle cx="401" cy="178" r="3" fill="#3578e5"/>
+<text x="412" y="182" font-size="13" fill="#1c1e21" font-weight="600" text-anchor="start">Live schemas</text>
+<text x="401" y="202" font-size="10.5" fill="#474e57" font-weight="400" text-anchor="start">Tables, columns, lint findings</text>
+<rect x="388" y="233" width="210" height="63" rx="9" fill="#fff" stroke="#c5d7f3"/>
+<circle cx="401" cy="254" r="3" fill="#009400"/>
+<text x="412" y="258" font-size="13" fill="#1c1e21" font-weight="600" text-anchor="start">Recorded changes</text>
+<text x="401" y="278" font-size="10.5" fill="#474e57" font-weight="400" text-anchor="start">Plans, task DDL, outcomes</text>
+<rect x="388" y="309" width="210" height="63" rx="9" fill="#fff" stroke="#c5d7f3"/>
+<circle cx="401" cy="330" r="3" fill="#b7791f"/>
+<text x="412" y="334" font-size="13" fill="#1c1e21" font-weight="600" text-anchor="start">Active progress</text>
+<text x="401" y="354" font-size="10.5" fill="#474e57" font-weight="400" text-anchor="start">Copying, throttling, cutover</text>
+<path d="M612 188 L646 188" fill="none" stroke="#ccd0d5" stroke-width="1.4"/>
+<circle cx="616.00" cy="188" r="2.8" fill="#3578e5"/>
+<rect x="657" y="157" width="267" height="66" rx="10" fill="#fff" stroke="#dadde1"/>
+<text x="673" y="182" font-size="13" fill="#1c1e21" font-weight="600" text-anchor="start">Find a fleet-wide pattern</text>
+<text x="673" y="203" font-size="10.8" fill="#474e57" font-weight="400" text-anchor="start">Which tables lack a primary key?</text>
+<path d="M612 264 L646 264" fill="none" stroke="#ccd0d5" stroke-width="1.4"/>
+<circle cx="624.33" cy="264" r="2.8" fill="#009400"/>
+<rect x="657" y="233" width="267" height="66" rx="10" fill="#fff" stroke="#dadde1"/>
+<text x="673" y="258" font-size="13" fill="#1c1e21" font-weight="600" text-anchor="start">Trace a change</text>
+<text x="673" y="279" font-size="10.8" fill="#474e57" font-weight="400" text-anchor="start">What ran, and which PR requested it?</text>
+<path d="M612 340 L646 340" fill="none" stroke="#ccd0d5" stroke-width="1.4"/>
+<circle cx="632.67" cy="340" r="2.8" fill="#b7791f"/>
+<rect x="657" y="309" width="267" height="66" rx="10" fill="#fff" stroke="#dadde1"/>
+<text x="673" y="334" font-size="13" fill="#1c1e21" font-weight="600" text-anchor="start">Follow a rollout</text>
+<text x="673" y="355" font-size="10.8" fill="#474e57" font-weight="400" text-anchor="start">What is moving or waiting?</text>
+<text x="163" y="427" font-size="11" fill="#474e57" font-weight="400" text-anchor="middle">Environments · deployments · shards</text>
+<text x="493" y="427" font-size="11" fill="#3578e5" font-weight="600" text-anchor="middle">Read-only access</text>
+<text x="790" y="427" font-size="10.5" fill="#474e57" font-weight="400" text-anchor="middle">Search and aggregation by the caller</text>
+<path d="M24 450 L924 450" fill="none" stroke="#e5e7eb" stroke-width="1"/>
+<text x="474" y="479" font-size="13" fill="#474e57" font-weight="400" text-anchor="middle">Understand what’s in your fleet, how it got there, and what’s changing now.</text>
+</svg>

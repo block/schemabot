@@ -9,8 +9,8 @@ import (
 	"os"
 	"testing"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 
@@ -53,7 +53,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	testDB, err = sql.Open("mysql", testDSN)
+	testDB, err = sql.Open("block-mysql", testDSN)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to connect to MySQL: %v\n", err)
 		os.Exit(1)

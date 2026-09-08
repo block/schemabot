@@ -273,6 +273,10 @@ func TestTiDBCostScalesWithTableSize(t *testing.T) {
 		{"set default", "ALTER TABLE `mutes` ALTER COLUMN `count` SET DEFAULT 0", false},
 		{"drop index", "ALTER TABLE `mutes` DROP INDEX `idx_created_at`", false},
 		{"drop foreign key", "ALTER TABLE `mutes` DROP FOREIGN KEY `fk_user`", false},
+		{"drop check constraint", "ALTER TABLE `mutes` DROP CHECK `chk_positive`", false},
+		// DROP CONSTRAINT resolves against the table's CHECK, FOREIGN KEY and
+		// UNIQUE constraints, and dropping any of the three is metadata-only.
+		{"drop named constraint", "ALTER TABLE `mutes` DROP CONSTRAINT `uq_name`", false},
 		{"index invisible", "ALTER TABLE `mutes` ALTER INDEX `idx_created_at` INVISIBLE", false},
 		{"comment only", "ALTER TABLE `mutes` COMMENT='muted things'", false},
 		{"create table with index", "CREATE TABLE `mutes` (`id` bigint, KEY `idx_id` (`id`))", false},

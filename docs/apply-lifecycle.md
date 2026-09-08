@@ -34,7 +34,7 @@ document:
   the database being changed). That record moves through states — from
   `pending` through `running` to a final verdict — and it is what you see in
   CLI status output and PR comments.
-- **Driver** — the worker inside SchemaBot that claims an apply and drives it
+- **Driver** — the component inside SchemaBot that claims an apply and drives it
   to a final state, reporting progress along the way. If a driver crashes, a
   peer picks the apply up and continues; the apply record is the durable truth,
   not any single process.

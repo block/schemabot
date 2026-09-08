@@ -242,6 +242,8 @@ func PreviewCLIOutput(previewType PreviewType) {
 		previewCLIMultiDeploymentApplyInProgress()
 	case PreviewCLIMultiDeployFailed:
 		previewCLIMultiDeploymentApplyFailed()
+	case PreviewCLIMultiDeployHalted:
+		previewCLIMultiDeploymentApplyHaltedWithLiveSibling()
 	case PreviewCLIMultiDeployCompleted:
 		previewCLIMultiDeploymentApplyCompleted()
 	case PreviewCLIMultiDeployAll:
