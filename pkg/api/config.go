@@ -993,7 +993,7 @@ type EtreCredentialsConfig struct {
 
 // DatabaseConfig holds configuration for a registered database.
 type DatabaseConfig struct {
-	// Type is the database type: "mysql", "vitess", or "strata".
+	// Type is "mysql", "postgres", "vitess", or "strata" (requires server opt-in).
 	Type string `yaml:"type"`
 
 	// App optionally names the application this database belongs to. Databases
@@ -1623,14 +1623,13 @@ func (c *ServerConfig) canonicalizeRepositories() error {
 	return nil
 }
 
-// Validate checks the configuration for required fields and consistency.
 // ValidateExperimentalStrata requires server opt-in for every registration path.
 func (c *ServerConfig) ValidateExperimentalStrata() error {
 	if c.ExperimentalStrataEnabled {
 		return nil
 	}
 	check := func(kind, name, databaseType string) error {
-		if databaseType == storage.DatabaseTypeStrata {
+		if strings.ToLower(strings.TrimSpace(databaseType)) == storage.DatabaseTypeStrata {
 			return fmt.Errorf("%s %q: Strata is experimental; set experimental-strata-enabled: true in the server configuration to enable it", kind, name)
 		}
 		return nil
@@ -1646,13 +1645,14 @@ func (c *ServerConfig) ValidateExperimentalStrata() error {
 		}
 	}
 	for _, resolver := range c.TargetResolver.Etre {
-		if err := check("resolver", resolver.DatabaseType, resolver.DatabaseType); err != nil {
+		if err := check("target_resolver.etre", resolver.DatabaseType, resolver.DatabaseType); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+// Validate checks the configuration for required fields and consistency.
 func (c *ServerConfig) Validate() error {
 	if err := c.ValidateExperimentalStrata(); err != nil {
 		return err
@@ -1742,7 +1742,11 @@ func (c *ServerConfig) Validate() error {
 		switch dbConfig.Type {
 		case storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres:
 		default:
-			return fmt.Errorf("database %q has invalid type %q; choose a database type supported by this server", name, dbConfig.Type)
+			types := "mysql, postgres, or vitess"
+			if c.ExperimentalStrataEnabled {
+				types = "mysql, postgres, vitess, or strata (experimental)"
+			}
+			return fmt.Errorf("database %q has invalid type %q; choose %s", name, dbConfig.Type, types)
 		}
 		if len(dbConfig.Environments) == 0 {
 			return fmt.Errorf("database %q has no environments configured", name)
