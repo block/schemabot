@@ -90,10 +90,14 @@ func parseLocalConfig(data []byte) (api.ServerConfig, error) {
 	return *cfg, nil
 }
 
-func runLocalServer(ctx context.Context, cfg api.ServerConfig, token, address string, g *Globals, ready func(string) error) error {
+func runLocalServer(ctx context.Context, cfg api.ServerConfig, token, address string, g *Globals, ready func(string) error, register ...func(localruntime.PrepareConfig)) error {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel()}))
 	slog.SetDefault(logger)
-	return serve.RunLocal(ctx, cfg, serve.LocalOptions{Address: address, Token: token, Ready: ready}, serve.WithLogger(logger), serve.WithBuildInfo(g.Version, g.Commit, g.Date))
+	options := serve.LocalOptions{Address: address, Token: token, Ready: ready}
+	if len(register) > 0 {
+		options.RegisterConfig = register[0]
+	}
+	return serve.RunLocal(ctx, cfg, options, serve.WithLogger(logger), serve.WithBuildInfo(g.Version, g.Commit, g.Date))
 }
 
 type LocalManagedCmd struct {
@@ -102,7 +106,7 @@ type LocalManagedCmd struct {
 }
 
 func (cmd *LocalManagedCmd) Run(ctx context.Context, g *Globals) error {
-	return localruntime.Run(ctx, cmd.Directory, cmd.Generation, func(ctx context.Context, path, token string, ready func(string) error) error {
+	return localruntime.Run(ctx, cmd.Directory, cmd.Generation, func(ctx context.Context, path, token string, ready func(string, localruntime.PrepareConfig) error) error {
 		data, err := localruntime.ReadPrivate(path)
 		if err != nil {
 			return err
@@ -111,7 +115,8 @@ func (cmd *LocalManagedCmd) Run(ctx context.Context, g *Globals) error {
 		if err != nil {
 			return err
 		}
-		return runLocalServer(ctx, cfg, token, "127.0.0.1:0", g, ready)
+		var prepare localruntime.PrepareConfig
+		return runLocalServer(ctx, cfg, token, "127.0.0.1:0", g, func(endpoint string) error { return ready(endpoint, prepare) }, func(p localruntime.PrepareConfig) { prepare = p })
 	})
 }
 
