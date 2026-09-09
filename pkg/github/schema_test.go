@@ -3,9 +3,37 @@ package github
 import (
 	"testing"
 
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestEmptiedPRNamespaces(t *testing.T) {
+	grouped := map[string]*ternv1.SchemaFiles{
+		"surviving": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint)"}},
+	}
+	tests := []struct {
+		name        string
+		ignored     []string
+		files       []PRFile
+		environment string
+		want        []string
+	}{
+		{name: "one namespace emptied among two", files: []PRFile{{Filename: "schema/removed/orders.sql", Status: "removed"}}, want: []string{"removed"}},
+		{name: "removed file has surviving sibling", files: []PRFile{{Filename: "schema/surviving/orders.sql", Status: "removed"}}},
+		{name: "outside schema root", files: []PRFile{{Filename: "other/removed/orders.sql", Status: "removed"}}},
+		{name: "ignored namespace", ignored: []string{"removed_$ENV"}, environment: "test", files: []PRFile{{Filename: "schema/removed_$ENV/orders.sql", Status: "removed"}}},
+		{name: "flat file", files: []PRFile{{Filename: "schema/orders.sql", Status: "removed"}}},
+		{name: "renamed file", files: []PRFile{{Filename: "schema/removed/orders.sql", Status: "renamed"}}},
+		{name: "environment suffix", environment: "test", files: []PRFile{{Filename: "schema/removed_$ENV/orders.sql", Status: "removed"}}, want: []string{"removed_test"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, emptiedPRNamespaces(grouped, tt.ignored, tt.files, "schema", tt.environment))
+		})
+	}
+}
 
 // Flat layout tests — the webhook strips the schemaPath prefix, leaving bare
 // filenames. path.Base(schemaPath) becomes the defaultNamespace.

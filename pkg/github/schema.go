@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"sort"
 	"strings"
 
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -111,6 +112,16 @@ func (ic *InstallationClient) CreateSchemaRequestForConfig(ctx context.Context, 
 		}
 		return nil, fmt.Errorf("no schema files found under %s for environment %q", schemaRoot, environment)
 	}
+	prFiles, err := ic.FetchPRFiles(ctx, repo, pr)
+	if err != nil {
+		return nil, fmt.Errorf("fetch changed files for %s#%d: %w", repo, pr, err)
+	}
+	for _, namespace := range emptiedPRNamespaces(schemaFiles, config.IgnoreNamespaces, prFiles, schemaRoot, environment) {
+		schemaFiles[namespace] = &ternv1.SchemaFiles{Files: map[string]string{}}
+		ic.logger.Info("namespace has no remaining schema files in this pull request; every live table becomes an undeclared drop",
+			"repo", repo, "pr", pr, "head_sha", prInfo.HeadSHA, "database", config.Database,
+			"database_type", config.GetType(), "environment", environment, "schema_root", schemaRoot, "namespace", namespace)
+	}
 
 	return &SchemaRequestResult{
 		Database:          config.Database,
@@ -123,6 +134,40 @@ func (ic *InstallationClient) CreateSchemaRequestForConfig(ctx context.Context, 
 		HeadSHA:           prInfo.HeadSHA,
 		IgnoredNamespaces: ignoredNamespaces,
 	}, nil
+}
+
+func emptiedPRNamespaces(grouped map[string]*ternv1.SchemaFiles, ignored []string, prFiles []PRFile, schemaRoot, environment string) []string {
+	ignoredSet := make(map[string]bool, len(ignored))
+	for _, namespace := range schema.ResolveIgnoreNamespaces(ignored, environment) {
+		ignoredSet[namespace] = true
+	}
+
+	prefix := path.Clean(schemaRoot) + "/"
+	emptied := make(map[string]bool)
+	for _, file := range prFiles {
+		if !isRemovedPRFile(file.Status) || !IsSchemaFile(file.Filename) {
+			continue
+		}
+		relativePath, ok := strings.CutPrefix(path.Clean(file.Filename), prefix)
+		if !ok {
+			continue
+		}
+		namespace, namespaced := schema.NamespaceForRelativePath(relativePath, path.Base(schemaRoot), environment)
+		if !namespaced || ignoredSet[namespace] || grouped[namespace] != nil {
+			continue
+		}
+		emptied[namespace] = true
+	}
+
+	result := make([]string, 0, len(emptied))
+	for namespace := range emptied {
+		result = append(result, namespace)
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	sort.Strings(result)
+	return result
 }
 
 func (ic *InstallationClient) resolveSchemaRootForEnvironment(ctx context.Context, repo, ref, configDir, environment string) (schemaRoot, schemaLinkPath string, err error) {

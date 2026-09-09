@@ -460,6 +460,32 @@ func TestEnginePlanUndeclaredTableIsBlockedDrop(t *testing.T) {
 	}
 }
 
+// TestEnginePlanEmptyNamespaceSurfacesAllLiveTables proves an explicitly empty
+// namespace remains a destructive divergence rather than a no-changes plan.
+func TestEnginePlanEmptyNamespaceSurfacesAllLiveTables(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_empty_namespace_test")
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE public.users (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	result, err := New().Plan(t.Context(), &engine.PlanRequest{
+		Database: "plan_empty_namespace_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err)
+	assert.False(t, result.NoChanges)
+	require.Len(t, result.Changes, 1)
+	assert.Equal(t, "public", result.Changes[0].Namespace)
+	require.Len(t, result.Changes[0].TableChanges, 1)
+	change := result.Changes[0].TableChanges[0]
+	assert.Equal(t, "users", change.Table)
+	assert.Equal(t, "DROP TABLE public.users", change.DDL)
+	assert.Equal(t, ddl.StatementDropTable, change.Operation)
+	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
+}
+
 // TestEnginePlanUndeclaredTableInMissingSchema proves a namespace whose
 // schema does not exist yet plans as a greenfield create: the live-table
 // enumeration finds nothing to reconcile against, and the declared table is

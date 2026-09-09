@@ -489,6 +489,11 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	if req.Credentials == nil || req.Credentials.DSN == "" {
 		return nil, fmt.Errorf("DSN credentials required for Spirit engine")
 	}
+	for namespace, files := range req.SchemaFiles {
+		if files == nil || len(files.Files) == 0 {
+			return nil, fmt.Errorf("namespace %q: removing every schema file of a namespace is not supported for MySQL; drop tables through a separately reviewed schema change", namespace)
+		}
+	}
 
 	// Extract database name from DSN (DSN is the source of truth for actual database)
 	_, _, _, database, err := parseDSN(req.Credentials.DSN)

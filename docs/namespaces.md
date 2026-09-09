@@ -117,6 +117,9 @@ type: vitess
 
 SchemaBot plans all keyspaces together — a single plan can contain changes across `commerce` and `commerce_sharded`. This is necessary because DDL and VSchema changes across keyspaces may need to be deployed atomically (e.g., moving a table between keyspaces).
 
+For MySQL and Vitess, deleting every schema file in a namespace is refused.
+Drop its tables through a separately reviewed schema change instead.
+
 ### Vitess — VSchema changes
 
 `vschema.json` controls Vitess routing (which tables live in which keyspace, sharding strategy, vindexes, etc.). When a `vschema.json` file changes:
