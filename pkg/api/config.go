@@ -42,6 +42,8 @@ var configIdentifierPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 // ServerConfig holds the server-side SchemaBot configuration.
 // This is loaded from a YAML file specified by SCHEMABOT_CONFIG_FILE.
 type ServerConfig struct {
+	liveDatabases *liveDatabaseRegistry
+
 	// ExperimentalStrataEnabled permits experimental Strata registrations and
 	// setup guidance. This server-only opt-in defaults to false.
 	ExperimentalStrataEnabled bool `yaml:"experimental-strata-enabled,omitempty"`
@@ -1096,6 +1098,8 @@ type ReviewPolicyConfig struct {
 
 // EnvironmentConfig holds per-environment database configuration.
 type EnvironmentConfig struct {
+	resolvedLocalDSN string
+
 	// DSN is the database connection string for local mode.
 	// Can be a direct DSN or a reference to a secret (e.g., "env:MYSQL_DSN").
 	DSN string `yaml:"dsn"`
@@ -1292,6 +1296,10 @@ type PostgresConfig struct {
 	// postgres.DefaultNativeSafeTableSizeLimitBytes applies.
 	NativeSafeTableSizeLimitBytes *int64 `yaml:"native_safe_table_size_limit_bytes,omitempty"`
 
+	// ConcurrentIndexMaxDuration bounds one CREATE INDEX CONCURRENTLY build.
+	// When unset, postgres.DefaultConcurrentIndexMaxDuration applies.
+	ConcurrentIndexMaxDuration string `yaml:"concurrent_index_max_duration,omitempty"`
+
 	// StatementTimeout bounds a single ordinary storage query on the
 	// connections SchemaBot opens to its own PostgreSQL storage database: the
 	// long-lived storage pool and the startup bootstrap's catalog reads. It
@@ -1337,6 +1345,11 @@ func (c PostgresConfig) NativeSafeTableSizeLimit() int64 {
 	return *c.NativeSafeTableSizeLimitBytes
 }
 
+// ConcurrentIndexMaxDurationOrDefault returns the configured concurrent index bound.
+func (c PostgresConfig) ConcurrentIndexMaxDurationOrDefault() time.Duration {
+	return parseDurationOrDefault(c.ConcurrentIndexMaxDuration, postgresengine.DefaultConcurrentIndexMaxDuration)
+}
+
 // StatementTimeoutOrDefault returns the configured storage statement budget or
 // its default. A configured "0" returns zero, meaning the budget is explicitly
 // disabled — callers pass that through to postgresconn, which writes
@@ -1349,6 +1362,18 @@ func (c PostgresConfig) StatementTimeoutOrDefault() time.Duration {
 func (c PostgresConfig) validate() error {
 	if c.NativeSafeTableSizeLimitBytes != nil && *c.NativeSafeTableSizeLimitBytes <= 0 {
 		return fmt.Errorf("postgres.native_safe_table_size_limit_bytes must be positive, got %d", *c.NativeSafeTableSizeLimitBytes)
+	}
+	if c.ConcurrentIndexMaxDuration != "" {
+		d, err := time.ParseDuration(c.ConcurrentIndexMaxDuration)
+		if err != nil {
+			return fmt.Errorf("postgres.concurrent_index_max_duration %q is not a valid duration: %w", c.ConcurrentIndexMaxDuration, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("postgres.concurrent_index_max_duration %q must be positive (omit it to use the default)", c.ConcurrentIndexMaxDuration)
+		}
+		if d > postgresengine.MaxConcurrentIndexMaxDuration {
+			return fmt.Errorf("postgres.concurrent_index_max_duration %q exceeds the largest bound the engine can honor (%s)", c.ConcurrentIndexMaxDuration, postgresengine.MaxConcurrentIndexMaxDuration)
+		}
 	}
 	// Zero is a meaningful setting here, unlike the pool durations: it disables
 	// the budget explicitly instead of selecting the default.
@@ -1472,7 +1497,7 @@ func (c *ServerConfig) RepoAdmins(repo string) (teams, users []string) {
 // restriction or a wildcard ("*") or repo-root (".") entry, where the config
 // could live anywhere and the probe must keep failing closed.
 func (c *ServerConfig) SchemaDirHintsForDatabase(repo, database string) (dirs []string, exhaustive bool) {
-	db, ok := c.Databases[database]
+	db, ok := c.DatabaseConfigs()[database]
 	if !ok {
 		return nil, true
 	}
@@ -1503,7 +1528,7 @@ func (c *ServerConfig) SchemaDirHintsForDatabase(repo, database string) (dirs []
 func (c *ServerConfig) SchemaDirHintsForRepo(repo string) (dirs []string, exhaustive bool) {
 	seen := make(map[string]struct{})
 	exhaustive = true
-	for _, db := range c.Databases {
+	for _, db := range c.DatabaseConfigs() {
 		if len(db.AllowedRepos) > 0 && !repoAllowed(db.AllowedRepos, repo) {
 			continue
 		}
@@ -2418,7 +2443,7 @@ func (c *ServerConfig) validateRequiredChecksNotAggregate() error {
 // Database returns the database configuration for the given name.
 // Returns nil if not found.
 func (c *ServerConfig) Database(name string) *DatabaseConfig {
-	if db, ok := c.Databases[name]; ok {
+	if db, ok := c.DatabaseConfigs()[name]; ok {
 		return &db
 	}
 	return nil
@@ -2865,7 +2890,7 @@ func (c *ServerConfig) KnownEnvironments() []string {
 	}
 	add(c.AllowedEnvironments...)
 	add(c.PromotionEnvironmentOrder()...)
-	for _, db := range c.Databases {
+	for _, db := range c.DatabaseConfigs() {
 		add(db.EnvironmentOrder...)
 		for env := range db.Environments {
 			add(env)
@@ -2894,7 +2919,7 @@ func (c *ServerConfig) IsEnvironmentKnown(env string) bool {
 	if slices.Contains(c.AllowedEnvironments, env) || slices.Contains(order, env) {
 		return true
 	}
-	for _, db := range c.Databases {
+	for _, db := range c.DatabaseConfigs() {
 		if _, ok := db.Environments[env]; ok {
 			return true
 		}
@@ -3129,6 +3154,9 @@ func (c EnvironmentConfig) validateLocalDSNConfig(context string) error {
 }
 
 func (c EnvironmentConfig) ResolveDSN() (string, error) {
+	if c.resolvedLocalDSN != "" {
+		return c.resolvedLocalDSN, nil
+	}
 	if c.DSNFrom != nil {
 		return c.DSNFrom.Resolve()
 	}

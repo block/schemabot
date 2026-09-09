@@ -2,10 +2,14 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"time"
 
@@ -17,6 +21,11 @@ import (
 
 // Config represents the global SchemaBot CLI configuration.
 type Config struct {
+	// revision binds a save to the bytes loaded, so concurrent setup or login
+	// cannot overwrite a newer profile configuration.
+	revision [32]byte
+	loaded   bool
+
 	DefaultProfile string             `yaml:"default_profile,omitempty"`
 	Profiles       map[string]Profile `yaml:"profiles"`
 }
@@ -75,7 +84,7 @@ func LoadConfig() (*Config, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return &Config{Profiles: make(map[string]Profile)}, nil
+			return &Config{Profiles: make(map[string]Profile), revision: sha256.Sum256(nil), loaded: true}, nil
 		}
 		return nil, fmt.Errorf("open config %s: %w", path, err)
 	}
@@ -92,6 +101,8 @@ func LoadConfig() (*Config, error) {
 	}
 
 	var cfg Config
+	cfg.revision = sha256.Sum256(data)
+	cfg.loaded = true
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
@@ -136,28 +147,91 @@ func requireSecureConfigMode(path string, mode os.FileMode) error {
 	return nil
 }
 
-// SaveConfig saves the configuration to ~/.schemabot/config.yaml.
+// ErrConfigChanged means another command saved configuration after it was read.
+var ErrConfigChanged = errors.New("CLI configuration changed; retry the command")
+
+var ErrConfigBusy = errors.New("CLI configuration is busy; retry the command")
+
+// UpdateConfig reapplies a small edit to the latest configuration after a concurrent
+// writer wins. The edit must not prompt or perform external work: credentials and
+// user choices are collected once, before entering this bounded save loop.
+func UpdateConfig(ctx context.Context, edit func(*Config) error) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		cfg, err := LoadConfig()
+		if err != nil {
+			return err
+		}
+		if err := edit(cfg); err != nil {
+			return err
+		}
+		err = SaveConfig(cfg)
+		if !errors.Is(err, ErrConfigChanged) && !errors.Is(err, ErrConfigBusy) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("save configuration after concurrent updates: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+// SaveConfig atomically saves configuration. Configurations returned by
+// LoadConfig are saved only if their on-disk revision has not changed.
 func SaveConfig(cfg *Config) error {
 	path, err := ConfigPath()
 	if err != nil {
 		return err
 	}
-
-	// Create directory if needed
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("create config directory: %w", err)
 	}
-
+	lease, err := lockConfig(path + ".lock")
+	if err != nil {
+		return err
+	}
+	defer utils.CloseAndLog(lease)
+	current, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("read current config: %w", err)
+	}
+	if cfg.loaded && sha256.Sum256(current) != cfg.revision {
+		return ErrConfigChanged
+	}
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
-
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	tmp, err := os.CreateTemp(dir, ".config-*")
+	if err != nil {
+		return fmt.Errorf("create config file: %w", err)
+	}
+	defer func() {
+		if err := os.Remove(tmp.Name()); err != nil && !os.IsNotExist(err) {
+			slog.Warn("remove temporary CLI configuration", "error", err)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		utils.CloseAndLog(tmp)
 		return fmt.Errorf("write config: %w", err)
 	}
-
+	if err := tmp.Sync(); err != nil {
+		utils.CloseAndLog(tmp)
+		return fmt.Errorf("sync config: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close config: %w", err)
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return fmt.Errorf("publish config: %w", err)
+	}
+	cfg.revision = sha256.Sum256(data)
+	cfg.loaded = true
 	return nil
 }
 
@@ -358,13 +432,19 @@ func ResolveBearerToken(ctx context.Context, tokenFlag, endpointFlag, profileFla
 		return token, fmt.Errorf("could not refresh the token for profile %q (run `%s login`): %w", profileName, cliname.Name(), err)
 	}
 
-	profile.Token = result.IDToken
-	profile.RefreshToken = result.RefreshToken
-	// Persist the new ID token expiry alongside the credential it describes.
-	profile.TokenExpiry = unixExpiry(result.Expiry)
-	cfg.Profiles[profileName] = profile
-	if err := SaveConfig(cfg); err != nil {
-		// The refreshed token is usable for this run even if it could not be saved.
+	// Save the completed grant against the latest config, without repeating the
+	// network exchange or overwriting a newer session for the same profile.
+	if err := UpdateConfig(context.WithoutCancel(ctx), func(latest *Config) error {
+		current, exists := latest.Profiles[profileName]
+		if !exists || !reflect.DeepEqual(current, profile) {
+			return fmt.Errorf("profile %q changed during token refresh; the newer profile was preserved", profileName)
+		}
+		current.Token = result.IDToken
+		current.RefreshToken = result.RefreshToken
+		current.TokenExpiry = unixExpiry(result.Expiry)
+		latest.Profiles[profileName] = current
+		return nil
+	}); err != nil {
 		return result.IDToken, fmt.Errorf("could not persist the refreshed token for profile %q: %w", profileName, err)
 	}
 	if !result.Expiry.After(time.Now()) {

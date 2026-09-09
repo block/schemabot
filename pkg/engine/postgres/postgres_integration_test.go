@@ -37,7 +37,7 @@ func TestEnginePullSchema(t *testing.T) {
 		CREATE TABLE app.events (id bigint PRIMARY KEY, message text NOT NULL)`)
 	require.NoError(t, err)
 
-	eng := NewForTarget(0, "pull_test", &engine.Credentials{DSN: dsn})
+	eng := NewForTarget(0, 0, "pull_test", &engine.Credentials{DSN: dsn})
 	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
 		Database: "pull_test", Type: "postgres", Environment: "test", Namespace: "app",
 	})
@@ -61,7 +61,7 @@ func TestEnginePullSchema(t *testing.T) {
 func TestEnginePullSchemaRejectsMissingSchema(t *testing.T) {
 	dsn, _ := testutil.StartPostgres(t, "pull_missing_test")
 
-	eng := NewForTarget(0, "pull_missing_test", &engine.Credentials{DSN: dsn})
+	eng := NewForTarget(0, 0, "pull_missing_test", &engine.Credentials{DSN: dsn})
 	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "missing"})
 
 	require.Error(t, err)
@@ -79,7 +79,7 @@ func TestEnginePullSchemaAggregatesUnrenderableTables(t *testing.T) {
 		CREATE UNLOGGED TABLE app.delivery_log (id bigint PRIMARY KEY)`)
 	require.NoError(t, err)
 
-	eng := NewForTarget(0, "pull_refusal_test", &engine.Credentials{DSN: dsn})
+	eng := NewForTarget(0, 0, "pull_refusal_test", &engine.Credentials{DSN: dsn})
 	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
 
 	require.Error(t, err)
@@ -101,7 +101,7 @@ func TestEnginePullSchemaRejectsUnmodeledTableObjects(t *testing.T) {
 		COMMENT ON TABLE app.accounts IS 'customer accounts'`)
 	require.NoError(t, err)
 
-	eng := NewForTarget(0, "pull_objects_test", &engine.Credentials{DSN: dsn})
+	eng := NewForTarget(0, 0, "pull_objects_test", &engine.Credentials{DSN: dsn})
 	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
 
 	require.Error(t, err)
@@ -121,7 +121,7 @@ func TestEnginePullSchemaRejectsTableInheritance(t *testing.T) {
 		CREATE TABLE app.child (detail text) INHERITS (app.parent)`)
 	require.NoError(t, err)
 
-	eng := NewForTarget(0, "pull_inheritance_test", &engine.Credentials{DSN: dsn})
+	eng := NewForTarget(0, 0, "pull_inheritance_test", &engine.Credentials{DSN: dsn})
 	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
 
 	require.Error(t, err)
@@ -141,7 +141,7 @@ func TestEnginePullSchemaDiscoversNonReservedSchemas(t *testing.T) {
 		CREATE TABLE shipping.parcels (id bigint PRIMARY KEY)`)
 	require.NoError(t, err)
 
-	eng := NewForTarget(0, "pull_discovery_test", &engine.Credentials{DSN: dsn})
+	eng := NewForTarget(0, 0, "pull_discovery_test", &engine.Credentials{DSN: dsn})
 	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{})
 
 	require.NoError(t, err)
@@ -163,7 +163,7 @@ func TestEnginePullSchemaExcludesPartitionChildren(t *testing.T) {
 		CREATE TABLE app.events_2026 PARTITION OF app.events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')`)
 	require.NoError(t, err)
 
-	eng := NewForTarget(0, "pull_partition_test", &engine.Credentials{DSN: dsn})
+	eng := NewForTarget(0, 0, "pull_partition_test", &engine.Credentials{DSN: dsn})
 	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
 
 	require.Error(t, err)
@@ -183,7 +183,7 @@ func TestEnginePullSchemaExcludesViews(t *testing.T) {
 		CREATE MATERIALIZED VIEW app.account_snapshot AS SELECT id FROM app.accounts`)
 	require.NoError(t, err)
 
-	eng := NewForTarget(0, "pull_views_test", &engine.Credentials{DSN: dsn})
+	eng := NewForTarget(0, 0, "pull_views_test", &engine.Credentials{DSN: dsn})
 	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
 
 	require.NoError(t, err)
@@ -200,7 +200,7 @@ func TestEnginePullSchemaReturnsCancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	eng := NewForTarget(0, "pull_cancel_test", &engine.Credentials{DSN: dsn})
+	eng := NewForTarget(0, 0, "pull_cancel_test", &engine.Credentials{DSN: dsn})
 	response, err := eng.PullSchema(ctx, &ternv1.PullSchemaRequest{Namespace: "public"})
 
 	require.ErrorIs(t, err, context.Canceled)
@@ -940,6 +940,42 @@ func TestEngineApplyConcurrentIndexBuild(t *testing.T) {
 		`SELECT i.indisvalid FROM pg_index i WHERE i.indexrelid = 'public.users_email_idx'::regclass`).Scan(&valid)
 	require.NoError(t, err)
 	assert.True(t, valid, "the built index must be catalog-valid, not merely present")
+}
+
+// TestEngineApplyConcurrentIndexBoundEndsTheBuild proves the configured
+// bound is what governs a concurrent build on the target: a build that
+// cannot finish inside it is ended by the server, the apply fails, and the
+// operator detail names the option and the bound the build ran past, so the
+// operator's next step is to raise it. Whether the cancelled build left its
+// own invalid index behind (retryable, the retry recovers it) or nothing at
+// all (refused, since retrying unchanged spends the same bound again)
+// depends on how far the build got before the timer fired; both surfaces
+// carry the option, so the assertion holds on either.
+func TestEngineApplyConcurrentIndexBoundEndsTheBuild(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "index_bound_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY, email text)")
+	require.NoError(t, err)
+	// Enough rows that the build's table scans outlast the bound on any
+	// machine; an empty table could finish inside it and report completion.
+	_, err = db.ExecContext(t.Context(),
+		"INSERT INTO public.users (id, email) SELECT n, 'user-' || n || '@example.com' FROM generate_series(1, 200000) AS n")
+	require.NoError(t, err)
+
+	bound := time.Millisecond
+	eng := NewWithOptions(0, bound)
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "users",
+		"CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "users")
+	require.Equal(t, engine.StateFailed, progress.State, "progress: %+v", progress)
+	assert.Contains(t, progress.ErrorMessage, "postgres.concurrent_index_max_duration (1ms)")
+	assert.Contains(t, progress.ErrorMessage, "raise postgres.concurrent_index_max_duration")
+
+	var valid bool
+	err = db.QueryRowContext(t.Context(),
+		`SELECT coalesce(bool_and(i.indisvalid), false) FROM pg_index i WHERE i.indexrelid = to_regclass('public.users_email_idx')`).Scan(&valid)
+	require.NoError(t, err)
+	assert.False(t, valid, "a build the bound ended must not leave a valid index the drive reported as failed")
 }
 
 // TestEngineApplyPartitionedParentConcurrentIndexRefusal proves the

@@ -88,7 +88,6 @@ package tern
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -139,6 +138,11 @@ type LocalConfig struct {
 	// PostgresNativeSafeTableSizeLimitBytes is the maximum table size in bytes
 	// for PostgreSQL native-safe execution. Zero uses the engine default.
 	PostgresNativeSafeTableSizeLimitBytes int64
+
+	// PostgresConcurrentIndexMaxDuration bounds one PostgreSQL concurrent index
+	// build, including abandoned-index recovery when an invalid leftover index
+	// must be rebuilt. Zero uses the engine default.
+	PostgresConcurrentIndexMaxDuration time.Duration
 
 	// Metadata holds engine-specific configuration as key-value pairs.
 	// The tern layer does not interpret these — it passes them through to the
@@ -334,7 +338,7 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 			Settings:            spiritSettings,
 		}),
 		planetscaleEngine: psEngine,
-		postgresEngine: postgres.NewForTarget(cfg.PostgresNativeSafeTableSizeLimitBytes, cfg.Database, &engine.Credentials{
+		postgresEngine: postgres.NewForTarget(cfg.PostgresNativeSafeTableSizeLimitBytes, cfg.PostgresConcurrentIndexMaxDuration, cfg.Database, &engine.Credentials{
 			DSN:      cfg.TargetDSN,
 			Metadata: maps.Clone(cfg.Metadata),
 		}),
@@ -3274,16 +3278,11 @@ func (c *LocalClient) loadStoredProgressMetadata(ctx context.Context, task *stor
 		c.logger.Debug("progress: no apply operation for stored metadata", "task_id", task.TaskIdentifier, "apply_operation_id", operationID)
 		return nil
 	}
-	metadata := make(map[string]string)
-	if op.ProgressMetadata != "" {
-		if err := json.Unmarshal([]byte(op.ProgressMetadata), &metadata); err != nil {
-			c.logger.Warn("progress response will omit persisted progress fields: failed to decode progress metadata",
-				"task_id", task.TaskIdentifier, "apply_operation_id", operationID, "error", err)
-			metadata = make(map[string]string)
-		}
-		if metadata == nil {
-			metadata = make(map[string]string)
-		}
+	metadata, err := op.ParseProgressMetadata()
+	if err != nil {
+		c.logger.Warn("progress response will omit persisted progress fields: failed to decode progress metadata",
+			"task_id", task.TaskIdentifier, "apply_operation_id", operationID, "error", err)
+		metadata = make(map[string]string)
 	}
 	if c.config.Type == storage.DatabaseTypeVitess && op.EngineResumeMetadata != "" {
 		display, err := PSDisplayMetadata(op.EngineResumeMetadata)

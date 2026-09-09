@@ -124,7 +124,7 @@ func (c *ServerConfig) RepoHasSchemaDirAllowlist(repo string) bool {
 	if c == nil {
 		return false
 	}
-	for _, dbConfig := range c.Databases {
+	for _, dbConfig := range c.DatabaseConfigs() {
 		if len(dbConfig.AllowedDirs) == 0 {
 			continue
 		}
@@ -142,7 +142,7 @@ func (c *ServerConfig) SchemaPathAllowedForRepo(repo, schemaPath string) bool {
 	if c == nil {
 		return false
 	}
-	for _, dbConfig := range c.Databases {
+	for _, dbConfig := range c.DatabaseConfigs() {
 		if len(dbConfig.AllowedDirs) == 0 {
 			continue
 		}
@@ -165,7 +165,7 @@ func (c *ServerConfig) DatabaseForSchemaPath(repo, schemaPath string) (string, b
 	if c == nil {
 		return "", false
 	}
-	for name, dbConfig := range c.Databases {
+	for name, dbConfig := range c.DatabaseConfigs() {
 		if len(dbConfig.AllowedDirs) == 0 || !databaseAllowsRepo(dbConfig, repo) {
 			continue
 		}
