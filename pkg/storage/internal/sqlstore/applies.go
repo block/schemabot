@@ -2376,6 +2376,12 @@ func (s *applyStore) expireRetryable(ctx context.Context, limit int) ([]*storage
 
 	// Oldest first, so a backlog drains in the order it accumulated rather than
 	// leaving the same tail unexpired every pass.
+	//
+	// The ordering rides an index on (state, updated_at) rather than sorting.
+	// That is what makes the LIMIT bound the work: without an index in the
+	// ordering's own direction the sort has to see every failed_retryable row
+	// before it can take the first page, so the lease gate below would be
+	// evaluated once per row in the state rather than once per row returned.
 	rows, err := tx.QueryContext(ctx, `
 		SELECT `+applyColumns+`
 		FROM applies
