@@ -1990,12 +1990,38 @@ func unleasedOperationGate(d Dialect) string {
 		)`, freshLeaseAfter)
 }
 
-// undrivenApplyGate admits only applies without any fresh operation lease.
-// State does not prove a lease is idle: a newly claimed retry keeps its
-// failed_retryable state while the operation-only driver starts. A finished
-// drive's leftover lease must be released or go stale before expiry too.
-// The candidate scan uses this gate for efficiency; lockUndrivenApply repeats
-// it while holding every operation row to exclude claims and heartbeats.
+// undrivenApplyGate renders the NOT EXISTS admitting only applies with no fresh
+// operation lease. It is the apply-granular counterpart of
+// unleasedOperationGate: that gate excludes one task row by its own operation's
+// lease, this one excludes a whole apply by any operation under it.
+//
+// Whole-apply is the granularity a writer needs when it settles an apply and its
+// rows together. Skipping the rows a live drive holds while writing the apply's
+// own verdict would settle the parent over children the writer just declined to
+// touch, so the two have to be decided as one, and the decision has to be made
+// where the parent is selected.
+//
+// It reads the lease and nothing else, because state does not tell the two
+// meanings of a lease apart. A redispatched operation keeps its failed_retryable
+// state for the whole drive — the claim rotates the lease and leaves the state
+// alone — so any state filter that admits failed_retryable admits an apply a
+// driver is part-way through retrying, which is the one case a whole-apply write
+// must not land under. Filtering it out instead would exclude the retry but not
+// the drive.
+//
+// Reading the lease alone only terminalizes because a drive clears its lease as
+// it ends. A leftover lease is indistinguishable from a live one for a full
+// staleness window, and a single-deployment apply that has just spent its last
+// attempt would be in that window every time, so without the handback this gate
+// would defer the ordinary shape of the work it exists to settle.
+//
+// The gate is a candidate filter, not the decision. An unlocked NOT EXISTS is a
+// read a claim can win the moment after it is evaluated, so a writer relying on
+// this repeats it under lockUndrivenApply, holding every operation row of the
+// apply.
+//
+// An apply with no operations is admitted. Nothing holds a lease over it, so
+// there is nothing here to exclude it by.
 func undrivenApplyGate(d Dialect) string {
 	freshLeaseAfter := d.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
 		LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)

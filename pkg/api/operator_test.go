@@ -38,7 +38,7 @@ func TestDriversConfig(t *testing.T) {
 // test exercises need implementations; any other call panics, which keeps the
 // test honest about the code path it covers.
 type recordingApplyOperationStore struct {
-	storage.ApplyOperationStore
+	stubApplyOperationStore
 	updateStateID    int64
 	updateStateValue string
 	updateStateErr   error
@@ -287,7 +287,7 @@ func TestMarkOperationFromApplyState_MirrorsFailedRetryable(t *testing.T) {
 // ListByApply so the derived-apply-state projection can be exercised against a
 // multi-deployment sibling set.
 type listingApplyOperationStore struct {
-	storage.ApplyOperationStore
+	stubApplyOperationStore
 	ops []*storage.ApplyOperation
 }
 
@@ -846,7 +846,7 @@ func (s *stubTaskStore) GetByApplyOperationID(context.Context, int64) ([]*storag
 // markFailedRecordingApplyOperationStore records MarkFailed so a test can assert
 // the operation row was persisted failed with its own task's message.
 type markFailedRecordingApplyOperationStore struct {
-	storage.ApplyOperationStore
+	stubApplyOperationStore
 	called    bool
 	failedID  int64
 	failedMsg string
@@ -923,7 +923,7 @@ func TestMarkOperationFromOwnResult_LeavesNonTerminalClaimable(t *testing.T) {
 // updateStateRecordingApplyOperationStore records UpdateState so a test can
 // assert a parked operation is persisted at waiting_for_cutover (completed_at nil).
 type updateStateRecordingApplyOperationStore struct {
-	storage.ApplyOperationStore
+	stubApplyOperationStore
 	called       bool
 	updatedID    int64
 	updatedState string
@@ -1137,7 +1137,7 @@ func (s *fakeControlRequestStore) CompletePending(_ context.Context, _ int64, op
 // markPendingStoppedRecordingStore records MarkPendingStoppedByApply so a test
 // can assert the operator stop reconciliation terminalized the pending siblings.
 type markPendingStoppedRecordingStore struct {
-	storage.ApplyOperationStore
+	stubApplyOperationStore
 	called     bool
 	stoppedFor int64
 	count      int64
@@ -1371,7 +1371,7 @@ func (s *casApplyStore) currentState() string {
 // recoverOperationStore backs the single claimed operation through the recover
 // flow: Get/ListByApply return the live row and MarkFailed transitions it.
 type recoverOperationStore struct {
-	storage.ApplyOperationStore
+	stubApplyOperationStore
 	mu sync.Mutex
 	op *storage.ApplyOperation
 }
@@ -1463,7 +1463,7 @@ func TestRecoverMultiApplyOperation_FailsTaskLessOperationAgainstReloadedParent(
 // genuine multi-operation set (so the operation-lease-only drive is valid), and
 // MarkFailed terminalizes the claimed row.
 type cutoverOpStore struct {
-	storage.ApplyOperationStore
+	stubApplyOperationStore
 	mu      sync.Mutex
 	op      *storage.ApplyOperation
 	sibling *storage.ApplyOperation
@@ -1502,6 +1502,20 @@ func (s *cutoverOpStore) MarkFailed(_ context.Context, _ int64, errMsg string) e
 }
 
 func (s *cutoverOpStore) Heartbeat(context.Context, int64) error { return nil }
+
+// A cutover drive holds an operation lease like any other and hands it back as
+// it returns, so the double has to record the clear rather than inherit a nil
+// store method.
+func (s *cutoverOpStore) ReleaseFinishedClaim(_ context.Context, lease storage.OperationLease) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.op.LeaseToken != lease.Token || !state.IsTerminalApplyState(s.op.State) {
+		return false, nil
+	}
+	s.op.LeaseOwner = ""
+	s.op.LeaseToken = ""
+	return true, nil
+}
 
 // The cutover claim path drives a barrier-parked operation through its swap via
 // ResumeApplyOperationCutover, not the copy-phase ResumeApplyOperation, and only
@@ -1560,6 +1574,11 @@ func TestRecoverApplyOperationCutover_RoutesThroughCutoverDrive(t *testing.T) {
 	assert.Equal(t, int64(0), copyID, "the cutover claim must not route through the copy-phase entrypoint")
 	assert.Equal(t, state.ApplyOperation.Failed, opStore.op.State,
 		"the task-less cutover operation must be terminalized failed")
+	// A cutover drive holds an operation lease exactly as a copy drive does, and
+	// expiry reads that lease alone, so leaving it behind would defer the apply's
+	// expiry for a staleness window over a drive that has already ended.
+	assert.Empty(t, opStore.op.LeaseToken,
+		"a cutover drive that ended must hand its operation lease back")
 }
 
 // A claimed cutover operation that is not part of a multi-operation apply must
@@ -1684,7 +1703,7 @@ func (s *panicContainmentApplyStore) Update(_ context.Context, apply *storage.Ap
 
 // staticOperationLookupStore serves one operation row for routing lookups.
 type staticOperationLookupStore struct {
-	storage.ApplyOperationStore
+	stubApplyOperationStore
 	op *storage.ApplyOperation
 }
 
@@ -1835,7 +1854,7 @@ func (s *unclaimableParentApplyStore) Get(context.Context, int64) (*storage.Appl
 // operation lease. It embeds the interface so any other call panics, keeping
 // the test honest about the code path it covers.
 type releaseRecordingOperationStore struct {
-	storage.ApplyOperationStore
+	stubApplyOperationStore
 	released bool
 }
 
@@ -2117,7 +2136,7 @@ func (m *tasklessOperationStores) Plans() storage.PlanStore    { return m.plans 
 // and records any further write, so a test can assert the drive's outcome is
 // read back rather than re-derived.
 type driveWrittenApplyOperationStore struct {
-	storage.ApplyOperationStore
+	stubApplyOperationStore
 	row     *storage.ApplyOperation
 	written bool
 }

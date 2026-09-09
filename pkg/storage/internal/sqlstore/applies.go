@@ -2436,8 +2436,27 @@ func (s *applyStore) expireRetryable(ctx context.Context, limit int) ([]*storage
 		})
 	}
 
-	// Both the parent and every operation are now locked, and the lease gate
-	// was rechecked after taking those locks. Claims and heartbeats cannot
+	// The writes below carry no gate of their own, and each way a drive can be
+	// claimed is excluded by a different thing.
+	//
+	// A parent-lease drive cannot start here, because starting one means passing
+	// ClaimApplyByID, whose predicate is the complement of this selection term
+	// for term: expiry takes attempt >= maxRecoveryAttempts OR a lapsed freshness
+	// window, and the claim's retryable clause requires attempt <
+	// maxRecoveryAttempts AND a live one. failed_retryable is also absent from
+	// claimableApplyStates(), so the claim's stale-lease clause cannot reach one
+	// either. That disjointness is pinned as a pair rather than per side — see
+	// TestApplyStore_ExpireRetryableAndTheParentClaimNeverAdmitTheSameApply. The
+	// parent FOR UPDATE is its backstop: ClaimApplyByID reads the same row FOR
+	// UPDATE SKIP LOCKED, so a driver that had already taken an operation row
+	// releases that lease instead of driving it (reconcileUnclaimableParent).
+	//
+	// An operation-lease drive is excluded by the locks taken just above instead,
+	// because the parent FOR UPDATE says nothing about it: a multi-operation
+	// drive never calls ClaimApplyByID, and FindNextApplyOperation locks
+	// apply_operations while reading applies only inside EXISTS subqueries, which
+	// take no lock. Both the parent and every operation are now locked and the
+	// lease gate was rechecked under those locks, so claims and heartbeats cannot
 	// change operation ownership until these writes commit (OW-8, ST-4).
 
 	// A pending task never started: it was blocked behind the failure that made

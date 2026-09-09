@@ -203,7 +203,7 @@ const reaperPassDeadline = 10 * time.Second
 // gatedApplyOperationStore holds its sweep open until the gate is closed, so a
 // test can observe what the pass does while one sweep is still scanning.
 type gatedApplyOperationStore struct {
-	storage.ApplyOperationStore
+	stubApplyOperationStore
 	gate <-chan struct{}
 }
 
@@ -308,6 +308,10 @@ type expiringApplyStore struct {
 
 func (s *expiringApplyStore) ExpireRetryable(ctx context.Context, limit int) ([]*storage.RetryableApplyExpiration, error) {
 	s.limit = limit
+	// Expirations and an error are mutually exclusive, and deliberately so: the
+	// real pass settles its whole batch in one transaction, so a failure rolls
+	// back everything it had matched. A double that could hand back both would
+	// let a test assert on partial reporting the store cannot produce.
 	if s.expireErr != nil {
 		return nil, s.expireErr
 	}
@@ -395,15 +399,13 @@ func TestRunRetryableExpiryPassLogsCarryFullApplyAttrs(t *testing.T) {
 	assert.Equal(t, string(storage.RetryableExpirationAttemptBudget), line["reason"])
 }
 
-// An expiry pass settles each apply in its own transaction, so expirations that
-// commit before a later one fails are real state changes an operator has to be
-// able to find. The pass reports them even when it ends in an error, and still
-// records the failure under its own reason.
-func TestRunRetryableExpiryPassReportsExpirationsThatLandedBeforeAFailure(t *testing.T) {
+// A storage error is the one ending of an expiry pass that is a fault, and it is
+// counted apart from the stranded sweeps so an operator alerting on claim
+// failures can tell which sweep is failing.
+func TestRunRetryableExpiryPassStorageErrorIsAFailure(t *testing.T) {
 	reader := reaperMetricReader(t)
 	svc, _ := retryableExpiryService(&expiringApplyStore{
-		expirations: budgetExpiration(),
-		expireErr:   errors.New("applies table unavailable"),
+		expireErr: errors.New("applies table unavailable"),
 	})
 
 	svc.runRetryableExpiryPass(t.Context())
