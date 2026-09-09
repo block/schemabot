@@ -487,6 +487,77 @@ func TestBlockMissingPrivilegesRequiresTargetTableWhenAbsent(t *testing.T) {
 	assert.Contains(t, err.Error(), "names no target table")
 }
 
+// TestConcurrentIndexStatement pins the one statement shape admitted under the
+// concurrent index duration envelope instead of the table size ceiling, over
+// the shapes the privilege tier derivation lets reach the ceiling: a blocking
+// index build and a plain ALTER stay inside it, and so does a concurrent
+// partition detach — CONCURRENTLY alone does not move a statement out of the
+// ceiling, the statement must build an index. A statement the parser rejects
+// is an error, never a silent classification either way.
+func TestConcurrentIndexStatement(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want bool
+	}{
+		{name: "concurrent index build", sql: "CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)", want: true},
+		{name: "blocking index build", sql: "CREATE INDEX users_email_idx ON public.users (email)"},
+		{name: "alter table", sql: "ALTER TABLE public.users ADD COLUMN email text"},
+		{name: "concurrent partition detach", sql: "ALTER TABLE public.events DETACH PARTITION public.events_2024 CONCURRENTLY"},
+		{name: "concurrent index drop", sql: "DROP INDEX CONCURRENTLY public.users_email_idx"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := concurrentIndexStatement(tt.sql)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+
+	_, err := concurrentIndexStatement("CREATE INDEX CONCURRENTLY ON")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parse PostgreSQL statement")
+}
+
+// TestBlockRewriteStepsKeepsEarlierVerdictsAndConcurrentBuilds proves the size
+// verdict lands only on the steps it is about: a step an earlier gate already
+// blocked keeps that gate's reason, so an operator missing a grant is not told
+// to shrink the table instead, and a concurrent index build stays executable
+// under its own bound while the native step beside it is blocked.
+func TestBlockRewriteStepsKeepsEarlierVerdictsAndConcurrentBuilds(t *testing.T) {
+	changes := []engine.TableChange{
+		{
+			Table:         "users",
+			DDL:           "ALTER TABLE public.users ADD CONSTRAINT users_email_key UNIQUE (email)",
+			ExecutionMode: engine.ExecutionModeBlocked,
+			ModeReason:    "privilege verdict",
+		},
+		{Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN email text"},
+		{Table: "users", DDL: "CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)"},
+	}
+
+	require.NoError(t, blockRewriteSteps(changes, "size verdict"))
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
+	assert.Equal(t, "privilege verdict", changes[0].ModeReason)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
+	assert.Equal(t, "size verdict", changes[1].ModeReason)
+	assert.Empty(t, changes[2].ExecutionMode)
+	assert.Empty(t, changes[2].ModeReason)
+}
+
+// TestBlockRewriteStepsFailsClosedOnUnparseableStep proves an executable step
+// whose statement the parser rejects fails the plan rather than being blocked
+// or exempted on a guess: the tier derivation parsed every executable step
+// already, so reaching one here that does not parse is an invariant violation.
+func TestBlockRewriteStepsFailsClosedOnUnparseableStep(t *testing.T) {
+	changes := []engine.TableChange{{Table: "users", DDL: "ALTER TABLE public.users ADD"}}
+
+	err := blockRewriteSteps(changes, "size verdict")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `classify planned statement for table "users"`)
+	assert.Empty(t, changes[0].ExecutionMode)
+}
+
 // TestBlockMissingPrivilegesRequiresMatchingTiers proves a tier slice that
 // does not pair one-to-one with the planned changes fails the plan closed
 // instead of guessing which step needs which access.

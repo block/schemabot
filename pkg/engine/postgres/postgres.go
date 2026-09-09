@@ -544,11 +544,13 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 }
 
 // blockOversizedTable applies the native-safe table size ceiling to executable
-// steps whose native cost scales with the existing table. Concurrent index
-// builds have their own duration envelope, but still use the preflight to prove
-// the target exists and is an ordinary or partitioned table. A typed refusal is
-// rendered as a blocked verdict; an operational failure fails planning rather
-// than producing an executable plan while the table size is unknown.
+// steps whose native cost scales with the existing table. The preflight
+// measures the table and proves it exists and is an ordinary or partitioned
+// table; which steps a size refusal blocks is decided in blockRewriteSteps,
+// where concurrent index builds keep their verdict because their bound is a
+// duration envelope, not the table size. A typed refusal is rendered as a
+// blocked verdict; an operational failure fails planning rather than producing
+// an executable plan while the table size is unknown.
 func blockOversizedTable(ctx context.Context, pool *pgxpool.Pool, report pgplan.Report, changes []engine.TableChange, tableSizeLimit int64) ([]engine.TableChange, error) {
 	if !hasExecutableChanges(changes) {
 		return changes, nil
@@ -559,14 +561,7 @@ func blockOversizedTable(ctx context.Context, pool *pgxpool.Pool, report pgplan.
 	if isGreenfieldTable(report) {
 		return changes, nil
 	}
-	limit := preflight.NoSizeLimit
-	for _, change := range changes {
-		if change.ExecutionMode == "" && !isConcurrentIndexChange(change) {
-			limit = tableSizeLimit
-			break
-		}
-	}
-	_, err := preflight.CheckTable(ctx, pool, report.Schema, report.Table, limit)
+	_, err := preflight.CheckTable(ctx, pool, report.Schema, report.Table, tableSizeLimit)
 	if err == nil {
 		return changes, nil
 	}
@@ -574,17 +569,16 @@ func blockOversizedTable(ctx context.Context, pool *pgxpool.Pool, report pgplan.
 	if r == nil {
 		return nil, fmt.Errorf("check size for table %q: %w", report.Table, err)
 	}
-	// The table name is a database-sourced identifier: quoting escapes control
-	// characters but leaves the Markdown cell separator alone, so the composed
-	// reason is sanitized as a whole before it reaches any change.
-	reason := sanitizeReasonText(fmt.Sprintf("statement for table %q: %s", report.Table, r.detail))
+	// The table name is a database-sourced identifier. Quoting escapes control
+	// characters but not whitespace runs, so the composed reason is collapsed
+	// to one line as a whole; the Markdown surfaces that render it escape
+	// their own delimiters at the rendering boundary, so the name reaches the
+	// operator as the relation it is.
+	reason := singleLine(fmt.Sprintf("statement for table %q: %s", report.Table, r.detail))
 	var sizeErr *preflight.SizeError
 	if errors.As(err, &sizeErr) {
-		for i := range changes {
-			if changes[i].ExecutionMode == "" && !isConcurrentIndexChange(changes[i]) {
-				changes[i].ExecutionMode = engine.ExecutionModeBlocked
-				changes[i].ModeReason = reason
-			}
+		if err := blockRewriteSteps(changes, reason); err != nil {
+			return nil, err
 		}
 		return changes, nil
 	}
@@ -592,9 +586,45 @@ func blockOversizedTable(ctx context.Context, pool *pgxpool.Pool, report pgplan.
 	return changes, nil
 }
 
-func isConcurrentIndexChange(change engine.TableChange) bool {
-	statement, err := pgstatement.ParseOne(change.DDL)
-	return err == nil && statement.Kind() == pgstatement.KindCreateIndex && statement.Concurrent()
+// blockRewriteSteps marks every still-executable step whose native cost
+// scales with the existing table blocked with the reason. A concurrent index
+// build keeps its verdict: it is bounded by its duration envelope rather than
+// the table size ceiling. Steps already carrying a verdict keep it, so a
+// refusal an earlier gate recorded is never overwritten by the size verdict.
+// Every executable step here was parsed when its privilege tier was derived,
+// so a statement that fails to classify is an invariant violation and fails
+// planning rather than being exempted or blocked on a guess.
+func blockRewriteSteps(changes []engine.TableChange, reason string) error {
+	for i := range changes {
+		if changes[i].ExecutionMode != "" {
+			continue
+		}
+		concurrentIndex, err := concurrentIndexStatement(changes[i].DDL)
+		if err != nil {
+			return fmt.Errorf("classify planned statement for table %q: %w", changes[i].Table, err)
+		}
+		if concurrentIndex {
+			continue
+		}
+		changes[i].ExecutionMode = engine.ExecutionModeBlocked
+		changes[i].ModeReason = reason
+	}
+	return nil
+}
+
+// concurrentIndexStatement reports whether sql is a single CREATE INDEX
+// CONCURRENTLY statement — the one shape SchemaBot's PostgreSQL support runs
+// under the concurrent index duration envelope instead of the table size
+// ceiling. Every other concurrent form the parser recognizes, including a
+// concurrent partition detach, stays inside the ceiling. The plan and apply
+// paths share this classification so the two can never disagree about which
+// bound a statement is admitted under.
+func concurrentIndexStatement(sql string) (bool, error) {
+	statement, err := pgstatement.ParseOne(sql)
+	if err != nil {
+		return false, fmt.Errorf("parse PostgreSQL statement: %w", err)
+	}
+	return statement.Kind() == pgstatement.KindCreateIndex && statement.Concurrent(), nil
 }
 
 // undeclaredTableDrops surfaces every live table in the namespace that no

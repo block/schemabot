@@ -199,11 +199,10 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		// The tier derivation above parsed this statement already, so a
 		// parse failure here is an invariant guard; the message stays curated
 		// like the refusals above because it reaches the operator surface.
-		statement, err := pgstatement.ParseOne(statements[0])
+		concurrentIndex, err = concurrentIndexStatement(statements[0])
 		if err != nil {
 			return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned statement could not be classified", tc.Table)
 		}
-		concurrentIndex = statement.Kind() == pgstatement.KindCreateIndex && statement.Concurrent()
 	}
 	return nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL, steps: len(statements), concurrentIndex: concurrentIndex}, nil
 }

@@ -765,8 +765,10 @@ over gRPC run with that deployment's engine settings.
 ## Postgres
 
 The `postgres:` block sets the largest table on which the PostgreSQL engine
-will execute native-safe DDL, the maximum duration of a concurrent index
-build, and the statement budget SchemaBot's own storage connections run under.
+will execute native-safe DDL whose cost scales with the table's existing data
+(`ALTER TABLE` and a blocking `CREATE INDEX`), the maximum duration of a
+concurrent index build, and the statement budget SchemaBot's own storage
+connections run under.
 The size limit is expressed in bytes and defaults to 1 GiB:
 
 ```yaml

@@ -355,12 +355,13 @@ func TestEnginePlanTableSizeRefusal(t *testing.T) {
 	assert.Contains(t, change.ModeReason, "SchemaBot's ceiling for a native-safe apply")
 }
 
-// TestEnginePlanTableSizeRefusalNeutralizesTableName proves the size verdict
-// is safe to render in a single-line Markdown table cell even when the table
-// name is not: a quoted PostgreSQL identifier may carry the cell separator,
-// and the reason must neutralize it rather than let a database-sourced name
-// break the layout of the PR comment that shows the verdict.
-func TestEnginePlanTableSizeRefusalNeutralizesTableName(t *testing.T) {
+// TestEnginePlanTableSizeRefusalKeepsTableNameVerbatim proves the size verdict
+// names the table exactly as the database spells it: a quoted PostgreSQL
+// identifier may carry Markdown delimiters, and the operator reading the
+// verdict needs the real name to act on it. Escaping for the surface that
+// shows the reason is the renderer's job, so the engine does not rewrite the
+// identifier on the renderer's behalf.
+func TestEnginePlanTableSizeRefusalKeepsTableNameVerbatim(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "plan_size_limit_odd_name_test")
 	_, err := db.ExecContext(t.Context(), `CREATE TABLE public."odd|users" (id bigint PRIMARY KEY)`)
 	require.NoError(t, err)
@@ -380,9 +381,8 @@ func TestEnginePlanTableSizeRefusalNeutralizesTableName(t *testing.T) {
 	require.Len(t, result.Changes[0].TableChanges, 1)
 	change := result.Changes[0].TableChanges[0]
 	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
-	assert.Contains(t, change.ModeReason, `statement for table "odd/users":`)
+	assert.Contains(t, change.ModeReason, `statement for table "odd|users":`)
 	assert.Contains(t, change.ModeReason, "1-byte threshold")
-	assert.NotContains(t, change.ModeReason, "|", "the cell separator must not survive into a rendered reason")
 }
 
 // TestEnginePlanOversizedTableAdmitsConcurrentIndex proves the plan applies
