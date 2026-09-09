@@ -293,7 +293,7 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 			}
 			nsChanges = append(nsChanges, nc)
 		}
-		templates.WriteNamespaceChanges(nsChanges, !isVitess, result.Database)
+		templates.WriteNamespaceChanges(nsChanges, !isVitess, result.Database, schema.DialectForDatabaseType(result.DatabaseType))
 	}
 
 	// Check for unsafe changes and show with ⚠️ (attention — the changes await consent)

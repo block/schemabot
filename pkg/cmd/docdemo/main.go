@@ -24,8 +24,10 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/commands"
+	"github.com/block/schemabot/pkg/schema"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/muesli/termenv"
 	"os"
 	"time"
@@ -67,26 +69,12 @@ func capture(fn func()) string {
 
 const ddl = "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)"
 
-func progress(p int, phase string, throttled bool) string {
-	return capture(func() {
-		table := t.TableProgress{TableName: "orders", Namespace: "shop", ChangeType: "alter", DDL: ddl, Status: phase, RowsCopied: int64(p) * 100000, RowsTotal: 10000000, PercentComplete: p, ETASeconds: int64(100-p) * 12}
-		if phase == state.Apply.Running {
-			table.ProgressDetail = fmt.Sprintf("%d/10000000 %d.00%% copyRows", table.RowsCopied, p)
-		}
-		table.Throttled = throttled
-		if throttled {
-			table.ThrottleReason = "Replication lag exceeds the configured limit"
-		}
-		t.WriteProgress(t.ProgressData{ApplyID: "apply-example-73", Database: "shop", Environment: "staging", State: phase, Engine: "Spirit", Tables: []t.TableProgress{table}})
-	})
-}
-
 // live renders the production interactive watcher against a loopback-only API
 // fixture. Init's first fetch seeds the model; subsequent requests have the apply
 // ID supplied by that response. No private model fields or UI strings are copied.
 func live(p int, phase string, throttled bool, key string) string {
 	response := apitypes.ProgressResponse{
-		ApplyID: "apply-example-73", Database: "shop", Environment: "staging", Engine: "Spirit", State: phase,
+		ApplyID: "apply-example-73", Database: "shop", DatabaseType: "mysql", Environment: "staging", Engine: "Spirit", State: phase,
 		Tables: []*apitypes.TableProgressResponse{{TableName: "orders", Keyspace: "shop", ChangeType: "alter", DDL: ddl,
 			Status: phase, RowsCopied: int64(p) * 100000, RowsTotal: 10000000, PercentComplete: int32(p), ETASeconds: int64(100-p) * 12,
 			Throttled: throttled, ThrottleReason: "Replication lag exceeds the configured limit"}},
@@ -150,19 +138,6 @@ func live(p int, phase string, throttled bool, key string) string {
 			panic("expected one stop request")
 		}
 	}
-	if key == "esc" {
-		var cmd tea.Cmd
-		updated, cmd = updated.Update(tea.KeyMsg{Type: tea.KeyEsc})
-		if cmd == nil {
-			panic("Escape did not detach")
-		}
-		if _, ok := cmd().(tea.QuitMsg); !ok {
-			panic("Escape did not quit the watcher")
-		}
-		if cutovers != 0 {
-			panic("detach triggered cutover")
-		}
-	}
 	if phase == state.Apply.Running && key == "" {
 		_, enter := updated.Update(tea.KeyMsg{Type: tea.KeyEnter})
 		if enter != nil {
@@ -171,6 +146,9 @@ func live(p int, phase string, throttled bool, key string) string {
 		_, escape := updated.Update(tea.KeyMsg{Type: tea.KeyEsc})
 		if escape == nil {
 			panic("running watch cannot detach")
+		}
+		if _, ok := escape().(tea.QuitMsg); !ok {
+			panic("Escape did not quit the watcher")
 		}
 		_, stop := updated.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'s'}})
 		if stop == nil {
@@ -198,7 +176,7 @@ func live(p int, phase string, throttled bool, key string) string {
 // watcher used by the CLI. Enter is exercised through its real control handler.
 func vitess(phase string, percentages []int, enter bool) string {
 	response := apitypes.ProgressResponse{
-		ApplyID: "apply-example-84", Database: "shop", Environment: "staging", Engine: "PlanetScale", State: phase,
+		ApplyID: "apply-example-84", Database: "shop", DatabaseType: "vitess", Environment: "staging", Engine: "PlanetScale", State: phase,
 		Metadata: map[string]string{"deploy_request_url": "https://app.planetscale.com/acme/shop/deploy-requests/42"},
 	}
 	table := &apitypes.TableProgressResponse{TableName: "orders", Keyspace: "commerce", ChangeType: "alter", DDL: ddl, Status: phase}
@@ -308,7 +286,7 @@ func vitessDemo() Demo {
 			t.WritePlanHeader(t.PlanHeaderData{Database: "shop", SchemaName: "schema", IsApply: apply})
 			t.WriteEnvironmentHeader("staging")
 			changes := []t.DDLChange{{TableName: "orders", ChangeType: "alter", DDL: ddl}}
-			t.WriteNamespaceChanges([]t.NamespaceChange{{Namespace: "commerce", Changes: changes}}, false, "shop")
+			t.WriteNamespaceChanges([]t.NamespaceChange{{Namespace: "commerce", Changes: changes}}, false, "shop", schema.DialectMySQL)
 			t.WritePlanSummary(changes)
 		})
 	}
@@ -498,7 +476,7 @@ func main() {
 			t.WritePlanHeader(t.PlanHeaderData{Database: "shop", SchemaName: "schema", IsMySQL: true, IsApply: apply})
 			changes := []t.DDLChange{{TableName: "orders", ChangeType: "alter", DDL: ddl}}
 			t.WriteEnvironmentHeader("staging")
-			t.WriteNamespaceChanges([]t.NamespaceChange{{Namespace: "shop", Changes: changes}}, true, "shop")
+			t.WriteNamespaceChanges([]t.NamespaceChange{{Namespace: "shop", Changes: changes}}, true, "shop", schema.DialectMySQL)
 			t.WritePlanSummary(changes)
 		})
 	}
@@ -516,27 +494,6 @@ func main() {
 		{1, "", "", live(90, state.Apply.Running, false, "")},
 		{4, "", "The change is complete", live(100, state.Apply.Completed, false, "")}}}}
 	now := time.Date(2026, 1, 15, 14, 30, 0, 0, time.UTC)
-	status := capture(func() {
-		t.WriteStatusList(t.StatusListData{ActiveCount: 1, Limit: 4, StateCounts: map[string]int{state.Apply.Running: 1, state.Apply.Completed: 2, state.Apply.Failed: 1}, Applies: []t.ActiveApplyData{
-			{ApplyID: "apply-example-73", Database: "shop", Environment: "staging", State: state.Apply.Running, Caller: "github:alex@acme/store#42", StartedAt: now.Add(-10 * time.Minute).Format(time.RFC3339)},
-			{ApplyID: "apply-example-72", Database: "billing", Environment: "staging", State: state.Apply.Completed, Caller: "github:sam@acme/billing#18", StartedAt: now.Add(-time.Hour).Format(time.RFC3339)},
-			{ApplyID: "apply-example-71", Database: "catalog", Environment: "staging", State: state.Apply.Failed, Caller: "github:jamie@acme/store#40", StartedAt: now.Add(-2 * time.Hour).Format(time.RFC3339)},
-			{ApplyID: "apply-example-70", Database: "accounts", Environment: "staging", State: state.Apply.Completed, Caller: "github:alex@acme/accounts#12", StartedAt: now.Add(-3 * time.Hour).Format(time.RFC3339)},
-		}})
-	})
-	plans := capture(func() {
-		t.WritePlansList(t.PlansListData{Limit: 3, Plans: []t.PlanSummaryData{
-			{PlanID: "plan-example-42", Database: "shop", Environment: "staging", Changes: "1 alter", Source: "acme/store#42", CreatedAt: now.Add(-10 * time.Minute)},
-			{PlanID: "plan-example-41", Database: "billing", Environment: "staging", Changes: "1 create", Source: "acme/billing#18", CreatedAt: now.Add(-time.Hour)},
-			{PlanID: "plan-example-40", Database: "catalog", Environment: "staging", Changes: "1 alter", Source: "acme/store#40", CreatedAt: now.Add(-2 * time.Hour)},
-		}})
-	})
-	demos = append(demos, Demo{Name: "cli-fleet", Title: "From the fleet to one change.", Frames: []Frame{
-		{5, "schemabot status -e staging", "See changes across databases", status},
-		{4, "schemabot status apply-example-73", "Inspect one running change", progress(60, state.Apply.Running, false)},
-		{3, "schemabot progress apply-example-73", "Attach to live progress; ESC detaches", live(60, state.Apply.Running, false, "")},
-		{2, "", "Press ESC to detach; the apply keeps running", live(60, state.Apply.Running, false, "esc")},
-		{5, "schemabot list-plans -e staging", "After pressing ESC, find recent plans", plans}}})
 	frames := []Frame{{2, "schemabot progress apply-example-73", "Follow an apply started with --defer-cutover", live(20, state.Apply.Running, false, "")}}
 	for p := 25; p <= 60; p += 5 {
 		frames = append(frames, Frame{0.18, "", "", live(p, state.Apply.Running, false, "")})
@@ -670,7 +627,7 @@ func rollbackDemo() Demo {
 					panic("automatic watcher polled after completion")
 				}
 			}
-			response = apitypes.ProgressResponse{ApplyID: "apply-example-86", Database: "shop", Environment: "staging", Engine: "Spirit", State: phase,
+			response = apitypes.ProgressResponse{ApplyID: "apply-example-86", Database: "shop", DatabaseType: "mysql", Environment: "staging", Engine: "Spirit", State: phase,
 				Tables: []*apitypes.TableProgressResponse{{TableName: "orders", Keyspace: "shop", ChangeType: "alter", DDL: rollbackDDL, Status: phase, PercentComplete: percent, RowsCopied: int64(percent) * 100000, RowsTotal: 10000000}}}
 		default:
 			panic("unexpected rollback request: " + r.Method + " " + r.URL.Path)
@@ -716,7 +673,7 @@ func rollbackDemo() Demo {
 		panic("declined rollback performed a write")
 	}
 	preview, _, found := strings.Cut(declined, "\nRollback cancelled.")
-	if !found || !strings.Contains(preview, rollbackDDL) {
+	if !found || !strings.Contains(ansi.Strip(preview), "ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);") || !strings.Contains(preview, t.ANSIBlue+"ALTER") {
 		panic("rollback preview missing")
 	}
 	fixtureMu.Lock()
@@ -776,7 +733,7 @@ func rollbackDemo() Demo {
 	}
 	frames = append(frames, copying...)
 	frames = append(frames, Frame{2, "", "The copy reaches 100%; wait for confirmed completion", finished}, Frame{4, "", "The new apply completes; the index is restored", final})
-	return Demo{Name: "cli-rollback", Title: "Review a rollback. Follow the new change.", Height: 670, Frames: frames}
+	return Demo{Name: "cli-rollback", Title: "Review a rollback. Follow the new change.", Height: 740, Frames: frames}
 }
 
 // rollbackInteractive gives the actual command terminal input while capturing

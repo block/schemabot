@@ -21,6 +21,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -434,7 +435,7 @@ func TestWriteSQLChanges(t *testing.T) {
 	}
 
 	output := captureStdout(func() {
-		templates.WriteSQLChanges(changes)
+		templates.WriteSQLChanges(changes, schema.DialectMySQL)
 	})
 
 	// Check table names with symbols on their own line, DDL indented below
@@ -600,7 +601,7 @@ func TestWriteMultiTablePlanOutput(t *testing.T) {
 			{ChangeType: "ALTER", TableName: "products", DDL: "ALTER TABLE `products` ADD INDEX `idx_category` (`category`)"},
 		}
 
-		templates.WriteSQLChanges(changes)
+		templates.WriteSQLChanges(changes, schema.DialectMySQL)
 		templates.WritePlanSummary(changes)
 	})
 
@@ -674,7 +675,7 @@ func TestWriteNamespaceChanges_CollapseIdenticalKeyspaces(t *testing.T) {
 	}
 
 	output := captureStdout(func() {
-		templates.WriteNamespaceChanges(namespaces, false, "commerce")
+		templates.WriteNamespaceChanges(namespaces, false, "commerce", schema.DialectMySQL)
 	})
 
 	plainOutput := stripAnsi(output)
@@ -707,7 +708,7 @@ func TestWriteNamespaceChanges_NoCollapseUnderThreshold(t *testing.T) {
 	}
 
 	output := captureStdout(func() {
-		templates.WriteNamespaceChanges(namespaces, false, "db")
+		templates.WriteNamespaceChanges(namespaces, false, "db", schema.DialectMySQL)
 	})
 
 	plainOutput := stripAnsi(output)
@@ -727,5 +728,22 @@ func TestWritePlanHeaderPostgres(t *testing.T) {
 		})
 		assert.Contains(t, output, "PostgreSQL Schema Change Plan")
 		assert.NotContains(t, output, "MySQL Schema Change Plan")
+	}
+}
+
+// Plan output retains the target grammar and each statement while leaving
+// the supplied API response unchanged, including for unknown database types.
+func TestPlanOutputPreservesTargetDialect(t *testing.T) {
+	for _, databaseType := range []string{"postgres", "custom"} {
+		t.Run(databaseType, func(t *testing.T) {
+			first := `ALTER TABLE "OrderHistory" ADD COLUMN "DeliveryNote" text DEFAULT 'Leave at reception, ring bell';`
+			second := `ALTER TABLE "OrderHistory" ADD COLUMN "Archived" boolean DEFAULT false;`
+			table := &apitypes.TableChangeResponse{TableName: "OrderHistory", ChangeType: "alter", DDL: first}
+			result := &apitypes.PlanResponse{Database: "shop", DatabaseType: databaseType, Changes: []*apitypes.SchemaChangeResponse{{Namespace: "public", TableChanges: []*apitypes.TableChangeResponse{table, {TableName: "OrderHistory", ChangeType: "alter", DDL: second}}}}}
+			output := captureOutput(t, func() { writePlanBody(result, false) })
+			assert.Contains(t, stripANSI(output), first)
+			assert.Contains(t, stripANSI(output), second)
+			assert.Equal(t, first, table.DDL)
+		})
 	}
 }
