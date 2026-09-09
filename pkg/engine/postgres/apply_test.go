@@ -19,6 +19,7 @@ import (
 	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/progress"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -175,7 +176,16 @@ func TestClassifyRefusal(t *testing.T) {
 		{
 			name: "concurrent build that ran past its bound and left nothing is a refusal naming the option",
 			err: fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", "users",
-				nameConcurrentIndexBound(&executor.BudgetError{Cause: executor.CauseStatement, Budget: 36 * time.Hour}, 36*time.Hour)),
+				nameConcurrentIndexBound(&executor.BudgetError{Cause: executor.CauseStatement, Budget: 36 * time.Hour}, 36*time.Hour, 36*time.Hour)),
+			wantReason:    "concurrent-index-bound-exceeded",
+			wantDetail:    []string{"ran past postgres.concurrent_index_max_duration (36h0m0s)", "raise postgres.concurrent_index_max_duration and re-run"},
+			wantNotDetail: []string{"statement budget", replanRemedy},
+		},
+		{
+			name: "bound ending the executor's catalog reads ahead of the build is the same refusal",
+			err: fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", "users",
+				nameConcurrentIndexBound(fmt.Errorf("resolve target: %w", &pgconn.PgError{Code: sqlstateQueryCanceled}),
+					36*time.Hour, 36*time.Hour+time.Second)),
 			wantReason:    "concurrent-index-bound-exceeded",
 			wantDetail:    []string{"ran past postgres.concurrent_index_max_duration (36h0m0s)", "raise postgres.concurrent_index_max_duration and re-run"},
 			wantNotDetail: []string{"statement budget", replanRemedy},
@@ -201,7 +211,7 @@ func TestClassifyRefusal(t *testing.T) {
 					Index:   "big_ref_idx",
 					Build:   &executor.BudgetError{Cause: executor.CauseStatement, Budget: 36 * time.Hour},
 					Cleanup: executor.ErrBuildLeftInvalidIndex,
-				}, 36*time.Hour)),
+				}, 36*time.Hour, 36*time.Hour)),
 		},
 		{
 			name:       "oversized table is a refusal",
@@ -1065,6 +1075,12 @@ func TestConcurrentIndexApplyCeilingLeavesSetupHeadroom(t *testing.T) {
 // before any build a bound could be shortened for; the SET ROLE probe it
 // also carries belongs to the copy-and-swap tier, which a concurrent index
 // build never reaches.
+//
+// The executor's own catalog reads ahead of the build — resolving the
+// target, inspecting the requested name, listing quarantined debris — are
+// not in the census: they run in the build session, whose statement_timeout
+// is already the bound, so the bound rather than the pool's limit is what
+// ends one that stalls, and the drive names the option for it.
 func TestConcurrentIndexHeadroomCoversSessionSetup(t *testing.T) {
 	setup := dbconn.DefaultConnectTimeout + // pool dial
 		dbconn.DefaultStatementTimeout + // preflight.CheckPrivileges
@@ -1115,7 +1131,9 @@ func TestNameConcurrentIndexBoundWrapsOnlyTheBoundsOwnVerdict(t *testing.T) {
 	bound := 36 * time.Hour
 	statementBudget := &executor.BudgetError{Cause: executor.CauseStatement, Budget: bound}
 
-	named := nameConcurrentIndexBound(fmt.Errorf("build: %w", statementBudget), bound)
+	// The executor's typed verdict is authoritative on its own; the elapsed
+	// time is not consulted for it.
+	named := nameConcurrentIndexBound(fmt.Errorf("build: %w", statementBudget), bound, time.Second)
 	var boundErr *concurrentIndexBoundError
 	require.ErrorAs(t, named, &boundErr)
 	assert.Equal(t, "the concurrent index build ran past postgres.concurrent_index_max_duration (36h0m0s) and was cancelled", boundErr.Error())
@@ -1123,14 +1141,36 @@ func TestNameConcurrentIndexBoundWrapsOnlyTheBoundsOwnVerdict(t *testing.T) {
 	require.ErrorAs(t, named, &budgetErr)
 	assert.Same(t, statementBudget, budgetErr)
 
-	for name, err := range map[string]error{
-		"lock budget":  &executor.BudgetError{Cause: executor.CauseLock, Budget: time.Second},
-		"cancellation": executor.ErrCancelledByCaller,
-		"abandoned entry without a build failure": &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx", Table: "users",
-			Cleanup: executor.ErrAbandonedInvalidIndex},
-	} {
-		t.Run(name, func(t *testing.T) {
-			assert.Same(t, err, nameConcurrentIndexBound(err, bound))
+	// A raw server cancellation of one of the executor's catalog reads ahead
+	// of the build is the bound's once the bound has elapsed; the server's
+	// error stays reachable for callers that read the code.
+	cancelled := &pgconn.PgError{Code: sqlstateQueryCanceled, Message: "canceling statement due to statement timeout"}
+	named = nameConcurrentIndexBound(fmt.Errorf("resolve target: %w", cancelled), bound, bound)
+	require.ErrorAs(t, named, &boundErr)
+	var pgErr *pgconn.PgError
+	require.ErrorAs(t, named, &pgErr)
+	assert.Same(t, cancelled, pgErr)
+
+	passThrough := []struct {
+		name    string
+		err     error
+		elapsed time.Duration
+	}{
+		{name: "lock budget", err: &executor.BudgetError{Cause: executor.CauseLock, Budget: time.Second}, elapsed: 2 * bound},
+		{name: "cancellation", err: executor.ErrCancelledByCaller, elapsed: 2 * bound},
+		{name: "abandoned entry without a build failure", elapsed: 2 * bound,
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx", Table: "users", Cleanup: executor.ErrAbandonedInvalidIndex}},
+		{name: "raw cancellation before the bound could fire", err: fmt.Errorf("resolve target: %w", cancelled), elapsed: bound - time.Millisecond},
+		{name: "raw cancellation the executor attributed to the caller", elapsed: 2 * bound,
+			err: fmt.Errorf("%w (after 1h): %w", executor.ErrCancelledByCaller, cancelled)},
+		{name: "raw cancellation the executor attributed to an outside party", elapsed: 2 * bound,
+			err: fmt.Errorf("%w (after 1h of a 36h budget): %w", executor.ErrCancelledExternally, cancelled)},
+		{name: "server error under another code after the bound", elapsed: 2 * bound,
+			err: fmt.Errorf("resolve target: %w", &pgconn.PgError{Code: "55P03"})},
+	}
+	for _, tc := range passThrough {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Same(t, tc.err, nameConcurrentIndexBound(tc.err, bound, tc.elapsed))
 		})
 	}
 }

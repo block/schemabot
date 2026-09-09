@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/block/pg-sprite/pkg/dbconn"
@@ -526,17 +527,19 @@ func refusalForCause(err error, table string) *refusal {
 		}
 		return r
 	}
+	// A concurrent build that ran past its bound and provably left nothing
+	// is refused like any other statement exhaustion — retrying unchanged
+	// spends the same bound again — but names the option that grants more
+	// time, since the bound is the operator's to set. The wrapper is decided
+	// on its own: the bound also ends the executor's catalog reads ahead of
+	// the build, which carry no typed budget verdict.
+	var boundErr *concurrentIndexBoundError
+	if errors.As(err, &boundErr) {
+		return &refusal{reason: "concurrent-index-bound-exceeded", cause: boundErr.Error(),
+			remedy: fmt.Sprintf("raise %s and re-run", concurrentIndexBoundOption)}
+	}
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
-		// A concurrent build that ran past its bound and provably left
-		// nothing is refused like any other statement exhaustion — retrying
-		// unchanged spends the same bound again — but names the option that
-		// grants more time, since the bound is the operator's to set.
-		var boundErr *concurrentIndexBoundError
-		if errors.As(err, &boundErr) {
-			return &refusal{reason: "concurrent-index-bound-exceeded", cause: boundErr.Error(),
-				remedy: fmt.Sprintf("raise %s and re-run", concurrentIndexBoundOption)}
-		}
 		return &refusal{reason: "not-native-safe-budget-exceeded", cause: budgetErr.Error()}
 	}
 	var partitionErr *preflight.UnsupportedPartitionedParentError
@@ -859,6 +862,7 @@ func buildIndexConcurrently(ctx context.Context, pool *pgxpool.Pool, change nati
 	// verdict rather than an ambiguous cancellation, and a cancel request
 	// that never reaches the server still cannot leave the statement running
 	// unbounded on the target.
+	start := time.Now()
 	_, err := executor.BuildIndexConcurrentlyWithProgress(ctx, pool, change.sql,
 		executor.ConcurrentBudget{Overall: change.concurrentIndexMaxDuration}, tracker)
 	if err == nil {
@@ -867,7 +871,7 @@ func buildIndexConcurrently(ctx context.Context, pool *pgxpool.Pool, change nati
 	var invalidErr *executor.InvalidIndexError
 	if !errors.As(err, &invalidErr) || !abandonedBeforeBuild(invalidErr) {
 		return fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", change.table,
-			nameConcurrentIndexBound(err, change.concurrentIndexMaxDuration))
+			nameConcurrentIndexBound(err, change.concurrentIndexMaxDuration, time.Since(start)))
 	}
 	logger.Info("PostgreSQL concurrent index build found an abandoned invalid index under the requested name or quarantined on the table; recovering it before the build",
 		"namespace", change.namespace, "table", change.table,
@@ -969,14 +973,39 @@ func (e *concurrentIndexBoundError) Error() string {
 
 func (e *concurrentIndexBoundError) Unwrap() error { return e.err }
 
+// sqlstateQueryCanceled is the SQLSTATE the server raises when a statement
+// is cancelled, whether by its statement_timeout or by a cancel request.
+const sqlstateQueryCanceled = "57014"
+
 // nameConcurrentIndexBound wraps a build failure caused by the bound's
 // statement timeout firing so the operator detail names the option; every
 // other failure passes through unchanged. A lock budget cannot be the cause
 // here — the build runs with lock_timeout disabled — so only the statement
 // cause is the bound's.
-func nameConcurrentIndexBound(err error, bound time.Duration) error {
+//
+// The bound is the build session's statement_timeout, so its timer ends
+// whichever statement the session is running when it fires. For the build
+// itself the executor types that as its statement budget verdict. For the
+// catalog reads the executor runs in the same session ahead of the build —
+// resolving the target, inspecting the requested name for an invalid entry,
+// listing quarantined debris — the cancellation comes back as the server's
+// raw query_canceled, and it is the bound's only when the bound has elapsed
+// since the build was requested, since the timer cannot fire sooner; a raw
+// cancellation before that came from outside the bound and passes through.
+// A cancellation the executor already attributed to the caller or to an
+// outside party keeps that attribution. pg-sprite typing its pre-build
+// reads under the served budget as the same statement budget verdict
+// retires the raw-code arm.
+func nameConcurrentIndexBound(err error, bound, elapsed time.Duration) error {
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
+		return &concurrentIndexBoundError{bound: bound, err: err}
+	}
+	if errors.Is(err, executor.ErrCancelledByCaller) || errors.Is(err, executor.ErrCancelledExternally) {
+		return err
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == sqlstateQueryCanceled && elapsed >= bound {
 		return &concurrentIndexBoundError{bound: bound, err: err}
 	}
 	return err

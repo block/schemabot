@@ -82,6 +82,9 @@ conditions:
   setup as slow as the server's own limits allow, so the build gets the full
   configured bound. Setup that outruns the headroom shortens the build by the
   excess, since the apply as a whole still ends at the bound plus the headroom.
+  The catalog reads pg-sprite runs in the build's own session ahead of the
+  build share its `statement_timeout`, so the bound ends one of those too and
+  the failure names the option all the same.
 
 The common supported case is a metadata-only `ALTER TABLE`, such as adding a
 nullable column:
