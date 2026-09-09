@@ -443,7 +443,7 @@ func writeAttributedChanges(sb *strings.Builder, changes []AttributedChangeData)
 	fmt.Fprintf(sb, "🛑 **Check before applying**: %d %s SchemaBot cannot attribute to this PR\n", n, pluralize("destructive change", n))
 	for _, d := range changes {
 		if d.Unresolved {
-			fmt.Fprintf(sb, "- `%s`: ownership could not be established; see server logs\n", d.Table)
+			fmt.Fprintf(sb, "- %s: ownership could not be established; see server logs\n", inlineCode(d.Table))
 			continue
 		}
 		// The owner named is the most recent open pull request that changed the
@@ -462,7 +462,7 @@ func writePlanMetadata(sb *strings.Builder, data PlanCommentData) {
 	parts := []string{fmt.Sprintf("**Database**: `%s`", data.Database)}
 	parts = append(parts, fmt.Sprintf("**Type**: `%s`", schemaChangePlanDatabaseTypeLabel(data.DatabaseType, data.IsMySQL)))
 	if data.IsMySQL && data.SchemaName != "" {
-		parts = append(parts, fmt.Sprintf("**Schema Name**: `%s`", data.SchemaName))
+		parts = append(parts, fmt.Sprintf("**Schema Name**: %s", inlineCode(data.SchemaName)))
 	}
 	if data.Tenant != "" {
 		parts = append(parts, fmt.Sprintf("**Tenant**: `%s`", data.Tenant))
@@ -596,7 +596,7 @@ func writeIgnoredNamespaces(sb *strings.Builder, ignored []string) {
 	}
 	quoted := make([]string, len(ignored))
 	for i, ns := range ignored {
-		quoted[i] = fmt.Sprintf("`%s`", ns)
+		quoted[i] = inlineCode(ns)
 	}
 	fmt.Fprintf(sb, glyph.Info+" Namespaces excluded from this plan by `ignore_namespaces`: %s\n\n", strings.Join(quoted, ", "))
 }
@@ -650,7 +650,7 @@ func writeMultiEnvIgnoredNamespaces(sb *strings.Builder, data MultiEnvPlanCommen
 		}
 		quoted := make([]string, len(plan.IgnoredNamespaces))
 		for i, ns := range plan.IgnoredNamespaces {
-			quoted[i] = fmt.Sprintf("`%s`", ns)
+			quoted[i] = inlineCode(ns)
 		}
 		fmt.Fprintf(sb, glyph.Info+" **%s**: namespaces excluded from this plan by `ignore_namespaces`: %s\n\n", capitalizeFirst(env), strings.Join(quoted, ", "))
 	}
@@ -782,7 +782,7 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 			if schemaNamespaces {
 				label = "Schema Name"
 			}
-			fmt.Fprintf(sb, "#### %s: `%s`\n", label, ks.Keyspace)
+			fmt.Fprintf(sb, "#### %s: %s\n", label, inlineCode(ks.Keyspace))
 		}
 
 		if hasVSchemaChanges {
@@ -1238,7 +1238,7 @@ func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 		for _, w := range warnings {
 			message := ui.CodeQuoteIdentifiers(w.Message)
 			if w.Table != "" {
-				fmt.Fprintf(sb, "- `%s`: %s\n", w.Table, message)
+				fmt.Fprintf(sb, "- %s: %s\n", inlineCode(w.Table), message)
 			} else {
 				fmt.Fprintf(sb, "- %s\n", message)
 			}
@@ -1252,7 +1252,7 @@ func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 	fmt.Fprintf(sb, "<details>\n<summary>\U0001f4a1 <b>Lint Warnings</b>: %d advisory %s</summary>\n\n", n, pluralize("finding", n))
 	for _, group := range groupLintWarningsByTable(warnings) {
 		if group.table != "" {
-			fmt.Fprintf(sb, "**`%s`**\n", group.table)
+			fmt.Fprintf(sb, "**%s**\n", inlineCode(group.table))
 		}
 		for _, message := range group.messages {
 			fmt.Fprintf(sb, "- %s\n", ui.CodeQuoteIdentifiers(message))

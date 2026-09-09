@@ -353,7 +353,7 @@ func writeShardKeyspaceSections(sb *strings.Builder, keyspaces []ShardedKeyspace
 		}
 	}
 	for _, ks := range keyspaces {
-		fmt.Fprintf(sb, "\n#### Keyspace `%s`\n\n", ks.Keyspace)
+		fmt.Fprintf(sb, "\n#### Keyspace %s\n\n", inlineCode(ks.Keyspace))
 		for _, t := range ks.Tables {
 			writeShardedTableLine(sb, t)
 		}
@@ -428,7 +428,7 @@ func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus) {
 			}
 			phrase += fmt.Sprintf(" — applied on %d of %d shards", landed, len(t.Shards))
 		}
-		line := fmt.Sprintf("**`%s`**: %s", t.Table, phrase)
+		line := fmt.Sprintf("**%s**: %s", inlineCode(t.Table), phrase)
 		if status == state.Task.Completed && len(t.Shards) > 1 {
 			line += fmt.Sprintf(" (%d shards)", len(t.Shards))
 		}
@@ -448,18 +448,18 @@ func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus) {
 // nothing claims to describe shards that have not started.
 func writeShardedTableCopyProgress(sb *strings.Builder, t ShardedTableStatus) {
 	if ui.EstimateExceeded(t.RowsCopied, t.RowsTotal) {
-		fmt.Fprintf(sb, "**`%s`**: %s Finalizing copy%s\n", t.Table, ui.ProgressBarActivity(), shardedCopyCoverageSuffix(t))
+		fmt.Fprintf(sb, "**%s**: %s Finalizing copy%s\n", inlineCode(t.Table), ui.ProgressBarActivity(), shardedCopyCoverageSuffix(t))
 		fmt.Fprintf(sb, "- Rows copied: %s so far\n", ui.FormatNumber(t.RowsCopied))
 		fmt.Fprintf(sb, "- %s _%s_\n", glyph.Info, ui.EstimateExceededTooltip)
 		return
 	}
 	pct := ui.RowCopyDisplayPercent(int(ui.ClampRows(t.RowsCopied, t.RowsTotal)*100/t.RowsTotal), t.RowsCopied)
 	if pct == 0 {
-		fmt.Fprintf(sb, "**`%s`**: ⏳ Starting copy...\n", t.Table)
+		fmt.Fprintf(sb, "**%s**: ⏳ Starting copy...\n", inlineCode(t.Table))
 		writeShardedRowsAndETA(sb, t)
 		return
 	}
-	fmt.Fprintf(sb, "**`%s`**: %s %d%%%s\n", t.Table, ui.ProgressBarRowCopy(pct), pct, shardedCopyCoverageSuffix(t))
+	fmt.Fprintf(sb, "**%s**: %s %d%%%s\n", inlineCode(t.Table), ui.ProgressBarRowCopy(pct), pct, shardedCopyCoverageSuffix(t))
 	writeShardedRowsAndETA(sb, t)
 }
 

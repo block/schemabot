@@ -302,9 +302,11 @@ database, and command, so nothing is lost for triage. Inbound webhook payloads a
 before decode. *Enforced:* the comment and table-cell sanitizers in
 `pkg/webhook/templates/common.go`, applied by the error renderers themselves
 (`pkg/webhook/templates/errors.go`); the DDL code fence sized past any backtick run in its
-content (`pkg/webhook/templates/fence.go`); the Check Run summary sanitizer and its markup escaper
-(`pkg/webhook/check_publisher.go`); the drift summary clamp (`pkg/webhook/plan_drift.go`); the
-request body limit (`pkg/webhook/handler.go`).
+content and bounded to a fixed block budget, and the code span that holds every PR-authored
+identifier — table, namespace, keyspace, schema path, check name — flattened to one line and
+delimited past any backtick run inside it (`pkg/webhook/templates/fence.go`); the Check Run
+summary sanitizer and its markup escaper (`pkg/webhook/check_publisher.go`); the drift summary
+clamp (`pkg/webhook/plan_drift.go`); the request body limit (`pkg/webhook/handler.go`).
 
 ### AV-9: SchemaBot never destroys its own storage to start
 
