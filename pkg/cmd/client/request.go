@@ -39,16 +39,21 @@ var webhookOpsHTTPClient = &http.Client{Timeout: 15 * time.Minute, Transport: au
 // sourced from an environment variable or file does not break the header.
 func SetAuthToken(token string) {
 	authTransport.token = strings.TrimSpace(token)
+	authTransport.origin = ""
 }
 
 // bearerTransport sets "Authorization: Bearer <token>" on each request when a
 // token is configured and the header is not already set.
 type bearerTransport struct {
-	base  http.RoundTripper
-	token string
+	base   http.RoundTripper
+	token  string
+	origin string
 }
 
 func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.origin != "" && req.URL.Scheme+"://"+req.URL.Host != t.origin {
+		return nil, fmt.Errorf("refusing to forward local runtime credentials to another endpoint")
+	}
 	if t.token != "" && req.Header.Get("Authorization") == "" {
 		if err := guardInsecureToken(req.URL); err != nil {
 			return nil, err
@@ -360,3 +365,6 @@ func FormatAPIError(statusCode int, body []byte) string {
 	}
 	return fmt.Sprintf("HTTP %d: %s", statusCode, bodyStr)
 }
+
+// SetLocalAuth binds the private runtime credential to its verified endpoint.
+func SetLocalAuth(token, endpoint string) { SetAuthToken(token); authTransport.origin = endpoint }

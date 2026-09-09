@@ -42,6 +42,12 @@ var configIdentifierPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 // ServerConfig holds the server-side SchemaBot configuration.
 // This is loaded from a YAML file specified by SCHEMABOT_CONFIG_FILE.
 type ServerConfig struct {
+	liveDatabases *liveDatabaseRegistry
+
+	// ExperimentalStrataEnabled permits experimental Strata registrations and
+	// setup guidance. This server-only opt-in defaults to false.
+	ExperimentalStrataEnabled bool `yaml:"experimental-strata-enabled,omitempty"`
+
 	// Storage configures SchemaBot's internal storage database.
 	// If not specified, falls back to the STORAGE_DSN environment variable,
 	// then to MYSQL_DSN (legacy name, honored for every dialect).
@@ -989,7 +995,7 @@ type EtreCredentialsConfig struct {
 
 // DatabaseConfig holds configuration for a registered database.
 type DatabaseConfig struct {
-	// Type is the database type: "mysql", "vitess", or "strata".
+	// Type is "mysql", "postgres", "vitess", or "strata" (requires server opt-in).
 	Type string `yaml:"type"`
 
 	// App optionally names the application this database belongs to. Databases
@@ -1092,6 +1098,8 @@ type ReviewPolicyConfig struct {
 
 // EnvironmentConfig holds per-environment database configuration.
 type EnvironmentConfig struct {
+	resolvedLocalDSN string
+
 	// DSN is the database connection string for local mode.
 	// Can be a direct DSN or a reference to a secret (e.g., "env:MYSQL_DSN").
 	DSN string `yaml:"dsn"`
@@ -1489,7 +1497,7 @@ func (c *ServerConfig) RepoAdmins(repo string) (teams, users []string) {
 // restriction or a wildcard ("*") or repo-root (".") entry, where the config
 // could live anywhere and the probe must keep failing closed.
 func (c *ServerConfig) SchemaDirHintsForDatabase(repo, database string) (dirs []string, exhaustive bool) {
-	db, ok := c.Databases[database]
+	db, ok := c.DatabaseConfigs()[database]
 	if !ok {
 		return nil, true
 	}
@@ -1520,7 +1528,7 @@ func (c *ServerConfig) SchemaDirHintsForDatabase(repo, database string) (dirs []
 func (c *ServerConfig) SchemaDirHintsForRepo(repo string) (dirs []string, exhaustive bool) {
 	seen := make(map[string]struct{})
 	exhaustive = true
-	for _, db := range c.Databases {
+	for _, db := range c.DatabaseConfigs() {
 		if len(db.AllowedRepos) > 0 && !repoAllowed(db.AllowedRepos, repo) {
 			continue
 		}
@@ -1640,8 +1648,40 @@ func (c *ServerConfig) canonicalizeRepositories() error {
 	return nil
 }
 
+// ValidateExperimentalStrata requires server opt-in for every registration path.
+func (c *ServerConfig) ValidateExperimentalStrata() error {
+	if c.ExperimentalStrataEnabled {
+		return nil
+	}
+	check := func(location, databaseType string) error {
+		if strings.ToLower(strings.TrimSpace(databaseType)) == storage.DatabaseTypeStrata {
+			return fmt.Errorf("%s: Strata is experimental; set experimental-strata-enabled: true in the server configuration to enable it", location)
+		}
+		return nil
+	}
+	for name, db := range c.Databases {
+		if err := check(fmt.Sprintf("database %q", name), db.Type); err != nil {
+			return err
+		}
+	}
+	for name, target := range c.TargetResolver.Targets {
+		if err := check(fmt.Sprintf("target %q", name), target.DatabaseType); err != nil {
+			return err
+		}
+	}
+	for index, resolver := range c.TargetResolver.Etre {
+		if err := check(fmt.Sprintf("target_resolver.etre[%d]", index), resolver.DatabaseType); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Validate checks the configuration for required fields and consistency.
 func (c *ServerConfig) Validate() error {
+	if err := c.ValidateExperimentalStrata(); err != nil {
+		return err
+	}
 	// The database registry is required for the control plane and for a
 	// single-database data plane. A data plane configured with a target_resolver
 	// resolves opaque targets dynamically and has no database registry, so it is
@@ -1727,7 +1767,11 @@ func (c *ServerConfig) Validate() error {
 		switch dbConfig.Type {
 		case storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres:
 		default:
-			return fmt.Errorf("database %q has invalid type %q (must be %s, %s, %s, or %s)", name, dbConfig.Type, storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres)
+			types := "mysql, postgres, or vitess"
+			if c.ExperimentalStrataEnabled {
+				types = "mysql, postgres, vitess, or strata (experimental)"
+			}
+			return fmt.Errorf("database %q has invalid type %q; choose %s", name, dbConfig.Type, types)
 		}
 		if len(dbConfig.Environments) == 0 {
 			return fmt.Errorf("database %q has no environments configured", name)
@@ -2399,7 +2443,7 @@ func (c *ServerConfig) validateRequiredChecksNotAggregate() error {
 // Database returns the database configuration for the given name.
 // Returns nil if not found.
 func (c *ServerConfig) Database(name string) *DatabaseConfig {
-	if db, ok := c.Databases[name]; ok {
+	if db, ok := c.DatabaseConfigs()[name]; ok {
 		return &db
 	}
 	return nil
@@ -2846,7 +2890,7 @@ func (c *ServerConfig) KnownEnvironments() []string {
 	}
 	add(c.AllowedEnvironments...)
 	add(c.PromotionEnvironmentOrder()...)
-	for _, db := range c.Databases {
+	for _, db := range c.DatabaseConfigs() {
 		add(db.EnvironmentOrder...)
 		for env := range db.Environments {
 			add(env)
@@ -2875,7 +2919,7 @@ func (c *ServerConfig) IsEnvironmentKnown(env string) bool {
 	if slices.Contains(c.AllowedEnvironments, env) || slices.Contains(order, env) {
 		return true
 	}
-	for _, db := range c.Databases {
+	for _, db := range c.DatabaseConfigs() {
 		if _, ok := db.Environments[env]; ok {
 			return true
 		}
@@ -3110,6 +3154,9 @@ func (c EnvironmentConfig) validateLocalDSNConfig(context string) error {
 }
 
 func (c EnvironmentConfig) ResolveDSN() (string, error) {
+	if c.resolvedLocalDSN != "" {
+		return c.resolvedLocalDSN, nil
+	}
 	if c.DSNFrom != nil {
 		return c.DSNFrom.Resolve()
 	}

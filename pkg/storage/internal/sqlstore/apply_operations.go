@@ -6,6 +6,7 @@ package sqlstore
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -23,7 +24,7 @@ import (
 // applyOperationColumns lists all columns for SELECT queries.
 const applyOperationColumns = `id, apply_id, deployment, operation_key, operation_kind, target, external_id, external_operation_id, state, error_message,
 	cutover_policy, on_failure, attempt, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
-	engine_resume_context, engine_resume_metadata, created_at, updated_at`
+	engine_resume_context, engine_resume_metadata, progress_metadata, created_at, updated_at`
 
 // applyOperationStore implements storage.ApplyOperationStore using MySQL.
 type applyOperationStore struct {
@@ -711,6 +712,30 @@ func (s *applyOperationStore) GetEngineResumeState(ctx context.Context, operatio
 		MigrationContext: contextVal.String,
 		Metadata:         metadata.String,
 	}, nil
+}
+
+// SaveProgressMetadata stores the engine's latest progress display metadata as
+// a JSON object on the operation that owns the execution. The operation write
+// guard preserves OW-2 by rejecting writes from a displaced driver.
+func (s *applyOperationStore) SaveProgressMetadata(ctx context.Context, operationID int64, metadata map[string]string) error {
+	if metadata == nil {
+		metadata = make(map[string]string)
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("encode progress metadata for apply_operation %d: %w", operationID, err)
+	}
+	guard, err := operationWriteGuardFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	args := append([]any{encoded, operationID}, guard.args()...)
+	query := guard.updateStatement(s.dialect, []JoinedUpdateAssignment{{Column: "progress_metadata", Expr: "?"}})
+	result, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("save progress metadata for apply_operation %d: %w", operationID, err)
+	}
+	return s.checkUpdatedOrExists(ctx, result, operationID, guard, false)
 }
 
 // releasedFailureExemptionSQL stops a terminal-failed earlier sibling from
@@ -1936,6 +1961,47 @@ func unleasedOperationGate(d Dialect) string {
 		)`, freshLeaseAfter)
 }
 
+// undrivenOperationGate renders the NOT EXISTS admitting only task rows whose
+// operation no driver is part-way through driving. It is the variant for a
+// writer that gets one attempt at a row rather than a standing offer to try
+// again, and it returns its positional arguments alongside the clause.
+//
+// The lease terms are unleasedOperationGate's, read the same way, and the
+// difference is the occupying-state filter that gate deliberately omits. That
+// omission makes a reaper more reluctant to write, which costs a reaper nothing:
+// a row it passes over comes back on the next sweep. It costs a one-shot writer
+// the row outright, and the shape it costs it on is the ordinary one. A drive
+// that settles its operation into a resumable state writes that state under its
+// lease and leaves the lease in place, so for a full staleness window afterwards
+// the row reads exactly like a live drive's. A single-deployment apply that has
+// just failed retryably is in that window every time.
+//
+// What the state filter cannot separate is the two things a leased
+// failed_retryable row can mean. A redispatch keeps that state for its whole
+// drive (see driverOccupyingOperationStates, which counts it for the fan-out cap
+// precisely because a driver really is occupying it), and a drive that has
+// settled leaves the identical row behind. Nothing in the row distinguishes
+// them; only the heartbeat going stale does, and that is the wait a one-shot
+// writer cannot take. So this gate admits them, which is the same exposure the
+// row had before any gate existed, rather than trading a live-sibling hole for a
+// window in which the ordinary case is never written at all.
+//
+// A task with no operation is admitted, as in unleasedOperationGate.
+func undrivenOperationGate(d Dialect) (string, []any) {
+	freshLeaseAfter := d.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+	drivingStates := claimableApplyStates()
+
+	return fmt.Sprintf(`NOT EXISTS (
+			SELECT 1
+			FROM apply_operations lease_holder
+			WHERE lease_holder.id = tasks.apply_operation_id
+				AND lease_holder.lease_owner <> ''
+				AND lease_holder.state IN (%s)
+				AND lease_holder.updated_at >= %s
+		)`, placeholders(len(drivingStates)), freshLeaseAfter), stringArgs(drivingStates)
+}
+
 // ReapStranded elects one reaper per pass and reaps under the lock. See
 // storage.ApplyOperationStore for the contract.
 func (s *applyOperationStore) ReapStranded(ctx context.Context, limit int) ([]*storage.ReapedOperation, error) {
@@ -2136,13 +2202,13 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 	var errMsg sql.NullString
 	var externalID sql.NullString
 	var externalOperationID sql.NullString
-	var engineResumeContext, engineResumeMetadata sql.NullString
+	var engineResumeContext, engineResumeMetadata, progressMetadata sql.NullString
 	var startedAt, completedAt, leaseAcquiredAt sql.NullTime
 
 	if err := s.Scan(
 		&ad.ID, &ad.ApplyID, &ad.Deployment, &ad.OperationKey, &ad.OperationKind, &ad.Target, &externalID, &externalOperationID, &ad.State, &errMsg,
 		&ad.CutoverPolicy, &ad.OnFailure, &ad.Attempt, &startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
-		&engineResumeContext, &engineResumeMetadata, &ad.CreatedAt, &ad.UpdatedAt,
+		&engineResumeContext, &engineResumeMetadata, &progressMetadata, &ad.CreatedAt, &ad.UpdatedAt,
 	); err != nil {
 		return nil, err
 	}
@@ -2173,6 +2239,9 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 	}
 	if engineResumeMetadata.Valid {
 		ad.EngineResumeMetadata = engineResumeMetadata.String
+	}
+	if progressMetadata.Valid {
+		ad.ProgressMetadata = progressMetadata.String
 	}
 	return &ad, nil
 }

@@ -5,11 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -23,29 +25,41 @@ import (
 type fakeOIDC struct {
 	server *httptest.Server
 
-	mu         sync.Mutex
-	challenges map[string]string // authorization code -> code_challenge
-	lastMethod string            // code_challenge_method seen at the authz endpoint
+	mu           sync.Mutex
+	challenges   map[string]string // authorization code -> code_challenge
+	refreshCalls int
+	lastMethod   string // code_challenge_method seen at the authz endpoint
 
-	// Knobs for negative cases.
+	// Provider response knobs are configured before the first request and then
+	// remain immutable; only request observations above need the mutex.
 	stateOverride string // when set, echo this state instead of the request's
 	authError     string // when set, redirect with ?error=<authError>
 
-	idToken          string
-	refreshedIDToken string // id_token returned for the refresh_token grant
-	accessToken      string
-	refreshToken     string
-	omitIDToken      bool // when true, the token response omits the id_token
+	idExpiry          int64
+	refreshedIDExpiry int64
+	omitRefreshToken  bool
+	accessExpires     int
+	idToken           string
+	refreshedIDToken  string // id_token returned for the refresh_token grant
+	accessToken       string
+	refreshToken      string
+	beforeRefresh     func()
+	omitIDToken       bool // when true, the token response omits the id_token
 }
 
 func newFakeOIDC(t *testing.T) *fakeOIDC {
 	t.Helper()
+	idExpiry := time.Now().Add(2 * time.Hour).Unix()
+	refreshedIDExpiry := time.Now().Add(3 * time.Hour).Unix()
 	f := &fakeOIDC{
-		challenges:       map[string]string{},
-		idToken:          "header.payload.signature",
-		refreshedIDToken: "refreshed.payload.signature",
-		accessToken:      "test-access-token",
-		refreshToken:     "test-refresh-token",
+		idExpiry:          idExpiry,
+		refreshedIDExpiry: refreshedIDExpiry,
+		challenges:        map[string]string{},
+		accessExpires:     3600,
+		idToken:           testIDToken(fmt.Sprintf(`{"exp":%d}`, idExpiry)),
+		refreshedIDToken:  testIDToken(fmt.Sprintf(`{"exp":%d}`, refreshedIDExpiry)),
+		accessToken:       "test-access-token",
+		refreshToken:      "test-refresh-token",
 	}
 
 	mux := http.NewServeMux()
@@ -102,6 +116,12 @@ func (f *fakeOIDC) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Form.Get("grant_type") == "refresh_token" {
+		if f.beforeRefresh != nil {
+			f.beforeRefresh()
+		}
+		f.mu.Lock()
+		f.refreshCalls++
+		f.mu.Unlock()
 		if r.Form.Get("refresh_token") == "" {
 			http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
 			return
@@ -110,7 +130,10 @@ func (f *fakeOIDC) handleToken(w http.ResponseWriter, r *http.Request) {
 			"access_token":  f.accessToken,
 			"token_type":    "Bearer",
 			"refresh_token": f.refreshToken,
-			"expires_in":    3600,
+			"expires_in":    f.accessExpires,
+		}
+		if f.omitRefreshToken {
+			delete(body, "refresh_token")
 		}
 		if !f.omitIDToken {
 			body["id_token"] = f.refreshedIDToken
@@ -137,7 +160,7 @@ func (f *fakeOIDC) handleToken(w http.ResponseWriter, r *http.Request) {
 		"access_token":  f.accessToken,
 		"token_type":    "Bearer",
 		"refresh_token": f.refreshToken,
-		"expires_in":    3600,
+		"expires_in":    f.accessExpires,
 	}
 	if !f.omitIDToken {
 		body["id_token"] = f.idToken
@@ -189,10 +212,10 @@ func TestLogin(t *testing.T) {
 	}, browserVisitor(ctx))
 	require.NoError(t, err)
 
-	assert.Equal(t, "header.payload.signature", result.IDToken)
+	assert.Equal(t, f.idToken, result.IDToken)
 	assert.Equal(t, "test-access-token", result.AccessToken)
 	assert.Equal(t, "test-refresh-token", result.RefreshToken)
-	assert.False(t, result.Expiry.IsZero(), "token expiry should be populated from expires_in")
+	assert.Equal(t, f.idExpiry, result.Expiry.Unix())
 
 	// The flow must use PKCE with S256; the token endpoint already rejected any
 	// verifier that didn't hash to the challenge, so reaching here proves the
@@ -283,4 +306,8 @@ func TestLoginValidatesConfig(t *testing.T) {
 		_, err := Login(t.Context(), LoginConfig{Issuer: "https://issuer.example.com", ClientID: "c", RedirectPort: 1}, nil)
 		require.Error(t, err)
 	})
+}
+
+func testIDToken(payload string) string {
+	return "eyJhbGciOiJSUzI1NiJ9." + base64.RawURLEncoding.EncodeToString([]byte(payload)) + ".test-signature"
 }

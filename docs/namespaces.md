@@ -5,21 +5,10 @@
 ## Table of Contents
 
 - [Schema Directory Structure](#schema-directory-structure)
-  - [MySQL — Single schema name](#mysql--single-schema-name)
-  - [MySQL — Multiple schema names on the same database](#mysql--multiple-schema-names-on-the-same-database)
-  - [MySQL — Different databases entirely](#mysql--different-databases-entirely)
-  - [Vitess — Multiple keyspaces](#vitess--multiple-keyspaces)
-  - [Vitess — VSchema changes](#vitess--vschema-changes)
 - [Where to Put the Schema Directory](#where-to-put-the-schema-directory)
 - [`$ENV` Substitution in Namespace Names](#env-substitution-in-namespace-names)
-  - [Example](#example)
-  - [Rules](#rules)
 - [Ignoring Namespaces](#ignoring-namespaces)
-  - [Rules](#rules-1)
-  - [Exclusions are disclosed](#exclusions-are-disclosed)
-  - [MySQL target DSN requirements](#mysql-target-dsn-requirements)
 - [Per-Target Schema Overrides](#per-target-schema-overrides)
-  - [Rules](#rules-2)
 - [Summary](#summary)
 - [How Namespaces Flow Through the System](#how-namespaces-flow-through-the-system)
 
