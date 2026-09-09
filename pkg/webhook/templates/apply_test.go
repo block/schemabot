@@ -117,6 +117,16 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 			wantOK: true,
 		},
 		{
+			// A standalone index drop is its own change type, so it never
+			// counts as a table drop and yields no application usage target.
+			name:         "PostgreSQL drop index is not a table drop",
+			databaseType: "postgres",
+			changes: []UnsafeChangeData{
+				{Table: "orders", Reason: `statement removes live structure from table "orders"`, DDL: `DROP INDEX "orders_status_idx"`, ChangeType: "drop_index"},
+			},
+			wantOK: false,
+		},
+		{
 			name: "multiple drop tables",
 			changes: []UnsafeChangeData{
 				{Table: "archived_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
