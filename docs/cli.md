@@ -272,6 +272,10 @@ files directly with the CLI, as shown below.
 
 ### Review an index change
 
+Plan output uses the target database dialect, including PostgreSQL identifier
+quoting. Statements for other dialects are kept separate instead of being
+combined with MySQL syntax.
+
 For this example, `schema/schemabot.yaml` contains:
 
 ```yaml
@@ -520,15 +524,21 @@ $ schemabot status apply-example-73
 
 ### Review a rollback before running it
 
+The preview and live progress format SQL using the target database dialect,
+preserving quoted names and values. If the server omits the database type or
+returns an unrecognized type, both views preserve the original SQL.
+
 Here is a rollback of the index added earlier. This example declines the
 confirmation, so nothing changes:
 
 ```console
 $ schemabot rollback -e staging apply-example-73
 Rollback Plan
-=============
-Database: shop
-Environment: staging
+┌───────────────────────────────────┐
+│  Database:      shop              │
+│  Environment:   staging           │
+│  Source apply:  apply-example-73  │
+└───────────────────────────────────┘
 
 The following changes will be applied to rollback:
 
@@ -553,14 +563,16 @@ same terminal until it confirms completion.
 ```console
 $ schemabot rollback -e staging apply-example-85
 Rollback Plan
-=============
-Database: shop
-Environment: staging
+┌───────────────────────────────────┐
+│  Database:      shop              │
+│  Environment:   staging           │
+│  Source apply:  apply-example-85  │
+└───────────────────────────────────┘
 
 The following changes will be applied to rollback:
 
   orders (alter):
-    ALTER TABLE `orders` ADD INDEX `idx_status` (`status`);
+    ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
 
 Do you want to apply this rollback? Only 'yes' will be accepted: yes
 🔒 Lock acquired for shop (mysql)
