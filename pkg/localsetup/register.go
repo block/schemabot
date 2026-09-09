@@ -58,6 +58,9 @@ func Register(m localruntime.Manager, r Registration) (bool, error) {
 				return nil, fmt.Errorf("runtime storage differs; registration cannot replace durable state storage")
 			}
 			cfg = *existing
+			if cfg.Databases == nil {
+				cfg.Databases = make(map[string]api.DatabaseConfig)
+			}
 			wanted := requested.Databases[r.Database]
 			database, exists := cfg.Databases[r.Database]
 			if exists {
