@@ -126,7 +126,102 @@ func testRetryableExpiryLeaseMeanings(t *testing.T, newStore func(*testing.T) *S
 		assertTaskState(t, store, tasks[0].TaskIdentifier, state.Task.Failed)
 		assertTaskState(t, store, tasks[1].TaskIdentifier, state.Task.Cancelled)
 	})
+
+	t.Run("a settling drive that hands its lease back expires on the next sweep", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		store := newStore(t)
+		apply, opIDs, tasks := seedExhaustedRetryableTree(t, ctx, store, "expiry_released_drive", maxRecoveryAttempts)
+
+		heartbeatsBefore := make([]time.Time, len(opIDs))
+		for i, id := range opIDs {
+			heartbeatsBefore[i] = operationHeartbeat(t, ctx, store, id)
+		}
+
+		// Handing the lease back is what collapses the ambiguity: the rows are
+		// otherwise identical to the deferred case above, and this pass admits
+		// immediately instead of waiting out a staleness window.
+		for i, id := range opIDs {
+			released, err := store.ApplyOperations().ReleaseSettledClaim(ctx, storage.OperationLease{
+				ApplyID: apply.ID, OperationID: id, Owner: leaseOwnerFor(i), Token: leaseTokenFor(i),
+			})
+			require.NoError(t, err)
+			assert.True(t, released, "the settling driver holds the lease it is handing back")
+		}
+
+		// The handback is a lease clear, not a touch. A dialect that moved the
+		// heartbeat here would push out the crash-recovery arm that re-offers
+		// this operation, and would do it on only one of the two engines.
+		for i, id := range opIDs {
+			assert.WithinDuration(t, heartbeatsBefore[i], operationHeartbeat(t, ctx, store, id), 0,
+				"handing the lease back must carry the settling write's heartbeat forward unchanged")
+		}
+
+		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		require.NoError(t, err)
+		require.Len(t, expired, 1)
+		assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
+
+		parent, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, parent)
+		assert.Equal(t, state.Apply.Failed, parent.State)
+		assertTaskState(t, store, tasks[0].TaskIdentifier, state.Task.Failed)
+		assertTaskState(t, store, tasks[1].TaskIdentifier, state.Task.Cancelled)
+	})
+
+	t.Run("the handback only clears the lease the settling drive held", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		store := newStore(t)
+		apply, opIDs, tasks := seedExhaustedRetryableTree(t, ctx, store, "expiry_release_guards", maxRecoveryAttempts)
+
+		released, err := store.ApplyOperations().ReleaseSettledClaim(ctx, storage.OperationLease{
+			ApplyID: apply.ID, OperationID: opIDs[0], Owner: leaseOwnerFor(0), Token: "token-a-peer-rotated-on",
+		})
+		require.NoError(t, err)
+		assert.False(t, released, "a lease a peer already rotated onto the row belongs to that peer's drive")
+
+		// A drive that ended somewhere other than failed_retryable is not a
+		// settling drive, and the lease it holds is not this handback's to clear.
+		_, err = store.db.ExecContext(ctx, "UPDATE apply_operations SET state = ? WHERE id = ?",
+			state.ApplyOperation.Running, opIDs[1])
+		require.NoError(t, err)
+		released, err = store.ApplyOperations().ReleaseSettledClaim(ctx, storage.OperationLease{
+			ApplyID: apply.ID, OperationID: opIDs[1], Owner: leaseOwnerFor(1), Token: leaseTokenFor(1),
+		})
+		require.NoError(t, err)
+		assert.False(t, released, "only an operation settled into failed_retryable has a settled lease to hand back")
+
+		for _, id := range opIDs {
+			op, err := store.ApplyOperations().Get(ctx, id)
+			require.NoError(t, err)
+			require.NotNil(t, op)
+			assert.NotEmpty(t, op.LeaseToken, "a refused handback leaves the lease it declined to clear in place")
+		}
+
+		// Both leases survived, so the apply is still deferred rather than
+		// half-released into a state expiry would admit.
+		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		require.NoError(t, err)
+		assert.Empty(t, expired)
+		parent, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, parent)
+		assert.Equal(t, state.Apply.FailedRetryable, parent.State)
+		assertTaskState(t, store, tasks[0].TaskIdentifier, state.Task.FailedRetryable)
+	})
 }
+
+// leaseOwnerFor and leaseTokenFor rebuild the lease seedExhaustedRetryableTree
+// stamped on the operation at the given position, so a test can present the
+// credential the settling drive would have held.
+func leaseOwnerFor(index int) string { return "driver-" + seededDeployments[index] }
+func leaseTokenFor(index int) string { return "token-" + seededDeployments[index] }
+
+// seededDeployments are the fan-out deployments seedExhaustedRetryableTree
+// attaches an operation for, in the order it returns their IDs.
+var seededDeployments = []string{"region-a", "region-b"}
 
 // seedExhaustedRetryableTree builds the row shape a fan-out apply comes to rest
 // in after a retryable failure: a failed_retryable parent at the given attempt
@@ -140,7 +235,7 @@ func seedExhaustedRetryableTree(t *testing.T, ctx context.Context, store *Storag
 	require.NoError(t, err)
 
 	var opIDs []int64
-	for _, deployment := range []string{"region-a", "region-b"} {
+	for _, deployment := range seededDeployments {
 		id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 			ApplyID: apply.ID, Deployment: deployment, Target: apply.Database,
 			State: state.ApplyOperation.Running,
@@ -188,6 +283,16 @@ func assertRetryableTreeIntact(t *testing.T, ctx context.Context, store *Storage
 	}
 	assertTaskState(t, store, tasks[0].TaskIdentifier, state.Task.FailedRetryable)
 	assertTaskState(t, store, tasks[1].TaskIdentifier, state.Task.Pending)
+}
+
+// operationHeartbeat reads the column both the claim path and expiry compare
+// against to decide a lease is idle.
+func operationHeartbeat(t *testing.T, ctx context.Context, store *Storage, operationID int64) time.Time {
+	t.Helper()
+	var heartbeat time.Time
+	require.NoError(t, store.db.QueryRowContext(ctx,
+		"SELECT updated_at FROM apply_operations WHERE id = ?", operationID).Scan(&heartbeat))
+	return heartbeat
 }
 
 // backdateOperationLease ages the operation's heartbeat on either dialect, which

@@ -38,6 +38,12 @@ const (
 	// operator claim, so a slow or hung storage layer cannot delay the resume
 	// the claim is about to drive.
 	ApplyClaimLogTimeout = 5 * time.Second
+
+	// settledClaimReleaseTimeout bounds the lease clear a drive performs on its
+	// way out. It runs detached from the driver context so a shutdown still
+	// hands the lease back, and the bound is what keeps that from holding the
+	// shutdown open on a hung storage layer.
+	settledClaimReleaseTimeout = 5 * time.Second
 )
 
 // StartOperator starts the background operator driver pool.
@@ -728,6 +734,10 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 	// Registered once here, before the branch: every drive below runs under this
 	// operation lease, and shutdown has to hand it back whichever path it took.
 	defer s.trackHeldOperationClaim(op, opLease)()
+	// Registered after the tracker so it runs first: the lease is handed back
+	// while this drive still owns it, and the tracker then deregisters a claim
+	// that is already clear.
+	defer s.releaseSettledOperationClaim(ctx, driverID, op, opLease)
 
 	// Choose the drive mode. A single-operation apply keeps the legacy
 	// parent-lease drive byte-for-byte. A multi-operation apply — by attached
@@ -1719,6 +1729,44 @@ func (s *Service) releaseOperationClaimBeforeDrive(ctx context.Context, driverID
 		return
 	}
 	s.logger.Info("operator: released the operation lease this driver will not drive under; the operation is offered on the next poll",
+		append(op.LogAttrs(), "driver", driverID)...)
+}
+
+// releaseSettledOperationClaim clears the operation lease a drive leaves behind
+// when it settles its operation into failed_retryable.
+//
+// A settling drive is finished with the row, but its lease stays fresh for a
+// full staleness window, and for that window nothing can tell the leftover
+// apart from the lease a driver just took to run the retry: same state, same
+// shape of owner, same recent heartbeat. Any reader that consults the lease to
+// ask whether a drive is in progress has to assume the pessimistic answer.
+// Clearing the lease at the point the drive actually ends makes a fresh lease
+// on a failed_retryable operation mean what it says.
+//
+// This runs as the drive returns rather than inside the state write, because
+// the multi-operation drive projects the parent apply's state under this same
+// operation lease after the operation is settled. Detached from the driver
+// context so a shutdown mid-drive still hands the lease back.
+//
+// A no-op on every other way out: the store write is guarded on the settled
+// state and on this driver's lease token, so an operation that ended somewhere
+// else, or one a peer has re-leased, is left alone.
+func (s *Service) releaseSettledOperationClaim(ctx context.Context, driverID int, op *storage.ApplyOperation, opLease storage.OperationLease) {
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), settledClaimReleaseTimeout)
+	defer cancel()
+
+	released, err := s.storage.ApplyOperations().ReleaseSettledClaim(releaseCtx, opLease)
+	if err != nil {
+		s.logger.Warn("operator: failed to clear the lease on the operation this driver settled; the leftover lease defers this apply's retryable expiry until it goes stale",
+			append(op.LogAttrs(), "driver", driverID, "error", err)...)
+		return
+	}
+	if !released {
+		s.logger.Debug("operator: no settled lease to clear for this operation; it did not end in failed_retryable under this driver's lease",
+			append(op.LogAttrs(), "driver", driverID)...)
+		return
+	}
+	s.logger.Info("operator: cleared the lease on the operation this driver settled into failed_retryable",
 		append(op.LogAttrs(), "driver", driverID)...)
 }
 

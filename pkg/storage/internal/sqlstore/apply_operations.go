@@ -1703,6 +1703,47 @@ func (s *applyOperationStore) ReleaseClaim(ctx context.Context, lease storage.Op
 	return rows > 0, nil
 }
 
+// ReleaseSettledClaim clears the lease on an operation this driver settled into
+// failed_retryable, so a fresh lease on that row means a drive is in progress
+// rather than that one ended here.
+//
+// It carries the heartbeat forward rather than moving it, unlike every other
+// write here. The settling write set updated_at moments ago, so the column
+// already says when the row last moved, and both directions from there are
+// wrong: ReleaseClaim's backdate would report a row that was just written as
+// stalled, and a fresh stamp would push out the crash-recovery arm of
+// FindNextApplyOperation, which re-offers a failed_retryable operation under a
+// stale parent only once the operation's own heartbeat has aged. Carrying it
+// forward leaves re-claim timing exactly as the settling write left it.
+//
+// The assignment is explicit for the same reason it is not a stamp: left out,
+// MySQL's ON UPDATE CURRENT_TIMESTAMP would refresh the heartbeat here and
+// PostgreSQL would not, so the two dialects would recover this row on different
+// schedules.
+//
+// Guarded on both the lease token and the settled state so it cannot clear a
+// lease a peer rotated onto the row, or one belonging to a drive that moved the
+// row somewhere else.
+func (s *applyOperationStore) ReleaseSettledClaim(ctx context.Context, lease storage.OperationLease) (bool, error) {
+	if !lease.Valid() {
+		return false, fmt.Errorf("release settled claim for apply_operation %d: %w", lease.OperationID, storage.ErrApplyLeaseLost)
+	}
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE apply_operations
+		SET lease_owner = '', lease_token = '', lease_acquired_at = NULL,
+		    updated_at = updated_at
+		WHERE id = ? AND lease_token = ? AND state = ?
+	`, lease.OperationID, lease.Token, state.ApplyOperation.FailedRetryable)
+	if err != nil {
+		return false, fmt.Errorf("release settled claim for apply_operation %d: %w", lease.OperationID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read release settled claim rows affected for apply_operation %d: %w", lease.OperationID, err)
+	}
+	return rows > 0, nil
+}
+
 // Heartbeat refreshes updated_at to maintain the claim's lease. Should be
 // called periodically by a driver holding the lease. Silent no-op when the
 // row no longer exists (mirrors ApplyStore.Heartbeat).

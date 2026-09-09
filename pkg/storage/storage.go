@@ -1354,6 +1354,23 @@ type ApplyOperationStore interface {
 	// row has moved on and needs nothing from the caller.
 	ReleaseClaim(ctx context.Context, lease OperationLease) (bool, error)
 
+	// ReleaseSettledClaim hands back the lease on an operation this driver
+	// settled into failed_retryable. A settling drive leaves its lease in place,
+	// so the row it walks away from is indistinguishable from one a driver just
+	// claimed for a retry — same state, same owner, same fresh heartbeat. Anything
+	// reading the lease to decide whether a drive is in progress therefore has to
+	// treat the leftover as live until it goes stale. Clearing it at the point the
+	// drive ends makes a fresh lease mean what it says.
+	//
+	// Unlike ReleaseClaim it carries the heartbeat forward instead of
+	// backdating it: the settling write set it, so it already says when the row
+	// last moved, and re-claim timing stays exactly as that write left it.
+	//
+	// The write is guarded on the lease token and on the settled state, so it is
+	// a no-op when a peer already rotated the lease or the row moved on. Reports
+	// whether the lease was cleared.
+	ReleaseSettledClaim(ctx context.Context, lease OperationLease) (bool, error)
+
 	// Heartbeat refreshes the child row's updated_at timestamp to extend the
 	// claim's lease while a driver is acting on it. Mirrors ApplyStore.Heartbeat
 	// semantics: silent no-op when the row no longer exists.
