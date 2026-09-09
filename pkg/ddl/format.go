@@ -15,15 +15,7 @@ import (
 //   - Data types, functions, and charset/collate values are lowercased
 //     while SQL keywords remain uppercase (PlanetScale style).
 func FormatDDL(ddl string) string {
-	raw := strings.TrimRight(strings.TrimSpace(ddl), ";") + ";"
-	// Canonicalize first
-	ddl = Canonicalize(ddl)
-
-	result := lowercaseTypes(layoutDDL(ddl))
-
-	// Ensure trailing semicolon
-	result = strings.TrimRight(result, "; ")
-	return preserveDisplaySQL(defaultParser, raw, result+";")
+	return FormatDDLForDialect(schema.DialectMySQL, ddl)
 }
 
 // layoutDDL line-breaks a canonicalized statement for readability: a CREATE
@@ -75,24 +67,22 @@ func layoutDDL(ddl string) string {
 // transformations preserve quoted names and values, and unknown dialects emit
 // only a debug diagnostic so interactive prompts remain readable.
 func FormatDDLForDialect(dialect schema.Dialect, stmt string) string {
-	if dialect == schema.DialectMySQL {
-		return FormatDDL(stmt)
-	}
 	raw := strings.TrimRight(strings.TrimSpace(stmt), ";") + ";"
 	parser, err := ParserForDialect(dialect)
 	if err != nil {
 		slog.Debug("DDL display formatting has no parser for this dialect; preserving original SQL", "dialect", dialect, "error", err)
 		return raw
 	}
-	formatted := strings.TrimRight(layoutDDL(parser.Canonicalize(raw)), "; ") + ";"
-	return preserveDisplaySQL(parser, raw, formatted)
-}
-
-// Display layout and case changes must preserve quoted identifiers and values.
-// Keep the original SQL whenever canonical comparison cannot prove equivalence.
-func preserveDisplaySQL(parser StatementParser, raw, formatted string) string {
-	if parser.Canonicalize(raw) != parser.Canonicalize(formatted) {
-		slog.Debug("DDL display normalization changed the statement; preserving original SQL")
+	canonical := parser.Canonicalize(raw)
+	formatted := layoutDDL(canonical)
+	if dialect == schema.DialectMySQL {
+		formatted = lowercaseTypes(formatted)
+	}
+	formatted = strings.TrimRight(formatted, "; ") + ";"
+	// Keep the original SQL whenever canonical comparison cannot prove that
+	// display layout and case changes preserve quoted identifiers and values.
+	if canonical != parser.Canonicalize(formatted) {
+		slog.Debug("DDL display normalization changed the statement; preserving original SQL", "dialect", dialect)
 		return raw
 	}
 	return formatted
