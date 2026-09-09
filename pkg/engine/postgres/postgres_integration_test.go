@@ -354,6 +354,35 @@ func TestEnginePlanTableSizeRefusal(t *testing.T) {
 	assert.Contains(t, change.ModeReason, "SchemaBot's ceiling for a native-safe apply")
 }
 
+// TestEnginePlanOversizedTableAdmitsConcurrentIndex proves the plan applies
+// the rewrite ceiling only to the native step while leaving a concurrent
+// index build executable under its duration policy.
+func TestEnginePlanOversizedTableAdmitsConcurrentIndex(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_oversized_concurrent_index_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY)")
+	require.NoError(t, err)
+	req := &engine.PlanRequest{
+		Database: "plan_oversized_concurrent_index_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text); CREATE INDEX users_email_idx ON users (email)",
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	result, err := NewWithTableSizeLimit(1).Plan(t.Context(), req)
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 2)
+	alter := result.Changes[0].TableChanges[0]
+	index := result.Changes[0].TableChanges[1]
+	assert.Equal(t, engine.ExecutionModeBlocked, alter.ExecutionMode)
+	assert.Contains(t, alter.ModeReason, "1-byte threshold")
+	assert.Empty(t, index.ExecutionMode)
+	assert.Contains(t, index.DDL, "CREATE INDEX CONCURRENTLY")
+}
+
 // TestEnginePlanCreateTableIgnoresSizeCeiling proves the native-safe table
 // size ceiling never blocks a greenfield CREATE TABLE: the ceiling bounds
 // rewrites of existing data, and a table that does not exist yet has none —
@@ -843,6 +872,37 @@ func TestEngineApplyTableSizeRefusal(t *testing.T) {
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "refused", progress.Metadata["phase"])
 	assert.False(t, progress.Retryable, "a size refusal is permanent until the ceiling or target changes")
+	assert.Contains(t, progress.ErrorMessage, "1-byte threshold")
+}
+
+// TestEngineApplyOversizedTableUsesKindSpecificBounds proves a concurrent
+// index build completes under its duration envelope on a table above the
+// rewrite ceiling, while a native ALTER on that table remains refused.
+func TestEngineApplyOversizedTableUsesKindSpecificBounds(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "oversized_kind_bounds_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY, email text)")
+	require.NoError(t, err)
+
+	eng := NewWithOptions(1, postgresApplyDeadline)
+	result, err := eng.Apply(t.Context(), applyRequest(dsn, "users",
+		"CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)"))
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	progress := awaitPostgresProgress(t, eng, "users")
+	assert.Equal(t, engine.StateCompleted, progress.State)
+
+	var valid bool
+	err = db.QueryRowContext(t.Context(),
+		`SELECT i.indisvalid FROM pg_index i WHERE i.indexrelid = 'public.users_email_idx'::regclass`).Scan(&valid)
+	require.NoError(t, err)
+	assert.True(t, valid)
+
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "users", "ALTER TABLE public.users ADD COLUMN nickname text"))
+	require.NoError(t, err)
+	progress = awaitPostgresProgress(t, eng, "users")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable)
 	assert.Contains(t, progress.ErrorMessage, "1-byte threshold")
 }
 

@@ -451,9 +451,10 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 	return changes, nil
 }
 
-// blockOversizedTable applies the native-safe table size ceiling to every
-// still-executable step. The apply path repeats the same CheckTable call, so
-// growth between plan and apply cannot bypass the ceiling. A typed refusal is
+// blockOversizedTable applies the native-safe table size ceiling to executable
+// steps whose native cost scales with the existing table. Concurrent index
+// builds have their own duration envelope, but still use the preflight to prove
+// the target exists and is an ordinary or partitioned table. A typed refusal is
 // rendered as a blocked verdict; an operational failure fails planning rather
 // than producing an executable plan while the table size is unknown.
 func blockOversizedTable(ctx context.Context, pool *pgxpool.Pool, report pgplan.Report, changes []engine.TableChange, tableSizeLimit int64) ([]engine.TableChange, error) {
@@ -466,7 +467,14 @@ func blockOversizedTable(ctx context.Context, pool *pgxpool.Pool, report pgplan.
 	if isGreenfieldTable(report) {
 		return changes, nil
 	}
-	_, err := preflight.CheckTable(ctx, pool, report.Schema, report.Table, tableSizeLimit)
+	limit := preflight.NoSizeLimit
+	for _, change := range changes {
+		if change.ExecutionMode == "" && !isConcurrentIndexChange(change) {
+			limit = tableSizeLimit
+			break
+		}
+	}
+	_, err := preflight.CheckTable(ctx, pool, report.Schema, report.Table, limit)
 	if err == nil {
 		return changes, nil
 	}
@@ -474,8 +482,23 @@ func blockOversizedTable(ctx context.Context, pool *pgxpool.Pool, report pgplan.
 	if r == nil {
 		return nil, fmt.Errorf("check size for table %q: %w", report.Table, err)
 	}
+	var sizeErr *preflight.SizeError
+	if errors.As(err, &sizeErr) {
+		for i := range changes {
+			if changes[i].ExecutionMode == "" && !isConcurrentIndexChange(changes[i]) {
+				changes[i].ExecutionMode = engine.ExecutionModeBlocked
+				changes[i].ModeReason = fmt.Sprintf("statement for table %q: %s", report.Table, r.detail)
+			}
+		}
+		return changes, nil
+	}
 	blockExecutableChanges(changes, fmt.Sprintf("statement for table %q: %s", report.Table, r.detail))
 	return changes, nil
+}
+
+func isConcurrentIndexChange(change engine.TableChange) bool {
+	statement, err := pgstatement.ParseOne(change.DDL)
+	return err == nil && statement.Kind() == pgstatement.KindCreateIndex && statement.Concurrent()
 }
 
 // undeclaredTableDrops surfaces every live table in the namespace that no

@@ -821,6 +821,9 @@ load, and durations above the largest `statement_timeout` PostgreSQL itself
 accepts (about 24 days); omit the option to use the default rather than setting
 `0`.
 
+Concurrent index builds do not consult the size ceiling; their work is bounded
+by `concurrent_index_max_duration` instead.
+
 The ceiling is process-wide: every PostgreSQL database this server drives
 shares the same value, and a database cannot override it in its own metadata.
 The ceiling only applies where this server constructs the PostgreSQL engine

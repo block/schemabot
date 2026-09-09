@@ -706,7 +706,11 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	if _, err := preflight.CheckPrivileges(ctx, pool, change.namespace, change.table, preflight.Requirement{Tier: tier}); err != nil {
 		return fmt.Errorf("check privileges for PostgreSQL table %q: %w", change.table, err)
 	}
-	table, err := preflight.CheckTable(ctx, pool, change.namespace, change.table, tableSizeLimit)
+	// Concurrent index builds are bounded by their caller-owned duration
+	// envelope rather than the rewrite ceiling. NoSizeLimit still proves the
+	// target exists and is an ordinary or partitioned table.
+	preflightLimit := applyTablePreflightLimit(change, tableSizeLimit)
+	table, err := preflight.CheckTable(ctx, pool, change.namespace, change.table, preflightLimit)
 	if err != nil {
 		return fmt.Errorf("preflight PostgreSQL table %q: %w", change.table, err)
 	}
@@ -752,6 +756,13 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		return fmt.Errorf("execute native-safe PostgreSQL statement on table %q: %w", change.table, err)
 	}
 	return nil
+}
+
+func applyTablePreflightLimit(change nativeApply, tableSizeLimit int64) int64 {
+	if change.concurrentIndex {
+		return preflight.NoSizeLimit
+	}
+	return tableSizeLimit
 }
 
 // executeCreate runs a greenfield create set through pg-sprite's create path:
