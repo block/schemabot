@@ -10,7 +10,7 @@ to see what is changing across your fleet.
 | See what is in a database | [Read the live schema](#read-the-live-schema) |
 | Make a schema change | [Plan and apply a change](#plan-and-apply-a-change) |
 | Check an ongoing change | [Follow progress and control the apply](#follow-and-control-a-change) |
-| Follow a PlanetScale deploy request | [Watch progress across shards](#planetscale-progress-across-every-shard) |
+| Manage a PlanetScale deploy request | [Deploy, follow shards, and control cutover](#manage-planetscale-deploy-requests) |
 | Build an integration | [Use structured output](#use-the-cli-from-scripts-and-agents) |
 
 The examples use a MySQL database named `shop` in `staging`.
@@ -414,10 +414,11 @@ the swap has finished.
 
 ![CLI progress shows copying, deferred cutover, and completion](../assets/cli-cutover.gif)
 
-### PlanetScale: progress across every shard
+### Manage PlanetScale deploy requests
 
-For a Vitess database using PlanetScale, the CLI follows the deploy request
-from creation through deployment and its revert window. This example uses
+For a Vitess database using PlanetScale, use the CLI to deploy, cut over,
+revert, or close the revert window while following progress across shards.
+This example uses
 `shop` registered as a Vitess database, `type: vitess` in `schema/schemabot.yaml`,
 and table files under `schema/commerce/` for the `commerce` keyspace.
 
