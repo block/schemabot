@@ -33,13 +33,19 @@ func TestRollbackPreviewUsesTargetDialect(t *testing.T) {
 			plan := apitypes.PlanResponse{Database: "shop", DatabaseType: tt.databaseType, Environment: "staging", Changes: []*apitypes.SchemaChangeResponse{{Namespace: "shop", TableChanges: []*apitypes.TableChangeResponse{{TableName: "orders", ChangeType: "alter", DDL: tt.sql}}}}}
 			requests := make(chan string, 4)
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				requests <- r.Method + " " + r.URL.Path
+				select {
+				case requests <- r.Method + " " + r.URL.Path:
+				default:
+					assert.Fail(t, "too many rollback preview requests", r.Method+" "+r.URL.Path)
+					http.Error(w, "too many requests", http.StatusBadRequest)
+					return
+				}
 				w.Header().Set("Content-Type", "application/json")
 				switch r.Method + " " + r.URL.Path {
 				case "POST /api/rollback/plan":
-					require.NoError(t, json.NewEncoder(w).Encode(plan))
+					assert.NoError(t, json.NewEncoder(w).Encode(plan))
 				case "GET /api/status":
-					require.NoError(t, json.NewEncoder(w).Encode(apitypes.StatusResponse{}))
+					assert.NoError(t, json.NewEncoder(w).Encode(apitypes.StatusResponse{}))
 				default:
 					http.Error(w, "unexpected request", http.StatusBadRequest)
 				}
