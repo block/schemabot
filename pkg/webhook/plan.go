@@ -648,14 +648,17 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 
 // shardedUnsafeChanges collects unsafe per-shard changes, grouped by (table,
 // reason) so a change present on several shards lists them together rather than
-// repeating. Returns nil when the plan carries no per-shard changes (the
-// non-sharded path uses the namespace-level unsafe view instead).
+// repeating. The group's statement and change type are the first shard's: the
+// reason already names what the change destroys, so shards whose statements
+// differ only in drift still describe one drop. Returns nil when the plan
+// carries no per-shard changes (the non-sharded path uses the namespace-level
+// unsafe view instead).
 func shardedUnsafeChanges(shards []*apitypes.ShardPlanResponse) []templates.UnsafeChangeData {
 	if len(shards) == 0 {
 		return nil
 	}
 	total := plannedShardCount(shards)
-	type key struct{ table, reason, ddl, changeType string }
+	type key struct{ table, reason string }
 	var order []key
 	byKey := make(map[key]*templates.UnsafeChangeData)
 	for _, sp := range shards {
@@ -667,7 +670,7 @@ func shardedUnsafeChanges(shards []*apitypes.ShardPlanResponse) []templates.Unsa
 			if !ok {
 				continue
 			}
-			k := key{table: unsafeChange.Table, reason: unsafeChange.Reason, ddl: unsafeChange.DDL, changeType: unsafeChange.ChangeType}
+			k := key{table: unsafeChange.Table, reason: unsafeChange.Reason}
 			uc := byKey[k]
 			if uc == nil {
 				uc = &templates.UnsafeChangeData{Table: unsafeChange.Table, Reason: unsafeChange.Reason, DDL: unsafeChange.DDL, ChangeType: unsafeChange.ChangeType, TotalShards: total}

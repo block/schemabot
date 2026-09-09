@@ -303,12 +303,12 @@ func (tidbStatementParser) DropTargets(stmt string) (DropTargets, error) {
 		return DropTargets{}, fmt.Errorf("expected one statement for drop targets, got %d", len(parsed))
 	}
 
+	// A standalone DROP INDEX arrives here as the ALTER TABLE ... DROP INDEX
+	// Spirit rewrites it into, so the ALTER branch counts both spellings.
 	var targets DropTargets
 	switch node := (*parsed[0].StmtNode).(type) {
 	case *ast.DropTableStmt:
 		targets.Tables = len(node.Tables)
-	case *ast.DropIndexStmt:
-		targets.Indexes = 1
 	case *ast.AlterTableStmt:
 		for _, spec := range node.Specs {
 			switch spec.Tp {
