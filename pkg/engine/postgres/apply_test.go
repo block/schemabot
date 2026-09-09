@@ -836,41 +836,80 @@ type failingRow struct{ err error }
 
 func (r failingRow) Scan(...any) error { return r.err }
 
-type indexProgressRow struct{}
+// indexProgressRow is one row of pg_stat_progress_create_index as pg-sprite
+// scans it: phase, blocks, tuples, lockers, then the current locker's PID.
+type indexProgressRow struct {
+	phase                     string
+	blocksDone, blocksTotal   uint64
+	tuplesDone, tuplesTotal   uint64
+	lockersTotal, lockersDone uint64
+	currentLockerPID          int32
+}
 
-func (indexProgressRow) Scan(dest ...any) error {
-	*(dest[0].(*string)) = "building index"
-	*(dest[1].(*uint64)) = 25
-	*(dest[2].(*uint64)) = 40
-	*(dest[3].(*uint64)) = 12
-	*(dest[4].(*uint64)) = 30
-	*(dest[5].(*uint64)) = 4
-	*(dest[6].(*uint64)) = 2
-	pid := int32(31337)
+func (r indexProgressRow) Scan(dest ...any) error {
+	*(dest[0].(*string)) = r.phase
+	*(dest[1].(*uint64)) = r.blocksDone
+	*(dest[2].(*uint64)) = r.blocksTotal
+	*(dest[3].(*uint64)) = r.tuplesDone
+	*(dest[4].(*uint64)) = r.tuplesTotal
+	*(dest[5].(*uint64)) = r.lockersTotal
+	*(dest[6].(*uint64)) = r.lockersDone
+	pid := r.currentLockerPID
 	*(dest[7].(**int32)) = &pid
 	return nil
 }
 
-type successfulIndexProgressSession struct{}
-
-func (successfulIndexProgressSession) QueryRow(context.Context, string, ...any) pgx.Row {
-	return indexProgressRow{}
+// heapScanRow is a btree build part-way through its first heap scan.
+var heapScanRow = indexProgressRow{
+	phase: "building index: scanning table", blocksDone: 25, blocksTotal: 40,
+	tuplesDone: 12, tuplesTotal: 30, lockersTotal: 4, lockersDone: 2, currentLockerPID: 31337,
 }
 
-func TestProgressReportsExecutorDetailAndBlockPercent(t *testing.T) {
-	eng := New()
+// publishedIndexProgressSession answers every progress read with the row it
+// currently holds, or with no row at all when the build has left the view.
+type publishedIndexProgressSession struct {
+	row *indexProgressRow
+}
+
+func (s *publishedIndexProgressSession) QueryRow(context.Context, string, ...any) pgx.Row {
+	if s.row == nil {
+		return failingRow{err: pgx.ErrNoRows}
+	}
+	return *s.row
+}
+
+func claimRunningIndexBuild(t *testing.T, eng *Engine, session *publishedIndexProgressSession) *progress.Tracker {
+	t.Helper()
 	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE INDEX widgets_name_idx ON public.widgets (name)", steps: 2}
 	tracker := newTestTracker(t)
 	tracker.Start(2, progress.OperationAdmitting)
 	tracker.StartStep(2, progress.OperationConcurrentIndex, "CREATE INDEX CONCURRENTLY widgets_name_idx ON public.widgets (name)")
 	tracker.SetAttempt(3)
-	tracker.SetConcurrentBuild(successfulIndexProgressSession{}, 42)
+	tracker.SetConcurrentBuild(session, 42)
 	eng.claimProgress("task-a", progressResult(engine.StateRunning, "running", time.Now(), change, ""), tracker, slog.Default())
+	return tracker
+}
 
+func pollRunningIndexBuild(t *testing.T, eng *Engine) *engine.ProgressResult {
+	t.Helper()
 	got, err := eng.Progress(t.Context(), &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: "task-a"}})
 	require.NoError(t, err)
-	assert.Equal(t, "concurrent-index-build", got.Metadata["operation"])
-	assert.Equal(t, "building index", got.Metadata["server_phase"])
+	return got
+}
+
+// TestProgressReportsExecutorDetailAndBuildPercent proves a poll during a
+// concurrent index build carries the executor's operation class and attempt,
+// the server's phase and every counter of its progress row, and a percent
+// that places the phase's block position on the whole build's scale, on the
+// apply and its table alike.
+func TestProgressReportsExecutorDetailAndBuildPercent(t *testing.T) {
+	eng := New()
+	row := heapScanRow
+	claimRunningIndexBuild(t, eng, &publishedIndexProgressSession{row: &row})
+
+	got := pollRunningIndexBuild(t, eng)
+	assert.Equal(t, "concurrent-index-build", got.Metadata["executor_operation"])
+	assert.Equal(t, "building index: scanning table", got.Metadata["server_phase"])
 	assert.Equal(t, "3", got.Metadata["attempt"])
 	assert.Equal(t, "25", got.Metadata["blocks_done"])
 	assert.Equal(t, "40", got.Metadata["blocks_total"])
@@ -879,7 +918,72 @@ func TestProgressReportsExecutorDetailAndBlockPercent(t *testing.T) {
 	assert.Equal(t, "2", got.Metadata["lockers_done"])
 	assert.Equal(t, "4", got.Metadata["lockers_total"])
 	assert.NotContains(t, got.Metadata, "current_locker_pid")
-	assert.Equal(t, 62, got.Tables[0].Progress)
+	assert.Equal(t, 25, got.Tables[0].Progress, "25 of 40 heap blocks inside the 0–40 band of the first heap scan")
+	assert.Equal(t, got.Tables[0].Progress, got.Progress, "the apply and its table report the same percent")
+}
+
+// TestProgressReportsHonestZerosWhileWaitingForWriters proves a phase that
+// publishes no block work still reports every counter: a build parked behind
+// writers reports zero lockers cleared and zero blocks, not missing keys, and
+// its percent is the phase's position on the whole build, not a division of
+// the zero block total.
+func TestProgressReportsHonestZerosWhileWaitingForWriters(t *testing.T) {
+	eng := New()
+	row := indexProgressRow{phase: "waiting for writers before validation", lockersTotal: 3}
+	claimRunningIndexBuild(t, eng, &publishedIndexProgressSession{row: &row})
+
+	got := pollRunningIndexBuild(t, eng)
+	assert.Equal(t, "0", got.Metadata["lockers_done"])
+	assert.Equal(t, "3", got.Metadata["lockers_total"])
+	assert.Equal(t, "0", got.Metadata["blocks_done"])
+	assert.Equal(t, "0", got.Metadata["blocks_total"])
+	assert.Equal(t, "0", got.Metadata["tuples_done"])
+	assert.Equal(t, "0", got.Metadata["tuples_total"])
+	assert.Equal(t, 60, got.Tables[0].Progress, "the first heap scan is behind it, validation ahead of it")
+	assert.Equal(t, 60, got.Progress)
+}
+
+// TestProgressKeepsLastKnownPercentWithoutABuildRow proves the derived
+// percent is part of the last-known position: once a poll has placed the
+// build on the whole scale, a later poll that finds no progress row — the
+// build between phases, its session released, or the view unreadable —
+// answers with that percent instead of the record's pre-execution zero, and
+// the next row moves it forward again.
+func TestProgressKeepsLastKnownPercentWithoutABuildRow(t *testing.T) {
+	eng := New()
+	row := heapScanRow
+	session := &publishedIndexProgressSession{row: &row}
+	claimRunningIndexBuild(t, eng, session)
+	require.Equal(t, 25, pollRunningIndexBuild(t, eng).Tables[0].Progress)
+
+	session.row = nil
+	got := pollRunningIndexBuild(t, eng)
+	assert.Equal(t, 25, got.Tables[0].Progress, "no row keeps the last-known percent")
+	assert.Equal(t, 25, got.Progress)
+	assert.NotContains(t, got.Metadata, "blocks_done", "no row publishes no counters")
+
+	validation := indexProgressRow{phase: "index validation: scanning table", blocksDone: 40, blocksTotal: 40}
+	session.row = &validation
+	got = pollRunningIndexBuild(t, eng)
+	assert.Equal(t, 95, got.Tables[0].Progress, "a completed validation scan stays below 100 until the apply completes")
+	assert.Equal(t, "40", got.Metadata["blocks_done"])
+}
+
+// TestProgressKeepsPercentWhenTheBuildRowReadFails proves a tolerated
+// progress-view failure does not reset the percent: the poll answers with
+// the last-known percent alongside the last-known step and statement.
+func TestProgressKeepsPercentWhenTheBuildRowReadFails(t *testing.T) {
+	eng := New()
+	row := heapScanRow
+	session := &publishedIndexProgressSession{row: &row}
+	tracker := claimRunningIndexBuild(t, eng, session)
+	require.Equal(t, 25, pollRunningIndexBuild(t, eng).Tables[0].Progress)
+
+	tracker.SetConcurrentBuild(&indexProgressSession{err: errors.New("connection reset by peer")}, 42)
+	got := pollRunningIndexBuild(t, eng)
+	assert.Equal(t, engine.StateRunning, got.State)
+	assert.Equal(t, 25, got.Tables[0].Progress)
+	assert.Equal(t, "2", got.Metadata["step"])
 }
 
 // TestExecutorProgressMetadataKeepsTerminalPercent proves a terminal result's
@@ -891,14 +995,34 @@ func TestExecutorProgressMetadataKeepsTerminalPercent(t *testing.T) {
 	tracker := newTestTracker(t)
 	tracker.Start(2, progress.OperationAdmitting)
 	tracker.StartStep(2, progress.OperationConcurrentIndex, "CREATE INDEX CONCURRENTLY widgets_name_idx ON public.widgets (name)")
-	tracker.SetConcurrentBuild(successfulIndexProgressSession{}, 42)
+	row := heapScanRow
+	tracker.SetConcurrentBuild(&publishedIndexProgressSession{row: &row}, 42)
 	terminal := progressResult(engine.StateCompleted, "completed", time.Now(), change, "")
 
 	require.NoError(t, executorProgressMetadata(t.Context(), tracker, terminal))
 
 	assert.Equal(t, 100, terminal.Tables[0].Progress)
+	assert.Equal(t, 100, terminal.Progress)
 	assert.Equal(t, "25", terminal.Metadata["blocks_done"])
 	assert.Equal(t, "40", terminal.Metadata["blocks_total"])
+}
+
+// TestExecutorProgressMetadataBoundsTheServerPhase proves the server phase
+// gets the same single-line treatment as every other operator-facing value
+// in the metadata, and that an unrecognised phase leaves the percent alone.
+func TestExecutorProgressMetadataBoundsTheServerPhase(t *testing.T) {
+	tracker := newTestTracker(t)
+	tracker.Start(1, progress.OperationAdmitting)
+	tracker.StartStep(1, progress.OperationConcurrentIndex, "CREATE INDEX CONCURRENTLY widgets_name_idx ON public.widgets (name)")
+	row := indexProgressRow{phase: "future phase |\nwith layout", blocksDone: 5, blocksTotal: 10}
+	tracker.SetConcurrentBuild(&publishedIndexProgressSession{row: &row}, 42)
+	result := &engine.ProgressResult{State: engine.StateRunning, Tables: []engine.TableProgress{{Progress: 7}}}
+
+	require.NoError(t, executorProgressMetadata(t.Context(), tracker, result))
+
+	assert.Equal(t, "future phase / with layout", result.Metadata["server_phase"])
+	assert.Equal(t, 7, result.Tables[0].Progress)
+	assert.Equal(t, "1", result.Metadata["step"], "a nil metadata map is allocated rather than written through")
 }
 
 // activeBuildTracker returns a tracker mid-way through a concurrent index

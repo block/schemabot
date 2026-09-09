@@ -91,12 +91,31 @@ bounded at apply time: each attempt has a 3-second lock budget and a
 statement that exceeds the execution budget is not allowed to continue
 unbounded.
 
-While a statement runs, PostgreSQL progress metadata includes `step`,
-`steps_total`, and the sanitized `statement`. When pg-sprite reports them, it
-also includes `operation`, `server_phase`, `attempt`, `blocks_done`,
-`blocks_total`, `tuples_done`, `tuples_total`, `lockers_done`, and
-`lockers_total`. During an index build with a non-zero block total, table
-progress is the completed-block percentage, clamped from 0 through 100.
+While a statement runs, PostgreSQL progress metadata carries two phase
+vocabularies in one flat map. `phase` is SchemaBot's own record of the apply:
+`preflight` for as long as the apply runs, then its terminal outcome
+(`completed`, `failed`, or `refused`).
+`server_phase` is the `phase` column of PostgreSQL's
+`pg_stat_progress_create_index` view, verbatim (for example `building index:
+scanning table` or `index validation: scanning index`), and is present only
+while PostgreSQL publishes a progress row for a concurrent index build. The
+metadata also carries `step`, `steps_total`, and the sanitized `statement`
+for the statement in flight; `executor_operation`, pg-sprite's class for the
+step (`admitting`, `optimistic`, `brief`, `validate-constraint`,
+`concurrent-index-build`); and `attempt`. Whenever a progress row is
+published, all six counters — `blocks_done`, `blocks_total`, `tuples_done`,
+`tuples_total`, `lockers_done`, `lockers_total` — are present, zeros
+included: a zero is a reading, and an absent key means PostgreSQL has not
+published a row. PostgreSQL scopes the block and tuple counters to the current
+phase and resets them at each phase boundary.
+
+Table progress during a concurrent index build is a whole-build estimate, not
+a phase ratio. Each server phase owns a fixed band of the 0–100 scale in
+PostgreSQL's documented phase order, a phase with block or tuple counters
+interpolates within its band, and a waiting or sorting phase reports the
+band's start. The estimate stays below 100 until the apply completes, and a
+poll that finds no progress row — between phases, or while the view cannot be
+read — keeps the last derived percent.
 
 A multi-statement plan — several tables changed, or one declarative edit that
 the planner expands into several steps — is not applied atomically. The
