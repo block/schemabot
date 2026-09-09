@@ -168,6 +168,22 @@ func escapeInlineMarkdown(text string) string {
 	return b.String()
 }
 
+const maxProgressStatementLen = 160
+
+// clampInlineCode keeps an engine-supplied statement on one bounded Markdown
+// line. Replacing code delimiters prevents the value from escaping its span.
+func clampInlineCode(text string, maxRunes int) string {
+	text = strings.Join(strings.FieldsFunc(text, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	}), " ")
+	text = strings.ReplaceAll(text, "`", "'")
+	runes := []rune(text)
+	if len(runes) <= maxRunes {
+		return text
+	}
+	return string(runes[:maxRunes-1]) + "…"
+}
+
 // maxCommentErrorLen bounds an error message rendered into a PR comment so a
 // pathological engine error cannot flood the comment. Genuine engine errors,
 // such as a Spirit preflight check reason, are a few hundred characters and

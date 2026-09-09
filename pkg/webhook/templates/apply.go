@@ -122,6 +122,9 @@ type ApplyStatusCommentData struct {
 	State        string // canonical lowercase apply state
 	Engine       string
 	ErrorMessage string
+	Step         int
+	StepsTotal   int
+	Statement    string
 
 	// DerivedStatus, when set, replaces the raw-state **Status** line in the
 	// rendered body. Multi-deployment sections set it for deployments whose
@@ -195,6 +198,7 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 	// inline (e.g. "Revert Window | Closes in 28m 30s") so the operator sees the
 	// state and its deadline in one place rather than on a separate line.
 	writeApplyStatusDetail(&sb, data)
+	writeApplyStep(&sb, data)
 
 	// Deploy-request link (PlanetScale) — the operator's entry point into the
 	// deploy request's own progress, which the comment does not otherwise surface.
@@ -236,6 +240,17 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 	}
 
 	return sb.String()
+}
+
+func writeApplyStep(sb *strings.Builder, data ApplyStatusCommentData) {
+	if !state.IsRunningApplyState(data.State) || data.Step <= 0 || data.StepsTotal <= 0 {
+		return
+	}
+	fmt.Fprintf(sb, "\nstep %d of %d", data.Step, data.StepsTotal)
+	if statement := clampInlineCode(data.Statement, maxProgressStatementLen); statement != "" {
+		fmt.Fprintf(sb, " · `%s`", statement)
+	}
+	sb.WriteString("\n")
 }
 
 // writeApplyStatusHeader writes the headline for an in-place apply status
@@ -1847,6 +1862,11 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 		CompletedAt:  resp.CompletedAt,
 	}
 	data.RevertExpiresAt = resp.Metadata["revert_expires_at"]
+	if step, err := apitypes.ParseProgressStep(resp.Metadata); err != nil {
+		slog.Warn("progress comment omits the statement position because the progress metadata is malformed", "apply_id", resp.ApplyID, "error", err)
+	} else {
+		data.Step, data.StepsTotal, data.Statement = step.Step, step.StepsTotal, step.Statement
+	}
 
 	if changes, err := apitypes.ParseVSchemaChanges(resp.Metadata); err != nil {
 		slog.Warn("failed to parse VSchema changes from progress metadata", "apply_id", resp.ApplyID, "error", err)

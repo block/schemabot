@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/cliname"
@@ -145,6 +146,7 @@ func WriteProgress(data ProgressData) {
 	}
 
 	WriteBox(rows, "State", colorFn)
+	writeProgressStep(data)
 
 	// Error below the box
 	if data.State == state.Apply.Failed && data.ErrorMessage != "" {
@@ -223,6 +225,28 @@ func WriteProgress(data ProgressData) {
 	if data.State == state.Apply.Failed {
 		writeFailureGuidance()
 	}
+}
+
+func writeProgressStep(data ProgressData) {
+	if !state.IsRunningApplyState(data.State) || data.Step <= 0 || data.StepsTotal <= 0 {
+		return
+	}
+	fmt.Printf("\nstep %d of %d", data.Step, data.StepsTotal)
+	if statement := clampTerminalLine(data.Statement, 160); statement != "" {
+		fmt.Printf(" · %s", statement)
+	}
+	fmt.Println()
+}
+
+func clampTerminalLine(text string, maxRunes int) string {
+	text = strings.Join(strings.FieldsFunc(text, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	}), " ")
+	runes := []rune(text)
+	if len(runes) <= maxRunes {
+		return text
+	}
+	return string(runes[:maxRunes-1]) + "…"
 }
 
 // FormatNamespacedTables returns tables grouped by keyspace as a string, collapsing

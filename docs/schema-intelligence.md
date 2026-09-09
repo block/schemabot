@@ -500,6 +500,24 @@ Response excerpt (illustrative values):
 
 </details>
 
+PostgreSQL create-set progress uses the same metadata shape:
+
+```json
+{
+  "engine": "postgres",
+  "state": "running",
+  "metadata": {
+    "phase": "create_set",
+    "step": "2",
+    "steps_total": "3",
+    "statement": "CREATE INDEX orders_ref_idx ON public.orders (ref)"
+  }
+}
+```
+
+The PR comment and CLI render this position as
+`step 2 of 3 · CREATE INDEX orders_ref_idx ON public.orders (ref)`.
+
 The numbers come from the engine while the apply is active, so they are as
 fresh as the last poll. Once the apply is terminal, the same endpoint answers
 from storage: rows, throttle state, and checksum counts are preserved on the
