@@ -255,6 +255,10 @@ files directly with the CLI, as shown below.
 
 ### Review an index change
 
+Plan output uses the target database dialect, including PostgreSQL identifier
+quoting. Statements for other dialects are kept separate instead of being
+combined with MySQL syntax.
+
 For this example, `schema/schemabot.yaml` contains:
 
 ```yaml

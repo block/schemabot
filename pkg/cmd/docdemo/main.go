@@ -24,6 +24,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/commands"
+	"github.com/block/schemabot/pkg/schema"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
@@ -285,7 +286,7 @@ func vitessDemo() Demo {
 			t.WritePlanHeader(t.PlanHeaderData{Database: "shop", SchemaName: "schema", IsApply: apply})
 			t.WriteEnvironmentHeader("staging")
 			changes := []t.DDLChange{{TableName: "orders", ChangeType: "alter", DDL: ddl}}
-			t.WriteNamespaceChanges([]t.NamespaceChange{{Namespace: "commerce", Changes: changes}}, false, "shop")
+			t.WriteNamespaceChanges([]t.NamespaceChange{{Namespace: "commerce", Changes: changes}}, false, "shop", schema.DialectMySQL)
 			t.WritePlanSummary(changes)
 		})
 	}
@@ -475,7 +476,7 @@ func main() {
 			t.WritePlanHeader(t.PlanHeaderData{Database: "shop", SchemaName: "schema", IsMySQL: true, IsApply: apply})
 			changes := []t.DDLChange{{TableName: "orders", ChangeType: "alter", DDL: ddl}}
 			t.WriteEnvironmentHeader("staging")
-			t.WriteNamespaceChanges([]t.NamespaceChange{{Namespace: "shop", Changes: changes}}, true, "shop")
+			t.WriteNamespaceChanges([]t.NamespaceChange{{Namespace: "shop", Changes: changes}}, true, "shop", schema.DialectMySQL)
 			t.WritePlanSummary(changes)
 		})
 	}

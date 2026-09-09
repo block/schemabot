@@ -624,6 +624,9 @@ Response excerpt (illustrative values):
 
 ## Inspect a stored plan
 
+The CLI uses the plan’s `database_type` when it displays SQL. PostgreSQL plans
+retain PostgreSQL grammar; unknown types retain their original statements.
+
 List recent plans across the databases in an environment:
 
 ```sh
