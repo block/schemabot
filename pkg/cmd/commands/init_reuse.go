@@ -71,8 +71,8 @@ func validateInitSchemaDestination(root string) error {
 	if len(entries) == 0 {
 		return nil
 	}
-	if _, err := os.Stat(filepath.Join(root, "schemabot.yaml")); err != nil {
-		return fmt.Errorf("schema directory contains files but no readable schemabot.yaml; choose an empty --schema-dir or prepare a valid configuration to reuse your files: %w", err)
+	if _, err := LoadCLIConfig(root); err != nil {
+		return fmt.Errorf("choose an empty --schema-dir or provide a valid schemabot.yaml to reuse your files: %w", err)
 	}
 	return nil
 }

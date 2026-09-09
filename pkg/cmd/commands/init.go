@@ -216,7 +216,10 @@ func publishInitSchemaWithRename(stage, root string, rename func(string, string)
 		if err := removeEmptyInitDir(root); err != nil {
 			return fmt.Errorf("schema directory changed before publication: %w", err)
 		}
-		return rename(stage, root)
+		if err := rename(stage, root); err != nil {
+			return fmt.Errorf("publish schema directory %q after removing empty destination: %w", root, err)
+		}
+		return nil
 	}
 	existing, err := initSchemaSnapshot(root)
 	if err != nil {
@@ -238,11 +241,13 @@ const initSnapshotMaxEntries = 10000
 func initSchemaSnapshot(root string) (map[string]string, error) {
 	result := make(map[string]string)
 	remaining := int64(initSnapshotMaxBytes)
+	entries := 0
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if len(result) >= initSnapshotMaxEntries {
+		entries++
+		if entries > initSnapshotMaxEntries {
 			return fmt.Errorf("schema directory exceeds %d entries; choose a dedicated schema directory", initSnapshotMaxEntries)
 		}
 		if entry.Type()&os.ModeSymlink != 0 {
@@ -253,7 +258,6 @@ func initSchemaSnapshot(root string) (map[string]string, error) {
 			return err
 		}
 		if entry.IsDir() {
-			result[relative+"/"] = ""
 			return nil
 		}
 		if !entry.Type().IsRegular() {
