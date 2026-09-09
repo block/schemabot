@@ -38,6 +38,10 @@ func (f fakeStatementParser) Classify(string) (StatementType, string, error) {
 	return f.classifyType, f.classifyTable, f.classifyErr
 }
 
+func (f fakeStatementParser) DropTargets(string) (DropTargets, error) {
+	return DropTargets{}, nil
+}
+
 func (f fakeStatementParser) CreateTableColumns(string) ([]string, error) {
 	return nil, nil
 }
@@ -299,4 +303,39 @@ func TestTiDBCostScalesWithTableSize(t *testing.T) {
 		_, err := p.CostScalesWithTableSize("ALTER TABLE `a` ADD INDEX `i` (`c`); DROP TABLE `b`")
 		assert.Error(t, err)
 	})
+}
+
+func TestTiDBDropTargets(t *testing.T) {
+	p := tidbStatementParser{}
+	tests := []struct {
+		name string
+		stmt string
+		want DropTargets
+		err  bool
+	}{
+		{"drop tables", "DROP TABLE a, b", DropTargets{Tables: 2}, false},
+		{"drop index", "DROP INDEX idx ON t", DropTargets{Indexes: 1}, false},
+		{"alter drops", "ALTER TABLE t DROP COLUMN c, DROP INDEX i", DropTargets{Columns: 1, Indexes: 1}, false},
+		{"alter drops two indexes", "ALTER TABLE t DROP INDEX a, DROP INDEX b", DropTargets{Indexes: 2}, false},
+		{"drop column shorthand", "ALTER TABLE t DROP c", DropTargets{Columns: 1}, false},
+		{"drop primary key", "ALTER TABLE t DROP PRIMARY KEY", DropTargets{}, false},
+		{"create table", "CREATE TABLE t (id bigint)", DropTargets{}, false},
+		// Spirit rejects a compound whose statements are not all ALTER TABLE
+		// before the single-statement guard runs; the all-ALTER compound is
+		// the input that reaches the guard.
+		{"multiple statements", "DROP TABLE a; DROP TABLE b", DropTargets{}, true},
+		{"multiple alters", "ALTER TABLE a DROP COLUMN x; ALTER TABLE b DROP COLUMN y", DropTargets{}, true},
+		{"garbage", "this is not SQL", DropTargets{}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := p.DropTargets(tt.stmt)
+			if tt.err {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }

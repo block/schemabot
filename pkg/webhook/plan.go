@@ -648,8 +648,11 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 
 // shardedUnsafeChanges collects unsafe per-shard changes, grouped by (table,
 // reason) so a change present on several shards lists them together rather than
-// repeating. Returns nil when the plan carries no per-shard changes (the
-// non-sharded path uses the namespace-level unsafe view instead).
+// repeating. The group's statement and change type are the first shard's: the
+// reason already names what the change destroys, so shards whose statements
+// differ only in drift still describe one drop. Returns nil when the plan
+// carries no per-shard changes (the non-sharded path uses the namespace-level
+// unsafe view instead).
 func shardedUnsafeChanges(shards []*apitypes.ShardPlanResponse) []templates.UnsafeChangeData {
 	if len(shards) == 0 {
 		return nil
@@ -670,7 +673,7 @@ func shardedUnsafeChanges(shards []*apitypes.ShardPlanResponse) []templates.Unsa
 			k := key{table: unsafeChange.Table, reason: unsafeChange.Reason}
 			uc := byKey[k]
 			if uc == nil {
-				uc = &templates.UnsafeChangeData{Table: unsafeChange.Table, Reason: unsafeChange.Reason, ChangeType: unsafeChange.ChangeType, TotalShards: total}
+				uc = &templates.UnsafeChangeData{Table: unsafeChange.Table, Reason: unsafeChange.Reason, DDL: unsafeChange.DDL, ChangeType: unsafeChange.ChangeType, TotalShards: total}
 				byKey[k] = uc
 				order = append(order, k)
 			}
@@ -939,6 +942,7 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 					unsafe = append(unsafe, templates.UnsafeChangeData{
 						Table:      uc.Table,
 						Reason:     uc.Reason,
+						DDL:        uc.DDL,
 						ChangeType: uc.ChangeType,
 					})
 				}
@@ -953,6 +957,7 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 			unsafe = append(unsafe, templates.UnsafeChangeData{
 				Table:      uc.Table,
 				Reason:     uc.Reason,
+				DDL:        uc.DDL,
 				ChangeType: uc.ChangeType,
 			})
 		}

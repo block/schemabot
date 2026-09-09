@@ -1015,8 +1015,8 @@ func PreviewCommentUnsafeBlocked() string {
 		},
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "users", Reason: "DROP INDEX idx_email"},
-			{Table: "orders", Reason: "DROP COLUMN notes"},
+			{Table: "users", Reason: "DROP INDEX idx_email", DDL: "ALTER TABLE `users` DROP INDEX `idx_email`", ChangeType: "alter"},
+			{Table: "orders", Reason: "DROP COLUMN notes", DDL: "ALTER TABLE `orders` DROP COLUMN `notes`", ChangeType: "alter"},
 		},
 	})
 }
@@ -1044,8 +1044,10 @@ func PreviewCommentDropColumnBlocked() string {
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
 			{
-				Table:  "customers",
-				Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\"",
+				Table:      "customers",
+				Reason:     "Unsafe operation detected: \"DROP COLUMN `nickname`\"",
+				DDL:        "ALTER TABLE `customers` DROP COLUMN `nickname`",
+				ChangeType: "alter",
 			},
 		},
 	})
@@ -1074,8 +1076,10 @@ func PreviewCommentDropIndexBlocked() string {
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
 			{
-				Table:  "customers",
-				Reason: "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\"",
+				Table:      "customers",
+				Reason:     "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\"",
+				DDL:        "ALTER TABLE `customers` DROP INDEX `idx_customers_email`",
+				ChangeType: "alter",
 			},
 		},
 	})
@@ -1172,8 +1176,8 @@ func PreviewCommentApplyPlanUnsafe() string {
 		HasUnsafeChanges: true,
 		AllowUnsafe:      true,
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "users", Reason: "DROP INDEX idx_email"},
-			{Table: "orders", Reason: "DROP COLUMN notes"},
+			{Table: "users", Reason: "DROP INDEX idx_email", DDL: "ALTER TABLE `users` DROP INDEX `idx_email`", ChangeType: "alter"},
+			{Table: "orders", Reason: "DROP COLUMN notes", DDL: "ALTER TABLE `orders` DROP COLUMN `notes`", ChangeType: "alter"},
 		},
 		IsLocked:     true,
 		LockOwner:    "acme/myapp#42",
