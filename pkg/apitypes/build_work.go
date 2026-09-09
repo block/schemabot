@@ -51,7 +51,9 @@ func (w BuildWork) WaitingOnLockers() bool {
 // metadata. It returns the zero value with a nil error when the engine
 // publishes no operation, and an error when a published counter is not a
 // non-negative integer, so a renderer can log the malformed value and omit
-// the work rather than show a wrong value.
+// the work rather than show a wrong value. A counter is published when its
+// key is present, whatever the value: an absent key means the engine has no
+// reading, while a present empty value is malformed.
 func ParseBuildWork(metadata map[string]string) (BuildWork, error) {
 	operation := metadata[buildOperationMetadataKey]
 	if operation == "" {
@@ -71,8 +73,8 @@ func ParseBuildWork(metadata map[string]string) (BuildWork, error) {
 		{"lockers_total", &work.LockersTotal},
 	}
 	for _, field := range fields {
-		raw := metadata[field.key]
-		if raw == "" {
+		raw, present := metadata[field.key]
+		if !present {
 			continue
 		}
 		value, err := strconv.ParseInt(raw, 10, 64)

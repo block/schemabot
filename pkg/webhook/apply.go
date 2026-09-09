@@ -38,6 +38,7 @@ func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, display 
 		Step:             display.Step.Step,
 		StepsTotal:       display.Step.StepsTotal,
 		Statement:        display.Step.Statement,
+		BuildWork:        display.BuildWork,
 		Tenant:           tenant,
 		Rollback:         apply.IsRollback(),
 		DeferCutover:     apply.GetOptions().DeferCutover,
@@ -53,9 +54,10 @@ func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, display 
 }
 
 // operationDisplay is the per-operation engine display projection surfaced in the
-// PR comment: the statement position from the operation's durable progress
-// metadata, and — for PlanetScale — VSchema application state and the
-// deploy-request URL from the engine resume metadata.
+// PR comment: the statement position and the running statement's server-side
+// work from the operation's durable progress metadata, and — for PlanetScale —
+// VSchema application state and the deploy-request URL from the engine resume
+// metadata.
 type operationDisplay struct {
 	VSchema          []apitypes.VSchemaChange
 	DeployRequestURL string
@@ -66,11 +68,15 @@ type operationDisplay struct {
 	// Step is the position of a running apply inside its statement sequence, as
 	// last persisted by the driver. Zero when the engine reports none.
 	Step apitypes.ProgressStep
+	// BuildWork is the server-reported work for the statement in flight, as
+	// last persisted by the driver. Zero when the engine reports none.
+	BuildWork apitypes.BuildWork
 }
 
 // isZero reports whether the projection carries nothing worth rendering.
 func (d operationDisplay) isZero() bool {
-	return len(d.VSchema) == 0 && d.DeployRequestURL == "" && d.RevertExpiresAt == "" && d.Step == (apitypes.ProgressStep{})
+	return len(d.VSchema) == 0 && d.DeployRequestURL == "" && d.RevertExpiresAt == "" &&
+		d.Step == (apitypes.ProgressStep{}) && d.BuildWork == (apitypes.BuildWork{})
 }
 
 // resolveDisplayByOperation projects each operation's engine display state from
@@ -88,12 +94,12 @@ func resolveDisplayByOperation(ctx context.Context, stor storage.Storage, apply 
 	}
 	var byOp map[int64]operationDisplay
 	for _, op := range ops {
-		step, err := storedProgressStep(op)
+		progress, err := storedProgressOf(op)
 		if err != nil {
-			slog.Warn("comment will omit the statement position: progress metadata is malformed",
+			slog.Warn("comment will omit the malformed part of the statement progress: progress metadata is malformed",
 				append(apply.LogAttrs(), "apply_operation_id", op.ID, "operation_deployment", op.Deployment, "error", err)...)
 		}
-		od := operationDisplay{Step: step}
+		od := operationDisplay{Step: progress.Step, BuildWork: progress.BuildWork}
 		if apply.Engine == storage.EnginePlanetScale {
 			od.VSchema, od.DeployRequestURL, od.RevertExpiresAt = planetScaleDisplay(ctx, stor, apply, op)
 		}
@@ -108,35 +114,57 @@ func resolveDisplayByOperation(ctx context.Context, stor storage.Storage, apply 
 	return byOp
 }
 
-// storedProgressStep decodes the statement position from the operation's
-// durable progress metadata. An operation that has persisted no metadata, or
-// whose engine publishes no position, yields the zero step with a nil error;
-// a record that cannot be decoded, or that carries an impossible position,
-// yields the zero step with the error so the caller can log it and render no
-// position rather than a wrong one.
-func storedProgressStep(op *storage.ApplyOperation) (apitypes.ProgressStep, error) {
-	metadata, err := op.ParseProgressMetadata()
-	if err != nil {
-		return apitypes.ProgressStep{}, err
-	}
-	return apitypes.ParseProgressStep(metadata)
+// storedProgress is the statement progress an operation's driver last persisted:
+// the position inside the statement sequence and the server-reported work for
+// the statement in flight.
+type storedProgress struct {
+	Step      apitypes.ProgressStep
+	BuildWork apitypes.BuildWork
 }
 
-// progressStepFingerprint summarises the statement position of every operation
-// so the comment observer can tell that a step advanced when no other progress
-// figure moved — an engine that executes a statement sequence reports no row
-// counts, so the position is the only figure that changes between polls.
-// Operations with no position, or with metadata that cannot be decoded,
-// contribute nothing: the render path logs the malformed record, and
-// repeating that warning on every poll would drown the log.
-func progressStepFingerprint(ops []*storage.ApplyOperation) string {
+// isZero reports whether the engine published neither a position nor work.
+func (p storedProgress) isZero() bool {
+	return p.Step == (apitypes.ProgressStep{}) && p.BuildWork == (apitypes.BuildWork{})
+}
+
+// storedProgressOf decodes the statement progress from the operation's durable
+// progress metadata. An operation that has persisted no metadata, or whose
+// engine publishes no position or work, yields the zero value with a nil
+// error. A record that cannot be decoded yields the zero value with the error.
+// A record whose position or work is malformed yields the zero value for that
+// part only, with the error, so the caller can log it and render the readable
+// part rather than a wrong one.
+func storedProgressOf(op *storage.ApplyOperation) (storedProgress, error) {
+	metadata, err := op.ParseProgressMetadata()
+	if err != nil {
+		return storedProgress{}, err
+	}
+	step, stepErr := apitypes.ParseProgressStep(metadata)
+	work, workErr := apitypes.ParseBuildWork(metadata)
+	return storedProgress{Step: step, BuildWork: work}, errors.Join(stepErr, workErr)
+}
+
+// progressFingerprint summarises the statement progress of every operation so
+// the comment observer can tell that it moved when no other progress figure
+// did — an engine that executes a statement sequence reports no row counts, so
+// the position, and the server's work on the running statement, are the only
+// figures that change between polls. Operations with no progress, or with
+// metadata that cannot be decoded, contribute nothing: the render path logs
+// the malformed record, and repeating that warning on every poll would drown
+// the log.
+func progressFingerprint(ops []*storage.ApplyOperation) string {
 	var sb strings.Builder
 	for _, op := range ops {
-		step, err := storedProgressStep(op)
-		if err != nil || step == (apitypes.ProgressStep{}) {
+		progress, err := storedProgressOf(op)
+		if err != nil || progress.isZero() {
 			continue
 		}
-		fmt.Fprintf(&sb, "%d:%d/%d;", op.ID, step.Step, step.StepsTotal)
+		fmt.Fprintf(&sb, "%d:%d/%d", op.ID, progress.Step.Step, progress.Step.StepsTotal)
+		if work := progress.BuildWork; work != (apitypes.BuildWork{}) {
+			fmt.Fprintf(&sb, " %s@%s#%d b%d/%d t%d/%d l%d/%d", work.Operation, work.ServerPhase, work.Attempt,
+				work.BlocksDone, work.BlocksTotal, work.TuplesDone, work.TuplesTotal, work.LockersDone, work.LockersTotal)
+		}
+		sb.WriteString(";")
 	}
 	return sb.String()
 }

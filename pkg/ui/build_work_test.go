@@ -64,6 +64,15 @@ func TestFormatBuildWork(t *testing.T) {
 			want: "waiting on 2 of 3 lockers",
 		},
 		{
+			name: "carried-over scan counters are omitted while waiting on lockers",
+			work: func() apitypes.BuildWork {
+				w := build("waiting for writers before validation")
+				w.BlocksDone, w.BlocksTotal, w.TuplesDone, w.TuplesTotal, w.LockersDone, w.LockersTotal = 10_000, 10_000, 50_000, 50_000, 1, 4
+				return w
+			}(),
+			want: "waiting on 3 of 4 lockers",
+		},
+		{
 			name: "lockers done past total shows none outstanding",
 			work: func() apitypes.BuildWork {
 				w := build("waiting for old snapshots")

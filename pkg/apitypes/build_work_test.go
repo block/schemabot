@@ -34,6 +34,12 @@ func TestParseBuildWork(t *testing.T) {
 		assert.Equal(t, BuildWork{}, work)
 	})
 
+	t.Run("present empty counter", func(t *testing.T) {
+		work, err := ParseBuildWork(map[string]string{"executor_operation": "concurrent-index-build", "blocks_done": "", "blocks_total": "10"})
+		require.ErrorContains(t, err, `blocks_done "" is not an integer`)
+		assert.Equal(t, BuildWork{}, work)
+	})
+
 	t.Run("negative counter", func(t *testing.T) {
 		work, err := ParseBuildWork(map[string]string{"executor_operation": "concurrent-index-build", "lockers_done": "-1"})
 		require.ErrorContains(t, err, "lockers_done -1 is negative")

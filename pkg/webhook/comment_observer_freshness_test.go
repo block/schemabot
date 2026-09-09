@@ -67,7 +67,7 @@ func TestProgressCommentDueStateChangeRendersImmediately(t *testing.T) {
 // The fingerprint changes exactly when an operation's statement position does,
 // is keyed per operation so sibling deployments cannot mask each other, and
 // ignores operations whose stored metadata carries no readable position.
-func TestProgressStepFingerprintTracksPositionPerOperation(t *testing.T) {
+func TestProgressFingerprintTracksPositionPerOperation(t *testing.T) {
 	ops := func(euStep, usStep string) []*storage.ApplyOperation {
 		return []*storage.ApplyOperation{
 			{ID: 1, Deployment: "eu", ProgressMetadata: `{"step":"` + euStep + `","steps_total":"3"}`},
@@ -75,9 +75,9 @@ func TestProgressStepFingerprintTracksPositionPerOperation(t *testing.T) {
 		}
 	}
 
-	assert.Equal(t, "1:1/3;2:1/3;", progressStepFingerprint(ops("1", "1")))
-	assert.NotEqual(t, progressStepFingerprint(ops("1", "1")), progressStepFingerprint(ops("2", "1")), "eu advancing is movement")
-	assert.NotEqual(t, progressStepFingerprint(ops("2", "1")), progressStepFingerprint(ops("1", "2")), "the same steps on swapped deployments are different positions")
+	assert.Equal(t, "1:1/3;2:1/3;", progressFingerprint(ops("1", "1")))
+	assert.NotEqual(t, progressFingerprint(ops("1", "1")), progressFingerprint(ops("2", "1")), "eu advancing is movement")
+	assert.NotEqual(t, progressFingerprint(ops("2", "1")), progressFingerprint(ops("1", "2")), "the same steps on swapped deployments are different positions")
 
 	unreadable := []*storage.ApplyOperation{
 		{ID: 1, ProgressMetadata: `{"step":`},
@@ -85,6 +85,31 @@ func TestProgressStepFingerprintTracksPositionPerOperation(t *testing.T) {
 		{ID: 3, ProgressMetadata: `{"phase":"preflight"}`},
 		{ID: 4},
 	}
-	assert.Empty(t, progressStepFingerprint(unreadable))
-	assert.Empty(t, progressStepFingerprint(nil))
+	assert.Empty(t, progressFingerprint(unreadable))
+	assert.Empty(t, progressFingerprint(nil))
+}
+
+// A concurrent index build holds its statement position for the whole build
+// while the server's block, tuple, and locker counters, its phase, and its
+// attempt move, so each of those is movement in the fingerprint; a position
+// with no build work fingerprints as before.
+func TestProgressFingerprintTracksBuildWork(t *testing.T) {
+	building := func(extra string) []*storage.ApplyOperation {
+		return []*storage.ApplyOperation{{ID: 1, Deployment: "eu",
+			ProgressMetadata: `{"step":"2","steps_total":"3","executor_operation":"concurrent-index-build","server_phase":"building index: scanning table",` + extra + `}`}}
+	}
+	scanning := progressFingerprint(building(`"blocks_done":"2500","blocks_total":"10000"`))
+	assert.Equal(t, "1:2/3 concurrent-index-build@building index: scanning table#0 b2500/10000 t0/0 l0/0;", scanning)
+	assert.NotEqual(t, scanning, progressFingerprint(building(`"blocks_done":"2600","blocks_total":"10000"`)), "blocks advancing is movement")
+	assert.NotEqual(t, scanning, progressFingerprint(building(`"blocks_done":"2500","blocks_total":"10000","attempt":"2"`)), "a retry is movement")
+
+	waiting := func(lockersDone string) []*storage.ApplyOperation {
+		return []*storage.ApplyOperation{{ID: 1, Deployment: "eu",
+			ProgressMetadata: `{"step":"2","steps_total":"3","executor_operation":"concurrent-index-build","server_phase":"waiting for writers before build","lockers_done":"` + lockersDone + `","lockers_total":"3"}`}}
+	}
+	assert.NotEqual(t, scanning, progressFingerprint(waiting("0")), "a phase change is movement")
+	assert.NotEqual(t, progressFingerprint(waiting("0")), progressFingerprint(waiting("1")), "a locker releasing is movement")
+
+	assert.Equal(t, "1:2/3;", progressFingerprint([]*storage.ApplyOperation{{ID: 1, ProgressMetadata: `{"step":"2","steps_total":"3"}`}}))
+	assert.Empty(t, progressFingerprint(building(`"blocks_done":"many"`)), "a malformed counter contributes nothing")
 }
