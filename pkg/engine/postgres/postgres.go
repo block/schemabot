@@ -9,6 +9,7 @@ import (
 	"maps"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"unicode"
@@ -176,9 +177,21 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			if err != nil {
 				return nil, fmt.Errorf("diff PostgreSQL table %q in namespace %q from file %q: %w", desired.Table(), namespace, filename, err)
 			}
-			changes, tiers, err := tableChanges(report, parser)
+			changes, tiers, unrecognized, err := tableChanges(report, parser)
 			if err != nil {
 				return nil, fmt.Errorf("render PostgreSQL plan for table %q in namespace %q: %w", desired.Table(), namespace, err)
+			}
+			for _, vocabulary := range unrecognized {
+				// The plan renders a blocked placeholder for the statement,
+				// so the operator is safe but uninformed; the log is where
+				// triage learns the planner's vocabulary grew, for whose
+				// schema file, and which value to map next.
+				slog.Warn("PostgreSQL planner returned vocabulary SchemaBot does not recognize; the plan blocks the statement with a placeholder verdict",
+					"database", req.Database,
+					"namespace", namespace,
+					"table", desired.Table(),
+					"vocabulary", vocabulary.kind,
+					"value", vocabulary.value)
 			}
 			changes, err = blockMissingPrivileges(ctx, pool, report, changes, tiers)
 			if err != nil {
@@ -208,21 +221,27 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 // derives each executable step's privilege tier alongside them. The returned
 // slices are parallel: tiers[i] is the access changes[i] needs from the
 // engine role, and is meaningful only while changes[i] carries no verdict —
-// a blocked step never reaches a privilege check.
-func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.TableChange, []preflight.Tier, error) {
+// a blocked step never reaches a privilege check. unrecognized carries one
+// entry per statement whose verdict is a placeholder for planner vocabulary
+// this build does not map, for the caller to log with the plan's identifiers.
+func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.TableChange, []preflight.Tier, []unrecognizedPlannerVocabulary, error) {
 	// Each statement's verdict is derived once and reused for both the
-	// greenfield decision and the rendering, so a verdict that logs does so
-	// once per statement.
+	// greenfield decision and the rendering, so a placeholder verdict is
+	// reported once per statement.
 	verdicts := make([]stepVerdict, len(report.Statements))
+	var unrecognized []unrecognizedPlannerVocabulary
 	for i, statement := range report.Statements {
-		verdicts[i].mode, verdicts[i].reason = executionVerdict(report.FormatVersion, statement, report.Table)
+		verdicts[i] = executionVerdict(report.FormatVersion, statement, report.Table)
+		if verdicts[i].unrecognized != nil {
+			unrecognized = append(unrecognized, *verdicts[i].unrecognized)
+		}
 	}
 	if isGreenfieldCreateSet(report, verdicts) {
 		change, tier, err := greenfieldCreateSet(report, parser)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		return []engine.TableChange{change}, []preflight.Tier{tier}, nil
+		return []engine.TableChange{change}, []preflight.Tier{tier}, unrecognized, nil
 	}
 
 	changes := make([]engine.TableChange, 0, len(report.Statements))
@@ -236,7 +255,7 @@ func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.Ta
 		for _, sql := range rendered {
 			operation, table, err := parser.Classify(sql)
 			if err != nil {
-				return nil, nil, fmt.Errorf("classify planned statement for table %q: %w", report.Table, err)
+				return nil, nil, nil, fmt.Errorf("classify planned statement for table %q: %w", report.Table, err)
 			}
 			if table == "" {
 				table = report.Table
@@ -270,14 +289,28 @@ func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.Ta
 			tiers = append(tiers, stepTier)
 		}
 	}
-	return changes, tiers, nil
+	return changes, tiers, unrecognized, nil
 }
 
 // stepVerdict is the execution mode and operator-facing reason derived for
 // one planned statement; an empty mode means the statement is executable.
+// unrecognized is set when the verdict is a placeholder for planner
+// vocabulary this build does not map, so the caller can log what moved.
 type stepVerdict struct {
-	mode   string
-	reason string
+	mode         string
+	reason       string
+	unrecognized *unrecognizedPlannerVocabulary
+}
+
+// unrecognizedPlannerVocabulary names a planner value outside the set this
+// build renders in its own words: kind says which vocabulary grew (the plan
+// contract, a disposition, or a create shape cause) and value is the entry
+// the planner returned. The operator sees a blocked placeholder either way;
+// this record exists so the server log names the value and the schema file
+// behind it.
+type unrecognizedPlannerVocabulary struct {
+	kind  string
+	value string
 }
 
 // isGreenfieldCreateSet reports whether the report describes a table that
@@ -719,40 +752,78 @@ func singleLine(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
-func executionVerdict(formatVersion int, statement pgplan.Statement, table string) (string, string) {
+// executionVerdict maps one planned statement to the verdict the operator
+// reviews. A planner value outside the vocabulary this mapping knows — a plan
+// contract, a disposition, or a create shape cause the planner added after the
+// mapping was written — still renders a blocked placeholder, and is reported
+// on the verdict so the caller can log it with the identifiers this function
+// does not have.
+func executionVerdict(formatVersion int, statement pgplan.Statement, table string) stepVerdict {
 	if formatVersion != pgplan.FormatVersion {
-		return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q has an unrecognized plan contract", table)
+		return stepVerdict{
+			mode:         engine.ExecutionModeBlocked,
+			reason:       fmt.Sprintf("statement for table %q has an unrecognized plan contract", table),
+			unrecognized: &unrecognizedPlannerVocabulary{kind: "plan_contract", value: strconv.Itoa(formatVersion)},
+		}
 	}
 	if statement.Disposition == router.DispositionExecute && statement.Route == planner.RouteNative &&
 		statement.Backend == router.BackendNative && len(statement.ExecSQL) > 0 {
-		return "", ""
+		return stepVerdict{}
 	}
 
 	// Planner explanations are deliberately not copied to operator-facing
 	// text, and neither is the planner's own vocabulary: each known
 	// disposition maps to a sentence in SchemaBot's words, since the operator
 	// reading it has never heard of the planning library.
+	blocked := func(reason string) stepVerdict {
+		return stepVerdict{mode: engine.ExecutionModeBlocked, reason: reason}
+	}
 	switch statement.Disposition {
 	case router.DispositionUnavailable:
 		if statement.Backend == router.BackendCopyAndSwap {
-			return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q requires copy-and-swap, which is unavailable", table)
+			return blocked(fmt.Sprintf("statement for table %q requires copy-and-swap, which is unavailable", table))
 		}
-		return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q requires an execution path SchemaBot's PostgreSQL support does not provide yet", table)
+		return blocked(fmt.Sprintf("statement for table %q requires an execution path SchemaBot's PostgreSQL support does not provide yet", table))
 	case router.DispositionRewriteRequired:
-		return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q must be rewritten into a form the engine can execute natively, then re-planned", table)
+		return blocked(fmt.Sprintf("statement for table %q must be rewritten into a form the engine can execute natively, then re-planned", table))
 	case router.DispositionRefuse:
 		if reason, ok := createShapeRefusalReason(statement.Cause, table); ok {
-			return engine.ExecutionModeBlocked, reason
+			return blocked(reason)
 		}
+		verdict := blocked(fmt.Sprintf("statement for table %q is refused: it cannot be executed safely as written", table))
+		// An absent cause is a refusal from outside the create path and the
+		// generic sentence is the right one; only a cause the mapping has no
+		// sentence for is vocabulary that moved.
 		if statement.Cause != "" {
-			slog.Warn("planner refusal carries a create shape cause SchemaBot does not recognize; rendering the generic refusal", "table", table, "cause", statement.Cause)
+			verdict.unrecognized = &unrecognizedPlannerVocabulary{kind: "create_shape_cause", value: string(statement.Cause)}
 		}
-		return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q is refused: it cannot be executed safely as written", table)
+		return verdict
+	case router.DispositionExecute:
+		// Execute on anything but the native route with native steps is a
+		// route or backend this build does not run, or a plan with nothing
+		// to run; the disposition itself is known, so the shape is what the
+		// triager needs to see.
+		verdict := blocked(fmt.Sprintf("statement for table %q has an unrecognized planner verdict", table))
+		verdict.unrecognized = &unrecognizedPlannerVocabulary{
+			kind:  "execute_shape",
+			value: fmt.Sprintf("route=%s backend=%s steps=%d", statement.Route, statement.Backend, len(statement.ExecSQL)),
+		}
+		return verdict
 	default:
-		return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q has an unrecognized planner verdict", table)
+		verdict := blocked(fmt.Sprintf("statement for table %q has an unrecognized planner verdict", table))
+		verdict.unrecognized = &unrecognizedPlannerVocabulary{kind: "disposition", value: string(statement.Disposition)}
+		return verdict
 	}
 }
 
+// createShapeRefusalReason renders the create path's typed refusal cause in
+// SchemaBot's words, naming the clause the author wrote and what to do about
+// it. The mapping covers the planner's whole closed set of causes, so the
+// completeness test over that set fails the day the planner grows a new one.
+// Two entries are reachable only through a front door other than this
+// engine's: pgstatement.ParseDesired refuses CONCURRENTLY and every statement
+// kind other than CREATE TABLE and CREATE INDEX before a plan exists, so
+// through planSchemas those shapes fail parsing rather than reaching a verdict.
 func createShapeRefusalReason(cause executor.CreateShapeCause, table string) (string, bool) {
 	var reason string
 	switch cause {
