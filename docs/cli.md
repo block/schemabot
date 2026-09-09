@@ -380,9 +380,10 @@ swap. During cutover, the watcher asks you to wait and disables Esc/stop.
 ### Understand throttling
 
 When copying is throttled, the live view explains why. This MySQL example
-pauses for replication lag, then continues as conditions improve.
+pauses when commits are slow, then continues as conditions improve. Recognized
+signals include a short explanation and a link to the [throttle reference](throttle.md).
 
-![MySQL progress shows a replication-lag throttle reason and resumes copying](../assets/cli-throttle.gif)
+![MySQL progress shows a commit-latency throttle signal, its docs link, and completion](../assets/cli-throttle.gif)
 
 ### Stop and resume a change
 

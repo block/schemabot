@@ -672,6 +672,7 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 		Throttled: true,
 	})
 	assert.Contains(t, noReason, "45.00% (throttled)")
+	assert.NotContains(t, noReason, ui.ThrottleDocURL)
 	assert.NotContains(t, noReason, "ℹ️ Throttled", "no tooltip without a reason")
 
 	unknownSignal := FormatTableProgress(TableProgress{
@@ -691,6 +692,10 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 	assert.Contains(t, checksumming, "🔍 Checksumming to verify data (21.92%) (throttled)")
 	assert.Contains(t, checksumming, "ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget")
 
+	assert.Contains(t, copying, "Docs: "+ui.ThrottleDocURL)
+	assert.Contains(t, checksumming, "Docs: "+ui.ThrottleDocURL)
+	assert.NotContains(t, unknownSignal, ui.ThrottleDocURL)
+
 	notThrottled := FormatTableProgress(TableProgress{
 		TableName: "orders", ChangeType: "alter", Status: state.Apply.Running,
 		RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
@@ -703,6 +708,8 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 		RowsCopied: 100000, RowsTotal: 100000, PercentComplete: 100,
 		Throttled: true, ThrottleReason: "replica-lag 12s > 10s",
 	})
+	assert.NotContains(t, completed, ui.ThrottleDocURL)
+	assert.NotContains(t, notThrottled, ui.ThrottleDocURL)
 	assert.NotContains(t, completed, "Throttled", "a terminal table never renders a stale throttle flag")
 }
 
