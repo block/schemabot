@@ -6,6 +6,7 @@ package sqlstore
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -23,7 +24,7 @@ import (
 // applyOperationColumns lists all columns for SELECT queries.
 const applyOperationColumns = `id, apply_id, deployment, operation_key, operation_kind, target, external_id, external_operation_id, state, error_message,
 	cutover_policy, on_failure, attempt, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
-	engine_resume_context, engine_resume_metadata, created_at, updated_at`
+	engine_resume_context, engine_resume_metadata, progress_metadata, created_at, updated_at`
 
 // applyOperationStore implements storage.ApplyOperationStore using MySQL.
 type applyOperationStore struct {
@@ -711,6 +712,30 @@ func (s *applyOperationStore) GetEngineResumeState(ctx context.Context, operatio
 		MigrationContext: contextVal.String,
 		Metadata:         metadata.String,
 	}, nil
+}
+
+// SaveProgressMetadata stores the engine's latest progress display metadata as
+// a JSON object on the operation that owns the execution. The operation write
+// guard preserves OW-2 by rejecting writes from a displaced driver.
+func (s *applyOperationStore) SaveProgressMetadata(ctx context.Context, operationID int64, metadata map[string]string) error {
+	if metadata == nil {
+		metadata = make(map[string]string)
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("encode progress metadata for apply_operation %d: %w", operationID, err)
+	}
+	guard, err := operationWriteGuardFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	args := append([]any{encoded, operationID}, guard.args()...)
+	query := guard.updateStatement(s.dialect, []JoinedUpdateAssignment{{Column: "progress_metadata", Expr: "?"}})
+	result, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("save progress metadata for apply_operation %d: %w", operationID, err)
+	}
+	return s.checkUpdatedOrExists(ctx, result, operationID, guard, false)
 }
 
 // releasedFailureExemptionSQL stops a terminal-failed earlier sibling from
@@ -2177,13 +2202,13 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 	var errMsg sql.NullString
 	var externalID sql.NullString
 	var externalOperationID sql.NullString
-	var engineResumeContext, engineResumeMetadata sql.NullString
+	var engineResumeContext, engineResumeMetadata, progressMetadata sql.NullString
 	var startedAt, completedAt, leaseAcquiredAt sql.NullTime
 
 	if err := s.Scan(
 		&ad.ID, &ad.ApplyID, &ad.Deployment, &ad.OperationKey, &ad.OperationKind, &ad.Target, &externalID, &externalOperationID, &ad.State, &errMsg,
 		&ad.CutoverPolicy, &ad.OnFailure, &ad.Attempt, &startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
-		&engineResumeContext, &engineResumeMetadata, &ad.CreatedAt, &ad.UpdatedAt,
+		&engineResumeContext, &engineResumeMetadata, &progressMetadata, &ad.CreatedAt, &ad.UpdatedAt,
 	); err != nil {
 		return nil, err
 	}
@@ -2214,6 +2239,9 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 	}
 	if engineResumeMetadata.Valid {
 		ad.EngineResumeMetadata = engineResumeMetadata.String
+	}
+	if progressMetadata.Valid {
+		ad.ProgressMetadata = progressMetadata.String
 	}
 	return &ad, nil
 }

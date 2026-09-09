@@ -358,3 +358,35 @@ func TestGroupsEngineExecution(t *testing.T) {
 		})
 	}
 }
+
+// TestApplyOperationParseProgressMetadata pins the read side of persisted
+// progress metadata: rows that never persisted any, or persisted a JSON null,
+// decode to an empty map a caller can overlay into, while a row that cannot be
+// decoded is reported rather than silently emptied.
+func TestApplyOperationParseProgressMetadata(t *testing.T) {
+	tests := []struct {
+		name   string
+		stored string
+		want   map[string]string
+	}{
+		{name: "never persisted", stored: "", want: map[string]string{}},
+		{name: "json null", stored: "null", want: map[string]string{}},
+		{name: "empty object", stored: "{}", want: map[string]string{}},
+		{name: "position fields", stored: `{"phase":"copying","step":"2","steps_total":"3"}`, want: map[string]string{"phase": "copying", "step": "2", "steps_total": "3"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			op := &ApplyOperation{ProgressMetadata: tc.stored}
+			got, err := op.ParseProgressMetadata()
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+
+	t.Run("malformed json", func(t *testing.T) {
+		op := &ApplyOperation{ProgressMetadata: `{"phase":`}
+		got, err := op.ParseProgressMetadata()
+		require.Error(t, err)
+		assert.Nil(t, got)
+	})
+}

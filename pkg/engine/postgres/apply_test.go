@@ -530,6 +530,33 @@ func TestProgressReportsExecutorStepPosition(t *testing.T) {
 	assert.Equal(t, change.sql, during.Tables[0].DDL, "the table's DDL stays the planned change, not the step in flight")
 }
 
+// TestProgressMetadataIsStableWhilePositionIsUnchanged pins the contract the
+// driver's persistence relies on: two polls of a running apply whose executor
+// position has not moved return identical metadata, so the driver's
+// change detection sees no difference and writes nothing. A field derived
+// from the wall clock would differ on every poll and defeat that check.
+func TestProgressMetadataIsStableWhilePositionIsUnchanged(t *testing.T) {
+	eng := New()
+	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE public.widgets (id bigint PRIMARY KEY)", steps: 3}
+	tracker := newTestTracker(t)
+	tracker.Start(3, progress.OperationAdmitting)
+	tracker.StartStep(2, progress.OperationBrief, "CREATE INDEX widgets_name_idx ON public.widgets (name)")
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now().Add(-time.Minute), change, ""), tracker, slog.Default())
+	req := &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: "task-a"}}
+
+	first, err := eng.Progress(t.Context(), req)
+	require.NoError(t, err)
+	time.Sleep(2 * time.Millisecond)
+	second, err := eng.Progress(t.Context(), req)
+	require.NoError(t, err)
+
+	assert.Equal(t, map[string]string{
+		"phase": "preflight", "step": "2", "steps_total": "3",
+		"statement": "CREATE INDEX widgets_name_idx ON public.widgets (name)",
+	}, first.Metadata)
+	assert.Equal(t, first.Metadata, second.Metadata)
+}
+
 // TestSanitizeStatementText pins the statement metadata contract: one line,
 // no control or format runes, bounded length, and otherwise the SQL exactly
 // as the executor runs it — a reason may trade its pipes for slashes because
