@@ -1045,7 +1045,7 @@ func recoveryContextDetail(err error, detail string) string {
 		recoveryErr.verdict.Schema, recoveryErr.verdict.Index, detail))
 }
 
-// Progress reports phase, elapsed time, and statement position for the apply
+// Progress reports phase and statement position for the apply
 // the caller identifies via ResumeState.MigrationContext. Every accepted apply
 // is tracked under its own identity, so a caller always reads its own schema
 // change's state and never a sibling's — one engine is shared for the lifetime
@@ -1088,9 +1088,6 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		// A terminal result already carries the executor's final position,
 		// folded in when it was published.
 		return &result, nil
-	}
-	if len(result.Tables) > 0 && result.Tables[0].StartedAt != nil {
-		result.Metadata["elapsed"] = time.Since(*result.Tables[0].StartedAt).Round(time.Millisecond).String()
 	}
 	if err := executorProgressMetadata(ctx, tracker, result.Metadata); err != nil {
 		// The poll still answers with the last-known position: a progress
@@ -1170,7 +1167,7 @@ func progressResult(state engine.State, phase string, started time.Time, change 
 		State: state, Progress: progress, Message: "PostgreSQL schema change " + phase,
 		ErrorMessage: detail,
 		Metadata: map[string]string{
-			"phase": phase, "elapsed": time.Since(started).Round(time.Millisecond).String(),
+			"phase": phase,
 			// The position the record carries before the executor has
 			// reported one: the first step of the planned sequence, with the
 			// total taken from the plan. executorProgressMetadata replaces
