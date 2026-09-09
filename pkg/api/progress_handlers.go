@@ -607,16 +607,17 @@ func (s *Service) handleDatabaseHistory(w http.ResponseWriter, r *http.Request) 
 // handleDatabaseEnvironments returns the list of environments for a database.
 // This is used by the CLI to discover environments when -e flag is not specified.
 func (s *Service) handleDatabaseEnvironments(w http.ResponseWriter, r *http.Request) {
+	config := s.config.withDatabaseSnapshot()
 	database := storage.CanonicalKey(r.PathValue("database"))
 	if database == "" {
 		s.writeError(w, http.StatusBadRequest, "database is required")
 		return
 	}
 
-	environments, err := s.config.DatabaseEnvironments(database)
+	environments, err := config.DatabaseEnvironments(database)
 	if err != nil {
-		available := make([]string, 0, len(s.config.Databases))
-		for name := range s.config.Databases {
+		available := make([]string, 0, len(config.DatabaseConfigs()))
+		for name := range config.DatabaseConfigs() {
 			available = append(available, name)
 		}
 		sort.Strings(available)
@@ -635,8 +636,8 @@ func (s *Service) handleDatabaseEnvironments(w http.ResponseWriter, r *http.Requ
 	}
 
 	if len(environments) == 0 {
-		available := make([]string, 0, len(s.config.Databases))
-		for name := range s.config.Databases {
+		available := make([]string, 0, len(config.DatabaseConfigs()))
+		for name := range config.DatabaseConfigs() {
 			available = append(available, name)
 		}
 		sort.Strings(available)
@@ -663,13 +664,14 @@ func (s *Service) handleDatabaseEnvironments(w http.ResponseWriter, r *http.Requ
 // server. It intentionally exposes topology metadata only; connection
 // strings, opaque execution targets, and endpoint addresses stay server-side.
 func (s *Service) handleDatabaseList(w http.ResponseWriter, r *http.Request) {
-	databaseType, err := parseDatabaseListTypeFilter(r, s.config)
+	config := s.config.withDatabaseSnapshot()
+	databaseType, err := parseDatabaseListTypeFilter(r, config)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	name := strings.TrimSpace(r.URL.Query().Get("name"))
-	resp, err := databaseListResponse(s.config, databaseType, name)
+	resp, err := databaseListResponse(config, databaseType, name)
 	if err != nil {
 		s.logger.Error("database list failed", "error", err)
 		s.writeError(w, http.StatusInternalServerError, "failed to list databases: "+err.Error())
@@ -703,9 +705,10 @@ func configuredDatabaseTypes(config *ServerConfig) []string {
 	if config == nil {
 		return nil
 	}
-	seen := make(map[string]bool, len(config.Databases))
-	types := make([]string, 0, len(config.Databases))
-	for _, dbConfig := range config.Databases {
+	dbs := config.DatabaseConfigs()
+	seen := make(map[string]bool, len(dbs))
+	types := make([]string, 0, len(dbs))
+	for _, dbConfig := range dbs {
 		if !seen[dbConfig.Type] {
 			seen[dbConfig.Type] = true
 			types = append(types, dbConfig.Type)
@@ -723,9 +726,11 @@ func databaseListResponse(config *ServerConfig, databaseType, name string) (*api
 	if config == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
+	config = config.withDatabaseSnapshot()
+	dbs := config.DatabaseConfigs()
 	nameFilter := storage.CanonicalKey(name)
-	databaseNames := make([]string, 0, len(config.Databases))
-	for database, dbConfig := range config.Databases {
+	databaseNames := make([]string, 0, len(dbs))
+	for database, dbConfig := range dbs {
 		if databaseType != "" && dbConfig.Type != databaseType {
 			continue
 		}
@@ -738,7 +743,7 @@ func databaseListResponse(config *ServerConfig, databaseType, name string) (*api
 
 	resp := &apitypes.DatabaseListResponse{Databases: make([]*apitypes.DatabaseResponse, 0, len(databaseNames))}
 	for _, database := range databaseNames {
-		dbConfig := config.Databases[database]
+		dbConfig := dbs[database]
 		environments, err := config.DatabaseEnvironments(database)
 		if err != nil {
 			return nil, fmt.Errorf("list database environments for database %q: %w", database, err)
