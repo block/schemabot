@@ -680,6 +680,7 @@ func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData)
 	sb.WriteString("\n")
 
 	dialect := dialectForEngine(data.Engine, data.ApplyID)
+	budget := newDDLBlockBudget(countTablesWithDDL(data.Tables))
 
 	for _, group := range groupTablesByNamespace(data.Tables) {
 		// Label the group by namespace when one is set. The bold metadata-style
@@ -694,10 +695,10 @@ func writeTableProgressSection(sb *strings.Builder, data ApplyStatusCommentData)
 			// so the row-copy percent is indeterminate. Render state-only until the
 			// apply transitions to running and real progress is known.
 			if data.State == state.Apply.Resuming && !state.IsTerminalTaskState(state.NormalizeTaskStatus(table.Status)) {
-				renderResumingTable(sb, dialect, table)
+				renderResumingTable(sb, dialect, table, budget)
 				continue
 			}
-			renderTableProgress(sb, dialect, table, data.State, data.Attempt, data.ErrorMessage)
+			renderTableProgress(sb, dialect, table, data.State, data.Attempt, data.ErrorMessage, budget)
 		}
 	}
 }
@@ -759,9 +760,9 @@ func namespaceLabel(engine string) string {
 // renderResumingTable renders a table while the apply is resuming, before the
 // data plane reports whether the change continues from its checkpoint or restarts
 // from scratch. The percent is intentionally omitted during this window.
-func renderResumingTable(sb *strings.Builder, dialect schema.Dialect, table TableProgressData) {
+func renderResumingTable(sb *strings.Builder, dialect schema.Dialect, table TableProgressData, budget *ddlBlockBudget) {
 	fmt.Fprintf(sb, "**%s**: \U0001f504 Resuming…\n", inlineCode(table.TableName))
-	writeDDLLine(sb, dialect, table.DDL)
+	writeDDLLine(sb, dialect, table.DDL, budget)
 	sb.WriteString("\n")
 }
 
@@ -840,19 +841,19 @@ func sortRowsByTable(rows []TableProgressData, statePriority func(tableStatus st
 // instead of ANSI. applyError is the apply-level error message the comment
 // renders as its own block, so a failed table's identical error is not
 // repeated below the row.
-func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table TableProgressData, applyState string, applyAttempt int, applyError string) {
+func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table TableProgressData, applyState string, applyAttempt int, applyError string, budget *ddlBlockBudget) {
 	// Normalize to canonical Task state for consistent matching.
 	status := state.NormalizeTaskStatus(table.Status)
 
 	switch status {
 	case state.Task.Pending:
 		fmt.Fprintf(sb, "**%s**: \u23f3 Queued\n", inlineCode(table.TableName))
-		writeDDLLine(sb, dialect, table.DDL)
+		writeDDLLine(sb, dialect, table.DDL, budget)
 
 	case state.Task.Completed:
 		bar := ui.ProgressBarComplete()
 		fmt.Fprintf(sb, "**%s**: %s \u2705 Complete\n", inlineCode(table.TableName), bar)
-		writeDDLLine(sb, dialect, table.DDL)
+		writeDDLLine(sb, dialect, table.DDL, budget)
 
 	case state.Task.CatchingUp:
 		// Row copy is complete; the engine is draining the changes that
@@ -860,7 +861,7 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		// catch-up can run for hours, so name the phase instead of rendering a
 		// serene completed copy.
 		fmt.Fprintf(sb, "**%s**: %s ⏩ Catching up on accumulated changes...\n", inlineCode(table.TableName), ui.ProgressBarRowCopy(100))
-		writeDDLLine(sb, dialect, table.DDL)
+		writeDDLLine(sb, dialect, table.DDL, budget)
 		if table.RowsCopied > 0 {
 			fmt.Fprintf(sb, "- Rows copied: %s\n", ui.FormatNumber(table.RowsCopied))
 		}
@@ -873,12 +874,12 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 			pct := ui.ClampPercent(int(table.ChecksumRowsChecked * 100 / table.ChecksumRowsTotal))
 			fmt.Fprintf(sb, "**%s**: %s \U0001f50d Checksumming to verify data (%s)%s\n", inlineCode(table.TableName), ui.ProgressBarRowCopy(pct),
 				ui.FormatRowCopyPercent(pct, table.ChecksumRowsChecked, table.ChecksumRowsTotal), throttledSuffix(table))
-			writeDDLLine(sb, dialect, table.DDL)
+			writeDDLLine(sb, dialect, table.DDL, budget)
 			fmt.Fprintf(sb, "- Rows verified: %s / %s\n",
 				ui.FormatNumber(ui.ClampRows(table.ChecksumRowsChecked, table.ChecksumRowsTotal)), ui.FormatNumber(table.ChecksumRowsTotal))
 		} else {
 			fmt.Fprintf(sb, "**%s**: %s \U0001f50d Checksumming to verify data...%s\n", inlineCode(table.TableName), ui.ProgressBarRowCopy(100), throttledSuffix(table))
-			writeDDLLine(sb, dialect, table.DDL)
+			writeDDLLine(sb, dialect, table.DDL, budget)
 		}
 		writeThrottleTooltip(sb, table)
 
@@ -887,14 +888,14 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		// accumulated on the source while it ran. Named separately from the
 		// pre-checksum catch-up so the row doesn't rewind to an earlier phase.
 		fmt.Fprintf(sb, "**%s**: %s ⏩ Data verified, applying final changes...\n", inlineCode(table.TableName), ui.ProgressBarRowCopy(100))
-		writeDDLLine(sb, dialect, table.DDL)
+		writeDDLLine(sb, dialect, table.DDL, budget)
 		if table.RowsCopied > 0 {
 			fmt.Fprintf(sb, "- Rows copied: %s\n", ui.FormatNumber(table.RowsCopied))
 		}
 
 	case state.Task.WaitingForCutover:
 		fmt.Fprintf(sb, "**%s**: %s Waiting for cutover\n", inlineCode(table.TableName), ui.ProgressBarWaitingCutover())
-		writeDDLLine(sb, dialect, table.DDL)
+		writeDDLLine(sb, dialect, table.DDL, budget)
 
 	case state.Task.Recovering:
 		if recoveringIsCopyingRows(table) {
@@ -902,7 +903,7 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 			bar := ui.ProgressBarRowCopy(pct)
 			fmt.Fprintf(sb, "**%s**: %s Row copy in progress (%s)\n", inlineCode(table.TableName), bar,
 				ui.FormatRowCopyPercent(table.PercentComplete, table.RowsCopied, table.RowsTotal))
-			writeDDLLine(sb, dialect, table.DDL)
+			writeDDLLine(sb, dialect, table.DDL, budget)
 			writeRowsAndETA(sb, table)
 			break
 		}
@@ -911,12 +912,12 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		// operator holds the next move.
 		bar := ui.ProgressBarActivity()
 		fmt.Fprintf(sb, "**%s**: %s Recovering state...\n", inlineCode(table.TableName), bar)
-		writeDDLLine(sb, dialect, table.DDL)
+		writeDDLLine(sb, dialect, table.DDL, budget)
 
 	case state.Task.CuttingOver:
 		bar := ui.ProgressBarActivity() // blue — automatic work, no operator action
 		fmt.Fprintf(sb, "**%s**: %s \U0001f504 Cutting over...\n", inlineCode(table.TableName), bar)
-		writeDDLLine(sb, dialect, table.DDL)
+		writeDDLLine(sb, dialect, table.DDL, budget)
 
 	case state.Task.Failed:
 		// A progress bar asserts that row copy happened. When the engine failed
@@ -932,7 +933,7 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		default:
 			fmt.Fprintf(sb, "**%s**: "+glyph.Failed+" Failed (before row copy started)\n", inlineCode(table.TableName))
 		}
-		writeDDLLine(sb, dialect, table.DDL)
+		writeDDLLine(sb, dialect, table.DDL, budget)
 		if taskErrorAddsDetail(table.ErrorMessage, applyError) {
 			writeTableErrorLine(sb, glyph.Failed, table.ErrorMessage)
 		}
@@ -940,16 +941,16 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 	case state.Task.FailedRetryable:
 		bar := ui.ProgressBarStopped(ui.RowCopyDisplayPercent(table.PercentComplete, table.RowsCopied))
 		if state.IsState(applyState, state.Apply.FailedRetryable) {
-			fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Interrupted — retrying automatically (attempt %d/%d)\n",
-				table.TableName, bar, applyAttempt+1, storage.MaxRecoveryAttempts)
+			fmt.Fprintf(sb, "**%s**: %s \U0001f504 Interrupted — retrying automatically (attempt %d/%d)\n",
+				inlineCode(table.TableName), bar, applyAttempt+1, storage.MaxRecoveryAttempts)
 		} else {
 			// The apply is paused by a data plane that retries on its own; its
 			// attempt count does not cross the wire, so announce the retry
 			// without inventing a number.
-			fmt.Fprintf(sb, "**`%s`**: %s \U0001f504 Interrupted — retrying automatically\n",
-				table.TableName, bar)
+			fmt.Fprintf(sb, "**%s**: %s \U0001f504 Interrupted — retrying automatically\n",
+				inlineCode(table.TableName), bar)
 		}
-		writeDDLLine(sb, dialect, table.DDL)
+		writeDDLLine(sb, dialect, table.DDL, budget)
 		if table.ErrorMessage != "" {
 			// The row above says SchemaBot is retrying on its own, so the
 			// error is context for the operator, not a failure to triage.
@@ -958,26 +959,26 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 
 	case state.Task.Cancelled:
 		fmt.Fprintf(sb, "**%s**: 🚫 Cancelled (not started)\n", inlineCode(table.TableName))
-		writeDDLLine(sb, dialect, table.DDL)
+		writeDDLLine(sb, dialect, table.DDL, budget)
 
 	case state.Task.RevertWindow:
 		// Deliberately no checkmark: the change is applied but not final while
 		// the revert window is open, and a checkmark reads as "done, walk away".
 		bar := ui.ProgressBarWaitingCutover()
 		fmt.Fprintf(sb, "**%s**: %s Complete (revert window open)\n", inlineCode(table.TableName), bar)
-		writeDDLLine(sb, dialect, table.DDL)
+		writeDDLLine(sb, dialect, table.DDL, budget)
 
 	case state.Task.Reverting:
 		bar := ui.ProgressBarWaitingCutover()
 		fmt.Fprintf(sb, "**%s**: %s \u21a9\ufe0f Reverting\n", inlineCode(table.TableName), bar)
-		writeDDLLine(sb, dialect, table.DDL)
+		writeDDLLine(sb, dialect, table.DDL, budget)
 
 	case state.Task.Stopped:
-		renderStoppedTable(sb, dialect, table)
+		renderStoppedTable(sb, dialect, table, budget)
 
 	default:
 		// Running / in-progress
-		renderRunningTable(sb, dialect, table)
+		renderRunningTable(sb, dialect, table, budget)
 	}
 
 	renderShardSummary(sb, table)
@@ -1136,12 +1137,12 @@ func isCopyingShardStatus(status string) bool {
 }
 
 // renderRunningTable renders a table that is actively copying rows.
-func renderRunningTable(sb *strings.Builder, dialect schema.Dialect, table TableProgressData) {
+func renderRunningTable(sb *strings.Builder, dialect schema.Dialect, table TableProgressData, budget *ddlBlockBudget) {
 	defer writeThrottleTooltip(sb, table)
 	if table.RowsTotal > 0 {
 		if ui.EstimateExceeded(table.RowsCopied, table.RowsTotal) {
 			fmt.Fprintf(sb, "**%s**: %s Finalizing copy%s\n", inlineCode(table.TableName), ui.ProgressBarActivity(), throttledSuffix(table))
-			writeDDLLine(sb, dialect, table.DDL)
+			writeDDLLine(sb, dialect, table.DDL, budget)
 			fmt.Fprintf(sb, "- Rows copied: %s so far\n", ui.FormatNumber(table.RowsCopied))
 			fmt.Fprintf(sb, "- "+glyph.Info+" _%s_\n", ui.EstimateExceededTooltip)
 			return
@@ -1153,19 +1154,19 @@ func renderRunningTable(sb *strings.Builder, dialect schema.Dialect, table Table
 			// (VReplication / Spirit ramp-up). A 0% bar reads as stuck, so show
 			// a starting indicator and the row total instead.
 			fmt.Fprintf(sb, "**%s**: ⏳ Starting copy...%s\n", inlineCode(table.TableName), throttledSuffix(table))
-			writeDDLLine(sb, dialect, table.DDL)
+			writeDDLLine(sb, dialect, table.DDL, budget)
 			writeRowsAndETA(sb, table)
 			return
 		}
 		bar := ui.ProgressBarRowCopy(pct)
 		fmt.Fprintf(sb, "**%s**: %s %s%s\n", inlineCode(table.TableName), bar,
 			ui.FormatRowCopyPercent(table.PercentComplete, table.RowsCopied, table.RowsTotal), throttledSuffix(table))
-		writeDDLLine(sb, dialect, table.DDL)
+		writeDDLLine(sb, dialect, table.DDL, budget)
 		writeRowsAndETA(sb, table)
 	} else {
 		// No row data yet (initializing or instant DDL)
 		fmt.Fprintf(sb, "**%s**: Running...%s\n", inlineCode(table.TableName), throttledSuffix(table))
-		writeDDLLine(sb, dialect, table.DDL)
+		writeDDLLine(sb, dialect, table.DDL, budget)
 	}
 }
 
@@ -1226,7 +1227,7 @@ func recoveringCopyPercent(tables []TableProgressData) (string, bool) {
 }
 
 // renderStoppedTable renders a table in the stopped state.
-func renderStoppedTable(sb *strings.Builder, dialect schema.Dialect, table TableProgressData) {
+func renderStoppedTable(sb *strings.Builder, dialect schema.Dialect, table TableProgressData, budget *ddlBlockBudget) {
 	switch {
 	case table.PercentComplete >= 100:
 		bar := ui.ProgressBarStopped(100)
@@ -1240,7 +1241,7 @@ func renderStoppedTable(sb *strings.Builder, dialect schema.Dialect, table Table
 		fmt.Fprintf(sb, "**%s**: \u23f9\ufe0f Stopped (not started)\n", inlineCode(table.TableName))
 	}
 
-	writeDDLLine(sb, dialect, table.DDL)
+	writeDDLLine(sb, dialect, table.DDL, budget)
 
 	// Show rows (no ETA) for stopped tables with progress
 	if table.RowsTotal > 0 && (table.PercentComplete > 0 || table.RowsCopied > 0) {
@@ -1275,12 +1276,25 @@ func dialectForEngine(engine, applyID string) schema.Dialect {
 	return schema.DialectMySQL
 }
 
-// writeDDLLine writes the DDL statement as a sql code block below the table name.
-func writeDDLLine(sb *strings.Builder, dialect schema.Dialect, rawDDL string) {
+// writeDDLLine writes the DDL statement as a sql code block below the table
+// name, drawing on the comment's shared DDL budget.
+func writeDDLLine(sb *strings.Builder, dialect schema.Dialect, rawDDL string, budget *ddlBlockBudget) {
 	if rawDDL != "" {
 		sb.WriteString("\n")
-		writeSQLFencedBlock(sb, ddl.FormatDDLForDialect(dialect, rawDDL))
+		writeSQLFencedBlock(sb, ddl.FormatDDLForDialect(dialect, rawDDL), budget)
 	}
+}
+
+// countTablesWithDDL counts the tables whose rendering carries a DDL block, so
+// the comment's DDL budget is shared across exactly those blocks.
+func countTablesWithDDL(tables []TableProgressData) int {
+	count := 0
+	for _, table := range tables {
+		if table.DDL != "" {
+			count++
+		}
+	}
+	return count
 }
 
 // writeRowsAndETA writes the rows copied / total line with optional ETA.
@@ -1670,6 +1684,7 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 	}
 
 	dialect := dialectForEngine(data.Engine, data.ApplyID)
+	budget := newDDLBlockBudget(countTablesWithDDL(data.Tables))
 
 	// What went wrong leads, then what landed, then what never ran — and a
 	// table's rows stay together so the reader meets each table once.
@@ -1739,7 +1754,7 @@ func writeSummaryTableListWithOptions(sb *strings.Builder, data ApplyStatusComme
 		}
 
 		for _, t := range g.tables {
-			writeSummaryTableEntry(sb, dialect, t, labelCompleted)
+			writeSummaryTableEntry(sb, dialect, t, labelCompleted, budget)
 		}
 
 		if groupCollapsed {
@@ -1776,7 +1791,7 @@ func groupStateEmoji(tables []TableProgressData) string {
 // unsuccessful apply, each row must answer "did this table make it?", so
 // completed tables are labeled explicitly. On a successful apply the header
 // already says every table completed, so the label would be noise.
-func writeSummaryTableEntry(sb *strings.Builder, dialect schema.Dialect, t TableProgressData, labelCompleted bool) {
+func writeSummaryTableEntry(sb *strings.Builder, dialect schema.Dialect, t TableProgressData, labelCompleted bool, budget *ddlBlockBudget) {
 	normalized := state.NormalizeTaskStatus(t.Status)
 
 	switch normalized {
@@ -1810,7 +1825,7 @@ func writeSummaryTableEntry(sb *strings.Builder, dialect schema.Dialect, t Table
 	}
 
 	if t.DDL != "" {
-		writeSQLFencedBlock(sb, ddl.FormatDDLForDialect(dialect, t.DDL))
+		writeSQLFencedBlock(sb, ddl.FormatDDLForDialect(dialect, t.DDL), budget)
 		sb.WriteString("\n")
 	} else {
 		sb.WriteString("\n")

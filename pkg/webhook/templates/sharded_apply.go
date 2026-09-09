@@ -696,7 +696,7 @@ func writeShardStatusTable(sb *strings.Builder, shards []ShardStatus) {
 	}
 	sb.WriteString("\n| Shard | Status |\n| --- | --- |\n")
 	for _, s := range shards {
-		fmt.Fprintf(sb, "| %s | %s |\n", markdownInlineCode(s.Shard), shardStatusCell(s))
+		fmt.Fprintf(sb, "| %s | %s |\n", inlineCodeCell(s.Shard), shardStatusCell(s))
 	}
 }
 

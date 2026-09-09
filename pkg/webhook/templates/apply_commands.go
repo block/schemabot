@@ -178,7 +178,7 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 	fmt.Fprintf(&sb, "**"+glyph.Refused+" Apply rejected**: %d unsafe %s detected\n", unsafeCount, pluralize("change", unsafeCount))
 	item := 0
 	for _, c := range data.UnsafeChanges {
-		writeUnsafeChangeItem(&sb, &item, "`"+c.Table+"`", c.Reason, c.ChangeType)
+		writeUnsafeChangeItem(&sb, &item, inlineCode(c.Table), c.Reason, c.ChangeType)
 	}
 	sb.WriteString("\n")
 	writeUnsafeDropGuidance(&sb, data.UnsafeChanges, data.IsMySQL)
@@ -228,7 +228,7 @@ func RenderBlockedChangesApplyRejected(data PlanCommentData) string {
 	n := len(data.BlockedChanges)
 	fmt.Fprintf(&sb, "**"+glyph.Refused+" Apply rejected**: %d planned %s the engine refuses to execute\n", n, pluralize("change", n))
 	for _, c := range data.BlockedChanges {
-		table := "`" + c.Table + "`"
+		table := inlineCode(c.Table)
 		if len(c.Shards) > 0 {
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
 		}

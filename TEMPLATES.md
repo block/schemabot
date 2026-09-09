@@ -291,7 +291,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 ⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target
-- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `` ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`) ``
 
 Applying restarts the copy from zero rows. To keep the work already done, apply the schema change that started it.
 
@@ -324,7 +324,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 ℹ️ **This apply destroys work in progress**: 1 unfinished copy on the target
-- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `` ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`) ``
 
 📋 **Plan**: **1** table to alter
 
@@ -352,7 +352,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 ⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target
-- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `` ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`) ``
 
 Applying restarts the copy from zero rows. To keep the work already done, apply the schema change that started it.
 
@@ -392,7 +392,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 ⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target
-- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `` ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`) ``
 
 Applying restarts the copy from zero rows. To keep the work already done, apply the schema change that started it.
 

@@ -171,8 +171,7 @@ func TestRenderUnmanagedSchemaConfigsNotice(t *testing.T) {
 		body := RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{
 			{Database: "inven`tory", SchemaPath: "services/inventory\nschema"},
 		})
-		assert.Contains(t, body, "- `services/inventory schema` — declares database `inventory`")
-		assert.NotContains(t, body, "``")
+		assert.Contains(t, body, "- `services/inventory schema` — declares database `` inven`tory ``")
 		assert.NotContains(t, body, "inventory\nschema")
 	})
 }
@@ -194,9 +193,7 @@ func TestRenderInvalidEnv(t *testing.T) {
 
 	t.Run("normalizes names that would break markdown code spans", func(t *testing.T) {
 		body := RenderInvalidEnv("apply", []string{"pro`duction", "sta\nging"})
-		assert.Contains(t, body, "`production`")
-		assert.Contains(t, body, "`sta ging`")
-		assert.NotContains(t, body, "``")
+		assert.Contains(t, body, "**Available environments**: `` pro`duction ``, `sta ging`")
 	})
 }
 

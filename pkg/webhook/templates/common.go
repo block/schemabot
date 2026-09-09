@@ -194,18 +194,18 @@ func vschemaDiffBudget(diffCount int) int {
 	return maxCommentVSchemaDiffLen / diffCount
 }
 
-// writeVSchemaDiffFence renders a VSchema diff inside a diff fence,
-// truncating past budget bytes with a visible marker instead of letting the
-// diff grow the comment past GitHub's limit.
+// writeVSchemaDiffFence renders a VSchema diff inside a diff fence sized so
+// no backtick run in the diff can close it early, truncating past budget bytes
+// with a visible marker instead of letting the diff grow the comment past
+// GitHub's limit.
 func writeVSchemaDiffFence(sb *strings.Builder, diff string, budget int) {
 	truncated := false
 	if len(diff) > budget {
 		diff = truncateToBytes(diff, budget)
 		truncated = true
 	}
-	sb.WriteString("```diff\n")
-	sb.WriteString(diff)
-	sb.WriteString("\n```\n\n")
+	writeFencedBlock(sb, "diff", diff)
+	sb.WriteString("\n")
 	if truncated {
 		sb.WriteString("_Diff truncated to fit GitHub's comment size limit; this PR's file diff shows the full VSchema change._\n\n")
 	}

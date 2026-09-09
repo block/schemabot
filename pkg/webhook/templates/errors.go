@@ -44,6 +44,44 @@ func (d SchemaErrorData) DatabaseTypeOptions() string {
 	return "`mysql`, `postgres`, or `vitess`"
 }
 
+// DatabaseNameCode renders the database the command or the PR's config named
+// as a code span the name cannot break out of.
+func (d SchemaErrorData) DatabaseNameCode() string {
+	return inlineCode(d.DatabaseName)
+}
+
+// DatabaseDeclarationCode renders the schemabot.yaml line that would declare
+// the database the command named, as a code span the name cannot break out of.
+func (d SchemaErrorData) DatabaseDeclarationCode() string {
+	return inlineCode("database: " + d.DatabaseName)
+}
+
+// SetupConfigBlock renders a starter schemabot.yaml for the database the
+// command named, inside a fence the name cannot close early; the name is kept
+// to one line so the starter stays one declaration per line.
+func (d SchemaErrorData) SetupConfigBlock() string {
+	var sb strings.Builder
+	writeFencedBlock(&sb, "yaml", "database: "+flattenIdentifier(d.DatabaseName)+"\ntype: mysql")
+	return sb.String()
+}
+
+// SchemaPathCode renders the schema directory the PR's config declared as a
+// code span the path cannot break out of.
+func (d SchemaErrorData) SchemaPathCode() string {
+	return inlineCode(d.SchemaPath)
+}
+
+// AllowedDirsKey renders the server config key that would authorize the
+// database's schema directory, as one code span the database name cannot
+// break out of.
+func (d SchemaErrorData) AllowedDirsKey() string {
+	return allowedDirsKey(d.DatabaseName)
+}
+
+func allowedDirsKey(database string) string {
+	return inlineCode("databases." + database + ".allowed_dirs")
+}
+
 // EnvironmentHeader renders the environment header segment: the single
 // environment the command targeted, or the deployment's environment scope
 // when the command spanned environments (multi-environment plans, including
@@ -51,15 +89,15 @@ func (d SchemaErrorData) DatabaseTypeOptions() string {
 // segment — never an empty code span or a vague placeholder.
 func (d SchemaErrorData) EnvironmentHeader() string {
 	if d.Environment != "" {
-		return "**Environment**: " + markdownInlineCode(d.Environment)
+		return "**Environment**: " + inlineCode(d.Environment)
 	}
 	switch len(d.Environments) {
 	case 0:
 		return ""
 	case 1:
-		return "**Environment**: " + markdownInlineCode(d.Environments[0])
+		return "**Environment**: " + inlineCode(d.Environments[0])
 	default:
-		return "**Environments**: " + strings.Join(markdownInlineCodeList(d.Environments), ", ")
+		return "**Environments**: " + strings.Join(inlineCodeList(d.Environments), ", ")
 	}
 }
 
@@ -89,11 +127,11 @@ func (d SchemaErrorData) Attribution() string {
 
 const databaseNotFoundTemplate = "## " + glyph.Attention + ` Database Not Found
 
-**Database**: ` + "`{{.DatabaseName}}`" + `{{with .EnvironmentHeader}} | {{.}}{{end}}
+**Database**: {{.DatabaseNameCode}}{{with .EnvironmentHeader}} | {{.}}{{end}}
 
 {{.Attribution}}
 
-No ` + "`schemabot.yaml`" + ` configuration with ` + "`database: {{.DatabaseName}}`" + ` was found in this repository.
+No ` + "`schemabot.yaml`" + ` configuration with {{.DatabaseDeclarationCode}} was found in this repository.
 
 Check that your ` + "`schemabot.yaml`" + ` file has the correct ` + "`database`" + ` field matching the ` + "`-d`" + ` flag value.`
 
@@ -140,7 +178,7 @@ schemabot {{.CommandName}} -e {{.ExampleEnvironment}} -d <database-name>
 
 const noConfigWithDatabaseTemplate = "## " + glyph.Info + ` No SchemaBot Configuration Found
 
-**Database**: ` + "`{{.DatabaseName}}`" + `{{with .EnvironmentHeader}} | {{.}}{{end}}
+**Database**: {{.DatabaseNameCode}}{{with .EnvironmentHeader}} | {{.}}{{end}}
 
 {{.Attribution}}
 
@@ -149,24 +187,20 @@ No ` + "`schemabot.yaml`" + ` configuration file exists in this repository.
 ### Setup Instructions
 Create a ` + "`schemabot.yaml`" + ` file in your schema directory:
 
-` + "```yaml" + `
-database: {{.DatabaseName}}
-type: mysql
-` + "```" + `
-
+{{.SetupConfigBlock}}
 ` + "`type`" + `: {{.DatabaseTypeOptions}}`
 
 const configOutsideAllowedDirsTemplate = "## " + glyph.Attention + ` SchemaBot Configuration Not Authorized
 
-**Database**: ` + "`{{.DatabaseName}}`" + `{{with .EnvironmentHeader}} | {{.}}{{end}}
+**Database**: {{.DatabaseNameCode}}{{with .EnvironmentHeader}} | {{.}}{{end}}
 
 {{.Attribution}}
 
 SchemaBot found a ` + "`schemabot.yaml`" + ` configuration, but this SchemaBot instance is not configured to manage its schema directory.
 
-**Schema directory**: ` + "`{{.SchemaPath}}`" + `
+**Schema directory**: {{.SchemaPathCode}}
 
-Ask a SchemaBot operator to add this directory to ` + "`databases.{{.DatabaseName}}.allowed_dirs`" + ` in the server config, or move the schema config and files under an allowed directory.`
+Ask a SchemaBot operator to add this directory to {{.AllowedDirsKey}} in the server config, or move the schema config and files under an allowed directory.`
 
 const unmanagedSchemaConfigsNoticeTemplate = "## " + glyph.Attention + ` Schema Changes Not Managed by SchemaBot
 
@@ -238,6 +272,19 @@ func RenderNoConfig(data SchemaErrorData) string {
 	return renderTemplate(tmplNoConfigWithDatabase, data)
 }
 
+// RenderConfigNotAuthorizedLine renders the same explanation as
+// RenderConfigNotAuthorized on one line, for surfaces that carry a command's
+// failure as an error string rather than a comment of its own. The schema
+// directory and database name come from the PR's own config, so both render
+// as code spans they cannot break out of.
+func RenderConfigNotAuthorizedLine(database, schemaPath string) string {
+	return strings.Join([]string{
+		"SchemaBot found a `schemabot.yaml` configuration, but this SchemaBot instance is not configured to manage its schema directory.",
+		"Schema directory: " + inlineCode(schemaPath) + ".",
+		"Ask a SchemaBot operator to add this directory to " + allowedDirsKey(database) + " in the server config, or move the schema config and files under an allowed directory.",
+	}, " ")
+}
+
 // RenderConfigNotAuthorized renders the error shown when schemabot.yaml exists
 // but its schema directory is outside the server-side allowed_dirs boundary.
 func RenderConfigNotAuthorized(data SchemaErrorData) string {
@@ -260,8 +307,8 @@ func RenderUnmanagedSchemaConfigsNotice(configs []UnmanagedSchemaConfigNoticeDat
 	normalized := make([]UnmanagedSchemaConfigNoticeData, len(configs))
 	for i, cfg := range configs {
 		normalized[i] = UnmanagedSchemaConfigNoticeData{
-			Database:   markdownInlineCode(cfg.Database),
-			SchemaPath: markdownInlineCode(cfg.SchemaPath),
+			Database:   inlineCode(cfg.Database),
+			SchemaPath: inlineCode(cfg.SchemaPath),
 		}
 	}
 	var sb strings.Builder
@@ -311,7 +358,7 @@ func RenderInvalidCommand() string {
 // handles. The configured environment names are normalized for markdown
 // display so an unexpected character cannot break the comment.
 func RenderInvalidEnv(action string, available []string) string {
-	quoted := markdownInlineCodeList(available)
+	quoted := inlineCodeList(available)
 	availableLine := ""
 	if len(quoted) > 0 {
 		availableLine = "\n**Available environments**: " + strings.Join(quoted, ", ") + "\n"
@@ -323,20 +370,12 @@ func RenderInvalidEnv(action string, available []string) string {
 **Usage**: `+"`schemabot %s -e <environment> [flags]`", availableLine, action))
 }
 
-// markdownInlineCode renders a value as a markdown inline code span,
-// normalizing characters that would break the span: backticks are stripped
-// and whitespace (including newlines) collapses to single spaces.
-func markdownInlineCode(s string) string {
-	s = strings.ReplaceAll(s, "`", "")
-	return "`" + strings.Join(strings.Fields(s), " ") + "`"
-}
-
-// markdownInlineCodeList renders each value as a normalized markdown inline
-// code span, ready to join into a comma-separated list.
-func markdownInlineCodeList(values []string) []string {
+// inlineCodeList renders each value as a code span, ready to join into a
+// comma-separated list.
+func inlineCodeList(values []string) []string {
 	quoted := make([]string, len(values))
 	for i, v := range values {
-		quoted[i] = markdownInlineCode(v)
+		quoted[i] = inlineCode(v)
 	}
 	return quoted
 }

@@ -450,8 +450,8 @@ func writeAttributedChanges(sb *strings.Builder, changes []AttributedChangeData)
 		// table, which is not necessarily the last one to change it: a later
 		// change from a pull request that has since closed leaves no open claim
 		// and is passed over.
-		fmt.Fprintf(sb, "- `%s`: changed by %s, which is still open\n",
-			d.Table, caller.PullRequestMarkdownLink(d.Repository, d.PullRequest))
+		fmt.Fprintf(sb, "- %s: changed by %s, which is still open\n",
+			inlineCode(d.Table), caller.PullRequestMarkdownLink(d.Repository, d.PullRequest))
 	}
 	sb.WriteString("\nA plan diffs this PR's schema files against the live database, so what another PR applied before merging reads here as something to remove. If that is not what you intend, merge that PR, or bring this PR's schema files up to date with it, then re-plan.\n\n")
 }
@@ -769,6 +769,7 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 		}
 	}
 	diffBudget := vschemaDiffBudget(diffCount)
+	ddlBudget := newDDLBlockBudget(countPlanDDLBlocks(data.Changes))
 
 	for _, ks := range data.Changes {
 		hasVSchemaChanges := ks.VSchemaChanged && !data.IsMySQL
@@ -796,20 +797,43 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData) {
 
 		if hasDDLChanges {
 			if len(ks.Shards) > 0 {
-				writeShardedPlanDDL(sb, ks.Shards, dialect)
+				writeShardedPlanDDL(sb, ks.Shards, dialect, ddlBudget)
 			} else {
-				writePlanDDLBlock(sb, ks.Statements, dialect)
+				writePlanDDLBlock(sb, ks.Statements, dialect, ddlBudget)
 			}
 		}
 	}
 }
 
+// countPlanDDLBlocks counts the DDL blocks writeKeyspaceChanges renders for
+// changes — one per unsharded keyspace with statements and one per group of
+// shards that share a change — so the comment's DDL budget is shared across
+// exactly those blocks.
+func countPlanDDLBlocks(changes []KeyspaceChangeData) int {
+	count := 0
+	for _, ks := range changes {
+		if len(ks.Shards) == 0 {
+			if len(ks.Statements) > 0 {
+				count++
+			}
+			continue
+		}
+		for _, g := range groupKeyspaceShardsByStatements(ks.Shards) {
+			if !g.Satisfied {
+				count++
+			}
+		}
+	}
+	return count
+}
+
 // writePlanDDLBlock writes a single fenced SQL block of statements, formatted
-// under the plan's own dialect. A greenfield create set is split so each of
-// its statements is formatted on its own line; rendering is best-effort, so a
-// statement that is neither a single statement nor a valid create set is
-// still rendered as written, and the reason is logged for triage.
-func writePlanDDLBlock(sb *strings.Builder, statements []string, dialect schema.Dialect) {
+// under the plan's own dialect and drawing on the comment's shared DDL budget.
+// A greenfield create set is split so each of its statements is formatted on
+// its own line; rendering is best-effort, so a statement that is neither a
+// single statement nor a valid create set is still rendered as written, and
+// the reason is logged for triage.
+func writePlanDDLBlock(sb *strings.Builder, statements []string, dialect schema.Dialect, budget *ddlBlockBudget) {
 	formattedStatements := make([]string, 0, len(statements))
 	parser, parserErr := ddl.ParserForDialect(dialect)
 	if parserErr != nil {
@@ -835,7 +859,7 @@ func writePlanDDLBlock(sb *strings.Builder, statements []string, dialect schema.
 		}
 		formattedStatements = append(formattedStatements, strings.Join(formattedCreateSet, "\n"))
 	}
-	writeSQLFencedBlock(sb, strings.Join(formattedStatements, "\n\n"))
+	writeSQLFencedBlock(sb, strings.Join(formattedStatements, "\n\n"), budget)
 	sb.WriteString("\n")
 }
 
@@ -843,7 +867,7 @@ func writePlanDDLBlock(sb *strings.Builder, statements []string, dialect schema.
 // that need the same statements share one block, so a uniform keyspace shows the
 // DDL once and a divergent one shows "what applies where" — each distinct change
 // set with the shards it applies to.
-func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange, dialect schema.Dialect) {
+func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange, dialect schema.Dialect, budget *ddlBlockBudget) {
 	groups := groupKeyspaceShardsByStatements(shards)
 	if len(groups) <= 1 {
 		// A single group of changing shards shows the DDL once, but still names the
@@ -853,7 +877,7 @@ func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange, dial
 		// an empty code block.
 		if len(groups) == 1 && !groups[0].Satisfied {
 			writeShardGroupHeading(sb, groups[0].Shards, len(shards))
-			writePlanDDLBlock(sb, groups[0].Statements, dialect)
+			writePlanDDLBlock(sb, groups[0].Statements, dialect, budget)
 		}
 		return
 	}
@@ -866,7 +890,7 @@ func writeShardedPlanDDL(sb *strings.Builder, shards []KeyspaceShardChange, dial
 			sb.WriteString("_Already applied — no change._\n\n")
 			continue
 		}
-		writePlanDDLBlock(sb, g.Statements, dialect)
+		writePlanDDLBlock(sb, g.Statements, dialect, budget)
 	}
 }
 
@@ -928,7 +952,7 @@ func planShardList(shards []string, totalShards int) string {
 	if len(shards) > shardNamesInlineLimit {
 		return shardCoveragePhrase(len(shards), totalShards)
 	}
-	quoted := markdownInlineCodeList(shards)
+	quoted := inlineCodeList(shards)
 	if len(quoted) == 1 {
 		return "shard " + quoted[0]
 	}
@@ -961,7 +985,7 @@ func writeShardGroupHeading(sb *strings.Builder, shards []string, totalShards in
 		return
 	}
 	fmt.Fprintf(sb, "<details>\n<summary><b>%s</b></summary>\n\n%s\n\n</details>\n\n",
-		shardCoveragePhrase(len(shards), totalShards), strings.Join(markdownInlineCodeList(shards), ", "))
+		shardCoveragePhrase(len(shards), totalShards), strings.Join(inlineCodeList(shards), ", "))
 }
 
 // writeDeploymentDrift renders the review-time drift rollup: a single uniform
@@ -1029,7 +1053,7 @@ func writeBlockedChanges(sb *strings.Builder, changes []BlockedChangeData) {
 	n := len(changes)
 	fmt.Fprintf(sb, glyph.Refused+" **Cannot apply**: %d %s the engine refuses to execute\n", n, pluralize("change", n))
 	for _, c := range changes {
-		table := "`" + c.Table + "`"
+		table := inlineCode(c.Table)
 		if len(c.Shards) > 0 {
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
 		}
@@ -1080,7 +1104,7 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 	n := len(changes)
 	fmt.Fprintf(sb, "⚙️ **Direct execution**: %d %s will run as %s\n", n, pluralize("change", n), headerNoun)
 	for _, c := range changes {
-		table := "`" + c.Table + "`"
+		table := inlineCode(c.Table)
 		if len(c.Shards) > 0 {
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
 		}
@@ -1098,7 +1122,7 @@ func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, isMySQL
 	fmt.Fprintf(sb, glyph.Attention+" **Issues**: %d unsafe %s detected\n", n, pluralize("change", n))
 	item := 0
 	for _, c := range changes {
-		table := "`" + c.Table + "`"
+		table := inlineCode(c.Table)
 		if len(c.Shards) > 0 {
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
 		}
