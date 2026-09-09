@@ -1,6 +1,7 @@
 package client
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -15,7 +16,7 @@ func TestRefreshToken(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, f.refreshedIDToken, result.IDToken)
 		assert.Equal(t, f.refreshToken, result.RefreshToken)
-		assert.False(t, result.Expiry.IsZero())
+		assert.Equal(t, f.refreshedIDExpiry, result.Expiry.Unix())
 	})
 
 	t.Run("validates required input before any network call", func(t *testing.T) {
@@ -64,7 +65,7 @@ func TestResolveBearerToken(t *testing.T) {
 			DefaultProfile: "default",
 			Profiles: map[string]Profile{"default": {
 				Endpoint:     "https://schemabot.example",
-				Token:        "stale-token",
+				Token:        testIDToken(`{"exp":1}`),
 				RefreshToken: "old-refresh-token",
 				TokenExpiry:  time.Now().Add(-time.Hour).Unix(),
 				OIDC:         &OIDCLogin{Issuer: f.issuer(), ClientID: "cli-client"},
@@ -81,7 +82,7 @@ func TestResolveBearerToken(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, f.refreshedIDToken, reloaded.Profiles["default"].Token)
 		assert.Equal(t, f.refreshToken, reloaded.Profiles["default"].RefreshToken)
-		assert.Greater(t, reloaded.Profiles["default"].TokenExpiry, time.Now().Unix())
+		assert.Equal(t, f.refreshedIDExpiry, reloaded.Profiles["default"].TokenExpiry)
 	})
 
 	t.Run("expired token with no refresh token returns stale token and a warning", func(t *testing.T) {
@@ -98,6 +99,48 @@ func TestResolveBearerToken(t *testing.T) {
 		tok, err := ResolveBearerToken(t.Context(), "", "", "")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "expired")
+		assert.Contains(t, err.Error(), "check the local clock")
 		assert.Equal(t, "stale-token", tok, "stale token is still returned so the command can run and re-login can fix it")
 	})
+}
+
+func TestRefreshPreservesConcurrentConfigEdits(t *testing.T) {
+	for _, replaceSession := range []bool{false, true} {
+		t.Run(fmt.Sprint(replaceSession), func(t *testing.T) {
+			t.Setenv("SCHEMABOT_TOKEN", "")
+			t.Setenv("SCHEMABOT_PROFILE", "")
+			f := newFakeOIDC(t)
+			started, release := make(chan struct{}), make(chan struct{})
+			f.beforeRefresh = func() { close(started); <-release }
+			writeConfig(t, &Config{Profiles: map[string]Profile{"default": {Endpoint: "https://example.test", Token: testIDToken(`{"exp":1}`), RefreshToken: "old", OIDC: &OIDCLogin{Issuer: f.issuer(), ClientID: "cli-client"}}}}, 0600)
+			done := make(chan error, 1)
+			go func() { _, err := ResolveBearerToken(t.Context(), "", "", "default"); done <- err }()
+			<-started
+			cfg, err := LoadConfig()
+			require.NoError(t, err)
+			cfg.Profiles["other"] = Profile{Endpoint: "https://other.example"}
+			if replaceSession {
+				p := cfg.Profiles["default"]
+				p.RefreshToken = "new-session"
+				cfg.Profiles["default"] = p
+			}
+			err = SaveConfig(cfg)
+			close(release)
+			require.NoError(t, err)
+			err = <-done
+			if replaceSession {
+				require.ErrorContains(t, err, "newer profile was preserved")
+			} else {
+				require.NoError(t, err)
+			}
+			saved, err := LoadConfig()
+			require.NoError(t, err)
+			require.Contains(t, saved.Profiles, "other")
+			if replaceSession {
+				require.Equal(t, "new-session", saved.Profiles["default"].RefreshToken)
+			} else {
+				require.Equal(t, f.refreshToken, saved.Profiles["default"].RefreshToken)
+			}
+		})
+	}
 }

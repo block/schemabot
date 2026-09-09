@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/progress"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -172,6 +174,23 @@ func TestClassifyRefusal(t *testing.T) {
 			wantReason: "not-native-safe-budget-exceeded",
 		},
 		{
+			name: "concurrent build that ran past its bound and left nothing is a refusal naming the option",
+			err: fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", "users",
+				nameConcurrentIndexBound(&executor.BudgetError{Cause: executor.CauseStatement, Budget: 36 * time.Hour}, 36*time.Hour, 36*time.Hour)),
+			wantReason:    "concurrent-index-bound-exceeded",
+			wantDetail:    []string{"ran past postgres.concurrent_index_max_duration (36h0m0s)", "raise postgres.concurrent_index_max_duration and re-run"},
+			wantNotDetail: []string{"statement budget", replanRemedy},
+		},
+		{
+			name: "bound ending the executor's catalog reads ahead of the build is the same refusal",
+			err: fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", "users",
+				nameConcurrentIndexBound(fmt.Errorf("resolve target: %w", &pgconn.PgError{Code: sqlstateQueryCanceled}),
+					36*time.Hour, 36*time.Hour+time.Second)),
+			wantReason:    "concurrent-index-bound-exceeded",
+			wantDetail:    []string{"ran past postgres.concurrent_index_max_duration (36h0m0s)", "raise postgres.concurrent_index_max_duration and re-run"},
+			wantNotDetail: []string{"statement budget", replanRemedy},
+		},
+		{
 			name: "lock budget exhaustion is operational",
 			err:  fmt.Errorf("execute: %w", &executor.BudgetError{Cause: executor.CauseLock, Budget: time.Second}),
 		},
@@ -183,6 +202,16 @@ func TestClassifyRefusal(t *testing.T) {
 				Build:   &executor.BudgetError{Cause: executor.CauseStatement, Budget: time.Second},
 				Cleanup: executor.ErrBuildLeftInvalidIndex,
 			}),
+		},
+		{
+			name: "invalid-index verdict stays operational when the bound wrapper names it",
+			err: fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", "users",
+				nameConcurrentIndexBound(&executor.InvalidIndexError{
+					Schema:  "public",
+					Index:   "big_ref_idx",
+					Build:   &executor.BudgetError{Cause: executor.CauseStatement, Budget: 36 * time.Hour},
+					Cleanup: executor.ErrBuildLeftInvalidIndex,
+				}, 36*time.Hour, 36*time.Hour)),
 		},
 		{
 			name:       "oversized table is a refusal",
@@ -504,6 +533,34 @@ func TestProgressReportsExecutorStepPosition(t *testing.T) {
 	assert.Equal(t, change.sql, during.Tables[0].DDL, "the table's DDL stays the planned change, not the step in flight")
 }
 
+// TestProgressMetadataIsStableWhilePositionIsUnchanged pins the contract the
+// driver's persistence relies on: two polls of a running apply whose executor
+// position has not moved return identical metadata, so the driver's
+// change detection sees no difference and writes nothing. A field derived
+// from the wall clock would differ on every poll and defeat that check.
+func TestProgressMetadataIsStableWhilePositionIsUnchanged(t *testing.T) {
+	eng := New()
+	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE public.widgets (id bigint PRIMARY KEY)", steps: 3}
+	tracker := newTestTracker(t)
+	tracker.Start(3, progress.OperationAdmitting)
+	tracker.StartStep(2, progress.OperationBrief, "CREATE INDEX widgets_name_idx ON public.widgets (name)")
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now().Add(-time.Minute), change, ""), tracker, slog.Default())
+	req := &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: "task-a"}}
+
+	first, err := eng.Progress(t.Context(), req)
+	require.NoError(t, err)
+	time.Sleep(2 * time.Millisecond)
+	second, err := eng.Progress(t.Context(), req)
+	require.NoError(t, err)
+
+	assert.Equal(t, map[string]string{
+		"phase": "preflight", "step": "2", "steps_total": "3",
+		"statement":          "CREATE INDEX widgets_name_idx ON public.widgets (name)",
+		"executor_operation": string(progress.OperationBrief),
+	}, first.Metadata)
+	assert.Equal(t, first.Metadata, second.Metadata)
+}
+
 // TestSanitizeStatementText pins the statement metadata contract: one line,
 // no control or format runes, bounded length, and otherwise the SQL exactly
 // as the executor runs it — a reason may trade its pipes for slashes because
@@ -563,16 +620,34 @@ const backgroundApplyDeadline = 10 * time.Second
 // returns whatever outcome the test scripted.
 type scriptedExecutor struct {
 	trackers    chan *progress.Tracker
+	envelopes   chan applyEnvelope
 	released    chan struct{}
 	releaseOnce sync.Once
 	run         func(tracker *progress.Tracker) error
 }
 
-func newScriptedExecutor(run func(tracker *progress.Tracker) error) *scriptedExecutor {
-	return &scriptedExecutor{trackers: make(chan *progress.Tracker, 1), released: make(chan struct{}), run: run}
+// applyEnvelope is what the drive handed the executor: the change as the
+// drive resolved it and the deadline of the context it runs under, read at
+// observed so a test can measure the time the drive granted.
+type applyEnvelope struct {
+	change      nativeApply
+	deadline    time.Time
+	hasDeadline bool
+	observed    time.Time
 }
 
-func (s *scriptedExecutor) execute(ctx context.Context, _ targetConn, _ nativeApply, _ int64, tracker *progress.Tracker, _ *slog.Logger) error {
+func newScriptedExecutor(run func(tracker *progress.Tracker) error) *scriptedExecutor {
+	return &scriptedExecutor{
+		trackers:  make(chan *progress.Tracker, 1),
+		envelopes: make(chan applyEnvelope, 1),
+		released:  make(chan struct{}),
+		run:       run,
+	}
+}
+
+func (s *scriptedExecutor) execute(ctx context.Context, _ targetConn, change nativeApply, _ int64, tracker *progress.Tracker, _ *slog.Logger) error {
+	deadline, hasDeadline := ctx.Deadline()
+	s.envelopes <- applyEnvelope{change: change, deadline: deadline, hasDeadline: hasDeadline, observed: time.Now()}
 	s.trackers <- tracker
 	select {
 	case <-s.released:
@@ -603,12 +678,33 @@ func (s *scriptedExecutor) tracker(t *testing.T) *progress.Tracker {
 	}
 }
 
-// applyAlterUsers wires scripted in as eng's executor and accepts one
-// native-safe change through Apply under key, logging to logger, with
-// credentials the executor never dials. When the test ends the executor is
-// released and the engine drained, in that order, so a drive parked at the
-// executor cannot outlive the test or hold Drain open.
+// envelope returns what the drive handed the executor, failing the test if
+// the drive never reached it.
+func (s *scriptedExecutor) envelope(t *testing.T) applyEnvelope {
+	t.Helper()
+	select {
+	case env := <-s.envelopes:
+		require.True(t, env.hasDeadline, "the drive must bound the executor's context")
+		return env
+	case <-time.After(backgroundApplyDeadline):
+		t.Fatal("the background drive never reached the executor")
+		return applyEnvelope{}
+	}
+}
+
+// applyAlterUsers accepts one native-safe ALTER on public.users through
+// applyChange.
 func applyAlterUsers(t *testing.T, eng *Engine, scripted *scriptedExecutor, key string, logger *slog.Logger) {
+	t.Helper()
+	applyChange(t, eng, scripted, key, "ALTER TABLE public.users ADD COLUMN email text", logger)
+}
+
+// applyChange wires scripted in as eng's executor and accepts one change on
+// public.users through Apply under key, logging to logger, with credentials
+// the executor never dials. When the test ends the executor is released and
+// the engine drained, in that order, so a drive parked at the executor
+// cannot outlive the test or hold Drain open.
+func applyChange(t *testing.T, eng *Engine, scripted *scriptedExecutor, key, ddl string, logger *slog.Logger) {
 	t.Helper()
 	eng.execute = scripted.execute
 	t.Cleanup(eng.Drain)
@@ -618,7 +714,7 @@ func applyAlterUsers(t *testing.T, eng *Engine, scripted *scriptedExecutor, key 
 		Changes: []engine.SchemaChange{{
 			Namespace: "public",
 			TableChanges: []engine.TableChange{{
-				Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN email text",
+				Table: "users", DDL: ddl,
 			}},
 		}},
 		Credentials: &engine.Credentials{DSN: "postgres://schemabot:secret@db.invalid/app?sslmode=disable"},
@@ -1227,19 +1323,156 @@ func TestRefusalForOutcomeTotalOverExecutorCodes(t *testing.T) {
 	}
 }
 
-// TestConcurrentIndexBudgetLeavesHeadroomUnderApplyCeiling pins the gap the
-// two bounds depend on: the server-side index budget must expire with at
-// least the named headroom to spare before the client-side ceiling cancels
-// the session, so an exhausted build surfaces as the typed budget verdict —
-// and its invalid-index catalog check still gets to run inside the ceiling —
-// rather than as an ambiguous external cancellation. Retuning either bound
-// without keeping the headroom fails here instead of in an apply.
-func TestConcurrentIndexBudgetLeavesHeadroomUnderApplyCeiling(t *testing.T) {
-	// A zero headroom would let the two bounds coincide and race, so the
-	// strict ordering is pinned on its own as well as through the gap.
-	require.Positive(t, concurrentIndexHeadroom)
-	assert.Less(t, concurrentIndexBudget, optimisticApplyCeiling)
-	assert.GreaterOrEqual(t, optimisticApplyCeiling-concurrentIndexBudget, concurrentIndexHeadroom)
+// TestOrdinaryApplyRunsUnderTheFixedCeiling proves a native statement's
+// drive hands the executor a context bounded by the fixed apply ceiling —
+// not by the concurrent index envelope — with room for the statement budget
+// under it.
+func TestOrdinaryApplyRunsUnderTheFixedCeiling(t *testing.T) {
+	scripted := newScriptedExecutor(func(*progress.Tracker) error { return nil })
+	eng := NewWithOptions(0, 3*time.Hour)
+	applyAlterUsers(t, eng, scripted, "task-a", slog.New(slog.DiscardHandler))
+
+	env := scripted.envelope(t)
+	granted := env.deadline.Sub(env.observed)
+	assert.False(t, env.change.concurrentIndex)
+	assert.Zero(t, env.change.concurrentIndexMaxDuration, "the build bound is stamped only on a concurrent index apply")
+	assert.LessOrEqual(t, granted, optimisticApplyCeiling)
+	assert.Greater(t, granted, optimisticStatementLimit, "the statement budget must fit under the ceiling")
+}
+
+// TestConcurrentIndexApplyCeilingLeavesSetupHeadroom proves the drive runs a
+// concurrent index build under a ceiling that sits above the configured
+// build bound — so the build's own deadline, not the ceiling, is what ends
+// an over-long build — and stamps that bound on the change the executor
+// receives. The granted time is measured from the executor's side: a ceiling
+// equal to the bound would fail here, and so would one padded past the
+// headroom the engine documents.
+func TestConcurrentIndexApplyCeilingLeavesSetupHeadroom(t *testing.T) {
+	const bound = 3 * time.Hour
+	scripted := newScriptedExecutor(func(*progress.Tracker) error { return nil })
+	eng := NewWithOptions(0, bound)
+	applyChange(t, eng, scripted, "task-a",
+		"CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)", slog.New(slog.DiscardHandler))
+
+	env := scripted.envelope(t)
+	granted := env.deadline.Sub(env.observed)
+	assert.True(t, env.change.concurrentIndex)
+	assert.Equal(t, bound, env.change.concurrentIndexMaxDuration)
+	assert.Greater(t, granted, bound, "the ceiling must outlast the build bound it wraps")
+	assert.LessOrEqual(t, granted, bound+concurrentIndexHeadroom)
+}
+
+// TestConcurrentIndexHeadroomCoversSessionSetup pins the headroom to what it
+// exists to absorb: the session setup executeOptimistic runs before the
+// build starts, with every step at the server-side limit the apply pool
+// gives it — one dial at the connect timeout, then the privilege check, the
+// table preflight and the partition facts lookup each at the pool's
+// statement_timeout. Under that headroom the build gets the full configured
+// bound even when setup is as slow as the server allows it to be.
+//
+// The privilege check counts as one read: its second query runs only when
+// the first finds no target table, and that ends the apply as a refusal
+// before any build a bound could be shortened for; the SET ROLE probe it
+// also carries belongs to the copy-and-swap tier, which a concurrent index
+// build never reaches.
+//
+// The executor's own catalog reads ahead of the build — resolving the
+// target, inspecting the requested name, listing quarantined debris — are
+// not in the census: they run in the build session, whose statement_timeout
+// is already the bound, so the bound rather than the pool's limit is what
+// ends one that stalls, and the drive names the option for it.
+func TestConcurrentIndexHeadroomCoversSessionSetup(t *testing.T) {
+	setup := dbconn.DefaultConnectTimeout + // pool dial
+		dbconn.DefaultStatementTimeout + // preflight.CheckPrivileges
+		dbconn.DefaultStatementTimeout + // preflight.CheckTable
+		dbconn.DefaultStatementTimeout // preflight.LookupTargetFacts
+	assert.GreaterOrEqual(t, concurrentIndexHeadroom, setup)
+}
+
+// TestConcurrentIndexMaximumIsTheServerStatementTimeoutCeiling pins the
+// largest accepted build bound to the largest statement_timeout PostgreSQL
+// itself accepts, and the constructor's normalization around it: a bound
+// above it is clamped, and a bound that is not positive adopts the default
+// instead of a deadline that would end every build on arrival.
+func TestConcurrentIndexMaximumIsTheServerStatementTimeoutCeiling(t *testing.T) {
+	assert.Equal(t, time.Duration(math.MaxInt32)*time.Millisecond, MaxConcurrentIndexMaxDuration)
+	assert.Less(t, MaxConcurrentIndexMaxDuration+concurrentIndexHeadroom, time.Duration(math.MaxInt64),
+		"the ceiling built on the maximum must not overflow")
+
+	assert.Equal(t, MaxConcurrentIndexMaxDuration, NewWithOptions(0, MaxConcurrentIndexMaxDuration+1).ConcurrentIndexMaxDuration())
+	assert.Equal(t, DefaultConcurrentIndexMaxDuration, NewWithOptions(0, 0).ConcurrentIndexMaxDuration())
+	assert.Equal(t, DefaultConcurrentIndexMaxDuration, NewWithOptions(0, -time.Second).ConcurrentIndexMaxDuration())
+	assert.Equal(t, 36*time.Hour, NewWithOptions(0, 36*time.Hour).ConcurrentIndexMaxDuration())
+}
+
+// TestBuildIndexConcurrentlyRefusesAnUnsetBound proves a concurrent build
+// never starts under a bound the drive did not stamp: the bound is the
+// build's server-side statement timeout and the recovery's only deadline, so
+// a missing one is refused before any session is acquired rather than handed
+// to the executor as an unbounded budget or run to an instant cancellation.
+// The drive always stamps a normalized bound, so this exercises the guard a
+// directly constructed nativeApply meets, not a state the drive produces.
+func TestBuildIndexConcurrentlyRefusesAnUnsetBound(t *testing.T) {
+	change := nativeApply{namespace: "public", table: "users",
+		sql: "CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)", concurrentIndex: true}
+
+	err := buildIndexConcurrently(t.Context(), nil, change, newTestTracker(t), slog.New(slog.DiscardHandler))
+
+	require.ErrorContains(t, err, `build PostgreSQL index concurrently on table "users": build bound is unset`)
+}
+
+// TestNameConcurrentIndexBoundWrapsOnlyTheBoundsOwnVerdict pins which build
+// failures get the option named: the statement budget verdict is the bound's
+// statement_timeout firing and is wrapped with the verdict still reachable,
+// while a lock budget, a cancellation, and an invalid-index verdict that
+// carries no build failure pass through untouched — none of them was the
+// bound's doing.
+func TestNameConcurrentIndexBoundWrapsOnlyTheBoundsOwnVerdict(t *testing.T) {
+	bound := 36 * time.Hour
+	statementBudget := &executor.BudgetError{Cause: executor.CauseStatement, Budget: bound}
+
+	// The executor's typed verdict is authoritative on its own; the elapsed
+	// time is not consulted for it.
+	named := nameConcurrentIndexBound(fmt.Errorf("build: %w", statementBudget), bound, time.Second)
+	var boundErr *concurrentIndexBoundError
+	require.ErrorAs(t, named, &boundErr)
+	assert.Equal(t, "the concurrent index build ran past postgres.concurrent_index_max_duration (36h0m0s) and was cancelled", boundErr.Error())
+	var budgetErr *executor.BudgetError
+	require.ErrorAs(t, named, &budgetErr)
+	assert.Same(t, statementBudget, budgetErr)
+
+	// A raw server cancellation of one of the executor's catalog reads ahead
+	// of the build is the bound's once the bound has elapsed; the server's
+	// error stays reachable for callers that read the code.
+	cancelled := &pgconn.PgError{Code: sqlstateQueryCanceled, Message: "canceling statement due to statement timeout"}
+	named = nameConcurrentIndexBound(fmt.Errorf("resolve target: %w", cancelled), bound, bound)
+	require.ErrorAs(t, named, &boundErr)
+	var pgErr *pgconn.PgError
+	require.ErrorAs(t, named, &pgErr)
+	assert.Same(t, cancelled, pgErr)
+
+	passThrough := []struct {
+		name    string
+		err     error
+		elapsed time.Duration
+	}{
+		{name: "lock budget", err: &executor.BudgetError{Cause: executor.CauseLock, Budget: time.Second}, elapsed: 2 * bound},
+		{name: "cancellation", err: executor.ErrCancelledByCaller, elapsed: 2 * bound},
+		{name: "abandoned entry without a build failure", elapsed: 2 * bound,
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx", Table: "users", Cleanup: executor.ErrAbandonedInvalidIndex}},
+		{name: "raw cancellation before the bound could fire", err: fmt.Errorf("resolve target: %w", cancelled), elapsed: bound - time.Millisecond},
+		{name: "raw cancellation the executor attributed to the caller", elapsed: 2 * bound,
+			err: fmt.Errorf("%w (after 1h): %w", executor.ErrCancelledByCaller, cancelled)},
+		{name: "raw cancellation the executor attributed to an outside party", elapsed: 2 * bound,
+			err: fmt.Errorf("%w (after 1h of a 36h budget): %w", executor.ErrCancelledExternally, cancelled)},
+		{name: "server error under another code after the bound", elapsed: 2 * bound,
+			err: fmt.Errorf("resolve target: %w", &pgconn.PgError{Code: "55P03"})},
+	}
+	for _, tc := range passThrough {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Same(t, tc.err, nameConcurrentIndexBound(tc.err, bound, tc.elapsed))
+		})
+	}
 }
 
 // TestRetryPathFitsUnderApplyCeiling pins the other execution path against
@@ -1281,7 +1514,21 @@ func TestInvalidIndexDetailMatchesVerdictOwnership(t *testing.T) {
 			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx",
 				Build: rawServerText, Cleanup: executor.ErrBuildLeftInvalidIndex},
 			wantDetail:    []string{`"public"."big_ref_idx"`, "own invalid index", "retry removes it", "rebuilds the index"},
-			wantNotDetail: []string{"db-internal-1"},
+			wantNotDetail: []string{"db-internal-1", "concurrent_index_max_duration"},
+		},
+		{
+			name: "own leftover the bound cancelled names the option to raise before the retry",
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx",
+				Build: &executor.BudgetError{Cause: executor.CauseStatement, Budget: 36 * time.Hour}, Cleanup: executor.ErrBuildLeftInvalidIndex},
+			wantDetail:    []string{`"public"."big_ref_idx"`, "own invalid index", "running past postgres.concurrent_index_max_duration (36h0m0s)", "retry removes it", "rebuilds the index under the same bound", "raise postgres.concurrent_index_max_duration first"},
+			wantNotDetail: []string{"statement budget"},
+		},
+		{
+			name: "own leftover from a lost lock budget does not blame the bound",
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx",
+				Build: &executor.BudgetError{Cause: executor.CauseLock, Budget: time.Second}, Cleanup: executor.ErrBuildLeftInvalidIndex},
+			wantDetail:    []string{`"public"."big_ref_idx"`, "own invalid index", "retry removes it"},
+			wantNotDetail: []string{"concurrent_index_max_duration"},
 		},
 		{
 			name: "abandoned entry says the retry removes and rebuilds it",
@@ -1643,6 +1890,48 @@ func TestValidateOptimisticApplyAcceptsCreateSet(t *testing.T) {
 	change, err := validateOptimisticApply(req)
 	require.NoError(t, err)
 	assert.Equal(t, req.Changes[0].TableChanges[0].DDL, change.sql)
+	assert.False(t, change.concurrentIndex)
+}
+
+// TestValidateOptimisticApplyClassifiesConcurrentIndex pins both halves of
+// the predicate that routes a statement to the concurrent-build executor:
+// only a lone CREATE INDEX that names CONCURRENTLY qualifies. A plain CREATE
+// INDEX is the same statement kind and must stay on the transactional path;
+// TestValidateOptimisticApplyAcceptsCreateSet pins that a create set, which
+// is never one statement, does not qualify either.
+func TestValidateOptimisticApplyClassifiesConcurrentIndex(t *testing.T) {
+	tests := []struct {
+		name       string
+		ddl        string
+		concurrent bool
+	}{
+		{
+			name:       "concurrent index",
+			ddl:        "CREATE INDEX CONCURRENTLY widgets_name_idx ON public.widgets (name)",
+			concurrent: true,
+		},
+		{
+			name:       "plain index stays transactional",
+			ddl:        "CREATE INDEX widgets_name_idx ON public.widgets (name)",
+			concurrent: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := &engine.ApplyRequest{
+				Database: "app",
+				Changes: []engine.SchemaChange{{Namespace: "public", TableChanges: []engine.TableChange{{
+					Table: "widgets",
+					DDL:   tc.ddl,
+				}}}},
+				Credentials: &engine.Credentials{DSN: "postgres://localhost/app"},
+			}
+
+			change, err := validateOptimisticApply(req)
+			require.NoError(t, err)
+			assert.Equal(t, tc.concurrent, change.concurrentIndex)
+		})
+	}
 }
 
 func TestValidateOptimisticApplyRefusesMixedCreateScript(t *testing.T) {

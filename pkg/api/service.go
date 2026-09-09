@@ -663,6 +663,7 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 		TargetDSN:                             targetDSN,
 		Metadata:                              metadata,
 		PostgresNativeSafeTableSizeLimitBytes: s.config.Postgres.NativeSafeTableSizeLimit(),
+		PostgresConcurrentIndexMaxDuration:    s.config.Postgres.ConcurrentIndexMaxDurationOrDefault(),
 		WakeOperator:                          s.wakeOperator,
 		EngineFactories:                       s.engineFactories,
 	}, s.storage, s.logger)

@@ -5,22 +5,14 @@
 ## Table of Contents
 
 - [1. Create a GitHub App](#1-create-a-github-app)
-  - [Basic Information](#basic-information)
-  - [Webhook](#webhook)
-  - [Permissions](#permissions)
-  - [Subscribe to Events](#subscribe-to-events)
-  - [Where Can This GitHub App Be Installed?](#where-can-this-github-app-be-installed)
-  - [Create the App](#create-the-app)
 - [2. Generate a Private Key](#2-generate-a-private-key)
 - [3. Install the App](#3-install-the-app)
 - [4. Configure SchemaBot](#4-configure-schemabot)
 - [5. Start SchemaBot](#5-start-schemabot)
 - [6. Add `schemabot.yaml` Config to Your Repository](#6-add-schemabotyaml-config-to-your-repository)
-  - [Schema File Layout](#schema-file-layout)
 - [7. Test It](#7-test-it)
 - [Environment Variables Reference](#environment-variables-reference)
 - [Webhook Ingress](#webhook-ingress)
-  - [IP Allowlisting](#ip-allowlisting)
 - [Webhook Signature Validation](#webhook-signature-validation)
 - [Repository-level Webhooks (optional)](#repository-level-webhooks-optional)
 - [Troubleshooting](#troubleshooting)
@@ -191,7 +183,7 @@ type: mysql
 | Field | Required | Description |
 |-------|----------|-------------|
 | `database` | Yes | Must match a database name in your SchemaBot server config |
-| `type` | Yes | `"mysql"`, `"vitess"`, `"strata"` (many MySQL shards behind a shared topology — see [Strata](strata-engine.md)), or `"postgres"` |
+| `type` | Yes | `"mysql"`, `"vitess"`, `"strata"` (experimental; requires server opt-in — see [Strata](strata-engine.md)), or `"postgres"` |
 | `ignore_namespaces` | No | Namespace subdirectories to exclude from plans, applies, and checks (see [Ignoring Namespaces](namespaces.md#ignoring-namespaces)) |
 
 Environment availability and promotion order are configured on the SchemaBot server.
