@@ -123,14 +123,23 @@ func TestCreateShapeRefusalReason(t *testing.T) {
 	}
 }
 
+// Every create shape cause pg-sprite can report renders as its own sentence:
+// not the generic refusal, not empty, and not the sentence for a different
+// cause — an operator told to remove a clause must be told about the clause
+// their statement actually has.
 func TestCreateShapeRefusalReasonExhaustive(t *testing.T) {
+	reasonsByCause := make(map[string]executor.CreateShapeCause)
 	for _, cause := range executor.CreateShapeCauses() {
 		mode, reason := executionVerdict(pgplan.FormatVersion, pgplan.Statement{
 			Disposition: router.DispositionRefuse,
 			Cause:       cause,
 		}, "users")
 		assert.Equal(t, engine.ExecutionModeBlocked, mode, cause)
+		assert.NotEmpty(t, reason, cause)
 		assert.NotEqual(t, `statement for table "users" is refused: it cannot be executed safely as written`, reason, cause)
+		prior, dup := reasonsByCause[reason]
+		assert.False(t, dup, "causes %q and %q render the same reason: %s", prior, cause, reason)
+		reasonsByCause[reason] = cause
 	}
 }
 
@@ -274,11 +283,11 @@ func TestIsGreenfieldCreateSetRejectsUnsafeStatements(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		verdicts []string
+		verdicts []stepVerdict
 		mutate   func(*pgplan.Report)
 	}{
-		{name: "destructive verdict", verdicts: []string{"destructive statement"}},
-		{name: "destructive term", verdicts: []string{""}, mutate: func(report *pgplan.Report) {
+		{name: "destructive verdict", verdicts: []stepVerdict{{mode: engine.ExecutionModeBlocked, reason: "destructive statement"}}},
+		{name: "destructive term", verdicts: []stepVerdict{{}}, mutate: func(report *pgplan.Report) {
 			report.Statements[0].Destructive = true
 		}},
 	}

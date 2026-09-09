@@ -210,9 +210,12 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 // engine role, and is meaningful only while changes[i] carries no verdict —
 // a blocked step never reaches a privilege check.
 func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.TableChange, []preflight.Tier, error) {
-	verdicts := make([]string, len(report.Statements))
+	// Each statement's verdict is derived once and reused for both the
+	// greenfield decision and the rendering, so a verdict that logs does so
+	// once per statement.
+	verdicts := make([]stepVerdict, len(report.Statements))
 	for i, statement := range report.Statements {
-		verdicts[i], _ = executionVerdict(report.FormatVersion, statement, report.Table)
+		verdicts[i].mode, verdicts[i].reason = executionVerdict(report.FormatVersion, statement, report.Table)
 	}
 	if isGreenfieldCreateSet(report, verdicts) {
 		change, tier, err := greenfieldCreateSet(report, parser)
@@ -224,8 +227,8 @@ func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.Ta
 
 	changes := make([]engine.TableChange, 0, len(report.Statements))
 	tiers := make([]preflight.Tier, 0, len(report.Statements))
-	for _, statement := range report.Statements {
-		mode, reason := executionVerdict(report.FormatVersion, statement, report.Table)
+	for i, statement := range report.Statements {
+		mode, reason := verdicts[i].mode, verdicts[i].reason
 		rendered := statement.ExecSQL
 		if len(rendered) == 0 {
 			rendered = []string{statement.SQL}
@@ -270,12 +273,19 @@ func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.Ta
 	return changes, tiers, nil
 }
 
+// stepVerdict is the execution mode and operator-facing reason derived for
+// one planned statement; an empty mode means the statement is executable.
+type stepVerdict struct {
+	mode   string
+	reason string
+}
+
 // isGreenfieldCreateSet reports whether the report describes a table that
 // does not exist yet and whose every statement is executable, so the table
 // and its indexes can ship as one apply unit. A report carrying any verdict
 // or destructive step keeps its per-statement rendering so each verdict
 // stays visible to the reviewer.
-func isGreenfieldCreateSet(report pgplan.Report, verdicts []string) bool {
+func isGreenfieldCreateSet(report pgplan.Report, verdicts []stepVerdict) bool {
 	if !isGreenfieldTable(report) {
 		return false
 	}
@@ -283,7 +293,7 @@ func isGreenfieldCreateSet(report pgplan.Report, verdicts []string) bool {
 		return false
 	}
 	for i, statement := range report.Statements {
-		if verdicts[i] != "" || statement.Destructive {
+		if verdicts[i].mode != "" || statement.Destructive {
 			return false
 		}
 	}
