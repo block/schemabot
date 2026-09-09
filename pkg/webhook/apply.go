@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"sort"
@@ -33,6 +34,9 @@ func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, display 
 		VSchemaChanges:   display.VSchema,
 		DeployRequestURL: display.DeployRequestURL,
 		RevertExpiresAt:  display.RevertExpiresAt,
+		Step:             display.Step.Step,
+		StepsTotal:       display.Step.StepsTotal,
+		Statement:        display.Step.Statement,
 		Tenant:           tenant,
 		Rollback:         apply.IsRollback(),
 		DeferCutover:     apply.GetOptions().DeferCutover,
@@ -48,8 +52,9 @@ func buildApplyCommentData(apply *storage.Apply, tasks []*storage.Task, display 
 }
 
 // operationDisplay is the per-operation engine display projection surfaced in the
-// PR comment: VSchema application state and the PlanetScale deploy-request URL.
-// Both come from the same engine resume metadata, so they are resolved together.
+// PR comment: the statement position from the operation's durable progress
+// metadata, and — for PlanetScale — VSchema application state and the
+// deploy-request URL from the engine resume metadata.
 type operationDisplay struct {
 	VSchema          []apitypes.VSchemaChange
 	DeployRequestURL string
@@ -57,45 +62,36 @@ type operationDisplay struct {
 	// (PlanetScale only), surfaced so the comment can show time remaining. Empty
 	// outside the revert window.
 	RevertExpiresAt string
+	// Step is the position of a running apply inside its statement sequence, as
+	// last persisted by the driver. Zero when the engine reports none.
+	Step apitypes.ProgressStep
 }
 
-// resolveDisplayByOperation projects each operation's engine display state
-// (VSchema status + deploy-request URL) from the engine resume metadata persisted
-// on the apply's operations — the same storage-backed projection the progress API
-// uses (overlayStoredDisplayMetadata). The comment path builds from storage and
-// never reads the engine progress response, so it is projected here too.
-// Best-effort: a non-PlanetScale apply, an operation without resume state, or a
-// decode error contributes nothing rather than blocking the comment.
+// isZero reports whether the projection carries nothing worth rendering.
+func (d operationDisplay) isZero() bool {
+	return len(d.VSchema) == 0 && d.DeployRequestURL == "" && d.RevertExpiresAt == "" && d.Step == (apitypes.ProgressStep{})
+}
+
+// resolveDisplayByOperation projects each operation's engine display state from
+// what is persisted on the apply's operations — the same storage-backed
+// projection the progress API uses (loadStoredProgressMetadata). The comment
+// path builds from storage and never reads the engine progress response, so it
+// is projected here too. Every engine contributes the statement position from
+// the operation's stored progress metadata; PlanetScale operations additionally
+// contribute VSchema status and the deploy-request URL from engine resume state.
+// Best-effort: an operation without stored state, or a decode error, contributes
+// nothing rather than blocking the comment.
 func resolveDisplayByOperation(ctx context.Context, stor storage.Storage, apply *storage.Apply, ops []*storage.ApplyOperation) map[int64]operationDisplay {
-	if apply == nil || apply.Engine != storage.EnginePlanetScale || len(ops) == 0 {
+	if apply == nil || len(ops) == 0 {
 		return nil
 	}
 	var byOp map[int64]operationDisplay
 	for _, op := range ops {
-		rs, err := stor.ApplyOperations().GetEngineResumeState(ctx, op.ID)
-		if errors.Is(err, storage.ErrEngineResumeStateNotFound) {
-			continue
+		od := operationDisplay{Step: storedProgressStep(apply, op)}
+		if apply.Engine == storage.EnginePlanetScale {
+			od.VSchema, od.DeployRequestURL, od.RevertExpiresAt = planetScaleDisplay(ctx, stor, apply, op)
 		}
-		if err != nil {
-			slog.Warn("comment will omit engine display metadata: failed to load engine resume state",
-				"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", err)
-			continue
-		}
-		display, err := tern.PSDisplayMetadata(rs.Metadata)
-		if err != nil {
-			slog.Warn("comment will omit engine display metadata: failed to decode engine resume state",
-				"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", err)
-			continue
-		}
-		changes, err := apitypes.ParseVSchemaChanges(display)
-		if err != nil {
-			// A malformed VSchema blob should not also drop the deploy-request URL,
-			// so log and continue with no VSchema rather than skipping the operation.
-			slog.Warn("comment will omit VSchema status: failed to parse VSchema changes",
-				"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", err)
-		}
-		od := operationDisplay{VSchema: changes, DeployRequestURL: display["deploy_request_url"], RevertExpiresAt: display["revert_expires_at"]}
-		if len(od.VSchema) == 0 && od.DeployRequestURL == "" && od.RevertExpiresAt == "" {
+		if od.isZero() {
 			continue
 		}
 		if byOp == nil {
@@ -104,6 +100,58 @@ func resolveDisplayByOperation(ctx context.Context, stor storage.Storage, apply 
 		byOp[op.ID] = od
 	}
 	return byOp
+}
+
+// storedProgressStep decodes the statement position from the operation's
+// durable progress metadata. A missing or malformed record yields the zero
+// step so the comment renders without a position.
+func storedProgressStep(apply *storage.Apply, op *storage.ApplyOperation) apitypes.ProgressStep {
+	if op.ProgressMetadata == "" {
+		return apitypes.ProgressStep{}
+	}
+	var metadata map[string]string
+	if err := json.Unmarshal([]byte(op.ProgressMetadata), &metadata); err != nil {
+		slog.Warn("comment will omit the statement position: failed to decode progress metadata",
+			"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", err)
+		return apitypes.ProgressStep{}
+	}
+	step, err := apitypes.ParseProgressStep(metadata)
+	if err != nil {
+		slog.Warn("comment will omit the statement position: progress metadata is malformed",
+			"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", err)
+		return apitypes.ProgressStep{}
+	}
+	return step
+}
+
+// planetScaleDisplay loads the operation's engine resume state and projects the
+// VSchema application state, deploy-request URL, and revert deadline from it.
+// An operation without resume state or with an undecodable record contributes
+// nothing.
+func planetScaleDisplay(ctx context.Context, stor storage.Storage, apply *storage.Apply, op *storage.ApplyOperation) (vschema []apitypes.VSchemaChange, deployRequestURL, revertExpiresAt string) {
+	rs, err := stor.ApplyOperations().GetEngineResumeState(ctx, op.ID)
+	if errors.Is(err, storage.ErrEngineResumeStateNotFound) {
+		return nil, "", ""
+	}
+	if err != nil {
+		slog.Warn("comment will omit engine display metadata: failed to load engine resume state",
+			"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", err)
+		return nil, "", ""
+	}
+	display, err := tern.PSDisplayMetadata(rs.Metadata)
+	if err != nil {
+		slog.Warn("comment will omit engine display metadata: failed to decode engine resume state",
+			"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", err)
+		return nil, "", ""
+	}
+	changes, err := apitypes.ParseVSchemaChanges(display)
+	if err != nil {
+		// A malformed VSchema blob should not also drop the deploy-request URL,
+		// so log and continue with no VSchema rather than skipping the operation.
+		slog.Warn("comment will omit VSchema status: failed to parse VSchema changes",
+			"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", err)
+	}
+	return changes, display["deploy_request_url"], display["revert_expires_at"]
 }
 
 // tableProgressFromTasks maps storage tasks to per-table template rows. The

@@ -500,14 +500,17 @@ Response excerpt (illustrative values):
 
 </details>
 
-PostgreSQL create-set progress uses the same metadata shape:
+PostgreSQL create-set progress uses the same metadata shape. The phase stays
+`preflight` for the whole run — PostgreSQL DDL has no copy or cutover phase to
+report — and the statement position is what moves:
 
 ```json
 {
   "engine": "postgres",
   "state": "running",
   "metadata": {
-    "phase": "create_set",
+    "phase": "preflight",
+    "elapsed": "4.2s",
     "step": "2",
     "steps_total": "3",
     "statement": "CREATE INDEX orders_ref_idx ON public.orders (ref)"
