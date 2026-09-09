@@ -46,7 +46,8 @@ The renderer reports the duration, byte size, and temporary frame directory
 for each GIF. It rejects frames with overflowing output. Set `CHROME` to a
 browser executable if needed; `NODE_PATH` can point to an existing Playwright
 installation. The HTML, JSON, and generator are all kept here so the output
-can be refreshed when CLI templates change.
+can be refreshed when CLI templates change. OSC 8 terminal links render blue
+and underlined in the recording so their labels remain recognizable as links.
 
 Review a plan frame, the fleet table, the throttle reason and ETA, the waiting
 state, and the completed state after rendering. Check the GIFs at README

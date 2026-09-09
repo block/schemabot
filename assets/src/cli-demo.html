@@ -5,7 +5,39 @@
 let demo,timeline,total;
 const escape=s=>s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
 const colors={30:'#1f2328',31:'#cf222e',32:'#1a7f37',33:'#9a6700',34:'#0969da',35:'#8250df',36:'#0550ae',37:'#59636e',90:'#59636e',91:'#cf222e',92:'#1a7f37',93:'#9a6700',94:'#0969da',95:'#8250df',96:'#0550ae'};
-function ansi(raw){raw=raw.replace(/\x1b\]8;[^\x07\x1b]*(?:\x07|\x1b\\)/g,'');let out='',last=0,style={},m;const re=/\x1b\[([0-9;]*)m/g;const span=s=>'<span style="'+Object.entries(style).map(([k,v])=>k+':'+v).join(';')+'">'+escape(s)+'</span>';while((m=re.exec(raw))){out+=span(raw.slice(last,m.index));const codes=m[1].split(';').map(Number);for(let i=0;i<codes.length;i++){const c=codes[i];if(c===0)style={};else if(c===1)style['font-weight']='600';else if(c===2)style.color='#59636e';else if(c===22)delete style['font-weight'];else if(c===39)delete style.color;else if(colors[c])style.color=colors[c];else if(c===38&&codes[i+1]===2){style.color=`rgb(${codes.slice(i+2,i+5).join(',')})`;i+=4;}}last=re.lastIndex;}return out+span(raw.slice(last));}
+function ansi(raw) {
+  let out = '', last = 0, style = {}, hyperlink = false, match;
+  const token = /\x1b\]8;[^;\x07\x1b]*;([^\x07\x1b]*)(?:\x07|\x1b\\)|\x1b\[([0-9;]*)m/g;
+  const span = text => {
+    const visibleStyle = hyperlink
+      ? {...style, color: '#0969da', 'text-decoration': 'underline', 'text-underline-offset': '3px'}
+      : style;
+    return '<span style="' + Object.entries(visibleStyle).map(([k, v]) => k + ':' + v).join(';') + '">' + escape(text) + '</span>';
+  };
+  while ((match = token.exec(raw))) {
+    out += span(raw.slice(last, match.index));
+    if (match[1] !== undefined) {
+      hyperlink = match[1] !== '';
+    } else {
+      const codes = match[2].split(';').map(Number);
+      for (let i = 0; i < codes.length; i++) {
+        const c = codes[i];
+        if (c === 0) style = {};
+        else if (c === 1) style['font-weight'] = '600';
+        else if (c === 2) style.color = '#59636e';
+        else if (c === 22) delete style['font-weight'];
+        else if (c === 39) delete style.color;
+        else if (colors[c]) style.color = colors[c];
+        else if (c === 38 && codes[i + 1] === 2) {
+          style.color = `rgb(${codes.slice(i + 2, i + 5).join(',')})`;
+          i += 4;
+        }
+      }
+    }
+    last = token.lastIndex;
+  }
+  return out + span(raw.slice(last));
+}
 window.setDemo=d=>{demo=d;document.body.style.height=(d.height||670)+'px';document.querySelector('.terminal').style.height=((d.height||670)-196)+'px';document.querySelector('.bar').textContent=d.name==='cli-ops'?'fleet · staging':'shop · staging';document.querySelector('#title').textContent=d.title;let time=0,command='',caption='';timeline=d.frames.map(f=>{const typing=f.command&&f.command!==command?1.4:0;command=f.command||command;caption=f.caption||caption;const settle=typing&&d.name==='cli-ops'?0.4:0;const frame={...f,start:time,typing,settle,command,caption};time+=typing+settle+f.seconds;return frame;});total=time;return total;};
 window.renderFrame=t=>{const f=timeline.find((f,i)=>t>=f.start&&(i===timeline.length-1||t<timeline[i+1].start))||timeline[0];const elapsed=t-f.start;const typing=elapsed<f.typing;document.querySelector('#command').textContent=f.command?'$ '+(typing?f.command.slice(0,Math.floor(elapsed/f.typing*f.command.length))+'▌':f.command):'';document.querySelector('#output').innerHTML=elapsed<f.typing+f.settle?'':ansi(f.output.trimEnd());document.querySelector('#caption').textContent=f.caption;document.querySelector('#line').style.width=(Math.min(t/total,1)*1100)+'px';const pre=document.querySelector('#output');return {overflow:pre.scrollWidth>1000||pre.scrollHeight>((demo.height||670)-305)};};
 </script></body></html>
