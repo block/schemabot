@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/json"
+	"fmt"
 	"slices"
 	"sort"
 	"strings"
@@ -1235,6 +1236,25 @@ func (opts ApplyOptions) Map() map[string]string {
 		options["rollback"] = "true"
 	}
 	return options
+}
+
+// ParseProgressMetadata decodes the operation's persisted progress display
+// metadata. An operation that has never persisted metadata, or whose stored
+// value is a JSON null, yields an empty non-nil map so callers can overlay
+// into it directly; malformed JSON is an error, because a row that cannot be
+// decoded is worth a log line rather than a silently empty progress view.
+func (op *ApplyOperation) ParseProgressMetadata() (map[string]string, error) {
+	metadata := make(map[string]string)
+	if op.ProgressMetadata == "" {
+		return metadata, nil
+	}
+	if err := json.Unmarshal([]byte(op.ProgressMetadata), &metadata); err != nil {
+		return nil, fmt.Errorf("decode apply operation progress metadata: %w", err)
+	}
+	if metadata == nil {
+		metadata = make(map[string]string)
+	}
+	return metadata, nil
 }
 
 // ParseApplyOptions parses the JSON options into ApplyOptions.

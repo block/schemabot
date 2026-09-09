@@ -457,8 +457,11 @@ engine and execution phase: copying can report rows and percent complete;
 as zero time remaining. Throttled tasks can include `throttle_reason`.
 Sharded engines can add per-shard progress, and multi-deployment applies list
 operations with their deployment, target, state, and cutover policy.
-The top-level `metadata` object carries the engine's latest position fields,
-such as `phase`, `step`, `steps_total`, and `statement`, when available.
+The top-level `metadata` object carries engine-specific display fields when the
+engine reports them: PostgreSQL applies report their position through `phase`,
+`step`, `steps_total`, and `statement`; PlanetScale applies report deploy
+request fields such as `branch_name` and `deploy_request_url`. Spirit applies
+report their progress on the table entries and add no position fields.
 
 <details>
 <summary>Request and response example</summary>
@@ -476,12 +479,6 @@ Response excerpt (illustrative values):
   "environment": "production",
   "engine": "spirit",
   "state": "running",
-  "metadata": {
-    "phase": "copying",
-    "step": "3",
-    "steps_total": "8",
-    "statement": "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)"
-  },
   "tables": [
     {
       "table_name": "orders",
@@ -500,10 +497,49 @@ Response excerpt (illustrative values):
 
 </details>
 
+<details>
+<summary>PostgreSQL response example</summary>
+
+```http
+GET /api/progress/apply/apply-example-74
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "apply_id": "apply-example-74",
+  "database": "shop",
+  "environment": "production",
+  "engine": "postgres",
+  "state": "running",
+  "metadata": {
+    "phase": "preflight",
+    "step": "3",
+    "steps_total": "8",
+    "statement": "CREATE INDEX CONCURRENTLY orders_status_idx ON public.orders (status)"
+  },
+  "tables": [
+    {
+      "table_name": "orders",
+      "keyspace": "public",
+      "ddl": "ALTER TABLE public.orders ADD COLUMN status text",
+      "status": "running",
+      "rows_copied": 0,
+      "rows_total": 0,
+      "percent_complete": 0
+    }
+  ]
+}
+```
+
+</details>
+
 The numbers come from the engine while the apply is active, so they are as
 fresh as the last poll. Once the apply is terminal, the same endpoint answers
 from storage: rows, throttle state, and checksum counts are preserved on the
-task record; ETA and per-shard rows are not persisted in this view.
+task record, and `metadata` holds the last position the engine reported; ETA
+and per-shard rows are not persisted in this view.
 
 ## What’s running across the fleet?
 

@@ -88,7 +88,6 @@ package tern
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -3274,16 +3273,11 @@ func (c *LocalClient) loadStoredProgressMetadata(ctx context.Context, task *stor
 		c.logger.Debug("progress: no apply operation for stored metadata", "task_id", task.TaskIdentifier, "apply_operation_id", operationID)
 		return nil
 	}
-	metadata := make(map[string]string)
-	if op.ProgressMetadata != "" {
-		if err := json.Unmarshal([]byte(op.ProgressMetadata), &metadata); err != nil {
-			c.logger.Warn("progress response will omit persisted progress fields: failed to decode progress metadata",
-				"task_id", task.TaskIdentifier, "apply_operation_id", operationID, "error", err)
-			metadata = make(map[string]string)
-		}
-		if metadata == nil {
-			metadata = make(map[string]string)
-		}
+	metadata, err := op.ParseProgressMetadata()
+	if err != nil {
+		c.logger.Warn("progress response will omit persisted progress fields: failed to decode progress metadata",
+			"task_id", task.TaskIdentifier, "apply_operation_id", operationID, "error", err)
+		metadata = make(map[string]string)
 	}
 	if c.config.Type == storage.DatabaseTypeVitess && op.EngineResumeMetadata != "" {
 		display, err := PSDisplayMetadata(op.EngineResumeMetadata)

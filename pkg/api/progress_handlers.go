@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -496,53 +495,55 @@ func setRevertSkippedMetadata(resp *apitypes.ProgressResponse, apply *storage.Ap
 	resp.Metadata["revert_skipped"] = "true"
 }
 
-// overlayStoredDisplayMetadata populates the PlanetScale display fields
-// (branch_name, deploy_request_url, is_instant, deferred_deploy) on a progress
-// response served from storage. On the live path these arrive from the engine's
-// progress projection; terminal, stopped, and resuming applies are served from
-// storage without polling the engine, so they are read from the durable engine
-// resume state persisted on the apply's operation. Best-effort: a value already
-// set by the caller is never overwritten, and applies that predate resume-state
-// persistence simply render without these fields.
+// overlayStoredDisplayMetadata populates the engine's display metadata on a
+// progress response served from storage. On the live path these fields arrive
+// from the engine's progress projection; terminal, stopped, and resuming
+// applies are served from storage without polling the engine, so they are read
+// from the apply's operation rows: the progress metadata the driver persisted
+// as the engine reported it (phase, step, statement position), and for
+// PlanetScale the deploy display fields (branch_name, deploy_request_url,
+// is_instant, deferred_deploy) decoded from the durable engine resume state,
+// which stay authoritative where both sources carry the same key. Best-effort:
+// a value already set by the caller is never overwritten, and applies that
+// predate persistence simply render without these fields.
 func (s *Service) overlayStoredDisplayMetadata(ctx context.Context, resp *apitypes.ProgressResponse, apply *storage.Apply, operationIDs map[int64]string) {
-	if apply == nil || apply.Engine != storage.EnginePlanetScale {
+	if apply == nil {
 		return
 	}
 	for opID := range operationIDs {
-		rs, err := s.storage.ApplyOperations().GetEngineResumeState(ctx, opID)
-		if errors.Is(err, storage.ErrEngineResumeStateNotFound) {
-			// Expected for operations that have not persisted engine state yet
-			// (or predate resume-state persistence) — nothing to overlay.
-			slog.Debug("progress response has no engine resume state to overlay",
-				"apply_id", apply.ApplyIdentifier, "apply_operation_id", opID)
-			continue
-		}
+		op, err := s.storage.ApplyOperations().Get(ctx, opID)
 		if err != nil {
-			slog.Warn("progress response will omit engine display fields: failed to load engine resume state",
-				"apply_id", apply.ApplyIdentifier,
-				"apply_operation_id", opID,
-				"database", apply.Database,
-				"environment", apply.Environment,
-				"error", err)
+			slog.Warn("progress response will omit stored engine metadata: failed to load apply operation",
+				append(apply.LogAttrs(), "apply_operation_id", opID, "error", err)...)
 			continue
 		}
-		display, err := tern.PSDisplayMetadata(rs.Metadata)
+		if op == nil {
+			slog.Warn("progress response will omit stored engine metadata: apply operation row is missing",
+				append(apply.LogAttrs(), "apply_operation_id", opID)...)
+			continue
+		}
+		metadata, err := op.ParseProgressMetadata()
 		if err != nil {
-			slog.Warn("progress response will omit engine display fields: failed to decode engine resume state",
-				"apply_id", apply.ApplyIdentifier,
-				"apply_operation_id", opID,
-				"database", apply.Database,
-				"environment", apply.Environment,
-				"error", err)
-			continue
+			slog.Warn("progress response will omit persisted progress fields: failed to decode progress metadata",
+				append(apply.LogAttrs(), "apply_operation_id", opID, "error", err)...)
+			metadata = make(map[string]string)
 		}
-		if len(display) == 0 {
+		if apply.Engine == storage.EnginePlanetScale && op.EngineResumeMetadata != "" {
+			display, err := tern.PSDisplayMetadata(op.EngineResumeMetadata)
+			if err != nil {
+				slog.Warn("progress response will omit engine display fields: failed to decode engine resume state",
+					append(apply.LogAttrs(), "apply_operation_id", opID, "error", err)...)
+			} else {
+				maps.Copy(metadata, display)
+			}
+		}
+		if len(metadata) == 0 {
 			continue
 		}
 		if resp.Metadata == nil {
-			resp.Metadata = make(map[string]string, len(display))
+			resp.Metadata = make(map[string]string, len(metadata))
 		}
-		for k, v := range display {
+		for k, v := range metadata {
 			if resp.Metadata[k] == "" {
 				resp.Metadata[k] = v
 			}
