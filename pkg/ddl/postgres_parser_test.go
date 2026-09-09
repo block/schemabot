@@ -668,6 +668,7 @@ func TestPostgresDropTargets(t *testing.T) {
 	}{
 		{"drop tables", "DROP TABLE a, b", DropTargets{Tables: 2}, false},
 		{"drop index", "DROP INDEX idx", DropTargets{Indexes: 1}, false},
+		{"drop indexes", "DROP INDEX a, b", DropTargets{Indexes: 2}, false},
 		{"drop column", "ALTER TABLE t DROP COLUMN IF EXISTS c", DropTargets{Columns: 1}, false},
 		{"drop primary key", "ALTER TABLE t DROP CONSTRAINT t_pkey", DropTargets{}, false},
 		{"create table", "CREATE TABLE t (id bigint)", DropTargets{}, false},

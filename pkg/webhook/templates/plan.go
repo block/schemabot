@@ -1268,8 +1268,10 @@ func classifyUnsafeDrops(change UnsafeChangeData, databaseType string, parser dd
 }
 
 // dropCountsWithTableFallback counts a table drop for a change whose type is
-// the table drop even when neither its statement nor its reason named one: an
-// engine may report the drop of an undeclared table without a statement.
+// the table drop even when neither its statement nor its reason named one. It
+// is a backstop for a stored change that reaches the renderer with neither a
+// parseable statement nor a reason that spells out DROP TABLE; every engine
+// stores both, so the backstop only matters when a producer omits them.
 // Index drops carry their own change type, so they never take this path.
 func dropCountsWithTableFallback(drops unsafeDropCounts, changeType string) unsafeDropCounts {
 	if strings.EqualFold(changeType, "drop") && drops.tables == 0 {

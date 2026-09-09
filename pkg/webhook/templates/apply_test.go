@@ -108,10 +108,23 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 			wantOK: true,
 		},
 		{
-			name:         "undeclared PostgreSQL table drop classified from change type",
+			// The statement already counts the table, so the change type
+			// must not count it a second time.
+			name:         "undeclared PostgreSQL table drop counts once",
 			databaseType: "postgres",
 			changes: []UnsafeChangeData{
-				{Table: "archived_orders", Reason: `DROP TABLE removes all data from table "archived_orders"`, DDL: `DROP TABLE "public"."archived_orders"`, ChangeType: "DrOp"},
+				{Table: "archived_orders", Reason: `DROP TABLE removes all data from table "archived_orders"`, DDL: `DROP TABLE "public"."archived_orders"`, ChangeType: "drop"},
+			},
+			want:   "the dropped table",
+			wantOK: true,
+		},
+		{
+			// Neither a statement nor a reason names the drop; the change
+			// type alone, in whatever case the producer wrote it, supplies it.
+			name:         "table drop without statement or reason words falls back to change type",
+			databaseType: "postgres",
+			changes: []UnsafeChangeData{
+				{Table: "archived_orders", Reason: "the table is not declared in the schema files", ChangeType: "DrOp"},
 			},
 			want:   "the dropped table",
 			wantOK: true,
@@ -479,6 +492,35 @@ func TestRenderUnsafeChangesBlockedIncludesDropIndexGuidance(t *testing.T) {
 	assert.Contains(t, rendered, "Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.")
 	assert.Contains(t, rendered, "Before dropping an index in MySQL, first make the dropped index invisible and verify application queries no longer rely on it for safe performance.")
 	assert.NotContains(t, rendered, "reads from or writes to the dropped index")
+}
+
+// The apply-blocked comment classifies drops with the target's parser: a
+// PostgreSQL statement whose reason never says DROP still gets the guidance.
+// Passing an empty database type here would fall back to the reason and
+// render no guidance at all.
+func TestRenderUnsafeChangesBlockedClassifiesPostgresDropsFromDDL(t *testing.T) {
+	rendered := RenderUnsafeChangesBlocked(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		IsMySQL:      false,
+		DatabaseType: "postgres",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					`ALTER TABLE "customers" DROP COLUMN "nickname", DROP COLUMN "legacy_code";`,
+				},
+			},
+		},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "customers", Reason: `statement removes live structure from table "customers"`, DDL: `ALTER TABLE "customers" DROP COLUMN "nickname", DROP COLUMN "legacy_code"`},
+		},
+	})
+
+	assert.Contains(t, rendered, "Before allowing a destructive drop, first deploy application code that no longer reads from or writes to any dropped columns.")
+	assert.NotContains(t, rendered, "the dropped column.")
 }
 
 func TestRenderUnsafeChangesBlockedUsesPluralMySQLDropIndexGuidance(t *testing.T) {

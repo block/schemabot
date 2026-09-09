@@ -316,10 +316,15 @@ func TestTiDBDropTargets(t *testing.T) {
 		{"drop tables", "DROP TABLE a, b", DropTargets{Tables: 2}, false},
 		{"drop index", "DROP INDEX idx ON t", DropTargets{Indexes: 1}, false},
 		{"alter drops", "ALTER TABLE t DROP COLUMN c, DROP INDEX i", DropTargets{Columns: 1, Indexes: 1}, false},
+		{"alter drops two indexes", "ALTER TABLE t DROP INDEX a, DROP INDEX b", DropTargets{Indexes: 2}, false},
 		{"drop column shorthand", "ALTER TABLE t DROP c", DropTargets{Columns: 1}, false},
 		{"drop primary key", "ALTER TABLE t DROP PRIMARY KEY", DropTargets{}, false},
 		{"create table", "CREATE TABLE t (id bigint)", DropTargets{}, false},
+		// Spirit rejects a compound whose statements are not all ALTER TABLE
+		// before the single-statement guard runs; the all-ALTER compound is
+		// the input that reaches the guard.
 		{"multiple statements", "DROP TABLE a; DROP TABLE b", DropTargets{}, true},
+		{"multiple alters", "ALTER TABLE a DROP COLUMN x; ALTER TABLE b DROP COLUMN y", DropTargets{}, true},
 		{"garbage", "this is not SQL", DropTargets{}, true},
 	}
 	for _, tt := range tests {
