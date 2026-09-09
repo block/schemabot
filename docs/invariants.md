@@ -774,18 +774,14 @@ classes exclude each other by one mechanism rather than by two that have to be k
 and a row can still be attributed by reading it. A reader's job is to report what is stored,
 including when what is stored is a task that has outlived its apply's verdict (UX-3).
 
-One writer stands outside this: `ExpireRetryable` terminalizes the task rows of an apply whose
-retry budget or recovery freshness has run out, selected by `apply_id` alone under a `FOR UPDATE`
-on the parent. The parent lock serializes it against a driver claiming that apply, but it reads no
-operation lease, so it is the one task write not covered by the sentence above. It is named here
-rather than left for a reader to discover, because an entry that overstates its own coverage is
-what makes the registry unreliable.
+Retryable-apply expiry writes task rows without holding a lease, and reads the row's operation
+lease before writing so that it excludes a live driver by that same mechanism.
 
 *Enforced:* lease predicates on the driver's apply and task writes
 (`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/applies.go`), the
-reaper's task sweeps (`unleasedOperationGate`,
-`pkg/storage/internal/sqlstore/apply_operations.go`), and a read path that builds progress from
-stored rows without writing them (`pkg/api/progress_handlers.go`).
+reaper's task sweeps and retryable-apply expiry's task writes (`unleasedOperationGate`,
+`undrivenOperationGate`, `pkg/storage/internal/sqlstore/apply_operations.go`), and a read path that
+builds progress from stored rows without writing them (`pkg/api/progress_handlers.go`).
 
 ## Control operations (CO)
 
