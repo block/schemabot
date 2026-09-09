@@ -62,13 +62,14 @@ conditions:
   [Index builds](#index-builds)). Statement kinds outside that set fail
   closed.
 - For a change to an existing table, the target is an ordinary or partitioned
-  table and its measured on-disk size is no more than the configured
-  native-apply ceiling (1 GiB by default; see
+  table. Native `ALTER TABLE` and blocking `CREATE INDEX` statements also
+  require its measured on-disk size to be no more than
+  the configured native-apply ceiling (1 GiB by default; see
   `postgres.native_safe_table_size_limit_bytes` in
   [configuration](configuration.md)). For a partitioned parent, the
   measurement includes its complete partition tree. The ceiling bounds
-  rewrites of existing data, so it does not apply to a `CREATE TABLE`: a
-  table that does not exist yet has none.
+  work that scales with existing data, so it does not apply to a `CREATE
+  TABLE` or `CREATE INDEX CONCURRENTLY`.
 - The target role passes the privilege preflight for the planned statement.
   A greenfield create is checked against the schema — the role needs `CREATE`
   on the target schema — because no table exists to state facts about.
@@ -98,6 +99,34 @@ bounded at apply time: each attempt has a 3-second lock budget and a
 statement that exceeds the execution budget is not allowed to continue
 unbounded.
 
+While a statement runs, PostgreSQL progress metadata carries two phase
+vocabularies in one flat map. `phase` is SchemaBot's own record of the apply:
+`preflight` for as long as the apply runs, then its terminal outcome
+(`completed`, `failed`, or `refused`).
+`server_phase` is the `phase` column of PostgreSQL's
+`pg_stat_progress_create_index` view, verbatim (for example `building index:
+scanning table` or `index validation: scanning index`), and is present only
+while PostgreSQL publishes a progress row for a concurrent index build. The
+metadata also carries `step`, `steps_total`, and the sanitized `statement`
+for the statement in flight; `executor_operation`, pg-sprite's class for the
+step (`admitting`, `optimistic`, `brief`, `validate-constraint`,
+`concurrent-index-build`); and `attempt`. Whenever a progress row is
+published, all six counters — `blocks_done`, `blocks_total`, `tuples_done`,
+`tuples_total`, `lockers_done`, `lockers_total` — are present, zeros
+included: a zero is a reading, and an absent key means PostgreSQL has not
+published a row. PostgreSQL scopes block and tuple counters to phases, but a
+completed phase's values can persist into the next phase. The completed heap
+scan's block counters remain visible while live tuples are sorted, so that
+sorting phase's zero-width band absorbs the carry-over and reports its start.
+
+Table progress during a concurrent index build is a whole-build estimate, not
+a phase ratio. Each server phase owns a fixed band of the 0–100 scale in
+PostgreSQL's documented phase order, a phase with block or tuple counters
+interpolates within its band, and a waiting or sorting phase reports the
+band's start. The estimate stays below 100 until the apply completes and never
+moves backwards within a build; a poll that finds no progress row — between
+phases, or while the view cannot be read — keeps the last derived percent.
+
 A multi-statement plan — several tables changed, or one declarative edit that
 the planner expands into several steps — is not applied atomically. The
 statements execute in order, each committing or failing in its own
@@ -123,6 +152,16 @@ when the bound is what ended the build it names the option to raise. A build
 that runs past the bound and provably leaves nothing behind is refused
 permanently, naming the option, because an identical retry would spend the
 same bound again.
+The native-apply size ceiling does not gate this path: the build is bounded
+by `postgres.concurrent_index_max_duration` instead, and a build the bound
+ended or an invalid-index outcome is reported as such rather than as a
+table-size verdict.
+Losing the driver pod mid-build does not stop the statement: the server keeps
+building until it finishes, fails, or its `statement_timeout` ends it, so the
+recovery re-plan on the next drive meets that build's outcome — a valid index
+it has nothing left to build, a build still in flight (the apply fails
+retryable, naming the index and the backend building it, until that build
+ends), or a failed build's invalid leftover.
 The next drive recovers that leftover itself: when the build finds an invalid
 index under the requested name, or quarantined on the table by an interrupted
 recovery, that pg-sprite can prove abandoned — on the target table, with no
@@ -145,6 +184,44 @@ indexes concurrently.
 Indexes declared together with a new table take a different path: they run as
 plain, non-concurrent steps inside the greenfield create set, because the table
 has no readers yet (see [Greenfield tables](#greenfield-tables)).
+
+### Control operations
+
+Cancel is supported for an existing table's concurrent index build. Plain DDL
+is never cancellable: each statement commits or fails on its own, so a cancel
+of one is declined as a typed unsupported operation and the durable request
+resolves terminally.
+
+A cancel of a running build signals the build's backend through the apply's
+pg-sprite progress tracker. When that signal cannot reach a running statement
+— the build has not started, has already returned, or its backend cannot be
+observed or signalled by the engine role — the engine cancels the apply's own
+context instead, which ends whatever statement the apply is on. Membership in
+`pg_signal_backend` lets the signal land on the build backend directly; without
+it the cancel still takes effect through the apply's context.
+
+The cancel is answered from the outcome the apply settles on, never from the
+signal alone. A build cancelled either way leaves an invalid index, which the
+apply records as the cancelled outcome and the next build under that name
+recovers as abandoned debris. A signal that races the build's completion may
+find the index already valid: that apply is reported as already completed, not
+cancelled, and the durable request reconciles to the completed outcome. A cancel
+that arrives after the apply has already failed is accepted over the failure,
+carrying the failure detail. A cancel whose build has not settled within the
+engine's wait is reported as still running, and the next attempt waits for it
+again.
+
+On shutdown the engine halts its running concurrent index builds the same way
+— by cancelling their contexts — so the process does not exit with a build
+running on the target under a lease nobody renews. A halt is not an operator
+cancel: the apply records the build's failure, stays active, and the next
+driver to claim it recovers the leftover index before its own build. Plain DDL
+is left to finish; a halt whose budget expires while such a statement is still
+running reports that the target may still be held.
+
+Stop remains unsupported. A concurrent build has no resumable midpoint, so a
+stop would be a permanent cancel under a misleading name; non-concurrent
+statements likewise have no engine phase to pause.
 
 ### Greenfield tables
 
@@ -209,11 +286,13 @@ when pg-sprite could not construct the concurrent form of a plain
 `CREATE INDEX`, since running the submitted form would falsify the plan's own
 verdict.
 
-The plan comment lists the table and SchemaBot's reason for the refusal. For a
-PostgreSQL plan, the plan Check Run concludes unsuccessfully, and an apply
-attempt is rejected before any apply or task is queued. Rewrite the declarative
-change into an eligible form or use a separately reviewed operational process;
-flags do not override an engine-blocked verdict.
+The plan comment lists the table and SchemaBot's reason for the refusal. When
+the create path refuses a statement's shape, that reason names the offending
+clause and how to remove or work around it. For a PostgreSQL plan, the plan
+Check Run concludes unsuccessfully, and an apply attempt is rejected before
+any apply or task is queued. Rewrite the declarative change into an eligible
+form or use a separately reviewed operational process; flags do not override
+an engine-blocked verdict.
 
 The engine does not execute `DROP TABLE` or other statement kinds outside its
 admitted set. That includes tables that exist on the target but that no schema
@@ -227,6 +306,8 @@ the target's tables and surfaces each undeclared one as a blocked, destructive
 `DROP TABLE` change: the engine will never run the drop, so the one choice
 left is whether to report the divergence, and hiding it would turn a target
 that does not match its declaration into a passing check.
+Deleting every schema file in one namespace keeps that namespace in the plan
+and surfaces every live table it contains as one of these blocked drops.
 Because the check fails for the whole database while any change is blocked,
 an undeclared table holds up every other change to that database until it is
 resolved — including changes in other namespaces, since every namespace at
@@ -295,24 +376,47 @@ surface.
 Planning establishes the statement shape. Apply time re-checks facts that can
 change or that depend on the target:
 
-- A table larger than the configured ceiling is refused permanently. This is
+- A table larger than the configured ceiling is refused permanently for native
+  `ALTER TABLE` and blocking `CREATE INDEX`. This is
   SchemaBot's native-apply ceiling, not a PostgreSQL limit. It defaults to
   1 GiB and is set with `postgres.native_safe_table_size_limit_bytes`; see
   [configuration](configuration.md) for the trade-offs of raising it. The
-  ceiling gates changes to existing tables only; a `CREATE TABLE` is exempt.
+  ceiling gates work whose cost scales with an existing table. A `CREATE TABLE`
+  is exempt, and `CREATE INDEX CONCURRENTLY` is admitted under the
+  `postgres.concurrent_index_max_duration` bound instead; a build the bound
+  ended and invalid-index outcomes are reported as such rather than as a size
+  verdict.
 - For a change to an existing table: a missing target, or an object that is
   not an ordinary or partitioned table, is refused permanently.
 - For a `CREATE TABLE`: a relation of any kind already occupying the name, a
   missing target schema, a duplicate name inside the statement, `IF NOT
   EXISTS`, and `PARTITION OF` against a live parent are each refused
   permanently, with a reason directing a fix or a re-plan.
+- After a `CREATE TABLE` commits, pg-sprite reads back the constraint-index
+  and sequence names the table owns. A table that owns a suffixed name in
+  place of one the schema file claims — an occupant took the first choice
+  between the catalog probe and the statement — is refused permanently, with
+  the missing and owned names in the reason; the table is left standing for
+  the operator to rename the relation or drop, then re-plan. A read-back that
+  does not complete is also refused permanently, even though pg-sprite marks
+  it retryable: SchemaBot's retry re-runs the whole plan, whose `CREATE
+  TABLE` has already committed, so it could only collide with the table this
+  apply created. The reason directs the operator to compare the table's
+  names against the schema file, then re-plan.
 - Insufficient privileges are refused permanently before DDL runs. The stored
   failure includes the provisioning `GRANT` derived by pg-sprite.
 - Exhausting the 30-second statement budget is a permanent native-safety
   refusal. Exhausting the lock budget is retryable after contention clears.
+- Every apply other than a concurrent index build runs under a fixed
+  five-minute client-side ceiling. It is not configurable: it exists to
+  guarantee a terminal progress state when a dial hangs or a connection is
+  black-holed, not to bound legitimate work, which the statement and lock
+  budgets above already bound. An apply the ceiling ends is recorded as a
+  retryable operational failure.
 - A concurrent index build runs under the
   `postgres.concurrent_index_max_duration` bound (24 hours by default), set
-  as the build's server-side `statement_timeout`. A build that
+  as the build's server-side `statement_timeout`, rather than that fixed
+  ceiling. A build that
   finds an invalid index already under the requested name or quarantined on
   the table that pg-sprite proves abandoned — a failed build's leftover on
   the target table with no backend building it, one whose builder the engine
@@ -359,16 +463,19 @@ PostgreSQL targets do not support:
 
 - pending drops;
 - deferred cutover (`--defer-cutover`);
-- stop, cancel, start, cutover, revert, skip-revert, or volume controls.
+- stop, start, cutover, revert, skip-revert, or volume controls;
+- cancel of anything other than a concurrent index build (see
+  [Control operations](#control-operations)).
 
 Each PostgreSQL DDL statement on this path runs as its own transaction that
-commits or fails. A stop or cancel request is stored through the normal
-durable control path, but the engine resolves it as a typed, terminal
-unsupported-operation decline; it does not report a successful stop or keep
-retrying the request. The apply
-continues to its own completion or failure. If an in-flight statement must be
-interrupted, find its backend in `pg_stat_activity` and use PostgreSQL's
-`pg_cancel_backend` through an operator-controlled database session.
+commits or fails. A stop request, or a cancel of plain DDL, is stored through
+the normal durable control path, but the engine resolves it as a typed,
+terminal unsupported-operation decline; it does not report a successful stop or
+keep retrying the request. The apply continues to its own completion or
+failure. If an in-flight plain DDL statement must be interrupted, find its
+backend in `pg_stat_activity` and use PostgreSQL's `pg_cancel_backend` through
+an operator-controlled database session; the apply records that as a failure
+the next drive retries.
 
 Pending drops is a MySQL/Spirit quarantine and cleaner. PostgreSQL plans do not
 gain that behavior from enabling the server-level `pending_drops` block.

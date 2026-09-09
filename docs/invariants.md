@@ -612,7 +612,8 @@ completeness test over it (`pkg/state/metadata.go`).
 `failed_retryable` is active, not terminal: recovery re-drives it automatically. Only
 `failed_retryable` tasks reset to `pending`, so completed tasks are never re-run, and the apply
 settles to permanent `failed` when the attempt budget is spent or the recovery window closes.
-*Enforced:* retry preparation and expiry (`pkg/api/operator.go`); budget semantics in
+*Enforced:* retry preparation in the drive loop (`pkg/api/operator.go`) and the expiry sweep
+(`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`); budget semantics in
 [apply-lifecycle.md](apply-lifecycle.md).
 
 ### ST-10: Rollouts respect order and fail closed on policy
@@ -779,14 +780,11 @@ classes exclude each other by one mechanism rather than by two that have to be k
 and a row can still be attributed by reading it. A reader's job is to report what is stored,
 including when what is stored is a task that has outlived its apply's verdict (UX-3).
 
-Retryable-apply expiry writes task rows without holding a lease, and reads the row's operation
-lease before writing so that it excludes a live driver by that same mechanism.
-
 *Enforced:* lease predicates on the driver's apply and task writes
-(`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/applies.go`), the
-reaper's task sweeps and retryable-apply expiry's task writes (`unleasedOperationGate`,
-`undrivenOperationGate`, `pkg/storage/internal/sqlstore/apply_operations.go`), and a read path that
-builds progress from stored rows without writing them (`pkg/api/progress_handlers.go`).
+(`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/applies.go`), the lease
+gates the reaper's sweeps select and write under (`unleasedOperationGate`, `undrivenApplyGate`,
+`pkg/storage/internal/sqlstore/apply_operations.go`), and a read path that builds progress from
+stored rows without writing them (`pkg/api/progress_handlers.go`).
 
 ## Control operations (CO)
 
@@ -1338,6 +1336,16 @@ Registering a local profile must not replace a different connection, change the 
 or overwrite a concurrent configuration update. Retrying an identical registration is safe.
 
 *Enforced:* `pkg/cmd/client/local_profile.go` and `pkg/cmd/client/config.go`.
+
+### AZ-9: Initialization preserves the target and existing files
+
+Initialization verifies the imported schema before publishing it and never applies changes to the
+target. It must not overwrite existing schema files or redirect an existing profile to another
+connection. A retry may reuse identical imported files. Failed setup preserves the runtime and
+its state so the retry uses the same execution authority.
+
+*Enforced:* `pkg/cmd/commands/init.go`, `pkg/cmd/commands/init_publish_darwin.go`,
+`pkg/cmd/commands/init_publish_linux.go`, and `pkg/cmd/commands/init_publish_other.go`.
 
 ## Structural enforcement
 

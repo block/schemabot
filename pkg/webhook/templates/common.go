@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // capitalizeFirst capitalizes the first letter of a string.
@@ -166,6 +168,14 @@ func escapeInlineMarkdown(text string) string {
 		b.WriteRune(r)
 	}
 	return b.String()
+}
+
+// inlineCodeStatement renders an engine-supplied statement inside a Markdown
+// code span: the shared single-line clamp bounds its width, and replacing the
+// code delimiter keeps the value from closing the span early. The replacement
+// is one rune for one, so the clamp's width bound still holds.
+func inlineCodeStatement(text string) string {
+	return strings.ReplaceAll(ui.ClampStatement(text), "`", "'")
 }
 
 // maxCommentErrorLen bounds an error message rendered into a PR comment so a
