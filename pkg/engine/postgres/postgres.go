@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"math"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 
 	"github.com/block/pg-sprite/pkg/dbconn"
@@ -45,8 +47,9 @@ type Engine struct {
 	// accepting a second apply on the same target must not evict the first
 	// one's state while it is still running, or the running apply's driver
 	// would be told its work no longer exists.
-	progress       map[string]*trackedApply
-	tableSizeLimit int64
+	progress                   map[string]*trackedApply
+	tableSizeLimit             int64
+	concurrentIndexMaxDuration time.Duration
 
 	// execute is a test seam standing in for executeOptimistic, so the apply
 	// drive — accept, claim, execute, terminal publish — can be exercised
@@ -71,6 +74,24 @@ type trackedApply struct {
 // ceiling when the server does not configure one.
 const DefaultNativeSafeTableSizeLimitBytes = int64(1 << 30)
 
+// DefaultConcurrentIndexMaxDuration bounds one concurrent index build.
+const DefaultConcurrentIndexMaxDuration = 24 * time.Hour
+
+// MaxConcurrentIndexMaxDuration is the largest bound the engine accepts for
+// one concurrent index build: the largest statement_timeout PostgreSQL
+// accepts, in milliseconds. The build runs under that server-side timer set
+// to the bound, so a larger value could not be handed to the server; the
+// recovery's engine-owned deadline honors the same ceiling. A bound above it
+// is not a build anyone waits for; it is the absence of a bound.
+const MaxConcurrentIndexMaxDuration = time.Duration(math.MaxInt32) * time.Millisecond
+
+// MinConcurrentIndexMaxDuration is the smallest bound the engine accepts for
+// one concurrent index build: statement_timeout is an integer millisecond
+// count, so anything shorter rounds to zero on the server, which disables
+// the timer instead of tightening it. The executor refuses such a budget as
+// unbounded; the engine never hands it one.
+const MinConcurrentIndexMaxDuration = time.Millisecond
+
 // New creates a new PostgreSQL engine.
 func New() *Engine {
 	return NewWithTableSizeLimit(DefaultNativeSafeTableSizeLimitBytes)
@@ -83,16 +104,39 @@ func New() *Engine {
 // the plan-time preflight check rejects a non-positive limit before apply,
 // and server config validation rejects it at startup.
 func NewWithTableSizeLimit(tableSizeLimit int64) *Engine {
+	return NewWithOptions(tableSizeLimit, DefaultConcurrentIndexMaxDuration)
+}
+
+// NewWithOptions creates a PostgreSQL engine with its process-wide apply
+// bounds. A concurrentIndexMaxDuration that is not positive adopts
+// DefaultConcurrentIndexMaxDuration: unlike the table size limit, no later
+// check refuses a negative bound, and a deadline already in the past would
+// end every concurrent build the instant it started. One above
+// MaxConcurrentIndexMaxDuration is clamped to it, and a positive one below
+// MinConcurrentIndexMaxDuration is raised to it, so the bound the engine
+// serves is always one the server's timer can hold. Server config validation
+// refuses all three before they reach this constructor; the normalization
+// here covers embedders that build the engine directly.
+func NewWithOptions(tableSizeLimit int64, concurrentIndexMaxDuration time.Duration) *Engine {
 	if tableSizeLimit == 0 {
 		tableSizeLimit = DefaultNativeSafeTableSizeLimitBytes
 	}
-	return &Engine{tableSizeLimit: tableSizeLimit}
+	if concurrentIndexMaxDuration <= 0 {
+		concurrentIndexMaxDuration = DefaultConcurrentIndexMaxDuration
+	}
+	if concurrentIndexMaxDuration < MinConcurrentIndexMaxDuration {
+		concurrentIndexMaxDuration = MinConcurrentIndexMaxDuration
+	}
+	if concurrentIndexMaxDuration > MaxConcurrentIndexMaxDuration {
+		concurrentIndexMaxDuration = MaxConcurrentIndexMaxDuration
+	}
+	return &Engine{tableSizeLimit: tableSizeLimit, concurrentIndexMaxDuration: concurrentIndexMaxDuration}
 }
 
 // NewForTarget creates a PostgreSQL engine with the target information needed
 // by capabilities whose request does not carry resolved credentials.
-func NewForTarget(tableSizeLimit int64, database string, credentials *engine.Credentials) *Engine {
-	e := NewWithTableSizeLimit(tableSizeLimit)
+func NewForTarget(tableSizeLimit int64, concurrentIndexMaxDuration time.Duration, database string, credentials *engine.Credentials) *Engine {
+	e := NewWithOptions(tableSizeLimit, concurrentIndexMaxDuration)
 	e.pullDatabase = database
 	e.pullCredentials = credentials
 	return e
@@ -101,6 +145,12 @@ func NewForTarget(tableSizeLimit int64, database string, credentials *engine.Cre
 // TableSizeLimit exposes the native-safe ceiling for wiring verification and observability.
 func (e *Engine) TableSizeLimit() int64 {
 	return e.tableSizeLimit
+}
+
+// ConcurrentIndexMaxDuration exposes the bound one concurrent index build
+// runs under, for wiring verification and observability.
+func (e *Engine) ConcurrentIndexMaxDuration() time.Duration {
+	return e.concurrentIndexMaxDuration
 }
 
 // Name returns the engine identifier.

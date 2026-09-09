@@ -29,7 +29,7 @@ import (
 )
 
 // Independent CLI invocations share one detached runtime. The same profile
-// carries a real plan and apply on either engine, then reconnects after a
+// carries a real plan, apply, and verified schema import on either engine, then reconnects after a
 // graceful stop without losing completed work.
 func TestSupervisorEngines(t *testing.T) {
 	binary := filepath.Join(t.TempDir(), "schemabot")
@@ -124,6 +124,28 @@ func TestSupervisorEngines(t *testing.T) {
 			var count int
 			require.NoError(t, db.QueryRowContext(verifyCtx, "SELECT COUNT(*) FROM widgets").Scan(&count))
 			assert.Zero(t, count)
+			// The imported files must plan back to an unchanged live database.
+			// Exercise the CLI's default verification, including engine inference.
+			schemaRoot := t.TempDir()
+			if engine == "postgres" {
+				// Default discovery includes empty schemas alongside populated ones.
+				execSQL(t, db, "CREATE SCHEMA empty_scope")
+			}
+			onboardCtx, cancelOnboard := context.WithTimeout(t.Context(), runtimeDeadline)
+			defer cancelOnboard()
+			onboard := exec.CommandContext(onboardCtx, binary, "onboard", "--profile", "alpha", "-d", "app", "-e", "development", "-s", schemaRoot)
+			onboard.Env = append(os.Environ(), "HOME="+home, "SCHEMABOT_ENDPOINT=", "SCHEMABOT_TOKEN=", "SCHEMABOT_PROFILE=")
+			output, err := onboard.CombinedOutput()
+			require.NoError(t, err, string(output))
+			assert.Contains(t, string(output), "Verified: pulled schema produces no schema changes in the source environment.")
+			config, err := os.ReadFile(filepath.Join(schemaRoot, "schemabot.yaml"))
+			require.NoError(t, err)
+			assert.Equal(t, "database: app\ntype: "+engine+"\n", string(config))
+			schema, err := os.ReadFile(filepath.Join(schemaRoot, namespace, "widgets.sql"))
+			require.NoError(t, err)
+			assert.Contains(t, string(schema), "widgets")
+			registrationCtx, cancelRegistration := context.WithTimeout(t.Context(), runtimeDeadline)
+			defer cancelRegistration()
 			// Exported after startup: the running child cannot inherit this variable.
 			t.Setenv("LIVE_NEW_TARGET", targetDSN)
 			addition := localsetup.Registration{Database: "billing", Environment: "development", Engine: engine, Storage: api.StorageConfig{DSN: storageDSN, Dialect: engine}, Connection: api.EnvironmentConfig{DSN: "env:LIVE_NEW_TARGET"}}
@@ -150,14 +172,14 @@ func TestSupervisorEngines(t *testing.T) {
 				require.True(t, control.Accepted, control.ErrorMessage)
 				waitSupervisedApply(t, connection, onlineApply.ApplyID, state.Apply.Completed)
 				var kept int
-				require.NoError(t, db.QueryRowContext(verifyCtx, "SELECT COUNT(*) FROM widgets WHERE name='keep me'").Scan(&kept))
+				require.NoError(t, db.QueryRowContext(registrationCtx, "SELECT COUNT(*) FROM widgets WHERE name='keep me'").Scan(&kept))
 				require.Equal(t, 524288, kept)
 			} else {
 				changed, err = localsetup.Register(manager, addition)
 				require.NoError(t, err)
 				require.True(t, changed)
 			}
-			updated, err := manager.Ensure(verifyCtx)
+			updated, err := manager.Ensure(registrationCtx)
 			require.NoError(t, err)
 			require.Equal(t, connection.Generation, updated.Generation)
 			require.Equal(t, connection.PID, updated.PID)
@@ -173,12 +195,13 @@ func TestSupervisorEngines(t *testing.T) {
 			var billingPlan apitypes.PlanResponse
 			request(t, connection.Endpoint, http.MethodPost, "/api/plan", connection.Token, apitypes.PlanRequest{Database: "billing", Environment: "development", Type: engine, SchemaFiles: map[string]*apitypes.SchemaFiles{namespace: {Files: map[string]string{"widgets.sql": "CREATE TABLE widgets (id bigint NOT NULL PRIMARY KEY, name text NOT NULL);"}}}}, http.StatusOK, &billingPlan)
 			require.Empty(t, billingPlan.Errors)
-
-			require.NoError(t, manager.Stop(verifyCtx))
-			record, err := manager.Status(verifyCtx)
+			stopCtx, cancelStop := context.WithTimeout(t.Context(), runtimeDeadline)
+			defer cancelStop()
+			require.NoError(t, manager.Stop(stopCtx))
+			record, err := manager.Status(stopCtx)
 			require.NoError(t, err)
 			assert.Equal(t, "stopped", record.State)
-			restarted, err := manager.Ensure(verifyCtx)
+			restarted, err := manager.Ensure(stopCtx)
 			require.NoError(t, err)
 			assert.NotEqual(t, connection.Generation, restarted.Generation)
 			var progress apitypes.ProgressResponse

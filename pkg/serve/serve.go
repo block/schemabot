@@ -810,6 +810,7 @@ func grpcLocalClientFactory(config *api.ServerConfig, wakeOperator func(applyIde
 			cfg.Metadata = map[string]string{}
 		}
 		cfg.PostgresNativeSafeTableSizeLimitBytes = config.Postgres.NativeSafeTableSizeLimit()
+		cfg.PostgresConcurrentIndexMaxDuration = config.Postgres.ConcurrentIndexMaxDurationOrDefault()
 		// Stated either way rather than only when disabled: a data plane that
 		// predates the opt-in default reads an absent key as "quarantine", so
 		// leaving it out during a rolling deploy would quarantine on a

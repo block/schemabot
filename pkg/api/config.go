@@ -1296,6 +1296,10 @@ type PostgresConfig struct {
 	// postgres.DefaultNativeSafeTableSizeLimitBytes applies.
 	NativeSafeTableSizeLimitBytes *int64 `yaml:"native_safe_table_size_limit_bytes,omitempty"`
 
+	// ConcurrentIndexMaxDuration bounds one CREATE INDEX CONCURRENTLY build.
+	// When unset, postgres.DefaultConcurrentIndexMaxDuration applies.
+	ConcurrentIndexMaxDuration string `yaml:"concurrent_index_max_duration,omitempty"`
+
 	// StatementTimeout bounds a single ordinary storage query on the
 	// connections SchemaBot opens to its own PostgreSQL storage database: the
 	// long-lived storage pool and the startup bootstrap's catalog reads. It
@@ -1341,6 +1345,11 @@ func (c PostgresConfig) NativeSafeTableSizeLimit() int64 {
 	return *c.NativeSafeTableSizeLimitBytes
 }
 
+// ConcurrentIndexMaxDurationOrDefault returns the configured concurrent index bound.
+func (c PostgresConfig) ConcurrentIndexMaxDurationOrDefault() time.Duration {
+	return parseDurationOrDefault(c.ConcurrentIndexMaxDuration, postgresengine.DefaultConcurrentIndexMaxDuration)
+}
+
 // StatementTimeoutOrDefault returns the configured storage statement budget or
 // its default. A configured "0" returns zero, meaning the budget is explicitly
 // disabled — callers pass that through to postgresconn, which writes
@@ -1353,6 +1362,21 @@ func (c PostgresConfig) StatementTimeoutOrDefault() time.Duration {
 func (c PostgresConfig) validate() error {
 	if c.NativeSafeTableSizeLimitBytes != nil && *c.NativeSafeTableSizeLimitBytes <= 0 {
 		return fmt.Errorf("postgres.native_safe_table_size_limit_bytes must be positive, got %d", *c.NativeSafeTableSizeLimitBytes)
+	}
+	if c.ConcurrentIndexMaxDuration != "" {
+		d, err := time.ParseDuration(c.ConcurrentIndexMaxDuration)
+		if err != nil {
+			return fmt.Errorf("postgres.concurrent_index_max_duration %q is not a valid duration: %w", c.ConcurrentIndexMaxDuration, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("postgres.concurrent_index_max_duration %q must be positive (omit it to use the default)", c.ConcurrentIndexMaxDuration)
+		}
+		if d < postgresengine.MinConcurrentIndexMaxDuration {
+			return fmt.Errorf("postgres.concurrent_index_max_duration %q is below the smallest bound the engine can honor (%s, the server timer's resolution)", c.ConcurrentIndexMaxDuration, postgresengine.MinConcurrentIndexMaxDuration)
+		}
+		if d > postgresengine.MaxConcurrentIndexMaxDuration {
+			return fmt.Errorf("postgres.concurrent_index_max_duration %q exceeds the largest bound the engine can honor (%s)", c.ConcurrentIndexMaxDuration, postgresengine.MaxConcurrentIndexMaxDuration)
+		}
 	}
 	// Zero is a meaningful setting here, unlike the pool durations: it disables
 	// the budget explicitly instead of selecting the default.

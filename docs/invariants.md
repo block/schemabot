@@ -1328,6 +1328,13 @@ published. Secret references remain references on disk.
 *Enforced:* `pkg/localsetup/register.go`, `pkg/localruntime/config.go`,
 `pkg/localruntime/manager.go`, `pkg/localruntime/host.go`, and `pkg/api/live_databases.go`.
 
+### AZ-8: Profile registration preserves connection identity
+
+Registering a local profile must not replace a different connection, change the default profile,
+or overwrite a concurrent configuration update. Retrying an identical registration is safe.
+
+*Enforced:* `pkg/cmd/client/local_profile.go` and `pkg/cmd/client/config.go`.
+
 ## Structural enforcement
 
 The strongest invariants are enforced by structure, so regressions fail CI instead of review:
