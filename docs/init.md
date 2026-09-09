@@ -11,7 +11,8 @@ the setup, and verify the baseline before making a first edit.
 ## Before you start
 
 Use MySQL or PostgreSQL, with an existing application database and a separate database for
-SchemaBot's state. They can share a server. Set `DATABASE_URL` and `SCHEMABOT_STORAGE_DSN` to
+SchemaBot's state. Vitess databases are not offered by the wizard yet; register them in the
+[server configuration](configuration.md) instead. They can share a server. Set `DATABASE_URL` and `SCHEMABOT_STORAGE_DSN` to
 their connection strings; the wizard saves references to those variables, never their values
 in your schema files. Keep those variables available for later CLI invocations.
 
@@ -51,8 +52,11 @@ the files. A successful setup ends with:
 
   Make your first edit, then review the plan:
 
-    schemabot plan -s 'schema' -e 'development' --profile 'default'
+    schemabot plan -s 'schema' -e 'development'
 ```
+
+The command names the profile with `--profile` only when the connection was saved under a
+profile that is not your default, so the next step works as printed.
 
 An empty namespace gets an explicit marker in `schema.sql` that preserves its scope. Keep that
 marker until you add your
