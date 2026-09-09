@@ -6,7 +6,7 @@ to see what is changing across your fleet.
 
 | What would you like to do? | Start here |
 |---|---|
-| Try SchemaBot for the first time | [Run the local quick start](../README.md#quick-start), then [connect the CLI](#connect-to-a-server) |
+| Try SchemaBot for the first time | [Initialize your database](#initialize-your-database) or [try the demo](../README.md#quick-start) |
 | See what is in a database | [Read the live schema](#read-the-live-schema) |
 | Make a schema change | [Plan and apply a change](#plan-and-apply-a-change) |
 | Check an ongoing change | [Follow progress and control the apply](#follow-and-control-a-change) |
@@ -16,6 +16,23 @@ to see what is changing across your fleet.
 The examples use a MySQL database named `shop` in `staging`.
 Substitute a database and environment from your server's inventory. The local
 quick start uses `testapp`; it does not create the `shop` database shown here.
+
+## Initialize your database
+
+`init` connects to your database, imports its schema, and stores a plan proving
+that the files match. It does not apply changes to the application database.
+Set `APP_DSN` and `STATE_DSN` in your shell first. The state connection must name
+a separate, existing database where SchemaBot can store its own metadata.
+
+```console
+$ schemabot init -d shop -e staging --type mysql --dsn env:APP_DSN --storage-dsn env:STATE_DSN --namespace shop --schema-dir schema --json
+{"database":"shop","environment":"staging","profile":"default","schema_dir":"/home/dev/shop/schema","plan_id":"plan-example-01","tables":4,"verified":true}
+```
+
+Keep the connection variable names stable on retries. Correct their values for
+credential or address mistakes. To use a different state database, choose a new
+`--runtime` and `--profile`; an existing runtime's durable state is never replaced.
+Use a local filesystem that supports exclusive directory rename for `--schema-dir`.
 
 ## Connect to a server
 
@@ -611,7 +628,7 @@ Prefer structured output when another program consumes the result:
 
 | Commands | JSON option |
 |---|---|
-| `databases`, `status`, `list-plans`, `logs`, `plan` | `--json` |
+| `databases`, `status`, `list-plans`, `logs`, `plan`, `init` | `--json` |
 | `pull` | `-o json` |
 
 For example:
