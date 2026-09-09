@@ -379,6 +379,13 @@ func TestCreateCollisionRefusalEntryPathsMatch(t *testing.T) {
 	assert.Equal(t, `a name the create set for "users" needs is already occupied (table, view, index, or sequence); re-plan, and if it recurs drop or rename the occupant or give the constraint, index, or sequence another name`, preflightRefusal.detail)
 }
 
+func TestApplyTablePreflightLimitFollowsStatementCost(t *testing.T) {
+	const configuredLimit = int64(1234)
+
+	assert.Equal(t, preflight.NoSizeLimit, applyTablePreflightLimit(nativeApply{concurrentIndex: true}, configuredLimit))
+	assert.Equal(t, configuredLimit, applyTablePreflightLimit(nativeApply{}, configuredLimit))
+}
+
 // The CLI status listing is the narrowest operator surface a refusal detail
 // is rendered on: it clamps the failure reason to statusReasonColumnWidth
 // bytes and truncates from the tail, where the remedy sits. The full

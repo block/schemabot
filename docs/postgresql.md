@@ -62,13 +62,14 @@ conditions:
   [Index builds](#index-builds)). Statement kinds outside that set fail
   closed.
 - For a change to an existing table, the target is an ordinary or partitioned
-  table and its measured on-disk size is no more than the configured
-  native-apply ceiling (1 GiB by default; see
+  table. Native `ALTER TABLE` and blocking `CREATE INDEX` statements also
+  require its measured on-disk size to be no more than
+  the configured native-apply ceiling (1 GiB by default; see
   `postgres.native_safe_table_size_limit_bytes` in
   [configuration](configuration.md)). For a partitioned parent, the
   measurement includes its complete partition tree. The ceiling bounds
-  rewrites of existing data, so it does not apply to a `CREATE TABLE`: a
-  table that does not exist yet has none.
+  work that scales with existing data, so it does not apply to a `CREATE
+  TABLE` or `CREATE INDEX CONCURRENTLY`.
 - The target role passes the privilege preflight for the planned statement.
   A greenfield create is checked against the schema — the role needs `CREATE`
   on the target schema — because no table exists to state facts about.
@@ -151,6 +152,10 @@ when the bound is what ended the build it names the option to raise. A build
 that runs past the bound and provably leaves nothing behind is refused
 permanently, naming the option, because an identical retry would spend the
 same bound again.
+The native-apply size ceiling does not gate this path: the build is bounded
+by `postgres.concurrent_index_max_duration` instead, and a build the bound
+ended or an invalid-index outcome is reported as such rather than as a
+table-size verdict.
 Losing the driver pod mid-build does not stop the statement: the server keeps
 building until it finishes, fails, or its `statement_timeout` ends it, so the
 recovery re-plan on the next drive meets that build's outcome — a valid index
@@ -301,6 +306,8 @@ the target's tables and surfaces each undeclared one as a blocked, destructive
 `DROP TABLE` change: the engine will never run the drop, so the one choice
 left is whether to report the divergence, and hiding it would turn a target
 that does not match its declaration into a passing check.
+Deleting every schema file in one namespace keeps that namespace in the plan
+and surfaces every live table it contains as one of these blocked drops.
 Because the check fails for the whole database while any change is blocked,
 an undeclared table holds up every other change to that database until it is
 resolved — including changes in other namespaces, since every namespace at
@@ -369,11 +376,16 @@ surface.
 Planning establishes the statement shape. Apply time re-checks facts that can
 change or that depend on the target:
 
-- A table larger than the configured ceiling is refused permanently. This is
+- A table larger than the configured ceiling is refused permanently for native
+  `ALTER TABLE` and blocking `CREATE INDEX`. This is
   SchemaBot's native-apply ceiling, not a PostgreSQL limit. It defaults to
   1 GiB and is set with `postgres.native_safe_table_size_limit_bytes`; see
   [configuration](configuration.md) for the trade-offs of raising it. The
-  ceiling gates changes to existing tables only; a `CREATE TABLE` is exempt.
+  ceiling gates work whose cost scales with an existing table. A `CREATE TABLE`
+  is exempt, and `CREATE INDEX CONCURRENTLY` is admitted under the
+  `postgres.concurrent_index_max_duration` bound instead; a build the bound
+  ended and invalid-index outcomes are reported as such rather than as a size
+  verdict.
 - For a change to an existing table: a missing target, or an object that is
   not an ordinary or partitioned table, is refused permanently.
 - For a `CREATE TABLE`: a relation of any kind already occupying the name, a
