@@ -49,6 +49,7 @@ type Engine struct {
 	// would be told its work no longer exists.
 	progress                   map[string]*trackedApply
 	tableSizeLimit             int64
+	optimisticApplyCeiling     time.Duration
 	concurrentIndexMaxDuration time.Duration
 
 	// execute is a test seam standing in for executeOptimistic, so the apply
@@ -118,7 +119,11 @@ func NewWithOptions(tableSizeLimit int64, concurrentIndexMaxDuration time.Durati
 	if concurrentIndexMaxDuration > MaxConcurrentIndexMaxDuration {
 		concurrentIndexMaxDuration = MaxConcurrentIndexMaxDuration
 	}
-	return &Engine{tableSizeLimit: tableSizeLimit, concurrentIndexMaxDuration: concurrentIndexMaxDuration}
+	return &Engine{
+		tableSizeLimit:             tableSizeLimit,
+		optimisticApplyCeiling:     optimisticApplyCeiling,
+		concurrentIndexMaxDuration: concurrentIndexMaxDuration,
+	}
 }
 
 // NewForTarget creates a PostgreSQL engine with the target information needed

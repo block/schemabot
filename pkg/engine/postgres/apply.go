@@ -212,7 +212,7 @@ func postgresCreateSetStatements(script string) ([]string, error) {
 func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change nativeApply, key string, started time.Time, logger *slog.Logger, tracker *progress.Tracker) {
 	// The context arrives detached from the caller (an accepted apply must
 	// survive the request), so boundedness comes from the ceiling instead.
-	ceiling := optimisticApplyCeiling
+	ceiling := e.optimisticApplyCeiling
 	if change.concurrentIndex {
 		ceiling = e.concurrentIndexMaxDuration + concurrentIndexHeadroom
 		change.concurrentIndexMaxDuration = e.concurrentIndexMaxDuration

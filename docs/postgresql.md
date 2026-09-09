@@ -115,6 +115,8 @@ statement timeout; the build is bounded instead by the engine's own deadline,
 `postgres.concurrent_index_max_duration` (24 hours unless configured) — and
 reports completion only once the catalog shows the index valid. A build that fails
 part-way leaves an invalid index; the stored failure names it and is retryable.
+If the driver pod is lost mid-build, its database session ends with the pod;
+the next drive recovers the resulting invalid index as abandoned debris.
 The next drive recovers that leftover itself: when the build finds an invalid
 index under the requested name, or quarantined on the table by an interrupted
 recovery, that pg-sprite can prove abandoned — on the target table, with no
@@ -299,7 +301,8 @@ change or that depend on the target:
 - Exhausting the 30-second statement budget is a permanent native-safety
   refusal. Exhausting the lock budget is retryable after contention clears.
 - A concurrent index build runs under the caller-owned
-  `postgres.concurrent_index_max_duration` bound (24 hours by default). A build that
+  `postgres.concurrent_index_max_duration` bound (24 hours by default), rather
+  than the fixed five-minute ceiling for other apply kinds. A build that
   finds an invalid index already under the requested name or quarantined on
   the table that pg-sprite proves abandoned — a failed build's leftover on
   the target table with no backend building it, one whose builder the engine
