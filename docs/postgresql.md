@@ -75,10 +75,11 @@ conditions:
 - The target role passes the privilege preflight for the planned statement.
   A greenfield create is checked against the schema — the role needs `CREATE`
   on the target schema — because no table exists to state facts about.
-- A `CREATE INDEX CONCURRENTLY` build is caller-owned and bounded by
-  `postgres.concurrent_index_max_duration`, which defaults to 24 hours. The
-  bound starts when the build starts; the session setup before it runs under
-  a separate headroom, so the build gets the full configured bound.
+- A `CREATE INDEX CONCURRENTLY` build is bounded by
+  `postgres.concurrent_index_max_duration`, which defaults to 24 hours, set as
+  the build's server-side `statement_timeout`. The bound starts when the build
+  starts; the session setup before it runs under a separate headroom, so the
+  build gets the full configured bound.
 
 The common supported case is a metadata-only `ALTER TABLE`, such as adding a
 nullable column:
@@ -110,18 +111,27 @@ author's: its planner constructs `CREATE INDEX CONCURRENTLY` as the safer form
 of a plain `CREATE INDEX`, and the plan surfaces that concurrent form for
 review. A statement already written with `CONCURRENTLY` surfaces as authored.
 The apply runs the reviewed build through pg-sprite's dedicated concurrent
-index-build executor — outside a transaction block, with no server-side
-statement timeout; the build is bounded instead by the engine's own deadline,
-`postgres.concurrent_index_max_duration` (24 hours unless configured) — and
-reports completion only once the catalog shows the index valid. A build that fails
-part-way leaves an invalid index; the stored failure names it and is retryable.
+index-build executor — outside a transaction block, with `lock_timeout`
+disabled and `statement_timeout` set to
+`postgres.concurrent_index_max_duration` (24 hours unless configured), so the
+server's own timer is what ends an over-long build — and reports completion
+only once the catalog shows the index valid. A build that fails part-way
+leaves an invalid index; the stored failure names it and is retryable, and
+when the bound is what ended the build it names the option to raise. A build
+that runs past the bound and provably leaves nothing behind is refused
+permanently, naming the option, because an identical retry would spend the
+same bound again.
 The next drive recovers that leftover itself: when the build finds an invalid
 index under the requested name, or quarantined on the table by an interrupted
 recovery, that pg-sprite can prove abandoned — on the target table, with no
 backend building it, or with a builder the engine role cannot see through the
 progress view — it runs pg-sprite's recovery, which removes the entry under a
 lock-held proof of abandonment and then builds, so a change interrupted
-mid-build converges without an operator dropping anything. The lock is the
+mid-build converges without an operator dropping anything. The recovery runs
+as one caller-owned envelope — proof, drops, then the build — under the
+engine's own deadline of the same configured bound, with no server-side
+statement timeout, since a served build would spend the bound once on the
+drops and again on the build. The lock is the
 proof: a build still holding the table, visible or not, stops the recovery at
 its lock budget and the apply fails retryable, still naming the index. A
 recovery that cannot prove the entry unchanged through to its removal fails
@@ -298,19 +308,24 @@ change or that depend on the target:
   failure includes the provisioning `GRANT` derived by pg-sprite.
 - Exhausting the 30-second statement budget is a permanent native-safety
   refusal. Exhausting the lock budget is retryable after contention clears.
-- A concurrent index build runs under the caller-owned
-  `postgres.concurrent_index_max_duration` bound (24 hours by default). A build that
+- A concurrent index build runs under the
+  `postgres.concurrent_index_max_duration` bound (24 hours by default), set
+  as the build's server-side `statement_timeout`. A build that
   finds an invalid index already under the requested name or quarantined on
   the table that pg-sprite proves abandoned — a failed build's leftover on
   the target table with no backend building it, one whose builder the engine
   role cannot observe, or quarantine debris an interrupted recovery left —
   recovers it inside the same apply: the proven entry is removed and the
-  index built under the same envelope as a plain build. A build
-  that leaves an invalid index behind — including one cancelled by that
-  budget — or finds one another backend is visibly still building fails as a
+  index built inside one caller-owned envelope under the engine's own
+  deadline of the same bound. A build
+  that leaves an invalid index behind — including one the bound's timer
+  cancelled — or finds one another backend is visibly still building fails as a
   retryable operational failure naming the index and the next step; the
   invalid index, not the cause that produced it, is the outcome the retry
-  acts on, and the next drive recovers the leftover as abandoned. A recovery
+  acts on, and the next drive recovers the leftover as abandoned. When the
+  bound is what cancelled the build, the detail also names
+  `postgres.concurrent_index_max_duration`, since the retry rebuilds under the
+  same bound and the operator's step is to raise it first. A recovery
   that fails before its build — the proof lock lost to a build still holding
   the table, or the entry changed between two verification points — fails
   retryable with the same naming; one that finds the pool a session short is
@@ -318,7 +333,9 @@ change or that depend on the target:
   index under the requested name that
   this change can never clear — one on a different table, or one that backs a
   constraint or belongs to a partitioned table — is refused permanently with
-  the same naming, as is a budget exhaustion that provably left nothing. A
+  the same naming, as is a build that ran past the bound and provably left
+  nothing, whose refusal names `postgres.concurrent_index_max_duration` as
+  the option to raise. A
   parent-level index build on a partitioned table is refused permanently, and
   so is a target connection pool too small to hold the build's sessions at
   once — the recovery holds one more session than the build, so a pool sized

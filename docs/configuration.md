@@ -815,8 +815,9 @@ The server fails startup validation when
 `native_safe_table_size_limit_bytes` is zero or negative.
 
 `concurrent_index_max_duration` is a Go duration string and defaults to `24h`.
-It bounds a `CREATE INDEX CONCURRENTLY` build and recovery as one caller-owned
-operation. The server refuses zero, negative, and invalid durations at config
+It is the build's server-side `statement_timeout`, and the engine's own
+deadline for the recovery of an abandoned leftover that a build runs before
+building. The server refuses zero, negative, and invalid durations at config
 load, and durations above the largest `statement_timeout` PostgreSQL itself
 accepts (about 24 days); omit the option to use the default rather than setting
 `0`.

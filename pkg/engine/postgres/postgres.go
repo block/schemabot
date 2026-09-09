@@ -78,11 +78,11 @@ const DefaultNativeSafeTableSizeLimitBytes = int64(1 << 30)
 const DefaultConcurrentIndexMaxDuration = 24 * time.Hour
 
 // MaxConcurrentIndexMaxDuration is the largest bound the engine accepts for
-// one concurrent index build. Caller-owned mode moves the build's bound from
-// the server's statement_timeout to the engine's deadline, so the engine
-// honors the same ceiling the server's own timer could have expressed: the
-// largest statement_timeout PostgreSQL accepts, in milliseconds. A bound
-// above it is not a build anyone waits for; it is the absence of a bound.
+// one concurrent index build: the largest statement_timeout PostgreSQL
+// accepts, in milliseconds. The build runs under that server-side timer set
+// to the bound, so a larger value could not be handed to the server; the
+// recovery's engine-owned deadline honors the same ceiling. A bound above it
+// is not a build anyone waits for; it is the absence of a bound.
 const MaxConcurrentIndexMaxDuration = time.Duration(math.MaxInt32) * time.Millisecond
 
 // New creates a new PostgreSQL engine.

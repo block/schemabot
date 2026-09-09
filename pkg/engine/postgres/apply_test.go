@@ -173,6 +173,14 @@ func TestClassifyRefusal(t *testing.T) {
 			wantReason: "not-native-safe-budget-exceeded",
 		},
 		{
+			name: "concurrent build that ran past its bound and left nothing is a refusal naming the option",
+			err: fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", "users",
+				nameConcurrentIndexBound(&executor.BudgetError{Cause: executor.CauseStatement, Budget: 36 * time.Hour}, 36*time.Hour)),
+			wantReason:    "concurrent-index-bound-exceeded",
+			wantDetail:    []string{"ran past postgres.concurrent_index_max_duration (36h0m0s)", "raise postgres.concurrent_index_max_duration and re-run"},
+			wantNotDetail: []string{"statement budget", replanRemedy},
+		},
+		{
 			name: "lock budget exhaustion is operational",
 			err:  fmt.Errorf("execute: %w", &executor.BudgetError{Cause: executor.CauseLock, Budget: time.Second}),
 		},
@@ -184,6 +192,16 @@ func TestClassifyRefusal(t *testing.T) {
 				Build:   &executor.BudgetError{Cause: executor.CauseStatement, Budget: time.Second},
 				Cleanup: executor.ErrBuildLeftInvalidIndex,
 			}),
+		},
+		{
+			name: "invalid-index verdict stays operational when the bound wrapper names it",
+			err: fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", "users",
+				nameConcurrentIndexBound(&executor.InvalidIndexError{
+					Schema:  "public",
+					Index:   "big_ref_idx",
+					Build:   &executor.BudgetError{Cause: executor.CauseStatement, Budget: 36 * time.Hour},
+					Cleanup: executor.ErrBuildLeftInvalidIndex,
+				}, 36*time.Hour)),
 		},
 		{
 			name:       "oversized table is a refusal",
@@ -1066,9 +1084,10 @@ func TestConcurrentIndexMaximumIsTheServerStatementTimeoutCeiling(t *testing.T) 
 }
 
 // TestBuildIndexConcurrentlyRefusesAnUnsetBound proves a concurrent build
-// never starts under a bound the drive did not stamp: caller-owned mode has
-// no server-side budget behind it, so a missing bound is refused before any
-// session is acquired rather than run to an instant cancellation.
+// never starts under a bound the drive did not stamp: the bound is the
+// build's server-side statement timeout and the recovery's only deadline, so
+// a missing one is refused before any session is acquired rather than handed
+// to the executor as an unbounded budget or run to an instant cancellation.
 func TestBuildIndexConcurrentlyRefusesAnUnsetBound(t *testing.T) {
 	change := nativeApply{namespace: "public", table: "users",
 		sql: "CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)", concurrentIndex: true}
@@ -1076,6 +1095,36 @@ func TestBuildIndexConcurrentlyRefusesAnUnsetBound(t *testing.T) {
 	err := buildIndexConcurrently(t.Context(), nil, change, newTestTracker(t), slog.New(slog.DiscardHandler))
 
 	require.ErrorContains(t, err, `build PostgreSQL index concurrently on table "users": build bound is unset`)
+}
+
+// TestNameConcurrentIndexBoundWrapsOnlyTheBoundsOwnVerdict pins which build
+// failures get the option named: the statement budget verdict is the bound's
+// statement_timeout firing and is wrapped with the verdict still reachable,
+// while a lock budget, a cancellation, and an invalid-index verdict that
+// carries no build failure pass through untouched — none of them was the
+// bound's doing.
+func TestNameConcurrentIndexBoundWrapsOnlyTheBoundsOwnVerdict(t *testing.T) {
+	bound := 36 * time.Hour
+	statementBudget := &executor.BudgetError{Cause: executor.CauseStatement, Budget: bound}
+
+	named := nameConcurrentIndexBound(fmt.Errorf("build: %w", statementBudget), bound)
+	var boundErr *concurrentIndexBoundError
+	require.ErrorAs(t, named, &boundErr)
+	assert.Equal(t, "the concurrent index build ran past postgres.concurrent_index_max_duration (36h0m0s) and was cancelled", boundErr.Error())
+	var budgetErr *executor.BudgetError
+	require.ErrorAs(t, named, &budgetErr)
+	assert.Same(t, statementBudget, budgetErr)
+
+	for name, err := range map[string]error{
+		"lock budget":  &executor.BudgetError{Cause: executor.CauseLock, Budget: time.Second},
+		"cancellation": executor.ErrCancelledByCaller,
+		"abandoned entry without a build failure": &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx", Table: "users",
+			Cleanup: executor.ErrAbandonedInvalidIndex},
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Same(t, err, nameConcurrentIndexBound(err, bound))
+		})
+	}
 }
 
 // TestRetryPathFitsUnderApplyCeiling pins the other execution path against
@@ -1117,7 +1166,21 @@ func TestInvalidIndexDetailMatchesVerdictOwnership(t *testing.T) {
 			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx",
 				Build: rawServerText, Cleanup: executor.ErrBuildLeftInvalidIndex},
 			wantDetail:    []string{`"public"."big_ref_idx"`, "own invalid index", "retry removes it", "rebuilds the index"},
-			wantNotDetail: []string{"db-internal-1"},
+			wantNotDetail: []string{"db-internal-1", "concurrent_index_max_duration"},
+		},
+		{
+			name: "own leftover the bound cancelled names the option to raise before the retry",
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx",
+				Build: &executor.BudgetError{Cause: executor.CauseStatement, Budget: 36 * time.Hour}, Cleanup: executor.ErrBuildLeftInvalidIndex},
+			wantDetail:    []string{`"public"."big_ref_idx"`, "own invalid index", "running past postgres.concurrent_index_max_duration (36h0m0s)", "retry removes it", "rebuilds the index under the same bound", "raise postgres.concurrent_index_max_duration first"},
+			wantNotDetail: []string{"statement budget"},
+		},
+		{
+			name: "own leftover from a lost lock budget does not blame the bound",
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx",
+				Build: &executor.BudgetError{Cause: executor.CauseLock, Budget: time.Second}, Cleanup: executor.ErrBuildLeftInvalidIndex},
+			wantDetail:    []string{`"public"."big_ref_idx"`, "own invalid index", "retry removes it"},
+			wantNotDetail: []string{"concurrent_index_max_duration"},
 		},
 		{
 			name: "abandoned entry says the retry removes and rebuilds it",
