@@ -229,7 +229,7 @@
         "seconds": 5,
         "command": "",
         "caption": "Slow commits pause copying; the docs explain the signal",
-        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 6,000,000 / 10,000,000 · ETA: 8m 0s\n       • \u001b[2mℹ️ Throttled: commit-latency 120ms \u003e= 50ms · backing off while database writes commit slowly\u001b[0m\n       • \u001b[2mDocs: https://github.com/block/schemabot/blob/main/docs/throttle.md\u001b[0m\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 6,000,000 / 10,000,000 · ETA: 8m 0s\n       • \u001b[2mℹ️ Throttled: commit-latency 120ms \u003e= 50ms · backing off while database writes commit slowly\u001b[0m\n       • \u001b[2mDocs: \u001b]8;;https://github.com/block/schemabot/blob/main/docs/throttle.md\u001b\\Throttle reference\u001b]8;;\u001b\\\u001b[0m\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
       },
       {
         "seconds": 0.18,

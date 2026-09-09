@@ -713,6 +713,17 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 	assert.NotContains(t, completed, "Throttled", "a terminal table never renders a stale throttle flag")
 }
 
+// Interactive throttle hints use the same labeled terminal links as CLI lists.
+func TestFormatTableProgress_ThrottleHyperlink(t *testing.T) {
+	enableHyperlinks(t)
+	output := FormatTableProgress(TableProgress{
+		TableName: "orders", ChangeType: "alter", Status: state.Apply.Running,
+		RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
+		Throttled: true, ThrottleReason: "commit-latency 120ms >= 50ms",
+	})
+	assert.Contains(t, output, "Docs: "+ui.Link("Throttle reference", ui.ThrottleDocURL))
+}
+
 func TestFormatTableProgress_InstantDDL(t *testing.T) {
 	tp := TableProgress{
 		TableName:  "users",
