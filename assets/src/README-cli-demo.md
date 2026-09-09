@@ -5,7 +5,6 @@ through the production Go templates and interactive `commands.WatchModel`:
 
 - `cli-plan-apply.gif`: inspect an index plan, confirm with yes, and follow an apply to completion
 - `cli-ops.gif`: list databases, pull a live schema with lint findings, show the latest 20 of 500 changes, then follow engine logs through completion
-- `cli-fleet.gif`: list changes, attach to the live watcher, detach with Esc, and list plans
 - `cli-cutover.gif`: finish copying, wait for the swap, and press Enter to cut over
 - `cli-throttle.gif`: see replication lag pause copying and watch it resume
 - `cli-rollback.gif`: review the DDL to restore an index, confirm with yes, then follow the new apply to completion
@@ -48,7 +47,7 @@ can be refreshed when CLI templates change.
 
 Review a plan frame, the fleet table, the throttle reason and ETA, the waiting
 state, and the completed state after rendering. Check the GIFs at README
-width as well as their native size (1100 × 670, 1100 × 740 for the shard view, or 1100 × 960 for the fleet view). Keep the rendering method and timing choices documented here.
+width as well as their native size (1100 × 670, 1100 × 740 for the shard and rollback views, or 1100 × 960 for the fleet view). Keep the rendering method and timing choices documented here.
 
 Pass a scenario name, such as `cli-vitess`, as the renderer’s first argument
 to refresh only that GIF. The PlanetScale fixture checks Enter against start
@@ -66,3 +65,5 @@ All animations render at 12 frames per second. The cutover copy advances in five
 The rollback illustration restores a removed index, which can require a row copy; the index drop in the text-only declined example can finish through native MySQL DDL. The rollback scenario runs `RollbackCmd` with both no and yes against a loopback fixture. It checks the source apply, target environment, request order, lock target, reviewed plan ID, and unsafe acknowledgment. Declining must issue no lock or apply request. The accepted command runs with `Watch: true`, opens its watcher automatically, and polls the new apply ID through 25%, 100%, and completion. Production watcher views provide the selected animation frames. No database is contacted. The preview and submitted output are separate selected terminal views, with input echo added for the animation.
 
 The rollback command runs in a child process with terminal input supplied by `scripts/cli-demo-tty.py` (Python 3 standard library). This exercises the actual automatic Bubble Tea startup after confirmation, including its completion exit. The fixture rejects a wrong apply ID, unexpected requests, or polling after completion. The helper has a bounded runtime and never opens the user's terminal.
+
+Rollback previews use the production boxed context and dialect-aware SQL formatting. A canonical comparison preserves identifiers and literal values when a display transformation would change them. All remaining scenarios use production SQL highlighting; the operations pull view retains the multiline schema supplied by the engine.

@@ -509,9 +509,11 @@ confirmation, so nothing changes:
 ```console
 $ schemabot rollback -e staging apply-example-73
 Rollback Plan
-=============
-Database: shop
-Environment: staging
+┌───────────────────────────────────┐
+│  Database:      shop              │
+│  Environment:   staging           │
+│  Source apply:  apply-example-73  │
+└───────────────────────────────────┘
 
 The following changes will be applied to rollback:
 
@@ -536,14 +538,16 @@ same terminal until it confirms completion.
 ```console
 $ schemabot rollback -e staging apply-example-85
 Rollback Plan
-=============
-Database: shop
-Environment: staging
+┌───────────────────────────────────┐
+│  Database:      shop              │
+│  Environment:   staging           │
+│  Source apply:  apply-example-85  │
+└───────────────────────────────────┘
 
 The following changes will be applied to rollback:
 
   orders (alter):
-    ALTER TABLE `orders` ADD INDEX `idx_status` (`status`);
+    ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
 
 Do you want to apply this rollback? Only 'yes' will be accepted: yes
 🔒 Lock acquired for shop (mysql)
