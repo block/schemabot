@@ -15,6 +15,7 @@ import (
 
 	"github.com/block/pg-sprite/pkg/dbconn"
 	"github.com/block/pg-sprite/pkg/diffplan"
+	"github.com/block/pg-sprite/pkg/executor"
 	pgplan "github.com/block/pg-sprite/pkg/plan"
 	"github.com/block/pg-sprite/pkg/planner"
 	"github.com/block/pg-sprite/pkg/preflight"
@@ -730,10 +731,43 @@ func executionVerdict(formatVersion int, statement pgplan.Statement, table strin
 	case router.DispositionRewriteRequired:
 		return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q must be rewritten into a form the engine can execute natively, then re-planned", table)
 	case router.DispositionRefuse:
+		if reason, ok := createShapeRefusalReason(statement.Cause, table); ok {
+			return engine.ExecutionModeBlocked, reason
+		}
+		if statement.Cause != "" {
+			slog.Warn("planner refusal carries a create shape cause SchemaBot does not recognize; rendering the generic refusal", "table", table, "cause", statement.Cause)
+		}
 		return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q is refused: it cannot be executed safely as written", table)
 	default:
 		return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q has an unrecognized planner verdict", table)
 	}
+}
+
+func createShapeRefusalReason(cause executor.CreateShapeCause, table string) (string, bool) {
+	var reason string
+	switch cause {
+	case executor.CreateShapePartitionOf:
+		reason = "declares PARTITION OF against a live parent, which SchemaBot's PostgreSQL create path does not support; create the partition outside SchemaBot or re-model the table"
+	case executor.CreateShapeInherits:
+		reason = "declares INHERITS against a live parent, which SchemaBot's PostgreSQL create path does not support; create the inheritance relationship outside SchemaBot or model a standalone table"
+	case executor.CreateShapeLike:
+		reason = "declares LIKE against a live source table, which SchemaBot's PostgreSQL create path does not support; declare the new table's columns and constraints explicitly"
+	case executor.CreateShapeOfType:
+		reason = "declares OF against a live composite type, which SchemaBot's PostgreSQL create path does not support; declare the new table's columns explicitly"
+	case executor.CreateShapeIfNotExists:
+		reason = "declares IF NOT EXISTS, which cannot verify that an existing relation has the requested shape; remove the clause and ensure the relation name is available"
+	case executor.CreateShapeConcurrently:
+		reason = "declares CONCURRENTLY for an index on a new table, which SchemaBot's PostgreSQL create path does not support; remove CONCURRENTLY so the index can be built before the table receives traffic"
+	case executor.CreateShapeDuplicateName:
+		reason = "declares the same relation name more than once; give every table, index, constraint, and sequence a unique name"
+	case executor.CreateShapeMultipleOperations:
+		reason = "contains multiple create operations in one statement; split them into separate CREATE TABLE or CREATE INDEX statements"
+	case executor.CreateShapeUnsupportedKind:
+		reason = "uses a statement kind SchemaBot's PostgreSQL create path does not support; use CREATE TABLE or CREATE INDEX, or create the object outside SchemaBot"
+	default:
+		return "", false
+	}
+	return fmt.Sprintf("statement for table %q %s", table, reason), true
 }
 
 func destructiveReason(destructive bool, table string) string {

@@ -3,6 +3,7 @@ package postgres
 import (
 	"testing"
 
+	"github.com/block/pg-sprite/pkg/executor"
 	pgplan "github.com/block/pg-sprite/pkg/plan"
 	"github.com/block/pg-sprite/pkg/planner"
 	"github.com/block/pg-sprite/pkg/preflight"
@@ -88,6 +89,68 @@ func TestExecutionVerdict(t *testing.T) {
 			assert.Equal(t, tt.wantReason, reason)
 		})
 	}
+}
+
+func TestCreateShapeRefusalReason(t *testing.T) {
+	tests := []struct {
+		name  string
+		cause executor.CreateShapeCause
+		want  string
+	}{
+		{
+			name:  "partition of",
+			cause: executor.CreateShapePartitionOf,
+			want:  `statement for table "users" declares PARTITION OF against a live parent, which SchemaBot's PostgreSQL create path does not support; create the partition outside SchemaBot or re-model the table`,
+		},
+		{
+			name:  "if not exists",
+			cause: executor.CreateShapeIfNotExists,
+			want:  `statement for table "users" declares IF NOT EXISTS, which cannot verify that an existing relation has the requested shape; remove the clause and ensure the relation name is available`,
+		},
+		{
+			name:  "multiple operations",
+			cause: executor.CreateShapeMultipleOperations,
+			want:  `statement for table "users" contains multiple create operations in one statement; split them into separate CREATE TABLE or CREATE INDEX statements`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := createShapeRefusalReason(tt.cause, "users")
+			assert.True(t, ok)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestCreateShapeRefusalReasonExhaustive(t *testing.T) {
+	for _, cause := range executor.CreateShapeCauses() {
+		mode, reason := executionVerdict(pgplan.FormatVersion, pgplan.Statement{
+			Disposition: router.DispositionRefuse,
+			Cause:       cause,
+		}, "users")
+		assert.Equal(t, engine.ExecutionModeBlocked, mode, cause)
+		assert.NotEqual(t, `statement for table "users" is refused: it cannot be executed safely as written`, reason, cause)
+	}
+}
+
+func TestExecutionVerdictUnknownCreateShapeCause(t *testing.T) {
+	mode, reason := executionVerdict(pgplan.FormatVersion, pgplan.Statement{
+		Disposition: router.DispositionRefuse,
+		Cause:       executor.CreateShapeCause("unknown"),
+	}, "users")
+
+	assert.Equal(t, engine.ExecutionModeBlocked, mode)
+	assert.Equal(t, `statement for table "users" is refused: it cannot be executed safely as written`, reason)
+}
+
+func TestExecutionVerdictEmptyCreateShapeCause(t *testing.T) {
+	mode, reason := executionVerdict(pgplan.FormatVersion, pgplan.Statement{
+		Disposition: router.DispositionRefuse,
+	}, "users")
+
+	assert.Equal(t, engine.ExecutionModeBlocked, mode)
+	assert.Equal(t, `statement for table "users" is refused: it cannot be executed safely as written`, reason)
 }
 
 func TestTableChangesMapsDestructiveSafety(t *testing.T) {
