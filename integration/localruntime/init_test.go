@@ -108,6 +108,11 @@ func TestInitEngines(t *testing.T) {
 			after, err := os.ReadFile(schemaPath)
 			require.NoError(t, err)
 			require.Equal(t, edited, after)
+			// Reuse must reject a real difference without changing the user's files.
+			output, err = run(append(slices.Clone(args), "--reuse-schema")...)
+			require.Error(t, err, string(output))
+			require.Contains(t, string(output), "still produce schema changes")
+			require.FileExists(t, filepath.Join(root, namespace, "notes.sql"))
 			// Explicit reuse accepts harmless formatting/comments without replacing files.
 			require.NoError(t, os.Remove(filepath.Join(root, namespace, "notes.sql")))
 			output, err = run(append(slices.Clone(args), "--reuse-schema")...)
@@ -116,6 +121,17 @@ func TestInitEngines(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, edited, after)
 
+			// Flat schema roots retain their original namespace through staging.
+			flatRoot := filepath.Join(t.TempDir(), namespace)
+			require.NoError(t, os.Mkdir(flatRoot, 0755))
+			cliConfig, err := os.ReadFile(filepath.Join(root, "schemabot.yaml"))
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(filepath.Join(flatRoot, "schemabot.yaml"), cliConfig, 0644))
+			require.NoError(t, os.WriteFile(filepath.Join(flatRoot, "widgets.sql"), edited, 0644))
+			flatArgs := slices.Clone(args)
+			flatArgs[slices.Index(flatArgs, "--schema-dir")+1] = flatRoot
+			output, err = run(append(flatArgs, "--reuse-schema")...)
+			require.NoError(t, err, string(output))
 			ctx, cancel := context.WithTimeout(t.Context(), runtimeDeadline)
 			defer cancel()
 			var name string

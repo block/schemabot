@@ -223,6 +223,9 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 		namespaces = append(namespaces, namespace)
 	}
 	sort.Strings(namespaces)
+	if err := rejectCaseCollisions("namespace", namespaces); err != nil {
+		return nil, err
+	}
 	for _, namespace := range namespaces {
 		if err := validateRelativePathPart("namespace", namespace); err != nil {
 			return nil, err
@@ -241,6 +244,9 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 			tableNames = append(tableNames, tableName)
 		}
 		sort.Strings(tableNames)
+		if err := rejectCaseCollisions("table in "+namespace, tableNames); err != nil {
+			return nil, err
+		}
 		for _, tableName := range tableNames {
 			if err := validateRelativePathPart("table", tableName); err != nil {
 				return nil, err
@@ -253,6 +259,19 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 	}
 
 	return &onboardWritePlan{root: root, databaseType: resp.Type, files: files, ignoreNamespaces: ignoreNamespaces}, nil
+}
+
+// Generated paths must remain distinct on case-insensitive filesystems too.
+func rejectCaseCollisions(kind string, names []string) error {
+	seen := make(map[string]string, len(names))
+	for _, name := range names {
+		folded := strings.ToLower(name)
+		if previous, exists := seen[folded]; exists {
+			return fmt.Errorf("%s names %q and %q collide on a case-insensitive filesystem; choose distinct names before onboarding", kind, previous, name)
+		}
+		seen[folded] = name
+	}
+	return nil
 }
 
 func onboardConfigYAML(database, databaseType string, ignoreNamespaces []string) string {

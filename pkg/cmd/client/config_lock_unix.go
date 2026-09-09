@@ -28,7 +28,7 @@ func lockConfig(path string) (*os.File, error) {
 	}
 	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		utils.CloseAndLog(f)
-		return nil, fmt.Errorf("CLI configuration is busy; retry the command: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrConfigBusy, err)
 	}
 	return f, nil
 }

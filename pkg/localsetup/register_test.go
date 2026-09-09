@@ -8,7 +8,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/localruntime"
+	"gopkg.in/yaml.v3"
 )
 
 func registration(t *testing.T, engine string) Registration {
@@ -105,4 +107,23 @@ func TestRegisterPreservesExistingStoragePool(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 17, cfg.Storage.Pool.MaxOpenConns)
 	require.Len(t, cfg.Databases, 2)
+}
+
+func TestRegisterIntoResolverOnlyConfig(t *testing.T) {
+	m := localruntime.Manager{Dir: filepath.Join(t.TempDir(), "shared")}
+	r := registration(t, "mysql")
+	cfg := api.ServerConfig{Storage: r.Storage, TargetResolver: api.TargetResolverConfig{Targets: map[string]inventory.StaticTarget{"existing": {DatabaseType: "mysql", DSN: "env:SETUP_TARGET"}}}}
+	data, err := yaml.Marshal(cfg)
+	require.NoError(t, err)
+	_, err = m.UpdateConfig(func([]byte) ([]byte, error) { return data, nil })
+	require.NoError(t, err)
+	changed, err := Register(m, r)
+	require.NoError(t, err)
+	require.True(t, changed)
+	saved, err := localruntime.ReadPrivate(filepath.Join(m.Dir, "runtime.yaml"))
+	require.NoError(t, err)
+	parsed, err := api.ParseServerConfig(saved)
+	require.NoError(t, err)
+	require.Contains(t, parsed.Databases, "app")
+	require.Contains(t, parsed.TargetResolver.Targets, "existing")
 }

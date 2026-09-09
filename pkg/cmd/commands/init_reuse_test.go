@@ -26,3 +26,16 @@ func TestStageExistingInitSchemaPreservesAndChecksScope(t *testing.T) {
 	_, err = stageExistingInitSchema(root, t.TempDir(), "other", "postgres", "development", []string{"public"})
 	require.ErrorContains(t, err, "different database or engine")
 }
+
+func TestStageExistingFlatSchemaUsesOriginalNamespace(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "app")
+	require.NoError(t, os.Mkdir(root, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"), []byte("database: app\ntype: mysql\n"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "widgets.sql"), []byte("CREATE TABLE widgets (id bigint);"), 0644))
+	_, err := stageExistingInitSchema(root, t.TempDir(), "app", "mysql", "development", []string{"app"})
+	require.NoError(t, err)
+	require.NoError(t, os.Remove(filepath.Join(root, "schemabot.yaml")))
+	_, err = stageExistingInitSchema(root, t.TempDir(), "app", "mysql", "development", []string{"app"})
+	require.ErrorContains(t, err, root)
+	require.NotContains(t, err.Error(), ".schemabot-init-")
+}

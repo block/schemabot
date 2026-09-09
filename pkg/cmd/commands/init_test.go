@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/block/schemabot/pkg/apitypes"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -47,4 +49,31 @@ func TestPublishInitSchemaReportsUnsupportedFilesystem(t *testing.T) {
 	existing := t.TempDir()
 	err = publishInitSchemaWithRename(existing, existing, func(string, string) error { return unsupported })
 	require.ErrorIs(t, err, unsupported)
+}
+
+func TestPublishInitRequiresVerifiedStoredBaseline(t *testing.T) {
+	for _, baseline := range []*apitypes.PlanResponse{nil, {}, {PlanID: "plan", Errors: []string{"cannot verify"}}, {PlanID: "plan", Changes: []*apitypes.SchemaChangeResponse{{TableChanges: []*apitypes.TableChangeResponse{{TableName: "orders", ChangeType: "create", DDL: "CREATE TABLE orders (id bigint);"}}}}}} {
+		root := filepath.Join(t.TempDir(), "schema")
+		stage := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(stage, "table.sql"), []byte("CREATE TABLE t (id bigint);"), 0644))
+		require.Error(t, publishVerifiedInitSchema(stage, root, baseline, "app", "dev"))
+		require.NoDirExists(t, root)
+		require.FileExists(t, filepath.Join(stage, "table.sql"))
+	}
+	stage := t.TempDir()
+	root := filepath.Join(t.TempDir(), "schema")
+	require.NoError(t, publishVerifiedInitSchema(stage, root, &apitypes.PlanResponse{PlanID: "plan"}, "app", "dev"))
+	info, err := os.Stat(root)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0755), info.Mode().Perm())
+}
+
+func TestInitSnapshotRejectsOversizedDirectory(t *testing.T) {
+	root := t.TempDir()
+	f, err := os.Create(filepath.Join(root, "dump.sql"))
+	require.NoError(t, err)
+	require.NoError(t, f.Truncate(initSnapshotMaxBytes+1))
+	require.NoError(t, f.Close())
+	_, err = initSchemaSnapshot(root)
+	require.ErrorContains(t, err, "choose a dedicated schema directory")
 }

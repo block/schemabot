@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -12,6 +13,8 @@ import (
 	"reflect"
 	"strings"
 	"time"
+
+	"github.com/block/schemabot/pkg/apitypes"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/cmd/client"
@@ -82,18 +85,24 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 		return nil, err
 	}
 	// Stage beside the destination so publication remains an atomic rename.
-	if err := os.MkdirAll(filepath.Dir(root), 0700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(root), 0755); err != nil {
 		return nil, fmt.Errorf("create schema parent directory: %w", err)
 	}
-	stage, err := os.MkdirTemp(filepath.Dir(root), ".schemabot-init-*")
+	stageContainer, err := os.MkdirTemp(filepath.Dir(root), ".schemabot-init-*")
 	if err != nil {
 		return nil, fmt.Errorf("create schema staging directory: %w", err)
 	}
 	defer func() {
-		if err := os.RemoveAll(stage); err != nil {
-			slog.Warn("remove schema staging directory", "path", stage, "error", err)
+		if err := os.RemoveAll(stageContainer); err != nil {
+			slog.Warn("remove schema staging directory", "path", stageContainer, "error", err)
 		}
 	}()
+	// Flat layouts derive their namespace from the schema root's basename.
+	// Preserve it inside the private staging container for verification too.
+	stage := filepath.Join(stageContainer, filepath.Base(root))
+	if err := os.Mkdir(stage, 0700); err != nil {
+		return nil, fmt.Errorf("create schema snapshot: %w", err)
+	}
 	dir, err := localruntime.Directory(cmd.Runtime)
 	if err != nil {
 		return nil, err
@@ -149,22 +158,30 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 	if err != nil {
 		return nil, fmt.Errorf("verify baseline: %w", err)
 	}
-	if err := validateOnboardPlanResult(baseline, cmd.Database, cmd.Environment); err != nil {
-		return nil, err
-	}
-	if baseline.PlanID == "" {
-		return nil, fmt.Errorf("baseline verification returned no stored plan")
-	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := publishInitSchema(stage, root); err != nil {
+	if err := publishVerifiedInitSchema(stage, root, baseline, cmd.Database, cmd.Environment); err != nil {
 		return nil, err
 	}
 	if _, err := client.RegisterLocalProfile(profile, cmd.Runtime); err != nil {
 		return nil, fmt.Errorf("verified schema is available at %s, but the profile could not be saved; rerun with the same inputs: %w", root, err)
 	}
 	return &initResult{Database: cmd.Database, Environment: cmd.Environment, Profile: profile, SchemaDir: root, PlanID: baseline.PlanID, Tables: pulled.TableCount, Verified: true}, nil
+}
+
+// Only a stored, unchanged baseline authorizes publication of imported files.
+func publishVerifiedInitSchema(stage, root string, baseline *apitypes.PlanResponse, database, environment string) error {
+	if err := validateOnboardPlanResult(baseline, database, environment); err != nil {
+		return err
+	}
+	if baseline.PlanID == "" {
+		return fmt.Errorf("baseline verification returned no stored plan")
+	}
+	if err := os.Chmod(stage, 0755); err != nil {
+		return fmt.Errorf("set schema directory permissions: %w", err)
+	}
+	return publishInitSchema(stage, root)
 }
 
 // Reuse only an exact prior result. Never merge imported files into a user's
@@ -187,7 +204,7 @@ func publishInitSchemaWithRename(stage, root string, rename func(string, string)
 	}
 	proposed, err := initSchemaSnapshot(stage)
 	if err != nil {
-		return err
+		return fmt.Errorf("compare verified import; existing files were preserved: %w", err)
 	}
 	if !reflect.DeepEqual(existing, proposed) {
 		return fmt.Errorf("schema directory %s differs from the verified import; existing files were preserved", root)
@@ -195,11 +212,18 @@ func publishInitSchemaWithRename(stage, root string, rename func(string, string)
 	return nil
 }
 
+const initSnapshotMaxBytes = 64 << 20
+const initSnapshotMaxEntries = 10000
+
 func initSchemaSnapshot(root string) (map[string]string, error) {
 	result := make(map[string]string)
+	remaining := int64(initSnapshotMaxBytes)
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
+		}
+		if len(result) >= initSnapshotMaxEntries {
+			return fmt.Errorf("schema directory exceeds %d entries; choose a dedicated schema directory", initSnapshotMaxEntries)
 		}
 		if entry.Type()&os.ModeSymlink != 0 {
 			return fmt.Errorf("schema import cannot reuse symlinks: %s", path)
@@ -215,10 +239,26 @@ func initSchemaSnapshot(root string) (map[string]string, error) {
 		if !entry.Type().IsRegular() {
 			return fmt.Errorf("schema import requires regular files: %s", path)
 		}
-		data, err := os.ReadFile(path)
+		info, err := entry.Info()
 		if err != nil {
-			return err
+			return fmt.Errorf("inspect schema file: %w", err)
 		}
+		if info.Size() > remaining {
+			return fmt.Errorf("schema directory exceeds %d bytes; choose a dedicated schema directory", initSnapshotMaxBytes)
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("open schema file: %w", err)
+		}
+		data, readErr := io.ReadAll(io.LimitReader(f, remaining+1))
+		closeErr := f.Close()
+		if err := errors.Join(readErr, closeErr); err != nil {
+			return fmt.Errorf("read schema file: %w", err)
+		}
+		if int64(len(data)) > remaining {
+			return fmt.Errorf("schema directory exceeds %d bytes; choose a dedicated schema directory", initSnapshotMaxBytes)
+		}
+		remaining -= int64(len(data))
 		result[relative] = string(data)
 		return nil
 	})
