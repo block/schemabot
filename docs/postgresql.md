@@ -209,11 +209,13 @@ when pg-sprite could not construct the concurrent form of a plain
 `CREATE INDEX`, since running the submitted form would falsify the plan's own
 verdict.
 
-The plan comment lists the table and SchemaBot's reason for the refusal. For a
-PostgreSQL plan, the plan Check Run concludes unsuccessfully, and an apply
-attempt is rejected before any apply or task is queued. Rewrite the declarative
-change into an eligible form or use a separately reviewed operational process;
-flags do not override an engine-blocked verdict.
+The plan comment lists the table and SchemaBot's reason for the refusal. When
+the create path refuses a statement's shape, that reason names the offending
+clause and how to remove or work around it. For a PostgreSQL plan, the plan
+Check Run concludes unsuccessfully, and an apply attempt is rejected before
+any apply or task is queued. Rewrite the declarative change into an eligible
+form or use a separately reviewed operational process; flags do not override
+an engine-blocked verdict.
 
 The engine does not execute `DROP TABLE` or other statement kinds outside its
 admitted set. That includes tables that exist on the target but that no schema
