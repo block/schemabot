@@ -392,7 +392,7 @@ Once the watcher confirms **Stopped**, run the displayed `start` command
 to resume from the checkpoint and reopen live progress.
 **Esc** only detaches your terminal and leaves the change running.
 
-![Press s, wait for Stopped, then run start and watch copying resume](../assets/cli-stop.gif)
+![Press s, wait for Stopped, then run start and follow the change to completion](../assets/cli-stop.gif)
 
 ### Choose when to cut over
 
@@ -427,6 +427,11 @@ Use `--defer-deploy` to review the deploy request before starting deployment.
 The animation confirms the apply with `yes`, then uses **Enter** at the deploy
 prompt. During copying, **Esc** detaches and **c** cancels the deploy request
 permanently; PlanetScale cancellation cannot be resumed.
+
+The CLI and PlanetScale console control the same deployment, with PlanetScale
+as the source of truth. You can cut over, revert, or close the revert window
+from either interface. If you act in the console, the CLI watcher follows
+along automatically; there is no need to repeat the action.
 
 You can attach to the same apply later. Each shard reports its own progress,
 rows, and ETA, so you can see which shard is still working:

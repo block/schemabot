@@ -540,7 +540,7 @@ func main() {
 	throttleFrames = append(throttleFrames, Frame{3, "", "The change completes", live(100, state.Apply.Completed, false, "")})
 	demos = append(demos, Demo{Name: "cli-throttle", Title: "See why a change slows down.", Frames: throttleFrames})
 	stopFrames := []Frame{
-		{2, "schemabot progress apply-example-73", "Follow the running change", live(50, state.Apply.Running, false, "")},
+		{2, "", "The change is already copying rows", live(50, state.Apply.Running, false, "")},
 		{1, "", "", live(55, state.Apply.Running, false, "")},
 		{2, "", "Press s to request a stop", live(55, state.Apply.Running, false, "s")},
 		{3, "", "Wait for Stopped; the CLI shows how to resume", live(55, state.Apply.Stopped, false, "")},
@@ -549,10 +549,10 @@ func main() {
 		})},
 		{1, "", "Start opens the live watcher automatically", live(55, state.Apply.Running, false, "")},
 	}
-	for p := 60; p <= 85; p += 5 {
+	for p := 60; p <= 100; p += 5 {
 		stopFrames = append(stopFrames, Frame{0.18, "", "Copying continues from the checkpoint", live(p, state.Apply.Running, false, "")})
 	}
-	stopFrames = append(stopFrames, Frame{2, "", "The change is running again", live(90, state.Apply.Running, false, "")})
+	stopFrames = append(stopFrames, Frame{3, "", "The watcher confirms completion", live(100, state.Apply.Completed, false, "")})
 	demos = append(demos, Demo{Name: "cli-stop", Title: "Stop and resume a change.", Frames: stopFrames})
 	demos = append(demos, vitessDemo())
 	fleetLines := busyFleet(now)

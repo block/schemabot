@@ -8,7 +8,7 @@ through the production Go templates and interactive `commands.WatchModel`:
 - `cli-fleet.gif`: list changes, attach to the live watcher, detach with Esc, and list plans
 - `cli-cutover.gif`: finish copying, wait for the swap, and press Enter to cut over
 - `cli-throttle.gif`: see replication lag pause copying and watch it resume
-- `cli-stop.gif`: press s through the real handler, await Stopped, then start and watch copying resume
+- `cli-stop.gif`: press s through the real handler, await Stopped, then start and follow the resumed change to completion
 - `cli-vitess.gif`: create a deploy request, deploy with Enter, follow four shards, and close the revert window
 
 They are template-based illustrations, not recordings of a live database.
