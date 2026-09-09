@@ -36,8 +36,8 @@ func PreviewCommentApplyPostgresMultiStatement() string {
 	data.Step, data.StepsTotal = 2, 3
 	data.Statement = "CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON public.users (last_seen_at)"
 	data.BuildWork = apitypes.BuildWork{
-		Operation: "concurrent-index-build", BlocksDone: 2500, BlocksTotal: 10000,
-		TuplesDone: 12000, TuplesTotal: 50000,
+		Operation: "concurrent-index-build", ServerPhase: "building index: scanning table",
+		BlocksDone: 2500, BlocksTotal: 10000,
 	}
 	return RenderApplyStatusComment(data)
 }

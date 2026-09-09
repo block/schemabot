@@ -52,27 +52,29 @@ func TestFormatApplyStatusComment_RendersStatementPositionPerDeployment(t *testi
 
 // A running concurrent index build persists the server's build work alongside
 // the statement position, and the PR comment renders it under the position, so
-// an operator sees the build advance even though no rows are copied.
+// an operator sees the build advance even though no rows are copied. The tuple
+// load still carries the finished heap scan's block counters; only the tuples
+// the phase owns are shown.
 func TestFormatApplyStatusComment_RendersStoredBuildWork(t *testing.T) {
 	ops := []*storage.ApplyOperation{{
 		ID:         1,
 		Deployment: "eu",
 		State:      state.ApplyOperation.Running,
 		ProgressMetadata: `{"step":"2","steps_total":"3","statement":"CREATE INDEX CONCURRENTLY idx_orders_status ON orders (status)",` +
-			`"executor_operation":"concurrent-index-build","server_phase":"building index: scanning table",` +
-			`"blocks_done":"2500","blocks_total":"10000","tuples_done":"12000","tuples_total":"50000","lockers_done":"0","lockers_total":"0"}`,
+			`"executor_operation":"concurrent-index-build","server_phase":"building index: loading tuples in tree",` +
+			`"blocks_done":"10000","blocks_total":"10000","tuples_done":"12000","tuples_total":"50000","lockers_done":"0","lockers_total":"0"}`,
 	}}
 
 	displayByOp := resolveDisplayByOperation(t.Context(), nil, runningApply(), ops)
 	require.Len(t, displayByOp, 1)
 	assert.Equal(t, apitypes.BuildWork{
-		Operation: "concurrent-index-build", ServerPhase: "building index: scanning table",
-		BlocksDone: 2500, BlocksTotal: 10000, TuplesDone: 12000, TuplesTotal: 50000,
+		Operation: "concurrent-index-build", ServerPhase: "building index: loading tuples in tree",
+		BlocksDone: 10000, BlocksTotal: 10000, TuplesDone: 12000, TuplesTotal: 50000,
 	}, displayByOp[1].BuildWork)
 
 	out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "")
 	assert.Contains(t, out, "step 2 of 3 · `CREATE INDEX CONCURRENTLY idx_orders_status ON orders (status)`\n"+
-		"building index: 25% of blocks (2,500/10,000) · 12,000/50,000 tuples\n")
+		"building index: 12,000/50,000 tuples\n")
 }
 
 // Each deployment of a fanned-out apply renders the build work persisted on its

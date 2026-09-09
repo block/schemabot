@@ -111,5 +111,8 @@ func TestProgressFingerprintTracksBuildWork(t *testing.T) {
 	assert.NotEqual(t, progressFingerprint(waiting("0")), progressFingerprint(waiting("1")), "a locker releasing is movement")
 
 	assert.Equal(t, "1:2/3;", progressFingerprint([]*storage.ApplyOperation{{ID: 1, ProgressMetadata: `{"step":"2","steps_total":"3"}`}}))
+	assert.Equal(t, "1:0/0 concurrent-index-build@waiting for old snapshots#0 b0/0 t0/0 l1/3;",
+		progressFingerprint([]*storage.ApplyOperation{{ID: 1, ProgressMetadata: `{"executor_operation":"concurrent-index-build","server_phase":"waiting for old snapshots","lockers_done":"1","lockers_total":"3"}`}}),
+		"build work without a position is still movement")
 	assert.Empty(t, progressFingerprint(building(`"blocks_done":"many"`)), "a malformed counter contributes nothing")
 }

@@ -11,8 +11,11 @@ const (
 )
 
 // BuildWork describes server-reported work for the operation currently being
-// executed. Counter fields are zero when the server does not report that kind
-// of work.
+// executed. ServerPhase is the server's own name for the phase, verbatim; the
+// counters are the server's readings, which may carry a completed phase's
+// values into the next one, so a renderer asks the engine which counters the
+// phase owns rather than reading them all. A counter is zero when the server
+// does not report that kind of work.
 type BuildWork struct {
 	Operation    string
 	ServerPhase  string
@@ -31,20 +34,6 @@ type BuildWork struct {
 // this package does not depend on the executor.
 func (w BuildWork) IsConcurrentIndexBuild() bool {
 	return w.Operation == "concurrent-index-build"
-}
-
-// WaitingOnLockers reports whether the server is in a concurrent index phase
-// that waits for sessions which could conflict with the build.
-func (w BuildWork) WaitingOnLockers() bool {
-	switch w.ServerPhase {
-	case "waiting for writers before build",
-		"waiting for writers before validation",
-		"waiting for old snapshots",
-		"waiting for readers before marking dead":
-		return true
-	default:
-		return false
-	}
 }
 
 // ParseBuildWork decodes the current operation's work from progress display

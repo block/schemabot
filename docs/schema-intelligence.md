@@ -554,10 +554,16 @@ carries the first-created deployment's position; the CLI's per-deployment view
 omits the position rather than show one deployment's under every heading.
 
 While the running statement is a concurrent index build, the next line shows
-the server's build work. Depending on the PostgreSQL phase, it reports block
-and tuple progress or the lockers still outstanding, and includes the attempt
-after a retry. For example:
-`building index: 25% of blocks (2,500/10,000) · 12,000/50,000 tuples · attempt 2`.
+the server's build work for the phase in flight. A scan reports its blocks,
+the tuple load reports its tuples, a wait reports the lockers still
+outstanding, and a sort names itself; the line is labelled `building index`
+until validation starts and `validating index` after. PostgreSQL carries a
+completed phase's counters into the next phase, so only the counter the
+current phase owns is shown, and the attempt is included after a retry. For
+example: `building index: 25% of blocks (2,500/10,000) · attempt 2` while the
+heap is scanned, then `building index: sorting live tuples`, then
+`building index: 12,000/50,000 tuples`, and later
+`validating index: 93% of blocks (930/1,000)` or `waiting on 2 of 3 lockers`.
 
 The numbers come from the engine while the apply is active, so they are as
 fresh as the last poll. Once the apply is terminal, the same endpoint answers

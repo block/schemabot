@@ -96,7 +96,7 @@ func resolveDisplayByOperation(ctx context.Context, stor storage.Storage, apply 
 	for _, op := range ops {
 		progress, err := storedProgressOf(op)
 		if err != nil {
-			slog.Warn("comment will omit the malformed part of the statement progress: progress metadata is malformed",
+			slog.Warn("comment will omit the malformed part of the statement progress",
 				append(apply.LogAttrs(), "apply_operation_id", op.ID, "operation_deployment", op.Deployment, "error", err)...)
 		}
 		od := operationDisplay{Step: progress.Step, BuildWork: progress.BuildWork}
@@ -116,7 +116,10 @@ func resolveDisplayByOperation(ctx context.Context, stor storage.Storage, apply 
 
 // storedProgress is the statement progress an operation's driver last persisted:
 // the position inside the statement sequence and the server-reported work for
-// the statement in flight.
+// the statement in flight. An engine that reports work on a statement also
+// reports which statement, so the two arrive together; the zero checks here
+// and on operationDisplay still test both parts, so a record that carries only
+// work counts as movement for the comment observer rather than as nothing.
 type storedProgress struct {
 	Step      apitypes.ProgressStep
 	BuildWork apitypes.BuildWork

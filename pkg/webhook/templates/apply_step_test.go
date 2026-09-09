@@ -34,8 +34,9 @@ func TestRenderApplyStatusCommentBuildWork(t *testing.T) {
 		"executor_operation": "concurrent-index-build",
 	}
 
-	t.Run("blocks only", func(t *testing.T) {
+	t.Run("heap scan", func(t *testing.T) {
 		metadata := maps.Clone(base)
+		metadata["server_phase"] = "building index: scanning table"
 		metadata["blocks_done"], metadata["blocks_total"] = "2500", "10000"
 		out := RenderApplyStatusComment(ApplyStatusFromProgress(&apitypes.ProgressResponse{State: state.Apply.Running, Metadata: metadata}, ""))
 		assert.Contains(t, out, "step 2 of 3 · `CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)`\n"+
@@ -52,7 +53,8 @@ func TestRenderApplyStatusCommentBuildWork(t *testing.T) {
 
 	t.Run("other operation is suppressed", func(t *testing.T) {
 		metadata := maps.Clone(base)
-		metadata["executor_operation"], metadata["blocks_done"], metadata["blocks_total"] = "brief", "25", "100"
+		metadata["executor_operation"], metadata["server_phase"] = "brief", "building index: scanning table"
+		metadata["blocks_done"], metadata["blocks_total"] = "25", "100"
 		out := RenderApplyStatusComment(ApplyStatusFromProgress(&apitypes.ProgressResponse{State: state.Apply.Running, Metadata: metadata}, ""))
 		assert.NotContains(t, out, "building index:")
 	})

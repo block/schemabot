@@ -53,15 +53,3 @@ func TestParseBuildWork(t *testing.T) {
 		assert.False(t, work.IsConcurrentIndexBuild())
 	})
 }
-
-func TestBuildWorkWaitingOnLockers(t *testing.T) {
-	for _, phase := range []string{
-		"waiting for writers before build", "waiting for writers before validation",
-		"waiting for old snapshots", "waiting for readers before marking dead",
-	} {
-		t.Run(phase, func(t *testing.T) {
-			assert.True(t, BuildWork{ServerPhase: phase}.WaitingOnLockers())
-		})
-	}
-	assert.False(t, BuildWork{ServerPhase: "building index: scanning table"}.WaitingOnLockers())
-}
