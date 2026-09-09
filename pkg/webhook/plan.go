@@ -254,7 +254,12 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// Find config to get the database identity. Environments are server-owned.
 	var schemaDatabase string
 	if databaseName != "" {
-		config, configDir, findErr := client.FindConfigByDatabaseName(ctx, repo, pr, databaseName)
+		findErr := h.unregisteredDatabaseError(repo, databaseName)
+		var config *ghclient.SchemabotConfig
+		var configDir string
+		if findErr == nil {
+			config, configDir, findErr = client.FindConfigByDatabaseName(ctx, repo, pr, databaseName)
+		}
 		if findErr != nil {
 			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, tenant, findErr) {
 				h.logger.Debug("unscoped fan-out plan targets a database not found by this deployment's discovery; staying silent",
@@ -578,7 +583,8 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 
 	var dbNotFoundErr *ghclient.DatabaseNotFoundError
 	if errors.As(err, &dbNotFoundErr) {
-		h.logger.Warn("schema request: database not found", logFields...)
+		data.SearchedDirs = dbNotFoundErr.SearchedDirs
+		h.logger.Warn("schema request: database not found", append(logFields, "searched_dirs", dbNotFoundErr.SearchedDirs)...)
 		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "database_not_found")
 		h.postComment(repo, pr, installationID, templates.RenderDatabaseNotFound(data))
 		return true
@@ -621,11 +627,26 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 
 	var dbNotConfiguredErr *api.DatabaseNotConfiguredError
 	if errors.As(err, &dbNotConfiguredErr) {
+		// The registry miss may name a database discovered from the PR's own
+		// config rather than the -d value, so render the one the error carries.
+		data.DatabaseName = dbNotConfiguredErr.Database
 		h.logger.Warn("schema request: database not configured on this server", logFields...)
 		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "database_not_configured")
-		data.ErrorDetail = err.Error()
-		h.postComment(repo, pr, installationID, templates.RenderGenericError(data))
+		h.postComment(repo, pr, installationID, templates.RenderDatabaseNotConfigured(data))
 		return true
+	}
+
+	// A truncated repository tree is incomplete discovery, not the command's
+	// answer: the caller keeps it retryable, exactly like an unexpected error,
+	// but the comment explains what the size of the repository means for
+	// discovery instead of quoting the raw error.
+	if errors.Is(err, ghclient.ErrGitTreeTruncated) {
+		h.logger.Error("schema request: repository tree truncated; config discovery incomplete", logFields...)
+		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "git_tree_truncated")
+		if !suppressRetryComments {
+			h.postComment(repo, pr, installationID, templates.RenderRepositoryTreeTruncated(data))
+		}
+		return false
 	}
 
 	var envNotConfiguredErr *environmentNotConfiguredError

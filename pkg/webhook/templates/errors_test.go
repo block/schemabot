@@ -257,3 +257,96 @@ func TestInvalidConfigDatabaseTypeLine(t *testing.T) {
 		assert.Equal(t, tc.want, got)
 	}
 }
+
+// TestRenderDatabaseNotFoundScopedSearch pins the wording for a repository too
+// large to search in full: the comment lists the configured directories that
+// were probed instead of claiming the whole repository was searched, and the
+// unscoped rendering keeps the repository-wide claim.
+func TestRenderDatabaseNotFoundScopedSearch(t *testing.T) {
+	t.Run("scoped search names the directories", func(t *testing.T) {
+		body := RenderDatabaseNotFound(SchemaErrorData{
+			Timestamp:    "2026-07-16 18:56:00",
+			Environment:  "staging",
+			DatabaseName: "payments",
+			SearchedDirs: []string{"services/payments/schema", "services/payments/legacy-schema"},
+		})
+		assert.Contains(t, body, "was found in the schema directories configured for this database on the SchemaBot server:")
+		assert.Contains(t, body, "- `services/payments/schema`\n- `services/payments/legacy-schema`\n")
+		assert.Contains(t, body, "SchemaBot searched only those directories")
+		assert.NotContains(t, body, "was found in this repository")
+	})
+
+	t.Run("full search keeps the repository-wide claim", func(t *testing.T) {
+		body := RenderDatabaseNotFound(SchemaErrorData{
+			Timestamp:    "2026-07-16 18:56:00",
+			Environment:  "staging",
+			DatabaseName: "payments",
+		})
+		assert.Contains(t, body, "was found in this repository")
+		assert.NotContains(t, body, "configured for this database")
+	})
+}
+
+// TestRenderDatabaseNotConfigured pins the comment for a database the server
+// has no configuration for: it names the database, says the repository's
+// schemabot.yaml may be correct, and points at the server-side remedy.
+func TestRenderDatabaseNotConfigured(t *testing.T) {
+	body := RenderDatabaseNotConfigured(SchemaErrorData{
+		RequestedBy:  "hubot",
+		Timestamp:    "2026-07-16 18:56:00",
+		Environment:  "staging",
+		DatabaseName: "payments",
+		CommandName:  "apply",
+	})
+	assert.Contains(t, body, "## ⚠️ Database Not Configured")
+	assert.Contains(t, body, "**Database**: `payments` | **Environment**: `staging`")
+	assert.Contains(t, body, "*Requested by @hubot at 2026-07-16 18:56:00 UTC*")
+	assert.Contains(t, body, "has no `payments` entry under `databases` in its server configuration")
+	assert.Contains(t, body, "A `schemabot.yaml` declaring `database: payments` is not enough on its own")
+	assert.Contains(t, body, "ask a SchemaBot operator to configure the database")
+	assert.NotContains(t, body, "was found in this repository")
+}
+
+// TestRenderRepositoryTreeTruncated pins the comment for a repository GitHub
+// could not return in full: a database-scoped command names the database and
+// the two server-side causes, an unscoped command explains the repo-wide
+// search instead, and the header follows the same database/environment
+// rules as the other schema request errors.
+func TestRenderRepositoryTreeTruncated(t *testing.T) {
+	t.Run("database-scoped command", func(t *testing.T) {
+		body := RenderRepositoryTreeTruncated(SchemaErrorData{
+			RequestedBy:  "hubot",
+			Timestamp:    "2026-07-16 18:56:00",
+			Environment:  "staging",
+			DatabaseName: "payments",
+			CommandName:  "apply",
+		})
+		assert.Contains(t, body, "## ⚠️ Repository Too Large to Search")
+		assert.Contains(t, body, "**Database**: `payments` | **Environment**: `staging`")
+		assert.Contains(t, body, "GitHub returned a truncated repository tree")
+		assert.Contains(t, body, "it has none it can search exhaustively for `payments`: the database is not configured on this instance, or its `allowed_dirs` leave the location of its config open")
+		assert.Contains(t, body, "or check that the `-d` value names a database this instance serves")
+	})
+
+	t.Run("unscoped auto-plan", func(t *testing.T) {
+		body := RenderRepositoryTreeTruncated(SchemaErrorData{
+			Timestamp:    "2026-07-16 18:56:00",
+			Environments: []string{"staging"},
+			CommandName:  "plan",
+		})
+		assert.Contains(t, body, "## ⚠️ Repository Too Large to Search\n\n**Environment**: `staging`\n\n*Triggered automatically by a pull request update at 2026-07-16 18:56:00 UTC*")
+		assert.Contains(t, body, "for this repository's databases, and those do not bound where every config may live")
+		assert.Contains(t, body, "give each of this repository's databases an `allowed_dirs` entry")
+		assert.NotContains(t, body, "**Database**")
+		assert.NotContains(t, body, "`-d`")
+	})
+
+	t.Run("unscoped deployment drops the header segment", func(t *testing.T) {
+		body := RenderRepositoryTreeTruncated(SchemaErrorData{
+			RequestedBy: "hubot",
+			Timestamp:   "2026-07-16 18:56:00",
+			CommandName: "plan",
+		})
+		assert.Contains(t, body, "## ⚠️ Repository Too Large to Search\n\n*Requested by @hubot at 2026-07-16 18:56:00 UTC*")
+	})
+}

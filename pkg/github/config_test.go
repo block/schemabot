@@ -1131,8 +1131,9 @@ func TestFindConfigByDatabaseNameInRepoTruncatedUsesScopedProbe(t *testing.T) {
 
 // A scoped probe that lists the database's configured directories completely
 // and finds no config for it is authoritative: the caller gets a clear
-// not-found error, with no misleading available-databases list (other
-// databases were never enumerated).
+// not-found error naming the directories that were searched, with no
+// misleading available-databases list (other databases were never
+// enumerated).
 func TestFindConfigByDatabaseNameInRepoTruncatedScopedProbeNotFound(t *testing.T) {
 	client, mux := setupConfigTestGitHubServer(t)
 	registerTruncatedRepoWithSchemaSubtree(t, mux, []map[string]any{
@@ -1149,7 +1150,9 @@ func TestFindConfigByDatabaseNameInRepoTruncatedScopedProbeNotFound(t *testing.T
 	var notFound *DatabaseNotFoundError
 	require.ErrorAs(t, err, &notFound)
 	assert.Equal(t, "payments", notFound.DatabaseName)
+	assert.Equal(t, []string{"apps/widgets/schema"}, notFound.SearchedDirs)
 	assert.Empty(t, notFound.AvailableDatabases)
+	assert.Contains(t, err.Error(), "configured schema directories: apps/widgets/schema")
 	assert.NotContains(t, err.Error(), "Available databases")
 }
 

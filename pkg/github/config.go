@@ -76,9 +76,18 @@ var (
 type DatabaseNotFoundError struct {
 	DatabaseName       string
 	AvailableDatabases []string
+	// SearchedDirs lists the directories a database-scoped search probed when
+	// GitHub truncated the repository tree and only the database's configured
+	// schema directories could be searched. Empty when the whole repository
+	// was searched.
+	SearchedDirs []string
 }
 
 func (e *DatabaseNotFoundError) Error() string {
+	if len(e.SearchedDirs) > 0 {
+		return fmt.Sprintf("database '%s' not found in its configured schema directories: %s",
+			e.DatabaseName, strings.Join(e.SearchedDirs, ", "))
+	}
 	if len(e.AvailableDatabases) == 0 {
 		return fmt.Sprintf("database '%s' not found", e.DatabaseName)
 	}
@@ -200,29 +209,29 @@ func (ic *InstallationClient) collectConfigsFromTree(ctx context.Context, repo, 
 // findAllConfigsForDatabase discovers configs for a database-scoped lookup.
 // With a complete tree it returns the full discovery result (scoped=false).
 // With a truncated tree it probes only the named database's configured
-// schema directories (scoped=true): absence there is authoritative for the
-// database, but the result does not enumerate other databases' configs. When
-// the database's directories cannot be probed exhaustively, it fails closed
-// with ErrGitTreeTruncated.
-func (ic *InstallationClient) findAllConfigsForDatabase(ctx context.Context, repo, ref, databaseName string) (*FindAllConfigsResult, bool, error) {
+// schema directories (scoped=true, searchedDirs naming them): absence there
+// is authoritative for the database, but the result does not enumerate other
+// databases' configs. When the database's directories cannot be probed
+// exhaustively, it fails closed with ErrGitTreeTruncated.
+func (ic *InstallationClient) findAllConfigsForDatabase(ctx context.Context, repo, ref, databaseName string) (result *FindAllConfigsResult, searchedDirs []string, scoped bool, err error) {
 	entries, truncated, err := ic.FetchGitTree(ctx, repo, ref)
 	if err != nil {
-		return nil, false, fmt.Errorf("fetch git tree: %w", err)
+		return nil, nil, false, fmt.Errorf("fetch git tree: %w", err)
 	}
 	if !truncated {
-		return ic.collectConfigsFromTree(ctx, repo, ref, entries), false, nil
+		return ic.collectConfigsFromTree(ctx, repo, ref, entries), nil, false, nil
 	}
-	result, ok, hintErr := ic.findConfigsInDatabaseHintDirs(ctx, repo, ref, databaseName)
+	result, searchedDirs, ok, hintErr := ic.findConfigsInDatabaseHintDirs(ctx, repo, ref, databaseName)
 	if hintErr != nil {
-		return nil, false, fmt.Errorf("discover schemabot config in configured schema dirs of database %s in repo %s ref %s: %w", databaseName, repo, ref, hintErr)
+		return nil, nil, false, fmt.Errorf("discover schemabot config in configured schema dirs of database %s in repo %s ref %s: %w", databaseName, repo, ref, hintErr)
 	}
 	if !ok {
-		return nil, false, fmt.Errorf("discover schemabot config for database %s in repo %s ref %s: %w", databaseName, repo, ref, ErrGitTreeTruncated)
+		return nil, nil, false, fmt.Errorf("discover schemabot config for database %s in repo %s ref %s: %w", databaseName, repo, ref, ErrGitTreeTruncated)
 	}
 	ic.logger.Info("git tree truncated; scoped config discovery to the database's configured schema dirs",
-		"repo", repo, "ref", ref, "database", databaseName,
+		"repo", repo, "ref", ref, "database", databaseName, "searched_dirs", searchedDirs,
 		"valid", len(result.ValidConfigs), "invalid", len(result.InvalidConfigs))
-	return result, true, nil
+	return result, searchedDirs, true, nil
 }
 
 // findConfigsInHintDirs discovers schemabot.yaml configs by scanning the
@@ -271,30 +280,32 @@ func (ic *InstallationClient) findConfigsInHintDirs(ctx context.Context, repo, r
 
 // findConfigsInDatabaseHintDirs discovers schemabot.yaml configs by scanning
 // only the named database's configured schema directories, for lookups that
-// already know which database they want. ok is false when the client has no
-// hints or the database's directories are not exhaustive (its config could
-// live outside any probe-able directory) — the caller must keep failing
-// closed with the truncation error. Unlike the repo-wide scan, an empty
-// result with exhaustive directories IS authoritative: no policy-valid
-// location for this database's config was left unscanned.
-func (ic *InstallationClient) findConfigsInDatabaseHintDirs(ctx context.Context, repo, ref, databaseName string) (*FindAllConfigsResult, bool, error) {
+// already know which database they want. It returns the directories it
+// scanned so a miss can name them. ok is false when the client has no hints
+// or the database's directories are not exhaustive (the database is not
+// configured here, or its config could live outside any probe-able
+// directory) — the caller must keep failing closed with the truncation error.
+// Unlike the repo-wide scan, an empty result with exhaustive directories IS
+// authoritative: no policy-valid location for this database's config was left
+// unscanned.
+func (ic *InstallationClient) findConfigsInDatabaseHintDirs(ctx context.Context, repo, ref, databaseName string) (*FindAllConfigsResult, []string, bool, error) {
 	if ic.configDirHints == nil {
 		ic.logger.Debug("no config dir hints configured; cannot scan truncated repo",
 			"repo", repo, "ref", ref, "database", databaseName)
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
 	hints, exhaustive := ic.configDirHints.SchemaDirHintsForDatabase(repo, databaseName)
 	if !exhaustive {
-		ic.logger.Warn("database's configured schema dirs do not cover every policy-valid config location; keeping fail-closed truncation error",
+		ic.logger.Warn("cannot bound where the database's config may live (database not configured here, or its allowed_dirs unrestricted); keeping fail-closed truncation error",
 			"repo", repo, "ref", ref, "database", databaseName, "hint_dirs", len(hints))
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
 
 	result, err := ic.scanHintDirsForConfigs(ctx, repo, ref, hints)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
-	return result, true, nil
+	return result, hints, true, nil
 }
 
 // scanHintDirsForConfigs scans the recursive subtree of each directory for
@@ -397,7 +408,7 @@ func (ic *InstallationClient) FindConfigByDatabaseNameInRepo(ctx context.Context
 		return nil, "", fmt.Errorf("fetch PR info: %w", err)
 	}
 
-	result, scoped, err := ic.findAllConfigsForDatabase(ctx, repo, prInfo.HeadSHA, databaseName)
+	result, searchedDirs, scoped, err := ic.findAllConfigsForDatabase(ctx, repo, prInfo.HeadSHA, databaseName)
 	if err != nil {
 		return nil, "", fmt.Errorf("find configs: %w", err)
 	}
@@ -417,9 +428,11 @@ func (ic *InstallationClient) FindConfigByDatabaseNameInRepo(ctx context.Context
 		}
 		if !ok {
 			// The scoped scan covered every directory this database's config
-			// could live in, so absence is authoritative. Other databases
-			// were not enumerated, so no available-databases list is offered.
-			return nil, "", &DatabaseNotFoundError{DatabaseName: databaseName}
+			// could live in, so absence is authoritative there — and the miss
+			// names those directories, since the rest of the repository was
+			// never searched. Other databases were not enumerated, so no
+			// available-databases list is offered.
+			return nil, "", &DatabaseNotFoundError{DatabaseName: databaseName, SearchedDirs: searchedDirs}
 		}
 		ic.logger.Debug("found config for database via scoped truncated-tree probe", "database", databaseName, "path", configDir)
 		return config, configDir, nil
