@@ -236,6 +236,9 @@ func writeProgressStep(data ProgressData) {
 		fmt.Printf(" · %s", statement)
 	}
 	fmt.Println()
+	if line := ui.FormatBuildWork(data.BuildWork); line != "" {
+		fmt.Println(line)
+	}
 }
 
 func clampTerminalLine(text string, maxRunes int) string {

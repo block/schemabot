@@ -3568,6 +3568,9 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Status**: In Progress
 
+step 2 of 3 · `CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON public.users (last_seen_at)`
+building index: 25% of blocks (2,500/10,000) · 12,000/50,000 tuples
+
 📊 1/3 complete · 1 running · 1 queued
 
 **Schema `public`**

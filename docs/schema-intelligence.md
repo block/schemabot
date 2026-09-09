@@ -518,6 +518,12 @@ PostgreSQL create-set progress uses the same metadata shape:
 The PR comment and CLI render this position as
 `step 2 of 3 · CREATE INDEX orders_ref_idx ON public.orders (ref)`.
 
+While the running statement is a concurrent index build, the next line shows
+the server's build work. Depending on the PostgreSQL phase, it reports block
+and tuple progress or the lockers still outstanding, and includes the attempt
+after a retry. For example:
+`building index: 25% of blocks (2,500/10,000) · 12,000/50,000 tuples · attempt 2`.
+
 The numbers come from the engine while the apply is active, so they are as
 fresh as the last poll. Once the apply is terminal, the same endpoint answers
 from storage: rows, throttle state, and checksum counts are preserved on the
