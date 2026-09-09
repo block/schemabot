@@ -10,6 +10,11 @@ import (
 	"github.com/block/schemabot/pkg/ui"
 )
 
+type initInputError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
 func (cmd *InitCmd) missingInputs() []string {
 	var missing []string
 	for _, field := range []struct{ name, value string }{
@@ -41,7 +46,7 @@ func (cmd *InitCmd) collectInputsWithTerminalState(ctx context.Context, g *Globa
 	if !cmd.interactive {
 		if cmd.JSON {
 			if err := json.NewEncoder(os.Stdout).Encode(map[string]any{
-				"error":   map[string]string{"code": "missing_inputs", "message": "Provide the missing flags or run init interactively."},
+				"error":   initInputError{Code: "missing_inputs", Message: "Provide the missing flags or run init interactively."},
 				"missing": missing,
 			}); err != nil {
 				return err

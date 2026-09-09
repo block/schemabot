@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -30,13 +31,15 @@ func CheckConnection(ctx context.Context, engine, dsn string) error {
 		return fmt.Errorf("connection checks are not available for this engine")
 	}
 	if err != nil {
-		return fmt.Errorf("we couldn’t read that connection; check its format and try again")
+		slog.DebugContext(ctx, "read setup connection failed", "engine", engine, "error", err)
+		return &setupConnectionError{message: "we couldn’t read that connection; check its format and try again", cause: err}
 	}
 	defer utils.CloseAndLog(db)
 	// An actual query also exercises already-established MySQL connections.
 	var one int
 	if err := db.QueryRowContext(ctx, "SELECT 1").Scan(&one); err != nil {
-		return fmt.Errorf("we couldn’t connect; check the address, credentials, and network, then try again")
+		slog.DebugContext(ctx, "check setup connection failed", "engine", engine, "error", err)
+		return &setupConnectionError{message: "we couldn’t connect; check the address, credentials, and network, then try again", cause: err}
 	}
 	return nil
 }

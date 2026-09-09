@@ -472,3 +472,27 @@ func TestInitTerminalStartupFailureDoesNotInitialize(t *testing.T) {
 	require.ErrorContains(t, err, "terminal startup failed")
 	require.False(t, called, "setup must not run when the terminal fails before Init")
 }
+
+func TestInitCancelledBeforeWorkReturnsError(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	called := false
+	result, err := runInitProgress(ctx, func(context.Context, func(string)) (*initResult, error) {
+		called = true
+		return &initResult{}, nil
+	}, tea.WithInput(nil), tea.WithOutput(io.Discard), tea.WithoutRenderer())
+	require.ErrorIs(t, err, context.Canceled)
+	require.Nil(t, result)
+	require.False(t, called)
+}
+
+func TestInitReviewEscapesFlagValues(t *testing.T) {
+	m := newInitWizard(&InitCmd{}, "default", io.Discard)
+	m.step = len(m.fields)
+	for _, i := range []int{0, 1, 2, 3, 4, 5, 6, 7} {
+		m.fields[i].value = "value\x1b[2J"
+	}
+	view := m.View()
+	require.NotContains(t, view, "\x1b[2J")
+	require.Contains(t, view, `\x1b[2J`)
+}

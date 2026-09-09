@@ -109,10 +109,12 @@ func runInitProgressProgram(ctx context.Context, initialize func(context.Context
 		defer close(finished)
 		select {
 		case <-runCtx.Done():
+			outcome.err = runCtx.Err()
 			return
 		case <-started:
 		}
-		if runCtx.Err() != nil {
+		if err := runCtx.Err(); err != nil {
+			outcome.err = err
 			return
 		}
 		outcome.result, outcome.err = initialize(runCtx, func(stage string) { p.Send(initStageMsg(stage)) })

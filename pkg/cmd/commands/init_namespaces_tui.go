@@ -216,14 +216,7 @@ func configureInitWizard(m *initWizard, cmd *InitCmd) {
 
 func (m *initWizard) namespaceChoices(original []string) []string {
 	if m.explicitNamespaces {
-		if m.fields[5].value == strings.Join(original, ", ") {
-			return slices.Clone(original)
-		}
-		names := strings.Split(m.fields[5].value, ",")
-		for i := range names {
-			names[i] = strings.TrimSpace(names[i])
-		}
-		return names
+		return initNamespaceInput(m.fields[5].value, original)
 	}
 	var chosen []string
 	for _, name := range m.names {

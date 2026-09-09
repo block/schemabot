@@ -334,13 +334,13 @@ func (m *initWizard) contentView() string {
 			b.WriteString(wrap.Render(m.notice) + "\n\n")
 		}
 		b.WriteString(bold.Render("Your database") + "\n")
-		b.WriteString(wrap.Render(m.fields[1].value+" · "+m.fields[0].value+" · "+m.fields[2].value) + "\n")
+		b.WriteString(wrap.Render(initTerminalText(m.fields[1].value+" · "+m.fields[0].value+" · "+m.fields[2].value)) + "\n")
 		b.WriteString(wrap.Render("Namespaces: "+initTerminalText(m.fields[5].value)) + "\n\n")
 		b.WriteString(bold.Render("Your schema files") + "\n")
-		b.WriteString(wrap.Render(m.fields[6].value+" · profile "+m.fields[7].value) + "\n\n")
+		b.WriteString(wrap.Render(initTerminalText(m.fields[6].value+" · profile "+m.fields[7].value)) + "\n\n")
 		b.WriteString(bold.Render("Connections") + "\n")
-		b.WriteString(wrap.Render("Application: "+m.fields[3].value) + "\n")
-		b.WriteString(wrap.Render("SchemaBot state: "+m.fields[4].value) + "\n")
+		b.WriteString(wrap.Render("Application: "+initTerminalText(m.fields[3].value)) + "\n")
+		b.WriteString(wrap.Render("SchemaBot state: "+initTerminalText(m.fields[4].value)) + "\n")
 		if m.hasExistingSchema {
 			b.WriteString("\nYou already have schema files here. We’ll verify them and keep your edits.\n")
 		}

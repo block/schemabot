@@ -39,3 +39,13 @@ func TestStageExistingFlatSchemaUsesOriginalNamespace(t *testing.T) {
 	require.ErrorContains(t, err, root)
 	require.NotContains(t, err.Error(), ".schemabot-init-")
 }
+
+func TestInitDestinationPreflight(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, validateInitSchemaDestination(root))
+	require.NoError(t, os.WriteFile(filepath.Join(root, ".gitkeep"), nil, 0600))
+	require.ErrorContains(t, validateInitSchemaDestination(root), "choose an empty --schema-dir")
+	require.FileExists(t, filepath.Join(root, ".gitkeep"))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"), []byte("database: app"), 0600))
+	require.NoError(t, validateInitSchemaDestination(root))
+}
