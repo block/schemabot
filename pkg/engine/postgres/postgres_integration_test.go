@@ -1026,6 +1026,42 @@ func TestEngineCancelConcurrentIndexBuildWithoutABackendSignal(t *testing.T) {
 	assertIndexInvalid(t, db, "orders_ref_idx")
 }
 
+// TestEngineApplyConcurrentIndexBoundEndsTheBuild proves the configured
+// bound is what governs a concurrent build on the target: a build that
+// cannot finish inside it is ended by the server, the apply fails, and the
+// operator detail names the option and the bound the build ran past, so the
+// operator's next step is to raise it. Whether the cancelled build left its
+// own invalid index behind (retryable, the retry recovers it) or nothing at
+// all (refused, since retrying unchanged spends the same bound again)
+// depends on how far the build got before the timer fired; both surfaces
+// carry the option, so the assertion holds on either.
+func TestEngineApplyConcurrentIndexBoundEndsTheBuild(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "index_bound_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY, email text)")
+	require.NoError(t, err)
+	// Enough rows that the build's table scans outlast the bound on any
+	// machine; an empty table could finish inside it and report completion.
+	_, err = db.ExecContext(t.Context(),
+		"INSERT INTO public.users (id, email) SELECT n, 'user-' || n || '@example.com' FROM generate_series(1, 200000) AS n")
+	require.NoError(t, err)
+
+	bound := time.Millisecond
+	eng := NewWithOptions(0, bound)
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "users",
+		"CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "users")
+	require.Equal(t, engine.StateFailed, progress.State, "progress: %+v", progress)
+	assert.Contains(t, progress.ErrorMessage, "postgres.concurrent_index_max_duration (1ms)")
+	assert.Contains(t, progress.ErrorMessage, "raise postgres.concurrent_index_max_duration")
+
+	var valid bool
+	err = db.QueryRowContext(t.Context(),
+		`SELECT coalesce(bool_and(i.indisvalid), false) FROM pg_index i WHERE i.indexrelid = to_regclass('public.users_email_idx')`).Scan(&valid)
+	require.NoError(t, err)
+	assert.False(t, valid, "a build the bound ended must not leave a valid index the drive reported as failed")
+}
+
 // TestEngineApplyPartitionedParentConcurrentIndexRefusal proves the
 // partition admission policy runs at apply time: a concurrent build against
 // a partitioned parent is permanently refused with the typed fixed-sentence

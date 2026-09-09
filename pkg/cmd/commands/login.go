@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"reflect"
 	"runtime"
 	"strings"
 	"time"
@@ -95,8 +96,15 @@ func (cmd *LoginCmd) Run(g *Globals) error {
 	if !result.Expiry.IsZero() {
 		profile.TokenExpiry = result.Expiry.Unix()
 	}
-	cfg.Profiles[profileName] = profile
-	if err := client.SaveConfig(cfg); err != nil {
+	if err := client.UpdateConfig(context.WithoutCancel(ctx), func(latest *client.Config) error {
+		current, exists := latest.Profiles[profileName]
+		if !exists || !sameEndpoint(current.Endpoint, profile.Endpoint) || current.LocalRuntime != profile.LocalRuntime || !reflect.DeepEqual(current.OIDC, profile.OIDC) {
+			return fmt.Errorf("profile %q changed its connection during login; the token was not saved to a different server", profileName)
+		}
+		current.Token, current.RefreshToken, current.TokenExpiry = profile.Token, profile.RefreshToken, profile.TokenExpiry
+		latest.Profiles[profileName] = current
+		return nil
+	}); err != nil {
 		return fmt.Errorf("save token to profile %q: %w", profileName, err)
 	}
 

@@ -23,7 +23,7 @@ func validLocalConfig() api.ServerConfig {
 
 func TestLocalConfiguration(t *testing.T) {
 	cfg := validLocalConfig()
-	err := validateLocalConfig(&cfg)
+	err := ValidateLocalConfig(&cfg)
 	require.NoError(t, err)
 	assert.Equal(t, "root@tcp(127.0.0.1:3306)/schemabot_state", cfg.Storage.DSN)
 	assert.Equal(t, "root@tcp(127.0.0.1:3306)/app", cfg.Databases["app"].Environments["development"].DSN)
@@ -47,7 +47,7 @@ func TestLocalConfiguration(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			config := validLocalConfig()
 			tc.mutate(&config)
-			err := validateLocalConfig(&config)
+			err := ValidateLocalConfig(&config)
 			require.ErrorContains(t, err, tc.message)
 		})
 	}
@@ -70,7 +70,7 @@ func TestLocalConfigurationUsesSharedEngineRouting(t *testing.T) {
 				db.Environments["development"] = api.EnvironmentConfig{DSN: "postgres://user:password@localhost/app?sslmode=disable"}
 			}
 			cfg.Databases["app"] = db
-			require.NoError(t, validateLocalConfig(&cfg))
+			require.NoError(t, ValidateLocalConfig(&cfg))
 			assert.Equal(t, engine, cfg.Databases["app"].Type)
 		})
 	}
@@ -82,7 +82,7 @@ func TestLocalConfigurationPreservesRemoteRouting(t *testing.T) {
 	cfg.Databases["app"] = api.DatabaseConfig{Type: "vitess", Environments: map[string]api.EnvironmentConfig{
 		"development": {Target: "app", Deployment: "regional"},
 	}}
-	require.NoError(t, validateLocalConfig(&cfg))
+	require.NoError(t, ValidateLocalConfig(&cfg))
 	assert.Equal(t, "127.0.0.1:9090", cfg.TernDeployments["regional"]["development"])
 	assert.Equal(t, "regional", cfg.Databases["app"].Environments["development"].Deployment)
 }
@@ -100,7 +100,7 @@ func TestLocalListenerReservedBeforeBuild(t *testing.T) {
 	cfg := validLocalConfig()
 	missing := filepath.Join(t.TempDir(), "missing.pem")
 	cfg.PlanetScale.MTLS = &api.PlanetScaleMTLSConfig{CABundle: missing, ClientCert: missing, ClientKey: missing}
-	require.NoError(t, validateLocalConfig(&cfg))
+	require.NoError(t, ValidateLocalConfig(&cfg))
 	err = RunLocal(ctx, cfg, LocalOptions{Address: listener.Addr().String(), Token: strings.Repeat("a", 64)})
 	require.ErrorContains(t, err, "listen for local runtime")
 }

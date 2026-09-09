@@ -288,6 +288,9 @@ func registerPlanetScaleMTLS(cfg *api.ServerConfig, logger *slog.Logger) error {
 // (RegisterGRPC / Handler), starts background work (Start), and releases
 // resources (Close). Run is Build plus SchemaBot's own gRPC/HTTP listeners.
 func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server, error) {
+	if err := cfg.ValidateExperimentalStrata(); err != nil {
+		return nil, err
+	}
 	o := options{logger: slog.Default()}
 	for _, opt := range opts {
 		opt(&o)
