@@ -41,12 +41,6 @@ func formatProgressDDLForDialect(dialect schema.Dialect, rawDDL string) string {
 	if rawDDL == "" {
 		return ""
 	}
-	if _, err := ddl.ParserForDialect(dialect); err != nil {
-		// A database type with no registered parser — empty (older server)
-		// or one this CLI doesn't know (newer server) — keeps the MySQL
-		// rendering rather than degrading to unformatted output.
-		dialect = schema.DialectMySQL
-	}
 	return IndentSQL(ddl.FormatDDLForDialect(dialect, rawDDL), indentContent) + "\n"
 }
 
@@ -145,6 +139,7 @@ func WriteProgress(data ProgressData) {
 	}
 
 	WriteBox(rows, "State", colorFn)
+	writeProgressStep(data)
 
 	// Error below the box
 	if data.State == state.Apply.Failed && data.ErrorMessage != "" {
@@ -198,6 +193,8 @@ func WriteProgress(data ProgressData) {
 		}
 	}
 
+	fmt.Print(FormatThrottleReference(data.Tables))
+
 	// Surface per-keyspace VSchema application status (and diff) from the engine's
 	// display metadata, rather than from a synthetic task in the table list.
 	if changes, err := apitypes.ParseVSchemaChanges(data.Metadata); err != nil {
@@ -223,6 +220,17 @@ func WriteProgress(data ProgressData) {
 	if data.State == state.Apply.Failed {
 		writeFailureGuidance()
 	}
+}
+
+func writeProgressStep(data ProgressData) {
+	if !state.IsRunningApplyState(data.State) || data.Step <= 0 || data.StepsTotal <= 0 {
+		return
+	}
+	fmt.Printf("\nstep %d of %d", data.Step, data.StepsTotal)
+	if statement := ui.ClampStatement(data.Statement); statement != "" {
+		fmt.Printf(" · %s", statement)
+	}
+	fmt.Println()
 }
 
 // FormatNamespacedTables returns tables grouped by keyspace as a string, collapsing
@@ -771,6 +779,21 @@ func throttledSuffix(t TableProgress) string {
 		return ""
 	}
 	return " (throttled)"
+}
+
+// FormatThrottleReference renders one shared reference for a progress view.
+// Table-specific throttle reasons remain beside each affected table.
+func FormatThrottleReference(tables []TableProgress) string {
+	for _, table := range tables {
+		if !table.Throttled || ui.ThrottleTip(table.ThrottleReason) == "" {
+			continue
+		}
+		if !state.IsState(table.Status, state.Task.Running, state.Task.Checksumming) {
+			continue
+		}
+		return fmt.Sprintf("  %sDocs: %s%s\n\n", ANSIDim, ui.Link("Throttle reference", ui.ThrottleDocURL), ANSIReset)
+	}
+	return ""
 }
 
 // writeThrottleTooltip explains the header's "(throttled)" annotation with the

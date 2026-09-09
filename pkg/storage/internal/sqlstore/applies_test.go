@@ -3273,7 +3273,7 @@ func TestApplyStore_ExpireRetryable(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	expired, err := store.Applies().ExpireRetryable(ctx)
+	expired, err := store.Applies().ExpireRetryable(ctx, 10)
 	require.NoError(t, err)
 	require.Len(t, expired, 1)
 	assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
@@ -3316,7 +3316,7 @@ func TestApplyStore_ExpireRetryableExpiresOldFailures(t *testing.T) {
 	`, apply.ID)
 	require.NoError(t, err)
 
-	expired, err := store.Applies().ExpireRetryable(ctx)
+	expired, err := store.Applies().ExpireRetryable(ctx, 10)
 	require.NoError(t, err)
 	require.Len(t, expired, 1)
 	assert.Equal(t, storage.RetryableExpirationRecoveryWindow, expired[0].Reason)
@@ -3362,7 +3362,7 @@ func TestApplyStore_ExpireRetryableTerminalizesRetryableOperations(t *testing.T)
 	})
 	require.NoError(t, err)
 
-	expired, err := store.Applies().ExpireRetryable(ctx)
+	expired, err := store.Applies().ExpireRetryable(ctx, 10)
 	require.NoError(t, err)
 	require.Len(t, expired, 1)
 	assert.Equal(t, state.Apply.Failed, expired[0].Apply.State)
@@ -3384,19 +3384,135 @@ func TestApplyStore_ExpireRetryableTerminalizesRetryableOperations(t *testing.T)
 	assert.Equal(t, state.ApplyOperation.WaitingForCutover, parkedOp.State, "a healthy successor parked at the cutover barrier must be left untouched")
 }
 
+// One instance expires per pass, so the batch bound is the fleet-wide drain rate
+// and a backlog has to drain in the order it accumulated: taking the newest
+// first would leave the same oldest tail unexpired every pass, holding its
+// targets against every new apply indefinitely.
+func TestApplyStore_ExpireRetryable_TakesTheOldestUpToTheLimit(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	// Created newest-first so insertion order cannot stand in for age.
+	identifiers := []string{"apply_expire_newest", "apply_expire_middle", "apply_expire_oldest"}
+	for i, identifier := range identifiers {
+		lock := createTestLock(t, store, fmt.Sprintf("expire_limit_db_%d", i), storage.DatabaseTypeMySQL)
+		apply := createTestApplyWithStateAndEnv(t, store, lock, identifier, int64(530+i), state.Apply.FailedRetryable, "staging")
+		_, err := testDB.ExecContext(ctx,
+			`UPDATE applies SET attempt = ?, updated_at = NOW() - INTERVAL ? MINUTE WHERE id = ?`,
+			maxRecoveryAttempts, i+1, apply.ID)
+		require.NoError(t, err)
+	}
+
+	expired, err := store.Applies().ExpireRetryable(ctx, 2)
+	require.NoError(t, err)
+	require.Len(t, expired, 2, "a pass settles at most the limit it was given")
+	assert.Equal(t, []string{"apply_expire_oldest", "apply_expire_middle"},
+		[]string{expired[0].Apply.ApplyIdentifier, expired[1].Apply.ApplyIdentifier},
+		"the backlog drains oldest first")
+
+	remaining, err := store.Applies().ExpireRetryable(ctx, 2)
+	require.NoError(t, err)
+	require.Len(t, remaining, 1, "the tail is settled by the next pass")
+	assert.Equal(t, "apply_expire_newest", remaining[0].Apply.ApplyIdentifier)
+}
+
 // Under fan-out the apply's retry budget belongs to the rollout, not to one
 // deployment: the redispatches of a failing deployment spend it while a sibling
 // deployment copies happily under its own operation lease. Expiry selects the
 // parent by apply_id, and a driver holding only an operation lease never bumps
 // the parent, so nothing about the parent row distinguishes the two
-// deployments' task rows. The operation lease does, and expiry reads it: the
-// abandoned deployment's rows are terminalized, the live one's are not.
+// deployments. The operation lease does, and expiry reads it — declining the
+// apply whole rather than writing the parent's verdict over rows it is not
+// willing to touch.
 //
 // Writing the live rows would not merely be wrong for a tick. A terminal stored
 // task is the durable final answer the drive reconciles forward from, so the
 // running drive would never move them back and a healthy deployment would come
 // to rest on a failed verdict no driver ever wrote.
-func TestApplyStore_ExpireRetryable_KeepsTasksWhoseOperationADriverHolds(t *testing.T) {
+//
+// Declining costs the apply a pass, not the expiry: expiry is a sweep, so once
+// the lease goes stale the next pass takes the apply and its rows together.
+// Expiry writes an apply's task and operation rows without gating each write on
+// a lease, which is only safe because no driver can start a drive under an apply
+// expiry is taking. The selection excludes a drive already under way; what
+// excludes one that has not started is that starting means passing
+// ClaimApplyByID, and the two predicates are exact complements — expiry wants a
+// spent budget or a lapsed freshness window, the claim wants a live budget and a
+// live window.
+//
+// That pairing is the property, so it is pinned as a pair. Testing either side
+// alone would still pass if someone widened one predicate and left the other
+// where it was, which is precisely the change that would let a driver start
+// under an apply this sweep is about to settle.
+func TestApplyStore_ExpireRetryableAndTheParentClaimNeverAdmitTheSameApply(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	// One database each: the one-active-apply guard admits a single active apply
+	// per target, and failed_retryable is active.
+	retryable := func(name string, planID int64) *storage.Apply {
+		lock := createTestLock(t, store, name+"_db", storage.DatabaseTypeMySQL)
+		return createTestApplyWithStateAndEnv(t, store, lock, name, planID, state.Apply.FailedRetryable, "staging")
+	}
+	spendBudget := func(apply *storage.Apply) {
+		_, err := testDB.ExecContext(ctx, `UPDATE applies SET attempt = ? WHERE id = ?`, maxRecoveryAttempts, apply.ID)
+		require.NoError(t, err)
+	}
+	lapseFreshness := func(apply *storage.Apply) {
+		_, err := testDB.ExecContext(ctx, `
+			UPDATE applies SET updated_at = NOW() - INTERVAL ? DAY WHERE id = ?
+		`, retryableRecoveryFreshnessDays+1, apply.ID)
+		require.NoError(t, err)
+	}
+
+	budgetSpent := retryable("apply_disjoint_budget", 540)
+	spendBudget(budgetSpent)
+
+	windowLapsed := retryable("apply_disjoint_window", 541)
+	lapseFreshness(windowLapsed)
+
+	both := retryable("apply_disjoint_both", 542)
+	spendBudget(both)
+	lapseFreshness(both)
+
+	// The control: still inside both budget and window, so it is the one apply
+	// here that recovery should redispatch rather than expire.
+	recoverable := retryable("apply_disjoint_recoverable", 543)
+
+	for _, apply := range []*storage.Apply{budgetSpent, windowLapsed, both} {
+		claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "operator-a")
+		require.NoError(t, err)
+		assert.Nil(t, claimed, "an apply expiry will take must not be claimable for a drive: %s", apply.ApplyIdentifier)
+	}
+
+	expired, err := store.Applies().ExpireRetryable(ctx, 10)
+	require.NoError(t, err)
+
+	expiredIDs := make([]string, 0, len(expired))
+	for _, expiration := range expired {
+		expiredIDs = append(expiredIDs, expiration.Apply.ApplyIdentifier)
+	}
+	assert.ElementsMatch(t,
+		[]string{budgetSpent.ApplyIdentifier, windowLapsed.ApplyIdentifier, both.ApplyIdentifier},
+		expiredIDs,
+		"expiry takes every apply the parent claim refuses, and only those")
+
+	persisted, err := store.Applies().Get(ctx, recoverable.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.FailedRetryable, persisted.State,
+		"an apply recovery can still redispatch is not expiry's to settle")
+
+	// Claimable all along, so the three refusals above were the predicate
+	// disagreeing with expiry rather than the fixture being unclaimable.
+	claimed, err := store.Applies().ClaimApplyByID(ctx, recoverable.ID, "operator-a")
+	require.NoError(t, err)
+	require.NotNil(t, claimed, "the apply expiry passed over is exactly the one a driver may take")
+}
+
+func TestApplyStore_ExpireRetryable_DeclinesAnApplyWhoseOperationADriverHolds(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := NewMySQL(testDB)
@@ -3413,36 +3529,52 @@ func TestApplyStore_ExpireRetryable_KeepsTasksWhoseOperationADriverHolds(t *test
 	// The sibling a driver is holding right now, heartbeated as of this instant.
 	held := leasedOperationFor(t, store, apply, "region-b")
 
-	strandedTask := createRetryableReapTask(t, store, apply, "task_expire_fanout_stranded", "users", state.Task.Running, "")
-	attachTaskToOperation(t, strandedTask.TaskIdentifier, abandoned)
+	abandonedTask := createRetryableReapTask(t, store, apply, "task_expire_fanout_abandoned", "users", state.Task.Running, "")
+	attachTaskToOperation(t, abandonedTask.TaskIdentifier, abandoned)
 	liveTask := createRetryableReapTask(t, store, apply, "task_expire_fanout_live", "orders", state.Task.Running, "")
 	attachTaskToOperation(t, liveTask.TaskIdentifier, held)
 	queuedTask := createRetryableReapTask(t, store, apply, "task_expire_fanout_queued", "products", state.Task.Pending, "")
 	attachTaskToOperation(t, queuedTask.TaskIdentifier, held)
 
-	expired, err := store.Applies().ExpireRetryable(ctx)
+	expired, err := store.Applies().ExpireRetryable(ctx, 10)
 	require.NoError(t, err)
-	require.Len(t, expired, 1)
-	assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
+	assert.Empty(t, expired, "one live sibling holds the whole apply, not just its own rows")
 
 	persisted, err := store.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
 	require.NotNil(t, persisted)
-	assert.Equal(t, state.Apply.Failed, persisted.State, "the rollout's verdict is still expiry's to write")
-
-	assertTaskState(t, store, strandedTask.TaskIdentifier, state.Task.Failed)
+	assert.Equal(t, state.Apply.FailedRetryable, persisted.State,
+		"the parent's verdict may not be written over rows the pass declined to touch")
+	assertTaskState(t, store, abandonedTask.TaskIdentifier, state.Task.Running)
 	assertTaskState(t, store, liveTask.TaskIdentifier, state.Task.Running)
 	assertTaskState(t, store, queuedTask.TaskIdentifier, state.Task.Pending)
+
+	// The driver dies and its lease ages out. Nothing else changes.
+	backdateOperationHeartbeat(t, held, storage.ApplyLeaseStaleAfter+time.Minute)
+
+	expired, err = store.Applies().ExpireRetryable(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, expired, 1, "a declined apply is offered again on the next pass")
+	assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
+
+	persisted, err = store.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, state.Apply.Failed, persisted.State)
+	assertTaskState(t, store, abandonedTask.TaskIdentifier, state.Task.Failed)
+	assertTaskState(t, store, liveTask.TaskIdentifier, state.Task.Failed)
+	assertTaskState(t, store, queuedTask.TaskIdentifier, state.Task.Cancelled)
 }
 
 // A drive that settles its operation into failed_retryable writes that state
 // under its lease and leaves the lease in place, so for a staleness window
-// afterwards the row carries a fresh-looking lease with no drive behind it. That
-// is the ordinary shape of a single-deployment apply that has just used its last
-// attempt, which is the apply expiry exists to terminalize. Reading that lease as
-// a live drive would leave the apply's own tables reporting a retry that has
-// already been given up on, and expiry never comes back to correct it.
-func TestApplyStore_ExpireRetryable_ExpiresTasksWhoseOperationSettledUnderAFreshLease(t *testing.T) {
+// afterwards the row carries a fresh-looking lease with no drive behind it.
+// That is the ordinary shape of a single-deployment apply that has just used its
+// last attempt, which is the apply expiry exists to terminalize. The gate reads
+// the operation's state alongside its lease for exactly this reason: waiting the
+// lease out would hold every such apply non-terminal for a staleness window,
+// with its target still blocked behind it.
+func TestApplyStore_ExpireRetryable_ExpiresAnApplyWhoseDriveLeftItsLeaseBehind(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := NewMySQL(testDB)
@@ -3463,60 +3595,12 @@ func TestApplyStore_ExpireRetryable_ExpiresTasksWhoseOperationSettledUnderAFresh
 	queuedTask := createRetryableReapTask(t, store, apply, "task_expire_settled_queued", "orders", state.Task.Pending, "")
 	attachTaskToOperation(t, queuedTask.TaskIdentifier, settled)
 
-	expired, err := store.Applies().ExpireRetryable(ctx)
+	expired, err := store.Applies().ExpireRetryable(ctx, 10)
 	require.NoError(t, err)
 	require.Len(t, expired, 1)
-
+	assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
 	assertTaskState(t, store, failedTask.TaskIdentifier, state.Task.Failed)
 	assertTaskState(t, store, queuedTask.TaskIdentifier, state.Task.Cancelled)
-}
-
-// A row expiry skips is deferred, not dropped. Expiry settles the parent in the
-// same transaction, which is the reapers' precondition, so once the driver's
-// lease goes stale the active-task sweep closes the rows out against that
-// verdict. Expiry itself never comes back — the apply it just settled no longer
-// matches its own selection — so this is the whole of the recovery path, and a
-// gate without it would strand every row it skipped.
-//
-// The queued row settles failed rather than cancelled: the sweep mirrors the
-// parent's verdict and does not draw expiry's did-no-work distinction. That is
-// coarser attribution on a table that was queued under a deployment which was
-// genuinely running, and it is the price of not writing a live drive's rows.
-func TestApplyStore_ExpireRetryable_ReapersSettleTheRowsTheLeaseGateSkipped(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	lock := createTestLock(t, store, "expire_handoff_db", storage.DatabaseTypeMySQL)
-	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_expire_handoff", 521, state.Apply.FailedRetryable, "staging")
-	_, err := testDB.ExecContext(ctx, `UPDATE applies SET attempt = ? WHERE id = ?`, maxRecoveryAttempts, apply.ID)
-	require.NoError(t, err)
-
-	held := leasedOperationFor(t, store, apply, "region-a")
-	liveTask := createRetryableReapTask(t, store, apply, "task_expire_handoff_live", "users", state.Task.Running, "")
-	attachTaskToOperation(t, liveTask.TaskIdentifier, held)
-	queuedTask := createRetryableReapTask(t, store, apply, "task_expire_handoff_queued", "orders", state.Task.Pending, "")
-	attachTaskToOperation(t, queuedTask.TaskIdentifier, held)
-
-	expired, err := store.Applies().ExpireRetryable(ctx)
-	require.NoError(t, err)
-	require.Len(t, expired, 1)
-	assertTaskState(t, store, liveTask.TaskIdentifier, state.Task.Running)
-	assertTaskState(t, store, queuedTask.TaskIdentifier, state.Task.Pending)
-
-	// The driver dies. Its lease ages out, its rows stop being mirrored, and the
-	// verdict expiry wrote has been quiet long enough to be the reaper's to
-	// mirror down.
-	backdateOperationHeartbeat(t, held, storage.ApplyLeaseStaleAfter+time.Minute)
-	backdateApplyUpdatedAt(t, apply.ID, strandedActiveParentQuiescence+time.Minute)
-	backdateTaskUpdatedAt(t, liveTask.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
-	backdateTaskUpdatedAt(t, queuedTask.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
-
-	settled, err := store.tasks.reapStrandedActive(ctx, 10)
-	require.NoError(t, err)
-	require.Len(t, settled, 2, "both rows the gate skipped are the sweep's once the lease goes stale")
-	assertTaskState(t, store, liveTask.TaskIdentifier, state.Task.Failed)
-	assertTaskState(t, store, queuedTask.TaskIdentifier, state.Task.Failed)
 }
 
 func TestApplyStore_FindMissingSummaryComment_ExcludesAppliesWithoutGitHubDestination(t *testing.T) {

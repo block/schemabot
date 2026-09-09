@@ -55,7 +55,7 @@ stay put, where this page moves as engines gain features.
 | **`stop`** | yes | no | planned |
 | **`start`** | yes | deferred deploys only | planned |
 | **Deferred cutover** | yes | yes | planned |
-| **`cancel`** | yes | yes | planned |
+| **`cancel`** | yes | yes | concurrent index builds only |
 | **`revert` / `skip-revert`** | no | yes | no |
 | **Throttling** | automatic, on live target signals | automatic, on live cluster signals; plus an operator-set rate on a running change | planned, on replica and slot lag; meanwhile a statement is cancelled at its budget rather than slowed |
 | **Adaptive pacing** | yes | no | planned |
