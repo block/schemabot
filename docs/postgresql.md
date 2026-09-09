@@ -180,6 +180,44 @@ Indexes declared together with a new table take a different path: they run as
 plain, non-concurrent steps inside the greenfield create set, because the table
 has no readers yet (see [Greenfield tables](#greenfield-tables)).
 
+### Control operations
+
+Cancel is supported for an existing table's concurrent index build. Plain DDL
+is never cancellable: each statement commits or fails on its own, so a cancel
+of one is declined as a typed unsupported operation and the durable request
+resolves terminally.
+
+A cancel of a running build signals the build's backend through the apply's
+pg-sprite progress tracker. When that signal cannot reach a running statement
+— the build has not started, has already returned, or its backend cannot be
+observed or signalled by the engine role — the engine cancels the apply's own
+context instead, which ends whatever statement the apply is on. Membership in
+`pg_signal_backend` lets the signal land on the build backend directly; without
+it the cancel still takes effect through the apply's context.
+
+The cancel is answered from the outcome the apply settles on, never from the
+signal alone. A build cancelled either way leaves an invalid index, which the
+apply records as the cancelled outcome and the next build under that name
+recovers as abandoned debris. A signal that races the build's completion may
+find the index already valid: that apply is reported as already completed, not
+cancelled, and the durable request reconciles to the completed outcome. A cancel
+that arrives after the apply has already failed is accepted over the failure,
+carrying the failure detail. A cancel whose build has not settled within the
+engine's wait is reported as still running, and the next attempt waits for it
+again.
+
+On shutdown the engine halts its running concurrent index builds the same way
+— by cancelling their contexts — so the process does not exit with a build
+running on the target under a lease nobody renews. A halt is not an operator
+cancel: the apply records the build's failure, stays active, and the next
+driver to claim it recovers the leftover index before its own build. Plain DDL
+is left to finish; a halt whose budget expires while such a statement is still
+running reports that the target may still be held.
+
+Stop remains unsupported. A concurrent build has no resumable midpoint, so a
+stop would be a permanent cancel under a misleading name; non-concurrent
+statements likewise have no engine phase to pause.
+
 ### Greenfield tables
 
 A `CREATE TABLE` for a table that does not exist on the target plans as a
@@ -413,16 +451,19 @@ PostgreSQL targets do not support:
 
 - pending drops;
 - deferred cutover (`--defer-cutover`);
-- stop, cancel, start, cutover, revert, skip-revert, or volume controls.
+- stop, start, cutover, revert, skip-revert, or volume controls;
+- cancel of anything other than a concurrent index build (see
+  [Control operations](#control-operations)).
 
 Each PostgreSQL DDL statement on this path runs as its own transaction that
-commits or fails. A stop or cancel request is stored through the normal
-durable control path, but the engine resolves it as a typed, terminal
-unsupported-operation decline; it does not report a successful stop or keep
-retrying the request. The apply
-continues to its own completion or failure. If an in-flight statement must be
-interrupted, find its backend in `pg_stat_activity` and use PostgreSQL's
-`pg_cancel_backend` through an operator-controlled database session.
+commits or fails. A stop request, or a cancel of plain DDL, is stored through
+the normal durable control path, but the engine resolves it as a typed,
+terminal unsupported-operation decline; it does not report a successful stop or
+keep retrying the request. The apply continues to its own completion or
+failure. If an in-flight plain DDL statement must be interrupted, find its
+backend in `pg_stat_activity` and use PostgreSQL's `pg_cancel_backend` through
+an operator-controlled database session; the apply records that as a failure
+the next drive retries.
 
 Pending drops is a MySQL/Spirit quarantine and cleaner. PostgreSQL plans do not
 gain that behavior from enabling the server-level `pending_drops` block.

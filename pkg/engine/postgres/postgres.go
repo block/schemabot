@@ -73,10 +73,35 @@ type Engine struct {
 // between, so Progress reads the step position and statement from it. The
 // logger is the apply's own, so a poll that cannot read the tracker logs
 // under the identifiers the apply was accepted with.
+//
+// Every field but done is read and written under Engine.mu. done is closed
+// by the drive goroutine once its terminal result is published, so a cancel
+// can wait for the outcome the drive settles on instead of guessing it.
 type trackedApply struct {
 	result  *engine.ProgressResult
-	tracker *progress.Tracker
+	tracker buildTracker
 	logger  *slog.Logger
+	// concurrentIndex records the shape the apply was admitted as: a
+	// concurrent index build is the one PostgreSQL change an operator can
+	// cancel, so the shape decides the answer before any server is asked.
+	concurrentIndex bool
+	// cancelApply ends the drive's own context. It is the cancel of last
+	// resort: the build backend is signalled through the tracker first, and
+	// the context is cancelled only when that signal cannot reach a running
+	// statement — the build has not started, has already returned, or its
+	// backend cannot be observed or signalled by this role.
+	cancelApply context.CancelFunc
+	// cancelRequested records that Cancel acted on this apply, so the drive
+	// can tell the operator's cancellation from a backend cancellation it did
+	// not ask for. It is set before the signal is sent and never reset once
+	// a signal may have reached the build.
+	cancelRequested bool
+	done            chan struct{}
+}
+
+type buildTracker interface {
+	Progress(context.Context) (progress.Snapshot, error)
+	CancelBuild(context.Context) error
 }
 
 // DefaultNativeSafeTableSizeLimitBytes preserves the native-safe execution
@@ -955,21 +980,57 @@ func (e *Engine) Drain() {
 	e.mu.Unlock()
 }
 
-// Stop declines: a PostgreSQL schema change runs each statement as a single
-// transactional DDL with no engine phase to pause — an in-flight statement
-// either commits or fails on its own. The typed decline lets the control
-// path resolve a durable stop request terminally instead of retrying it.
-func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, engine.NewUnsupportedOperationError("stop is not supported for PostgreSQL schema changes: each statement runs as a single transaction that commits or fails on its own")
+// HaltForShutdown brings this instance's in-flight concurrent index builds
+// down so the process can exit without leaving them running on the target
+// under a lease nobody renews. A concurrent build has no checkpoint: halting
+// it cancels the statement, and the invalid index it leaves is what the next
+// driver to claim the apply meets as abandoned debris and recovers before its
+// own build. Plain DDL is left to finish — its statements are bounded by
+// their own lock and statement timeouts, and interrupting a create set
+// mid-sequence would leave a committed prefix no later drive can complete.
+//
+// This is not an operator cancel: no cancel is recorded on the tracked
+// applies, so the outcome the drive publishes for a halted build is the
+// failure its leftover index describes, and the apply stays active for
+// another driver to claim. The wait is bounded by ctx so a build that will
+// not come down reports that the target may still be held instead of holding
+// shutdown open.
+func (e *Engine) HaltForShutdown(ctx context.Context) error {
+	e.mu.Lock()
+	halted := 0
+	for _, tracked := range e.progress {
+		if tracked.concurrentIndex && !tracked.result.State.IsTerminal() && tracked.cancelApply != nil {
+			tracked.cancelApply()
+			halted++
+		}
+	}
+	e.mu.Unlock()
+	if halted > 0 {
+		slog.Info("PostgreSQL engine halting concurrent index builds for shutdown", "builds", halted)
+	}
+
+	// Wait off the calling goroutine so work that will not come down bounds
+	// shutdown at ctx rather than blocking it forever. The wait goroutine ends
+	// with the drives it is waiting on.
+	settled := make(chan struct{})
+	go func() {
+		e.wg.Wait()
+		close(settled)
+	}()
+	select {
+	case <-settled:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("halt PostgreSQL engine for shutdown: schema change work is still running on the target: %w", ctx.Err())
+	}
 }
 
-// Cancel declines: the engine runs each statement as one transaction and does
-// not track the database backend executing it, so it cannot terminate the
-// statement itself. An in-flight DDL can still be interrupted at the database
-// — during a lock pileup that is exactly what an operator needs — so the
-// decline reason points at the out-of-band path instead of stopping at "no".
-func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, engine.NewUnsupportedOperationError("cancel is not implemented for PostgreSQL schema changes: the engine cannot terminate its in-flight statement, which commits or fails as one transaction; to interrupt it at the database, find the backend running the DDL in pg_stat_activity and cancel it with pg_cancel_backend")
+// Stop declines: a concurrent index build has no resumable midpoint, so stop
+// would be a permanent cancel under a misleading name. Other PostgreSQL DDL
+// also has no engine phase to pause. The typed decline lets the control path
+// resolve a durable stop request terminally instead of retrying it.
+func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	return nil, engine.NewUnsupportedOperationError("stop is not supported for PostgreSQL schema changes: concurrent index builds have no resumable midpoint, and other statements commit or fail on their own")
 }
 
 // Start declines: PostgreSQL schema changes cannot be stopped, so there is
@@ -1001,3 +1062,6 @@ var _ engine.Engine = (*Engine)(nil)
 
 // Compile-time check that Engine implements engine.Drainer.
 var _ engine.Drainer = (*Engine)(nil)
+
+// Compile-time check that Engine implements engine.ShutdownHalter.
+var _ engine.ShutdownHalter = (*Engine)(nil)

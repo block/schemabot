@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"net/url"
+	"sync"
 	"testing"
 	"time"
 
@@ -942,6 +943,90 @@ func TestEngineApplyConcurrentIndexBuild(t *testing.T) {
 	assert.True(t, valid, "the built index must be catalog-valid, not merely present")
 }
 
+// An operator cancel signals a concurrent build parked behind an open writer,
+// settles the apply as cancelled, and preserves the invalid index entry that
+// the next drive uses for automatic recovery.
+func TestEngineCancelConcurrentIndexBuild(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "cancel_index_build_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
+	require.NoError(t, err)
+	writer := holdOrdersWriter(t, db)
+	defer writer.release(t)
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders",
+		"CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		var invalid bool
+		err := db.QueryRowContext(t.Context(), `SELECT NOT indisvalid FROM pg_index WHERE indexrelid = to_regclass('public.orders_ref_idx')`).Scan(&invalid)
+		return err == nil && invalid
+	}, postgresApplyDeadline, 10*time.Millisecond, "the build never parked after creating its invalid catalog entry")
+
+	result, err := eng.Cancel(t.Context(), cancelRequestFor("orders"))
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	writer.release(t)
+
+	got := awaitPostgresProgress(t, eng, "orders")
+	assert.Equal(t, engine.StateCancelled, got.State)
+	assert.Contains(t, got.ErrorMessage, "orders_ref_idx")
+	assertIndexInvalid(t, db, "orders_ref_idx")
+}
+
+// TestEngineCancelConcurrentIndexBuildWithoutABackendSignal proves the cancel
+// of last resort against a live build. With activity tracking off on the
+// target the server reports every backend's state as disabled, so the
+// tracker cannot tell the parked build from an idle backend and sends no
+// signal; the engine ends the drive's own context instead. That must still
+// stop the statement on the server: the cancel settles while the writer the
+// build is waiting on is still open, so nothing but the context ended the
+// build, and the operator is answered with a cancelled apply whose leftover
+// index the next drive recovers.
+func TestEngineCancelConcurrentIndexBuildWithoutABackendSignal(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "cancel_fallback_test")
+	_, err := db.ExecContext(t.Context(), "ALTER DATABASE cancel_fallback_test SET track_activities = off")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
+	require.NoError(t, err)
+	writer := holdOrdersWriter(t, db)
+	defer writer.release(t)
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders",
+		"CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"))
+	require.NoError(t, err)
+	// Tracking off leaves the build's query text unrecorded, so the parked
+	// builder is found through the lock it waits on — the writer's virtual
+	// transaction — rather than through what it is running.
+	var builderPID int
+	var builderState sql.NullString
+	require.Eventually(t, func() bool {
+		err := db.QueryRowContext(t.Context(), `
+			SELECT a.pid, a.state
+			FROM pg_locks l
+			JOIN pg_stat_activity a ON a.pid = l.pid
+			JOIN pg_index i ON i.indexrelid = to_regclass('public.orders_ref_idx')
+			WHERE a.datname = current_database() AND l.locktype = 'virtualxid' AND NOT l.granted AND NOT i.indisvalid`).Scan(&builderPID, &builderState)
+		return err == nil
+	}, postgresApplyDeadline, 10*time.Millisecond, "the build never parked behind the writer after creating its invalid catalog entry")
+	require.Equal(t, "disabled", builderState.String, "the server must hide the builder's state, or the tracker signals it and the context path is not what settles the cancel")
+
+	result, err := eng.Cancel(t.Context(), cancelRequestFor("orders"))
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	assert.Equal(t, "Concurrent index build cancelled", result.Message)
+
+	got := awaitPostgresProgress(t, eng, "orders")
+	assert.Equal(t, engine.StateCancelled, got.State, "progress: %+v", got)
+	assert.Equal(t, "cancelled", got.Metadata["phase"])
+	assert.Contains(t, got.ErrorMessage, "orders_ref_idx")
+	assertBackendGone(t, db, builderPID)
+
+	writer.release(t)
+	assertIndexInvalid(t, db, "orders_ref_idx")
+}
+
 // TestEngineApplyConcurrentIndexBoundEndsTheBuild proves the configured
 // bound is what governs a concurrent build on the target: a build that
 // cannot finish inside it is ended by the server, the apply fails, and the
@@ -1133,45 +1218,22 @@ func TestEngineApplyConcurrentIndexRedriveAfterKilledBuild(t *testing.T) {
 	// An open writer holds a lock the build must wait for after it commits
 	// its invalid catalog entry, so the build is parked at a point where
 	// killing it provably leaves that entry behind.
-	writer, err := db.Conn(t.Context())
-	require.NoError(t, err)
-	defer utils.CloseAndLog(writer)
-	writerTx, err := writer.BeginTx(t.Context(), nil)
-	require.NoError(t, err)
-	// Releases the writer lock if an assertion fails before the explicit
-	// rollback below. This must be a defer, not a t.Cleanup: closing the
-	// conn waits for its open transaction to finish, so the rollback has to
-	// run before the deferred conn close or the test would hang on failure.
-	defer func() {
-		if err := writerTx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
-			t.Errorf("roll back writer transaction: %v", err)
-		}
-	}()
-	_, err = writerTx.ExecContext(t.Context(), "INSERT INTO public.orders (id, ref) VALUES (1, 'held')")
-	require.NoError(t, err)
+	writer := holdOrdersWriter(t, db)
+	defer writer.release(t)
 
 	eng := New()
 	statement := "CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"
 	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders", statement))
 	require.NoError(t, err)
 
-	var builderPID int
-	require.Eventually(t, func() bool {
-		err := db.QueryRowContext(t.Context(), `
-			SELECT a.pid
-			FROM pg_stat_activity a
-			JOIN pg_index i ON i.indexrelid = to_regclass('public.orders_ref_idx')
-			WHERE a.datname = current_database() AND a.pid <> pg_backend_pid()
-			  AND a.query LIKE 'CREATE INDEX CONCURRENTLY%' AND a.state <> 'idle' AND NOT i.indisvalid`).Scan(&builderPID)
-		return err == nil
-	}, postgresApplyDeadline, 10*time.Millisecond, "the build never committed its invalid catalog entry while parked behind the writer")
+	builderPID := awaitParkedBuilder(t, db, "orders_ref_idx")
 	// The bounded form waits for the backend to exit, so the writer's
 	// rollback below cannot race a builder that has not gone yet.
 	var terminated bool
 	err = db.QueryRowContext(t.Context(), "SELECT pg_terminate_backend($1, 5000)", builderPID).Scan(&terminated)
 	require.NoError(t, err)
 	require.True(t, terminated, "the build backend must be gone before the writer releases its lock")
-	require.NoError(t, writerTx.Rollback())
+	writer.release(t)
 
 	progress := awaitPostgresProgress(t, eng, "orders")
 	require.Equal(t, engine.StateFailed, progress.State, "progress: %+v", progress)
@@ -1185,6 +1247,49 @@ func TestEngineApplyConcurrentIndexRedriveAfterKilledBuild(t *testing.T) {
 	progress = awaitPostgresProgress(t, eng, "orders")
 	assert.Equal(t, engine.StateCompleted, progress.State, "progress: %+v", progress)
 	assert.Equal(t, "completed", progress.Metadata["phase"])
+	assertIndexValidWithoutDebris(t, db, "orders", "orders_ref_idx")
+}
+
+// TestEngineHaltForShutdownEndsAParkedConcurrentBuild proves a shutdown halt
+// brings a live concurrent build down on the server and leaves the apply for
+// the next driver. The build is parked behind an open writer, so the halt
+// returning within its bound while the writer is still open shows the
+// drive's context — not the lock release — ended the statement. The halt
+// records no cancel: the drive publishes the failure its leftover index
+// describes, retryable, and re-driving the same statement recovers that
+// leftover and completes the index.
+func TestEngineHaltForShutdownEndsAParkedConcurrentBuild(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "halt_build_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
+	require.NoError(t, err)
+	writer := holdOrdersWriter(t, db)
+	defer writer.release(t)
+
+	eng := New()
+	statement := "CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders", statement))
+	require.NoError(t, err)
+	builderPID := awaitParkedBuilder(t, db, "orders_ref_idx")
+
+	haltCtx, cancelHalt := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancelHalt()
+	require.NoError(t, eng.HaltForShutdown(haltCtx), "the halt must bring the parked build down while the writer still holds its lock")
+
+	progress, err := eng.Progress(t.Context(), progressRequestFor("orders"))
+	require.NoError(t, err)
+	require.Equal(t, engine.StateFailed, progress.State, "a halt is not an operator cancel; progress: %+v", progress)
+	assert.Equal(t, "failed", progress.Metadata["phase"])
+	assert.True(t, progress.Retryable, "the halted build's leftover is operational; the next driver recovers it")
+	assert.Contains(t, progress.ErrorMessage, "orders_ref_idx")
+	assert.Contains(t, progress.ErrorMessage, "invalid index")
+	assertBackendGone(t, db, builderPID)
+	assertIndexInvalid(t, db, "orders_ref_idx")
+
+	writer.release(t)
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders", statement))
+	require.NoError(t, err)
+	progress = awaitPostgresProgress(t, eng, "orders")
+	assert.Equal(t, engine.StateCompleted, progress.State, "progress: %+v", progress)
 	assertIndexValidWithoutDebris(t, db, "orders", "orders_ref_idx")
 }
 
@@ -1334,6 +1439,87 @@ func applyTaskID(table string) string {
 
 func progressRequestFor(table string) *engine.ProgressRequest {
 	return &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: applyTaskID(table)}}
+}
+
+func cancelRequestFor(table string) *engine.ControlRequest {
+	return &engine.ControlRequest{ResumeState: &engine.ResumeState{MigrationContext: applyTaskID(table)}}
+}
+
+// heldWriter is an open transaction with an uncommitted row write on
+// public.orders. A concurrent index build on the table commits its invalid
+// catalog entry and then waits for this transaction to finish, so the build
+// is parked at a point where ending it provably leaves that entry behind.
+type heldWriter struct {
+	conn     *sql.Conn
+	tx       *sql.Tx
+	released sync.Once
+}
+
+// holdOrdersWriter opens the writer. Tests call release at the point the
+// build should be let go and also defer it, so an assertion failing earlier
+// still frees the lock. The deferred call must be a defer, not a t.Cleanup:
+// closing the conn waits for its open transaction to finish, so the
+// rollback has to run before the conn closes or a failing test would hang.
+func holdOrdersWriter(t *testing.T, db *sql.DB) *heldWriter {
+	t.Helper()
+	conn, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	tx, err := conn.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	_, err = tx.ExecContext(t.Context(), "INSERT INTO public.orders (id, ref) VALUES (1, 'held')")
+	require.NoError(t, err)
+	return &heldWriter{conn: conn, tx: tx}
+}
+
+// release rolls the transaction back and closes its conn. The second call —
+// the deferred one after an explicit release — is a no-op, so the conn is
+// closed by exactly one owner.
+func (w *heldWriter) release(t *testing.T) {
+	t.Helper()
+	w.released.Do(func() {
+		assert.NoError(t, w.tx.Rollback(), "roll back writer transaction")
+		utils.CloseAndLog(w.conn)
+	})
+}
+
+// awaitParkedBuilder waits for a concurrent build of index to have committed
+// its invalid catalog entry and be parked, and returns its backend PID.
+func awaitParkedBuilder(t *testing.T, db *sql.DB, index string) int {
+	t.Helper()
+	var builderPID int
+	require.Eventually(t, func() bool {
+		err := db.QueryRowContext(t.Context(), `
+			SELECT a.pid
+			FROM pg_stat_activity a
+			JOIN pg_index i ON i.indexrelid = to_regclass($1)
+			WHERE a.datname = current_database() AND a.pid <> pg_backend_pid()
+			  AND a.query LIKE 'CREATE INDEX CONCURRENTLY%' AND a.state <> 'idle' AND NOT i.indisvalid`, "public."+index).Scan(&builderPID)
+		return err == nil
+	}, postgresApplyDeadline, 10*time.Millisecond, "the build never committed its invalid catalog entry while parked behind the writer")
+	return builderPID
+}
+
+// assertBackendGone waits for the server to have no backend under pid: the
+// statement it ran is over and its session is closed.
+func assertBackendGone(t *testing.T, db *sql.DB, pid int) {
+	t.Helper()
+	assert.Eventually(t, func() bool {
+		var present bool
+		err := db.QueryRowContext(t.Context(), `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)`, pid).Scan(&present)
+		return err == nil && !present
+	}, postgresApplyDeadline, 10*time.Millisecond, "backend %d is still on the server", pid)
+}
+
+// assertIndexInvalid asserts the index exists in public and is marked invalid:
+// the leftover a build that was ended after committing its catalog entry
+// leaves for the next drive to recover.
+func assertIndexInvalid(t *testing.T, db *sql.DB, index string) {
+	t.Helper()
+	var valid sql.NullBool
+	err := db.QueryRowContext(t.Context(),
+		`SELECT i.indisvalid FROM pg_index i WHERE i.indexrelid = to_regclass($1)`, "public."+index).Scan(&valid)
+	require.NoError(t, err, "index public.%s must still exist", index)
+	assert.False(t, valid.Bool, "the ended build's index entry must be invalid, not completed behind the cancel")
 }
 
 func awaitPostgresProgress(t *testing.T, eng *Engine, table string) *engine.ProgressResult {

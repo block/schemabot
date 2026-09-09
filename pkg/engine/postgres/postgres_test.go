@@ -581,7 +581,7 @@ func TestPlanRejectsInvalidInputsBeforeConnecting(t *testing.T) {
 	assert.Contains(t, err.Error(), "DSN credentials are required")
 }
 
-// Every lifecycle control declines with a typed unsupported-operation error:
+// Lifecycle controls without a PostgreSQL execution phase decline with a typed unsupported-operation error:
 // PostgreSQL DDL runs each statement as a single transactional statement with
 // no engine phase to pause, resume, swap, revert, or retune. The typed decline
 // is what lets the durable control path resolve a request terminally instead
@@ -595,11 +595,6 @@ func TestLifecycleControlsDeclineAsUnsupported(t *testing.T) {
 	}{
 		{"stop", func(t *testing.T) error {
 			result, err := eng.Stop(t.Context(), &engine.ControlRequest{})
-			assert.Nil(t, result)
-			return err
-		}},
-		{"cancel", func(t *testing.T) error {
-			result, err := eng.Cancel(t.Context(), &engine.ControlRequest{})
 			assert.Nil(t, result)
 			return err
 		}},
