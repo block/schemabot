@@ -494,17 +494,21 @@ func blockOversizedTable(ctx context.Context, pool *pgxpool.Pool, report pgplan.
 	if r == nil {
 		return nil, fmt.Errorf("check size for table %q: %w", report.Table, err)
 	}
+	// The table name is a database-sourced identifier: quoting escapes control
+	// characters but leaves the Markdown cell separator alone, so the composed
+	// reason is sanitized as a whole before it reaches any change.
+	reason := sanitizeReasonText(fmt.Sprintf("statement for table %q: %s", report.Table, r.detail))
 	var sizeErr *preflight.SizeError
 	if errors.As(err, &sizeErr) {
 		for i := range changes {
 			if changes[i].ExecutionMode == "" && !isConcurrentIndexChange(changes[i]) {
 				changes[i].ExecutionMode = engine.ExecutionModeBlocked
-				changes[i].ModeReason = fmt.Sprintf("statement for table %q: %s", report.Table, r.detail)
+				changes[i].ModeReason = reason
 			}
 		}
 		return changes, nil
 	}
-	blockExecutableChanges(changes, fmt.Sprintf("statement for table %q: %s", report.Table, r.detail))
+	blockExecutableChanges(changes, reason)
 	return changes, nil
 }
 

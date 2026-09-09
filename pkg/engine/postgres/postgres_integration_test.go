@@ -354,6 +354,36 @@ func TestEnginePlanTableSizeRefusal(t *testing.T) {
 	assert.Contains(t, change.ModeReason, "SchemaBot's ceiling for a native-safe apply")
 }
 
+// TestEnginePlanTableSizeRefusalNeutralizesTableName proves the size verdict
+// is safe to render in a single-line Markdown table cell even when the table
+// name is not: a quoted PostgreSQL identifier may carry the cell separator,
+// and the reason must neutralize it rather than let a database-sourced name
+// break the layout of the PR comment that shows the verdict.
+func TestEnginePlanTableSizeRefusalNeutralizesTableName(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_size_limit_odd_name_test")
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE public."odd|users" (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+	req := &engine.PlanRequest{
+		Database: "plan_size_limit_odd_name_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"odd_users.sql": `CREATE TABLE "odd|users" (id bigint PRIMARY KEY, email text)`,
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	result, err := NewWithTableSizeLimit(1).Plan(t.Context(), req)
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 1)
+	change := result.Changes[0].TableChanges[0]
+	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
+	assert.Contains(t, change.ModeReason, `statement for table "odd/users":`)
+	assert.Contains(t, change.ModeReason, "1-byte threshold")
+	assert.NotContains(t, change.ModeReason, "|", "the cell separator must not survive into a rendered reason")
+}
+
 // TestEnginePlanOversizedTableAdmitsConcurrentIndex proves the plan applies
 // the rewrite ceiling only to the native step while leaving a concurrent
 // index build executable under its duration policy.
