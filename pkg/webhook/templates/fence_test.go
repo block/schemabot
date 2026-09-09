@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/state"
 )
 
 func TestWriteSQLFencedBlock(t *testing.T) {
@@ -72,5 +73,16 @@ func TestDDLBlocksContainHostileIdentifier(t *testing.T) {
 		writeDDLLine(&out, schema.DialectPostgres, hostileDDL)
 
 		assert.Equal(t, "\n"+expectedBlock, out.String())
+	})
+
+	t.Run("apply summary", func(t *testing.T) {
+		var out strings.Builder
+		writeSummaryTableEntry(&out, schema.DialectPostgres, TableProgressData{
+			TableName: "x",
+			Status:    state.Task.Completed,
+			DDL:       hostileDDL,
+		}, false)
+
+		assert.Equal(t, "**`x`**\n"+expectedBlock+"\n", out.String())
 	})
 }
