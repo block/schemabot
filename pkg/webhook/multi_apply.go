@@ -171,6 +171,7 @@ func buildDeploymentDetail(apply *storage.Apply, op *storage.ApplyOperation, tas
 		Step:             display.Step.Step,
 		StepsTotal:       display.Step.StepsTotal,
 		Statement:        display.Step.Statement,
+		BuildWork:        display.BuildWork,
 		Tenant:           tenant,
 		Rollback:         apply.IsRollback(),
 		DeferCutover:     apply.GetOptions().DeferCutover,

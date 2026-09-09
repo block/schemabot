@@ -125,6 +125,7 @@ type ApplyStatusCommentData struct {
 	Step         int
 	StepsTotal   int
 	Statement    string
+	BuildWork    apitypes.BuildWork
 
 	// DerivedStatus, when set, replaces the raw-state **Status** line in the
 	// rendered body. Multi-deployment sections set it for deployments whose
@@ -251,6 +252,9 @@ func writeApplyStep(sb *strings.Builder, data ApplyStatusCommentData) {
 		fmt.Fprintf(sb, " · `%s`", statement)
 	}
 	sb.WriteString("\n")
+	if line := ui.FormatBuildWork(data.BuildWork); line != "" {
+		fmt.Fprintf(sb, "%s\n", line)
+	}
 }
 
 // writeApplyStatusHeader writes the headline for an in-place apply status
@@ -1883,6 +1887,11 @@ func ApplyStatusFromProgress(resp *apitypes.ProgressResponse, requestedBy string
 		slog.Warn("progress comment omits the statement position because the progress metadata is malformed", "apply_id", resp.ApplyID, "error", err)
 	} else {
 		data.Step, data.StepsTotal, data.Statement = step.Step, step.StepsTotal, step.Statement
+	}
+	if work, err := apitypes.ParseBuildWork(resp.Metadata); err != nil {
+		slog.Warn("progress comment omits build work because the progress metadata is malformed", "apply_id", resp.ApplyID, "error", err)
+	} else {
+		data.BuildWork = work
 	}
 
 	if changes, err := apitypes.ParseVSchemaChanges(resp.Metadata); err != nil {
