@@ -137,9 +137,15 @@ func runInitProgressProgram(ctx context.Context, initialize func(context.Context
 	}
 	return m.finished.result, m.finished.err
 }
-func initCompletion(result *initResult, environment string) string {
+
+// initCompletion prints the next command with only the flags it needs: the
+// profile is named when the CLI would not resolve to it on its own.
+func initCompletion(result *initResult, environment, defaultProfile string) string {
 	quote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
-	next := fmt.Sprintf("%s plan -s %s -e %s --profile %s", cliname.Name(), quote(result.SchemaDir), quote(environment), quote(result.Profile))
+	next := fmt.Sprintf("%s plan -s %s -e %s", cliname.Name(), quote(result.SchemaDir), quote(environment))
+	if result.Profile != defaultProfile {
+		next += " --profile " + quote(result.Profile)
+	}
 	noun := "tables"
 	if result.Tables == 1 {
 		noun = "table"

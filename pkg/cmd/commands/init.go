@@ -69,7 +69,11 @@ func (cmd *InitCmd) Run(ctx context.Context, g *Globals) error {
 	}
 	display := *result
 	display.SchemaDir = cmd.SchemaDir
-	fmt.Print(initCompletion(&display, cmd.Environment))
+	cfg, err := client.LoadConfig()
+	if err != nil {
+		return fmt.Errorf("load CLI configuration after initialization: %w", err)
+	}
+	fmt.Print(initCompletion(&display, cmd.Environment, client.ResolveProfileName(cfg, "")))
 	return nil
 }
 

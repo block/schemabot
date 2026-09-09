@@ -101,9 +101,15 @@ func TestInitProgressCancellationWaitsForCleanup(t *testing.T) {
 	require.NotNil(t, cmd)
 }
 func TestInitCompletionQuotesNextCommand(t *testing.T) {
-	output := initCompletion(&initResult{SchemaDir: "my schema", Profile: "dev's profile"}, "development")
+	output := initCompletion(&initResult{SchemaDir: "my schema", Profile: "dev's profile"}, "development", "default")
 	require.Contains(t, output, "-s 'my schema'")
 	require.Contains(t, output, "--profile 'dev'\"'\"'s profile'")
+}
+
+func TestInitCompletionOmitsDefaultProfile(t *testing.T) {
+	output := initCompletion(&initResult{SchemaDir: "schema", Profile: "default"}, "development", "default")
+	require.Contains(t, output, "schemabot plan -s 'schema' -e 'development'\n")
+	require.NotContains(t, output, "--profile")
 }
 
 func TestInitWizardContextCancellationLeavesInputsUntouched(t *testing.T) {
