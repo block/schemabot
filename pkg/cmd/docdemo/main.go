@@ -554,7 +554,7 @@ func main() {
 	}
 	stopFrames = append(stopFrames, Frame{3, "", "The watcher confirms completion", live(100, state.Apply.Completed, false, "")})
 	demos = append(demos, Demo{Name: "cli-stop", Title: "Stop and resume a change.", Frames: stopFrames})
-	demos = append(demos, vitessDemo())
+	demos = append(demos, vitessDemo(), rollbackDemo())
 	fleetLines := busyFleet(now)
 	pull := capture(func() {
 		// The capture pipe is not a TTY; this frame represents an interactive terminal.
@@ -580,4 +580,142 @@ func main() {
 	if err := enc.Encode(demos); err != nil {
 		panic(err)
 	}
+}
+
+// rollbackDemo runs both confirmation choices through the real rollback command.
+// Every HTTP request terminates at this fictional fixture; no engine is invoked.
+func rollbackDemo() Demo {
+	const rollbackDDL = "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`);"
+	plan := apitypes.PlanResponse{PlanID: "plan-example-rollback", Database: "shop", DatabaseType: "mysql", Environment: "staging", Engine: "Spirit",
+		Changes: []*apitypes.SchemaChangeResponse{{Namespace: "shop", TableChanges: []*apitypes.TableChangeResponse{{TableName: "orders", ChangeType: "alter", DDL: rollbackDDL}}}}}
+	var requests []string
+	rollbackPhase := state.Apply.Running
+	rollbackPercent := int32(25)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		var response any
+		switch r.Method + " " + r.URL.Path {
+		case "POST /api/rollback/plan":
+			var request apitypes.ControlRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				panic(err)
+			}
+			if request.ApplyID != "apply-example-85" || request.Environment != "staging" {
+				panic("wrong rollback source")
+			}
+			response = plan
+		case "GET /api/status":
+			if r.URL.Query().Get("environment") != "staging" || r.URL.Query().Get("active") != "true" {
+				panic("wrong rollback preflight")
+			}
+			response = apitypes.StatusResponse{}
+		case "GET /api/locks/shop/mysql", "POST /api/locks/acquire":
+			if r.Method == http.MethodPost {
+				var request map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					panic(err)
+				}
+				if request["database"] != "shop" || request["database_type"] != "mysql" || request["owner"] == "" {
+					panic("wrong rollback lock")
+				}
+			}
+			response = map[string]any{"lock": nil}
+		case "POST /api/apply":
+			var request apitypes.ApplyRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				panic(err)
+			}
+			if request.PlanID != plan.PlanID || request.Environment != "staging" || request.Options["allow_unsafe"] != "true" {
+				panic("wrong rollback apply")
+			}
+			response = apitypes.ApplyResponse{Accepted: true, ApplyID: "apply-example-86"}
+		case "GET /api/progress/apply/", "GET /api/progress/apply/apply-example-86":
+			response = apitypes.ProgressResponse{ApplyID: "apply-example-86", Database: "shop", Environment: "staging", Engine: "Spirit", State: rollbackPhase,
+				Tables: []*apitypes.TableProgressResponse{{TableName: "orders", Keyspace: "shop", ChangeType: "alter", DDL: rollbackDDL, Status: rollbackPhase, PercentComplete: rollbackPercent, RowsCopied: int64(rollbackPercent) * 100000, RowsTotal: 10000000}}}
+		default:
+			panic("unexpected rollback request: " + r.Method + " " + r.URL.Path)
+		}
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			panic(err)
+		}
+	}))
+	defer server.Close()
+	run := func(answer string) string {
+		input, writer, err := os.Pipe()
+		if err != nil {
+			panic(err)
+		}
+		if _, err := io.WriteString(writer, answer+"\n"); err != nil {
+			panic(err)
+		}
+		if err := writer.Close(); err != nil {
+			panic(err)
+		}
+		old := os.Stdin
+		os.Stdin = input
+		defer func() {
+			os.Stdin = old
+			if err := input.Close(); err != nil {
+				panic(err)
+			}
+		}()
+		return capture(func() {
+			cmd := commands.RollbackCmd{ApplyID: "apply-example-85", Environment: "staging", Watch: false}
+			if err := cmd.Run(&commands.Globals{Endpoint: server.URL}); err != nil {
+				panic(err)
+			}
+		})
+	}
+	declined := run("no")
+	if strings.Join(requests, ",") != "POST /api/rollback/plan,GET /api/status" {
+		panic("declined rollback performed a write")
+	}
+	preview, _, found := strings.Cut(declined, "\nRollback cancelled.")
+	if !found || !strings.Contains(preview, rollbackDDL) {
+		panic("rollback preview missing")
+	}
+	requests = nil
+	accepted := run("yes")
+	if strings.Join(requests, ",") != "POST /api/rollback/plan,GET /api/status,GET /api/locks/shop/mysql,POST /api/locks/acquire,POST /api/apply" {
+		panic("wrong rollback request sequence")
+	}
+	submitted, found := strings.CutPrefix(accepted, preview)
+	if !found || !strings.Contains(submitted, "Rollback started: apply-example-86") {
+		panic("rollback acceptance missing")
+	}
+	render := func() string {
+		model := commands.NewWatchModel(server.URL, "shop", "staging", true)
+		batch := model.Init()().(tea.BatchMsg)
+		updated, _ := model.Update(batch[0]())
+		return updated.View()
+	}
+	started := render()
+	var copying []Frame
+	for p := int32(30); p < 100; p += 5 {
+		rollbackPercent = p
+		copying = append(copying, Frame{0.18, "", "Follow the new apply", render()})
+	}
+	rollbackPercent = 100
+	finished := render()
+	if !strings.Contains(finished, "100") {
+		panic("rollback progress missing: " + finished)
+	}
+	rollbackPhase = state.Apply.Completed
+	final := render()
+	if !strings.Contains(final, "Apply complete!") || !strings.Contains(final, "apply-example-86") {
+		panic("rollback completion missing: " + final)
+	}
+	command := "schemabot rollback -e staging apply-example-85 --no-watch"
+	frames := []Frame{
+		{4, command, "Review the plan to restore the removed index", preview + "▌"},
+		{0.25, "", "Type yes only after reviewing the plan", preview + "y▌"},
+		{0.25, "", "", preview + "ye▌"},
+		{1, "", "", preview + "yes"},
+		{3, "", "The rollback starts a new apply: apply-example-86", submitted},
+		{2, "schemabot progress apply-example-86", "Follow the new apply", started},
+	}
+	frames = append(frames, copying...)
+	frames = append(frames, Frame{2, "", "The copy reaches 100%; wait for confirmed completion", finished}, Frame{4, "", "The new apply completes; the index is restored", final})
+	return Demo{Name: "cli-rollback", Title: "Review a rollback. Follow the new change.", Height: 670, Frames: frames}
 }

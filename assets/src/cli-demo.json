@@ -517,6 +517,145 @@
     ]
   },
   {
+    "height": 670,
+    "name": "cli-rollback",
+    "title": "Review a rollback. Follow the new change.",
+    "frames": [
+      {
+        "seconds": 4,
+        "command": "schemabot rollback -e staging apply-example-85 --no-watch",
+        "caption": "Review the plan to restore the removed index",
+        "output": "\nRollback Plan\n=============\nDatabase: shop\nEnvironment: staging\n\nThe following changes will be applied to rollback:\n\n  orders (alter):\n    ALTER TABLE `orders` ADD INDEX `idx_status` (`status`);\n\nDo you want to apply this rollback? Only 'yes' will be accepted: ▌"
+      },
+      {
+        "seconds": 0.25,
+        "command": "",
+        "caption": "Type yes only after reviewing the plan",
+        "output": "\nRollback Plan\n=============\nDatabase: shop\nEnvironment: staging\n\nThe following changes will be applied to rollback:\n\n  orders (alter):\n    ALTER TABLE `orders` ADD INDEX `idx_status` (`status`);\n\nDo you want to apply this rollback? Only 'yes' will be accepted: y▌"
+      },
+      {
+        "seconds": 0.25,
+        "command": "",
+        "caption": "",
+        "output": "\nRollback Plan\n=============\nDatabase: shop\nEnvironment: staging\n\nThe following changes will be applied to rollback:\n\n  orders (alter):\n    ALTER TABLE `orders` ADD INDEX `idx_status` (`status`);\n\nDo you want to apply this rollback? Only 'yes' will be accepted: ye▌"
+      },
+      {
+        "seconds": 1,
+        "command": "",
+        "caption": "",
+        "output": "\nRollback Plan\n=============\nDatabase: shop\nEnvironment: staging\n\nThe following changes will be applied to rollback:\n\n  orders (alter):\n    ALTER TABLE `orders` ADD INDEX `idx_status` (`status`);\n\nDo you want to apply this rollback? Only 'yes' will be accepted: yes"
+      },
+      {
+        "seconds": 3,
+        "command": "",
+        "caption": "The rollback starts a new apply: apply-example-86",
+        "output": "🔒 Lock acquired for shop (mysql)\n\nApplying rollback...\n\nRollback started: apply-example-86\nTo watch and manage: schemabot progress apply-example-86\n"
+      },
+      {
+        "seconds": 2,
+        "command": "schemabot progress apply-example-86",
+        "caption": "Follow the new apply",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 25.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 2,500,000 / 10,000,000\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
+      },
+      {
+        "seconds": 0.18,
+        "command": "",
+        "caption": "Follow the new apply",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 30.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 3,000,000 / 10,000,000\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
+      },
+      {
+        "seconds": 0.18,
+        "command": "",
+        "caption": "Follow the new apply",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 3,500,000 / 10,000,000\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
+      },
+      {
+        "seconds": 0.18,
+        "command": "",
+        "caption": "Follow the new apply",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 40.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 4,000,000 / 10,000,000\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
+      },
+      {
+        "seconds": 0.18,
+        "command": "",
+        "caption": "Follow the new apply",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 45.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 4,500,000 / 10,000,000\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
+      },
+      {
+        "seconds": 0.18,
+        "command": "",
+        "caption": "Follow the new apply",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 50.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 5,000,000 / 10,000,000\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
+      },
+      {
+        "seconds": 0.18,
+        "command": "",
+        "caption": "Follow the new apply",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜ 55.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 5,500,000 / 10,000,000\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
+      },
+      {
+        "seconds": 0.18,
+        "command": "",
+        "caption": "Follow the new apply",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 6,000,000 / 10,000,000\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
+      },
+      {
+        "seconds": 0.18,
+        "command": "",
+        "caption": "Follow the new apply",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜ 65.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 6,500,000 / 10,000,000\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
+      },
+      {
+        "seconds": 0.18,
+        "command": "",
+        "caption": "Follow the new apply",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 70.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 7,000,000 / 10,000,000\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
+      },
+      {
+        "seconds": 0.18,
+        "command": "",
+        "caption": "Follow the new apply",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜ 75.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 7,500,000 / 10,000,000\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
+      },
+      {
+        "seconds": 0.18,
+        "command": "",
+        "caption": "Follow the new apply",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 80.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 8,000,000 / 10,000,000\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
+      },
+      {
+        "seconds": 0.18,
+        "command": "",
+        "caption": "Follow the new apply",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜ 85.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 8,500,000 / 10,000,000\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
+      },
+      {
+        "seconds": 0.18,
+        "command": "",
+        "caption": "Follow the new apply",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜ 90.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 9,000,000 / 10,000,000\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
+      },
+      {
+        "seconds": 0.18,
+        "command": "",
+        "caption": "Follow the new apply",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜ 95.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 9,500,000 / 10,000,000\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
+      },
+      {
+        "seconds": 2,
+        "command": "",
+        "caption": "The copy reaches 100%; wait for confirmed completion",
+        "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 100.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 10,000,000 / 10,000,000\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
+      },
+      {
+        "seconds": 4,
+        "command": "",
+        "caption": "The new apply completes; the index is restored",
+        "output": "\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n\n\n\n\u001b[1m\u001b[32m✓ Apply complete!\u001b[0m Changes: 1 altered. Apply ID: apply-example-86\n"
+      }
+    ]
+  },
+  {
     "height": 960,
     "name": "cli-ops",
     "title": "Know your database fleet.",

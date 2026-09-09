@@ -525,6 +525,45 @@ Do you want to apply this rollback? Only 'yes' will be accepted: no
 Rollback cancelled.
 ```
 
+When you are ready, answer `yes`. For a separate example, suppose
+the completed `apply-example-85` removed an index you now need again. This animation restores
+that index, using fictional local API responses:
+
+![CLI rollback previews the index change, accepts confirmation, and completes a new apply](../assets/cli-rollback.gif)
+
+The animation uses `--no-watch` so you can see the new apply ID before attaching
+to it. Without that flag, rollback opens the live watcher automatically.
+
+```console
+$ schemabot rollback -e staging apply-example-85 --no-watch
+Rollback Plan
+=============
+Database: shop
+Environment: staging
+
+The following changes will be applied to rollback:
+
+  orders (alter):
+    ALTER TABLE `orders` ADD INDEX `idx_status` (`status`);
+
+Do you want to apply this rollback? Only 'yes' will be accepted: yes
+🔒 Lock acquired for shop (mysql)
+
+Applying rollback...
+
+Rollback started: apply-example-86
+To watch and manage: schemabot progress apply-example-86
+
+$ schemabot progress apply-example-86
+...progress updates...
+✓ Apply complete! Changes: 1 altered. Apply ID: apply-example-86
+```
+
+Follow the **new** apply ID (`apply-example-86`), rather than the original
+change. Wait for `Apply complete!`; reaching 100% of the copy alone does not
+confirm that the apply has finished. In this example, completion means the
+index has been restored.
+
 Rollback uses the stored schema and current database to produce a new plan.
 It is not a data restore, and feasibility depends on the engine, intervening
 changes, and retained history. Review the generated DDL and confirmation

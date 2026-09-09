@@ -1,6 +1,6 @@
 # CLI guide animations
 
-These GIFs illustrate seven operator workflows using fictional data passed
+These GIFs illustrate operator workflows using fictional data passed
 through the production Go templates and interactive `commands.WatchModel`:
 
 - `cli-plan-apply.gif`: inspect an index plan, confirm with yes, and follow an apply to completion
@@ -8,6 +8,7 @@ through the production Go templates and interactive `commands.WatchModel`:
 - `cli-fleet.gif`: list changes, attach to the live watcher, detach with Esc, and list plans
 - `cli-cutover.gif`: finish copying, wait for the swap, and press Enter to cut over
 - `cli-throttle.gif`: see replication lag pause copying and watch it resume
+- `cli-rollback.gif`: review the DDL to restore an index, confirm with yes, then follow the new apply to completion
 - `cli-stop.gif`: press s through the real handler, await Stopped, then start and follow the resumed change to completion
 - `cli-vitess.gif`: create a deploy request, deploy with Enter, follow four shards, and close the revert window
 
@@ -61,3 +62,5 @@ The inventory uses the real databases command against a loopback fixture. The st
 The fleet pull view enables the production interactive color setting and shows the entire result in one frame. Each fleet command finishes typing, then pauses briefly before output appears.
 
 All animations render at 12 frames per second. The cutover copy advances in five-point steps, with brief holds for interactive controls.
+
+The rollback illustration restores a removed index, which can require a row copy; the index drop in the text-only declined example can finish through native MySQL DDL. The rollback scenario runs `RollbackCmd` with both no and yes against a loopback fixture. It checks the source apply, target environment, request order, lock target, reviewed plan ID, and unsafe acknowledgment. Declining must issue no lock or apply request. The accepted response returns a new apply ID; production watcher views show that new apply reaching 100% and completion. No database is contacted. The preview and submitted output are separate selected terminal views, with input echo added for the animation.
