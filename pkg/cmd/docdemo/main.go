@@ -73,7 +73,7 @@ const ddl = "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)"
 // ID supplied by that response. No private model fields or UI strings are copied.
 func live(p int, phase string, throttled bool, key string) string {
 	response := apitypes.ProgressResponse{
-		ApplyID: "apply-example-73", Database: "shop", Environment: "staging", Engine: "Spirit", State: phase,
+		ApplyID: "apply-example-73", Database: "shop", DatabaseType: "mysql", Environment: "staging", Engine: "Spirit", State: phase,
 		Tables: []*apitypes.TableProgressResponse{{TableName: "orders", Keyspace: "shop", ChangeType: "alter", DDL: ddl,
 			Status: phase, RowsCopied: int64(p) * 100000, RowsTotal: 10000000, PercentComplete: int32(p), ETASeconds: int64(100-p) * 12,
 			Throttled: throttled, ThrottleReason: "Replication lag exceeds the configured limit"}},
@@ -175,7 +175,7 @@ func live(p int, phase string, throttled bool, key string) string {
 // watcher used by the CLI. Enter is exercised through its real control handler.
 func vitess(phase string, percentages []int, enter bool) string {
 	response := apitypes.ProgressResponse{
-		ApplyID: "apply-example-84", Database: "shop", Environment: "staging", Engine: "PlanetScale", State: phase,
+		ApplyID: "apply-example-84", Database: "shop", DatabaseType: "vitess", Environment: "staging", Engine: "PlanetScale", State: phase,
 		Metadata: map[string]string{"deploy_request_url": "https://app.planetscale.com/acme/shop/deploy-requests/42"},
 	}
 	table := &apitypes.TableProgressResponse{TableName: "orders", Keyspace: "commerce", ChangeType: "alter", DDL: ddl, Status: phase}
@@ -626,7 +626,7 @@ func rollbackDemo() Demo {
 					panic("automatic watcher polled after completion")
 				}
 			}
-			response = apitypes.ProgressResponse{ApplyID: "apply-example-86", Database: "shop", Environment: "staging", Engine: "Spirit", State: phase,
+			response = apitypes.ProgressResponse{ApplyID: "apply-example-86", Database: "shop", DatabaseType: "mysql", Environment: "staging", Engine: "Spirit", State: phase,
 				Tables: []*apitypes.TableProgressResponse{{TableName: "orders", Keyspace: "shop", ChangeType: "alter", DDL: rollbackDDL, Status: phase, PercentComplete: percent, RowsCopied: int64(percent) * 100000, RowsTotal: 10000000}}}
 		default:
 			panic("unexpected rollback request: " + r.Method + " " + r.URL.Path)

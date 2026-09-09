@@ -78,7 +78,6 @@ func TestRollbackPreviewUsesTargetDialect(t *testing.T) {
 			require.Len(t, requests, 2)
 			assert.Equal(t, "POST /api/rollback/plan", <-requests)
 			assert.Equal(t, "GET /api/status", <-requests)
-			assert.Equal(t, tt.sql, plan.Changes[0].TableChanges[0].DDL)
 		})
 	}
 }

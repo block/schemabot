@@ -15,6 +15,7 @@ import (
 //   - Data types, functions, and charset/collate values are lowercased
 //     while SQL keywords remain uppercase (PlanetScale style).
 func FormatDDL(ddl string) string {
+	raw := strings.TrimRight(strings.TrimSpace(ddl), ";") + ";"
 	// Canonicalize first
 	ddl = Canonicalize(ddl)
 
@@ -22,7 +23,7 @@ func FormatDDL(ddl string) string {
 
 	// Ensure trailing semicolon
 	result = strings.TrimRight(result, "; ")
-	return result + ";"
+	return preserveDisplaySQL(defaultParser, raw, result+";")
 }
 
 // layoutDDL line-breaks a canonicalized statement for readability: a CREATE
@@ -70,19 +71,31 @@ func layoutDDL(ddl string) string {
 // the dialect's parser rejects — or any statement of a dialect with no
 // registered parser (logged, since it means a database type reached the
 // display layer without a parser) — renders unformatted, with only
-// surrounding whitespace trimmed and a trailing semicolon enforced.
+// surrounding whitespace trimmed and a trailing semicolon enforced. Display
+// transformations preserve quoted names and values, and unknown dialects emit
+// only a debug diagnostic so interactive prompts remain readable.
 func FormatDDLForDialect(dialect schema.Dialect, stmt string) string {
 	if dialect == schema.DialectMySQL {
 		return FormatDDL(stmt)
 	}
-	result := strings.TrimSpace(stmt)
-	if p, err := ParserForDialect(dialect); err != nil {
-		slog.Warn("DDL display formatting has no parser for this dialect; statements will render unformatted",
-			"dialect", dialect, "error", err)
-	} else {
-		result = layoutDDL(p.Canonicalize(result))
+	raw := strings.TrimRight(strings.TrimSpace(stmt), ";") + ";"
+	parser, err := ParserForDialect(dialect)
+	if err != nil {
+		slog.Debug("DDL display formatting has no parser for this dialect; preserving original SQL", "dialect", dialect, "error", err)
+		return raw
 	}
-	return strings.TrimRight(result, "; ") + ";"
+	formatted := strings.TrimRight(layoutDDL(parser.Canonicalize(raw)), "; ") + ";"
+	return preserveDisplaySQL(parser, raw, formatted)
+}
+
+// Display layout and case changes must preserve quoted identifiers and values.
+// Keep the original SQL whenever canonical comparison cannot prove equivalence.
+func preserveDisplaySQL(parser StatementParser, raw, formatted string) string {
+	if parser.Canonicalize(raw) != parser.Canonicalize(formatted) {
+		slog.Debug("DDL display normalization changed the statement; preserving original SQL")
+		return raw
+	}
+	return formatted
 }
 
 // dataTypePattern matches SQL data types that should be lowercased.
@@ -128,9 +141,6 @@ func lowercaseTypes(ddl string) string {
 
 	// Strip _CHARSET'...' introducers (redundant with column charset)
 	ddl = charsetLiteralPattern.ReplaceAllString(ddl, "$2")
-
-	// Strip redundant DEFAULT NULL (implied for nullable columns)
-	ddl = strings.ReplaceAll(ddl, " DEFAULT NULL", "")
 
 	// Lowercase data types
 	ddl = dataTypePattern.ReplaceAllStringFunc(ddl, strings.ToLower)

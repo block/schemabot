@@ -503,6 +503,10 @@ $ schemabot status apply-example-73
 
 ### Review a rollback before running it
 
+The preview and live progress format SQL using the target database dialect,
+preserving quoted names and values. If the server omits the database type or
+returns an unrecognized type, both views preserve the original SQL.
+
 Here is a rollback of the index added earlier. This example declines the
 confirmation, so nothing changes:
 

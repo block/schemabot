@@ -448,7 +448,10 @@ live view:
   • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
 ```
 
-Use `schemabot status apply-example-73` for a single snapshot.
+Use `schemabot status apply-example-73` for a single snapshot. SQL rendering
+uses the target database dialect and preserves quoted names and values. If
+`database_type` is missing or unrecognized, the CLI displays the original SQL
+without choosing another dialect.
 
 While an apply runs, `GET /api/progress/apply/{apply_id}` is the live view.
 Table entries identify the DDL and task state. Available metrics depend on the
