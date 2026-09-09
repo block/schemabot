@@ -976,6 +976,16 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 // record was replaced while the tracker was being read — the only writer of
 // a replacement is the terminal publish, whose percent is decided by its
 // state.
+//
+// The percent never regresses within a record. A record hosts one build —
+// a concurrent index apply is a single statement, and the executor's
+// bounded retries apply to transactional statements, not to a build — and
+// the band scale only advances as the build moves through its phases, so a
+// poll whose row derives a lower percent than the record carries read the
+// server before a poller that has already carried a later row forward. The
+// tracker serializes the reads but not the write-backs, so the earlier
+// reading lands here second; it adopts the record's percent rather than
+// pinning a position the build has left behind.
 func (e *Engine) retainRunningPercent(key string, source, result *engine.ProgressResult) {
 	if len(result.Tables) == 0 {
 		return
@@ -984,6 +994,11 @@ func (e *Engine) retainRunningPercent(key string, source, result *engine.Progres
 	defer e.mu.Unlock()
 	tracked := e.progress[key]
 	if tracked == nil || tracked.result != source || len(source.Tables) == 0 {
+		return
+	}
+	if result.Progress < source.Progress {
+		result.Progress = source.Progress
+		result.Tables[0].Progress = source.Tables[0].Progress
 		return
 	}
 	source.Progress = result.Progress

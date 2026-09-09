@@ -487,7 +487,7 @@ func TestProgressReportsExecutorStepPosition(t *testing.T) {
 	assert.Equal(t, "1", before.Metadata["step"], "before the executor reports, the record keeps the planned first step")
 	assert.Equal(t, "3", before.Metadata["steps_total"])
 	assert.NotContains(t, before.Metadata, "statement")
-	for _, key := range []string{"operation", "server_phase", "attempt", "blocks_done", "blocks_total", "tuples_done", "tuples_total", "lockers_done", "lockers_total"} {
+	for _, key := range []string{"executor_operation", "server_phase", "attempt", "blocks_done", "blocks_total", "tuples_done", "tuples_total", "lockers_done", "lockers_total"} {
 		assert.NotContains(t, before.Metadata, key)
 	}
 
@@ -967,6 +967,31 @@ func TestProgressKeepsLastKnownPercentWithoutABuildRow(t *testing.T) {
 	got = pollRunningIndexBuild(t, eng)
 	assert.Equal(t, 95, got.Tables[0].Progress, "a completed validation scan stays below 100 until the apply completes")
 	assert.Equal(t, "40", got.Metadata["blocks_done"])
+}
+
+// TestProgressNeverRegressesWithinABuild proves a row that derives a lower
+// percent than the record already carries is a stale reading — a build
+// moves through its phases in one direction — so the poll answers with the
+// record's percent and the record keeps it, rather than the earlier reading
+// being pinned as the last-known position.
+func TestProgressNeverRegressesWithinABuild(t *testing.T) {
+	eng := New()
+	validation := indexProgressRow{phase: "index validation: scanning table", blocksDone: 40, blocksTotal: 40}
+	session := &publishedIndexProgressSession{row: &validation}
+	claimRunningIndexBuild(t, eng, session)
+	require.Equal(t, 95, pollRunningIndexBuild(t, eng).Tables[0].Progress)
+
+	stale := heapScanRow
+	session.row = &stale
+	got := pollRunningIndexBuild(t, eng)
+	assert.Equal(t, 95, got.Tables[0].Progress, "a row from an earlier phase does not pull the percent back")
+	assert.Equal(t, 95, got.Progress)
+	assert.Equal(t, "25", got.Metadata["blocks_done"], "the counters still report the row that was read")
+
+	session.row = nil
+	got = pollRunningIndexBuild(t, eng)
+	assert.Equal(t, 95, got.Tables[0].Progress, "the record kept the later position")
+	assert.Equal(t, 95, got.Progress)
 }
 
 // TestProgressKeepsPercentWhenTheBuildRowReadFails proves a tolerated

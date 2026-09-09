@@ -113,9 +113,9 @@ Table progress during a concurrent index build is a whole-build estimate, not
 a phase ratio. Each server phase owns a fixed band of the 0–100 scale in
 PostgreSQL's documented phase order, a phase with block or tuple counters
 interpolates within its band, and a waiting or sorting phase reports the
-band's start. The estimate stays below 100 until the apply completes, and a
-poll that finds no progress row — between phases, or while the view cannot be
-read — keeps the last derived percent.
+band's start. The estimate stays below 100 until the apply completes and never
+moves backwards within a build; a poll that finds no progress row — between
+phases, or while the view cannot be read — keeps the last derived percent.
 
 A multi-statement plan — several tables changed, or one declarative edit that
 the planner expands into several steps — is not applied atomically. The
