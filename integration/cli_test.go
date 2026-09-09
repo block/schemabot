@@ -1125,10 +1125,10 @@ func runCLIWithError(t *testing.T, binPath string, args ...string) (string, erro
 // parseApplyID extracts an apply ID (e.g., "apply-abc12345") from CLI output.
 func parseApplyID(t *testing.T, output string) string {
 	t.Helper()
-	re := regexp.MustCompile(`apply-[a-f0-9]+`)
-	match := re.FindString(output)
-	require.NotEmptyf(t, match, "no apply ID found in output:\n%s", output)
-	return match
+	re := regexp.MustCompile(`(?:Apply|Rollback) started: (apply-[a-f0-9]+)`)
+	match := re.FindStringSubmatch(output)
+	require.Lenf(t, match, 2, "no started apply ID found in output:\n%s", output)
+	return match[1]
 }
 
 // waitForHTTP waits for an HTTP endpoint to be available.
@@ -1280,7 +1280,9 @@ CREATE TABLE items (
 		)
 		// Should show rollback plan with DROP COLUMN
 		assertContains(t, out, "Rollback started")
-		waitForApplyFromOutput(t, endpoint, out, "completed", 30*time.Second)
+		rollbackID := parseApplyID(t, out)
+		require.NotEqual(t, applyID, rollbackID, "rollback starts a new apply")
+		waitForState(t, endpoint, rollbackID, "completed", 30*time.Second)
 	})
 
 	// Step 4: Verify schema matches original (plan should show we need to add the column back)
