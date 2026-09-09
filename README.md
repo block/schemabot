@@ -80,7 +80,7 @@ SchemaBot handles the full lifecycle:
 - **Plan**: diff the desired schema against the live database and compute the DDL
 - **Apply**: execute the DDL online using [Spirit](https://github.com/block/spirit) (MySQL), [PlanetScale deploy requests](https://planetscale.com/docs/vitess/schema-changes/deploy-requests) (Vitess), or [pg-sprite](https://github.com/block/pg-sprite) (PostgreSQL)
 - **Progress**: track row copy progress, the ETA, and per-table and per-shard status
-- **Control**: `stop` (pause), `start` (resume), `cutover` (trigger the table swap), `cancel` (end the change), and `revert` (roll back)
+- **Control**: `stop` (pause), `start` (resume), `cutover` (trigger the table swap), `cancel` (end the change), and `rollback` (roll back)
 
 Simple changes (e.g., adding a column) use instant DDL and complete in milliseconds. Operations that require a row copy (e.g., adding an index) run online without blocking reads or writes.
 

@@ -435,7 +435,7 @@ func fleetInventory() string {
 }
 
 func busyFleet(now time.Time) []string {
-	data := t.StatusListData{ActiveCount: 24, Limit: 20, HasMore: true, StateCounts: map[string]int{state.Apply.Completed: 462, state.Apply.Running: 24, state.Apply.Failed: 9, state.Apply.Stopped: 5}}
+	data := t.StatusListData{ActiveCount: 3, Limit: 20, HasMore: true, StateCounts: map[string]int{state.Apply.Completed: 483, state.Apply.Running: 3, state.Apply.Failed: 9, state.Apply.Stopped: 5}}
 	names := []string{"shop", "billing", "catalog", "accounts", "inventory", "search", "analytics", "notifications"}
 	for i := 0; i < 20; i++ {
 		phase := state.Apply.Completed
@@ -509,16 +509,16 @@ func main() {
 		{3, "schemabot progress apply-example-73", "Attach to live progress; ESC detaches", live(60, state.Apply.Running, false, "")},
 		{2, "", "Press ESC to detach; the apply keeps running", live(60, state.Apply.Running, false, "esc")},
 		{5, "schemabot list-plans -e staging", "After pressing ESC, find recent plans", plans}}})
-	frames := []Frame{{3, "schemabot progress apply-example-73", "Follow an apply started with --defer-cutover", live(20, state.Apply.Running, false, "")}}
-	for _, p := range []int{35, 50, 60} {
-		frames = append(frames, Frame{0.7, "", "", live(p, state.Apply.Running, false, "")})
+	frames := []Frame{{2, "schemabot progress apply-example-73", "Follow an apply started with --defer-cutover", live(20, state.Apply.Running, false, "")}}
+	for p := 25; p <= 60; p += 5 {
+		frames = append(frames, Frame{0.18, "", "", live(p, state.Apply.Running, false, "")})
 	}
-	frames = append(frames, Frame{3, "", "See why copying has slowed", live(60, state.Apply.Running, true, "")})
-	for _, p := range []int{70, 80, 90, 100} {
-		frames = append(frames, Frame{0.7, "", "Copying resumes as conditions improve", live(p, state.Apply.Running, false, "")})
+	frames = append(frames, Frame{2, "", "See why copying has slowed", live(60, state.Apply.Running, true, "")})
+	for p := 65; p <= 100; p += 5 {
+		frames = append(frames, Frame{0.18, "", "Copying resumes as conditions improve", live(p, state.Apply.Running, false, "")})
 	}
-	frames = append(frames, Frame{3, "", "Copy complete; wait for the final swap", live(100, state.Apply.WaitingForCutover, false, "")}, Frame{2, "", "Press Enter to request the final swap", live(100, state.Apply.WaitingForCutover, false, "enter")}, Frame{4, "", "The watcher confirms completion", live(100, state.Apply.Completed, false, "")})
-	demos = append(demos, Demo{Name: "cli-cutover", Title: "Know when to wait. Choose when to swap.", Frames: frames})
+	frames = append(frames, Frame{3, "", "Copy complete; wait for the final swap", live(100, state.Apply.WaitingForCutover, false, "")}, Frame{2, "", "Press Enter to request the final swap", live(100, state.Apply.WaitingForCutover, false, "enter")}, Frame{3, "", "The watcher confirms completion", live(100, state.Apply.Completed, false, "")})
+	demos = append(demos, Demo{Name: "cli-cutover", Title: "Choose when to cut over.", Frames: frames})
 	demos = append(demos, vitessDemo())
 	fleetLines := busyFleet(now)
 	pull := capture(func() {

@@ -57,3 +57,5 @@ The operations animation runs `LogsCmd` against a loopback logs response, includ
 The inventory uses the real databases command against a loopback fixture. The status fixture totals 500 changes and renders the default 20 rows, shown together in a stationary view.
 
 The fleet pull view enables the production interactive color setting and shows the entire result in one frame. Each fleet command finishes typing, then pauses briefly before output appears.
+
+All animations render at 12 frames per second. The cutover copy advances in five-point steps, with brief holds for throttling and interactive controls.

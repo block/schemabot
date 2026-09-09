@@ -186,7 +186,7 @@ findings, each with output examples.
 
 ### Find recent changes and plans
 
-![CLI status across several databases, a running change, and recent plans](../assets/cli-fleet.gif)
+![Explore databases, inspect live schemas and lint findings, list recent changes, and follow logs](../assets/cli-ops.gif)
 
 ```console
 $ schemabot status -e staging

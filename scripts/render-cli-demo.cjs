@@ -28,18 +28,19 @@ async function main() {
       const duration = await page.evaluate(d => window.setDemo(d), demo);
       const frames = [];
       let previous;
-      const fps = 8;
+      const fps = 12;
+      const delay = 100 / fps;
 
       for (let i = 0; i <= Math.ceil(duration * fps); i++) {
         const check = await page.evaluate(t => window.renderFrame(t), i / fps);
         if (check.overflow) throw Error(demo.name + ' content clipped at ' + i / fps);
         const png = await page.screenshot();
         if (previous && png.equals(previous)) {
-          frames.at(-1).delay += 12.5;
+          frames.at(-1).delay += delay;
         } else {
           const file = path.join(tmp, String(i).padStart(4, '0') + '.png');
           fs.writeFileSync(file, png);
-          frames.push({ file, delay: 12.5 });
+          frames.push({ file, delay });
           previous = png;
         }
       }
