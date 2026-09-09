@@ -295,17 +295,23 @@ func operationHeartbeat(t *testing.T, ctx context.Context, store *Storage, opera
 	return heartbeat
 }
 
+// agedHeartbeatExpr renders the given age as a SQL expression subtracted from
+// the database's own current time. Every heartbeat a test writes goes through
+// this rather than a client timestamp: the gates compare against database time,
+// so a stamp computed here would carry the client's clock — and, for the
+// Postgres container, its offset from the host's — into the comparison.
+func agedHeartbeatExpr(store *Storage, age time.Duration) string {
+	return store.Applies().(*applyStore).dialect.RelativeTime(
+		TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(age.Microseconds())), IntervalMicrosecond)
+}
+
 // backdateOperationLease ages the operation's heartbeat on either dialect, which
-// is what both the claim path and expiry read to decide a lease is idle. The age
-// is subtracted from database time for the same reason the stamp above uses
-// NOW(): the reader compares against database time.
+// is what both the claim path and expiry read to decide a lease is idle.
 func backdateOperationLease(t *testing.T, ctx context.Context, store *Storage, operationID int64, age time.Duration) {
 	t.Helper()
-	dialect := store.Applies().(*applyStore).dialect
-	staleHeartbeat := dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
-		LiteralIntervalAmount(uint64(age.Microseconds())), IntervalMicrosecond)
 	_, err := store.db.ExecContext(ctx,
-		"UPDATE apply_operations SET updated_at = "+staleHeartbeat+" WHERE id = ?", operationID)
+		"UPDATE apply_operations SET updated_at = "+agedHeartbeatExpr(store, age)+" WHERE id = ?", operationID)
 	require.NoError(t, err)
 }
 
@@ -322,20 +328,21 @@ func testRetryableExpiryOperationFence(t *testing.T, newStore func(*testing.T) *
 			apply := createTestApplyWithStateAndEnv(t, store, lock, "expiry_fence", 991, state.Apply.FailedRetryable, "staging")
 			_, err := store.db.ExecContext(ctx, "UPDATE applies SET attempt = ? WHERE id = ?", maxRecoveryAttempts, apply.ID)
 			require.NoError(t, err)
+			staleHeartbeat := agedHeartbeatExpr(store, 2*storage.ApplyLeaseStaleAfter)
 			var opIDs []int64
 			for _, deployment := range []string{"region-a", "region-b"} {
 				id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
 					ApplyID: apply.ID, Deployment: deployment, Target: apply.Database, State: state.ApplyOperation.Running,
 				})
 				require.NoError(t, err)
-				_, err = store.db.ExecContext(ctx, `UPDATE apply_operations SET lease_owner = 'old-driver', lease_token = 'old-token', updated_at = ? WHERE id = ?`, time.Now().Add(-2*storage.ApplyLeaseStaleAfter), id)
+				_, err = store.db.ExecContext(ctx, `UPDATE apply_operations SET lease_owner = 'old-driver', lease_token = 'old-token', updated_at = `+staleHeartbeat+` WHERE id = ?`, id)
 				require.NoError(t, err)
 				opIDs = append(opIDs, id)
 			}
 			if scenario == "cutover claim wins" || scenario == "expiry blocks cutover" {
-				_, err = store.db.ExecContext(ctx, "UPDATE apply_operations SET state = ?, cutover_policy = ?, updated_at = ? WHERE id = ?", state.ApplyOperation.Completed, storage.CutoverPolicyParallel, time.Now().Add(-2*storage.ApplyLeaseStaleAfter), opIDs[0])
+				_, err = store.db.ExecContext(ctx, "UPDATE apply_operations SET state = ?, cutover_policy = ?, updated_at = "+staleHeartbeat+" WHERE id = ?", state.ApplyOperation.Completed, storage.CutoverPolicyParallel, opIDs[0])
 				require.NoError(t, err)
-				_, err = store.db.ExecContext(ctx, "UPDATE apply_operations SET state = ?, cutover_policy = ?, updated_at = ? WHERE id = ?", state.ApplyOperation.WaitingForCutover, storage.CutoverPolicyParallel, time.Now().Add(-2*storage.ApplyLeaseStaleAfter), opIDs[1])
+				_, err = store.db.ExecContext(ctx, "UPDATE apply_operations SET state = ?, cutover_policy = ?, updated_at = "+staleHeartbeat+" WHERE id = ?", state.ApplyOperation.WaitingForCutover, storage.CutoverPolicyParallel, opIDs[1])
 				require.NoError(t, err)
 			}
 			task := createRetryableReapTask(t, store, apply, "expiry_task", "users", state.Task.Running, "")
