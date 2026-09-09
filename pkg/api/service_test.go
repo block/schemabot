@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -497,4 +498,22 @@ func TestNewLocalTernClient_ConfiguresPostgresTableSizeLimit(t *testing.T) {
 	eng, ok := lc.Engine().(*postgresengine.Engine)
 	require.True(t, ok)
 	assert.Equal(t, limit, eng.TableSizeLimit())
+}
+
+// The server-level concurrent index bound reaches the engine of every local
+// client the control plane builds, so a configured value governs concurrent
+// builds instead of silently reverting to the default.
+func TestNewLocalTernClient_ConfiguresPostgresConcurrentIndexMaxDuration(t *testing.T) {
+	cfg := &ServerConfig{Postgres: PostgresConfig{ConcurrentIndexMaxDuration: "36h"}}
+	service := New(nil, cfg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	envConfig := EnvironmentConfig{DSN: "postgres://localhost:5432/orders"}
+	client, err := service.newLocalTernClient("orders-staging", "orders", storage.DatabaseTypePostgres, envConfig)
+	require.NoError(t, err)
+
+	lc, ok := client.(*tern.LocalClient)
+	require.True(t, ok)
+	eng, ok := lc.Engine().(*postgresengine.Engine)
+	require.True(t, ok)
+	assert.Equal(t, 36*time.Hour, eng.ConcurrentIndexMaxDuration())
 }

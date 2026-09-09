@@ -765,13 +765,14 @@ over gRPC run with that deployment's engine settings.
 ## Postgres
 
 The `postgres:` block sets the largest table on which the PostgreSQL engine
-will execute native-safe DDL, and the statement budget SchemaBot's own storage
-connections run under. The size limit is expressed in bytes and defaults to
-1 GiB:
+will execute native-safe DDL, the maximum duration of a concurrent index
+build, and the statement budget SchemaBot's own storage connections run under.
+The size limit is expressed in bytes and defaults to 1 GiB:
 
 ```yaml
 postgres:
   native_safe_table_size_limit_bytes: 4294967296
+  concurrent_index_max_duration: 24h
   statement_timeout: 30s
 ```
 
@@ -792,6 +793,15 @@ existing data, and a table that does not exist yet has none.
 
 The server fails startup validation when
 `native_safe_table_size_limit_bytes` is zero or negative.
+
+`concurrent_index_max_duration` is a Go duration string and defaults to `24h`.
+It is the build's server-side `statement_timeout`, and the engine's own
+deadline for the recovery of an abandoned leftover that a build runs before
+building. The server refuses zero, negative, and invalid durations at config
+load, durations below one millisecond (the resolution of `statement_timeout`;
+a shorter value would round to zero on the server and switch the timer off),
+and durations above the largest `statement_timeout` PostgreSQL itself accepts
+(about 24 days); omit the option to use the default rather than setting `0`.
 
 The ceiling is process-wide: every PostgreSQL database this server drives
 shares the same value, and a database cannot override it in its own metadata.
