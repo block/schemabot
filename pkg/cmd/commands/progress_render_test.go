@@ -1,8 +1,12 @@
 package commands
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/ui"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
@@ -116,4 +120,31 @@ func TestProgressRenderingNormalizesRawEngineStatuses(t *testing.T) {
 	assert.NotContains(t, out, "Status: complete")
 	assert.NotContains(t, out, "ready_to_complete")
 	assert.NotContains(t, out, "Status: queued")
+}
+
+// A view explains every paced table while offering the shared reference once,
+// including namespaced and multi-deployment output in both status and watch.
+func TestProgressThrottleReferenceOncePerView(t *testing.T) {
+	for _, namespace := range []string{"", "shop"} {
+		for _, multi := range []bool{false, true} {
+			name := fmt.Sprintf("namespace=%s/multi=%t", namespace, multi)
+			t.Run(name, func(t *testing.T) {
+				tables := make([]templates.TableProgress, 8)
+				for i := range tables {
+					tables[i] = templates.TableProgress{TableName: fmt.Sprintf("orders_%d", i), Namespace: namespace, Deployment: "primary", Status: state.Task.Running, Throttled: true, ThrottleReason: "commit-latency 120ms >= 100ms", RowsTotal: 100, RowsCopied: 50, PercentComplete: 50}
+				}
+				var operations []templates.ProgressOperation
+				if multi {
+					operations = []templates.ProgressOperation{{Deployment: "primary", State: state.ApplyOperation.Running}, {Deployment: "secondary", State: state.ApplyOperation.Running}}
+				}
+				data := templates.ProgressData{State: state.Apply.Running, Tables: tables, Operations: operations}
+				model := WatchModel{initialized: true, state: state.Apply.Running, tables: tables, operations: operations}
+				outputs := []string{captureOutput(t, func() { templates.WriteProgress(data) }), model.View()}
+				for _, output := range outputs {
+					assert.Equal(t, 1, strings.Count(output, ui.ThrottleDocURL), output)
+					assert.Equal(t, 8, strings.Count(output, "Throttled: commit-latency"), output)
+				}
+			})
+		}
+	}
 }

@@ -386,7 +386,8 @@ $ schemabot progress apply-example-73
        ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
        • Rows: 6,000,000 / 10,000,000 · ETA: 8m 0s
        • ℹ️ Throttled: commit-latency 120ms >= 100ms · backing off while database writes commit slowly
-       • Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
+
+  Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
 
 
 
@@ -403,7 +404,8 @@ swap. During cutover, the watcher asks you to wait and disables Esc/stop.
 
 When copying is throttled, the live view explains why. This MySQL example
 pauses when commits are slow, then continues as conditions improve. Recognized
-signals include a short explanation and a link to the [throttle reference](throttle.md).
+signals include a short explanation beside each affected table. One shared
+link to the [throttle reference](throttle.md) appears below the tables.
 The link uses a readable label in supported terminals and the full URL in plain output,
 matching `list-plans` and `status`.
 

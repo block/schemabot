@@ -143,6 +143,7 @@ func (m WatchModel) progressView() string {
 	// Show table progress once past branch setup phases.
 	if !state.IsSetupPhase(m.state) {
 		m.renderTables(&b, tables)
+		b.WriteString(templates.FormatThrottleReference(tables))
 	}
 
 	// Footer based on state

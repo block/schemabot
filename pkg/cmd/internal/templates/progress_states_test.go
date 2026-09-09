@@ -692,8 +692,6 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 	assert.Contains(t, checksumming, "🔍 Checksumming to verify data (21.92%) (throttled)")
 	assert.Contains(t, checksumming, "ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget")
 
-	assert.Contains(t, copying, "Docs: "+ui.ThrottleDocURL)
-	assert.Contains(t, checksumming, "Docs: "+ui.ThrottleDocURL)
 	assert.NotContains(t, unknownSignal, ui.ThrottleDocURL)
 
 	notThrottled := FormatTableProgress(TableProgress{
@@ -716,11 +714,11 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 // Interactive throttle hints use the same labeled terminal links as CLI lists.
 func TestFormatTableProgress_ThrottleHyperlink(t *testing.T) {
 	enableHyperlinks(t)
-	output := FormatTableProgress(TableProgress{
+	output := FormatThrottleReference([]TableProgress{{
 		TableName: "orders", ChangeType: "alter", Status: state.Apply.Running,
 		RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
 		Throttled: true, ThrottleReason: "commit-latency 120ms >= 100ms",
-	})
+	}})
 	assert.Contains(t, output, "Docs: "+ui.Link("Throttle reference", ui.ThrottleDocURL))
 }
 
@@ -1092,4 +1090,16 @@ func TestFormatTableProgressOperatorHaltedBars(t *testing.T) {
 	})
 	assert.Contains(t, failed, "❌ Failed")
 	assert.Contains(t, failed, ui.ColorRed)
+}
+
+func TestThrottleReferenceRequiresActiveRecognizedSignal(t *testing.T) {
+	for _, table := range []TableProgress{
+		{Status: state.Task.Running, ThrottleReason: "redo-aware 4 > 3"},
+		{Status: state.Task.Running, Throttled: true, ThrottleReason: "unknown"},
+		{Status: state.Task.Running, Throttled: true},
+		{Status: state.Task.Completed, Throttled: true, ThrottleReason: "redo-aware 4 > 3"},
+		{Status: state.Task.Stopped, Throttled: true, ThrottleReason: "redo-aware 4 > 3"},
+	} {
+		assert.Empty(t, FormatThrottleReference([]TableProgress{table}))
+	}
 }
