@@ -1,7 +1,9 @@
 package commands
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -144,4 +146,74 @@ func TestInitRejectsOverridesBeforeSideEffects(t *testing.T) {
 			require.NoDirExists(t, filepath.Join(home, ".schemabot", "runtimes", "local"))
 		})
 	}
+}
+
+func TestInitRetryPreservesUnrelatedSubdirectory(t *testing.T) {
+	root, stage := t.TempDir(), t.TempDir()
+	for _, dir := range []string{root, stage} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "table.sql"), []byte("schema"), 0600))
+	}
+	require.NoError(t, os.Mkdir(filepath.Join(root, "docs"), 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "docs", "design.md"), []byte("keep"), 0600))
+	require.NoError(t, publishInitSchema(stage, root))
+	require.FileExists(t, filepath.Join(root, "docs", "design.md"))
+}
+
+func TestInitFailedConnectionDoesNotRegister(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SCHEMABOT_ENDPOINT", "")
+	t.Setenv("SCHEMABOT_TOKEN", "")
+	t.Setenv("INIT_BAD_TARGET", "invalid-dsn")
+	t.Setenv("INIT_STATE", "user@tcp(localhost:3306)/state")
+	cmd := InitCmd{Database: "app", Environment: "dev", Type: "mysql", DSN: "env:INIT_BAD_TARGET", StorageDSN: "env:INIT_STATE", Runtime: "local", Namespaces: []string{"app"}, SchemaDir: filepath.Join(home, "schema")}
+	_, err := cmd.initialize(t.Context(), &Globals{})
+	require.ErrorContains(t, err, "before registering runtime")
+	require.NoDirExists(t, filepath.Join(home, ".schemabot", "runtimes", "local"))
+	require.NoDirExists(t, cmd.SchemaDir)
+}
+
+func TestInitReuseRejectsInvalidRootBeforeRegistration(t *testing.T) {
+	for _, which := range []string{"missing", "empty", "wrong-scope", "wrong-database"} {
+		t.Run(which, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Setenv("SCHEMABOT_ENDPOINT", "")
+			t.Setenv("SCHEMABOT_TOKEN", "")
+			// Connections are deliberately unset: reuse validation must happen first.
+			t.Setenv("INIT_REUSE_TARGET", "")
+			t.Setenv("INIT_REUSE_STATE", "")
+			root := filepath.Join(home, "schema")
+			if which != "missing" {
+				require.NoError(t, os.Mkdir(root, 0700))
+			}
+			if which == "wrong-scope" || which == "wrong-database" {
+				require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"), []byte("database: app\ntype: mysql\n"), 0600))
+				require.NoError(t, os.Mkdir(filepath.Join(root, "app"), 0700))
+				require.NoError(t, os.WriteFile(filepath.Join(root, "app", "tables.sql"), []byte("CREATE TABLE t (id bigint);"), 0600))
+			}
+			cmd := InitCmd{ReuseSchema: true, Database: "app", Environment: "dev", Type: "mysql", DSN: "env:INIT_REUSE_TARGET", StorageDSN: "env:INIT_REUSE_STATE", Runtime: "local", Namespaces: []string{"app"}, SchemaDir: root}
+			if which == "wrong-scope" {
+				cmd.Namespaces = []string{"other"}
+			}
+			if which == "wrong-database" {
+				cmd.Database = "other"
+			}
+			_, err := cmd.initialize(t.Context(), &Globals{})
+			require.ErrorContains(t, err, "cannot reuse schema directory")
+			require.NotContains(t, err.Error(), "connection environment")
+			require.NoDirExists(t, filepath.Join(home, ".schemabot", "runtimes", "local"))
+		})
+	}
+}
+
+func TestInitCancellationPreservesCauseAndRecovery(t *testing.T) {
+	err := retainedInitError(fmt.Errorf("import live schema: %w", context.Canceled))
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorContains(t, err, "setup cancelled")
+	require.ErrorContains(t, err, "retained for retry")
+	require.NotContains(t, err.Error(), "connection")
+	err = retainedInitError(errors.New("schema files changed"))
+	require.ErrorContains(t, err, "schema files changed")
+	require.NotContains(t, err.Error(), "cancelled")
 }

@@ -108,11 +108,53 @@ func TestInitEngines(t *testing.T) {
 			after, err := os.ReadFile(schemaPath)
 			require.NoError(t, err)
 			require.Equal(t, edited, after)
+			// Reuse must reject a real difference without changing the user's files.
+			output, err = run(append(slices.Clone(args), "--reuse-schema")...)
+			require.Error(t, err, string(output))
+			require.Contains(t, string(output), "still produce schema changes")
+			require.FileExists(t, filepath.Join(root, namespace, "notes.sql"))
+			// Explicit reuse accepts harmless formatting/comments without replacing files.
+			require.NoError(t, os.Remove(filepath.Join(root, namespace, "notes.sql")))
+			output, err = run(append(slices.Clone(args), "--reuse-schema")...)
+			require.NoError(t, err, string(output))
+			after, err = os.ReadFile(schemaPath)
+			require.NoError(t, err)
+			require.Equal(t, edited, after)
+
+			// Flat schema roots retain their original namespace through staging.
+			flatRoot := filepath.Join(t.TempDir(), namespace)
+			require.NoError(t, os.Mkdir(flatRoot, 0755))
+			cliConfig, err := os.ReadFile(filepath.Join(root, "schemabot.yaml"))
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(filepath.Join(flatRoot, "schemabot.yaml"), cliConfig, 0644))
+			require.NoError(t, os.WriteFile(filepath.Join(flatRoot, "widgets.sql"), edited, 0644))
+			flatArgs := slices.Clone(args)
+			flatArgs[slices.Index(flatArgs, "--schema-dir")+1] = flatRoot
+			output, err = run(append(flatArgs, "--reuse-schema")...)
+			require.NoError(t, err, string(output))
 			ctx, cancel := context.WithTimeout(t.Context(), runtimeDeadline)
 			defer cancel()
 			var name string
 			require.NoError(t, db.QueryRowContext(ctx, "SELECT name FROM widgets WHERE id = 1").Scan(&name))
 			require.Equal(t, "keep me", name)
+			// An explicitly empty live namespace is a valid starting point.
+			execSQL(t, db, "DROP TABLE widgets")
+			blankRoot := filepath.Join(t.TempDir(), "schema")
+			blankArgs := slices.Clone(args)
+			blankArgs[slices.Index(blankArgs, "--schema-dir")+1] = blankRoot
+			output, err = run(blankArgs...)
+			require.NoError(t, err, string(output))
+			var blank struct {
+				Tables   int  `json:"tables"`
+				Verified bool `json:"verified"`
+			}
+			require.NoError(t, json.Unmarshal(output, &blank))
+			require.Zero(t, blank.Tables)
+			require.True(t, blank.Verified)
+			marker, err := os.ReadFile(filepath.Join(blankRoot, namespace, "schema.sql"))
+			require.NoError(t, err)
+			require.Contains(t, string(marker), "-- This namespace is empty")
+
 		})
 	}
 }

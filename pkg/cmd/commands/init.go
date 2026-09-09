@@ -25,6 +25,7 @@ import (
 // InitCmd uses explicit inputs for the shared initialization workflow. A future
 // wizard can collect the same inputs without implementing a second setup path.
 type InitCmd struct {
+	ReuseSchema bool     `name:"reuse-schema" help:"Verify existing desired files without replacing them"`
 	Database    string   `short:"d" required:"" help:"Name to register for this database"`
 	Environment string   `short:"e" required:"" help:"Environment to initialize"`
 	Type        string   `required:"" enum:"mysql,postgres" help:"Database engine: mysql or postgres"`
@@ -83,21 +84,37 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if err != nil {
 		return nil, err
 	}
+	if err := validateInitSchemaDestination(root); err != nil {
+		return nil, err
+	}
 	// Stage beside the destination so publication remains an atomic rename.
 	if err := os.MkdirAll(filepath.Dir(root), 0755); err != nil {
 		return nil, fmt.Errorf("create schema parent directory: %w", err)
 	}
-	stage, err := os.MkdirTemp(filepath.Dir(root), ".schemabot-init-*")
+	stageContainer, err := os.MkdirTemp(filepath.Dir(root), ".schemabot-init-*")
 	if err != nil {
 		return nil, fmt.Errorf("create schema staging directory: %w", err)
 	}
 	defer func() {
-		if err := os.RemoveAll(stage); err != nil {
-			slog.Warn("remove schema staging directory", "path", stage, "error", err)
+		if err := os.RemoveAll(stageContainer); err != nil {
+			slog.Warn("remove schema staging directory", "path", stageContainer, "error", err)
 		}
 	}()
+	// Flat layouts derive their namespace from the schema root's basename.
+	// Preserve it inside the private staging container for verification too.
+	stage := filepath.Join(stageContainer, filepath.Base(root))
+	if err := os.Mkdir(stage, 0700); err != nil {
+		return nil, fmt.Errorf("create schema snapshot: %w", err)
+	}
 	if err := checkInitPublication(stage, renameInitSchema); err != nil {
 		return nil, err
+	}
+	var ignored []string
+	if cmd.ReuseSchema {
+		ignored, err = stageExistingInitSchema(root, stage, cmd.Database, cmd.Type, cmd.Environment, namespaces)
+		if err != nil {
+			return nil, fmt.Errorf("cannot reuse schema directory %q; choose an existing configured directory for --reuse-schema: %w", root, err)
+		}
 	}
 	dir, err := localruntime.Directory(cmd.Runtime)
 	if err != nil {
@@ -121,14 +138,14 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if err != nil {
 		return nil, err
 	}
-	result, err := cmd.importBaseline(ctx, manager, stage, root, profile, namespaces)
+	result, err := cmd.importBaseline(ctx, manager, stage, root, profile, namespaces, ignored)
 	if err != nil {
-		return nil, fmt.Errorf("initialization incomplete; runtime registration is retained for retry; correct the connection environment variables and retry with the same references, or choose a new --runtime and --profile for a different state database: %w", err)
+		return nil, retainedInitError(err)
 	}
 	return result, nil
 }
 
-func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Manager, stage, root, profile string, namespaces []string) (*initResult, error) {
+func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Manager, stage, root, profile string, namespaces, ignored []string) (*initResult, error) {
 	startupCtx, cancelStartup := context.WithTimeout(ctx, 30*time.Second)
 	connection, err := manager.Ensure(startupCtx)
 	cancelStartup()
@@ -140,14 +157,16 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 	if err != nil {
 		return nil, fmt.Errorf("import live schema: %w", err)
 	}
-	plan, err := buildOnboardWritePlan(stage, pulled, nil)
-	if err != nil {
-		return nil, err
+	if !cmd.ReuseSchema {
+		plan, err := buildOnboardWritePlan(stage, pulled, nil)
+		if err != nil {
+			return nil, err
+		}
+		if err := plan.write(); err != nil {
+			return nil, err
+		}
 	}
-	if err := plan.write(); err != nil {
-		return nil, err
-	}
-	baseline, _, err := client.CallPlanAPI(connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, stage, "", 0, nil, false)
+	baseline, _, err := client.CallPlanAPI(connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, stage, "", 0, ignored, false)
 	if err != nil {
 		return nil, fmt.Errorf("verify baseline: %w", err)
 	}
@@ -198,7 +217,10 @@ func publishInitSchemaWithRename(stage, root string, rename func(string, string)
 		if err := removeEmptyInitDir(root); err != nil {
 			return fmt.Errorf("schema directory changed before publication: %w", err)
 		}
-		return rename(stage, root)
+		if err := rename(stage, root); err != nil {
+			return fmt.Errorf("publish schema directory %q after removing empty destination: %w", root, err)
+		}
+		return nil
 	}
 	existing, err := initSchemaSnapshot(root)
 	if err != nil {
@@ -220,11 +242,13 @@ const initSnapshotMaxEntries = 10000
 func initSchemaSnapshot(root string) (map[string]string, error) {
 	result := make(map[string]string)
 	remaining := int64(initSnapshotMaxBytes)
+	entries := 0
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if len(result) >= initSnapshotMaxEntries {
+		entries++
+		if entries > initSnapshotMaxEntries {
 			return fmt.Errorf("schema directory exceeds %d entries; choose a dedicated schema directory", initSnapshotMaxEntries)
 		}
 		if entry.Type()&os.ModeSymlink != 0 {
@@ -235,7 +259,6 @@ func initSchemaSnapshot(root string) (map[string]string, error) {
 			return err
 		}
 		if entry.IsDir() {
-			result[relative+"/"] = ""
 			return nil
 		}
 		if !entry.Type().IsRegular() {
@@ -268,4 +291,11 @@ func initSchemaSnapshot(root string) (map[string]string, error) {
 		return nil
 	})
 	return result, err
+}
+
+func retainedInitError(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return fmt.Errorf("setup cancelled; runtime registration is retained for retry: %w", err)
+	}
+	return fmt.Errorf("initialization incomplete; runtime registration is retained for retry: %w", err)
 }
