@@ -3,6 +3,8 @@
 
 All templates rendered with sample data.
 
+DDL code fences are sized to be longer than any backtick run in their content.
+
 ## Plan & Status
 
 ### PR Comments
@@ -318,7 +320,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 ⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target
-- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `` ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`) ``
 
 Applying restarts the copy from zero rows. To keep the work already done, apply the schema change that started it.
 
@@ -351,7 +353,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 ℹ️ **This apply destroys work in progress**: 1 unfinished copy on the target
-- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `` ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`) ``
 
 📋 **Plan**: **1** table to alter
 
@@ -379,7 +381,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 ⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target
-- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `` ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`) ``
 
 Applying restarts the copy from zero rows. To keep the work already done, apply the schema change that started it.
 
@@ -419,7 +421,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 ⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target
-- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `` ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`) ``
 
 Applying restarts the copy from zero rows. To keep the work already done, apply the schema change that started it.
 
@@ -3596,6 +3598,9 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 *Applied by @jackjackbits at 2026-01-01 00:00:00 UTC*
 
 **Status**: In Progress
+
+step 2 of 3 · `CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON public.users (last_seen_at)`
+building index: 25% of blocks (2,500/10,000)
 
 📊 1/3 complete · 1 running · 1 queued
 

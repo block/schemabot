@@ -109,6 +109,8 @@ cat > "$SNAPSHOT" <<'HEADER'
 
 All templates rendered with sample data.
 
+DDL code fences are sized to be longer than any backtick run in their content.
+
 HEADER
 
 # Helper: render a paired section with PR and CLI subsections

@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -965,12 +966,35 @@ const maxGitHubCompareFiles = 300
 
 // FetchPRFiles gets the list of files changed in a PR.
 //
+// Like FetchPullRequest, it honours the request-scoped cache attached to ctx
+// via WithPRInfoCache, so the discovery, safety-check, and per-environment
+// schema reads within one webhook delivery share a single listing and by
+// construction see the same one. Callers without a cache on ctx fetch on every
+// call. Only a complete listing is cached: a capped one is an error, and the
+// caller that meets it fails closed rather than planning from it.
+//
 // When the PR changes more files than GitHub will report (ErrPRFilesIncomplete),
 // the returned slice still carries the visible prefix of the listing alongside
 // the error. That prefix must never be planned from — the withheld tail could
 // hold a schema change — but callers may inspect it to describe the cap, e.g.
 // whether the PR visibly touches schema at all.
 func (ic *InstallationClient) FetchPRFiles(ctx context.Context, repo string, pr int) ([]PRFile, error) {
+	cache := prInfoCacheFromContext(ctx)
+	if cache == nil {
+		return ic.fetchPRFiles(ctx, repo, pr)
+	}
+	if files, ok := cache.getFiles(repo, pr); ok {
+		return slices.Clone(files), nil
+	}
+	files, err := ic.fetchPRFiles(ctx, repo, pr)
+	if err != nil {
+		return files, err
+	}
+	cache.setFiles(repo, pr, files)
+	return files, nil
+}
+
+func (ic *InstallationClient) fetchPRFiles(ctx context.Context, repo string, pr int) ([]PRFile, error) {
 	owner, repoName := splitRepo(repo)
 	opts := &gh.ListOptions{PerPage: 100}
 	var allFiles []PRFile

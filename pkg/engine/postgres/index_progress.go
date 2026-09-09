@@ -2,90 +2,47 @@ package postgres
 
 import (
 	"math"
-	"strings"
 
 	"github.com/block/pg-sprite/pkg/progress"
+
+	"github.com/block/schemabot/pkg/engine/postgres/indexphase"
 )
 
-// concurrentIndexPhaseBand places one phase of a concurrent index build on
-// the whole build's percent scale. PostgreSQL scopes the block and tuple
-// counters it publishes to a phase, but a completed phase's values can persist
-// into the next phase: the heap scan's completed block counters remain during
-// sorting live tuples. Each phase therefore owns a fixed band of the whole,
-// in the order PostgreSQL documents for CREATE INDEX CONCURRENTLY; a phase
-// with counters interpolates within its band, while a zero-width band absorbs
-// carried counters and reports its start rather than its end.
-type concurrentIndexPhaseBand struct {
-	phase      string
-	start, end int
-}
-
-// concurrentIndexPhaseBands lists the phases of a concurrent index build in
-// execution order. The btree access method reports its build as three
-// sub-phases, so those appear alongside the bare phase that other access
-// methods report. The band widths are a display heuristic: the two heap scans
-// and the index scan dominate a build's wall time, and every band ends below
-// 100 so a running build never reads as finished. pg-sprite reporting a
-// whole-build percent of its own would retire this table.
-var concurrentIndexPhaseBands = []concurrentIndexPhaseBand{
-	{phase: "initializing", start: 0, end: 0},
-	{phase: "waiting for writers before build", start: 0, end: 0},
-	{phase: "building index: scanning table", start: 0, end: 40},
-	{phase: "building index: sorting live tuples", start: 40, end: 40},
-	{phase: "building index: loading tuples in tree", start: 40, end: 60},
-	{phase: buildingIndexPhase, start: 0, end: 60},
-	{phase: "waiting for writers before validation", start: 60, end: 60},
-	{phase: "index validation: scanning index", start: 60, end: 75},
-	{phase: "index validation: sorting tuples", start: 75, end: 75},
-	{phase: "index validation: scanning table", start: 75, end: 95},
-	{phase: "waiting for old snapshots", start: 95, end: 95},
-}
-
 // concurrentIndexPercent derives a whole-build percent from the phase and
-// counters PostgreSQL publishes for a concurrent index build. The phase is
-// matched exactly, then by its "building index" family for an access method
-// whose sub-phase this table does not know. Within a band the fraction comes
-// from the block counters when the phase publishes a block total and from
-// the tuple counters otherwise; an over-reported counter is clamped so the
-// value never leaves the band. A phase this table does not know reports
-// false so the caller keeps the percent it already has.
+// counters PostgreSQL publishes for a concurrent index build. Each phase owns
+// a band of the whole in indexphase.Phases; the fraction within the band comes
+// from the counter pair that phase publishes, so a completed scan's counters
+// carried into a sort or a wait cannot move it off its band's start. An
+// over-reported counter is clamped so the value never leaves the band. A
+// phase the table does not know reports false so the caller keeps the percent
+// it already has.
 func concurrentIndexPercent(serverPhase string, work progress.Work) (int, bool) {
-	band, ok := lookupConcurrentIndexPhaseBand(serverPhase)
+	phase, ok := indexphase.Lookup(serverPhase)
 	if !ok {
 		return 0, false
 	}
 	fraction := 0.0
-	switch {
-	case work.BlocksTotal > 0:
-		fraction = float64(work.BlocksDone) / float64(work.BlocksTotal)
-	case work.TuplesTotal > 0:
-		fraction = float64(work.TuplesDone) / float64(work.TuplesTotal)
+	switch phase.Counter {
+	case indexphase.Blocks:
+		fraction = ratio(work.BlocksDone, work.BlocksTotal)
+	case indexphase.Tuples:
+		fraction = ratio(work.TuplesDone, work.TuplesTotal)
+	case indexphase.BlocksOrTuples:
+		if work.BlocksTotal > 0 {
+			fraction = ratio(work.BlocksDone, work.BlocksTotal)
+		} else {
+			fraction = ratio(work.TuplesDone, work.TuplesTotal)
+		}
+	case indexphase.None, indexphase.Lockers:
 	}
 	fraction = math.Min(math.Max(fraction, 0), 1)
-	return band.start + int(math.Round(fraction*float64(band.end-band.start))), true
+	return phase.Start + int(math.Round(fraction*float64(phase.End-phase.Start))), true
 }
 
-// buildingIndexPhase is the phase PostgreSQL reports while the access method
-// builds the index. An access method that reports progress appends its
-// sub-phase after a colon, so the bare phase also serves as the family
-// fallback for a sub-phase the band table does not list.
-const buildingIndexPhase = "building index"
-
-func lookupConcurrentIndexPhaseBand(serverPhase string) (concurrentIndexPhaseBand, bool) {
-	if band, ok := exactConcurrentIndexPhaseBand(serverPhase); ok {
-		return band, true
+// ratio is done over total, or zero while the server has published no total.
+func ratio(done, total uint64) float64 {
+	if total == 0 {
+		return 0
 	}
-	if strings.HasPrefix(serverPhase, buildingIndexPhase+": ") {
-		return exactConcurrentIndexPhaseBand(buildingIndexPhase)
-	}
-	return concurrentIndexPhaseBand{}, false
-}
-
-func exactConcurrentIndexPhaseBand(serverPhase string) (concurrentIndexPhaseBand, bool) {
-	for _, band := range concurrentIndexPhaseBands {
-		if band.phase == serverPhase {
-			return band, true
-		}
-	}
-	return concurrentIndexPhaseBand{}, false
+	return float64(done) / float64(total)
 }

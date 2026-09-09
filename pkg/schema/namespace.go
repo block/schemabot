@@ -78,17 +78,11 @@ func GroupFilesByNamespace(files map[string]string, defaultNamespace string, env
 			continue
 		}
 
-		namespace := path.Dir(relativePath)
-		if namespace == "." || namespace == "" {
-			namespace = defaultNamespace
+		namespace, namespaced := NamespaceForRelativePath(relativePath, defaultNamespace, environment)
+		if !namespaced {
 			hasFlatFile = true
 		} else {
 			hasNamespacedFile = true
-		}
-
-		// Replace $ENV in namespace keys when environment is known.
-		if environment != "" {
-			namespace = strings.ReplaceAll(namespace, "$ENV", environment)
 		}
 
 		if result[namespace] == nil {
@@ -116,6 +110,20 @@ func GroupFilesByNamespace(files map[string]string, defaultNamespace string, env
 	sort.Strings(removed)
 
 	return result, removed, nil
+}
+
+// NamespaceForRelativePath derives the namespace key used when grouping a
+// schema file. The bool reports whether the file is in a namespace directory.
+func NamespaceForRelativePath(relativePath, defaultNamespace, environment string) (string, bool) {
+	namespace := path.Dir(relativePath)
+	namespaced := namespace != "." && namespace != ""
+	if !namespaced {
+		namespace = defaultNamespace
+	}
+	if environment != "" {
+		namespace = strings.ReplaceAll(namespace, "$ENV", environment)
+	}
+	return namespace, namespaced
 }
 
 // ResolveIgnoreNamespaces applies the same $ENV substitution to

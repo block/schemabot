@@ -765,8 +765,10 @@ over gRPC run with that deployment's engine settings.
 ## Postgres
 
 The `postgres:` block sets the largest table on which the PostgreSQL engine
-will execute native-safe DDL, the maximum duration of a concurrent index
-build, and the statement budget SchemaBot's own storage connections run under.
+will execute native-safe DDL whose cost scales with the table's existing data
+(`ALTER TABLE` and a blocking `CREATE INDEX`), the maximum duration of a
+concurrent index build, and the statement budget SchemaBot's own storage
+connections run under.
 The size limit is expressed in bytes and defaults to 1 GiB:
 
 ```yaml
@@ -802,6 +804,9 @@ load, durations below one millisecond (the resolution of `statement_timeout`;
 a shorter value would round to zero on the server and switch the timer off),
 and durations above the largest `statement_timeout` PostgreSQL itself accepts
 (about 24 days); omit the option to use the default rather than setting `0`.
+
+Concurrent index builds do not consult the size ceiling; their work is bounded
+by `concurrent_index_max_duration` instead.
 
 The ceiling is process-wide: every PostgreSQL database this server drives
 shares the same value, and a database cannot override it in its own metadata.

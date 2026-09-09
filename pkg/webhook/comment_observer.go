@@ -383,15 +383,16 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 type progressSnapshot struct {
 	state      string
 	rowsCopied int64
-	// steps fingerprints every operation's statement position. It is what
-	// moves for an engine that executes a statement sequence and reports no
-	// row counts, so without it such an apply would read as stalled from its
-	// first poll and its position would refresh only at the slow interval.
+	// steps fingerprints every operation's statement position and the server's
+	// work on the running statement. It is what moves for an engine that
+	// executes a statement sequence and reports no row counts, so without it
+	// such an apply would read as stalled from its first poll and its position
+	// would refresh only at the slow interval.
 	steps string
 }
 
 func progressSnapshotOf(applyState string, tasks []*storage.Task, ops []*storage.ApplyOperation) progressSnapshot {
-	snapshot := progressSnapshot{state: applyState, steps: progressStepFingerprint(ops)}
+	snapshot := progressSnapshot{state: applyState, steps: progressFingerprint(ops)}
 	for _, t := range tasks {
 		snapshot.rowsCopied += t.RowsCopied
 	}

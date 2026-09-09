@@ -355,6 +355,98 @@ func TestEnginePlanTableSizeRefusal(t *testing.T) {
 	assert.Contains(t, change.ModeReason, "SchemaBot's ceiling for a native-safe apply")
 }
 
+// TestEnginePlanTableSizeRefusalKeepsTableNameVerbatim proves the size verdict
+// names the table exactly as the database spells it: a quoted PostgreSQL
+// identifier may carry Markdown delimiters, and the operator reading the
+// verdict needs the real name to act on it. Escaping for the surface that
+// shows the reason is the renderer's job, so the engine does not rewrite the
+// identifier on the renderer's behalf.
+func TestEnginePlanTableSizeRefusalKeepsTableNameVerbatim(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_size_limit_odd_name_test")
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE public."odd|users" (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+	req := &engine.PlanRequest{
+		Database: "plan_size_limit_odd_name_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"odd_users.sql": `CREATE TABLE "odd|users" (id bigint PRIMARY KEY, email text)`,
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	result, err := NewWithTableSizeLimit(1).Plan(t.Context(), req)
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 1)
+	change := result.Changes[0].TableChanges[0]
+	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
+	assert.Contains(t, change.ModeReason, `statement for table "odd|users":`)
+	assert.Contains(t, change.ModeReason, "1-byte threshold")
+}
+
+// TestEnginePlanOversizedTableAdmitsConcurrentIndex proves the plan applies
+// the rewrite ceiling only to the native step while leaving a concurrent
+// index build executable under its duration policy.
+func TestEnginePlanOversizedTableAdmitsConcurrentIndex(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_oversized_concurrent_index_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY)")
+	require.NoError(t, err)
+	req := &engine.PlanRequest{
+		Database: "plan_oversized_concurrent_index_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text); CREATE INDEX users_email_idx ON users (email)",
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	result, err := NewWithTableSizeLimit(1).Plan(t.Context(), req)
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 2)
+	alter := result.Changes[0].TableChanges[0]
+	index := result.Changes[0].TableChanges[1]
+	assert.Equal(t, engine.ExecutionModeBlocked, alter.ExecutionMode)
+	assert.Contains(t, alter.ModeReason, "1-byte threshold")
+	assert.Empty(t, index.ExecutionMode)
+	assert.Contains(t, index.DDL, "CREATE INDEX CONCURRENTLY")
+}
+
+// TestEnginePlanOversizedTableIndexOnlyDiffHasNoBlockedChange proves the
+// plan a reviewer can actually apply: when the only diff against an
+// already-oversized table is a new index, the plan holds exactly one change,
+// a concurrent index build, and none of its changes is blocked. The ceiling
+// bounds rewrites of existing data, and an index build rewrites none, so a
+// table past the ceiling must not turn an index-only PR into one that can
+// never merge.
+func TestEnginePlanOversizedTableIndexOnlyDiffHasNoBlockedChange(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_oversized_index_only_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY, email text)")
+	require.NoError(t, err)
+	req := &engine.PlanRequest{
+		Database: "plan_oversized_index_only_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text); CREATE INDEX users_email_idx ON users (email)",
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	result, err := NewWithTableSizeLimit(1).Plan(t.Context(), req)
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 1, "an index-only diff plans as the index build alone")
+	index := result.Changes[0].TableChanges[0]
+	assert.Equal(t, "users", index.Table)
+	assert.Empty(t, index.ExecutionMode, "the only change must be executable, not blocked")
+	assert.Empty(t, index.ModeReason)
+	assert.Contains(t, index.DDL, "CREATE INDEX CONCURRENTLY")
+	assert.Contains(t, index.DDL, "users_email_idx")
+}
+
 // TestEnginePlanCreateTableIgnoresSizeCeiling proves the native-safe table
 // size ceiling never blocks a greenfield CREATE TABLE: the ceiling bounds
 // rewrites of existing data, and a table that does not exist yet has none —
@@ -464,6 +556,32 @@ func TestEnginePlanUndeclaredTableIsBlockedDrop(t *testing.T) {
 	for _, table := range []string{"legacy_users", "orders", "regions", "warehouses", "scratch", "users_history", "_settings", "audit_log_archive_2019", "ext_owned_config"} {
 		assert.True(t, testutil.PostgresTableExists(t, db, "public", table), "planning must never touch the target")
 	}
+}
+
+// TestEnginePlanEmptyNamespaceSurfacesAllLiveTables proves an explicitly empty
+// namespace remains a destructive divergence rather than a no-changes plan.
+func TestEnginePlanEmptyNamespaceSurfacesAllLiveTables(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_empty_namespace_test")
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE public.users (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	result, err := New().Plan(t.Context(), &engine.PlanRequest{
+		Database: "plan_empty_namespace_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err)
+	assert.False(t, result.NoChanges)
+	require.Len(t, result.Changes, 1)
+	assert.Equal(t, "public", result.Changes[0].Namespace)
+	require.Len(t, result.Changes[0].TableChanges, 1)
+	change := result.Changes[0].TableChanges[0]
+	assert.Equal(t, "users", change.Table)
+	assert.Equal(t, "DROP TABLE public.users", change.DDL)
+	assert.Equal(t, ddl.StatementDropTable, change.Operation)
+	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
 }
 
 // TestEnginePlanUndeclaredTableInMissingSchema proves a namespace whose
@@ -849,6 +967,37 @@ func TestEngineApplyTableSizeRefusal(t *testing.T) {
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "refused", progress.Metadata["phase"])
 	assert.False(t, progress.Retryable, "a size refusal is permanent until the ceiling or target changes")
+	assert.Contains(t, progress.ErrorMessage, "1-byte threshold")
+}
+
+// TestEngineApplyOversizedTableUsesKindSpecificBounds proves a concurrent
+// index build completes under its duration envelope on a table above the
+// rewrite ceiling, while a native ALTER on that table remains refused.
+func TestEngineApplyOversizedTableUsesKindSpecificBounds(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "oversized_kind_bounds_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY, email text)")
+	require.NoError(t, err)
+
+	eng := NewWithOptions(1, postgresApplyDeadline)
+	result, err := eng.Apply(t.Context(), applyRequest(dsn, "users",
+		"CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)"))
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	progress := awaitPostgresProgress(t, eng, "users")
+	assert.Equal(t, engine.StateCompleted, progress.State)
+
+	var valid bool
+	err = db.QueryRowContext(t.Context(),
+		`SELECT i.indisvalid FROM pg_index i WHERE i.indexrelid = 'public.users_email_idx'::regclass`).Scan(&valid)
+	require.NoError(t, err)
+	assert.True(t, valid)
+
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "users", "ALTER TABLE public.users ADD COLUMN nickname text"))
+	require.NoError(t, err)
+	progress = awaitPostgresProgress(t, eng, "users")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable)
 	assert.Contains(t, progress.ErrorMessage, "1-byte threshold")
 }
 
