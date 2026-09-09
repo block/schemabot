@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"log/slog"
 	"math"
 	"regexp"
 	"strconv"
@@ -29,6 +30,9 @@ type ProgressData struct {
 	ErrorMessage   string
 	StartedAt      string // RFC3339 format
 	CompletedAt    string // RFC3339 format
+	Step           int
+	StepsTotal     int
+	Statement      string
 	Operations     []ProgressOperation
 	Tables         []TableProgress
 	Options        map[string]string // Apply options (defer_cutover, skip_revert, etc.)
@@ -160,6 +164,11 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		Options:        result.Options,
 		Metadata:       result.Metadata,
 		Released:       result.Released,
+	}
+	if step, err := apitypes.ParseProgressStep(result.Metadata); err != nil {
+		slog.Warn("progress output omits the statement position because the progress metadata is malformed", "apply_id", result.ApplyID, "error", err)
+	} else {
+		data.Step, data.StepsTotal, data.Statement = step.Step, step.StepsTotal, step.Statement
 	}
 	dialect := schema.DialectForDatabaseType(result.DatabaseType)
 

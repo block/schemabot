@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -18,6 +19,8 @@ import (
 	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/progress"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -114,6 +117,100 @@ func TestClassifyRefusal(t *testing.T) {
 			wantNotDetail: []string{"step 1 of 1"},
 		},
 		{
+			name: "create name mismatch names the relations and leaves the table standing",
+			err: fmt.Errorf("execute: %w", &executor.SequenceStepError{
+				Step: 1, Total: 3, Err: &executor.CreateNameMismatchError{
+					Schema: "public", Table: "users",
+					Missing:   []string{"users_pkey", "users_id_seq"},
+					Unclaimed: []string{"users_pkey1", "users_id_seq1"},
+				},
+			}),
+			wantReason: "create-name-mismatch",
+			wantDetail: []string{
+				`the CREATE TABLE for "users" committed`,
+				`"users_pkey", "users_id_seq"`,
+				`owns "users_pkey1", "users_id_seq1" instead`,
+				"step 1 of 3 failed",
+				createNameMismatchRemedy,
+			},
+			wantNotDetail: []string{"after the CREATE TABLE committed"},
+		},
+		{
+			name: "create name mismatch identifiers are sanitized for Markdown",
+			err: &executor.CreateNameMismatchError{
+				Schema: "public", Table: "users",
+				Missing:   []string{"users|pkey"},
+				Unclaimed: []string{"users\npkey1"},
+			},
+			wantReason:    "create-name-mismatch",
+			wantDetail:    []string{`"users/pkey"`, `"users\npkey1"`},
+			wantNotDetail: []string{"|", "\n"},
+		},
+		{
+			name:       "bare create name mismatch code still refuses",
+			err:        fmt.Errorf("execute: %w", executor.ErrCreateNameMismatch),
+			wantReason: "create-name-mismatch",
+			wantDetail: []string{`the CREATE TABLE for "users" committed`, "suffixed name", createNameMismatchRemedy},
+		},
+		{
+			name: "unverified create names refuse because a retry collides with the committed table",
+			err: fmt.Errorf("execute: %w", &executor.SequenceStepError{
+				Step: 1, Total: 2, Err: fmt.Errorf("%w: %w", executor.ErrCreateNamesUnverified, context.Canceled),
+			}),
+			wantReason: "create-names-unverified",
+			wantDetail: []string{
+				`the CREATE TABLE for "users" committed`,
+				"could not be read",
+				"step 1 of 2 failed",
+				"compare the table's constraint-index and sequence names against the schema file, then " + replanRemedy,
+			},
+			wantNotDetail: []string{context.Canceled.Error()},
+		},
+		{
+			name: "unverified create names keep their verdict when the read-back found no table at the name",
+			err: fmt.Errorf("execute: %w", &executor.SequenceStepError{
+				Step: 1, Total: 2, Err: fmt.Errorf("%w: public.users: %w", executor.ErrCreateNamesUnverified,
+					fmt.Errorf("%w: public.users", preflight.ErrTableNotFound)),
+			}),
+			wantReason:    "create-names-unverified",
+			wantDetail:    []string{`the CREATE TABLE for "users" committed`, "could not be read"},
+			wantNotDetail: []string{"does not exist on the target"},
+		},
+		{
+			name: "unverified create names keep their verdict when the read-back found a non-table at the name",
+			err: fmt.Errorf("execute: %w", &executor.SequenceStepError{
+				Step: 1, Total: 2, Err: fmt.Errorf("%w: public.users: %w", executor.ErrCreateNamesUnverified,
+					fmt.Errorf("%w: public.users has relkind %q", preflight.ErrNotTable, "v")),
+			}),
+			wantReason:    "create-names-unverified",
+			wantDetail:    []string{`the CREATE TABLE for "users" committed`, "could not be read"},
+			wantNotDetail: []string{"is not an ordinary or partitioned table"},
+		},
+		{
+			name: "create name mismatch with nothing owned unclaimed omits the owned clause",
+			err: &executor.CreateNameMismatchError{
+				Schema: "public", Table: "users",
+				Missing: []string{"users_pkey"},
+			},
+			wantReason:    "create-name-mismatch",
+			wantDetail:    []string{`does not own "users_pkey" the schema file claims`, createNameMismatchRemedy},
+			wantNotDetail: []string{"instead", "no name"},
+		},
+		{
+			name: "create name mismatch enumerates a bounded prefix of a wide table's names",
+			err: &executor.CreateNameMismatchError{
+				Schema: "public", Table: "users",
+				Missing:   []string{"users_a_key", "users_b_key", "users_c_key", "users_d_key", "users_e_key"},
+				Unclaimed: []string{"users_a_key1", "users_b_key1", "users_c_key1", "users_d_key1", "users_e_key1"},
+			},
+			wantReason: "create-name-mismatch",
+			wantDetail: []string{
+				`does not own "users_a_key", "users_b_key", "users_c_key", and 2 more the schema file claims`,
+				`owns "users_a_key1", "users_b_key1", "users_c_key1", and 2 more instead`,
+			},
+			wantNotDetail: []string{"users_d_key", "users_e_key"},
+		},
+		{
 			name:       "invariant violation fails closed as a refusal",
 			err:        fmt.Errorf("execute: %w", executor.ErrInvariantViolation),
 			wantReason: "engine-invariant-violation",
@@ -172,6 +269,23 @@ func TestClassifyRefusal(t *testing.T) {
 			wantReason: "not-native-safe-budget-exceeded",
 		},
 		{
+			name: "concurrent build that ran past its bound and left nothing is a refusal naming the option",
+			err: fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", "users",
+				nameConcurrentIndexBound(&executor.BudgetError{Cause: executor.CauseStatement, Budget: 36 * time.Hour}, 36*time.Hour, 36*time.Hour)),
+			wantReason:    "concurrent-index-bound-exceeded",
+			wantDetail:    []string{"ran past postgres.concurrent_index_max_duration (36h0m0s)", "raise postgres.concurrent_index_max_duration and re-run"},
+			wantNotDetail: []string{"statement budget", replanRemedy},
+		},
+		{
+			name: "bound ending the executor's catalog reads ahead of the build is the same refusal",
+			err: fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", "users",
+				nameConcurrentIndexBound(fmt.Errorf("resolve target: %w", &pgconn.PgError{Code: sqlstateQueryCanceled}),
+					36*time.Hour, 36*time.Hour+time.Second)),
+			wantReason:    "concurrent-index-bound-exceeded",
+			wantDetail:    []string{"ran past postgres.concurrent_index_max_duration (36h0m0s)", "raise postgres.concurrent_index_max_duration and re-run"},
+			wantNotDetail: []string{"statement budget", replanRemedy},
+		},
+		{
 			name: "lock budget exhaustion is operational",
 			err:  fmt.Errorf("execute: %w", &executor.BudgetError{Cause: executor.CauseLock, Budget: time.Second}),
 		},
@@ -183,6 +297,16 @@ func TestClassifyRefusal(t *testing.T) {
 				Build:   &executor.BudgetError{Cause: executor.CauseStatement, Budget: time.Second},
 				Cleanup: executor.ErrBuildLeftInvalidIndex,
 			}),
+		},
+		{
+			name: "invalid-index verdict stays operational when the bound wrapper names it",
+			err: fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", "users",
+				nameConcurrentIndexBound(&executor.InvalidIndexError{
+					Schema:  "public",
+					Index:   "big_ref_idx",
+					Build:   &executor.BudgetError{Cause: executor.CauseStatement, Budget: 36 * time.Hour},
+					Cleanup: executor.ErrBuildLeftInvalidIndex,
+				}, 36*time.Hour, 36*time.Hour)),
 		},
 		{
 			name:       "oversized table is a refusal",
@@ -281,6 +405,32 @@ func TestCreateCollisionRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 			assert.LessOrEqual(t, lead+len(createCollisionLead), statusReasonKeptWidth, r.detail)
 		})
 	}
+}
+
+// The mismatch cause carries the identifiers the remedy acts on, so unlike
+// the collision detail it cannot promise its remedy's lead for a table name
+// of any legal length: three maximal identifiers alone overrun the clamp.
+// What it does promise is that the enumeration is bounded — a wide table
+// cannot push the whole remedy out by owning more names — and that for the
+// shape a real table produces, a primary key and a serial column with their
+// suffixed twins, the lead that names the first action still lands inside
+// the clamp.
+func TestCreateNameMismatchRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
+	const lead = "; free the first-choice name"
+	err := fmt.Errorf("execute: %w", &executor.SequenceStepError{
+		Step: 1, Total: 3, Err: &executor.CreateNameMismatchError{
+			Schema: "public", Table: "users",
+			Missing:   []string{"users_pkey", "users_id_seq"},
+			Unclaimed: []string{"users_pkey1", "users_id_seq1"},
+		},
+	})
+
+	r := classifyRefusal(err, "users")
+
+	require.NotNil(t, r)
+	at := strings.Index(r.detail, lead)
+	require.GreaterOrEqual(t, at, 0, r.detail)
+	assert.LessOrEqual(t, at+len(lead), statusReasonKeptWidth, r.detail)
 }
 
 func TestCreateCollisionRefusalFitsStatusReasonColumn(t *testing.T) {
@@ -479,7 +629,7 @@ func TestProgressReportsExecutorStepPosition(t *testing.T) {
 	eng := New()
 	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE public.widgets (id bigint PRIMARY KEY)", steps: 3}
 	tracker := newTestTracker(t)
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, slog.Default())
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, slog.Default(), false, nil)
 	req := &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: "task-a"}}
 
 	before, err := eng.Progress(t.Context(), req)
@@ -487,6 +637,9 @@ func TestProgressReportsExecutorStepPosition(t *testing.T) {
 	assert.Equal(t, "1", before.Metadata["step"], "before the executor reports, the record keeps the planned first step")
 	assert.Equal(t, "3", before.Metadata["steps_total"])
 	assert.NotContains(t, before.Metadata, "statement")
+	for _, key := range []string{"executor_operation", "server_phase", "attempt", "blocks_done", "blocks_total", "tuples_done", "tuples_total", "lockers_done", "lockers_total"} {
+		assert.NotContains(t, before.Metadata, key)
+	}
 
 	tracker.Start(3, progress.OperationAdmitting)
 	tracker.StartStep(2, progress.OperationBrief, "CREATE INDEX widgets_name_idx\n\tON public.widgets ((first_name || ' ' ||\x00 last_name))")
@@ -499,6 +652,34 @@ func TestProgressReportsExecutorStepPosition(t *testing.T) {
 	assert.Equal(t, "CREATE INDEX widgets_name_idx ON public.widgets ((first_name || ' ' || last_name))", during.Metadata["statement"],
 		"the statement collapses whitespace and drops control runes but keeps its SQL operators intact")
 	assert.Equal(t, change.sql, during.Tables[0].DDL, "the table's DDL stays the planned change, not the step in flight")
+}
+
+// TestProgressMetadataIsStableWhilePositionIsUnchanged pins the contract the
+// driver's persistence relies on: two polls of a running apply whose executor
+// position has not moved return identical metadata, so the driver's
+// change detection sees no difference and writes nothing. A field derived
+// from the wall clock would differ on every poll and defeat that check.
+func TestProgressMetadataIsStableWhilePositionIsUnchanged(t *testing.T) {
+	eng := New()
+	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE public.widgets (id bigint PRIMARY KEY)", steps: 3}
+	tracker := newTestTracker(t)
+	tracker.Start(3, progress.OperationAdmitting)
+	tracker.StartStep(2, progress.OperationBrief, "CREATE INDEX widgets_name_idx ON public.widgets (name)")
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now().Add(-time.Minute), change, ""), tracker, slog.Default(), false, nil)
+	req := &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: "task-a"}}
+
+	first, err := eng.Progress(t.Context(), req)
+	require.NoError(t, err)
+	time.Sleep(2 * time.Millisecond)
+	second, err := eng.Progress(t.Context(), req)
+	require.NoError(t, err)
+
+	assert.Equal(t, map[string]string{
+		"phase": "preflight", "step": "2", "steps_total": "3",
+		"statement":          "CREATE INDEX widgets_name_idx ON public.widgets (name)",
+		"executor_operation": string(progress.OperationBrief),
+	}, first.Metadata)
+	assert.Equal(t, first.Metadata, second.Metadata)
 }
 
 // TestSanitizeStatementText pins the statement metadata contract: one line,
@@ -531,13 +712,13 @@ func TestPublishProgressKeepsTerminalPositionAsPublished(t *testing.T) {
 	eng := New()
 	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE public.widgets (id bigint PRIMARY KEY)", steps: 2}
 	tracker := newTestTracker(t)
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, slog.Default())
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, slog.Default(), false, nil)
 	tracker.Start(2, progress.OperationAdmitting)
 	tracker.StartStep(2, progress.OperationBrief, "CREATE INDEX widgets_name_idx ON public.widgets (name)")
 	tracker.Finish(errors.New("boom"))
 
 	terminal := progressResult(engine.StateFailed, "failed", time.Now(), change, "detail")
-	require.NoError(t, executorProgressMetadata(t.Context(), tracker, terminal.Metadata))
+	require.NoError(t, executorProgressMetadata(t.Context(), tracker, terminal))
 	eng.publishProgress("task-a", terminal, slog.Default())
 
 	got, err := eng.Progress(t.Context(), &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: "task-a"}})
@@ -560,16 +741,34 @@ const backgroundApplyDeadline = 10 * time.Second
 // returns whatever outcome the test scripted.
 type scriptedExecutor struct {
 	trackers    chan *progress.Tracker
+	envelopes   chan applyEnvelope
 	released    chan struct{}
 	releaseOnce sync.Once
 	run         func(tracker *progress.Tracker) error
 }
 
-func newScriptedExecutor(run func(tracker *progress.Tracker) error) *scriptedExecutor {
-	return &scriptedExecutor{trackers: make(chan *progress.Tracker, 1), released: make(chan struct{}), run: run}
+// applyEnvelope is what the drive handed the executor: the change as the
+// drive resolved it and the deadline of the context it runs under, read at
+// observed so a test can measure the time the drive granted.
+type applyEnvelope struct {
+	change      nativeApply
+	deadline    time.Time
+	hasDeadline bool
+	observed    time.Time
 }
 
-func (s *scriptedExecutor) execute(ctx context.Context, _ targetConn, _ nativeApply, _ int64, tracker *progress.Tracker, _ *slog.Logger) error {
+func newScriptedExecutor(run func(tracker *progress.Tracker) error) *scriptedExecutor {
+	return &scriptedExecutor{
+		trackers:  make(chan *progress.Tracker, 1),
+		envelopes: make(chan applyEnvelope, 1),
+		released:  make(chan struct{}),
+		run:       run,
+	}
+}
+
+func (s *scriptedExecutor) execute(ctx context.Context, _ targetConn, change nativeApply, _ int64, tracker *progress.Tracker, _ *slog.Logger) error {
+	deadline, hasDeadline := ctx.Deadline()
+	s.envelopes <- applyEnvelope{change: change, deadline: deadline, hasDeadline: hasDeadline, observed: time.Now()}
 	s.trackers <- tracker
 	select {
 	case <-s.released:
@@ -600,12 +799,33 @@ func (s *scriptedExecutor) tracker(t *testing.T) *progress.Tracker {
 	}
 }
 
-// applyAlterUsers wires scripted in as eng's executor and accepts one
-// native-safe change through Apply under key, logging to logger, with
-// credentials the executor never dials. When the test ends the executor is
-// released and the engine drained, in that order, so a drive parked at the
-// executor cannot outlive the test or hold Drain open.
+// envelope returns what the drive handed the executor, failing the test if
+// the drive never reached it.
+func (s *scriptedExecutor) envelope(t *testing.T) applyEnvelope {
+	t.Helper()
+	select {
+	case env := <-s.envelopes:
+		require.True(t, env.hasDeadline, "the drive must bound the executor's context")
+		return env
+	case <-time.After(backgroundApplyDeadline):
+		t.Fatal("the background drive never reached the executor")
+		return applyEnvelope{}
+	}
+}
+
+// applyAlterUsers accepts one native-safe ALTER on public.users through
+// applyChange.
 func applyAlterUsers(t *testing.T, eng *Engine, scripted *scriptedExecutor, key string, logger *slog.Logger) {
+	t.Helper()
+	applyChange(t, eng, scripted, key, "ALTER TABLE public.users ADD COLUMN email text", logger)
+}
+
+// applyChange wires scripted in as eng's executor and accepts one change on
+// public.users through Apply under key, logging to logger, with credentials
+// the executor never dials. When the test ends the executor is released and
+// the engine drained, in that order, so a drive parked at the executor
+// cannot outlive the test or hold Drain open.
+func applyChange(t *testing.T, eng *Engine, scripted *scriptedExecutor, key, ddl string, logger *slog.Logger) {
 	t.Helper()
 	eng.execute = scripted.execute
 	t.Cleanup(eng.Drain)
@@ -615,7 +835,7 @@ func applyAlterUsers(t *testing.T, eng *Engine, scripted *scriptedExecutor, key 
 		Changes: []engine.SchemaChange{{
 			Namespace: "public",
 			TableChanges: []engine.TableChange{{
-				Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN email text",
+				Table: "users", DDL: ddl,
 			}},
 		}},
 		Credentials: &engine.Credentials{DSN: "postgres://schemabot:secret@db.invalid/app?sslmode=disable"},
@@ -673,6 +893,140 @@ func TestApplyRegistersExecutorTracker(t *testing.T) {
 	assert.Equal(t, "2", terminal.Metadata["step"], "the terminal result carries the position the executor finished at")
 	assert.Equal(t, "2", terminal.Metadata["steps_total"])
 	assert.Equal(t, "ALTER TABLE public.users ADD COLUMN email text", terminal.Metadata["statement"])
+}
+
+// An executor cancellation is this apply's operator cancellation only when
+// the engine recorded that it sent the signal. The invalid leftover remains
+// named so the next drive can recover it.
+func TestApplyClassifiesRequestedConcurrentBuildCancel(t *testing.T) {
+	scripted := newScriptedExecutor(func(tracker *progress.Tracker) error {
+		tracker.Finish(errors.New("cancelled"))
+		return &executor.InvalidIndexError{
+			Schema: "public", Index: "users_email_idx", Table: "users",
+			Build: executor.ErrCancelledExternally, Cleanup: executor.ErrBuildLeftInvalidIndex,
+		}
+	})
+	eng := New()
+	const key = "task-a"
+	applyAlterUsers(t, eng, scripted, key, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	scripted.tracker(t)
+	eng.mu.Lock()
+	eng.progress[key].cancelRequested = true
+	eng.mu.Unlock()
+	scripted.release()
+
+	require.Eventually(t, func() bool {
+		return pollProgress(t, eng, key).State.IsTerminal()
+	}, backgroundApplyDeadline, 10*time.Millisecond)
+	terminal := pollProgress(t, eng, key)
+	assert.Equal(t, engine.StateCancelled, terminal.State)
+	assert.Contains(t, terminal.ErrorMessage, "users_email_idx")
+}
+
+// A build cancelled from outside SchemaBot — an operator's pg_cancel_backend,
+// a connection reaper — is not a cancel nobody asked for: with no cancel
+// recorded on the apply it is a retryable failure whose leftover index the
+// next drive recovers.
+func TestApplyTreatsAnUnrequestedCancellationAsAFailure(t *testing.T) {
+	scripted := newScriptedExecutor(func(tracker *progress.Tracker) error {
+		tracker.Finish(errors.New("cancelled"))
+		return &executor.InvalidIndexError{
+			Schema: "public", Index: "users_email_idx", Table: "users",
+			Build: executor.ErrCancelledExternally, Cleanup: executor.ErrBuildLeftInvalidIndex,
+		}
+	})
+	eng := New()
+	const key = "task-a"
+	applyAlterUsers(t, eng, scripted, key, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	scripted.tracker(t)
+	scripted.release()
+
+	require.Eventually(t, func() bool {
+		return pollProgress(t, eng, key).State.IsTerminal()
+	}, backgroundApplyDeadline, 10*time.Millisecond)
+	terminal := pollProgress(t, eng, key)
+	assert.Equal(t, engine.StateFailed, terminal.State)
+	assert.True(t, terminal.Retryable)
+	assert.Contains(t, terminal.ErrorMessage, "users_email_idx")
+}
+
+const concurrentIndexDDL = "CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)"
+
+// applyConcurrentIndex accepts one concurrent index build on public.users
+// through applyChange.
+func applyConcurrentIndex(t *testing.T, eng *Engine, scripted *scriptedExecutor, key string) {
+	t.Helper()
+	applyChange(t, eng, scripted, key, concurrentIndexDDL, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+// A cancel issued while the drive has not yet reserved a build backend cannot
+// signal anything, so the engine ends the drive's own context; the executor
+// returns the cancellation, the drive publishes it as this cancel, and the
+// cancel is answered from that outcome.
+func TestCancelEndsAConcurrentBuildThroughTheApplyDrive(t *testing.T) {
+	scripted := newScriptedExecutor(func(*progress.Tracker) error {
+		return errors.New("the executor must be ended by its context, not released")
+	})
+	eng := New()
+	const key = "task-a"
+	applyConcurrentIndex(t, eng, scripted, key)
+	scripted.tracker(t)
+
+	result, err := eng.Cancel(t.Context(), &engine.ControlRequest{ResumeState: &engine.ResumeState{MigrationContext: key}})
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+
+	terminal := pollProgress(t, eng, key)
+	assert.Equal(t, engine.StateCancelled, terminal.State)
+	assert.Equal(t, "Concurrent index build cancelled", terminal.ErrorMessage)
+}
+
+// A halt for shutdown ends a running concurrent build without recording a
+// cancel: the outcome the drive publishes is the executor's failure, so the
+// apply stays active for another driver to claim and recover the leftover.
+func TestHaltForShutdownEndsConcurrentBuildsWithoutRecordingACancel(t *testing.T) {
+	scripted := newScriptedExecutor(func(*progress.Tracker) error {
+		return errors.New("the executor must be ended by its context, not released")
+	})
+	eng := New()
+	const key = "task-a"
+	applyConcurrentIndex(t, eng, scripted, key)
+	scripted.tracker(t)
+
+	ctx, cancel := context.WithTimeout(t.Context(), backgroundApplyDeadline)
+	defer cancel()
+	require.NoError(t, eng.HaltForShutdown(ctx))
+
+	terminal := pollProgress(t, eng, key)
+	assert.True(t, terminal.State.IsTerminal(), "the halted drive must have published before the halt returned")
+	assert.NotEqual(t, engine.StateCancelled, terminal.State, "a halt is not an operator cancel")
+}
+
+// A halt for shutdown leaves plain DDL to finish, so a statement that will not
+// return within the shutdown budget is reported as still holding the target
+// rather than interrupted.
+func TestHaltForShutdownLeavesPlainDDLToFinish(t *testing.T) {
+	scripted := newScriptedExecutor(func(tracker *progress.Tracker) error {
+		tracker.Finish(nil)
+		return nil
+	})
+	eng := New()
+	const key = "task-a"
+	applyAlterUsers(t, eng, scripted, key, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	scripted.tracker(t)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	err := eng.HaltForShutdown(ctx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Contains(t, err.Error(), "still running on the target")
+	assert.Equal(t, engine.StateRunning, pollProgress(t, eng, key).State, "plain DDL is not interrupted by a halt")
+
+	scripted.release()
+	require.Eventually(t, func() bool {
+		return pollProgress(t, eng, key).State.IsTerminal()
+	}, backgroundApplyDeadline, 10*time.Millisecond)
+	assert.Equal(t, engine.StateCompleted, pollProgress(t, eng, key).State)
 }
 
 // TestTerminalPublishReportsAnUnfinishedExecutorBuild pins the guard on the
@@ -741,7 +1095,7 @@ func TestProgressReadsTheTrackerOutsideTheEngineLock(t *testing.T) {
 	session := &blockingProgressSession{started: make(chan struct{}), release: make(chan struct{})}
 	tracker.SetConcurrentBuild(session, 42)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, logger)
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, logger, false, nil)
 
 	polled := make(chan error, 1)
 	go func() {
@@ -757,7 +1111,7 @@ func TestProgressReadsTheTrackerOutsideTheEngineLock(t *testing.T) {
 	claimed := make(chan struct{})
 	go func() {
 		defer close(claimed)
-		eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), newTestTracker(t), logger)
+		eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), newTestTracker(t), logger, false, nil)
 		eng.publishProgress("task-b", progressResult(engine.StateCompleted, "completed", time.Now(), change, ""), logger)
 	}()
 	select {
@@ -783,7 +1137,7 @@ func TestProgressNeverReadsTheTrackerForATerminalApply(t *testing.T) {
 	eng := New()
 	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE public.widgets (id bigint PRIMARY KEY)", steps: 2}
 	tracker, session := activeBuildTracker(t, errors.New("progress view unavailable"))
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, slog.Default())
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, slog.Default(), false, nil)
 	terminal := progressResult(engine.StateFailed, "failed", time.Now(), change, "detail")
 	terminal.Metadata["step"] = "2"
 	eng.publishProgress("task-a", terminal, slog.Default())
@@ -833,6 +1187,275 @@ type failingRow struct{ err error }
 
 func (r failingRow) Scan(...any) error { return r.err }
 
+// indexProgressRow is one row of pg_stat_progress_create_index as pg-sprite
+// scans it: phase, blocks, tuples, lockers, then the current locker's PID.
+type indexProgressRow struct {
+	phase                     string
+	blocksDone, blocksTotal   uint64
+	tuplesDone, tuplesTotal   uint64
+	lockersTotal, lockersDone uint64
+	currentLockerPID          int32
+}
+
+func (r indexProgressRow) Scan(dest ...any) error {
+	*(dest[0].(*string)) = r.phase
+	*(dest[1].(*uint64)) = r.blocksDone
+	*(dest[2].(*uint64)) = r.blocksTotal
+	*(dest[3].(*uint64)) = r.tuplesDone
+	*(dest[4].(*uint64)) = r.tuplesTotal
+	*(dest[5].(*uint64)) = r.lockersTotal
+	*(dest[6].(*uint64)) = r.lockersDone
+	pid := r.currentLockerPID
+	*(dest[7].(**int32)) = &pid
+	return nil
+}
+
+// heapScanRow is a btree build part-way through its first heap scan.
+var heapScanRow = indexProgressRow{
+	phase: "building index: scanning table", blocksDone: 25, blocksTotal: 40,
+	tuplesDone: 12, tuplesTotal: 30, lockersTotal: 4, lockersDone: 2, currentLockerPID: 31337,
+}
+
+// publishedIndexProgressSession answers every progress read with the row it
+// currently holds, or with no row at all when the build has left the view.
+type publishedIndexProgressSession struct {
+	row    *indexProgressRow
+	onRead func()
+}
+
+func (s *publishedIndexProgressSession) QueryRow(context.Context, string, ...any) pgx.Row {
+	if s.onRead != nil {
+		s.onRead()
+	}
+	if s.row == nil {
+		return failingRow{err: pgx.ErrNoRows}
+	}
+	return *s.row
+}
+
+func claimRunningIndexBuild(t *testing.T, eng *Engine, session *publishedIndexProgressSession) *progress.Tracker {
+	t.Helper()
+	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE INDEX widgets_name_idx ON public.widgets (name)", steps: 2}
+	tracker := newTestTracker(t)
+	tracker.Start(2, progress.OperationAdmitting)
+	tracker.StartStep(2, progress.OperationConcurrentIndex, "CREATE INDEX CONCURRENTLY widgets_name_idx ON public.widgets (name)")
+	tracker.SetAttempt(3)
+	tracker.SetConcurrentBuild(session, 42)
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "running", time.Now(), change, ""), tracker, slog.Default(), false, nil)
+	return tracker
+}
+
+func pollRunningIndexBuild(t *testing.T, eng *Engine) *engine.ProgressResult {
+	t.Helper()
+	got, err := eng.Progress(t.Context(), &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: "task-a"}})
+	require.NoError(t, err)
+	return got
+}
+
+// TestProgressReportsExecutorDetailAndBuildPercent proves a poll during a
+// concurrent index build carries the executor's operation class and attempt,
+// the server's phase and every counter of its progress row, and a percent
+// that places the phase's block position on the whole build's scale, on the
+// apply and its table alike.
+func TestProgressReportsExecutorDetailAndBuildPercent(t *testing.T) {
+	eng := New()
+	row := heapScanRow
+	claimRunningIndexBuild(t, eng, &publishedIndexProgressSession{row: &row})
+
+	got := pollRunningIndexBuild(t, eng)
+	assert.Equal(t, "concurrent-index-build", got.Metadata["executor_operation"])
+	assert.Equal(t, "building index: scanning table", got.Metadata["server_phase"])
+	assert.Equal(t, "3", got.Metadata["attempt"])
+	assert.Equal(t, "25", got.Metadata["blocks_done"])
+	assert.Equal(t, "40", got.Metadata["blocks_total"])
+	assert.Equal(t, "12", got.Metadata["tuples_done"])
+	assert.Equal(t, "30", got.Metadata["tuples_total"])
+	assert.Equal(t, "2", got.Metadata["lockers_done"])
+	assert.Equal(t, "4", got.Metadata["lockers_total"])
+	assert.NotContains(t, got.Metadata, "current_locker_pid")
+	assert.Equal(t, 25, got.Tables[0].Progress, "25 of 40 heap blocks inside the 0–40 band of the first heap scan")
+	assert.Equal(t, got.Tables[0].Progress, got.Progress, "the apply and its table report the same percent")
+}
+
+// TestProgressReportsHonestZerosWhileWaitingForWriters proves a phase that
+// publishes no block work still reports every counter: a build parked behind
+// writers reports zero lockers cleared and zero blocks, not missing keys, and
+// its percent is the phase's position on the whole build, not a division of
+// the zero block total.
+func TestProgressReportsHonestZerosWhileWaitingForWriters(t *testing.T) {
+	eng := New()
+	row := indexProgressRow{phase: "waiting for writers before validation", lockersTotal: 3}
+	claimRunningIndexBuild(t, eng, &publishedIndexProgressSession{row: &row})
+
+	got := pollRunningIndexBuild(t, eng)
+	assert.Equal(t, "0", got.Metadata["lockers_done"])
+	assert.Equal(t, "3", got.Metadata["lockers_total"])
+	assert.Equal(t, "0", got.Metadata["blocks_done"])
+	assert.Equal(t, "0", got.Metadata["blocks_total"])
+	assert.Equal(t, "0", got.Metadata["tuples_done"])
+	assert.Equal(t, "0", got.Metadata["tuples_total"])
+	assert.Equal(t, 60, got.Tables[0].Progress, "the first heap scan is behind it, validation ahead of it")
+	assert.Equal(t, 60, got.Progress)
+}
+
+// TestProgressKeepsLastKnownPercentWithoutABuildRow proves the derived
+// percent is part of the last-known position: once a poll has placed the
+// build on the whole scale, a later poll that finds no progress row — the
+// build between phases, its session released, or the view unreadable —
+// answers with that percent instead of the record's pre-execution zero, and
+// the next row moves it forward again.
+func TestProgressKeepsLastKnownPercentWithoutABuildRow(t *testing.T) {
+	eng := New()
+	row := heapScanRow
+	session := &publishedIndexProgressSession{row: &row}
+	claimRunningIndexBuild(t, eng, session)
+	require.Equal(t, 25, pollRunningIndexBuild(t, eng).Tables[0].Progress)
+
+	session.row = nil
+	got := pollRunningIndexBuild(t, eng)
+	assert.Equal(t, 25, got.Tables[0].Progress, "no row keeps the last-known percent")
+	assert.Equal(t, 25, got.Progress)
+	assert.NotContains(t, got.Metadata, "blocks_done", "no row publishes no counters")
+
+	validation := indexProgressRow{phase: "index validation: scanning table", blocksDone: 40, blocksTotal: 40}
+	session.row = &validation
+	got = pollRunningIndexBuild(t, eng)
+	assert.Equal(t, 95, got.Tables[0].Progress, "a completed validation scan stays below 100 until the apply completes")
+	assert.Equal(t, "40", got.Metadata["blocks_done"])
+}
+
+// TestProgressNeverRegressesWithinABuild proves a row that derives a lower
+// percent than the record already carries is a stale reading — a build
+// moves through its phases in one direction — so the poll answers with the
+// record's percent and the record keeps it, rather than the earlier reading
+// being pinned as the last-known position.
+func TestProgressNeverRegressesWithinABuild(t *testing.T) {
+	eng := New()
+	validation := indexProgressRow{phase: "index validation: scanning table", blocksDone: 40, blocksTotal: 40}
+	session := &publishedIndexProgressSession{row: &validation}
+	claimRunningIndexBuild(t, eng, session)
+	require.Equal(t, 95, pollRunningIndexBuild(t, eng).Tables[0].Progress)
+
+	stale := heapScanRow
+	session.row = &stale
+	got := pollRunningIndexBuild(t, eng)
+	assert.Equal(t, 95, got.Tables[0].Progress, "a row from an earlier phase does not pull the percent back")
+	assert.Equal(t, 95, got.Progress)
+	assert.Equal(t, "25", got.Metadata["blocks_done"], "the counters still report the row that was read")
+
+	session.row = nil
+	got = pollRunningIndexBuild(t, eng)
+	assert.Equal(t, 95, got.Tables[0].Progress, "the record kept the later position")
+	assert.Equal(t, 95, got.Progress)
+}
+
+func TestProgressStraddlingATerminalPublishDoesNotFloorToTheRetiredRecord(t *testing.T) {
+	eng := New()
+	validation := indexProgressRow{phase: "index validation: scanning table", blocksDone: 40, blocksTotal: 40}
+	session := &publishedIndexProgressSession{row: &validation}
+	claimRunningIndexBuild(t, eng, session)
+	require.Equal(t, 95, pollRunningIndexBuild(t, eng).Progress)
+
+	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE INDEX widgets_name_idx ON public.widgets (name)", steps: 2}
+	heapScan := heapScanRow
+	session.row = &heapScan
+	session.onRead = func() {
+		session.onRead = nil
+		eng.publishProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), change, ""), slog.Default())
+	}
+	got := pollRunningIndexBuild(t, eng)
+	assert.Equal(t, engine.StateRunning, got.State)
+	assert.Equal(t, 25, got.Progress)
+	assert.Equal(t, 25, got.Tables[0].Progress)
+
+	got = pollRunningIndexBuild(t, eng)
+	assert.Equal(t, engine.StateCompleted, got.State)
+	assert.Equal(t, 100, got.Progress)
+	assert.Equal(t, 100, got.Tables[0].Progress)
+}
+
+func TestProgressStraddlingAReclaimDoesNotFloorToTheRetiredRecord(t *testing.T) {
+	eng := New()
+	validation := indexProgressRow{phase: "index validation: scanning table", blocksDone: 40, blocksTotal: 40}
+	session := &publishedIndexProgressSession{row: &validation}
+	tracker := claimRunningIndexBuild(t, eng, session)
+	require.Equal(t, 95, pollRunningIndexBuild(t, eng).Progress)
+
+	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE INDEX widgets_name_idx ON public.widgets (name)", steps: 2}
+	heapScan := heapScanRow
+	session.row = &heapScan
+	session.onRead = func() {
+		session.onRead = nil
+		eng.claimProgress("task-a", progressResult(engine.StateRunning, "running", time.Now(), change, ""), tracker, slog.Default(), false, nil)
+	}
+	got := pollRunningIndexBuild(t, eng)
+	assert.Equal(t, engine.StateRunning, got.State)
+	assert.Equal(t, 25, got.Progress)
+	assert.Equal(t, 25, got.Tables[0].Progress)
+
+	session.row = nil
+	got = pollRunningIndexBuild(t, eng)
+	assert.Equal(t, engine.StateRunning, got.State)
+	assert.Equal(t, 0, got.Progress)
+	assert.Equal(t, 0, got.Tables[0].Progress)
+}
+
+// TestProgressKeepsPercentWhenTheBuildRowReadFails proves a tolerated
+// progress-view failure does not reset the percent: the poll answers with
+// the last-known percent alongside the last-known step and statement.
+func TestProgressKeepsPercentWhenTheBuildRowReadFails(t *testing.T) {
+	eng := New()
+	row := heapScanRow
+	session := &publishedIndexProgressSession{row: &row}
+	tracker := claimRunningIndexBuild(t, eng, session)
+	require.Equal(t, 25, pollRunningIndexBuild(t, eng).Tables[0].Progress)
+
+	tracker.SetConcurrentBuild(&indexProgressSession{err: errors.New("connection reset by peer")}, 42)
+	got := pollRunningIndexBuild(t, eng)
+	assert.Equal(t, engine.StateRunning, got.State)
+	assert.Equal(t, 25, got.Tables[0].Progress)
+	assert.Equal(t, "2", got.Metadata["step"])
+}
+
+// TestExecutorProgressMetadataKeepsTerminalPercent proves a terminal result's
+// percent is decided by its state: a tracker still answering with a partial
+// build position folds its counters into the metadata but never pulls a
+// completed apply below 100.
+func TestExecutorProgressMetadataKeepsTerminalPercent(t *testing.T) {
+	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE INDEX widgets_name_idx ON public.widgets (name)", steps: 2}
+	tracker := newTestTracker(t)
+	tracker.Start(2, progress.OperationAdmitting)
+	tracker.StartStep(2, progress.OperationConcurrentIndex, "CREATE INDEX CONCURRENTLY widgets_name_idx ON public.widgets (name)")
+	row := heapScanRow
+	tracker.SetConcurrentBuild(&publishedIndexProgressSession{row: &row}, 42)
+	terminal := progressResult(engine.StateCompleted, "completed", time.Now(), change, "")
+
+	require.NoError(t, executorProgressMetadata(t.Context(), tracker, terminal))
+
+	assert.Equal(t, 100, terminal.Tables[0].Progress)
+	assert.Equal(t, 100, terminal.Progress)
+	assert.Equal(t, "25", terminal.Metadata["blocks_done"])
+	assert.Equal(t, "40", terminal.Metadata["blocks_total"])
+}
+
+// TestExecutorProgressMetadataBoundsTheServerPhase proves the server phase
+// gets the same single-line treatment as every other operator-facing value
+// in the metadata, and that an unrecognised phase leaves the percent alone.
+func TestExecutorProgressMetadataBoundsTheServerPhase(t *testing.T) {
+	tracker := newTestTracker(t)
+	tracker.Start(1, progress.OperationAdmitting)
+	tracker.StartStep(1, progress.OperationConcurrentIndex, "CREATE INDEX CONCURRENTLY widgets_name_idx ON public.widgets (name)")
+	row := indexProgressRow{phase: "future phase |\nwith layout", blocksDone: 5, blocksTotal: 10}
+	tracker.SetConcurrentBuild(&publishedIndexProgressSession{row: &row}, 42)
+	result := &engine.ProgressResult{State: engine.StateRunning, Tables: []engine.TableProgress{{Progress: 7}}}
+
+	require.NoError(t, executorProgressMetadata(t.Context(), tracker, result))
+
+	assert.Equal(t, "future phase / with layout", result.Metadata["server_phase"])
+	assert.Equal(t, 7, result.Tables[0].Progress)
+	assert.Equal(t, "1", result.Metadata["step"], "a nil metadata map is allocated rather than written through")
+}
+
 // activeBuildTracker returns a tracker mid-way through a concurrent index
 // build whose server-side progress read fails with readErr.
 func activeBuildTracker(t *testing.T, readErr error) (*progress.Tracker, *indexProgressSession) {
@@ -854,7 +1477,7 @@ func TestExecutorProgressMetadataKeepsLastKnownPositionOnReadError(t *testing.T)
 	tracker, session := activeBuildTracker(t, readErr)
 	metadata := map[string]string{"step": "1", "steps_total": "1"}
 
-	err := executorProgressMetadata(t.Context(), tracker, metadata)
+	err := executorProgressMetadata(t.Context(), tracker, &engine.ProgressResult{Metadata: metadata})
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, readErr)
@@ -875,7 +1498,7 @@ func TestExecutorProgressMetadataReadsOnItsOwnBoundedContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	err := executorProgressMetadata(ctx, tracker, map[string]string{})
+	err := executorProgressMetadata(ctx, tracker, &engine.ProgressResult{Metadata: map[string]string{}})
 
 	require.Error(t, err)
 	require.True(t, session.queried)
@@ -894,7 +1517,7 @@ func TestProgressAnswersLastKnownPositionWhenTrackerReadFails(t *testing.T) {
 	tracker, _ := activeBuildTracker(t, errors.New("connection reset by peer"))
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, logger)
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, logger, false, nil)
 
 	got, err := eng.Progress(t.Context(), &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: "task-a"}})
 
@@ -934,6 +1557,10 @@ func TestRefusalForOutcomeTotalOverExecutorCodes(t *testing.T) {
 		// policy, so re-running it unchanged would only spend the lease
 		// again.
 		executor.CodeBudgetStatementExceeded: "the statement budget is the native-safety lease",
+		// The CREATE TABLE committed before the names read failed, and
+		// SchemaBot's retry re-runs the whole plan rather than the read
+		// alone, so every retry collides with the table this apply created.
+		executor.CodeCreateNamesUnverified: "a retry re-runs the committed CREATE TABLE",
 	}
 	for _, code := range executor.Codes() {
 		t.Run(string(code), func(t *testing.T) {
@@ -955,34 +1582,366 @@ func TestRefusalForOutcomeTotalOverExecutorCodes(t *testing.T) {
 	}
 }
 
-// TestConcurrentIndexBudgetLeavesHeadroomUnderApplyCeiling pins the gap the
-// two bounds depend on: the server-side index budget must expire with at
-// least the named headroom to spare before the client-side ceiling cancels
-// the session, so an exhausted build surfaces as the typed budget verdict —
-// and its invalid-index catalog check still gets to run inside the ceiling —
-// rather than as an ambiguous external cancellation. Retuning either bound
-// without keeping the headroom fails here instead of in an apply.
-func TestConcurrentIndexBudgetLeavesHeadroomUnderApplyCeiling(t *testing.T) {
-	// A zero headroom would let the two bounds coincide and race, so the
-	// strict ordering is pinned on its own as well as through the gap.
-	require.Positive(t, concurrentIndexHeadroom)
-	assert.Less(t, concurrentIndexBudget, optimisticApplyCeiling)
-	assert.GreaterOrEqual(t, optimisticApplyCeiling-concurrentIndexBudget, concurrentIndexHeadroom)
+// TestOrdinaryApplyRunsUnderTheFixedCeiling proves a native statement's
+// drive hands the executor a context bounded by the fixed apply ceiling —
+// not by the concurrent index envelope — with room under it for the whole
+// retry path. The bound is measured from the executor's side, so it is the
+// ceiling the engine actually grants that must hold the retry path, not the
+// constant it is seeded from: a constructor that seeded a shorter ceiling
+// would still sit under the constant and still clear the statement budget,
+// but would cancel a lock-contended statement mid-retry and turn its typed
+// budget verdict into an external cancellation.
+func TestOrdinaryApplyRunsUnderTheFixedCeiling(t *testing.T) {
+	scripted := newScriptedExecutor(func(*progress.Tracker) error { return nil })
+	eng := NewWithOptions(0, 3*time.Hour)
+	applyAlterUsers(t, eng, scripted, "task-a", slog.New(slog.DiscardHandler))
+
+	env := scripted.envelope(t)
+	granted := env.deadline.Sub(env.observed)
+	assert.False(t, env.change.concurrentIndex)
+	assert.Zero(t, env.change.concurrentIndexMaxDuration, "the build bound is stamped only on a concurrent index apply")
+	assert.LessOrEqual(t, granted, optimisticApplyCeiling)
+	assert.Greater(t, granted, retryPathWorstCase(t), "the retry path must fit under the ceiling the engine actually grants")
 }
 
-// TestRetryPathFitsUnderApplyCeiling pins the other execution path against
-// the same ceiling: every attempt the default retry policy allows, each at
-// its full statement limit, plus the longest backoff between them, must
-// finish before the ceiling cancels the session — otherwise a lock-contended
-// native statement would surface as an external cancellation instead of the
-// typed budget verdict. The policy comes from pg-sprite, so a dependency
-// bump that widens it fails here instead of in an apply.
-func TestRetryPathFitsUnderApplyCeiling(t *testing.T) {
+// retryPathWorstCase is the longest legitimate run of the native retry path:
+// every attempt the default retry policy allows, each at its full statement
+// limit, plus the longest backoff between attempts. The policy comes from
+// pg-sprite, so a dependency bump that widens it moves this value.
+func retryPathWorstCase(t *testing.T) time.Duration {
+	t.Helper()
 	policy := executor.DefaultRetryPolicy()
 	require.Positive(t, policy.MaxAttempts)
 	attempts := time.Duration(policy.MaxAttempts)
-	worstCase := attempts*optimisticStatementLimit + (attempts-1)*policy.MaxBackoff
-	assert.Less(t, worstCase, optimisticApplyCeiling)
+	return attempts*optimisticStatementLimit + (attempts-1)*policy.MaxBackoff
+}
+
+// TestConcurrentIndexApplyCeilingLeavesSetupHeadroom proves the drive runs a
+// concurrent index build under a ceiling that sits above the configured
+// build bound — so the build's own deadline, not the ceiling, is what ends
+// an over-long build — and stamps that bound on the change the executor
+// receives. The granted time is measured from the executor's side: a ceiling
+// equal to the bound would fail here, and so would one padded past the
+// headroom the engine documents.
+func TestConcurrentIndexApplyCeilingLeavesSetupHeadroom(t *testing.T) {
+	const bound = 3 * time.Hour
+	scripted := newScriptedExecutor(func(*progress.Tracker) error { return nil })
+	eng := NewWithOptions(0, bound)
+	applyChange(t, eng, scripted, "task-a",
+		"CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)", slog.New(slog.DiscardHandler))
+
+	env := scripted.envelope(t)
+	granted := env.deadline.Sub(env.observed)
+	assert.True(t, env.change.concurrentIndex)
+	assert.Equal(t, bound, env.change.concurrentIndexMaxDuration)
+	assert.Greater(t, granted, bound, "the ceiling must outlast the build bound it wraps")
+	assert.LessOrEqual(t, granted, bound+concurrentIndexHeadroom)
+}
+
+// TestConcurrentIndexHeadroomCoversSessionSetup pins the headroom to what it
+// exists to absorb: the session setup executeOptimistic runs before the
+// build starts, with every step at the server-side limit the apply pool
+// gives it — one dial at the connect timeout, then the privilege check, the
+// table preflight and the partition facts lookup each at the pool's
+// statement_timeout. Under that headroom the build gets the full configured
+// bound even when setup is as slow as the server allows it to be.
+//
+// The privilege check counts as one read: its second query runs only when
+// the first finds no target table, and that ends the apply as a refusal
+// before any build a bound could be shortened for; the SET ROLE probe it
+// also carries belongs to the copy-and-swap tier, which a concurrent index
+// build never reaches.
+//
+// The executor's own catalog reads ahead of the build — resolving the
+// target, inspecting the requested name, listing quarantined debris — are
+// not in the census: they run in the build session, whose statement_timeout
+// is already the bound, so the bound rather than the pool's limit is what
+// ends one that stalls, and the drive names the option for it.
+func TestConcurrentIndexHeadroomCoversSessionSetup(t *testing.T) {
+	setup := dbconn.DefaultConnectTimeout + // pool dial
+		dbconn.DefaultStatementTimeout + // preflight.CheckPrivileges
+		dbconn.DefaultStatementTimeout + // preflight.CheckTable
+		dbconn.DefaultStatementTimeout // preflight.LookupTargetFacts
+	assert.GreaterOrEqual(t, concurrentIndexHeadroom, setup)
+}
+
+// TestConcurrentIndexMaximumIsTheServerStatementTimeoutCeiling pins the
+// accepted build bound to the range statement_timeout itself can hold: the
+// largest value PostgreSQL accepts at the top, and one millisecond, its
+// resolution, at the bottom, below which the server's timer rounds to zero
+// and switches off. The constructor's normalization around that range: a
+// bound above it is clamped, a positive bound below it is raised, and a
+// bound that is not positive adopts the default instead of a deadline that
+// would end every build on arrival.
+func TestConcurrentIndexMaximumIsTheServerStatementTimeoutCeiling(t *testing.T) {
+	assert.Equal(t, time.Duration(math.MaxInt32)*time.Millisecond, MaxConcurrentIndexMaxDuration)
+	assert.Less(t, MaxConcurrentIndexMaxDuration+concurrentIndexHeadroom, time.Duration(math.MaxInt64),
+		"the ceiling built on the maximum must not overflow")
+	assert.Equal(t, time.Millisecond, MinConcurrentIndexMaxDuration)
+
+	assert.Equal(t, MaxConcurrentIndexMaxDuration, NewWithOptions(0, MaxConcurrentIndexMaxDuration+1).ConcurrentIndexMaxDuration())
+	assert.Equal(t, MinConcurrentIndexMaxDuration, NewWithOptions(0, 500*time.Microsecond).ConcurrentIndexMaxDuration())
+	assert.Equal(t, MinConcurrentIndexMaxDuration, NewWithOptions(0, MinConcurrentIndexMaxDuration).ConcurrentIndexMaxDuration())
+	assert.Equal(t, DefaultConcurrentIndexMaxDuration, NewWithOptions(0, 0).ConcurrentIndexMaxDuration())
+	assert.Equal(t, DefaultConcurrentIndexMaxDuration, NewWithOptions(0, -time.Second).ConcurrentIndexMaxDuration())
+	assert.Equal(t, 36*time.Hour, NewWithOptions(0, 36*time.Hour).ConcurrentIndexMaxDuration())
+}
+
+// TestConcurrentIndexBoundsMatchTheExecutorsBudgetRange proves the engine's
+// floor and ceiling are the executor's own, not a copy of them: the executor
+// refuses a served budget one step outside either bound as unbounded and
+// accepts a budget exactly on it. The executor validates the budget before
+// it touches the pool or the statement, so the probe needs neither a target
+// nor a real build; the accepted cases use a plain CREATE INDEX so the call
+// stops at admission, one step past validation, instead of reaching the
+// pool. Asserting the refusal's wording pins the value the executor holds,
+// so a dependency bump that moves either bound fails here rather than in a
+// refused apply on a configuration this engine had accepted.
+func TestConcurrentIndexBoundsMatchTheExecutorsBudgetRange(t *testing.T) {
+	const concurrent = "CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)"
+	const plain = "CREATE INDEX users_email_idx ON public.users (email)"
+	probe := func(sql string, overall time.Duration) error {
+		_, err := executor.BuildIndexConcurrentlyWithProgress(t.Context(), nil, sql, executor.ConcurrentBudget{Overall: overall}, newTestTracker(t))
+		return err
+	}
+
+	err := probe(concurrent, MinConcurrentIndexMaxDuration-time.Nanosecond)
+	require.ErrorIs(t, err, executor.ErrUnboundedBudget)
+	assert.ErrorContains(t, err, "at least 1ms")
+
+	err = probe(concurrent, MaxConcurrentIndexMaxDuration+time.Millisecond)
+	require.ErrorIs(t, err, executor.ErrUnboundedBudget)
+	assert.ErrorContains(t, err, "at most "+MaxConcurrentIndexMaxDuration.String())
+
+	for _, bound := range []time.Duration{MinConcurrentIndexMaxDuration, MaxConcurrentIndexMaxDuration} {
+		err = probe(plain, bound)
+		require.ErrorIs(t, err, executor.ErrNotConcurrentIndexBuild, "the probe must stop at admission, past validation")
+		assert.NotErrorIs(t, err, executor.ErrUnboundedBudget, "a bound the engine accepts must be one the executor serves")
+	}
+}
+
+// TestBuildIndexConcurrentlyRefusesAnUnsetBound proves a concurrent build
+// never starts under a bound the drive did not stamp: the bound is the
+// build's server-side statement timeout and the recovery's only deadline, so
+// a missing one is refused before any session is acquired rather than handed
+// to the executor as an unbounded budget or run to an instant cancellation.
+// The drive always stamps a normalized bound, so this exercises the guard a
+// directly constructed nativeApply meets, not a state the drive produces.
+func TestBuildIndexConcurrentlyRefusesAnUnsetBound(t *testing.T) {
+	change := nativeApply{namespace: "public", table: "users",
+		sql: "CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)", concurrentIndex: true}
+
+	err := buildIndexConcurrently(t.Context(), nil, change, newTestTracker(t), slog.New(slog.DiscardHandler))
+
+	require.ErrorContains(t, err, `build PostgreSQL index concurrently on table "users": build bound is unset`)
+}
+
+// concurrentIndexCall records the envelope one executor entry point was
+// handed: the budget and the deadline of the context it ran under.
+type concurrentIndexCall struct {
+	budget      executor.ConcurrentBudget
+	deadline    time.Time
+	hasDeadline bool
+}
+
+type concurrentIndexCalls struct {
+	build, rebuild []concurrentIndexCall
+}
+
+// scriptConcurrentIndex swaps the concurrent index executor for one whose
+// build and recovery are scripted, restoring the executor's own functions
+// when the test ends. Each call's envelope is recorded before the script
+// answers.
+func scriptConcurrentIndex(t *testing.T, build func() error, rebuild func() error) *concurrentIndexCalls {
+	t.Helper()
+	calls := &concurrentIndexCalls{}
+	record := func(ctx context.Context, budget executor.ConcurrentBudget) concurrentIndexCall {
+		deadline, ok := ctx.Deadline()
+		return concurrentIndexCall{budget: budget, deadline: deadline, hasDeadline: ok}
+	}
+	previous := concurrentIndex
+	concurrentIndex = concurrentIndexExecutor{
+		build: func(ctx context.Context, _ *pgxpool.Pool, _ string, budget executor.ConcurrentBudget, _ *progress.Tracker) (executor.IndexBuildReport, error) {
+			calls.build = append(calls.build, record(ctx, budget))
+			return executor.IndexBuildReport{}, build()
+		},
+		rebuild: func(ctx context.Context, _ *pgxpool.Pool, _ string, budget executor.ConcurrentBudget) (executor.IndexRecoveryReport, error) {
+			calls.rebuild = append(calls.rebuild, record(ctx, budget))
+			return executor.IndexRecoveryReport{}, rebuild()
+		},
+	}
+	t.Cleanup(func() { concurrentIndex = previous })
+	return calls
+}
+
+func concurrentIndexChange(bound time.Duration) nativeApply {
+	return nativeApply{namespace: "public", table: "users",
+		sql:             "CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)",
+		concurrentIndex: true, concurrentIndexMaxDuration: bound}
+}
+
+// TestBuildIndexConcurrentlyRunsTheBuildUnderTheServedBound proves the plain
+// build is handed the configured bound as its served statement budget, so
+// the server's own timer ends an over-long build and reports exhaustion as
+// the executor's typed verdict, rather than running caller-owned with no
+// server-side statement timeout.
+func TestBuildIndexConcurrentlyRunsTheBuildUnderTheServedBound(t *testing.T) {
+	const bound = 3 * time.Hour
+	calls := scriptConcurrentIndex(t, func() error { return nil }, func() error {
+		return errors.New("no recovery is expected for a build that succeeded")
+	})
+
+	err := buildIndexConcurrently(t.Context(), nil, concurrentIndexChange(bound), newTestTracker(t), slog.New(slog.DiscardHandler))
+
+	require.NoError(t, err)
+	require.Len(t, calls.build, 1)
+	assert.Equal(t, executor.ConcurrentBudget{Overall: bound}, calls.build[0].budget)
+	assert.Empty(t, calls.rebuild)
+}
+
+// TestBuildIndexConcurrentlyRecoversUnderItsOwnCallerOwnedDeadline proves the
+// recovery over an abandoned invalid index runs as one caller-owned envelope
+// bounded by a fresh deadline of the configured bound: caller-owned, because
+// the executor's served mode would spend the bound once on the drops and
+// again on the build; a deadline of its own, because the apply ceiling the
+// caller holds is the bound plus the setup headroom, and the recovery must
+// end within the bound the operator configured, not the ceiling above it.
+func TestBuildIndexConcurrentlyRecoversUnderItsOwnCallerOwnedDeadline(t *testing.T) {
+	const bound = 3 * time.Hour
+	abandoned := &executor.InvalidIndexError{Schema: "public", Index: "users_email_idx", Table: "users",
+		Cleanup: executor.ErrAbandonedInvalidIndex}
+	require.True(t, abandonedBeforeBuild(abandoned), "the scripted verdict must be one the drive recovers")
+	calls := scriptConcurrentIndex(t, func() error { return abandoned }, func() error { return nil })
+	ctx, cancel := context.WithTimeout(t.Context(), bound+concurrentIndexHeadroom)
+	defer cancel()
+	ceiling, _ := ctx.Deadline()
+
+	before := time.Now()
+	err := buildIndexConcurrently(ctx, nil, concurrentIndexChange(bound), newTestTracker(t), slog.New(slog.DiscardHandler))
+
+	require.NoError(t, err)
+	require.Len(t, calls.build, 1)
+	require.Len(t, calls.rebuild, 1)
+	recovery := calls.rebuild[0]
+	assert.Equal(t, executor.ConcurrentBudget{CallerOwned: true}, recovery.budget)
+	require.True(t, recovery.hasDeadline, "the recovery must run under a deadline")
+	assert.WithinDuration(t, before.Add(bound), recovery.deadline, concurrentIndexHeadroom/2,
+		"the recovery starts with the configured bound ahead of it, not the caller's ceiling")
+	assert.True(t, recovery.deadline.Before(ceiling), "the recovery's deadline must fall inside the caller's ceiling")
+}
+
+// TestBuildIndexConcurrentlyNamesTheBoundThatEndedTheBuild proves the option
+// is named on the drive's own error path, for each way the bound ends a
+// build: the served build's typed statement budget verdict, and a raw
+// cancellation of the executor's in-session catalog reads once the bound
+// has elapsed. Both classify as the same refusal with the same remedy.
+func TestBuildIndexConcurrentlyNamesTheBoundThatEndedTheBuild(t *testing.T) {
+	const bound = 5 * time.Millisecond
+	cases := []struct {
+		name  string
+		build func() error
+	}{
+		{
+			name: "served build exhausts its statement budget",
+			build: func() error {
+				return &executor.BudgetError{Cause: executor.CauseStatement, Budget: bound}
+			},
+		},
+		{
+			name: "pre-build catalog read is cancelled once the bound has elapsed",
+			build: func() error {
+				// The drive names the bound on a raw cancellation only once
+				// the bound has elapsed on its own clock, so real time must
+				// pass here; overshooting is the safe direction.
+				time.Sleep(2 * bound)
+				return fmt.Errorf("resolve target: %w", &pgconn.PgError{Code: sqlstateQueryCanceled})
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := scriptConcurrentIndex(t, tc.build, func() error {
+				return errors.New("no recovery is expected for a build the bound ended")
+			})
+
+			err := buildIndexConcurrently(t.Context(), nil, concurrentIndexChange(bound), newTestTracker(t), slog.New(slog.DiscardHandler))
+
+			require.Error(t, err)
+			assert.Empty(t, calls.rebuild)
+			r := classifyRefusal(err, "users")
+			require.NotNil(t, r, "a bound-ended build that left nothing is a refusal")
+			assert.Equal(t, "concurrent-index-bound-exceeded", r.reason)
+			assert.Contains(t, r.detail, "postgres.concurrent_index_max_duration (5ms)")
+			assert.Contains(t, r.detail, "raise postgres.concurrent_index_max_duration and re-run")
+		})
+	}
+}
+
+// TestNameConcurrentIndexBoundWrapsOnlyTheBoundsOwnVerdict pins which build
+// failures get the option named: the statement budget verdict is the bound's
+// statement_timeout firing and is wrapped with the verdict still reachable,
+// while a lock budget, a cancellation, and an invalid-index verdict that
+// carries no build failure pass through untouched — none of them was the
+// bound's doing.
+func TestNameConcurrentIndexBoundWrapsOnlyTheBoundsOwnVerdict(t *testing.T) {
+	bound := 36 * time.Hour
+	statementBudget := &executor.BudgetError{Cause: executor.CauseStatement, Budget: bound}
+
+	// The executor's typed verdict is authoritative on its own; the elapsed
+	// time is not consulted for it.
+	named := nameConcurrentIndexBound(fmt.Errorf("build: %w", statementBudget), bound, time.Second)
+	var boundErr *concurrentIndexBoundError
+	require.ErrorAs(t, named, &boundErr)
+	assert.Equal(t, "the concurrent index build ran past postgres.concurrent_index_max_duration (36h0m0s) and was cancelled", boundErr.Error())
+	var budgetErr *executor.BudgetError
+	require.ErrorAs(t, named, &budgetErr)
+	assert.Same(t, statementBudget, budgetErr)
+
+	// A raw server cancellation of one of the executor's catalog reads ahead
+	// of the build is the bound's once the bound has elapsed; the server's
+	// error stays reachable for callers that read the code.
+	cancelled := &pgconn.PgError{Code: sqlstateQueryCanceled, Message: "canceling statement due to statement timeout"}
+	named = nameConcurrentIndexBound(fmt.Errorf("resolve target: %w", cancelled), bound, bound)
+	require.ErrorAs(t, named, &boundErr)
+	var pgErr *pgconn.PgError
+	require.ErrorAs(t, named, &pgErr)
+	assert.Same(t, cancelled, pgErr)
+
+	passThrough := []struct {
+		name    string
+		err     error
+		elapsed time.Duration
+	}{
+		{name: "lock budget", err: &executor.BudgetError{Cause: executor.CauseLock, Budget: time.Second}, elapsed: 2 * bound},
+		{name: "cancellation", err: executor.ErrCancelledByCaller, elapsed: 2 * bound},
+		{name: "abandoned entry without a build failure", elapsed: 2 * bound,
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx", Table: "users", Cleanup: executor.ErrAbandonedInvalidIndex}},
+		{name: "raw cancellation before the bound could fire", err: fmt.Errorf("resolve target: %w", cancelled), elapsed: bound - time.Millisecond},
+		{name: "raw cancellation the executor attributed to the caller", elapsed: 2 * bound,
+			err: fmt.Errorf("%w (after 1h): %w", executor.ErrCancelledByCaller, cancelled)},
+		{name: "raw cancellation the executor attributed to an outside party", elapsed: 2 * bound,
+			err: fmt.Errorf("%w (after 1h of a 36h budget): %w", executor.ErrCancelledExternally, cancelled)},
+		{name: "server error under another code after the bound", elapsed: 2 * bound,
+			err: fmt.Errorf("resolve target: %w", &pgconn.PgError{Code: "55P03"})},
+	}
+	for _, tc := range passThrough {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Same(t, tc.err, nameConcurrentIndexBound(tc.err, bound, tc.elapsed))
+		})
+	}
+}
+
+// TestRetryPathFitsUnderApplyCeiling pins the constant the engine's ceiling
+// is seeded from against the retry path: every attempt the default retry
+// policy allows, each at its full statement limit, plus the longest backoff
+// between them, must finish before the ceiling cancels the session —
+// otherwise a lock-contended native statement would surface as an external
+// cancellation instead of the typed budget verdict. A dependency bump that
+// widens the policy fails here instead of in an apply;
+// TestOrdinaryApplyRunsUnderTheFixedCeiling pins the same relationship on
+// the ceiling the drive actually grants.
+func TestRetryPathFitsUnderApplyCeiling(t *testing.T) {
+	assert.Less(t, retryPathWorstCase(t), optimisticApplyCeiling)
 }
 
 // TestInvalidIndexDetailMatchesVerdictOwnership pins the advice ladder to
@@ -1009,7 +1968,21 @@ func TestInvalidIndexDetailMatchesVerdictOwnership(t *testing.T) {
 			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx",
 				Build: rawServerText, Cleanup: executor.ErrBuildLeftInvalidIndex},
 			wantDetail:    []string{`"public"."big_ref_idx"`, "own invalid index", "retry removes it", "rebuilds the index"},
-			wantNotDetail: []string{"db-internal-1"},
+			wantNotDetail: []string{"db-internal-1", "concurrent_index_max_duration"},
+		},
+		{
+			name: "own leftover the bound cancelled names the option to raise before the retry",
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx",
+				Build: &executor.BudgetError{Cause: executor.CauseStatement, Budget: 36 * time.Hour}, Cleanup: executor.ErrBuildLeftInvalidIndex},
+			wantDetail:    []string{`"public"."big_ref_idx"`, "own invalid index", "running past postgres.concurrent_index_max_duration (36h0m0s)", "retry removes it", "rebuilds the index under the same bound", "raise postgres.concurrent_index_max_duration first"},
+			wantNotDetail: []string{"statement budget"},
+		},
+		{
+			name: "own leftover from a lost lock budget does not blame the bound",
+			err: &executor.InvalidIndexError{Schema: "public", Index: "big_ref_idx",
+				Build: &executor.BudgetError{Cause: executor.CauseLock, Budget: time.Second}, Cleanup: executor.ErrBuildLeftInvalidIndex},
+			wantDetail:    []string{`"public"."big_ref_idx"`, "own invalid index", "retry removes it"},
+			wantNotDetail: []string{"concurrent_index_max_duration"},
 		},
 		{
 			name: "abandoned entry says the retry removes and rebuilds it",
@@ -1204,7 +2177,7 @@ func TestRecoveryFailureDetailNamesTheAbandonedIndex(t *testing.T) {
 func TestProgressIsKeyedToTheRequestingApply(t *testing.T) {
 	eng := New()
 	change := nativeApply{namespace: "public", table: "t_a", sql: "ALTER TABLE public.t_a ADD COLUMN a text"}
-	eng.claimProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), change, ""), newTestTracker(t), slog.Default())
+	eng.claimProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), change, ""), newTestTracker(t), slog.Default(), false, nil)
 
 	tracked, err := eng.Progress(t.Context(), &engine.ProgressRequest{
 		ResumeState: &engine.ResumeState{MigrationContext: "task-a"},
@@ -1236,8 +2209,8 @@ func TestConcurrentAppliesEachAnswerForTheirOwnWork(t *testing.T) {
 	eng := New()
 	changeA := nativeApply{namespace: "public", table: "t_a", sql: "ALTER TABLE public.t_a ADD COLUMN a text"}
 	changeB := nativeApply{namespace: "public", table: "t_b", sql: "ALTER TABLE public.t_b ADD COLUMN b text"}
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), changeA, ""), newTestTracker(t), slog.Default())
-	eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), changeB, ""), newTestTracker(t), slog.Default())
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), changeA, ""), newTestTracker(t), slog.Default(), false, nil)
+	eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), changeB, ""), newTestTracker(t), slog.Default(), false, nil)
 
 	first, err := eng.Progress(t.Context(), &engine.ProgressRequest{
 		ResumeState: &engine.ResumeState{MigrationContext: "task-a"},
@@ -1265,10 +2238,10 @@ func TestClaimProgressRetiresSettledApplies(t *testing.T) {
 	settled := nativeApply{namespace: "public", table: "t_settled", sql: "ALTER TABLE public.t_settled ADD COLUMN a text"}
 	running := nativeApply{namespace: "public", table: "t_running", sql: "ALTER TABLE public.t_running ADD COLUMN b text"}
 	fresh := nativeApply{namespace: "public", table: "t_fresh", sql: "ALTER TABLE public.t_fresh ADD COLUMN c text"}
-	eng.claimProgress("task-settled", progressResult(engine.StateCompleted, "completed", time.Now(), settled, ""), newTestTracker(t), slog.Default())
-	eng.claimProgress("task-running", progressResult(engine.StateRunning, "preflight", time.Now(), running, ""), newTestTracker(t), slog.Default())
+	eng.claimProgress("task-settled", progressResult(engine.StateCompleted, "completed", time.Now(), settled, ""), newTestTracker(t), slog.Default(), false, nil)
+	eng.claimProgress("task-running", progressResult(engine.StateRunning, "preflight", time.Now(), running, ""), newTestTracker(t), slog.Default(), false, nil)
 
-	eng.claimProgress("task-fresh", progressResult(engine.StateRunning, "preflight", time.Now(), fresh, ""), newTestTracker(t), slog.Default())
+	eng.claimProgress("task-fresh", progressResult(engine.StateRunning, "preflight", time.Now(), fresh, ""), newTestTracker(t), slog.Default(), false, nil)
 
 	retired, err := eng.Progress(t.Context(), &engine.ProgressRequest{
 		ResumeState: &engine.ResumeState{MigrationContext: "task-settled"},
@@ -1294,7 +2267,7 @@ func TestUntrackedApplyProgressIsDiscarded(t *testing.T) {
 	eng := New()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	changeB := nativeApply{namespace: "public", table: "t_b", sql: "ALTER TABLE public.t_b ADD COLUMN b text"}
-	eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), changeB, ""), newTestTracker(t), slog.Default())
+	eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), changeB, ""), newTestTracker(t), slog.Default(), false, nil)
 
 	changeA := nativeApply{namespace: "public", table: "t_a", sql: "ALTER TABLE public.t_a ADD COLUMN a text"}
 	eng.publishProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), changeA, ""), logger)
@@ -1322,8 +2295,8 @@ func TestDrainStopsTrackingEverySchemaChange(t *testing.T) {
 	eng := New()
 	changeA := nativeApply{namespace: "public", table: "t_a", sql: "ALTER TABLE public.t_a ADD COLUMN a text"}
 	changeB := nativeApply{namespace: "public", table: "t_b", sql: "ALTER TABLE public.t_b ADD COLUMN b text"}
-	eng.claimProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), changeA, ""), newTestTracker(t), slog.Default())
-	eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), changeB, ""), newTestTracker(t), slog.Default())
+	eng.claimProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), changeA, ""), newTestTracker(t), slog.Default(), false, nil)
+	eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), changeB, ""), newTestTracker(t), slog.Default(), false, nil)
 
 	eng.Drain()
 
@@ -1371,6 +2344,48 @@ func TestValidateOptimisticApplyAcceptsCreateSet(t *testing.T) {
 	change, err := validateOptimisticApply(req)
 	require.NoError(t, err)
 	assert.Equal(t, req.Changes[0].TableChanges[0].DDL, change.sql)
+	assert.False(t, change.concurrentIndex)
+}
+
+// TestValidateOptimisticApplyClassifiesConcurrentIndex pins both halves of
+// the predicate that routes a statement to the concurrent-build executor:
+// only a lone CREATE INDEX that names CONCURRENTLY qualifies. A plain CREATE
+// INDEX is the same statement kind and must stay on the transactional path;
+// TestValidateOptimisticApplyAcceptsCreateSet pins that a create set, which
+// is never one statement, does not qualify either.
+func TestValidateOptimisticApplyClassifiesConcurrentIndex(t *testing.T) {
+	tests := []struct {
+		name       string
+		ddl        string
+		concurrent bool
+	}{
+		{
+			name:       "concurrent index",
+			ddl:        "CREATE INDEX CONCURRENTLY widgets_name_idx ON public.widgets (name)",
+			concurrent: true,
+		},
+		{
+			name:       "plain index stays transactional",
+			ddl:        "CREATE INDEX widgets_name_idx ON public.widgets (name)",
+			concurrent: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := &engine.ApplyRequest{
+				Database: "app",
+				Changes: []engine.SchemaChange{{Namespace: "public", TableChanges: []engine.TableChange{{
+					Table: "widgets",
+					DDL:   tc.ddl,
+				}}}},
+				Credentials: &engine.Credentials{DSN: "postgres://localhost/app"},
+			}
+
+			change, err := validateOptimisticApply(req)
+			require.NoError(t, err)
+			assert.Equal(t, tc.concurrent, change.concurrentIndex)
+		})
+	}
 }
 
 func TestValidateOptimisticApplyRefusesMixedCreateScript(t *testing.T) {

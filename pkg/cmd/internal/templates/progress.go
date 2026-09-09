@@ -145,6 +145,7 @@ func WriteProgress(data ProgressData) {
 	}
 
 	WriteBox(rows, "State", colorFn)
+	writeProgressStep(data)
 
 	// Error below the box
 	if data.State == state.Apply.Failed && data.ErrorMessage != "" {
@@ -223,6 +224,17 @@ func WriteProgress(data ProgressData) {
 	if data.State == state.Apply.Failed {
 		writeFailureGuidance()
 	}
+}
+
+func writeProgressStep(data ProgressData) {
+	if !state.IsRunningApplyState(data.State) || data.Step <= 0 || data.StepsTotal <= 0 {
+		return
+	}
+	fmt.Printf("\nstep %d of %d", data.Step, data.StepsTotal)
+	if statement := ui.ClampStatement(data.Statement); statement != "" {
+		fmt.Printf(" · %s", statement)
+	}
+	fmt.Println()
 }
 
 // FormatNamespacedTables returns tables grouped by keyspace as a string, collapsing
