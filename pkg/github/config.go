@@ -623,6 +623,10 @@ func isRemovedPRFile(status string) bool {
 	return strings.EqualFold(status, "removed")
 }
 
+func isRenamedPRFile(status string) bool {
+	return strings.EqualFold(status, "renamed")
+}
+
 func filterSchemaFiles(files []string) []string {
 	var result []string
 	for _, file := range files {
