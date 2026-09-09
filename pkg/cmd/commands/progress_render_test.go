@@ -135,6 +135,7 @@ func TestProgressThrottleReferenceOncePerView(t *testing.T) {
 				}
 				var operations []templates.ProgressOperation
 				if multi {
+					tables[len(tables)-1].Deployment = "secondary"
 					operations = []templates.ProgressOperation{{Deployment: "primary", State: state.ApplyOperation.Running}, {Deployment: "secondary", State: state.ApplyOperation.Running}}
 				}
 				data := templates.ProgressData{State: state.Apply.Running, Tables: tables, Operations: operations}

@@ -1093,6 +1093,13 @@ func TestFormatTableProgressOperatorHaltedBars(t *testing.T) {
 }
 
 func TestThrottleReferenceRequiresActiveRecognizedSignal(t *testing.T) {
+	for _, status := range []string{state.Task.Running, state.Task.Checksumming} {
+		t.Run(status, func(t *testing.T) {
+			table := TableProgress{Status: status, Throttled: true, ThrottleReason: "redo-aware 4 > 3"}
+			assert.Contains(t, FormatThrottleReference([]TableProgress{table}), ui.ThrottleDocURL)
+		})
+	}
+
 	for _, table := range []TableProgress{
 		{Status: state.Task.Running, ThrottleReason: "redo-aware 4 > 3"},
 		{Status: state.Task.Running, Throttled: true, ThrottleReason: "unknown"},
