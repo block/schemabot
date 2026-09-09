@@ -265,7 +265,7 @@ func rejectCaseCollisions(kind string, names []string) error {
 	for _, name := range names {
 		folded := strings.ToLower(name)
 		if previous, exists := seen[folded]; exists {
-			return fmt.Errorf("%s names %q and %q collide on a case-insensitive filesystem; choose distinct names before onboarding", kind, previous, name)
+			return fmt.Errorf("%s names %q and %q would collide on a case-insensitive filesystem; schema files must be portable across checkouts, so choose names that differ beyond letter case before onboarding", kind, previous, name)
 		}
 		seen[folded] = name
 	}
