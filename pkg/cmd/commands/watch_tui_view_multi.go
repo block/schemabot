@@ -23,6 +23,7 @@ func (m WatchModel) multiDeploymentProgressView() string {
 		m.writeDeploymentSection(&b, deployment)
 	}
 
+	b.WriteString(templates.FormatThrottleReference(m.tables))
 	m.writeMultiDeploymentFooter(&b, model)
 	return b.String()
 }

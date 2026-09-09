@@ -1,8 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -290,4 +293,161 @@ func TestRunStrandedReaperPassReportsTaskSettlementsThatLandedBeforeAFailure(t *
 
 	assert.Equal(t, []string{"stranded_task_reaper_error"}, claimFailureReasons(t, reader),
 		"the failure is still recorded after the committed settlements are reported")
+}
+
+// expiringApplyStore serves the retryable-expiry pass a fixed outcome — a set
+// of expirations, or a storage failure — so the pass can be exercised without a
+// database. It records the limit it was handed, and honours the caller's
+// context so a pass cut short by shutdown can be modelled.
+type expiringApplyStore struct {
+	storage.ApplyStore
+	expirations []*storage.RetryableApplyExpiration
+	expireErr   error
+	limit       int
+}
+
+func (s *expiringApplyStore) ExpireRetryable(ctx context.Context, limit int) ([]*storage.RetryableApplyExpiration, error) {
+	s.limit = limit
+	// Expirations and an error are mutually exclusive, and deliberately so: the
+	// real pass settles its whole batch in one transaction, so a failure rolls
+	// back everything it had matched. A double that could hand back both would
+	// let a test assert on partial reporting the store cannot produce.
+	if s.expireErr != nil {
+		return nil, s.expireErr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.expirations, nil
+}
+
+// retryableExpiryService wires a service whose expiry pass is served by applies,
+// returning the store its apply-log writes land in.
+func retryableExpiryService(applies storage.ApplyStore) (*Service, *capturingApplyLogStore) {
+	applyLogs := &capturingApplyLogStore{}
+	svc := newTestService()
+	svc.storage = &mockStorageWithApplyStores{applies: applies, applyLogs: applyLogs}
+	return svc, applyLogs
+}
+
+// expiredApply is a failed_retryable apply the pass has just settled, carrying
+// the full triage attribute set an operator reads the expiry line for.
+func expiredApply() *storage.Apply {
+	return &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-42",
+		Database:        "payments",
+		DatabaseType:    "mysql",
+		Deployment:      "region-a",
+		Environment:     "staging",
+		Repository:      "org/repo",
+		PullRequest:     123,
+		State:           state.Apply.Failed,
+		Attempt:         storage.MaxRecoveryAttempts,
+		ExternalID:      "remote-apply-7",
+	}
+}
+
+func budgetExpiration() []*storage.RetryableApplyExpiration {
+	return []*storage.RetryableApplyExpiration{
+		{Apply: expiredApply(), Reason: storage.RetryableExpirationAttemptBudget},
+	}
+}
+
+// Expiry is what makes a retryable failure permanent, so it belongs in the
+// apply's own log stream: that stream is what the CLI and the PR summary
+// render, and an apply whose last entry is a paused attempt reads as one that
+// went terminal for no stated reason.
+func TestRunRetryableExpiryPassRecordsWhyRecoveryStoppedInTheApplyLog(t *testing.T) {
+	svc, applyLogs := retryableExpiryService(&expiringApplyStore{expirations: budgetExpiration()})
+
+	svc.runRetryableExpiryPass(t.Context())
+
+	require.Len(t, applyLogs.logs, 1)
+	entry := applyLogs.logs[0]
+	assert.Equal(t, storage.LogLevelError, entry.Level)
+	assert.Equal(t, int64(42), entry.ApplyID)
+	assert.Contains(t, entry.Message,
+		fmt.Sprintf("%d of %d attempts", storage.MaxRecoveryAttempts, storage.MaxRecoveryAttempts))
+	assert.Contains(t, entry.Message, string(storage.RetryableExpirationAttemptBudget))
+	assert.Equal(t, state.Apply.FailedRetryable, entry.OldState)
+	assert.Equal(t, state.Apply.Failed, entry.NewState)
+}
+
+// A retryable-apply expiry is a control-plane lifecycle transition an operator
+// triages from logs alone, so the expiry line must carry the apply's full
+// triage attributes — including external_id, the join key to the data plane's
+// logs — plus the expiry-specific attempt and reason.
+func TestRunRetryableExpiryPassLogsCarryFullApplyAttrs(t *testing.T) {
+	var logBuf bytes.Buffer
+	svc, _ := retryableExpiryService(&expiringApplyStore{expirations: budgetExpiration()})
+	svc.logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	svc.runRetryableExpiryPass(t.Context())
+
+	line := requireLogLine(t, decodeLogLines(t, logBuf.Bytes()), "operator: retryable apply expired")
+	assert.Equal(t, "apply-42", line["apply_id"])
+	assert.Equal(t, "payments", line["database"])
+	assert.Equal(t, "mysql", line["database_type"])
+	assert.Equal(t, "staging", line["environment"])
+	assert.Equal(t, "org/repo", line["repo"])
+	assert.Equal(t, float64(123), line["pr"])
+	assert.Equal(t, "region-a", line["deployment"])
+	assert.Equal(t, state.Apply.Failed, line["state"])
+	assert.Equal(t, "remote-apply-7", line["external_id"])
+	assert.Equal(t, float64(storage.MaxRecoveryAttempts), line["attempt"])
+	assert.Equal(t, string(storage.RetryableExpirationAttemptBudget), line["reason"])
+}
+
+// A storage error is the one ending of an expiry pass that is a fault, and it is
+// counted apart from the stranded sweeps so an operator alerting on claim
+// failures can tell which sweep is failing.
+func TestRunRetryableExpiryPassStorageErrorIsAFailure(t *testing.T) {
+	reader := reaperMetricReader(t)
+	svc, _ := retryableExpiryService(&expiringApplyStore{
+		expireErr: errors.New("applies table unavailable"),
+	})
+
+	svc.runRetryableExpiryPass(t.Context())
+
+	assert.Equal(t, []string{"expire_retryable_error"}, claimFailureReasons(t, reader),
+		"the failure is recorded under the expiry sweep's own reason")
+}
+
+// Losing the expiry election is the expected outcome on every instance but one,
+// so a busy pass records no failure.
+func TestRunRetryableExpiryPassBusyIsNotAFailure(t *testing.T) {
+	reader := reaperMetricReader(t)
+	svc, _ := retryableExpiryService(&expiringApplyStore{expireErr: storage.ErrRetryableExpiryBusy})
+
+	svc.runRetryableExpiryPass(t.Context())
+
+	assert.Empty(t, claimFailureReasons(t, reader), "an unelected expiry pass is not a failure")
+}
+
+// A shutdown cancels the pass mid-query. The next instance to be elected runs
+// the same pass moments later, so the ending is a routine deploy and not a
+// fault: it must not tick the claim-failure counter operators alert on.
+func TestRunRetryableExpiryPassInterruptedByShutdownIsNotAFailure(t *testing.T) {
+	reader := reaperMetricReader(t)
+	svc, _ := retryableExpiryService(&expiringApplyStore{})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	svc.runRetryableExpiryPass(ctx)
+
+	assert.Empty(t, claimFailureReasons(t, reader),
+		"an expiry pass cut short by shutdown must not tick the claim-failure counter")
+}
+
+// One instance expires per pass, so the batch bound is the fleet-wide drain
+// rate per interval rather than a per-driver rate — an unbounded pass would let
+// a large backlog hold a single transaction open across the whole set.
+func TestRunRetryableExpiryPassBoundsTheBatch(t *testing.T) {
+	applies := &expiringApplyStore{}
+	svc, _ := retryableExpiryService(applies)
+
+	svc.runRetryableExpiryPass(t.Context())
+
+	assert.Equal(t, retryableExpiryBatch, applies.limit)
 }

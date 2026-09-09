@@ -6,7 +6,7 @@ to see what is changing across your fleet.
 
 | What would you like to do? | Start here |
 |---|---|
-| Try SchemaBot for the first time | [Run the local quick start](../README.md#quick-start), then [connect the CLI](#connect-to-a-server) |
+| Try SchemaBot for the first time | [Initialize your database](#initialize-your-database) or [try the demo](../README.md#quick-start) |
 | See what is in a database | [Read the live schema](#read-the-live-schema) |
 | Make a schema change | [Plan and apply a change](#plan-and-apply-a-change) |
 | Check an ongoing change | [Follow progress and control the apply](#follow-and-control-a-change) |
@@ -16,6 +16,23 @@ to see what is changing across your fleet.
 The examples use a MySQL database named `shop` in `staging`.
 Substitute a database and environment from your server's inventory. The local
 quick start uses `testapp`; it does not create the `shop` database shown here.
+
+## Initialize your database
+
+`init` connects to your database, imports its schema, and stores a plan proving
+that the files match. It does not apply changes to the application database.
+Set `APP_DSN` and `STATE_DSN` in your shell first. The state connection must name
+a separate, existing database where SchemaBot can store its own metadata.
+
+```console
+$ schemabot init -d shop -e staging --type mysql --dsn env:APP_DSN --storage-dsn env:STATE_DSN --namespace shop --schema-dir schema --json
+{"database":"shop","environment":"staging","profile":"default","schema_dir":"/home/dev/shop/schema","plan_id":"plan-example-01","tables":4,"verified":true}
+```
+
+Keep the connection variable names stable on retries. Correct their values for
+credential or address mistakes. To use a different state database, choose a new
+`--runtime` and `--profile`; an existing runtime's durable state is never replaced.
+Use a local filesystem that supports exclusive directory rename for `--schema-dir`.
 
 ## Connect to a server
 
@@ -255,6 +272,10 @@ files directly with the CLI, as shown below.
 
 ### Review an index change
 
+Plan output uses the target database dialect, including PostgreSQL identifier
+quoting. Statements for other dialects are kept separate instead of being
+combined with MySQL syntax.
+
 For this example, `schema/schemabot.yaml` contains:
 
 ```yaml
@@ -364,7 +385,9 @@ $ schemabot progress apply-example-73
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)
        ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
        • Rows: 6,000,000 / 10,000,000 · ETA: 8m 0s
-       • ℹ️ Throttled: Replication lag exceeds the configured limit
+       • ℹ️ Throttled: commit-latency 120ms >= 100ms · backing off while database writes commit slowly
+
+  Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
 
 
 
@@ -380,9 +403,13 @@ swap. During cutover, the watcher asks you to wait and disables Esc/stop.
 ### Understand throttling
 
 When copying is throttled, the live view explains why. This MySQL example
-pauses for replication lag, then continues as conditions improve.
+pauses when commits are slow, then continues as conditions improve. Recognized
+signals include a short explanation beside each affected table. One shared
+link to the [throttle reference](throttle.md) appears below the tables.
+The link uses a readable label in supported terminals and the full URL in plain output,
+matching `list-plans` and `status`.
 
-![MySQL progress shows a replication-lag throttle reason and resumes copying](../assets/cli-throttle.gif)
+![MySQL progress shows a commit-latency throttle signal, its docs link, and completion](../assets/cli-throttle.gif)
 
 ### Stop and resume a change
 
@@ -503,15 +530,21 @@ $ schemabot status apply-example-73
 
 ### Review a rollback before running it
 
+The preview and live progress format SQL using the target database dialect,
+preserving quoted names and values. If the server omits the database type or
+returns an unrecognized type, both views preserve the original SQL.
+
 Here is a rollback of the index added earlier. This example declines the
 confirmation, so nothing changes:
 
 ```console
 $ schemabot rollback -e staging apply-example-73
 Rollback Plan
-=============
-Database: shop
-Environment: staging
+┌───────────────────────────────────┐
+│  Database:      shop              │
+│  Environment:   staging           │
+│  Source apply:  apply-example-73  │
+└───────────────────────────────────┘
 
 The following changes will be applied to rollback:
 
@@ -536,14 +569,16 @@ same terminal until it confirms completion.
 ```console
 $ schemabot rollback -e staging apply-example-85
 Rollback Plan
-=============
-Database: shop
-Environment: staging
+┌───────────────────────────────────┐
+│  Database:      shop              │
+│  Environment:   staging           │
+│  Source apply:  apply-example-85  │
+└───────────────────────────────────┘
 
 The following changes will be applied to rollback:
 
   orders (alter):
-    ALTER TABLE `orders` ADD INDEX `idx_status` (`status`);
+    ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
 
 Do you want to apply this rollback? Only 'yes' will be accepted: yes
 🔒 Lock acquired for shop (mysql)
@@ -611,7 +646,7 @@ Prefer structured output when another program consumes the result:
 
 | Commands | JSON option |
 |---|---|
-| `databases`, `status`, `list-plans`, `logs`, `plan` | `--json` |
+| `databases`, `status`, `list-plans`, `logs`, `plan`, `init` | `--json` |
 | `pull` | `-o json` |
 
 For example:

@@ -7,6 +7,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/cliname"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"vitess.io/vitess/go/vt/key"
 )
@@ -32,8 +33,9 @@ func previewPreparingBranchOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "users", Namespace: "myapp_sharded",
-				DDL:    "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
-				Status: state.Apply.Pending,
+				Dialect: schema.DialectMySQL,
+				DDL:     "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
+				Status:  state.Apply.Pending,
 			},
 		},
 	}
@@ -54,8 +56,9 @@ func previewRefreshingBranchOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "users", Namespace: "myapp_sharded",
-				DDL:    "ALTER TABLE `users` ADD COLUMN `region` varchar(50) DEFAULT NULL",
-				Status: state.Apply.Pending,
+				Dialect: schema.DialectMySQL,
+				DDL:     "ALTER TABLE `users` ADD COLUMN `region` varchar(50) DEFAULT NULL",
+				Status:  state.Apply.Pending,
 			},
 		},
 	}
@@ -104,8 +107,9 @@ func previewCreatingDeployRequestOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "users", Namespace: "myapp_sharded",
-				DDL:    "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
-				Status: state.Apply.Pending,
+				Dialect: schema.DialectMySQL,
+				DDL:     "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
+				Status:  state.Apply.Pending,
 			},
 		},
 	}
@@ -165,6 +169,7 @@ func previewVitessDDLWithVSchemaOutput() {
 			{
 				TableName: "users", Namespace: "myapp_sharded",
 				ChangeType:      "alter",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
 				Status:          state.Apply.Completed,
 				RowsCopied:      50000,
@@ -211,12 +216,14 @@ func previewVitessMultiKeyspaceOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "users", Namespace: "myapp_sharded",
-				DDL:    "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
-				Status: state.Apply.Completed,
+				Dialect: schema.DialectMySQL,
+				DDL:     "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
+				Status:  state.Apply.Completed,
 			},
 			{
 				TableName: "orders_seq",
 				Namespace: "myapp_unsharded",
+				Dialect:   schema.DialectMySQL,
 				DDL:       "CREATE TABLE `orders_seq` (`id` int unsigned NOT NULL DEFAULT '0', `next_id` bigint unsigned, `cache` bigint unsigned, PRIMARY KEY (`id`)) ENGINE InnoDB",
 				Status:    state.Apply.Running,
 			},
@@ -239,6 +246,7 @@ func previewVitessShardProgressOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "orders", Namespace: "myapp_sharded",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `orders` ADD INDEX `idx_total` (`total_cents`)",
 				Status:          state.Apply.Running,
 				RowsCopied:      2800000,
@@ -269,6 +277,7 @@ func previewVitessCutoverRetryOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "orders", Namespace: "myapp_sharded",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `orders` ADD INDEX `idx_total` (`total_cents`)",
 				Status:          state.Task.WaitingForCutover,
 				RowsCopied:      4000000,
@@ -301,6 +310,7 @@ func previewVitessInstantDDLOutput() {
 			{
 				TableName: "users", Namespace: "myapp_sharded",
 				ChangeType: "alter",
+				Dialect:    schema.DialectMySQL,
 				DDL:        "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
 				Status:     state.Apply.Completed,
 				IsInstant:  true,
@@ -328,8 +338,9 @@ func previewVitessRevertWindowOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "orders", Namespace: "myapp_sharded",
-				DDL:    "ALTER TABLE `orders` ADD INDEX `idx_total` (`total_cents`)",
-				Status: state.Apply.RevertWindow,
+				Dialect: schema.DialectMySQL,
+				DDL:     "ALTER TABLE `orders` ADD INDEX `idx_total` (`total_cents`)",
+				Status:  state.Apply.RevertWindow,
 			},
 		},
 	}
@@ -347,8 +358,9 @@ func previewVitessStagingOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "customers", Namespace: "myapp_sharded",
-				DDL:    "ALTER TABLE `customers` ADD INDEX `idx_created_at`(`created_at`)",
-				Status: state.Apply.Running,
+				Dialect: schema.DialectMySQL,
+				DDL:     "ALTER TABLE `customers` ADD INDEX `idx_created_at`(`created_at`)",
+				Status:  state.Apply.Running,
 				// RowsTotal > 0 but RowsCopied == 0 triggers "⏳ Starting copy..."
 				RowsCopied: 0,
 				RowsTotal:  124760460,
@@ -377,8 +389,9 @@ func previewVitessRunningOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "users", Namespace: "myapp_sharded",
-				DDL:    "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
-				Status: state.Apply.Running,
+				Dialect: schema.DialectMySQL,
+				DDL:     "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
+				Status:  state.Apply.Running,
 			},
 		},
 	}
@@ -401,8 +414,9 @@ func previewVitessCompletedOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "users", Namespace: "myapp_sharded",
-				DDL:    "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
-				Status: state.Apply.Completed,
+				Dialect: schema.DialectMySQL,
+				DDL:     "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
+				Status:  state.Apply.Completed,
 			},
 		},
 	}
@@ -427,12 +441,14 @@ func previewVitessMultiKeyspaceCompletedWatchOutput() {
 			{
 				TableName: "events",
 				Namespace: "commerce_sharded",
+				Dialect:   schema.DialectMySQL,
 				DDL:       ddl,
 				Status:    state.Apply.Completed,
 			},
 			{
 				TableName: "events",
 				Namespace: "commerce_sharded_006",
+				Dialect:   schema.DialectMySQL,
 				DDL:       ddl,
 				Status:    state.Apply.Completed,
 			},
@@ -458,8 +474,9 @@ func previewVitessFailedOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "users", Namespace: "myapp_sharded",
-				DDL:    "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
-				Status: state.Apply.Failed,
+				Dialect: schema.DialectMySQL,
+				DDL:     "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
+				Status:  state.Apply.Failed,
 			},
 		},
 	}
@@ -486,8 +503,9 @@ func previewVitessWaitingForDeployOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "users", Namespace: "myapp_sharded",
-				DDL:    "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
-				Status: state.Apply.Pending,
+				Dialect: schema.DialectMySQL,
+				DDL:     "ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL",
+				Status:  state.Apply.Pending,
 			},
 		},
 	}
@@ -512,6 +530,7 @@ func previewVitessWaitingForCutoverOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "orders", Namespace: "myapp_sharded",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `orders` ADD INDEX `idx_total` (`total_cents`)",
 				Status:          state.Apply.WaitingForCutover,
 				RowsCopied:      4000000,
@@ -545,6 +564,7 @@ func previewVitessCuttingOverOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "orders", Namespace: "myapp_sharded",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `orders` ADD INDEX `idx_total` (`total_cents`)",
 				Status:          state.Apply.CuttingOver,
 				RowsCopied:      4000000,
@@ -575,6 +595,7 @@ func previewVitessCancelledOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "orders", Namespace: "myapp_sharded",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `orders` ADD INDEX `idx_total` (`total_cents`)",
 				Status:          state.Apply.Cancelled,
 				RowsCopied:      1200000,
@@ -649,6 +670,7 @@ func previewVitessLargeShardCountOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "transactions", Namespace: "commerce_sharded",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL",
 				Status:          state.Apply.Running,
 				RowsCopied:      totalCopied,
@@ -675,6 +697,7 @@ func previewVitessManyKeyspacesOutput() {
 			TableName:  "transactions",
 			Namespace:  ks,
 			ChangeType: "alter",
+			Dialect:    schema.DialectMySQL,
 			DDL:        "ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL",
 			Status:     state.Apply.Completed,
 			IsInstant:  true,
@@ -718,6 +741,7 @@ func previewVitessManyKeyspacesOutput() {
 	tables = append(tables, TableProgress{
 		TableName:       "transactions",
 		Namespace:       "commerce_sharded",
+		Dialect:         schema.DialectMySQL,
 		DDL:             "ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL",
 		Status:          state.Apply.Running,
 		RowsCopied:      totalCopied,
@@ -757,6 +781,7 @@ func previewProgressOutput() {
 			{
 				TableName:       "users",
 				Namespace:       "testapp",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
 				RowsCopied:      3500000,
 				RowsTotal:       7200000,
@@ -778,12 +803,14 @@ func previewWaitingForCutoverOutput() {
 			{
 				TableName: "order_items",
 				Namespace: "testapp",
+				Dialect:   schema.DialectMySQL,
 				DDL:       "ALTER TABLE `order_items` ADD INDEX `idx_product_id` (`product_id`)",
 				Status:    state.Apply.WaitingForCutover,
 			},
 			{
 				TableName: "users",
 				Namespace: "testapp",
+				Dialect:   schema.DialectMySQL,
 				DDL:       "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
 				Status:    state.Apply.WaitingForCutover,
 			},
@@ -814,13 +841,15 @@ func previewCuttingOverOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "order_items", Namespace: "testapp",
-				DDL:    "ALTER TABLE `order_items` ADD INDEX `idx_product_id` (`product_id`)",
-				Status: state.Apply.CuttingOver,
+				Dialect: schema.DialectMySQL,
+				DDL:     "ALTER TABLE `order_items` ADD INDEX `idx_product_id` (`product_id`)",
+				Status:  state.Apply.CuttingOver,
 			},
 			{
 				TableName: "users", Namespace: "testapp",
-				DDL:    "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
-				Status: state.Apply.CuttingOver,
+				Dialect: schema.DialectMySQL,
+				DDL:     "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
+				Status:  state.Apply.CuttingOver,
 			},
 		},
 	}
@@ -837,13 +866,15 @@ func previewCompletedOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "order_items", Namespace: "testapp",
-				DDL:    "ALTER TABLE `order_items` ADD INDEX `idx_product_id` (`product_id`)",
-				Status: state.Apply.Completed,
+				Dialect: schema.DialectMySQL,
+				DDL:     "ALTER TABLE `order_items` ADD INDEX `idx_product_id` (`product_id`)",
+				Status:  state.Apply.Completed,
 			},
 			{
 				TableName: "users", Namespace: "testapp",
-				DDL:    "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
-				Status: state.Apply.Completed,
+				Dialect: schema.DialectMySQL,
+				DDL:     "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
+				Status:  state.Apply.Completed,
 			},
 		},
 	}
@@ -865,8 +896,9 @@ func previewFailedOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "users", Namespace: "testapp",
-				DDL:    "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
-				Status: state.Apply.Failed,
+				Dialect: schema.DialectMySQL,
+				DDL:     "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
+				Status:  state.Apply.Failed,
 			},
 		},
 	}
@@ -884,6 +916,7 @@ func previewStoppedOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "users", Namespace: "testapp",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
 				Status:          state.Apply.Stopped,
 				RowsCopied:      156342,
@@ -892,6 +925,7 @@ func previewStoppedOutput() {
 			},
 			{
 				TableName: "orders", Namespace: "testapp",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `orders` ADD INDEX `idx_total_cents` (`total_cents`)",
 				Status:          state.Apply.Stopped,
 				PercentComplete: 0, // Never started
@@ -914,9 +948,10 @@ func previewApplyWatchOutput() {
 		ApplyID:   "apply-a1b2c3d4e5f6",
 		StartedAt: previewTime.Add(-8 * time.Minute).Format(time.RFC3339),
 		Tables: []TableProgress{
-			{TableName: "orders", Namespace: "testapp", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: state.Apply.Completed},
+			{TableName: "orders", Namespace: "testapp", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: state.Apply.Completed},
 			{
 				TableName: "users", Namespace: "testapp",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
 				Status:          state.Apply.Running,
 				RowsCopied:      914707,
@@ -924,7 +959,7 @@ func previewApplyWatchOutput() {
 				PercentComplete: 62,
 				ETASeconds:      195, // 3m 15s
 			},
-			{TableName: "products", Namespace: "testapp", DDL: "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)", Status: state.Apply.Pending},
+			{TableName: "products", Namespace: "testapp", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)", Status: state.Apply.Pending},
 		},
 	}
 	WriteProgress(data)
@@ -942,9 +977,9 @@ func previewApplyWatchOutput() {
 		StartedAt:   previewTime.Add(-12 * time.Minute).Format(time.RFC3339),
 		CompletedAt: previewTime.Add(-30 * time.Second).Format(time.RFC3339),
 		Tables: []TableProgress{
-			{TableName: "orders", Namespace: "testapp", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: state.Apply.Completed},
-			{TableName: "products", Namespace: "testapp", DDL: "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)", Status: state.Apply.Completed},
-			{TableName: "users", Namespace: "testapp", DDL: "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)", Status: state.Apply.Completed},
+			{TableName: "orders", Namespace: "testapp", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: state.Apply.Completed},
+			{TableName: "products", Namespace: "testapp", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)", Status: state.Apply.Completed},
+			{TableName: "users", Namespace: "testapp", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)", Status: state.Apply.Completed},
 		},
 	}
 	WriteProgress(dataComplete)
@@ -962,16 +997,17 @@ func previewApplyStoppedOutput() {
 		ApplyID:   "apply-a1b2c3d4e5f6",
 		StartedAt: previewTime.Add(-8 * time.Minute).Format(time.RFC3339),
 		Tables: []TableProgress{
-			{TableName: "orders", Namespace: "testapp", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: state.Apply.Completed},
+			{TableName: "orders", Namespace: "testapp", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: state.Apply.Completed},
 			{
 				TableName: "users", Namespace: "testapp",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
 				Status:          state.Apply.Stopped,
 				RowsCopied:      45000,
 				RowsTotal:       100000,
 				PercentComplete: 45,
 			},
-			{TableName: "products", Namespace: "testapp", DDL: "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)", Status: state.Apply.Stopped, PercentComplete: 0},
+			{TableName: "products", Namespace: "testapp", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)", Status: state.Apply.Stopped, PercentComplete: 0},
 		},
 	}
 	WriteProgress(data)
@@ -1006,16 +1042,17 @@ func previewStopCommandOutput() {
 		ApplyID:   "apply-a1b2c3d4e5f6",
 		StartedAt: previewTime.Add(-8 * time.Minute).Format(time.RFC3339),
 		Tables: []TableProgress{
-			{TableName: "orders", Namespace: "testapp", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: state.Apply.Completed},
+			{TableName: "orders", Namespace: "testapp", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: state.Apply.Completed},
 			{
 				TableName: "users", Namespace: "testapp",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
 				Status:          state.Apply.Stopped,
 				RowsCopied:      156342,
 				RowsTotal:       397453,
 				PercentComplete: 39,
 			},
-			{TableName: "products", Namespace: "testapp", DDL: "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)", Status: state.Apply.Stopped, PercentComplete: 0},
+			{TableName: "products", Namespace: "testapp", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)", Status: state.Apply.Stopped, PercentComplete: 0},
 		},
 	}
 	WriteProgress(data)
@@ -1043,9 +1080,10 @@ func previewStartCommandOutput() {
 		ApplyID:   "apply-a1b2c3d4e5f6",
 		StartedAt: previewTime.Add(-8 * time.Minute).Format(time.RFC3339),
 		Tables: []TableProgress{
-			{TableName: "orders", Namespace: "testapp", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: state.Apply.Completed},
+			{TableName: "orders", Namespace: "testapp", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: state.Apply.Completed},
 			{
 				TableName: "users", Namespace: "testapp",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
 				Status:          state.Apply.Running,
 				RowsCopied:      158000, // Resumed from checkpoint, slightly more progress
@@ -1053,7 +1091,7 @@ func previewStartCommandOutput() {
 				PercentComplete: 40,
 				ETASeconds:      480,
 			},
-			{TableName: "products", Namespace: "testapp", DDL: "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)", Status: state.Apply.Pending},
+			{TableName: "products", Namespace: "testapp", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)", Status: state.Apply.Pending},
 		},
 	}
 	WriteProgress(data)
