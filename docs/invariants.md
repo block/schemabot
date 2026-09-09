@@ -774,18 +774,18 @@ classes exclude each other by one mechanism rather than by two that have to be k
 and a row can still be attributed by reading it. A reader's job is to report what is stored,
 including when what is stored is a task that has outlived its apply's verdict (UX-3).
 
-Retryable-apply expiry also protects task rows with fresh operation leases, including live
-redispatches. Skipped tasks remain the driver's to finish; the reaper can settle abandoned ones
-after its lease and quiescence gates permit it.
-
-Expiry's apply and retryable-operation verdicts are an exception: they can become permanently
-failed when the recovery budget expires, even while an operation lease remains fresh. This
-releases the deployment-order gate; it does not authorize overwriting that driver's task rows.
+Retryable-apply expiry is an exception to this coverage. Its task gate excludes fresh leases
+in active states, but a fresh `failed_retryable` lease can represent either a live redispatch or
+a finished attempt. Expiry currently admits that ambiguous case, so it can terminalize a live
+redispatch's tasks. Its apply and retryable-operation verdicts also carry no operation-lease gate.
+The parent lock serializes expiry against parent-apply claims; it does not exclude an
+operation-only driver. These writes must not be treated as covered by the guarantee above.
 
 *Enforced:* lease predicates on driver writes (`pkg/storage/internal/sqlstore/tasks.go`,
-`pkg/storage/internal/sqlstore/applies.go`), the shared `unleasedOperationGate` on expiry and
-reaper task writes (`pkg/storage/internal/sqlstore/apply_operations.go`), and read-only progress
-assembly (`pkg/api/progress_handlers.go`).
+`pkg/storage/internal/sqlstore/applies.go`), `unleasedOperationGate` on reaper task writes
+(`pkg/storage/internal/sqlstore/apply_operations.go`), and read-only progress assembly
+(`pkg/api/progress_handlers.go`). Expiry's narrower `undrivenOperationGate` is the exception
+recorded here.
 
 ## Control operations (CO)
 
