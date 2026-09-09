@@ -71,20 +71,37 @@ func (cmd *InitCmd) initializeWithUI(ctx context.Context, g *Globals) (*initResu
 	if !cmd.interactive {
 		return cmd.initialize(ctx, g)
 	}
+	return runInitProgress(ctx, func(runCtx context.Context, report func(string)) (*initResult, error) {
+		cmd.progress = report
+		defer func() { cmd.progress = nil }()
+		return cmd.initialize(runCtx, g)
+	}, tea.WithInput(os.Stdin), tea.WithOutput(os.Stdout))
+}
+
+func runInitProgress(ctx context.Context, initialize func(context.Context, func(string)) (*initResult, error), options ...tea.ProgramOption) (*initResult, error) {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#0969DA", Dark: "#79C0FF"})
 	m := &initProgress{spinner: s, cancel: cancel, width: 72}
-	// The program stays alive until initialization returns, including after cancel,
-	// so cleanup finishes before the terminal is returned to the shell.
-	p := tea.NewProgram(m, tea.WithInput(os.Stdin), tea.WithOutput(os.Stdout), tea.WithoutSignalHandler())
-	cmd.progress = func(stage string) { p.Send(initStageMsg(stage)) }
-	defer func() { cmd.progress = nil }()
-	m.run = func() tea.Msg { r, err := cmd.initialize(runCtx, g); return initFinishedMsg{r, err} }
-	if _, err := p.Run(); err != nil {
-		return nil, err
+	options = append(options, tea.WithoutSignalHandler())
+	p := tea.NewProgram(m, options...)
+	finished := make(chan struct{})
+	var outcome initFinishedMsg
+	// Own initialization outside Bubble Tea's Cmd goroutines so every exit,
+	// including a terminal failure before Init, can cancel and join cleanup.
+	go func() {
+		defer close(finished)
+		outcome.result, outcome.err = initialize(runCtx, func(stage string) { p.Send(initStageMsg(stage)) })
+	}()
+	m.run = func() tea.Msg { <-finished; return outcome }
+	_, runErr := p.Run()
+	cancel()
+	p.Kill()
+	<-finished
+	if runErr != nil {
+		return nil, fmt.Errorf("run setup display: %w", runErr)
 	}
 	if m.finished == nil {
 		return nil, fmt.Errorf("setup interrupted")

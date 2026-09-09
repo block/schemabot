@@ -83,8 +83,14 @@ func (m *initWizard) loadField() {
 	m.scroll = 0
 	m.connectionChecked = false
 	if m.step >= len(m.fields) {
-		entries, err := os.ReadDir(m.fields[6].value)
-		m.hasExistingSchema = err == nil && len(entries) > 0
+		reuse, err := initSchemaReuse(m.fields[6].value)
+		if err != nil {
+			m.step = 6
+			m.loadField()
+			m.err = err.Error()
+			return
+		}
+		m.hasExistingSchema = reuse
 		m.input.Blur()
 		return
 	}
@@ -192,9 +198,6 @@ func (m *initWizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.fields[m.step].value = m.input.Value()
 				}
 				m.step--
-				if m.step == 4 && !m.explicitNamespaces {
-					m.step = 3
-				}
 				m.err = ""
 				m.loadField()
 			}

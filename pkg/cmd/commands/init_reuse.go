@@ -7,7 +7,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/schema"
 )
 
 // Snapshot the user's files before verification. Publication later compares
@@ -16,6 +16,9 @@ func stageExistingInitSchema(root, stage, database, engine, environment string, 
 	snapshot, err := initSchemaSnapshot(root)
 	if err != nil {
 		return nil, err
+	}
+	if _, exists := snapshot["schemabot.yaml"]; !exists {
+		return nil, fmt.Errorf("schemabot.yaml not found in %q; choose a schema directory with a valid configuration", root)
 	}
 	for relative, content := range snapshot {
 		path := filepath.Join(stage, relative)
@@ -39,7 +42,7 @@ func stageExistingInitSchema(root, stage, database, engine, environment string, 
 	if cfg.Database != database || cfg.Type != engine {
 		return nil, fmt.Errorf("existing schema configuration names a different database or engine")
 	}
-	files, _, err := client.ReadSchemaFiles(stage, environment, cfg.IgnoreNamespaces)
+	files, _, err := schema.GroupFilesByNamespace(snapshot, filepath.Base(root), environment, cfg.IgnoreNamespaces)
 	if err != nil {
 		return nil, err
 	}

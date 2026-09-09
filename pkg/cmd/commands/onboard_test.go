@@ -430,3 +430,19 @@ func TestBuildOnboardWritePlanEmptyNamespace(t *testing.T) {
 		})
 	}
 }
+
+func TestOnboardRetainsEmptyNamespacesAndRejectsCaseCollisions(t *testing.T) {
+	response := &apitypes.PullSchemaResponse{Database: "app", Type: "postgres", Environment: "development", Namespaces: map[string]*apitypes.PulledNamespace{
+		"public": {Tables: map[string]string{}}, "billing": {Tables: map[string]string{"orders": "CREATE TABLE orders (id bigint);"}},
+	}}
+	root := t.TempDir()
+	plan, err := buildOnboardWritePlan(root, response, nil)
+	require.NoError(t, err)
+	require.Contains(t, plan.files, filepath.Join("public", "schema.sql"))
+	response.Namespaces["billing"].Tables["Orders"] = "CREATE TABLE \"Orders\" (id bigint);"
+	_, err = buildOnboardWritePlan(root, response, nil)
+	require.ErrorContains(t, err, "case-insensitive filesystem")
+	entries, err := os.ReadDir(root)
+	require.NoError(t, err)
+	require.Empty(t, entries)
+}

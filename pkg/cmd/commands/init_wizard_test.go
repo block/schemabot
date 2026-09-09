@@ -2,6 +2,8 @@ package commands
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -58,6 +60,7 @@ func TestInitWizardReviewExistingFilesAndCancel(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "users.sql")
 	require.NoError(t, os.WriteFile(path, []byte("existing"), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"), []byte("database: app\ntype: postgres\n"), 0600))
 	m := newInitWizard(&InitCmd{SchemaDir: root}, "default", io.Discard)
 	m.step = len(m.fields)
 	m.loadField()
@@ -396,4 +399,55 @@ func TestInitRejectsUnrelatedFilesBeforeReview(t *testing.T) {
 	require.Contains(t, m.err, "schemabot.yaml")
 	require.Contains(t, m.err, root)
 	require.NotContains(t, m.err, ".schemabot-init-")
+}
+
+func TestInitMissingInputsJSONUsesErrorObject(t *testing.T) {
+	cmd := InitCmd{JSON: true}
+	output := captureStdout(func() {
+		require.ErrorIs(t, cmd.collectInputsWithTerminalState(t.Context(), &Globals{}, false, false), ErrSilent)
+	})
+	var response struct {
+		Error   struct{ Code, Message string }
+		Missing []string
+	}
+	require.NoError(t, json.Unmarshal([]byte(output), &response))
+	require.Equal(t, "missing_inputs", response.Error.Code)
+	require.NotEmpty(t, response.Error.Message)
+	require.Contains(t, response.Missing, "database")
+}
+
+func TestInitWizardChecksFolderBeforeReviewAndKeepsStateStepReachable(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, ".gitkeep"), nil, 0644))
+	m := newInitWizard(&InitCmd{SchemaDir: root}, "default", io.Discard)
+	m.step = len(m.fields)
+	m.loadField()
+	require.Equal(t, 6, m.step)
+	require.Contains(t, m.err, "placeholder")
+	require.NotContains(t, m.View(), "verify them and keep your edits")
+	require.FileExists(t, filepath.Join(root, ".gitkeep"))
+	m.step = 5
+	m.explicitNamespaces = false
+	m.loadField()
+	wizardKey(m, tea.KeyShiftTab)
+	require.Equal(t, 4, m.step)
+}
+
+type initBrokenTerminal struct{}
+
+func (initBrokenTerminal) Read([]byte) (int, error) { return 0, errors.New("terminal failed") }
+
+func TestInitTerminalFailureJoinsCleanup(t *testing.T) {
+	cleaned := make(chan struct{})
+	_, err := runInitProgress(t.Context(), func(ctx context.Context, report func(string)) (*initResult, error) {
+		defer close(cleaned)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}, tea.WithInput(initBrokenTerminal{}), tea.WithOutput(io.Discard), tea.WithoutRenderer())
+	require.Error(t, err)
+	select {
+	case <-cleaned:
+	default:
+		t.Fatal("terminal returned before cleanup")
+	}
 }

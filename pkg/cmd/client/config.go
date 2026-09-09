@@ -149,6 +149,36 @@ func requireSecureConfigMode(path string, mode os.FileMode) error {
 // ErrConfigChanged means another command saved configuration after it was read.
 var ErrConfigChanged = errors.New("CLI configuration changed; retry the command")
 
+var ErrConfigBusy = errors.New("CLI configuration is busy; retry the command")
+
+// UpdateConfig reapplies a small edit to the latest configuration after a concurrent
+// writer wins. The edit must not prompt or perform external work: credentials and
+// user choices are collected once, before entering this bounded save loop.
+func UpdateConfig(ctx context.Context, edit func(*Config) error) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		cfg, err := LoadConfig()
+		if err != nil {
+			return err
+		}
+		if err := edit(cfg); err != nil {
+			return err
+		}
+		err = SaveConfig(cfg)
+		if !errors.Is(err, ErrConfigChanged) && !errors.Is(err, ErrConfigBusy) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("save configuration after concurrent updates: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
 // SaveConfig atomically saves configuration. Configurations returned by
 // LoadConfig are saved only if their on-disk revision has not changed.
 func SaveConfig(cfg *Config) error {

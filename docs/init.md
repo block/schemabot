@@ -82,7 +82,7 @@ Missing inputs are explicit and exit unsuccessfully:
 
 ```console
 $ schemabot init --non-interactive --json
-{"error":"missing_inputs","missing":["database","environment","type","dsn","storage-dsn","namespace"]}
+{"error":{"code":"missing_inputs","message":"Provide the missing flags or run init interactively."},"missing":["database","environment","type","dsn","storage-dsn","namespace"]}
 ```
 
 A failed setup preserves existing files and retains any runtime registration and state already

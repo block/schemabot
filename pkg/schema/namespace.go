@@ -12,6 +12,8 @@ import (
 const EmptyNamespaceDeclaration = "-- This namespace is empty. Add CREATE TABLE declarations here.\n"
 
 // GroupFilesByNamespace groups schema files by namespace using their relative paths.
+// An explicit empty-namespace marker retains the namespace with an empty Files map;
+// the marker itself is metadata and is not sent to an engine.
 // Two layouts are supported:
 //
 //  1. Flat layout — SQL files directly in the schema directory. The namespace

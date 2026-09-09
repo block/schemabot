@@ -40,10 +40,10 @@ func (cmd *InitCmd) collectInputsWithTerminalState(ctx context.Context, g *Globa
 	}
 	if !cmd.interactive {
 		if cmd.JSON {
-			if err := json.NewEncoder(os.Stdout).Encode(struct {
-				Error   string   `json:"error"`
-				Missing []string `json:"missing"`
-			}{"missing_inputs", missing}); err != nil {
+			if err := json.NewEncoder(os.Stdout).Encode(map[string]any{
+				"error":   map[string]string{"code": "missing_inputs", "message": "Provide the missing flags or run init interactively."},
+				"missing": missing,
+			}); err != nil {
 				return err
 			}
 			return ErrSilent
