@@ -78,8 +78,10 @@ conditions:
 - A `CREATE INDEX CONCURRENTLY` build is bounded by
   `postgres.concurrent_index_max_duration`, which defaults to 24 hours, set as
   the build's server-side `statement_timeout`. The bound starts when the build
-  starts; the session setup before it runs under a separate headroom, so the
-  build gets the full configured bound.
+  starts; the session setup before it runs under a separate headroom sized for
+  setup as slow as the server's own limits allow, so the build gets the full
+  configured bound. Setup that outruns the headroom shortens the build by the
+  excess, since the apply as a whole still ends at the bound plus the headroom.
 
 The common supported case is a metadata-only `ALTER TABLE`, such as adding a
 nullable column:

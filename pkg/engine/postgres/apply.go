@@ -846,7 +846,10 @@ func buildIndexConcurrently(ctx context.Context, pool *pgxpool.Pool, change nati
 		// recovery's only deadline; a non-positive one would be refused by
 		// the executor as unbounded, or end every recovery before it starts
 		// and report it as a cancellation, so an unset bound is refused
-		// before any session is acquired.
+		// before any session is acquired. The drive cannot reach this
+		// branch — the engine constructor normalizes its option and
+		// runOptimisticApply stamps the result on every change — so it
+		// guards a nativeApply built without going through the drive.
 		return fmt.Errorf("build PostgreSQL index concurrently on table %q: build bound is unset", change.table)
 	}
 	// The build runs under a server-side statement_timeout of the configured
@@ -883,7 +886,9 @@ func buildIndexConcurrently(ctx context.Context, pool *pgxpool.Pool, change nati
 	// until it finishes on its own, bounded only by the lock timeouts the
 	// recovery sets for itself. The refused build charged only catalog reads
 	// against the ceiling, so the recovery starts with the full bound ahead
-	// of it.
+	// of it; that rests on abandonedBeforeBuild admitting only verdicts with
+	// no build attached, since a verdict reached after a build ran would
+	// arrive here with the bound already spent once.
 	recoveryCtx, cancel := context.WithTimeout(ctx, change.concurrentIndexMaxDuration)
 	defer cancel()
 	report, err := executor.RebuildAbandonedIndex(recoveryCtx, pool, change.sql,

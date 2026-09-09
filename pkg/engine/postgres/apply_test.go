@@ -1059,6 +1059,12 @@ func TestConcurrentIndexApplyCeilingLeavesSetupHeadroom(t *testing.T) {
 // table preflight and the partition facts lookup each at the pool's
 // statement_timeout. Under that headroom the build gets the full configured
 // bound even when setup is as slow as the server allows it to be.
+//
+// The privilege check counts as one read: its second query runs only when
+// the first finds no target table, and that ends the apply as a refusal
+// before any build a bound could be shortened for; the SET ROLE probe it
+// also carries belongs to the copy-and-swap tier, which a concurrent index
+// build never reaches.
 func TestConcurrentIndexHeadroomCoversSessionSetup(t *testing.T) {
 	setup := dbconn.DefaultConnectTimeout + // pool dial
 		dbconn.DefaultStatementTimeout + // preflight.CheckPrivileges
@@ -1088,6 +1094,8 @@ func TestConcurrentIndexMaximumIsTheServerStatementTimeoutCeiling(t *testing.T) 
 // build's server-side statement timeout and the recovery's only deadline, so
 // a missing one is refused before any session is acquired rather than handed
 // to the executor as an unbounded budget or run to an instant cancellation.
+// The drive always stamps a normalized bound, so this exercises the guard a
+// directly constructed nativeApply meets, not a state the drive produces.
 func TestBuildIndexConcurrentlyRefusesAnUnsetBound(t *testing.T) {
 	change := nativeApply{namespace: "public", table: "users",
 		sql: "CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)", concurrentIndex: true}
@@ -1545,19 +1553,45 @@ func TestValidateOptimisticApplyAcceptsCreateSet(t *testing.T) {
 	assert.False(t, change.concurrentIndex)
 }
 
+// TestValidateOptimisticApplyClassifiesConcurrentIndex pins both halves of
+// the predicate that routes a statement to the concurrent-build executor:
+// only a lone CREATE INDEX that names CONCURRENTLY qualifies. A plain CREATE
+// INDEX is the same statement kind and must stay on the transactional path;
+// TestValidateOptimisticApplyAcceptsCreateSet pins that a create set, which
+// is never one statement, does not qualify either.
 func TestValidateOptimisticApplyClassifiesConcurrentIndex(t *testing.T) {
-	req := &engine.ApplyRequest{
-		Database: "app",
-		Changes: []engine.SchemaChange{{Namespace: "public", TableChanges: []engine.TableChange{{
-			Table: "widgets",
-			DDL:   "CREATE INDEX CONCURRENTLY widgets_name_idx ON public.widgets (name)",
-		}}}},
-		Credentials: &engine.Credentials{DSN: "postgres://localhost/app"},
+	tests := []struct {
+		name       string
+		ddl        string
+		concurrent bool
+	}{
+		{
+			name:       "concurrent index",
+			ddl:        "CREATE INDEX CONCURRENTLY widgets_name_idx ON public.widgets (name)",
+			concurrent: true,
+		},
+		{
+			name:       "plain index stays transactional",
+			ddl:        "CREATE INDEX widgets_name_idx ON public.widgets (name)",
+			concurrent: false,
+		},
 	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := &engine.ApplyRequest{
+				Database: "app",
+				Changes: []engine.SchemaChange{{Namespace: "public", TableChanges: []engine.TableChange{{
+					Table: "widgets",
+					DDL:   tc.ddl,
+				}}}},
+				Credentials: &engine.Credentials{DSN: "postgres://localhost/app"},
+			}
 
-	change, err := validateOptimisticApply(req)
-	require.NoError(t, err)
-	assert.True(t, change.concurrentIndex)
+			change, err := validateOptimisticApply(req)
+			require.NoError(t, err)
+			assert.Equal(t, tc.concurrent, change.concurrentIndex)
+		})
+	}
 }
 
 func TestValidateOptimisticApplyRefusesMixedCreateScript(t *testing.T) {
