@@ -28,6 +28,8 @@ func TestConcurrentIndexPercent(t *testing.T) {
 		{name: "first heap scan complete stops at 40", phase: "building index: scanning table",
 			work: progress.Work{BlocksDone: 40, BlocksTotal: 40}, want: 40, derived: true},
 		{name: "sorting live tuples sits at 40", phase: "building index: sorting live tuples", want: 40, derived: true},
+		{name: "first heap scan counters persist through sorting live tuples", phase: "building index: sorting live tuples",
+			work: progress.Work{BlocksDone: 80000, BlocksTotal: 80000}, want: 40, derived: true},
 		{name: "loading tuples interpolates on the tuple counters", phase: "building index: loading tuples in tree",
 			work: progress.Work{TuplesDone: 10, TuplesTotal: 20}, want: 50, derived: true},
 		{name: "an access method without sub-phases uses the whole build band", phase: "building index",

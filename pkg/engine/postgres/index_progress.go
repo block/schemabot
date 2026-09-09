@@ -9,12 +9,12 @@ import (
 
 // concurrentIndexPhaseBand places one phase of a concurrent index build on
 // the whole build's percent scale. PostgreSQL scopes the block and tuple
-// counters it publishes to the current phase and resets them at every phase
-// boundary, so a counter ratio on its own would run to 100 during the first
-// heap scan and fall back to 0 when validation begins. Each phase instead
-// owns a fixed band of the whole, in the order PostgreSQL documents for
-// CREATE INDEX CONCURRENTLY; a phase with counters interpolates within its
-// band and a phase without them reports the band's start.
+// counters it publishes to a phase, but a completed phase's values can persist
+// into the next phase: the heap scan's completed block counters remain during
+// sorting live tuples. Each phase therefore owns a fixed band of the whole,
+// in the order PostgreSQL documents for CREATE INDEX CONCURRENTLY; a phase
+// with counters interpolates within its band, while a zero-width band absorbs
+// carried counters and reports its start rather than its end.
 type concurrentIndexPhaseBand struct {
 	phase      string
 	start, end int

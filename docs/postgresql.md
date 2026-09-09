@@ -106,8 +106,10 @@ step (`admitting`, `optimistic`, `brief`, `validate-constraint`,
 published, all six counters — `blocks_done`, `blocks_total`, `tuples_done`,
 `tuples_total`, `lockers_done`, `lockers_total` — are present, zeros
 included: a zero is a reading, and an absent key means PostgreSQL has not
-published a row. PostgreSQL scopes the block and tuple counters to the current
-phase and resets them at each phase boundary.
+published a row. PostgreSQL scopes block and tuple counters to phases, but a
+completed phase's values can persist into the next phase. The completed heap
+scan's block counters remain visible while live tuples are sorted, so that
+sorting phase's zero-width band absorbs the carry-over and reports its start.
 
 Table progress during a concurrent index build is a whole-build estimate, not
 a phase ratio. Each server phase owns a fixed band of the 0–100 scale in

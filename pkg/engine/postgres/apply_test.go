@@ -868,10 +868,14 @@ var heapScanRow = indexProgressRow{
 // publishedIndexProgressSession answers every progress read with the row it
 // currently holds, or with no row at all when the build has left the view.
 type publishedIndexProgressSession struct {
-	row *indexProgressRow
+	row    *indexProgressRow
+	onRead func()
 }
 
 func (s *publishedIndexProgressSession) QueryRow(context.Context, string, ...any) pgx.Row {
+	if s.onRead != nil {
+		s.onRead()
+	}
 	if s.row == nil {
 		return failingRow{err: pgx.ErrNoRows}
 	}
@@ -992,6 +996,57 @@ func TestProgressNeverRegressesWithinABuild(t *testing.T) {
 	got = pollRunningIndexBuild(t, eng)
 	assert.Equal(t, 95, got.Tables[0].Progress, "the record kept the later position")
 	assert.Equal(t, 95, got.Progress)
+}
+
+func TestProgressStraddlingATerminalPublishDoesNotFloorToTheRetiredRecord(t *testing.T) {
+	eng := New()
+	validation := indexProgressRow{phase: "index validation: scanning table", blocksDone: 40, blocksTotal: 40}
+	session := &publishedIndexProgressSession{row: &validation}
+	claimRunningIndexBuild(t, eng, session)
+	require.Equal(t, 95, pollRunningIndexBuild(t, eng).Progress)
+
+	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE INDEX widgets_name_idx ON public.widgets (name)", steps: 2}
+	heapScan := heapScanRow
+	session.row = &heapScan
+	session.onRead = func() {
+		session.onRead = nil
+		eng.publishProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), change, ""), slog.Default())
+	}
+	got := pollRunningIndexBuild(t, eng)
+	assert.Equal(t, engine.StateRunning, got.State)
+	assert.Equal(t, 25, got.Progress)
+	assert.Equal(t, 25, got.Tables[0].Progress)
+
+	got = pollRunningIndexBuild(t, eng)
+	assert.Equal(t, engine.StateCompleted, got.State)
+	assert.Equal(t, 100, got.Progress)
+	assert.Equal(t, 100, got.Tables[0].Progress)
+}
+
+func TestProgressStraddlingAReclaimDoesNotFloorToTheRetiredRecord(t *testing.T) {
+	eng := New()
+	validation := indexProgressRow{phase: "index validation: scanning table", blocksDone: 40, blocksTotal: 40}
+	session := &publishedIndexProgressSession{row: &validation}
+	tracker := claimRunningIndexBuild(t, eng, session)
+	require.Equal(t, 95, pollRunningIndexBuild(t, eng).Progress)
+
+	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE INDEX widgets_name_idx ON public.widgets (name)", steps: 2}
+	heapScan := heapScanRow
+	session.row = &heapScan
+	session.onRead = func() {
+		session.onRead = nil
+		eng.claimProgress("task-a", progressResult(engine.StateRunning, "running", time.Now(), change, ""), tracker, slog.Default())
+	}
+	got := pollRunningIndexBuild(t, eng)
+	assert.Equal(t, engine.StateRunning, got.State)
+	assert.Equal(t, 25, got.Progress)
+	assert.Equal(t, 25, got.Tables[0].Progress)
+
+	session.row = nil
+	got = pollRunningIndexBuild(t, eng)
+	assert.Equal(t, engine.StateRunning, got.State)
+	assert.Equal(t, 0, got.Progress)
+	assert.Equal(t, 0, got.Tables[0].Progress)
 }
 
 // TestProgressKeepsPercentWhenTheBuildRowReadFails proves a tolerated

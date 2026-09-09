@@ -973,9 +973,12 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 // executor's steps, after the build session is released, or on a tolerated
 // read failure derives nothing, and without the write-back it would answer
 // with the record's pre-execution zero. The write-back is skipped when the
-// record was replaced while the tracker was being read — the only writer of
-// a replacement is the terminal publish, whose percent is decided by its
-// state.
+// record was replaced while the tracker was being read, whether by a terminal
+// publish or a re-claim. Both the floor and the write-back target the cloned
+// record, so neither applies once that record is no longer the one the engine
+// serves. This write is on the writer side of the UX-3 boundary: the drive
+// loop's poll path mutates only the engine's in-memory record, while operator
+// reads use stored rows that only the drive persists.
 //
 // The percent never regresses within a record. A record hosts one build —
 // a concurrent index apply is a single statement, and the executor's
