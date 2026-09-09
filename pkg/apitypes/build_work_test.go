@@ -33,6 +33,19 @@ func TestParseBuildWork(t *testing.T) {
 		require.Error(t, err)
 		assert.Equal(t, BuildWork{}, work)
 	})
+
+	t.Run("negative counter", func(t *testing.T) {
+		work, err := ParseBuildWork(map[string]string{"executor_operation": "concurrent-index-build", "lockers_done": "-1"})
+		require.ErrorContains(t, err, "lockers_done -1 is negative")
+		assert.Equal(t, BuildWork{}, work)
+	})
+
+	t.Run("other operation keeps its counters", func(t *testing.T) {
+		work, err := ParseBuildWork(map[string]string{"executor_operation": "alter-table", "attempt": "3"})
+		require.NoError(t, err)
+		assert.Equal(t, BuildWork{Operation: "alter-table", Attempt: 3}, work)
+		assert.False(t, work.IsConcurrentIndexBuild())
+	})
 }
 
 func TestBuildWorkWaitingOnLockers(t *testing.T) {
