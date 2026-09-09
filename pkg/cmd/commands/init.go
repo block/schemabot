@@ -224,6 +224,13 @@ func initSchemaSnapshot(root string) (map[string]string, error) {
 		if !entry.Type().IsRegular() {
 			return fmt.Errorf("schema import requires regular files: %s", path)
 		}
+		info, err := entry.Info()
+		if err != nil {
+			return fmt.Errorf("inspect schema file: %w", err)
+		}
+		if info.Size() > remaining {
+			return fmt.Errorf("schema directory exceeds %d bytes; choose a dedicated schema directory", initSnapshotMaxBytes)
+		}
 		f, err := os.Open(path)
 		if err != nil {
 			return fmt.Errorf("open schema file: %w", err)

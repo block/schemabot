@@ -52,7 +52,7 @@ func TestPublishInitSchemaReportsUnsupportedFilesystem(t *testing.T) {
 }
 
 func TestPublishInitRequiresVerifiedStoredBaseline(t *testing.T) {
-	for _, baseline := range []*apitypes.PlanResponse{nil, {}, {PlanID: "plan", Errors: []string{"cannot verify"}}, {PlanID: "plan", Changes: []*apitypes.SchemaChangeResponse{{}}}} {
+	for _, baseline := range []*apitypes.PlanResponse{nil, {}, {PlanID: "plan", Errors: []string{"cannot verify"}}, {PlanID: "plan", Changes: []*apitypes.SchemaChangeResponse{{TableChanges: []*apitypes.TableChangeResponse{{TableName: "orders", ChangeType: "create", DDL: "CREATE TABLE orders (id bigint);"}}}}}} {
 		root := filepath.Join(t.TempDir(), "schema")
 		stage := t.TempDir()
 		require.NoError(t, os.WriteFile(filepath.Join(stage, "table.sql"), []byte("CREATE TABLE t (id bigint);"), 0644))
