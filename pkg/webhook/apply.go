@@ -2,11 +2,12 @@ package webhook
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -87,7 +88,12 @@ func resolveDisplayByOperation(ctx context.Context, stor storage.Storage, apply 
 	}
 	var byOp map[int64]operationDisplay
 	for _, op := range ops {
-		od := operationDisplay{Step: storedProgressStep(apply, op)}
+		step, err := storedProgressStep(op)
+		if err != nil {
+			slog.Warn("comment will omit the statement position: progress metadata is malformed",
+				append(apply.LogAttrs(), "apply_operation_id", op.ID, "operation_deployment", op.Deployment, "error", err)...)
+		}
+		od := operationDisplay{Step: step}
 		if apply.Engine == storage.EnginePlanetScale {
 			od.VSchema, od.DeployRequestURL, od.RevertExpiresAt = planetScaleDisplay(ctx, stor, apply, op)
 		}
@@ -103,25 +109,36 @@ func resolveDisplayByOperation(ctx context.Context, stor storage.Storage, apply 
 }
 
 // storedProgressStep decodes the statement position from the operation's
-// durable progress metadata. A missing or malformed record yields the zero
-// step so the comment renders without a position.
-func storedProgressStep(apply *storage.Apply, op *storage.ApplyOperation) apitypes.ProgressStep {
-	if op.ProgressMetadata == "" {
-		return apitypes.ProgressStep{}
-	}
-	var metadata map[string]string
-	if err := json.Unmarshal([]byte(op.ProgressMetadata), &metadata); err != nil {
-		slog.Warn("comment will omit the statement position: failed to decode progress metadata",
-			"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", err)
-		return apitypes.ProgressStep{}
-	}
-	step, err := apitypes.ParseProgressStep(metadata)
+// durable progress metadata. An operation that has persisted no metadata, or
+// whose engine publishes no position, yields the zero step with a nil error;
+// a record that cannot be decoded, or that carries an impossible position,
+// yields the zero step with the error so the caller can log it and render no
+// position rather than a wrong one.
+func storedProgressStep(op *storage.ApplyOperation) (apitypes.ProgressStep, error) {
+	metadata, err := op.ParseProgressMetadata()
 	if err != nil {
-		slog.Warn("comment will omit the statement position: progress metadata is malformed",
-			"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", err)
-		return apitypes.ProgressStep{}
+		return apitypes.ProgressStep{}, err
 	}
-	return step
+	return apitypes.ParseProgressStep(metadata)
+}
+
+// progressStepFingerprint summarises the statement position of every operation
+// so the comment observer can tell that a step advanced when no other progress
+// figure moved — an engine that executes a statement sequence reports no row
+// counts, so the position is the only figure that changes between polls.
+// Operations with no position, or with metadata that cannot be decoded,
+// contribute nothing: the render path logs the malformed record, and
+// repeating that warning on every poll would drown the log.
+func progressStepFingerprint(ops []*storage.ApplyOperation) string {
+	var sb strings.Builder
+	for _, op := range ops {
+		step, err := storedProgressStep(op)
+		if err != nil || step == (apitypes.ProgressStep{}) {
+			continue
+		}
+		fmt.Fprintf(&sb, "%d:%d/%d;", op.ID, step.Step, step.StepsTotal)
+	}
+	return sb.String()
 }
 
 // planetScaleDisplay loads the operation's engine resume state and projects the
