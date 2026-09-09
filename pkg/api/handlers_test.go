@@ -4213,6 +4213,52 @@ func TestProgressFromLocalStorageOverlaysPersistedProgressMetadata(t *testing.T)
 	}, resp.Metadata)
 }
 
+// On a multi-operation apply the top-level metadata has one slot per key, so
+// the operations are overlaid in creation order: the first-created operation
+// supplies the generic position fields and later operations fill only the keys
+// it left empty. The same operation wins on every poll, so consecutive reads
+// never flip between deployments.
+func TestProgressFromLocalStorageOverlaysOperationsInCreationOrder(t *testing.T) {
+	firstOpID, secondOpID := int64(80), int64(81)
+	apply := &storage.Apply{
+		ID:              34,
+		ApplyIdentifier: "apply_pg_two_ops",
+		Database:        "shop",
+		DatabaseType:    storage.DatabaseTypePostgres,
+		Environment:     "staging",
+		Engine:          storage.EnginePostgres,
+		State:           state.Apply.Running,
+	}
+	svc := New(&mockStorageWithApplyStores{
+		tasks: &capturingTaskStore{tasks: []*storage.Task{
+			{ApplyID: apply.ID, ApplyOperationID: &firstOpID, TaskIdentifier: "task_orders_a", TableName: "orders", Namespace: "public", DDLAction: "alter", DDL: "ALTER TABLE public.orders ADD COLUMN note text", State: state.Task.Completed, Database: "shop", DatabaseType: storage.DatabaseTypePostgres, Engine: storage.EnginePostgres, Environment: "staging"},
+			{ApplyID: apply.ID, ApplyOperationID: &secondOpID, TaskIdentifier: "task_orders_b", TableName: "orders", Namespace: "public", DDLAction: "alter", DDL: "ALTER TABLE public.orders ADD COLUMN note text", State: state.Task.Running, Database: "shop", DatabaseType: storage.DatabaseTypePostgres, Engine: storage.EnginePostgres, Environment: "staging"},
+		}},
+		operations: &staticApplyOperationStore{
+			operations: []*storage.ApplyOperation{
+				{
+					ID: firstOpID, ApplyID: apply.ID, Deployment: "shop-a", Target: "shop-a", State: state.ApplyOperation.Completed,
+					ProgressMetadata: `{"phase":"completed","step":"2","steps_total":"2"}`,
+				},
+				{
+					ID: secondOpID, ApplyID: apply.ID, Deployment: "shop-b", Target: "shop-b", State: state.ApplyOperation.Running,
+					ProgressMetadata: `{"phase":"preflight","step":"1","steps_total":"2","statement":"ALTER TABLE public.orders ADD COLUMN note text"}`,
+				},
+			},
+		},
+	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	for range 5 {
+		resp, err := svc.progressFromLocalStorage(t.Context(), apply)
+
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{
+			"phase": "completed", "step": "2", "steps_total": "2",
+			"statement": "ALTER TABLE public.orders ADD COLUMN note text",
+		}, resp.Metadata)
+	}
+}
+
 // Malformed persisted progress metadata degrades to a response without those
 // fields; it never fails the progress request.
 func TestProgressFromLocalStorageToleratesMalformedProgressMetadata(t *testing.T) {

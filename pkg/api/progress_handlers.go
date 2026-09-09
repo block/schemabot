@@ -287,10 +287,14 @@ func progressOperationsFromRows(ops []*storage.ApplyOperation) ([]*apitypes.Prog
 	return responses, deploymentByOperationID
 }
 
-func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *storage.Apply) ([]*apitypes.ProgressOperationResponse, map[int64]string, bool) {
+// bestEffortProgressOperations loads the apply's operation rows once and
+// returns every projection the storage-served progress response needs from
+// them: the API operation entries, the operation-id→deployment map, the raw
+// rows (for the stored engine metadata overlay), and the release latch.
+func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *storage.Apply) ([]*apitypes.ProgressOperationResponse, map[int64]string, []*storage.ApplyOperation, bool) {
 	if apply == nil {
 		s.logger.Warn("progress response will omit per-deployment operations: apply is nil")
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
 	operations, deploymentByOperationID, ops, err := s.progressOperationsForApply(ctx, apply)
 	if err != nil {
@@ -299,9 +303,9 @@ func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *stora
 		s.logger.Warn("progress response will omit per-deployment operations",
 			append(apply.LogAttrs(),
 				"error", err)...)
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
-	return operations, deploymentByOperationID, s.resolveReleaseLatch(ctx, apply, ops)
+	return operations, deploymentByOperationID, ops, s.resolveReleaseLatch(ctx, apply, ops)
 }
 
 // handleProgressByApplyID handles GET /api/progress/apply/{apply_id} requests.
@@ -506,33 +510,28 @@ func setRevertSkippedMetadata(resp *apitypes.ProgressResponse, apply *storage.Ap
 // which stay authoritative where both sources carry the same key. Best-effort:
 // a value already set by the caller is never overwritten, and applies that
 // predate persistence simply render without these fields.
-func (s *Service) overlayStoredDisplayMetadata(ctx context.Context, resp *apitypes.ProgressResponse, apply *storage.Apply, operationIDs map[int64]string) {
+//
+// ops is the apply's operation rows in creation order, as ListByApply returns
+// them. The top-level metadata has one slot per key, so on a multi-operation
+// apply the first-created operation supplies the generic position fields and
+// later operations fill only the keys it left empty — the same operation wins
+// on every poll, so consecutive reads never flip between deployments.
+func overlayStoredDisplayMetadata(resp *apitypes.ProgressResponse, apply *storage.Apply, ops []*storage.ApplyOperation) {
 	if apply == nil {
 		return
 	}
-	for opID := range operationIDs {
-		op, err := s.storage.ApplyOperations().Get(ctx, opID)
-		if err != nil {
-			slog.Warn("progress response will omit stored engine metadata: failed to load apply operation",
-				append(apply.LogAttrs(), "apply_operation_id", opID, "error", err)...)
-			continue
-		}
-		if op == nil {
-			slog.Warn("progress response will omit stored engine metadata: apply operation row is missing",
-				append(apply.LogAttrs(), "apply_operation_id", opID)...)
-			continue
-		}
+	for _, op := range ops {
 		metadata, err := op.ParseProgressMetadata()
 		if err != nil {
 			slog.Warn("progress response will omit persisted progress fields: failed to decode progress metadata",
-				append(apply.LogAttrs(), "apply_operation_id", opID, "error", err)...)
+				append(apply.LogAttrs(), "apply_operation_id", op.ID, "operation_deployment", op.Deployment, "error", err)...)
 			metadata = make(map[string]string)
 		}
 		if apply.Engine == storage.EnginePlanetScale && op.EngineResumeMetadata != "" {
 			display, err := tern.PSDisplayMetadata(op.EngineResumeMetadata)
 			if err != nil {
 				slog.Warn("progress response will omit engine display fields: failed to decode engine resume state",
-					append(apply.LogAttrs(), "apply_operation_id", opID, "error", err)...)
+					append(apply.LogAttrs(), "apply_operation_id", op.ID, "operation_deployment", op.Deployment, "error", err)...)
 			} else {
 				maps.Copy(metadata, display)
 			}
@@ -1137,10 +1136,10 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	}
 	overlayApplyOptions(httpResp, apply)
 	setRevertSkippedMetadata(httpResp, apply)
-	operations, deploymentByOperationID, released := s.bestEffortProgressOperations(ctx, apply)
+	operations, deploymentByOperationID, ops, released := s.bestEffortProgressOperations(ctx, apply)
 	httpResp.Operations = operations
 	httpResp.Released = released
-	s.overlayStoredDisplayMetadata(ctx, httpResp, apply, deploymentByOperationID)
+	overlayStoredDisplayMetadata(httpResp, apply, ops)
 
 	for _, task := range tasks {
 		tpr := &apitypes.TableProgressResponse{
