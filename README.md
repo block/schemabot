@@ -32,9 +32,7 @@ Open a PR with your schema changes, and SchemaBot plans, applies, and verifies t
 
 [![SchemaBot PR workflow: plan, apply, progress, completion, checks, and merge](./assets/pr-workflow-demo.gif)](./docs/pre-merge-workflow.md)
 
-*Illustrated using SchemaBot’s actual PR comments*
-
-[Walk through each step](./docs/pre-merge-workflow.md#the-pr-workflow-step-by-step) at your own pace
+[Walk through the illustrated PR workflow](./docs/pre-merge-workflow.md#the-pr-workflow-step-by-step)
 
 ## From your terminal
 

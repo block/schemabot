@@ -528,12 +528,10 @@ func main() {
 		defer func() { ui.Colors = previousColors }()
 		t.WritePullSchema(&apitypes.PullSchemaResponse{Database: "shop", Type: "mysql", Environment: "staging", TableCount: 1, Namespaces: map[string]*apitypes.PulledNamespace{"shop": {Lint: []*apitypes.LintViolationResponse{{Table: "orders", Column: "created_at", Severity: "warning", Linter: "zero_date", Message: `column "created_at" with type "datetime" has a zero default value`}}, Tables: map[string]string{"orders": "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `status` varchar(32) NOT NULL,\n  `created_at` datetime NOT NULL DEFAULT '0000-00-00 00:00:00',\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"}}}})
 	})
-	demos = append(demos, Demo{Name: "cli-ops", Title: "Know your database fleet.", Height: 740, Frames: []Frame{
+	demos = append(demos, Demo{Name: "cli-ops", Title: "Know your database fleet.", Height: 960, Frames: []Frame{
 		{2, "schemabot databases", "See the databases and environments in your fleet", fleetInventory()},
 		{3.5, "schemabot pull -d shop -e staging --table orders --lint", "Inspect the live schema and its lint findings", pull},
-		{2, "schemabot status -e staging", "500 changes; the latest 20 at a glance", strings.Join(fleetLines[:15], "\n")},
-		{0.8, "", "Scroll through the latest changes", strings.Join(fleetLines[8:23], "\n")},
-		{1.2, "", "", strings.Join(fleetLines[len(fleetLines)-15:], "\n")},
+		{4, "schemabot status -e staging", "500 changes; the latest 20 at a glance", strings.Join(fleetLines, "\n")},
 		{1, "schemabot logs apply-example-73 -f", "Follow the engine logs as they arrive", followLogView(5)},
 		{0.6, "", "", followLogView(9)},
 		{0.9, "", "See why copying slows down", followLogView(10)},

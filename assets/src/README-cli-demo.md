@@ -4,7 +4,7 @@ These GIFs illustrate five operator workflows using fictional data passed
 through the production Go templates and interactive `commands.WatchModel`:
 
 - `cli-plan-apply.gif`: inspect an index plan, confirm with yes, and follow an apply to completion
-- `cli-ops.gif`: list databases, pull a live schema with lint findings, scroll the latest 20 of 500 changes, then follow engine logs through completion
+- `cli-ops.gif`: list databases, pull a live schema with lint findings, show the latest 20 of 500 changes, then follow engine logs through completion
 - `cli-fleet.gif`: list changes, attach to the live watcher, detach with Esc, and list plans
 - `cli-cutover.gif`: see a throttle reason, finish copying, defer the swap, and press Enter to cut over
 - `cli-vitess.gif`: create a deploy request, deploy with Enter, follow four shards, and close the revert window
@@ -45,7 +45,7 @@ can be refreshed when CLI templates change.
 
 Review a plan frame, the fleet table, the throttle reason and ETA, the waiting
 state, and the completed state after rendering. Check the GIFs at README
-width as well as their native size (1100 × 670, or 1100 × 740 for the shard view). Keep the rendering method and timing choices documented here.
+width as well as their native size (1100 × 670, 1100 × 740 for the shard view, or 1100 × 960 for the fleet view). Keep the rendering method and timing choices documented here.
 
 Pass a scenario name, such as `cli-vitess`, as the renderer’s first argument
 to refresh only that GIF. The PlanetScale fixture checks Enter against start
@@ -54,6 +54,6 @@ by the PlanetScale engine to cancel the deploy request.
 
 The operations animation runs `LogsCmd` against a loopback logs response, including its real follow prompt and colored formatter. The fixture cancels after the initial window; no external logs are fetched. Log messages match the queue event, Spirit runner output, and replica throttler. Selected batches arrive at compressed intervals, with the most recent 14 terminal lines kept in view as the tail scrolls.
 
-The inventory uses the real databases command against a loopback fixture. The status fixture totals 500 changes and renders the default 20 rows, shown through overlapping terminal windows as the view scrolls.
+The inventory uses the real databases command against a loopback fixture. The status fixture totals 500 changes and renders the default 20 rows, shown together in a stationary view.
 
 The fleet pull view enables the production interactive color setting and shows the entire result in one frame. Each fleet command finishes typing, then pauses briefly before output appears.
