@@ -164,6 +164,50 @@ func TestClassifyRefusal(t *testing.T) {
 			wantNotDetail: []string{context.Canceled.Error()},
 		},
 		{
+			name: "unverified create names keep their verdict when the read-back found no table at the name",
+			err: fmt.Errorf("execute: %w", &executor.SequenceStepError{
+				Step: 1, Total: 2, Err: fmt.Errorf("%w: public.users: %w", executor.ErrCreateNamesUnverified,
+					fmt.Errorf("%w: public.users", preflight.ErrTableNotFound)),
+			}),
+			wantReason:    "create-names-unverified",
+			wantDetail:    []string{`the CREATE TABLE for "users" committed`, "could not be read"},
+			wantNotDetail: []string{"does not exist on the target"},
+		},
+		{
+			name: "unverified create names keep their verdict when the read-back found a non-table at the name",
+			err: fmt.Errorf("execute: %w", &executor.SequenceStepError{
+				Step: 1, Total: 2, Err: fmt.Errorf("%w: public.users: %w", executor.ErrCreateNamesUnverified,
+					fmt.Errorf("%w: public.users has relkind %q", preflight.ErrNotTable, "v")),
+			}),
+			wantReason:    "create-names-unverified",
+			wantDetail:    []string{`the CREATE TABLE for "users" committed`, "could not be read"},
+			wantNotDetail: []string{"is not an ordinary or partitioned table"},
+		},
+		{
+			name: "create name mismatch with nothing owned unclaimed omits the owned clause",
+			err: &executor.CreateNameMismatchError{
+				Schema: "public", Table: "users",
+				Missing: []string{"users_pkey"},
+			},
+			wantReason:    "create-name-mismatch",
+			wantDetail:    []string{`does not own "users_pkey" the schema file claims`, createNameMismatchRemedy},
+			wantNotDetail: []string{"instead", "no name"},
+		},
+		{
+			name: "create name mismatch enumerates a bounded prefix of a wide table's names",
+			err: &executor.CreateNameMismatchError{
+				Schema: "public", Table: "users",
+				Missing:   []string{"users_a_key", "users_b_key", "users_c_key", "users_d_key", "users_e_key"},
+				Unclaimed: []string{"users_a_key1", "users_b_key1", "users_c_key1", "users_d_key1", "users_e_key1"},
+			},
+			wantReason: "create-name-mismatch",
+			wantDetail: []string{
+				`does not own "users_a_key", "users_b_key", "users_c_key", and 2 more the schema file claims`,
+				`owns "users_a_key1", "users_b_key1", "users_c_key1", and 2 more instead`,
+			},
+			wantNotDetail: []string{"users_d_key", "users_e_key"},
+		},
+		{
 			name:       "invariant violation fails closed as a refusal",
 			err:        fmt.Errorf("execute: %w", executor.ErrInvariantViolation),
 			wantReason: "engine-invariant-violation",
@@ -331,6 +375,32 @@ func TestCreateCollisionRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 			assert.LessOrEqual(t, lead+len(createCollisionLead), statusReasonKeptWidth, r.detail)
 		})
 	}
+}
+
+// The mismatch cause carries the identifiers the remedy acts on, so unlike
+// the collision detail it cannot promise its remedy's lead for a table name
+// of any legal length: three maximal identifiers alone overrun the clamp.
+// What it does promise is that the enumeration is bounded — a wide table
+// cannot push the whole remedy out by owning more names — and that for the
+// shape a real table produces, a primary key and a serial column with their
+// suffixed twins, the lead that names the first action still lands inside
+// the clamp.
+func TestCreateNameMismatchRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
+	const lead = "; free the first-choice name"
+	err := fmt.Errorf("execute: %w", &executor.SequenceStepError{
+		Step: 1, Total: 3, Err: &executor.CreateNameMismatchError{
+			Schema: "public", Table: "users",
+			Missing:   []string{"users_pkey", "users_id_seq"},
+			Unclaimed: []string{"users_pkey1", "users_id_seq1"},
+		},
+	})
+
+	r := classifyRefusal(err, "users")
+
+	require.NotNil(t, r)
+	at := strings.Index(r.detail, lead)
+	require.GreaterOrEqual(t, at, 0, r.detail)
+	assert.LessOrEqual(t, at+len(lead), statusReasonKeptWidth, r.detail)
 }
 
 func TestCreateCollisionRefusalFitsStatusReasonColumn(t *testing.T) {

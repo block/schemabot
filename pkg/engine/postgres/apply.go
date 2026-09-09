@@ -520,6 +520,15 @@ func refusalForCause(err error, table string) *refusal {
 		return &refusal{reason: "table-too-large",
 			cause: sizeErr.Error() + "; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit"}
 	}
+	// Decided before the bare table sentinels below: the unverified-create
+	// wrap carries the read-back's own cause inside it, and a table no longer
+	// at its name or no longer a table are two of those causes. The outcome
+	// is the state the step left — a committed table whose names are
+	// unproven — not the fault that kept them from being proven, so the
+	// inner sentinel must not claim the verdict.
+	if errors.Is(err, executor.ErrCreateNamesUnverified) {
+		return createNamesUnverifiedRefusal(table)
+	}
 	if errors.Is(err, preflight.ErrTableNotFound) {
 		return tableNotFoundRefusal(table)
 	}
@@ -560,15 +569,7 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return createNameMismatchRefusal(
 			fmt.Sprintf("the CREATE TABLE for %q committed but the table does not own a constraint-index or sequence name the schema file claims; the server chose a suffixed name instead", table)), true
 	case executor.CodeCreateNamesUnverified:
-		// pg-sprite leaves this outcome retryable because the read that
-		// failed could be repeated on its own. SchemaBot cannot repeat only
-		// the read: its retry re-runs the identical plan, whose CREATE
-		// TABLE has already committed, so every retry collides with the
-		// table this apply created. The table stands with unproven names,
-		// and proving them is an operator's comparison, not a retry's.
-		return &refusal{reason: "create-names-unverified",
-			cause:  fmt.Sprintf("the CREATE TABLE for %q committed but the relation names the table owns could not be read, so whether the server honoured every claimed name is unproven", table),
-			remedy: "compare the table's constraint-index and sequence names against the schema file, then " + replanRemedy}, true
+		return createNamesUnverifiedRefusal(table), true
 	case executor.CodeDuplicateCreateName:
 		return &refusal{reason: "duplicate-create-name",
 			cause:  fmt.Sprintf("the create set for %q claims the same relation name twice (a CREATE INDEX name repeats the table's implicit constraint-index name or another index)", table),
@@ -687,23 +688,57 @@ func createNameMismatchRefusal(cause string) *refusal {
 // committed table lacks and the suffixed names the server chose instead, so
 // the operator knows which relation to rename. The names come from the
 // schema file and the catalog, the same provenance as the table name every
-// refusal already renders.
+// refusal already renders. The typed error always carries at least one
+// missing name — a table that honoured every claim is not a mismatch — but
+// may own nothing unclaimed when a relation was dropped inside the read-back
+// window, so the owned clause is rendered only when there is one to name.
 func createNameMismatchCause(table string, mismatch *executor.CreateNameMismatchError) string {
-	return fmt.Sprintf("the CREATE TABLE for %q committed but the table does not own %s the schema file claims; it owns %s instead",
-		table, quotedNames(mismatch.Missing), quotedNames(mismatch.Unclaimed))
+	cause := fmt.Sprintf("the CREATE TABLE for %q committed but the table does not own %s the schema file claims",
+		table, quotedNames(mismatch.Missing))
+	if len(mismatch.Unclaimed) == 0 {
+		return cause
+	}
+	return cause + fmt.Sprintf("; it owns %s instead", quotedNames(mismatch.Unclaimed))
 }
 
-// quotedNames renders identifiers for a refusal cause, or a fixed phrase for
-// an empty list so the sentence stays well-formed.
+// maxQuotedNames bounds how many identifiers a refusal cause enumerates. A
+// wide table can claim a name per constraint and per serial column, and the
+// composed detail is rendered on a surface that truncates from the tail,
+// where the remedy sits; the leading names locate the problem and the count
+// says how much the operator has not been shown.
+const maxQuotedNames = 3
+
+// quotedNames renders identifiers for a refusal cause, enumerating at most
+// maxQuotedNames and counting the rest.
 func quotedNames(names []string) string {
-	if len(names) == 0 {
-		return "no name"
+	shown := names
+	if len(shown) > maxQuotedNames {
+		shown = shown[:maxQuotedNames]
 	}
-	quoted := make([]string, len(names))
-	for i, name := range names {
+	quoted := make([]string, len(shown))
+	for i, name := range shown {
 		quoted[i] = fmt.Sprintf("%q", name)
 	}
-	return strings.Join(quoted, ", ")
+	rendered := strings.Join(quoted, ", ")
+	if rest := len(names) - len(shown); rest > 0 {
+		rendered += fmt.Sprintf(", and %d more", rest)
+	}
+	return rendered
+}
+
+// createNamesUnverifiedRefusal is decided by the wrap, not by the cause it
+// carries. pg-sprite leaves the outcome retryable because the read that
+// failed could be repeated on its own. SchemaBot cannot repeat only the
+// read: its retry re-runs the identical plan, whose CREATE TABLE has already
+// committed, so every retry collides with the table this apply created. The
+// table stands with unproven names, and proving them is an operator's
+// comparison, not a retry's.
+func createNamesUnverifiedRefusal(table string) *refusal {
+	return &refusal{
+		reason: "create-names-unverified",
+		cause:  fmt.Sprintf("the CREATE TABLE for %q committed but the relation names the table owns could not be read, so whether the server honoured every claimed name is unproven", table),
+		remedy: "compare the table's constraint-index and sequence names against the schema file, then " + replanRemedy,
+	}
 }
 
 func tableNotFoundRefusal(table string) *refusal {
