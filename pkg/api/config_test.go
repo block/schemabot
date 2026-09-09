@@ -4617,6 +4617,19 @@ postgres:
 		require.ErrorContains(t, err, "is not a valid duration")
 	})
 
+	t.Run("accepts the engine minimum", func(t *testing.T) {
+		cfg := PostgresConfig{ConcurrentIndexMaxDuration: postgresengine.MinConcurrentIndexMaxDuration.String()}
+		require.NoError(t, cfg.validate())
+		assert.Equal(t, postgresengine.MinConcurrentIndexMaxDuration, cfg.ConcurrentIndexMaxDurationOrDefault())
+	})
+
+	t.Run("refuses duration below the server timer's resolution", func(t *testing.T) {
+		cfg := PostgresConfig{ConcurrentIndexMaxDuration: "500us"}
+		err := cfg.validate()
+		require.ErrorContains(t, err, "postgres.concurrent_index_max_duration")
+		require.ErrorContains(t, err, "below the smallest bound the engine can honor (1ms")
+	})
+
 	t.Run("accepts the engine maximum", func(t *testing.T) {
 		cfg := PostgresConfig{ConcurrentIndexMaxDuration: postgresengine.MaxConcurrentIndexMaxDuration.String()}
 		require.NoError(t, cfg.validate())

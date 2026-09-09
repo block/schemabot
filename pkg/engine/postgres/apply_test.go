@@ -20,6 +20,7 @@ import (
 	"github.com/block/pg-sprite/pkg/progress"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -528,6 +529,33 @@ func TestProgressReportsExecutorStepPosition(t *testing.T) {
 	assert.Equal(t, "CREATE INDEX widgets_name_idx ON public.widgets ((first_name || ' ' || last_name))", during.Metadata["statement"],
 		"the statement collapses whitespace and drops control runes but keeps its SQL operators intact")
 	assert.Equal(t, change.sql, during.Tables[0].DDL, "the table's DDL stays the planned change, not the step in flight")
+}
+
+// TestProgressMetadataIsStableWhilePositionIsUnchanged pins the contract the
+// driver's persistence relies on: two polls of a running apply whose executor
+// position has not moved return identical metadata, so the driver's
+// change detection sees no difference and writes nothing. A field derived
+// from the wall clock would differ on every poll and defeat that check.
+func TestProgressMetadataIsStableWhilePositionIsUnchanged(t *testing.T) {
+	eng := New()
+	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE public.widgets (id bigint PRIMARY KEY)", steps: 3}
+	tracker := newTestTracker(t)
+	tracker.Start(3, progress.OperationAdmitting)
+	tracker.StartStep(2, progress.OperationBrief, "CREATE INDEX widgets_name_idx ON public.widgets (name)")
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now().Add(-time.Minute), change, ""), tracker, slog.Default())
+	req := &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: "task-a"}}
+
+	first, err := eng.Progress(t.Context(), req)
+	require.NoError(t, err)
+	time.Sleep(2 * time.Millisecond)
+	second, err := eng.Progress(t.Context(), req)
+	require.NoError(t, err)
+
+	assert.Equal(t, map[string]string{
+		"phase": "preflight", "step": "2", "steps_total": "3",
+		"statement": "CREATE INDEX widgets_name_idx ON public.widgets (name)",
+	}, first.Metadata)
+	assert.Equal(t, first.Metadata, second.Metadata)
 }
 
 // TestSanitizeStatementText pins the statement metadata contract: one line,
@@ -1224,19 +1252,58 @@ func TestConcurrentIndexHeadroomCoversSessionSetup(t *testing.T) {
 }
 
 // TestConcurrentIndexMaximumIsTheServerStatementTimeoutCeiling pins the
-// largest accepted build bound to the largest statement_timeout PostgreSQL
-// itself accepts, and the constructor's normalization around it: a bound
-// above it is clamped, and a bound that is not positive adopts the default
-// instead of a deadline that would end every build on arrival.
+// accepted build bound to the range statement_timeout itself can hold: the
+// largest value PostgreSQL accepts at the top, and one millisecond, its
+// resolution, at the bottom, below which the server's timer rounds to zero
+// and switches off. The constructor's normalization around that range: a
+// bound above it is clamped, a positive bound below it is raised, and a
+// bound that is not positive adopts the default instead of a deadline that
+// would end every build on arrival.
 func TestConcurrentIndexMaximumIsTheServerStatementTimeoutCeiling(t *testing.T) {
 	assert.Equal(t, time.Duration(math.MaxInt32)*time.Millisecond, MaxConcurrentIndexMaxDuration)
 	assert.Less(t, MaxConcurrentIndexMaxDuration+concurrentIndexHeadroom, time.Duration(math.MaxInt64),
 		"the ceiling built on the maximum must not overflow")
+	assert.Equal(t, time.Millisecond, MinConcurrentIndexMaxDuration)
 
 	assert.Equal(t, MaxConcurrentIndexMaxDuration, NewWithOptions(0, MaxConcurrentIndexMaxDuration+1).ConcurrentIndexMaxDuration())
+	assert.Equal(t, MinConcurrentIndexMaxDuration, NewWithOptions(0, 500*time.Microsecond).ConcurrentIndexMaxDuration())
+	assert.Equal(t, MinConcurrentIndexMaxDuration, NewWithOptions(0, MinConcurrentIndexMaxDuration).ConcurrentIndexMaxDuration())
 	assert.Equal(t, DefaultConcurrentIndexMaxDuration, NewWithOptions(0, 0).ConcurrentIndexMaxDuration())
 	assert.Equal(t, DefaultConcurrentIndexMaxDuration, NewWithOptions(0, -time.Second).ConcurrentIndexMaxDuration())
 	assert.Equal(t, 36*time.Hour, NewWithOptions(0, 36*time.Hour).ConcurrentIndexMaxDuration())
+}
+
+// TestConcurrentIndexBoundsMatchTheExecutorsBudgetRange proves the engine's
+// floor and ceiling are the executor's own, not a copy of them: the executor
+// refuses a served budget one step outside either bound as unbounded and
+// accepts a budget exactly on it. The executor validates the budget before
+// it touches the pool or the statement, so the probe needs neither a target
+// nor a real build; the accepted cases use a plain CREATE INDEX so the call
+// stops at admission, one step past validation, instead of reaching the
+// pool. Asserting the refusal's wording pins the value the executor holds,
+// so a dependency bump that moves either bound fails here rather than in a
+// refused apply on a configuration this engine had accepted.
+func TestConcurrentIndexBoundsMatchTheExecutorsBudgetRange(t *testing.T) {
+	const concurrent = "CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)"
+	const plain = "CREATE INDEX users_email_idx ON public.users (email)"
+	probe := func(sql string, overall time.Duration) error {
+		_, err := executor.BuildIndexConcurrentlyWithProgress(t.Context(), nil, sql, executor.ConcurrentBudget{Overall: overall}, newTestTracker(t))
+		return err
+	}
+
+	err := probe(concurrent, MinConcurrentIndexMaxDuration-time.Nanosecond)
+	require.ErrorIs(t, err, executor.ErrUnboundedBudget)
+	assert.ErrorContains(t, err, "at least 1ms")
+
+	err = probe(concurrent, MaxConcurrentIndexMaxDuration+time.Millisecond)
+	require.ErrorIs(t, err, executor.ErrUnboundedBudget)
+	assert.ErrorContains(t, err, "at most "+MaxConcurrentIndexMaxDuration.String())
+
+	for _, bound := range []time.Duration{MinConcurrentIndexMaxDuration, MaxConcurrentIndexMaxDuration} {
+		err = probe(plain, bound)
+		require.ErrorIs(t, err, executor.ErrNotConcurrentIndexBuild, "the probe must stop at admission, past validation")
+		assert.NotErrorIs(t, err, executor.ErrUnboundedBudget, "a bound the engine accepts must be one the executor serves")
+	}
 }
 
 // TestBuildIndexConcurrentlyRefusesAnUnsetBound proves a concurrent build
@@ -1253,6 +1320,147 @@ func TestBuildIndexConcurrentlyRefusesAnUnsetBound(t *testing.T) {
 	err := buildIndexConcurrently(t.Context(), nil, change, newTestTracker(t), slog.New(slog.DiscardHandler))
 
 	require.ErrorContains(t, err, `build PostgreSQL index concurrently on table "users": build bound is unset`)
+}
+
+// concurrentIndexCall records the envelope one executor entry point was
+// handed: the budget and the deadline of the context it ran under.
+type concurrentIndexCall struct {
+	budget      executor.ConcurrentBudget
+	deadline    time.Time
+	hasDeadline bool
+}
+
+type concurrentIndexCalls struct {
+	build, rebuild []concurrentIndexCall
+}
+
+// scriptConcurrentIndex swaps the concurrent index executor for one whose
+// build and recovery are scripted, restoring the executor's own functions
+// when the test ends. Each call's envelope is recorded before the script
+// answers.
+func scriptConcurrentIndex(t *testing.T, build func() error, rebuild func() error) *concurrentIndexCalls {
+	t.Helper()
+	calls := &concurrentIndexCalls{}
+	record := func(ctx context.Context, budget executor.ConcurrentBudget) concurrentIndexCall {
+		deadline, ok := ctx.Deadline()
+		return concurrentIndexCall{budget: budget, deadline: deadline, hasDeadline: ok}
+	}
+	previous := concurrentIndex
+	concurrentIndex = concurrentIndexExecutor{
+		build: func(ctx context.Context, _ *pgxpool.Pool, _ string, budget executor.ConcurrentBudget, _ *progress.Tracker) (executor.IndexBuildReport, error) {
+			calls.build = append(calls.build, record(ctx, budget))
+			return executor.IndexBuildReport{}, build()
+		},
+		rebuild: func(ctx context.Context, _ *pgxpool.Pool, _ string, budget executor.ConcurrentBudget) (executor.IndexRecoveryReport, error) {
+			calls.rebuild = append(calls.rebuild, record(ctx, budget))
+			return executor.IndexRecoveryReport{}, rebuild()
+		},
+	}
+	t.Cleanup(func() { concurrentIndex = previous })
+	return calls
+}
+
+func concurrentIndexChange(bound time.Duration) nativeApply {
+	return nativeApply{namespace: "public", table: "users",
+		sql:             "CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)",
+		concurrentIndex: true, concurrentIndexMaxDuration: bound}
+}
+
+// TestBuildIndexConcurrentlyRunsTheBuildUnderTheServedBound proves the plain
+// build is handed the configured bound as its served statement budget, so
+// the server's own timer ends an over-long build and reports exhaustion as
+// the executor's typed verdict, rather than running caller-owned with no
+// server-side statement timeout.
+func TestBuildIndexConcurrentlyRunsTheBuildUnderTheServedBound(t *testing.T) {
+	const bound = 3 * time.Hour
+	calls := scriptConcurrentIndex(t, func() error { return nil }, func() error {
+		return errors.New("no recovery is expected for a build that succeeded")
+	})
+
+	err := buildIndexConcurrently(t.Context(), nil, concurrentIndexChange(bound), newTestTracker(t), slog.New(slog.DiscardHandler))
+
+	require.NoError(t, err)
+	require.Len(t, calls.build, 1)
+	assert.Equal(t, executor.ConcurrentBudget{Overall: bound}, calls.build[0].budget)
+	assert.Empty(t, calls.rebuild)
+}
+
+// TestBuildIndexConcurrentlyRecoversUnderItsOwnCallerOwnedDeadline proves the
+// recovery over an abandoned invalid index runs as one caller-owned envelope
+// bounded by a fresh deadline of the configured bound: caller-owned, because
+// the executor's served mode would spend the bound once on the drops and
+// again on the build; a deadline of its own, because the apply ceiling the
+// caller holds is the bound plus the setup headroom, and the recovery must
+// end within the bound the operator configured, not the ceiling above it.
+func TestBuildIndexConcurrentlyRecoversUnderItsOwnCallerOwnedDeadline(t *testing.T) {
+	const bound = 3 * time.Hour
+	abandoned := &executor.InvalidIndexError{Schema: "public", Index: "users_email_idx", Table: "users",
+		Cleanup: executor.ErrAbandonedInvalidIndex}
+	require.True(t, abandonedBeforeBuild(abandoned), "the scripted verdict must be one the drive recovers")
+	calls := scriptConcurrentIndex(t, func() error { return abandoned }, func() error { return nil })
+	ctx, cancel := context.WithTimeout(t.Context(), bound+concurrentIndexHeadroom)
+	defer cancel()
+	ceiling, _ := ctx.Deadline()
+
+	before := time.Now()
+	err := buildIndexConcurrently(ctx, nil, concurrentIndexChange(bound), newTestTracker(t), slog.New(slog.DiscardHandler))
+
+	require.NoError(t, err)
+	require.Len(t, calls.build, 1)
+	require.Len(t, calls.rebuild, 1)
+	recovery := calls.rebuild[0]
+	assert.Equal(t, executor.ConcurrentBudget{CallerOwned: true}, recovery.budget)
+	require.True(t, recovery.hasDeadline, "the recovery must run under a deadline")
+	assert.WithinDuration(t, before.Add(bound), recovery.deadline, concurrentIndexHeadroom/2,
+		"the recovery starts with the configured bound ahead of it, not the caller's ceiling")
+	assert.True(t, recovery.deadline.Before(ceiling), "the recovery's deadline must fall inside the caller's ceiling")
+}
+
+// TestBuildIndexConcurrentlyNamesTheBoundThatEndedTheBuild proves the option
+// is named on the drive's own error path, for each way the bound ends a
+// build: the served build's typed statement budget verdict, and a raw
+// cancellation of the executor's in-session catalog reads once the bound
+// has elapsed. Both classify as the same refusal with the same remedy.
+func TestBuildIndexConcurrentlyNamesTheBoundThatEndedTheBuild(t *testing.T) {
+	const bound = 5 * time.Millisecond
+	cases := []struct {
+		name  string
+		build func() error
+	}{
+		{
+			name: "served build exhausts its statement budget",
+			build: func() error {
+				return &executor.BudgetError{Cause: executor.CauseStatement, Budget: bound}
+			},
+		},
+		{
+			name: "pre-build catalog read is cancelled once the bound has elapsed",
+			build: func() error {
+				// The drive names the bound on a raw cancellation only once
+				// the bound has elapsed on its own clock, so real time must
+				// pass here; overshooting is the safe direction.
+				time.Sleep(2 * bound)
+				return fmt.Errorf("resolve target: %w", &pgconn.PgError{Code: sqlstateQueryCanceled})
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := scriptConcurrentIndex(t, tc.build, func() error {
+				return errors.New("no recovery is expected for a build the bound ended")
+			})
+
+			err := buildIndexConcurrently(t.Context(), nil, concurrentIndexChange(bound), newTestTracker(t), slog.New(slog.DiscardHandler))
+
+			require.Error(t, err)
+			assert.Empty(t, calls.rebuild)
+			r := classifyRefusal(err, "users")
+			require.NotNil(t, r, "a bound-ended build that left nothing is a refusal")
+			assert.Equal(t, "concurrent-index-bound-exceeded", r.reason)
+			assert.Contains(t, r.detail, "postgres.concurrent_index_max_duration (5ms)")
+			assert.Contains(t, r.detail, "raise postgres.concurrent_index_max_duration and re-run")
+		})
+	}
 }
 
 // TestNameConcurrentIndexBoundWrapsOnlyTheBoundsOwnVerdict pins which build
