@@ -816,6 +816,26 @@ func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, 
 	return nil
 }
 
+// concurrentIndexExecutor names the two executor entry points a concurrent
+// index build reaches: the build itself and the recovery run over an
+// abandoned invalid index. It is a test seam, so a test can observe the
+// budget and the context deadline the drive hands each one against an
+// executor it scripts instead of a target to dial; the package default is
+// the executor's own functions. The engine's execute seam cannot reach these
+// calls, since it replaces the whole of executeOptimistic. The seam is
+// package state shared by every drive in the process, so swapping it is not
+// safe from a test that runs in parallel with another; scriptConcurrentIndex
+// restores it when each test ends.
+type concurrentIndexExecutor struct {
+	build   func(ctx context.Context, pool *pgxpool.Pool, sql string, budget executor.ConcurrentBudget, tracker *progress.Tracker) (executor.IndexBuildReport, error)
+	rebuild func(ctx context.Context, pool *pgxpool.Pool, sql string, budget executor.ConcurrentBudget) (executor.IndexRecoveryReport, error)
+}
+
+var concurrentIndex = concurrentIndexExecutor{
+	build:   executor.BuildIndexConcurrentlyWithProgress,
+	rebuild: executor.RebuildAbandonedIndex,
+}
+
 // buildIndexConcurrently runs a CREATE INDEX CONCURRENTLY through pg-sprite's
 // dedicated index-build executor, which runs it outside a transaction block
 // under the CONCURRENTLY budget policy and returns a catalog-verified
@@ -863,7 +883,7 @@ func buildIndexConcurrently(ctx context.Context, pool *pgxpool.Pool, change nati
 	// that never reaches the server still cannot leave the statement running
 	// unbounded on the target.
 	start := time.Now()
-	_, err := executor.BuildIndexConcurrentlyWithProgress(ctx, pool, change.sql,
+	_, err := concurrentIndex.build(ctx, pool, change.sql,
 		executor.ConcurrentBudget{Overall: change.concurrentIndexMaxDuration}, tracker)
 	if err == nil {
 		return nil
@@ -895,7 +915,7 @@ func buildIndexConcurrently(ctx context.Context, pool *pgxpool.Pool, change nati
 	// arrive here with the bound already spent once.
 	recoveryCtx, cancel := context.WithTimeout(ctx, change.concurrentIndexMaxDuration)
 	defer cancel()
-	report, err := executor.RebuildAbandonedIndex(recoveryCtx, pool, change.sql,
+	report, err := concurrentIndex.rebuild(recoveryCtx, pool, change.sql,
 		executor.ConcurrentBudget{CallerOwned: true})
 	if err != nil {
 		return fmt.Errorf("rebuild PostgreSQL index concurrently on table %q: %w", change.table,

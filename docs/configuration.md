@@ -798,9 +798,10 @@ The server fails startup validation when
 It is the build's server-side `statement_timeout`, and the engine's own
 deadline for the recovery of an abandoned leftover that a build runs before
 building. The server refuses zero, negative, and invalid durations at config
-load, and durations above the largest `statement_timeout` PostgreSQL itself
-accepts (about 24 days); omit the option to use the default rather than setting
-`0`.
+load, durations below one millisecond (the resolution of `statement_timeout`;
+a shorter value would round to zero on the server and switch the timer off),
+and durations above the largest `statement_timeout` PostgreSQL itself accepts
+(about 24 days); omit the option to use the default rather than setting `0`.
 
 The ceiling is process-wide: every PostgreSQL database this server drives
 shares the same value, and a database cannot override it in its own metadata.
