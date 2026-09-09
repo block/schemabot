@@ -117,9 +117,6 @@ type: vitess
 
 SchemaBot plans all keyspaces together — a single plan can contain changes across `commerce` and `commerce_sharded`. This is necessary because DDL and VSchema changes across keyspaces may need to be deployed atomically (e.g., moving a table between keyspaces).
 
-For MySQL and Vitess, deleting every schema file in a namespace is refused.
-Drop its tables through a separately reviewed schema change instead.
-
 ### Vitess — VSchema changes
 
 `vschema.json` controls Vitess routing (which tables live in which keyspace, sharding strategy, vindexes, etc.). When a `vschema.json` file changes:
@@ -134,6 +131,15 @@ A VSchema change that removes a vindex, a table routing entry, or a table's
 column-vindex association is an unsafe change and requires the same
 `--allow-unsafe` acknowledgment as destructive DDL — see
 [lint-and-safety-levels.md](./lint-and-safety-levels.md#what-unsafe-means).
+
+### Removing a namespace
+
+Deleting every schema file in a namespace, or moving them all out of it, does
+not remove the namespace from the plan. Every table it still holds is planned
+as a `DROP TABLE` change: on MySQL and Vitess an unsafe change that needs the
+explicit drop approval before it can run, on PostgreSQL a blocked change that
+fails the check until the tables are declared again or dropped through a
+reviewed schema change.
 
 ## Where to Put the Schema Directory
 

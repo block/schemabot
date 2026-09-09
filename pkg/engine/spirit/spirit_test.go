@@ -9,17 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
-	"github.com/block/schemabot/pkg/schema"
 )
-
-func TestPlanRejectsEmptyNamespace(t *testing.T) {
-	_, err := New(Config{}).Plan(t.Context(), &engine.PlanRequest{
-		SchemaFiles: schema.SchemaFiles{"orders": {Files: map[string]string{}}},
-		Credentials: &engine.Credentials{DSN: "user:password@tcp(localhost:3306)/commerce"},
-	})
-
-	require.EqualError(t, err, `namespace "orders": removing every schema file of a namespace is not supported for MySQL; drop tables through a separately reviewed schema change`)
-}
 
 // TestProgressState verifies that a progress poll reports the tracked state
 // for every terminal outcome regardless of what a lingering runner's Spirit

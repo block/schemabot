@@ -24,7 +24,11 @@ func TestEmptiedPRNamespaces(t *testing.T) {
 		{name: "outside schema root", files: []PRFile{{Filename: "other/removed/orders.sql", Status: "removed"}}},
 		{name: "ignored namespace", ignored: []string{"removed_$ENV"}, environment: "test", files: []PRFile{{Filename: "schema/removed_$ENV/orders.sql", Status: "removed"}}},
 		{name: "flat file", files: []PRFile{{Filename: "schema/orders.sql", Status: "removed"}}},
-		{name: "renamed file", files: []PRFile{{Filename: "schema/removed/orders.sql", Status: "renamed"}}},
+		{name: "renamed out of its namespace", files: []PRFile{{Filename: "schema/surviving/orders.sql", PreviousFilename: "schema/removed/orders.sql", Status: "renamed"}}, want: []string{"removed"}},
+		{name: "renamed within its namespace", files: []PRFile{{Filename: "schema/surviving/orders_v2.sql", PreviousFilename: "schema/surviving/orders.sql", Status: "renamed"}}},
+		{name: "renamed in from another namespace", files: []PRFile{{Filename: "schema/removed/orders.sql", PreviousFilename: "schema/surviving/orders.sql", Status: "renamed"}}},
+		{name: "renamed without a previous path", files: []PRFile{{Filename: "schema/removed/orders.sql", Status: "renamed"}}},
+		{name: "renamed to a non-schema file", files: []PRFile{{Filename: "schema/removed/orders.txt", PreviousFilename: "schema/removed/orders.sql", Status: "renamed"}}, want: []string{"removed"}},
 		{name: "environment suffix", environment: "test", files: []PRFile{{Filename: "schema/removed_$ENV/orders.sql", Status: "removed"}}, want: []string{"removed_test"}},
 	}
 

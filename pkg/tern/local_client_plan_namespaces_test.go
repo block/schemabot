@@ -1,7 +1,6 @@
 package tern
 
 import (
-	"fmt"
 	"testing"
 
 	"github.com/block/schemabot/pkg/ddl"
@@ -20,25 +19,24 @@ func planNamespacesTestClient() *LocalClient {
 	}}
 }
 
-func TestNormalizeSchemaFilesRejectsEmptyMySQLFamilyNamespace(t *testing.T) {
-	for _, databaseType := range []string{storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess} {
+// TestNormalizeSchemaFilesKeepsEmptyNamespace proves a namespace that
+// declares no schema files reaches the engine on every database type, so the
+// engine can surface each live table it still holds as a DROP TABLE change
+// instead of the plan reporting nothing to change.
+func TestNormalizeSchemaFilesKeepsEmptyNamespace(t *testing.T) {
+	for _, databaseType := range []string{storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres} {
 		t.Run(databaseType, func(t *testing.T) {
 			client := &LocalClient{config: LocalConfig{Database: "commerce", Type: databaseType}}
-			_, err := client.normalizeSchemaFiles(schema.SchemaFiles{"orders": {Files: map[string]string{}}})
 
-			require.EqualError(t, err, fmt.Sprintf(`namespace "orders": removing every schema file of a namespace is not supported for %s; drop tables through a separately reviewed schema change`, databaseType))
+			normalized, err := client.normalizeSchemaFiles(schema.SchemaFiles{"orders": {Files: map[string]string{}}})
+
+			require.NoError(t, err)
+			require.Len(t, normalized, 1)
+			for _, files := range normalized {
+				assert.Empty(t, files.Files)
+			}
 		})
 	}
-}
-
-func TestNormalizeSchemaFilesKeepsEmptyPostgresNamespace(t *testing.T) {
-	client := &LocalClient{config: LocalConfig{Database: "commerce", Type: storage.DatabaseTypePostgres}}
-	files := schema.SchemaFiles{"orders": {Files: map[string]string{}}}
-
-	normalized, err := client.normalizeSchemaFiles(files)
-
-	require.NoError(t, err)
-	assert.Equal(t, files, normalized)
 }
 
 // TestNamespacesFromEngineChangesPersistsVSchemaMetadata verifies the local

@@ -655,9 +655,6 @@ func (c *LocalClient) deferredCutoverSignalExists(ctx context.Context, apply *st
 }
 
 func (c *LocalClient) normalizeSchemaFiles(schemaFiles schema.SchemaFiles) (schema.SchemaFiles, error) {
-	if err := rejectEmptyNamespaces(schemaFiles, c.config.Type); err != nil {
-		return nil, err
-	}
 	if c.config.Type != storage.DatabaseTypeMySQL {
 		return schemaFiles, nil
 	}
@@ -670,22 +667,6 @@ func (c *LocalClient) normalizeSchemaFiles(schemaFiles schema.SchemaFiles) (sche
 		normalized[targetNamespace] = files
 	}
 	return normalized, nil
-}
-
-// rejectEmptyNamespaces refuses a plan request whose namespace declares no
-// schema files. Only the PostgreSQL engine reconciles an empty desired set —
-// every live table becomes a blocked undeclared drop — so every other engine
-// fails closed rather than treat the missing files as "nothing to change".
-func rejectEmptyNamespaces(schemaFiles schema.SchemaFiles, databaseType string) error {
-	if databaseType == storage.DatabaseTypePostgres {
-		return nil
-	}
-	for ns, files := range schemaFiles {
-		if files == nil || len(files.Files) == 0 {
-			return fmt.Errorf("namespace %q: removing every schema file of a namespace is not supported for %s; drop tables through a separately reviewed schema change", ns, databaseType)
-		}
-	}
-	return nil
 }
 
 func (c *LocalClient) planNamespace(ns string) string {
