@@ -539,6 +539,15 @@ type PlanResponse struct {
 	// applying this plan will adopt or discard, one entry per namespace holding
 	// any. Empty when the target is clean, which is the ordinary case.
 	ExistingCopies []*ExistingCopyResponse `json:"existing_copies,omitempty"`
+	// ExemptTables lists live tables intentionally excluded from a plan verdict.
+	ExemptTables []*ExemptTablesResponse `json:"exempt_tables,omitempty"`
+}
+
+// ExemptTablesResponse describes live tables exempt from a plan verdict.
+type ExemptTablesResponse struct {
+	Namespace string   `json:"namespace"`
+	Tables    []string `json:"tables"`
+	Reason    string   `json:"reason"`
 }
 
 // Dispositions an ExistingCopyResponse can carry. These mirror the engine's

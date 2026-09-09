@@ -532,6 +532,13 @@ message ExistingCopy {
   bool running = 7;
 }
 
+// ExemptTables lists live tables intentionally excluded from a plan verdict.
+message ExemptTables {
+  string namespace = 1;
+  repeated string tables = 2;
+  string reason = 3;
+}
+
 // ShardPlan reports a shard's own changes for a namespace. A shard is changing
 // when changes is non-empty; carrying the changes (rather than a separate
 // needs_change flag) means a keyspace whose shards diverge — drift, or a
@@ -561,6 +568,8 @@ message PlanResponse {
   // Unfinished work already on the target that applying this plan will
   // continue or destroy. Empty when nothing is at stake.
   repeated ExistingCopy existing_copies = 7;
+  // Live tables intentionally excluded from a plan verdict, grouped by namespace.
+  repeated ExemptTables exempt_tables = 8;
 }
 
 // PlanDiffResponse contains a deployment's desired-vs-live diff. It mirrors
