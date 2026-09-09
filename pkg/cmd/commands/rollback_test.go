@@ -61,10 +61,12 @@ func TestRollbackPreviewUsesTargetDialect(t *testing.T) {
 				os.Stdin = original
 				require.NoError(t, input.Close())
 			})
+			var runErr error
 			output := captureStdout(func() {
 				cmd := RollbackCmd{ApplyID: "apply-example-85", Environment: "staging", Watch: true}
-				require.NoError(t, cmd.Run(&Globals{Endpoint: server.URL}))
+				runErr = cmd.Run(&Globals{Endpoint: server.URL})
 			})
+			require.NoError(t, runErr)
 			plain := stripAnsi(output)
 			assert.Contains(t, plain, "Rollback Plan\n┌")
 			assert.Contains(t, plain, "│  Database:      shop")
