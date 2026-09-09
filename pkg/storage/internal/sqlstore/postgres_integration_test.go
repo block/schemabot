@@ -975,8 +975,6 @@ func TestPostgresExpireRetryableDefersToTheOperationLease(t *testing.T) {
 	}
 	abandonedOpID := insertOperation(t, "region-a", "op-1")
 	heldOpID := insertOperation(t, "region-b", "op-2")
-	_, err = db.ExecContext(t.Context(), `UPDATE apply_operations SET state = $1 WHERE id = $2`, state.ApplyOperation.FailedRetryable, heldOpID)
-	require.NoError(t, err)
 	_, err = db.ExecContext(t.Context(),
 		`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
 		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), abandonedOpID)
@@ -984,7 +982,7 @@ func TestPostgresExpireRetryableDefersToTheOperationLease(t *testing.T) {
 
 	// A third deployment whose drive settled it into failed_retryable and left
 	// its lease behind: a fresh-looking lease with no drive behind it, which the
-	// gate must protect because it is indistinguishable from a live redispatch.
+	// gate must not read as live.
 	settledOpID := insertOperation(t, "region-c", "op-3")
 	_, err = db.ExecContext(t.Context(),
 		`UPDATE apply_operations SET state = $1, updated_at = NOW() WHERE id = $2`,
@@ -1025,8 +1023,8 @@ func TestPostgresExpireRetryableDefersToTheOperationLease(t *testing.T) {
 		"a live driver's rows are not expiry's to terminalize")
 	assert.Equal(t, state.Task.Pending, taskState(t, "task-expire-queued"),
 		"nor the work queued behind them")
-	assert.Equal(t, state.Task.FailedRetryable, taskState(t, "task-expire-settled"),
-		"a fresh retryable lease must be protected even after its drive settles")
+	assert.Equal(t, state.Task.Failed, taskState(t, "task-expire-settled"),
+		"a lease its drive left behind speaks for nothing")
 
 	// The driver dies: its lease ages out, its rows stop being mirrored, and the
 	// verdict expiry wrote goes quiet long enough for the sweep to mirror it down.
