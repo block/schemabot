@@ -115,15 +115,18 @@ statement timeout; the build is bounded instead by the engine's own deadline,
 `postgres.concurrent_index_max_duration` (24 hours unless configured) — and
 reports completion only once the catalog shows the index valid. A build that fails
 part-way leaves an invalid index; the stored failure names it and is retryable.
-If the driver pod is lost mid-build, its database session ends with the pod;
-the next drive recovers the resulting invalid index as abandoned debris.
-The next drive recovers that leftover itself: when the build finds an invalid
-index under the requested name, or quarantined on the table by an interrupted
-recovery, that pg-sprite can prove abandoned — on the target table, with no
-backend building it, or with a builder the engine role cannot see through the
-progress view — it runs pg-sprite's recovery, which removes the entry under a
-lock-held proof of abandonment and then builds, so a change interrupted
-mid-build converges without an operator dropping anything. The lock is the
+Losing the driver pod mid-build does not stop the statement: the server keeps
+building until it finishes or fails on its own, so the recovery re-plan on the
+next drive meets that build's outcome — a valid index it has nothing left to
+build, a build still in flight (the apply fails retryable, naming the index and
+the backend building it, until that build ends), or a failed build's invalid
+leftover. The next drive recovers that leftover itself: when the build finds
+an invalid index under the requested name, or quarantined on the table by an
+interrupted recovery, that pg-sprite can prove abandoned — on the target
+table, with no backend building it, or with a builder the engine role cannot
+see through the progress view — it runs pg-sprite's recovery, which removes
+the entry under a lock-held proof of abandonment and then builds, so a change
+interrupted mid-build converges without an operator dropping anything. The lock is the
 proof: a build still holding the table, visible or not, stops the recovery at
 its lock budget and the apply fails retryable, still naming the index. A
 recovery that cannot prove the entry unchanged through to its removal fails
