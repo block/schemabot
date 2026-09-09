@@ -65,8 +65,8 @@ conditions:
   [Index builds](#index-builds)). Statement kinds outside that set fail
   closed.
 - For a change to an existing table, the target is an ordinary or partitioned
-  table. Native `ALTER TABLE`, `DROP INDEX`, `REINDEX`, and blocking `CREATE
-  INDEX` statements also require its measured on-disk size to be no more than
+  table. Native `ALTER TABLE` and blocking `CREATE INDEX` statements also
+  require its measured on-disk size to be no more than
   the configured native-apply ceiling (1 GiB by default; see
   `postgres.native_safe_table_size_limit_bytes` in
   [configuration](configuration.md)). For a partitioned parent, the
@@ -288,7 +288,7 @@ Planning establishes the statement shape. Apply time re-checks facts that can
 change or that depend on the target:
 
 - A table larger than the configured ceiling is refused permanently for native
-  `ALTER TABLE`, `DROP INDEX`, `REINDEX`, and blocking `CREATE INDEX`. This is
+  `ALTER TABLE` and blocking `CREATE INDEX`. This is
   SchemaBot's native-apply ceiling, not a PostgreSQL limit. It defaults to
   1 GiB and is set with `postgres.native_safe_table_size_limit_bytes`; see
   [configuration](configuration.md) for the trade-offs of raising it. The
