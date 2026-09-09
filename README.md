@@ -94,7 +94,7 @@ Grab the CLI from [Releases](#releases), then point it at a database you already
 schemabot init
 ```
 
-The wizard connects to your MySQL or PostgreSQL database, imports its schema into declarative `.sql` files, and verifies a no-change plan before it finishes. It reads your application's schema and never changes it. SchemaBot keeps its own plans and progress in a separate database, which can live on the same server. Make your first edit, run `schemabot plan`, and you are working the way the PR workflow does. [docs/init.md](./docs/init.md) walks through each step, including the flag form for agents and scripts.
+The wizard connects to your MySQL, PostgreSQL, or Vitess database, imports its schema into declarative `.sql` files, and verifies a no-change plan before it finishes. It reads your application's schema and never changes it. SchemaBot keeps its own plans and progress in a separate database, which can live on the same server. Make your first edit, run `schemabot plan`, and you are working the way the PR workflow does. [docs/init.md](./docs/init.md) walks through each step, including the flag form for agents and scripts.
 
 To explore SchemaBot with demo databases instead, try it from a clone. The demo brings up local MySQL containers, applies a schema, and seeds data; the schemas and configs it uses are documented in [examples/](./examples/README.md):
 

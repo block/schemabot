@@ -31,8 +31,11 @@ type InitCmd struct {
 	ReuseSchema    bool         `name:"reuse-schema" help:"Verify existing desired files without replacing them"`
 	Database       string       `short:"d" help:"Name to register for this database"`
 	Environment    string       `short:"e" help:"Environment to initialize"`
-	Type           string       `help:"Database engine: mysql or postgres"`
-	DSN            string       `help:"Target connection as env:VARIABLE (credentials stay out of schema files)"`
+	Type           string       `help:"Database engine: mysql, postgres, or vitess"`
+	DSN            string       `help:"Target connection as env:VARIABLE (credentials stay out of schema files); a vtgate address for Vitess"`
+	Organization   string       `help:"PlanetScale organization that owns a Vitess database"`
+	APIToken       string       `name:"api-token" help:"PlanetScale service token as env:VARIABLE holding name:value; Vitess only"`
+	APIURL         string       `name:"api-url" help:"PlanetScale-compatible API base URL for a Vitess database; defaults to PlanetScale"`
 	StorageDSN     string       `name:"storage-dsn" help:"Existing separate state database as env:VARIABLE; startup initializes SchemaBot metadata tables"`
 	SchemaDir      string       `name:"schema-dir" short:"s" default:"schema" help:"New schema directory, or unchanged files from a prior initialization"`
 	Namespaces     []string     `name:"namespace" help:"Explicit namespace to import; repeat for multiple namespaces"`
@@ -81,9 +84,13 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if g.Endpoint != "" || g.Token != "" || os.Getenv("SCHEMABOT_ENDPOINT") != "" || os.Getenv("SCHEMABOT_TOKEN") != "" {
 		return nil, fmt.Errorf("local initialization cannot be combined with endpoint or authentication overrides")
 	}
-	for _, ref := range []string{cmd.DSN, cmd.StorageDSN} {
+	refs := []string{cmd.DSN, cmd.StorageDSN}
+	if cmd.Type == "vitess" {
+		refs = append(refs, cmd.APIToken)
+	}
+	for _, ref := range refs {
 		if !strings.HasPrefix(ref, "env:") || strings.TrimSpace(strings.TrimPrefix(ref, "env:")) == "" {
-			return nil, fmt.Errorf("provide target and storage connections as env:VARIABLE references")
+			return nil, fmt.Errorf("provide target, storage, and token connections as env:VARIABLE references")
 		}
 	}
 	namespaces, err := onboardPullNamespaces(cmd.Namespaces)
@@ -146,15 +153,21 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	}
 	manager := localruntime.Manager{Dir: dir, Binary: binary, Version: g.Version}
 	cmd.reportProgress("Setting up your database connection...")
-	for _, ref := range []string{cmd.DSN, cmd.StorageDSN} {
-		if err := localsetup.CheckConnection(ctx, cmd.Type, os.Getenv(strings.TrimPrefix(ref, "env:"))); err != nil {
-			return nil, fmt.Errorf("check %s before registering runtime: %w", ref, err)
+	storageDialect := initStorageDialect(cmd.Type)
+	for _, connection := range []struct{ engine, ref string }{{cmd.Type, cmd.DSN}, {storageDialect, cmd.StorageDSN}} {
+		if err := localsetup.CheckConnection(ctx, connection.engine, os.Getenv(strings.TrimPrefix(connection.ref, "env:"))); err != nil {
+			return nil, fmt.Errorf("check %s before registering runtime: %w", connection.ref, err)
+		}
+	}
+	if cmd.Type == "vitess" {
+		if err := localsetup.CheckPlanetScale(ctx, cmd.planetScaleTarget()); err != nil {
+			return nil, fmt.Errorf("check %s before registering runtime: %w", cmd.APIToken, err)
 		}
 	}
 	_, err = localsetup.Register(manager, localsetup.Registration{
 		Database: cmd.Database, Environment: cmd.Environment, Engine: cmd.Type,
-		Connection: api.EnvironmentConfig{DSN: cmd.DSN},
-		Storage:    api.StorageConfig{Dialect: cmd.Type, DSN: cmd.StorageDSN},
+		Connection: api.EnvironmentConfig{DSN: cmd.DSN, Organization: cmd.Organization, TokenSecretRef: cmd.APIToken, APIURL: cmd.APIURL},
+		Storage:    api.StorageConfig{Dialect: storageDialect, DSN: cmd.StorageDSN},
 	})
 	if err != nil {
 		return nil, err
@@ -164,6 +177,25 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 		return nil, retainedInitError(err)
 	}
 	return result, nil
+}
+
+// SchemaBot's state runs on MySQL or PostgreSQL. Vitess is a target engine,
+// not a storage dialect, so its state lives in a MySQL database.
+func initStorageDialect(engine string) string {
+	if engine == "postgres" {
+		return "postgres"
+	}
+	return "mysql"
+}
+
+func (cmd *InitCmd) planetScaleTarget() localsetup.Target {
+	return localsetup.Target{
+		Engine:       cmd.Type,
+		Database:     cmd.Database,
+		Organization: cmd.Organization,
+		Token:        os.Getenv(strings.TrimPrefix(cmd.APIToken, "env:")),
+		APIURL:       cmd.APIURL,
+	}
 }
 
 func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Manager, stage, root, profile string, namespaces, ignored []string) (*initResult, error) {

@@ -29,7 +29,7 @@ func initConnectionSummary(engine, ref string) string {
 	}
 	var host, database string
 	switch engine {
-	case "mysql":
+	case "mysql", "vitess":
 		cfg, err := mysql.ParseDSN(dsn)
 		if err != nil {
 			return "Connection found; couldn’t read its destination. Check the connection string."
@@ -45,6 +45,24 @@ func initConnectionSummary(engine, ref string) string {
 		return "Connection variable found."
 	}
 	return fmt.Sprintf("Host: %q\nDatabase: %q", host, database)
+}
+
+// Show the token's name, never its value: the name identifies the service
+// token in PlanetScale's console.
+func initTokenSummary(ref string) string {
+	ref = strings.TrimSpace(ref)
+	if !initVariable.MatchString(ref) {
+		return "Enter env:VARIABLE_NAME to find your PlanetScale service token."
+	}
+	raw := os.Getenv(strings.TrimPrefix(ref, "env:"))
+	if raw == "" {
+		return "This variable isn’t set yet. Set it to name:value before continuing setup."
+	}
+	name, _, ok := strings.Cut(raw, ":")
+	if !ok || strings.TrimSpace(name) == "" {
+		return "Token found; it should look like name:value. Check the variable."
+	}
+	return fmt.Sprintf("Token: %q", strings.TrimSpace(name))
 }
 
 type initConnectionMsg struct {
@@ -66,10 +84,22 @@ func (m *initWizard) checkConnection() tea.Cmd {
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	m.cancelDiscovery = cancel
-	engine, dsn := m.fields[0].value, os.Getenv(strings.TrimPrefix(strings.TrimSpace(m.input.Value()), "env:"))
+	secret := os.Getenv(strings.TrimPrefix(strings.TrimSpace(m.input.Value()), "env:"))
+	if m.step == stepAPIToken {
+		target := m.planetScaleTarget(secret)
+		checkAPI := m.checkAPI
+		if checkAPI == nil {
+			checkAPI = localsetup.CheckPlanetScale
+		}
+		return func() tea.Msg { defer cancel(); return initConnectionMsg{generation, checkAPI(ctx, target)} }
+	}
+	engine := m.engine()
+	if m.step == stepStorageDSN {
+		engine = initStorageDialect(engine)
+	}
 	check := m.check
 	if check == nil {
 		check = localsetup.CheckConnection
 	}
-	return func() tea.Msg { defer cancel(); return initConnectionMsg{generation, check(ctx, engine, dsn)} }
+	return func() tea.Msg { defer cancel(); return initConnectionMsg{generation, check(ctx, engine, secret)} }
 }

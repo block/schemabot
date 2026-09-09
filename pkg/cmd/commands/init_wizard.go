@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/ui"
@@ -24,6 +25,13 @@ func (cmd *InitCmd) missingInputs() []string {
 			missing = append(missing, field.name)
 		}
 	}
+	if cmd.Type == "vitess" {
+		for _, field := range []struct{ name, value string }{{"organization", cmd.Organization}, {"api-token", cmd.APIToken}} {
+			if strings.TrimSpace(field.value) == "" {
+				missing = append(missing, field.name)
+			}
+		}
+	}
 	if len(cmd.Namespaces) == 0 {
 		missing = append(missing, "namespace")
 	}
@@ -36,8 +44,8 @@ func (cmd *InitCmd) collectInputs(ctx context.Context, g *Globals) error {
 
 func (cmd *InitCmd) collectInputsWithTerminalState(ctx context.Context, g *Globals, stdinTerminal, stdoutTerminal bool) error {
 	cmd.interactive = !cmd.NonInteractive && !cmd.JSON && stdinTerminal && stdoutTerminal
-	if cmd.Type != "" && cmd.Type != "mysql" && cmd.Type != "postgres" {
-		return fmt.Errorf("database engine must be mysql or postgres")
+	if cmd.Type != "" && !slices.Contains(initEngineKeys(), cmd.Type) {
+		return fmt.Errorf("database engine must be %s", strings.Join(initEngineKeys(), ", "))
 	}
 	missing := cmd.missingInputs()
 	if len(missing) == 0 {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/localsetup"
@@ -23,7 +22,8 @@ func (m *initWizard) discoverNamespaces() tea.Cmd {
 	m.err = ""
 	m.generation++
 	generation := m.generation
-	engine, ref := m.fields[0].value, m.fields[3].value
+	engine, ref, tokenRef := m.engine(), m.fields[stepDSN].value, m.fields[stepAPIToken].value
+	target := m.planetScaleTarget("")
 	ctx := m.ctx
 	if ctx == nil {
 		ctx = context.TODO()
@@ -39,12 +39,21 @@ func (m *initWizard) discoverNamespaces() tea.Cmd {
 		if !initVariable.MatchString(ref) || strings.TrimSpace(dsn) == "" {
 			return initNamespacesMsg{generation: generation, err: fmt.Errorf("choose an env:VARIABLE connection that you’ve already set")}
 		}
-		names, err := m.discover(ctx, engine, dsn)
+		if engine != "vitess" {
+			target = localsetup.Target{Engine: engine}
+		} else {
+			target.Token = os.Getenv(strings.TrimPrefix(tokenRef, "env:"))
+			if !initVariable.MatchString(tokenRef) || strings.TrimSpace(target.Token) == "" {
+				return initNamespacesMsg{generation: generation, err: fmt.Errorf("choose an env:VARIABLE PlanetScale token that you’ve already set")}
+			}
+		}
+		target.DSN = dsn
+		names, err := m.discover(ctx, target)
 		return initNamespacesMsg{generation, names, err}
 	}
 }
 func (m *initWizard) acceptNamespaces(msg initNamespacesMsg) tea.Cmd {
-	if msg.generation != m.generation || m.step != 5 {
+	if msg.generation != m.generation || m.step != stepNamespaces {
 		return nil
 	}
 	m.discovering = false
@@ -65,12 +74,12 @@ func (m *initWizard) acceptNamespaces(msg initNamespacesMsg) tea.Cmd {
 			m.names = nil
 			return nil
 		}
-		m.fields[5].value = m.names[0]
+		m.fields[stepNamespaces].value = m.names[0]
 		m.selected[m.names[0]] = true
 		m.notice = fmt.Sprintf("Found %s. We’ll use that.", initTerminalText(m.names[0]))
 		return m.advance()
 	}
-	m.fields[5].value = ""
+	m.fields[stepNamespaces].value = ""
 	return nil
 }
 func (m *initWizard) filteredNamespaces() []string {
@@ -89,8 +98,8 @@ func (m *initWizard) namespaceKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if len(m.names) == 0 {
 		if msg.String() == "m" {
 			m.explicitNamespaces = true
-			m.fields[5].value = ""
-			m.fields[5].hint = "Enter the namespaces you want to manage, separated by commas."
+			m.fields[stepNamespaces].value = ""
+			m.fields[stepNamespaces].hint = "Enter the namespaces you want to manage, separated by commas."
 			m.err = ""
 			m.loadField()
 			return m, nil
@@ -127,7 +136,7 @@ func (m *initWizard) namespaceKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.err = err.Error()
 			return m, nil
 		}
-		m.fields[5].value = strings.Join(chosen, ", ")
+		m.fields[stepNamespaces].value = strings.Join(chosen, ", ")
 		return m, m.advance()
 	default:
 		var cmd tea.Cmd
@@ -175,11 +184,11 @@ func (m *initWizard) namespaceView() string {
 }
 func (m *initWizard) advance() tea.Cmd {
 	m.step++
-	for m.step < len(m.fields) && !m.editing && m.skip[m.step] {
+	for m.step < len(m.fields) && ((!m.editing && m.skip[m.step]) || m.hidden(m.step)) {
 		m.step++
 	}
 	m.loadField()
-	if m.step == 5 && !m.explicitNamespaces {
+	if m.step == stepNamespaces && !m.explicitNamespaces {
 		m.input.SetValue("")
 		m.input.Placeholder = "Search namespaces"
 		m.names = nil
@@ -192,31 +201,31 @@ func (m *initWizard) advance() tea.Cmd {
 // flags bypass discovery; their scope is still verified by the shared baseline.
 func configureInitWizard(m *initWizard, cmd *InitCmd) {
 	m.discover = localsetup.DiscoverNamespaces
+	m.checkAPI = localsetup.CheckPlanetScale
+	m.apiURL = cmd.APIURL
 	m.skip = make([]bool, len(m.fields))
-	for _, i := range []int{2, 6, 7} {
+	for _, i := range []int{stepEnvironment, stepSchemaDir, stepProfile} {
 		m.skip[i] = true
 	}
-	for i, v := range map[int]string{0: cmd.Type, 1: cmd.Database} {
+	for i, v := range map[int]string{stepEngine: cmd.Type, stepName: cmd.Database, stepOrganization: cmd.Organization} {
 		m.skip[i] = v != ""
 	}
 	m.explicitNamespaces = len(cmd.Namespaces) > 0
 	if !m.explicitNamespaces {
-		m.fields[5].hint = "We’ll find the namespaces available through your connection."
+		m.fields[stepNamespaces].hint = "We’ll find the namespaces available through your connection."
 	}
-	m.skip[5] = m.explicitNamespaces
+	m.skip[stepNamespaces] = m.explicitNamespaces
 	// Connection steps always remain visible, even when flags or environment
 	// variables supplied them. Users confirm the target before discovery.
 	m.selected = map[string]bool{}
-	if slices.Contains(m.skip, false) {
-		for m.skip[m.step] {
-			m.step++
-		}
+	for m.step < len(m.fields) && (m.skip[m.step] || m.hidden(m.step)) {
+		m.step++
 	}
 }
 
 func (m *initWizard) namespaceChoices(original []string) []string {
 	if m.explicitNamespaces {
-		return initNamespaceInput(m.fields[5].value, original)
+		return initNamespaceInput(m.fields[stepNamespaces].value, original)
 	}
 	var chosen []string
 	for _, name := range m.names {

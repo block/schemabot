@@ -21,11 +21,11 @@ func TestConnectionErrorsNeverExposeDSN(t *testing.T) {
 			err := CheckConnection(t.Context(), engine, dsn)
 			require.Error(t, err)
 			require.NotContains(t, err.Error(), secret)
-			_, err = DiscoverNamespaces(t.Context(), engine, dsn)
+			_, err = DiscoverNamespaces(t.Context(), Target{Engine: engine, DSN: dsn})
 			require.Error(t, err)
 			require.NotContains(t, err.Error(), secret)
 			require.Error(t, CheckConnection(t.Context(), engine, ""))
-			_, err = DiscoverNamespaces(t.Context(), engine, "")
+			_, err = DiscoverNamespaces(t.Context(), Target{Engine: engine})
 			require.Error(t, err)
 		})
 	}
