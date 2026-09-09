@@ -109,6 +109,13 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if err := checkInitPublication(stage, renameInitSchema); err != nil {
 		return nil, err
 	}
+	var ignored []string
+	if cmd.ReuseSchema {
+		ignored, err = stageExistingInitSchema(root, stage, cmd.Database, cmd.Type, cmd.Environment, namespaces)
+		if err != nil {
+			return nil, fmt.Errorf("cannot reuse schema directory %q; choose an existing configured directory for --reuse-schema: %w", root, err)
+		}
+	}
 	dir, err := localruntime.Directory(cmd.Runtime)
 	if err != nil {
 		return nil, err
@@ -131,14 +138,14 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if err != nil {
 		return nil, err
 	}
-	result, err := cmd.importBaseline(ctx, manager, stage, root, profile, namespaces)
+	result, err := cmd.importBaseline(ctx, manager, stage, root, profile, namespaces, ignored)
 	if err != nil {
-		return nil, fmt.Errorf("initialization incomplete; runtime registration is retained for retry; correct the connection environment variables and retry with the same references, or choose a new --runtime and --profile for a different state database: %w", err)
+		return nil, retainedInitError(err)
 	}
 	return result, nil
 }
 
-func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Manager, stage, root, profile string, namespaces []string) (*initResult, error) {
+func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Manager, stage, root, profile string, namespaces, ignored []string) (*initResult, error) {
 	startupCtx, cancelStartup := context.WithTimeout(ctx, 30*time.Second)
 	connection, err := manager.Ensure(startupCtx)
 	cancelStartup()
@@ -150,13 +157,7 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 	if err != nil {
 		return nil, fmt.Errorf("import live schema: %w", err)
 	}
-	var ignored []string
-	if cmd.ReuseSchema {
-		ignored, err = stageExistingInitSchema(root, stage, cmd.Database, cmd.Type, cmd.Environment, namespaces)
-		if err != nil {
-			return nil, err
-		}
-	} else {
+	if !cmd.ReuseSchema {
 		plan, err := buildOnboardWritePlan(stage, pulled, nil)
 		if err != nil {
 			return nil, err
@@ -290,4 +291,11 @@ func initSchemaSnapshot(root string) (map[string]string, error) {
 		return nil
 	})
 	return result, err
+}
+
+func retainedInitError(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return fmt.Errorf("setup cancelled; runtime registration is retained for retry: %w", err)
+	}
+	return fmt.Errorf("initialization incomplete; runtime registration is retained for retry: %w", err)
 }

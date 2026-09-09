@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/block/mysql"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/stretchr/testify/require"
 )
@@ -30,6 +31,10 @@ func TestConnectionFailureCategories(t *testing.T) {
 		want  string
 	}{
 		{context.DeadlineExceeded, "timed out"},
+		{context.Canceled, "cancelled"},
+		{&pgconn.PgError{Code: "28P01", Message: "private-password"}, "database error 28P01"},
+		{&pgconn.PgError{Code: "28?01", Message: "private-password"}, "database rejected the connection"},
+		{&pgconn.PgError{Code: "private", Message: "private-password"}, "connection could not be verified"},
 		{syscall.ECONNREFUSED, "connection refused"},
 		{&net.DNSError{Name: "private-host", Err: "private-detail"}, "hostname could not be resolved"},
 		{&mysql.MySQLError{Number: 1045, Message: "private-password"}, "database error 1045"},
