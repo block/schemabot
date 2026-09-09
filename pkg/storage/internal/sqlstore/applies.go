@@ -2414,33 +2414,39 @@ func (s *applyStore) expireRetryable(ctx context.Context, limit int) ([]*storage
 		})
 	}
 
-	// The writes below carry no gate of their own, because no driver can be
-	// driving under these applies while this transaction runs. Three separate
-	// things have to hold for that, and it is worth naming all three: the
-	// FOR UPDATE above is the weakest of them, and on its own would not be
-	// enough — it locks applies, while an operation claim locks apply_operations
-	// and never reads the parent row.
+	// The writes below carry no gate of their own. What keeps them off a live
+	// drive differs by how the drive was claimed, and the two cases are not
+	// equally well covered — so name them separately rather than as one
+	// guarantee.
 	//
-	// A drive that is already under way is excluded by the selection, which
-	// admits only applies with no operation a driver is part-way through
-	// driving.
+	// A parent-lease drive cannot start under an apply this selection matched.
+	// Starting one means passing ClaimApplyByID, and the two predicates are
+	// complements term for term: expiry takes attempt >= maxRecoveryAttempts OR
+	// a lapsed freshness window, and the claim's retryable clause requires
+	// attempt < maxRecoveryAttempts AND a live one. failed_retryable is also
+	// absent from claimableApplyStates(), so the claim's stale-lease clause
+	// cannot reach one either. That disjointness is pinned as a pair rather than
+	// per side — see
+	// TestApplyStore_ExpireRetryableAndTheParentClaimNeverAdmitTheSameApply. The
+	// FOR UPDATE above is its backstop: ClaimApplyByID reads the same row FOR
+	// UPDATE SKIP LOCKED, so for as long as this transaction runs the parent
+	// claim skips the row and refuses regardless of predicate, and a driver that
+	// had already taken an operation row releases that lease instead of driving
+	// it (reconcileUnclaimableParent).
 	//
-	// A drive that has not started yet cannot start, because starting one means
-	// passing ClaimApplyByID, and the applies this selection matches are exactly
-	// the ones that claim refuses. The two predicates are complements term for
-	// term: expiry takes attempt >= maxRecoveryAttempts OR a lapsed freshness
-	// window, and the claim's retryable clause requires attempt <
-	// maxRecoveryAttempts AND a live one. failed_retryable is also absent from
-	// claimableApplyStates(), so the claim's stale-lease clause cannot reach one
-	// either. That disjointness is the load-bearing property here, and it is
-	// pinned as a pair rather than per side — see
-	// TestApplyStore_ExpireRetryableAndTheParentClaimNeverAdmitTheSameApply.
+	// An operation-lease drive gets none of that. A multi-operation drive never
+	// calls ClaimApplyByID, and FindNextApplyOperation takes FOR UPDATE SKIP
+	// LOCKED on apply_operations while reading applies only inside EXISTS
+	// subqueries, which take no lock. So the parent FOR UPDATE is not a backstop
+	// against it, and the selection gate is the whole of the exclusion.
 	//
-	// The FOR UPDATE is the backstop under both. ClaimApplyByID reads the same
-	// row FOR UPDATE SKIP LOCKED, so for as long as this transaction runs the
-	// parent claim skips the row and refuses regardless of predicate, and a
-	// driver that had already taken an operation row releases that lease instead
-	// of driving it (reconcileUnclaimableParent).
+	// That gate is therefore the load-bearing term for fan-out, and it is not
+	// yet strong enough to carry it: it excludes a leased operation only while
+	// that operation's state is one the claim path would take, and a redispatch
+	// claim leaves the operation at failed_retryable, which is not. The gate has
+	// to read the lease alone, and the lease has to be re-checked under a lock
+	// on every operation of the apply, before an ungated write here is safe
+	// under fan-out.
 
 	// A pending task never started: it was blocked behind the failure that made
 	// the apply retryable, so expiring the apply cancels it — mirroring how a

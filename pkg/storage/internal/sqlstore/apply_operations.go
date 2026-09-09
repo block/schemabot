@@ -1948,18 +1948,30 @@ func unleasedOperationGate(d Dialect) string {
 // touch, so the two have to be decided as one, and the decision has to be made
 // where the parent is selected.
 //
-// The lease terms are unleasedOperationGate's, read the same way, plus the
-// occupying-state filter that gate deliberately omits — which here is the same
-// filter the claim path itself applies (freshLeaseCountSQL), so this admits an
-// apply exactly where a driver would be allowed to take its operations.
+// The lease terms are unleasedOperationGate's, read the same way, plus a
+// state filter that gate deliberately omits.
 //
-// The filter is load-bearing rather than a relaxation. A drive that settles its
-// operation into a resumable state writes that state under its lease and leaves
-// the lease in place, so for a full staleness window afterwards the row reads
-// exactly like a live drive's, and a single-deployment apply that has just used
-// its last attempt is in that window every time. Reading the lease alone would
-// hold every such apply — the ordinary shape of the work this exists to
-// terminalize — for a staleness window before its verdict could land.
+// The filter buys termination. A drive that settles its operation into a
+// resumable state writes that state under its lease and leaves the lease in
+// place, so for a full staleness window afterwards the row reads exactly like a
+// live drive's, and a single-deployment apply that has just used its last
+// attempt is in that window every time. Reading the lease alone would hold every
+// such apply — the ordinary shape of the work this exists to terminalize — for a
+// staleness window before its verdict could land.
+//
+// It buys that at a cost, and the cost is not yet paid for. The states here are
+// claimableApplyStates(), which is not the set that means "a driver is occupying
+// this operation" — that set is driverOccupyingOperationStates(), and the two
+// part at failed_retryable. A redispatched operation keeps that state for its
+// whole drive, so this gate admits an apply whose operation a driver is
+// part-way through retrying, which is the one case a whole-apply write must not
+// land under.
+//
+// Closing it means the gate reads the lease alone, which in turn means a drive
+// clears its lease as it ends rather than leaving it behind — the leftover lease
+// is the only reason the state filter is here — and that a writer relying on the
+// gate re-checks it under a lock on every operation of the apply, since an
+// unfiltered NOT EXISTS evaluated once is a read a claim can race.
 //
 // An apply with no operations is admitted. Nothing holds a lease over it, so
 // there is nothing here to exclude it by.

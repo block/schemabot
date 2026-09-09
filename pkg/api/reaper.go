@@ -262,10 +262,11 @@ func (s *Service) recordSweepOutcome(ctx context.Context, sweep reapSweep, reape
 func (s *Service) runRetryableExpiryPass(ctx context.Context) {
 	expired, err := s.storage.Applies().ExpireRetryable(ctx, retryableExpiryBatch)
 
-	// Report what landed before handling the error, as the stranded sweeps do:
-	// an expiry that failed part-way still committed the applies it settled, and
-	// those are the ones an operator asking why an apply stopped retrying needs
-	// to find.
+	// A pass settles its whole batch in one transaction, so this is all of what
+	// it expired or none of it — an error means nothing committed and there is
+	// nothing here to report. Each apply still gets its own line and its own
+	// durable log entry, because "why did this apply stop retrying" is asked one
+	// apply at a time.
 	for _, expiration := range expired {
 		apply := expiration.Apply
 		s.logger.Error("operator: retryable apply expired",
