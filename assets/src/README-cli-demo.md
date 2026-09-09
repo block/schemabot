@@ -1,12 +1,14 @@
 # CLI guide animations
 
-These GIFs illustrate five operator workflows using fictional data passed
+These GIFs illustrate seven operator workflows using fictional data passed
 through the production Go templates and interactive `commands.WatchModel`:
 
 - `cli-plan-apply.gif`: inspect an index plan, confirm with yes, and follow an apply to completion
 - `cli-ops.gif`: list databases, pull a live schema with lint findings, show the latest 20 of 500 changes, then follow engine logs through completion
 - `cli-fleet.gif`: list changes, attach to the live watcher, detach with Esc, and list plans
-- `cli-cutover.gif`: see a throttle reason, finish copying, defer the swap, and press Enter to cut over
+- `cli-cutover.gif`: finish copying, wait for the swap, and press Enter to cut over
+- `cli-throttle.gif`: see replication lag pause copying and watch it resume
+- `cli-stop.gif`: press s through the real handler, await Stopped, then start and watch copying resume
 - `cli-vitess.gif`: create a deploy request, deploy with Enter, follow four shards, and close the revert window
 
 They are template-based illustrations, not recordings of a live database.
@@ -58,4 +60,4 @@ The inventory uses the real databases command against a loopback fixture. The st
 
 The fleet pull view enables the production interactive color setting and shows the entire result in one frame. Each fleet command finishes typing, then pauses briefly before output appears.
 
-All animations render at 12 frames per second. The cutover copy advances in five-point steps, with brief holds for throttling and interactive controls.
+All animations render at 12 frames per second. The cutover copy advances in five-point steps, with brief holds for interactive controls.

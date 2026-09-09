@@ -378,7 +378,23 @@ Press **Esc** to detach while copying; the apply keeps running. **s** requests
 a stop for this MySQL example. At deferred cutover, **Enter** requests the
 swap. During cutover, the watcher asks you to wait and disables Esc/stop.
 
-### Wait for the right moment to swap
+### Understand throttling
+
+When copying is throttled, the live view explains why. This MySQL example
+pauses for replication lag, then continues as conditions improve.
+
+![MySQL progress shows a replication-lag throttle reason and resumes copying](../assets/cli-throttle.gif)
+
+### Stop and resume a change
+
+For a MySQL online copy, press **s** in the live view to request a stop.
+Once the watcher confirms **Stopped**, run the displayed `start` command
+to resume from the checkpoint and reopen live progress.
+**Esc** only detaches your terminal and leaves the change running.
+
+![Press s, wait for Stopped, then run start and watch copying resume](../assets/cli-stop.gif)
+
+### Choose when to cut over
 
 For engines that support deferred cutover, start the apply with
 `--defer-cutover` to hold the final swap. Copying can finish while the live
@@ -396,7 +412,7 @@ $ schemabot cutover -e staging apply-example-73
 Keep watching until the state is `Completed`; acceptance alone does not mean
 the swap has finished.
 
-![CLI progress shows copying, a throttle reason, deferred cutover, and completion](../assets/cli-cutover.gif)
+![CLI progress shows copying, deferred cutover, and completion](../assets/cli-cutover.gif)
 
 ### PlanetScale: progress across every shard
 
