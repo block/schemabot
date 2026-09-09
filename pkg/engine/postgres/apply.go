@@ -33,11 +33,11 @@ const (
 	// Server-side statement/lock timeouts bound queries once a session is
 	// healthy, but they cannot unwedge a hung dial or a black-holed
 	// connection — the ceiling guarantees the drive always reaches a
-	// terminal progress state. Above the worst legitimate run on either
-	// execution path — generously above the retry path's (retry attempts x
-	// statement limit plus backoffs), and above the concurrent index
-	// budget with enough headroom for session setup and the post-failure
-	// catalog verdict — so it only fires on genuine hangs.
+	// terminal progress state. Generously above the worst legitimate run of
+	// the retry path (retry attempts x statement limit plus backoffs) so it
+	// only fires on genuine hangs. A concurrent index build does not run
+	// under this constant: its ceiling is the configured build bound plus
+	// concurrentIndexHeadroom.
 	optimisticApplyCeiling = 5 * time.Minute
 
 	// executorProgressReadTimeout bounds one read of the executor's tracker.
@@ -65,18 +65,23 @@ const (
 	// the socket.
 	executorProgressReadHeadroom = 5 * time.Second
 
-	// concurrentIndexHeadroom is the least the apply ceiling must exceed
-	// the caller-owned concurrent index bound by. The ceiling wraps the whole
-	// apply,
-	// so the gap has to absorb everything that shares the ceiling with the
-	// build — pool dial, the privilege check, the preflight table read, the
-	// partition admission facts lookup, and the rest of the session setup
-	// executeOptimistic runs before the build — and, after the bound has
-	// already expired, the catalog verdict that names an invalid leftover
-	// index. If the ceiling fires first the verdict has no live context to
-	// run in and the failure degrades to an external cancellation that
-	// names no index, which is the outcome the verdict exists to prevent.
-	concurrentIndexHeadroom = time.Minute
+	// concurrentIndexHeadroom is how far a concurrent index apply's ceiling
+	// sits above the configured build bound. The ceiling wraps the whole
+	// apply while the build bound starts only when the build starts, so the
+	// gap is the time granted to everything executeOptimistic runs before the
+	// build: the pool dial, the privilege check, the preflight table read and
+	// the partition admission facts lookup. As long as that setup finishes
+	// within the headroom, the build's own deadline is the one that ends an
+	// over-long build and the build gets the full bound the operator
+	// configured; setup that outruns the headroom shortens the build by the
+	// excess, because the ceiling then fires first. Nothing after the build
+	// depends on the gap: pg-sprite runs its post-failure catalog verdict on
+	// a detached context of its own, and the terminal publish reads the
+	// tracker the same way. The bound is sized to cover setup even when
+	// every one of its steps runs to the server-side limit the pool sets
+	// for it — the connect timeout for the dial, the statement_timeout for
+	// each preflight read.
+	concurrentIndexHeadroom = 2 * time.Minute
 )
 
 type nativeApply struct {
@@ -178,9 +183,12 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	}
 	concurrentIndex := false
 	if len(statements) == 1 {
+		// The tier derivation above parsed this statement already, so a
+		// parse failure here is an invariant guard; the message stays curated
+		// like the refusals above because it reaches the operator surface.
 		statement, err := pgstatement.ParseOne(statements[0])
 		if err != nil {
-			return nativeApply{}, fmt.Errorf("classify PostgreSQL statement for table %q: %w", tc.Table, err)
+			return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned statement could not be classified", tc.Table)
 		}
 		concurrentIndex = statement.Kind() == pgstatement.KindCreateIndex && statement.Concurrent()
 	}
@@ -813,6 +821,12 @@ func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, 
 // it acted on, so the operator detail still names the index the retry acts
 // on.
 func buildIndexConcurrently(ctx context.Context, pool *pgxpool.Pool, change nativeApply, tracker *progress.Tracker, logger *slog.Logger) error {
+	if change.concurrentIndexMaxDuration <= 0 {
+		// Caller-owned mode makes this deadline the build's only bound, and a
+		// non-positive one would end every build before it starts and report
+		// it as a cancellation, so an unset bound is refused rather than run.
+		return fmt.Errorf("build PostgreSQL index concurrently on table %q: build bound is unset", change.table)
+	}
 	buildCtx, cancel := context.WithTimeout(ctx, change.concurrentIndexMaxDuration)
 	defer cancel()
 	_, err := executor.BuildIndexConcurrentlyWithProgress(buildCtx, pool, change.sql,
@@ -831,14 +845,13 @@ func buildIndexConcurrently(ctx context.Context, pool *pgxpool.Pool, change nati
 	// The recovery is one envelope — abandonment proof, quarantine drops,
 	// then the build — bounded as a whole by the same caller-owned context a
 	// plain build gets, so the ceiling headroom pinned for the build holds for
-	// the recovery too. Caller-owned mode makes this deadline the only bound
-	// on both, and the build's own catalog verdict
-	// still runs after it on the executor's detached context. Caller-owned
-	// mode runs the drops and the build with no server-side statement
-	// timeout, so this deadline is the only thing that ends them: a
-	// cancellation the server never receives leaves the statement running
-	// on the target until it finishes on its own, bounded only by the lock
-	// timeouts the recovery sets for itself.
+	// the recovery too. Caller-owned mode runs the drops and the build with
+	// no server-side statement timeout, so this deadline is the only thing
+	// that ends them, and the build's own catalog verdict still runs after
+	// it on the executor's detached context. A cancellation the server never
+	// receives leaves the statement running on the target until it finishes
+	// on its own, bounded only by the lock timeouts the recovery sets for
+	// itself.
 	report, err := executor.RebuildAbandonedIndex(buildCtx, pool, change.sql,
 		executor.ConcurrentBudget{CallerOwned: true})
 	if err != nil {

@@ -77,9 +77,13 @@ const DefaultNativeSafeTableSizeLimitBytes = int64(1 << 30)
 // DefaultConcurrentIndexMaxDuration bounds one concurrent index build.
 const DefaultConcurrentIndexMaxDuration = 24 * time.Hour
 
-// MaxConcurrentIndexMaxDuration is the largest bound the engine can honor
-// because the apply ceiling adds headroom on top of it and must not overflow.
-const MaxConcurrentIndexMaxDuration = time.Duration(math.MaxInt64) - concurrentIndexHeadroom
+// MaxConcurrentIndexMaxDuration is the largest bound the engine accepts for
+// one concurrent index build. Caller-owned mode moves the build's bound from
+// the server's statement_timeout to the engine's deadline, so the engine
+// honors the same ceiling the server's own timer could have expressed: the
+// largest statement_timeout PostgreSQL accepts, in milliseconds. A bound
+// above it is not a build anyone waits for; it is the absence of a bound.
+const MaxConcurrentIndexMaxDuration = time.Duration(math.MaxInt32) * time.Millisecond
 
 // New creates a new PostgreSQL engine.
 func New() *Engine {
@@ -96,15 +100,21 @@ func NewWithTableSizeLimit(tableSizeLimit int64) *Engine {
 	return NewWithOptions(tableSizeLimit, DefaultConcurrentIndexMaxDuration)
 }
 
-// NewWithOptions creates a PostgreSQL engine with its process-wide apply bounds.
+// NewWithOptions creates a PostgreSQL engine with its process-wide apply
+// bounds. A concurrentIndexMaxDuration that is not positive adopts
+// DefaultConcurrentIndexMaxDuration: unlike the table size limit, no later
+// check refuses a negative bound, and a deadline already in the past would
+// end every concurrent build the instant it started. One above
+// MaxConcurrentIndexMaxDuration is clamped to it. Server config validation
+// refuses both before they reach this constructor; the normalization here
+// covers embedders that build the engine directly.
 func NewWithOptions(tableSizeLimit int64, concurrentIndexMaxDuration time.Duration) *Engine {
 	if tableSizeLimit == 0 {
 		tableSizeLimit = DefaultNativeSafeTableSizeLimitBytes
 	}
-	if concurrentIndexMaxDuration == 0 {
+	if concurrentIndexMaxDuration <= 0 {
 		concurrentIndexMaxDuration = DefaultConcurrentIndexMaxDuration
 	}
-	// Keep the apply ceiling within the time.Duration range after adding headroom.
 	if concurrentIndexMaxDuration > MaxConcurrentIndexMaxDuration {
 		concurrentIndexMaxDuration = MaxConcurrentIndexMaxDuration
 	}
@@ -123,6 +133,12 @@ func NewForTarget(tableSizeLimit int64, concurrentIndexMaxDuration time.Duration
 // TableSizeLimit exposes the native-safe ceiling for wiring verification and observability.
 func (e *Engine) TableSizeLimit() int64 {
 	return e.tableSizeLimit
+}
+
+// ConcurrentIndexMaxDuration exposes the bound one concurrent index build
+// runs under, for wiring verification and observability.
+func (e *Engine) ConcurrentIndexMaxDuration() time.Duration {
+	return e.concurrentIndexMaxDuration
 }
 
 // Name returns the engine identifier.

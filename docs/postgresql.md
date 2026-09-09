@@ -76,9 +76,9 @@ conditions:
   A greenfield create is checked against the schema — the role needs `CREATE`
   on the target schema — because no table exists to state facts about.
 - A `CREATE INDEX CONCURRENTLY` build is caller-owned and bounded by
-  `postgres.concurrent_index_max_duration`, which defaults to 24 hours. Its
-  catalog verdict and terminal classification retain a separate headroom
-  after the build bound expires.
+  `postgres.concurrent_index_max_duration`, which defaults to 24 hours. The
+  bound starts when the build starts; the session setup before it runs under
+  a separate headroom, so the build gets the full configured bound.
 
 The common supported case is a metadata-only `ALTER TABLE`, such as adding a
 nullable column:
@@ -110,9 +110,10 @@ author's: its planner constructs `CREATE INDEX CONCURRENTLY` as the safer form
 of a plain `CREATE INDEX`, and the plan surfaces that concurrent form for
 review. A statement already written with `CONCURRENTLY` surfaces as authored.
 The apply runs the reviewed build through pg-sprite's dedicated concurrent
-index-build executor — outside a transaction block, under a 4-minute overall
-budget instead of the per-statement lock and statement limits — and reports
-completion only once the catalog shows the index valid. A build that fails
+index-build executor — outside a transaction block, with no server-side
+statement timeout; the build is bounded instead by the engine's own deadline,
+`postgres.concurrent_index_max_duration` (24 hours unless configured) — and
+reports completion only once the catalog shows the index valid. A build that fails
 part-way leaves an invalid index; the stored failure names it and is retryable.
 The next drive recovers that leftover itself: when the build finds an invalid
 index under the requested name, or quarantined on the table by an interrupted

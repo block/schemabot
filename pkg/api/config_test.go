@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
+	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/namedlock"
@@ -4584,9 +4585,21 @@ func TestPostgresConcurrentIndexMaxDuration(t *testing.T) {
 	})
 
 	t.Run("configured duration", func(t *testing.T) {
-		cfg := PostgresConfig{ConcurrentIndexMaxDuration: "36h"}
-		require.NoError(t, cfg.validate())
-		assert.Equal(t, 36*time.Hour, cfg.ConcurrentIndexMaxDurationOrDefault())
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(`
+databases:
+  mydb:
+    type: postgres
+    environments:
+      staging:
+        dsn: postgres://localhost/mydb
+postgres:
+  concurrent_index_max_duration: 36h
+`), 0o600))
+
+		cfg, err := LoadServerConfigFromFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, 36*time.Hour, cfg.Postgres.ConcurrentIndexMaxDurationOrDefault())
 	})
 
 	for _, value := range []string{"0", "-1s"} {
@@ -4604,8 +4617,14 @@ func TestPostgresConcurrentIndexMaxDuration(t *testing.T) {
 		require.ErrorContains(t, err, "is not a valid duration")
 	})
 
+	t.Run("accepts the engine maximum", func(t *testing.T) {
+		cfg := PostgresConfig{ConcurrentIndexMaxDuration: postgresengine.MaxConcurrentIndexMaxDuration.String()}
+		require.NoError(t, cfg.validate())
+		assert.Equal(t, postgresengine.MaxConcurrentIndexMaxDuration, cfg.ConcurrentIndexMaxDurationOrDefault())
+	})
+
 	t.Run("refuses duration above engine maximum", func(t *testing.T) {
-		cfg := PostgresConfig{ConcurrentIndexMaxDuration: "2562047h47m"}
+		cfg := PostgresConfig{ConcurrentIndexMaxDuration: (postgresengine.MaxConcurrentIndexMaxDuration + time.Millisecond).String()}
 		err := cfg.validate()
 		require.ErrorContains(t, err, "exceeds the largest bound the engine can honor")
 	})

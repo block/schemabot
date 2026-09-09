@@ -817,7 +817,9 @@ The server fails startup validation when
 `concurrent_index_max_duration` is a Go duration string and defaults to `24h`.
 It bounds a `CREATE INDEX CONCURRENTLY` build and recovery as one caller-owned
 operation. The server refuses zero, negative, and invalid durations at config
-load; omit the option to use the default rather than setting `0`.
+load, and durations above the largest `statement_timeout` PostgreSQL itself
+accepts (about 24 days); omit the option to use the default rather than setting
+`0`.
 
 The ceiling is process-wide: every PostgreSQL database this server drives
 shares the same value, and a database cannot override it in its own metadata.

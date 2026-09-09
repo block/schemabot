@@ -3952,6 +3952,21 @@ func TestNewLocalClientConfiguresPostgresTableSizeLimit(t *testing.T) {
 	assert.Equal(t, int64(4<<30), eng.TableSizeLimit())
 }
 
+// The configured concurrent index bound reaches the PostgreSQL engine the
+// local client builds, so a configured value governs every concurrent build
+// instead of silently reverting to the default.
+func TestNewLocalClientConfiguresPostgresConcurrentIndexMaxDuration(t *testing.T) {
+	c, err := NewLocalClient(LocalConfig{
+		Database:                           "orders",
+		Type:                               storage.DatabaseTypePostgres,
+		PostgresConcurrentIndexMaxDuration: 36 * time.Hour,
+	}, nil, slog.Default())
+	require.NoError(t, err)
+	eng, ok := c.getEngine().(*postgresengine.Engine)
+	require.True(t, ok)
+	assert.Equal(t, 36*time.Hour, eng.ConcurrentIndexMaxDuration())
+}
+
 // A type with no built-in engine and no registered factory fails closed.
 func TestNewLocalClientErrorsWhenEngineUnregistered(t *testing.T) {
 	_, err := NewLocalClient(LocalConfig{Database: "db", Type: "customengine"}, nil, slog.Default())
