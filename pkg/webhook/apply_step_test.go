@@ -50,6 +50,70 @@ func TestFormatApplyStatusComment_RendersStatementPositionPerDeployment(t *testi
 	assert.Equal(t, 1, strings.Count(out, "step 1 of 2 · `ALTER TABLE orders ADD COLUMN note text`"))
 }
 
+// A running concurrent index build persists the server's build work alongside
+// the statement position, and the PR comment renders it under the position, so
+// an operator sees the build advance even though no rows are copied. The tuple
+// load still carries the finished heap scan's block counters; only the tuples
+// the phase owns are shown.
+func TestFormatApplyStatusComment_RendersStoredBuildWork(t *testing.T) {
+	ops := []*storage.ApplyOperation{{
+		ID:         1,
+		Deployment: "eu",
+		State:      state.ApplyOperation.Running,
+		ProgressMetadata: `{"step":"2","steps_total":"3","statement":"CREATE INDEX CONCURRENTLY idx_orders_status ON orders (status)",` +
+			`"executor_operation":"concurrent-index-build","server_phase":"building index: loading tuples in tree",` +
+			`"blocks_done":"10000","blocks_total":"10000","tuples_done":"12000","tuples_total":"50000","lockers_done":"0","lockers_total":"0"}`,
+	}}
+
+	displayByOp := resolveDisplayByOperation(t.Context(), nil, runningApply(), ops)
+	require.Len(t, displayByOp, 1)
+	assert.Equal(t, apitypes.BuildWork{
+		Operation: "concurrent-index-build", ServerPhase: "building index: loading tuples in tree",
+		BlocksDone: 10000, BlocksTotal: 10000, TuplesDone: 12000, TuplesTotal: 50000,
+	}, displayByOp[1].BuildWork)
+
+	out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "")
+	assert.Contains(t, out, "step 2 of 3 · `CREATE INDEX CONCURRENTLY idx_orders_status ON orders (status)`\n"+
+		"building index: 12,000/50,000 tuples\n")
+}
+
+// Each deployment of a fanned-out apply renders the build work persisted on its
+// own operation: a deployment waiting on lockers reports them, and a sibling
+// still scanning reports its blocks.
+func TestFormatApplyStatusComment_RendersBuildWorkPerDeployment(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier,
+			ProgressMetadata: `{"step":"1","steps_total":"1","statement":"CREATE INDEX CONCURRENTLY idx ON t (c)",` +
+				`"executor_operation":"concurrent-index-build","server_phase":"waiting for writers before build","lockers_done":"1","lockers_total":"3"}`},
+		{ID: 2, Deployment: "us", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier,
+			ProgressMetadata: `{"step":"1","steps_total":"1","statement":"CREATE INDEX CONCURRENTLY idx ON t (c)",` +
+				`"executor_operation":"concurrent-index-build","server_phase":"building index: scanning table","blocks_done":"1","blocks_total":"4"}`},
+	}
+
+	displayByOp := resolveDisplayByOperation(t.Context(), nil, runningApply(), ops)
+	require.Len(t, displayByOp, 2)
+
+	out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "")
+	assert.Contains(t, out, "**Deployments**: 2 running")
+	assert.Equal(t, 1, strings.Count(out, "\nwaiting on 2 of 3 lockers\n"))
+	assert.Equal(t, 1, strings.Count(out, "\nbuilding index: 25% of blocks (1/4)\n"))
+}
+
+// A malformed build counter drops the build work line but keeps the readable
+// statement position, so one bad counter does not hide where the apply is.
+func TestFormatApplyStatusComment_KeepsPositionWhenBuildWorkIsMalformed(t *testing.T) {
+	ops := []*storage.ApplyOperation{{ID: 1, Deployment: "eu", State: state.ApplyOperation.Running,
+		ProgressMetadata: `{"step":"2","steps_total":"3","statement":"CREATE INDEX CONCURRENTLY idx ON t (c)","executor_operation":"concurrent-index-build","blocks_done":"many"}`}}
+
+	displayByOp := resolveDisplayByOperation(t.Context(), nil, runningApply(), ops)
+	require.Len(t, displayByOp, 1)
+	assert.Equal(t, apitypes.BuildWork{}, displayByOp[1].BuildWork)
+
+	out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "")
+	assert.Contains(t, out, "step 2 of 3 · `CREATE INDEX CONCURRENTLY idx ON t (c)`\n")
+	assert.NotContains(t, out, "building index")
+}
+
 // Stored progress metadata that cannot be decoded, or that carries an
 // impossible position, contributes no position rather than a wrong one, and
 // the rest of the comment still renders.

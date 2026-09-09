@@ -3,6 +3,7 @@ package templates
 import (
 	"time"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -31,7 +32,14 @@ func PreviewCommentApplyPostgresMultiStatement() string {
 	tables[0].Status = state.Task.Completed
 	tables[1].Status = state.Task.Running
 	tables[2].Status = state.Task.Pending
-	return RenderApplyStatusComment(samplePostgresApplyData(state.Apply.Running, tables))
+	data := samplePostgresApplyData(state.Apply.Running, tables)
+	data.Step, data.StepsTotal = 2, 3
+	data.Statement = "CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON public.users (last_seen_at)"
+	data.BuildWork = apitypes.BuildWork{
+		Operation: "concurrent-index-build", ServerPhase: "building index: scanning table",
+		BlocksDone: 2500, BlocksTotal: 10000,
+	}
+	return RenderApplyStatusComment(data)
 }
 
 // PreviewCommentSummaryPostgresMultiStatementFailed renders the failed summary

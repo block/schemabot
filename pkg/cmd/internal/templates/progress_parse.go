@@ -33,6 +33,7 @@ type ProgressData struct {
 	Step           int
 	StepsTotal     int
 	Statement      string
+	BuildWork      apitypes.BuildWork
 	Operations     []ProgressOperation
 	Tables         []TableProgress
 	Options        map[string]string // Apply options (defer_cutover, skip_revert, etc.)
@@ -169,6 +170,11 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		slog.Warn("progress output omits the statement position because the progress metadata is malformed", "apply_id", result.ApplyID, "error", err)
 	} else {
 		data.Step, data.StepsTotal, data.Statement = step.Step, step.StepsTotal, step.Statement
+	}
+	if work, err := apitypes.ParseBuildWork(result.Metadata); err != nil {
+		slog.Warn("progress output omits build work because the progress metadata is malformed", "apply_id", result.ApplyID, "error", err)
+	} else {
+		data.BuildWork = work
 	}
 	dialect := schema.DialectForDatabaseType(result.DatabaseType)
 
