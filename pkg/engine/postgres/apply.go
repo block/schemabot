@@ -38,7 +38,8 @@ const (
 	// the retry path (retry attempts x statement limit plus backoffs) so it
 	// only fires on genuine hangs. A concurrent index build does not run
 	// under this constant: its ceiling is the configured build bound plus
-	// concurrentIndexHeadroom.
+	// concurrentIndexHeadroom. The constructor seeds the engine's field of
+	// the same name from it; the apply reads the field.
 	optimisticApplyCeiling = 5 * time.Minute
 
 	// executorProgressReadTimeout bounds one read of the executor's tracker.
@@ -216,7 +217,7 @@ func postgresCreateSetStatements(script string) ([]string, error) {
 func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change nativeApply, key string, started time.Time, logger *slog.Logger, tracker *progress.Tracker) {
 	// The context arrives detached from the caller (an accepted apply must
 	// survive the request), so boundedness comes from the ceiling instead.
-	ceiling := optimisticApplyCeiling
+	ceiling := e.optimisticApplyCeiling
 	if change.concurrentIndex {
 		ceiling = e.concurrentIndexMaxDuration + concurrentIndexHeadroom
 		change.concurrentIndexMaxDuration = e.concurrentIndexMaxDuration

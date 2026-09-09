@@ -1053,8 +1053,13 @@ func TestRefusalForOutcomeTotalOverExecutorCodes(t *testing.T) {
 
 // TestOrdinaryApplyRunsUnderTheFixedCeiling proves a native statement's
 // drive hands the executor a context bounded by the fixed apply ceiling —
-// not by the concurrent index envelope — with room for the statement budget
-// under it.
+// not by the concurrent index envelope — with room under it for the whole
+// retry path. The bound is measured from the executor's side, so it is the
+// ceiling the engine actually grants that must hold the retry path, not the
+// constant it is seeded from: a constructor that seeded a shorter ceiling
+// would still sit under the constant and still clear the statement budget,
+// but would cancel a lock-contended statement mid-retry and turn its typed
+// budget verdict into an external cancellation.
 func TestOrdinaryApplyRunsUnderTheFixedCeiling(t *testing.T) {
 	scripted := newScriptedExecutor(func(*progress.Tracker) error { return nil })
 	eng := NewWithOptions(0, 3*time.Hour)
@@ -1065,7 +1070,19 @@ func TestOrdinaryApplyRunsUnderTheFixedCeiling(t *testing.T) {
 	assert.False(t, env.change.concurrentIndex)
 	assert.Zero(t, env.change.concurrentIndexMaxDuration, "the build bound is stamped only on a concurrent index apply")
 	assert.LessOrEqual(t, granted, optimisticApplyCeiling)
-	assert.Greater(t, granted, optimisticStatementLimit, "the statement budget must fit under the ceiling")
+	assert.Greater(t, granted, retryPathWorstCase(t), "the retry path must fit under the ceiling the engine actually grants")
+}
+
+// retryPathWorstCase is the longest legitimate run of the native retry path:
+// every attempt the default retry policy allows, each at its full statement
+// limit, plus the longest backoff between attempts. The policy comes from
+// pg-sprite, so a dependency bump that widens it moves this value.
+func retryPathWorstCase(t *testing.T) time.Duration {
+	t.Helper()
+	policy := executor.DefaultRetryPolicy()
+	require.Positive(t, policy.MaxAttempts)
+	attempts := time.Duration(policy.MaxAttempts)
+	return attempts*optimisticStatementLimit + (attempts-1)*policy.MaxBackoff
 }
 
 // TestConcurrentIndexApplyCeilingLeavesSetupHeadroom proves the drive runs a
@@ -1383,19 +1400,17 @@ func TestNameConcurrentIndexBoundWrapsOnlyTheBoundsOwnVerdict(t *testing.T) {
 	}
 }
 
-// TestRetryPathFitsUnderApplyCeiling pins the other execution path against
-// the same ceiling: every attempt the default retry policy allows, each at
-// its full statement limit, plus the longest backoff between them, must
-// finish before the ceiling cancels the session — otherwise a lock-contended
-// native statement would surface as an external cancellation instead of the
-// typed budget verdict. The policy comes from pg-sprite, so a dependency
-// bump that widens it fails here instead of in an apply.
+// TestRetryPathFitsUnderApplyCeiling pins the constant the engine's ceiling
+// is seeded from against the retry path: every attempt the default retry
+// policy allows, each at its full statement limit, plus the longest backoff
+// between them, must finish before the ceiling cancels the session —
+// otherwise a lock-contended native statement would surface as an external
+// cancellation instead of the typed budget verdict. A dependency bump that
+// widens the policy fails here instead of in an apply;
+// TestOrdinaryApplyRunsUnderTheFixedCeiling pins the same relationship on
+// the ceiling the drive actually grants.
 func TestRetryPathFitsUnderApplyCeiling(t *testing.T) {
-	policy := executor.DefaultRetryPolicy()
-	require.Positive(t, policy.MaxAttempts)
-	attempts := time.Duration(policy.MaxAttempts)
-	worstCase := attempts*optimisticStatementLimit + (attempts-1)*policy.MaxBackoff
-	assert.Less(t, worstCase, optimisticApplyCeiling)
+	assert.Less(t, retryPathWorstCase(t), optimisticApplyCeiling)
 }
 
 // TestInvalidIndexDetailMatchesVerdictOwnership pins the advice ladder to

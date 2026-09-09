@@ -123,6 +123,12 @@ when the bound is what ended the build it names the option to raise. A build
 that runs past the bound and provably leaves nothing behind is refused
 permanently, naming the option, because an identical retry would spend the
 same bound again.
+Losing the driver pod mid-build does not stop the statement: the server keeps
+building until it finishes, fails, or its `statement_timeout` ends it, so the
+recovery re-plan on the next drive meets that build's outcome — a valid index
+it has nothing left to build, a build still in flight (the apply fails
+retryable, naming the index and the backend building it, until that build
+ends), or a failed build's invalid leftover.
 The next drive recovers that leftover itself: when the build finds an invalid
 index under the requested name, or quarantined on the table by an interrupted
 recovery, that pg-sprite can prove abandoned — on the target table, with no
@@ -310,9 +316,16 @@ change or that depend on the target:
   failure includes the provisioning `GRANT` derived by pg-sprite.
 - Exhausting the 30-second statement budget is a permanent native-safety
   refusal. Exhausting the lock budget is retryable after contention clears.
+- Every apply other than a concurrent index build runs under a fixed
+  five-minute client-side ceiling. It is not configurable: it exists to
+  guarantee a terminal progress state when a dial hangs or a connection is
+  black-holed, not to bound legitimate work, which the statement and lock
+  budgets above already bound. An apply the ceiling ends is recorded as a
+  retryable operational failure.
 - A concurrent index build runs under the
   `postgres.concurrent_index_max_duration` bound (24 hours by default), set
-  as the build's server-side `statement_timeout`. A build that
+  as the build's server-side `statement_timeout`, rather than that fixed
+  ceiling. A build that
   finds an invalid index already under the requested name or quarantined on
   the table that pg-sprite proves abandoned — a failed build's leftover on
   the target table with no backend building it, one whose builder the engine
