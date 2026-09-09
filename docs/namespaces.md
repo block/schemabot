@@ -132,6 +132,41 @@ column-vindex association is an unsafe change and requires the same
 `--allow-unsafe` acknowledgment as destructive DDL — see
 [lint-and-safety-levels.md](./lint-and-safety-levels.md#what-unsafe-means).
 
+### Removing a namespace
+
+Deleting every schema file in a namespace, or moving them all out of it, does
+not remove the namespace from the plan while another namespace still declares
+files under the schema root. Every table the emptied namespace still holds is
+planned as a `DROP TABLE` change: on MySQL and Vitess an unsafe change that
+needs the explicit drop approval before it can run, on PostgreSQL a blocked
+change that fails the check until the tables are declared again or dropped
+through a reviewed schema change. Only the files the pull request itself
+removes count — a deletion it inherited from history its base branch has not
+caught up with is not one it proposes.
+
+A pull request that removes the last schema files under the root — the only
+namespace, or every one of them — cannot be planned at all: an empty root is
+indistinguishable from one that moved, so discovery fails closed and the plan
+comment says the removal has not taken effect and what completes it.
+
+To retire a namespace, drop its tables first, through a reviewed schema change
+that keeps the files in place, and delete the directory once they are gone.
+The divergence is visible exactly once — in the pull request whose diff
+contains the deletion. After it merges, the default branch carries no record
+that the namespace existed, so no later plan surfaces those tables.
+
+To keep a namespace declared while it holds no tables, leave one `.sql` file in
+its directory whose whole content is the empty-namespace declaration:
+
+```sql
+-- This namespace is empty. Add CREATE TABLE declarations here.
+```
+
+The file creates the namespace and contributes no statement, so the namespace
+reconciles to no tables on every plan. Deleting that file is a removal like any
+other: the pull request that deletes it plans every table the namespace holds
+as a drop.
+
 ## Where to Put the Schema Directory
 
 SchemaBot is location-agnostic: config discovery finds `schemabot.yaml` anywhere

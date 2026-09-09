@@ -301,6 +301,8 @@ the target's tables and surfaces each undeclared one as a blocked, destructive
 `DROP TABLE` change: the engine will never run the drop, so the one choice
 left is whether to report the divergence, and hiding it would turn a target
 that does not match its declaration into a passing check.
+Deleting every schema file in one namespace keeps that namespace in the plan
+and surfaces every live table it contains as one of these blocked drops.
 Because the check fails for the whole database while any change is blocked,
 an undeclared table holds up every other change to that database until it is
 resolved — including changes in other namespaces, since every namespace at
