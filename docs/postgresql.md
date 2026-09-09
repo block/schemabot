@@ -316,10 +316,16 @@ change or that depend on the target:
   failure includes the provisioning `GRANT` derived by pg-sprite.
 - Exhausting the 30-second statement budget is a permanent native-safety
   refusal. Exhausting the lock budget is retryable after contention clears.
+- Every apply other than a concurrent index build runs under a fixed
+  five-minute client-side ceiling. It is not configurable: it exists to
+  guarantee a terminal progress state when a dial hangs or a connection is
+  black-holed, not to bound legitimate work, which the statement and lock
+  budgets above already bound. An apply the ceiling ends is recorded as a
+  retryable operational failure.
 - A concurrent index build runs under the
   `postgres.concurrent_index_max_duration` bound (24 hours by default), set
-  as the build's server-side `statement_timeout`, rather than the fixed
-  five-minute ceiling for other apply kinds. A build that
+  as the build's server-side `statement_timeout`, rather than that fixed
+  ceiling. A build that
   finds an invalid index already under the requested name or quarantined on
   the table that pg-sprite proves abandoned — a failed build's leftover on
   the target table with no backend building it, one whose builder the engine

@@ -38,7 +38,8 @@ const (
 	// the retry path (retry attempts x statement limit plus backoffs) so it
 	// only fires on genuine hangs. A concurrent index build does not run
 	// under this constant: its ceiling is the configured build bound plus
-	// concurrentIndexHeadroom.
+	// concurrentIndexHeadroom. The constructor seeds the engine's field of
+	// the same name from it; the apply reads the field.
 	optimisticApplyCeiling = 5 * time.Minute
 
 	// executorProgressReadTimeout bounds one read of the executor's tracker.

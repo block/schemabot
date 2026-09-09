@@ -47,8 +47,14 @@ type Engine struct {
 	// accepting a second apply on the same target must not evict the first
 	// one's state while it is still running, or the running apply's driver
 	// would be told its work no longer exists.
-	progress                   map[string]*trackedApply
-	tableSizeLimit             int64
+	progress       map[string]*trackedApply
+	tableSizeLimit int64
+
+	// optimisticApplyCeiling is the fixed client-side ceiling on one ordinary
+	// apply, seeded from the package constant of the same name. It is not an
+	// operator option: production never varies it, and only in-package tests
+	// assign it, to observe the ceiling ending an apply without waiting out
+	// the production value.
 	optimisticApplyCeiling     time.Duration
 	concurrentIndexMaxDuration time.Duration
 

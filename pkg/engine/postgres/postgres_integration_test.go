@@ -25,10 +25,6 @@ import (
 
 const postgresApplyDeadline = 10 * time.Second
 
-func (e *Engine) setOptimisticApplyCeiling(ceiling time.Duration) {
-	e.optimisticApplyCeiling = ceiling
-}
-
 // TestEnginePullSchema exports every ordinary table in a requested schema as
 // an independently parseable declarative file, including constraints and
 // secondary indexes.
@@ -1035,8 +1031,19 @@ func TestEngineApplyConcurrentIndexRecoversAbandonedInvalid(t *testing.T) {
 // remains bounded by the fixed apply ceiling. While parked behind a writer,
 // the build remains running past that ceiling and exposes its current executor
 // position; after the writer releases, it completes with a valid index.
+//
+// The ceiling is shortened so the build can be observed past twice its
+// length inside the shared poll deadline; that coupling is the constraint on
+// its value. Its relationship to the lock timeout is not: the executor
+// retries a lost lock budget, so a budget verdict cannot surface before
+// several lock timeouts have elapsed, and any ceiling short enough to be
+// observed here ends the ordinary statement first. Its failure therefore
+// carries the generic detail, which is what tells the ceiling apart from a
+// lock budget — the two are otherwise published identically.
 func TestEngineApplyConcurrentIndexOutlivesFixedApplyCeiling(t *testing.T) {
 	const fixedCeiling = 2 * time.Second
+	require.Less(t, 2*fixedCeiling, postgresApplyDeadline,
+		"the build must be observable past twice the ceiling inside the poll deadline")
 	dsn, db := testutil.StartPostgres(t, "long_index_build_test")
 	_, err := db.ExecContext(t.Context(), `
 		CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text);
@@ -1066,7 +1073,7 @@ func TestEngineApplyConcurrentIndexOutlivesFixedApplyCeiling(t *testing.T) {
 
 	writerTx := parkWriter("orders")
 	eng := New()
-	eng.setOptimisticApplyCeiling(fixedCeiling)
+	eng.optimisticApplyCeiling = fixedCeiling
 	statement := "CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"
 	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders", statement))
 	require.NoError(t, err)
@@ -1084,9 +1091,12 @@ func TestEngineApplyConcurrentIndexOutlivesFixedApplyCeiling(t *testing.T) {
 		return catalogErr == nil && !valid && time.Since(started) >= 2*fixedCeiling
 	}, postgresApplyDeadline, 10*time.Millisecond,
 		"concurrent index build did not remain running past the fixed apply ceiling")
-	assert.Equal(t, "1", midBuild.Metadata["step"])
-	assert.Equal(t, "1", midBuild.Metadata["steps_total"])
-	assert.Equal(t, statement, midBuild.Metadata["statement"])
+	// The statement text is the one position key the accepted record does
+	// not seed: a single-statement apply already carries step 1 of 1 before
+	// the executor reports anything, so only the statement proves the
+	// executor tracker is the source of the mid-build position.
+	assert.Equal(t, statement, midBuild.Metadata["statement"],
+		"the mid-build position must come from the executor tracker, not the accept-time seed")
 	require.NoError(t, writerTx.Rollback())
 
 	completed := awaitPostgresProgress(t, eng, "orders")
