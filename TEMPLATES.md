@@ -3,6 +3,8 @@
 
 All templates rendered with sample data.
 
+DDL code fences are sized to be longer than any backtick run in their content.
+
 ## Plan & Status
 
 ### PR Comments

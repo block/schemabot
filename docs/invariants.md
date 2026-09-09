@@ -301,7 +301,8 @@ be careful. The unredacted error goes to the server log next to the repo, PR, en
 database, and command, so nothing is lost for triage. Inbound webhook payloads are size-bounded
 before decode. *Enforced:* the comment and table-cell sanitizers in
 `pkg/webhook/templates/common.go`, applied by the error renderers themselves
-(`pkg/webhook/templates/errors.go`); the Check Run summary sanitizer and its markup escaper
+(`pkg/webhook/templates/errors.go`); the DDL code fence sized past any backtick run in its
+content (`pkg/webhook/templates/fence.go`); the Check Run summary sanitizer and its markup escaper
 (`pkg/webhook/check_publisher.go`); the drift summary clamp (`pkg/webhook/plan_drift.go`); the
 request body limit (`pkg/webhook/handler.go`).
 

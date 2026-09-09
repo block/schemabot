@@ -1278,7 +1278,8 @@ func dialectForEngine(engine, applyID string) schema.Dialect {
 // writeDDLLine writes the DDL statement as a sql code block below the table name.
 func writeDDLLine(sb *strings.Builder, dialect schema.Dialect, rawDDL string) {
 	if rawDDL != "" {
-		fmt.Fprintf(sb, "\n```sql\n%s\n```\n", ddl.FormatDDLForDialect(dialect, rawDDL))
+		sb.WriteString("\n")
+		writeSQLFencedBlock(sb, ddl.FormatDDLForDialect(dialect, rawDDL))
 	}
 }
 
@@ -1809,7 +1810,8 @@ func writeSummaryTableEntry(sb *strings.Builder, dialect schema.Dialect, t Table
 	}
 
 	if t.DDL != "" {
-		fmt.Fprintf(sb, "```sql\n%s\n```\n\n", ddl.FormatDDLForDialect(dialect, t.DDL))
+		writeSQLFencedBlock(sb, ddl.FormatDDLForDialect(dialect, t.DDL))
+		sb.WriteString("\n")
 	} else {
 		sb.WriteString("\n")
 	}
