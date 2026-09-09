@@ -145,3 +145,28 @@ func TestInitRejectsOverridesBeforeSideEffects(t *testing.T) {
 		})
 	}
 }
+
+func TestInitRetryPreservesUnrelatedSubdirectory(t *testing.T) {
+	root, stage := t.TempDir(), t.TempDir()
+	for _, dir := range []string{root, stage} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "table.sql"), []byte("schema"), 0600))
+	}
+	require.NoError(t, os.Mkdir(filepath.Join(root, "docs"), 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "docs", "design.md"), []byte("keep"), 0600))
+	require.NoError(t, publishInitSchema(stage, root))
+	require.FileExists(t, filepath.Join(root, "docs", "design.md"))
+}
+
+func TestInitFailedConnectionDoesNotRegister(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SCHEMABOT_ENDPOINT", "")
+	t.Setenv("SCHEMABOT_TOKEN", "")
+	t.Setenv("INIT_BAD_TARGET", "invalid-dsn")
+	t.Setenv("INIT_STATE", "user@tcp(localhost:3306)/state")
+	cmd := InitCmd{Database: "app", Environment: "dev", Type: "mysql", DSN: "env:INIT_BAD_TARGET", StorageDSN: "env:INIT_STATE", Runtime: "local", Namespaces: []string{"app"}, SchemaDir: filepath.Join(home, "schema")}
+	_, err := cmd.initialize(t.Context(), &Globals{})
+	require.ErrorContains(t, err, "before registering runtime")
+	require.NoDirExists(t, filepath.Join(home, ".schemabot", "runtimes", "local"))
+	require.NoDirExists(t, cmd.SchemaDir)
+}

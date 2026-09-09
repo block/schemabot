@@ -46,6 +46,6 @@ func TestInitDestinationPreflight(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(root, ".gitkeep"), nil, 0600))
 	require.ErrorContains(t, validateInitSchemaDestination(root), "choose an empty --schema-dir")
 	require.FileExists(t, filepath.Join(root, ".gitkeep"))
-	require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"), []byte("database: app"), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"), []byte("database: app\ntype: mysql\n"), 0600))
 	require.NoError(t, validateInitSchemaDestination(root))
 }

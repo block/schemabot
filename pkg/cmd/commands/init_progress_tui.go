@@ -103,6 +103,7 @@ func runInitProgressProgram(ctx context.Context, initialize func(context.Context
 	started := make(chan struct{})
 	finished := make(chan struct{})
 	var outcome initFinishedMsg
+	initialized := false
 	// Own cleanup outside Bubble Tea, but begin work only after its Init
 	// command runs. A terminal startup failure must not register a runtime.
 	go func() {
@@ -117,6 +118,7 @@ func runInitProgressProgram(ctx context.Context, initialize func(context.Context
 			outcome.err = err
 			return
 		}
+		initialized = true
 		outcome.result, outcome.err = initialize(runCtx, func(stage string) { p.Send(initStageMsg(stage)) })
 	}()
 	m.run = func() tea.Msg { close(started); <-finished; return outcome }
@@ -125,6 +127,9 @@ func runInitProgressProgram(ctx context.Context, initialize func(context.Context
 	p.Kill()
 	<-finished
 	if runErr != nil {
+		if !initialized && ctx.Err() == nil {
+			return nil, fmt.Errorf("run setup display: %w", runErr)
+		}
 		return outcome.result, errors.Join(fmt.Errorf("run setup display: %w", runErr), outcome.err)
 	}
 	if m.finished == nil {

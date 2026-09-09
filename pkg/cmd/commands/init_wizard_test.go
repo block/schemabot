@@ -470,6 +470,7 @@ func TestInitTerminalStartupFailureDoesNotInitialize(t *testing.T) {
 		return nil, nil
 	}, func(tea.Model) initProgressProgram { return initStartupFailure{} })
 	require.ErrorContains(t, err, "terminal startup failed")
+	require.NotErrorIs(t, err, context.Canceled)
 	require.False(t, called, "setup must not run when the terminal fails before Init")
 }
 
