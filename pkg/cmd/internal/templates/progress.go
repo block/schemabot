@@ -193,6 +193,8 @@ func WriteProgress(data ProgressData) {
 		}
 	}
 
+	fmt.Print(FormatThrottleReference(data.Tables))
+
 	// Surface per-keyspace VSchema application status (and diff) from the engine's
 	// display metadata, rather than from a synthetic task in the table list.
 	if changes, err := apitypes.ParseVSchemaChanges(data.Metadata); err != nil {
@@ -777,6 +779,21 @@ func throttledSuffix(t TableProgress) string {
 		return ""
 	}
 	return " (throttled)"
+}
+
+// FormatThrottleReference renders one shared reference for a progress view.
+// Table-specific throttle reasons remain beside each affected table.
+func FormatThrottleReference(tables []TableProgress) string {
+	for _, table := range tables {
+		if !table.Throttled || ui.ThrottleTip(table.ThrottleReason) == "" {
+			continue
+		}
+		if !state.IsState(table.Status, state.Task.Running, state.Task.Checksumming) {
+			continue
+		}
+		return fmt.Sprintf("  %sDocs: %s%s\n\n", ANSIDim, ui.Link("Throttle reference", ui.ThrottleDocURL), ANSIReset)
+	}
+	return ""
 }
 
 // writeThrottleTooltip explains the header's "(throttled)" annotation with the

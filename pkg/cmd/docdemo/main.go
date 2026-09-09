@@ -77,7 +77,7 @@ func live(p int, phase string, throttled bool, key string) string {
 		ApplyID: "apply-example-73", Database: "shop", DatabaseType: "mysql", Environment: "staging", Engine: "Spirit", State: phase,
 		Tables: []*apitypes.TableProgressResponse{{TableName: "orders", Keyspace: "shop", ChangeType: "alter", DDL: ddl,
 			Status: phase, RowsCopied: int64(p) * 100000, RowsTotal: 10000000, PercentComplete: int32(p), ETASeconds: int64(100-p) * 12,
-			Throttled: throttled, ThrottleReason: "Replication lag exceeds the configured limit"}},
+			Throttled: throttled, ThrottleReason: "commit-latency 120ms >= 100ms"}},
 	}
 	var cutovers, stops int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -503,16 +503,20 @@ func main() {
 	}
 	frames = append(frames, Frame{3, "", "Copy complete; wait for the final swap", live(100, state.Apply.WaitingForCutover, false, "")}, Frame{2, "", "Press Enter to request the final swap", live(100, state.Apply.WaitingForCutover, false, "enter")}, Frame{3, "", "The watcher confirms completion", live(100, state.Apply.Completed, false, "")})
 	demos = append(demos, Demo{Name: "cli-cutover", Title: "Choose when to cut over.", Frames: frames})
+	// This scenario illustrates a terminal that supports labeled links.
+	previousHyperlinks := ui.Hyperlinks
+	ui.Hyperlinks = true
 	throttleFrames := []Frame{{2, "schemabot progress apply-example-73", "Follow the row copy", live(40, state.Apply.Running, false, "")}}
 	for p := 45; p <= 60; p += 5 {
 		throttleFrames = append(throttleFrames, Frame{0.18, "", "", live(p, state.Apply.Running, false, "")})
 	}
-	throttleFrames = append(throttleFrames, Frame{3, "", "Replication lag pauses copying; the reason stays visible", live(60, state.Apply.Running, true, "")})
+	throttleFrames = append(throttleFrames, Frame{5, "", "Slow commits pause copying; the docs explain the signal", live(60, state.Apply.Running, true, "")})
 	for p := 65; p <= 100; p += 5 {
 		throttleFrames = append(throttleFrames, Frame{0.18, "", "Copying resumes when conditions improve", live(p, state.Apply.Running, false, "")})
 	}
 	throttleFrames = append(throttleFrames, Frame{3, "", "The change completes", live(100, state.Apply.Completed, false, "")})
 	demos = append(demos, Demo{Name: "cli-throttle", Title: "See why a change slows down.", Frames: throttleFrames})
+	ui.Hyperlinks = previousHyperlinks
 	stopFrames := []Frame{
 		{2, "", "The change is already copying rows", live(50, state.Apply.Running, false, "")},
 		{1, "", "", live(55, state.Apply.Running, false, "")},

@@ -6,7 +6,7 @@ through the production Go templates and interactive `commands.WatchModel`:
 - `cli-plan-apply.gif`: inspect an index plan, confirm with yes, and follow an apply to completion
 - `cli-ops.gif`: list databases, pull a live schema with lint findings, show the latest 20 of 500 changes, then follow engine logs through completion
 - `cli-cutover.gif`: finish copying, wait for the swap, and press Enter to cut over
-- `cli-throttle.gif`: see replication lag pause copying and watch it resume
+- `cli-throttle.gif`: see commit-latency pause copying, read the labeled docs link, and watch it resume
 - `cli-rollback.gif`: review the DDL to restore an index, confirm with yes, then follow the new apply to completion
 - `cli-stop.gif`: press s through the real handler, await Stopped, then start and follow the resumed change to completion
 - `cli-vitess.gif`: create a deploy request, deploy with Enter, follow four shards, and close the revert window
@@ -23,6 +23,9 @@ From the repository root, generate the output with the current templates:
 ```sh
 go run ./pkg/cmd/docdemo/main.go > assets/src/cli-demo.json
 ```
+
+The throttle scenario enables the production terminal hyperlink helper, matching
+the labeled links in `list-plans` and `status`. Plain output prints the full URL.
 
 The generator writes a JSON array of scenarios to that file. It uses a
 loopback-only HTTP fixture to feed typed progress responses through
@@ -43,7 +46,8 @@ The renderer reports the duration, byte size, and temporary frame directory
 for each GIF. It rejects frames with overflowing output. Set `CHROME` to a
 browser executable if needed; `NODE_PATH` can point to an existing Playwright
 installation. The HTML, JSON, and generator are all kept here so the output
-can be refreshed when CLI templates change.
+can be refreshed when CLI templates change. OSC 8 terminal links render blue
+and underlined in the recording so their labels remain recognizable as links.
 
 Review a plan frame, the fleet table, the throttle reason and ETA, the waiting
 state, and the completed state after rendering. Check the GIFs at README

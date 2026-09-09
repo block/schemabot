@@ -5585,6 +5585,8 @@ Sequential mode: First complete, second paused by the engine's throttler
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
+  Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
+
 
 ```
 </details>
