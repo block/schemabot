@@ -535,6 +535,15 @@ Response excerpt (illustrative values):
 
 </details>
 
+The PostgreSQL phase stays `preflight` for the whole run — PostgreSQL DDL has
+no copy or cutover phase to report — and the statement position is what moves.
+The PR comment renders that position under each running deployment, and the
+CLI renders it for a single-deployment apply, as
+`step 2 of 2 · CREATE INDEX CONCURRENTLY orders_status_idx ON public.orders (status)`.
+The top-level `metadata` has one slot per key, so on a multi-deployment apply it
+carries the first-created deployment's position; the CLI's per-deployment view
+omits the position rather than show one deployment's under every heading.
+
 The numbers come from the engine while the apply is active, so they are as
 fresh as the last poll. Once the apply is terminal, the same endpoint answers
 from storage: rows, throttle state, and checksum counts are preserved on the

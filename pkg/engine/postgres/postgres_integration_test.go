@@ -5,6 +5,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"net/url"
 	"sync"
 	"testing"
@@ -1108,6 +1109,98 @@ func TestEngineApplyConcurrentIndexRecoversAbandonedInvalid(t *testing.T) {
 	assert.Equal(t, engine.StateCompleted, progress.State, "progress: %+v", progress)
 	assert.Equal(t, "completed", progress.Metadata["phase"])
 	assertIndexValidWithoutDebris(t, db, "orders", "orders_ref_idx")
+}
+
+// TestEngineApplyConcurrentIndexOutlivesFixedApplyCeiling proves a concurrent
+// index build keeps its configured build envelope while an ordinary statement
+// remains bounded by the fixed apply ceiling. While parked behind a writer,
+// the build remains running past that ceiling and exposes its current executor
+// position; after the writer releases, it completes with a valid index.
+//
+// The ceiling is shortened so the build can be observed past twice its
+// length inside the shared poll deadline; that coupling is the constraint on
+// its value. Its relationship to the lock timeout is not: the executor
+// retries a lost lock budget, so a budget verdict cannot surface before
+// several lock timeouts have elapsed, and any ceiling short enough to be
+// observed here ends the ordinary statement first. Its failure therefore
+// carries the generic detail, which is what tells the ceiling apart from a
+// lock budget — the two are otherwise published identically.
+func TestEngineApplyConcurrentIndexOutlivesFixedApplyCeiling(t *testing.T) {
+	const fixedCeiling = 2 * time.Second
+	require.Less(t, 2*fixedCeiling, postgresApplyDeadline,
+		"the build must be observable past twice the ceiling inside the poll deadline")
+	dsn, db := testutil.StartPostgres(t, "long_index_build_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text);
+		CREATE TABLE public.accounts (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	// parkWriter opens a transaction holding a row lock on the table so a
+	// build or statement against it waits. The cleanup rolls the writer back
+	// before closing its connection — closing a connection waits for its
+	// open transaction, so a failed assertion must not leave the writer
+	// parked or the container teardown would hang behind it.
+	parkWriter := func(table string) *sql.Tx {
+		conn, connErr := db.Conn(t.Context())
+		require.NoError(t, connErr)
+		tx, txErr := conn.BeginTx(t.Context(), nil)
+		require.NoError(t, txErr)
+		t.Cleanup(func() {
+			if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+				t.Errorf("roll back writer transaction on %s: %v", table, err)
+			}
+			utils.CloseAndLog(conn)
+		})
+		_, execErr := tx.ExecContext(t.Context(), "INSERT INTO public."+table+" (id) VALUES (1)")
+		require.NoError(t, execErr)
+		return tx
+	}
+
+	writerTx := parkWriter("orders")
+	eng := New()
+	eng.optimisticApplyCeiling = fixedCeiling
+	statement := "CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders", statement))
+	require.NoError(t, err)
+
+	started := time.Now()
+	var midBuild *engine.ProgressResult
+	require.Eventually(t, func() bool {
+		midBuild, err = eng.Progress(t.Context(), progressRequestFor("orders"))
+		if err != nil || midBuild.State != engine.StateRunning {
+			return false
+		}
+		var valid bool
+		catalogErr := db.QueryRowContext(t.Context(),
+			`SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass('public.orders_ref_idx')`).Scan(&valid)
+		return catalogErr == nil && !valid && time.Since(started) >= 2*fixedCeiling
+	}, postgresApplyDeadline, 10*time.Millisecond,
+		"concurrent index build did not remain running past the fixed apply ceiling")
+	// The statement text is the one position key the accepted record does
+	// not seed: a single-statement apply already carries step 1 of 1 before
+	// the executor reports anything, so only the statement proves the
+	// executor tracker is the source of the mid-build position.
+	assert.Equal(t, statement, midBuild.Metadata["statement"],
+		"the mid-build position must come from the executor tracker, not the accept-time seed")
+	require.NoError(t, writerTx.Rollback())
+
+	completed := awaitPostgresProgress(t, eng, "orders")
+	assert.Equal(t, engine.StateCompleted, completed.State, "progress: %+v", completed)
+	assert.Equal(t, "completed", completed.Metadata["phase"])
+	assertIndexValidWithoutDebris(t, db, "orders", "orders_ref_idx")
+
+	ordinaryWriterTx := parkWriter("accounts")
+	ordinaryStarted := time.Now()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "accounts",
+		"ALTER TABLE public.accounts ADD COLUMN email text"))
+	require.NoError(t, err)
+	failed := awaitPostgresProgress(t, eng, "accounts")
+	assert.GreaterOrEqual(t, time.Since(ordinaryStarted), fixedCeiling)
+	assert.Equal(t, engine.StateFailed, failed.State)
+	assert.Equal(t, "failed", failed.Metadata["phase"])
+	assert.True(t, failed.Retryable)
+	assert.Equal(t, "PostgreSQL schema change failed; see server logs", failed.ErrorMessage)
+	require.NoError(t, ordinaryWriterTx.Rollback())
 }
 
 // TestEngineApplyConcurrentIndexRedriveAfterKilledBuild proves the
