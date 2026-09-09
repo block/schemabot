@@ -311,8 +311,7 @@ Do you want to apply these changes? Only 'yes' will be accepted: yes
 ```
 
 The animation shows the progress after confirmation. `-y` skips the prompt;
-it does not grant permissions or bypass safety checks. `--no-watch` returns
-after starting the apply so you can follow it later.
+it does not grant permissions or bypass safety checks.
 
 After the apply completes, plan again against the same environment:
 
@@ -531,11 +530,11 @@ that index, using fictional local API responses:
 
 ![CLI rollback previews the index change, accepts confirmation, and completes a new apply](../assets/cli-rollback.gif)
 
-The animation uses `--no-watch` so you can see the new apply ID before attaching
-to it. Without that flag, rollback opens the live watcher automatically.
+After you confirm, rollback opens the live watcher automatically. Stay in the
+same terminal until it confirms completion.
 
 ```console
-$ schemabot rollback -e staging apply-example-85 --no-watch
+$ schemabot rollback -e staging apply-example-85
 Rollback Plan
 =============
 Database: shop
@@ -552,15 +551,13 @@ Do you want to apply this rollback? Only 'yes' will be accepted: yes
 Applying rollback...
 
 Rollback started: apply-example-86
-To watch and manage: schemabot progress apply-example-86
-
-$ schemabot progress apply-example-86
+Watching progress...
 ...progress updates...
 ✓ Apply complete! Changes: 1 altered. Apply ID: apply-example-86
 ```
 
-Follow the **new** apply ID (`apply-example-86`), rather than the original
-change. Wait for `Apply complete!`; reaching 100% of the copy alone does not
+The watcher follows the **new** apply ID (`apply-example-86`). Wait for
+`Apply complete!`; reaching 100% of the copy alone does not
 confirm that the apply has finished. In this example, completion means the
 index has been restored.
 
@@ -638,6 +635,11 @@ $ schemabot databases --json
 for the entire command, which also prints the plan and other messages.
 For fully structured writes, use the API. `progress` has no JSON output flag;
 use `status --json` for a structured snapshot.
+
+For agents and automated processes, `apply --no-watch` and `rollback --no-watch`
+return after submission without opening an interactive watcher. Retain the new
+apply ID and check its status; submission alone does not confirm completion.
+Interactive operators should keep the default automatic watcher.
 
 Do not scrape colored tables or progress bars. Check the exit status and the
 returned payload, and retain plan/apply IDs for follow-up reads. An accepted

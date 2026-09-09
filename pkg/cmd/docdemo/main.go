@@ -14,10 +14,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/commands"
@@ -476,6 +479,20 @@ func main() {
 	if err := os.Setenv("SCHEMABOT_TOKEN", "fictional-doc-fixture"); err != nil {
 		panic(err)
 	}
+	if len(os.Args) == 3 && os.Args[1] == "rollback-fixture" {
+		endpoint, err := url.Parse(os.Args[2])
+		if err != nil {
+			panic(err)
+		}
+		if endpoint.Scheme != "http" || endpoint.Hostname() != "127.0.0.1" {
+			panic("rollback fixture requires a loopback HTTP endpoint")
+		}
+		cmd := commands.RollbackCmd{ApplyID: "apply-example-85", Environment: "staging", Watch: true}
+		if err := cmd.Run(&commands.Globals{Endpoint: endpoint.String()}); err != nil {
+			panic(err)
+		}
+		return
+	}
 	renderPlan := func(apply bool) string {
 		return capture(func() {
 			t.WritePlanHeader(t.PlanHeaderData{Database: "shop", SchemaName: "schema", IsMySQL: true, IsApply: apply})
@@ -589,9 +606,14 @@ func rollbackDemo() Demo {
 	plan := apitypes.PlanResponse{PlanID: "plan-example-rollback", Database: "shop", DatabaseType: "mysql", Environment: "staging", Engine: "Spirit",
 		Changes: []*apitypes.SchemaChangeResponse{{Namespace: "shop", TableChanges: []*apitypes.TableChangeResponse{{TableName: "orders", ChangeType: "alter", DDL: rollbackDDL}}}}}
 	var requests []string
+	var fixtureMu sync.Mutex
+	watchingCommand := false
+	watchPolls := 0
 	rollbackPhase := state.Apply.Running
 	rollbackPercent := int32(25)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fixtureMu.Lock()
+		defer fixtureMu.Unlock()
 		requests = append(requests, r.Method+" "+r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
 		var response any
@@ -631,8 +653,25 @@ func rollbackDemo() Demo {
 			}
 			response = apitypes.ApplyResponse{Accepted: true, ApplyID: "apply-example-86"}
 		case "GET /api/progress/apply/", "GET /api/progress/apply/apply-example-86":
-			response = apitypes.ProgressResponse{ApplyID: "apply-example-86", Database: "shop", Environment: "staging", Engine: "Spirit", State: rollbackPhase,
-				Tables: []*apitypes.TableProgressResponse{{TableName: "orders", Keyspace: "shop", ChangeType: "alter", DDL: rollbackDDL, Status: rollbackPhase, PercentComplete: rollbackPercent, RowsCopied: int64(rollbackPercent) * 100000, RowsTotal: 10000000}}}
+			phase, percent := rollbackPhase, rollbackPercent
+			if watchingCommand {
+				if r.URL.Path != "/api/progress/apply/apply-example-86" {
+					panic("automatic watcher did not use the new apply ID")
+				}
+				watchPolls++
+				switch watchPolls {
+				case 1:
+					phase, percent = state.Apply.Running, 25
+				case 2:
+					phase, percent = state.Apply.Running, 100
+				case 3:
+					phase, percent = state.Apply.Completed, 100
+				default:
+					panic("automatic watcher polled after completion")
+				}
+			}
+			response = apitypes.ProgressResponse{ApplyID: "apply-example-86", Database: "shop", Environment: "staging", Engine: "Spirit", State: phase,
+				Tables: []*apitypes.TableProgressResponse{{TableName: "orders", Keyspace: "shop", ChangeType: "alter", DDL: rollbackDDL, Status: phase, PercentComplete: percent, RowsCopied: int64(percent) * 100000, RowsTotal: 10000000}}}
 		default:
 			panic("unexpected rollback request: " + r.Method + " " + r.URL.Path)
 		}
@@ -661,61 +700,101 @@ func rollbackDemo() Demo {
 			}
 		}()
 		return capture(func() {
-			cmd := commands.RollbackCmd{ApplyID: "apply-example-85", Environment: "staging", Watch: false}
+			cmd := commands.RollbackCmd{ApplyID: "apply-example-85", Environment: "staging", Watch: true}
 			if err := cmd.Run(&commands.Globals{Endpoint: server.URL}); err != nil {
 				panic(err)
 			}
 		})
 	}
+	requestSequence := func() string {
+		fixtureMu.Lock()
+		defer fixtureMu.Unlock()
+		return strings.Join(requests, ",")
+	}
 	declined := run("no")
-	if strings.Join(requests, ",") != "POST /api/rollback/plan,GET /api/status" {
+	if requestSequence() != "POST /api/rollback/plan,GET /api/status" {
 		panic("declined rollback performed a write")
 	}
 	preview, _, found := strings.Cut(declined, "\nRollback cancelled.")
 	if !found || !strings.Contains(preview, rollbackDDL) {
 		panic("rollback preview missing")
 	}
+	fixtureMu.Lock()
 	requests = nil
-	accepted := run("yes")
-	if strings.Join(requests, ",") != "POST /api/rollback/plan,GET /api/status,GET /api/locks/shop/mysql,POST /api/locks/acquire,POST /api/apply" {
+	watchingCommand = true
+	fixtureMu.Unlock()
+	accepted := rollbackInteractive(server.URL)
+	fixtureMu.Lock()
+	watchingCommand = false
+	polls := watchPolls
+	fixtureMu.Unlock()
+	if requestSequence() != "POST /api/rollback/plan,GET /api/status,GET /api/locks/shop/mysql,POST /api/locks/acquire,POST /api/apply,GET /api/progress/apply/apply-example-86,GET /api/progress/apply/apply-example-86,GET /api/progress/apply/apply-example-86" {
 		panic("wrong rollback request sequence")
 	}
 	submitted, found := strings.CutPrefix(accepted, preview)
 	if !found || !strings.Contains(submitted, "Rollback started: apply-example-86") {
 		panic("rollback acceptance missing")
 	}
-	render := func() string {
+	if polls != 3 || !strings.Contains(accepted, "100.00%") || !strings.Contains(accepted, "Apply complete!") {
+		panic("automatic rollback watcher did not reach completion: " + accepted)
+	}
+	submitted, _, found = strings.Cut(submitted, "Watching progress...\n")
+	if !found {
+		panic("automatic watcher announcement missing")
+	}
+	submitted += "Watching progress...\n"
+	render := func(phase string, percent int32) string {
+		fixtureMu.Lock()
+		rollbackPhase, rollbackPercent = phase, percent
+		fixtureMu.Unlock()
 		model := commands.NewWatchModel(server.URL, "shop", "staging", true)
 		batch := model.Init()().(tea.BatchMsg)
 		updated, _ := model.Update(batch[0]())
 		return updated.View()
 	}
-	started := render()
+	started := render(state.Apply.Running, 25)
 	var copying []Frame
 	for p := int32(30); p < 100; p += 5 {
-		rollbackPercent = p
-		copying = append(copying, Frame{0.18, "", "Follow the new apply", render()})
+		copying = append(copying, Frame{0.18, "", "Follow the new apply", render(state.Apply.Running, p)})
 	}
-	rollbackPercent = 100
-	finished := render()
+	finished := render(state.Apply.Running, 100)
 	if !strings.Contains(finished, "100") {
 		panic("rollback progress missing: " + finished)
 	}
-	rollbackPhase = state.Apply.Completed
-	final := render()
+	final := render(state.Apply.Completed, 100)
 	if !strings.Contains(final, "Apply complete!") || !strings.Contains(final, "apply-example-86") {
 		panic("rollback completion missing: " + final)
 	}
-	command := "schemabot rollback -e staging apply-example-85 --no-watch"
+	command := "schemabot rollback -e staging apply-example-85"
 	frames := []Frame{
 		{4, command, "Review the plan to restore the removed index", preview + "▌"},
 		{0.25, "", "Type yes only after reviewing the plan", preview + "y▌"},
 		{0.25, "", "", preview + "ye▌"},
 		{1, "", "", preview + "yes"},
-		{3, "", "The rollback starts a new apply: apply-example-86", submitted},
-		{2, "schemabot progress apply-example-86", "Follow the new apply", started},
+		{1.5, "", "Rollback starts the new apply and opens its watcher", submitted},
+		{2, "", "Live progress opens automatically after confirmation", started},
 	}
 	frames = append(frames, copying...)
 	frames = append(frames, Frame{2, "", "The copy reaches 100%; wait for confirmed completion", finished}, Frame{4, "", "The new apply completes; the index is restored", final})
 	return Demo{Name: "cli-rollback", Title: "Review a rollback. Follow the new change.", Height: 670, Frames: frames}
+}
+
+// rollbackInteractive gives the actual command terminal input while capturing
+// its output. The helper process runs this generator's loopback-only mode.
+func rollbackInteractive(endpoint string) string {
+	executable, err := os.Executable()
+	if err != nil {
+		panic(err)
+	}
+	_, source, _, _ := runtime.Caller(0)
+	helper := filepath.Join(filepath.Dir(source), "../../../scripts/cli-demo-tty.py")
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "python3", helper, executable, "rollback-fixture", endpoint)
+	cmd.Stderr = os.Stderr
+	output, err := cmd.Output()
+	if err != nil {
+		panic(fmt.Errorf("run interactive rollback fixture: %w", err))
+	}
+	return string(output)
 }

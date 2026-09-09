@@ -523,7 +523,7 @@
     "frames": [
       {
         "seconds": 4,
-        "command": "schemabot rollback -e staging apply-example-85 --no-watch",
+        "command": "schemabot rollback -e staging apply-example-85",
         "caption": "Review the plan to restore the removed index",
         "output": "\nRollback Plan\n=============\nDatabase: shop\nEnvironment: staging\n\nThe following changes will be applied to rollback:\n\n  orders (alter):\n    ALTER TABLE `orders` ADD INDEX `idx_status` (`status`);\n\nDo you want to apply this rollback? Only 'yes' will be accepted: ▌"
       },
@@ -546,15 +546,15 @@
         "output": "\nRollback Plan\n=============\nDatabase: shop\nEnvironment: staging\n\nThe following changes will be applied to rollback:\n\n  orders (alter):\n    ALTER TABLE `orders` ADD INDEX `idx_status` (`status`);\n\nDo you want to apply this rollback? Only 'yes' will be accepted: yes"
       },
       {
-        "seconds": 3,
+        "seconds": 1.5,
         "command": "",
-        "caption": "The rollback starts a new apply: apply-example-86",
-        "output": "🔒 Lock acquired for shop (mysql)\n\nApplying rollback...\n\nRollback started: apply-example-86\nTo watch and manage: schemabot progress apply-example-86\n"
+        "caption": "Rollback starts the new apply and opens its watcher",
+        "output": "🔒 Lock acquired for shop (mysql)\n\nApplying rollback...\n\nRollback started: apply-example-86\nWatching progress...\n"
       },
       {
         "seconds": 2,
-        "command": "schemabot progress apply-example-86",
-        "caption": "Follow the new apply",
+        "command": "",
+        "caption": "Live progress opens automatically after confirmation",
         "output": "\u001b[38;5;205m⣾ \u001b[0mRunning...\n\n  \u001b[1m── shop ──\u001b[0m\n\n     ~ orders: 🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 25.00%\n       \u001b[34mALTER\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m \u001b[34mADD\u001b[0m \u001b[34mINDEX\u001b[0m `idx_status`(`status`);\n       • Rows: 2,500,000 / 10,000,000\n\n\n\n\u001b[2mESC detach • s stop\u001b[0m\n"
       },
       {
