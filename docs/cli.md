@@ -385,7 +385,8 @@ $ schemabot progress apply-example-73
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)
        ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
        • Rows: 6,000,000 / 10,000,000 · ETA: 8m 0s
-       • ℹ️ Throttled: Replication lag exceeds the configured limit
+       • ℹ️ Throttled: commit-latency 120ms >= 100ms · backing off while database writes commit slowly
+       • Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
 
 
 

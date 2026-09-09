@@ -77,7 +77,7 @@ func live(p int, phase string, throttled bool, key string) string {
 		ApplyID: "apply-example-73", Database: "shop", DatabaseType: "mysql", Environment: "staging", Engine: "Spirit", State: phase,
 		Tables: []*apitypes.TableProgressResponse{{TableName: "orders", Keyspace: "shop", ChangeType: "alter", DDL: ddl,
 			Status: phase, RowsCopied: int64(p) * 100000, RowsTotal: 10000000, PercentComplete: int32(p), ETASeconds: int64(100-p) * 12,
-			Throttled: throttled, ThrottleReason: "commit-latency 120ms >= 50ms"}},
+			Throttled: throttled, ThrottleReason: "commit-latency 120ms >= 100ms"}},
 	}
 	var cutovers, stops int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

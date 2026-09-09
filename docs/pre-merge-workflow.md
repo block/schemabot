@@ -401,6 +401,7 @@ One frame from the live output (illustrative values):
   ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
   • Rows: 6,000,000 / 10,000,000 · ETA: 42m 0s
   • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
+  • Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
 ```
 
 The view refreshes until the apply finishes. Here, copying is slowing down
