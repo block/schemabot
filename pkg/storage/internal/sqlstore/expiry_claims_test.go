@@ -133,8 +133,15 @@ func testRetryableExpiryLeaseMeanings(t *testing.T, newStore func(*testing.T) *S
 		store := newStore(t)
 		apply, opIDs, tasks := seedExhaustedRetryableTree(t, ctx, store, "expiry_released_drive", maxRecoveryAttempts)
 
+		// Age the heartbeat well past the column's resolution before releasing,
+		// while leaving it comfortably inside the staleness window. MySQL stores
+		// updated_at as second-granular datetime, so comparing a NOW() stamp
+		// against a release milliseconds later cannot see an ON UPDATE refresh
+		// at all — the assertion below would hold whether or not the statement
+		// assigns the column.
 		heartbeatsBefore := make([]time.Time, len(opIDs))
 		for i, id := range opIDs {
+			backdateOperationLease(t, ctx, store, id, storage.ApplyLeaseStaleAfter/2)
 			heartbeatsBefore[i] = operationHeartbeat(t, ctx, store, id)
 		}
 
@@ -142,7 +149,7 @@ func testRetryableExpiryLeaseMeanings(t *testing.T, newStore func(*testing.T) *S
 		// otherwise identical to the deferred case above, and this pass admits
 		// immediately instead of waiting out a staleness window.
 		for i, id := range opIDs {
-			released, err := store.ApplyOperations().ReleaseSettledClaim(ctx, storage.OperationLease{
+			released, err := store.ApplyOperations().ReleaseFinishedClaim(ctx, storage.OperationLease{
 				ApplyID: apply.ID, OperationID: id, Owner: leaseOwnerFor(i), Token: leaseTokenFor(i),
 			})
 			require.NoError(t, err)
@@ -170,28 +177,66 @@ func testRetryableExpiryLeaseMeanings(t *testing.T, newStore func(*testing.T) *S
 		assertTaskState(t, store, tasks[1].TaskIdentifier, state.Task.Cancelled)
 	})
 
+	// The ordinary fan-out shape: one deployment finished, the other burned the
+	// budget. Reading the lease alone means the completed sibling's leftover
+	// would defer the whole apply for a staleness window on every successful
+	// rollout, so a drive that ends in a settled state hands its lease back too.
+	t.Run("a completed sibling's lease does not defer the apply", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		store := newStore(t)
+		apply, opIDs, _ := seedExhaustedRetryableTree(t, ctx, store, "expiry_completed_sibling", maxRecoveryAttempts)
+
+		_, err := store.db.ExecContext(ctx, "UPDATE apply_operations SET state = ? WHERE id = ?",
+			state.ApplyOperation.Completed, opIDs[0])
+		require.NoError(t, err)
+
+		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		require.NoError(t, err)
+		require.Empty(t, expired, "both leases are still held, so the apply is deferred")
+
+		for i, id := range opIDs {
+			released, err := store.ApplyOperations().ReleaseFinishedClaim(ctx, storage.OperationLease{
+				ApplyID: apply.ID, OperationID: id, Owner: leaseOwnerFor(i), Token: leaseTokenFor(i),
+			})
+			require.NoError(t, err)
+			assert.True(t, released, "a completed drive has ended as surely as a settling one")
+		}
+
+		expired, err = store.Applies().ExpireRetryable(ctx, 10)
+		require.NoError(t, err)
+		require.Len(t, expired, 1, "no lease is left to defer the apply")
+	})
+
 	t.Run("the handback only clears the lease the settling drive held", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 		defer cancel()
 		store := newStore(t)
 		apply, opIDs, tasks := seedExhaustedRetryableTree(t, ctx, store, "expiry_release_guards", maxRecoveryAttempts)
 
-		released, err := store.ApplyOperations().ReleaseSettledClaim(ctx, storage.OperationLease{
+		released, err := store.ApplyOperations().ReleaseFinishedClaim(ctx, storage.OperationLease{
 			ApplyID: apply.ID, OperationID: opIDs[0], Owner: leaseOwnerFor(0), Token: "token-a-peer-rotated-on",
 		})
 		require.NoError(t, err)
 		assert.False(t, released, "a lease a peer already rotated onto the row belongs to that peer's drive")
 
-		// A drive that ended somewhere other than failed_retryable is not a
-		// settling drive, and the lease it holds is not this handback's to clear.
+		// Neither a drive still under way nor one parked somewhere a driver may
+		// resume from has ended, so neither lease is this handback's to clear.
+		// Stopped is the one that has to be named: it is terminal, but a driver
+		// may claim it and resume writing under its lease.
+		for _, notEnded := range []string{state.ApplyOperation.Running, state.ApplyOperation.Stopped} {
+			_, err = store.db.ExecContext(ctx, "UPDATE apply_operations SET state = ? WHERE id = ?",
+				notEnded, opIDs[1])
+			require.NoError(t, err)
+			released, err = store.ApplyOperations().ReleaseFinishedClaim(ctx, storage.OperationLease{
+				ApplyID: apply.ID, OperationID: opIDs[1], Owner: leaseOwnerFor(1), Token: leaseTokenFor(1),
+			})
+			require.NoError(t, err)
+			assert.Falsef(t, released, "a %s operation has not ended, so its lease is not the handback's to clear", notEnded)
+		}
 		_, err = store.db.ExecContext(ctx, "UPDATE apply_operations SET state = ? WHERE id = ?",
-			state.ApplyOperation.Running, opIDs[1])
+			state.ApplyOperation.FailedRetryable, opIDs[1])
 		require.NoError(t, err)
-		released, err = store.ApplyOperations().ReleaseSettledClaim(ctx, storage.OperationLease{
-			ApplyID: apply.ID, OperationID: opIDs[1], Owner: leaseOwnerFor(1), Token: leaseTokenFor(1),
-		})
-		require.NoError(t, err)
-		assert.False(t, released, "only an operation settled into failed_retryable has a settled lease to hand back")
 
 		for _, id := range opIDs {
 			op, err := store.ApplyOperations().Get(ctx, id)

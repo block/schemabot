@@ -1703,9 +1703,17 @@ func (s *applyOperationStore) ReleaseClaim(ctx context.Context, lease storage.Op
 	return rows > 0, nil
 }
 
-// ReleaseSettledClaim clears the lease on an operation this driver settled into
-// failed_retryable, so a fresh lease on that row means a drive is in progress
-// rather than that one ended here.
+// ReleaseFinishedClaim clears the lease on an operation whose drive has ended,
+// so a fresh lease on a row means a drive is in progress rather than that one
+// ended here.
+//
+// "Ended" is the settled states plus failed_retryable. Settled is the terminal
+// set minus stopped, matching state.SettledApplyStates: a stopped operation is
+// terminal but still addressable, so a driver may resume writing under its
+// lease and the lease is not this call's to clear. failed_retryable is the
+// state whose leftover lease is indistinguishable from a live retry's, which is
+// what makes the clear worth doing at all; the settled states are here because
+// a lease-only reader cannot tell those leftovers apart either.
 //
 // It carries the heartbeat forward rather than moving it, unlike every other
 // write here. The settling write set updated_at moments ago, so the column
@@ -1721,25 +1729,30 @@ func (s *applyOperationStore) ReleaseClaim(ctx context.Context, lease storage.Op
 // PostgreSQL would not, so the two dialects would recover this row on different
 // schedules.
 //
-// Guarded on both the lease token and the settled state so it cannot clear a
-// lease a peer rotated onto the row, or one belonging to a drive that moved the
-// row somewhere else.
-func (s *applyOperationStore) ReleaseSettledClaim(ctx context.Context, lease storage.OperationLease) (bool, error) {
+// Guarded on both the lease token and the ended states so it cannot clear a
+// lease a peer rotated onto the row, or one belonging to a drive that left the
+// row somewhere a driver may still resume from.
+func (s *applyOperationStore) ReleaseFinishedClaim(ctx context.Context, lease storage.OperationLease) (bool, error) {
 	if !lease.Valid() {
-		return false, fmt.Errorf("release settled claim for apply_operation %d: %w", lease.OperationID, storage.ErrApplyLeaseLost)
+		return false, fmt.Errorf("release finished claim for apply_operation %d: %w", lease.OperationID, storage.ErrApplyLeaseLost)
 	}
-	result, err := s.db.ExecContext(ctx, `
+	endedStates := append([]string{state.ApplyOperation.FailedRetryable}, state.SettledApplyStates...)
+	args := []any{lease.OperationID, lease.Token}
+	for _, s := range endedStates {
+		args = append(args, s)
+	}
+	result, err := s.db.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE apply_operations
 		SET lease_owner = '', lease_token = '', lease_acquired_at = NULL,
 		    updated_at = updated_at
-		WHERE id = ? AND lease_token = ? AND state = ?
-	`, lease.OperationID, lease.Token, state.ApplyOperation.FailedRetryable)
+		WHERE id = ? AND lease_token = ? AND state IN (%s)
+	`, placeholders(len(endedStates))), args...)
 	if err != nil {
-		return false, fmt.Errorf("release settled claim for apply_operation %d: %w", lease.OperationID, err)
+		return false, fmt.Errorf("release finished claim for apply_operation %d: %w", lease.OperationID, err)
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("read release settled claim rows affected for apply_operation %d: %w", lease.OperationID, err)
+		return false, fmt.Errorf("read release finished claim rows affected for apply_operation %d: %w", lease.OperationID, err)
 	}
 	return rows > 0, nil
 }
