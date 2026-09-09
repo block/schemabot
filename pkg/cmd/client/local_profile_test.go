@@ -1,6 +1,7 @@
 package client
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -64,4 +65,20 @@ func TestRegisterLocalProfileRejectsInvalidRuntimeBeforeWriting(t *testing.T) {
 	require.Error(t, err)
 	_, err = os.Stat(filepath.Join(home, ".schemabot"))
 	require.True(t, os.IsNotExist(err))
+}
+
+func TestConcurrentLocalProfileRegistration(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	start := make(chan struct{})
+	errs := make(chan error, 8)
+	for i := range 8 {
+		go func() { <-start; _, err := RegisterLocalProfile(fmt.Sprintf("project-%d", i), "shared"); errs <- err }()
+	}
+	close(start)
+	for range 8 {
+		require.NoError(t, <-errs)
+	}
+	cfg, err := LoadConfig()
+	require.NoError(t, err)
+	require.Len(t, cfg.Profiles, 8)
 }

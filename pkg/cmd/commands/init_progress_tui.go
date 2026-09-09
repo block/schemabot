@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -78,30 +79,51 @@ func (cmd *InitCmd) initializeWithUI(ctx context.Context, g *Globals) (*initResu
 	}, tea.WithInput(os.Stdin), tea.WithOutput(os.Stdout))
 }
 
+type initProgressProgram interface {
+	Run() (tea.Model, error)
+	Send(tea.Msg)
+	Kill()
+}
+
 func runInitProgress(ctx context.Context, initialize func(context.Context, func(string)) (*initResult, error), options ...tea.ProgramOption) (*initResult, error) {
+	options = append(options, tea.WithoutSignalHandler())
+	return runInitProgressProgram(ctx, initialize, func(model tea.Model) initProgressProgram {
+		return tea.NewProgram(model, options...)
+	})
+}
+
+func runInitProgressProgram(ctx context.Context, initialize func(context.Context, func(string)) (*initResult, error), newProgram func(tea.Model) initProgressProgram) (*initResult, error) {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#0969DA", Dark: "#79C0FF"})
 	m := &initProgress{spinner: s, cancel: cancel, width: 72}
-	options = append(options, tea.WithoutSignalHandler())
-	p := tea.NewProgram(m, options...)
+	p := newProgram(m)
+	started := make(chan struct{})
 	finished := make(chan struct{})
 	var outcome initFinishedMsg
-	// Own initialization outside Bubble Tea's Cmd goroutines so every exit,
-	// including a terminal failure before Init, can cancel and join cleanup.
+	// Own cleanup outside Bubble Tea, but begin work only after its Init
+	// command runs. A terminal startup failure must not register a runtime.
 	go func() {
 		defer close(finished)
+		select {
+		case <-runCtx.Done():
+			return
+		case <-started:
+		}
+		if runCtx.Err() != nil {
+			return
+		}
 		outcome.result, outcome.err = initialize(runCtx, func(stage string) { p.Send(initStageMsg(stage)) })
 	}()
-	m.run = func() tea.Msg { <-finished; return outcome }
+	m.run = func() tea.Msg { close(started); <-finished; return outcome }
 	_, runErr := p.Run()
 	cancel()
 	p.Kill()
 	<-finished
 	if runErr != nil {
-		return nil, fmt.Errorf("run setup display: %w", runErr)
+		return outcome.result, errors.Join(fmt.Errorf("run setup display: %w", runErr), outcome.err)
 	}
 	if m.finished == nil {
 		return nil, fmt.Errorf("setup interrupted")

@@ -96,7 +96,7 @@ func (cmd *LoginCmd) Run(g *Globals) error {
 	if !result.Expiry.IsZero() {
 		profile.TokenExpiry = result.Expiry.Unix()
 	}
-	if err := client.UpdateConfig(ctx, func(latest *client.Config) error {
+	if err := client.UpdateConfig(context.WithoutCancel(ctx), func(latest *client.Config) error {
 		current, exists := latest.Profiles[profileName]
 		if !exists || !sameEndpoint(current.Endpoint, profile.Endpoint) || current.LocalRuntime != profile.LocalRuntime || !reflect.DeepEqual(current.OIDC, profile.OIDC) {
 			return fmt.Errorf("profile %q changed its connection during login; the token was not saved to a different server", profileName)

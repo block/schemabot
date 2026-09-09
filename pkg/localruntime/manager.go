@@ -107,6 +107,7 @@ func (m Manager) Ensure(ctx context.Context) (Connection, error) {
 	lastState := "starting"
 	var mismatchSince time.Time
 	for {
+		observedMismatch := false
 		r, err := m.record()
 		if err == nil {
 			if r.Binary != binary {
@@ -127,6 +128,7 @@ func (m Manager) Ensure(ctx context.Context) (Connection, error) {
 						// A registration can publish between identity and file reads.
 						// Wait for a matching snapshot, never restart the live host.
 						live.State = "configuration_mismatch"
+						observedMismatch = true
 						if mismatchSince.IsZero() {
 							mismatchSince = time.Now()
 						} else if time.Since(mismatchSince) >= configMismatchGrace {
@@ -144,6 +146,9 @@ func (m Manager) Ensure(ctx context.Context) (Connection, error) {
 					}
 				}
 			}
+		}
+		if !observedMismatch {
+			mismatchSince = time.Time{}
 		}
 		// A released lease proves the child exited. An unhealthy process holding it
 		// is never replaced, even when its control listener is unreachable.

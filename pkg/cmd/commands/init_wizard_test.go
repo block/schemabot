@@ -433,21 +433,42 @@ func TestInitWizardChecksFolderBeforeReviewAndKeepsStateStepReachable(t *testing
 	require.Equal(t, 4, m.step)
 }
 
-type initBrokenTerminal struct{}
+type initBrokenTerminal struct{ started <-chan struct{} }
 
-func (initBrokenTerminal) Read([]byte) (int, error) { return 0, errors.New("terminal failed") }
+func (r initBrokenTerminal) Read([]byte) (int, error) {
+	<-r.started
+	return 0, errors.New("terminal failed")
+}
 
 func TestInitTerminalFailureJoinsCleanup(t *testing.T) {
-	cleaned := make(chan struct{})
+	started, cleaned := make(chan struct{}), make(chan struct{})
 	_, err := runInitProgress(t.Context(), func(ctx context.Context, report func(string)) (*initResult, error) {
 		defer close(cleaned)
+		close(started)
 		<-ctx.Done()
-		return nil, ctx.Err()
-	}, tea.WithInput(initBrokenTerminal{}), tea.WithOutput(io.Discard), tea.WithoutRenderer())
-	require.Error(t, err)
+		return nil, errors.New("initialization incomplete; runtime registration is retained for retry")
+	}, tea.WithInput(initBrokenTerminal{started: started}), tea.WithOutput(io.Discard), tea.WithoutRenderer())
+	require.ErrorContains(t, err, "terminal failed")
+	require.ErrorContains(t, err, "runtime registration is retained for retry")
 	select {
 	case <-cleaned:
 	default:
 		t.Fatal("terminal returned before cleanup")
 	}
+}
+
+type initStartupFailure struct{}
+
+func (initStartupFailure) Run() (tea.Model, error) { return nil, errors.New("terminal startup failed") }
+func (initStartupFailure) Kill()                   {}
+func (initStartupFailure) Send(tea.Msg)            {}
+
+func TestInitTerminalStartupFailureDoesNotInitialize(t *testing.T) {
+	called := false
+	_, err := runInitProgressProgram(t.Context(), func(ctx context.Context, report func(string)) (*initResult, error) {
+		called = true
+		return nil, nil
+	}, func(tea.Model) initProgressProgram { return initStartupFailure{} })
+	require.ErrorContains(t, err, "terminal startup failed")
+	require.False(t, called, "setup must not run when the terminal fails before Init")
 }
