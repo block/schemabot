@@ -558,6 +558,15 @@ func refusalForCause(err error, table string) *refusal {
 		return &refusal{reason: "table-too-large",
 			cause: sizeErr.Error() + "; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit"}
 	}
+	// Decided before the bare table sentinels below: the unverified-create
+	// wrap carries the read-back's own cause inside it, and a table no longer
+	// at its name or no longer a table are two of those causes. The outcome
+	// is the state the step left — a committed table whose names are
+	// unproven — not the fault that kept them from being proven, so the
+	// inner sentinel must not claim the verdict.
+	if errors.Is(err, executor.ErrCreateNamesUnverified) {
+		return createNamesUnverifiedRefusal(table)
+	}
 	if errors.Is(err, preflight.ErrTableNotFound) {
 		return tableNotFoundRefusal(table)
 	}
@@ -567,6 +576,10 @@ func refusalForCause(err error, table string) *refusal {
 	}
 	if preflight.IsNameOccupied(err) {
 		return createCollisionRefusal(table)
+	}
+	var mismatchErr *executor.CreateNameMismatchError
+	if errors.As(err, &mismatchErr) {
+		return createNameMismatchRefusal(createNameMismatchCause(table, mismatchErr))
 	}
 	if errors.Is(err, preflight.ErrSchemaNotFound) {
 		return &refusal{reason: "schema-not-found",
@@ -588,6 +601,13 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 	switch code {
 	case executor.CodeCreateCollision:
 		return createCollisionRefusal(table), true
+	case executor.CodeCreateNameMismatch:
+		// The typed error names the relations involved and refusalForCause
+		// prefers it; this arm keeps the vocabulary total for a bare code.
+		return createNameMismatchRefusal(
+			fmt.Sprintf("the CREATE TABLE for %q committed but the table does not own a constraint-index or sequence name the schema file claims; the server chose a suffixed name instead", table)), true
+	case executor.CodeCreateNamesUnverified:
+		return createNamesUnverifiedRefusal(table), true
 	case executor.CodeDuplicateCreateName:
 		return &refusal{reason: "duplicate-create-name",
 			cause:  fmt.Sprintf("the create set for %q claims the same relation name twice (a CREATE INDEX name repeats the table's implicit constraint-index name or another index)", table),
@@ -681,6 +701,81 @@ func createCollisionRefusal(table string) *refusal {
 		reason: "create-collision",
 		cause:  fmt.Sprintf("a name the create set for %q needs is already occupied (table, view, index, or sequence)", table),
 		remedy: createCollisionRemedy,
+	}
+}
+
+// createNameMismatchRemedy is an operator's, not a retry's: the CREATE TABLE
+// committed, so re-running the identical plan collides with the table this
+// apply created, and the table stands under a name the schema file did not
+// choose. Re-planning comes last because only the current schema, with the
+// relation renamed or the table gone, tells the next plan what remains.
+const createNameMismatchRemedy = "free the first-choice name and rename the owned relation to it, or drop the table, then " + replanRemedy
+
+// createNameMismatchRefusal takes its cause from the caller because the
+// typed error names the claimed names the table lacks and the names it owns
+// instead, while the bare outcome code knows only that the two differ.
+func createNameMismatchRefusal(cause string) *refusal {
+	return &refusal{
+		reason: "create-name-mismatch",
+		cause:  cause,
+		remedy: createNameMismatchRemedy,
+	}
+}
+
+// createNameMismatchCause names the constraint-index or sequence names the
+// committed table lacks and the suffixed names the server chose instead, so
+// the operator knows which relation to rename. The names come from the
+// schema file and the catalog, the same provenance as the table name every
+// refusal already renders. The typed error always carries at least one
+// missing name — a table that honoured every claim is not a mismatch — but
+// may own nothing unclaimed when a relation was dropped inside the read-back
+// window, so the owned clause is rendered only when there is one to name.
+func createNameMismatchCause(table string, mismatch *executor.CreateNameMismatchError) string {
+	cause := fmt.Sprintf("the CREATE TABLE for %q committed but the table does not own %s the schema file claims",
+		table, quotedNames(mismatch.Missing))
+	if len(mismatch.Unclaimed) == 0 {
+		return cause
+	}
+	return cause + fmt.Sprintf("; it owns %s instead", quotedNames(mismatch.Unclaimed))
+}
+
+// maxQuotedNames bounds how many identifiers a refusal cause enumerates. A
+// wide table can claim a name per constraint and per serial column, and the
+// composed detail is rendered on a surface that truncates from the tail,
+// where the remedy sits; the leading names locate the problem and the count
+// says how much the operator has not been shown.
+const maxQuotedNames = 3
+
+// quotedNames renders identifiers for a refusal cause, enumerating at most
+// maxQuotedNames and counting the rest.
+func quotedNames(names []string) string {
+	shown := names
+	if len(shown) > maxQuotedNames {
+		shown = shown[:maxQuotedNames]
+	}
+	quoted := make([]string, len(shown))
+	for i, name := range shown {
+		quoted[i] = fmt.Sprintf("%q", name)
+	}
+	rendered := strings.Join(quoted, ", ")
+	if rest := len(names) - len(shown); rest > 0 {
+		rendered += fmt.Sprintf(", and %d more", rest)
+	}
+	return rendered
+}
+
+// createNamesUnverifiedRefusal is decided by the wrap, not by the cause it
+// carries. pg-sprite leaves the outcome retryable because the read that
+// failed could be repeated on its own. SchemaBot cannot repeat only the
+// read: its retry re-runs the identical plan, whose CREATE TABLE has already
+// committed, so every retry collides with the table this apply created. The
+// table stands with unproven names, and proving them is an operator's
+// comparison, not a retry's.
+func createNamesUnverifiedRefusal(table string) *refusal {
+	return &refusal{
+		reason: "create-names-unverified",
+		cause:  fmt.Sprintf("the CREATE TABLE for %q committed but the relation names the table owns could not be read, so whether the server honoured every claimed name is unproven", table),
+		remedy: "compare the table's constraint-index and sequence names against the schema file, then " + replanRemedy,
 	}
 }
 

@@ -215,11 +215,13 @@ when pg-sprite could not construct the concurrent form of a plain
 `CREATE INDEX`, since running the submitted form would falsify the plan's own
 verdict.
 
-The plan comment lists the table and SchemaBot's reason for the refusal. For a
-PostgreSQL plan, the plan Check Run concludes unsuccessfully, and an apply
-attempt is rejected before any apply or task is queued. Rewrite the declarative
-change into an eligible form or use a separately reviewed operational process;
-flags do not override an engine-blocked verdict.
+The plan comment lists the table and SchemaBot's reason for the refusal. When
+the create path refuses a statement's shape, that reason names the offending
+clause and how to remove or work around it. For a PostgreSQL plan, the plan
+Check Run concludes unsuccessfully, and an apply attempt is rejected before
+any apply or task is queued. Rewrite the declarative change into an eligible
+form or use a separately reviewed operational process; flags do not override
+an engine-blocked verdict.
 
 The engine does not execute `DROP TABLE` or other statement kinds outside its
 admitted set. That includes tables that exist on the target but that no schema
@@ -312,6 +314,17 @@ change or that depend on the target:
   missing target schema, a duplicate name inside the statement, `IF NOT
   EXISTS`, and `PARTITION OF` against a live parent are each refused
   permanently, with a reason directing a fix or a re-plan.
+- After a `CREATE TABLE` commits, pg-sprite reads back the constraint-index
+  and sequence names the table owns. A table that owns a suffixed name in
+  place of one the schema file claims — an occupant took the first choice
+  between the catalog probe and the statement — is refused permanently, with
+  the missing and owned names in the reason; the table is left standing for
+  the operator to rename the relation or drop, then re-plan. A read-back that
+  does not complete is also refused permanently, even though pg-sprite marks
+  it retryable: SchemaBot's retry re-runs the whole plan, whose `CREATE
+  TABLE` has already committed, so it could only collide with the table this
+  apply created. The reason directs the operator to compare the table's
+  names against the schema file, then re-plan.
 - Insufficient privileges are refused permanently before DDL runs. The stored
   failure includes the provisioning `GRANT` derived by pg-sprite.
 - Exhausting the 30-second statement budget is a permanent native-safety
