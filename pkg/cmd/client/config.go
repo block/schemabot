@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"time"
 
@@ -431,13 +432,19 @@ func ResolveBearerToken(ctx context.Context, tokenFlag, endpointFlag, profileFla
 		return token, fmt.Errorf("could not refresh the token for profile %q (run `%s login`): %w", profileName, cliname.Name(), err)
 	}
 
-	profile.Token = result.IDToken
-	profile.RefreshToken = result.RefreshToken
-	// Persist the new ID token expiry alongside the credential it describes.
-	profile.TokenExpiry = unixExpiry(result.Expiry)
-	cfg.Profiles[profileName] = profile
-	if err := SaveConfig(cfg); err != nil {
-		// The refreshed token is usable for this run even if it could not be saved.
+	// Save the completed grant against the latest config, without repeating the
+	// network exchange or overwriting a newer session for the same profile.
+	if err := UpdateConfig(context.WithoutCancel(ctx), func(latest *Config) error {
+		current, exists := latest.Profiles[profileName]
+		if !exists || !reflect.DeepEqual(current, profile) {
+			return fmt.Errorf("profile %q changed during token refresh; the newer profile was preserved", profileName)
+		}
+		current.Token = result.IDToken
+		current.RefreshToken = result.RefreshToken
+		current.TokenExpiry = unixExpiry(result.Expiry)
+		latest.Profiles[profileName] = current
+		return nil
+	}); err != nil {
 		return result.IDToken, fmt.Errorf("could not persist the refreshed token for profile %q: %w", profileName, err)
 	}
 	if !result.Expiry.After(time.Now()) {
