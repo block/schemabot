@@ -7,7 +7,7 @@ through the production Go templates and interactive `commands.WatchModel`:
 - `cli-ops.gif`: list databases, pull a live schema with lint findings, show the latest 20 of 500 changes, then follow engine logs through completion
 - `cli-fleet.gif`: list changes, attach to the live watcher, detach with Esc, and list plans
 - `cli-cutover.gif`: finish copying, wait for the swap, and press Enter to cut over
-- `cli-throttle.gif`: see commit-latency pause copying, read the docs link, and watch it resume
+- `cli-throttle.gif`: see commit-latency pause copying, read the labeled docs link, and watch it resume
 - `cli-rollback.gif`: review the DDL to restore an index, confirm with yes, then follow the new apply to completion
 - `cli-stop.gif`: press s through the real handler, await Stopped, then start and follow the resumed change to completion
 - `cli-vitess.gif`: create a deploy request, deploy with Enter, follow four shards, and close the revert window
@@ -24,6 +24,9 @@ From the repository root, generate the output with the current templates:
 ```sh
 go run ./pkg/cmd/docdemo/main.go > assets/src/cli-demo.json
 ```
+
+The throttle scenario enables the production terminal hyperlink helper, matching
+the labeled links in `list-plans` and `status`. Plain output prints the full URL.
 
 The generator writes a JSON array of scenarios to that file. It uses a
 loopback-only HTTP fixture to feed typed progress responses through

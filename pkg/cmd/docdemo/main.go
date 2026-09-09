@@ -546,6 +546,9 @@ func main() {
 	}
 	frames = append(frames, Frame{3, "", "Copy complete; wait for the final swap", live(100, state.Apply.WaitingForCutover, false, "")}, Frame{2, "", "Press Enter to request the final swap", live(100, state.Apply.WaitingForCutover, false, "enter")}, Frame{3, "", "The watcher confirms completion", live(100, state.Apply.Completed, false, "")})
 	demos = append(demos, Demo{Name: "cli-cutover", Title: "Choose when to cut over.", Frames: frames})
+	// This scenario illustrates a terminal that supports labeled links.
+	previousHyperlinks := ui.Hyperlinks
+	ui.Hyperlinks = true
 	throttleFrames := []Frame{{2, "schemabot progress apply-example-73", "Follow the row copy", live(40, state.Apply.Running, false, "")}}
 	for p := 45; p <= 60; p += 5 {
 		throttleFrames = append(throttleFrames, Frame{0.18, "", "", live(p, state.Apply.Running, false, "")})
@@ -556,6 +559,7 @@ func main() {
 	}
 	throttleFrames = append(throttleFrames, Frame{3, "", "The change completes", live(100, state.Apply.Completed, false, "")})
 	demos = append(demos, Demo{Name: "cli-throttle", Title: "See why a change slows down.", Frames: throttleFrames})
+	ui.Hyperlinks = previousHyperlinks
 	stopFrames := []Frame{
 		{2, "", "The change is already copying rows", live(50, state.Apply.Running, false, "")},
 		{1, "", "", live(55, state.Apply.Running, false, "")},
