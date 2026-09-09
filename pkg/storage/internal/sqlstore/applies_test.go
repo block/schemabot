@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -4825,4 +4826,38 @@ func TestApplyStore_ReleaseClaim_InvalidLeaseIsRefused(t *testing.T) {
 
 	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
 	assert.False(t, released)
+}
+
+// The expiry sweep orders its candidates by updated_at under FOR UPDATE, so
+// the index that serves that ordering is what bounds the work the LIMIT takes.
+// state = ? is an equality predicate, so a btree on (state, updated_at) hands
+// back rows already in the ordering's direction; without it the planner has to
+// sort the whole failed_retryable state before the first page exists, which
+// under FOR UPDATE means locking rows the sweep will never return.
+//
+// This asserts the index as the embedded MySQL schema file declares it, on the
+// MySQL store this package's tests run against, under the name MySQL's
+// table-scoped naming gives it. The PostgreSQL counterpart carries a different
+// name because its index names are schema-wide; the schema parity tests pin it
+// by shape rather than by name.
+func TestApplyExpiryOrderingIsIndexed(t *testing.T) {
+	ctx := t.Context()
+
+	rows, err := testDB.QueryContext(ctx, `
+		SELECT COLUMN_NAME FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'applies' AND INDEX_NAME = 'idx_state_updated'
+		ORDER BY SEQ_IN_INDEX`)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rows)
+
+	var indexColumns []string
+	for rows.Next() {
+		var column string
+		require.NoError(t, rows.Scan(&column))
+		indexColumns = append(indexColumns, column)
+	}
+	require.NoError(t, rows.Err())
+
+	assert.Equal(t, []string{"state", "updated_at"}, indexColumns,
+		"the expiry ordering needs an index on exactly its filter and ordering columns, in that order")
 }

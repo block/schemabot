@@ -139,12 +139,10 @@ func (stubApplyOperationStore) ReleaseFinishedClaim(context.Context, storage.Ope
 
 type staticApplyOperationStore struct {
 	stubApplyOperationStore
-	operations      []*storage.ApplyOperation
-	err             error
-	resumeStateByOp map[int64]*storage.EngineResumeState
-	resumeStateErr  error
-	reaped          []*storage.ReapedOperation
-	reapErr         error
+	operations []*storage.ApplyOperation
+	err        error
+	reaped     []*storage.ReapedOperation
+	reapErr    error
 }
 
 func (s *staticApplyOperationStore) Get(_ context.Context, id int64) (*storage.ApplyOperation, error) {
