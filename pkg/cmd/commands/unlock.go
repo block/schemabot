@@ -12,7 +12,7 @@ import (
 // UnlockCmd releases a database lock.
 type UnlockCmd struct {
 	Database string `short:"d" required:"" help:"Database name"`
-	Type     string `short:"t" help:"Database type: mysql, vitess, strata, or postgres" default:"mysql"`
+	Type     string `short:"t" help:"Database type registered with the server" default:"mysql"`
 	Force    bool   `help:"Force release lock (bypass ownership check)"`
 }
 

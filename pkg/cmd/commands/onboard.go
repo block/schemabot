@@ -11,6 +11,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -204,8 +205,10 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 	if strings.TrimSpace(resp.Database) == "" {
 		return nil, fmt.Errorf("pull schema response database is empty")
 	}
-	if resp.Type != storage.DatabaseTypeMySQL && resp.Type != storage.DatabaseTypeVitess {
-		return nil, fmt.Errorf("onboard currently supports %s and %s databases; got %s", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, resp.Type)
+	switch resp.Type {
+	case storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypePostgres:
+	default:
+		return nil, fmt.Errorf("onboard currently supports %s, %s, and %s databases; got %s", storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypePostgres, resp.Type)
 	}
 	if len(resp.Namespaces) == 0 {
 		return nil, fmt.Errorf("pull schema returned no tables for database %s environment %s", resp.Database, resp.Environment)
@@ -220,6 +223,9 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 		namespaces = append(namespaces, namespace)
 	}
 	sort.Strings(namespaces)
+	if err := rejectCaseCollisions("namespace", namespaces); err != nil {
+		return nil, err
+	}
 	for _, namespace := range namespaces {
 		if err := validateRelativePathPart("namespace", namespace); err != nil {
 			return nil, err
@@ -229,13 +235,16 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 			return nil, fmt.Errorf("pulled namespace %s is empty", namespace)
 		}
 		if len(pulled.Tables) == 0 && len(pulled.Artifacts) == 0 {
-			return nil, fmt.Errorf("pulled namespace %s contains no tables or artifacts", namespace)
+			files[filepath.Join(namespace, "schema.sql")] = schema.EmptyNamespaceDeclaration
 		}
 		tableNames := make([]string, 0, len(pulled.Tables))
 		for tableName := range pulled.Tables {
 			tableNames = append(tableNames, tableName)
 		}
 		sort.Strings(tableNames)
+		if err := rejectCaseCollisions("table in "+namespace, tableNames); err != nil {
+			return nil, err
+		}
 		for _, tableName := range tableNames {
 			if err := validateRelativePathPart("table", tableName); err != nil {
 				return nil, err
@@ -248,6 +257,19 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 	}
 
 	return &onboardWritePlan{root: root, databaseType: resp.Type, files: files, ignoreNamespaces: ignoreNamespaces}, nil
+}
+
+// Generated paths must remain distinct on case-insensitive filesystems too.
+func rejectCaseCollisions(kind string, names []string) error {
+	seen := make(map[string]string, len(names))
+	for _, name := range names {
+		folded := strings.ToLower(name)
+		if previous, exists := seen[folded]; exists {
+			return fmt.Errorf("%s names %q and %q would collide on a case-insensitive filesystem; schema files must be portable across checkouts, so choose names that differ beyond letter case before onboarding", kind, previous, name)
+		}
+		seen[folded] = name
+	}
+	return nil
 }
 
 func onboardConfigYAML(database, databaseType string, ignoreNamespaces []string) string {

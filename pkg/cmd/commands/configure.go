@@ -2,9 +2,12 @@ package commands
 
 import (
 	"bufio"
+	"context"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -19,7 +22,9 @@ type ConfigureCmd struct {
 }
 
 // ConfigureSetupCmd is the default configure command (interactive profile setup).
-type ConfigureSetupCmd struct{}
+type ConfigureSetupCmd struct {
+	input io.Reader
+}
 
 // Run executes the configure command (interactive profile setup).
 func (cmd *ConfigureSetupCmd) Run(g *Globals) error {
@@ -35,9 +40,13 @@ func (cmd *ConfigureSetupCmd) Run(g *Globals) error {
 	}
 
 	// Get existing profile values for defaults
-	existingProfile := cfg.Profiles[profileName]
+	existingProfile, existed := cfg.Profiles[profileName]
 
-	reader := bufio.NewReader(os.Stdin)
+	input := cmd.input
+	if input == nil {
+		input = os.Stdin
+	}
+	reader := bufio.NewReader(input)
 
 	// Prompt for endpoint
 	defaultEndpoint := existingProfile.Endpoint
@@ -51,20 +60,25 @@ func (cmd *ConfigureSetupCmd) Run(g *Globals) error {
 		endpoint = defaultEndpoint
 	}
 
-	profile, loginCleared := reconfiguredProfile(existingProfile, endpoint)
-	cfg.Profiles[profileName] = profile
-	if loginCleared {
-		fmt.Printf("\nEndpoint changed; the cached login for %s was cleared. Run `%s login` to sign in to the new endpoint.\n", existingProfile.Endpoint, cliname.Name())
-	}
-
-	// If this is the first profile or named "default", set as default
-	if cfg.DefaultProfile == "" || profileName == "default" {
-		cfg.DefaultProfile = profileName
-	}
-
-	// Save config
-	if err := client.SaveConfig(cfg); err != nil {
+	var loginCleared bool
+	if err := client.UpdateConfig(context.Background(), func(latest *client.Config) error {
+		current, exists := latest.Profiles[profileName]
+		if exists != existed || !sameEndpoint(current.Endpoint, existingProfile.Endpoint) || current.LocalRuntime != existingProfile.LocalRuntime || !reflect.DeepEqual(current.OIDC, existingProfile.OIDC) {
+			return fmt.Errorf("profile %q changed its connection while configure was open; your newer settings were preserved. Run `%s configure` again to review them", profileName, cliname.Name())
+		}
+		var profile client.Profile
+		profile, loginCleared = reconfiguredProfile(current, endpoint)
+		latest.Profiles[profileName] = profile
+		if latest.DefaultProfile == "" || profileName == "default" {
+			latest.DefaultProfile = profileName
+		}
+		cfg = latest
+		return nil
+	}); err != nil {
 		return fmt.Errorf("save config: %w", err)
+	}
+	if loginCleared {
+		fmt.Printf("\nEndpoint changed; the cached login was cleared. Run `%s login` to sign in to the new endpoint.\n", cliname.Name())
 	}
 
 	configPath, _ := client.ConfigPath()

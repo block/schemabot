@@ -565,6 +565,10 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 		CommandName:  commandName,
 	}
 
+	if config := h.config(); config != nil {
+		data.ExperimentalStrataEnabled = config.ExperimentalStrataEnabled
+	}
+
 	logFields := []any{
 		"repo", repo, "pr", pr, "environment", environment,
 		"database", databaseName, "action", commandName, "error", err,
