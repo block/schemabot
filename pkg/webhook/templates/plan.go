@@ -27,6 +27,7 @@ type LintViolationData struct {
 type UnsafeChangeData struct {
 	Table  string
 	Reason string
+	DDL    string
 	// ChangeType is the engine's change type (e.g. "drop"), rendered when the
 	// change carries no parseable reason so the finding still explains itself.
 	ChangeType string
@@ -338,7 +339,7 @@ func RenderPlanComment(data PlanCommentData) string {
 	// operator acknowledged them with --allow-unsafe (apply-confirm re-checks
 	// and blocks otherwise), so repeating them there is noise.
 	if data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 && !data.IsLocked {
-		writeUnsafeWarning(&sb, data.UnsafeChanges, data.IsMySQL)
+		writeUnsafeWarning(&sb, data.UnsafeChanges, data.DatabaseType, data.IsMySQL)
 	}
 
 	// Lint violations — shown on the plan comment for review, omitted on the
@@ -1117,7 +1118,7 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 	sb.WriteString("\n" + footer + "\n\n")
 }
 
-func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, isMySQL bool) {
+func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, databaseType string, isMySQL bool) {
 	n := countUnsafeFindings(changes)
 	fmt.Fprintf(sb, glyph.Attention+" **Issues**: %d unsafe %s detected\n", n, pluralize("change", n))
 	item := 0
@@ -1129,7 +1130,7 @@ func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, isMySQL
 		writeUnsafeChangeItem(sb, &item, table, c.Reason, c.ChangeType)
 	}
 	sb.WriteString("\n")
-	writeUnsafeDropGuidance(sb, changes, isMySQL)
+	writeUnsafeDropGuidance(sb, changes, databaseType, isMySQL)
 }
 
 // writeUnsafeChangeItem writes one table's unsafe findings, one numbered line
@@ -1173,9 +1174,10 @@ func countUnsafeFindings(changes []UnsafeChangeData) int {
 	return n
 }
 
-func writeUnsafeDropGuidance(sb *strings.Builder, changes []UnsafeChangeData, isMySQL bool) {
-	applicationUsageTarget, hasApplicationUsageTarget := unsafeDropApplicationUsageTarget(changes)
-	indexActionTarget, indexInvisibleTarget, indexQueryTarget, hasIndexUsageTarget := unsafeDropIndexUsageTargets(changes)
+func writeUnsafeDropGuidance(sb *strings.Builder, changes []UnsafeChangeData, databaseType string, isMySQL bool) {
+	drops := countUnsafeDrops(changes, databaseType)
+	applicationUsageTarget, hasApplicationUsageTarget := unsafeDropApplicationUsageTarget(drops)
+	indexActionTarget, indexInvisibleTarget, indexQueryTarget, hasIndexUsageTarget := unsafeDropIndexUsageTargets(drops)
 	if !hasApplicationUsageTarget && !hasIndexUsageTarget {
 		return
 	}
@@ -1193,15 +1195,8 @@ func writeUnsafeDropGuidance(sb *strings.Builder, changes []UnsafeChangeData, is
 	}
 }
 
-func unsafeDropApplicationUsageTarget(changes []UnsafeChangeData) (string, bool) {
-	dropColumns := 0
-	dropTables := 0
-	for _, change := range changes {
-		upperReason := strings.ToUpper(change.Reason)
-		dropColumns += strings.Count(upperReason, "DROP COLUMN")
-		dropTables += strings.Count(upperReason, "DROP TABLE")
-	}
-
+func unsafeDropApplicationUsageTarget(drops unsafeDropCounts) (string, bool) {
+	dropColumns, dropTables := drops.columns, drops.tables
 	if dropColumns > 1 && dropTables > 1 {
 		return "any dropped tables or columns", true
 	}
@@ -1229,19 +1224,76 @@ func unsafeDropApplicationUsageTarget(changes []UnsafeChangeData) (string, bool)
 	return "", false
 }
 
-func unsafeDropIndexUsageTargets(changes []UnsafeChangeData) (actionTarget, invisibleTarget, queryTarget string, ok bool) {
-	dropIndexes := 0
-	for _, change := range changes {
-		dropIndexes += strings.Count(strings.ToUpper(change.Reason), "DROP INDEX")
-	}
-
-	if dropIndexes == 1 {
+func unsafeDropIndexUsageTargets(drops unsafeDropCounts) (actionTarget, invisibleTarget, queryTarget string, ok bool) {
+	if drops.indexes == 1 {
 		return "an index", "the dropped index", "it", true
 	}
-	if dropIndexes > 1 {
+	if drops.indexes > 1 {
 		return "indexes", "any dropped indexes", "them", true
 	}
 	return "", "", "", false
+}
+
+// unsafeDropCounts is what the plan's unsafe changes drop, summed across
+// changes, so the guidance can name the kind of object an application must
+// stop relying on before the drop is allowed.
+type unsafeDropCounts struct {
+	columns int
+	tables  int
+	indexes int
+}
+
+func (c unsafeDropCounts) add(other unsafeDropCounts) unsafeDropCounts {
+	return unsafeDropCounts{columns: c.columns + other.columns, tables: c.tables + other.tables, indexes: c.indexes + other.indexes}
+}
+
+// countUnsafeDrops classifies each unsafe change through the target dialect's
+// parser. A change whose statement is unavailable or does not parse falls
+// back to the words in its reason, so guidance still renders for plans that
+// predate stored DDL.
+func countUnsafeDrops(changes []UnsafeChangeData, databaseType string) unsafeDropCounts {
+	parser, err := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType))
+	if err != nil {
+		slog.Warn("destructive drop guidance falls back to the unsafe reasons because no statement parser serves the database type",
+			"database_type", databaseType, "error", err)
+		parser = nil
+	}
+	var total unsafeDropCounts
+	for _, change := range changes {
+		total = total.add(classifyUnsafeDrops(change, databaseType, parser))
+	}
+	return total
+}
+
+func classifyUnsafeDrops(change UnsafeChangeData, databaseType string, parser ddl.StatementParser) unsafeDropCounts {
+	if parser != nil && strings.TrimSpace(change.DDL) != "" {
+		targets, err := parser.DropTargets(change.DDL)
+		if err == nil {
+			return dropCountsWithTableFallback(unsafeDropCounts{columns: targets.Columns, tables: targets.Tables, indexes: targets.Indexes}, change.ChangeType)
+		}
+		slog.Warn("destructive drop guidance falls back to the unsafe reason because the statement did not parse",
+			"table", change.Table, "database_type", databaseType, "error", err)
+	}
+
+	upperReason := strings.ToUpper(change.Reason)
+	return dropCountsWithTableFallback(unsafeDropCounts{
+		columns: strings.Count(upperReason, "DROP COLUMN"),
+		tables:  strings.Count(upperReason, "DROP TABLE"),
+		indexes: strings.Count(upperReason, "DROP INDEX"),
+	}, change.ChangeType)
+}
+
+// dropCountsWithTableFallback counts a table drop for a change whose type is
+// the table drop even when neither its statement nor its reason named one. It
+// is a backstop for a stored change that reaches the renderer with neither a
+// parseable statement nor a reason that spells out DROP TABLE; every engine
+// stores both, so the backstop only matters when a producer omits them.
+// Index drops carry their own change type, so they never take this path.
+func dropCountsWithTableFallback(drops unsafeDropCounts, changeType string) unsafeDropCounts {
+	if strings.EqualFold(changeType, "drop") && drops.tables == 0 {
+		drops.tables++
+	}
+	return drops
 }
 
 // lintWarningsFoldThreshold is the warning count above which the lint section
@@ -1583,7 +1635,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 
 	// Unsafe changes warning
 	if plan.HasUnsafeChanges && len(plan.UnsafeChanges) > 0 {
-		writeUnsafeWarning(sb, plan.UnsafeChanges, plan.IsMySQL)
+		writeUnsafeWarning(sb, plan.UnsafeChanges, plan.DatabaseType, plan.IsMySQL)
 	}
 
 	// Lint violations

@@ -87,6 +87,35 @@ func (postgresStatementParser) Classify(stmt string) (StatementType, string, err
 	return stmtType, table, nil
 }
 
+func (postgresStatementParser) DropTargets(stmt string) (DropTargets, error) {
+	result, err := pgquery.Parse(stmt)
+	if err != nil {
+		return DropTargets{}, fmt.Errorf("parse drop targets from statement %q: %w", statementPreview(stmt), err)
+	}
+	stmts := result.GetStmts()
+	if len(stmts) != 1 {
+		return DropTargets{}, fmt.Errorf("expected one statement for drop targets, got %d", len(stmts))
+	}
+
+	var targets DropTargets
+	switch node := stmts[0].GetStmt().GetNode().(type) {
+	case *pgproto.Node_DropStmt:
+		switch node.DropStmt.GetRemoveType() {
+		case pgproto.ObjectType_OBJECT_TABLE:
+			targets.Tables = len(node.DropStmt.GetObjects())
+		case pgproto.ObjectType_OBJECT_INDEX:
+			targets.Indexes = len(node.DropStmt.GetObjects())
+		}
+	case *pgproto.Node_AlterTableStmt:
+		for _, cmd := range node.AlterTableStmt.GetCmds() {
+			if cmd.GetAlterTableCmd().GetSubtype() == pgproto.AlterTableType_AT_DropColumn {
+				targets.Columns++
+			}
+		}
+	}
+	return targets, nil
+}
+
 // createSetRelation returns the identity of the relation targeted by a CREATE
 // TABLE or CREATE INDEX statement as the parsed (schema, name) pair. Keeping
 // this narrower than Classify preserves its established bare-table-name

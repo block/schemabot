@@ -1237,10 +1237,12 @@ func (s *Service) createStoredApply(
 ) (*storage.Apply, int64, error) {
 	now := time.Now()
 	applyOpts := storage.ApplyOptionsFromMap(options)
-	if err := rejectUnsafeStoredPlanWithoutOptIn(plan, applyOpts); err != nil {
+	// Blocked changes reject before unsafe changes because no opt-in can make a
+	// statement the engine refuses executable.
+	if err := rejectBlockedStoredPlan(plan); err != nil {
 		return nil, 0, err
 	}
-	if err := rejectBlockedStoredPlan(plan); err != nil {
+	if err := rejectUnsafeStoredPlanWithoutOptIn(plan, applyOpts); err != nil {
 		return nil, 0, err
 	}
 
