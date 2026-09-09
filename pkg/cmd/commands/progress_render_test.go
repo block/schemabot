@@ -37,16 +37,16 @@ func TestProgressRenderingUsesTargetDialect(t *testing.T) {
 			quoted:       true,
 		},
 		{
-			name:         "missing database type keeps MySQL formatting",
+			name:         "missing database type preserves SQL",
 			databaseType: "",
 			dialect:      schema.Dialect(""),
-			quoted:       true,
+			expectedDDL:  rawDDL + ";",
 		},
 		{
-			name:         "unrecognized database type keeps MySQL formatting",
+			name:         "unrecognized database type preserves SQL",
 			databaseType: "spanner",
 			dialect:      schema.Dialect("spanner"),
-			quoted:       true,
+			expectedDDL:  rawDDL + ";",
 		},
 	}
 

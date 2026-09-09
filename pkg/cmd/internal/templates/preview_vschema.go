@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/block/schemabot/pkg/cmd/cliname"
+	"github.com/block/schemabot/pkg/schema"
 )
 
 // previewVSchemaPlanOutput shows a plan with both DDL and VSchema changes in one keyspace.
@@ -65,7 +66,7 @@ func previewVSchemaPlanOutput() {
 			VSchemaDiff:    vschemaChanges[0].Diff,
 		},
 	}
-	WriteNamespaceChanges(namespaces, false, "testapp-vitess")
+	WriteNamespaceChanges(namespaces, false, "testapp-vitess", schema.DialectMySQL)
 	WritePlanSummaryWithVSchema(changes, vschemaChanges)
 }
 
@@ -111,7 +112,7 @@ func previewVSchemaOnlyOutput() {
 			VSchemaDiff:    vschemaChanges[0].Diff,
 		},
 	}
-	WriteNamespaceChanges(namespaces, false, "testapp-vitess")
+	WriteNamespaceChanges(namespaces, false, "testapp-vitess", schema.DialectMySQL)
 	WritePlanSummaryWithVSchema(nil, vschemaChanges)
 }
 
@@ -188,6 +189,6 @@ func previewMultiKeyspacePlanOutput() {
 			VSchemaDiff:    vsDiffByKS["testapp"],
 		},
 	}
-	WriteNamespaceChanges(namespaces, false, "testapp-vitess")
+	WriteNamespaceChanges(namespaces, false, "testapp-vitess", schema.DialectMySQL)
 	WritePlanSummaryWithVSchema(changes, vschemaChanges)
 }

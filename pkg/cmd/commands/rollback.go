@@ -77,26 +77,7 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 		fmt.Println("No changes. Schema is already at the original state.")
 		return nil
 	}
-	tables := planResult.FlatTables()
-
-	// Step 2: Show the rollback plan
-	fmt.Println()
-	fmt.Println("Rollback Plan")
-	fmt.Println("=============")
-	fmt.Printf("Database: %s\n", database)
-	fmt.Printf("Environment: %s\n", environment)
-	fmt.Println()
-	fmt.Println("The following changes will be applied to rollback:")
-	fmt.Println()
-	for _, tbl := range tables {
-		fmt.Printf("  %s (%s):\n", tbl.TableName, tbl.ChangeType)
-		fmt.Printf("    %s\n", tbl.DDL)
-	}
-	for _, sc := range planResult.Changes {
-		if sc.HasVSchemaChange() {
-			fmt.Printf("  %s: VSchema update\n", sc.Namespace)
-		}
-	}
+	templates.WriteRollbackPlan(planResult, cmd.ApplyID)
 
 	// Disclose unsafe changes before the confirmation prompt. Rollback has no
 	// --allow-unsafe flag; the interactive confirmation is the acknowledgment.
