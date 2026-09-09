@@ -21,7 +21,7 @@ func TestInitAdaptivePasteOnlySavesAfterConfirmation(t *testing.T) {
 	t.Setenv("DATABASE_URL", "")
 	cmd := InitCmd{Type: "mysql", Database: "shop", Runtime: "demo", Namespaces: []string{"shop"}, SchemaDir: filepath.Join(t.TempDir(), "schema")}
 	m := newInitWizard(&cmd, "demo", io.Discard)
-	require.Equal(t, 3, m.step)
+	require.Equal(t, stepDSN, m.step)
 	require.Contains(t, m.contentView(), "Paste a connection string")
 	wizardKey(m, tea.KeyEnter)
 	require.Equal(t, textinput.EchoPassword, m.input.EchoMode)
@@ -143,7 +143,7 @@ func TestInitPasteBackToConnectionChoices(t *testing.T) {
 	require.Contains(t, stripANSI(m.View()), "shift+tab back")
 	wizardKey(m, tea.KeyShiftTab)
 	require.Equal(t, "menu", m.connectionEditor.mode)
-	require.Equal(t, 3, m.step)
+	require.Equal(t, stepDSN, m.step)
 	require.False(t, m.cancelled)
 	require.NotContains(t, m.View(), "private-password")
 	wizardKey(m, tea.KeyDown)
@@ -186,14 +186,14 @@ func TestInitConnectionAutoAdvance(t *testing.T) {
 			}
 			m.Update(initConnectionAdvanceMsg{generation: generation, step: 3})
 			if action == "advance" {
-				require.Equal(t, 4, m.step)
+				require.Equal(t, stepStorageDSN, m.step)
 				require.Contains(t, stripANSI(m.View()), "✓ Database connected")
-				require.Equal(t, "env:DATABASE_URL", m.fields[3].value)
+				require.Equal(t, "env:DATABASE_URL", m.fields[stepDSN].value)
 				require.False(t, m.confirmed)
 				m.Update(initConnectionAdvanceMsg{generation: generation, step: 3})
-				require.Equal(t, 4, m.step)
+				require.Equal(t, stepStorageDSN, m.step)
 			} else {
-				require.Equal(t, 3, m.step)
+				require.Equal(t, stepDSN, m.step)
 			}
 		})
 	}

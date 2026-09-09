@@ -46,7 +46,7 @@ func (m *initWizard) useDraftConnection(dsn string) tea.Cmd {
 	m.draftConnections[ref] = dsn
 	m.input.SetValue(ref)
 	m.input.EchoMode = textinput.EchoNormal
-	m.connectionSummary = initConnectionDestination(m.fields[0].value, dsn)
+	m.connectionSummary = initConnectionDestination(m.fields[stepEngine].value, dsn)
 	m.connectionEditor.mode = "ready"
 	return tea.Batch(m.checkConnection(), m.spinner.Tick)
 }
@@ -104,7 +104,7 @@ func (m *initWizard) connectionKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 						return true, nil
 					}
 					m.input.SetValue(m.fields[m.step].value)
-					m.connectionSummary = initConnectionDestination(m.fields[0].value, dsn)
+					m.connectionSummary = initConnectionDestination(m.fields[stepEngine].value, dsn)
 					e.mode = "ready"
 					return true, tea.Batch(m.checkConnection(), m.spinner.Tick)
 				}
@@ -121,7 +121,7 @@ func (m *initWizard) connectionKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 				e.mode = "details"
 				e.detail = 0
 				e.values = [5]string{"localhost", "3306", "", "", ""}
-				if m.fields[0].value == "postgres" {
+				if m.fields[stepEngine].value == "postgres" {
 					e.values[1] = "5432"
 				}
 				m.loadConnectionDetail()
@@ -141,7 +141,7 @@ func (m *initWizard) connectionKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 		return false, nil
 	}
 	if e.mode == "paste" {
-		value, err := normalizeInitConnection(m.fields[0].value, strings.TrimSpace(m.input.Value()))
+		value, err := normalizeInitConnection(m.fields[stepEngine].value, strings.TrimSpace(m.input.Value()))
 		if err != nil {
 			m.err = err.Error()
 			return true, nil
@@ -169,7 +169,7 @@ func (m *initWizard) connectionKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 			return true, textinput.Blink
 		}
 		var dsn string
-		if m.fields[0].value == "mysql" {
+		if m.fields[stepEngine].value != "postgres" {
 			cfg := mysql.NewConfig()
 			cfg.Net = "tcp"
 			cfg.Addr = net.JoinHostPort(e.values[0], e.values[1])
@@ -204,7 +204,7 @@ func (m *initWizard) connectionEditorView() string {
 			}
 			dsn, err := m.resolveConnection(ref)
 			if err == nil {
-				b.WriteString(initConnectionDestination(m.fields[0].value, dsn) + "\n")
+				b.WriteString(initConnectionDestination(m.fields[stepEngine].value, dsn) + "\n")
 			}
 			b.WriteString("\n")
 		}

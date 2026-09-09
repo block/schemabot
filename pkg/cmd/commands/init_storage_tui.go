@@ -30,7 +30,7 @@ func (m *initWizard) storageChoiceView() string {
 		b.WriteString(label + "\n  " + muted.Render(choice.hint) + "\n\n")
 	}
 	engine := "MySQL"
-	if m.fields[0].value == "postgres" {
+	if m.fields[stepEngine].value == "postgres" {
 		engine = "PostgreSQL"
 	}
 	if m.integrated {

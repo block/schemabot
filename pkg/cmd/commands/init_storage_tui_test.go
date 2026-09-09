@@ -13,7 +13,7 @@ func TestInitStorageChoices(t *testing.T) {
 		t.Run(engine, func(t *testing.T) {
 			cmd := InitCmd{Type: engine, Namespaces: []string{"app"}, SchemaDir: t.TempDir(), ReuseSchema: true}
 			m := newInitWizard(&cmd, "default", io.Discard)
-			m.step = 4
+			m.step = stepStorageDSN
 			m.loadField()
 			require.True(t, m.integrated)
 			require.Contains(t, m.contentView(), "└── schemabot (new database)")
