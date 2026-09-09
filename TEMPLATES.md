@@ -5578,6 +5578,7 @@ Sequential mode: First complete, second paused by the engine's throttler
        ALTER TABLE `orders` ADD INDEX `idx_user_status`(`user_id`, `status`);
        • Rows: 3,100,000 / 5,000,000
        • ℹ️ Throttled: commit-latency 112.4ms >= 100ms · backing off while database writes commit slowly
+       • Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
 
      ~ products: ⏳ Queued
        ALTER TABLE `products` ADD COLUMN `weight_grams` int DEFAULT 0;

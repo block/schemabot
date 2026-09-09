@@ -792,6 +792,7 @@ func writeThrottleTooltip(b *strings.Builder, t TableProgress) {
 	// engine signal degrades to raw text rather than a wrong explanation.
 	if tip := ui.ThrottleTip(t.ThrottleReason); tip != "" {
 		fmt.Fprintf(b, indentDetail+"%s"+glyph.Info+" Throttled: %s · %s%s\n", ANSIDim, t.ThrottleReason, tip, ANSIReset)
+		fmt.Fprintf(b, indentDetail+"%sDocs: %s%s\n", ANSIDim, ui.ThrottleDocURL, ANSIReset)
 		return
 	}
 	fmt.Fprintf(b, indentDetail+"%s"+glyph.Info+" Throttled: %s%s\n", ANSIDim, t.ThrottleReason, ANSIReset)
