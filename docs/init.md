@@ -54,7 +54,8 @@ the files. A successful setup ends with:
     schemabot plan -s 'schema' -e 'development' --profile 'default'
 ```
 
-An empty namespace gets a comment-only `schema.sql` file that preserves its scope. Add your
+An empty namespace gets an explicit marker in `schema.sql` that preserves its scope. Keep that
+marker until you add your
 first table declaration there when you are ready; setup does not invent a sample table.
 
 If schema files already exist, the review screen explains that they will be verified and reused. It checks their
