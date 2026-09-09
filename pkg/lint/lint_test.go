@@ -183,3 +183,103 @@ func TestToEngineWarnings(t *testing.T) {
 	assert.Equal(t, "email", warnings[0].Column)
 	assert.Equal(t, "orders", warnings[1].Table)
 }
+
+// A declared column written as `boolean NOT NULL DEFAULT FALSE` is stored by
+// MySQL as `tinyint(1) NOT NULL DEFAULT '0'`, so the planner has to read the
+// keyword and the integer as the same default. Reading them as different is the
+// worst shape of planner bug in front of a live database: every plan emits an
+// ALTER that re-stores the value it already holds, the ALTER succeeds, and the
+// next plan emits it again — a schema that never converges and a merge gate
+// that never clears on its own.
+//
+// Integer columns are the ones that store the keyword as exactly 1/0, and they
+// are the only ones that converge here. Other types read the keyword through
+// their own rules — a `year` stores TRUE as 2001, a scaled `decimal` pads it to
+// '1.00', a `bit` stores b'1' — so on those the declared keyword and the stored
+// value stay genuinely different.
+func TestPlanChangesBooleanKeywordDefaultConverges(t *testing.T) {
+	converges := []struct {
+		name     string
+		declared string
+		live     string
+	}{
+		{
+			name:     "FALSE against the stored 0",
+			declared: "`flag` boolean NOT NULL DEFAULT FALSE",
+			live:     "`flag` tinyint(1) NOT NULL DEFAULT '0'",
+		},
+		{
+			name:     "TRUE against the stored 1",
+			declared: "`flag` boolean NOT NULL DEFAULT TRUE",
+			live:     "`flag` tinyint(1) NOT NULL DEFAULT '1'",
+		},
+		{
+			name:     "the keyword in lower case",
+			declared: "`flag` boolean not null default false",
+			live:     "`flag` tinyint(1) NOT NULL DEFAULT '0'",
+		},
+		{
+			name:     "the bool synonym",
+			declared: "`flag` bool NOT NULL DEFAULT FALSE",
+			live:     "`flag` tinyint(1) NOT NULL DEFAULT '0'",
+		},
+		{
+			name:     "a wider integer type",
+			declared: "`flag` int NOT NULL DEFAULT FALSE",
+			live:     "`flag` int NOT NULL DEFAULT '0'",
+		},
+	}
+	for _, tt := range converges {
+		t.Run(tt.name, func(t *testing.T) {
+			current := []table.TableSchema{{Name: "widgets", Schema: tableWithColumn(tt.live)}}
+			desired := []table.TableSchema{{Name: "widgets", Schema: tableWithColumn(tt.declared)}}
+
+			plan, err := PlanChanges(current, desired, nil, New().SpiritConfig())
+			require.NoError(t, err)
+			assert.Empty(t, plan.Statements())
+		})
+	}
+
+	// Reading the keyword and the integer as the same default must not go so far
+	// as to read two genuinely different defaults as the same one. That failure
+	// skips a required ALTER instead of emitting a spurious one, so the column
+	// keeps a value the schema no longer declares — worse than the loop above,
+	// and invisible, because nothing is left for a later plan to re-emit.
+	plans := []struct {
+		name     string
+		declared string
+		live     string
+		want     string
+	}{
+		{
+			name:     "a default that really did change",
+			declared: "`flag` boolean NOT NULL DEFAULT FALSE",
+			live:     "`flag` tinyint(1) NOT NULL DEFAULT '1'",
+			want:     "MODIFY COLUMN `flag` tinyint(1) NOT NULL DEFAULT 0",
+		},
+		{
+			name:     "a quoted string default against the stored 0",
+			declared: "`flag` varchar(8) NOT NULL DEFAULT 'FALSE'",
+			live:     "`flag` varchar(8) NOT NULL DEFAULT '0'",
+			want:     "MODIFY COLUMN `flag` varchar(8) NOT NULL DEFAULT 'FALSE'",
+		},
+	}
+	for _, tt := range plans {
+		t.Run(tt.name+" still plans an alter", func(t *testing.T) {
+			current := []table.TableSchema{{Name: "widgets", Schema: tableWithColumn(tt.live)}}
+			desired := []table.TableSchema{{Name: "widgets", Schema: tableWithColumn(tt.declared)}}
+
+			plan, err := PlanChanges(current, desired, nil, New().SpiritConfig())
+			require.NoError(t, err)
+			require.Len(t, plan.Statements(), 1)
+			assert.Contains(t, plan.Statements()[0], tt.want)
+		})
+	}
+}
+
+// tableWithColumn wraps the column definition under test in a table with a
+// primary key, so each case states only the column it is about.
+func tableWithColumn(column string) string {
+	return "CREATE TABLE `widgets` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, " + column +
+		", PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+}
