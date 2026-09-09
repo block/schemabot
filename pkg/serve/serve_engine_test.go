@@ -4,6 +4,7 @@ import (
 	"errors"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -104,6 +105,29 @@ func TestGRPCLocalClientFactoryConfiguresPostgresTableSizeLimit(t *testing.T) {
 	eng, ok := lc.Engine().(*postgresengine.Engine)
 	require.True(t, ok)
 	assert.Equal(t, limit, eng.TableSizeLimit())
+}
+
+// The data-plane client factory applies the server-level concurrent index
+// bound to every LocalClient it builds, so a configured value governs
+// concurrent builds on the gRPC/router path instead of silently reverting to
+// the default.
+func TestGRPCLocalClientFactoryConfiguresPostgresConcurrentIndexMaxDuration(t *testing.T) {
+	factory := grpcLocalClientFactory(&api.ServerConfig{
+		Postgres: api.PostgresConfig{ConcurrentIndexMaxDuration: "36h"},
+	}, nil, nil)
+
+	client, err := factory(tern.LocalConfig{
+		Database:  "orders",
+		Type:      storage.DatabaseTypePostgres,
+		TargetDSN: "postgres://localhost:5432/orders",
+	}, mysqlstore.New(nil), slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+
+	lc, ok := client.(*tern.LocalClient)
+	require.True(t, ok)
+	eng, ok := lc.Engine().(*postgresengine.Engine)
+	require.True(t, ok)
+	assert.Equal(t, 36*time.Hour, eng.ConcurrentIndexMaxDuration())
 }
 
 // Without a registered engine, the data-plane client factory fails closed for a

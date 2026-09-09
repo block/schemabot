@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/block/pg-sprite/pkg/dbconn"
@@ -33,11 +34,11 @@ const (
 	// Server-side statement/lock timeouts bound queries once a session is
 	// healthy, but they cannot unwedge a hung dial or a black-holed
 	// connection — the ceiling guarantees the drive always reaches a
-	// terminal progress state. Above the worst legitimate run on either
-	// execution path — generously above the retry path's (retry attempts x
-	// statement limit plus backoffs), and above the concurrent index
-	// budget with enough headroom for session setup and the post-failure
-	// catalog verdict — so it only fires on genuine hangs.
+	// terminal progress state. Generously above the worst legitimate run of
+	// the retry path (retry attempts x statement limit plus backoffs) so it
+	// only fires on genuine hangs. A concurrent index build does not run
+	// under this constant: its ceiling is the configured build bound plus
+	// concurrentIndexHeadroom.
 	optimisticApplyCeiling = 5 * time.Minute
 
 	// executorProgressReadTimeout bounds one read of the executor's tracker.
@@ -65,34 +66,35 @@ const (
 	// the socket.
 	executorProgressReadHeadroom = 5 * time.Second
 
-	// concurrentIndexBudget bounds one CREATE INDEX CONCURRENTLY build.
-	// Concurrent builds get their own budget instead of the per-statement
-	// limit: their snapshot waits are lock waits by implementation, so the
-	// executor runs them with lock_timeout disabled under one overall
-	// statement deadline. Deliberately below the apply ceiling so the
-	// server-side deadline fires before the client-side ceiling cancels
-	// the session — exhaustion then surfaces as the typed budget verdict
-	// rather than an ambiguous external cancellation.
-	concurrentIndexBudget = 4 * time.Minute
-
-	// concurrentIndexHeadroom is the least the apply ceiling must exceed
-	// the concurrent index budget by. The ceiling wraps the whole apply,
-	// so the gap has to absorb everything that shares the ceiling with the
-	// build — pool dial, the privilege check, the preflight table read, the
-	// partition admission facts lookup, and the rest of the session setup
-	// executeOptimistic runs before the build — and, after the budget has
-	// already expired, the catalog verdict that names an invalid leftover
-	// index. If the ceiling fires first the verdict has no live context to
-	// run in and the failure degrades to an external cancellation that
-	// names no index, which is the outcome the verdict exists to prevent.
-	concurrentIndexHeadroom = time.Minute
+	// concurrentIndexHeadroom is how far a concurrent index apply's ceiling
+	// sits above the configured build bound. The ceiling wraps the whole
+	// apply while the build bound — the build's server-side statement
+	// timeout, or the recovery's deadline — starts only when the build
+	// starts, so the gap is the time granted to everything executeOptimistic
+	// runs before the build: the pool dial, the privilege check, the
+	// preflight table read and the partition admission facts lookup. As long
+	// as that setup finishes within the headroom, the bound is what ends an
+	// over-long build — the server's timer fires first and exhaustion
+	// surfaces as the typed budget verdict — and the build gets the full
+	// bound the operator configured; setup that outruns the headroom shortens
+	// the build by the excess, because the ceiling then fires first and the
+	// outcome degrades to a cancellation. Nothing after the build
+	// depends on the gap: pg-sprite runs its post-failure catalog verdict on
+	// a detached context of its own, and the terminal publish reads the
+	// tracker the same way. The bound is sized to cover setup even when
+	// every one of its steps runs to the server-side limit the pool sets
+	// for it — the connect timeout for the dial, the statement_timeout for
+	// each preflight read.
+	concurrentIndexHeadroom = 2 * time.Minute
 )
 
 type nativeApply struct {
-	namespace string
-	table     string
-	sql       string
-	steps     int
+	namespace                  string
+	table                      string
+	sql                        string
+	steps                      int
+	concurrentIndex            bool
+	concurrentIndexMaxDuration time.Duration
 }
 
 // targetConn carries one background apply's connection inputs: the raw DSN
@@ -183,7 +185,18 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	if _, err := preflight.RequiredTier(statements); err != nil {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: SchemaBot's PostgreSQL support does not execute this statement shape yet", tc.Table)
 	}
-	return nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL, steps: len(statements)}, nil
+	concurrentIndex := false
+	if len(statements) == 1 {
+		// The tier derivation above parsed this statement already, so a
+		// parse failure here is an invariant guard; the message stays curated
+		// like the refusals above because it reaches the operator surface.
+		statement, err := pgstatement.ParseOne(statements[0])
+		if err != nil {
+			return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned statement could not be classified", tc.Table)
+		}
+		concurrentIndex = statement.Kind() == pgstatement.KindCreateIndex && statement.Concurrent()
+	}
+	return nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL, steps: len(statements), concurrentIndex: concurrentIndex}, nil
 }
 
 // postgresCreateSetStatements parses one statement or a greenfield create set
@@ -203,7 +216,12 @@ func postgresCreateSetStatements(script string) ([]string, error) {
 func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change nativeApply, key string, started time.Time, logger *slog.Logger, tracker *progress.Tracker) {
 	// The context arrives detached from the caller (an accepted apply must
 	// survive the request), so boundedness comes from the ceiling instead.
-	ctx, cancel := context.WithTimeout(ctx, optimisticApplyCeiling)
+	ceiling := optimisticApplyCeiling
+	if change.concurrentIndex {
+		ceiling = e.concurrentIndexMaxDuration + concurrentIndexHeadroom
+		change.concurrentIndexMaxDuration = e.concurrentIndexMaxDuration
+	}
+	ctx, cancel := context.WithTimeout(ctx, ceiling)
 	defer cancel()
 	// Every terminal result carries the executor's final position: the
 	// executor finishes its tracker before it returns, so the read is
@@ -338,6 +356,14 @@ func invalidIndexAdvice(invalidErr *executor.InvalidIndexError) (cause, remedy s
 	name := fmt.Sprintf("%q.%q", invalidErr.Schema, invalidErr.Index)
 	switch invalidErr.Code() {
 	case executor.CodeInvalidIndexOwnLeftover:
+		// A leftover the bound's statement timeout produced says so: the
+		// retry rebuilds under the same bound, so the operator's step is to
+		// raise it, and the budget the verdict carries is that bound.
+		var budgetErr *executor.BudgetError
+		if errors.As(invalidErr.Build, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
+			return fmt.Sprintf("this build left its own invalid index %s on the target after running past %s (%s)", name, concurrentIndexBoundOption, budgetErr.Budget),
+				fmt.Sprintf("the retry removes it and rebuilds the index under the same bound, so raise %s first; drop it yourself only if the retries are exhausted", concurrentIndexBoundOption)
+		}
 		return fmt.Sprintf("this build left its own invalid index %s on the target", name),
 			"the retry removes it and rebuilds the index; drop it yourself only if the retries are exhausted"
 	case executor.CodeInvalidIndexAbandoned:
@@ -500,6 +526,17 @@ func refusalForCause(err error, table string) *refusal {
 			r.cause, r.remedy = invalidIndexAdvice(invalidErr)
 		}
 		return r
+	}
+	// A concurrent build that ran past its bound and provably left nothing
+	// is refused like any other statement exhaustion — retrying unchanged
+	// spends the same bound again — but names the option that grants more
+	// time, since the bound is the operator's to set. The wrapper is decided
+	// on its own: the bound also ends the executor's catalog reads ahead of
+	// the build, which carry no typed budget verdict.
+	var boundErr *concurrentIndexBoundError
+	if errors.As(err, &boundErr) {
+		return &refusal{reason: "concurrent-index-bound-exceeded", cause: boundErr.Error(),
+			remedy: fmt.Sprintf("raise %s and re-run", concurrentIndexBoundOption)}
 	}
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
@@ -710,7 +747,7 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 			return fmt.Errorf("admit statement for partitioned PostgreSQL table %q: %w", change.table, err)
 		}
 	}
-	if statement.Kind() == pgstatement.KindCreateIndex && statement.Concurrent() {
+	if change.concurrentIndex {
 		// A concurrent build cannot run inside a transaction block, so it
 		// must not reach the transactional optimistic executor.
 		return buildIndexConcurrently(ctx, pool, change, tracker, logger)
@@ -796,7 +833,7 @@ func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, 
 // typed it.
 //
 // A leftover this drive's own build produced is not recovered here. Its
-// build just ran under the budget this drive holds, and a rebuild inside
+// build just ran under the bound this drive holds, and a rebuild inside
 // the same apply ceiling could only degrade to an external cancellation that
 // names nothing; the failure stays operational and retryable, and the next
 // drive meets the leftover as abandoned debris and recovers it.
@@ -807,32 +844,56 @@ func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, 
 // it acted on, so the operator detail still names the index the retry acts
 // on.
 func buildIndexConcurrently(ctx context.Context, pool *pgxpool.Pool, change nativeApply, tracker *progress.Tracker, logger *slog.Logger) error {
+	if change.concurrentIndexMaxDuration <= 0 {
+		// The bound is the build's server-side statement timeout and the
+		// recovery's only deadline; a non-positive one would be refused by
+		// the executor as unbounded, or end every recovery before it starts
+		// and report it as a cancellation, so an unset bound is refused
+		// before any session is acquired. The drive cannot reach this
+		// branch — the engine constructor normalizes its option and
+		// runOptimisticApply stamps the result on every change — so it
+		// guards a nativeApply built without going through the drive.
+		return fmt.Errorf("build PostgreSQL index concurrently on table %q: build bound is unset", change.table)
+	}
+	// The build runs under a server-side statement_timeout of the configured
+	// bound, with the apply ceiling — the bound plus the setup headroom — as
+	// the client-side backstop above it. The server's timer is what ends an
+	// over-long build, so exhaustion arrives as the executor's typed budget
+	// verdict rather than an ambiguous cancellation, and a cancel request
+	// that never reaches the server still cannot leave the statement running
+	// unbounded on the target.
+	start := time.Now()
 	_, err := executor.BuildIndexConcurrentlyWithProgress(ctx, pool, change.sql,
-		executor.ConcurrentBudget{Overall: concurrentIndexBudget}, tracker)
+		executor.ConcurrentBudget{Overall: change.concurrentIndexMaxDuration}, tracker)
 	if err == nil {
 		return nil
 	}
 	var invalidErr *executor.InvalidIndexError
 	if !errors.As(err, &invalidErr) || !abandonedBeforeBuild(invalidErr) {
-		return fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", change.table, err)
+		return fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", change.table,
+			nameConcurrentIndexBound(err, change.concurrentIndexMaxDuration, time.Since(start)))
 	}
 	logger.Info("PostgreSQL concurrent index build found an abandoned invalid index under the requested name or quarantined on the table; recovering it before the build",
 		"namespace", change.namespace, "table", change.table,
 		"index_schema", invalidErr.Schema, "index", invalidErr.Index, "verdict", invalidErr.Code())
 
 	// The recovery is one envelope — abandonment proof, quarantine drops,
-	// then the build — bounded as a whole by the same budget a plain build
-	// gets, so the ceiling headroom pinned for the build holds for the
-	// recovery too. The executor's served mode would spend that budget once
-	// on the drops and once more on the build; caller-owned mode makes this
-	// deadline the only bound on both, and the build's own catalog verdict
-	// still runs after it on the executor's detached context. Caller-owned
-	// mode runs the drops and the build with no server-side statement
-	// timeout, so this deadline is the only thing that ends them: a
-	// cancellation the server never receives leaves the statement running
-	// on the target until it finishes on its own, bounded only by the lock
-	// timeouts the recovery sets for itself.
-	recoveryCtx, cancel := context.WithTimeout(ctx, concurrentIndexBudget)
+	// then the build — bounded as a whole by one deadline of the configured
+	// bound, so the ceiling headroom pinned for the build holds for the
+	// recovery too. The executor's served mode would spend that bound once
+	// on the drops and once more on the build, which no ceiling built on a
+	// single bound can hold; caller-owned mode makes this deadline the only
+	// bound on both, and the build's own catalog verdict still runs after it
+	// on the executor's detached context. Caller-owned mode runs the drops
+	// and the build with no server-side statement timeout, so a cancellation
+	// the server never receives leaves the statement running on the target
+	// until it finishes on its own, bounded only by the lock timeouts the
+	// recovery sets for itself. The refused build charged only catalog reads
+	// against the ceiling, so the recovery starts with the full bound ahead
+	// of it; that rests on abandonedBeforeBuild admitting only verdicts with
+	// no build attached, since a verdict reached after a build ran would
+	// arrive here with the bound already spent once.
+	recoveryCtx, cancel := context.WithTimeout(ctx, change.concurrentIndexMaxDuration)
 	defer cancel()
 	report, err := executor.RebuildAbandonedIndex(recoveryCtx, pool, change.sql,
 		executor.ConcurrentBudget{CallerOwned: true})
@@ -889,6 +950,66 @@ func (e *indexRecoveryError) Error() string {
 }
 
 func (e *indexRecoveryError) Unwrap() error { return e.err }
+
+// concurrentIndexBoundOption is the configuration key an operator changes
+// when a concurrent index build needs more time than the bound allows.
+const concurrentIndexBoundOption = "postgres.concurrent_index_max_duration"
+
+// concurrentIndexBoundError reports that a concurrent index build ran past
+// the configured bound. pg-sprite types the exhaustion as a statement budget
+// verdict, whose text reads like the per-statement budget an ordinary
+// native-safe statement runs under; this wrapper names the option the
+// operator changes instead. The verdict stays reachable to errors.As, so an
+// invalid-index verdict wrapping the same exhaustion is still decided by its
+// own code.
+type concurrentIndexBoundError struct {
+	bound time.Duration
+	err   error
+}
+
+func (e *concurrentIndexBoundError) Error() string {
+	return fmt.Sprintf("the concurrent index build ran past %s (%s) and was cancelled", concurrentIndexBoundOption, e.bound)
+}
+
+func (e *concurrentIndexBoundError) Unwrap() error { return e.err }
+
+// sqlstateQueryCanceled is the SQLSTATE the server raises when a statement
+// is cancelled, whether by its statement_timeout or by a cancel request.
+const sqlstateQueryCanceled = "57014"
+
+// nameConcurrentIndexBound wraps a build failure caused by the bound's
+// statement timeout firing so the operator detail names the option; every
+// other failure passes through unchanged. A lock budget cannot be the cause
+// here — the build runs with lock_timeout disabled — so only the statement
+// cause is the bound's.
+//
+// The bound is the build session's statement_timeout, so its timer ends
+// whichever statement the session is running when it fires. For the build
+// itself the executor types that as its statement budget verdict. For the
+// catalog reads the executor runs in the same session ahead of the build —
+// resolving the target, inspecting the requested name for an invalid entry,
+// listing quarantined debris — the cancellation comes back as the server's
+// raw query_canceled, and it is the bound's only when the bound has elapsed
+// since the build was requested, since the timer cannot fire sooner; a raw
+// cancellation before that came from outside the bound and passes through.
+// A cancellation the executor already attributed to the caller or to an
+// outside party keeps that attribution. pg-sprite typing its pre-build
+// reads under the served budget as the same statement budget verdict
+// retires the raw-code arm.
+func nameConcurrentIndexBound(err error, bound, elapsed time.Duration) error {
+	var budgetErr *executor.BudgetError
+	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
+		return &concurrentIndexBoundError{bound: bound, err: err}
+	}
+	if errors.Is(err, executor.ErrCancelledByCaller) || errors.Is(err, executor.ErrCancelledExternally) {
+		return err
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == sqlstateQueryCanceled && elapsed >= bound {
+		return &concurrentIndexBoundError{bound: bound, err: err}
+	}
+	return err
+}
 
 // recoveryContextDetail prefixes an operator-facing detail with the abandoned
 // invalid index a failed recovery was clearing, so a failure typed without
