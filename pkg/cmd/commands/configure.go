@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -20,7 +22,9 @@ type ConfigureCmd struct {
 }
 
 // ConfigureSetupCmd is the default configure command (interactive profile setup).
-type ConfigureSetupCmd struct{}
+type ConfigureSetupCmd struct {
+	input io.Reader
+}
 
 // Run executes the configure command (interactive profile setup).
 func (cmd *ConfigureSetupCmd) Run(g *Globals) error {
@@ -36,9 +40,13 @@ func (cmd *ConfigureSetupCmd) Run(g *Globals) error {
 	}
 
 	// Get existing profile values for defaults
-	existingProfile := cfg.Profiles[profileName]
+	existingProfile, existed := cfg.Profiles[profileName]
 
-	reader := bufio.NewReader(os.Stdin)
+	input := cmd.input
+	if input == nil {
+		input = os.Stdin
+	}
+	reader := bufio.NewReader(input)
 
 	// Prompt for endpoint
 	defaultEndpoint := existingProfile.Endpoint
@@ -54,8 +62,12 @@ func (cmd *ConfigureSetupCmd) Run(g *Globals) error {
 
 	var loginCleared bool
 	if err := client.UpdateConfig(context.Background(), func(latest *client.Config) error {
+		current, exists := latest.Profiles[profileName]
+		if exists != existed || !sameEndpoint(current.Endpoint, existingProfile.Endpoint) || current.LocalRuntime != existingProfile.LocalRuntime || !reflect.DeepEqual(current.OIDC, existingProfile.OIDC) {
+			return fmt.Errorf("profile %q changed its connection while configure was open; your newer settings were preserved. Run `%s configure` again to review them", profileName, cliname.Name())
+		}
 		var profile client.Profile
-		profile, loginCleared = reconfiguredProfile(latest.Profiles[profileName], endpoint)
+		profile, loginCleared = reconfiguredProfile(current, endpoint)
 		latest.Profiles[profileName] = profile
 		if latest.DefaultProfile == "" || profileName == "default" {
 			latest.DefaultProfile = profileName
