@@ -116,12 +116,12 @@ func (ic *InstallationClient) FetchConfig(ctx context.Context, repo, configPath,
 		return nil, fmt.Errorf("invalid schemabot.yaml at %s: database is required", configPath)
 	}
 	if config.Type == "" {
-		return nil, fmt.Errorf("invalid schemabot.yaml at %s: type is required (must be 'vitess', 'mysql', 'strata', or 'postgres')", configPath)
+		return nil, fmt.Errorf("invalid schemabot.yaml at %s: type is required; copy the type from this database's server registration (normally 'mysql', 'postgres', or 'vitess')", configPath)
 	}
 	switch config.Type {
 	case DatabaseTypeVitess, DatabaseTypeMySQL, DatabaseTypeStrata, DatabaseTypePostgres:
 	default:
-		return nil, fmt.Errorf("invalid schemabot.yaml at %s: type must be 'vitess', 'mysql', 'strata', or 'postgres', got '%s'", configPath, declaredType)
+		return nil, fmt.Errorf("invalid schemabot.yaml at %s: unknown type '%s'; copy the type from this database's server registration (normally 'mysql', 'postgres', or 'vitess')", configPath, declaredType)
 	}
 	if err := schema.ValidateIgnoreNamespaces(config.IgnoreNamespaces); err != nil {
 		return nil, fmt.Errorf("invalid schemabot.yaml at %s: %w", configPath, err)

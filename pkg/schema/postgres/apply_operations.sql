@@ -9,6 +9,7 @@ CREATE TABLE apply_operations (
   external_operation_id varchar(255) DEFAULT NULL,
   engine_resume_context varchar(255) DEFAULT NULL,
   engine_resume_metadata jsonb DEFAULT NULL,
+  progress_metadata jsonb DEFAULT NULL,
   state varchar(100) NOT NULL DEFAULT 'pending',
   error_message text,
   cutover_policy varchar(16) NOT NULL DEFAULT 'rolling',

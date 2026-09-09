@@ -166,7 +166,7 @@ func (c *ServerConfig) PRCommandAuthorizedPrincipals(repo, database string) (ope
 		}
 		return dst
 	}
-	if db, ok := c.Databases[database]; ok {
+	if db, ok := c.DatabaseConfigs()[database]; ok {
 		operators = add(operators, db.OperatorTeams)
 		operators = add(operators, db.OperatorUsers)
 	}

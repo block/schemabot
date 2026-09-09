@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -288,10 +287,14 @@ func progressOperationsFromRows(ops []*storage.ApplyOperation) ([]*apitypes.Prog
 	return responses, deploymentByOperationID
 }
 
-func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *storage.Apply) ([]*apitypes.ProgressOperationResponse, map[int64]string, bool) {
+// bestEffortProgressOperations loads the apply's operation rows once and
+// returns every projection the storage-served progress response needs from
+// them: the API operation entries, the operation-id→deployment map, the raw
+// rows (for the stored engine metadata overlay), and the release latch.
+func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *storage.Apply) ([]*apitypes.ProgressOperationResponse, map[int64]string, []*storage.ApplyOperation, bool) {
 	if apply == nil {
 		s.logger.Warn("progress response will omit per-deployment operations: apply is nil")
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
 	operations, deploymentByOperationID, ops, err := s.progressOperationsForApply(ctx, apply)
 	if err != nil {
@@ -300,9 +303,9 @@ func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *stora
 		s.logger.Warn("progress response will omit per-deployment operations",
 			append(apply.LogAttrs(),
 				"error", err)...)
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
-	return operations, deploymentByOperationID, s.resolveReleaseLatch(ctx, apply, ops)
+	return operations, deploymentByOperationID, ops, s.resolveReleaseLatch(ctx, apply, ops)
 }
 
 // handleProgressByApplyID handles GET /api/progress/apply/{apply_id} requests.
@@ -496,53 +499,50 @@ func setRevertSkippedMetadata(resp *apitypes.ProgressResponse, apply *storage.Ap
 	resp.Metadata["revert_skipped"] = "true"
 }
 
-// overlayStoredDisplayMetadata populates the PlanetScale display fields
-// (branch_name, deploy_request_url, is_instant, deferred_deploy) on a progress
-// response served from storage. On the live path these arrive from the engine's
-// progress projection; terminal, stopped, and resuming applies are served from
-// storage without polling the engine, so they are read from the durable engine
-// resume state persisted on the apply's operation. Best-effort: a value already
-// set by the caller is never overwritten, and applies that predate resume-state
-// persistence simply render without these fields.
-func (s *Service) overlayStoredDisplayMetadata(ctx context.Context, resp *apitypes.ProgressResponse, apply *storage.Apply, operationIDs map[int64]string) {
-	if apply == nil || apply.Engine != storage.EnginePlanetScale {
+// overlayStoredDisplayMetadata populates the engine's display metadata on a
+// progress response served from storage. On the live path these fields arrive
+// from the engine's progress projection; terminal, stopped, and resuming
+// applies are served from storage without polling the engine, so they are read
+// from the apply's operation rows: the progress metadata the driver persisted
+// as the engine reported it (phase, step, statement position), and for
+// PlanetScale the deploy display fields (branch_name, deploy_request_url,
+// is_instant, deferred_deploy) decoded from the durable engine resume state,
+// which stay authoritative where both sources carry the same key. Best-effort:
+// a value already set by the caller is never overwritten, and applies that
+// predate persistence simply render without these fields.
+//
+// ops is the apply's operation rows in creation order, as ListByApply returns
+// them. The top-level metadata has one slot per key, so on a multi-operation
+// apply the first-created operation supplies the generic position fields and
+// later operations fill only the keys it left empty — the same operation wins
+// on every poll, so consecutive reads never flip between deployments.
+func overlayStoredDisplayMetadata(resp *apitypes.ProgressResponse, apply *storage.Apply, ops []*storage.ApplyOperation) {
+	if apply == nil {
 		return
 	}
-	for opID := range operationIDs {
-		rs, err := s.storage.ApplyOperations().GetEngineResumeState(ctx, opID)
-		if errors.Is(err, storage.ErrEngineResumeStateNotFound) {
-			// Expected for operations that have not persisted engine state yet
-			// (or predate resume-state persistence) — nothing to overlay.
-			slog.Debug("progress response has no engine resume state to overlay",
-				"apply_id", apply.ApplyIdentifier, "apply_operation_id", opID)
-			continue
-		}
+	for _, op := range ops {
+		metadata, err := op.ParseProgressMetadata()
 		if err != nil {
-			slog.Warn("progress response will omit engine display fields: failed to load engine resume state",
-				"apply_id", apply.ApplyIdentifier,
-				"apply_operation_id", opID,
-				"database", apply.Database,
-				"environment", apply.Environment,
-				"error", err)
-			continue
+			slog.Warn("progress response will omit persisted progress fields: failed to decode progress metadata",
+				append(apply.LogAttrs(), "apply_operation_id", op.ID, "operation_deployment", op.Deployment, "error", err)...)
+			metadata = make(map[string]string)
 		}
-		display, err := tern.PSDisplayMetadata(rs.Metadata)
-		if err != nil {
-			slog.Warn("progress response will omit engine display fields: failed to decode engine resume state",
-				"apply_id", apply.ApplyIdentifier,
-				"apply_operation_id", opID,
-				"database", apply.Database,
-				"environment", apply.Environment,
-				"error", err)
-			continue
+		if apply.Engine == storage.EnginePlanetScale && op.EngineResumeMetadata != "" {
+			display, err := tern.PSDisplayMetadata(op.EngineResumeMetadata)
+			if err != nil {
+				slog.Warn("progress response will omit engine display fields: failed to decode engine resume state",
+					append(apply.LogAttrs(), "apply_operation_id", op.ID, "operation_deployment", op.Deployment, "error", err)...)
+			} else {
+				maps.Copy(metadata, display)
+			}
 		}
-		if len(display) == 0 {
+		if len(metadata) == 0 {
 			continue
 		}
 		if resp.Metadata == nil {
-			resp.Metadata = make(map[string]string, len(display))
+			resp.Metadata = make(map[string]string, len(metadata))
 		}
-		for k, v := range display {
+		for k, v := range metadata {
 			if resp.Metadata[k] == "" {
 				resp.Metadata[k] = v
 			}
@@ -607,16 +607,17 @@ func (s *Service) handleDatabaseHistory(w http.ResponseWriter, r *http.Request) 
 // handleDatabaseEnvironments returns the list of environments for a database.
 // This is used by the CLI to discover environments when -e flag is not specified.
 func (s *Service) handleDatabaseEnvironments(w http.ResponseWriter, r *http.Request) {
+	config := s.config.withDatabaseSnapshot()
 	database := storage.CanonicalKey(r.PathValue("database"))
 	if database == "" {
 		s.writeError(w, http.StatusBadRequest, "database is required")
 		return
 	}
 
-	environments, err := s.config.DatabaseEnvironments(database)
+	environments, err := config.DatabaseEnvironments(database)
 	if err != nil {
-		available := make([]string, 0, len(s.config.Databases))
-		for name := range s.config.Databases {
+		available := make([]string, 0, len(config.DatabaseConfigs()))
+		for name := range config.DatabaseConfigs() {
 			available = append(available, name)
 		}
 		sort.Strings(available)
@@ -635,8 +636,8 @@ func (s *Service) handleDatabaseEnvironments(w http.ResponseWriter, r *http.Requ
 	}
 
 	if len(environments) == 0 {
-		available := make([]string, 0, len(s.config.Databases))
-		for name := range s.config.Databases {
+		available := make([]string, 0, len(config.DatabaseConfigs()))
+		for name := range config.DatabaseConfigs() {
 			available = append(available, name)
 		}
 		sort.Strings(available)
@@ -663,13 +664,14 @@ func (s *Service) handleDatabaseEnvironments(w http.ResponseWriter, r *http.Requ
 // server. It intentionally exposes topology metadata only; connection
 // strings, opaque execution targets, and endpoint addresses stay server-side.
 func (s *Service) handleDatabaseList(w http.ResponseWriter, r *http.Request) {
-	databaseType, err := parseDatabaseListTypeFilter(r, s.config)
+	config := s.config.withDatabaseSnapshot()
+	databaseType, err := parseDatabaseListTypeFilter(r, config)
 	if err != nil {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	name := strings.TrimSpace(r.URL.Query().Get("name"))
-	resp, err := databaseListResponse(s.config, databaseType, name)
+	resp, err := databaseListResponse(config, databaseType, name)
 	if err != nil {
 		s.logger.Error("database list failed", "error", err)
 		s.writeError(w, http.StatusInternalServerError, "failed to list databases: "+err.Error())
@@ -703,9 +705,10 @@ func configuredDatabaseTypes(config *ServerConfig) []string {
 	if config == nil {
 		return nil
 	}
-	seen := make(map[string]bool, len(config.Databases))
-	types := make([]string, 0, len(config.Databases))
-	for _, dbConfig := range config.Databases {
+	dbs := config.DatabaseConfigs()
+	seen := make(map[string]bool, len(dbs))
+	types := make([]string, 0, len(dbs))
+	for _, dbConfig := range dbs {
 		if !seen[dbConfig.Type] {
 			seen[dbConfig.Type] = true
 			types = append(types, dbConfig.Type)
@@ -723,9 +726,11 @@ func databaseListResponse(config *ServerConfig, databaseType, name string) (*api
 	if config == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
+	config = config.withDatabaseSnapshot()
+	dbs := config.DatabaseConfigs()
 	nameFilter := storage.CanonicalKey(name)
-	databaseNames := make([]string, 0, len(config.Databases))
-	for database, dbConfig := range config.Databases {
+	databaseNames := make([]string, 0, len(dbs))
+	for database, dbConfig := range dbs {
 		if databaseType != "" && dbConfig.Type != databaseType {
 			continue
 		}
@@ -738,7 +743,7 @@ func databaseListResponse(config *ServerConfig, databaseType, name string) (*api
 
 	resp := &apitypes.DatabaseListResponse{Databases: make([]*apitypes.DatabaseResponse, 0, len(databaseNames))}
 	for _, database := range databaseNames {
-		dbConfig := config.Databases[database]
+		dbConfig := dbs[database]
 		environments, err := config.DatabaseEnvironments(database)
 		if err != nil {
 			return nil, fmt.Errorf("list database environments for database %q: %w", database, err)
@@ -1136,10 +1141,10 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	}
 	overlayApplyOptions(httpResp, apply)
 	setRevertSkippedMetadata(httpResp, apply)
-	operations, deploymentByOperationID, released := s.bestEffortProgressOperations(ctx, apply)
+	operations, deploymentByOperationID, ops, released := s.bestEffortProgressOperations(ctx, apply)
 	httpResp.Operations = operations
 	httpResp.Released = released
-	s.overlayStoredDisplayMetadata(ctx, httpResp, apply, deploymentByOperationID)
+	overlayStoredDisplayMetadata(httpResp, apply, ops)
 
 	for _, task := range tasks {
 		tpr := &apitypes.TableProgressResponse{

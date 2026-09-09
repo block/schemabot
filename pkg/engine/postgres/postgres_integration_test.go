@@ -383,6 +383,39 @@ func TestEnginePlanOversizedTableAdmitsConcurrentIndex(t *testing.T) {
 	assert.Contains(t, index.DDL, "CREATE INDEX CONCURRENTLY")
 }
 
+// TestEnginePlanOversizedTableIndexOnlyDiffHasNoBlockedChange proves the
+// plan a reviewer can actually apply: when the only diff against an
+// already-oversized table is a new index, the plan holds exactly one change,
+// a concurrent index build, and none of its changes is blocked. The ceiling
+// bounds rewrites of existing data, and an index build rewrites none, so a
+// table past the ceiling must not turn an index-only PR into one that can
+// never merge.
+func TestEnginePlanOversizedTableIndexOnlyDiffHasNoBlockedChange(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_oversized_index_only_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY, email text)")
+	require.NoError(t, err)
+	req := &engine.PlanRequest{
+		Database: "plan_oversized_index_only_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text); CREATE INDEX users_email_idx ON users (email)",
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	result, err := NewWithTableSizeLimit(1).Plan(t.Context(), req)
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 1, "an index-only diff plans as the index build alone")
+	index := result.Changes[0].TableChanges[0]
+	assert.Equal(t, "users", index.Table)
+	assert.Empty(t, index.ExecutionMode, "the only change must be executable, not blocked")
+	assert.Empty(t, index.ModeReason)
+	assert.Contains(t, index.DDL, "CREATE INDEX CONCURRENTLY")
+	assert.Contains(t, index.DDL, "users_email_idx")
+}
+
 // TestEnginePlanCreateTableIgnoresSizeCeiling proves the native-safe table
 // size ceiling never blocks a greenfield CREATE TABLE: the ceiling bounds
 // rewrites of existing data, and a table that does not exist yet has none —
@@ -1000,6 +1033,42 @@ func TestEngineApplyConcurrentIndexBuild(t *testing.T) {
 		`SELECT i.indisvalid FROM pg_index i WHERE i.indexrelid = 'public.users_email_idx'::regclass`).Scan(&valid)
 	require.NoError(t, err)
 	assert.True(t, valid, "the built index must be catalog-valid, not merely present")
+}
+
+// TestEngineApplyConcurrentIndexBoundEndsTheBuild proves the configured
+// bound is what governs a concurrent build on the target: a build that
+// cannot finish inside it is ended by the server, the apply fails, and the
+// operator detail names the option and the bound the build ran past, so the
+// operator's next step is to raise it. Whether the cancelled build left its
+// own invalid index behind (retryable, the retry recovers it) or nothing at
+// all (refused, since retrying unchanged spends the same bound again)
+// depends on how far the build got before the timer fired; both surfaces
+// carry the option, so the assertion holds on either.
+func TestEngineApplyConcurrentIndexBoundEndsTheBuild(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "index_bound_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY, email text)")
+	require.NoError(t, err)
+	// Enough rows that the build's table scans outlast the bound on any
+	// machine; an empty table could finish inside it and report completion.
+	_, err = db.ExecContext(t.Context(),
+		"INSERT INTO public.users (id, email) SELECT n, 'user-' || n || '@example.com' FROM generate_series(1, 200000) AS n")
+	require.NoError(t, err)
+
+	bound := time.Millisecond
+	eng := NewWithOptions(0, bound)
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "users",
+		"CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "users")
+	require.Equal(t, engine.StateFailed, progress.State, "progress: %+v", progress)
+	assert.Contains(t, progress.ErrorMessage, "postgres.concurrent_index_max_duration (1ms)")
+	assert.Contains(t, progress.ErrorMessage, "raise postgres.concurrent_index_max_duration")
+
+	var valid bool
+	err = db.QueryRowContext(t.Context(),
+		`SELECT coalesce(bool_and(i.indisvalid), false) FROM pg_index i WHERE i.indexrelid = to_regclass('public.users_email_idx')`).Scan(&valid)
+	require.NoError(t, err)
+	assert.False(t, valid, "a build the bound ended must not leave a valid index the drive reported as failed")
 }
 
 // TestEngineApplyPartitionedParentConcurrentIndexRefusal proves the

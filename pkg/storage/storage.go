@@ -1285,6 +1285,10 @@ type ApplyOperationStore interface {
 	// GetEngineResumeState returns opaque engine resume state for the operation.
 	GetEngineResumeState(ctx context.Context, operationID int64) (*EngineResumeState, error)
 
+	// SaveProgressMetadata stores the latest engine progress display metadata.
+	// A new attempt can display the prior attempt's position until its first progress save.
+	SaveProgressMetadata(ctx context.Context, operationID int64, metadata map[string]string) error
+
 	// FindNextApplyOperation atomically claims the next child row that needs
 	// attention and rotates a fresh operation lease (owner + token) onto it in
 	// the same transaction, returning the row populated with that lease.

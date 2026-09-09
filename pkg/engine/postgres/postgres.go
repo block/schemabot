@@ -78,12 +78,19 @@ const DefaultNativeSafeTableSizeLimitBytes = int64(1 << 30)
 const DefaultConcurrentIndexMaxDuration = 24 * time.Hour
 
 // MaxConcurrentIndexMaxDuration is the largest bound the engine accepts for
-// one concurrent index build. Caller-owned mode moves the build's bound from
-// the server's statement_timeout to the engine's deadline, so the engine
-// honors the same ceiling the server's own timer could have expressed: the
-// largest statement_timeout PostgreSQL accepts, in milliseconds. A bound
-// above it is not a build anyone waits for; it is the absence of a bound.
+// one concurrent index build: the largest statement_timeout PostgreSQL
+// accepts, in milliseconds. The build runs under that server-side timer set
+// to the bound, so a larger value could not be handed to the server; the
+// recovery's engine-owned deadline honors the same ceiling. A bound above it
+// is not a build anyone waits for; it is the absence of a bound.
 const MaxConcurrentIndexMaxDuration = time.Duration(math.MaxInt32) * time.Millisecond
+
+// MinConcurrentIndexMaxDuration is the smallest bound the engine accepts for
+// one concurrent index build: statement_timeout is an integer millisecond
+// count, so anything shorter rounds to zero on the server, which disables
+// the timer instead of tightening it. The executor refuses such a budget as
+// unbounded; the engine never hands it one.
+const MinConcurrentIndexMaxDuration = time.Millisecond
 
 // New creates a new PostgreSQL engine.
 func New() *Engine {
@@ -105,15 +112,20 @@ func NewWithTableSizeLimit(tableSizeLimit int64) *Engine {
 // DefaultConcurrentIndexMaxDuration: unlike the table size limit, no later
 // check refuses a negative bound, and a deadline already in the past would
 // end every concurrent build the instant it started. One above
-// MaxConcurrentIndexMaxDuration is clamped to it. Server config validation
-// refuses both before they reach this constructor; the normalization here
-// covers embedders that build the engine directly.
+// MaxConcurrentIndexMaxDuration is clamped to it, and a positive one below
+// MinConcurrentIndexMaxDuration is raised to it, so the bound the engine
+// serves is always one the server's timer can hold. Server config validation
+// refuses all three before they reach this constructor; the normalization
+// here covers embedders that build the engine directly.
 func NewWithOptions(tableSizeLimit int64, concurrentIndexMaxDuration time.Duration) *Engine {
 	if tableSizeLimit == 0 {
 		tableSizeLimit = DefaultNativeSafeTableSizeLimitBytes
 	}
 	if concurrentIndexMaxDuration <= 0 {
 		concurrentIndexMaxDuration = DefaultConcurrentIndexMaxDuration
+	}
+	if concurrentIndexMaxDuration < MinConcurrentIndexMaxDuration {
+		concurrentIndexMaxDuration = MinConcurrentIndexMaxDuration
 	}
 	if concurrentIndexMaxDuration > MaxConcurrentIndexMaxDuration {
 		concurrentIndexMaxDuration = MaxConcurrentIndexMaxDuration
