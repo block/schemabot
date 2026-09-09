@@ -20,6 +20,9 @@ import (
 
 const pollInterval = 100 * time.Millisecond
 
+// Allow an in-flight registration to finish publishing without hiding persistent drift.
+const configMismatchGrace = time.Second
+
 // Record contains process identity, not database apply state. A recorded PID is
 // diagnostic only; ownership is proven by the lifetime lock and control endpoint.
 type Record struct {
@@ -102,6 +105,7 @@ func (m Manager) Ensure(ctx context.Context) (Connection, error) {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	lastState := "starting"
+	var mismatchSince time.Time
 	for {
 		r, err := m.record()
 		if err == nil {
@@ -123,6 +127,13 @@ func (m Manager) Ensure(ctx context.Context) (Connection, error) {
 						// A registration can publish between identity and file reads.
 						// Wait for a matching snapshot, never restart the live host.
 						live.State = "configuration_mismatch"
+						if mismatchSince.IsZero() {
+							mismatchSince = time.Now()
+						} else if time.Since(mismatchSince) >= configMismatchGrace {
+							return Connection{}, fmt.Errorf("local runtime %s configuration differs from its saved registration; restore runtime.yaml or finish active work and stop the runtime before restarting", r.ID)
+						}
+					} else {
+						mismatchSince = time.Time{}
 					}
 					lastState = live.State
 					if live.State == "ready" {

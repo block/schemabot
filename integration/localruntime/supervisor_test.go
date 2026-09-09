@@ -127,9 +127,13 @@ func TestSupervisorEngines(t *testing.T) {
 			// The imported files must plan back to an unchanged live database.
 			// Exercise the CLI's default verification, including engine inference.
 			schemaRoot := t.TempDir()
+			if engine == "postgres" {
+				// Default discovery includes empty schemas alongside populated ones.
+				execSQL(t, db, "CREATE SCHEMA empty_scope")
+			}
 			onboardCtx, cancelOnboard := context.WithTimeout(t.Context(), runtimeDeadline)
 			defer cancelOnboard()
-			onboard := exec.CommandContext(onboardCtx, binary, "onboard", "--profile", "alpha", "-d", "app", "-e", "development", "-s", schemaRoot, "--namespace", namespace)
+			onboard := exec.CommandContext(onboardCtx, binary, "onboard", "--profile", "alpha", "-d", "app", "-e", "development", "-s", schemaRoot)
 			onboard.Env = append(os.Environ(), "HOME="+home, "SCHEMABOT_ENDPOINT=", "SCHEMABOT_TOKEN=", "SCHEMABOT_PROFILE=")
 			output, err := onboard.CombinedOutput()
 			require.NoError(t, err, string(output))

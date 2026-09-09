@@ -2,6 +2,7 @@ package commands
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"net/url"
 	"os"
@@ -51,20 +52,21 @@ func (cmd *ConfigureSetupCmd) Run(g *Globals) error {
 		endpoint = defaultEndpoint
 	}
 
-	profile, loginCleared := reconfiguredProfile(existingProfile, endpoint)
-	cfg.Profiles[profileName] = profile
-	if loginCleared {
-		fmt.Printf("\nEndpoint changed; the cached login for %s was cleared. Run `%s login` to sign in to the new endpoint.\n", existingProfile.Endpoint, cliname.Name())
-	}
-
-	// If this is the first profile or named "default", set as default
-	if cfg.DefaultProfile == "" || profileName == "default" {
-		cfg.DefaultProfile = profileName
-	}
-
-	// Save config
-	if err := client.SaveConfig(cfg); err != nil {
+	var loginCleared bool
+	if err := client.UpdateConfig(context.Background(), func(latest *client.Config) error {
+		var profile client.Profile
+		profile, loginCleared = reconfiguredProfile(latest.Profiles[profileName], endpoint)
+		latest.Profiles[profileName] = profile
+		if latest.DefaultProfile == "" || profileName == "default" {
+			latest.DefaultProfile = profileName
+		}
+		cfg = latest
+		return nil
+	}); err != nil {
 		return fmt.Errorf("save config: %w", err)
+	}
+	if loginCleared {
+		fmt.Printf("\nEndpoint changed; the cached login was cleared. Run `%s login` to sign in to the new endpoint.\n", cliname.Name())
 	}
 
 	configPath, _ := client.ConfigPath()
