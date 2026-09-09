@@ -7,14 +7,18 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
+	"math"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 
 	"github.com/block/pg-sprite/pkg/dbconn"
 	"github.com/block/pg-sprite/pkg/diffplan"
+	"github.com/block/pg-sprite/pkg/executor"
 	pgplan "github.com/block/pg-sprite/pkg/plan"
 	"github.com/block/pg-sprite/pkg/planner"
 	"github.com/block/pg-sprite/pkg/preflight"
@@ -48,6 +52,14 @@ type Engine struct {
 	progress       map[string]*trackedApply
 	tableSizeLimit int64
 
+	// optimisticApplyCeiling is the fixed client-side ceiling on one ordinary
+	// apply, seeded from the package constant of the same name. It is not an
+	// operator option: production never varies it, and only in-package tests
+	// assign it, to observe the ceiling ending an apply without waiting out
+	// the production value.
+	optimisticApplyCeiling     time.Duration
+	concurrentIndexMaxDuration time.Duration
+
 	// execute is a test seam standing in for executeOptimistic, so the apply
 	// drive — accept, claim, execute, terminal publish — can be exercised
 	// against an executor the test scripts instead of a target to dial. Nil
@@ -61,15 +73,58 @@ type Engine struct {
 // between, so Progress reads the step position and statement from it. The
 // logger is the apply's own, so a poll that cannot read the tracker logs
 // under the identifiers the apply was accepted with.
+//
+// Every field but done is read and written under Engine.mu. done is closed
+// by the drive goroutine once its terminal result is published, so a cancel
+// can wait for the outcome the drive settles on instead of guessing it.
 type trackedApply struct {
 	result  *engine.ProgressResult
-	tracker *progress.Tracker
+	tracker buildTracker
 	logger  *slog.Logger
+	// concurrentIndex records the shape the apply was admitted as: a
+	// concurrent index build is the one PostgreSQL change an operator can
+	// cancel, so the shape decides the answer before any server is asked.
+	concurrentIndex bool
+	// cancelApply ends the drive's own context. It is the cancel of last
+	// resort: the build backend is signalled through the tracker first, and
+	// the context is cancelled only when that signal cannot reach a running
+	// statement — the build has not started, has already returned, or its
+	// backend cannot be observed or signalled by this role.
+	cancelApply context.CancelFunc
+	// cancelRequested records that Cancel acted on this apply, so the drive
+	// can tell the operator's cancellation from a backend cancellation it did
+	// not ask for. It is set before the signal is sent and never reset once
+	// a signal may have reached the build.
+	cancelRequested bool
+	done            chan struct{}
+}
+
+type buildTracker interface {
+	Progress(context.Context) (progress.Snapshot, error)
+	CancelBuild(context.Context) error
 }
 
 // DefaultNativeSafeTableSizeLimitBytes preserves the native-safe execution
 // ceiling when the server does not configure one.
 const DefaultNativeSafeTableSizeLimitBytes = int64(1 << 30)
+
+// DefaultConcurrentIndexMaxDuration bounds one concurrent index build.
+const DefaultConcurrentIndexMaxDuration = 24 * time.Hour
+
+// MaxConcurrentIndexMaxDuration is the largest bound the engine accepts for
+// one concurrent index build: the largest statement_timeout PostgreSQL
+// accepts, in milliseconds. The build runs under that server-side timer set
+// to the bound, so a larger value could not be handed to the server; the
+// recovery's engine-owned deadline honors the same ceiling. A bound above it
+// is not a build anyone waits for; it is the absence of a bound.
+const MaxConcurrentIndexMaxDuration = time.Duration(math.MaxInt32) * time.Millisecond
+
+// MinConcurrentIndexMaxDuration is the smallest bound the engine accepts for
+// one concurrent index build: statement_timeout is an integer millisecond
+// count, so anything shorter rounds to zero on the server, which disables
+// the timer instead of tightening it. The executor refuses such a budget as
+// unbounded; the engine never hands it one.
+const MinConcurrentIndexMaxDuration = time.Millisecond
 
 // New creates a new PostgreSQL engine.
 func New() *Engine {
@@ -83,16 +138,43 @@ func New() *Engine {
 // the plan-time preflight check rejects a non-positive limit before apply,
 // and server config validation rejects it at startup.
 func NewWithTableSizeLimit(tableSizeLimit int64) *Engine {
+	return NewWithOptions(tableSizeLimit, DefaultConcurrentIndexMaxDuration)
+}
+
+// NewWithOptions creates a PostgreSQL engine with its process-wide apply
+// bounds. A concurrentIndexMaxDuration that is not positive adopts
+// DefaultConcurrentIndexMaxDuration: unlike the table size limit, no later
+// check refuses a negative bound, and a deadline already in the past would
+// end every concurrent build the instant it started. One above
+// MaxConcurrentIndexMaxDuration is clamped to it, and a positive one below
+// MinConcurrentIndexMaxDuration is raised to it, so the bound the engine
+// serves is always one the server's timer can hold. Server config validation
+// refuses all three before they reach this constructor; the normalization
+// here covers embedders that build the engine directly.
+func NewWithOptions(tableSizeLimit int64, concurrentIndexMaxDuration time.Duration) *Engine {
 	if tableSizeLimit == 0 {
 		tableSizeLimit = DefaultNativeSafeTableSizeLimitBytes
 	}
-	return &Engine{tableSizeLimit: tableSizeLimit}
+	if concurrentIndexMaxDuration <= 0 {
+		concurrentIndexMaxDuration = DefaultConcurrentIndexMaxDuration
+	}
+	if concurrentIndexMaxDuration < MinConcurrentIndexMaxDuration {
+		concurrentIndexMaxDuration = MinConcurrentIndexMaxDuration
+	}
+	if concurrentIndexMaxDuration > MaxConcurrentIndexMaxDuration {
+		concurrentIndexMaxDuration = MaxConcurrentIndexMaxDuration
+	}
+	return &Engine{
+		tableSizeLimit:             tableSizeLimit,
+		optimisticApplyCeiling:     optimisticApplyCeiling,
+		concurrentIndexMaxDuration: concurrentIndexMaxDuration,
+	}
 }
 
 // NewForTarget creates a PostgreSQL engine with the target information needed
 // by capabilities whose request does not carry resolved credentials.
-func NewForTarget(tableSizeLimit int64, database string, credentials *engine.Credentials) *Engine {
-	e := NewWithTableSizeLimit(tableSizeLimit)
+func NewForTarget(tableSizeLimit int64, concurrentIndexMaxDuration time.Duration, database string, credentials *engine.Credentials) *Engine {
+	e := NewWithOptions(tableSizeLimit, concurrentIndexMaxDuration)
 	e.pullDatabase = database
 	e.pullCredentials = credentials
 	return e
@@ -101,6 +183,12 @@ func NewForTarget(tableSizeLimit int64, database string, credentials *engine.Cre
 // TableSizeLimit exposes the native-safe ceiling for wiring verification and observability.
 func (e *Engine) TableSizeLimit() int64 {
 	return e.tableSizeLimit
+}
+
+// ConcurrentIndexMaxDuration exposes the bound one concurrent index build
+// runs under, for wiring verification and observability.
+func (e *Engine) ConcurrentIndexMaxDuration() time.Duration {
+	return e.concurrentIndexMaxDuration
 }
 
 // Name returns the engine identifier.
@@ -175,9 +263,21 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			if err != nil {
 				return nil, fmt.Errorf("diff PostgreSQL table %q in namespace %q from file %q: %w", desired.Table(), namespace, filename, err)
 			}
-			changes, tiers, err := tableChanges(report, parser)
+			changes, tiers, unrecognized, err := tableChanges(report, parser)
 			if err != nil {
 				return nil, fmt.Errorf("render PostgreSQL plan for table %q in namespace %q: %w", desired.Table(), namespace, err)
+			}
+			for _, vocabulary := range unrecognized {
+				// The plan renders a blocked placeholder for the statement,
+				// so the operator is safe but uninformed; the log is where
+				// triage learns the planner's vocabulary grew, for whose
+				// schema file, and which value to map next.
+				slog.Warn("PostgreSQL planner returned vocabulary SchemaBot does not recognize; the plan blocks the statement with a placeholder verdict",
+					"database", req.Database,
+					"namespace", namespace,
+					"table", desired.Table(),
+					"vocabulary", vocabulary.kind,
+					"value", vocabulary.value)
 			}
 			changes, err = blockMissingPrivileges(ctx, pool, report, changes, tiers)
 			if err != nil {
@@ -207,24 +307,33 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 // derives each executable step's privilege tier alongside them. The returned
 // slices are parallel: tiers[i] is the access changes[i] needs from the
 // engine role, and is meaningful only while changes[i] carries no verdict —
-// a blocked step never reaches a privilege check.
-func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.TableChange, []preflight.Tier, error) {
-	verdicts := make([]string, len(report.Statements))
+// a blocked step never reaches a privilege check. unrecognized carries one
+// entry per statement whose verdict is a placeholder for planner vocabulary
+// this build does not map, for the caller to log with the plan's identifiers.
+func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.TableChange, []preflight.Tier, []unrecognizedPlannerVocabulary, error) {
+	// Each statement's verdict is derived once and reused for both the
+	// greenfield decision and the rendering, so a placeholder verdict is
+	// reported once per statement.
+	verdicts := make([]stepVerdict, len(report.Statements))
+	var unrecognized []unrecognizedPlannerVocabulary
 	for i, statement := range report.Statements {
-		verdicts[i], _ = executionVerdict(report.FormatVersion, statement, report.Table)
+		verdicts[i] = executionVerdict(report.FormatVersion, statement, report.Table)
+		if verdicts[i].unrecognized != nil {
+			unrecognized = append(unrecognized, *verdicts[i].unrecognized)
+		}
 	}
 	if isGreenfieldCreateSet(report, verdicts) {
 		change, tier, err := greenfieldCreateSet(report, parser)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		return []engine.TableChange{change}, []preflight.Tier{tier}, nil
+		return []engine.TableChange{change}, []preflight.Tier{tier}, unrecognized, nil
 	}
 
 	changes := make([]engine.TableChange, 0, len(report.Statements))
 	tiers := make([]preflight.Tier, 0, len(report.Statements))
-	for _, statement := range report.Statements {
-		mode, reason := executionVerdict(report.FormatVersion, statement, report.Table)
+	for i, statement := range report.Statements {
+		mode, reason := verdicts[i].mode, verdicts[i].reason
 		rendered := statement.ExecSQL
 		if len(rendered) == 0 {
 			rendered = []string{statement.SQL}
@@ -232,7 +341,7 @@ func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.Ta
 		for _, sql := range rendered {
 			operation, table, err := parser.Classify(sql)
 			if err != nil {
-				return nil, nil, fmt.Errorf("classify planned statement for table %q: %w", report.Table, err)
+				return nil, nil, nil, fmt.Errorf("classify planned statement for table %q: %w", report.Table, err)
 			}
 			if table == "" {
 				table = report.Table
@@ -266,7 +375,28 @@ func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.Ta
 			tiers = append(tiers, stepTier)
 		}
 	}
-	return changes, tiers, nil
+	return changes, tiers, unrecognized, nil
+}
+
+// stepVerdict is the execution mode and operator-facing reason derived for
+// one planned statement; an empty mode means the statement is executable.
+// unrecognized is set when the verdict is a placeholder for planner
+// vocabulary this build does not map, so the caller can log what moved.
+type stepVerdict struct {
+	mode         string
+	reason       string
+	unrecognized *unrecognizedPlannerVocabulary
+}
+
+// unrecognizedPlannerVocabulary names a planner value outside the set this
+// build renders in its own words: kind says which vocabulary grew (the plan
+// contract, a disposition, or a create shape cause) and value is the entry
+// the planner returned. The operator sees a blocked placeholder either way;
+// this record exists so the server log names the value and the schema file
+// behind it.
+type unrecognizedPlannerVocabulary struct {
+	kind  string
+	value string
 }
 
 // isGreenfieldCreateSet reports whether the report describes a table that
@@ -274,7 +404,7 @@ func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.Ta
 // and its indexes can ship as one apply unit. A report carrying any verdict
 // or destructive step keeps its per-statement rendering so each verdict
 // stays visible to the reviewer.
-func isGreenfieldCreateSet(report pgplan.Report, verdicts []string) bool {
+func isGreenfieldCreateSet(report pgplan.Report, verdicts []stepVerdict) bool {
 	if !isGreenfieldTable(report) {
 		return false
 	}
@@ -282,7 +412,7 @@ func isGreenfieldCreateSet(report pgplan.Report, verdicts []string) bool {
 		return false
 	}
 	for i, statement := range report.Statements {
-		if verdicts[i] != "" || statement.Destructive {
+		if verdicts[i].mode != "" || statement.Destructive {
 			return false
 		}
 	}
@@ -705,32 +835,103 @@ func singleLine(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
-func executionVerdict(formatVersion int, statement pgplan.Statement, table string) (string, string) {
+// executionVerdict maps one planned statement to the verdict the operator
+// reviews. A planner value outside the vocabulary this mapping knows — a plan
+// contract, a disposition, or a create shape cause the planner added after the
+// mapping was written — still renders a blocked placeholder, and is reported
+// on the verdict so the caller can log it with the identifiers this function
+// does not have.
+func executionVerdict(formatVersion int, statement pgplan.Statement, table string) stepVerdict {
 	if formatVersion != pgplan.FormatVersion {
-		return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q has an unrecognized plan contract", table)
+		return stepVerdict{
+			mode:         engine.ExecutionModeBlocked,
+			reason:       fmt.Sprintf("statement for table %q has an unrecognized plan contract", table),
+			unrecognized: &unrecognizedPlannerVocabulary{kind: "plan_contract", value: strconv.Itoa(formatVersion)},
+		}
 	}
 	if statement.Disposition == router.DispositionExecute && statement.Route == planner.RouteNative &&
 		statement.Backend == router.BackendNative && len(statement.ExecSQL) > 0 {
-		return "", ""
+		return stepVerdict{}
 	}
 
 	// Planner explanations are deliberately not copied to operator-facing
 	// text, and neither is the planner's own vocabulary: each known
 	// disposition maps to a sentence in SchemaBot's words, since the operator
 	// reading it has never heard of the planning library.
+	blocked := func(reason string) stepVerdict {
+		return stepVerdict{mode: engine.ExecutionModeBlocked, reason: reason}
+	}
 	switch statement.Disposition {
 	case router.DispositionUnavailable:
 		if statement.Backend == router.BackendCopyAndSwap {
-			return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q requires copy-and-swap, which is unavailable", table)
+			return blocked(fmt.Sprintf("statement for table %q requires copy-and-swap, which is unavailable", table))
 		}
-		return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q requires an execution path SchemaBot's PostgreSQL support does not provide yet", table)
+		return blocked(fmt.Sprintf("statement for table %q requires an execution path SchemaBot's PostgreSQL support does not provide yet", table))
 	case router.DispositionRewriteRequired:
-		return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q must be rewritten into a form the engine can execute natively, then re-planned", table)
+		return blocked(fmt.Sprintf("statement for table %q must be rewritten into a form the engine can execute natively, then re-planned", table))
 	case router.DispositionRefuse:
-		return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q is refused: it cannot be executed safely as written", table)
+		if reason, ok := createShapeRefusalReason(statement.Cause, table); ok {
+			return blocked(reason)
+		}
+		verdict := blocked(fmt.Sprintf("statement for table %q is refused: it cannot be executed safely as written", table))
+		// An absent cause is a refusal from outside the create path and the
+		// generic sentence is the right one; only a cause the mapping has no
+		// sentence for is vocabulary that moved.
+		if statement.Cause != "" {
+			verdict.unrecognized = &unrecognizedPlannerVocabulary{kind: "create_shape_cause", value: string(statement.Cause)}
+		}
+		return verdict
+	case router.DispositionExecute:
+		// Execute on anything but the native route with native steps is a
+		// route or backend this build does not run, or a plan with nothing
+		// to run; the disposition itself is known, so the shape is what the
+		// triager needs to see.
+		verdict := blocked(fmt.Sprintf("statement for table %q has an unrecognized planner verdict", table))
+		verdict.unrecognized = &unrecognizedPlannerVocabulary{
+			kind:  "execute_shape",
+			value: fmt.Sprintf("route=%s backend=%s steps=%d", statement.Route, statement.Backend, len(statement.ExecSQL)),
+		}
+		return verdict
 	default:
-		return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q has an unrecognized planner verdict", table)
+		verdict := blocked(fmt.Sprintf("statement for table %q has an unrecognized planner verdict", table))
+		verdict.unrecognized = &unrecognizedPlannerVocabulary{kind: "disposition", value: string(statement.Disposition)}
+		return verdict
 	}
+}
+
+// createShapeRefusalReason renders the create path's typed refusal cause in
+// SchemaBot's words, naming the clause the author wrote and what to do about
+// it. The mapping covers the planner's whole closed set of causes, so the
+// completeness test over that set fails the day the planner grows a new one.
+// Two entries are reachable only through a front door other than this
+// engine's: pgstatement.ParseDesired refuses CONCURRENTLY and every statement
+// kind other than CREATE TABLE and CREATE INDEX before a plan exists, so
+// through planSchemas those shapes fail parsing rather than reaching a verdict.
+func createShapeRefusalReason(cause executor.CreateShapeCause, table string) (string, bool) {
+	var reason string
+	switch cause {
+	case executor.CreateShapePartitionOf:
+		reason = "declares PARTITION OF against a live parent, which SchemaBot's PostgreSQL create path does not support; create the partition outside SchemaBot or re-model the table"
+	case executor.CreateShapeInherits:
+		reason = "declares INHERITS against a live parent, which SchemaBot's PostgreSQL create path does not support; create the inheritance relationship outside SchemaBot or model a standalone table"
+	case executor.CreateShapeLike:
+		reason = "declares LIKE against a live source table, which SchemaBot's PostgreSQL create path does not support; declare the new table's columns and constraints explicitly"
+	case executor.CreateShapeOfType:
+		reason = "declares OF against a live composite type, which SchemaBot's PostgreSQL create path does not support; declare the new table's columns explicitly"
+	case executor.CreateShapeIfNotExists:
+		reason = "declares IF NOT EXISTS, which cannot verify that an existing relation has the requested shape; remove the clause and ensure the relation name is available"
+	case executor.CreateShapeConcurrently:
+		reason = "declares CONCURRENTLY for an index on a new table, which SchemaBot's PostgreSQL create path does not support; remove CONCURRENTLY so the index can be built before the table receives traffic"
+	case executor.CreateShapeDuplicateName:
+		reason = "declares the same relation name more than once; give every table, index, constraint, and sequence a unique name"
+	case executor.CreateShapeMultipleOperations:
+		reason = "contains multiple create operations in one statement; split them into separate CREATE TABLE or CREATE INDEX statements"
+	case executor.CreateShapeUnsupportedKind:
+		reason = "uses a statement kind SchemaBot's PostgreSQL create path does not support; use CREATE TABLE or CREATE INDEX, or create the object outside SchemaBot"
+	default:
+		return "", false
+	}
+	return fmt.Sprintf("statement for table %q %s", table, reason), true
 }
 
 func destructiveReason(destructive bool, table string) string {
@@ -776,21 +977,57 @@ func (e *Engine) Drain() {
 	e.mu.Unlock()
 }
 
-// Stop declines: a PostgreSQL schema change runs each statement as a single
-// transactional DDL with no engine phase to pause — an in-flight statement
-// either commits or fails on its own. The typed decline lets the control
-// path resolve a durable stop request terminally instead of retrying it.
-func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, engine.NewUnsupportedOperationError("stop is not supported for PostgreSQL schema changes: each statement runs as a single transaction that commits or fails on its own")
+// HaltForShutdown brings this instance's in-flight concurrent index builds
+// down so the process can exit without leaving them running on the target
+// under a lease nobody renews. A concurrent build has no checkpoint: halting
+// it cancels the statement, and the invalid index it leaves is what the next
+// driver to claim the apply meets as abandoned debris and recovers before its
+// own build. Plain DDL is left to finish — its statements are bounded by
+// their own lock and statement timeouts, and interrupting a create set
+// mid-sequence would leave a committed prefix no later drive can complete.
+//
+// This is not an operator cancel: no cancel is recorded on the tracked
+// applies, so the outcome the drive publishes for a halted build is the
+// failure its leftover index describes, and the apply stays active for
+// another driver to claim. The wait is bounded by ctx so a build that will
+// not come down reports that the target may still be held instead of holding
+// shutdown open.
+func (e *Engine) HaltForShutdown(ctx context.Context) error {
+	e.mu.Lock()
+	halted := 0
+	for _, tracked := range e.progress {
+		if tracked.concurrentIndex && !tracked.result.State.IsTerminal() && tracked.cancelApply != nil {
+			tracked.cancelApply()
+			halted++
+		}
+	}
+	e.mu.Unlock()
+	if halted > 0 {
+		slog.Info("PostgreSQL engine halting concurrent index builds for shutdown", "builds", halted)
+	}
+
+	// Wait off the calling goroutine so work that will not come down bounds
+	// shutdown at ctx rather than blocking it forever. The wait goroutine ends
+	// with the drives it is waiting on.
+	settled := make(chan struct{})
+	go func() {
+		e.wg.Wait()
+		close(settled)
+	}()
+	select {
+	case <-settled:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("halt PostgreSQL engine for shutdown: schema change work is still running on the target: %w", ctx.Err())
+	}
 }
 
-// Cancel declines: the engine runs each statement as one transaction and does
-// not track the database backend executing it, so it cannot terminate the
-// statement itself. An in-flight DDL can still be interrupted at the database
-// — during a lock pileup that is exactly what an operator needs — so the
-// decline reason points at the out-of-band path instead of stopping at "no".
-func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, engine.NewUnsupportedOperationError("cancel is not implemented for PostgreSQL schema changes: the engine cannot terminate its in-flight statement, which commits or fails as one transaction; to interrupt it at the database, find the backend running the DDL in pg_stat_activity and cancel it with pg_cancel_backend")
+// Stop declines: a concurrent index build has no resumable midpoint, so stop
+// would be a permanent cancel under a misleading name. Other PostgreSQL DDL
+// also has no engine phase to pause. The typed decline lets the control path
+// resolve a durable stop request terminally instead of retrying it.
+func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
+	return nil, engine.NewUnsupportedOperationError("stop is not supported for PostgreSQL schema changes: concurrent index builds have no resumable midpoint, and other statements commit or fail on their own")
 }
 
 // Start declines: PostgreSQL schema changes cannot be stopped, so there is
@@ -822,3 +1059,6 @@ var _ engine.Engine = (*Engine)(nil)
 
 // Compile-time check that Engine implements engine.Drainer.
 var _ engine.Drainer = (*Engine)(nil)
+
+// Compile-time check that Engine implements engine.ShutdownHalter.
+var _ engine.ShutdownHalter = (*Engine)(nil)

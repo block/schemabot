@@ -800,9 +800,20 @@ type ApplyStore interface {
 	CheckLease(ctx context.Context, lease ApplyLease) error
 
 	// ExpireRetryable transitions failed_retryable applies that exhausted their
-	// retry budget or recovery freshness window to permanent failed. Returns the
-	// applies updated.
-	ExpireRetryable(ctx context.Context) ([]*RetryableApplyExpiration, error)
+	// retry budget or recovery freshness window to permanent failed, settling
+	// their task and operation rows against that verdict. Returns the applies
+	// updated, oldest first, at most limit of them.
+	//
+	// An apply is taken whole or not at all, and only when no driver is part-way
+	// through driving an operation under it. An apply it passes over is offered
+	// again on the next pass, so a live drive keeps its own rows and loses
+	// nothing but the interval.
+	//
+	// One instance expires per pass, guarded by an advisory lock;
+	// ErrRetryableExpiryBusy reports that another instance holds it. The lock is
+	// an efficiency gate, not a safety one: the selection is guarded, so
+	// concurrent passes would be correct but would each pay the full scan.
+	ExpireRetryable(ctx context.Context, limit int) ([]*RetryableApplyExpiration, error)
 
 	// FindMissingSummaryComment returns GitHub-backed applies that recently
 	// reached a terminal state (including stopped, judged by updated_at since a
@@ -866,6 +877,11 @@ const (
 	RetryableExpirationAttemptBudget  RetryableExpirationReason = "retry_budget_exhausted"
 	RetryableExpirationRecoveryWindow RetryableExpirationReason = "recovery_window_expired"
 )
+
+// ErrRetryableExpiryBusy reports that another instance holds the retryable-apply
+// expiry lock, so this pass did no work. It is an expected outcome on every
+// instance but one, not a failure.
+var ErrRetryableExpiryBusy = errors.New("another instance is expiring retryable applies")
 
 // RetryableApplyExpiration is a failed_retryable apply that was made permanent
 // because operator recovery should no longer retry it automatically.
@@ -1284,6 +1300,10 @@ type ApplyOperationStore interface {
 
 	// GetEngineResumeState returns opaque engine resume state for the operation.
 	GetEngineResumeState(ctx context.Context, operationID int64) (*EngineResumeState, error)
+
+	// SaveProgressMetadata stores the latest engine progress display metadata.
+	// A new attempt can display the prior attempt's position until its first progress save.
+	SaveProgressMetadata(ctx context.Context, operationID int64, metadata map[string]string) error
 
 	// FindNextApplyOperation atomically claims the next child row that needs
 	// attention and rotates a fresh operation lease (owner + token) onto it in

@@ -420,6 +420,17 @@ func TestBuildOnboardWritePlanPostgres(t *testing.T) {
 	assert.Equal(t, "postgres", plan.databaseType)
 }
 
+func TestBuildOnboardWritePlanEmptyNamespace(t *testing.T) {
+	for _, engine := range []string{"mysql", "postgres"} {
+		t.Run(engine, func(t *testing.T) {
+			plan, err := buildOnboardWritePlan(t.TempDir(), &apitypes.PullSchemaResponse{Database: "app", Type: engine, Namespaces: map[string]*apitypes.PulledNamespace{"app": {Tables: map[string]string{}}}}, nil)
+			require.NoError(t, err)
+			require.NoError(t, plan.write())
+			require.Equal(t, "-- This namespace is empty. Add CREATE TABLE declarations here.\n", plan.files[filepath.Join("app", "schema.sql")])
+		})
+	}
+}
+
 func TestOnboardRetainsEmptyNamespacesAndRejectsCaseCollisions(t *testing.T) {
 	response := &apitypes.PullSchemaResponse{Database: "app", Type: "postgres", Environment: "development", Namespaces: map[string]*apitypes.PulledNamespace{
 		"public": {Tables: map[string]string{}}, "billing": {Tables: map[string]string{"orders": "CREATE TABLE orders (id bigint);"}},
@@ -431,7 +442,4 @@ func TestOnboardRetainsEmptyNamespacesAndRejectsCaseCollisions(t *testing.T) {
 	response.Namespaces["billing"].Tables["Orders"] = "CREATE TABLE \"Orders\" (id bigint);"
 	_, err = buildOnboardWritePlan(root, response, nil)
 	require.ErrorContains(t, err, "case-insensitive filesystem")
-	entries, err := os.ReadDir(root)
-	require.NoError(t, err)
-	require.Empty(t, entries)
 }

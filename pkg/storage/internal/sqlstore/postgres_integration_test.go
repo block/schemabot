@@ -936,13 +936,13 @@ func TestPostgresFindNextApplyOperationCrashRecoveryAdmitsOneDriverPerWindow(t *
 	assert.Equal(t, state.ApplyOperation.FailedRetryable, reclaimed.State, "the handoff must not change the row's state")
 }
 
-// Retryable-apply expiry renders the same lease gate as the reaper's sweeps,
-// and it renders it into its own two statements, so PostgreSQL has to execute
-// them too. The fan-out shape is the one the gate exists for: one deployment's
-// redispatches spend the rollout's retry budget while a sibling copies under a
-// live operation lease, and only that lease tells the two deployments' task
-// rows apart. What the gate skips is then the active-task sweep's, once the
-// driver's lease has aged out.
+// Retryable-apply expiry reads the operation lease the way the reaper's sweeps
+// do, and it renders that read into its own selection, so PostgreSQL has to
+// execute it too. The fan-out shape is the one the gate exists for: one
+// deployment's redispatches spend the rollout's retry budget while a sibling
+// copies under a live operation lease, and only that lease tells a dead
+// deployment from a live one. Expiry settles the apply and its rows together,
+// so one live sibling holds the whole apply until its lease ages out.
 func TestPostgresExpireRetryableDefersToTheOperationLease(t *testing.T) {
 	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_expire_lease")
 	db, err := postgresconn.Open(dsn)
@@ -1001,7 +1001,7 @@ func TestPostgresExpireRetryableDefersToTheOperationLease(t *testing.T) {
 			"ALTER TABLE "+table+" ADD COLUMN email varchar(255)")
 		require.NoError(t, err)
 	}
-	insertTask(t, "task-expire-stranded", "users", abandonedOpID, state.Task.Running)
+	insertTask(t, "task-expire-abandoned", "users", abandonedOpID, state.Task.Running)
 	insertTask(t, "task-expire-live", "orders", heldOpID, state.Task.Running)
 	insertTask(t, "task-expire-queued", "products", heldOpID, state.Task.Pending)
 	insertTask(t, "task-expire-settled", "invoices", settledOpID, state.Task.FailedRetryable)
@@ -1014,37 +1014,29 @@ func TestPostgresExpireRetryableDefersToTheOperationLease(t *testing.T) {
 		return got
 	}
 
-	expired, err := store.Applies().ExpireRetryable(t.Context())
+	expired, err := store.Applies().ExpireRetryable(t.Context(), 10)
 	require.NoError(t, err)
-	require.Len(t, expired, 1)
-	assert.Equal(t, state.Apply.Failed, expired[0].Apply.State, "the rollout's verdict is still expiry's to write")
-	assert.Equal(t, state.Task.Failed, taskState(t, "task-expire-stranded"))
-	assert.Equal(t, state.Task.Running, taskState(t, "task-expire-live"),
-		"a live driver's rows are not expiry's to terminalize")
-	assert.Equal(t, state.Task.Pending, taskState(t, "task-expire-queued"),
-		"nor the work queued behind them")
-	assert.Equal(t, state.Task.Failed, taskState(t, "task-expire-settled"),
-		"a lease its drive left behind speaks for nothing")
+	assert.Empty(t, expired, "one live sibling holds the whole apply, not just its own rows")
+	assert.Equal(t, state.Task.Running, taskState(t, "task-expire-abandoned"))
+	assert.Equal(t, state.Task.Running, taskState(t, "task-expire-live"))
+	assert.Equal(t, state.Task.Pending, taskState(t, "task-expire-queued"))
+	assert.Equal(t, state.Task.FailedRetryable, taskState(t, "task-expire-settled"))
 
-	// The driver dies: its lease ages out, its rows stop being mirrored, and the
-	// verdict expiry wrote goes quiet long enough for the sweep to mirror it down.
+	// The driver dies and its lease ages out. Nothing else changes: the settled
+	// sibling's lease is as fresh as it was, and the gate already reads it for
+	// what it is.
 	_, err = db.ExecContext(t.Context(),
 		`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
 		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), heldOpID)
 	require.NoError(t, err)
-	_, err = db.ExecContext(t.Context(),
-		`UPDATE applies SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
-		int64((strandedActiveParentQuiescence + time.Minute).Seconds()), applyID)
-	require.NoError(t, err)
-	_, err = db.ExecContext(t.Context(), `
-		UPDATE tasks SET updated_at = NOW() - make_interval(secs => $1)
-		WHERE task_identifier IN ('task-expire-live', 'task-expire-queued')`,
-		int64((strandedActiveTaskQuiescence + time.Minute).Seconds()))
-	require.NoError(t, err)
 
-	reaped, err := store.Tasks().ReapStrandedActive(t.Context(), 10)
+	expired, err = store.Applies().ExpireRetryable(t.Context(), 10)
 	require.NoError(t, err)
-	require.Len(t, reaped, 2, "both rows the gate skipped are the sweep's once the lease goes stale")
+	require.Len(t, expired, 1, "a declined apply is offered again on the next pass")
+	assert.Equal(t, state.Apply.Failed, expired[0].Apply.State)
+	assert.Equal(t, state.Task.Failed, taskState(t, "task-expire-abandoned"))
 	assert.Equal(t, state.Task.Failed, taskState(t, "task-expire-live"))
-	assert.Equal(t, state.Task.Failed, taskState(t, "task-expire-queued"))
+	assert.Equal(t, state.Task.Cancelled, taskState(t, "task-expire-queued"),
+		"a task that never started is cancelled, not failed")
+	assert.Equal(t, state.Task.Failed, taskState(t, "task-expire-settled"))
 }

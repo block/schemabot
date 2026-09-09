@@ -210,11 +210,11 @@ func TestFormatDDL_LowercaseTypes(t *testing.T) {
 			},
 		},
 		{
-			name:  "DEFAULT NULL stripped",
+			name:  "explicit NULL defaults preserved",
 			input: "CREATE TABLE `t` (`id` BIGINT NOT NULL, `name` VARCHAR(255) DEFAULT NULL, `count` INT DEFAULT NULL)",
 			contains: []string{
-				"`name` varchar(255),",
-				"`count` int",
+				"`name` varchar(255) DEFAULT NULL,",
+				"`count` int DEFAULT NULL",
 			},
 		},
 		{
@@ -496,4 +496,31 @@ func TestFormatDDLForDialect(t *testing.T) {
 			"CREATE TABLE t (id INT);")
 		assert.Equal(t, "CREATE TABLE t (id INT);", got)
 	})
+}
+
+// Every display entry point preserves quoted names, literal contents, and
+// statement boundaries, even when layout formatting cannot be applied safely.
+func TestDisplayFormattingPreservesSQL(t *testing.T) {
+	cases := []struct {
+		name    string
+		dialect schema.Dialect
+		raw     string
+	}{
+		{"mysql quoted names and literal", schema.DialectMySQL, "ALTER TABLE `INT` ADD COLUMN `TEXT` varchar(64) DEFAULT 'KEEP INT, DEFAULT NULL'"},
+		{"postgres literal comma", schema.DialectPostgres, `ALTER TABLE "OrderHistory" ADD COLUMN "Label" text DEFAULT 'Keep INT, Case', ADD COLUMN payload jsonb`},
+		{"statement boundaries", schema.DialectMySQL, "ALTER TABLE orders ADD COLUMN note text; DROP TABLE orders"},
+		{"unknown dialect", schema.Dialect("custom"), `ALTER TABLE "INT" ADD COLUMN "TEXT" text DEFAULT 'KEEP INT, DEFAULT NULL'`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			expected := tc.raw + ";"
+			if tc.dialect == schema.DialectPostgres {
+				expected = "ALTER TABLE \"OrderHistory\"\n    ADD COLUMN \"Label\" text DEFAULT 'Keep INT, Case',\n    ADD COLUMN payload jsonb;"
+			}
+			assert.Equal(t, expected, FormatDDLForDialect(tc.dialect, " \n"+tc.raw+" \n"))
+			if tc.dialect == schema.DialectMySQL {
+				assert.Equal(t, tc.raw+";", FormatDDL(tc.raw))
+			}
+		})
+	}
 }

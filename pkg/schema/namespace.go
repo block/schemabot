@@ -12,6 +12,8 @@ import (
 const EmptyNamespaceDeclaration = "-- This namespace is empty. Add CREATE TABLE declarations here.\n"
 
 // GroupFilesByNamespace groups schema files by namespace using their relative paths.
+// An explicit empty-namespace marker retains the namespace with an empty Files map;
+// the marker itself is metadata and is not sent to an engine.
 // Two layouts are supported:
 //
 //  1. Flat layout — SQL files directly in the schema directory. The namespace
@@ -76,17 +78,11 @@ func GroupFilesByNamespace(files map[string]string, defaultNamespace string, env
 			continue
 		}
 
-		namespace := path.Dir(relativePath)
-		if namespace == "." || namespace == "" {
-			namespace = defaultNamespace
+		namespace, namespaced := NamespaceForRelativePath(relativePath, defaultNamespace, environment)
+		if !namespaced {
 			hasFlatFile = true
 		} else {
 			hasNamespacedFile = true
-		}
-
-		// Replace $ENV in namespace keys when environment is known.
-		if environment != "" {
-			namespace = strings.ReplaceAll(namespace, "$ENV", environment)
 		}
 
 		if result[namespace] == nil {
@@ -114,6 +110,20 @@ func GroupFilesByNamespace(files map[string]string, defaultNamespace string, env
 	sort.Strings(removed)
 
 	return result, removed, nil
+}
+
+// NamespaceForRelativePath derives the namespace key used when grouping a
+// schema file. The bool reports whether the file is in a namespace directory.
+func NamespaceForRelativePath(relativePath, defaultNamespace, environment string) (string, bool) {
+	namespace := path.Dir(relativePath)
+	namespaced := namespace != "." && namespace != ""
+	if !namespaced {
+		namespace = defaultNamespace
+	}
+	if environment != "" {
+		namespace = strings.ReplaceAll(namespace, "$ENV", environment)
+	}
+	return namespace, namespaced
 }
 
 // ResolveIgnoreNamespaces applies the same $ENV substitution to

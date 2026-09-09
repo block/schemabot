@@ -446,17 +446,31 @@ live view:
   ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
   • Rows: 6,000,000 / 10,000,000 · ETA: 42m 0s
   • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
+
+  Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
 ```
 
-Use `schemabot status apply-example-73` for a single snapshot.
+Use `schemabot status apply-example-73` for a single snapshot. SQL rendering
+uses the target database dialect and preserves quoted names and values. If
+`database_type` is missing or unrecognized, the CLI displays the original SQL
+without choosing another dialect.
 
 While an apply runs, `GET /api/progress/apply/{apply_id}` is the live view.
 Table entries identify the DDL and task state. Available metrics depend on the
 engine and execution phase: copying can report rows and percent complete;
 `eta_seconds` is an estimate and may be omitted. Do not interpret an absent ETA
 as zero time remaining. Throttled tasks can include `throttle_reason`.
+A PostgreSQL concurrent index build reports a whole-build percentage estimated
+from the server's build phase and its counters; it stays below 100 until the
+apply completes and holds its last value between phases (see
+[postgresql.md](postgresql.md)).
 Sharded engines can add per-shard progress, and multi-deployment applies list
 operations with their deployment, target, state, and cutover policy.
+The top-level `metadata` object carries engine-specific display fields when the
+engine reports them: PostgreSQL applies report their position through `phase`,
+`step`, `steps_total`, and `statement`; PlanetScale applies report deploy
+request fields such as `branch_name` and `deploy_request_url`. Spirit applies
+currently report progress on the table entries and do not report position fields.
 
 <details>
 <summary>Request and response example</summary>
@@ -492,10 +506,59 @@ Response excerpt (illustrative values):
 
 </details>
 
+<details>
+<summary>PostgreSQL response example</summary>
+
+```http
+GET /api/progress/apply/apply-example-74
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "apply_id": "apply-example-74",
+  "database": "shop",
+  "environment": "production",
+  "engine": "postgres",
+  "state": "running",
+  "metadata": {
+    "phase": "preflight",
+    "step": "2",
+    "steps_total": "2",
+    "statement": "CREATE INDEX CONCURRENTLY orders_status_idx ON public.orders (status)"
+  },
+  "tables": [
+    {
+      "table_name": "orders",
+      "keyspace": "public",
+      "ddl": "ALTER TABLE public.orders ADD COLUMN status text; CREATE INDEX CONCURRENTLY orders_status_idx ON public.orders (status)",
+      "status": "running",
+      "rows_copied": 0,
+      "rows_total": 0,
+      "percent_complete": 0
+    }
+  ]
+}
+```
+
+</details>
+
+The PostgreSQL phase stays `preflight` for the whole run — PostgreSQL DDL has
+no copy or cutover phase to report — and the statement position is what moves.
+The PR comment renders that position under each running deployment, and the
+CLI renders it for a single-deployment apply, as
+`step 2 of 2 · CREATE INDEX CONCURRENTLY orders_status_idx ON public.orders (status)`.
+The top-level `metadata` has one slot per key, so on a multi-deployment apply it
+carries the first-created deployment's position; the CLI's per-deployment view
+omits the position rather than show one deployment's under every heading.
+
 The numbers come from the engine while the apply is active, so they are as
 fresh as the last poll. Once the apply is terminal, the same endpoint answers
 from storage: rows, throttle state, and checksum counts are preserved on the
-task record; ETA and per-shard rows are not persisted in this view.
+task record, and `metadata` holds the last position the engine reported; ETA
+and per-shard rows are not persisted in this view. A new attempt can display
+the prior attempt's position until its first progress save.
 
 ## What’s running across the fleet?
 
@@ -528,6 +591,8 @@ Output excerpt:
   ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
   • Rows: 6,000,000 / 10,000,000 · ETA: 42m 0s
   • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
+
+  Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
 ```
 
 Here, `orders` is 60% copied with an estimated 42 minutes remaining. Copying
@@ -620,6 +685,9 @@ Response excerpt (illustrative values):
 </details>
 
 ## Inspect a stored plan
+
+The CLI uses the plan’s `database_type` when it displays SQL. PostgreSQL plans
+retain PostgreSQL grammar; unknown types retain their original statements.
 
 List recent plans across the databases in an environment:
 

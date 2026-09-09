@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"sort"
 	"strings"
 
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -105,11 +106,40 @@ func (ic *InstallationClient) CreateSchemaRequestForConfig(ctx context.Context, 
 			"repo", repo, "pr", pr, "database", config.Database, "environment", environment,
 			"schema_root", schemaRoot, "unmatched_entries", unmatched)
 	}
+	prFiles, err := ic.FetchPRFiles(ctx, repo, pr)
+	if err != nil {
+		return nil, fmt.Errorf("fetch changed files for %s#%d: %w", repo, pr, err)
+	}
+	// A file the pull request inherited from history its base has not caught up
+	// with — a stacked pull request on a stale base carries every deletion
+	// already merged ahead of it — is not one it proposes, and must not plan a
+	// namespace it never touched. Narrowing at the pinned head also ties the
+	// deletion evidence to the commit the declaration was read from: a vacated
+	// path survives only when that commit lacks it and the default branch holds
+	// it.
+	vacated, _, err := ic.PRFilesProposedAgainstDefaultBranch(ctx, repo, prInfo.HeadSHA, vacatedSchemaFiles(prFiles, schemaRoot))
+	if err != nil {
+		return nil, fmt.Errorf("scope the schema files %s#%d removes to what it proposes: %w", repo, pr, err)
+	}
 	if len(schemaFiles) == 0 {
+		// An empty schema root is indistinguishable from one that moved, so
+		// discovery fails closed rather than planning every table in the
+		// database as a drop. When the pull request itself emptied the root,
+		// say so: the operator needs to know the removal has not taken effect
+		// and what completes it.
+		if len(vacated) > 0 {
+			return nil, fmt.Errorf("no schema files found under %s for environment %q: this pull request removes the last schema files under it, so the tables those files declared stay live and the removal does not take effect; drop them through a reviewed schema change before deleting the files", schemaRoot, environment)
+		}
 		if len(ignoredNamespaces) > 0 {
 			return nil, fmt.Errorf("no schema files found under %s for environment %q after excluding ignored namespaces %v", schemaRoot, environment, ignoredNamespaces)
 		}
 		return nil, fmt.Errorf("no schema files found under %s for environment %q", schemaRoot, environment)
+	}
+	for _, namespace := range emptiedPRNamespaces(schemaFiles, config.IgnoreNamespaces, vacated, schemaRoot, environment) {
+		schemaFiles[namespace] = &ternv1.SchemaFiles{Files: map[string]string{}}
+		ic.logger.Info("namespace has no remaining schema files in this pull request; the plan will surface every live table it holds as a DROP TABLE change",
+			"repo", repo, "pr", pr, "head_sha", prInfo.HeadSHA, "database", config.Database,
+			"database_type", config.GetType(), "environment", environment, "schema_root", schemaRoot, "namespace", namespace)
 	}
 
 	return &SchemaRequestResult{
@@ -123,6 +153,86 @@ func (ic *InstallationClient) CreateSchemaRequestForConfig(ctx context.Context, 
 		HeadSHA:           prInfo.HeadSHA,
 		IgnoredNamespaces: ignoredNamespaces,
 	}, nil
+}
+
+// vacatedSchemaFiles returns, as deletions, the schema files under schemaRoot
+// that the pull request left empty: a deleted file's own path and a renamed
+// file's previous one. Each is reported with the removed status so the caller
+// can ask the proposed-against-default-branch narrowing the one question that
+// matters for it — does the default branch still hold this path.
+//
+// Only files head discovery reads are kept: those directly under the root or
+// one namespace directory below it. A file nested deeper is never declared,
+// so removing it declares nothing either.
+func vacatedSchemaFiles(prFiles []PRFile, schemaRoot string) []PRFile {
+	prefix := path.Clean(schemaRoot) + "/"
+	var vacated []PRFile
+	for _, file := range prFiles {
+		vacatedPath, ok := vacatedSchemaPath(file)
+		if !ok {
+			continue
+		}
+		relativePath, ok := strings.CutPrefix(path.Clean(vacatedPath), prefix)
+		if !ok || strings.Count(relativePath, "/") > 1 {
+			continue
+		}
+		vacated = append(vacated, PRFile{Filename: path.Clean(vacatedPath), Status: "removed"})
+	}
+	return vacated
+}
+
+// emptiedPRNamespaces returns the namespaces the pull request emptied: those
+// whose schema files it vacated (see vacatedSchemaFiles) and which no file at
+// the head commit still declares. Absent from the grouped files, such a
+// namespace would otherwise vanish from the plan while every table it holds
+// stays live.
+func emptiedPRNamespaces(grouped map[string]*ternv1.SchemaFiles, ignored []string, vacated []PRFile, schemaRoot, environment string) []string {
+	ignoredSet := make(map[string]bool, len(ignored))
+	for _, namespace := range schema.ResolveIgnoreNamespaces(ignored, environment) {
+		ignoredSet[namespace] = true
+	}
+
+	prefix := path.Clean(schemaRoot) + "/"
+	emptied := make(map[string]bool)
+	for _, file := range vacated {
+		relativePath, ok := strings.CutPrefix(path.Clean(file.Filename), prefix)
+		if !ok {
+			continue
+		}
+		namespace, namespaced := schema.NamespaceForRelativePath(relativePath, path.Base(schemaRoot), environment)
+		if !namespaced || ignoredSet[namespace] || grouped[namespace] != nil {
+			continue
+		}
+		emptied[namespace] = true
+	}
+
+	result := make([]string, 0, len(emptied))
+	for namespace := range emptied {
+		result = append(result, namespace)
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	sort.Strings(result)
+	return result
+}
+
+// vacatedSchemaPath reports the schema file path a pull request file left
+// empty: the path of a deleted file, or the previous path of a renamed one.
+func vacatedSchemaPath(file PRFile) (string, bool) {
+	var vacated string
+	switch {
+	case isRemovedPRFile(file.Status):
+		vacated = file.Filename
+	case isRenamedPRFile(file.Status):
+		vacated = file.PreviousFilename
+	default:
+		return "", false
+	}
+	if !IsSchemaFile(vacated) {
+		return "", false
+	}
+	return vacated, true
 }
 
 func (ic *InstallationClient) resolveSchemaRootForEnvironment(ctx context.Context, repo, ref, configDir, environment string) (schemaRoot, schemaLinkPath string, err error) {
