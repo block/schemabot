@@ -286,6 +286,35 @@ func TestCodeQuoteIdentifiers(t *testing.T) {
 	}
 }
 
+// An engine-reported statement renders as a single line of bounded width on
+// every surface: line breaks, tabs, and control bytes fold into single spaces,
+// text within the bound passes through untouched, and text past it is cut to
+// exactly the bound with a trailing ellipsis.
+func TestClampStatement(t *testing.T) {
+	atBound := strings.Repeat("x", MaxStatementRunes)
+	tests := []struct {
+		name   string
+		input  string
+		expect string
+	}{
+		{name: "empty", input: "", expect: ""},
+		{name: "plain statement unchanged", input: "CREATE INDEX idx ON t (c)", expect: "CREATE INDEX idx ON t (c)"},
+		{name: "newlines tabs and control bytes fold to one space", input: "CREATE INDEX\r\n\tidx\x1b[31m ON t (c)", expect: "CREATE INDEX idx [31m ON t (c)"},
+		{name: "surrounding whitespace dropped", input: "  ALTER TABLE t ADD c int \n", expect: "ALTER TABLE t ADD c int"},
+		{name: "exactly at the bound passes through", input: atBound, expect: atBound},
+		{name: "one past the bound is cut with an ellipsis", input: atBound + "y", expect: strings.Repeat("x", MaxStatementRunes-1) + "…"},
+		{name: "cut counts runes not bytes", input: strings.Repeat("é", MaxStatementRunes+5), expect: strings.Repeat("é", MaxStatementRunes-1) + "…"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ClampStatement(tt.input)
+			assert.Equal(t, tt.expect, got)
+			assert.LessOrEqual(t, len([]rune(got)), MaxStatementRunes)
+		})
+	}
+}
+
 // A byte count reads as a magnitude: bytes below a kibibyte, and one decimal
 // place with a binary unit above it, so a table's footprint is scannable.
 func TestFormatBytesBinary(t *testing.T) {
