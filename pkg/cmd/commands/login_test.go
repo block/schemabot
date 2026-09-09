@@ -107,6 +107,11 @@ func TestLoginCmdRunCachesToken(t *testing.T) {
 	cmd := &LoginCmd{
 		loginFn: func(_ context.Context, lc client.LoginConfig, _ client.BrowserOpener) (*client.LoginResult, error) {
 			gotCfg = lc
+			// Another terminal saves a profile while the browser login is open.
+			latest, err := client.LoadConfig()
+			require.NoError(t, err)
+			latest.Profiles["other"] = client.Profile{Endpoint: "https://other.example"}
+			require.NoError(t, client.SaveConfig(latest))
 			return &client.LoginResult{IDToken: idToken}, nil
 		},
 		openBrowser: func(string) error { return nil },
@@ -121,6 +126,7 @@ func TestLoginCmdRunCachesToken(t *testing.T) {
 	reloaded, err := client.LoadConfig()
 	require.NoError(t, err)
 	assert.Equal(t, idToken, reloaded.Profiles["default"].Token)
+	assert.Equal(t, "https://other.example", reloaded.Profiles["other"].Endpoint)
 }
 
 // Without OIDC settings on the profile and no flags, login fails with a clear
