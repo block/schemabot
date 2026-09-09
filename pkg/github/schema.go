@@ -39,6 +39,25 @@ type SchemaRequestResult struct {
 // files in the repository.
 type EnvironmentValidator func(database, environment string) error
 
+// NoSchemaFilesError indicates schema discovery found no schema files under
+// the resolved schema root for the requested environment. Its message carries
+// only SchemaBot-owned wording and config identifiers, so it is safe to render
+// on a PR: the fix (add schema files or correct the schema root) belongs to
+// the repository author.
+type NoSchemaFilesError struct {
+	SchemaRoot        string
+	Environment       string
+	IgnoredNamespaces []string
+}
+
+func (e *NoSchemaFilesError) Error() string {
+	if len(e.IgnoredNamespaces) > 0 {
+		return fmt.Sprintf("no schema files found under %s for environment %q after excluding ignored namespaces %v",
+			e.SchemaRoot, e.Environment, e.IgnoredNamespaces)
+	}
+	return fmt.Sprintf("no schema files found under %s for environment %q", e.SchemaRoot, e.Environment)
+}
+
 // CreateSchemaRequestFromPR discovers config, fetches schema files, and builds a plan request.
 func (ic *InstallationClient) CreateSchemaRequestFromPR(ctx context.Context, repo string, pr int, environment, databaseName string, validateEnvironment EnvironmentValidator) (*SchemaRequestResult, error) {
 	var config *SchemabotConfig
@@ -106,10 +125,11 @@ func (ic *InstallationClient) CreateSchemaRequestForConfig(ctx context.Context, 
 			"schema_root", schemaRoot, "unmatched_entries", unmatched)
 	}
 	if len(schemaFiles) == 0 {
-		if len(ignoredNamespaces) > 0 {
-			return nil, fmt.Errorf("no schema files found under %s for environment %q after excluding ignored namespaces %v", schemaRoot, environment, ignoredNamespaces)
+		return nil, &NoSchemaFilesError{
+			SchemaRoot:        schemaRoot,
+			Environment:       environment,
+			IgnoredNamespaces: ignoredNamespaces,
 		}
-		return nil, fmt.Errorf("no schema files found under %s for environment %q", schemaRoot, environment)
 	}
 
 	return &SchemaRequestResult{

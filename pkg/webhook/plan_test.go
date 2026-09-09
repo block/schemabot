@@ -833,7 +833,8 @@ func TestUserFacingErrorExplainsNoHealthyUpstream(t *testing.T) {
 	assert.Contains(t, got, "SchemaBot could not reach the remote deployment `pie`")
 	assert.Contains(t, got, "target `orders-staging`")
 	assert.Contains(t, got, "service or network path is unavailable")
-	assert.Contains(t, got, "Raw error: remote deployment \"pie\" target \"orders-staging\" unavailable: rpc error: code = Unavailable desc = no healthy upstream")
+	assert.Contains(t, got, "If the problem persists, contact your SchemaBot operators")
+	assert.NotContains(t, got, "rpc error")
 }
 
 func TestUserFacingErrorPreservesNonGRPCErrors(t *testing.T) {
@@ -859,13 +860,25 @@ func TestUserFacingErrorExplainsConfigOutsideAllowedDirs(t *testing.T) {
 }
 
 func TestUserFacingErrorDetailDoesNotWrapFormattedRemoteErrors(t *testing.T) {
-	formatted := "SchemaBot could not reach the remote deployment `pie` for target `orders-staging`. No healthy upstream is available. Raw error: rpc error: code = Unavailable desc = no healthy upstream"
+	formatted := "SchemaBot could not reach the remote deployment `pie` for target `orders-staging`. No healthy upstream is available. The service or network path is unavailable; retry after the upstream is healthy. If the problem persists, contact your SchemaBot operators."
 
 	got := userFacingErrorDetail(formatted)
 
 	assert.Equal(t, formatted, got)
 	assert.Equal(t, 1, strings.Count(got, "SchemaBot could not reach"))
-	assert.Equal(t, 1, strings.Count(got, "Raw error:"))
+}
+
+// A detail that pairs the formatted remote-unavailable guidance with raw
+// transport text must be re-rendered, not passed through: the raw block can
+// carry hostnames and driver internals that never belong on a PR.
+func TestUserFacingErrorDetailReRendersFormattedMessageCarryingRawError(t *testing.T) {
+	hybrid := "SchemaBot could not reach the remote deployment `pie`. Retry after the service is healthy.\n\nRaw error: rpc error: code = Unavailable desc = dial tcp 10.0.0.1:443"
+
+	got := userFacingErrorDetail(hybrid)
+
+	assert.Contains(t, got, "SchemaBot could not reach the remote schema change service")
+	assert.NotContains(t, got, "10.0.0.1")
+	assert.NotContains(t, got, "Raw error")
 }
 
 func TestRenderUnsafeChangesBlocked_UsedByApplyFlow(t *testing.T) {

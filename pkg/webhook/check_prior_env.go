@@ -162,14 +162,15 @@ func (h *Handler) checkPriorEnvViaLocal(
 ) (blocked bool, err error) {
 	check, err := h.waitForLocalPriorEnvCheck(ctx, repo, pr, database, dbType, environment, priorEnv)
 	if err != nil {
+		errorRef := newErrorReference()
 		h.logger.Error("failed to look up prior environment check",
 			"repo", repo, "pr", pr,
 			"database", database, "database_type", dbType,
 			"environment", environment, "prior_environment", priorEnv,
-			"error", err)
+			"error_ref", errorRef, "error", err)
 		if !suppressRetryComments {
 			h.postComment(repo, pr, installationID,
-				templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "read SchemaBot storage"))
+				templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "read SchemaBot storage", errorRef))
 		}
 		return false, fmt.Errorf("prior environment gate read stored check for %s: %w", priorEnv, err)
 	}
@@ -287,22 +288,24 @@ func (h *Handler) checkPriorEnvViaGitHub(
 ) (blocked bool, err error) {
 	client, err := h.clientForRepo(repo, installationID)
 	if err != nil {
+		errorRef := newErrorReference()
 		h.logger.Error("failed to create GitHub client for prior env check, stopping apply",
-			"prior_env", priorEnv, "error", err)
+			"prior_env", priorEnv, "error_ref", errorRef, "error", err)
 		if !suppressRetryComments {
 			h.postComment(repo, pr, installationID,
-				templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "create GitHub client"))
+				templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "create GitHub client", errorRef))
 		}
 		return false, fmt.Errorf("prior environment gate create GitHub client for %s: %w", priorEnv, err)
 	}
 
 	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 	if err != nil {
+		errorRef := newErrorReference()
 		h.logger.Error("failed to fetch PR for prior env check, stopping apply",
-			"prior_env", priorEnv, "error", err)
+			"prior_env", priorEnv, "error_ref", errorRef, "error", err)
 		if !suppressRetryComments {
 			h.postComment(repo, pr, installationID,
-				templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "fetch PR details"))
+				templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "fetch PR details", errorRef))
 		}
 		return false, fmt.Errorf("prior environment gate fetch PR %s#%d for %s: %w", repo, pr, priorEnv, err)
 	}
@@ -310,15 +313,16 @@ func (h *Handler) checkPriorEnvViaGitHub(
 	checkName := aggregateCheckNameForEnv(h.promotionCheckNameForRepo(repo), priorEnv)
 	checkResult, untrustedApps, err := h.waitForGitHubPriorEnvCheck(ctx, client, repo, pr, database, environment, priorEnv, prInfo.HeadSHA, checkName)
 	if err != nil {
+		errorRef := newErrorReference()
 		h.logger.Error("failed to query GitHub check for prior environment, stopping apply",
 			"repo", repo, "pr", pr,
 			"database", database,
 			"environment", environment, "prior_environment", priorEnv,
 			"head_sha", prInfo.HeadSHA,
-			"check_name", checkName, "error", err)
+			"check_name", checkName, "error_ref", errorRef, "error", err)
 		if !suppressRetryComments {
 			h.postComment(repo, pr, installationID,
-				templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "query check runs"))
+				templates.RenderApplyBlockedByPriorEnvCheckError(priorEnv, "query check runs", errorRef))
 		}
 		return false, fmt.Errorf("prior environment gate query check run %q for %s: %w", checkName, priorEnv, err)
 	}

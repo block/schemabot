@@ -21,6 +21,9 @@ const (
 	previewHeadSHA              = "abcdef1234567890abcdef1234567890abcdef12"
 	previewStaleSHA             = "0123456789abcdef0123456789abcdef01234567"
 	previewRequestedBy          = "jackjackbits"
+	// previewErrorReference is the fixed sample error reference rendered in
+	// internal-error previews; production generates a fresh one per failure.
+	previewErrorReference = "ab12cd34"
 )
 
 func previewSupportChannel() SupportChannelData {
@@ -648,13 +651,15 @@ func PreviewCommentErrorInvalid() string {
 }
 
 // PreviewCommentErrorGeneric renders a generic plan failure error comment.
+// The detail mirrors what the webhook handler composes for an internal
+// failure: fixed retry guidance plus an error reference, never raw error text.
 func PreviewCommentErrorGeneric() string {
 	return RenderGenericError(SchemaErrorData{
 		RequestedBy: previewRequestedBy,
 		Timestamp:   "2026-01-15 14:30:00",
 		Environment: "staging",
 		CommandName: action.Plan,
-		ErrorDetail: "failed to fetch repository contents: API rate limit exceeded",
+		ErrorDetail: "Failed to prepare the schema change request. Internal SchemaBot error. Retry (error reference `" + previewErrorReference + "`).",
 	})
 }
 
@@ -666,7 +671,7 @@ func PreviewCommentErrorGenericAutoPlan() string {
 		Timestamp:    "2026-01-15 14:30:00",
 		Environments: []string{"staging"},
 		CommandName:  action.Plan,
-		ErrorDetail:  "failed to fetch repository contents: API rate limit exceeded",
+		ErrorDetail:  "Failed to prepare the schema change request. Internal SchemaBot error. Retry (error reference `" + previewErrorReference + "`).",
 	})
 }
 
@@ -793,13 +798,16 @@ func PreviewCommentReviewRequiredNoOperators() string {
 	})
 }
 
-// PreviewCommentReviewGateError renders a sample review gate error comment (fail-closed).
+// PreviewCommentReviewGateError renders a sample review gate error comment
+// (fail-closed). The detail mirrors what the webhook handler composes when the
+// gate cannot be evaluated: internal-error guidance with an error reference,
+// plus the team-membership hint for the one cause with a user-side remedy.
 func PreviewCommentReviewGateError() string {
 	return RenderGenericError(SchemaErrorData{
 		RequestedBy: previewRequestedBy,
 		Environment: "staging",
 		CommandName: action.Apply,
-		ErrorDetail: "Review gate check failed; see server logs for details. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.",
+		ErrorDetail: "Review gate check failed. Internal SchemaBot error. Retry (error reference `" + previewErrorReference + "`). If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.",
 	})
 }
 
@@ -862,13 +870,13 @@ func PreviewCommentApplyBlockedByCheckStatusError() string {
 		&CheckStatusAccessDetails{
 			GitHubApp:          "schemabot-app",
 			MissingPermissions: []string{"Checks: Read", "Commit statuses: Read"},
-		})
+		}, previewErrorReference)
 }
 
 // PreviewCommentApplyBlockedByPriorEnvCheckError renders a sample fail-closed
 // block for a prior-environment check that could not be read.
 func PreviewCommentApplyBlockedByPriorEnvCheckError() string {
-	return RenderApplyBlockedByPriorEnvCheckError("staging", "query check runs")
+	return RenderApplyBlockedByPriorEnvCheckError("staging", "query check runs", previewErrorReference)
 }
 
 // PreviewCommentApplyBlockedByMissingPriorEnvCheck renders a sample block for

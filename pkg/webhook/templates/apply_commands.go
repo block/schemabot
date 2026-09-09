@@ -582,8 +582,9 @@ func RenderApplyBlockedByNonPassingChecks(environment string, notPassing []Block
 // The function recognises the "Resource not accessible" permission error and
 // surfaces a targeted hint; the error itself is never rendered — raw GitHub
 // errors can carry internal detail (hosts, headers, newlines) that must not
-// land in PR markdown, so operators triage from the server logs. Both branches
-// include a fenced retry command, matching the non-passing/in-progress siblings.
+// land in PR markdown, so the comment carries an error reference and operators
+// triage from the server logs. Both branches include a fenced retry command,
+// matching the non-passing/in-progress siblings.
 type CheckStatusAccessDetails struct {
 	GitHubApp              string
 	MissingPermissions     []string
@@ -591,7 +592,7 @@ type CheckStatusAccessDetails struct {
 	CommitStatusesReadable bool
 }
 
-func RenderApplyBlockedByCheckStatusError(environment string, err error, details *CheckStatusAccessDetails) string {
+func RenderApplyBlockedByCheckStatusError(environment string, err error, details *CheckStatusAccessDetails, errorRef string) string {
 	var sb strings.Builder
 
 	// Failure glyph, not refusal: a check-status read error is transient — an
@@ -614,7 +615,7 @@ func RenderApplyBlockedByCheckStatusError(environment string, err error, details
 			}
 			sb.WriteString("\nGrant or accept those permissions, then retry:\n")
 		case details != nil && details.ChecksReadable && details.CommitStatusesReadable:
-			sb.WriteString("Diagnostic REST probes could read both **Checks** and **Commit statuses**, so the check-status read failed even though the underlying permissions appear readable. Retry the command; if it keeps failing, inspect the SchemaBot logs for the exact GitHub API error:\n")
+			fmt.Fprintf(&sb, "Diagnostic REST probes could read both **Checks** and **Commit statuses**, so the check-status read failed even though the underlying permissions appear readable. Internal SchemaBot error. Retry (error reference `%s`):\n", errorRef)
 		default:
 			sb.WriteString("Verify the app installation has access to this repository and has permission to read both **Checks** and **Commit statuses**, then retry:\n")
 		}
@@ -622,8 +623,15 @@ func RenderApplyBlockedByCheckStatusError(environment string, err error, details
 		return sb.String()
 	}
 
-	sb.WriteString("Unable to verify PR check statuses; see server logs for details.\n\n")
-	sb.WriteString("Retry:\n")
+	if err != nil {
+		fmt.Fprintf(&sb, "Unable to verify PR check statuses. Internal SchemaBot error. Retry (error reference `%s`):\n", errorRef)
+	} else {
+		// Defensive: callers should always pass a non-nil error here, but
+		// referencing an error that was never surfaced would be confusing if
+		// a nil error ever slipped through.
+		sb.WriteString("Unable to verify PR check statuses.\n\n")
+		sb.WriteString("Retry:\n")
+	}
 	fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
 
 	return offerSupportChannel(sb.String())
@@ -690,17 +698,16 @@ func RenderApplyBlockedByInProgressChecks(environment string, inProgress, notRep
 // aggregate check status. Reason describes the operation that failed (e.g.
 // "create GitHub client", "fetch PR details", "query check runs"). The error
 // itself is never rendered — raw GitHub/storage errors can carry internal
-// detail that must not land in PR markdown, so operators triage from the
-// server logs.
-func RenderApplyBlockedByPriorEnvCheckError(priorEnv, reason string) string {
+// detail that must not land in PR markdown, so the comment carries an error
+// reference and operators triage from the server logs.
+func RenderApplyBlockedByPriorEnvCheckError(priorEnv, reason, errorRef string) string {
 	var sb strings.Builder
 
 	// Failure glyph, not refusal: the prior-environment read is transient —
 	// an unchanged retry can succeed — so this is a failed verification the
 	// apply fail-closed on, not a request SchemaBot refuses to perform.
 	sb.WriteString("## " + glyph.Failed + " Apply Blocked\n\n")
-	fmt.Fprintf(&sb, "Could not verify %s status: failed to %s. Retry the apply command.\n\n", priorEnv, reason)
-	sb.WriteString("_See server logs for details._")
+	fmt.Fprintf(&sb, "Could not verify %s status: failed to %s. Internal SchemaBot error. Retry (error reference `%s`).\n", priorEnv, reason, errorRef)
 
 	return offerSupportChannel(sb.String())
 }
