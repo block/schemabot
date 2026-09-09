@@ -248,7 +248,7 @@ func writeApplyStep(sb *strings.Builder, data ApplyStatusCommentData) {
 		return
 	}
 	fmt.Fprintf(sb, "\nstep %d of %d", data.Step, data.StepsTotal)
-	if statement := clampInlineCode(data.Statement, maxProgressStatementLen); statement != "" {
+	if statement := inlineCodeStatement(data.Statement); statement != "" {
 		fmt.Fprintf(sb, " · `%s`", statement)
 	}
 	sb.WriteString("\n")

@@ -40,5 +40,6 @@ CREATE INDEX idx_applies_repo_pr ON applies (repository, pull_request);
 CREATE INDEX idx_applies_created_id ON applies (created_at, id);
 CREATE INDEX idx_applies_environment_created_id ON applies (environment, created_at, id);
 CREATE INDEX idx_applies_state_created_id ON applies (state, created_at, id);
+CREATE INDEX idx_applies_state_updated ON applies (state, updated_at);
 CREATE INDEX idx_applies_environment_state_created_id ON applies (environment, state, created_at, id);
 CREATE INDEX idx_applies_completed_at_state ON applies (completed_at, state);

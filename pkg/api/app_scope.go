@@ -54,7 +54,7 @@ func (c *ServerConfig) DatabasesForApp(app string) ([]string, error) {
 		return nil, fmt.Errorf("resolve app: app identifier is empty")
 	}
 	var names []string
-	for name, dbConfig := range c.Databases {
+	for name, dbConfig := range c.DatabaseConfigs() {
 		if dbConfig.App == app {
 			names = append(names, name)
 		}

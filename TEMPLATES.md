@@ -710,8 +710,8 @@ Choose one:
 ```sql
 CREATE TABLE `address_seq` (
     `id` tinyint unsigned NOT NULL DEFAULT '0',
-    `next_id` bigint unsigned,
-    `cache` bigint unsigned,
+    `next_id` bigint unsigned DEFAULT NULL,
+    `cache` bigint unsigned DEFAULT NULL,
     PRIMARY KEY(`id`)
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
@@ -893,8 +893,8 @@ schemabot apply -e staging
 ```sql
 CREATE TABLE `address_seq` (
     `id` tinyint unsigned NOT NULL DEFAULT '0',
-    `next_id` bigint unsigned,
-    `cache` bigint unsigned,
+    `next_id` bigint unsigned DEFAULT NULL,
+    `cache` bigint unsigned DEFAULT NULL,
     PRIMARY KEY(`id`)
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
@@ -2503,8 +2503,8 @@ schemabot unlock
 ```sql
 CREATE TABLE `address_seq` (
     `id` tinyint unsigned NOT NULL DEFAULT '0',
-    `next_id` bigint unsigned,
-    `cache` bigint unsigned,
+    `next_id` bigint unsigned DEFAULT NULL,
+    `cache` bigint unsigned DEFAULT NULL,
     PRIMARY KEY(`id`)
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
@@ -3759,7 +3759,7 @@ Deploy request: https://app.planetscale.com/acme/myapp/deploy-requests/42
 **`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
-ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 ```
 
 
@@ -4972,7 +4972,7 @@ Applied by namespace:
 
 **`users`**
 ```sql
-ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 ```
 
 
@@ -5118,7 +5118,7 @@ ALTER TABLE `addresses` ADD INDEX `idx_zip`(`zip_code`);
 
 **`users`** — Completed
 ```sql
-ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 ```
 
 
@@ -5204,7 +5204,7 @@ ALTER TABLE `payments` ADD INDEX `idx_order_id`(`order_id`);
 
 **`users`**
 ```sql
-ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 ```
 
 **`addresses`**
@@ -5588,6 +5588,8 @@ Sequential mode: First complete, second paused by the engine's throttler
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
+  Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
+
 
 ```
 </details>
@@ -5947,7 +5949,7 @@ Use 'schemabot start' to resume from checkpoint.
   ── myapp_sharded ──
 
      ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Running...
-       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+       ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 
 
 ```
@@ -5972,7 +5974,7 @@ Use 'schemabot start' to resume from checkpoint.
   ── myapp_sharded ──
 
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+       ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 
 
 ```
@@ -6032,7 +6034,7 @@ Use 'schemabot start' to resume from checkpoint.
   ── myapp_sharded ──
 
      ~ users: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
-       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+       ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 
 
 To recover: Fix the issue above, then run a new apply.
@@ -6171,7 +6173,7 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
   ── commerce_sharded ──
 
      ~ transactions: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜ 57.21%
-       ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+       ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL;
        • Rows: 110,573,340 / 193,280,000 · ETA: 4m 40s
        • Shards: 256 (30 waiting for cutover, 226 copying)
            ● -01: waiting for cutover
@@ -6207,7 +6209,7 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
   ── commerce_sharded ──
 
      ~ transactions: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜ 67.89%
-       ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+       ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL;
        • Rows: 29,435,000 / 43,360,000 · ETA: 2m 37s
        • Shards: 32 (12 waiting for cutover, 20 copying)
            ● -08: waiting for cutover
@@ -6224,31 +6226,31 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
   ── commerce_001 ──
 
      ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ⚡ Applied instantly
-       ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+       ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL;
 
 
   ── commerce_002 ──
 
      ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ⚡ Applied instantly
-       ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+       ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL;
 
 
   ── commerce_003 ──
 
      ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ⚡ Applied instantly
-       ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+       ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL;
 
 
   ── commerce_004 ──
 
      ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ⚡ Applied instantly
-       ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+       ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL;
 
 
   ── commerce_005 ──
 
      ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ⚡ Applied instantly
-       ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+       ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL;
 
 
   ... and 27 more keyspaces (all completed)
@@ -6332,7 +6334,7 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
   ── myapp_sharded ──
 
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+       ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 
 
 ```
@@ -6357,7 +6359,7 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
   ── myapp_sharded ──
 
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+       ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 
     ~ VSchema (myapp_sharded): Applying...
        + "xxhash": {"type": "xxhash"}
@@ -6591,7 +6593,7 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
   ── myapp_sharded ──
 
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ⚡ Applied instantly
-       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+       ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 
 
 ```
@@ -7883,20 +7885,20 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 🟢 us-east — ready for cutover — next in order (orders-us-east)
 
      ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
 🔄 eu-west — running table copy (orders-eu-west)
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.00%
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
        • Rows: 42,000 / 120,000 · ETA: 4m 0s
 
 
 ⏳ ap-south — waiting for eu-west (orders-ap-south)
 
      ~ orders: ⏳ Queued
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
 
@@ -7926,7 +7928,7 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 ✅ us-east — completed (orders-us-east)
 
      ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
 ❌ eu-west — failed (orders-eu-west)
@@ -7939,7 +7941,7 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 ⏸️ ap-south — halted — eu-west failed (orders-ap-south)
 
      ~ orders: 🚫 Cancelled (not started)
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
 
@@ -7976,14 +7978,14 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 🔄 eu-west — running table copy (orders-eu-west)
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.00%
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
        • Rows: 42,000 / 120,000 · ETA: 4m 0s
 
 
 ⏸️ ap-south — halted — us-east failed (orders-ap-south)
 
      ~ orders: ⏳ Queued
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
 
@@ -8009,19 +8011,19 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 ✅ us-east — completed (orders-us-east)
 
      ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
 ✅ eu-west — completed (orders-eu-west)
 
      ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
 ✅ ap-south — completed (orders-ap-south)
 
      ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
 ```
@@ -8621,7 +8623,7 @@ Environment: production
   External apply ID: remote-apply-us-east-001
 
      ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
 🔄 eu-west — running table copy (orders-eu-west)
@@ -8629,14 +8631,14 @@ Environment: production
   External apply ID: remote-apply-eu-west-001
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.42%
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
        • Rows: 42,500 / 120,000 · ETA: 4m 0s
 
 
 ⏳ ap-south — waiting for eu-west (orders-ap-south)
 
      ~ orders: ⏳ Queued
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
 ESC to detach

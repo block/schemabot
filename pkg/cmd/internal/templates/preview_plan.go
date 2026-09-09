@@ -1,5 +1,7 @@
 package templates
 
+import "github.com/block/schemabot/pkg/schema"
+
 func previewPlanOutput() {
 	WritePlanHeader(PlanHeaderData{
 		Database:    "testapp",
@@ -9,7 +11,7 @@ func previewPlanOutput() {
 	})
 
 	changes := samplePlanChanges()
-	WriteSQLChanges(changes)
+	WriteSQLChanges(changes, schema.DialectMySQL)
 	WriteLintViolations(samplePlanLintViolations())
 	WritePlanSummary(changes)
 	WriteOptions(true, false) // Show defer cutover option
@@ -51,7 +53,7 @@ func previewVitessPlanOutput() {
 			},
 		},
 	}
-	WriteNamespaceChanges(namespaces, false, "commerce")
+	WriteNamespaceChanges(namespaces, false, "commerce", schema.DialectMySQL)
 
 	// Flat summary across all namespaces
 	var allChanges []DDLChange
@@ -79,7 +81,7 @@ func previewMultiEnvPlanOutput() {
 		IsMySQL:    true,
 	})
 	changes := samplePlanChanges()
-	WriteSQLChanges(changes)
+	WriteSQLChanges(changes, schema.DialectMySQL)
 	WritePlanSummary(changes)
 }
 
@@ -94,7 +96,7 @@ func previewMultiEnvPlanDiffOutput() {
 	WriteNoChanges()
 	WriteEnvironmentHeader("production")
 	changes := samplePlanChanges()
-	WriteSQLChanges(changes)
+	WriteSQLChanges(changes, schema.DialectMySQL)
 	WritePlanSummary(changes)
 }
 
@@ -106,7 +108,7 @@ func previewMultiEnvPlanLintOutput() {
 		IsMySQL:    true,
 	})
 	changes := samplePlanChanges()
-	WriteSQLChanges(changes)
+	WriteSQLChanges(changes, schema.DialectMySQL)
 	WriteLintViolations(samplePlanLintViolations())
 	WritePlanSummary(changes)
 }

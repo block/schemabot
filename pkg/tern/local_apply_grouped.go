@@ -372,11 +372,17 @@ func (c *LocalClient) saveApplyProgressMetadata(ctx context.Context, apply *stor
 	return nil
 }
 
-func (c *LocalClient) persistProgressMetadataIfChanged(ctx context.Context, task *storage.Task, previous, current map[string]string) (map[string]string, error) {
+func (c *LocalClient) persistProgressMetadataIfChanged(previous, current map[string]string, leaseLost *bool, save func(map[string]string) error) (map[string]string, error) {
+	if *leaseLost {
+		return previous, nil
+	}
 	if maps.Equal(previous, current) {
 		return previous, nil
 	}
-	if err := c.saveProgressMetadata(ctx, task, current); err != nil {
+	if err := save(current); err != nil {
+		if errors.Is(err, storage.ErrApplyLeaseLost) {
+			*leaseLost = true
+		}
 		return previous, err
 	}
 	return maps.Clone(current), nil
@@ -711,13 +717,13 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		return false
 	}
 	var saveErr error
-	if !maps.Equal(ps.lastProgressMetadata, result.Metadata) {
-		saveErr = c.saveApplyProgressMetadata(ctx, apply, tasks, result.Metadata)
-		if saveErr == nil {
-			ps.lastProgressMetadata = maps.Clone(result.Metadata)
-		}
-	}
-	if saveErr != nil {
+	ps.lastProgressMetadata, saveErr = c.persistProgressMetadataIfChanged(ps.lastProgressMetadata, result.Metadata, &ps.progressMetadataLeaseLost, func(metadata map[string]string) error {
+		return c.saveApplyProgressMetadata(ctx, apply, tasks, metadata)
+	})
+	if errors.Is(saveErr, storage.ErrApplyLeaseLost) {
+		logger.Debug("progress metadata persistence stopped because the operation lease was lost during failover",
+			append(apply.MutableLogAttrs(), "error", saveErr)...)
+	} else if saveErr != nil {
 		logger.Warn("failed to persist engine progress metadata; the drive will retry on the next poll",
 			append(apply.MutableLogAttrs(), "error", saveErr)...)
 	}

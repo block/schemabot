@@ -1,6 +1,7 @@
 package localruntime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -18,6 +19,9 @@ import (
 )
 
 const pollInterval = 100 * time.Millisecond
+
+// Allow an in-flight registration to finish publishing without hiding persistent drift.
+const configMismatchGrace = time.Second
 
 // Record contains process identity, not database apply state. A recorded PID is
 // diagnostic only; ownership is proven by the lifetime lock and control endpoint.
@@ -71,7 +75,7 @@ func (m Manager) Ensure(ctx context.Context) (Connection, error) {
 	if err := privateDirectory(m.Dir); err != nil {
 		return Connection{}, err
 	}
-	config, err := ReadPrivate(filepath.Join(m.Dir, "runtime.yaml"))
+	_, err := ReadPrivate(filepath.Join(m.Dir, "runtime.yaml"))
 	if err != nil {
 		return Connection{}, fmt.Errorf("read runtime configuration: %w", err)
 	}
@@ -84,6 +88,14 @@ func (m Manager) Ensure(ctx context.Context) (Connection, error) {
 		return Connection{}, err
 	}
 	if available {
+		// Setup may have published a registration after the initial read. The
+		// startup lease prevents registration from superseding this snapshot
+		// before the child takes ownership.
+		config, err := ReadPrivate(filepath.Join(m.Dir, "runtime.yaml"))
+		if err != nil {
+			utils.CloseAndLog(lease)
+			return Connection{}, fmt.Errorf("read runtime configuration: %w", err)
+		}
 		err = m.start(ctx, lease, config, binary)
 		utils.CloseAndLog(lease)
 		if err != nil {
@@ -93,11 +105,13 @@ func (m Manager) Ensure(ctx context.Context) (Connection, error) {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	lastState := "starting"
+	var mismatchSince time.Time
 	for {
+		observedMismatch := false
 		r, err := m.record()
 		if err == nil {
-			if r.Config != digest(config) || r.Binary != binary {
-				return Connection{}, fmt.Errorf("local runtime %s uses a different binary or configuration; finish active work and stop it before restarting", r.ID)
+			if r.Binary != binary {
+				return Connection{}, fmt.Errorf("local runtime %s uses a different binary; finish active work and stop it before restarting", r.ID)
 			}
 			if r.Control != "" {
 				token, readErr := ReadPrivate(filepath.Join(m.Dir, "token"))
@@ -106,6 +120,23 @@ func (m Manager) Ensure(ctx context.Context) (Connection, error) {
 				}
 				var live Record
 				if err = m.call(ctx, r, string(token), http.MethodGet, "/identity", &live); err == nil {
+					current, readErr := ReadPrivate(filepath.Join(m.Dir, "runtime.yaml"))
+					if readErr != nil {
+						return Connection{}, readErr
+					}
+					if live.Config != digest(current) {
+						// A registration can publish between identity and file reads.
+						// Wait for a matching snapshot, never restart the live host.
+						live.State = "configuration_mismatch"
+						observedMismatch = true
+						if mismatchSince.IsZero() {
+							mismatchSince = time.Now()
+						} else if time.Since(mismatchSince) >= configMismatchGrace {
+							return Connection{}, fmt.Errorf("local runtime %s configuration differs from its saved registration; restore runtime.yaml or finish active work and stop the runtime before restarting", r.ID)
+						}
+					} else {
+						mismatchSince = time.Time{}
+					}
 					lastState = live.State
 					if live.State == "ready" {
 						return Connection{Record: live, Token: string(token)}, nil
@@ -115,6 +146,9 @@ func (m Manager) Ensure(ctx context.Context) (Connection, error) {
 					}
 				}
 			}
+		}
+		if !observedMismatch {
+			mismatchSince = time.Time{}
 		}
 		// A released lease proves the child exited. An unhealthy process holding it
 		// is never replaced, even when its control listener is unreachable.
@@ -272,10 +306,14 @@ func loopback(endpoint string) error {
 var controlClient = &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil}, CheckRedirect: func(*http.Request, []*http.Request) error { return fmt.Errorf("runtime redirects are not allowed") }}
 
 func (m Manager) call(ctx context.Context, r Record, token, method, path string, result *Record) error {
+	return m.callBody(ctx, r, token, method, path, result, nil)
+}
+
+func (m Manager) callBody(ctx context.Context, r Record, token, method, path string, result *Record, payload []byte) error {
 	if err := loopback(r.Control); err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, method, r.Control+path, nil)
+	req, err := http.NewRequestWithContext(ctx, method, r.Control+path, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -285,12 +323,16 @@ func (m Manager) call(ctx context.Context, r Record, token, method, path string,
 	}
 	req.Header.Set("X-Runtime-Generation", r.Generation)
 	req.Header.Set("X-Runtime-Nonce", nonce)
+	req.Header.Set("X-Runtime-Body", digest(payload))
 	req.Header.Set("X-Runtime-Signature", signature(token, requestMessage(req)))
 	resp, err := controlClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusConflict && path == "/config" {
+		return errConfigChanged
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("runtime control refused request (%d)", resp.StatusCode)
 	}
@@ -305,7 +347,7 @@ func (m Manager) call(ctx context.Context, r Record, token, method, path string,
 		if err := json.Unmarshal(data, result); err != nil {
 			return err
 		}
-		if result.ID != r.ID || result.Generation != r.Generation || result.Binary != r.Binary || result.Config != r.Config {
+		if result.ID != r.ID || result.Generation != r.Generation || result.Binary != r.Binary {
 			return fmt.Errorf("runtime identity mismatch")
 		}
 		if result.Endpoint != "" {

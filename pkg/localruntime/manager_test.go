@@ -27,7 +27,7 @@ const testDeadline = 10 * time.Second
 // covered in integration/localruntime.
 func TestMain(m *testing.M) {
 	if len(os.Args) == 7 && os.Args[1] == "local" && os.Args[2] == "managed" {
-		err := Run(context.Background(), os.Args[4], os.Args[6], func(ctx context.Context, config, token string, ready func(string) error) error {
+		err := Run(context.Background(), os.Args[4], os.Args[6], func(ctx context.Context, config, token string, ready func(string, PrepareConfig) error) error {
 			data, err := ReadPrivate(config)
 			if err != nil {
 				return err
@@ -67,7 +67,12 @@ func TestMain(m *testing.M) {
 					fmt.Fprintln(os.Stderr, err)
 				}
 			}()
-			if err := ready("http://" + listener.Addr().String()); err != nil {
+			if err := ready("http://"+listener.Addr().String(), func(data []byte, _ map[string]map[string]string) (func(), error) {
+				if string(data) == "reject" {
+					return nil, fmt.Errorf("invalid config")
+				}
+				return func() {}, nil
+			}); err != nil {
 				return err
 			}
 			<-ctx.Done()
@@ -155,8 +160,11 @@ func TestRefusesMismatchAndDegraded(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, os.WriteFile(filepath.Join(manager.Dir, "runtime.yaml"), []byte("changed"), 0600))
 			_, err = manager.Ensure(inspectCtx)
-			require.ErrorContains(t, err, "different binary or configuration")
-			after, err := manager.Status(inspectCtx)
+			require.ErrorContains(t, err, "configuration differs")
+			require.NoError(t, inspectCtx.Err(), "persistent drift must fail before the caller deadline")
+			statusCtx, cancelStatus := context.WithTimeout(t.Context(), testDeadline)
+			defer cancelStatus()
+			after, err := manager.Status(statusCtx)
 			require.NoError(t, err)
 			assert.Equal(t, original.Generation, after.Generation)
 			assert.Equal(t, config, after.State)
@@ -210,7 +218,7 @@ func TestIdentityAndCrashRecovery(t *testing.T) {
 	changed := manager
 	changed.Binary = changedBinary
 	_, err = changed.Ensure(ctx)
-	require.ErrorContains(t, err, "different binary or configuration")
+	require.ErrorContains(t, err, "different binary")
 	same, err := manager.Status(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, connection.Generation, same.Generation)

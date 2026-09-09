@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // capitalizeFirst capitalizes the first letter of a string.
@@ -168,20 +170,12 @@ func escapeInlineMarkdown(text string) string {
 	return b.String()
 }
 
-const maxProgressStatementLen = 160
-
-// clampInlineCode keeps an engine-supplied statement on one bounded Markdown
-// line. Replacing code delimiters prevents the value from escaping its span.
-func clampInlineCode(text string, maxRunes int) string {
-	text = strings.Join(strings.FieldsFunc(text, func(r rune) bool {
-		return unicode.IsSpace(r) || unicode.IsControl(r)
-	}), " ")
-	text = strings.ReplaceAll(text, "`", "'")
-	runes := []rune(text)
-	if len(runes) <= maxRunes {
-		return text
-	}
-	return string(runes[:maxRunes-1]) + "…"
+// inlineCodeStatement renders an engine-supplied statement inside a Markdown
+// code span: the shared single-line clamp bounds its width, and replacing the
+// code delimiter keeps the value from closing the span early. The replacement
+// is one rune for one, so the clamp's width bound still holds.
+func inlineCodeStatement(text string) string {
+	return strings.ReplaceAll(ui.ClampStatement(text), "`", "'")
 }
 
 // maxCommentErrorLen bounds an error message rendered into a PR comment so a

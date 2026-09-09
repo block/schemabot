@@ -1,10 +1,13 @@
 package commands
 
 import (
+	"io"
+	"strings"
 	"testing"
 
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // Reconfiguring a profile's endpoint must not log the operator out unless the
@@ -95,6 +98,74 @@ func TestSameEndpoint(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			assert.Equal(t, tc.same, sameEndpoint(tc.a, tc.b))
 			assert.Equal(t, tc.same, sameEndpoint(tc.b, tc.a), "the comparison must not depend on argument order")
+		})
+	}
+}
+
+// Mutate configuration after the prompt's defaults are loaded but before the
+// user submits their answer, without relying on goroutine timing.
+type configurePromptInput struct {
+	beforeRead func()
+	reader     io.Reader
+}
+
+func (r *configurePromptInput) Read(p []byte) (int, error) {
+	if r.beforeRead != nil {
+		r.beforeRead()
+		r.beforeRead = nil
+	}
+	return r.reader.Read(p)
+}
+
+func TestConfigurePreservesConcurrentChanges(t *testing.T) {
+	for _, change := range []string{"endpoint", "oidc", "runtime", "deleted", "created", "token", "other-profile"} {
+		t.Run(change, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			cfg := &client.Config{Profiles: map[string]client.Profile{}}
+			if change != "created" {
+				cfg.Profiles["default"] = client.Profile{Endpoint: "https://old.example", Token: "old-token"}
+			}
+			require.NoError(t, client.SaveConfig(cfg))
+			var concurrent client.Profile
+			cmd := ConfigureSetupCmd{input: &configurePromptInput{reader: strings.NewReader("\n"), beforeRead: func() {
+				latest, err := client.LoadConfig()
+				require.NoError(t, err)
+				concurrent = latest.Profiles["default"]
+				switch change {
+				case "endpoint", "created":
+					concurrent.Endpoint = "https://new.example"
+					concurrent.Token = "new-token"
+				case "oidc":
+					concurrent.OIDC = &client.OIDCLogin{Issuer: "https://issuer.example", ClientID: "new-client"}
+				case "runtime":
+					concurrent.LocalRuntime = "project"
+				case "token":
+					concurrent.Token = "refreshed-token"
+				case "other-profile":
+					latest.Profiles["other"] = client.Profile{Endpoint: "https://other.example"}
+				}
+				latest.Profiles["default"] = concurrent
+				if change == "deleted" {
+					delete(latest.Profiles, "default")
+				}
+				require.NoError(t, client.SaveConfig(latest))
+			}}}
+			err := cmd.Run(&Globals{})
+			if change == "token" || change == "other-profile" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, "newer settings were preserved")
+			}
+			saved, err := client.LoadConfig()
+			require.NoError(t, err)
+			if change == "deleted" {
+				require.NotContains(t, saved.Profiles, "default")
+			} else {
+				require.Equal(t, concurrent, saved.Profiles["default"])
+			}
+			if change == "other-profile" {
+				require.Contains(t, saved.Profiles, "other")
+			}
 		})
 	}
 }

@@ -607,7 +607,8 @@ completeness test over it (`pkg/state/metadata.go`).
 `failed_retryable` is active, not terminal: recovery re-drives it automatically. Only
 `failed_retryable` tasks reset to `pending`, so completed tasks are never re-run, and the apply
 settles to permanent `failed` when the attempt budget is spent or the recovery window closes.
-*Enforced:* retry preparation and expiry (`pkg/api/operator.go`); budget semantics in
+*Enforced:* retry preparation in the drive loop (`pkg/api/operator.go`) and the expiry sweep
+(`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`); budget semantics in
 [apply-lifecycle.md](apply-lifecycle.md).
 
 ### ST-10: Rollouts respect order and fail closed on policy
@@ -774,14 +775,11 @@ classes exclude each other by one mechanism rather than by two that have to be k
 and a row can still be attributed by reading it. A reader's job is to report what is stored,
 including when what is stored is a task that has outlived its apply's verdict (UX-3).
 
-Retryable-apply expiry writes task rows without holding a lease, and reads the row's operation
-lease before writing so that it excludes a live driver by that same mechanism.
-
 *Enforced:* lease predicates on the driver's apply and task writes
-(`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/applies.go`), the
-reaper's task sweeps and retryable-apply expiry's task writes (`unleasedOperationGate`,
-`undrivenOperationGate`, `pkg/storage/internal/sqlstore/apply_operations.go`), and a read path that
-builds progress from stored rows without writing them (`pkg/api/progress_handlers.go`).
+(`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/applies.go`), the lease
+gates the reaper's sweeps select and write under (`unleasedOperationGate`, `undrivenApplyGate`,
+`pkg/storage/internal/sqlstore/apply_operations.go`), and a read path that builds progress from
+stored rows without writing them (`pkg/api/progress_handlers.go`).
 
 ## Control operations (CO)
 
@@ -1307,16 +1305,42 @@ command discovery and the unowned-command policy (`pkg/webhook/commands.go`).
 
 ### AZ-6: Local hosting preserves its boundaries
 
-The internal local host reserves a numeric loopback listener before storage bootstrap or
-operator startup. Every route, including probes, requires its private credential. Local hosting
-rejects service authentication configuration and GitHub Apps rather than silently changing their
-authorization behavior. Its credential identifies the runtime, not an independently approved human.
+The local host accepts only authenticated loopback traffic. It rejects service authentication
+and GitHub Apps rather than changing their authorization behavior. Its credential identifies
+the runtime, not an independently approved human.
 
-State storage must use an explicit connection and a different database name from each locally
-configured target in the same database family. This conservative name check does not establish
-isolation for dynamically resolved targets. Local hosting never opts into destructive storage
-bootstrap. *Enforced:* `pkg/serve/local.go`, `pkg/auth/local.go`, and
-`pkg/api/storage_isolation.go`; process recovery is covered in `integration/localruntime`.
+State storage must use an explicit connection and a different database name from each configured
+target in the same database family. This name check does not establish isolation for dynamically
+resolved targets. Local hosting never permits destructive storage bootstrap.
+
+*Enforced:* `pkg/serve/local.go`, `pkg/auth/local.go`, and `pkg/api/storage_isolation.go`.
+
+### AZ-7: Local registration preserves existing work
+
+Adding a database or environment must preserve existing targets, server settings, durable state,
+and active applies. Every addition passes the local host's safety checks, and concurrent registrations
+must not overwrite one another. The running host must accept configuration changes before they are
+published. Secret references remain references on disk.
+
+*Enforced:* `pkg/localsetup/register.go`, `pkg/localruntime/config.go`,
+`pkg/localruntime/manager.go`, `pkg/localruntime/host.go`, and `pkg/api/live_databases.go`.
+
+### AZ-8: Profile registration preserves connection identity
+
+Registering a local profile must not replace a different connection, change the default profile,
+or overwrite a concurrent configuration update. Retrying an identical registration is safe.
+
+*Enforced:* `pkg/cmd/client/local_profile.go` and `pkg/cmd/client/config.go`.
+
+### AZ-9: Initialization preserves the target and existing files
+
+Initialization verifies the imported schema before publishing it and never applies changes to the
+target. It must not overwrite existing schema files or redirect an existing profile to another
+connection. A retry may reuse identical imported files. Failed setup preserves the runtime and
+its state so the retry uses the same execution authority.
+
+*Enforced:* `pkg/cmd/commands/init.go`, `pkg/cmd/commands/init_publish_darwin.go`,
+`pkg/cmd/commands/init_publish_linux.go`, and `pkg/cmd/commands/init_publish_other.go`.
 
 ## Structural enforcement
 
