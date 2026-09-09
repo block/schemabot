@@ -34,7 +34,7 @@ func TestRenderPlanComment_DiscardedCopyWarnsWhileTheDecisionIsTheOperators(t *t
 	plan := RenderPlanComment(data)
 	assert.Contains(t, plan, "⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target\n")
 	assert.Contains(t, plan, "- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, "+
-		"which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`",
+		"which was `` ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`) ``",
 		"a cause that is a comparison names the side the operator cannot see from the plan above")
 	assert.NotContains(t, plan, "3h 12m of copying",
 		"the copy's age dates its last checkpoint, so it can never be read as elapsed copying")
@@ -91,10 +91,9 @@ func TestRenderPlanComment_DiscardedCopyReadsAsARecordOnceApplying(t *testing.T)
 // shared inline-code sanitizer. A quoted identifier may legally carry a
 // backtick or a newline, and either would end a code span early or split the
 // entry across lines in the one section an operator reads to decide whether
-// hours of copying are expendable. The sanitizer drops the backtick rather than
-// escaping it, so a name that carries one is shown closed up; a readable entry
-// that survives is worth more here than byte fidelity for a name no target
-// realistically has.
+// hours of copying are expendable. The sanitizer widens the span's delimiter
+// past any backtick run in the name, so the name is shown as written and still
+// cannot close the span.
 func TestRenderPlanComment_DiscardedCopyKeepsHostileIdentifiersOnOneLine(t *testing.T) {
 	out := RenderPlanComment(PlanCommentData{
 		Database: "testapp", Environment: "staging", IsMySQL: true,
@@ -109,10 +108,8 @@ func TestRenderPlanComment_DiscardedCopyKeepsHostileIdentifiersOnOneLine(t *test
 		},
 	})
 
-	assert.Contains(t, out, "- `orders`, `line items` in `app db` (last progress 3h 12m ago): `futurereason value`\n",
-		"identifiers and an untranslated reason render as one entry on one line")
-	assert.NotContains(t, out, "ord`ers", "a backtick in an identifier cannot end the code span early")
-	assert.NotContains(t, out, "future`reason", "a backtick in a reason cannot end the code span early")
+	assert.Contains(t, out, "- `` ord`ers ``, `line items` in `` app` db `` (last progress 3h 12m ago): `` future`reason value ``\n",
+		"identifiers and an untranslated reason render as one entry on one line, each inside a span its backtick cannot close")
 }
 
 // The statement a copy was started for is read off a live target, so an entry
@@ -131,8 +128,8 @@ func TestRenderPlanComment_DiscardedCopyClampsTheStartingStatement(t *testing.T)
 	})
 
 	entry := entryLine(t, out, "- `orders` in `testapp`:")
-	assert.Contains(t, entry, "which was `ALTER TABLE orders ADD INDEX idx_")
-	assert.Contains(t, entry, "…`", "an over-long statement is truncated with an ellipsis inside the code span")
+	assert.Contains(t, entry, "which was `` ALTER TABLE `orders` ADD INDEX `idx_")
+	assert.Contains(t, entry, "… ``", "an over-long statement is truncated with an ellipsis inside the code span")
 	assert.LessOrEqual(t, len([]rune(entry)), 300, "the entry stays scannable next to the others in its section")
 }
 

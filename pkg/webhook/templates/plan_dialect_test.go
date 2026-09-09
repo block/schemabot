@@ -45,7 +45,7 @@ func TestWritePlanDDLBlock_PostgresCreateSet(t *testing.T) {
 	var out strings.Builder
 	writePlanDDLBlock(&out, []string{
 		"CREATE TABLE t (id bigint, v text); CREATE INDEX t_v_idx ON t (v)",
-	}, schema.DialectPostgres)
+	}, schema.DialectPostgres, newDDLBlockBudget(1))
 
 	assert.Equal(t, "```sql\nCREATE TABLE t (\n    id bigint,\n    v text\n);\nCREATE INDEX t_v_idx ON t USING btree (v);\n```\n\n", out.String())
 }
