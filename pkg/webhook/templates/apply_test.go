@@ -60,15 +60,33 @@ func TestRenderApplyCommentsIncludeEnvironmentInTitle(t *testing.T) {
 
 func TestUnsafeDropUsageTarget(t *testing.T) {
 	tests := []struct {
-		name    string
-		changes []UnsafeChangeData
-		want    string
-		wantOK  bool
+		name         string
+		databaseType string
+		changes      []UnsafeChangeData
+		want         string
+		wantOK       bool
 	}{
 		{
 			name: "drop column",
 			changes: []UnsafeChangeData{
 				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\""},
+			},
+			want:   "the dropped column",
+			wantOK: true,
+		},
+		{
+			name:         "PostgreSQL drop column classified from DDL",
+			databaseType: "postgres",
+			changes: []UnsafeChangeData{
+				{Table: "customers", Reason: `statement removes live structure from table "customers"`, DDL: `ALTER TABLE "customers" DROP COLUMN IF EXISTS "nickname"`},
+			},
+			want:   "the dropped column",
+			wantOK: true,
+		},
+		{
+			name: "MySQL drop column without column keyword",
+			changes: []UnsafeChangeData{
+				{Table: "customers", Reason: "destructive change", DDL: "ALTER TABLE `customers` DROP `nickname`"},
 			},
 			want:   "the dropped column",
 			wantOK: true,
@@ -85,6 +103,15 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 			name: "drop table",
 			changes: []UnsafeChangeData{
 				{Table: "archived_orders", Reason: "Unsafe operation detected: \"DROP TABLE\""},
+			},
+			want:   "the dropped table",
+			wantOK: true,
+		},
+		{
+			name:         "undeclared PostgreSQL table drop classified from change type",
+			databaseType: "postgres",
+			changes: []UnsafeChangeData{
+				{Table: "archived_orders", Reason: `DROP TABLE removes all data from table "archived_orders"`, DDL: `DROP TABLE "public"."archived_orders"`, ChangeType: "DrOp"},
 			},
 			want:   "the dropped table",
 			wantOK: true,
@@ -147,7 +174,11 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, ok := unsafeDropApplicationUsageTarget(tt.changes)
+			databaseType := tt.databaseType
+			if databaseType == "" {
+				databaseType = "mysql"
+			}
+			got, ok := unsafeDropApplicationUsageTarget(countUnsafeDrops(tt.changes, databaseType))
 
 			assert.Equal(t, tt.wantOK, ok)
 			assert.Equal(t, tt.want, got)
@@ -342,6 +373,7 @@ func TestRenderApplyStatusComment_ThrottledChecksumming(t *testing.T) {
 func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 	tests := []struct {
 		name                string
+		databaseType        string
 		changes             []UnsafeChangeData
 		wantActionTarget    string
 		wantInvisibleTarget string
@@ -352,6 +384,17 @@ func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 			name: "drop index",
 			changes: []UnsafeChangeData{
 				{Table: "customers", Reason: "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\""},
+			},
+			wantActionTarget:    "an index",
+			wantInvisibleTarget: "the dropped index",
+			wantQueryTarget:     "it",
+			wantOK:              true,
+		},
+		{
+			name:         "PostgreSQL drop index classified from DDL",
+			databaseType: "postgres",
+			changes: []UnsafeChangeData{
+				{Table: "customers", Reason: `statement removes live structure from table "customers"`, DDL: `DROP INDEX "idx_customers_email"`},
 			},
 			wantActionTarget:    "an index",
 			wantInvisibleTarget: "the dropped index",
@@ -389,7 +432,11 @@ func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotActionTarget, gotInvisibleTarget, gotQueryTarget, ok := unsafeDropIndexUsageTargets(tt.changes)
+			databaseType := tt.databaseType
+			if databaseType == "" {
+				databaseType = "mysql"
+			}
+			gotActionTarget, gotInvisibleTarget, gotQueryTarget, ok := unsafeDropIndexUsageTargets(countUnsafeDrops(tt.changes, databaseType))
 
 			assert.Equal(t, tt.wantOK, ok)
 			assert.Equal(t, tt.wantActionTarget, gotActionTarget)

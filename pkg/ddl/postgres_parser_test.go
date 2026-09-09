@@ -658,6 +658,35 @@ func TestPostgresParserCreateIndex(t *testing.T) {
 	assert.Empty(t, indexName, "a non-index statement is not an index expectation")
 }
 
+func TestPostgresDropTargets(t *testing.T) {
+	p := postgresStatementParser{}
+	tests := []struct {
+		name string
+		stmt string
+		want DropTargets
+		err  bool
+	}{
+		{"drop tables", "DROP TABLE a, b", DropTargets{Tables: 2}, false},
+		{"drop index", "DROP INDEX idx", DropTargets{Indexes: 1}, false},
+		{"drop column", "ALTER TABLE t DROP COLUMN IF EXISTS c", DropTargets{Columns: 1}, false},
+		{"drop primary key", "ALTER TABLE t DROP CONSTRAINT t_pkey", DropTargets{}, false},
+		{"create table", "CREATE TABLE t (id bigint)", DropTargets{}, false},
+		{"multiple statements", "DROP TABLE a; DROP TABLE b", DropTargets{}, true},
+		{"garbage", "this is not SQL", DropTargets{}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := p.DropTargets(tt.stmt)
+			if tt.err {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 // The two parser implementations must diverge where the grammars genuinely
 // differ while honoring the same seam contract, so a caller routed through
 // ParserForDialect gets dialect-correct behavior from identical inputs.

@@ -655,7 +655,7 @@ func shardedUnsafeChanges(shards []*apitypes.ShardPlanResponse) []templates.Unsa
 		return nil
 	}
 	total := plannedShardCount(shards)
-	type key struct{ table, reason string }
+	type key struct{ table, reason, ddl, changeType string }
 	var order []key
 	byKey := make(map[key]*templates.UnsafeChangeData)
 	for _, sp := range shards {
@@ -667,10 +667,10 @@ func shardedUnsafeChanges(shards []*apitypes.ShardPlanResponse) []templates.Unsa
 			if !ok {
 				continue
 			}
-			k := key{table: unsafeChange.Table, reason: unsafeChange.Reason}
+			k := key{table: unsafeChange.Table, reason: unsafeChange.Reason, ddl: unsafeChange.DDL, changeType: unsafeChange.ChangeType}
 			uc := byKey[k]
 			if uc == nil {
-				uc = &templates.UnsafeChangeData{Table: unsafeChange.Table, Reason: unsafeChange.Reason, ChangeType: unsafeChange.ChangeType, TotalShards: total}
+				uc = &templates.UnsafeChangeData{Table: unsafeChange.Table, Reason: unsafeChange.Reason, DDL: unsafeChange.DDL, ChangeType: unsafeChange.ChangeType, TotalShards: total}
 				byKey[k] = uc
 				order = append(order, k)
 			}
@@ -929,6 +929,7 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 					unsafe = append(unsafe, templates.UnsafeChangeData{
 						Table:      uc.Table,
 						Reason:     uc.Reason,
+						DDL:        uc.DDL,
 						ChangeType: uc.ChangeType,
 					})
 				}
@@ -943,6 +944,7 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 			unsafe = append(unsafe, templates.UnsafeChangeData{
 				Table:      uc.Table,
 				Reason:     uc.Reason,
+				DDL:        uc.DDL,
 				ChangeType: uc.ChangeType,
 			})
 		}

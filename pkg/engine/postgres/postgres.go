@@ -488,9 +488,6 @@ func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, nam
 		if err != nil {
 			return nil, fmt.Errorf("classify drop for undeclared table %q: %w", live.name, err)
 		}
-		// The plan template decides whether to render its destructive-drop
-		// guidance from the words "DROP TABLE" in this reason, so the wording
-		// has to keep naming the statement.
 		drops = append(drops, engine.TableChange{
 			Table:         live.name,
 			Operation:     operation,
