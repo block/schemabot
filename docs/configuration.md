@@ -60,6 +60,38 @@ characters. Consumer `schemabot.yaml` files are not held to this rule: the
 `database:` and `type:` values are folded to lowercase when the file is read,
 so `database: Payments` resolves to the `payments` server key.
 
+### Grouping databases into an application
+
+An application whose data lives in more than one database — sharded, or split by
+concern — sets the same `app` on each of them:
+
+```yaml
+databases:
+  shop_001:
+    type: mysql
+    app: shop
+    environments:
+      production:
+        dsn: "env:SHOP_001_DSN"
+  shop_002:
+    type: mysql
+    app: shop
+    environments:
+      production:
+        dsn: "env:SHOP_002_DSN"
+```
+
+`app` is optional and purely descriptive: it does not affect routing, planning,
+or applies. It exists so that the grouping is declared rather than guessed from
+database names, which is unreliable — a shard's position in a naming sequence
+need not match its position in the application, and a database whose name shares
+a prefix with the family need not belong to it.
+
+`schemabot databases --app shop` (API: `GET /api/databases?app=shop`) returns an
+application's databases together, and each database in any listing reports the
+app it belongs to. The filter matches the whole value, so `--app shop` never
+returns a `shop_archive` app.
+
 ### Building DSNs from separate secrets
 
 If your deployment stores database connection metadata separately from passwords,

@@ -456,8 +456,14 @@ type DatabaseListResponse struct {
 // DatabaseResponse describes one server-side database without
 // exposing connection strings, opaque execution targets, or endpoint addresses.
 type DatabaseResponse struct {
-	Database     string                         `json:"database"`
-	Type         string                         `json:"type"`
+	Database string `json:"database"`
+	Type     string `json:"type"`
+	// App names the application this database belongs to. Databases sharing an
+	// app value form one application, which is what lets a caller reconcile a
+	// sharded family back to the service that owns it instead of inferring the
+	// grouping from database names. Empty when the database's config does not
+	// set one.
+	App          string                         `json:"app,omitempty"`
 	Environments []*DatabaseEnvironmentResponse `json:"environments"`
 }
 

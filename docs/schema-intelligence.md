@@ -45,27 +45,53 @@ shop       mysql     staging, production  staging: us-east; production: eu-west,
 analytics  postgres  production           production: us-east
 ```
 
+Filter with `--type`, `--name` (a case-insensitive substring, so one query
+covers a sharded family), and `--app`.
+
+`--app` is how you retrieve one application's databases together. An
+application whose data is spread across several databases sets the same `app`
+on each, and the filter matches that value in full rather than as a substring,
+so an app whose name is a prefix of another is never folded into it:
+
+```sh
+schemabot databases --app shop
+```
+
+```text
+DATABASE  APP   TYPE   ENVIRONMENTS         DEPLOYMENTS
+shop_001  shop  mysql  staging, production  staging: us-east; production: us-east
+shop_002  shop  mysql  staging, production  staging: us-east; production: us-east
+```
+
+The `APP` column appears only when at least one listed database reports an app.
+
 <details>
 <summary>API equivalent</summary>
 
 ```http
-GET /api/databases
+GET /api/databases?app=shop
 ```
+
+`type`, `name`, and `app` are all optional and combine; every one supplied must
+match. `app` is omitted from a database's entry when its configuration sets
+none.
 
 ```json
 {
   "databases": [
     {
-      "database": "shop",
+      "database": "shop_001",
       "type": "mysql",
+      "app": "shop",
       "environments": [
         {"environment": "staging", "deployments": ["us-east"]},
         {"environment": "production", "deployments": ["us-east", "eu-west"]}
       ]
     },
     {
-      "database": "analytics",
-      "type": "postgres",
+      "database": "shop_002",
+      "type": "mysql",
+      "app": "shop",
       "environments": [
         {"environment": "production", "deployments": ["us-east"]}
       ]

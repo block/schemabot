@@ -3460,7 +3460,7 @@ func TestDatabaseListRejectsInvalidDeploymentTopology(t *testing.T) {
 				},
 			},
 		},
-	}, "", "")
+	}, "", "", "")
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `database "orders" environment "production" deployments map is empty`)
@@ -7103,4 +7103,83 @@ func TestSetRevertSkippedMetadata(t *testing.T) {
 	now := time.Now()
 	setRevertSkippedMetadata(resp, &storage.Apply{RevertSkippedAt: &now})
 	assert.Equal(t, "true", resp.Metadata["revert_skipped"], "flag set once revert_skipped_at is present")
+}
+
+// One application's databases are returned together by app name, and each
+// carries the app it belongs to. The filter matches the whole app value rather
+// than a substring, so an app whose name is a prefix of another is not folded
+// into it — guessing the grouping from names is what the app key replaces.
+func TestDatabaseListFiltersByApp(t *testing.T) {
+	config := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders_001": {
+				Type:         storage.DatabaseTypeMySQL,
+				App:          "orders",
+				Environments: map[string]EnvironmentConfig{"production": {Deployment: "pie", Target: "orders-001"}},
+			},
+			"orders_002": {
+				Type:         storage.DatabaseTypeMySQL,
+				App:          "orders",
+				Environments: map[string]EnvironmentConfig{"production": {Deployment: "pie", Target: "orders-002"}},
+			},
+			"orders_archive": {
+				Type:         storage.DatabaseTypeMySQL,
+				App:          "orders_archive",
+				Environments: map[string]EnvironmentConfig{"production": {Deployment: "pie", Target: "orders-archive"}},
+			},
+			"legacy": {
+				Type:         storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{"production": {Deployment: "pie", Target: "legacy"}},
+			},
+		},
+	}
+
+	resp, err := databaseListResponse(config, "", "", "orders")
+	require.NoError(t, err)
+	require.Len(t, resp.Databases, 2, "orders_archive is a different app, not a longer orders name")
+	assert.Equal(t, "orders_001", resp.Databases[0].Database)
+	assert.Equal(t, "orders", resp.Databases[0].App)
+	assert.Equal(t, "orders_002", resp.Databases[1].Database)
+
+	unfiltered, err := databaseListResponse(config, "", "", "")
+	require.NoError(t, err)
+	require.Len(t, unfiltered.Databases, 4)
+	byName := make(map[string]string, len(unfiltered.Databases))
+	for _, database := range unfiltered.Databases {
+		byName[database.Database] = database.App
+	}
+	assert.Equal(t, "orders", byName["orders_001"])
+	assert.Equal(t, "orders_archive", byName["orders_archive"])
+	assert.Empty(t, byName["legacy"], "a database whose config sets no app reports none")
+
+	noMatch, err := databaseListResponse(config, "", "", "payments")
+	require.NoError(t, err)
+	assert.Empty(t, noMatch.Databases)
+}
+
+// The app filter composes with the name filter rather than replacing it.
+func TestDatabaseListCombinesAppAndNameFilters(t *testing.T) {
+	config := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders_001": {
+				Type:         storage.DatabaseTypeMySQL,
+				App:          "orders",
+				Environments: map[string]EnvironmentConfig{"production": {Deployment: "pie", Target: "orders-001"}},
+			},
+			"orders_002": {
+				Type:         storage.DatabaseTypeMySQL,
+				App:          "orders",
+				Environments: map[string]EnvironmentConfig{"production": {Deployment: "pie", Target: "orders-002"}},
+			},
+		},
+	}
+
+	resp, err := databaseListResponse(config, "", "002", "orders")
+	require.NoError(t, err)
+	require.Len(t, resp.Databases, 1)
+	assert.Equal(t, "orders_002", resp.Databases[0].Database)
+
+	none, err := databaseListResponse(config, "", "002", "payments")
+	require.NoError(t, err)
+	assert.Empty(t, none.Databases, "both filters must match")
 }

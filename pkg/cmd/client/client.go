@@ -59,6 +59,10 @@ type ListDatabasesOptions struct {
 	Type string
 	// Name keeps only databases whose name contains it, case-insensitively.
 	Name string
+	// App keeps only databases whose configured app equals it. Unlike Name,
+	// this matches the whole value: an app is a declared identifier, not a
+	// naming convention.
+	App string
 }
 
 // ListDatabases fetches the configured databases known to the server.
@@ -70,6 +74,9 @@ func ListDatabases(endpoint string, opts ListDatabasesOptions) (*apitypes.Databa
 	}
 	if opts.Name != "" {
 		values.Set("name", opts.Name)
+	}
+	if opts.App != "" {
+		values.Set("app", opts.App)
 	}
 	if encoded := values.Encode(); encoded != "" {
 		requestPath += "?" + encoded

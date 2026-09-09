@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -16,6 +17,7 @@ import (
 type DatabasesCmd struct {
 	Type string `help:"Only show databases of this type; the server validates the value against its configured database types"`
 	Name string `help:"Only show databases whose name contains this string, case-insensitively; a family prefix like omnibus matches every shard"`
+	App  string `help:"Only show databases belonging to this app; matches the whole app name, so every database of one application is returned together"`
 	JSON bool   `help:"Output as JSON"`
 }
 
@@ -29,11 +31,12 @@ func (cmd *DatabasesCmd) Run(g *Globals) error {
 	// the rendered headers and empty-state message agree with what the server
 	// actually filtered on.
 	name := strings.TrimSpace(cmd.Name)
+	app := strings.TrimSpace(cmd.App)
 
 	var resp *apitypes.DatabaseListResponse
 	err = withLoading("Loading databases...", !cmd.JSON, func() error {
 		var loadErr error
-		resp, loadErr = client.ListDatabases(ep, client.ListDatabasesOptions{Type: cmd.Type, Name: name})
+		resp, loadErr = client.ListDatabases(ep, client.ListDatabasesOptions{Type: cmd.Type, Name: name, App: app})
 		return loadErr
 	})
 	if err != nil {
@@ -42,36 +45,66 @@ func (cmd *DatabasesCmd) Run(g *Globals) error {
 	if cmd.JSON {
 		return writeJSON(resp)
 	}
-	return writeDatabaseList(os.Stdout, resp, name)
+	return writeDatabaseList(os.Stdout, resp, name, app)
 }
 
-func writeDatabaseList(w io.Writer, resp *apitypes.DatabaseListResponse, nameFilter string) error {
+func writeDatabaseList(w io.Writer, resp *apitypes.DatabaseListResponse, nameFilter, appFilter string) error {
 	if resp == nil || len(resp.Databases) == 0 {
 		// An empty filtered list means no match, not an unconfigured server —
 		// say so, or operators misread the deployment as empty.
-		if nameFilter != "" {
-			_, err := fmt.Fprintf(w, "No databases match --name %q.\n", nameFilter)
+		if filters := activeDatabaseFilters(nameFilter, appFilter); filters != "" {
+			_, err := fmt.Fprintf(w, "No databases match %s.\n", filters)
 			return err
 		}
 		_, err := fmt.Fprintln(w, "No databases configured.")
 		return err
 	}
 
+	// The app column appears only once some database reports an app, so a
+	// deployment that has not adopted the key is not given a column of dashes.
+	showApp := slices.ContainsFunc(resp.Databases, func(database *apitypes.DatabaseResponse) bool {
+		return database != nil && database.App != ""
+	})
+
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	if _, err := fmt.Fprintln(tw, "DATABASE\tTYPE\tENVIRONMENTS\tDEPLOYMENTS"); err != nil {
+	header := "DATABASE\tTYPE\tENVIRONMENTS\tDEPLOYMENTS"
+	if showApp {
+		header = "DATABASE\tAPP\tTYPE\tENVIRONMENTS\tDEPLOYMENTS"
+	}
+	if _, err := fmt.Fprintln(tw, header); err != nil {
 		return err
 	}
 	for _, database := range resp.Databases {
-		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n",
-			database.Database,
-			database.Type,
-			databaseEnvironments(database.Environments),
-			databaseDeployments(database.Environments),
-		); err != nil {
+		fields := []string{database.Database, database.Type, databaseEnvironments(database.Environments), databaseDeployments(database.Environments)}
+		if showApp {
+			fields = []string{database.Database, orDash(database.App), database.Type, databaseEnvironments(database.Environments), databaseDeployments(database.Environments)}
+		}
+		if _, err := fmt.Fprintln(tw, strings.Join(fields, "\t")); err != nil {
 			return err
 		}
 	}
 	return tw.Flush()
+}
+
+// activeDatabaseFilters describes the filters a caller actually supplied, so an
+// empty result names the query that produced it rather than only the first
+// filter that happened to be checked.
+func activeDatabaseFilters(nameFilter, appFilter string) string {
+	parts := make([]string, 0, 2)
+	if nameFilter != "" {
+		parts = append(parts, fmt.Sprintf("--name %q", nameFilter))
+	}
+	if appFilter != "" {
+		parts = append(parts, fmt.Sprintf("--app %q", appFilter))
+	}
+	return strings.Join(parts, " and ")
+}
+
+func orDash(value string) string {
+	if value == "" {
+		return "-"
+	}
+	return value
 }
 
 func databaseEnvironments(environments []*apitypes.DatabaseEnvironmentResponse) string {

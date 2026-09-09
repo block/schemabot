@@ -671,7 +671,8 @@ func (s *Service) handleDatabaseList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := strings.TrimSpace(r.URL.Query().Get("name"))
-	resp, err := databaseListResponse(config, databaseType, name)
+	app := strings.TrimSpace(r.URL.Query().Get("app"))
+	resp, err := databaseListResponse(config, databaseType, name, app)
 	if err != nil {
 		s.logger.Error("database list failed", "error", err)
 		s.writeError(w, http.StatusInternalServerError, "failed to list databases: "+err.Error())
@@ -719,22 +720,31 @@ func configuredDatabaseTypes(config *ServerConfig) []string {
 }
 
 // databaseListResponse builds the sanitized database list, keeping only
-// databases matching the optional type and name filters. The name filter is a
-// case-insensitive substring match so one query covers a sharded family
+// databases matching the optional type, name, and app filters. The name filter
+// is a case-insensitive substring match so one query covers a sharded family
 // (omnibus matches omnibus_001, omnibus_002, ...).
-func databaseListResponse(config *ServerConfig, databaseType, name string) (*apitypes.DatabaseListResponse, error) {
+//
+// The app filter matches the whole value instead, because an app is a declared
+// identifier rather than a naming convention: a substring match would fold
+// distinct apps together whenever one name is a prefix of another, which is
+// exactly the guess-from-the-name behavior the app key exists to replace.
+func databaseListResponse(config *ServerConfig, databaseType, name, app string) (*apitypes.DatabaseListResponse, error) {
 	if config == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
 	config = config.withDatabaseSnapshot()
 	dbs := config.DatabaseConfigs()
 	nameFilter := storage.CanonicalKey(name)
+	appFilter := storage.CanonicalKey(app)
 	databaseNames := make([]string, 0, len(dbs))
 	for database, dbConfig := range dbs {
 		if databaseType != "" && dbConfig.Type != databaseType {
 			continue
 		}
 		if nameFilter != "" && !strings.Contains(storage.CanonicalKey(database), nameFilter) {
+			continue
+		}
+		if appFilter != "" && storage.CanonicalKey(dbConfig.App) != appFilter {
 			continue
 		}
 		databaseNames = append(databaseNames, database)
@@ -751,6 +761,7 @@ func databaseListResponse(config *ServerConfig, databaseType, name string) (*api
 		databaseResp := &apitypes.DatabaseResponse{
 			Database:     database,
 			Type:         dbConfig.Type,
+			App:          dbConfig.App,
 			Environments: make([]*apitypes.DatabaseEnvironmentResponse, 0, len(environments)),
 		}
 		for _, environment := range environments {
