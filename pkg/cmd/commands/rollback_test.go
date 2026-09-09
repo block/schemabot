@@ -23,7 +23,7 @@ func TestRollbackPreviewUsesTargetDialect(t *testing.T) {
 		{"vitess", "vitess", "alter table orders add index idx_status(status)", "ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);"},
 		{"strata", "strata", "alter table orders add column note text", "ALTER TABLE `orders` ADD COLUMN `note` text;"},
 		{"postgres", "postgres", `alter table "OrderHistory" add column "Label" text, add column payload jsonb`, "ALTER TABLE \"OrderHistory\"\n    ADD COLUMN \"Label\" text,\n    ADD COLUMN payload jsonb;"},
-		{"mysql quoted values", "mysql", "ALTER TABLE `INT`\n    ADD COLUMN `TEXT` varchar(64) DEFAULT 'KEEP INT, DEFAULT NULL';", "ALTER TABLE `INT`\n    ADD COLUMN `TEXT` varchar(64) DEFAULT 'KEEP INT, DEFAULT NULL';"},
+		{"mysql quoted values", "mysql", "\n  ALTER TABLE `INT`\n    ADD COLUMN `TEXT` varchar(64) DEFAULT 'KEEP INT, DEFAULT NULL';  \n", "ALTER TABLE `INT`\n    ADD COLUMN `TEXT` varchar(64) DEFAULT 'KEEP INT, DEFAULT NULL';"},
 		{"postgres literal comma", "postgres", "ALTER TABLE \"OrderHistory\"\n    ADD COLUMN \"Label\" text DEFAULT 'Keep INT, Case',\n    ADD COLUMN payload jsonb;", "ALTER TABLE \"OrderHistory\"\n    ADD COLUMN \"Label\" text DEFAULT 'Keep INT, Case',\n    ADD COLUMN payload jsonb;"},
 		{"unknown dialect", "custom", "ALTER TABLE \"OrderHistory\"\n    ADD COLUMN \"Label\" text DEFAULT 'Keep Case';", "ALTER TABLE \"OrderHistory\"\n    ADD COLUMN \"Label\" text DEFAULT 'Keep Case';"},
 	}

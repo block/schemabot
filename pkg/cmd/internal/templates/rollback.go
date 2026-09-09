@@ -36,6 +36,7 @@ func WriteRollbackPlan(plan *apitypes.PlanResponse, sourceApplyID string) {
 // A display transformation must not alter quoted names or values. Canonical
 // comparison also catches layout changes inside literals and expressions.
 func rollbackDisplayDDL(dialect schema.Dialect, raw string) string {
+	raw = strings.TrimRight(strings.TrimSpace(raw), ";") + ";"
 	formatted := ddl.FormatDDLForDialect(dialect, raw)
 	parser, err := ddl.ParserForDialect(dialect)
 	if err != nil {
@@ -43,8 +44,8 @@ func rollbackDisplayDDL(dialect schema.Dialect, raw string) string {
 		return formatted
 	}
 	if parser.Canonicalize(raw) != parser.Canonicalize(formatted) {
-		slog.Warn("Rollback SQL display normalization changed the statement; preserving original SQL", "dialect", dialect)
-		return strings.TrimRight(strings.TrimSpace(raw), ";") + ";"
+		slog.Debug("Rollback SQL display normalization changed the statement; preserving original SQL", "dialect", dialect)
+		return raw
 	}
 	return formatted
 }
