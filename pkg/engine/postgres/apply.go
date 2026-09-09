@@ -233,7 +233,7 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	// then carries the tracker's last-known position instead of a fresh
 	// read the reserved session can no longer answer.
 	publish := func(result *engine.ProgressResult) {
-		if err := executorProgressMetadata(ctx, tracker, result.Metadata); err != nil {
+		if err := executorProgressMetadata(ctx, tracker, result); err != nil {
 			logger.Warn("PostgreSQL apply terminal progress reports the last-known executor position",
 				"namespace", change.namespace, "table", change.table, "task_id", key, "error", err)
 		}
@@ -1177,9 +1177,10 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		// abandoned by a crashed server.
 		return &engine.ProgressResult{State: engine.StatePending, Message: "No active schema change"}, nil
 	}
-	result := *tracked.result
-	result.Metadata = cloneMetadata(tracked.result.Metadata)
-	result.Tables = cloneTables(tracked.result.Tables)
+	source := tracked.result
+	result := *source
+	result.Metadata = cloneMetadata(source.Metadata)
+	result.Tables = cloneTables(source.Tables)
 	tracker, logger := tracked.tracker, tracked.logger
 	e.mu.Unlock()
 
@@ -1188,24 +1189,77 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		// folded in when it was published.
 		return &result, nil
 	}
-	if err := executorProgressMetadata(ctx, tracker, result.Metadata); err != nil {
+	if err := executorProgressMetadata(ctx, tracker, &result); err != nil {
 		// The poll still answers with the last-known position: a progress
 		// view the engine cannot read this instant is not a reason to tell
 		// the driver its apply is unobservable.
 		logger.Warn("PostgreSQL apply progress reports the last-known executor position",
 			"task_id", key, "error", err)
 	}
+	e.retainRunningPercent(key, source, &result)
 	return &result, nil
 }
 
-// executorProgressMetadata folds the tracker's current position into the
-// published metadata: the 1-based step the executor is running, the sequence
-// length it announced, and the statement text of that step. Each key is
-// written only once the executor has reported it, so before execution starts
-// the metadata keeps progressResult's pre-execution position. The statement
-// passes through sanitizeStatementText because the metadata is destined for
-// operator-facing single-line rendering and is stored at a bounded width,
-// and the value must satisfy both the moment one starts reading it.
+// retainRunningPercent carries a poll's derived percent forward on the
+// running record it was cloned from, so the percent is part of the
+// last-known position the next poll starts from. The server publishes a
+// build row only while the build is in flight: a poll that lands between the
+// executor's steps, after the build session is released, or on a tolerated
+// read failure derives nothing, and without the write-back it would answer
+// with the record's pre-execution zero. The write-back is skipped when the
+// record was replaced while the tracker was being read, whether by a terminal
+// publish or a re-claim. Both the floor and the write-back target the cloned
+// record, so neither applies once that record is no longer the one the engine
+// serves. This write is on the writer side of the UX-3 boundary: the drive
+// loop's poll path mutates only the engine's in-memory record, while operator
+// reads use stored rows that only the drive persists.
+//
+// The percent never regresses within a record. A record hosts one build —
+// a concurrent index apply is a single statement, and the executor's
+// bounded retries apply to transactional statements, not to a build — and
+// the band scale only advances as the build moves through its phases, so a
+// poll whose row derives a lower percent than the record carries read the
+// server before a poller that has already carried a later row forward. The
+// tracker serializes the reads but not the write-backs, so the earlier
+// reading lands here second; it adopts the record's percent rather than
+// pinning a position the build has left behind.
+func (e *Engine) retainRunningPercent(key string, source, result *engine.ProgressResult) {
+	if len(result.Tables) == 0 {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	tracked := e.progress[key]
+	if tracked == nil || tracked.result != source || len(source.Tables) == 0 {
+		return
+	}
+	if result.Progress < source.Progress {
+		result.Progress = source.Progress
+		result.Tables[0].Progress = source.Tables[0].Progress
+		return
+	}
+	source.Progress = result.Progress
+	source.Tables[0].Progress = result.Tables[0].Progress
+}
+
+// executorProgressMetadata folds the tracker's current position and operation
+// detail into the published result: the 1-based step the executor is running,
+// the sequence length it announced, the statement text of that step, the
+// executor's operation class, the attempt, and — while PostgreSQL publishes a
+// progress row for a concurrent index build — the server's phase with its
+// block, tuple and locker counters. Each key is written only once the
+// executor has reported it, so before execution starts the metadata keeps
+// progressResult's pre-execution position. The counters are the exception:
+// once the server publishes a row every counter is written, zeros included,
+// because a zero is a reading (no lockers cleared yet) and an absent key
+// means the server has not published one. A running result's percent is
+// derived from the server phase and counters through concurrentIndexPercent;
+// without a row, or in a phase the band table does not know, the percent the
+// result already carries stands. The statement passes through
+// sanitizeStatementText and the server phase through sanitizeReasonText
+// because the metadata is destined for operator-facing single-line rendering
+// and is stored at a bounded width, and the value must satisfy both the
+// moment one starts reading it.
 //
 // For an active concurrent index build the tracker queries the session the
 // executor reserved for the build's failure verdict. The read runs on its
@@ -1220,10 +1274,14 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 // tracker read fails only when the server's progress view cannot be queried;
 // the snapshot still carries the last-known position, which is written
 // before the error is returned for the caller to log.
-func executorProgressMetadata(ctx context.Context, tracker *progress.Tracker, metadata map[string]string) error {
+func executorProgressMetadata(ctx context.Context, tracker *progress.Tracker, result *engine.ProgressResult) error {
 	if tracker == nil {
 		return nil
 	}
+	if result.Metadata == nil {
+		result.Metadata = make(map[string]string)
+	}
+	metadata := result.Metadata
 	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), executorProgressReadTimeout)
 	defer cancel()
 	snapshot, err := tracker.Progress(readCtx)
@@ -1236,10 +1294,46 @@ func executorProgressMetadata(ctx context.Context, tracker *progress.Tracker, me
 	if statement := sanitizeStatementText(snapshot.Detail.Statement); statement != "" {
 		metadata["statement"] = statement
 	}
+	if snapshot.Detail.Operation != "" {
+		metadata["executor_operation"] = string(snapshot.Detail.Operation)
+	}
+	if serverPhase := sanitizeReasonText(snapshot.Detail.ServerPhase); serverPhase != "" {
+		metadata["server_phase"] = serverPhase
+	}
+	if snapshot.Detail.Attempt > 0 {
+		metadata["attempt"] = strconv.Itoa(snapshot.Detail.Attempt)
+	}
+	if work := snapshot.Detail.Work; work != nil {
+		metadata["blocks_done"] = strconv.FormatUint(work.BlocksDone, 10)
+		metadata["blocks_total"] = strconv.FormatUint(work.BlocksTotal, 10)
+		metadata["tuples_done"] = strconv.FormatUint(work.TuplesDone, 10)
+		metadata["tuples_total"] = strconv.FormatUint(work.TuplesTotal, 10)
+		metadata["lockers_done"] = strconv.FormatUint(work.LockersDone, 10)
+		metadata["lockers_total"] = strconv.FormatUint(work.LockersTotal, 10)
+		// A build row describes work in flight, so it only refines a running
+		// result's percent. A terminal result's percent is decided by its
+		// state; a stale build snapshot must not pull a completed apply
+		// below 100.
+		if !result.State.IsTerminal() {
+			setRunningPercent(result, snapshot.Detail.ServerPhase, *work)
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("read pg-sprite executor progress: %w", err)
 	}
 	return nil
+}
+
+// setRunningPercent writes the whole-build percent derived from a build row
+// onto both the apply and its single table, so the two never disagree. A
+// phase the band table does not know leaves both as they were.
+func setRunningPercent(result *engine.ProgressResult, serverPhase string, work progress.Work) {
+	percent, ok := concurrentIndexPercent(serverPhase, work)
+	if !ok || len(result.Tables) == 0 {
+		return
+	}
+	result.Progress = percent
+	result.Tables[0].Progress = percent
 }
 
 // progressIdentity extracts the apply identity that keys engine progress.

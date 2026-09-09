@@ -98,6 +98,34 @@ bounded at apply time: each attempt has a 3-second lock budget and a
 statement that exceeds the execution budget is not allowed to continue
 unbounded.
 
+While a statement runs, PostgreSQL progress metadata carries two phase
+vocabularies in one flat map. `phase` is SchemaBot's own record of the apply:
+`preflight` for as long as the apply runs, then its terminal outcome
+(`completed`, `failed`, or `refused`).
+`server_phase` is the `phase` column of PostgreSQL's
+`pg_stat_progress_create_index` view, verbatim (for example `building index:
+scanning table` or `index validation: scanning index`), and is present only
+while PostgreSQL publishes a progress row for a concurrent index build. The
+metadata also carries `step`, `steps_total`, and the sanitized `statement`
+for the statement in flight; `executor_operation`, pg-sprite's class for the
+step (`admitting`, `optimistic`, `brief`, `validate-constraint`,
+`concurrent-index-build`); and `attempt`. Whenever a progress row is
+published, all six counters — `blocks_done`, `blocks_total`, `tuples_done`,
+`tuples_total`, `lockers_done`, `lockers_total` — are present, zeros
+included: a zero is a reading, and an absent key means PostgreSQL has not
+published a row. PostgreSQL scopes block and tuple counters to phases, but a
+completed phase's values can persist into the next phase. The completed heap
+scan's block counters remain visible while live tuples are sorted, so that
+sorting phase's zero-width band absorbs the carry-over and reports its start.
+
+Table progress during a concurrent index build is a whole-build estimate, not
+a phase ratio. Each server phase owns a fixed band of the 0–100 scale in
+PostgreSQL's documented phase order, a phase with block or tuple counters
+interpolates within its band, and a waiting or sorting phase reports the
+band's start. The estimate stays below 100 until the apply completes and never
+moves backwards within a build; a poll that finds no progress row — between
+phases, or while the view cannot be read — keeps the last derived percent.
+
 A multi-statement plan — several tables changed, or one declarative edit that
 the planner expands into several steps — is not applied atomically. The
 statements execute in order, each committing or failing in its own
