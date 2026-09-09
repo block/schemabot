@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/block/schemabot/pkg/localsetup"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/stretchr/testify/require"
@@ -38,7 +39,7 @@ func TestInitWizardNavigationAndValidation(t *testing.T) {
 	wizardKey(m, tea.KeyEnter)
 	m.input.SetValue("postgres://secret")
 	wizardKey(m, tea.KeyEnter)
-	require.Equal(t, 3, m.step)
+	require.Equal(t, stepDSN, m.step)
 	require.Contains(t, m.err, "env:VARIABLE")
 	m.input.SetValue("env:DATABASE_URL")
 	wizardKey(m, tea.KeyEnter)
@@ -81,10 +82,10 @@ func TestInitWizardNonInteractive(t *testing.T) {
 func TestInitWizardMissingVariableAndNarrowTerminal(t *testing.T) {
 	t.Setenv("DATABASE_URL", "")
 	m := newInitWizard(&InitCmd{}, "default", io.Discard)
-	m.step = 3
+	m.step = stepDSN
 	m.loadField()
 	wizardKey(m, tea.KeyEnter)
-	require.Equal(t, 3, m.step)
+	require.Equal(t, stepDSN, m.step)
 	require.Contains(t, m.err, "This variable is empty")
 	m.Update(tea.WindowSizeMsg{Width: 40, Height: 24})
 	require.NotEmpty(t, m.View())
@@ -156,23 +157,23 @@ func TestInitWizardNarrowReviewCanScroll(t *testing.T) {
 
 func TestInitWizardDiscoverySelectsOneAndReviewsDefaults(t *testing.T) {
 	m := newInitWizard(&InitCmd{}, "default", io.Discard)
-	m.step = 5
+	m.step = stepNamespaces
 	m.generation = 1
 	m.discovering = true
 	m.Update(initNamespacesMsg{generation: 1, names: []string{"public"}})
 	require.Equal(t, len(m.fields), m.step)
-	require.Equal(t, "public", m.fields[5].value)
+	require.Equal(t, "public", m.fields[stepNamespaces].value)
 	require.Contains(t, m.View(), "Found public")
 	require.False(t, m.confirmed)
 	wizardKey(m, tea.KeyShiftTab)
-	require.Equal(t, 7, m.step)
+	require.Equal(t, stepProfile, m.step)
 	m.input.SetValue("my-profile")
 	wizardKey(m, tea.KeyEnter)
-	require.Equal(t, "my-profile", m.fields[7].value)
+	require.Equal(t, "my-profile", m.fields[stepProfile].value)
 }
 func TestInitWizardDiscoveryPickerKeepsSelectionAcrossSearch(t *testing.T) {
 	m := newInitWizard(&InitCmd{}, "default", io.Discard)
-	m.step = 5
+	m.step = stepNamespaces
 	m.generation = 1
 	m.loadField()
 	m.Update(initNamespacesMsg{generation: 1, names: []string{"analytics", "public", "reports"}})
@@ -183,20 +184,20 @@ func TestInitWizardDiscoveryPickerKeepsSelectionAcrossSearch(t *testing.T) {
 	m.cursor = 0
 	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(" ")})
 	wizardKey(m, tea.KeyEnter)
-	require.Equal(t, "analytics, reports", m.fields[5].value)
+	require.Equal(t, "analytics, reports", m.fields[stepNamespaces].value)
 	require.Equal(t, len(m.fields), m.step)
 }
 func TestInitWizardDiscoveryFailureAndStaleResponse(t *testing.T) {
 	m := newInitWizard(&InitCmd{}, "default", io.Discard)
-	m.step = 5
+	m.step = stepNamespaces
 	m.generation = 2
 	m.Update(initNamespacesMsg{generation: 1, names: []string{"wrong_database"}})
 	require.Empty(t, m.names)
 	m.Update(initNamespacesMsg{generation: 2})
-	require.Equal(t, 5, m.step)
+	require.Equal(t, stepNamespaces, m.step)
 	require.Contains(t, m.err, "didn’t find")
 	m.Update(initNamespacesMsg{generation: 2, err: fmt.Errorf("connection unavailable")})
-	require.Equal(t, 5, m.step)
+	require.Equal(t, stepNamespaces, m.step)
 	require.Contains(t, m.err, "connection unavailable")
 }
 
@@ -204,8 +205,8 @@ func TestInitWizardDiscoveryNeverFallsBackToAmbientConnection(t *testing.T) {
 	t.Setenv("UNSET_INIT_TARGET", "")
 	m := newInitWizard(&InitCmd{DSN: "env:UNSET_INIT_TARGET"}, "default", io.Discard)
 	m.ctx = t.Context()
-	m.step = 5
-	m.discover = func(context.Context, string, string) ([]string, error) {
+	m.step = stepNamespaces
+	m.discover = func(context.Context, localsetup.Target) ([]string, error) {
 		t.Fatal("must not connect with an empty DSN")
 		return nil, nil
 	}
@@ -223,17 +224,17 @@ func TestInitWizardConfirmsConfiguredConnections(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://demo:secret@localhost:5432/shop?sslmode=disable")
 	t.Setenv("SCHEMABOT_STORAGE_DSN", "postgres://demo:secret@localhost:5432/state?sslmode=disable")
 	m := newInitWizard(&InitCmd{Type: "postgres", Database: "shop", DSN: "env:DATABASE_URL", StorageDSN: "env:SCHEMABOT_STORAGE_DSN"}, "default", io.Discard)
-	require.Equal(t, 3, m.step)
+	require.Equal(t, stepDSN, m.step)
 	require.Contains(t, m.View(), "localhost:5432")
 	require.Contains(t, m.View(), `Database: "shop"`)
 	require.NotContains(t, m.View(), "secret")
 	wizardKey(m, tea.KeyEnter)
 	require.True(t, m.checkingConnection)
-	require.Equal(t, 3, m.step)
+	require.Equal(t, stepDSN, m.step)
 	m.Update(initConnectionMsg{generation: m.generation})
 	require.Contains(t, m.View(), "✓ Connected")
 	wizardKey(m, tea.KeyEnter)
-	require.Equal(t, 4, m.step)
+	require.Equal(t, stepStorageDSN, m.step)
 	require.Contains(t, m.View(), `Database: "state"`)
 	require.False(t, m.confirmed)
 }
@@ -268,7 +269,7 @@ func TestInitConnectionFailureRetryAndEdit(t *testing.T) {
 	m := newInitWizard(&InitCmd{Type: "postgres", Database: "shop"}, "default", io.Discard)
 	wizardKey(m, tea.KeyEnter)
 	m.Update(initConnectionMsg{generation: m.generation, err: fmt.Errorf("couldn’t connect")})
-	require.Equal(t, 3, m.step)
+	require.Equal(t, stepDSN, m.step)
 	require.False(t, m.connectionChecked)
 	wizardKey(m, tea.KeyEnter)
 	require.True(t, m.checkingConnection)
@@ -298,7 +299,7 @@ func TestInitTerminalModes(t *testing.T) {
 		})
 	}
 	cmd := InitCmd{Type: "unknown"}
-	require.ErrorContains(t, cmd.collectInputsWithTerminalState(t.Context(), &Globals{}, true, true), "must be mysql or postgres")
+	require.ErrorContains(t, cmd.collectInputsWithTerminalState(t.Context(), &Globals{}, true, true), "must be mysql, postgres, vitess")
 }
 
 func TestInitPublishEmptyDirectoryPreservesConcurrentFiles(t *testing.T) {
@@ -321,11 +322,11 @@ func TestInitPublishEmptyDirectoryPreservesConcurrentFiles(t *testing.T) {
 
 func TestInitWizardRejectsTrailingNamespaceBeforeReview(t *testing.T) {
 	m := newInitWizard(&InitCmd{Namespaces: []string{"public"}}, "default", io.Discard)
-	m.step = 5
+	m.step = stepNamespaces
 	m.loadField()
 	m.input.SetValue("public,")
 	wizardKey(m, tea.KeyEnter)
-	require.Equal(t, 5, m.step)
+	require.Equal(t, stepNamespaces, m.step)
 	require.NotEmpty(t, m.err)
 	require.False(t, m.confirmed)
 }
@@ -333,7 +334,7 @@ func TestInitWizardRejectsTrailingNamespaceBeforeReview(t *testing.T) {
 func TestInitExplicitNamespacesRoundTrip(t *testing.T) {
 	for _, names := range [][]string{{"sales", "west"}, {"sales,west"}} {
 		m := newInitWizard(&InitCmd{Namespaces: names}, "default", io.Discard)
-		m.step = 5
+		m.step = stepNamespaces
 		m.loadField()
 		require.Empty(t, m.validate())
 		require.Equal(t, names, m.namespaceChoices(names))
@@ -343,7 +344,7 @@ func TestInitExplicitNamespacesRoundTrip(t *testing.T) {
 func TestInitCatalogNamesCannotControlTerminal(t *testing.T) {
 	name := "a\x1b[2Jb"
 	m := newInitWizard(&InitCmd{}, "default", io.Discard)
-	m.step = 5
+	m.step = stepNamespaces
 	m.loadField()
 	m.generation = 1
 	m.Update(initNamespacesMsg{generation: 1, names: []string{name, "public"}})
@@ -356,7 +357,7 @@ func TestInitCatalogNamesCannotControlTerminal(t *testing.T) {
 
 func TestInitManualNamespaceFallback(t *testing.T) {
 	m := newInitWizard(&InitCmd{}, "default", io.Discard)
-	m.step = 5
+	m.step = stepNamespaces
 	m.err = "discovery failed"
 	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("m")})
 	require.True(t, m.explicitNamespaces)
@@ -373,7 +374,7 @@ func TestInitCopyBackPreservesConnectionsAndDoesNotInitialize(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"), []byte("database: shop\ntype: postgres\n"), 0600))
 	original := InitCmd{Namespaces: []string{"sales", "west"}}
 	m := newInitWizard(&original, "default", io.Discard)
-	values := []string{"postgres", "shop", "development", "env:APP", "env:STATE", "sales, west", root, "chosen"}
+	values := []string{"postgres", "shop", "development", "env:APP", "", "", "env:STATE", "sales, west", root, "chosen"}
 	for i, v := range values {
 		m.fields[i].value = v
 	}
@@ -401,7 +402,7 @@ func TestInitRejectsUnrelatedFilesBeforeReview(t *testing.T) {
 	m.step = len(m.fields)
 	wizardKey(m, tea.KeyEnter)
 	require.False(t, m.confirmed)
-	require.Equal(t, 6, m.step)
+	require.Equal(t, stepSchemaDir, m.step)
 	require.Contains(t, m.err, "schemabot.yaml")
 	require.Contains(t, m.err, root)
 	require.NotContains(t, m.err, ".schemabot-init-")
@@ -428,15 +429,15 @@ func TestInitWizardChecksFolderBeforeReviewAndKeepsStateStepReachable(t *testing
 	m := newInitWizard(&InitCmd{SchemaDir: root}, "default", io.Discard)
 	m.step = len(m.fields)
 	m.loadField()
-	require.Equal(t, 6, m.step)
+	require.Equal(t, stepSchemaDir, m.step)
 	require.Contains(t, m.err, "placeholder")
 	require.NotContains(t, m.View(), "verify them and keep your edits")
 	require.FileExists(t, filepath.Join(root, ".gitkeep"))
-	m.step = 5
+	m.step = stepNamespaces
 	m.explicitNamespaces = false
 	m.loadField()
 	wizardKey(m, tea.KeyShiftTab)
-	require.Equal(t, 4, m.step)
+	require.Equal(t, stepStorageDSN, m.step)
 }
 
 type initBrokenTerminal struct{ started <-chan struct{} }
@@ -496,10 +497,125 @@ func TestInitCancelledBeforeWorkReturnsError(t *testing.T) {
 func TestInitReviewEscapesFlagValues(t *testing.T) {
 	m := newInitWizard(&InitCmd{}, "default", io.Discard)
 	m.step = len(m.fields)
-	for _, i := range []int{0, 1, 2, 3, 4, 5, 6, 7} {
+	for i := range m.fields {
 		m.fields[i].value = "value\x1b[2J"
 	}
 	view := m.View()
 	require.NotContains(t, view, "\x1b[2J")
 	require.Contains(t, view, `\x1b[2J`)
+}
+
+// A Vitess database adds the PlanetScale organization and token steps between
+// the application and state connections. The token step shows the token's name
+// only, the state connection is checked as MySQL, and the review lists the
+// PlanetScale details alongside the connections.
+func TestInitWizardVitessStepsAndReview(t *testing.T) {
+	t.Setenv("DATABASE_URL", "user:secret@tcp(vtgate:3306)/shop")
+	t.Setenv("PLANETSCALE_TOKEN", "tok-name:tok-secret")
+	t.Setenv("SCHEMABOT_STORAGE_DSN", "user:secret@tcp(localhost:3306)/state")
+	m := newInitWizard(&InitCmd{Namespaces: []string{"commerce"}, APIURL: "http://localscale"}, "default", io.Discard)
+	wizardKey(m, tea.KeyUp)
+	require.Equal(t, "vitess", m.engine())
+	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, stepName, m.step)
+	require.Contains(t, m.View(), "PlanetScale database name")
+	m.input.SetValue("shop")
+	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, stepDSN, m.step)
+	require.Contains(t, m.View(), "vtgate:3306")
+	wizardKey(m, tea.KeyEnter)
+	m.Update(initConnectionMsg{generation: m.generation})
+	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, stepOrganization, m.step)
+	m.input.SetValue("Acme")
+	wizardKey(m, tea.KeyEnter)
+	require.NotEmpty(t, m.err)
+	m.input.SetValue("acme")
+	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, stepAPIToken, m.step)
+	require.Contains(t, m.View(), `Token: "tok-name"`)
+	require.NotContains(t, m.View(), "tok-secret")
+	var checked localsetup.Target
+	m.checkAPI = func(_ context.Context, target localsetup.Target) error { checked = target; return nil }
+	result := m.checkConnection()().(initConnectionMsg)
+	require.NoError(t, result.err)
+	require.Equal(t, localsetup.Target{Engine: "vitess", Database: "shop", Organization: "acme", Token: "tok-name:tok-secret", APIURL: "http://localscale"}, checked)
+	m.Update(result)
+	require.True(t, m.connectionChecked)
+	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, stepStorageDSN, m.step)
+	require.Contains(t, m.View(), "MySQL database of their own")
+	var storageEngine string
+	m.check = func(_ context.Context, engine, _ string) error { storageEngine = engine; return nil }
+	m.Update(m.checkConnection()())
+	require.Equal(t, "mysql", storageEngine)
+	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, len(m.fields), m.step)
+	view := m.View()
+	require.Contains(t, view, "PlanetScale organization: acme")
+	require.Contains(t, view, "PlanetScale API: env:PLANETSCALE_TOKEN")
+	wizardKey(m, tea.KeyEnter)
+	require.True(t, m.confirmed)
+	cmd, g := InitCmd{}, Globals{}
+	require.NoError(t, m.copyToCommand(&cmd, &g))
+	require.Equal(t, "vitess", cmd.Type)
+	require.Equal(t, "acme", cmd.Organization)
+	require.Equal(t, "env:PLANETSCALE_TOKEN", cmd.APIToken)
+	require.Equal(t, "env:SCHEMABOT_STORAGE_DSN", cmd.StorageDSN)
+}
+
+// Other engines move straight from the application connection to the state
+// connection, forward and back, and never copy PlanetScale values.
+func TestInitWizardHidesPlanetScaleStepsForOtherEngines(t *testing.T) {
+	t.Setenv("DATABASE_URL", "test-only")
+	t.Setenv("SCHEMABOT_STORAGE_DSN", "test-only")
+	m := newInitWizard(&InitCmd{Type: "mysql", Database: "shop", Namespaces: []string{"shop"}}, "default", io.Discard)
+	require.Equal(t, stepDSN, m.step)
+	wizardKey(m, tea.KeyEnter)
+	m.Update(initConnectionMsg{generation: m.generation})
+	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, stepStorageDSN, m.step)
+	wizardKey(m, tea.KeyShiftTab)
+	require.Equal(t, stepDSN, m.step)
+	m.confirmed = true
+	cmd := InitCmd{}
+	require.NoError(t, m.copyToCommand(&cmd, &Globals{}))
+	require.Equal(t, "mysql", cmd.Type)
+	require.Empty(t, cmd.Organization)
+	require.Empty(t, cmd.APIToken)
+}
+
+func TestInitVitessMissingInputs(t *testing.T) {
+	cmd := InitCmd{Type: "vitess", NonInteractive: true}
+	err := cmd.collectInputs(t.Context(), &Globals{})
+	require.ErrorContains(t, err, "--organization")
+	require.ErrorContains(t, err, "--api-token")
+	mysql := InitCmd{Type: "mysql", NonInteractive: true}
+	err = mysql.collectInputs(t.Context(), &Globals{})
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "organization")
+}
+
+func TestInitVitessDiscoveryUsesPlanetScaleTarget(t *testing.T) {
+	t.Setenv("VT_DSN", "user:secret@tcp(vtgate:3306)/shop")
+	t.Setenv("PS_TOKEN", "n:v")
+	m := newInitWizard(&InitCmd{Type: "vitess", Database: "shop", Organization: "acme", DSN: "env:VT_DSN", APIToken: "env:PS_TOKEN", APIURL: "http://localscale"}, "default", io.Discard)
+	m.ctx = t.Context()
+	var got localsetup.Target
+	m.discover = func(_ context.Context, target localsetup.Target) ([]string, error) {
+		got = target
+		return []string{"commerce"}, nil
+	}
+	msg := m.discoverNamespaces()().(initNamespacesMsg)
+	require.NoError(t, msg.err)
+	require.Equal(t, localsetup.Target{Engine: "vitess", DSN: "user:secret@tcp(vtgate:3306)/shop", Database: "shop", Organization: "acme", Token: "n:v", APIURL: "http://localscale"}, got)
+	t.Setenv("PS_TOKEN", "")
+	msg = m.discoverNamespaces()().(initNamespacesMsg)
+	require.ErrorContains(t, msg.err, "PlanetScale token")
+}
+
+func TestInitStorageDialect(t *testing.T) {
+	require.Equal(t, "mysql", initStorageDialect("mysql"))
+	require.Equal(t, "postgres", initStorageDialect("postgres"))
+	require.Equal(t, "mysql", initStorageDialect("vitess"))
 }

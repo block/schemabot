@@ -10,11 +10,15 @@ the setup, and verify the baseline before making a first edit.
 
 ## Before you start
 
-Use MySQL or PostgreSQL, with an existing application database and a separate database for
-SchemaBot's state. Vitess databases are not offered by the wizard yet; register them in the
-[server configuration](configuration.md) instead. They can share a server. Set `DATABASE_URL` and `SCHEMABOT_STORAGE_DSN` to
+Use MySQL, PostgreSQL, or Vitess, with an existing application database and a separate database
+for SchemaBot's state. They can share a server. Set `DATABASE_URL` and `SCHEMABOT_STORAGE_DSN` to
 their connection strings; the wizard saves references to those variables, never their values
 in your schema files. Keep those variables available for later CLI invocations.
+
+For Vitess, the application connection is your vtgate address, and the wizard also asks for the
+PlanetScale organization and a service token variable, `PLANETSCALE_TOKEN`, whose value is the
+token's `name:value`. SchemaBot opens deploy requests with that token and reads keyspaces from
+the `main` branch. Its own state lives in a MySQL database outside Vitess.
 
 Setup initializes SchemaBot's metadata tables in the state database. Baseline planning also
 needs the engine's scratch privileges. Setup never applies application schema changes.
@@ -34,7 +38,8 @@ and includes everything in the final review.
 Before setting up a runtime, SchemaBot reads the target catalog to discover namespaces. One
 result is selected automatically; multiple results appear in a searchable list. Use Space to
 select namespaces and Enter to continue. MySQL stays within the database named in the DSN;
-PostgreSQL lists accessible application schemas. No results or a failed connection stops here
+PostgreSQL lists accessible application schemas; Vitess lists the keyspaces of the `main`
+branch. No results or a failed connection stops here
 with a chance to retry, edit the connection, or press `m` to enter namespaces manually.
 Explicit `--namespace` flags also bypass discovery. Discovery uses only the application connection. State metadata is initialized only after the final review.
 
@@ -79,7 +84,9 @@ $ schemabot init --non-interactive --json --type mysql \
 {"database":"shop","environment":"development","profile":"default","schema_dir":"/project/schema","plan_id":"plan-example","tables":1,"verified":true}
 ```
 
-Paths and plan IDs vary. Existing schema directories with a valid `schemabot.yaml` are verified and
+Paths and plan IDs vary. A Vitess database also takes `--organization` and `--api-token
+env:PLANETSCALE_TOKEN`, plus `--api-url` for a PlanetScale-compatible private endpoint.
+Existing schema directories with a valid `schemabot.yaml` are verified and
 reused automatically, including with flags. `--reuse-schema` is also accepted. Select a named
 connection with `--profile`; existing profiles and the default connection are preserved.
 

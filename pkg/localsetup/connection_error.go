@@ -9,6 +9,7 @@ import (
 
 	"github.com/block/mysql"
 	"github.com/jackc/pgx/v5/pgconn"
+	ps "github.com/planetscale/planetscale-go/planetscale"
 )
 
 // Preserve the cause for diagnostic callers while displaying only safe error
@@ -35,6 +36,10 @@ func connectionFailureReason(err error) string {
 	var dns *net.DNSError
 	if errors.As(err, &dns) {
 		return "database hostname could not be resolved"
+	}
+	var psError *ps.Error
+	if errors.As(err, &psError) {
+		return fmt.Sprintf("PlanetScale API error %s", psError.Code)
 	}
 	var mysqlError *mysql.MySQLError
 	if errors.As(err, &mysqlError) {

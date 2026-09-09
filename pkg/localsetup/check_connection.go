@@ -23,7 +23,8 @@ func CheckConnection(ctx context.Context, engine, dsn string) error {
 	var db *sql.DB
 	var err error
 	switch engine {
-	case "mysql":
+	case "mysql", "vitess":
+		// A Vitess application connection is a vtgate, which speaks the MySQL protocol.
 		db, err = mysqlconn.Open(dsn)
 	case "postgres":
 		db, err = postgresconn.Open(dsn)
