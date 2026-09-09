@@ -131,7 +131,7 @@ func TestClassifyRefusal(t *testing.T) {
 				`"users_pkey", "users_id_seq"`,
 				`owns "users_pkey1", "users_id_seq1" instead`,
 				"step 1 of 3 failed",
-				createNameMismatchRemedy,
+				"free the first-choice name and rename the owned relation to it, or drop the table, then re-plan against the current schema",
 			},
 			wantNotDetail: []string{"after the CREATE TABLE committed"},
 		},
@@ -197,7 +197,7 @@ func TestClassifyRefusal(t *testing.T) {
 			wantNotDetail: []string{"instead", "no name"},
 		},
 		{
-			name: "create name mismatch enumerates a bounded prefix of a wide table's names",
+			name: "create name mismatch enumerates the prefix of a wide table's names that fits and counts the rest",
 			err: &executor.CreateNameMismatchError{
 				Schema: "public", Table: "users",
 				Missing:   []string{"users_a_key", "users_b_key", "users_c_key", "users_d_key", "users_e_key"},
@@ -205,10 +205,21 @@ func TestClassifyRefusal(t *testing.T) {
 			},
 			wantReason: "create-name-mismatch",
 			wantDetail: []string{
-				`does not own "users_a_key", "users_b_key", "users_c_key", and 2 more the schema file claims`,
-				`owns "users_a_key1", "users_b_key1", "users_c_key1", and 2 more instead`,
+				`does not own "users_a_key", and 4 more the schema file claims`,
+				`owns "users_a_key1", and 4 more instead`,
 			},
-			wantNotDetail: []string{"users_d_key", "users_e_key"},
+			wantNotDetail: []string{"users_b_key", "users_e_key"},
+		},
+		{
+			name: "create name mismatch counts names too long to show",
+			err: &executor.CreateNameMismatchError{
+				Schema: "public", Table: "users",
+				Missing:   []string{strings.Repeat("m", 63), strings.Repeat("n", 63)},
+				Unclaimed: []string{strings.Repeat("o", 63)},
+			},
+			wantReason:    "create-name-mismatch",
+			wantDetail:    []string{"does not own 2 names the schema file claims; it owns 1 name instead"},
+			wantNotDetail: []string{`"mmm`, `"ooo`},
 		},
 		{
 			name:       "invariant violation fails closed as a refusal",
@@ -407,27 +418,136 @@ func TestCreateCollisionRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 	}
 }
 
-// The mismatch cause carries the identifiers the remedy acts on, so unlike
-// the collision detail it cannot promise its remedy's lead for a table name
-// of any legal length: three maximal identifiers alone overrun the clamp.
-// What it does promise is that the enumeration is bounded — a wide table
-// cannot push the whole remedy out by owning more names — and that for the
-// shape a real table produces, a primary key and a serial column with their
-// suffixed twins, the lead that names the first action still lands inside
-// the clamp.
+// The mismatch cause carries the identifiers the remedy acts on, and the
+// enumeration yields room to the table name so that, like the collision
+// detail, the remedy's lead lands inside the clamp for a table name of any
+// legal length, however many names of whatever length the table claims and
+// owns. A short table name with the shape a real table produces, a primary
+// key and a serial column with their suffixed twins, still shows every name.
 func TestCreateNameMismatchRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 	const lead = "; free the first-choice name"
-	err := fmt.Errorf("execute: %w", &executor.SequenceStepError{
-		Step: 1, Total: 3, Err: &executor.CreateNameMismatchError{
-			Schema: "public", Table: "users",
-			Missing:   []string{"users_pkey", "users_id_seq"},
-			Unclaimed: []string{"users_pkey1", "users_id_seq1"},
+	longest := strings.Repeat("a", maxIdentifierLength)
+	widest := []string{longest, longest, longest, longest, longest}
+	tests := []struct {
+		name       string
+		table      string
+		mismatch   *executor.CreateNameMismatchError
+		total      int
+		wantDetail []string
+	}{
+		{
+			name:  "realistic shape shows every name",
+			table: "users",
+			mismatch: &executor.CreateNameMismatchError{
+				Missing: []string{"users_pkey", "users_id_seq"}, Unclaimed: []string{"users_pkey1", "users_id_seq1"},
+			},
+			total:      3,
+			wantDetail: []string{`"users_pkey", "users_id_seq" the schema file claims; it owns "users_pkey1", "users_id_seq1" instead`},
 		},
+		{
+			name:  "ordinary table name past the width a count bound protected",
+			table: "payment_methods",
+			mismatch: &executor.CreateNameMismatchError{
+				Missing: []string{"payment_methods_pkey", "payment_methods_id_seq"}, Unclaimed: []string{"payment_methods_pkey1", "payment_methods_id_seq1"},
+			},
+			total:      3,
+			wantDetail: []string{`"payment_methods_pkey", and 1 more the schema file claims`},
+		},
+		{
+			name:       "maximal table name, maximal names, three-digit create set",
+			table:      longest,
+			mismatch:   &executor.CreateNameMismatchError{Missing: widest, Unclaimed: widest},
+			total:      120,
+			wantDetail: []string{"does not own 5 names the schema file claims; it owns 5 names instead"},
+		},
+		{
+			name:     "maximal table name with nothing owned unclaimed",
+			table:    longest,
+			mismatch: &executor.CreateNameMismatchError{Missing: widest},
+			total:    120,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.mismatch.Schema, tt.mismatch.Table = "public", tt.table
+			err := fmt.Errorf("execute: %w", &executor.SequenceStepError{Step: 1, Total: tt.total, Err: tt.mismatch})
+
+			r := classifyRefusal(err, tt.table)
+
+			require.NotNil(t, r)
+			assert.Equal(t, "create-name-mismatch", r.reason)
+			at := strings.Index(r.detail, lead)
+			require.GreaterOrEqual(t, at, 0, r.detail)
+			assert.LessOrEqual(t, at+len(lead), statusReasonKeptWidth, r.detail)
+			for _, want := range tt.wantDetail {
+				assert.Contains(t, r.detail, want)
+			}
+		})
+	}
+}
+
+// quotedNames spends its budget on whole names: a name is shown only when it
+// fits together with the separator before it and the count of what follows,
+// so the rendering never exceeds the budget it was given, and a budget too
+// small for even the first name still says how many names there are.
+func TestQuotedNamesFitsBudget(t *testing.T) {
+	names := []string{"users_pkey", "users_id_seq", "users_email_key"}
+	tests := []struct {
+		name   string
+		names  []string
+		budget int
+		want   string
+	}{
+		{name: "everything fits", names: names, budget: 60, want: `"users_pkey", "users_id_seq", "users_email_key"`},
+		{name: "the count of the rest is charged against the budget", names: names, budget: 39, want: `"users_pkey", and 2 more`},
+		{name: "two names and the count fit exactly", names: names, budget: 40, want: `"users_pkey", "users_id_seq", and 1 more`},
+		{name: "nothing fits", names: names, budget: 11, want: "3 names"},
+		{name: "a single name that does not fit is counted in the singular", names: names[:1], budget: 0, want: "1 name"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := quotedNames(tt.names, tt.budget)
+
+			assert.Equal(t, tt.want, got)
+			assert.LessOrEqual(t, len(got), max(tt.budget, len(countedNames(len(tt.names)))))
+		})
+	}
+}
+
+// The bare create-names-unverified code is never what production hands the
+// outcome switch — the sentinel rides along whenever the code does, and
+// refusalForCause decides on it first — so the arm that keeps the switch total
+// is pinned to the same verdict the sentinel produces.
+func TestRefusalForOutcomeBareUnverifiedCodeMatchesTheSentinelVerdict(t *testing.T) {
+	fromCode, known := refusalForOutcome(executor.CodeCreateNamesUnverified, "users")
+	fromSentinel := classifyRefusal(fmt.Errorf("execute: %w", executor.ErrCreateNamesUnverified), "users")
+
+	require.True(t, known)
+	require.NotNil(t, fromCode)
+	require.NotNil(t, fromSentinel)
+	assert.Equal(t, "create-names-unverified", fromCode.reason)
+	assert.Equal(t, fromSentinel.reason, fromCode.reason)
+	assert.Equal(t, fromSentinel.cause, fromCode.cause)
+	assert.Equal(t, fromSentinel.remedy, fromCode.remedy)
+	assert.Contains(t, fromCode.remedy, "compare the table's constraint-index and sequence names against the schema file")
+}
+
+// The unverified cause carries only the table name, so like the collision
+// detail it can promise its remedy's lead for a table name of any legal
+// length. The read-back runs right after the CREATE TABLE, so the step
+// clause is always the first step's, and the lead that must survive names
+// which of the table's names the operator compares.
+func TestCreateNamesUnverifiedRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
+	const lead = "; compare the table's constraint-index and sequence names"
+	longest := strings.Repeat("a", maxIdentifierLength)
+	err := fmt.Errorf("execute: %w", &executor.SequenceStepError{
+		Step: 1, Total: 3, Err: fmt.Errorf("%w: public.%s: %w", executor.ErrCreateNamesUnverified, longest, context.Canceled),
 	})
 
-	r := classifyRefusal(err, "users")
+	r := classifyRefusal(err, longest)
 
 	require.NotNil(t, r)
+	assert.Equal(t, "create-names-unverified", r.reason)
 	at := strings.Index(r.detail, lead)
 	require.GreaterOrEqual(t, at, 0, r.detail)
 	assert.LessOrEqual(t, at+len(lead), statusReasonKeptWidth, r.detail)

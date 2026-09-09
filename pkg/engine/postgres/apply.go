@@ -628,6 +628,9 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return createNameMismatchRefusal(
 			fmt.Sprintf("the CREATE TABLE for %q committed but the table does not own a constraint-index or sequence name the schema file claims; the server chose a suffixed name instead", table)), true
 	case executor.CodeCreateNamesUnverified:
+		// The sentinel is present whenever this code is, so refusalForCause
+		// decides the verdict before control reaches here; this arm keeps
+		// the switch total and gives the bare code the same verdict.
 		return createNamesUnverifiedRefusal(table), true
 	case executor.CodeDuplicateCreateName:
 		return &refusal{reason: "duplicate-create-name",
@@ -751,38 +754,72 @@ func createNameMismatchRefusal(cause string) *refusal {
 // missing name — a table that honoured every claim is not a mismatch — but
 // may own nothing unclaimed when a relation was dropped inside the read-back
 // window, so the owned clause is rendered only when there is one to name.
+//
+// The two enumerations share the byte room the table name leaves them, split
+// evenly when both are rendered: the missing names and the owned names are
+// the two halves of one comparison, and neither is worth more of the
+// operator's screen than the other.
 func createNameMismatchCause(table string, mismatch *executor.CreateNameMismatchError) string {
-	cause := fmt.Sprintf("the CREATE TABLE for %q committed but the table does not own %s the schema file claims",
-		table, quotedNames(mismatch.Missing))
+	budget := max(0, mismatchNamesRoom-len(table))
 	if len(mismatch.Unclaimed) == 0 {
-		return cause
+		return fmt.Sprintf("the CREATE TABLE for %q committed but the table does not own %s the schema file claims",
+			table, quotedNames(mismatch.Missing, budget))
 	}
-	return cause + fmt.Sprintf("; it owns %s instead", quotedNames(mismatch.Unclaimed))
+	return fmt.Sprintf("the CREATE TABLE for %q committed but the table does not own %s the schema file claims; it owns %s instead",
+		table, quotedNames(mismatch.Missing, budget/2), quotedNames(mismatch.Unclaimed, budget/2))
 }
 
-// maxQuotedNames bounds how many identifiers a refusal cause enumerates. A
-// wide table can claim a name per constraint and per serial column, and the
-// composed detail is rendered on a surface that truncates from the tail,
-// where the remedy sits; the leading names locate the problem and the count
-// says how much the operator has not been shown.
-const maxQuotedNames = 3
+// mismatchNamesRoom is the byte room a mismatch cause has for the table name
+// and the identifiers it enumerates together. The narrowest operator surface
+// truncates a refusal detail from the tail, where the remedy sits, and the
+// remedy is the only clause that says the table is still standing and needs
+// renaming or dropping. The room is what that surface leaves once the fixed
+// prose around the names, the failed-step clause, and the remedy's lead have
+// taken theirs, so the enumerations shrink as the table name grows and the
+// lead survives for a table name of any legal length.
+const mismatchNamesRoom = 84
 
-// quotedNames renders identifiers for a refusal cause, enumerating at most
-// maxQuotedNames and counting the rest.
-func quotedNames(names []string) string {
-	shown := names
-	if len(shown) > maxQuotedNames {
-		shown = shown[:maxQuotedNames]
+// quotedNames renders identifiers for a refusal cause inside a byte budget:
+// it enumerates the leading names that fit alongside a count of the rest, and
+// falls back to the count alone when not even the first name fits.
+func quotedNames(names []string, budget int) string {
+	var quoted []string
+	used := 0
+	for i, name := range names {
+		q := fmt.Sprintf("%q", name)
+		need := len(q)
+		if i > 0 {
+			need += len(", ")
+		}
+		tail := 0
+		if rest := len(names) - i - 1; rest > 0 {
+			tail = len(remainingNames(rest))
+		}
+		if used+need+tail > budget {
+			break
+		}
+		quoted = append(quoted, q)
+		used += need
 	}
-	quoted := make([]string, len(shown))
-	for i, name := range shown {
-		quoted[i] = fmt.Sprintf("%q", name)
+	if len(quoted) == 0 {
+		return countedNames(len(names))
 	}
 	rendered := strings.Join(quoted, ", ")
-	if rest := len(names) - len(shown); rest > 0 {
-		rendered += fmt.Sprintf(", and %d more", rest)
+	if rest := len(names) - len(quoted); rest > 0 {
+		rendered += remainingNames(rest)
 	}
 	return rendered
+}
+
+func remainingNames(rest int) string {
+	return fmt.Sprintf(", and %d more", rest)
+}
+
+func countedNames(n int) string {
+	if n == 1 {
+		return "1 name"
+	}
+	return fmt.Sprintf("%d names", n)
 }
 
 // createNamesUnverifiedRefusal is decided by the wrap, not by the cause it
@@ -791,11 +828,13 @@ func quotedNames(names []string) string {
 // read: its retry re-runs the identical plan, whose CREATE TABLE has already
 // committed, so every retry collides with the table this apply created. The
 // table stands with unproven names, and proving them is an operator's
-// comparison, not a retry's.
+// comparison, not a retry's. The cause is kept terse — the remedy, not the
+// cause, names which names to compare — so that the remedy's lead survives
+// the narrowest operator surface for a table name of any legal length.
 func createNamesUnverifiedRefusal(table string) *refusal {
 	return &refusal{
 		reason: "create-names-unverified",
-		cause:  fmt.Sprintf("the CREATE TABLE for %q committed but the relation names the table owns could not be read, so whether the server honoured every claimed name is unproven", table),
+		cause:  fmt.Sprintf("the CREATE TABLE for %q committed but the names it owns could not be read back", table),
 		remedy: "compare the table's constraint-index and sequence names against the schema file, then " + replanRemedy,
 	}
 }
