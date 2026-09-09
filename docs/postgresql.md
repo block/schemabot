@@ -98,6 +98,34 @@ bounded at apply time: each attempt has a 3-second lock budget and a
 statement that exceeds the execution budget is not allowed to continue
 unbounded.
 
+While a statement runs, PostgreSQL progress metadata carries two phase
+vocabularies in one flat map. `phase` is SchemaBot's own record of the apply:
+`preflight` for as long as the apply runs, then its terminal outcome
+(`completed`, `failed`, or `refused`).
+`server_phase` is the `phase` column of PostgreSQL's
+`pg_stat_progress_create_index` view, verbatim (for example `building index:
+scanning table` or `index validation: scanning index`), and is present only
+while PostgreSQL publishes a progress row for a concurrent index build. The
+metadata also carries `step`, `steps_total`, and the sanitized `statement`
+for the statement in flight; `executor_operation`, pg-sprite's class for the
+step (`admitting`, `optimistic`, `brief`, `validate-constraint`,
+`concurrent-index-build`); and `attempt`. Whenever a progress row is
+published, all six counters — `blocks_done`, `blocks_total`, `tuples_done`,
+`tuples_total`, `lockers_done`, `lockers_total` — are present, zeros
+included: a zero is a reading, and an absent key means PostgreSQL has not
+published a row. PostgreSQL scopes block and tuple counters to phases, but a
+completed phase's values can persist into the next phase. The completed heap
+scan's block counters remain visible while live tuples are sorted, so that
+sorting phase's zero-width band absorbs the carry-over and reports its start.
+
+Table progress during a concurrent index build is a whole-build estimate, not
+a phase ratio. Each server phase owns a fixed band of the 0–100 scale in
+PostgreSQL's documented phase order, a phase with block or tuple counters
+interpolates within its band, and a waiting or sorting phase reports the
+band's start. The estimate stays below 100 until the apply completes and never
+moves backwards within a build; a poll that finds no progress row — between
+phases, or while the view cannot be read — keeps the last derived percent.
+
 A multi-statement plan — several tables changed, or one declarative edit that
 the planner expands into several steps — is not applied atomically. The
 statements execute in order, each committing or failing in its own
@@ -253,11 +281,13 @@ when pg-sprite could not construct the concurrent form of a plain
 `CREATE INDEX`, since running the submitted form would falsify the plan's own
 verdict.
 
-The plan comment lists the table and SchemaBot's reason for the refusal. For a
-PostgreSQL plan, the plan Check Run concludes unsuccessfully, and an apply
-attempt is rejected before any apply or task is queued. Rewrite the declarative
-change into an eligible form or use a separately reviewed operational process;
-flags do not override an engine-blocked verdict.
+The plan comment lists the table and SchemaBot's reason for the refusal. When
+the create path refuses a statement's shape, that reason names the offending
+clause and how to remove or work around it. For a PostgreSQL plan, the plan
+Check Run concludes unsuccessfully, and an apply attempt is rejected before
+any apply or task is queued. Rewrite the declarative change into an eligible
+form or use a separately reviewed operational process; flags do not override
+an engine-blocked verdict.
 
 The engine does not execute `DROP TABLE` or other statement kinds outside its
 admitted set. That includes tables that exist on the target but that no schema
@@ -350,6 +380,17 @@ change or that depend on the target:
   missing target schema, a duplicate name inside the statement, `IF NOT
   EXISTS`, and `PARTITION OF` against a live parent are each refused
   permanently, with a reason directing a fix or a re-plan.
+- After a `CREATE TABLE` commits, pg-sprite reads back the constraint-index
+  and sequence names the table owns. A table that owns a suffixed name in
+  place of one the schema file claims — an occupant took the first choice
+  between the catalog probe and the statement — is refused permanently, with
+  the missing and owned names in the reason; the table is left standing for
+  the operator to rename the relation or drop, then re-plan. A read-back that
+  does not complete is also refused permanently, even though pg-sprite marks
+  it retryable: SchemaBot's retry re-runs the whole plan, whose `CREATE
+  TABLE` has already committed, so it could only collide with the table this
+  apply created. The reason directs the operator to compare the table's
+  names against the schema file, then re-plan.
 - Insufficient privileges are refused permanently before DDL runs. The stored
   failure includes the provisioning `GRANT` derived by pg-sprite.
 - Exhausting the 30-second statement budget is a permanent native-safety
