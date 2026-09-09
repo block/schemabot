@@ -301,9 +301,14 @@ be careful. The unredacted error goes to the server log next to the repo, PR, en
 database, and command, so nothing is lost for triage. Inbound webhook payloads are size-bounded
 before decode. *Enforced:* the comment and table-cell sanitizers in
 `pkg/webhook/templates/common.go`, applied by the error renderers themselves
-(`pkg/webhook/templates/errors.go`); the Check Run summary sanitizer and its markup escaper
-(`pkg/webhook/check_publisher.go`); the drift summary clamp (`pkg/webhook/plan_drift.go`); the
-request body limit (`pkg/webhook/handler.go`).
+(`pkg/webhook/templates/errors.go`); the code fences sized past any backtick run in their
+content, DDL fences drawing on a budget shared across the comment, and the code span that holds
+an identifier read from the PR's schema files, its `schemabot.yaml`, or a command's `-d` flag —
+table, namespace, keyspace, shard, schema path, database, check name — flattened to one line and
+delimited past any backtick run inside it (`pkg/webhook/templates/fence.go`, exercised across
+its rendering surfaces by `pkg/webhook/templates/hostile_identifier_test.go`); the Check Run
+summary sanitizer and its markup escaper (`pkg/webhook/check_publisher.go`); the drift summary
+clamp (`pkg/webhook/plan_drift.go`); the request body limit (`pkg/webhook/handler.go`).
 
 ### AV-9: SchemaBot never destroys its own storage to start
 

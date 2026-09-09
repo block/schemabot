@@ -231,6 +231,9 @@ func writeProgressStep(data ProgressData) {
 		fmt.Printf(" · %s", statement)
 	}
 	fmt.Println()
+	if line := ui.FormatBuildWork(data.BuildWork); line != "" {
+		fmt.Println(line)
+	}
 }
 
 // FormatNamespacedTables returns tables grouped by keyspace as a string, collapsing

@@ -60,15 +60,33 @@ func TestRenderApplyCommentsIncludeEnvironmentInTitle(t *testing.T) {
 
 func TestUnsafeDropUsageTarget(t *testing.T) {
 	tests := []struct {
-		name    string
-		changes []UnsafeChangeData
-		want    string
-		wantOK  bool
+		name         string
+		databaseType string
+		changes      []UnsafeChangeData
+		want         string
+		wantOK       bool
 	}{
 		{
 			name: "drop column",
 			changes: []UnsafeChangeData{
 				{Table: "customers", Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\""},
+			},
+			want:   "the dropped column",
+			wantOK: true,
+		},
+		{
+			name:         "PostgreSQL drop column classified from DDL",
+			databaseType: "postgres",
+			changes: []UnsafeChangeData{
+				{Table: "customers", Reason: `statement removes live structure from table "customers"`, DDL: `ALTER TABLE "customers" DROP COLUMN IF EXISTS "nickname"`},
+			},
+			want:   "the dropped column",
+			wantOK: true,
+		},
+		{
+			name: "MySQL drop column without column keyword",
+			changes: []UnsafeChangeData{
+				{Table: "customers", Reason: "destructive change", DDL: "ALTER TABLE `customers` DROP `nickname`"},
 			},
 			want:   "the dropped column",
 			wantOK: true,
@@ -88,6 +106,38 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 			},
 			want:   "the dropped table",
 			wantOK: true,
+		},
+		{
+			// The statement already counts the table, so the change type
+			// must not count it a second time.
+			name:         "undeclared PostgreSQL table drop counts once",
+			databaseType: "postgres",
+			changes: []UnsafeChangeData{
+				{Table: "archived_orders", Reason: `DROP TABLE removes all data from table "archived_orders"`, DDL: `DROP TABLE "public"."archived_orders"`, ChangeType: "drop"},
+			},
+			want:   "the dropped table",
+			wantOK: true,
+		},
+		{
+			// Neither a statement nor a reason names the drop; the change
+			// type alone, in whatever case the producer wrote it, supplies it.
+			name:         "table drop without statement or reason words falls back to change type",
+			databaseType: "postgres",
+			changes: []UnsafeChangeData{
+				{Table: "archived_orders", Reason: "the table is not declared in the schema files", ChangeType: "DrOp"},
+			},
+			want:   "the dropped table",
+			wantOK: true,
+		},
+		{
+			// A standalone index drop is its own change type, so it never
+			// counts as a table drop and yields no application usage target.
+			name:         "PostgreSQL drop index is not a table drop",
+			databaseType: "postgres",
+			changes: []UnsafeChangeData{
+				{Table: "orders", Reason: `statement removes live structure from table "orders"`, DDL: `DROP INDEX "orders_status_idx"`, ChangeType: "drop_index"},
+			},
+			wantOK: false,
 		},
 		{
 			name: "multiple drop tables",
@@ -147,7 +197,11 @@ func TestUnsafeDropUsageTarget(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, ok := unsafeDropApplicationUsageTarget(tt.changes)
+			databaseType := tt.databaseType
+			if databaseType == "" {
+				databaseType = "mysql"
+			}
+			got, ok := unsafeDropApplicationUsageTarget(countUnsafeDrops(tt.changes, databaseType))
 
 			assert.Equal(t, tt.wantOK, ok)
 			assert.Equal(t, tt.want, got)
@@ -342,6 +396,7 @@ func TestRenderApplyStatusComment_ThrottledChecksumming(t *testing.T) {
 func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 	tests := []struct {
 		name                string
+		databaseType        string
 		changes             []UnsafeChangeData
 		wantActionTarget    string
 		wantInvisibleTarget string
@@ -352,6 +407,17 @@ func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 			name: "drop index",
 			changes: []UnsafeChangeData{
 				{Table: "customers", Reason: "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\""},
+			},
+			wantActionTarget:    "an index",
+			wantInvisibleTarget: "the dropped index",
+			wantQueryTarget:     "it",
+			wantOK:              true,
+		},
+		{
+			name:         "PostgreSQL drop index classified from DDL",
+			databaseType: "postgres",
+			changes: []UnsafeChangeData{
+				{Table: "customers", Reason: `statement removes live structure from table "customers"`, DDL: `DROP INDEX "idx_customers_email"`},
 			},
 			wantActionTarget:    "an index",
 			wantInvisibleTarget: "the dropped index",
@@ -389,7 +455,11 @@ func TestUnsafeDropIndexUsageTargets(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotActionTarget, gotInvisibleTarget, gotQueryTarget, ok := unsafeDropIndexUsageTargets(tt.changes)
+			databaseType := tt.databaseType
+			if databaseType == "" {
+				databaseType = "mysql"
+			}
+			gotActionTarget, gotInvisibleTarget, gotQueryTarget, ok := unsafeDropIndexUsageTargets(countUnsafeDrops(tt.changes, databaseType))
 
 			assert.Equal(t, tt.wantOK, ok)
 			assert.Equal(t, tt.wantActionTarget, gotActionTarget)
@@ -422,6 +492,35 @@ func TestRenderUnsafeChangesBlockedIncludesDropIndexGuidance(t *testing.T) {
 	assert.Contains(t, rendered, "Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.")
 	assert.Contains(t, rendered, "Before dropping an index in MySQL, first make the dropped index invisible and verify application queries no longer rely on it for safe performance.")
 	assert.NotContains(t, rendered, "reads from or writes to the dropped index")
+}
+
+// The apply-blocked comment classifies drops with the target's parser: a
+// PostgreSQL statement whose reason never says DROP still gets the guidance.
+// Passing an empty database type here would fall back to the reason and
+// render no guidance at all.
+func TestRenderUnsafeChangesBlockedClassifiesPostgresDropsFromDDL(t *testing.T) {
+	rendered := RenderUnsafeChangesBlocked(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		IsMySQL:      false,
+		DatabaseType: "postgres",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					`ALTER TABLE "customers" DROP COLUMN "nickname", DROP COLUMN "legacy_code";`,
+				},
+			},
+		},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "customers", Reason: `statement removes live structure from table "customers"`, DDL: `ALTER TABLE "customers" DROP COLUMN "nickname", DROP COLUMN "legacy_code"`},
+		},
+	})
+
+	assert.Contains(t, rendered, "Before allowing a destructive drop, first deploy application code that no longer reads from or writes to any dropped columns.")
+	assert.NotContains(t, rendered, "the dropped column.")
 }
 
 func TestRenderUnsafeChangesBlockedUsesPluralMySQLDropIndexGuidance(t *testing.T) {

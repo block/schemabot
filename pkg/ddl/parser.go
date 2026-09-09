@@ -38,6 +38,11 @@ type StatementParser interface {
 	// cannot hide behind the classification of the first one.
 	Classify(stmt string) (StatementType, string, error)
 
+	// DropTargets reports how many tables, columns and indexes exactly one
+	// statement drops, so operator guidance can name what an application must
+	// stop relying on. Statements that drop nothing report zeros.
+	DropTargets(stmt string) (DropTargets, error)
+
 	// CreateTableColumns returns the declared column names from exactly one
 	// CREATE TABLE statement. Table-level constraints are not columns.
 	CreateTableColumns(stmt string) ([]string, error)
@@ -80,6 +85,12 @@ type StatementParser interface {
 	// Canonicalize normalizes a single DDL statement's formatting, returning
 	// the input unchanged when it cannot be parsed.
 	Canonicalize(ddl string) string
+}
+
+type DropTargets struct {
+	Tables  int
+	Columns int
+	Indexes int
 }
 
 // defaultParser backs the package-level SplitStatements, ClassifyStatement, and
@@ -281,6 +292,34 @@ func (tidbStatementParser) Classify(stmt string) (StatementType, string, error) 
 		)
 	}
 	return statementTypeFromSpirit(results[0].Type), results[0].Table, nil
+}
+
+func (tidbStatementParser) DropTargets(stmt string) (DropTargets, error) {
+	parsed, err := statement.New(stmt)
+	if err != nil {
+		return DropTargets{}, fmt.Errorf("parse drop targets from statement %q: %w", statementPreview(stmt), err)
+	}
+	if len(parsed) != 1 {
+		return DropTargets{}, fmt.Errorf("expected one statement for drop targets, got %d", len(parsed))
+	}
+
+	// A standalone DROP INDEX arrives here as the ALTER TABLE ... DROP INDEX
+	// Spirit rewrites it into, so the ALTER branch counts both spellings.
+	var targets DropTargets
+	switch node := (*parsed[0].StmtNode).(type) {
+	case *ast.DropTableStmt:
+		targets.Tables = len(node.Tables)
+	case *ast.AlterTableStmt:
+		for _, spec := range node.Specs {
+			switch spec.Tp {
+			case ast.AlterTableDropColumn:
+				targets.Columns++
+			case ast.AlterTableDropIndex:
+				targets.Indexes++
+			}
+		}
+	}
+	return targets, nil
 }
 
 // CreateTableColumns implements StatementParser.

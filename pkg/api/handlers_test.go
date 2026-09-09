@@ -3718,6 +3718,42 @@ func TestExecuteApplyRejectsBlockedStoredPlan(t *testing.T) {
 	assert.Empty(t, tasks.tasks)
 }
 
+func TestExecuteApplyRejectsBlockedUnsafeStoredPlanAsBlocked(t *testing.T) {
+	plan := executeApplyTestPlan()
+	change := &plan.Namespaces["testdb"].Tables[0]
+	change.IsUnsafe = true
+	change.UnsafeReason = "DROP COLUMN removes data"
+	change.ExecutionMode = "blocked"
+	change.ModeReason = "statement cannot be executed safely as written"
+
+	applies := &capturingApplyStore{}
+	tasks := &capturingTaskStore{}
+	applies.taskStore = tasks
+	svc := New(&mockStorageWithApplyStores{
+		plans:     &staticPlanStore{plan: plan},
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
+	}, testServerConfig(), map[string]tern.Client{
+		"default/staging": &mockTernClient{},
+	}, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{
+		PlanID:      "plan-1",
+		Environment: "staging",
+	})
+
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Zero(t, applyID)
+	assert.Contains(t, err.Error(), "blocked change")
+	assert.Contains(t, err.Error(), "cannot be executed safely as written")
+	assert.NotContains(t, err.Error(), "allow_unsafe")
+	assert.Nil(t, applies.apply)
+	assert.Empty(t, tasks.tasks)
+}
+
 func TestExecuteApplyQueuesUnsafeStoredPlanWithOptIn(t *testing.T) {
 	plan := executeApplyTestPlan()
 	plan.Namespaces["testdb"].Tables[0].IsUnsafe = true
