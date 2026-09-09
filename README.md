@@ -88,7 +88,15 @@ Not every engine supports every feature, and some share a verb without sharing i
 
 ## Quick Start
 
-Try it from a clone. The demo brings up local MySQL containers, applies a schema, and seeds data; the schemas and configs it uses are documented in [examples/](./examples/README.md):
+Install the CLI with [Homebrew](https://brew.sh/):
+
+```bash
+brew install block/tap/schemabot
+```
+
+[Installation and upgrades](./docs/cli.md#install-the-cli) · [Connect to your server](./docs/cli.md#connect-to-a-server)
+
+To explore SchemaBot with demo databases, try it from a clone. The demo brings up local MySQL containers, applies a schema, and seeds data; the schemas and configs it uses are documented in [examples/](./examples/README.md):
 
 ```bash
 make demo    # Start services, apply schema, seed data

@@ -87,7 +87,7 @@ Pushing a `vX.Y.Z` tag triggers two workflows:
 
 | Workflow | Artifacts |
 | --- | --- |
-| `Release` (GoReleaser) | `schemabot` binaries for linux/amd64, linux/arm64, darwin/arm64, plus checksums, attached to a GitHub Release |
+| `Release` (GoReleaser) | `schemabot` binaries for linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, plus checksums, attached to a GitHub Release |
 | `Docker & Helm` | `ghcr.io/block/schemabot:vX.Y.Z` and the Helm chart at `oci://ghcr.io/block/charts/schemabot` |
 
 Nothing else is required. There is no manual artifact step.

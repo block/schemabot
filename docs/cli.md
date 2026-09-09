@@ -17,9 +17,41 @@ The examples use a MySQL database named `shop` in `staging`.
 Substitute a database and environment from your server's inventory. The local
 quick start uses `testapp`; it does not create the `shop` database shown here.
 
+## Install the CLI
+
+With [Homebrew](https://brew.sh/), install the published binary without building
+SchemaBot or installing Go:
+
+```bash
+brew install block/tap/schemabot
+```
+
+The tap currently supports Apple Silicon Macs and Linux on x86-64 or ARM64.
+Intel Mac binaries will be available after the next release includes them.
+On Windows, use a Linux environment such as WSL2; native Windows support is
+not yet part of the release.
+
+Check the installed version:
+
+```console
+$ schemabot --version
+v0.1.67 (commit: 542cd3141a927bfdc997f0950e162cd4af67671f)
+```
+
+Your version may be newer. To upgrade, run `brew update` followed by
+`brew upgrade block/tap/schemabot`.
+
+Prefer a standalone binary? Download the archive for your operating system
+and architecture from [GitHub Releases](https://github.com/block/schemabot/releases).
+Verify it against that release's `checksums.txt`, extract it, and put `schemabot`
+on your `PATH`.
+
+Installation gives you the CLI. To use it, [connect to a SchemaBot server](#connect-to-a-server),
+or start the [local demo](../README.md#quick-start).
+
 ## Connect to a server
 
-Install a [released CLI binary](../README.md#releases). If you have not set
+[Install the CLI](#install-the-cli) first. If you have not set
 up a server yet, the [local quick start](../README.md#quick-start) starts one
 with demo databases. For your own installation, follow the
 [server and access guide](auth.md#where-schemabot-runs).
