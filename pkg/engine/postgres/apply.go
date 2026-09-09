@@ -822,7 +822,10 @@ func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, 
 // budget and the context deadline the drive hands each one against an
 // executor it scripts instead of a target to dial; the package default is
 // the executor's own functions. The engine's execute seam cannot reach these
-// calls, since it replaces the whole of executeOptimistic.
+// calls, since it replaces the whole of executeOptimistic. The seam is
+// package state shared by every drive in the process, so swapping it is not
+// safe from a test that runs in parallel with another; scriptConcurrentIndex
+// restores it when each test ends.
 type concurrentIndexExecutor struct {
 	build   func(ctx context.Context, pool *pgxpool.Pool, sql string, budget executor.ConcurrentBudget, tracker *progress.Tracker) (executor.IndexBuildReport, error)
 	rebuild func(ctx context.Context, pool *pgxpool.Pool, sql string, budget executor.ConcurrentBudget) (executor.IndexRecoveryReport, error)

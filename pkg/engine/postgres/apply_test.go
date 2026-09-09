@@ -1139,6 +1139,39 @@ func TestConcurrentIndexMaximumIsTheServerStatementTimeoutCeiling(t *testing.T) 
 	assert.Equal(t, 36*time.Hour, NewWithOptions(0, 36*time.Hour).ConcurrentIndexMaxDuration())
 }
 
+// TestConcurrentIndexBoundsMatchTheExecutorsBudgetRange proves the engine's
+// floor and ceiling are the executor's own, not a copy of them: the executor
+// refuses a served budget one step outside either bound as unbounded and
+// accepts a budget exactly on it. The executor validates the budget before
+// it touches the pool or the statement, so the probe needs neither a target
+// nor a real build; the accepted cases use a plain CREATE INDEX so the call
+// stops at admission, one step past validation, instead of reaching the
+// pool. Asserting the refusal's wording pins the value the executor holds,
+// so a dependency bump that moves either bound fails here rather than in a
+// refused apply on a configuration this engine had accepted.
+func TestConcurrentIndexBoundsMatchTheExecutorsBudgetRange(t *testing.T) {
+	const concurrent = "CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)"
+	const plain = "CREATE INDEX users_email_idx ON public.users (email)"
+	probe := func(sql string, overall time.Duration) error {
+		_, err := executor.BuildIndexConcurrentlyWithProgress(t.Context(), nil, sql, executor.ConcurrentBudget{Overall: overall}, newTestTracker(t))
+		return err
+	}
+
+	err := probe(concurrent, MinConcurrentIndexMaxDuration-time.Nanosecond)
+	require.ErrorIs(t, err, executor.ErrUnboundedBudget)
+	assert.ErrorContains(t, err, "at least 1ms")
+
+	err = probe(concurrent, MaxConcurrentIndexMaxDuration+time.Millisecond)
+	require.ErrorIs(t, err, executor.ErrUnboundedBudget)
+	assert.ErrorContains(t, err, "at most "+MaxConcurrentIndexMaxDuration.String())
+
+	for _, bound := range []time.Duration{MinConcurrentIndexMaxDuration, MaxConcurrentIndexMaxDuration} {
+		err = probe(plain, bound)
+		require.ErrorIs(t, err, executor.ErrNotConcurrentIndexBuild, "the probe must stop at admission, past validation")
+		assert.NotErrorIs(t, err, executor.ErrUnboundedBudget, "a bound the engine accepts must be one the executor serves")
+	}
+}
+
 // TestBuildIndexConcurrentlyRefusesAnUnsetBound proves a concurrent build
 // never starts under a bound the drive did not stamp: the bound is the
 // build's server-side statement timeout and the recovery's only deadline, so
@@ -1244,7 +1277,7 @@ func TestBuildIndexConcurrentlyRecoversUnderItsOwnCallerOwnedDeadline(t *testing
 	recovery := calls.rebuild[0]
 	assert.Equal(t, executor.ConcurrentBudget{CallerOwned: true}, recovery.budget)
 	require.True(t, recovery.hasDeadline, "the recovery must run under a deadline")
-	assert.WithinDuration(t, before.Add(bound), recovery.deadline, time.Minute,
+	assert.WithinDuration(t, before.Add(bound), recovery.deadline, concurrentIndexHeadroom/2,
 		"the recovery starts with the configured bound ahead of it, not the caller's ceiling")
 	assert.True(t, recovery.deadline.Before(ceiling), "the recovery's deadline must fall inside the caller's ceiling")
 }
@@ -1269,6 +1302,9 @@ func TestBuildIndexConcurrentlyNamesTheBoundThatEndedTheBuild(t *testing.T) {
 		{
 			name: "pre-build catalog read is cancelled once the bound has elapsed",
 			build: func() error {
+				// The drive names the bound on a raw cancellation only once
+				// the bound has elapsed on its own clock, so real time must
+				// pass here; overshooting is the safe direction.
 				time.Sleep(2 * bound)
 				return fmt.Errorf("resolve target: %w", &pgconn.PgError{Code: sqlstateQueryCanceled})
 			},
