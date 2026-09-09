@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"strings"
@@ -18,22 +19,19 @@ func RegisterLocalProfile(name, runtimeID string) (bool, error) {
 	if _, err := localruntime.Directory(runtimeID); err != nil {
 		return false, err
 	}
-	cfg, err := LoadConfig()
-	if err != nil {
-		return false, err
-	}
 	wanted := Profile{LocalRuntime: runtimeID}
-	if existing, ok := cfg.Profiles[name]; ok {
-		// Treat unexpected fields as a conflict. Local profiles must not
-		// retain remote credentials or acquire new behavior silently.
-		if reflect.DeepEqual(existing, wanted) {
-			return false, nil
+	changed := false
+	err := UpdateConfig(context.Background(), func(cfg *Config) error {
+		changed = false
+		if existing, ok := cfg.Profiles[name]; ok {
+			if reflect.DeepEqual(existing, wanted) {
+				return nil
+			}
+			return fmt.Errorf("profile %q already has a different connection; choose another profile name", name)
 		}
-		return false, fmt.Errorf("profile %q already has a different connection; choose another profile name", name)
-	}
-	cfg.Profiles[name] = wanted
-	if err := SaveConfig(cfg); err != nil {
-		return false, err
-	}
-	return true, nil
+		cfg.Profiles[name] = wanted
+		changed = true
+		return nil
+	})
+	return changed && err == nil, err
 }

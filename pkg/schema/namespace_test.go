@@ -335,3 +335,18 @@ func TestResolveIgnoreNamespaces(t *testing.T) {
 	assert.Equal(t, []string{"fixtures_$ENV"},
 		ResolveIgnoreNamespaces([]string{"fixtures_$ENV"}, ""))
 }
+
+func TestEmptyNamespaceDeclarationPreservesIntent(t *testing.T) {
+	for _, content := range []string{EmptyNamespaceDeclaration, "  \n" + EmptyNamespaceDeclaration + "\n "} {
+		got, _, err := GroupFilesByNamespace(map[string]string{"public/schema.sql": content}, "app", "", nil)
+		require.NoError(t, err)
+		require.Contains(t, got, "public")
+		require.NotNil(t, got["public"].Files)
+		require.Empty(t, got["public"].Files)
+	}
+	for _, content := range []string{"-- a user comment", EmptyNamespaceDeclaration + "\n-- another comment", EmptyNamespaceDeclaration + "\nCREATE TABLE orders (id bigint);"} {
+		got, _, err := GroupFilesByNamespace(map[string]string{"public/schema.sql": content}, "app", "", nil)
+		require.NoError(t, err)
+		require.Equal(t, content, got["public"].Files["schema.sql"])
+	}
+}

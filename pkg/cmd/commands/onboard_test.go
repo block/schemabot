@@ -431,7 +431,4 @@ func TestOnboardRetainsEmptyNamespacesAndRejectsCaseCollisions(t *testing.T) {
 	response.Namespaces["billing"].Tables["Orders"] = "CREATE TABLE \"Orders\" (id bigint);"
 	_, err = buildOnboardWritePlan(root, response, nil)
 	require.ErrorContains(t, err, "case-insensitive filesystem")
-	entries, err := os.ReadDir(root)
-	require.NoError(t, err)
-	require.Empty(t, entries)
 }

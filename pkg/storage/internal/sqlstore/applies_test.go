@@ -3412,6 +3412,8 @@ func TestApplyStore_ExpireRetryable_KeepsTasksWhoseOperationADriverHolds(t *test
 	backdateOperationHeartbeat(t, abandoned, storage.ApplyLeaseStaleAfter+time.Minute)
 	// The sibling a driver is holding right now, heartbeated as of this instant.
 	held := leasedOperationFor(t, store, apply, "region-b")
+	_, err = testDB.ExecContext(ctx, `UPDATE apply_operations SET state = ?, updated_at = NOW() WHERE id = ?`, state.ApplyOperation.FailedRetryable, held)
+	require.NoError(t, err)
 
 	strandedTask := createRetryableReapTask(t, store, apply, "task_expire_fanout_stranded", "users", state.Task.Running, "")
 	attachTaskToOperation(t, strandedTask.TaskIdentifier, abandoned)
@@ -3435,14 +3437,9 @@ func TestApplyStore_ExpireRetryable_KeepsTasksWhoseOperationADriverHolds(t *test
 	assertTaskState(t, store, queuedTask.TaskIdentifier, state.Task.Pending)
 }
 
-// A drive that settles its operation into failed_retryable writes that state
-// under its lease and leaves the lease in place, so for a staleness window
-// afterwards the row carries a fresh-looking lease with no drive behind it. That
-// is the ordinary shape of a single-deployment apply that has just used its last
-// attempt, which is the apply expiry exists to terminalize. Reading that lease as
-// a live drive would leave the apply's own tables reporting a retry that has
-// already been given up on, and expiry never comes back to correct it.
-func TestApplyStore_ExpireRetryable_ExpiresTasksWhoseOperationSettledUnderAFreshLease(t *testing.T) {
+// A fresh failed_retryable lease is ambiguous: it may be a completed attempt
+// or a running redispatch. Expiry must defer its task writes in both cases.
+func TestApplyStore_ExpireRetryable_DefersTasksUnderAFreshRetryableLease(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := NewMySQL(testDB)
@@ -3467,8 +3464,19 @@ func TestApplyStore_ExpireRetryable_ExpiresTasksWhoseOperationSettledUnderAFresh
 	require.NoError(t, err)
 	require.Len(t, expired, 1)
 
+	assertTaskState(t, store, failedTask.TaskIdentifier, state.Task.FailedRetryable)
+	assertTaskState(t, store, queuedTask.TaskIdentifier, state.Task.Pending)
+	backdateOperationHeartbeat(t, settled, storage.ApplyLeaseStaleAfter+time.Minute)
+	backdateApplyUpdatedAt(t, apply.ID, strandedRetryableQuiescence+time.Minute)
+	backdateTaskUpdatedAt(t, queuedTask.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
+	reaped, err := store.tasks.reapStrandedRetryable(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, reaped, 1)
+	active, err := store.tasks.reapStrandedActive(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, active, 1)
 	assertTaskState(t, store, failedTask.TaskIdentifier, state.Task.Failed)
-	assertTaskState(t, store, queuedTask.TaskIdentifier, state.Task.Cancelled)
+	assertTaskState(t, store, queuedTask.TaskIdentifier, state.Task.Failed)
 }
 
 // A row expiry skips is deferred, not dropped. Expiry settles the parent in the
