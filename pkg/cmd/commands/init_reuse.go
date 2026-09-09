@@ -58,3 +58,21 @@ func stageExistingInitSchema(root, stage, database, engine, environment string, 
 	}
 	return cfg.IgnoreNamespaces, nil
 }
+
+// Existing files are never adopted implicitly without a SchemaBot declaration.
+func validateInitSchemaDestination(root string) error {
+	entries, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read schema directory: %w", err)
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	if _, err := os.Stat(filepath.Join(root, "schemabot.yaml")); err != nil {
+		return fmt.Errorf("schema directory contains files but no readable schemabot.yaml; choose an empty --schema-dir or prepare a valid configuration to reuse your files: %w", err)
+	}
+	return nil
+}

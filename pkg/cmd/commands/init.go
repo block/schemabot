@@ -33,7 +33,7 @@ type InitCmd struct {
 	StorageDSN  string   `name:"storage-dsn" required:"" help:"Existing separate state database as env:VARIABLE; startup initializes SchemaBot metadata tables"`
 	SchemaDir   string   `name:"schema-dir" short:"s" default:"schema" help:"New schema directory, or unchanged files from a prior initialization"`
 	Namespaces  []string `name:"namespace" required:"" help:"Explicit namespace to import; repeat for multiple namespaces"`
-	Runtime     string   `default:"local" hidden:"" help:"Local runtime identity"`
+	Runtime     string   `default:"local" help:"Local runtime identity"`
 	JSON        bool     `name:"json" help:"Return the verified setup result as JSON"`
 }
 
@@ -84,6 +84,9 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if err != nil {
 		return nil, err
 	}
+	if err := validateInitSchemaDestination(root); err != nil {
+		return nil, err
+	}
 	// Stage beside the destination so publication remains an atomic rename.
 	if err := os.MkdirAll(filepath.Dir(root), 0755); err != nil {
 		return nil, fmt.Errorf("create schema parent directory: %w", err)
@@ -103,6 +106,9 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if err := os.Mkdir(stage, 0700); err != nil {
 		return nil, fmt.Errorf("create schema snapshot: %w", err)
 	}
+	if err := checkInitPublication(stage, renameInitSchema); err != nil {
+		return nil, err
+	}
 	dir, err := localruntime.Directory(cmd.Runtime)
 	if err != nil {
 		return nil, err
@@ -112,6 +118,11 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 		return nil, err
 	}
 	manager := localruntime.Manager{Dir: dir, Binary: binary, Version: g.Version}
+	for _, ref := range []string{cmd.DSN, cmd.StorageDSN} {
+		if err := localsetup.CheckConnection(ctx, cmd.Type, os.Getenv(strings.TrimPrefix(ref, "env:"))); err != nil {
+			return nil, fmt.Errorf("check %s before registering runtime: %w", ref, err)
+		}
+	}
 	_, err = localsetup.Register(manager, localsetup.Registration{
 		Database: cmd.Database, Environment: cmd.Environment, Engine: cmd.Type,
 		Connection: api.EnvironmentConfig{DSN: cmd.DSN},
@@ -122,7 +133,7 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	}
 	result, err := cmd.importBaseline(ctx, manager, stage, root, profile, namespaces)
 	if err != nil {
-		return nil, fmt.Errorf("initialization incomplete; runtime registration is retained for retry: %w", err)
+		return nil, fmt.Errorf("initialization incomplete; runtime registration is retained for retry; correct the connection environment variables and retry with the same references, or choose a new --runtime and --profile for a different state database: %w", err)
 	}
 	return result, nil
 }
@@ -178,9 +189,6 @@ func publishVerifiedInitSchema(stage, root string, baseline *apitypes.PlanRespon
 	if baseline.PlanID == "" {
 		return fmt.Errorf("baseline verification returned no stored plan")
 	}
-	if err := os.Chmod(stage, 0755); err != nil {
-		return fmt.Errorf("set schema directory permissions: %w", err)
-	}
 	return publishInitSchema(stage, root)
 }
 
@@ -197,6 +205,18 @@ func publishInitSchemaWithRename(stage, root string, rename func(string, string)
 	}
 	if !errors.Is(publishErr, fs.ErrExist) {
 		return fmt.Errorf("publish schema directory without replacing existing files: %w", publishErr)
+	}
+	if info, err := os.Lstat(root); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("schema import cannot reuse symlinks: %s", root)
+	}
+	// Removing a directory with rmdir can only succeed while it is empty.
+	// A concurrent file creation or symlink replacement fails closed; the
+	// subsequent no-replace rename also preserves a concurrently created target.
+	if entries, err := os.ReadDir(root); err == nil && len(entries) == 0 {
+		if err := removeEmptyInitDir(root); err != nil {
+			return fmt.Errorf("schema directory changed before publication: %w", err)
+		}
+		return rename(stage, root)
 	}
 	existing, err := initSchemaSnapshot(root)
 	if err != nil {
@@ -238,6 +258,9 @@ func initSchemaSnapshot(root string) (map[string]string, error) {
 		}
 		if !entry.Type().IsRegular() {
 			return fmt.Errorf("schema import requires regular files: %s", path)
+		}
+		if filepath.Ext(relative) != ".sql" && filepath.Base(relative) != "schemabot.yaml" && filepath.Base(relative) != "vschema.json" {
+			return nil
 		}
 		info, err := entry.Info()
 		if err != nil {
