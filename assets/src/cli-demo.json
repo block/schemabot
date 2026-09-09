@@ -271,6 +271,7 @@
     ]
   },
   {
+    "height": 740,
     "name": "cli-ops",
     "title": "Know your database fleet.",
     "frames": [
@@ -281,16 +282,10 @@
         "output": "DATABASE       TYPE   ENVIRONMENTS         DEPLOYMENTS\naccounts       mysql  staging, production  -\nanalytics      mysql  staging, production  -\nbilling        mysql  staging, production  -\ncatalog        mysql  staging, production  -\ninventory      mysql  staging, production  -\nnotifications  mysql  staging, production  -\nsearch         mysql  staging, production  -\nshop           mysql  staging, production  -\n"
       },
       {
-        "seconds": 2,
+        "seconds": 3.5,
         "command": "schemabot pull -d shop -e staging --table orders --lint",
-        "caption": "Spot lint findings in the live schema",
-        "output": "┌─────────────────────────┐\n│  Database:     shop     │\n│  Type:         mysql    │\n│  Environment:  staging  │\n│  Tables:       1        │\n└─────────────────────────┘\n\n-- Namespace `shop` — 1 table\n-- Lint: 1 violation\n--   [warning] orders: column \"created_at\" with type \"datetime\" has a zero default value\n\nCREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `status` varchar(32) NOT NULL,\n  `created_at` datetime NOT NULL DEFAULT '0000-00-00 00:00:00',"
-      },
-      {
-        "seconds": 1.5,
-        "command": "",
-        "caption": "Inspect the table behind the finding",
-        "output": "│  Type:         mysql    │\n│  Environment:  staging  │\n│  Tables:       1        │\n└─────────────────────────┘\n\n-- Namespace `shop` — 1 table\n-- Lint: 1 violation\n--   [warning] orders: column \"created_at\" with type \"datetime\" has a zero default value\n\nCREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `status` varchar(32) NOT NULL,\n  `created_at` datetime NOT NULL DEFAULT '0000-00-00 00:00:00',\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+        "caption": "Inspect the live schema and its lint findings",
+        "output": "┌─────────────────────────┐\n│  Database:     shop     │\n│  Type:         mysql    │\n│  Environment:  staging  │\n│  Tables:       1        │\n└─────────────────────────┘\n\n\u001b[2m-- Namespace \u001b[0m\u001b[1m`shop`\u001b[0m\u001b[2m — 1 table\u001b[0m\n\u001b[2m-- Lint: 1 violation\u001b[0m\n--   \u001b[33m[warning]\u001b[0m orders: column \"created_at\" with type \"datetime\" has a zero default value\n\n\u001b[34mCREATE\u001b[0m \u001b[34mTABLE\u001b[0m \u001b[35m`orders`\u001b[0m (\n  `id` \u001b[34mbigint\u001b[0m unsigned \u001b[34mNOT\u001b[0m \u001b[34mNULL\u001b[0m \u001b[34mAUTO_INCREMENT\u001b[0m,\n  `status` \u001b[34mvarchar\u001b[0m(32) \u001b[34mNOT\u001b[0m \u001b[34mNULL\u001b[0m,\n  `created_at` datetime \u001b[34mNOT\u001b[0m \u001b[34mNULL\u001b[0m \u001b[34mDEFAULT\u001b[0m '0000-00-00 00:00:00',\n  \u001b[34mPRIMARY\u001b[0m \u001b[34mKEY\u001b[0m (`id`)\n) \u001b[34mENGINE\u001b[0m=InnoDB \u001b[34mDEFAULT\u001b[0m \u001b[34mCHARSET\u001b[0m=utf8mb4 \u001b[34mCOLLATE\u001b[0m=utf8mb4_0900_ai_ci;\n"
       },
       {
         "seconds": 2,
