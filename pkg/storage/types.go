@@ -954,6 +954,7 @@ type ApplyOperation struct {
 	EngineResumeMetadata string
 	// ProgressMetadata is the latest engine progress display metadata encoded as
 	// JSON. It is durable read-model state and is not replayed into the engine.
+	// A new attempt can display the prior attempt's position until its first progress save.
 	ProgressMetadata string
 
 	// CreatedAt is when the child row was inserted (typically at apply create).

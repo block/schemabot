@@ -657,12 +657,13 @@ func (s *exactProgressStorage) ApplyOperations() storage.ApplyOperationStore {
 
 type exactProgressApplyOperationStore struct {
 	storage.ApplyOperationStore
-	data           *storage.EngineResumeState
-	ops            []*storage.ApplyOperation
-	err            error
-	saveErr        error
-	saved          *storage.EngineResumeState
-	progressWrites int
+	data            *storage.EngineResumeState
+	ops             []*storage.ApplyOperation
+	err             error
+	saveErr         error
+	progressSaveErr error
+	saved           *storage.EngineResumeState
+	progressWrites  int
 }
 
 func (s *exactProgressApplyOperationStore) Get(_ context.Context, operationID int64) (*storage.ApplyOperation, error) {
@@ -682,6 +683,9 @@ func (s *exactProgressApplyOperationStore) Get(_ context.Context, operationID in
 
 func (s *exactProgressApplyOperationStore) SaveProgressMetadata(_ context.Context, operationID int64, metadata map[string]string) error {
 	s.progressWrites++
+	if s.progressSaveErr != nil {
+		return s.progressSaveErr
+	}
 	for _, op := range s.ops {
 		if op.ID == operationID {
 			encoded, err := json.Marshal(metadata)
@@ -734,17 +738,51 @@ func TestPersistProgressMetadataOnlyWhenChanged(t *testing.T) {
 	}
 	task := &storage.Task{TaskIdentifier: "task-progress", ApplyOperationID: &operationID}
 	metadata := map[string]string{"phase": "copying", "step": "2"}
+	leaseLost := false
 
-	previous, err := client.persistProgressMetadataIfChanged(t.Context(), task, nil, metadata)
+	save := func(metadata map[string]string) error {
+		return client.saveProgressMetadata(t.Context(), task, metadata)
+	}
+	previous, err := client.persistProgressMetadataIfChanged(nil, metadata, &leaseLost, save)
 	require.NoError(t, err)
 	assert.Equal(t, 1, store.progressWrites)
-	previous, err = client.persistProgressMetadataIfChanged(t.Context(), task, previous, maps.Clone(metadata))
+	previous, err = client.persistProgressMetadataIfChanged(previous, maps.Clone(metadata), &leaseLost, save)
 	require.NoError(t, err)
 	assert.Equal(t, 1, store.progressWrites)
 	metadata["step"] = "3"
-	_, err = client.persistProgressMetadataIfChanged(t.Context(), task, previous, metadata)
+	_, err = client.persistProgressMetadataIfChanged(previous, metadata, &leaseLost, save)
 	require.NoError(t, err)
 	assert.Equal(t, 2, store.progressWrites)
+}
+
+func TestPersistProgressMetadataKeepsPreviousAndRetriesAfterError(t *testing.T) {
+	previous := map[string]string{"step": "1"}
+	current := map[string]string{"step": "2"}
+	store := &exactProgressApplyOperationStore{progressSaveErr: errors.New("storage unavailable")}
+	save := func(metadata map[string]string) error { return store.SaveProgressMetadata(t.Context(), 17, metadata) }
+	leaseLost := false
+
+	got, err := (&LocalClient{}).persistProgressMetadataIfChanged(previous, current, &leaseLost, save)
+	require.Error(t, err)
+	assert.Equal(t, previous, got)
+	store.progressSaveErr = nil
+	got, err = (&LocalClient{}).persistProgressMetadataIfChanged(got, current, &leaseLost, save)
+	require.NoError(t, err)
+	assert.Equal(t, current, got)
+	assert.Equal(t, 2, store.progressWrites)
+}
+
+func TestPersistProgressMetadataStopsAfterLeaseLoss(t *testing.T) {
+	store := &exactProgressApplyOperationStore{progressSaveErr: storage.ErrApplyLeaseLost}
+	save := func(metadata map[string]string) error { return store.SaveProgressMetadata(t.Context(), 17, metadata) }
+	leaseLost := false
+
+	previous, err := (&LocalClient{}).persistProgressMetadataIfChanged(nil, map[string]string{"step": "1"}, &leaseLost, save)
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+	assert.True(t, leaseLost)
+	_, err = (&LocalClient{}).persistProgressMetadataIfChanged(previous, map[string]string{"step": "2"}, &leaseLost, save)
+	require.NoError(t, err)
+	assert.Equal(t, 1, store.progressWrites)
 }
 
 func TestLoadStoredProgressMetadataMergesVitessResumeFieldsLast(t *testing.T) {
@@ -1099,6 +1137,29 @@ func TestLocalClient_ProgressServesTaskLessApplyFromOperations(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.True(t, isTerminalProtoState(resp.State), "task-less completed apply should report a terminal state, got %v", resp.State)
+}
+
+func TestLocalClient_ProgressCarriesStoredProgressMetadata(t *testing.T) {
+	operationID := int64(20)
+	apply := &storage.Apply{ID: 8, ApplyIdentifier: "apply-postgres-progress", Engine: storage.EnginePostgres, State: state.Apply.Running}
+	client := &LocalClient{
+		config: LocalConfig{Type: storage.DatabaseTypePostgres},
+		storage: &exactProgressStorage{
+			applies: &exactProgressApplyStore{apply: apply},
+			tasks: &exactProgressTaskStore{tasks: []*storage.Task{{
+				ApplyID: apply.ID, ApplyOperationID: &operationID, TaskIdentifier: "task-postgres-progress", Engine: storage.EnginePostgres, State: state.Task.Running,
+			}}},
+			applyOperations: &exactProgressApplyOperationStore{ops: []*storage.ApplyOperation{{
+				ID: operationID, ProgressMetadata: `{"phase":"preflight","step":"2","steps_total":"2"}`,
+			}}},
+		},
+		logger: slog.Default(),
+	}
+
+	resp, err := client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: apply.ApplyIdentifier})
+	require.NoError(t, err)
+	assert.Equal(t, "preflight", resp.Metadata["phase"])
+	assert.Equal(t, "2", resp.Metadata["step"])
 }
 
 func groupedResumeStateClient(databaseType string, applyOperations storage.ApplyOperationStore) *LocalClient {
@@ -3439,6 +3500,40 @@ func TestHandleAtomicProgressTickOperationGate(t *testing.T) {
 		assert.Equal(t, state.Apply.Completed, apply.State, "a single-operation apply terminalizes when its operation completes")
 		assert.NotNil(t, apply.CompletedAt, "a completed apply stamps completed_at")
 	})
+}
+
+func TestHandleAtomicProgressTickPersistsMetadataOnceAndStopsAfterLeaseLoss(t *testing.T) {
+	operationID := int64(91)
+	apply := &storage.Apply{ID: 91, ApplyIdentifier: "apply-progress-metadata", Database: "testdb", State: state.Apply.Running}
+	tasks := []*storage.Task{{
+		ApplyID: apply.ID, ApplyOperationID: &operationID, TaskIdentifier: "task-progress-metadata", State: state.Task.Running, TableName: "users",
+	}}
+	store := &exactProgressApplyOperationStore{ops: []*storage.ApplyOperation{{ID: operationID, State: state.ApplyOperation.Running}}}
+	client := &LocalClient{
+		storage: &exactProgressStorage{
+			applies: &snapshotApplyStore{stored: *apply}, tasks: &exactProgressTaskStore{tasks: tasks},
+			controlRequests: &testControlRequestStore{}, applyOperations: store,
+		},
+		logger: slog.Default(),
+	}
+	eng := &fakeControlEngine{progressResult: &engine.ProgressResult{
+		State: engine.StateRunning, Metadata: map[string]string{"phase": "preflight", "step": "1"},
+		Tables: []engine.TableProgress{{Table: "users", State: state.Task.Running}},
+	}}
+	ps := &atomicPollState{lastProgressLog: time.Now()}
+
+	assert.False(t, client.handleAtomicProgressTick(t.Context(), eng, apply, tasks, &engine.Credentials{}, nil, ps, nil, false))
+	assert.Equal(t, 1, store.progressWrites)
+	assert.False(t, client.handleAtomicProgressTick(t.Context(), eng, apply, tasks, &engine.Credentials{}, nil, ps, nil, false))
+	assert.Equal(t, 1, store.progressWrites)
+
+	store.progressSaveErr = storage.ErrApplyLeaseLost
+	eng.progressResult.Metadata["step"] = "2"
+	assert.False(t, client.handleAtomicProgressTick(t.Context(), eng, apply, tasks, &engine.Credentials{}, nil, ps, nil, false))
+	assert.Equal(t, 2, store.progressWrites)
+	eng.progressResult.Metadata["step"] = "3"
+	assert.False(t, client.handleAtomicProgressTick(t.Context(), eng, apply, tasks, &engine.Credentials{}, nil, ps, nil, false))
+	assert.Equal(t, 2, store.progressWrites)
 }
 
 // Under an ordered-cutover policy a multi-deployment operation runs its copy

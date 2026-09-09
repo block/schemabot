@@ -461,7 +461,7 @@ The top-level `metadata` object carries engine-specific display fields when the
 engine reports them: PostgreSQL applies report their position through `phase`,
 `step`, `steps_total`, and `statement`; PlanetScale applies report deploy
 request fields such as `branch_name` and `deploy_request_url`. Spirit applies
-report their progress on the table entries and add no position fields.
+currently report progress on the table entries and do not report position fields.
 
 <details>
 <summary>Request and response example</summary>
@@ -515,15 +515,15 @@ Response excerpt (illustrative values):
   "state": "running",
   "metadata": {
     "phase": "preflight",
-    "step": "3",
-    "steps_total": "8",
+    "step": "2",
+    "steps_total": "2",
     "statement": "CREATE INDEX CONCURRENTLY orders_status_idx ON public.orders (status)"
   },
   "tables": [
     {
       "table_name": "orders",
       "keyspace": "public",
-      "ddl": "ALTER TABLE public.orders ADD COLUMN status text",
+      "ddl": "ALTER TABLE public.orders ADD COLUMN status text; CREATE INDEX CONCURRENTLY orders_status_idx ON public.orders (status)",
       "status": "running",
       "rows_copied": 0,
       "rows_total": 0,
@@ -539,7 +539,8 @@ The numbers come from the engine while the apply is active, so they are as
 fresh as the last poll. Once the apply is terminal, the same endpoint answers
 from storage: rows, throttle state, and checksum counts are preserved on the
 task record, and `metadata` holds the last position the engine reported; ETA
-and per-shard rows are not persisted in this view.
+and per-shard rows are not persisted in this view. A new attempt can display
+the prior attempt's position until its first progress save.
 
 ## What’s running across the fleet?
 

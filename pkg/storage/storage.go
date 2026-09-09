@@ -1286,6 +1286,7 @@ type ApplyOperationStore interface {
 	GetEngineResumeState(ctx context.Context, operationID int64) (*EngineResumeState, error)
 
 	// SaveProgressMetadata stores the latest engine progress display metadata.
+	// A new attempt can display the prior attempt's position until its first progress save.
 	SaveProgressMetadata(ctx context.Context, operationID int64, metadata map[string]string) error
 
 	// FindNextApplyOperation atomically claims the next child row that needs

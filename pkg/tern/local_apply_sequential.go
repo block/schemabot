@@ -330,7 +330,8 @@ type atomicPollState struct {
 	// emitted once per apply rather than on every poll.
 	warnedPerShardUnavailable bool
 
-	lastProgressMetadata map[string]string
+	lastProgressMetadata      map[string]string
+	progressMetadataLeaseLost bool
 }
 
 // operationLeaseOnlyDrive reports the operation lease of a drive that holds an
@@ -540,6 +541,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 	var consecutiveErrors int
 	var resumeEventLogged bool
 	var lastProgressMetadata map[string]string
+	var progressMetadataLeaseLost bool
 	lostWork := lostEngineWorkTracker{budget: c.lostEngineWorkPendingBudget(eng)}
 	watchdog := taskStallWatchdog{interval: c.taskStallWarnInterval()}
 
@@ -653,8 +655,13 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 			consecutiveErrors = 0
 			c.logEngineResumeOnce(ctx, logger, apply, result.ResumedFromCheckpoint, &resumeEventLogged)
 			var saveErr error
-			lastProgressMetadata, saveErr = c.persistProgressMetadataIfChanged(ctx, task, lastProgressMetadata, result.Metadata)
-			if saveErr != nil {
+			lastProgressMetadata, saveErr = c.persistProgressMetadataIfChanged(lastProgressMetadata, result.Metadata, &progressMetadataLeaseLost, func(metadata map[string]string) error {
+				return c.saveProgressMetadata(ctx, task, metadata)
+			})
+			if errors.Is(saveErr, storage.ErrApplyLeaseLost) {
+				logger.Debug("progress metadata persistence stopped because the operation lease was lost during failover",
+					append(task.LogAttrs(), "error", saveErr)...)
+			} else if saveErr != nil {
 				logger.Warn("failed to persist engine progress metadata; the drive will retry on the next poll",
 					append(task.LogAttrs(), "error", saveErr)...)
 			}

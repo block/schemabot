@@ -481,6 +481,10 @@ func TestApplyOperationStore_EngineResumeState(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(operation.ProgressMetadata), &storedProgressMetadata))
 	assert.NotNil(t, storedProgressMetadata)
 	assert.Empty(t, storedProgressMetadata)
+	parsedProgressMetadata, err := operation.ParseProgressMetadata()
+	require.NoError(t, err)
+	assert.NotNil(t, parsedProgressMetadata)
+	assert.Empty(t, parsedProgressMetadata)
 
 	updated := &storage.EngineResumeState{
 		ApplyOperationID: operationID,
@@ -4625,6 +4629,20 @@ func TestApplyOperationStore_LeaseGuardsWrites(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, resumeAfterCurrent)
 	assert.Equal(t, "current-context", resumeAfterCurrent.EngineResumeContext)
+
+	progressID := createApplyOperationForLeaseTest(t, store, apply.ID, "op-progress-metadata")
+	stampOperationLease(t, progressID, "driver", "op-token")
+	invalidProgressCtx := storage.WithOperationLease(ctx, storage.OperationLease{ApplyID: apply.ID, OperationID: progressID, Owner: "driver"})
+	require.ErrorIs(t, store.ApplyOperations().SaveProgressMetadata(invalidProgressCtx, progressID, map[string]string{"step": "1"}), storage.ErrApplyLeaseLost)
+	require.ErrorIs(t, store.ApplyOperations().SaveProgressMetadata(staleCtx, progressID, map[string]string{"step": "2"}), storage.ErrApplyLeaseLost)
+	require.NoError(t, store.ApplyOperations().SaveProgressMetadata(currentCtx, progressID, nil))
+	progressAfterCurrent, err := store.ApplyOperations().Get(ctx, progressID)
+	require.NoError(t, err)
+	require.NotNil(t, progressAfterCurrent)
+	parsedProgressMetadata, err := progressAfterCurrent.ParseProgressMetadata()
+	require.NoError(t, err)
+	assert.NotNil(t, parsedProgressMetadata)
+	assert.Empty(t, parsedProgressMetadata)
 	assert.JSONEq(t, `{"deploy_request_id":456}`, resumeAfterCurrent.EngineResumeMetadata)
 
 	otherID := createApplyOperationForLeaseTest(t, store, otherApply.ID, "region-other")
@@ -4744,6 +4762,11 @@ func TestApplyOperationStore_OperationLeaseGuardsWrites(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, resumeAfterCurrent)
 	assert.Equal(t, "current-context", resumeAfterCurrent.EngineResumeContext)
+
+	progressID := createApplyOperationForLeaseTest(t, store, apply.ID, "op-progress-metadata")
+	stampOperationLease(t, progressID, "driver", "op-token")
+	require.ErrorIs(t, store.ApplyOperations().SaveProgressMetadata(opCtx(progressID, "stale-op-token"), progressID, map[string]string{"step": "2"}), storage.ErrApplyLeaseLost)
+	require.NoError(t, store.ApplyOperations().SaveProgressMetadata(opCtx(progressID, "op-token"), progressID, map[string]string{"step": "2"}))
 
 	// Operation lease takes precedence: even with a current apply lease also on
 	// the context, a stale operation token must fail closed.

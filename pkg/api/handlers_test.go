@@ -4207,8 +4207,10 @@ func TestProgressFromLocalStorageOverlaysPersistedProgressMetadata(t *testing.T)
 	resp, err := svc.progressFromLocalStorage(t.Context(), apply)
 
 	require.NoError(t, err)
+	resp.Metadata["phase"] = "caller-phase"
+	overlayStoredDisplayMetadata(resp, apply, []*storage.ApplyOperation{{ProgressMetadata: `{"phase":"stored-phase"}`}})
 	assert.Equal(t, map[string]string{
-		"phase": "completed", "step": "2", "steps_total": "2",
+		"phase": "caller-phase", "step": "2", "steps_total": "2",
 		"statement": "ALTER TABLE public.orders ADD COLUMN note text", "elapsed_ms": "1834",
 	}, resp.Metadata)
 }
