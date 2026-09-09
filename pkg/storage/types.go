@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/json"
+	"fmt"
 	"slices"
 	"sort"
 	"strings"
@@ -951,6 +952,10 @@ type ApplyOperation struct {
 	// replays them but does not interpret them for control/progress calls.
 	EngineResumeContext  string
 	EngineResumeMetadata string
+	// ProgressMetadata is the latest engine progress display metadata encoded as
+	// JSON. It is durable read-model state and is not replayed into the engine.
+	// A new attempt can display the prior attempt's position until its first progress save.
+	ProgressMetadata string
 
 	// CreatedAt is when the child row was inserted (typically at apply create).
 	CreatedAt time.Time
@@ -1232,6 +1237,25 @@ func (opts ApplyOptions) Map() map[string]string {
 		options["rollback"] = "true"
 	}
 	return options
+}
+
+// ParseProgressMetadata decodes the operation's persisted progress display
+// metadata. An operation that has never persisted metadata, or whose stored
+// value is a JSON null, yields an empty non-nil map so callers can overlay
+// into it directly; malformed JSON is an error, because a row that cannot be
+// decoded is worth a log line rather than a silently empty progress view.
+func (op *ApplyOperation) ParseProgressMetadata() (map[string]string, error) {
+	metadata := make(map[string]string)
+	if op.ProgressMetadata == "" {
+		return metadata, nil
+	}
+	if err := json.Unmarshal([]byte(op.ProgressMetadata), &metadata); err != nil {
+		return nil, fmt.Errorf("decode apply operation progress metadata: %w", err)
+	}
+	if metadata == nil {
+		metadata = make(map[string]string)
+	}
+	return metadata, nil
 }
 
 // ParseApplyOptions parses the JSON options into ApplyOptions.

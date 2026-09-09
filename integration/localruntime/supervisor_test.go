@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -17,18 +18,18 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
-	"gopkg.in/yaml.v3"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	runtimehost "github.com/block/schemabot/pkg/localruntime"
+	"github.com/block/schemabot/pkg/localsetup"
 	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/testutil"
 )
 
 // Independent CLI invocations share one detached runtime. The same profile
-// carries a real plan and apply on either engine, then reconnects after a
+// carries a real plan, apply, and verified schema import on either engine, then reconnects after a
 // graceful stop without losing completed work.
 func TestSupervisorEngines(t *testing.T) {
 	binary := filepath.Join(t.TempDir(), "schemabot")
@@ -39,15 +40,17 @@ func TestSupervisorEngines(t *testing.T) {
 	for _, engine := range []string{"mysql", "postgres"} {
 		t.Run(engine, func(t *testing.T) {
 			storageDSN, targetDSN, db := supervisorDatabase(t, engine)
-			config := api.ServerConfig{Storage: api.StorageConfig{Dialect: engine, DSN: storageDSN}, Databases: map[string]api.DatabaseConfig{"app": {Type: engine, Environments: map[string]api.EnvironmentConfig{"development": {DSN: targetDSN}}}}}
-			data, err := yaml.Marshal(config)
-			require.NoError(t, err)
 			home := t.TempDir()
 			dir := filepath.Join(home, ".schemabot", "runtimes", "shared")
-			require.NoError(t, os.MkdirAll(dir, 0700))
-			require.NoError(t, os.WriteFile(filepath.Join(dir, "runtime.yaml"), data, 0600))
-			require.NoError(t, os.WriteFile(filepath.Join(home, ".schemabot", "config.yaml"), []byte("profiles:\n  alpha:\n    local_runtime: shared\n  beta:\n    local_runtime: shared\n"), 0600))
 			manager := runtimehost.Manager{Dir: dir, Binary: binary, Version: "dev"}
+			changed, err := localsetup.Register(manager, localsetup.Registration{
+				Database: "app", Environment: "development", Engine: engine,
+				Storage:    api.StorageConfig{Dialect: engine, DSN: storageDSN},
+				Connection: api.EnvironmentConfig{DSN: targetDSN},
+			})
+			require.NoError(t, err)
+			require.True(t, changed)
+			require.NoError(t, os.WriteFile(filepath.Join(home, ".schemabot", "config.yaml"), []byte("profiles:\n  alpha:\n    local_runtime: shared\n  beta:\n    local_runtime: shared\n"), 0600))
 			t.Cleanup(func() {
 				ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), runtimeDeadline)
 				defer cancel()
@@ -121,11 +124,84 @@ func TestSupervisorEngines(t *testing.T) {
 			var count int
 			require.NoError(t, db.QueryRowContext(verifyCtx, "SELECT COUNT(*) FROM widgets").Scan(&count))
 			assert.Zero(t, count)
-			require.NoError(t, manager.Stop(verifyCtx))
-			record, err := manager.Status(verifyCtx)
+			// The imported files must plan back to an unchanged live database.
+			// Exercise the CLI's default verification, including engine inference.
+			schemaRoot := t.TempDir()
+			if engine == "postgres" {
+				// Default discovery includes empty schemas alongside populated ones.
+				execSQL(t, db, "CREATE SCHEMA empty_scope")
+			}
+			onboardCtx, cancelOnboard := context.WithTimeout(t.Context(), runtimeDeadline)
+			defer cancelOnboard()
+			onboard := exec.CommandContext(onboardCtx, binary, "onboard", "--profile", "alpha", "-d", "app", "-e", "development", "-s", schemaRoot)
+			onboard.Env = append(os.Environ(), "HOME="+home, "SCHEMABOT_ENDPOINT=", "SCHEMABOT_TOKEN=", "SCHEMABOT_PROFILE=")
+			output, err := onboard.CombinedOutput()
+			require.NoError(t, err, string(output))
+			assert.Contains(t, string(output), "Verified: pulled schema produces no schema changes in the source environment.")
+			config, err := os.ReadFile(filepath.Join(schemaRoot, "schemabot.yaml"))
+			require.NoError(t, err)
+			assert.Equal(t, "database: app\ntype: "+engine+"\n", string(config))
+			schema, err := os.ReadFile(filepath.Join(schemaRoot, namespace, "widgets.sql"))
+			require.NoError(t, err)
+			assert.Contains(t, string(schema), "widgets")
+			registrationCtx, cancelRegistration := context.WithTimeout(t.Context(), runtimeDeadline)
+			defer cancelRegistration()
+			// Exported after startup: the running child cannot inherit this variable.
+			t.Setenv("LIVE_NEW_TARGET", targetDSN)
+			addition := localsetup.Registration{Database: "billing", Environment: "development", Engine: engine, Storage: api.StorageConfig{DSN: storageDSN, Dialect: engine}, Connection: api.EnvironmentConfig{DSN: "env:LIVE_NEW_TARGET"}}
+			if engine == "mysql" {
+				// Hold a real online copy at cutover while another database is added.
+				execSQL(t, db, "INSERT INTO widgets (id,name) VALUES (1,'keep me')")
+				for i := range 19 {
+					execSQL(t, db, fmt.Sprintf("INSERT INTO widgets (id,name) SELECT id + %d,name FROM widgets", 1<<i))
+				}
+				var onlinePlan apitypes.PlanResponse
+				request(t, connection.Endpoint, http.MethodPost, "/api/plan", connection.Token, apitypes.PlanRequest{Database: "app", Environment: "development", Type: engine, SchemaFiles: map[string]*apitypes.SchemaFiles{namespace: {Files: map[string]string{"widgets.sql": "CREATE TABLE widgets (id bigint NOT NULL PRIMARY KEY, name text NOT NULL, INDEX idx_name (name(10)));"}}}}, http.StatusOK, &onlinePlan)
+				require.Empty(t, onlinePlan.Errors)
+				require.Len(t, onlinePlan.Changes, 1)
+				var onlineApply apitypes.ApplyResponse
+				request(t, connection.Endpoint, http.MethodPost, "/api/apply", connection.Token, apitypes.ApplyRequest{PlanID: onlinePlan.PlanID, Environment: "development", Options: map[string]string{"defer_cutover": "true", "skip_revert": "true"}}, http.StatusOK, &onlineApply)
+				require.True(t, onlineApply.Accepted, onlineApply.ErrorMessage)
+				waitSupervisedApply(t, connection, onlineApply.ApplyID, state.Apply.WaitingForCutover)
+				changed, err = localsetup.Register(manager, addition)
+				require.NoError(t, err)
+				require.True(t, changed)
+				waitSupervisedApply(t, connection, onlineApply.ApplyID, state.Apply.WaitingForCutover)
+				var control apitypes.ControlResponse
+				request(t, connection.Endpoint, http.MethodPost, "/api/cutover", connection.Token, apitypes.ControlRequest{ApplyID: onlineApply.ApplyID, Environment: "development"}, http.StatusOK, &control)
+				require.True(t, control.Accepted, control.ErrorMessage)
+				waitSupervisedApply(t, connection, onlineApply.ApplyID, state.Apply.Completed)
+				var kept int
+				require.NoError(t, db.QueryRowContext(registrationCtx, "SELECT COUNT(*) FROM widgets WHERE name='keep me'").Scan(&kept))
+				require.Equal(t, 524288, kept)
+			} else {
+				changed, err = localsetup.Register(manager, addition)
+				require.NoError(t, err)
+				require.True(t, changed)
+			}
+			updated, err := manager.Ensure(registrationCtx)
+			require.NoError(t, err)
+			require.Equal(t, connection.Generation, updated.Generation)
+			require.Equal(t, connection.PID, updated.PID)
+			changed, err = localsetup.Register(manager, addition)
+			require.NoError(t, err)
+			require.False(t, changed)
+			saved, err := runtimehost.ReadPrivate(filepath.Join(dir, "runtime.yaml"))
+			require.NoError(t, err)
+			require.Contains(t, string(saved), "env:LIVE_NEW_TARGET")
+			var catalog apitypes.DatabaseListResponse
+			request(t, connection.Endpoint, http.MethodGet, "/api/databases", connection.Token, nil, http.StatusOK, &catalog)
+			require.Len(t, catalog.Databases, 2)
+			var billingPlan apitypes.PlanResponse
+			request(t, connection.Endpoint, http.MethodPost, "/api/plan", connection.Token, apitypes.PlanRequest{Database: "billing", Environment: "development", Type: engine, SchemaFiles: map[string]*apitypes.SchemaFiles{namespace: {Files: map[string]string{"widgets.sql": "CREATE TABLE widgets (id bigint NOT NULL PRIMARY KEY, name text NOT NULL);"}}}}, http.StatusOK, &billingPlan)
+			require.Empty(t, billingPlan.Errors)
+			stopCtx, cancelStop := context.WithTimeout(t.Context(), runtimeDeadline)
+			defer cancelStop()
+			require.NoError(t, manager.Stop(stopCtx))
+			record, err := manager.Status(stopCtx)
 			require.NoError(t, err)
 			assert.Equal(t, "stopped", record.State)
-			restarted, err := manager.Ensure(verifyCtx)
+			restarted, err := manager.Ensure(stopCtx)
 			require.NoError(t, err)
 			assert.NotEqual(t, connection.Generation, restarted.Generation)
 			var progress apitypes.ProgressResponse
@@ -155,4 +231,13 @@ func supervisorDatabase(t *testing.T, engine string) (string, string, *sql.DB) {
 	storageDSN, err := testutil.MySQLDSN(t.Context(), container, "runtime_state", "parseTime=true")
 	require.NoError(t, err)
 	return storageDSN, dsn, db
+}
+
+func waitSupervisedApply(t *testing.T, connection runtimehost.Connection, applyID, wanted string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		var progress apitypes.ProgressResponse
+		request(t, connection.Endpoint, http.MethodGet, "/api/progress/apply/"+applyID, connection.Token, nil, http.StatusOK, &progress)
+		return state.IsState(progress.State, wanted)
+	}, runtimeDeadline, 100*time.Millisecond)
 }

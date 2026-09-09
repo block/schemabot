@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/block/schemabot/pkg/state"
 )
@@ -150,6 +151,30 @@ func FormatETA(seconds int64) string {
 	default:
 		return fmt.Sprintf("%dd %dh", seconds/day, (seconds%day)/hour)
 	}
+}
+
+// MaxStatementRunes bounds an engine-reported statement rendered as a
+// progress position so a pathological DDL text cannot flood a terminal line
+// or a PR comment. Both surfaces share the bound so the operator reads the
+// same excerpt in the CLI and on the PR.
+const MaxStatementRunes = 160
+
+// ClampStatement folds an engine-supplied statement onto one bounded line:
+// every run of whitespace or control characters — newlines, tabs, ANSI escape
+// bytes — collapses to a single space, and text past MaxStatementRunes is cut
+// with an ellipsis so the result is at most MaxStatementRunes runes. The
+// statement is untrusted input as far as rendering is concerned, so this is
+// the single place its line and width discipline live for both the CLI and
+// the PR comment.
+func ClampStatement(text string) string {
+	text = strings.Join(strings.FieldsFunc(text, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	}), " ")
+	runes := []rune(text)
+	if len(runes) <= MaxStatementRunes {
+		return text
+	}
+	return string(runes[:MaxStatementRunes-1]) + "…"
 }
 
 // ClampRows returns rows clamped to total for display purposes.

@@ -93,7 +93,7 @@ type NamespaceChange struct {
 // WriteNamespaceChanges writes per-namespace DDL and VSchema sections.
 // For MySQL with a single namespace matching the database, the namespace header is omitted.
 // For Vitess, each keyspace gets a header with optional VSchema diff.
-func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database string) {
+func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database string, dialect schema.Dialect) {
 	singleNamespace := len(namespaces) == 1 && isMySQL && namespaces[0].Namespace == database
 
 	// Sort a copy so callers aren't affected by reordering. This keeps output
@@ -141,7 +141,7 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 				fmt.Print(FormatKeyspaceHeader(ns.Namespace))
 			}
 			// Show DDL once
-			WriteSQLChanges(g.namespaces[0].Changes)
+			WriteSQLChanges(g.namespaces[0].Changes, dialect)
 		} else {
 			for _, ns := range g.namespaces {
 				if !singleNamespace {
@@ -155,7 +155,7 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 					}
 				}
 				if len(ns.Changes) > 0 {
-					WriteSQLChanges(ns.Changes)
+					WriteSQLChanges(ns.Changes, dialect)
 				}
 			}
 		}
@@ -195,14 +195,16 @@ func colorizeDiffLine(line string) string {
 
 // WriteSQLChanges writes the SQL changes section matching the progress view format:
 // table name on its own line with change symbol, DDL indented below.
-func WriteSQLChanges(changes []DDLChange) {
-	combined := combineAlterStatements(changes)
+func WriteSQLChanges(changes []DDLChange, dialect schema.Dialect) {
+	combined := changes
+	if dialect == schema.DialectMySQL {
+		combined = combineAlterStatements(changes)
+	}
 	for _, change := range combined {
 		// Table name line: "     ~ tablename:"
 		fmt.Printf(indentTable+"%s%s\n", progressSymbol(change.ChangeType), change.TableName)
-		// DDL indented below. The plan view reconstructs statements under
-		// MySQL grammar (combineAlterStatements), so it renders MySQL-pinned.
-		fmt.Print(formatProgressDDLForDialect(schema.DialectMySQL, change.DDL))
+		// DDL uses the target dialect; only MySQL statements are combined.
+		fmt.Print(formatProgressDDLForDialect(dialect, change.DDL))
 		fmt.Println()
 	}
 }

@@ -37,8 +37,8 @@ require (
 	github.com/aws/smithy-go v1.27.7 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/block/mysql v0.0.0-20260906224346-ee0a93fe50d6 // indirect
-	github.com/block/pg-sprite v0.3.1 // indirect
-	github.com/block/spirit v0.17.1-0.20260907005557-10804bbe247c // indirect
+	github.com/block/pg-sprite v0.3.2-0.20260908032959-fd4bcb17c4b8 // indirect
+	github.com/block/spirit v0.17.1-0.20260908172838-1ab2595e45a1 // indirect
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect

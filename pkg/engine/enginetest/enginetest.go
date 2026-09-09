@@ -16,12 +16,11 @@
 // fixture without one, so a new engine cannot silently opt out of the
 // contract.
 //
-// The postgres engine is not wired into this suite: it deliberately declines
-// every control operation with a typed UnsupportedOperationError (its
-// statements commit or fail on their own, so there is no engine phase for a
-// command to act on), which its own unit tests pin. The suite's cases target
-// engines whose backends carry per-change control state; wire postgres here
-// if it ever grows backend-driven control behavior.
+// The postgres engine runs the cancel and progress cases: a concurrent index
+// build is the one PostgreSQL change an operator can cancel, and the engine
+// answers a cancel from the outcome the tracked apply settled on. It skips the
+// stop cases with a documented reason — it declines stop for every change with
+// a typed UnsupportedOperationError, which its own unit tests pin.
 package enginetest
 
 import (

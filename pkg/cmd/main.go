@@ -31,6 +31,7 @@ type CLI struct {
 
 	VersionFlag kong.VersionFlag `name:"version" help:"Show version information"`
 
+	Init       commands.InitCmd       `cmd:"" help:"Initialize a local connection and verify imported schema"`
 	Plan       commands.PlanCmd       `cmd:"" help:"Create a schema change plan"`
 	Onboard    commands.OnboardCmd    `cmd:"" help:"Pull live schema into a new declarative schema directory"`
 	Pull       commands.PullCmd       `cmd:"" help:"Return live schema from a source environment"`
@@ -92,7 +93,7 @@ func main() {
 	// defer, since the os.Exit below would skip a deferred cancel.
 	// Hosting a local runtime does not use a remote profile or its credentials.
 	var localEndpoint string
-	if !strings.HasPrefix(ctx.Command(), "local ") {
+	if !strings.HasPrefix(ctx.Command(), "local ") && ctx.Command() != "init" {
 		if usesLocalRuntime(ctx.Command()) {
 			localCtx, cancelLocal := context.WithTimeout(context.Background(), 30*time.Second)
 			connection, err := client.ResolveLocalConnection(localCtx, cli.Endpoint, cli.Profile, cli.Token, version)

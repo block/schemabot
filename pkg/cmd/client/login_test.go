@@ -43,6 +43,7 @@ type fakeOIDC struct {
 	refreshedIDToken  string // id_token returned for the refresh_token grant
 	accessToken       string
 	refreshToken      string
+	beforeRefresh     func()
 	omitIDToken       bool // when true, the token response omits the id_token
 }
 
@@ -115,6 +116,9 @@ func (f *fakeOIDC) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Form.Get("grant_type") == "refresh_token" {
+		if f.beforeRefresh != nil {
+			f.beforeRefresh()
+		}
 		f.mu.Lock()
 		f.refreshCalls++
 		f.mu.Unlock()
