@@ -70,6 +70,10 @@ func (s *Service) StartOperator(ctx context.Context) {
 	if reaperEvery <= 0 {
 		reaperEvery = StrandedReaperInterval
 	}
+	expiryEvery := s.retryableExpiryEvery
+	if expiryEvery <= 0 {
+		expiryEvery = RetryableExpiryInterval
+	}
 	s.stopRecovery = stop
 	s.cancelRecovery = cancel
 	s.operatorWake = wake
@@ -88,11 +92,14 @@ func (s *Service) StartOperator(ctx context.Context) {
 		})
 	}
 
-	// The reaper is maintenance, not claim work, so it runs on its own slow
-	// cadence outside the driver pool. It shares the driver lifecycle: one
-	// goroutine per process, stopped by StopOperator.
+	// The reaper is maintenance, not claim work, so it runs outside the driver
+	// pool on cadences of its own. It shares the driver lifecycle: one goroutine
+	// per pass per process, stopped by StopOperator.
 	s.recoveryWg.Go(func() {
-		s.strandedReaperLoop(driverCtx, stop, reaperEvery)
+		s.reaperLoop(driverCtx, stop, reaperEvery, "stranded rows", s.runStrandedReaperPass)
+	})
+	s.recoveryWg.Go(func() {
+		s.reaperLoop(driverCtx, stop, expiryEvery, "retryable expiry", s.runRetryableExpiryPass)
 	})
 
 	// The fan-out cap only means something relative to the pool it bounds, and
@@ -103,7 +110,8 @@ func (s *Service) StartOperator(ctx context.Context) {
 		"drivers", driverCount,
 		"max_drivers_per_apply", storage.BuildOptions(storage.WithMaxDriversPerApply(s.config.MaxDriversPerApply)).MaxDriversPerApply,
 		"interval", s.operatorPollInterval,
-		"stranded_reaper_interval", reaperEvery)
+		"stranded_reaper_interval", reaperEvery,
+		"retryable_expiry_interval", expiryEvery)
 }
 
 // StopOperator stops the background operator and waits for all drivers to finish.
@@ -590,8 +598,8 @@ func (s *Service) driveTick(ctx context.Context, driverID int) {
 	metrics.RecordRecoveredPanic(ctx, "operator_tick")
 }
 
-// logClaimFailure reports a failed claim or maintenance pass, separating the
-// two ways a rung of the ladder fails. A pass cut short by shutdown is a
+// logClaimFailure reports a failed claim, separating the two ways a rung of the
+// ladder fails. A pass cut short by shutdown is a
 // routine deploy: the driver context is cancelled between polls, so whichever
 // rung was mid-query reports it and the rungs behind it report the same
 // cancellation moments later, while a successor driver reclaims all of it. Like
@@ -616,49 +624,6 @@ func (s *Service) logClaimFailure(ctx context.Context, msg, reason string, attrs
 	}
 	s.logger.Error(msg, attrs...)
 	metrics.RecordOperatorClaimFailure(ctx, reason)
-}
-
-// expireRetryableApplies runs the retryable-apply expiry maintenance pass,
-// terminalizing failed_retryable applies that have exhausted their attempts or
-// freshness window. It is best-effort: a storage error is logged and recorded
-// but not returned, so the caller can still claim new work in the same tick.
-func (s *Service) expireRetryableApplies(ctx context.Context, driverID int) {
-	expired, err := s.storage.Applies().ExpireRetryable(ctx)
-	if err != nil {
-		s.logClaimFailure(ctx, "operator: failed to expire retryable applies", "expire_retryable_error",
-			"driver", driverID, "error", err)
-		return
-	}
-	for _, expiration := range expired {
-		apply := expiration.Apply
-		s.logger.Error("operator: retryable apply expired",
-			append(apply.LogAttrs(),
-				"driver", driverID,
-				"attempt", apply.Attempt,
-				"reason", expiration.Reason)...)
-		metrics.RecordOperatorResumeFailure(ctx, apply.Database, apply.Deployment, apply.Environment, string(expiration.Reason))
-		s.logApplyExpiration(ctx, apply, expiration.Reason)
-	}
-}
-
-// logApplyExpiration appends a durable apply log entry recording that operator
-// recovery gave up on the apply. Expiry is what makes a retryable failure
-// permanent, so without it the apply log ends on the last paused attempt and an
-// operator reading the CLI or the PR summary sees the apply reach a terminal
-// state with nothing stating why. Best-effort: a failed append must not stop
-// the driver from expiring the remaining applies.
-func (s *Service) logApplyExpiration(ctx context.Context, apply *storage.Apply, reason storage.RetryableExpirationReason) {
-	s.appendApplyLog(ctx, s.logger, &storage.ApplyLog{
-		ApplyID:   apply.ID,
-		Level:     storage.LogLevelError,
-		EventType: storage.LogEventError,
-		Source:    storage.LogSourceSchemaBot,
-		Message: fmt.Sprintf("Operator recovery gave up on the apply after %d of %d attempts (%s); it will not be retried automatically",
-			apply.Attempt, storage.MaxRecoveryAttempts, reason),
-		OldState:  state.Apply.FailedRetryable,
-		NewState:  state.Apply.Failed,
-		CreatedAt: s.clock.Now(),
-	}, "why recovery stopped", apply.LogAttrs()...)
 }
 
 // appendApplyLog writes one entry to the apply's own log stream, bounded so a
@@ -697,12 +662,6 @@ func (s *Service) markDriverBusy(ctx context.Context) func() {
 // claims at most one unit — a pending-stop reconciliation, a barrier-parked
 // cutover, or an apply operation — to keep the drive loop responsive.
 func (s *Service) recoverApplies(ctx context.Context, driverID int) {
-	// Retryable-apply expiry is best-effort maintenance: run it first, but a
-	// storage failure here must not stop the driver from claiming new pending
-	// work in the same tick, or a transient expiry error would starve every
-	// queued apply behind it.
-	s.expireRetryableApplies(ctx, driverID)
-
 	owner := driverLeaseOwner(driverID)
 
 	// Service a pending stop with no claimable operation to carry it before
