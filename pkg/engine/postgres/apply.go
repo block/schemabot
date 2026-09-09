@@ -141,10 +141,18 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	}
 	started := time.Now()
 	key := progressIdentity(req.ResumeState)
-	e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""), tracker, logger)
-	bgCtx := context.WithoutCancel(ctx)
+	// An accepted apply must survive the request that accepted it, so the
+	// drive's context is detached from the caller. It is cancellable so the
+	// engine itself can end the drive — a cancel of last resort, and the
+	// halt on shutdown.
+	applyCtx, cancelApply := context.WithCancel(context.WithoutCancel(ctx))
+	done := e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""), tracker, logger, change.concurrentIndex, cancelApply)
 	conn := targetConn{dsn: req.Credentials.DSN, caCertPath: caPath}
-	e.wg.Go(func() { e.runOptimisticApply(bgCtx, conn, change, key, started, logger, tracker) })
+	e.wg.Go(func() {
+		defer close(done)
+		defer cancelApply()
+		e.runOptimisticApply(applyCtx, conn, change, key, started, logger, tracker)
+	})
 
 	return &engine.ApplyResult{
 		Accepted:    true,
@@ -211,7 +219,8 @@ func postgresCreateSetStatements(script string) ([]string, error) {
 
 func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change nativeApply, key string, started time.Time, logger *slog.Logger, tracker *progress.Tracker) {
 	// The context arrives detached from the caller (an accepted apply must
-	// survive the request), so boundedness comes from the ceiling instead.
+	// survive the request) and ends only when the engine cancels the drive,
+	// so boundedness comes from the ceiling instead.
 	ceiling := optimisticApplyCeiling
 	if change.concurrentIndex {
 		ceiling = e.concurrentIndexMaxDuration + concurrentIndexHeadroom
@@ -245,7 +254,11 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	}
 
 	var invalidErr *executor.InvalidIndexError
-	if errors.Is(err, executor.ErrCancelledExternally) && e.consumeCancelRequested(key) {
+	if isCancellation(err) && e.cancelRequested(key) {
+		// The cancellation is the operator's only when this engine recorded
+		// that it acted on the apply: a backend cancelled from outside
+		// SchemaBot is a failure the next drive retries, never a cancel
+		// nobody asked for.
 		detail := "Concurrent index build cancelled"
 		if errors.As(err, &invalidErr) {
 			detail = invalidIndexDetail(invalidErr)
@@ -1011,11 +1024,9 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 // executor's fence for longer than the engine allows any single read. A
 // tracker read fails only when the server's progress view cannot be queried;
 // the snapshot still carries the last-known position, which is written
-// before the error is returned for the caller to log.
+// before the error is returned for the caller to log. Every tracked apply
+// carries the tracker Apply created for it, so the caller never passes none.
 func executorProgressMetadata(ctx context.Context, tracker buildTracker, metadata map[string]string) error {
-	if tracker == nil {
-		return nil
-	}
 	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), executorProgressReadTimeout)
 	defer cancel()
 	snapshot, err := tracker.Progress(readCtx)
@@ -1093,7 +1104,10 @@ func progressResult(state engine.State, phase string, started time.Time, change 
 // Entries for applies that are still running are never retired, so an
 // in-flight change always answers for itself no matter how many siblings the
 // engine accepts.
-func (e *Engine) claimProgress(key string, result *engine.ProgressResult, tracker *progress.Tracker, logger *slog.Logger) {
+//
+// The returned channel is the drive's to close once its terminal result is
+// published; Cancel waits on it for the outcome.
+func (e *Engine) claimProgress(key string, result *engine.ProgressResult, tracker *progress.Tracker, logger *slog.Logger, concurrentIndex bool, cancelApply context.CancelFunc) chan struct{} {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.progress == nil {
@@ -1104,7 +1118,12 @@ func (e *Engine) claimProgress(key string, result *engine.ProgressResult, tracke
 			delete(e.progress, id)
 		}
 	}
-	e.progress[key] = &trackedApply{result: result, tracker: tracker, logger: logger}
+	done := make(chan struct{})
+	e.progress[key] = &trackedApply{
+		result: result, tracker: tracker, logger: logger,
+		concurrentIndex: concurrentIndex, cancelApply: cancelApply, done: done,
+	}
+	return done
 }
 
 // publishProgress stores a background apply's progress unless the engine has
