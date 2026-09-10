@@ -434,19 +434,15 @@ func testRetryableExpiryOperationFence(t *testing.T, newStore func(*testing.T) *
 				claimed, err := claim(ctx, "new-driver")
 				require.NoError(t, err)
 				require.NotNil(t, claimed)
-				admitted, err := expiryStore.lockUndrivenApply(ctx, tx, apply.ID)
-				require.NoError(t, err)
-				assert.False(t, admitted, "lease recheck must reject a claim made after candidate selection")
+				assert.False(t, lockUndrivenApply(ctx, t, expiryStore, tx, apply.ID),
+					"lease recheck must reject a claim made after candidate selection")
 			case "heartbeat wins":
 				err := store.ApplyOperations().Heartbeat(storage.WithOperationLease(ctx, storage.OperationLease{ApplyID: apply.ID, OperationID: opIDs[0], Token: "old-token"}), opIDs[0])
 				require.NoError(t, err)
-				admitted, err := expiryStore.lockUndrivenApply(ctx, tx, apply.ID)
-				require.NoError(t, err)
-				assert.False(t, admitted, "renewed lease must exclude expiry even though selection saw it stale")
+				assert.False(t, lockUndrivenApply(ctx, t, expiryStore, tx, apply.ID),
+					"renewed lease must exclude expiry even though selection saw it stale")
 			case "expiry wins", "expiry blocks cutover":
-				admitted, err := expiryStore.lockUndrivenApply(ctx, tx, apply.ID)
-				require.NoError(t, err)
-				require.True(t, admitted)
+				require.True(t, lockUndrivenApply(ctx, t, expiryStore, tx, apply.ID))
 				claim := store.ApplyOperations().FindNextApplyOperation
 				if scenario == "expiry blocks cutover" {
 					claim = store.ApplyOperations().FindNextApplyOperationCutover
@@ -459,4 +455,159 @@ func testRetryableExpiryOperationFence(t *testing.T, newStore func(*testing.T) *
 			assertTaskState(t, store, task.TaskIdentifier, state.Task.Running)
 		})
 	}
+}
+
+func TestMySQLRetryableExpiryDecidesEachCandidateAlone(t *testing.T) {
+	testRetryableExpiryDecidesEachCandidateAlone(t, func(t *testing.T) *Storage {
+		clearTables(t)
+		return NewMySQL(testDB)
+	})
+}
+
+func TestPostgresRetryableExpiryDecidesEachCandidateAlone(t *testing.T) {
+	_, db := testutil.StartPostgres(t, "expiry_candidate_isolation")
+	applyPostgresTestSchema(t, db)
+	testRetryableExpiryDecidesEachCandidateAlone(t, func(t *testing.T) *Storage {
+		clearPostgresTables(t, db)
+		return NewPostgres(db)
+	})
+}
+
+// A sweep carries every candidate its selection returned, and the recheck that
+// follows locks and reads them together. The verdict stays each apply's own: an
+// apply a driver still holds is declined, and the rest of the batch settles in
+// the same pass. Reading the batch as a whole in either direction is a real
+// failure — one live drive would strand every other exhausted apply behind it,
+// or one settled apply would carry the batch's verdict onto a tree a driver is
+// working on.
+func testRetryableExpiryDecidesEachCandidateAlone(t *testing.T, newStore func(*testing.T) *Storage) {
+	t.Run("a live lease defers only its own apply", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		store := newStore(t)
+
+		held, heldOps, heldTasks := seedExhaustedRetryableTree(t, ctx, store, "candidate_held", maxRecoveryAttempts)
+		free, freeOps, freeTasks := seedExhaustedRetryableTree(t, ctx, store, "candidate_free", maxRecoveryAttempts)
+
+		// Every lease ages out but the one a drive is still holding.
+		for _, id := range append(append([]int64{}, heldOps[1:]...), freeOps...) {
+			backdateOperationLease(t, ctx, store, id, storage.ApplyLeaseStaleAfter+time.Minute)
+		}
+
+		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		require.NoError(t, err)
+		require.Len(t, expired, 1, "the candidate the live lease does not cover still settles")
+		assert.Equal(t, free.ID, expired[0].Apply.ID)
+		assertRetryableTreeIntact(t, ctx, store, held.ID, heldOps, heldTasks)
+		assertTaskState(t, store, freeTasks[0].TaskIdentifier, state.Task.Failed)
+		assertTaskState(t, store, freeTasks[1].TaskIdentifier, state.Task.Cancelled)
+
+		// The deferral costs the apply a pass, not its expiry.
+		backdateOperationLease(t, ctx, store, heldOps[0], storage.ApplyLeaseStaleAfter+time.Minute)
+		expired, err = store.Applies().ExpireRetryable(ctx, 10)
+		require.NoError(t, err)
+		require.Len(t, expired, 1)
+		assert.Equal(t, held.ID, expired[0].Apply.ID)
+		assertTaskState(t, store, heldTasks[0].TaskIdentifier, state.Task.Failed)
+		assertTaskState(t, store, heldTasks[1].TaskIdentifier, state.Task.Cancelled)
+	})
+
+	t.Run("a claim landing after selection defers only its own apply", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		store := newStore(t)
+		expiryStore := store.Applies().(*applyStore)
+
+		first, firstOps, _ := seedExhaustedRetryableTree(t, ctx, store, "candidate_first", maxRecoveryAttempts)
+		second, secondOps, _ := seedExhaustedRetryableTree(t, ctx, store, "candidate_second", maxRecoveryAttempts)
+
+		// Both trees as a crashed fan-out leaves them: the parent's budget is
+		// spent, so expiry selects it, while the operations are mid-drive under a
+		// lease that has gone stale, so the operation claim can still take one.
+		// That overlap is what puts a claim and this recheck on the same rows.
+		staleHeartbeat := agedHeartbeatExpr(store, storage.ApplyLeaseStaleAfter+time.Minute)
+		for _, id := range append(append([]int64{}, firstOps...), secondOps...) {
+			_, err := store.db.ExecContext(ctx, `
+				UPDATE apply_operations
+				SET state = ?, lease_owner = 'old-driver', lease_token = 'old-token',
+				    updated_at = `+staleHeartbeat+`
+				WHERE id = ?
+			`, state.ApplyOperation.Running, id)
+			require.NoError(t, err)
+		}
+
+		// Pause where expiry pauses: both parents locked, no operation locked yet.
+		// A claim can still land, because it locks apply_operations and reads
+		// applies only inside EXISTS subqueries, which take no lock.
+		tx, err := store.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+		require.NoError(t, err)
+		defer rollbackTx(ctx, tx, "test batched expiry selection")
+		for _, id := range []int64{first.ID, second.ID} {
+			var locked int64
+			require.NoError(t, tx.QueryRowContext(ctx,
+				"SELECT id FROM applies WHERE id = ? AND state = ? AND attempt >= ? FOR UPDATE",
+				id, state.Apply.FailedRetryable, maxRecoveryAttempts).Scan(&locked))
+		}
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "new-driver")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "a stale lease is claimable right up until expiry locks the operation")
+
+		undriven, err := expiryStore.lockUndrivenApplies(ctx, tx, []int64{first.ID, second.ID})
+		require.NoError(t, err)
+		other := first.ID
+		if claimed.ApplyID == first.ID {
+			other = second.ID
+		}
+		assert.False(t, undriven[claimed.ApplyID], "the apply whose operation was just claimed is declined")
+		assert.True(t, undriven[other], "its co-candidate is decided on its own leases, not the batch's")
+	})
+
+	t.Run("a locked operation defers only its own apply", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		store := newStore(t)
+
+		busyApply, busyOps, busyTasks := seedExhaustedRetryableTree(t, ctx, store, "candidate_busy", maxRecoveryAttempts)
+		free, freeOps, freeTasks := seedExhaustedRetryableTree(t, ctx, store, "candidate_unlocked", maxRecoveryAttempts)
+		for _, id := range append(append([]int64{}, busyOps...), freeOps...) {
+			backdateOperationLease(t, ctx, store, id, storage.ApplyLeaseStaleAfter+time.Minute)
+		}
+
+		// A claim holding one operation while it waits on the parent's retry
+		// budget. SKIP LOCKED leaves that row out of the lock scan, so its apply
+		// reads as incompletely locked and is declined whole.
+		busyTx, err := store.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+		require.NoError(t, err)
+		defer rollbackTx(ctx, busyTx, "test locked expiry candidate")
+		var lockedID int64
+		require.NoError(t, busyTx.QueryRowContext(ctx,
+			"SELECT id FROM apply_operations WHERE id = ? FOR UPDATE", busyOps[1]).Scan(&lockedID))
+
+		expired, err := store.Applies().ExpireRetryable(ctx, 10)
+		require.NoError(t, err)
+		require.Len(t, expired, 1, "an unlocked candidate settles alongside a locked one")
+		assert.Equal(t, free.ID, expired[0].Apply.ID)
+		assertRetryableTreeIntact(t, ctx, store, busyApply.ID, busyOps, busyTasks)
+		assertTaskState(t, store, freeTasks[0].TaskIdentifier, state.Task.Failed)
+		assertTaskState(t, store, freeTasks[1].TaskIdentifier, state.Task.Cancelled)
+
+		require.NoError(t, busyTx.Rollback())
+		expired, err = store.Applies().ExpireRetryable(ctx, 10)
+		require.NoError(t, err)
+		require.Len(t, expired, 1)
+		assert.Equal(t, busyApply.ID, expired[0].Apply.ID)
+		assertTaskState(t, store, busyTasks[0].TaskIdentifier, state.Task.Failed)
+		assertTaskState(t, store, busyTasks[1].TaskIdentifier, state.Task.Cancelled)
+	})
+}
+
+// lockUndrivenApply is the single-candidate shape of lockUndrivenApplies. The
+// scenarios above each pin one apply's decision at the boundary where a claim
+// and expiry race for it, so they read the batch's verdict for that one row.
+func lockUndrivenApply(ctx context.Context, t *testing.T, store *applyStore, tx *rebindTx, applyID int64) bool {
+	t.Helper()
+	undriven, err := store.lockUndrivenApplies(ctx, tx, []int64{applyID})
+	require.NoError(t, err)
+	return undriven[applyID]
 }

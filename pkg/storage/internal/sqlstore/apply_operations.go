@@ -2042,7 +2042,7 @@ func unleasedOperationGate(d Dialect) string {
 //
 // The gate is a candidate filter, not the decision. An unlocked NOT EXISTS is a
 // read a claim can win the moment after it is evaluated, so a writer relying on
-// this repeats it under lockUndrivenApply, holding every operation row of the
+// this repeats it under lockUndrivenApplies, holding every operation row of the
 // apply.
 //
 // An apply with no operations is admitted. Nothing holds a lease over it, so
