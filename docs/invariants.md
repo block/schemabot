@@ -482,9 +482,15 @@ and CLI flows do not write passing checks.
 
 Aggregates blocked on unresolved or stale state are re-evaluated by SchemaBot itself, not left
 waiting for a lucky comment or push. The exception is a block that no retry can lift (untrusted
-App, misconfigured check name), which blocks immediately and permanently. *Enforced:* stale-check
-reconciliation (`pkg/webhook/check_records.go`) and aggregate re-evaluation
-(`pkg/webhook/check_aggregate.go`, `pkg/webhook/checks_backfill.go`).
+App, misconfigured check name), which blocks immediately and permanently.
+
+A block an operator owes a target a reconciliation for is not an exception to this. It converges
+too, by the operator reconciling the target — what it must not do is converge on its own, since
+that would clear the block without the divergence behind it being addressed.
+
+*Enforced:* stale-check reconciliation (`pkg/webhook/check_records.go`), aggregate re-evaluation
+(`pkg/webhook/check_aggregate.go`, `pkg/webhook/checks_backfill.go`), and the re-plan a settled
+apply owes a PR whose head moved past the commit its check names (`pkg/webhook/handler.go`).
 
 ### MG-11: A terminal outcome lands on the commit the PR is gated on
 
