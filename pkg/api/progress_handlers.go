@@ -670,8 +670,13 @@ func (s *Service) handleDatabaseList(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	app, err := parseDatabaseListAppFilter(r, config)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	name := strings.TrimSpace(r.URL.Query().Get("name"))
-	resp, err := databaseListResponse(config, databaseType, name)
+	resp, err := databaseListResponse(config, databaseType, name, app)
 	if err != nil {
 		s.logger.Error("database list failed", "error", err)
 		s.writeError(w, http.StatusInternalServerError, "failed to list databases: "+err.Error())
@@ -699,6 +704,21 @@ func parseDatabaseListTypeFilter(r *http.Request, config *ServerConfig) (string,
 	return "", fmt.Errorf("type %q matches no configured database type (configured: %s)", databaseType, strings.Join(configured, ", "))
 }
 
+// parseDatabaseListAppFilter validates the optional ?app= filter against the
+// apps configured databases actually declare. Like the type filter and
+// app-scoped commands, an app no database declares is rejected rather than
+// silently matching nothing.
+func parseDatabaseListAppFilter(r *http.Request, config *ServerConfig) (string, error) {
+	app := storage.CanonicalKey(strings.TrimSpace(r.URL.Query().Get("app")))
+	if app == "" {
+		return "", nil
+	}
+	if _, err := config.DatabasesForApp(app); err != nil {
+		return "", err
+	}
+	return app, nil
+}
+
 // configuredDatabaseTypes returns the distinct database types present in
 // server config, sorted for deterministic error messages.
 func configuredDatabaseTypes(config *ServerConfig) []string {
@@ -719,10 +739,11 @@ func configuredDatabaseTypes(config *ServerConfig) []string {
 }
 
 // databaseListResponse builds the sanitized database list, keeping only
-// databases matching the optional type and name filters. The name filter is a
-// case-insensitive substring match so one query covers a sharded family
-// (omnibus matches omnibus_001, omnibus_002, ...).
-func databaseListResponse(config *ServerConfig, databaseType, name string) (*apitypes.DatabaseListResponse, error) {
+// databases matching the optional type, name, and app filters. The name
+// filter is a case-insensitive substring match so one query covers a sharded
+// family (omnibus matches omnibus_001, omnibus_002, ...); the app filter is a
+// whole-identifier match against the canonical value its parser produced.
+func databaseListResponse(config *ServerConfig, databaseType, name, app string) (*apitypes.DatabaseListResponse, error) {
 	if config == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
@@ -732,6 +753,9 @@ func databaseListResponse(config *ServerConfig, databaseType, name string) (*api
 	databaseNames := make([]string, 0, len(dbs))
 	for database, dbConfig := range dbs {
 		if databaseType != "" && dbConfig.Type != databaseType {
+			continue
+		}
+		if app != "" && dbConfig.App != app {
 			continue
 		}
 		if nameFilter != "" && !strings.Contains(storage.CanonicalKey(database), nameFilter) {
@@ -751,6 +775,7 @@ func databaseListResponse(config *ServerConfig, databaseType, name string) (*api
 		databaseResp := &apitypes.DatabaseResponse{
 			Database:     database,
 			Type:         dbConfig.Type,
+			App:          dbConfig.App,
 			Environments: make([]*apitypes.DatabaseEnvironmentResponse, 0, len(environments)),
 		}
 		for _, environment := range environments {

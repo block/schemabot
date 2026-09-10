@@ -428,9 +428,17 @@ type ForeignKeyCatalog struct {
 
 // PullSchemaRequest is the HTTP request body for POST /api/pull.
 type PullSchemaRequest struct {
-	Database      string   `json:"database"`
-	Environment   string   `json:"environment"`
-	Type          string   `json:"type"`
+	Database    string `json:"database"`
+	Environment string `json:"environment"`
+	Type        string `json:"type"`
+	// App selects the database by its configured app identifier instead of
+	// its name. Exactly one of Database or App must be set, and App must
+	// resolve to exactly one configured database: a pull reads one database,
+	// so an app declared by several databases is an error naming the
+	// candidates, never an arbitrary pick. The pull endpoint enforces the
+	// exactly-one rule and resolves App to a database before execution;
+	// callers invoking the execution layer directly must set Database.
+	App           string   `json:"app,omitempty"`
 	Namespaces    []string `json:"namespaces,omitempty"`
 	CatalogDetail string   `json:"catalog_detail,omitempty"`
 	// Lint runs the schema linters over every pulled table and attaches the
@@ -441,11 +449,15 @@ type PullSchemaRequest struct {
 
 // PullSchemaResponse is the HTTP response body for POST /api/pull.
 type PullSchemaResponse struct {
-	Database    string                      `json:"database"`
-	Type        string                      `json:"type"`
-	Environment string                      `json:"environment"`
-	Namespaces  map[string]*PulledNamespace `json:"namespaces"`
-	TableCount  int32                       `json:"table_count"`
+	Database    string `json:"database"`
+	Type        string `json:"type"`
+	Environment string `json:"environment"`
+	// App is the database's configured app identifier, echoed whether the
+	// request selected the database by name or by app. Empty when the
+	// database declares no app.
+	App        string                      `json:"app,omitempty"`
+	Namespaces map[string]*PulledNamespace `json:"namespaces"`
+	TableCount int32                       `json:"table_count"`
 }
 
 // DatabaseListResponse is the HTTP response body for GET /api/databases.
@@ -456,8 +468,12 @@ type DatabaseListResponse struct {
 // DatabaseResponse describes one server-side database without
 // exposing connection strings, opaque execution targets, or endpoint addresses.
 type DatabaseResponse struct {
-	Database     string                         `json:"database"`
-	Type         string                         `json:"type"`
+	Database string `json:"database"`
+	Type     string `json:"type"`
+	// App is the database's configured app identifier, so callers can group
+	// databases into applications and join this inventory against systems
+	// that know only the app. Empty when the database declares no app.
+	App          string                         `json:"app,omitempty"`
 	Environments []*DatabaseEnvironmentResponse `json:"environments"`
 }
 
