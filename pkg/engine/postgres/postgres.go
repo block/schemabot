@@ -289,11 +289,19 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			}
 			schemaChange.TableChanges = append(schemaChange.TableChanges, changes...)
 		}
-		drops, err := undeclaredTableDrops(ctx, pool, req.Database, namespace, desiredTables, parser)
+		drops, exempt, err := undeclaredTableDrops(ctx, pool, req.Database, namespace, desiredTables, parser)
 		if err != nil {
 			return nil, fmt.Errorf("compare live tables against schema files in namespace %q: %w", namespace, err)
 		}
 		schemaChange.TableChanges = append(schemaChange.TableChanges, drops...)
+		if len(exempt) > 0 {
+			slices.Sort(exempt)
+			result.ExemptTables = append(result.ExemptTables, &engine.ExemptTables{
+				Namespace: namespace,
+				Tables:    exempt,
+				Reason:    "archive naming",
+			})
+		}
 		if len(schemaChange.TableChanges) > 0 {
 			result.Changes = append(result.Changes, schemaChange)
 		}
@@ -642,9 +650,9 @@ func concurrentIndexStatement(sql string) (bool, error) {
 // convention exempt from the verdict, as they are in the MySQL engine's view
 // of its live schema: an archive is a retired copy kept outside declarative
 // schema files. The naming convention is the per-table exemption;
-// ignore_namespaces is the per-namespace one. The plan does not render the
-// exemption, so each exempt table is logged: the one place the silence is
-// visible.
+// ignore_namespaces is the per-namespace one. Each exempt table is logged
+// and returned on the plan so the PR comment discloses what the verdict
+// skipped.
 //
 // The verdict names only remedies the operator can follow. A table that owns
 // or is referenced by foreign key constraints cannot be brought under
@@ -653,12 +661,13 @@ func concurrentIndexStatement(sql string) (bool, error) {
 // relationship needs instead of pointing at a file the pull cannot write. The
 // catalog is read directly because the namespace's schema may not exist yet,
 // in which case the answer is an empty set, not an error.
-func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared map[string]bool, parser ddl.StatementParser) ([]engine.TableChange, error) {
+func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared map[string]bool, parser ddl.StatementParser) ([]engine.TableChange, []string, error) {
 	tables, err := liveTables(ctx, pool, namespace)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var drops []engine.TableChange
+	var exempt []string
 	for _, live := range tables {
 		if declared[live.name] {
 			continue
@@ -668,12 +677,13 @@ func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, nam
 				"database", database,
 				"namespace", namespace,
 				"table", live.name)
+			exempt = append(exempt, live.name)
 			continue
 		}
 		sql := parser.Canonicalize("DROP TABLE " + pgx.Identifier{namespace, live.name}.Sanitize())
 		operation, _, err := parser.Classify(sql)
 		if err != nil {
-			return nil, fmt.Errorf("classify drop for undeclared table %q: %w", live.name, err)
+			return nil, nil, fmt.Errorf("classify drop for undeclared table %q: %w", live.name, err)
 		}
 		// The plan comment classifies this drop from the statement; when a
 		// stored plan carries no statement it falls back to the words "DROP
@@ -689,7 +699,7 @@ func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, nam
 			ModeReason:    sanitizeReasonText(undeclaredTableReason(namespace, live)),
 		})
 	}
-	return drops, nil
+	return drops, exempt, nil
 }
 
 // undeclaredTableReason explains why the drop is blocked and what the

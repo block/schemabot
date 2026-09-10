@@ -45,6 +45,7 @@ func previewCommentAllOutput() {
 	}{
 		{"PLAN COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentPlan()) }},
 		{"PLAN COMMENT (IGNORED NAMESPACES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoredNamespaces()) }},
+		{"PLAN COMMENT (EXEMPT TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanExemptTables()) }},
 		{"PLAN COMMENT (MANY LINT WARNINGS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyLintWarnings()) }},
 		{"PLAN COMMENT (ENGINE-BLOCKED CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBlocked()) }},
 		{"PLAN COMMENT (DIRECT-EXECUTION CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDirect()) }},
@@ -63,9 +64,9 @@ func previewCommentAllOutput() {
 		{"APPLY REJECTED (ENGINE-BLOCKED CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedRejected()) }},
 		{"PLAN COMMENT (TENANT TARGET)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanTenant()) }},
 		{"PLAN COMMENT (NO CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanNoChanges()) }},
-		{"NO MANAGED SCHEMA CHANGES", func() { fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChanges()) }},
-		{"NO MANAGED SCHEMA CHANGES (CHECKS REFRESHED)", func() { fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshed()) }},
-		{"NO MANAGED SCHEMA CHANGES (GATED ON TENANTS)", func() {
+		{"NO SCHEMA FILES CHANGED", func() { fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChanges()) }},
+		{"NO SCHEMA FILES CHANGED (CHECKS REFRESHED)", func() { fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshed()) }},
+		{"NO SCHEMA FILES CHANGED (GATED ON TENANTS)", func() {
 			fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshedGatedOnTenants())
 		}},
 		{"RECONCILIATION REQUIRED (IN PROGRESS)", func() { fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationInProgress()) }},
@@ -153,6 +154,7 @@ func previewCommentPlanAllOutput() {
 	}{
 		{"MYSQL PLAN", func() { fmt.Print(webhooktemplates.PreviewCommentPlan()) }},
 		{"MYSQL PLAN (IGNORED NAMESPACES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoredNamespaces()) }},
+		{"POSTGRES PLAN (EXEMPT TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanExemptTables()) }},
 		{"MYSQL PLAN (MANY LINT WARNINGS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyLintWarnings()) }},
 		{"MYSQL PLAN (ENGINE-BLOCKED CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBlocked()) }},
 		{"MYSQL PLAN (DIRECT-EXECUTION CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDirect()) }},
@@ -172,9 +174,9 @@ func previewCommentPlanAllOutput() {
 		{"APPLY REJECTED (ENGINE-BLOCKED CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedRejected()) }},
 		{"MYSQL PLAN (TENANT TARGET)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanTenant()) }},
 		{"MYSQL PLAN (NO CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanNoChanges()) }},
-		{"NO MANAGED SCHEMA CHANGES", func() { fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChanges()) }},
-		{"NO MANAGED SCHEMA CHANGES (CHECKS REFRESHED)", func() { fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshed()) }},
-		{"NO MANAGED SCHEMA CHANGES (GATED ON TENANTS)", func() {
+		{"NO SCHEMA FILES CHANGED", func() { fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChanges()) }},
+		{"NO SCHEMA FILES CHANGED (CHECKS REFRESHED)", func() { fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshed()) }},
+		{"NO SCHEMA FILES CHANGED (GATED ON TENANTS)", func() {
 			fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshedGatedOnTenants())
 		}},
 		{"RECONCILIATION REQUIRED (IN PROGRESS)", func() { fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationInProgress()) }},

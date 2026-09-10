@@ -120,6 +120,9 @@ type PlanCommentData struct {
 	// introduces an ignore_namespaces entry visible in review.
 	IgnoredNamespaces []string
 
+	// ExemptTables lists live tables excluded from a plan verdict by namespace.
+	ExemptTables []ExemptTablesData
+
 	// Unsafe change tracking
 	HasUnsafeChanges bool
 	AllowUnsafe      bool
@@ -170,6 +173,13 @@ type PlanCommentData struct {
 	// deployment compares to the reviewed primary plan. Nil for a single-target
 	// database (nothing to compare) or when drift was not evaluated.
 	DeploymentDrift *DeploymentDriftData
+}
+
+// ExemptTablesData describes live tables exempt from a plan verdict.
+type ExemptTablesData struct {
+	Namespace string
+	Tables    []string
+	Reason    string
 }
 
 // DeploymentDriftData renders the review-time drift rollup in the PR preview: a
@@ -284,9 +294,10 @@ func RenderPlanComment(data PlanCommentData) string {
 	// genuinely unchanged one.
 	if totalChanges == 0 {
 		writeNoChangesDetected(&sb, data)
-		if len(data.IgnoredNamespaces) > 0 {
+		if len(data.IgnoredNamespaces) > 0 || hasExemptTables(data.ExemptTables) {
 			sb.WriteString("\n")
 			writeIgnoredNamespaces(&sb, data.IgnoredNamespaces)
+			writeExemptTables(&sb, data.ExemptTables)
 		}
 		return appendAgentHint(sb.String(), data.AgentHint)
 	}
@@ -545,6 +556,7 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 		writeNoChangesDetected(sb, data)
 		sb.WriteString("\n")
 		writeIgnoredNamespaces(sb, data.IgnoredNamespaces)
+		writeExemptTables(sb, data.ExemptTables)
 		return
 	}
 
@@ -586,6 +598,7 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	// Disclosed directly under the plan summary so the exclusion reads as
 	// part of the plan result: what was counted, then what was withheld.
 	writeIgnoredNamespaces(sb, data.IgnoredNamespaces)
+	writeExemptTables(sb, data.ExemptTables)
 }
 
 // writeIgnoredNamespaces renders the ignore_namespaces disclosure line. No-op
@@ -600,6 +613,96 @@ func writeIgnoredNamespaces(sb *strings.Builder, ignored []string) {
 		quoted[i] = inlineCode(ns)
 	}
 	fmt.Fprintf(sb, glyph.Info+" Namespaces excluded from this plan by `ignore_namespaces`: %s\n\n", strings.Join(quoted, ", "))
+}
+
+// writeExemptTables renders one disclosure line per namespace whose live
+// tables the plan exempted from the undeclared-table verdict, so a reviewer
+// can tell an exempted table from a declared one. No-op when nothing was
+// exempted, which is the ordinary case. The namespace and table names come
+// from the target's catalog, so they render as code spans they cannot break
+// out of; the reason is engine prose and is sanitized like any other.
+func writeExemptTables(sb *strings.Builder, groups []ExemptTablesData) {
+	for _, group := range groups {
+		if len(group.Tables) == 0 {
+			continue
+		}
+		fmt.Fprintf(sb, glyph.Info+" Tables in namespace %s exempt from the undeclared-table verdict (%s): %s\n\n",
+			inlineCode(group.Namespace), exemptReason(group.Reason), strings.Join(inlineCodeList(group.Tables), ", "))
+	}
+}
+
+// hasExemptTables reports whether writeExemptTables would render anything for
+// these groups. It counts tables rather than groups, so a namespace entry
+// that carries no tables does not earn the disclosure its spacing.
+func hasExemptTables(groups []ExemptTablesData) bool {
+	for _, group := range groups {
+		if len(group.Tables) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func exemptReason(reason string) string {
+	return escapeInlineMarkdown(SanitizeInlineError(reason))
+}
+
+// writeMultiEnvExemptTables renders the exempt-table disclosure for the
+// all-environments-clean path, where no per-environment sections exist to
+// carry it. When every environment exempted the same tables it renders the
+// shared lines once; otherwise one set of lines per environment, since the
+// live tables can differ per environment.
+func writeMultiEnvExemptTables(sb *strings.Builder, data MultiEnvPlanCommentData) {
+	if !multiEnvHasExemptTables(data) {
+		return
+	}
+	first := planExemptTables(data, data.Environments[0])
+	identical := true
+	for _, env := range data.Environments[1:] {
+		if !slices.EqualFunc(planExemptTables(data, env), first, exemptTablesEqual) {
+			identical = false
+			break
+		}
+	}
+	if identical {
+		writeExemptTables(sb, first)
+		return
+	}
+	for _, env := range data.Environments {
+		for _, group := range planExemptTables(data, env) {
+			if len(group.Tables) == 0 {
+				continue
+			}
+			fmt.Fprintf(sb, glyph.Info+" **%s**: tables in namespace %s exempt from the undeclared-table verdict (%s): %s\n\n",
+				capitalizeFirst(env), inlineCode(group.Namespace), exemptReason(group.Reason), strings.Join(inlineCodeList(group.Tables), ", "))
+		}
+	}
+}
+
+// multiEnvHasExemptTables reports whether any environment's plan exempted
+// tables, so callers can decide whether the disclosure (and its spacing)
+// renders at all.
+func multiEnvHasExemptTables(data MultiEnvPlanCommentData) bool {
+	for _, env := range data.Environments {
+		if hasExemptTables(planExemptTables(data, env)) {
+			return true
+		}
+	}
+	return false
+}
+
+// planExemptTables returns the exempt tables for one environment, or nil when
+// that environment has no plan (for example, it failed to plan).
+func planExemptTables(data MultiEnvPlanCommentData, env string) []ExemptTablesData {
+	plan, ok := data.Plans[env]
+	if !ok || plan == nil {
+		return nil
+	}
+	return plan.ExemptTables
+}
+
+func exemptTablesEqual(a, b ExemptTablesData) bool {
+	return a.Namespace == b.Namespace && a.Reason == b.Reason && slices.Equal(a.Tables, b.Tables)
 }
 
 // multiEnvHasIgnoredNamespaces reports whether any environment's plan excluded
@@ -1457,9 +1560,10 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 	// unchanged.
 	if envsWithChanges == 0 && !hasErrors && !AnyEnvHasDriftToShow(data) {
 		sb.WriteString("✅ **No schema changes detected** for any environment.\n")
-		if multiEnvHasIgnoredNamespaces(data) {
+		if multiEnvHasIgnoredNamespaces(data) || multiEnvHasExemptTables(data) {
 			sb.WriteString("\n")
 			writeMultiEnvIgnoredNamespaces(&sb, data)
+			writeMultiEnvExemptTables(&sb, data)
 		}
 		return appendAgentHint(sb.String(), data.AgentHint)
 	}
@@ -1590,6 +1694,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 	if totalChanges == 0 {
 		sb.WriteString("✅ **No schema changes detected**\n\n")
 		writeIgnoredNamespaces(sb, plan.IgnoredNamespaces)
+		writeExemptTables(sb, plan.ExemptTables)
 		return
 	}
 

@@ -2414,13 +2414,17 @@ func (s *applyStore) expireRetryable(ctx context.Context, limit int) ([]*storage
 	// heartbeat that won after the scan causes the whole apply to be deferred.
 	// AttachOperationWithTasks locks the parent, so no new sibling can attach
 	// while we establish and hold this complete set of operation locks.
+	candidateIDs := make([]int64, 0, len(applies))
+	for _, apply := range applies {
+		candidateIDs = append(candidateIDs, apply.ID)
+	}
+	undriven, err := s.lockUndrivenApplies(ctx, tx, candidateIDs)
+	if err != nil {
+		return nil, err
+	}
 	eligible := make([]*storage.Apply, 0, len(applies))
 	for _, apply := range applies {
-		undriven, err := s.lockUndrivenApply(ctx, tx, apply.ID)
-		if err != nil {
-			return nil, err
-		}
-		if undriven {
+		if undriven[apply.ID] {
 			eligible = append(eligible, apply)
 		}
 	}
@@ -2534,44 +2538,120 @@ func (s *applyStore) expireRetryable(ctx context.Context, limit int) ([]*storage
 	return expirations, nil
 }
 
-// lockUndrivenApply requires the parent row to be locked by tx. It admits the
-// apply only after locking its complete operation set and rechecking leases.
+// lockUndrivenApplies requires every parent row to be locked by tx. It reports,
+// per apply, whether that apply's complete operation set could be locked and
+// still reads as undriven afterwards. The decision stays per apply: one
+// candidate holding a live operation lease defers itself and nothing else.
+//
 // SKIP LOCKED avoids waiting for a claim that holds an operation and needs the
 // parent to consume retry budget: waiting here would invert that lock order.
-func (s *applyStore) lockUndrivenApply(ctx context.Context, tx *rebindTx, applyID int64) (bool, error) {
-	rows, err := tx.QueryContext(ctx, `
-		SELECT id FROM apply_operations
-		WHERE apply_id = ? ORDER BY id
-		FOR UPDATE SKIP LOCKED
-	`, applyID)
-	if err != nil {
-		return false, fmt.Errorf("lock operations for retryable expiry of apply %d: %w", applyID, err)
+// A row a claim holds is therefore absent from the lock scan rather than waited
+// on, which is why the locked rows are counted against a separate total instead
+// of being trusted as the whole set — an aggregate over the same statement
+// would only ever see the rows the lock succeeded on.
+//
+// The lock scan imposes no ordering. Its rows are only counted per apply, and
+// SKIP LOCKED means no lock here ever waits, so acquisition order cannot form a
+// cycle. Ordering it would only add a sort of the whole candidate set, taken
+// while the blocking parent locks are held.
+//
+// Three statements over the whole candidate set rather than three per candidate:
+// the expiry transaction holds blocking parent locks for as long as this runs,
+// and AttachOperationWithTasks waits on those, so the cost of the recheck is
+// paid by anything attaching an operation to one of these applies. Errors carry
+// the candidate count rather than an apply id because the pass is one
+// transaction — a failure rolls the whole batch back, so no single apply is the
+// one that failed.
+func (s *applyStore) lockUndrivenApplies(ctx context.Context, tx *rebindTx, applyIDs []int64) (map[int64]bool, error) {
+	undriven := make(map[int64]bool, len(applyIDs))
+	if len(applyIDs) == 0 {
+		return undriven, nil
 	}
-	locked := 0
+	args := make([]any, 0, len(applyIDs))
+	for _, id := range applyIDs {
+		args = append(args, id)
+	}
+	in := placeholders(len(applyIDs))
+
+	locked := make(map[int64]int, len(applyIDs))
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
+		SELECT apply_id FROM apply_operations
+		WHERE apply_id IN (%s)
+		FOR UPDATE SKIP LOCKED
+	`, in), args...)
+	if err != nil {
+		return nil, fmt.Errorf("lock operations for retryable expiry of %d applies: %w", len(applyIDs), err)
+	}
 	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
+		var applyID int64
+		if err := rows.Scan(&applyID); err != nil {
 			utils.CloseAndLog(rows)
-			return false, fmt.Errorf("scan operation for retryable expiry of apply %d: %w", applyID, err)
+			return nil, fmt.Errorf("scan locked operation for retryable expiry of %d applies: %w", len(applyIDs), err)
 		}
-		locked++
+		locked[applyID]++
 	}
 	err = rows.Err()
 	utils.CloseAndLog(rows)
 	if err != nil {
-		return false, fmt.Errorf("read operations for retryable expiry of apply %d: %w", applyID, err)
+		return nil, fmt.Errorf("read locked operations for retryable expiry of %d applies: %w", len(applyIDs), err)
 	}
-	var total int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM apply_operations WHERE apply_id = ?`, applyID).Scan(&total); err != nil {
-		return false, fmt.Errorf("count operations for retryable expiry of apply %d: %w", applyID, err)
+
+	total := make(map[int64]int, len(applyIDs))
+	totalRows, err := tx.QueryContext(ctx, fmt.Sprintf(`
+		SELECT apply_id, COUNT(*) FROM apply_operations
+		WHERE apply_id IN (%s)
+		GROUP BY apply_id
+	`, in), args...)
+	if err != nil {
+		return nil, fmt.Errorf("count operations for retryable expiry of %d applies: %w", len(applyIDs), err)
 	}
-	if locked != total {
-		return false, nil
+	for totalRows.Next() {
+		var applyID int64
+		var count int
+		if err := totalRows.Scan(&applyID, &count); err != nil {
+			utils.CloseAndLog(totalRows)
+			return nil, fmt.Errorf("scan operation count for retryable expiry of %d applies: %w", len(applyIDs), err)
+		}
+		total[applyID] = count
 	}
-	gate := undrivenApplyGate(s.dialect)
-	var undriven bool
-	if err := tx.QueryRowContext(ctx, `SELECT `+gate+` FROM applies WHERE id = ?`, applyID).Scan(&undriven); err != nil {
-		return false, fmt.Errorf("recheck operation leases for retryable expiry of apply %d: %w", applyID, err)
+	err = totalRows.Err()
+	utils.CloseAndLog(totalRows)
+	if err != nil {
+		return nil, fmt.Errorf("read operation counts for retryable expiry of %d applies: %w", len(applyIDs), err)
+	}
+
+	// The bound inside the gate repeats the candidate list, so its placeholders
+	// are bound a second time.
+	gateArgs := make([]any, 0, len(args)*2)
+	gateArgs = append(gateArgs, args...)
+	gateArgs = append(gateArgs, args...)
+
+	unleased := make(map[int64]bool, len(applyIDs))
+	gateRows, err := tx.QueryContext(ctx, fmt.Sprintf(`
+		SELECT id FROM applies
+		WHERE id IN (%s) AND %s
+	`, in, undrivenApplyGateBoundedTo(s.dialect, in)), gateArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("recheck operation leases for retryable expiry of %d applies: %w", len(applyIDs), err)
+	}
+	for gateRows.Next() {
+		var applyID int64
+		if err := gateRows.Scan(&applyID); err != nil {
+			utils.CloseAndLog(gateRows)
+			return nil, fmt.Errorf("scan lease recheck for retryable expiry of %d applies: %w", len(applyIDs), err)
+		}
+		unleased[applyID] = true
+	}
+	err = gateRows.Err()
+	utils.CloseAndLog(gateRows)
+	if err != nil {
+		return nil, fmt.Errorf("read lease recheck for retryable expiry of %d applies: %w", len(applyIDs), err)
+	}
+
+	// An apply with no operations has nothing to lock and nothing holding a
+	// lease over it, so both counts are zero and the gate admits it.
+	for _, id := range applyIDs {
+		undriven[id] = locked[id] == total[id] && unleased[id]
 	}
 	return undriven, nil
 }

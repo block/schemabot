@@ -76,6 +76,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCLIOutput(previewType)
 	// Comment template types
 	case templates.PreviewCommentPlan, templates.PreviewCommentPlanBlocked,
+		templates.PreviewCommentPlanIgnoredNamespaces, templates.PreviewCommentPlanExemptTables,
 		templates.PreviewCommentPlanDirect,
 		templates.PreviewCommentPlanCopyDiscarded, templates.PreviewCommentPlanCopyDiscardedApplying,
 		templates.PreviewCommentPlanCopyDiscardedPaused,
@@ -270,7 +271,7 @@ Comment Templates (GitHub PR comments):
   comment_apply_blocked_rejected Apply rejected: plan contains engine-blocked statements
   comment_plan_tenant           Tenant-targeted plan comment
   comment_plan_empty            Plan comment with no changes
-  comment_no_managed_schema     No managed schema changes in current PR
+  comment_no_managed_schema     No schema files changed in current PR
   comment_reconcile_in_progress Empty diff with an in-progress apply
   comment_reconcile_completed   Empty diff with a completed apply
   comment_plan_copy_discarded   Plan whose apply would throw away an unfinished copy

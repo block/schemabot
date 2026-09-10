@@ -442,7 +442,7 @@ func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.
 	}
 
 	h.updateAggregateCheck(publishHeadCtx(ctx, a, prInfo), ghInstClient, a.Repository, a.PullRequest, aggregatePublishSHA(checkRecord, prInfo))
-	h.replanAfterCheckOwnershipRelease(a, checkRecord, prInfo)
+	h.replanAfterTerminalApply(a, checkRecord, prInfo)
 }
 
 // publishHeadCtx scopes the aggregate publish to the head the caller already
@@ -487,26 +487,24 @@ func aggregatePublishSHA(check *storage.Check, prInfo *github.PullRequestInfo) s
 	return prInfo.HeadSHA
 }
 
-// replanAfterCheckOwnershipRelease re-plans a PR whose head moved while an
-// apply held its check.
+// replanAfterTerminalApply re-plans a PR whose head moved while an apply held
+// its check.
 //
 // A plan that ran during the apply was refused by the guard preserving
 // in-progress apply-owned state, so the stored row is still recorded against
 // the apply's commit. The aggregate holds a row recorded for another commit as
 // blocking until results land for the current head, and nothing else produces
 // them: a terminal apply writes the row it owned, not a plan for the newer
-// commit. Releasing ownership is the first moment a plan for the current head
+// commit. The apply settling is the first moment a plan for the current head
 // can be stored, which is why the re-plan belongs here — without it the PR
 // stays gated on a check no path will refresh.
 //
-// Ownership that survives the terminal outcome — a cancelled apply whose
-// completed task history keeps the row claimed — is deliberately left alone: an
-// operator owes that target a reconciliation and a clean plan must not replace
-// the block.
+// A terminal outcome that leaves the target owing an operator a reconciliation
+// is deliberately left alone: a clean plan must not replace that block.
 //
 // prInfo is the caller's uncached read of the PR, shared with the commit the
 // aggregate was just published on so both decisions see one head.
-func (h *Handler) replanAfterCheckOwnershipRelease(a *storage.Apply, check *storage.Check, prInfo *github.PullRequestInfo) {
+func (h *Handler) replanAfterTerminalApply(a *storage.Apply, check *storage.Check, prInfo *github.PullRequestInfo) {
 	logFields := []any{
 		"apply_id", a.ApplyIdentifier,
 		"repo", a.Repository,
@@ -517,10 +515,11 @@ func (h *Handler) replanAfterCheckOwnershipRelease(a *storage.Apply, check *stor
 		"check_head_sha", check.HeadSHA,
 		"head_sha", prInfo.HeadSHA,
 		"check_apply_id", check.ApplyID,
+		"check_conclusion", check.Conclusion,
 		"pr_state", prInfo.State,
 	}
-	if !replanOwedAfterOwnershipRelease(check, prInfo) {
-		h.logger.Debug("no re-plan after terminal apply: the stored check is still apply-owned, already covers the PR head, or the PR is closed",
+	if !replanOwedAfterTerminalApply(check, prInfo) {
+		h.logger.Debug("no re-plan after terminal apply: the stored check owes a reconciliation, already covers the PR head, or the PR is closed",
 			logFields...)
 		return
 	}
@@ -529,7 +528,7 @@ func (h *Handler) replanAfterCheckOwnershipRelease(a *storage.Apply, check *stor
 	if config := h.service.Config(); config != nil {
 		tenant = config.Tenant
 	}
-	h.logger.Info("re-planning after a terminal apply released its check: the PR head moved while the apply held it, so no plan result covers the current commit",
+	h.logger.Info("re-planning after a terminal apply: the PR head moved while the apply held its check, so no plan result covers the current commit",
 		logFields...)
 	h.goSafe(a.Repository, a.PullRequest, a.InstallationID, "", func() {
 		// System-triggered: no actor to authorize, and no comment — the operator
@@ -539,18 +538,38 @@ func (h *Handler) replanAfterCheckOwnershipRelease(a *storage.Apply, check *stor
 	})
 }
 
-// replanOwedAfterOwnershipRelease reports whether releasing a check's apply
-// ownership leaves the PR with no plan result for the commit it is gated on.
+// replanOwedAfterTerminalApply reports whether a settled apply leaves the PR
+// with no plan result for the commit it is gated on.
 //
-// Ownership that survives the terminal outcome — a cancelled apply whose
-// completed task history keeps the row claimed — owes an operator a
-// reconciliation, and a clean plan must not replace that block. A row already
-// on the PR head needs nothing. A closed PR has no gate left to converge.
-func replanOwedAfterOwnershipRelease(check *storage.Check, prInfo *github.PullRequestInfo) bool {
-	return check.ApplyID == 0 &&
+// A row already on the PR head needs nothing. A closed PR has no gate left to
+// converge.
+func replanOwedAfterTerminalApply(check *storage.Check, prInfo *github.PullRequestInfo) bool {
+	return checkOpenToPlanForNewerCommit(check) &&
 		!prInfo.IsClosed() &&
 		prInfo.HeadSHA != "" &&
 		prInfo.HeadSHA != check.HeadSHA
+}
+
+// checkOpenToPlanForNewerCommit reports whether a plan computed for a newer
+// commit may replace this stored row.
+//
+// A row the terminal write left unowned is open to one: no apply is holding it
+// and no block was retained on it. A row still carrying its apply is open only
+// where that apply succeeded, because success is the one terminal outcome that
+// leaves the target holding exactly what the apply set out to put there — a
+// plan against it measures the newer commit and nothing else.
+//
+// Every other retained row is a block an operator owes a target: a cancelled
+// apply whose completed task history keeps the row claimed, a failed apply, an
+// apply whose commit removed the schema it had already applied. A plan run
+// against those targets could come back clean while the divergence it is
+// blocking on is still there, so the block outlives the head it was recorded
+// for and is cleared by reconciliation rather than by a newer commit.
+func checkOpenToPlanForNewerCommit(check *storage.Check) bool {
+	if check.ApplyID == 0 {
+		return true
+	}
+	return check.Status == checkStatusCompleted && check.Conclusion == checkConclusionSuccess
 }
 
 // errGitHubAppResolution marks factoryForRepo failures. GitHub App resolution

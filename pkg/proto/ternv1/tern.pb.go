@@ -1597,6 +1597,67 @@ func (x *ExistingCopy) GetRunning() bool {
 	return false
 }
 
+// ExemptTables lists live tables intentionally excluded from a plan verdict.
+type ExemptTables struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Namespace     string                 `protobuf:"bytes,1,opt,name=namespace,proto3" json:"namespace,omitempty"`
+	Tables        []string               `protobuf:"bytes,2,rep,name=tables,proto3" json:"tables,omitempty"`
+	Reason        string                 `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExemptTables) Reset() {
+	*x = ExemptTables{}
+	mi := &file_tern_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExemptTables) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExemptTables) ProtoMessage() {}
+
+func (x *ExemptTables) ProtoReflect() protoreflect.Message {
+	mi := &file_tern_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExemptTables.ProtoReflect.Descriptor instead.
+func (*ExemptTables) Descriptor() ([]byte, []int) {
+	return file_tern_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *ExemptTables) GetNamespace() string {
+	if x != nil {
+		return x.Namespace
+	}
+	return ""
+}
+
+func (x *ExemptTables) GetTables() []string {
+	if x != nil {
+		return x.Tables
+	}
+	return nil
+}
+
+func (x *ExemptTables) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
 // ShardPlan reports a shard's own changes for a namespace. A shard is changing
 // when changes is non-empty; carrying the changes (rather than a separate
 // needs_change flag) means a keyspace whose shards diverge — drift, or a
@@ -1617,7 +1678,7 @@ type ShardPlan struct {
 
 func (x *ShardPlan) Reset() {
 	*x = ShardPlan{}
-	mi := &file_tern_proto_msgTypes[14]
+	mi := &file_tern_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1629,7 +1690,7 @@ func (x *ShardPlan) String() string {
 func (*ShardPlan) ProtoMessage() {}
 
 func (x *ShardPlan) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[14]
+	mi := &file_tern_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1642,7 +1703,7 @@ func (x *ShardPlan) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShardPlan.ProtoReflect.Descriptor instead.
 func (*ShardPlan) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{14}
+	return file_tern_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *ShardPlan) GetShard() string {
@@ -1681,13 +1742,15 @@ type PlanResponse struct {
 	// Unfinished work already on the target that applying this plan will
 	// continue or destroy. Empty when nothing is at stake.
 	ExistingCopies []*ExistingCopy `protobuf:"bytes,7,rep,name=existing_copies,json=existingCopies,proto3" json:"existing_copies,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Live tables intentionally excluded from a plan verdict, grouped by namespace.
+	ExemptTables  []*ExemptTables `protobuf:"bytes,8,rep,name=exempt_tables,json=exemptTables,proto3" json:"exempt_tables,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PlanResponse) Reset() {
 	*x = PlanResponse{}
-	mi := &file_tern_proto_msgTypes[15]
+	mi := &file_tern_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1699,7 +1762,7 @@ func (x *PlanResponse) String() string {
 func (*PlanResponse) ProtoMessage() {}
 
 func (x *PlanResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[15]
+	mi := &file_tern_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1712,7 +1775,7 @@ func (x *PlanResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlanResponse.ProtoReflect.Descriptor instead.
 func (*PlanResponse) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{15}
+	return file_tern_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *PlanResponse) GetPlanId() string {
@@ -1764,6 +1827,13 @@ func (x *PlanResponse) GetExistingCopies() []*ExistingCopy {
 	return nil
 }
 
+func (x *PlanResponse) GetExemptTables() []*ExemptTables {
+	if x != nil {
+		return x.ExemptTables
+	}
+	return nil
+}
+
 // PlanDiffResponse contains a deployment's desired-vs-live diff. It mirrors
 // PlanResponse but omits plan_id: PlanDiff never persists a plan, so its result
 // is not applyable. Used by the control plane to compare deployments at review
@@ -1783,7 +1853,7 @@ type PlanDiffResponse struct {
 
 func (x *PlanDiffResponse) Reset() {
 	*x = PlanDiffResponse{}
-	mi := &file_tern_proto_msgTypes[16]
+	mi := &file_tern_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1795,7 +1865,7 @@ func (x *PlanDiffResponse) String() string {
 func (*PlanDiffResponse) ProtoMessage() {}
 
 func (x *PlanDiffResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[16]
+	mi := &file_tern_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1808,7 +1878,7 @@ func (x *PlanDiffResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlanDiffResponse.ProtoReflect.Descriptor instead.
 func (*PlanDiffResponse) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{16}
+	return file_tern_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *PlanDiffResponse) GetEngine() Engine {
@@ -1888,7 +1958,7 @@ type ApplyRequest struct {
 
 func (x *ApplyRequest) Reset() {
 	*x = ApplyRequest{}
-	mi := &file_tern_proto_msgTypes[17]
+	mi := &file_tern_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1900,7 +1970,7 @@ func (x *ApplyRequest) String() string {
 func (*ApplyRequest) ProtoMessage() {}
 
 func (x *ApplyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[17]
+	mi := &file_tern_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1913,7 +1983,7 @@ func (x *ApplyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyRequest.ProtoReflect.Descriptor instead.
 func (*ApplyRequest) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{17}
+	return file_tern_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *ApplyRequest) GetPlanId() string {
@@ -2042,7 +2112,7 @@ type ApplyConflict struct {
 
 func (x *ApplyConflict) Reset() {
 	*x = ApplyConflict{}
-	mi := &file_tern_proto_msgTypes[18]
+	mi := &file_tern_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2054,7 +2124,7 @@ func (x *ApplyConflict) String() string {
 func (*ApplyConflict) ProtoMessage() {}
 
 func (x *ApplyConflict) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[18]
+	mi := &file_tern_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2067,7 +2137,7 @@ func (x *ApplyConflict) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyConflict.ProtoReflect.Descriptor instead.
 func (*ApplyConflict) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{18}
+	return file_tern_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *ApplyConflict) GetTable() string {
@@ -2144,7 +2214,7 @@ type ApplyResponse struct {
 
 func (x *ApplyResponse) Reset() {
 	*x = ApplyResponse{}
-	mi := &file_tern_proto_msgTypes[19]
+	mi := &file_tern_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2156,7 +2226,7 @@ func (x *ApplyResponse) String() string {
 func (*ApplyResponse) ProtoMessage() {}
 
 func (x *ApplyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[19]
+	mi := &file_tern_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2169,7 +2239,7 @@ func (x *ApplyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyResponse.ProtoReflect.Descriptor instead.
 func (*ApplyResponse) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{19}
+	return file_tern_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *ApplyResponse) GetAccepted() bool {
@@ -2227,7 +2297,7 @@ type ProgressRequest struct {
 
 func (x *ProgressRequest) Reset() {
 	*x = ProgressRequest{}
-	mi := &file_tern_proto_msgTypes[20]
+	mi := &file_tern_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2239,7 +2309,7 @@ func (x *ProgressRequest) String() string {
 func (*ProgressRequest) ProtoMessage() {}
 
 func (x *ProgressRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[20]
+	mi := &file_tern_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2252,7 +2322,7 @@ func (x *ProgressRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProgressRequest.ProtoReflect.Descriptor instead.
 func (*ProgressRequest) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{20}
+	return file_tern_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *ProgressRequest) GetApplyId() string {
@@ -2283,7 +2353,7 @@ type LogsRequest struct {
 
 func (x *LogsRequest) Reset() {
 	*x = LogsRequest{}
-	mi := &file_tern_proto_msgTypes[21]
+	mi := &file_tern_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2295,7 +2365,7 @@ func (x *LogsRequest) String() string {
 func (*LogsRequest) ProtoMessage() {}
 
 func (x *LogsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[21]
+	mi := &file_tern_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2308,7 +2378,7 @@ func (x *LogsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogsRequest.ProtoReflect.Descriptor instead.
 func (*LogsRequest) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{21}
+	return file_tern_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *LogsRequest) GetApplyId() string {
@@ -2371,7 +2441,7 @@ type ApplyLog struct {
 
 func (x *ApplyLog) Reset() {
 	*x = ApplyLog{}
-	mi := &file_tern_proto_msgTypes[22]
+	mi := &file_tern_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2383,7 +2453,7 @@ func (x *ApplyLog) String() string {
 func (*ApplyLog) ProtoMessage() {}
 
 func (x *ApplyLog) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[22]
+	mi := &file_tern_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2396,7 +2466,7 @@ func (x *ApplyLog) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyLog.ProtoReflect.Descriptor instead.
 func (*ApplyLog) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{22}
+	return file_tern_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *ApplyLog) GetId() int64 {
@@ -2479,7 +2549,7 @@ type LogsResponse struct {
 
 func (x *LogsResponse) Reset() {
 	*x = LogsResponse{}
-	mi := &file_tern_proto_msgTypes[23]
+	mi := &file_tern_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2491,7 +2561,7 @@ func (x *LogsResponse) String() string {
 func (*LogsResponse) ProtoMessage() {}
 
 func (x *LogsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[23]
+	mi := &file_tern_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2504,7 +2574,7 @@ func (x *LogsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogsResponse.ProtoReflect.Descriptor instead.
 func (*LogsResponse) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{23}
+	return file_tern_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *LogsResponse) GetApplyId() string {
@@ -2537,7 +2607,7 @@ type ShardProgress struct {
 
 func (x *ShardProgress) Reset() {
 	*x = ShardProgress{}
-	mi := &file_tern_proto_msgTypes[24]
+	mi := &file_tern_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2549,7 +2619,7 @@ func (x *ShardProgress) String() string {
 func (*ShardProgress) ProtoMessage() {}
 
 func (x *ShardProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[24]
+	mi := &file_tern_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2562,7 +2632,7 @@ func (x *ShardProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShardProgress.ProtoReflect.Descriptor instead.
 func (*ShardProgress) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{24}
+	return file_tern_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *ShardProgress) GetShard() string {
@@ -2651,7 +2721,7 @@ type TableProgress struct {
 
 func (x *TableProgress) Reset() {
 	*x = TableProgress{}
-	mi := &file_tern_proto_msgTypes[25]
+	mi := &file_tern_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2663,7 +2733,7 @@ func (x *TableProgress) String() string {
 func (*TableProgress) ProtoMessage() {}
 
 func (x *TableProgress) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[25]
+	mi := &file_tern_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2676,7 +2746,7 @@ func (x *TableProgress) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TableProgress.ProtoReflect.Descriptor instead.
 func (*TableProgress) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{25}
+	return file_tern_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *TableProgress) GetTaskId() string {
@@ -2828,7 +2898,7 @@ type SettledControlRequest struct {
 
 func (x *SettledControlRequest) Reset() {
 	*x = SettledControlRequest{}
-	mi := &file_tern_proto_msgTypes[26]
+	mi := &file_tern_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2840,7 +2910,7 @@ func (x *SettledControlRequest) String() string {
 func (*SettledControlRequest) ProtoMessage() {}
 
 func (x *SettledControlRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[26]
+	mi := &file_tern_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2853,7 +2923,7 @@ func (x *SettledControlRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SettledControlRequest.ProtoReflect.Descriptor instead.
 func (*SettledControlRequest) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{26}
+	return file_tern_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *SettledControlRequest) GetOperation() string {
@@ -2911,7 +2981,7 @@ type ProgressResponse struct {
 
 func (x *ProgressResponse) Reset() {
 	*x = ProgressResponse{}
-	mi := &file_tern_proto_msgTypes[27]
+	mi := &file_tern_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2923,7 +2993,7 @@ func (x *ProgressResponse) String() string {
 func (*ProgressResponse) ProtoMessage() {}
 
 func (x *ProgressResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[27]
+	mi := &file_tern_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2936,7 +3006,7 @@ func (x *ProgressResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProgressResponse.ProtoReflect.Descriptor instead.
 func (*ProgressResponse) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{27}
+	return file_tern_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *ProgressResponse) GetApplyId() string {
@@ -3027,7 +3097,7 @@ type CutoverRequest struct {
 
 func (x *CutoverRequest) Reset() {
 	*x = CutoverRequest{}
-	mi := &file_tern_proto_msgTypes[28]
+	mi := &file_tern_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3039,7 +3109,7 @@ func (x *CutoverRequest) String() string {
 func (*CutoverRequest) ProtoMessage() {}
 
 func (x *CutoverRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[28]
+	mi := &file_tern_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3052,7 +3122,7 @@ func (x *CutoverRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CutoverRequest.ProtoReflect.Descriptor instead.
 func (*CutoverRequest) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{28}
+	return file_tern_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *CutoverRequest) GetApplyId() string {
@@ -3087,7 +3157,7 @@ type CutoverResponse struct {
 
 func (x *CutoverResponse) Reset() {
 	*x = CutoverResponse{}
-	mi := &file_tern_proto_msgTypes[29]
+	mi := &file_tern_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3099,7 +3169,7 @@ func (x *CutoverResponse) String() string {
 func (*CutoverResponse) ProtoMessage() {}
 
 func (x *CutoverResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[29]
+	mi := &file_tern_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3112,7 +3182,7 @@ func (x *CutoverResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CutoverResponse.ProtoReflect.Descriptor instead.
 func (*CutoverResponse) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{29}
+	return file_tern_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *CutoverResponse) GetAccepted() bool {
@@ -3142,7 +3212,7 @@ type RevertRequest struct {
 
 func (x *RevertRequest) Reset() {
 	*x = RevertRequest{}
-	mi := &file_tern_proto_msgTypes[30]
+	mi := &file_tern_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3154,7 +3224,7 @@ func (x *RevertRequest) String() string {
 func (*RevertRequest) ProtoMessage() {}
 
 func (x *RevertRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[30]
+	mi := &file_tern_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3167,7 +3237,7 @@ func (x *RevertRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RevertRequest.ProtoReflect.Descriptor instead.
 func (*RevertRequest) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{30}
+	return file_tern_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *RevertRequest) GetApplyId() string {
@@ -3195,7 +3265,7 @@ type RevertResponse struct {
 
 func (x *RevertResponse) Reset() {
 	*x = RevertResponse{}
-	mi := &file_tern_proto_msgTypes[31]
+	mi := &file_tern_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3207,7 +3277,7 @@ func (x *RevertResponse) String() string {
 func (*RevertResponse) ProtoMessage() {}
 
 func (x *RevertResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[31]
+	mi := &file_tern_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3220,7 +3290,7 @@ func (x *RevertResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RevertResponse.ProtoReflect.Descriptor instead.
 func (*RevertResponse) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{31}
+	return file_tern_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *RevertResponse) GetAccepted() bool {
@@ -3250,7 +3320,7 @@ type SkipRevertRequest struct {
 
 func (x *SkipRevertRequest) Reset() {
 	*x = SkipRevertRequest{}
-	mi := &file_tern_proto_msgTypes[32]
+	mi := &file_tern_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3262,7 +3332,7 @@ func (x *SkipRevertRequest) String() string {
 func (*SkipRevertRequest) ProtoMessage() {}
 
 func (x *SkipRevertRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[32]
+	mi := &file_tern_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3275,7 +3345,7 @@ func (x *SkipRevertRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SkipRevertRequest.ProtoReflect.Descriptor instead.
 func (*SkipRevertRequest) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{32}
+	return file_tern_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *SkipRevertRequest) GetApplyId() string {
@@ -3303,7 +3373,7 @@ type SkipRevertResponse struct {
 
 func (x *SkipRevertResponse) Reset() {
 	*x = SkipRevertResponse{}
-	mi := &file_tern_proto_msgTypes[33]
+	mi := &file_tern_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3315,7 +3385,7 @@ func (x *SkipRevertResponse) String() string {
 func (*SkipRevertResponse) ProtoMessage() {}
 
 func (x *SkipRevertResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[33]
+	mi := &file_tern_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3328,7 +3398,7 @@ func (x *SkipRevertResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SkipRevertResponse.ProtoReflect.Descriptor instead.
 func (*SkipRevertResponse) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{33}
+	return file_tern_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *SkipRevertResponse) GetAccepted() bool {
@@ -3354,7 +3424,7 @@ type HealthRequest struct {
 
 func (x *HealthRequest) Reset() {
 	*x = HealthRequest{}
-	mi := &file_tern_proto_msgTypes[34]
+	mi := &file_tern_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3366,7 +3436,7 @@ func (x *HealthRequest) String() string {
 func (*HealthRequest) ProtoMessage() {}
 
 func (x *HealthRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[34]
+	mi := &file_tern_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3379,7 +3449,7 @@ func (x *HealthRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthRequest.ProtoReflect.Descriptor instead.
 func (*HealthRequest) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{34}
+	return file_tern_proto_rawDescGZIP(), []int{35}
 }
 
 // HealthResponse is the health check response.
@@ -3392,7 +3462,7 @@ type HealthResponse struct {
 
 func (x *HealthResponse) Reset() {
 	*x = HealthResponse{}
-	mi := &file_tern_proto_msgTypes[35]
+	mi := &file_tern_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3404,7 +3474,7 @@ func (x *HealthResponse) String() string {
 func (*HealthResponse) ProtoMessage() {}
 
 func (x *HealthResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[35]
+	mi := &file_tern_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3417,7 +3487,7 @@ func (x *HealthResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthResponse.ProtoReflect.Descriptor instead.
 func (*HealthResponse) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{35}
+	return file_tern_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *HealthResponse) GetStatus() string {
@@ -3445,7 +3515,7 @@ type StopRequest struct {
 
 func (x *StopRequest) Reset() {
 	*x = StopRequest{}
-	mi := &file_tern_proto_msgTypes[36]
+	mi := &file_tern_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3457,7 +3527,7 @@ func (x *StopRequest) String() string {
 func (*StopRequest) ProtoMessage() {}
 
 func (x *StopRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[36]
+	mi := &file_tern_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3470,7 +3540,7 @@ func (x *StopRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StopRequest.ProtoReflect.Descriptor instead.
 func (*StopRequest) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{36}
+	return file_tern_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *StopRequest) GetApplyId() string {
@@ -3511,7 +3581,7 @@ type StopResponse struct {
 
 func (x *StopResponse) Reset() {
 	*x = StopResponse{}
-	mi := &file_tern_proto_msgTypes[37]
+	mi := &file_tern_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3523,7 +3593,7 @@ func (x *StopResponse) String() string {
 func (*StopResponse) ProtoMessage() {}
 
 func (x *StopResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[37]
+	mi := &file_tern_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3536,7 +3606,7 @@ func (x *StopResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StopResponse.ProtoReflect.Descriptor instead.
 func (*StopResponse) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{37}
+	return file_tern_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *StopResponse) GetAccepted() bool {
@@ -3592,7 +3662,7 @@ type CancelRequest struct {
 
 func (x *CancelRequest) Reset() {
 	*x = CancelRequest{}
-	mi := &file_tern_proto_msgTypes[38]
+	mi := &file_tern_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3604,7 +3674,7 @@ func (x *CancelRequest) String() string {
 func (*CancelRequest) ProtoMessage() {}
 
 func (x *CancelRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[38]
+	mi := &file_tern_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3617,7 +3687,7 @@ func (x *CancelRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelRequest.ProtoReflect.Descriptor instead.
 func (*CancelRequest) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{38}
+	return file_tern_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *CancelRequest) GetApplyId() string {
@@ -3656,7 +3726,7 @@ type CancelResponse struct {
 
 func (x *CancelResponse) Reset() {
 	*x = CancelResponse{}
-	mi := &file_tern_proto_msgTypes[39]
+	mi := &file_tern_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3668,7 +3738,7 @@ func (x *CancelResponse) String() string {
 func (*CancelResponse) ProtoMessage() {}
 
 func (x *CancelResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[39]
+	mi := &file_tern_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3681,7 +3751,7 @@ func (x *CancelResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelResponse.ProtoReflect.Descriptor instead.
 func (*CancelResponse) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{39}
+	return file_tern_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *CancelResponse) GetAccepted() bool {
@@ -3730,7 +3800,7 @@ type StartRequest struct {
 
 func (x *StartRequest) Reset() {
 	*x = StartRequest{}
-	mi := &file_tern_proto_msgTypes[40]
+	mi := &file_tern_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3742,7 +3812,7 @@ func (x *StartRequest) String() string {
 func (*StartRequest) ProtoMessage() {}
 
 func (x *StartRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[40]
+	mi := &file_tern_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3755,7 +3825,7 @@ func (x *StartRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartRequest.ProtoReflect.Descriptor instead.
 func (*StartRequest) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{40}
+	return file_tern_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *StartRequest) GetApplyId() string {
@@ -3794,7 +3864,7 @@ type StartResponse struct {
 
 func (x *StartResponse) Reset() {
 	*x = StartResponse{}
-	mi := &file_tern_proto_msgTypes[41]
+	mi := &file_tern_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3806,7 +3876,7 @@ func (x *StartResponse) String() string {
 func (*StartResponse) ProtoMessage() {}
 
 func (x *StartResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_tern_proto_msgTypes[41]
+	mi := &file_tern_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3819,7 +3889,7 @@ func (x *StartResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartResponse.ProtoReflect.Descriptor instead.
 func (*StartResponse) Descriptor() ([]byte, []int) {
-	return file_tern_proto_rawDescGZIP(), []int{41}
+	return file_tern_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *StartResponse) GetAccepted() bool {
@@ -3992,11 +4062,15 @@ const file_tern_proto_rawDesc = "" +
 	"\vage_seconds\x18\x05 \x01(\x03R\n" +
 	"ageSeconds\x12\x1c\n" +
 	"\tstatement\x18\x06 \x01(\tR\tstatement\x12\x18\n" +
-	"\arunning\x18\a \x01(\bR\arunning\"o\n" +
+	"\arunning\x18\a \x01(\bR\arunning\"\\\n" +
+	"\fExemptTables\x12\x1c\n" +
+	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x12\x16\n" +
+	"\x06tables\x18\x02 \x03(\tR\x06tables\x12\x16\n" +
+	"\x06reason\x18\x03 \x01(\tR\x06reason\"o\n" +
 	"\tShardPlan\x12\x14\n" +
 	"\x05shard\x18\x01 \x01(\tR\x05shard\x12\x1c\n" +
 	"\tnamespace\x18\x02 \x01(\tR\tnamespace\x12.\n" +
-	"\achanges\x18\x03 \x03(\v2\x14.tern.v1.TableChangeR\achanges\"\xc6\x02\n" +
+	"\achanges\x18\x03 \x03(\v2\x14.tern.v1.TableChangeR\achanges\"\x82\x03\n" +
 	"\fPlanResponse\x12\x17\n" +
 	"\aplan_id\x18\x01 \x01(\tR\x06planId\x12'\n" +
 	"\x06engine\x18\x02 \x01(\x0e2\x0f.tern.v1.EngineR\x06engine\x12/\n" +
@@ -4004,7 +4078,8 @@ const file_tern_proto_rawDesc = "" +
 	"\x0flint_violations\x18\x04 \x03(\v2\x16.tern.v1.LintViolationR\x0elintViolations\x12\x16\n" +
 	"\x06errors\x18\x05 \x03(\tR\x06errors\x12*\n" +
 	"\x06shards\x18\x06 \x03(\v2\x12.tern.v1.ShardPlanR\x06shards\x12>\n" +
-	"\x0fexisting_copies\x18\a \x03(\v2\x15.tern.v1.ExistingCopyR\x0eexistingCopies\"\xf1\x01\n" +
+	"\x0fexisting_copies\x18\a \x03(\v2\x15.tern.v1.ExistingCopyR\x0eexistingCopies\x12:\n" +
+	"\rexempt_tables\x18\b \x03(\v2\x15.tern.v1.ExemptTablesR\fexemptTables\"\xf1\x01\n" +
 	"\x10PlanDiffResponse\x12'\n" +
 	"\x06engine\x18\x01 \x01(\x0e2\x0f.tern.v1.EngineR\x06engine\x12/\n" +
 	"\achanges\x18\x02 \x03(\v2\x15.tern.v1.SchemaChangeR\achanges\x12?\n" +
@@ -4267,7 +4342,7 @@ func file_tern_proto_rawDescGZIP() []byte {
 }
 
 var file_tern_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
-var file_tern_proto_msgTypes = make([]protoimpl.MessageInfo, 54)
+var file_tern_proto_msgTypes = make([]protoimpl.MessageInfo, 55)
 var file_tern_proto_goTypes = []any{
 	(Engine)(0),                   // 0: tern.v1.Engine
 	(State)(0),                    // 1: tern.v1.State
@@ -4287,121 +4362,123 @@ var file_tern_proto_goTypes = []any{
 	(*SchemaChange)(nil),          // 15: tern.v1.SchemaChange
 	(*LintViolation)(nil),         // 16: tern.v1.LintViolation
 	(*ExistingCopy)(nil),          // 17: tern.v1.ExistingCopy
-	(*ShardPlan)(nil),             // 18: tern.v1.ShardPlan
-	(*PlanResponse)(nil),          // 19: tern.v1.PlanResponse
-	(*PlanDiffResponse)(nil),      // 20: tern.v1.PlanDiffResponse
-	(*ApplyRequest)(nil),          // 21: tern.v1.ApplyRequest
-	(*ApplyConflict)(nil),         // 22: tern.v1.ApplyConflict
-	(*ApplyResponse)(nil),         // 23: tern.v1.ApplyResponse
-	(*ProgressRequest)(nil),       // 24: tern.v1.ProgressRequest
-	(*LogsRequest)(nil),           // 25: tern.v1.LogsRequest
-	(*ApplyLog)(nil),              // 26: tern.v1.ApplyLog
-	(*LogsResponse)(nil),          // 27: tern.v1.LogsResponse
-	(*ShardProgress)(nil),         // 28: tern.v1.ShardProgress
-	(*TableProgress)(nil),         // 29: tern.v1.TableProgress
-	(*SettledControlRequest)(nil), // 30: tern.v1.SettledControlRequest
-	(*ProgressResponse)(nil),      // 31: tern.v1.ProgressResponse
-	(*CutoverRequest)(nil),        // 32: tern.v1.CutoverRequest
-	(*CutoverResponse)(nil),       // 33: tern.v1.CutoverResponse
-	(*RevertRequest)(nil),         // 34: tern.v1.RevertRequest
-	(*RevertResponse)(nil),        // 35: tern.v1.RevertResponse
-	(*SkipRevertRequest)(nil),     // 36: tern.v1.SkipRevertRequest
-	(*SkipRevertResponse)(nil),    // 37: tern.v1.SkipRevertResponse
-	(*HealthRequest)(nil),         // 38: tern.v1.HealthRequest
-	(*HealthResponse)(nil),        // 39: tern.v1.HealthResponse
-	(*StopRequest)(nil),           // 40: tern.v1.StopRequest
-	(*StopResponse)(nil),          // 41: tern.v1.StopResponse
-	(*CancelRequest)(nil),         // 42: tern.v1.CancelRequest
-	(*CancelResponse)(nil),        // 43: tern.v1.CancelResponse
-	(*StartRequest)(nil),          // 44: tern.v1.StartRequest
-	(*StartResponse)(nil),         // 45: tern.v1.StartResponse
-	nil,                           // 46: tern.v1.SchemaFiles.FilesEntry
-	nil,                           // 47: tern.v1.PulledNamespace.TablesEntry
-	nil,                           // 48: tern.v1.PulledNamespace.ArtifactsEntry
-	nil,                           // 49: tern.v1.PulledNamespace.TableCatalogEntry
-	nil,                           // 50: tern.v1.PullSchemaResponse.NamespacesEntry
-	nil,                           // 51: tern.v1.PlanRequest.SchemaFilesEntry
-	nil,                           // 52: tern.v1.TableChange.MetadataEntry
-	nil,                           // 53: tern.v1.SchemaChange.MetadataEntry
-	nil,                           // 54: tern.v1.SchemaChange.OriginalFilesEntry
-	nil,                           // 55: tern.v1.ApplyRequest.OptionsEntry
-	nil,                           // 56: tern.v1.ApplyRequest.SchemaFilesEntry
-	nil,                           // 57: tern.v1.ProgressResponse.MetadataEntry
+	(*ExemptTables)(nil),          // 18: tern.v1.ExemptTables
+	(*ShardPlan)(nil),             // 19: tern.v1.ShardPlan
+	(*PlanResponse)(nil),          // 20: tern.v1.PlanResponse
+	(*PlanDiffResponse)(nil),      // 21: tern.v1.PlanDiffResponse
+	(*ApplyRequest)(nil),          // 22: tern.v1.ApplyRequest
+	(*ApplyConflict)(nil),         // 23: tern.v1.ApplyConflict
+	(*ApplyResponse)(nil),         // 24: tern.v1.ApplyResponse
+	(*ProgressRequest)(nil),       // 25: tern.v1.ProgressRequest
+	(*LogsRequest)(nil),           // 26: tern.v1.LogsRequest
+	(*ApplyLog)(nil),              // 27: tern.v1.ApplyLog
+	(*LogsResponse)(nil),          // 28: tern.v1.LogsResponse
+	(*ShardProgress)(nil),         // 29: tern.v1.ShardProgress
+	(*TableProgress)(nil),         // 30: tern.v1.TableProgress
+	(*SettledControlRequest)(nil), // 31: tern.v1.SettledControlRequest
+	(*ProgressResponse)(nil),      // 32: tern.v1.ProgressResponse
+	(*CutoverRequest)(nil),        // 33: tern.v1.CutoverRequest
+	(*CutoverResponse)(nil),       // 34: tern.v1.CutoverResponse
+	(*RevertRequest)(nil),         // 35: tern.v1.RevertRequest
+	(*RevertResponse)(nil),        // 36: tern.v1.RevertResponse
+	(*SkipRevertRequest)(nil),     // 37: tern.v1.SkipRevertRequest
+	(*SkipRevertResponse)(nil),    // 38: tern.v1.SkipRevertResponse
+	(*HealthRequest)(nil),         // 39: tern.v1.HealthRequest
+	(*HealthResponse)(nil),        // 40: tern.v1.HealthResponse
+	(*StopRequest)(nil),           // 41: tern.v1.StopRequest
+	(*StopResponse)(nil),          // 42: tern.v1.StopResponse
+	(*CancelRequest)(nil),         // 43: tern.v1.CancelRequest
+	(*CancelResponse)(nil),        // 44: tern.v1.CancelResponse
+	(*StartRequest)(nil),          // 45: tern.v1.StartRequest
+	(*StartResponse)(nil),         // 46: tern.v1.StartResponse
+	nil,                           // 47: tern.v1.SchemaFiles.FilesEntry
+	nil,                           // 48: tern.v1.PulledNamespace.TablesEntry
+	nil,                           // 49: tern.v1.PulledNamespace.ArtifactsEntry
+	nil,                           // 50: tern.v1.PulledNamespace.TableCatalogEntry
+	nil,                           // 51: tern.v1.PullSchemaResponse.NamespacesEntry
+	nil,                           // 52: tern.v1.PlanRequest.SchemaFilesEntry
+	nil,                           // 53: tern.v1.TableChange.MetadataEntry
+	nil,                           // 54: tern.v1.SchemaChange.MetadataEntry
+	nil,                           // 55: tern.v1.SchemaChange.OriginalFilesEntry
+	nil,                           // 56: tern.v1.ApplyRequest.OptionsEntry
+	nil,                           // 57: tern.v1.ApplyRequest.SchemaFilesEntry
+	nil,                           // 58: tern.v1.ProgressResponse.MetadataEntry
 }
 var file_tern_proto_depIdxs = []int32{
-	46, // 0: tern.v1.SchemaFiles.files:type_name -> tern.v1.SchemaFiles.FilesEntry
+	47, // 0: tern.v1.SchemaFiles.files:type_name -> tern.v1.SchemaFiles.FilesEntry
 	3,  // 1: tern.v1.PullSchemaRequest.catalog_detail:type_name -> tern.v1.PullCatalogDetail
-	47, // 2: tern.v1.PulledNamespace.tables:type_name -> tern.v1.PulledNamespace.TablesEntry
-	48, // 3: tern.v1.PulledNamespace.artifacts:type_name -> tern.v1.PulledNamespace.ArtifactsEntry
+	48, // 2: tern.v1.PulledNamespace.tables:type_name -> tern.v1.PulledNamespace.TablesEntry
+	49, // 3: tern.v1.PulledNamespace.artifacts:type_name -> tern.v1.PulledNamespace.ArtifactsEntry
 	7,  // 4: tern.v1.PulledNamespace.namespace_catalog:type_name -> tern.v1.NamespaceCatalog
-	49, // 5: tern.v1.PulledNamespace.table_catalog:type_name -> tern.v1.PulledNamespace.TableCatalogEntry
+	50, // 5: tern.v1.PulledNamespace.table_catalog:type_name -> tern.v1.PulledNamespace.TableCatalogEntry
 	9,  // 6: tern.v1.TableCatalog.columns:type_name -> tern.v1.ColumnCatalog
 	10, // 7: tern.v1.TableCatalog.indexes:type_name -> tern.v1.IndexCatalog
 	11, // 8: tern.v1.TableCatalog.foreign_keys:type_name -> tern.v1.ForeignKeyCatalog
-	50, // 9: tern.v1.PullSchemaResponse.namespaces:type_name -> tern.v1.PullSchemaResponse.NamespacesEntry
-	51, // 10: tern.v1.PlanRequest.schema_files:type_name -> tern.v1.PlanRequest.SchemaFilesEntry
+	51, // 9: tern.v1.PullSchemaResponse.namespaces:type_name -> tern.v1.PullSchemaResponse.NamespacesEntry
+	52, // 10: tern.v1.PlanRequest.schema_files:type_name -> tern.v1.PlanRequest.SchemaFilesEntry
 	2,  // 11: tern.v1.TableChange.change_type:type_name -> tern.v1.ChangeType
-	52, // 12: tern.v1.TableChange.metadata:type_name -> tern.v1.TableChange.MetadataEntry
+	53, // 12: tern.v1.TableChange.metadata:type_name -> tern.v1.TableChange.MetadataEntry
 	14, // 13: tern.v1.SchemaChange.table_changes:type_name -> tern.v1.TableChange
-	53, // 14: tern.v1.SchemaChange.metadata:type_name -> tern.v1.SchemaChange.MetadataEntry
-	54, // 15: tern.v1.SchemaChange.original_files:type_name -> tern.v1.SchemaChange.OriginalFilesEntry
+	54, // 14: tern.v1.SchemaChange.metadata:type_name -> tern.v1.SchemaChange.MetadataEntry
+	55, // 15: tern.v1.SchemaChange.original_files:type_name -> tern.v1.SchemaChange.OriginalFilesEntry
 	14, // 16: tern.v1.ShardPlan.changes:type_name -> tern.v1.TableChange
 	0,  // 17: tern.v1.PlanResponse.engine:type_name -> tern.v1.Engine
 	15, // 18: tern.v1.PlanResponse.changes:type_name -> tern.v1.SchemaChange
 	16, // 19: tern.v1.PlanResponse.lint_violations:type_name -> tern.v1.LintViolation
-	18, // 20: tern.v1.PlanResponse.shards:type_name -> tern.v1.ShardPlan
+	19, // 20: tern.v1.PlanResponse.shards:type_name -> tern.v1.ShardPlan
 	17, // 21: tern.v1.PlanResponse.existing_copies:type_name -> tern.v1.ExistingCopy
-	0,  // 22: tern.v1.PlanDiffResponse.engine:type_name -> tern.v1.Engine
-	15, // 23: tern.v1.PlanDiffResponse.changes:type_name -> tern.v1.SchemaChange
-	16, // 24: tern.v1.PlanDiffResponse.lint_violations:type_name -> tern.v1.LintViolation
-	18, // 25: tern.v1.PlanDiffResponse.shards:type_name -> tern.v1.ShardPlan
-	55, // 26: tern.v1.ApplyRequest.options:type_name -> tern.v1.ApplyRequest.OptionsEntry
-	56, // 27: tern.v1.ApplyRequest.schema_files:type_name -> tern.v1.ApplyRequest.SchemaFilesEntry
-	14, // 28: tern.v1.ApplyRequest.ddl_changes:type_name -> tern.v1.TableChange
-	22, // 29: tern.v1.ApplyResponse.conflict:type_name -> tern.v1.ApplyConflict
-	26, // 30: tern.v1.LogsResponse.logs:type_name -> tern.v1.ApplyLog
-	28, // 31: tern.v1.TableProgress.shards:type_name -> tern.v1.ShardProgress
-	2,  // 32: tern.v1.TableProgress.change_type:type_name -> tern.v1.ChangeType
-	1,  // 33: tern.v1.ProgressResponse.state:type_name -> tern.v1.State
-	0,  // 34: tern.v1.ProgressResponse.engine:type_name -> tern.v1.Engine
-	29, // 35: tern.v1.ProgressResponse.tables:type_name -> tern.v1.TableProgress
-	57, // 36: tern.v1.ProgressResponse.metadata:type_name -> tern.v1.ProgressResponse.MetadataEntry
-	30, // 37: tern.v1.ProgressResponse.settled_control_requests:type_name -> tern.v1.SettledControlRequest
-	8,  // 38: tern.v1.PulledNamespace.TableCatalogEntry.value:type_name -> tern.v1.TableCatalog
-	6,  // 39: tern.v1.PullSchemaResponse.NamespacesEntry.value:type_name -> tern.v1.PulledNamespace
-	4,  // 40: tern.v1.PlanRequest.SchemaFilesEntry.value:type_name -> tern.v1.SchemaFiles
-	4,  // 41: tern.v1.ApplyRequest.SchemaFilesEntry.value:type_name -> tern.v1.SchemaFiles
-	5,  // 42: tern.v1.Tern.PullSchema:input_type -> tern.v1.PullSchemaRequest
-	13, // 43: tern.v1.Tern.Plan:input_type -> tern.v1.PlanRequest
-	13, // 44: tern.v1.Tern.PlanDiff:input_type -> tern.v1.PlanRequest
-	21, // 45: tern.v1.Tern.Apply:input_type -> tern.v1.ApplyRequest
-	24, // 46: tern.v1.Tern.Progress:input_type -> tern.v1.ProgressRequest
-	25, // 47: tern.v1.Tern.Logs:input_type -> tern.v1.LogsRequest
-	32, // 48: tern.v1.Tern.Cutover:input_type -> tern.v1.CutoverRequest
-	34, // 49: tern.v1.Tern.Revert:input_type -> tern.v1.RevertRequest
-	36, // 50: tern.v1.Tern.SkipRevert:input_type -> tern.v1.SkipRevertRequest
-	38, // 51: tern.v1.Tern.Health:input_type -> tern.v1.HealthRequest
-	40, // 52: tern.v1.Tern.Stop:input_type -> tern.v1.StopRequest
-	42, // 53: tern.v1.Tern.Cancel:input_type -> tern.v1.CancelRequest
-	44, // 54: tern.v1.Tern.Start:input_type -> tern.v1.StartRequest
-	12, // 55: tern.v1.Tern.PullSchema:output_type -> tern.v1.PullSchemaResponse
-	19, // 56: tern.v1.Tern.Plan:output_type -> tern.v1.PlanResponse
-	20, // 57: tern.v1.Tern.PlanDiff:output_type -> tern.v1.PlanDiffResponse
-	23, // 58: tern.v1.Tern.Apply:output_type -> tern.v1.ApplyResponse
-	31, // 59: tern.v1.Tern.Progress:output_type -> tern.v1.ProgressResponse
-	27, // 60: tern.v1.Tern.Logs:output_type -> tern.v1.LogsResponse
-	33, // 61: tern.v1.Tern.Cutover:output_type -> tern.v1.CutoverResponse
-	35, // 62: tern.v1.Tern.Revert:output_type -> tern.v1.RevertResponse
-	37, // 63: tern.v1.Tern.SkipRevert:output_type -> tern.v1.SkipRevertResponse
-	39, // 64: tern.v1.Tern.Health:output_type -> tern.v1.HealthResponse
-	41, // 65: tern.v1.Tern.Stop:output_type -> tern.v1.StopResponse
-	43, // 66: tern.v1.Tern.Cancel:output_type -> tern.v1.CancelResponse
-	45, // 67: tern.v1.Tern.Start:output_type -> tern.v1.StartResponse
-	55, // [55:68] is the sub-list for method output_type
-	42, // [42:55] is the sub-list for method input_type
-	42, // [42:42] is the sub-list for extension type_name
-	42, // [42:42] is the sub-list for extension extendee
-	0,  // [0:42] is the sub-list for field type_name
+	18, // 22: tern.v1.PlanResponse.exempt_tables:type_name -> tern.v1.ExemptTables
+	0,  // 23: tern.v1.PlanDiffResponse.engine:type_name -> tern.v1.Engine
+	15, // 24: tern.v1.PlanDiffResponse.changes:type_name -> tern.v1.SchemaChange
+	16, // 25: tern.v1.PlanDiffResponse.lint_violations:type_name -> tern.v1.LintViolation
+	19, // 26: tern.v1.PlanDiffResponse.shards:type_name -> tern.v1.ShardPlan
+	56, // 27: tern.v1.ApplyRequest.options:type_name -> tern.v1.ApplyRequest.OptionsEntry
+	57, // 28: tern.v1.ApplyRequest.schema_files:type_name -> tern.v1.ApplyRequest.SchemaFilesEntry
+	14, // 29: tern.v1.ApplyRequest.ddl_changes:type_name -> tern.v1.TableChange
+	23, // 30: tern.v1.ApplyResponse.conflict:type_name -> tern.v1.ApplyConflict
+	27, // 31: tern.v1.LogsResponse.logs:type_name -> tern.v1.ApplyLog
+	29, // 32: tern.v1.TableProgress.shards:type_name -> tern.v1.ShardProgress
+	2,  // 33: tern.v1.TableProgress.change_type:type_name -> tern.v1.ChangeType
+	1,  // 34: tern.v1.ProgressResponse.state:type_name -> tern.v1.State
+	0,  // 35: tern.v1.ProgressResponse.engine:type_name -> tern.v1.Engine
+	30, // 36: tern.v1.ProgressResponse.tables:type_name -> tern.v1.TableProgress
+	58, // 37: tern.v1.ProgressResponse.metadata:type_name -> tern.v1.ProgressResponse.MetadataEntry
+	31, // 38: tern.v1.ProgressResponse.settled_control_requests:type_name -> tern.v1.SettledControlRequest
+	8,  // 39: tern.v1.PulledNamespace.TableCatalogEntry.value:type_name -> tern.v1.TableCatalog
+	6,  // 40: tern.v1.PullSchemaResponse.NamespacesEntry.value:type_name -> tern.v1.PulledNamespace
+	4,  // 41: tern.v1.PlanRequest.SchemaFilesEntry.value:type_name -> tern.v1.SchemaFiles
+	4,  // 42: tern.v1.ApplyRequest.SchemaFilesEntry.value:type_name -> tern.v1.SchemaFiles
+	5,  // 43: tern.v1.Tern.PullSchema:input_type -> tern.v1.PullSchemaRequest
+	13, // 44: tern.v1.Tern.Plan:input_type -> tern.v1.PlanRequest
+	13, // 45: tern.v1.Tern.PlanDiff:input_type -> tern.v1.PlanRequest
+	22, // 46: tern.v1.Tern.Apply:input_type -> tern.v1.ApplyRequest
+	25, // 47: tern.v1.Tern.Progress:input_type -> tern.v1.ProgressRequest
+	26, // 48: tern.v1.Tern.Logs:input_type -> tern.v1.LogsRequest
+	33, // 49: tern.v1.Tern.Cutover:input_type -> tern.v1.CutoverRequest
+	35, // 50: tern.v1.Tern.Revert:input_type -> tern.v1.RevertRequest
+	37, // 51: tern.v1.Tern.SkipRevert:input_type -> tern.v1.SkipRevertRequest
+	39, // 52: tern.v1.Tern.Health:input_type -> tern.v1.HealthRequest
+	41, // 53: tern.v1.Tern.Stop:input_type -> tern.v1.StopRequest
+	43, // 54: tern.v1.Tern.Cancel:input_type -> tern.v1.CancelRequest
+	45, // 55: tern.v1.Tern.Start:input_type -> tern.v1.StartRequest
+	12, // 56: tern.v1.Tern.PullSchema:output_type -> tern.v1.PullSchemaResponse
+	20, // 57: tern.v1.Tern.Plan:output_type -> tern.v1.PlanResponse
+	21, // 58: tern.v1.Tern.PlanDiff:output_type -> tern.v1.PlanDiffResponse
+	24, // 59: tern.v1.Tern.Apply:output_type -> tern.v1.ApplyResponse
+	32, // 60: tern.v1.Tern.Progress:output_type -> tern.v1.ProgressResponse
+	28, // 61: tern.v1.Tern.Logs:output_type -> tern.v1.LogsResponse
+	34, // 62: tern.v1.Tern.Cutover:output_type -> tern.v1.CutoverResponse
+	36, // 63: tern.v1.Tern.Revert:output_type -> tern.v1.RevertResponse
+	38, // 64: tern.v1.Tern.SkipRevert:output_type -> tern.v1.SkipRevertResponse
+	40, // 65: tern.v1.Tern.Health:output_type -> tern.v1.HealthResponse
+	42, // 66: tern.v1.Tern.Stop:output_type -> tern.v1.StopResponse
+	44, // 67: tern.v1.Tern.Cancel:output_type -> tern.v1.CancelResponse
+	46, // 68: tern.v1.Tern.Start:output_type -> tern.v1.StartResponse
+	56, // [56:69] is the sub-list for method output_type
+	43, // [43:56] is the sub-list for method input_type
+	43, // [43:43] is the sub-list for extension type_name
+	43, // [43:43] is the sub-list for extension extendee
+	0,  // [0:43] is the sub-list for field type_name
 }
 
 func init() { file_tern_proto_init() }
@@ -4410,14 +4487,14 @@ func file_tern_proto_init() {
 		return
 	}
 	file_tern_proto_msgTypes[9].OneofWrappers = []any{}
-	file_tern_proto_msgTypes[22].OneofWrappers = []any{}
+	file_tern_proto_msgTypes[23].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_tern_proto_rawDesc), len(file_tern_proto_rawDesc)),
 			NumEnums:      4,
-			NumMessages:   54,
+			NumMessages:   55,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

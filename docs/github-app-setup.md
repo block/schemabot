@@ -258,6 +258,18 @@ schemabot plan                  # Plan for all configured environments
 schemabot plan -d mydb          # Plan for a specific database (multi-db repos)
 ```
 
+### First apply for a schema directory that is already merged
+
+SchemaBot plans a database when the PR changes a file under its schema directory. A PR that changes nothing there gets a passing `No schema files changed` check, even when the database itself is still empty. That is the usual shape of a new database: the declarative schema files merge first, and the database is configured on the SchemaBot server afterwards, so no PR diff is left to trigger the plan.
+
+Reconcile the drift with a nonce edit. Add or toggle a `# nonce` comment line in the database's `schemabot.yaml` and open the PR. The change is inert, but it sits in the schema directory, so SchemaBot plans the whole directory against the live schema and the plan shows every table to create, including the ones whose files the PR did not touch. Apply from the plan comment as usual:
+
+```
+schemabot apply -e staging
+```
+
+The same edit reconciles drift on any database, not only a new one. See [Reconciling drift with a nonce edit](pre-merge-workflow.md#reconciling-drift-with-a-nonce-edit).
+
 ## Environment Variables Reference
 
 | Variable | Required | Default | Description |
