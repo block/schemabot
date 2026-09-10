@@ -7,6 +7,7 @@
 package postgresconn
 
 import (
+	"context"
 	"crypto/x509"
 	"database/sql"
 	"database/sql/driver"
@@ -48,7 +49,9 @@ type Option func(*pgx.ConnConfig)
 // override it, and the zero "wait indefinitely" value is deliberately
 // replaced — so an attempt against an unreachable or half-open endpoint fails
 // and is retried instead of blocking its caller indefinitely. pgconn applies
-// it to the whole connection process: dial, TLS, startup, and auth.
+// it to dial, TLS, startup and auth; this package applies the same budget to
+// the session setup it runs on the new connection afterwards, which pgconn
+// leaves on the caller's context.
 const defaultConnectTimeout = 30 * time.Second
 
 // WithConnectTimeout bounds a single connection attempt — pgconn applies it
@@ -66,17 +69,18 @@ func WithConnectTimeout(d time.Duration) Option {
 
 // MaxStatementTimeout is the largest budget PostgreSQL accepts, since
 // statement_timeout is a millisecond integer GUC and the server rejects
-// anything above the signed 32-bit maximum. Exceeding it is not a clamp but a
-// FATAL raised while the backend applies the startup packet, so every
-// connection fails at dial rather than one statement failing late. Exported so
-// config validation can refuse the value where an operator can still see it.
+// anything above the signed 32-bit maximum. Exceeding it is not a clamp but an
+// error the server raises when the budget is set, and that happens as the
+// connection is established, so every connection fails at dial rather than one
+// statement failing late. Exported so config validation can refuse the value
+// where an operator can still see it.
 const MaxStatementTimeout = time.Duration(math.MaxInt32) * time.Millisecond
 
 // WithStatementTimeout bounds how long the server lets a single statement run
-// on every connection the pool opens, as a session statement_timeout carried
-// in the startup packet. A zero duration disables the budget explicitly
+// on every connection the pool opens, as a session statement_timeout set on
+// the new session. A zero duration disables the budget explicitly
 // (statement_timeout=0), which is not the same as omitting the option: the
-// option always writes the parameter, so the connection runs under SchemaBot's
+// option always sets the parameter, so the connection runs under SchemaBot's
 // stated budget rather than whatever the platform set at the role or database
 // level. Omitting it inherits that ambient value.
 //
@@ -96,8 +100,63 @@ func WithStatementTimeout(d time.Duration) Option {
 		if d < 0 {
 			return
 		}
-		setRuntimeParam(cfg, "statement_timeout", strconv.FormatInt(statementTimeoutMillis(d), 10))
+		// Applied with SET on the new session rather than carried in the startup
+		// packet. A connection pooler in front of storage passes through only the
+		// startup parameters it knows, and statement_timeout is not one of them:
+		// stock PgBouncer answers an unknown parameter with a FATAL, so every dial
+		// fails rather than one statement running unbudgeted. SET reaches the same
+		// session GUC over a protocol the pooler does forward. Any DSN-carried
+		// statement_timeout stays in the startup packet, so it is cleared here to
+		// keep this option the single source of the budget.
+		//
+		// The reach that makes SET work is also its cost. Against a
+		// transaction-mode pooler the GUC lands on a shared server backend and
+		// outlives the client connection, so a storage endpoint that is refused
+		// for lacking session affinity can leave the budget behind on a backend
+		// in its own (database, user) pool. That residue is the price of
+		// connecting at all: the startup-packet form fails every dial through
+		// such a pooler, whatever its pool mode.
+		stmt := statementTimeoutSQL(d)
+		clearRuntimeParam(cfg, "statement_timeout")
+		cfg.AfterConnect = func(ctx context.Context, conn *pgconn.PgConn) error {
+			// pgconn applies ConnectTimeout to the dial, TLS, startup and auth
+			// and then runs this hook on the caller's context, which the pool
+			// supplies with no deadline of its own. An endpoint that finishes
+			// auth and then stops answering — a half-open path, a wedged
+			// pooler backend — would leave this statement waiting forever on
+			// the single goroutine connections are opened on, stalling every
+			// caller queued behind it. Reading the budget here rather than at
+			// option time picks up the package default, which is filled in
+			// after every option has run.
+			if timeout := cfg.ConnectTimeout; timeout > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, timeout)
+				defer cancel()
+			}
+			if err := execStatementTimeout(ctx, conn, stmt); err != nil {
+				return fmt.Errorf("%s: %w", stmt, err)
+			}
+			return nil
+		}
 	}
+}
+
+// execStatementTimeout runs the budget statement on a newly connected session.
+// It is a variable so a unit test can observe the statement the hook actually
+// sends: pgconn's AfterConnect takes a concrete *pgconn.PgConn, so without a
+// seam here the only assertion available off a live server is that some hook
+// was installed — which stays true no matter which statement it carries.
+var execStatementTimeout = func(ctx context.Context, conn *pgconn.PgConn, stmt string) error {
+	_, err := conn.Exec(ctx, stmt).ReadAll()
+	return err
+}
+
+// statementTimeoutSQL is the statement the option runs on each new session to
+// arm the budget. The value is an integer this package derives, never caller
+// text, so it is safe to interpolate — and it has to be, since SET does not
+// take a bind parameter.
+func statementTimeoutSQL(d time.Duration) string {
+	return "SET statement_timeout = " + strconv.FormatInt(statementTimeoutMillis(d), 10)
 }
 
 // statementTimeoutMillis converts d to the whole milliseconds
@@ -116,18 +175,16 @@ func statementTimeoutMillis(d time.Duration) int64 {
 	return int64((d-1)/time.Millisecond) + 1
 }
 
-// setRuntimeParam sets a startup-packet parameter, first removing any
-// differently-cased spelling of the same name. GUC names are case-insensitive
-// on the server and pgx preserves DSN key case in RuntimeParams, so a plain
-// assignment could leave two spellings of one parameter in the startup packet
-// and let map iteration order decide which wins.
-func setRuntimeParam(cfg *pgx.ConnConfig, key, value string) {
+// clearRuntimeParam removes a startup-packet parameter under every spelling
+// of its name. GUC names are case-insensitive on the server and pgx preserves
+// DSN key case in RuntimeParams, so deleting only the canonical spelling could
+// leave a differently-cased one behind and still in force.
+func clearRuntimeParam(cfg *pgx.ConnConfig, key string) {
 	for k := range cfg.RuntimeParams {
 		if strings.EqualFold(k, key) {
 			delete(cfg.RuntimeParams, k)
 		}
 	}
-	cfg.RuntimeParams[key] = value
 }
 
 // WithRootCAs pins the certificate authorities the connection trusts when the
