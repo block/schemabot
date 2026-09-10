@@ -13,6 +13,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/block/pg-sprite/pkg/dbconn"
 	"github.com/block/pg-sprite/pkg/executor"
@@ -205,21 +206,21 @@ func TestClassifyRefusal(t *testing.T) {
 			},
 			wantReason: "create-name-mismatch",
 			wantDetail: []string{
-				`does not own "users_a_key", and 4 more the schema file claims`,
+				`does not own "users_a_key", "users_b_key", and 3 more the schema file claims`,
 				`owns "users_a_key1", and 4 more instead`,
 			},
-			wantNotDetail: []string{"users_b_key", "users_e_key"},
+			wantNotDetail: []string{"users_c_key", "users_b_key1"},
 		},
 		{
-			name: "create name mismatch counts names too long to show",
+			name: "create name mismatch counts the names too long to show and names the one that fits",
 			err: &executor.CreateNameMismatchError{
 				Schema: "public", Table: "users",
 				Missing:   []string{strings.Repeat("m", 63), strings.Repeat("n", 63)},
 				Unclaimed: []string{strings.Repeat("o", 63)},
 			},
 			wantReason:    "create-name-mismatch",
-			wantDetail:    []string{"does not own 2 names the schema file claims; it owns 1 name instead"},
-			wantNotDetail: []string{`"mmm`, `"ooo`},
+			wantDetail:    []string{`does not own 2 names the schema file claims; it owns "` + strings.Repeat("o", 63) + `" instead`},
+			wantNotDetail: []string{`"mmm`, `"nnn`},
 		},
 		{
 			name:       "invariant violation fails closed as a refusal",
@@ -406,16 +407,19 @@ const (
 func TestCreateCollisionRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 	longest := strings.Repeat("a", maxIdentifierLength)
 	tests := []struct {
-		name string
-		err  error
+		name  string
+		table string
+		err   error
 	}{
-		{name: "single statement", err: fmt.Errorf("preflight: %w", preflight.ErrRelationExists)},
-		{name: "step past the committed CREATE TABLE", err: fmt.Errorf("execute: %w",
+		{name: "single statement", table: longest, err: fmt.Errorf("preflight: %w", preflight.ErrRelationExists)},
+		{name: "step past the committed CREATE TABLE", table: longest, err: fmt.Errorf("execute: %w",
 			&executor.SequenceStepError{Step: 2, Total: 3, Err: executor.ErrCreateCollision})},
+		{name: "table name whose quoting doubles its bytes", table: strings.Repeat(`"`, maxIdentifierLength),
+			err: fmt.Errorf("execute: %w", &executor.SequenceStepError{Step: 2, Total: 3, Err: executor.ErrCreateCollision})},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			r := classifyRefusal(tt.err, longest)
+			r := classifyRefusal(tt.err, tt.table)
 
 			require.NotNil(t, r)
 			lead := strings.Index(r.detail, createCollisionLead)
@@ -428,9 +432,14 @@ func TestCreateCollisionRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 // The mismatch cause carries the identifiers the remedy acts on, and the
 // enumeration yields room to the table name so that, like the collision
 // detail, the remedy's lead lands inside the clamp for a table name of any
-// legal length, however many names of whatever length the table claims and
-// owns. A short table name with the shape a real table produces, a primary
-// key and a serial column with their suffixed twins, still shows every name.
+// legal length and spelling, however many names of whatever length the table
+// claims and owns. The room is spent on pairs first — a missing name beside
+// the suffixed name that took its place — and a table name with the shape a
+// real table produces, a primary key and a serial column with their suffixed
+// twins, keeps at least one pair on screen well past the width a short name
+// enjoys. The tightest shape is a short table name with names that fill the
+// room to the byte at a four-digit create set: its lead ends exactly at the
+// clamp, so the room constant has no slack to lose in either direction.
 func TestCreateNameMismatchRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 	const lead = "; free the first-choice name"
 	longest := strings.Repeat("a", maxIdentifierLength)
@@ -441,6 +450,7 @@ func TestCreateNameMismatchRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 		mismatch   *executor.CreateNameMismatchError
 		total      int
 		wantDetail []string
+		wantExact  bool
 	}{
 		{
 			name:  "realistic shape shows every name",
@@ -452,13 +462,50 @@ func TestCreateNameMismatchRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 			wantDetail: []string{`"users_pkey", "users_id_seq" the schema file claims; it owns "users_pkey1", "users_id_seq1" instead`},
 		},
 		{
-			name:  "ordinary table name past the width a count bound protected",
+			name:  "ordinary table name keeps one pair when two do not fit",
 			table: "payment_methods",
 			mismatch: &executor.CreateNameMismatchError{
 				Missing: []string{"payment_methods_pkey", "payment_methods_id_seq"}, Unclaimed: []string{"payment_methods_pkey1", "payment_methods_id_seq1"},
 			},
 			total:      3,
-			wantDetail: []string{`"payment_methods_pkey", and 1 more the schema file claims`},
+			wantDetail: []string{`"payment_methods_pkey", and 1 more the schema file claims; it owns "payment_methods_pkey1", and 1 more instead`},
+		},
+		{
+			name:  "longer table name names the missing side when a pair does not fit",
+			table: "payment_method_attachments",
+			mismatch: &executor.CreateNameMismatchError{
+				Missing: []string{"payment_method_attachments_pkey"}, Unclaimed: []string{"payment_method_attachments_pkey1"},
+			},
+			total:      3,
+			wantDetail: []string{`"payment_method_attachments_pkey" the schema file claims; it owns 1 name instead`},
+		},
+		{
+			name:  "nothing owned unclaimed spends the owned clause's room on names",
+			table: "payment_method_attachment",
+			mismatch: &executor.CreateNameMismatchError{
+				Missing: []string{"payment_method_attachment_pkey", "payment_method_attachment_id_seq"},
+			},
+			total:      3,
+			wantDetail: []string{`"payment_method_attachment_pkey", "payment_method_attachment_id_seq" the schema file claims`},
+		},
+		{
+			name:  "short table name with names that fill the room at a four-digit create set",
+			table: "tt",
+			mismatch: &executor.CreateNameMismatchError{
+				Missing: []string{longest}, Unclaimed: []string{"tt_pkey_suffix1"},
+			},
+			total:      1200,
+			wantDetail: []string{`"` + longest + `" the schema file claims; it owns "tt_pkey_suffix1" instead`},
+			wantExact:  true,
+		},
+		{
+			name:  "one byte past the room gives up the owned name rather than the lead",
+			table: "tt",
+			mismatch: &executor.CreateNameMismatchError{
+				Missing: []string{longest}, Unclaimed: []string{"tt_pkey_suffix10"},
+			},
+			total:      1200,
+			wantDetail: []string{`"` + longest + `" the schema file claims; it owns 1 name instead`},
 		},
 		{
 			name:       "maximal table name, maximal names, three-digit create set",
@@ -473,6 +520,12 @@ func TestCreateNameMismatchRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 			mismatch: &executor.CreateNameMismatchError{Missing: widest},
 			total:    120,
 		},
+		{
+			name:     "table name whose quoting doubles its bytes",
+			table:    strings.Repeat(`"`, maxIdentifierLength),
+			mismatch: &executor.CreateNameMismatchError{Missing: widest, Unclaimed: widest},
+			total:    1200,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -486,6 +539,9 @@ func TestCreateNameMismatchRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 			at := strings.Index(r.detail, lead)
 			require.GreaterOrEqual(t, at, 0, r.detail)
 			assert.LessOrEqual(t, at+len(lead), statusReasonKeptWidth, r.detail)
+			if tt.wantExact {
+				assert.Equal(t, statusReasonKeptWidth, at+len(lead), r.detail)
+			}
 			for _, want := range tt.wantDetail {
 				assert.Contains(t, r.detail, want)
 			}
@@ -493,10 +549,66 @@ func TestCreateNameMismatchRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 	}
 }
 
-// quotedNames spends its budget on whole names: a name is shown only when it
-// fits together with the separator before it and the count of what follows,
-// so the rendering never exceeds the budget it was given, and a budget too
-// small for even the first name still says how many names there are.
+// quotedTable is the quoted identifier for any name whose quoting adds only
+// the two quotes, and for a name whose escapes would take it past the width
+// a plain name of the maximum legal length takes, it is cut on a rune
+// boundary and marked so it never exceeds that width.
+func TestQuotedTableBoundsEscapedNames(t *testing.T) {
+	longest := strings.Repeat("a", maxIdentifierLength)
+	tests := []struct {
+		name  string
+		table string
+		want  string
+	}{
+		{name: "ordinary name", table: "users", want: `"users"`},
+		{name: "maximal plain name", table: longest, want: `"` + longest + `"`},
+		{name: "escapes within the width", table: `us"ers`, want: `"us\"ers"`},
+		{name: "quotes throughout", table: strings.Repeat(`"`, maxIdentifierLength), want: `"` + strings.Repeat(`\"`, 30) + `..."`},
+		{name: "multi-byte runes behind escapes", table: strings.Repeat(`\`, 20) + strings.Repeat("é", 21), want: `"` + strings.Repeat(`\\`, 20) + strings.Repeat("é", 10) + `..."`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := quotedTable(tt.table)
+
+			assert.Equal(t, tt.want, got)
+			assert.LessOrEqual(t, len(got), quotedTableWidth)
+			assert.True(t, utf8.ValidString(got))
+		})
+	}
+}
+
+// mismatchNames spends a shared room on pairs before it spends on either
+// list alone, so a rendering that shows a missing name beside the owned name
+// that displaced it wins over one that shows more names from one side, and
+// when no pair fits, more names win, the missing side ahead on a tie.
+func TestMismatchNamesPrefersPairs(t *testing.T) {
+	missing := []string{"aaaa", strings.Repeat("b", 30)}
+	unclaimed := []string{"ccccc"}
+	tests := []struct {
+		name          string
+		room          int
+		wantMissing   string
+		wantUnclaimed string
+	}{
+		{name: "a pair beats both missing names alone", room: 46, wantMissing: `"aaaa", and 1 more`, wantUnclaimed: `"ccccc"`},
+		{name: "one name from either side, the missing side wins the tie", room: 24, wantMissing: `"aaaa", and 1 more`, wantUnclaimed: "1 name"},
+		{name: "only the owned side fits", room: 14, wantMissing: "2 names", wantUnclaimed: `"ccccc"`},
+		{name: "nothing fits", room: 0, wantMissing: "2 names", wantUnclaimed: "1 name"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotMissing, gotUnclaimed := mismatchNames(missing, unclaimed, tt.room)
+
+			assert.Equal(t, tt.wantMissing, gotMissing)
+			assert.Equal(t, tt.wantUnclaimed, gotUnclaimed)
+		})
+	}
+}
+
+// quotedNames spends its budget on whole names: it shows the most leading
+// names whose rendering, with the count of what follows, fits the budget, so
+// the rendering never exceeds the budget it was given, and a budget too small
+// for even the first name still says how many names there are.
 func TestQuotedNamesFitsBudget(t *testing.T) {
 	names := []string{"users_pkey", "users_id_seq", "users_email_key"}
 	tests := []struct {
@@ -506,6 +618,7 @@ func TestQuotedNamesFitsBudget(t *testing.T) {
 		want   string
 	}{
 		{name: "everything fits", names: names, budget: 60, want: `"users_pkey", "users_id_seq", "users_email_key"`},
+		{name: "everything fits exactly, with no count to charge", names: []string{"ab", "cd"}, budget: 10, want: `"ab", "cd"`},
 		{name: "the count of the rest is charged against the budget", names: names, budget: 39, want: `"users_pkey", and 2 more`},
 		{name: "two names and the count fit exactly", names: names, budget: 40, want: `"users_pkey", "users_id_seq", and 1 more`},
 		{name: "nothing fits", names: names, budget: 11, want: "3 names"},
@@ -541,23 +654,33 @@ func TestRefusalForOutcomeBareUnverifiedCodeMatchesTheSentinelVerdict(t *testing
 
 // The unverified cause carries only the table name, so like the collision
 // detail it can promise its remedy's lead for a table name of any legal
-// length. The read-back runs right after the CREATE TABLE, so the step
-// clause is always the first step's, and the lead that must survive names
-// which of the table's names the operator compares.
+// length and spelling. The read-back runs right after the CREATE TABLE, so
+// the step clause is always the first step's, and the lead that must survive
+// is the one that tells the operator which of the table's names to compare.
 func TestCreateNamesUnverifiedRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 	const lead = "; compare the table's constraint-index and sequence names"
-	longest := strings.Repeat("a", maxIdentifierLength)
-	err := fmt.Errorf("execute: %w", &executor.SequenceStepError{
-		Step: 1, Total: 3, Err: fmt.Errorf("%w: public.%s: %w", executor.ErrCreateNamesUnverified, longest, context.Canceled),
-	})
+	tests := []struct {
+		name  string
+		table string
+	}{
+		{name: "maximal table name", table: strings.Repeat("a", maxIdentifierLength)},
+		{name: "table name whose quoting doubles its bytes", table: strings.Repeat(`"`, maxIdentifierLength)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := fmt.Errorf("execute: %w", &executor.SequenceStepError{
+				Step: 1, Total: 1200, Err: fmt.Errorf("%w: public.%s: %w", executor.ErrCreateNamesUnverified, tt.table, context.Canceled),
+			})
 
-	r := classifyRefusal(err, longest)
+			r := classifyRefusal(err, tt.table)
 
-	require.NotNil(t, r)
-	assert.Equal(t, "create-names-unverified", r.reason)
-	at := strings.Index(r.detail, lead)
-	require.GreaterOrEqual(t, at, 0, r.detail)
-	assert.LessOrEqual(t, at+len(lead), statusReasonKeptWidth, r.detail)
+			require.NotNil(t, r)
+			assert.Equal(t, "create-names-unverified", r.reason)
+			at := strings.Index(r.detail, lead)
+			require.GreaterOrEqual(t, at, 0, r.detail)
+			assert.LessOrEqual(t, at+len(lead), statusReasonKeptWidth, r.detail)
+		})
+	}
 }
 
 func TestCreateCollisionRefusalFitsStatusReasonColumn(t *testing.T) {
