@@ -1049,9 +1049,18 @@ func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, _ string) ([]table
 		return nil, fmt.Errorf("ping database: %w", err)
 	}
 
-	tables, err := table.LoadSchemaFromDB(ctx, db, table.WithoutUnderscoreTables, table.WithoutArchiveTables, table.WithStrippedAutoIncrement)
+	tables, err := table.LoadSchemaFromDB(ctx, db, table.WithoutUnderscoreTables, table.WithoutArchiveTables)
 	if err != nil {
 		return nil, fmt.Errorf("load schema: %w", err)
+	}
+	// The auto-increment counter tracks where this instance's sequence sits, so
+	// leaving it in would diff every table against a desired schema that has none.
+	for i, tbl := range tables {
+		stripped, err := ddl.StripTableAutoIncrement(tbl.Schema)
+		if err != nil {
+			return nil, fmt.Errorf("strip auto-increment counter for table %s: %w", tbl.Name, err)
+		}
+		tables[i].Schema = stripped
 	}
 	return tables, nil
 }
