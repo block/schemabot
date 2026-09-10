@@ -124,6 +124,65 @@ func TestRenderChecksInspectionReportsAMissingCheckRun(t *testing.T) {
 	assert.NotContains(t, rendered, "\nNothing is holding the merge gate open.")
 }
 
+// A run another app already answers under is the finding a backfill cannot
+// close. Recreating SchemaBot's run leaves the other app's in place, and
+// branch protection reads whichever one it picked, so an operator sent to the
+// backfill alone runs it and watches the gate stay shut.
+func TestRenderChecksInspectionReportsAnUntrustedConflictBesideAMissingRun(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	require.NoError(t, renderChecksInspection(&out, &apitypes.ChecksInspectResponse{
+		Repo: "octo/repo", PullRequest: 709,
+		HeadSHA: "43da12bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", PRState: "open",
+		ChecksEnabled:          true,
+		MissingCheckRunNames:   []string{"SchemaBot (production)"},
+		UntrustedConflictNames: []string{"SchemaBot (production)"},
+		Rows: []apitypes.InspectedCheck{{
+			Environment: "production", Database: "widgets",
+			RecordedSHA: "43da12bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", CoversHead: true,
+			Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionSuccess,
+			Reason: checkstate.ReasonResolved, Summary: "The plan concluded successfully.",
+			Remedy: "Nothing to do.", SelfConverging: true,
+		}},
+	}))
+
+	rendered := out.String()
+	assert.Contains(t, rendered, "Held by another app on 43da12bb: SchemaBot (production).")
+	assert.Contains(t, rendered, "cannot touch the other app's",
+		"the operator has to be told the backfill does not reach the conflicting run")
+}
+
+// A conflict outlives a trusted run that is present and passing: protection
+// may be reading the other app's run instead. Asserting a clear gate over one
+// would be this command stating something it cannot see.
+func TestRenderChecksInspectionDoesNotCallTheGateClearOverAnUntrustedConflict(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	require.NoError(t, renderChecksInspection(&out, &apitypes.ChecksInspectResponse{
+		Repo: "octo/repo", PullRequest: 709,
+		HeadSHA: "43da12bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", PRState: "open",
+		ChecksEnabled: true,
+		CheckRunsOnHead: []apitypes.InspectedCheckRun{{
+			Name: "SchemaBot (production)", CheckRunID: 102754133862,
+			Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionSuccess,
+		}},
+		UntrustedConflictNames: []string{"SchemaBot (production)"},
+		Rows: []apitypes.InspectedCheck{{
+			Environment: "production", Database: "widgets",
+			RecordedSHA: "43da12bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", CoversHead: true,
+			Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionSuccess,
+			Reason: checkstate.ReasonResolved, Summary: "The plan concluded successfully.",
+			Remedy: "Nothing to do.", SelfConverging: true,
+		}},
+	}))
+
+	rendered := out.String()
+	assert.Contains(t, rendered, "another app answers under SchemaBot (production)")
+	assert.NotContains(t, rendered, "Nothing is holding the merge gate open.")
+}
+
 // A name GitHub could not be read for comes back neither present nor
 // missing. Reporting it as missing would recommend recreating a Check Run
 // that may well be sitting there, so the inspection says the read failed and

@@ -147,7 +147,25 @@ func writeCheckRunLines(w io.Writer, response *apitypes.ChecksInspectResponse) e
 	if err := writeMissingCheckRunLine(w, response); err != nil {
 		return err
 	}
+	if err := writeUntrustedConflictLine(w, response); err != nil {
+		return err
+	}
 	return writeUnreadableCheckRunLine(w, response)
+}
+
+// writeUntrustedConflictLine names the expected Check Runs another app is also
+// answering under. Branch protection reads whichever run it picked, and no
+// backfill touches the other app's, so an operator told only that a run is
+// missing runs the backfill and watches the gate stay closed. The conflict is
+// resolved on GitHub — by removing or renaming the other app's run, or by
+// trusting that app — and this line is the only place the text output says so.
+func writeUntrustedConflictLine(w io.Writer, response *apitypes.ChecksInspectResponse) error {
+	if len(response.UntrustedConflictNames) == 0 {
+		return nil
+	}
+	_, err := fmt.Fprintf(w, "Held by another app on %s: %s. A backfill recreates SchemaBot's run but cannot touch the other app's, so remove or rename it, or add its app to the trusted apps, before expecting the gate to move.\n",
+		shortSHA(response.HeadSHA), strings.Join(response.UntrustedConflictNames, ", "))
+	return err
 }
 
 // writeChecksDisabledLine states that the deployment publishes no Check Runs
@@ -256,6 +274,10 @@ func writeChecksBlockingSection(w io.Writer, response *apitypes.ChecksInspectRes
 // GitHub could not be read for. Each keeps branch protection closed on its own,
 // and the last leaves the question open rather than answered.
 //
+// A name another app also answers under is reported before any of them: the
+// gate may be reading that run, so no claim this command can make about
+// SchemaBot's own state settles whether the gate is clear.
+//
 // The passing line also names the environment when the response was narrowed
 // to one. Rows outside that environment were never read, so an unqualified
 // claim about the whole pull request would be one this response cannot make.
@@ -263,6 +285,11 @@ func writeChecksNothingBlockingLine(w io.Writer, response *apitypes.ChecksInspec
 	if len(response.MissingCheckRunNames) > 0 && response.ChecksEnabled {
 		_, err := fmt.Fprintf(w, "\nNo stored row is holding the merge gate open, but a missing Check Run is: branch protection cannot pass without %s.\n",
 			strings.Join(response.MissingCheckRunNames, ", "))
+		return err
+	}
+	if len(response.UntrustedConflictNames) > 0 {
+		_, err := fmt.Fprintf(w, "\nNo stored row is holding the merge gate open, but another app answers under %s on %s, so which run branch protection reads is not SchemaBot's to say.\n",
+			strings.Join(response.UntrustedConflictNames, ", "), shortSHA(response.HeadSHA))
 		return err
 	}
 	if holding := checkRunNamesHoldingGate(response); len(holding) > 0 {

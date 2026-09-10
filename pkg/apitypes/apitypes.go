@@ -396,13 +396,15 @@ type ChecksInspectResponse struct {
 	// Run that may be sitting on the head, and treating the empty result as
 	// "no gap" would report a GitHub outage as a clear gate.
 	UnreadableCheckRunNames []string `json:"unreadable_check_run_names,omitempty"`
-	// UntrustedConflictNames is every missing name that a same-named Check Run
-	// from an app SchemaBot does not trust is already sitting under. Such a
-	// name is still missing, and a backfill still creates the trusted run, but
-	// the operator has a second thing to resolve: the run branch protection
-	// may be reading is not the one SchemaBot writes. Reporting only the
-	// absence would send them to recreate a run and leave them puzzled when
-	// the gate does not move.
+	// UntrustedConflictNames is every expected name a same-named Check Run
+	// from an app SchemaBot does not trust is also sitting under, whether or
+	// not the trusted run exists. The operator has something to resolve either
+	// way: the run branch protection reads may not be the one SchemaBot
+	// writes, and no backfill touches the other app's. When the name is also
+	// missing, reporting only the absence would send them to recreate a run
+	// and leave them puzzled when the gate does not move; when the trusted run
+	// is present, dropping the conflict would report a clear gate over a
+	// duplicate holding it closed.
 	UntrustedConflictNames []string `json:"untrusted_conflict_names,omitempty"`
 	// Rows is the stored check state, one entry per environment and database.
 	Rows []InspectedCheck `json:"rows"`

@@ -269,11 +269,14 @@ func applyHoldingCheck(ctx context.Context, store storage.Storage, check *storag
 // reported, since a stale one left on the head is worth seeing, but no name is
 // called missing there. The absence is the configuration.
 //
-// A name only an untrusted app has a run under is missing and conflicted, not
-// one or the other. The trusted run really is absent, so a backfill is still
-// the action; but branch protection may be reading the untrusted run, which no
-// backfill touches, so reporting the absence alone would leave the operator
-// recreating a run and wondering why the gate did not move.
+// A name an untrusted app also has a run under is reported as conflicted
+// whether or not the trusted run exists, because branch protection picks the
+// run it reads and no backfill touches the untrusted one. When the trusted run
+// is absent the name is missing and conflicted at once: a backfill is still the
+// action, but reporting the absence alone would leave the operator recreating a
+// run and wondering why the gate did not move. When the trusted run is present
+// the conflict is the whole finding, and dropping it would let this inspection
+// state that nothing holds the gate while protection reads a failing duplicate.
 func checkRunsOnHead(ctx context.Context, cfg *ServerConfig, client checksInspectClient, repo, headSHA, environment string, logger *slog.Logger) headCheckRuns {
 	names := webhookMissingCheckNames(cfg, repo, environment, "")
 	if len(names) == 0 || headSHA == "" {
@@ -304,6 +307,11 @@ func checkRunsOnHead(ctx context.Context, cfg *ServerConfig, client checksInspec
 				result.untrustedConflicts = append(result.untrustedConflicts, name)
 			}
 			continue
+		}
+		if len(untrustedApps) > 0 {
+			logger.Warn("a SchemaBot Check Run is on the head commit under this name, and so is an untrusted app's",
+				"repo", repo, "head_sha", headSHA, "check_name", name, "untrusted_apps", untrustedApps)
+			result.untrustedConflicts = append(result.untrustedConflicts, name)
 		}
 		inspected := InspectedCheckRun{
 			Name:       run.Name,

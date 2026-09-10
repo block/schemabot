@@ -680,6 +680,12 @@ progress the line says so rather than naming a command that recreates
 nothing. On a repository the deployment publishes no Check Runs for, nothing
 is reported as missing at all: there the absence is the configuration.
 
+A name another app is also answering under is reported on its own line,
+whether or not SchemaBot's own run is there. Branch protection reads whichever
+run it picked and no backfill touches the other app's, so that conflict is
+resolved on GitHub — remove or rename the other run, or add its app to the
+trusted apps — and until it is, nothing here claims the gate is clear.
+
 A row marked `(older)` was recorded for a commit the pull request has moved
 past. The aggregate holds those as blocking whatever they concluded, which is
 why a successful apply can leave the gate open.
@@ -703,7 +709,9 @@ to narrow to there. A narrowed run that finds nothing blocking says so in
 those terms ("Nothing in production is holding the merge gate open. Other
 environments were not read."), because a clean answer for one environment is
 not a clean answer for the pull request. `--json` gives each row a stable
-`reason` code to branch on. This is an admin operation.
+`reason` code to branch on. The inspection only reads, so any token that can
+already see a pull request's status can run it; recreating a Check Run with
+`checks backfill` is the admin operation.
 
 ### Recover missing GitHub checks
 

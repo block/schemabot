@@ -402,6 +402,53 @@ func TestCheckRunsOnHeadReportsAnUntrustedRunUnderAMissingName(t *testing.T) {
 	assert.Empty(t, got.unreadable)
 }
 
+// A trusted run under the name does not end the conflict. Branch protection
+// reads whichever run it picked, and no backfill touches the other app's, so
+// the name stays reported and an inspection over it never states the gate is
+// clear on SchemaBot's own record alone.
+func TestCheckRunsOnHeadKeepsAnUntrustedConflictBesideATrustedRun(t *testing.T) {
+	t.Parallel()
+
+	cfg := inspectTestConfig()
+	names := webhookMissingCheckNames(cfg, "octo/repo", "", "")
+	require.Len(t, names, 2, "this test needs a deployment publishing one check per environment")
+
+	client := &inspectGitHubClient{
+		runs: map[string]*ghclient.CheckRunResult{names[0]: {
+			ID: 7, Name: names[0], Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionSuccess,
+		}},
+		untrustedApps: map[string][]string{names[0]: {"other-app"}},
+	}
+	got := checkRunsOnHead(t.Context(), cfg, client, "octo/repo", "43da12bb", "", discardLogger())
+
+	require.Len(t, got.found, 1)
+	assert.Equal(t, names[0], got.found[0].Name)
+	assert.Equal(t, []string{names[1]}, got.missing, "the present run is not missing")
+	assert.Equal(t, []string{names[0]}, got.untrustedConflicts,
+		"a present trusted run does not remove the other app's")
+}
+
+// The conflict has to reach the caller, not just the read: the whole point of
+// the field is that a backfill will not move the gate on its own.
+func TestInspectChecksCarriesUntrustedConflictsToTheResponse(t *testing.T) {
+	t.Parallel()
+
+	cfg := inspectTestConfig()
+	names := webhookMissingCheckNames(cfg, "octo/repo", "", "")
+	require.NotEmpty(t, names)
+	client := &inspectGitHubClient{
+		prInfo:        &ghclient.PullRequestInfo{HeadSHA: "43da12bb", State: "open"},
+		untrustedApps: map[string][]string{names[0]: {"other-app"}},
+	}
+	store := &inspectStorage{checks: &inspectCheckStore{}, applies: &inspectApplyStore{}}
+
+	resp, err := inspectChecks(t.Context(), cfg, store, client,
+		ChecksInspectRequest{Repo: "octo/repo", PullRequest: 709}, discardLogger())
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{names[0]}, resp.UntrustedConflictNames)
+}
+
 // A repository this deployment publishes no Check Runs for has no run to
 // recreate, so no expected name is reported as missing there. Naming one
 // would send an operator after a gap that is the configuration.
