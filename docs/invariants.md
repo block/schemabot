@@ -387,7 +387,7 @@ publish path (`pkg/webhook/check_publisher.go`, `pkg/webhook/check_aggregate.go`
 ### MG-2: Absence never passes
 
 The aggregate check is created on every PR head commit. A PR that touches no managed schema files
-still gets one: an explicit passing "no schema changes detected". GitHub treats a missing required
+still gets one: an explicit passing "no schema files changed". GitHub treats a missing required
 check as not passing, so having nothing to say has to be said rather than left empty. The same
 logic applies in reverse. When SchemaBot expects a check, environment, or config and cannot find
 it, that reads as blocking, never as not-applicable. A gate must not be removable by the very

@@ -33,7 +33,7 @@ type SchemaChangeReconciliationItem struct {
 // state.
 func RenderNoManagedSchemaChanges(data SchemaErrorData) string {
 	var sb strings.Builder
-	sb.WriteString("## ✅ No Schema Changes Detected\n\n")
+	sb.WriteString("## ✅ No Schema Files Changed\n\n")
 	if data.Environment != "" {
 		fmt.Fprintf(&sb, "**Environment**: `%s`\n\n", data.Environment)
 	}
@@ -47,9 +47,6 @@ func RenderNoManagedSchemaChanges(data SchemaErrorData) string {
 // SchemaBot check state instead of running a plan.
 type NoManagedSchemaChangesChecksRefreshedData struct {
 	RequestedBy string
-	// Environment is the -e value of the command that ran, so the pasteable
-	// plan hint targets the same environment; empty when none was given.
-	Environment string
 	// Repository is the owner/name the head SHA links to; when empty the SHA
 	// renders as plain text.
 	Repository string
@@ -65,15 +62,15 @@ type NoManagedSchemaChangesChecksRefreshedData struct {
 // state on the current head.
 func RenderNoManagedSchemaChangesChecksRefreshed(data NoManagedSchemaChangesChecksRefreshedData) string {
 	var sb strings.Builder
-	sb.WriteString("## ✅ No Schema Changes Detected\n\n")
+	sb.WriteString("## ✅ No Schema Files Changed\n\n")
 	head := formatCommitRef(data.Repository, data.HeadSHA)
 	if data.GatedOnTenants {
 		fmt.Fprintf(&sb, "SchemaBot found no changes to schema files managed by this deployment in this PR, but the PR touches schema paths owned by tenant deployments. The SchemaBot check was refreshed on %s and will pass once every tenant deployment's own check succeeds.\n", head)
 	} else {
 		fmt.Fprintf(&sb, "SchemaBot found no changes to managed schema files in this PR. The SchemaBot checks were refreshed as passing on %s.\n", head)
 		sb.WriteString("\n<details>\n<summary>Expected a plan?</summary>\n\n")
-		sb.WriteString("SchemaBot plans a database only when a PR changes a file under that database's schema directory. This PR changes none, so no database was compared against its schema directory. To run that comparison anyway, for example for a new database whose schema directory merged before the database was configured, name the database:\n\n")
-		fmt.Fprintf(&sb, "```\nschemabot plan%s -d <database>\n```\n\n</details>\n", environmentFlag(data.Environment))
+		sb.WriteString("SchemaBot plans a database only when a PR changes a file under that database's schema directory. This PR changes none, so no database was compared against its schema directory.\n\n")
+		sb.WriteString("To plan a database whose files are already correct, for example a new database whose schema directory merged before the database was configured, give the PR a change in that directory: add or toggle a `# nonce` comment line in the database's `schemabot.yaml` and push. SchemaBot then plans the whole directory against the live schema, and the plan comment carries the apply command.\n\n</details>\n")
 	}
 	if data.RequestedBy != "" {
 		fmt.Fprintf(&sb, "\n_Requested by @%s_\n", data.RequestedBy)
@@ -127,15 +124,6 @@ func writeReconciliationMetadata(sb *strings.Builder, items []SchemaChangeReconc
 		fmt.Fprintf(sb, "| `%s` | `%s` | `%s` | `%s` |\n", item.Database, item.Environment, applyID, state)
 	}
 	sb.WriteString("\n")
-}
-
-// environmentFlag renders the -e flag for a pasteable command, or nothing when
-// the triggering command named no environment.
-func environmentFlag(environment string) string {
-	if environment == "" {
-		return ""
-	}
-	return " -e " + environment
 }
 
 func writeRequestedLine(sb *strings.Builder, requestedBy, timestamp string) {

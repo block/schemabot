@@ -19,21 +19,83 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 )
 
-// TestE2EFirstApplyToBlankDatabaseThroughNamedDatabase covers the first apply
-// to a database whose declarative schema directory is already merged: the live
-// database holds no tables, the schema files sit on the default branch, and the
-// PR touches nothing under the schema directory. The PR diff is only what triggers
-// an unscoped plan, so that plan reports that it detected no schema changes and tells
-// the user how to ask for the directory anyway. Naming the database is that ask:
-// discovery finds the config in the repository, the desired schema is the whole
-// directory at the PR head, and the apply creates the tables on the blank database.
-func TestE2EFirstApplyToBlankDatabaseThroughNamedDatabase(t *testing.T) {
-	dbName := "webhook_first_apply_named_db"
+// TestE2EFirstApplyToBlankDatabaseThroughNonceEdit covers the first apply to
+// a database whose declarative schema directory is already merged: the live
+// database holds no tables and the schema files sit on the default branch. A PR
+// that changes nothing under the schema directory gets no plan, only a comment
+// that says nothing was compared and how to get a plan. A nonce edit to the
+// database's schemabot.yaml is that way: the PR now touches the schema
+// directory, so the plan covers the whole directory against the live schema,
+// shows the CREATE TABLE for a file the PR did not touch, and the apply creates
+// that table on the blank database.
+func TestE2EFirstApplyToBlankDatabaseThroughNonceEdit(t *testing.T) {
+	dbName := "webhook_first_apply_nonce_db"
 	svc := setupE2EService(t, dbName)
 
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	requireNoTable(t, dbName, "users")
+
+	t.Run("a PR outside the schema directory gets no plan and the nonce hint", func(t *testing.T) {
+		prFiles := []*gh.CommitFile{{Filename: new("README.md"), Status: new("modified")}}
+		h, result := newFirstApplyRepo(t, svc, dbName, schemaFiles, schemabotConfig, prFiles)
+
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot plan -e staging", isPR: true}, nil))
+		require.Equal(t, http.StatusOK, rr.Code)
+		assert.Contains(t, rr.Body.String(), "no managed schema changes handled")
+
+		body := requireNextComment(t, result, "no schema files changed comment")
+		assert.Contains(t, body, "No Schema Files Changed")
+		assert.Contains(t, body, "refreshed as passing")
+		assert.Contains(t, body, "no database was compared against its schema directory")
+		assert.Contains(t, body, "`# nonce`")
+		assert.NotContains(t, body, "CREATE TABLE")
+		requireNoTable(t, dbName, "users")
+	})
+
+	t.Run("a nonce edit to schemabot.yaml plans and applies the whole directory", func(t *testing.T) {
+		nonceConfig := schemabotConfig + "# nonce\n"
+		prFiles := []*gh.CommitFile{{Filename: new("schema/" + ghclient.ConfigFileName), Status: new("modified")}}
+		h, result := newFirstApplyRepo(t, svc, dbName, schemaFiles, nonceConfig, prFiles)
+
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot plan -e staging", isPR: true}, nil))
+		require.Equal(t, http.StatusOK, rr.Code)
+
+		body := requireNextComment(t, result, "plan comment for the nonce PR")
+		assert.Contains(t, body, "## Schema Change Plan")
+		assert.Contains(t, body, "CREATE TABLE")
+		assert.Contains(t, body, "`users`")
+		assert.Contains(t, body, dbName)
+		assert.NotContains(t, body, "No Schema Files Changed")
+
+		rr = httptest.NewRecorder()
+		h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot apply -e staging", isPR: true}, nil))
+		require.Equal(t, http.StatusOK, rr.Code)
+		assert.Contains(t, rr.Body.String(), "apply started")
+
+		body = requireNextComment(t, result, "apply comment for the nonce PR")
+		assert.Contains(t, body, "## Schema Change Apply")
+		assert.Contains(t, body, "CREATE TABLE")
+		assert.Contains(t, body, dbName)
+
+		requireTableEventually(t, dbName, "users")
+	})
+}
+
+// newFirstApplyRepo serves a fake GitHub repository whose schema directory
+// holds the given files and config at both the PR head and the base branch,
+// with prFiles as the PR's changed files, and returns a handler wired to it.
+func newFirstApplyRepo(t *testing.T, svc *api.Service, dbName string, schemaFiles map[string]string, schemabotConfig string, prFiles []*gh.CommitFile) (*Handler, *planFlowResult) {
+	t.Helper()
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
@@ -41,64 +103,15 @@ func TestE2EFirstApplyToBlankDatabaseThroughNamedDatabase(t *testing.T) {
 	client := gh.NewClient(nil)
 	client.BaseURL, _ = url.Parse(server.URL + "/")
 
-	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
-	schemaFiles := map[string]string{
-		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
-	}
-	// The PR changes a file outside the schema directory; the directory itself is
-	// already on the default branch at the same content the head carries.
-	prFiles := []*gh.CommitFile{{Filename: new("README.md"), Status: new("modified")}}
 	result := setupFakeGitHubForPlanWithPRFiles(t, mux, schemaFiles, schemabotConfig, dbName, prFiles)
-	result.baseHolds(schemaFixturePath(dbName, "users.sql"))
+	for name := range schemaFiles {
+		result.baseHolds(schemaFixturePath(dbName, name))
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
 	factory := &fakeClientFactory{client: installClient}
-	h := NewHandler(svc, factory, nil, logger)
-
-	requireNoTable(t, dbName, "users")
-
-	t.Run("unscoped plan reports no managed schema changes and names the way in", func(t *testing.T) {
-		rr := httptest.NewRecorder()
-		h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot plan -e staging", isPR: true}, nil))
-		require.Equal(t, http.StatusOK, rr.Code)
-		assert.Contains(t, rr.Body.String(), "no managed schema changes handled")
-
-		body := requireNextComment(t, result, "no managed schema changes comment")
-		assert.Contains(t, body, "No Schema Changes Detected")
-		assert.Contains(t, body, "refreshed as passing")
-		assert.Contains(t, body, "Expected a plan?")
-		assert.Contains(t, body, "schemabot plan -e staging -d <database>")
-		assert.NotContains(t, body, "schemabot apply")
-	})
-
-	t.Run("plan naming the database plans the whole schema directory", func(t *testing.T) {
-		rr := httptest.NewRecorder()
-		h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot plan -d " + dbName, isPR: true}, nil))
-		require.Equal(t, http.StatusOK, rr.Code)
-		assert.Contains(t, rr.Body.String(), "multi-env plan started")
-
-		body := requireNextComment(t, result, "plan comment for the named database")
-		assert.Contains(t, body, "CREATE TABLE")
-		assert.Contains(t, body, "`users`")
-		assert.Contains(t, body, dbName)
-		assert.NotContains(t, body, "No Schema Changes Detected")
-		assert.NotContains(t, body, "Database Not Found")
-	})
-
-	t.Run("apply naming the database creates the tables on the blank database", func(t *testing.T) {
-		rr := httptest.NewRecorder()
-		h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot apply -e staging -d " + dbName, isPR: true}, nil))
-		require.Equal(t, http.StatusOK, rr.Code)
-		assert.Contains(t, rr.Body.String(), "apply started")
-
-		body := requireNextComment(t, result, "apply comment for the named database")
-		assert.Contains(t, body, "## Schema Change Apply")
-		assert.Contains(t, body, "CREATE TABLE")
-		assert.Contains(t, body, dbName)
-
-		requireTableEventually(t, dbName, "users")
-	})
+	return NewHandler(svc, factory, nil, logger), result
 }
 
 // requireNextComment returns the next comment the fake GitHub received, failing
@@ -136,7 +149,7 @@ func countTable(t *testing.T, dbName, table string) int {
 
 func requireNoTable(t *testing.T, dbName, table string) {
 	t.Helper()
-	require.Zero(t, countTable(t, dbName, table), "the database starts without %s", table)
+	require.Zero(t, countTable(t, dbName, table), "the database has no %s table", table)
 }
 
 // requireTableEventually polls the live database until the apply has created

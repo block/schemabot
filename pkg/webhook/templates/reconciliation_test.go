@@ -62,29 +62,21 @@ func TestRenderSchemaChangeReconciliationRequiredCompleted(t *testing.T) {
 }
 
 func TestRenderNoManagedSchemaChangesChecksRefreshed(t *testing.T) {
-	t.Run("plain refresh explains why no plan ran and how to plan a named database", func(t *testing.T) {
+	t.Run("plain refresh explains why no plan ran and how a nonce edit gets one", func(t *testing.T) {
 		rendered := RenderNoManagedSchemaChangesChecksRefreshed(NoManagedSchemaChangesChecksRefreshedData{
 			RequestedBy: "alice",
 			Repository:  "acme/payments",
 			HeadSHA:     "abcdef1234567890abcdef1234567890abcdef12",
 		})
 
-		assert.Contains(t, rendered, "## ✅ No Schema Changes Detected")
+		assert.Contains(t, rendered, "## ✅ No Schema Files Changed")
 		assert.Contains(t, rendered, "refreshed as passing on [`abcdef1`](https://github.com/acme/payments/commit/abcdef1234567890abcdef1234567890abcdef12).")
 		assert.Contains(t, rendered, "<summary>Expected a plan?</summary>")
 		assert.Contains(t, rendered, "This PR changes none, so no database was compared against its schema directory.")
-		assert.Contains(t, rendered, "```\nschemabot plan -d <database>\n```")
+		assert.Contains(t, rendered, "add or toggle a `# nonce` comment line in the database's `schemabot.yaml` and push")
+		assert.Contains(t, rendered, "the plan comment carries the apply command")
 		assert.NotContains(t, rendered, "schemabot apply")
-	})
-
-	t.Run("plain refresh carries the environment the command named", func(t *testing.T) {
-		rendered := RenderNoManagedSchemaChangesChecksRefreshed(NoManagedSchemaChangesChecksRefreshedData{
-			RequestedBy: "alice",
-			Environment: "staging",
-			HeadSHA:     "abc123",
-		})
-
-		assert.Contains(t, rendered, "```\nschemabot plan -e staging -d <database>\n```")
+		assert.NotContains(t, rendered, "-d <database>")
 		assert.True(t, strings.HasSuffix(rendered, "\n_Requested by @alice_\n"), "attribution closes the comment: %q", rendered)
 		assert.NotContains(t, rendered, "UTC")
 	})
@@ -97,7 +89,7 @@ func TestRenderNoManagedSchemaChangesChecksRefreshed(t *testing.T) {
 		})
 
 		assert.Contains(t, rendered, "refreshed on `abc123` and will pass once every tenant deployment's own check succeeds")
-		assert.NotContains(t, rendered, "schemabot plan -d")
+		assert.NotContains(t, rendered, "nonce")
 		assert.Contains(t, rendered, "\n_Requested by @alice_\n")
 	})
 }
@@ -109,6 +101,6 @@ func TestRenderNoManagedSchemaChanges(t *testing.T) {
 		Environment: "staging",
 	})
 
-	assert.Contains(t, rendered, "## ✅ No Schema Changes Detected")
+	assert.Contains(t, rendered, "## ✅ No Schema Files Changed")
 	assert.Contains(t, rendered, "no changes to managed schema files in this PR and no apply-owned state")
 }

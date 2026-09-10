@@ -187,11 +187,11 @@ any other required flags filled in.
 You apply while the PR is open. Once the required schema checks pass, merging
 records the desired state the databases already run.
 
-- **No schema edits?** The PR gets a passing `No schema changes detected` check.
+- **No schema edits?** The PR gets a passing `No schema files changed` check.
   SchemaBot plans a database only when the PR changes a file under its schema
-  directory, so no database is compared against its schema. To run that
-  comparison anyway, such as the first apply to a new database whose schema
-  already merged, name the database: `schemabot plan -d <database>`
+  directory, so no database is compared against its schema. To plan a database
+  whose files are already correct, such as the first apply to a new database,
+  add or toggle a `# nonce` comment line in its `schemabot.yaml`
 - **Another PR holds the database lock?** The apply is refused and names the
   holder. Wait for that PR to merge or release the lock
 - **Schema files changed on the base branch?** Rebase before applying so your

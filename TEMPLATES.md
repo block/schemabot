@@ -572,10 +572,10 @@ schemabot apply -e staging --tenant alpha
 </details>
 
 <details>
-<summary><a name="no-schema-changes-detected"></a><strong>No Schema Changes Detected</strong></summary>
+<summary><a name="no-schema-files-changed"></a><strong>No Schema Files Changed</strong></summary>
 
 
-## ✅ No Schema Changes Detected
+## ✅ No Schema Files Changed
 
 **Environment**: `staging`
 
@@ -586,21 +586,19 @@ SchemaBot found no changes to managed schema files in this PR and no apply-owned
 </details>
 
 <details>
-<summary><a name="no-schema-changes-detected-checks-refreshed"></a><strong>No Schema Changes Detected (Checks Refreshed)</strong></summary>
+<summary><a name="no-schema-files-changed-checks-refreshed"></a><strong>No Schema Files Changed (Checks Refreshed)</strong></summary>
 
 
-## ✅ No Schema Changes Detected
+## ✅ No Schema Files Changed
 
 SchemaBot found no changes to managed schema files in this PR. The SchemaBot checks were refreshed as passing on [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12).
 
 <details>
 <summary>Expected a plan?</summary>
 
-SchemaBot plans a database only when a PR changes a file under that database's schema directory. This PR changes none, so no database was compared against its schema directory. To run that comparison anyway, for example for a new database whose schema directory merged before the database was configured, name the database:
+SchemaBot plans a database only when a PR changes a file under that database's schema directory. This PR changes none, so no database was compared against its schema directory.
 
-```
-schemabot plan -e staging -d <database>
-```
+To plan a database whose files are already correct, for example a new database whose schema directory merged before the database was configured, give the PR a change in that directory: add or toggle a `# nonce` comment line in the database's `schemabot.yaml` and push. SchemaBot then plans the whole directory against the live schema, and the plan comment carries the apply command.
 
 </details>
 
@@ -609,10 +607,10 @@ _Requested by @jackjackbits_
 </details>
 
 <details>
-<summary><a name="no-schema-changes-detected-gated-on-tenants"></a><strong>No Schema Changes Detected (Gated On Tenants)</strong></summary>
+<summary><a name="no-schema-files-changed-gated-on-tenants"></a><strong>No Schema Files Changed (Gated On Tenants)</strong></summary>
 
 
-## ✅ No Schema Changes Detected
+## ✅ No Schema Files Changed
 
 SchemaBot found no changes to schema files managed by this deployment in this PR, but the PR touches schema paths owned by tenant deployments. The SchemaBot check was refreshed on [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12) and will pass once every tenant deployment's own check succeeds.
 

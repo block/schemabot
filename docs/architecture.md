@@ -185,7 +185,7 @@ The rollup is intentionally conservative — first match wins:
 checks by name on each PR head commit and treats a missing check as not passing
 — it cannot distinguish "SchemaBot had no work to do" from "SchemaBot failed to
 report". SchemaBot therefore creates the aggregate check on every PR head, and
-publishes a passing `No schema changes detected` aggregate on PRs that do not
+publishes a passing `No schema files changed` aggregate on PRs that do not
 touch managed schema files so non-schema PRs are not blocked by a missing
 required check.
 

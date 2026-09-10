@@ -622,7 +622,7 @@ func TestE2EPassingAggregateOnNonSchemaPR(t *testing.T) {
 
 // An aggregate participant does not own the required check on a repo — the
 // leader does. On a PR that touches none of its schema, a participant posts no
-// check run at all (rather than a passing "No schema changes detected" aggregate
+// check run at all (rather than a passing "No schema files changed" aggregate
 // that would add a per-tenant row near the merge button).
 func TestE2EParticipantSilentOnNonSchemaPR(t *testing.T) {
 	svc := setupE2EServiceWithConfig(t, &api.ServerConfig{
