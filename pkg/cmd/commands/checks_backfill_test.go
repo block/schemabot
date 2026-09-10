@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -352,25 +353,28 @@ func TestRateLimitPauseDuration(t *testing.T) {
 	assert.False(t, pause, "a past reset means the next request sees a fresh budget")
 }
 
-// The stuck section carries what the server concluded about each entry, so
-// an operator sweeping a fleet can act on the report itself rather than
-// opening every pull request in it. Rows that already resolved are left out
-// of the reason cell: they explain nothing about why the run is still
+// The stuck section carries what the server concluded about each run, so an
+// operator sweeping a fleet can act on the report itself rather than opening
+// every pull request in it. Rows that already resolved are left out of the
+// reason cell, and so is the rollup: neither explains why the run is still
 // sitting, and listing them alongside the real cause hides it.
 func TestStuckChecksPastThresholdCarriesTheServerDisposition(t *testing.T) {
 	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
 	stuck := stuckChecksPastThreshold("octo/repo", []apitypes.StuckCheckPR{
 		{
 			Number: 5, URL: "https://github.com/octo/repo/pull/5", HeadSHA: "sha5",
-			WaitingOn: apitypes.WaitingOnOperator,
-			StoredRows: []apitypes.InspectedCheck{
-				{Database: "resolved", Reason: checkstate.ReasonResolved, SelfConverging: true},
-				{Database: "owed", Reason: checkstate.ReasonReconciliationOwed, Blocking: true},
-				{Database: "also-owed", Reason: checkstate.ReasonReconciliationOwed, Blocking: true},
-				{Database: "waiting", Reason: checkstate.ReasonApplyRunning, Blocking: true, SelfConverging: true},
-			},
 			Checks: []apitypes.IncompleteCheckRun{
-				{Name: "SchemaBot (production)", CheckRunID: 50, Status: "in_progress", StartedAt: "2026-07-12T08:30:00Z"},
+				{
+					Name: "SchemaBot (production)", CheckRunID: 50, Status: "in_progress", StartedAt: "2026-07-12T08:30:00Z",
+					WaitingOn: apitypes.WaitingOnOperator,
+					StoredRows: []apitypes.InspectedCheck{
+						{Database: checkstate.AggregateSentinel, Aggregate: true, Reason: checkstate.ReasonAggregateRollup, Blocking: true, SelfConverging: true},
+						{Database: "resolved", Reason: checkstate.ReasonResolved, SelfConverging: true},
+						{Database: "owed", Reason: checkstate.ReasonReconciliationOwed, Blocking: true},
+						{Database: "also-owed", Reason: checkstate.ReasonReconciliationOwed, Blocking: true},
+						{Database: "waiting", Reason: checkstate.ReasonApplyRunning, Blocking: true, SelfConverging: true},
+					},
+				},
 			},
 		},
 	}, time.Hour, now)
@@ -415,9 +419,25 @@ func TestWriteChecksBackfillReportRendersStuckDisposition(t *testing.T) {
 	assert.Contains(t, rendered, checkstate.ReasonReconciliationOwed)
 	assert.Contains(t, rendered, "sq schemabot checks show <owner/repo> <pr>")
 
-	line := lineContaining(t, rendered, "https://github.com/octo/repo/pull/6")
-	assert.Contains(t, line, "-", "an unexplained entry renders as unknown, never as self-converging")
-	assert.NotContains(t, line, apitypes.WaitingOnSchemaBot)
+	// A bare substring check would pass on the "in_progress" and "2h0m0s"
+	// cells that already carry a hyphen, so the two cells that matter are
+	// read out of the row and compared whole.
+	cells := renderedCells(lineContaining(t, rendered, "https://github.com/octo/repo/pull/6"))
+	require.Len(t, cells, 6, "PR, check, status, age, waiting-on, reason")
+	assert.Equal(t, "-", cells[4], "an unexplained entry renders as unknown, never as self-converging")
+	assert.Equal(t, "-", cells[5], "no stored row means no reason to name")
+}
+
+// tabwriterCellGap matches the run of padding between two rendered cells. A
+// cell's own text can hold single spaces, so only a longer run separates one
+// cell from the next.
+var tabwriterCellGap = regexp.MustCompile(`\s{2,}`)
+
+// renderedCells splits one tabwriter row back into its cells, so a test can
+// assert on the value of a column rather than on a substring that any column
+// could satisfy.
+func renderedCells(line string) []string {
+	return tabwriterCellGap.Split(strings.TrimSpace(line), -1)
 }
 
 // lineContaining returns the single rendered line carrying needle, so a

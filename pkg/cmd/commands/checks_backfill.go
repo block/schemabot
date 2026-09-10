@@ -469,8 +469,8 @@ func stuckChecksPastThreshold(repo string, prs []apitypes.StuckCheckPR, stuckAft
 				Status:     check.Status,
 				StartedAt:  check.StartedAt,
 				Age:        age,
-				WaitingOn:  pr.WaitingOn,
-				Reasons:    blockingReasons(pr.StoredRows),
+				WaitingOn:  check.WaitingOn,
+				Reasons:    blockingReasons(check.StoredRows),
 			})
 		}
 	}
@@ -481,10 +481,14 @@ func stuckChecksPastThreshold(repo string, prs []apitypes.StuckCheckPR, stuckAft
 // holding the gate open, dropping the ones that already resolved. A resolved
 // row explains nothing about why the run is still sitting, and listing it
 // alongside the real cause is what makes a sweep unreadable.
+//
+// The rollup row is dropped for the same reason. It restates the rows beside
+// it, so it adds a reason that names the symptom the operator is already
+// looking at instead of the cause underneath it.
 func blockingReasons(rows []apitypes.InspectedCheck) []string {
 	var reasons []string
 	for _, row := range rows {
-		if !row.Blocking || row.Reason == "" {
+		if row.Aggregate || !row.Blocking || row.Reason == "" {
 			continue
 		}
 		if !slices.Contains(reasons, row.Reason) {

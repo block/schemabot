@@ -411,7 +411,7 @@ func executeChecksScan(ctx context.Context, cfg *ServerConfig, store storage.Sto
 	if err != nil {
 		return nil, err
 	}
-	response, err := scanWebhookMissingChecks(ctx, installationClient, store, req.Repo, webhookMissingCheckNames(cfg, req.Repo, req.Environment, req.CheckName), req.Page, updatedSince, logger)
+	response, err := scanWebhookMissingChecks(ctx, installationClient, store, req.Repo, webhookExpectedCheckNames(cfg, req.Repo, req.Environment, req.CheckName), req.Page, updatedSince, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -839,22 +839,42 @@ func webhookRedrivePayloadMetadata(delivery *gh.HookDelivery) (webhookRedrivePay
 	return webhookRedrivePayload{repo: payload.Repository.FullName, prs: prs}, nil
 }
 
-func webhookMissingCheckNames(cfg *ServerConfig, repo, environment, override string) []string {
+// webhookExpectedCheckName is one Check Run name this deployment publishes,
+// together with the environment it reports on. Environment is empty when the
+// name is not scoped to one, which is what lets a caller tell "this run
+// covers everything" apart from "this run covers production".
+type webhookExpectedCheckName struct {
+	Name        string
+	Environment string
+}
+
+func webhookExpectedCheckNames(cfg *ServerConfig, repo, environment, override string) []webhookExpectedCheckName {
 	if override != "" {
-		return []string{override}
+		// An operator-supplied name says nothing about which environment it
+		// reports on, so nothing is scoped to it.
+		return []webhookExpectedCheckName{{Name: override}}
 	}
 	base := cfg.GitHubCheckNameBaseForRepo(repo)
 	if environment != "" {
-		return []string{fmt.Sprintf("%s (%s)", base, environment)}
+		return []webhookExpectedCheckName{{Name: fmt.Sprintf("%s (%s)", base, environment), Environment: environment}}
 	}
 	if len(cfg.AllowedEnvironments) > 0 {
-		out := make([]string, 0, len(cfg.AllowedEnvironments))
+		out := make([]webhookExpectedCheckName, 0, len(cfg.AllowedEnvironments))
 		for _, env := range cfg.AllowedEnvironments {
-			out = append(out, fmt.Sprintf("%s (%s)", base, env))
+			out = append(out, webhookExpectedCheckName{Name: fmt.Sprintf("%s (%s)", base, env), Environment: env})
 		}
 		return out
 	}
-	return []string{base}
+	return []webhookExpectedCheckName{{Name: base}}
+}
+
+func webhookMissingCheckNames(cfg *ServerConfig, repo, environment, override string) []string {
+	expected := webhookExpectedCheckNames(cfg, repo, environment, override)
+	names := make([]string, 0, len(expected))
+	for _, name := range expected {
+		names = append(names, name.Name)
+	}
+	return names
 }
 
 type webhookMissingCheckScanClient interface {
@@ -862,10 +882,14 @@ type webhookMissingCheckScanClient interface {
 	FindCheckRunByName(ctx context.Context, repo, headSHA, checkName string) (*ghclient.CheckRunResult, []string, error)
 }
 
-func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckScanClient, store storage.Storage, repo string, checkNames []string, page int, updatedSince time.Time, logger *slog.Logger) (*ChecksScanResponse, error) {
+func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckScanClient, store storage.Storage, repo string, expectedNames []webhookExpectedCheckName, page int, updatedSince time.Time, logger *slog.Logger) (*ChecksScanResponse, error) {
 	prs, nextPage, lastPage, err := client.ListOpenPullRequestsPage(ctx, repo, page, webhookScanPRPageSize)
 	if err != nil {
 		return nil, err
+	}
+	checkNames := make([]string, 0, len(expectedNames))
+	for _, expected := range expectedNames {
+		checkNames = append(checkNames, expected.Name)
 	}
 	result := &ChecksScanResponse{
 		Repo:             repo,
@@ -884,10 +908,14 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 		var missing []string
 		var untrustedConflicts []string
 		var incomplete []IncompleteCheckRun
-		for _, checkName := range checkNames {
-			run, untrustedApps, err := client.FindCheckRunByName(ctx, repo, pr.HeadSHA, checkName)
+		// The environment each uncompleted run reports on, positionally
+		// aligned with incomplete, so its rows can be narrowed to it once the
+		// PR's stored state has been read.
+		var incompleteEnvironments []string
+		for _, expected := range expectedNames {
+			run, untrustedApps, err := client.FindCheckRunByName(ctx, repo, pr.HeadSHA, expected.Name)
 			if err != nil {
-				return nil, fmt.Errorf("scan %s#%d for check %q at %s: %w", repo, pr.Number, checkName, pr.HeadSHA, err)
+				return nil, fmt.Errorf("scan %s#%d for check %q at %s: %w", repo, pr.Number, expected.Name, pr.HeadSHA, err)
 			}
 			if run != nil {
 				if !checkRunCompleted(run) {
@@ -897,29 +925,35 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 						Status:     run.Status,
 						StartedAt:  formatCheckRunStartedAt(run.StartedAt),
 					})
+					incompleteEnvironments = append(incompleteEnvironments, expected.Environment)
 				}
 				continue
 			}
-			missing = append(missing, checkName)
+			missing = append(missing, expected.Name)
 			// No trusted check exists, but a same-named one from an untrusted
 			// app does: backfill will still create the trusted check, yet the
 			// operator likely also needs to resolve the conflicting check.
 			if len(untrustedApps) > 0 {
-				untrustedConflicts = append(untrustedConflicts, checkName)
+				untrustedConflicts = append(untrustedConflicts, expected.Name)
 			}
 		}
 		if len(incomplete) > 0 {
-			stuck := StuckCheckPR{
+			// One read serves every uncompleted run on this PR; each run then
+			// keeps only the rows for the environment it gates.
+			rows := storedRowsBehindStuckCheck(ctx, store, repo, pr.Number, pr.HeadSHA, logger)
+			for i := range incomplete {
+				scoped := storedRowsForEnvironment(rows, incompleteEnvironments[i])
+				incomplete[i].StoredRows = scoped
+				incomplete[i].WaitingOn = waitingOnForStoredRows(scoped)
+			}
+			result.Stuck = append(result.Stuck, StuckCheckPR{
 				Number:  pr.Number,
 				URL:     caller.PullRequestURL(repo, pr.Number),
 				Title:   pr.Title,
 				HeadSHA: pr.HeadSHA,
 				HeadRef: pr.HeadRef,
 				Checks:  incomplete,
-			}
-			stuck.StoredRows = storedRowsBehindStuckCheck(ctx, store, repo, pr.Number, pr.HeadSHA, logger)
-			stuck.WaitingOn = waitingOnForStoredRows(stuck.StoredRows)
-			result.Stuck = append(result.Stuck, stuck)
+			})
 		}
 		if len(missing) == 0 {
 			continue
@@ -995,20 +1029,46 @@ func storedRowsBehindStuckCheck(ctx context.Context, store storage.Storage, repo
 	return rows
 }
 
-// waitingOnForStoredRows reduces a stuck entry's rows to the one answer that
-// decides whether an operator opens it. One row needing a person makes the
-// whole entry need one: an entry reported as self-converging when part of it
-// is not would be read as safe to leave alone.
-func waitingOnForStoredRows(rows []InspectedCheck) string {
-	if len(rows) == 0 {
-		return ""
+// storedRowsForEnvironment narrows a PR's stored rows to the ones a single
+// Check Run gates on. An unscoped run keeps all of them: the deployment
+// publishes one run covering every environment, so every row is its own.
+func storedRowsForEnvironment(rows []InspectedCheck, environment string) []InspectedCheck {
+	if environment == "" {
+		return rows
 	}
+	var scoped []InspectedCheck
 	for _, row := range rows {
-		if row.Blocking && !row.SelfConverging {
-			return apitypes.WaitingOnOperator
+		if row.Environment == environment {
+			scoped = append(scoped, row)
 		}
 	}
-	return apitypes.WaitingOnSchemaBot
+	return scoped
+}
+
+// waitingOnForStoredRows reduces a stuck run's rows to the one answer that
+// decides whether an operator opens it. One row needing a person makes the
+// whole run need one: a run reported as self-converging when part of it is
+// not would be read as safe to leave alone.
+//
+// No blocking row means no stored row explains the run, which is reported as
+// no answer. Calling that "schemabot" would promise a convergence nothing
+// recorded is going to deliver, and that is the reading that leaves a wedged
+// gate sitting.
+//
+// The rollup is a projection of the rows beside it and never a cause of its
+// own, so it decides nothing here.
+func waitingOnForStoredRows(rows []InspectedCheck) string {
+	waiting := ""
+	for _, row := range rows {
+		if row.Aggregate || !row.Blocking {
+			continue
+		}
+		if !row.SelfConverging {
+			return apitypes.WaitingOnOperator
+		}
+		waiting = apitypes.WaitingOnSchemaBot
+	}
+	return waiting
 }
 
 // checkRunCompleted reports whether the Check Run's status is "completed".

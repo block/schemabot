@@ -765,10 +765,15 @@ No missing SchemaBot Check Runs found.
 
 `WAITING ON` is `schemabot` when every blocking stored row behind the run
 resolves on its own, and `operator` as soon as one of them does not. A `-`
-means the server read no stored state for that pull request, which is not the
-same as nothing needing a person. `REASON` lists the blocking rows' `reason`
-codes, the same ones `checks show` prints, so an entry worth opening is
-visible from the sweep itself.
+means no stored row explains that run, either because the server could not
+read any or because none of the rows it read is blocking. Neither is the same
+as nothing needing a person. `REASON` lists the blocking rows' `reason` codes,
+the same ones `checks show` prints, so an entry worth opening is visible from
+the sweep itself.
+
+Each row is read against the environment its own Check Run gates, so a pull
+request with a clean staging gate and a production reconciliation shows the
+reconciliation only on the production line.
 
 ## Use the CLI from scripts and agents
 

@@ -337,23 +337,9 @@ type StuckCheckPR struct {
 	HeadSHA string               `json:"head_sha"`
 	HeadRef string               `json:"head_ref"`
 	Checks  []IncompleteCheckRun `json:"checks"`
-	// StoredRows is the stored check state behind the uncompleted run, read
-	// against this PR's head. An uncompleted Check Run says only that the
-	// gate is open; these rows say what it is open on, and whether that is
-	// something SchemaBot resolves or something a person has to.
-	//
-	// Empty when the scan could not read stored state. That is reported as
-	// absence rather than as a failed scan: the Check Run findings are the
-	// part the backfill acts on, and they are already in hand.
-	StoredRows []InspectedCheck `json:"stored_rows,omitempty"`
-	// WaitingOn classifies the rows: "operator" when any of them needs a
-	// person, "schemabot" when they all resolve on their own, and empty when
-	// there are no rows to read. It is the field that decides whether a stuck
-	// entry in a fleet sweep is worth opening.
-	WaitingOn string `json:"waiting_on,omitempty"`
 }
 
-// Values for StuckCheckPR.WaitingOn.
+// Values for IncompleteCheckRun.WaitingOn.
 const (
 	WaitingOnSchemaBot = "schemabot"
 	WaitingOnOperator  = "operator"
@@ -367,6 +353,26 @@ type IncompleteCheckRun struct {
 	Status     string `json:"status"`
 	// StartedAt is RFC3339; empty when GitHub did not report a start time.
 	StartedAt string `json:"started_at,omitempty"`
+	// StoredRows is the stored check state behind this uncompleted run, read
+	// against the PR's head and narrowed to the environment this run reports
+	// on. An uncompleted Check Run says only that the gate is open; these
+	// rows say what it is open on, and whether that is something SchemaBot
+	// resolves or something a person has to.
+	//
+	// A PR carries one run per environment and each gates merge on its own,
+	// so the rows are per run rather than per PR: attributing another
+	// environment's rows to this run would name a cause that has nothing to
+	// do with why it is sitting.
+	//
+	// Empty when the scan could not read stored state. That is reported as
+	// absence rather than as a failed scan: the Check Run findings are the
+	// part the backfill acts on, and they are already in hand.
+	StoredRows []InspectedCheck `json:"stored_rows,omitempty"`
+	// WaitingOn classifies the rows: "operator" when any of them needs a
+	// person, "schemabot" when they all resolve on their own, and empty when
+	// no row explains the run. It is the field that decides whether a stuck
+	// entry in a fleet sweep is worth opening.
+	WaitingOn string `json:"waiting_on,omitempty"`
 }
 
 // ChecksInspectRequest asks for the stored check state one pull request holds,
@@ -454,6 +460,11 @@ type InspectedCheck struct {
 	Environment  string `json:"environment"`
 	DatabaseType string `json:"database_type"`
 	Database     string `json:"database"`
+	// Aggregate marks the rollup row rather than a database's own row. The
+	// rollup restates the rows beside it, so it is never an independent
+	// cause: a reader looking for what is holding the gate open reads the
+	// database rows and lets this one alone.
+	Aggregate bool `json:"aggregate,omitempty"`
 	// RecordedSHA is the commit this row was recorded for, which is not always
 	// the commit the pull request is gated on. It is deliberately not named
 	// head_sha: the response carries that too, for the pull request's actual
