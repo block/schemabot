@@ -5,7 +5,7 @@
 ## Table of Contents
 
 - [Current behavior](#current-behavior)
-- [Decision: probe each configured target once at startup](#decision-probe-each-configured-target-once-at-startup)
+- [Decision: probe each enumerable target once at startup](#decision-probe-each-enumerable-target-once-at-startup)
 - [Decision: layer a DSN-keyed cache with evict-and-retry-once](#decision-layer-a-dsn-keyed-cache-with-evict-and-retry-once)
 - [Decision: classify typed authentication failures centrally](#decision-classify-typed-authentication-failures-centrally)
 - [Observability](#observability)
@@ -66,13 +66,35 @@ resolver resolves those once when it is built, and the credential rotation
 runbook requires a process reboot. This design does not change that `dsn`
 semantic. PostgreSQL is the first target fleet using per-request `dsn_from`.
 
-## Decision: probe each configured target once at startup
+## Decision: probe each enumerable target once at startup
 
-The data plane will issue `SELECT 1` once for every configured target when its
-server starts. The probe resolves the target through the same inventory path as
-a request and opens it through `mysqlconn.Open` or `postgresconn.Open`, including
-the normal transport policy. It verifies authentication, database selection,
-and enough grant to execute a read without inspecting or changing schema.
+The data plane will issue `SELECT 1` once for every target its inventory can
+enumerate when its server starts. The probe resolves each target through the
+same inventory path as a request and opens it through `mysqlconn.Open` or
+`postgresconn.Open`, including the normal transport policy.
+
+The `inventory.Resolver` contract resolves one supplied request; it has no list
+operation. A static inventory can enumerate its configured map, but a discovery
+resolver such as the Etre resolver finds a target by querying for it on demand
+and, when an environment label is configured, refuses to resolve without an
+environment. The probe therefore adds an optional `inventory.Enumerator`
+capability: `StaticResolver` implements it by returning one request per
+configured target (target and database type; static resolution does not use
+the environment), and the type-routing resolver implements it by concatenating
+the enumerations of the child resolvers that offer one. A resolver without the
+capability is skipped with one Info log naming the database type it serves, so
+an operator can see that discovery-resolved targets are outside probe coverage.
+Their credentials are still repaired at use time by the second decision.
+
+The guarantee is deliberately narrow. A successful probe proves that the
+resolved credentials authenticate, that the session can select the database
+when the DSN names one, and that the session can execute a statement. It does
+not prove any table, schema, or catalog privilege: `SELECT 1` touches no
+object, and a MySQL `dsn_from` DSN is namespace-free, with the schema injected
+per request, so a MySQL target can pass the probe and still fail a pull or plan
+on a missing grant. A grant-level check would have to run per namespace with
+the operation's own statements; that is what the routed operations already do,
+and their typed failures are the signal for provisioning defects.
 
 Each probe has its own context timeout. A fixed-size goroutine pool bounds
 concurrency, so target count cannot create an unbounded connection burst and a
@@ -124,12 +146,43 @@ can appear in diagnostics. For `dsn_from`, the next request after a secret
 refresh resolves a different DSN, misses deterministically, and constructs a
 fresh `LocalClient` without waiting for an authentication failure.
 
-The logical route still owns at most one current client. Publishing a client
-for a new DSN hash atomically replaces and closes the prior client for that
-target, type, environment, and namespace. A map that retains every historical
-hash would leak pools after every rotation, so stale generations are evicted on
-replacement. Concurrent creators keep the existing duplicate-close behavior:
-one generation wins and the unused client is closed.
+The logical route still publishes at most one current client. Publishing a
+client for a new DSN hash atomically replaces the prior client as the
+destination for new work on that target, type, environment, and namespace.
+Concurrent creators keep the existing duplicate-close behavior: one generation
+wins and the never-published client is closed.
+
+Replacement does not close the prior generation. A `LocalClient` owns
+in-process state for the applies it is driving: engine runners, progress
+observers, and the drive loop's view of the operation. Closing it under a
+running apply would abort work that a credential rotation has no reason to
+touch (AV-2: a running schema change keeps running), and dropping it from the
+router's map would hide it from `TargetRouter.HaltForShutdown`, which halts
+only the clients the map still holds, and from `SetObserver`, which attaches to
+the client that owns the apply. Work that has started on a generation therefore
+finishes on it:
+
+- The router records which generation owns each apply when `Apply`,
+  `ResumeApply`, or an operation resume starts on it, and routes progress,
+  observer attachment, and in-process recovery for that apply to the owning
+  generation until the apply is terminal. Two generations in one process must
+  never drive the same apply; that is the same hazard OW-3 bounds across
+  processes, and here it is prevented outright by ownership. New pulls, plans,
+  and new applies go to the current generation.
+- Control operations keep their existing routing. They act by writing durable
+  state, never by reaching into a generation's memory (CO-9), so which
+  generation serves them does not matter.
+- A replaced generation moves to a retiring set that `HaltForShutdown` and
+  `Close` still walk, so a shutting-down process halts its drives exactly as it
+  would have before the rotation and a peer can reclaim them (OW-3). The router
+  closes a retiring generation once it owns no non-terminal apply; a generation
+  that never drove an apply is closed on replacement.
+
+Bounded retention follows from ownership rather than from a count: the set of
+retiring generations is at most one per apply still running on an old
+credential, and each is released when that apply settles. A map that retained
+every historical hash unconditionally would leak a pool per rotation, which is
+why retirement is tied to the applies rather than to the hash.
 
 Second, an authentication-classified failure before an operation starts
 mutating causes the router to evict the exact failed generation, resolve the
@@ -167,16 +220,28 @@ The two layers cover the time-of-check to time-of-use sequence:
 ```
 
 Retry safety is determined at the routed operation boundary, not merely by the
-error code:
+error code, and only a failure that provably came from the target connection is
+eligible:
 
 | Routed operation | Automatic retry | Reason |
 | --- | --- | --- |
 | `PullSchema` | Yes | Reads catalog state; no target mutation has begun. |
-| `Plan` | Yes | Live-schema reads and plan persistence are idempotent before target execution. |
+| `Plan` | Target read phase only | `LocalClient.Plan` reads the live schema through the engine, then persists the plan with `c.storage.Plans().Create` and reads storage again. Only the engine phase talks to the target, so only its failure is eligible; a storage failure after it is not. |
 | `PlanDiff` | Yes | Read-only and non-persisting. |
 | Initial client construction or connection probe | Yes | No operation has begun. |
 | `Apply` | No | Materialization and execution share the call boundary; an error does not prove target mutation never started. |
 | Resume, cutover, stop, cancel, revert, skip-revert | No | They act on existing work; replay belongs to their durable, operation-specific reconciliation paths. |
+
+The router cannot tell a target authentication failure from a storage one by
+inspecting the driver error: SchemaBot's own storage is MySQL or PostgreSQL too,
+so an `errors.As` against the driver error types at the router would match a
+storage credential failure surfacing through `Plan`, evict a healthy target
+generation, and re-run target planning for nothing. Classification therefore
+happens where the target connection is opened. The `mysqlconn.Open` and
+`postgresconn.Open` call sites that open target sessions wrap a classified
+failure in a typed target-authentication error carrying the classification; the
+router matches only that type. Storage errors never pass through those call
+sites, so they cannot carry it and stay on the existing failure path.
 
 An implementation may retry a pre-apply connection acquisition only if it is
 factored before the engine's apply call and can prove no statement, deploy
@@ -206,14 +271,18 @@ A shared, dialect-aware classifier returns a small closed enum:
 | Classification | MySQL driver code | PostgreSQL SQLSTATE | Meaning |
 | --- | --- | --- | --- |
 | `AuthInvalidCredentials` | 1045 | `28P01` | User/password rejected. |
-| `AuthNoGrant` | 1044 | `28000` | Authorization or database access rejected. |
-| `AuthNoDatabase` | 1049 | — | Selected database does not exist. |
+| `AuthNoGrant` | 1044 | `28000`, `42501` | Authorization rejected: the role may not authorize as requested (`28000`), or lacks `CONNECT` on the database or the privilege the probe statement needs (`42501`). |
+| `AuthNoDatabase` | 1049 | `3D000` | Selected database does not exist. |
 | `NotAuth` | everything else | everything else | Preserve the existing failure path. |
 
 Classification uses `errors.As` against `*mysql.MySQLError` from the Go MySQL
 driver and `*pgconn.PgError` from pgx. It never matches error strings. Wrapping
 therefore preserves classification while redaction and contextual error text
-remain independent.
+remain independent. The classifier runs at the target connection boundary, on
+the error from the open and first ping of a target session, and its result
+travels in the typed target-authentication error described above; it is not
+applied to arbitrary errors at the router, where a storage failure could carry
+the same driver type.
 
 `AuthNoDatabase` and `AuthNoGrant` trigger the same single repair attempt as
 invalid credentials because rotation can change the selected database, role, or
@@ -233,16 +302,18 @@ would erase the low-cardinality outcome needed for useful logs and metrics.
 
 ## Observability
 
-Metric names follow the repository's OpenTelemetry convention: a
-`schemabot.<area>.<event>_total` counter with bounded attributes, and every
-sample carries `environment` (using `unknown` only when no target environment
-exists).
+The instruments follow the recipe in `pkg/metrics/README.md` § Adding New
+Metrics: an `Int64Counter` named `schemabot.<area>.<event>.total`, bounded
+attributes, and `environment` on every sample through `EnvironmentAttribute`
+(`unknown` only when no target environment exists). The catalog carries both
+`.total` and `_total` suffixes from earlier additions; new instruments take the
+recipe's form rather than either neighbor's.
 
 | Metric | Attributes | Meaning |
 | --- | --- | --- |
-| `schemabot.target.probe_total` | `target`, `database_type`, `environment`, `outcome` | One startup result per configured target. Outcomes: `success`, `auth_invalid_credentials`, `auth_no_grant`, `auth_no_database`, `resolve_error`, `timeout`, `connection_error`. |
-| `schemabot.target.client_evictions_total` | `database_type`, `environment`, `reason` | Replaced generations. Reasons: `dsn_changed`, `auth_invalid_credentials`, `auth_no_grant`, `auth_no_database`. Target is omitted from this hot-path counter to bound cardinality. |
-| `schemabot.target.auth_retries_total` | `operation`, `database_type`, `environment`, `classification`, `outcome` | Eligible single retries and whether they succeeded, failed, or could not re-resolve. |
+| `schemabot.target.probe.total` | `target`, `database_type`, `environment`, `outcome` | One startup result per enumerated target. Outcomes: `success`, `auth_invalid_credentials`, `auth_no_grant`, `auth_no_database`, `resolve_error`, `timeout`, `connection_error`. |
+| `schemabot.target.client_evictions.total` | `database_type`, `environment`, `reason` | Replaced generations. Reasons: `dsn_changed`, `auth_invalid_credentials`, `auth_no_grant`, `auth_no_database`. Target is omitted from this hot-path counter to bound cardinality. |
+| `schemabot.target.auth_retries.total` | `operation`, `database_type`, `environment`, `classification`, `outcome` | Eligible single retries and whether they succeeded, failed, or could not re-resolve. |
 
 The target label is acceptable on the startup probe because configured
 inventory is bounded and each target emits once per process start. Retry and
@@ -279,14 +350,19 @@ before joining this shared outcome model.
 
 ## Rollout
 
-1. Add the shared typed classifier and exhaustive tests for wrapped MySQL and
-   PostgreSQL driver errors, including every `NotAuth` class.
-2. Add the bounded, asynchronous startup probe to `Server.Start`, warn-only,
-   with logs and `schemabot.target.probe_total`.
-3. Add compare-and-delete eviction and one retry to read-only routed operations;
-   leave apply and control methods on their existing failure paths.
-4. Add the DSN-hash generation to `clientForTarget`, atomically replacing and
-   closing stale clients so cache size stays bounded per logical route.
+1. Add the shared typed classifier, the typed target-authentication error that
+   carries it from the target connection boundary, and exhaustive tests for
+   wrapped MySQL and PostgreSQL driver errors, including every `NotAuth` class
+   and a storage-originated driver error that must not classify.
+2. Add the `inventory.Enumerator` capability to the static and type-routing
+   resolvers, then the bounded, asynchronous startup probe to `Server.Start`,
+   warn-only, with logs and `schemabot.target.probe.total`.
+3. Add compare-and-delete eviction and one retry to `PullSchema`, `PlanDiff`,
+   and the target read phase of `Plan`; leave apply and control methods on
+   their existing failure paths.
+4. Add the DSN-hash generation to `clientForTarget` with per-apply generation
+   ownership and the retiring set, so a replaced generation finishes the applies
+   it owns, stays visible to shutdown, and is closed when it owns none.
 5. Run a credential-rotation drill on the PostgreSQL pilot. Retire the runbook's
    reboot step for `dsn_from` targets after the metrics prove deterministic
    replacement and bounded retry; retain it for static-`dsn:` MySQL targets
@@ -296,6 +372,9 @@ before joining this shared outcome model.
 
 - Gating startup, readiness, or liveness on target health.
 - Periodically probing every target in the first version.
+- Probing targets that only a discovery resolver can name; they are covered by
+  use-time self-heal until a resolver offers enumeration.
+- Proving table, schema, or catalog privileges at startup.
 - Managing, generating, rotating, or distributing secrets and database grants.
 - Changing `dsn` resolution or reload semantics.
 - Retrying apply, control operations, or any operation after target mutation may
