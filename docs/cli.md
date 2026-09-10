@@ -775,6 +775,11 @@ Each row is read against the environment its own Check Run gates, so a pull
 request with a clean staging gate and a production reconciliation shows the
 reconciliation only on the production line.
 
+The stored rows are read only for runs old enough to reach the report, since
+a fleet sweep would otherwise pay a storage read per pull request for runs
+that started minutes ago and never get printed. `--stuck-after` sets that
+threshold, and a run whose start time cannot be read is always explained.
+
 ## Use the CLI from scripts and agents
 
 Prefer structured output when another program consumes the result:

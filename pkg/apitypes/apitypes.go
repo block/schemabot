@@ -239,6 +239,17 @@ type ChecksScanRequest struct {
 	// the scan stops paging as soon as it crosses the cutoff — bounding an
 	// incident-window sweep by the window instead of the repo's PR count.
 	UpdatedSince string `json:"updated_since,omitempty"`
+	// StuckAfter, when set (a Go duration such as "1h"), limits the stored-row
+	// annotation on uncompleted Check Runs to runs that have been sitting at
+	// least this long. Every uncompleted run is still reported; a young one
+	// simply comes back unannotated, since the annotation costs a storage read
+	// per pull request and one per apply behind it, and a caller that drops
+	// young runs before rendering never shows the result.
+	//
+	// A run whose start time is missing, unparseable, or in the future is
+	// annotated: a start time that cannot prove a run is young must not be
+	// read as deciding that it is.
+	StuckAfter string `json:"stuck_after,omitempty"`
 }
 
 type ChecksScanResponse struct {

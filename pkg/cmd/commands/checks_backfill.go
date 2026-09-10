@@ -207,6 +207,7 @@ scanning:
 				CheckName:    cmd.CheckName,
 				Page:         page,
 				UpdatedSince: updatedSince,
+				StuckAfter:   cmd.StuckAfter,
 			})
 			if canceled := backfillCanceledError(err, stopProgress); canceled != nil {
 				return canceled

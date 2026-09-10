@@ -396,6 +396,17 @@ func executeChecksScan(ctx context.Context, cfg *ServerConfig, store storage.Sto
 			return nil, webhookOpsRequestErrorf("parse updated_since %q as RFC3339: %v", req.UpdatedSince, err)
 		}
 	}
+	var annotateAfter time.Duration
+	if req.StuckAfter != "" {
+		var err error
+		annotateAfter, err = time.ParseDuration(req.StuckAfter)
+		if err != nil {
+			return nil, webhookOpsRequestErrorf("parse stuck_after %q as a duration: %v", req.StuckAfter, err)
+		}
+		if annotateAfter < 0 {
+			return nil, webhookOpsRequestErrorf("stuck_after must not be negative")
+		}
+	}
 	if logger == nil {
 		logger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	}
@@ -411,7 +422,7 @@ func executeChecksScan(ctx context.Context, cfg *ServerConfig, store storage.Sto
 	if err != nil {
 		return nil, err
 	}
-	response, err := scanWebhookMissingChecks(ctx, installationClient, store, req.Repo, webhookExpectedCheckNames(cfg, req.Repo, req.Environment, req.CheckName), req.Page, updatedSince, logger)
+	response, err := scanWebhookMissingChecks(ctx, installationClient, store, req.Repo, webhookExpectedCheckNames(cfg, req.Repo, req.Environment, req.CheckName), req.Page, updatedSince, annotateAfter, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -850,9 +861,12 @@ type webhookExpectedCheckName struct {
 
 func webhookExpectedCheckNames(cfg *ServerConfig, repo, environment, override string) []webhookExpectedCheckName {
 	if override != "" {
-		// An operator-supplied name says nothing about which environment it
-		// reports on, so nothing is scoped to it.
-		return []webhookExpectedCheckName{{Name: override}}
+		// An operator-supplied name carries no environment of its own, so the
+		// scope is the one the caller asked for, and nothing when they asked
+		// for nothing. Dropping an environment they did name would hand the
+		// override every environment's rows, which is the mis-attribution
+		// this scoping exists to prevent.
+		return []webhookExpectedCheckName{{Name: override, Environment: environment}}
 	}
 	base := cfg.GitHubCheckNameBaseForRepo(repo)
 	if environment != "" {
@@ -882,11 +896,26 @@ type webhookMissingCheckScanClient interface {
 	FindCheckRunByName(ctx context.Context, repo, headSHA, checkName string) (*ghclient.CheckRunResult, []string, error)
 }
 
-func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckScanClient, store storage.Storage, repo string, expectedNames []webhookExpectedCheckName, page int, updatedSince time.Time, logger *slog.Logger) (*ChecksScanResponse, error) {
+// checkRunSittingLongEnough reports whether an uncompleted Check Run has been
+// sitting at least as long as the caller's threshold.
+//
+// A start time that is absent or in the future proves nothing about the run's
+// age, so it counts as long enough. The threshold exists to skip work the
+// caller will not display, and a run whose age cannot be established is one
+// the caller displays.
+func checkRunSittingLongEnough(startedAt time.Time, threshold time.Duration, now time.Time) bool {
+	if threshold <= 0 || startedAt.IsZero() || startedAt.After(now) {
+		return true
+	}
+	return now.Sub(startedAt) >= threshold
+}
+
+func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckScanClient, store storage.Storage, repo string, expectedNames []webhookExpectedCheckName, page int, updatedSince time.Time, annotateAfter time.Duration, logger *slog.Logger) (*ChecksScanResponse, error) {
 	prs, nextPage, lastPage, err := client.ListOpenPullRequestsPage(ctx, repo, page, webhookScanPRPageSize)
 	if err != nil {
 		return nil, err
 	}
+	now := time.Now().UTC()
 	checkNames := make([]string, 0, len(expectedNames))
 	for _, expected := range expectedNames {
 		checkNames = append(checkNames, expected.Name)
@@ -912,6 +941,10 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 		// aligned with incomplete, so its rows can be narrowed to it once the
 		// PR's stored state has been read.
 		var incompleteEnvironments []string
+		// Whether any uncompleted run on this PR has been sitting long enough
+		// for the caller to render it. One that has not is not worth a storage
+		// read, and the caller drops it before it reaches an operator.
+		annotate := true
 		for _, expected := range expectedNames {
 			run, untrustedApps, err := client.FindCheckRunByName(ctx, repo, pr.HeadSHA, expected.Name)
 			if err != nil {
@@ -926,6 +959,9 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 						StartedAt:  formatCheckRunStartedAt(run.StartedAt),
 					})
 					incompleteEnvironments = append(incompleteEnvironments, expected.Environment)
+					if !checkRunSittingLongEnough(run.StartedAt, annotateAfter, now) {
+						annotate = false
+					}
 				}
 				continue
 			}
@@ -938,13 +974,18 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 			}
 		}
 		if len(incomplete) > 0 {
-			// One read serves every uncompleted run on this PR; each run then
-			// keeps only the rows for the environment it gates.
-			rows := storedRowsBehindStuckCheck(ctx, store, repo, pr.Number, pr.HeadSHA, logger)
-			for i := range incomplete {
-				scoped := storedRowsForEnvironment(rows, incompleteEnvironments[i])
-				incomplete[i].StoredRows = scoped
-				incomplete[i].WaitingOn = waitingOnForStoredRows(scoped)
+			if annotate {
+				// One read serves every uncompleted run on this PR; each run
+				// then keeps only the rows for the environment it gates.
+				rows := storedRowsBehindStuckCheck(ctx, store, repo, pr.Number, pr.HeadSHA, logger)
+				for i := range incomplete {
+					scoped := storedRowsForEnvironment(rows, incompleteEnvironments[i])
+					incomplete[i].StoredRows = scoped
+					incomplete[i].WaitingOn = waitingOnForStoredRows(scoped)
+				}
+			} else {
+				logger.Debug("checks scan reporting an uncompleted Check Run without its stored rows: it has not been sitting long enough for the caller to render",
+					"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA)
 			}
 			result.Stuck = append(result.Stuck, StuckCheckPR{
 				Number:  pr.Number,
