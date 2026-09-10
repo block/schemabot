@@ -51,7 +51,7 @@ CREATE TABLE `customers` (
   `public_id` varchar(64) NOT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_public_id` (`public_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_bin;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 ```
 
 This adds an index and changes how rows are stored and reached. A natural or composite primary
@@ -121,7 +121,7 @@ phase to understand what remains after the copy reaches 100%.
 
 Row totals and ETA are estimates. Numeric chunking can measure key-space traversal, while the
 general chunker counts copied rows against estimated totals; neither is a promise of a finish
-time. If the copy exceeds its estimated total, SchemaBot shows **Active** and the number of rows
+time. If the copy exceeds its estimated total, SchemaBot shows **Finalizing copy** and the number of rows
 copied so far. It reconciles the total when the copy actually finishes. The row-copy ETA does not
 include every later phase or a scheduled cutover wait.
 
@@ -154,7 +154,7 @@ specific state. The bar is 20 squares wide; filled squares represent percent com
 
 **Copying rows after estimate exceeded** — full-width activity indicator with no percentage:
 ```
-  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Active
+  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Finalizing copy
           ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
        • Rows copied: 145,000 so far
        • ℹ️ More rows than initially estimated, copying is still active and will continue

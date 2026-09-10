@@ -21,9 +21,11 @@ engine is what touches your tables.
 
 | Engine | Target | Built on |
 |---|---|---|
-| Spirit | MySQL | [Spirit](mysql.md) |
+| Spirit | MySQL | [Spirit](https://github.com/block/spirit) |
 | PlanetScale | Vitess | [PlanetScale deploy requests](https://planetscale.com/docs/vitess/schema-changes/deploy-requests) |
 | pg-sprite | PostgreSQL | [pg-sprite](https://github.com/block/pg-sprite) |
+
+For primary key choices and online copy progress, see the [MySQL guide](mysql.md).
 
 Engines are adapters rather than implementations. None of them reimplements online schema change;
 each one drives existing machinery and translates between it and the rest of SchemaBot. In every
