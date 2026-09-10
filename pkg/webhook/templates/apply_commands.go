@@ -172,6 +172,15 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 
 	writePlanSummary(&sb, data, totalStatements, keyspacesWithVSchema)
 
+	// Lint findings, and the guides for what they name. This is where the
+	// operator decides whether to pass --allow-unsafe, so the reading that
+	// informs the decision belongs above the rejection rather than only on the
+	// plan comment that preceded it.
+	if len(data.LintViolations) > 0 {
+		writeLintViolations(&sb, data.LintViolations)
+	}
+	writeRelatedGuidance(&sb, data.disclosesEverySeverity())
+
 	// Unsafe changes blocked section
 	sb.WriteString("---\n\n")
 	unsafeCount := countUnsafeFindings(data.UnsafeChanges)

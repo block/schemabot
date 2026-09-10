@@ -362,9 +362,7 @@ func RenderPlanComment(data PlanCommentData) string {
 	if len(data.LintViolations) > 0 && !data.IsLocked {
 		writeLintViolations(&sb, data.LintViolations)
 	}
-	if !data.IsLocked {
-		writeRelatedGuidance(&sb, data)
-	}
+	writeRelatedGuidance(&sb, data.disclosesEverySeverity())
 
 	// Errors
 	if len(data.Errors) > 0 {
@@ -1600,13 +1598,13 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 		}
 	}
 
-	var guidancePlans []PlanCommentData
+	var guidanceScopes []guidanceScope
 	for _, env := range data.Environments {
 		if plan := data.Plans[env]; plan != nil && data.Errors[env] == "" {
-			guidancePlans = append(guidancePlans, *plan)
+			guidanceScopes = append(guidanceScopes, plan.disclosesEverySeverity())
 		}
 	}
-	writeRelatedGuidance(&sb, guidancePlans...)
+	writeRelatedGuidance(&sb, guidanceScopes...)
 
 	// Footer with apply instructions
 	sb.WriteString("---\n\n")

@@ -22,20 +22,49 @@ var lintGuides = []lintGuide{
 	{rules: []string{"rename_column"}, label: "Renaming a column or table", url: "https://github.com/block/schemabot/blob/main/docs/pre-merge-workflow.md#renaming-a-column-or-table", mysqlOnly: true},
 }
 
-// writeRelatedGuidance collects docs across severities and environments, outside
-// the optional findings fold. Unknown rules have no link until registered here.
-func writeRelatedGuidance(sb *strings.Builder, plans ...PlanCommentData) {
+// guidanceScope is the lint rules one comment discloses for one plan, with the
+// dialect that decides which guides apply. A comment links a guide only for a
+// finding it shows, so a reader never meets a link with nothing above it that
+// explains why it is there.
+type guidanceScope struct {
+	rules   []string
+	isMySQL bool
+}
+
+// disclosesEverySeverity scopes a comment that shows findings of every
+// severity: error-severity findings reach it as unsafe changes carrying the
+// lint message, and the rest through the lint fold. A locked apply comment
+// shows neither, so it discloses nothing.
+func (d PlanCommentData) disclosesEverySeverity() guidanceScope {
+	if d.IsLocked {
+		return guidanceScope{}
+	}
+	return guidanceScope{rules: d.LintRuleNames, isMySQL: d.IsMySQL}
+}
+
+// disclosesNonErrorsOnly scopes a comment that shows the lint fold and no
+// unsafe section, which leaves its error-severity findings unshown.
+func (d PlanCommentData) disclosesNonErrorsOnly() guidanceScope {
+	rules := make([]string, 0, len(d.LintViolations))
+	for _, finding := range d.LintViolations {
+		rules = append(rules, finding.LinterName)
+	}
+	return guidanceScope{rules: rules, isMySQL: d.IsMySQL}
+}
+
+// writeRelatedGuidance links the docs for the rules its scopes disclose, across
+// severities and environments, outside the optional findings fold. Unknown
+// rules have no link until registered above.
+func writeRelatedGuidance(sb *strings.Builder, scopes ...guidanceScope) {
 	seen := make(map[string]bool)
 	var links []string
 	for _, guide := range lintGuides {
-		for _, plan := range plans {
-			if plan.IsLocked || (guide.mysqlOnly && !plan.IsMySQL) {
+		for _, scope := range scopes {
+			if guide.mysqlOnly && !scope.isMySQL {
 				continue
 			}
-			matches := slices.ContainsFunc(plan.LintRuleNames, func(rule string) bool {
+			matches := slices.ContainsFunc(scope.rules, func(rule string) bool {
 				return slices.Contains(guide.rules, rule)
-			}) || slices.ContainsFunc(plan.LintViolations, func(finding LintViolationData) bool {
-				return slices.Contains(guide.rules, finding.LinterName)
 			})
 			if matches && !seen[guide.url] {
 				seen[guide.url] = true

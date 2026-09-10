@@ -21,6 +21,10 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
+// The rollback comment has no unsafe section, so it shows warning-severity
+// findings and withholds error-severity ones. It links a guide only for what it
+// shows: an operator reading "Related guidance" with nothing above it naming
+// the rule has no way to tell what the link is about.
 func TestRollbackPlanCommentRelatedGuidance(t *testing.T) {
 	for _, severity := range []string{"warning", "error"} {
 		t.Run(severity, func(t *testing.T) {
@@ -40,8 +44,14 @@ func TestRollbackPlanCommentRelatedGuidance(t *testing.T) {
 				assert.Empty(t, data.LintViolations)
 			}
 			out := templates.RenderRollbackPlanComment(data)
-			assert.Equal(t, 1, strings.Count(out, "docs/mysql.md#choosing-a-primary-key"))
-			assert.Contains(t, out, "📖 **Related guidance:**\n\n- [Choosing a primary key]")
+			if severity == "warning" {
+				assert.Equal(t, 1, strings.Count(out, "docs/mysql.md#choosing-a-primary-key"),
+					"two findings on one rule link the guide once")
+				assert.Contains(t, out, "📖 **Related guidance:**\n\n- [Choosing a primary key]")
+			} else {
+				assert.NotContains(t, out, "docs/mysql.md#choosing-a-primary-key")
+				assert.NotContains(t, out, "📖 **Related guidance:**")
+			}
 		})
 	}
 }

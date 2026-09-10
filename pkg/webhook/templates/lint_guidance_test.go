@@ -33,8 +33,8 @@ func TestRelatedGuidanceAggregatesRulesAcrossEnvironments(t *testing.T) {
 	assert.NotContains(t, out, "unknown_rule")
 
 	var forward, reverse strings.Builder
-	writeRelatedGuidance(&forward, first, second)
-	writeRelatedGuidance(&reverse, second, first)
+	writeRelatedGuidance(&forward, first.disclosesEverySeverity(), second.disclosesEverySeverity())
+	writeRelatedGuidance(&reverse, second.disclosesEverySeverity(), first.disclosesEverySeverity())
 	assert.Equal(t, forward.String(), reverse.String(), "guide order must not depend on environment order")
 
 	data.Errors = map[string]string{"production": "Plan unavailable"}
@@ -49,7 +49,27 @@ func TestRelatedGuidanceIgnoresUnknownAndLockedFindings(t *testing.T) {
 		{IsMySQL: false, LintRuleNames: []string{"primary_key"}},
 	} {
 		var out strings.Builder
-		writeRelatedGuidance(&out, data)
+		writeRelatedGuidance(&out, data.disclosesEverySeverity())
 		assert.Empty(t, out.String())
 	}
+}
+
+// A comment that shows no unsafe section leaves its error-severity findings
+// unshown, so it links no guide for them: a "Related guidance" link with no
+// finding above it reads as advice about nothing.
+func TestRelatedGuidanceSkipsFindingsTheCommentWithholds(t *testing.T) {
+	data := PlanCommentData{
+		IsMySQL:        true,
+		LintRuleNames:  []string{"primary_key", "rename_column"},
+		LintViolations: []LintViolationData{{Table: "customers", LinterName: "rename_column", Message: "Column rename detected"}},
+	}
+
+	var withheld strings.Builder
+	writeRelatedGuidance(&withheld, data.disclosesNonErrorsOnly())
+	assert.Contains(t, withheld.String(), "#renaming-a-column-or-table", "the shown finding keeps its guide")
+	assert.NotContains(t, withheld.String(), primaryKeyDocURL, "the withheld finding contributes no link")
+
+	var shown strings.Builder
+	writeRelatedGuidance(&shown, data.disclosesEverySeverity())
+	assert.Contains(t, shown.String(), primaryKeyDocURL, "a comment that shows every severity links both")
 }

@@ -1645,6 +1645,14 @@ ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
 
 📋 **Plan**: **2** tables to alter
 
+💡 **Lint Warnings**: 1 advisory finding
+- `orders`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+
+📖 **Related guidance:**
+
+- [Choosing a primary key](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key)
+- [Renaming a column or table](https://github.com/block/schemabot/blob/main/docs/pre-merge-workflow.md#renaming-a-column-or-table)
+
 ---
 
 **⛔ Apply rejected**: 3 unsafe changes detected
