@@ -508,45 +508,45 @@ func TestDSNParseErrorsRedactCredentials(t *testing.T) {
 	})
 }
 
-// GUC names are case-insensitive on the server and pgx preserves DSN key case,
-// so a DSN-carried statement_timeout under a different spelling must be
-// replaced rather than left beside the option's value: two spellings of one
-// parameter in the startup packet would let map iteration order decide which
-// budget the session runs under.
-func TestWithStatementTimeoutReplacesCaseVariantDSNValue(t *testing.T) {
+// The budget is armed on the session, so the startup packet must not also
+// carry one. GUC names are case-insensitive on the server and pgx preserves
+// DSN key case, so a DSN-carried statement_timeout is cleared under whatever
+// spelling it arrived in — left behind, it would set the session's budget
+// before the option's SET and be the value in force for any statement the
+// pooler routes to a connection the SET never reached.
+func TestWithStatementTimeoutClearsCaseVariantDSNValue(t *testing.T) {
 	t.Parallel()
 
 	cfg, err := connectionConfig("postgres://user:pass@host:5432/db?statement_TIMEOUT=1000", WithStatementTimeout(45*time.Second))
 	require.NoError(t, err)
 
-	var found []string
-	for k, v := range cfg.RuntimeParams {
-		if strings.EqualFold(k, "statement_timeout") {
-			found = append(found, k+"="+v)
-		}
+	for k := range cfg.RuntimeParams {
+		assert.False(t, strings.EqualFold(k, "statement_timeout"),
+			"no spelling of statement_timeout may survive in the startup packet, found %q", k)
 	}
-	require.Len(t, found, 1, "exactly one spelling of statement_timeout survives")
-	assert.Equal(t, "statement_timeout=45000", found[0])
+	assert.NotNil(t, cfg.AfterConnect, "the budget must be armed on the new session")
 }
 
 // A negative duration means "no budget chosen": the option must leave a
-// DSN-carried statement_timeout exactly as it found it.
+// DSN-carried statement_timeout exactly as it found it, and arm nothing.
 func TestWithStatementTimeoutNegativeLeavesDSNValue(t *testing.T) {
 	t.Parallel()
 
 	cfg, err := connectionConfig("postgres://user:pass@host:5432/db?statement_timeout=1000", WithStatementTimeout(-1))
 	require.NoError(t, err)
 	assert.Equal(t, "1000", cfg.RuntimeParams["statement_timeout"])
+	assert.Nil(t, cfg.AfterConnect)
 }
 
-// Zero writes the parameter rather than omitting it, so the session runs with
-// the budget explicitly disabled instead of inheriting the platform's value.
-func TestWithStatementTimeoutZeroWritesExplicitDisable(t *testing.T) {
+// Zero arms the budget rather than skipping it, so the session runs with the
+// budget explicitly disabled instead of inheriting the platform's value.
+func TestWithStatementTimeoutZeroArmsExplicitDisable(t *testing.T) {
 	t.Parallel()
 
 	cfg, err := connectionConfig("postgres://user:pass@host:5432/db", WithStatementTimeout(0))
 	require.NoError(t, err)
-	assert.Equal(t, "0", cfg.RuntimeParams["statement_timeout"])
+	assert.NotNil(t, cfg.AfterConnect)
+	assert.Equal(t, "SET statement_timeout = 0", statementTimeoutSQL(0))
 }
 
 // statement_timeout is expressed in whole milliseconds, so a finer duration
@@ -570,9 +570,7 @@ func TestWithStatementTimeoutRoundsSubMillisecondUp(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			cfg, err := connectionConfig("postgres://user:pass@host:5432/db", WithStatementTimeout(tc.d))
-			require.NoError(t, err)
-			assert.Equal(t, tc.want, cfg.RuntimeParams["statement_timeout"])
+			assert.Equal(t, "SET statement_timeout = "+tc.want, statementTimeoutSQL(tc.d))
 		})
 	}
 }

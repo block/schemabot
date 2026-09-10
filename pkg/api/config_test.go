@@ -4741,9 +4741,9 @@ func TestPostgresStatementTimeoutConfig(t *testing.T) {
 	})
 
 	// statement_timeout is a millisecond integer GUC, so a budget past the
-	// signed 32-bit maximum is not clamped: the backend raises a FATAL while
-	// applying the startup packet and every connection fails at dial. Startup
-	// validation is where the value can still be named.
+	// signed 32-bit maximum is not clamped: the server rejects it when the new
+	// session arms it and every connection fails at dial. Startup validation
+	// is where the value can still be named.
 	t.Run("a value above what PostgreSQL accepts fails validation", func(t *testing.T) {
 		t.Parallel()
 		cfg := postgresCfg("600h")
