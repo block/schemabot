@@ -233,7 +233,7 @@ func (h *Handler) unregisteredDatabaseError(repo, databaseName string) error {
 }
 
 // answerUnregisteredDatabase is the registry-first gate a command path runs
-// before any GitHub read, including the no-managed-schema-changes preflight:
+// before any GitHub read, including the preflight for a PR with no managed schema changes:
 // a -d database this deployment does not serve gets its answer from the
 // registry alone (unregisteredDatabaseError), so the response never depends on
 // what the PR happens to touch or on a repository read succeeding. The answer
