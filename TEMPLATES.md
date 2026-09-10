@@ -601,7 +601,7 @@ A PR plan covers the databases whose schema directories the PR changes. This PR 
 Two cases still need a plan even though the files are already correct:
 
 - **A new database.** Its schema directory merged before the database was configured, so no PR ever applied the files and the live database is empty.
-- **An existing database with drift.** The live schema differs from the schema files for any reason, such as a change made outside SchemaBot. The files did not change, so nothing triggers a plan.
+- **An existing database with drift.** The live schema does not match the schema files. The files did not change, so nothing triggers a plan.
 
 In either case, give the PR a change in that database's schema directory: add or toggle a `# nonce` comment line in its `schemabot.yaml` and push. SchemaBot then plans the whole directory against the live schema, and the plan comment carries the apply command.
 

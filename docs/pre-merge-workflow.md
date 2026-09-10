@@ -284,9 +284,8 @@ branch. It comes in two shapes:
 - **A new database.** Its schema files merged before the database was
   configured, so no PR ever applied them and the database is empty. A freshly
   provisioned copy or tenant starts the same way.
-- **An existing database.** The live schema differs from the schema files for
-  any reason, such as a change made outside SchemaBot. The files did not
-  change, so nothing triggers a plan.
+- **An existing database.** The live schema does not match the schema files.
+  The files did not change, so nothing triggers a plan.
 
 In both cases the files already describe the schema you want, so there is
 nothing to edit, and a PR that changes nothing under the schema directory gets
