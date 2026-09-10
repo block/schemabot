@@ -28,6 +28,7 @@ type Storage struct {
 	checks          *checkStore
 	settings        *settingsStore
 	webhookEvents   *webhookEventStore
+	pendingDrops    *pendingDropStore
 }
 
 var _ storage.Storage = (*Storage)(nil)
@@ -97,6 +98,7 @@ func NewWithDependencies(deps Dependencies) *Storage {
 		checks:          &checkStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
 		settings:        &settingsStore{db: rdb, dialect: deps.Dialect},
 		webhookEvents:   &webhookEventStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
+		pendingDrops:    &pendingDropStore{db: rdb, dialect: deps.Dialect},
 	}
 }
 
@@ -158,6 +160,11 @@ func (s *Storage) Settings() storage.SettingsStore {
 // WebhookEvents returns the durable webhook event inbox store.
 func (s *Storage) WebhookEvents() storage.WebhookEventStore {
 	return s.webhookEvents
+}
+
+// PendingDrops returns the pending-drops quarantine ledger store.
+func (s *Storage) PendingDrops() storage.PendingDropStore {
+	return s.pendingDrops
 }
 
 // Ping verifies the database connection is alive.
