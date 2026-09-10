@@ -33,7 +33,7 @@ type SchemaChangeReconciliationItem struct {
 // state.
 func RenderNoManagedSchemaChanges(data SchemaErrorData) string {
 	var sb strings.Builder
-	sb.WriteString("## ✅ No Schema Files Changed\n\n")
+	sb.WriteString("## " + glyph.Info + " No Schema Files Changed\n\n")
 	if data.Environment != "" {
 		fmt.Fprintf(&sb, "**Environment**: `%s`\n\n", data.Environment)
 	}
@@ -62,7 +62,7 @@ type NoManagedSchemaChangesChecksRefreshedData struct {
 // state on the current head.
 func RenderNoManagedSchemaChangesChecksRefreshed(data NoManagedSchemaChangesChecksRefreshedData) string {
 	var sb strings.Builder
-	sb.WriteString("## ✅ No Schema Files Changed\n\n")
+	sb.WriteString("## " + glyph.Info + " No Schema Files Changed\n\n")
 	head := formatCommitRef(data.Repository, data.HeadSHA)
 	if data.GatedOnTenants {
 		fmt.Fprintf(&sb, "SchemaBot found no changes to schema files managed by this deployment in this PR, but the PR touches schema paths owned by tenant deployments. The SchemaBot check was refreshed on %s and will pass once every tenant deployment's own check succeeds.\n", head)

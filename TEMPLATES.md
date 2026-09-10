@@ -575,7 +575,7 @@ schemabot apply -e staging --tenant alpha
 <summary><a name="no-schema-files-changed"></a><strong>No Schema Files Changed</strong></summary>
 
 
-## ✅ No Schema Files Changed
+## ℹ️ No Schema Files Changed
 
 **Environment**: `staging`
 
@@ -589,7 +589,7 @@ SchemaBot found no changes to managed schema files in this PR and no apply-owned
 <summary><a name="no-schema-files-changed-checks-refreshed"></a><strong>No Schema Files Changed (Checks Refreshed)</strong></summary>
 
 
-## ✅ No Schema Files Changed
+## ℹ️ No Schema Files Changed
 
 SchemaBot found no changes to managed schema files in this PR. The SchemaBot checks were refreshed as passing on [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12).
 
@@ -610,7 +610,7 @@ _Requested by @jackjackbits_
 <summary><a name="no-schema-files-changed-gated-on-tenants"></a><strong>No Schema Files Changed (Gated On Tenants)</strong></summary>
 
 
-## ✅ No Schema Files Changed
+## ℹ️ No Schema Files Changed
 
 SchemaBot found no changes to schema files managed by this deployment in this PR, but the PR touches schema paths owned by tenant deployments. The SchemaBot check was refreshed on [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12) and will pass once every tenant deployment's own check succeeds.
 
