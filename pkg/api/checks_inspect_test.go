@@ -2,7 +2,11 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"testing"
 	"time"
@@ -10,6 +14,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/checkstate"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
@@ -97,6 +103,47 @@ func TestExecuteChecksInspectValidation(t *testing.T) {
 	_, err = executeChecksInspect(t.Context(), cfg, nil, ChecksInspectRequest{Repo: "octo/repo", PullRequest: 7}, discardLogger())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "storage is not configured")
+
+	// A repository that is not an owner/name pair is the caller's mistake, and
+	// it has to read as one: left to the installation lookup it would surface
+	// as a server error for a request that was never answerable.
+	_, err = executeChecksInspect(t.Context(), cfg, store, ChecksInspectRequest{Repo: "acme", PullRequest: 7}, discardLogger())
+	require.Error(t, err)
+	var shapeErr *webhookOpsRequestError
+	require.ErrorAs(t, err, &shapeErr, "a malformed repository is a 400, not a 500")
+	assert.Contains(t, err.Error(), "owner/name pair")
+}
+
+// The endpoint is reached the way an operator's CLI reaches it: one GET, with
+// the target in the query string. Nothing else in this package's tests goes
+// through the mux, so the method, the path, and the mapping of a caller's
+// mistake onto a 400 are pinned here.
+func TestChecksInspectRouteAnswersOneGET(t *testing.T) {
+	svc := New(&inspectStorage{checks: &inspectCheckStore{}, applies: &inspectApplyStore{}},
+		inspectTestConfig(), nil, slog.New(slog.DiscardHandler))
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/checks/inspect?repo=acme/store", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusBadRequest, w.Code, "a request that names no pull request is the caller's error")
+	var body apitypes.ErrorResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&body))
+	assert.Contains(t, body.Error, "pull_request is required")
+
+	// An inspection stages nothing, so it stays on the read tier. That follows
+	// from the method: were it ever registered as a POST it would classify as
+	// write and the route authorization sweep would demand an authorization
+	// check the handler does not make.
+	assert.Equal(t, auth.TierRead, auth.TierForRequest(http.MethodGet, "/api/checks/inspect"))
+
+	post := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/checks/inspect", nil)
+	postRecorder := httptest.NewRecorder()
+	mux.ServeHTTP(postRecorder, post)
+	assert.Equal(t, http.StatusMethodNotAllowed, postRecorder.Code,
+		"the inspection answers over GET alone")
 }
 
 // The shape an operator reaches for this command to explain: an apply
@@ -425,4 +472,19 @@ func TestChecksInspectRequestFromQueryRefusesAnUnusableTarget(t *testing.T) {
 			assert.ErrorAs(t, err, &reqErr, "an unusable target is the caller's error, not the server's")
 		})
 	}
+}
+
+// A repository is an identity key, and every consumer of one folds its case.
+// The two ways of naming the same repository in one request therefore agree
+// however each is spelled — refusing them as a contradiction would reject a
+// target that either half alone resolves.
+func TestChecksInspectRequestFromQueryFoldsRepositoryCase(t *testing.T) {
+	req, err := checksInspectRequestFromQuery(url.Values{
+		"repo":         {"Acme/Store"},
+		"pull_request": {"https://github.com/acme/store/pull/412"},
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, "acme/store", req.Repo)
+	assert.Equal(t, 412, req.PullRequest)
 }

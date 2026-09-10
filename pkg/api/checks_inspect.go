@@ -84,7 +84,12 @@ func checksInspectRequestFromQuery(query url.Values) (ChecksInspectRequest, erro
 	if pr == 0 {
 		return req, webhookOpsRequestErrorf("%q names a repository but no pull request; give the number too", reference)
 	}
-	if req.Repo != "" && req.Repo != repo {
+	// Compared folded, because every consumer below folds: the storage lookup,
+	// the checks-enabled test, and the app resolution all read a repository
+	// through storage.CanonicalKey. Comparing the raw spellings would refuse
+	// "Acme/Store" beside a lowercase URL as a contradiction while either
+	// spelling on its own is accepted.
+	if req.Repo != "" && storage.CanonicalKey(req.Repo) != storage.CanonicalKey(repo) {
 		return req, webhookOpsRequestErrorf("repo is %q but pull_request names %q; pass one of the two", req.Repo, repo)
 	}
 	req.Repo = repo
@@ -108,6 +113,13 @@ func executeChecksInspect(ctx context.Context, cfg *ServerConfig, store storage.
 	}
 	if req.Repo == "" {
 		return nil, webhookOpsRequestErrorf("repo is required")
+	}
+	// The shape is checked here rather than left to the first thing that trips
+	// over it: a repository that is not an owner/name pair is the caller's
+	// mistake, and letting the installation lookup fail on it reports a server
+	// error for a request that was never answerable.
+	if !caller.IsRepoFullName(req.Repo) {
+		return nil, webhookOpsRequestErrorf("repo %q is not an owner/name pair", req.Repo)
 	}
 	if req.PullRequest <= 0 {
 		return nil, webhookOpsRequestErrorf("pull_request must be positive")
@@ -317,9 +329,7 @@ func checkRunsOnHead(ctx context.Context, cfg *ServerConfig, client checksInspec
 			Status:     run.Status,
 			Conclusion: run.Conclusion,
 		}
-		if !run.StartedAt.IsZero() {
-			inspected.StartedAt = run.StartedAt.UTC().Format(time.RFC3339)
-		}
+		inspected.StartedAt = formatCheckRunStartedAt(run.StartedAt)
 		result.found = append(result.found, inspected)
 	}
 	return result

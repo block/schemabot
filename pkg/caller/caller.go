@@ -198,7 +198,7 @@ func ParsePullRequestReference(reference string) (repo string, pr int, err error
 		return repo, pr, nil
 	}
 	if repo, number, found := strings.Cut(trimmed, "#"); found {
-		if !isRepoFullName(repo) {
+		if !IsRepoFullName(repo) {
 			return "", 0, invalidPullRequestReference(reference)
 		}
 		pr, err := parsePullRequestNumber(number)
@@ -207,7 +207,7 @@ func ParsePullRequestReference(reference string) (repo string, pr int, err error
 		}
 		return repo, pr, nil
 	}
-	if !isRepoFullName(trimmed) {
+	if !IsRepoFullName(trimmed) {
 		return "", 0, invalidPullRequestReference(reference)
 	}
 	return trimmed, 0, nil
@@ -259,10 +259,12 @@ func parsePullRequestNumber(number string) (int, error) {
 	return pr, nil
 }
 
-// isRepoFullName reports whether a string is an "owner/name" pair. Neither
+// IsRepoFullName reports whether a string is an "owner/name" pair. Neither
 // half may be empty, and a third segment means the string is a path rather
-// than a repository.
-func isRepoFullName(s string) bool {
+// than a repository. Exported so a caller that takes a repository as its own
+// parameter refuses a malformed one the same way a reference carrying it does,
+// rather than passing the mistake down to whatever fails on it first.
+func IsRepoFullName(s string) bool {
 	owner, name, found := strings.Cut(s, "/")
 	return found && owner != "" && name != "" && !strings.Contains(name, "/")
 }
