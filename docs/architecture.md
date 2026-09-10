@@ -489,7 +489,7 @@ full record tree and how it behaves during recovery.
 
 ### Progress Flow And Observers
 
-Tern's progress poller is where raw engine progress becomes SchemaBot state. On each tick, Tern asks the engine for progress, derives task state from the engine response, derives the apply state from those tasks, persists both, and notifies an optional `ProgressObserver`. For the Spirit engine, [Spirit progress architecture](mysql.md#progress-architecture) traces every field in this pipeline from Spirit's in-memory state to what the CLI and PR comment render.
+Tern's progress poller is where raw engine progress becomes SchemaBot state. On each tick, Tern asks the engine for progress, derives task state from the engine response, derives the apply state from those tasks, persists both, and notifies an optional `ProgressObserver`. For the Spirit engine, [Spirit progress architecture](#spirit-progress-architecture) traces every field in this pipeline from Spirit's in-memory state to what the CLI and PR comment render.
 
 ```
 Engine progress
@@ -675,6 +675,315 @@ best-effort reconciliation pass for completed applies with a progress comment
 but no summary comment. That means `OnTerminal` was missed during a process
 restart. The webhook runtime posts the missing summary from the apply record's
 stored GitHub context, and errors never fail server startup.
+
+#### Spirit progress architecture
+
+The reference below traces Spirit's progress through the engine wrapper, stored task state, API,
+and CLI. It is useful when a display is stale or a phase does not look right.
+
+<details>
+<summary>Engine progress, state mapping, persistence, and API reference</summary>
+
+##### Data flow overview
+
+```
+Spirit Runner → Engine wrapper → Lease-held drive → Task storage → API → CLI / PR comment
+live memory     Progress()        polls and writes   saved progress       reads only
+```
+
+Each layer adds, transforms, or merges data. Understanding which values are live
+(read from Spirit's in-memory state) vs persisted (read from SchemaBot storage) is
+key to debugging stale-progress issues.
+
+##### What Spirit exposes
+
+See Spirit's [chunker selection](https://github.com/block/spirit/blob/1ab2595e45a1b0c3ae4afc62c70449dc28230cc2/pkg/table/chunker.go#L149)
+and [change replay](https://github.com/block/spirit/blob/1ab2595e45a1b0c3ae4afc62c70449dc28230cc2/pkg/change/subscription_buffered.go#L30).
+
+`runner.Progress()` returns [`status.Progress`](https://github.com/block/spirit/blob/main/pkg/status/progress.go):
+
+Spirit's [structured progress reference](https://github.com/block/spirit/blob/main/pkg/status/README.md#structured-runner-progress)
+documents the upstream contract. The fields below explain what SchemaBot consumes and displays.
+
+| Field           | Type              | Notes |
+|-----------------|-------------------|-------|
+| `CurrentState`  | `status.State`    | Atomic int32 enum: `Initial`, `CopyRows`, `WaitingOnSentinelTable`, `Checksum`, `CutOver`, `Close`, ... |
+| `Summary`       | `string`          | `"71436/221193 32.30% copyRows ETA 5m 30s"` |
+| `Tables[]`      | `[]TableProgress` | Per-table: `TableName`, `RowsCopied` (uint64), `RowsTotal` (uint64), `IsComplete` (bool) |
+| `ETA` | `status.ETA` | Remaining row-copy estimate and availability (`measuring`, `ready`, `due`, or no estimate). |
+| `Resume`        | `bool`            | True only after the runner successfully resumed from its durable checkpoint; a fresh start (or an abandoned resume attempt) reports false. |
+| `Throttle`      | `status.ThrottleStatus` | `Throttled` (bool), `Reason` (display-only string, `"<signal> <observed> <op> <threshold>"`), `Utilization` (float64, 0 means unknown — never render it as idle). |
+
+Key details:
+- **ETA is structured** in `Progress.ETA`: its state says whether a duration is available. The engine maps a ready estimate to `ETASeconds` for tables still copying.
+- **`IsComplete`** comes from the chunker's in-memory `finalChunkSent` flag, NOT from the checkpoint table. This means `IsComplete` is lost on crash — it only exists while the runner is alive.
+- **`RowsCopied` can exceed `RowsTotal`** when the initial MySQL estimate is low. Downstream renderers treat this as an active estimate-exceeded state rather than a percentage above 100%.
+- **`Checksum` progress (`prog.Checksum.RowsChecked` / `RowsTotal`) is populated only while
+  `CurrentState == Checksum`** — it reads zero before the verify starts and again after it
+  finishes (including during `PostChecksum`). A renderer that shows checksum counters for any
+  other phase shows zeros.
+- **`Throttle` is populated only for the paced phases** — the row copy and the checksum
+  verify report the throttler's live status; every other phase reports the zero
+  `ThrottleStatus{}`, so a finished schema change can never look paused on an aged-out
+  signal. A composite throttler joins the reasons of every currently-throttling child with
+  `"; "`, and `Throttled` can be true with an empty `Reason` (a throttler that implements
+  no reason extension).
+
+##### Spirit runner lifecycle
+
+`status.State` is a strictly forward-moving enum. A runner walks these phases in
+order (skipping the ones that don't apply to its change):
+
+| Order | State | `String()` | What the runner is doing |
+|-------|-------|------------|--------------------------|
+| 1 | `Initial` | `initial` | Setup: parsing the DDL, creating the shadow table, attaching the binlog subscription. |
+| 2 | `CopyRows` | `copyRows` | Bulk-copying rows into the shadow table. The only phase with per-table row-copy progress. |
+| 3 | `ApplyChangeset` | `applyChangeset` | First binlog drain: applying the changes that accumulated on the source during the copy. Duration depends on the write backlog and replay throughput. |
+| 4 | `RestoreSecondaryIndexes` | `restoreSecondaryIndexes` | Re-adding secondary indexes that were deferred during the copy. |
+| 5 | `AnalyzeTable` | `analyzeTable` | `ANALYZE TABLE` on the shadow table so the optimizer has fresh statistics. |
+| 6 | `Checksum` | `checksum` | Verifying the copied data against the source. The only phase where `prog.Checksum` counters are live. |
+| 7 | `PostChecksum` | `postChecksum` | Second binlog drain: applying the changes that accumulated while the checksum ran. Duration depends on the remaining write backlog. |
+| 8 | `WaitingOnSentinelTable` | `waitingOnSentinelTable` | Deferred cutover: parked until the sentinel table is dropped (SchemaBot's cutover command). Spirit runs a continuous checksum loop while parked. |
+| 9 | `CutOver` | `cutOver` | Atomically swapping the shadow table in. |
+| 10 | `ReverseWindow` | `reverseWindow` | Post-cutover window where the change can still be reverted (old table kept in sync). |
+| 11 | `Close` | `close` | Teardown; the change is done. |
+| 12 | `ErrCleanup` | `errCleanup` | Cleaning up after a failure. |
+
+Two properties matter for display:
+
+- **The drains (3 and 7) look identical from row counts alone.** Both report every
+  table's copy as complete with no counter moving, so they must be surfaced by
+  *phase name* or they render as a serene finished copy while the engine works
+  through the remaining backlog.
+- **The enum only moves forward** within one runner, but SchemaBot polls it
+  asynchronously — a stale poll can deliver an earlier phase after a later one
+  was already stored. The task-state ranks below re-impose the forward order on
+  the stored/displayed state.
+
+##### Engine layer
+
+`pkg/engine/spirit/spirit.go` `Progress()`:
+
+1. Reads `runner.Progress()` from the single runner (all tables share one runner in atomic mode).
+2. Resolves the overall state via `progressState()`: the tracked terminal state
+   (`stopped`, `failed`) is authoritative — Spirit's status only refines a
+   non-terminal state (e.g. surfacing the sentinel wait for a deferred cutover).
+3. Builds per-table `engine.TableProgress` in `buildSpiritTableProgress()`:
+   - Each table's `State` is the raw Spirit phase string (`copyRows`, `applyChangeset`, ...).
+   - Calculates `Progress` percent (clamped 0–100) and preserves raw `RowsCopied`
+     so renderers can detect when the initial estimate was exceeded.
+   - Sets `ProgressDetail` = formatted summary like `"12345/50000 24% copyRows"`.
+   - When `IsComplete` is true, reconciles `RowsTotal = RowsCopied` (the estimate
+     was never a count; the copied total is ground truth once the copy finishes)
+     and sets `Progress` to 100. The table keeps the runner phase while the
+     runner is in an active post-copy phase (`spiritPostCopyPhase`: applying the
+     changeset, restoring indexes, analyzing, checksumming, post-checksum,
+     cutting over) — only outside those phases does it report `"completed"`,
+     meaning "done copying while other tables copy".
+   - Stamps the runner-wide checksum estimate (`ChecksumRowsChecked`/`Total`) on
+     every table unconditionally — Spirit populates it only during the verify
+     phase, and every copy is complete by then.
+   - Stamps the runner-wide throttle status (`Throttled`/`ThrottleReason`) on the
+     tables participating in paced work — a table still copying, or every table
+     during the verify (`tableInPacedPhase`) — so a completed table is never
+     rendered as paused by another table's copy. The reason passes through
+     `engine.SanitizeThrottleReason` so it can never break an operator surface.
+4. Sets `ProgressResult.ResumedFromCheckpoint` from `Progress.Resume`, which the
+   drive turns into a one-per-claim "resumed from checkpoint" timeline event
+   (`logEngineResumeOnce`).
+
+Key types: `engine.ProgressResult`, `engine.TableProgress` (`pkg/engine/engine.go`).
+
+When no runner exists (engine stopped, no active schema change), returns `StatePending` with
+message `"No active schema change"`.
+
+##### How Spirit phases surface as task states
+
+The operator's lease-held drive polls the engine and refines the stored task
+state from the per-table engine phase via `tablePhaseTaskState`
+(`pkg/tern/local_apply_grouped.go`) — the atomic drive in
+`syncAtomicTaskProgress`, the sequential drive in `pollTaskToCompletion`. The
+stored task is the single render surface: the CLI and the PR comment both name
+the phase from it.
+
+`state.NormalizeTaskStatus` (`pkg/state/task.go`) maps engine strings to
+canonical task states:
+
+| Spirit phase | Task state | Rendered as |
+|--------------|------------|-------------|
+| `initial`, `copyRows`, `restoreSecondaryIndexes`, `analyzeTable`, `errCleanup` | `running` | Row-copy progress bar |
+| `applyChangeset` | `catching_up` | "⏩ Catching up on accumulated changes..." |
+| `checksum` | `checksumming` | "🔍 Checksumming to verify data (N%)" |
+| `postChecksum` | `post_checksum` | "⏩ Data verified, applying final changes..." |
+| `waitingOnSentinelTable` | `waiting_for_cutover` | "Waiting for cutover" |
+| `cutOver` | `cutting_over` | "🔄 Cutting over..." |
+| `close` | `completed` | "✓ Complete" |
+
+Only the mid-flight phases refine a running task (`tablePhaseTaskState` accepts
+`catching_up`, `checksumming`, `post_checksum`, `cutting_over`). A per-table
+`"completed"` never completes the task — for Spirit it means only that the
+table's copy finished, not that it cut over.
+
+Because polling is asynchronous, refinement goes through
+`taskStateWithNoBackwardProgress` (`pkg/tern/local_client.go`), which orders the
+active phases monotonically:
+
+```
+pending → waiting_for_deploy → running → catching_up → checksumming
+        → post_checksum → waiting_for_cutover → cutting_over
+        → revert_window → reverting
+```
+
+A stale poll delivering an earlier phase never rewinds the stored state, so the
+displayed phase walks the lifecycle strictly forward — mirroring Spirit's own
+enum order. Terminal states and operator-owned states (`stopped`,
+`failed_retryable`) are handled by separate policies before the rank applies.
+
+The phases are also first-class apply states: `deriveOverallState` (and
+`state.DeriveApplyState`) surface the **least-advanced active phase** at the
+apply level — while any table still copies rows the apply is `running`; once
+every active table is draining or verifying, the apply names that phase
+(`catching_up`, `checksumming`, `post_checksum`). All three are
+running-family: `state.IsRunningApplyState` matches them, so control gates
+(stop, start, cutover readiness), the driver claim list, and check
+aggregation treat them exactly like `running`. On the wire they are the
+`STATE_CATCHING_UP` / `STATE_CHECKSUMMING` / `STATE_POST_CHECKSUM` proto
+values.
+
+##### Tern layer — drive writes, readers read stored
+
+`pkg/tern/local_client.go` `Progress()` renders **entirely from stored state**.
+The operator's lease-held drive (`pollForCompletionAtomic` /
+`pollTaskToCompletion`) is the sole engine poller: it advances task and apply
+state, terminalizes the apply, and persists per-table figures (and per-shard
+rows) every tick. Readers never poll the engine — an instance-local engine has
+no live result for a reader on another pod, and the drive keeps stored current.
+
+`Progress()`:
+
+1. Loads ALL tasks for the requested apply from storage.
+2. Picks the most relevant task (priority: active > stopped > pending > terminal).
+3. Builds the per-table response from the stored task rows: `Status`,
+   `RowsCopied`, `RowsTotal`, `ProgressPercent`, `ETASeconds`,
+   `ChecksumRowsChecked/Total`, `Throttled`, `ThrottleReason`. When per-shard rows are persisted, the table
+   headline is the aggregate of those rows, computed at read time.
+
+Reading stored state matters for:
+- **Cross-pod reads**: the reader is rarely the pod holding the drive lease.
+- **Stopped tasks**: progress was saved at stop time (see "Stop snapshot" below).
+- **Completed tasks and crash recovery**: the engine is gone but storage has the
+  last polled snapshot.
+
+Overall state is derived from all tasks via `deriveOverallState()` and `state.DeriveApplyState`; active post-copy phases remain visible as described above.
+
+##### What gets persisted in storage
+
+Task fields updated during polling (`storage.Task` in `pkg/storage/types.go`):
+
+| Field             | Type   | Source |
+|-------------------|--------|--------|
+| `RowsCopied`      | int64  | From `engine.TableProgress.RowsCopied` |
+| `RowsTotal`       | int64  | From `engine.TableProgress.RowsTotal` |
+| `ProgressPercent`  | int    | From `engine.TableProgress.Progress` (0–100) |
+| `ETASeconds`      | int    | From `engine.TableProgress.ETASeconds` |
+| `ChecksumRowsChecked` | int64 | From `engine.TableProgress.ChecksumRowsChecked` |
+| `ChecksumRowsTotal`   | int64 | From `engine.TableProgress.ChecksumRowsTotal` |
+| `Throttled`       | bool   | From `engine.TableProgress.Throttled`; cleared when the task comes to rest (`transitionTaskState`) |
+| `ThrottleReason`  | string | From `engine.TableProgress.ThrottleReason`, sanitized at every ingest boundary; empty whenever `Throttled` is false |
+| `IsInstant`       | bool   | From `engine.TableProgress.IsInstant` |
+| `State`           | string | Mapped from `engine.State` |
+| `StartedAt`       | time   | Set when task transitions to RUNNING |
+| `CompletedAt`     | time   | Set when engine reports a terminal state |
+| `UpdatedAt`       | time   | Bumped on every poll |
+
+**When task rows are updated:**
+
+| Trigger | What writes | Frequency | Fields updated |
+|---------|-------------|-----------|----------------|
+| `pollForCompletionAtomic` (atomic mode) | Poller goroutine | Every 500ms | `State`, `RowsCopied`, `RowsTotal`, `ProgressPercent`, `ETASeconds`, `Throttled`, `ThrottleReason`, `UpdatedAt`, `CompletedAt` (on terminal) |
+| `pollTaskToCompletion` (sequential mode) | Poller goroutine | Every 500ms | Same as above, plus `IsInstant` |
+| Durable stop request | Lease-held drive | Once, after the engine stops | `State` → STOPPED for non-terminal tasks, `RowsCopied`, `RowsTotal`, `ProgressPercent`, `ETASeconds`, `CompletedAt` |
+| `executeGroupedApply` / `executeApplySequential` | Apply launcher | Once at start | `State` → RUNNING, `StartedAt` |
+
+The lease-held drive is the write path. A stop request is recorded durably; the drive stops the
+engine, captures its final progress, and settles non-terminal tasks as stopped. A completed row
+copy alone does not complete a task: cutover may still be outstanding.
+
+##### Polling modes (atomic vs sequential)
+
+###### Atomic mode (`--defer-cutover`)
+
+One Spirit runner handles all DDLs together. `pollForCompletionAtomic` polls every 500ms:
+- Updates ALL tasks with the shared engine state and per-table row counts.
+- Maintains a heartbeat (bumps `apply.updated_at` every 10s) so the recovery loop knows it's alive.
+- Auto-triggers cutover if `defer_cutover` is NOT set (shouldn't happen in this mode, but defensive).
+
+###### Sequential mode (default)
+
+One Spirit runner per table, processed in order. `pollTaskToCompletion` polls every 500ms:
+- Updates the single active task with engine progress, refining a running task
+  into its engine-reported post-copy phase the same way the atomic sync does.
+- Re-fetches task state from storage each tick to detect external Stop signals.
+- When the task reaches a terminal state, returns. The outer loop (`executeApplySequential`) then starts the next table.
+
+##### API and CLI layers
+
+The progress bars are rendered by `pkg/cmd/internal/templates/progress.go`.
+
+###### API (`pkg/api/progress_handlers.go`)
+
+`progressResponseFromProto()` does a direct proto → JSON mapping. `handleProgressByApplyID()`
+adds apply-level fields: `apply_id`, `database`, `environment`.
+
+###### CLI/TUI (`pkg/cmd/commands/watch_tui.go`)
+
+The TUI polls the API every **2 seconds** via `tick()`.
+
+`parseProgressResult()` delegates to `ParseProgressResponse()` in
+`pkg/cmd/internal/templates/progress_parse.go`. It normally uses the structured API fields; the
+stored-progress API leaves `ProgressDetail` empty. For older responses that supply a summary,
+`ParseSpiritProgress()` can extract its values:
+
+```
+"71436/221193 32.30% copyRows ETA 5m 30s"
+ ↓       ↓      ↓       ↓          ↓
+RowsCopied RowsTotal Percent State    ETA
+```
+
+Summary parsing is a compatibility path for responses that supply `ProgressDetail`; ordinary
+progress reads use the stored numeric fields. The engine supplies a structured `ETASeconds`
+value when its row-copy estimate is ready.
+
+For the operator-facing display examples and controls, see the
+[TUI rendering reference](mysql.md#tui-rendering-reference).
+
+##### Key behaviors
+
+1. **The drive writes, readers read stored.** Only the lease-held drive polls the engine; every
+   progress read (CLI, PR comment, API) renders from the stored task rows the drive maintains.
+
+2. **Stop snapshots do not imply cutover.** The drive captures the engine's final progress after
+   stopping it, but keeps non-terminal tasks stopped even if their row copy finished. Start
+   re-plans against the live schema to determine what remains.
+
+3. **`IsComplete` is in-memory only.** Spirit's `TableProgress.IsComplete` is set from the
+   chunker's `finalChunkSent` flag — it's never written to the checkpoint table. On crash, this
+   flag is lost. Recovery uses re-plan (diff against current DB state) rather than relying on
+   `IsComplete`.
+
+4. **Progress can lag after a crash.** Polling targets a 500ms interval, but database and
+   scheduling delays can make the stored snapshot older. Recovery reconciles against the live
+   database and durable checkpoints; the display is not a recovery checkpoint.
+
+5. **ETA comes from the engine's structured estimate.** `buildSpiritTableProgress` maps a ready
+   `Progress.ETA` into `ETASeconds` for tables still copying. No estimate is displayed before the
+   rate is established or for a finished table.
+
+6. **Estimate-exceeded display.** Spirit can report `RowsCopied > RowsTotal` when MySQL's initial
+   estimate is low. SchemaBot preserves the raw copied count, clamps determinate percentages to 100,
+   and switches active row-copy renderers to an `Active` display with copied-so-far rows.
+
+</details>
 
 ### Operator
 
