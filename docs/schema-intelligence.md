@@ -78,10 +78,11 @@ GET /api/databases
 </details>
 
 Each entry carries `app` when the database's configuration declares an app
-identifier — the grouping that app-scoped commands (`--app <name>`) target.
-Databases sharing an `app` value form one application, so an inventory keyed
-by application joins against this field rather than parsing database names.
-The field is omitted when the database declares no app.
+identifier — the grouping the `?app=` filter below and the pull endpoint's
+`app` selector target. Databases sharing an `app` value form one application,
+so an inventory keyed by application joins against this field rather than
+parsing database names. The field is omitted when the database declares no
+app.
 
 The list accepts three query filters, combinable: `?type=` (exact,
 case-sensitive engine type), `?name=` (case-insensitive substring of the

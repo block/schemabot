@@ -739,9 +739,10 @@ func configuredDatabaseTypes(config *ServerConfig) []string {
 }
 
 // databaseListResponse builds the sanitized database list, keeping only
-// databases matching the optional type and name filters. The name filter is a
-// case-insensitive substring match so one query covers a sharded family
-// (omnibus matches omnibus_001, omnibus_002, ...).
+// databases matching the optional type, name, and app filters. The name
+// filter is a case-insensitive substring match so one query covers a sharded
+// family (omnibus matches omnibus_001, omnibus_002, ...); the app filter is a
+// whole-identifier match against the canonical value its parser produced.
 func databaseListResponse(config *ServerConfig, databaseType, name, app string) (*apitypes.DatabaseListResponse, error) {
 	if config == nil {
 		return nil, fmt.Errorf("server config is nil")
