@@ -100,9 +100,15 @@ type checksStuckCheck struct {
 	// "unknown" when GitHub did not report a start time.
 	Age string `json:"age"`
 	// WaitingOn says whether the stored state behind this run resolves on its
-	// own ("schemabot") or needs a person ("operator"). Empty when the server
-	// reported no stored state, which is itself the answer: the run is
-	// holding a gate SchemaBot has nothing recorded for.
+	// own ("schemabot") or needs a person ("operator").
+	//
+	// Empty means no stored row explains the run, which covers more than an
+	// empty read: rows may exist and none of them block once scoped to this
+	// run's environment, or the only one that does is the aggregate, which
+	// restates the rows beside it rather than naming a cause. Empty also
+	// means unannotated when the scan was given a stuck_after this run is too
+	// young for. A reader that takes it for a failed storage read draws a
+	// conclusion the field does not support.
 	WaitingOn string `json:"waiting_on,omitempty"`
 	// Reasons are the distinct dispositions of the blocking stored rows, in
 	// the order the server reported them. They are what makes a stuck row

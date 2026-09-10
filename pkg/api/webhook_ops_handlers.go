@@ -941,10 +941,16 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 		// aligned with incomplete, so its rows can be narrowed to it once the
 		// PR's stored state has been read.
 		var incompleteEnvironments []string
-		// Whether any uncompleted run on this PR has been sitting long enough
-		// for the caller to render it. One that has not is not worth a storage
-		// read, and the caller drops it before it reaches an operator.
-		annotate := true
+		// Whether each uncompleted run has been sitting long enough for the
+		// caller to render it, positionally aligned with incomplete. A run
+		// that has not is not worth annotating, since the caller drops it
+		// before it reaches an operator.
+		//
+		// The decision is per run, not per pull request: a PR can carry an old
+		// run beside a young one, and the old one is exactly what the caller
+		// is about to render. Letting the young one speak for both would send
+		// back the run an operator is looking at with nothing explaining it.
+		var annotate []bool
 		for _, expected := range expectedNames {
 			run, untrustedApps, err := client.FindCheckRunByName(ctx, repo, pr.HeadSHA, expected.Name)
 			if err != nil {
@@ -959,9 +965,7 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 						StartedAt:  formatCheckRunStartedAt(run.StartedAt),
 					})
 					incompleteEnvironments = append(incompleteEnvironments, expected.Environment)
-					if !checkRunSittingLongEnough(run.StartedAt, annotateAfter, now) {
-						annotate = false
-					}
+					annotate = append(annotate, checkRunSittingLongEnough(run.StartedAt, annotateAfter, now))
 				}
 				continue
 			}
@@ -974,18 +978,22 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 			}
 		}
 		if len(incomplete) > 0 {
-			if annotate {
-				// One read serves every uncompleted run on this PR; each run
-				// then keeps only the rows for the environment it gates.
-				rows := storedRowsBehindStuckCheck(ctx, store, repo, pr.Number, pr.HeadSHA, logger)
-				for i := range incomplete {
-					scoped := storedRowsForEnvironment(rows, incompleteEnvironments[i])
-					incomplete[i].StoredRows = scoped
-					incomplete[i].WaitingOn = waitingOnForStoredRows(scoped)
+			// One read serves every run on this PR that earned an annotation,
+			// so it is made once and only when at least one did; each run then
+			// keeps only the rows for the environment it gates.
+			var rows []InspectedCheck
+			if slices.Contains(annotate, true) {
+				rows = storedRowsBehindStuckCheck(ctx, store, repo, pr.Number, pr.HeadSHA, logger)
+			}
+			for i := range incomplete {
+				if !annotate[i] {
+					logger.Debug("checks scan reporting an uncompleted Check Run without its stored rows: it has not been sitting long enough for the caller to render",
+						"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA, "check_name", incomplete[i].Name)
+					continue
 				}
-			} else {
-				logger.Debug("checks scan reporting an uncompleted Check Run without its stored rows: it has not been sitting long enough for the caller to render",
-					"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA)
+				scoped := storedRowsForEnvironment(rows, incompleteEnvironments[i])
+				incomplete[i].StoredRows = scoped
+				incomplete[i].WaitingOn = waitingOnForStoredRows(scoped)
 			}
 			result.Stuck = append(result.Stuck, StuckCheckPR{
 				Number:  pr.Number,

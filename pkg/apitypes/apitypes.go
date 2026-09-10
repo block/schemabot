@@ -381,8 +381,10 @@ type IncompleteCheckRun struct {
 	StoredRows []InspectedCheck `json:"stored_rows,omitempty"`
 	// WaitingOn classifies the rows: "operator" when any of them needs a
 	// person, "schemabot" when they all resolve on their own, and empty when
-	// no row explains the run. It is the field that decides whether a stuck
-	// entry in a fleet sweep is worth opening.
+	// no row explains the run — whether because none was read, none blocks
+	// once scoped to this run's environment, or the only blocking one is the
+	// aggregate. It is the field that decides whether a stuck entry in a
+	// fleet sweep is worth opening.
 	WaitingOn string `json:"waiting_on,omitempty"`
 }
 

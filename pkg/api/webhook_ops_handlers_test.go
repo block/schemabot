@@ -1193,6 +1193,58 @@ func TestScanWebhookMissingChecksSkipsTheAnnotationForAYoungRun(t *testing.T) {
 	assert.Equal(t, apitypes.WaitingOnOperator, result.Stuck[0].Checks[0].WaitingOn)
 }
 
+// A pull request can carry an old uncompleted run beside a young one, and the
+// old one is exactly what the caller renders. The age threshold decides each
+// run on its own, so the young one never speaks for both: an operator looking
+// at the old run gets the stored state explaining it.
+func TestScanWebhookMissingChecksAnnotatesAnOldRunBesideAYoungOne(t *testing.T) {
+	t.Parallel()
+
+	client := fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 19, Title: "one old, one young", HeadSHA: "sha19", HeadRef: "feature-19"},
+		},
+		runs: map[string]*ghclient.CheckRunResult{
+			"sha19/SchemaBot (production)": {ID: 190, Name: "SchemaBot (production)",
+				Status: "in_progress", StartedAt: time.Now().UTC().Add(-24 * time.Hour)},
+			"sha19/SchemaBot (staging)": {ID: 191, Name: "SchemaBot (staging)",
+				Status: "in_progress", StartedAt: time.Now().UTC().Add(-time.Minute)},
+		},
+	}
+	store := &inspectStorage{
+		checks: &inspectCheckStore{checks: []*storage.Check{
+			{Environment: "production", DatabaseName: "widgets", HeadSHA: "sha19", ApplyID: 9,
+				Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionActionRequired,
+				BlockingReason: checkstate.BlockRollbackCompleted},
+			{Environment: "staging", DatabaseName: "widgets", HeadSHA: "sha19", ApplyID: 9,
+				Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionActionRequired,
+				BlockingReason: checkstate.BlockRollbackCompleted},
+		}},
+		applies: &inspectApplyStore{applies: map[int64]*storage.Apply{
+			9: {ApplyIdentifier: "apply-9", State: "rolled_back"},
+		}},
+	}
+	names := []webhookExpectedCheckName{
+		{Name: "SchemaBot (production)", Environment: "production"},
+		{Name: "SchemaBot (staging)", Environment: "staging"},
+	}
+
+	result, err := scanWebhookMissingChecks(t.Context(), client, store, "octo/repo", names, 0, time.Time{}, time.Hour, discardLogger())
+
+	require.NoError(t, err)
+	require.Len(t, result.Stuck, 1)
+	require.Len(t, result.Stuck[0].Checks, 2)
+
+	annotated := map[string]string{}
+	for _, run := range result.Stuck[0].Checks {
+		annotated[run.Name] = run.WaitingOn
+	}
+	assert.Equal(t, apitypes.WaitingOnOperator, annotated["SchemaBot (production)"],
+		"the old run is the one the caller renders, so it carries its stored state")
+	assert.Empty(t, annotated["SchemaBot (staging)"],
+		"the young run is still reported, just unannotated")
+}
+
 // The rollup restates the rows beside it, so it is never what an operator
 // acts on. A run whose only blocking row is the rollup has nothing recorded
 // that explains it, and saying "schemabot" there would promise a convergence
