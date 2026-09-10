@@ -528,6 +528,7 @@ func TestE2EAutoPlanEmptySchemaRootNamesDatabase(t *testing.T) {
 	case body := <-result.comments:
 		assert.Contains(t, body, "failed to plan")
 		assert.Contains(t, body, "no schema files found")
+		assert.Contains(t, body, "removes the last schema files under it")
 		assert.Contains(t, body, "**Database**: `"+dbName+"`")
 		assert.Contains(t, body, "**Type**: `MySQL`")
 	case <-time.After(webhookIntegrationPollDeadline):

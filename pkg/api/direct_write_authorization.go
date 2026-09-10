@@ -48,7 +48,7 @@ type DirectWriteAuthorizationResult struct {
 // whole decision and the handler-level check is a pass-through, preserving
 // the semantics of deployments that never configure operator groups.
 func (c *ServerConfig) scopedWriteEnabled() bool {
-	for _, dbConfig := range c.Databases {
+	for _, dbConfig := range c.DatabaseConfigs() {
 		if len(trimmedNonEmpty(dbConfig.OperatorGroups)) > 0 {
 			return true
 		}
@@ -69,7 +69,7 @@ func (c *ServerConfig) AuthorizeDirectWrite(user *auth.User, database, environme
 		return result
 	}
 
-	dbConfig, ok := c.Databases[database]
+	dbConfig, ok := c.DatabaseConfigs()[database]
 	if !ok {
 		return DirectWriteAuthorizationResult{Allowed: false, Reason: DirectWriteReasonMissingDatabaseConfig}
 	}
@@ -95,7 +95,7 @@ func (c *ServerConfig) AuthorizeDirectDatabaseWrite(user *auth.User, database st
 		return result
 	}
 
-	dbConfig, ok := c.Databases[database]
+	dbConfig, ok := c.DatabaseConfigs()[database]
 	if !ok {
 		return DirectWriteAuthorizationResult{Allowed: false, Reason: DirectWriteReasonMissingDatabaseConfig}
 	}
@@ -150,7 +150,7 @@ func (c *ServerConfig) validateOperatorScoping() error {
 	environments := trimmedNonEmpty(c.Auth.ForwardAuth.OperatorEnvironments)
 
 	var grantedDatabases []string
-	for name, dbConfig := range c.Databases {
+	for name, dbConfig := range c.DatabaseConfigs() {
 		groups := trimmedNonEmpty(dbConfig.OperatorGroups)
 		if len(groups) == 0 {
 			continue
@@ -196,7 +196,7 @@ func (c *ServerConfig) validateOperatorScoping() error {
 // are all outside the operator-environment policy can never authorize an
 // operation, so it is a configuration error, not a silent no-op.
 func (c *ServerConfig) databaseHasAnyEnvironment(database string, environments []string) bool {
-	dbConfig, ok := c.Databases[database]
+	dbConfig, ok := c.DatabaseConfigs()[database]
 	if !ok {
 		return false
 	}
@@ -212,7 +212,7 @@ func (c *ServerConfig) databaseHasAnyEnvironment(database string, environments [
 // defines the environment. Used as a typo guard on instance-wide environment
 // lists: an environment nobody configures can never authorize anything.
 func (c *ServerConfig) environmentConfiguredOnAnyDatabase(env string) bool {
-	for _, dbConfig := range c.Databases {
+	for _, dbConfig := range c.DatabaseConfigs() {
 		if _, ok := dbConfig.Environments[env]; ok {
 			return true
 		}
@@ -227,7 +227,7 @@ func (c *ServerConfig) environmentConfiguredOnAnyDatabase(env string) bool {
 func (c *ServerConfig) OperatorGroupUnion() []string {
 	seen := make(map[string]struct{})
 	var union []string
-	for _, dbConfig := range c.Databases {
+	for _, dbConfig := range c.DatabaseConfigs() {
 		for _, g := range trimmedNonEmpty(dbConfig.OperatorGroups) {
 			if _, ok := seen[g]; ok {
 				continue
@@ -250,7 +250,7 @@ func (c *ServerConfig) metricDatabaseAttribute(database string) string {
 	if database == "" {
 		return ""
 	}
-	if _, ok := c.Databases[database]; ok {
+	if _, ok := c.DatabaseConfigs()[database]; ok {
 		return database
 	}
 	return "unconfigured"
@@ -412,7 +412,7 @@ func (s *Service) directWriteDenialMessage(operation, database, environment stri
 		return fmt.Sprintf("%s requires an authenticated caller identity", operation)
 	default:
 		grantingGroups := writeGroups
-		if dbConfig, ok := s.config.Databases[database]; ok {
+		if dbConfig, ok := s.config.DatabaseConfigs()[database]; ok {
 			grantingGroups = append(slices.Clone(writeGroups), trimmedNonEmpty(dbConfig.OperatorGroups)...)
 		}
 		return fmt.Sprintf("%s on database %q requires membership in one of: %s",

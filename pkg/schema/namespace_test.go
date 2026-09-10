@@ -1,6 +1,7 @@
 package schema
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -334,4 +335,44 @@ func TestResolveIgnoreNamespaces(t *testing.T) {
 		ResolveIgnoreNamespaces([]string{"fixtures_$ENV", "local_fixtures"}, "staging"))
 	assert.Equal(t, []string{"fixtures_$ENV"},
 		ResolveIgnoreNamespaces([]string{"fixtures_$ENV"}, ""))
+}
+
+func TestGroupFilesByNamespaceEmptyDeclaration(t *testing.T) {
+	grouped, _, err := GroupFilesByNamespace(map[string]string{"public/schema.sql": EmptyNamespaceDeclaration}, "app", "development", nil)
+	require.NoError(t, err)
+	require.Contains(t, grouped, "public")
+	require.Empty(t, grouped["public"].Files)
+	// User SQL after the marker must never be skipped.
+	edited := EmptyNamespaceDeclaration + "CREATE TABLE users (id bigint);"
+	grouped, _, err = GroupFilesByNamespace(map[string]string{"public/schema.sql": edited}, "app", "development", nil)
+	require.NoError(t, err)
+	require.Equal(t, edited, grouped["public"].Files["schema.sql"])
+}
+
+func TestEmptyNamespaceDeclarationSurvivesEditorWhitespace(t *testing.T) {
+	for _, content := range []string{strings.TrimSpace(EmptyNamespaceDeclaration), strings.ReplaceAll(EmptyNamespaceDeclaration, "\n", "\r\n"), EmptyNamespaceDeclaration + " \t\n"} {
+		grouped, _, err := GroupFilesByNamespace(map[string]string{"public/schema.sql": content}, "app", "development", nil)
+		require.NoError(t, err)
+		require.Contains(t, grouped, "public")
+		require.Empty(t, grouped["public"].Files)
+	}
+	content := EmptyNamespaceDeclaration + "\r\nCREATE TABLE users (id bigint);"
+	grouped, _, err := GroupFilesByNamespace(map[string]string{"public/schema.sql": content}, "app", "development", nil)
+	require.NoError(t, err)
+	require.Equal(t, content, grouped["public"].Files["schema.sql"])
+}
+
+func TestEmptyNamespaceDeclarationPreservesIntent(t *testing.T) {
+	for _, content := range []string{EmptyNamespaceDeclaration, "  \n" + EmptyNamespaceDeclaration + "\n "} {
+		got, _, err := GroupFilesByNamespace(map[string]string{"public/schema.sql": content}, "app", "", nil)
+		require.NoError(t, err)
+		require.Contains(t, got, "public")
+		require.NotNil(t, got["public"].Files)
+		require.Empty(t, got["public"].Files)
+	}
+	for _, content := range []string{"-- a user comment", EmptyNamespaceDeclaration + "\n-- another comment", EmptyNamespaceDeclaration + "\nCREATE TABLE orders (id bigint);"} {
+		got, _, err := GroupFilesByNamespace(map[string]string{"public/schema.sql": content}, "app", "", nil)
+		require.NoError(t, err)
+		require.Equal(t, content, got["public"].Files["schema.sql"])
+	}
 }

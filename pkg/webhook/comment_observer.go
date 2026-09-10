@@ -65,10 +65,12 @@ type CommentObserver struct {
 	// claim.
 	authorityOwner string
 
-	mu                sync.Mutex
-	lastProgressPost  time.Time
-	lastState         string
-	lastRowsCopied    int64
+	mu               sync.Mutex
+	lastProgressPost time.Time
+	// lastRendered is the progress snapshot the tracked comment last showed;
+	// progressCommentDue judges movement against it. Rotations that post a
+	// fresh comment record only the state they rendered.
+	lastRendered      progressSnapshot
 	stagnantTicks     int
 	hasCutoverComment bool
 	resumeRotated     bool
@@ -303,7 +305,7 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 		if _, posted, _ := o.postAndTrackComment(apply, state.Comment.Cutover, body, nil); posted {
 			o.hasCutoverComment = true
 		}
-		o.lastState = currentState
+		o.lastRendered.state = currentState
 		return
 	}
 
@@ -323,7 +325,7 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 			return
 		}
 		if adopted && o.rotateProgressCommentAfterCutover(apply, tasks) {
-			o.lastState = currentState
+			o.lastRendered.state = currentState
 			o.lastProgressPost = now
 			o.stagnantTicks = 0
 		}
@@ -337,7 +339,7 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 		// copy and leave the prior comment frozen at "Stopped" as the record of where
 		// the apply paused.
 		if !state.IsTerminalApplyState(apply.State) && o.rotateProgressCommentForResume(apply, tasks) {
-			o.lastState = currentState
+			o.lastRendered.state = currentState
 			o.lastProgressPost = now
 			o.stagnantTicks = 0
 			return
@@ -348,47 +350,93 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 		// belongs at the bottom of the PR timeline, with the old comment frozen at
 		// its pre-operation state as the record.
 		if o.rotateProgressCommentForControlPhase(apply, tasks) {
-			o.lastState = currentState
+			o.lastRendered.state = currentState
 			o.lastProgressPost = now
 			o.stagnantTicks = 0
 			return
 		}
 	}
 
-	// Adaptive rate limiting — ported from watchApplyProgress.
-	// Edit every 5s when progress is moving, slow to 30s when stagnant.
-	var totalRows int64
-	for _, t := range tasks {
-		totalRows += t.RowsCopied
+	// The operation rows are loaded ahead of the rate-limit decision because
+	// the statement position they carry is part of what counts as movement;
+	// the same rows then feed the render, so the comment shows the position
+	// that made it due. A failed load leaves the position out of this tick's
+	// signal and the render falls back to the single-deployment layout, which
+	// logs the failure.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ops, opsErr := o.stor.ApplyOperations().ListByApply(ctx, o.applyID)
+	if opsErr != nil {
+		o.logger.Debug("observer: failed to load apply operations for the comment freshness check; the statement position will not count as movement this tick",
+			"apply_id", o.applyID, "error", opsErr)
+	}
+	if !o.progressCommentDue(now, progressSnapshotOf(currentState, tasks, ops)) {
+		return
 	}
 
+	body := o.statusCommentFromOps(apply, ops, opsErr, tasks, o.shardsByTable(ctx, apply, ops))
+	o.editTrackedComment(apply, state.Comment.Progress, body)
+}
+
+// progressSnapshot is the freshness signal for the tracked progress comment:
+// the figures whose movement between polls means the comment is out of date.
+type progressSnapshot struct {
+	state      string
+	rowsCopied int64
+	// steps fingerprints every operation's statement position and the server's
+	// work on the running statement. It is what moves for an engine that
+	// executes a statement sequence and reports no row counts, so without it
+	// such an apply would read as stalled from its first poll and its position
+	// would refresh only at the slow interval.
+	steps string
+}
+
+func progressSnapshotOf(applyState string, tasks []*storage.Task, ops []*storage.ApplyOperation) progressSnapshot {
+	snapshot := progressSnapshot{state: applyState, steps: progressFingerprint(ops)}
+	for _, t := range tasks {
+		snapshot.rowsCopied += t.RowsCopied
+	}
+	return snapshot
+}
+
+// progressCommentDue applies the adaptive rate limit — ported from
+// watchApplyProgress — and reports whether the tracked progress comment is due
+// an edit on this tick, recording the snapshot as rendered when it is. Edits
+// land every activeInterval while the snapshot keeps moving and slow to
+// stagnantInterval once it has held still for stagnantThresh consecutive ticks;
+// a state change is rendered at once.
+//
+// Movement is judged against the snapshot the comment last rendered, not the
+// last one observed. A change that arrives inside the interval therefore stays
+// pending — every tick until the interval elapses still reads as movement — and
+// is rendered on the first due tick. Comparing against the last observed
+// snapshot instead would count the ticks after the change as stagnant and, for
+// a figure that moves rarely, defer rendering it to the slow interval.
+func (o *CommentObserver) progressCommentDue(now time.Time, current progressSnapshot) bool {
 	interval := activeInterval
 	if o.stagnantTicks >= stagnantThresh {
 		interval = stagnantInterval
 	}
+	sinceLastPost := now.Sub(o.lastProgressPost)
 
-	if totalRows == o.lastRowsCopied && currentState == o.lastState {
+	if current == o.lastRendered {
 		o.stagnantTicks++
-		if o.stagnantTicks >= stagnantThresh && now.Sub(o.lastProgressPost) < stagnantInterval {
-			return // stagnant — skip edit
+		if o.stagnantTicks >= stagnantThresh && sinceLastPost < stagnantInterval {
+			return false // stagnant — skip edit
 		}
-		if now.Sub(o.lastProgressPost) < interval {
-			return // not time yet
+		if sinceLastPost < interval {
+			return false // not time yet
 		}
 	} else {
 		o.stagnantTicks = 0
-		o.lastRowsCopied = totalRows
-		if now.Sub(o.lastProgressPost) < activeInterval && currentState == o.lastState {
-			return // active but not time yet (unless state changed)
+		if sinceLastPost < activeInterval && current.state == o.lastRendered.state {
+			return false // moving but not time yet (unless state changed)
 		}
 	}
 
-	o.lastState = currentState
+	o.lastRendered = current
 	o.lastProgressPost = now
-
-	// Edit the progress comment
-	body := o.formatStatusComment(apply, tasks)
-	o.editTrackedComment(apply, state.Comment.Progress, body)
+	return true
 }
 
 // OnTerminal is called when the apply reaches a terminal state.

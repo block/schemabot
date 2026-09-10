@@ -6,17 +6,8 @@
 
 - [Why apply before merge](#why-apply-before-merge)
 - [The dev loop](#the-dev-loop)
-  - [Converging a local database](#converging-a-local-database)
-  - [Where the data-access layer fits](#where-the-data-access-layer-fits)
-  - [When to ship the schema](#when-to-ship-the-schema)
 - [The PR workflow, step by step](#the-pr-workflow-step-by-step)
-  - [Applies happen before merge](#applies-happen-before-merge)
-  - [What the check means](#what-the-check-means)
-  - [Promotion order](#promotion-order)
-  - [If the check is stuck](#if-the-check-is-stuck)
 - [Destructive changes: two different workflows](#destructive-changes-two-different-workflows)
-  - [Renaming a column or table](#renaming-a-column-or-table)
-  - [Habits for a shared staging database](#habits-for-a-shared-staging-database)
 - [The safety gates in the loop](#the-safety-gates-in-the-loop)
 - [The CLI in the loop](#the-cli-in-the-loop)
 - [Where to go next](#where-to-go-next)
@@ -410,6 +401,8 @@ One frame from the live output (illustrative values):
   ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
   • Rows: 6,000,000 / 10,000,000 · ETA: 42m 0s
   • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
+
+  Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
 ```
 
 The view refreshes until the apply finishes. Here, copying is slowing down

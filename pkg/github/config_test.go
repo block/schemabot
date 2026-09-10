@@ -291,7 +291,9 @@ func TestFetchConfigInvalidTypeReportsDeclaredSpelling(t *testing.T) {
 	_, err := ic.FetchConfig(t.Context(), "octocat/hello-world", "schema/schemabot.yaml", "abc123")
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "got 'SQLite'")
+	assert.Contains(t, err.Error(), "unknown type 'SQLite'")
+	assert.Contains(t, err.Error(), "server registration")
+	assert.NotContains(t, err.Error(), "strata")
 }
 
 // TestFindConfigsForPRFilesProbesEachDirectoryOnce exercises discovery for a
@@ -638,6 +640,104 @@ func TestCreateSchemaRequestFromPRUsesRepoRootEnvironmentSymlinkSchemaRoot(t *te
 	assert.Equal(t, "CREATE TABLE orders (id bigint primary key);\n", result.SchemaFiles["orders_001"].Files["orders.sql"])
 }
 
+// TestCreateSchemaRequestFromPRSurfacesEmptiedNamespace verifies the wiring
+// between the changed-file list and the plan request: a namespace whose only
+// schema file the pull request deletes, and which the default branch still
+// holds, reaches the request as a namespace with no files, so the engine plans
+// every live table it holds as a drop instead of never hearing about it.
+func TestCreateSchemaRequestFromPRSurfacesEmptiedNamespace(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerPullRequest(t, mux, "head-sha")
+	registerPullRequestFiles(t, mux, []*gh.CommitFile{{
+		Filename: new("schema/removed/orders.sql"),
+		Status:   new("removed"),
+	}})
+	proposedFilesRepo{
+		head:       map[string]string{"schema/surviving/users.sql": "blob-users"},
+		defaultTip: map[string]string{"schema/removed/orders.sql": "blob-orders", "schema/surviving/users.sql": "blob-users"},
+	}.serve(t, mux)
+	registerEmptiedNamespaceSchemaRoot(t, mux)
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	result, err := ic.CreateSchemaRequestFromPR(t.Context(), "octocat/hello-world", 1, "", "", nil)
+
+	require.NoError(t, err)
+	require.Contains(t, result.SchemaFiles, "removed")
+	assert.Empty(t, result.SchemaFiles["removed"].Files)
+	require.Contains(t, result.SchemaFiles, "surviving")
+	assert.Equal(t, "CREATE TABLE users (id bigint primary key);\n", result.SchemaFiles["surviving"].Files["users.sql"])
+}
+
+// TestCreateSchemaRequestFromPRIgnoresInheritedDeletion covers a pull request
+// whose base lags the default branch: GitHub lists a deletion the default
+// branch already carries, and that deletion must not plan drops for a
+// namespace the pull request never touched.
+func TestCreateSchemaRequestFromPRIgnoresInheritedDeletion(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerPullRequest(t, mux, "head-sha")
+	registerPullRequestFiles(t, mux, []*gh.CommitFile{{
+		Filename: new("schema/removed/orders.sql"),
+		Status:   new("removed"),
+	}})
+	proposedFilesRepo{
+		head:       map[string]string{"schema/surviving/users.sql": "blob-users"},
+		defaultTip: map[string]string{"schema/surviving/users.sql": "blob-users"},
+	}.serve(t, mux)
+	registerEmptiedNamespaceSchemaRoot(t, mux)
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	result, err := ic.CreateSchemaRequestFromPR(t.Context(), "octocat/hello-world", 1, "", "", nil)
+
+	require.NoError(t, err)
+	assert.NotContains(t, result.SchemaFiles, "removed")
+	assert.Contains(t, result.SchemaFiles, "surviving")
+}
+
+// TestCreateSchemaRequestFromPRFailsClosedWhenPullRequestEmptiesSchemaRoot
+// covers the most complete removal: the pull request deletes the last schema
+// file under the root. An empty root is indistinguishable from one that moved,
+// so discovery refuses to plan rather than dropping every table in the
+// database, and the error tells the operator the removal has not taken effect.
+func TestCreateSchemaRequestFromPRFailsClosedWhenPullRequestEmptiesSchemaRoot(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerPullRequest(t, mux, "head-sha")
+	registerPullRequestFiles(t, mux, []*gh.CommitFile{{
+		Filename: new("schema/removed/orders.sql"),
+		Status:   new("removed"),
+	}})
+	proposedFilesRepo{
+		head:       map[string]string{},
+		defaultTip: map[string]string{"schema/removed/orders.sql": "blob-orders"},
+	}.serve(t, mux)
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/schema/schemabot.yaml", "database: orders\ntype: mysql\n")
+	registerDirectoryContent(t, mux, "/repos/octocat/hello-world/contents/schema", []*gh.RepositoryContent{
+		{Type: new("file"), Name: new("schemabot.yaml"), Path: new("schema/schemabot.yaml")},
+	})
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	_, err := ic.CreateSchemaRequestFromPR(t.Context(), "octocat/hello-world", 1, "", "", nil)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no schema files found under schema")
+	assert.Contains(t, err.Error(), "removes the last schema files under it")
+}
+
+// registerEmptiedNamespaceSchemaRoot serves a schema root whose config sits at
+// the root and whose only surviving namespace directory holds one table.
+func registerEmptiedNamespaceSchemaRoot(t *testing.T, mux *http.ServeMux) {
+	t.Helper()
+
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/schema/schemabot.yaml", "database: orders\ntype: mysql\n")
+	registerDirectoryContent(t, mux, "/repos/octocat/hello-world/contents/schema", []*gh.RepositoryContent{
+		{Type: new("file"), Name: new("schemabot.yaml"), Path: new("schema/schemabot.yaml")},
+		{Type: new("dir"), Name: new("surviving"), Path: new("schema/surviving")},
+	})
+	registerDirectoryContent(t, mux, "/repos/octocat/hello-world/contents/schema/surviving", []*gh.RepositoryContent{
+		{Type: new("file"), Name: new("users.sql"), Path: new("schema/surviving/users.sql")},
+	})
+	registerFileContent(t, mux, "/repos/octocat/hello-world/contents/schema/surviving/users.sql", "CREATE TABLE users (id bigint primary key);\n")
+}
+
 func TestResolveSchemaRootForEnvironmentRejectsPathTraversal(t *testing.T) {
 	ic := &InstallationClient{}
 	for _, environment := range []string{"../other", "prod/blue", ".", "..", `prod\blue`} {
@@ -907,6 +1007,30 @@ func widgetsConfigDirHints(t *testing.T, dirs ...string) ConfigDirHints {
 	return testConfigDirHints{t: t, dirs: dirs, exhaustive: true}
 }
 
+// A database that does not accept changes from the repository has no schema
+// directory the truncated-tree probe may search, and the hints say so with an
+// exhaustive empty answer. The miss then reports the policy, not a search of
+// the repository: nothing in it was read, so nothing in it can be blamed.
+func TestFindConfigByDatabaseNameInRepoTruncatedDatabaseRejectsRepository(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerTruncatedRepoWithSchemaSubtree(t, mux, []map[string]any{
+		{"path": "schemabot.yaml", "type": "blob", "sha": "blob-config", "mode": "100644"},
+	})
+	registerConfigTestPullRequest(t, mux)
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ic.SetConfigDirHints(testConfigDirHints{t: t, exhaustive: true})
+
+	_, _, err := ic.FindConfigByDatabaseNameInRepo(t.Context(), "octocat/hello-world", 1, "payments")
+
+	var notFound *DatabaseNotFoundError
+	require.ErrorAs(t, err, &notFound)
+	assert.Equal(t, "payments", notFound.DatabaseName)
+	assert.True(t, notFound.RepositoryNotAccepted())
+	assert.Empty(t, notFound.SearchedDirs)
+	assert.Contains(t, err.Error(), "database 'payments' accepts no schema changes from this repository")
+}
+
 // A repo-root schema path cannot be recovered through a subtree fetch when
 // the repository tree is truncated — the root tree is the truncated listing
 // itself — so schema-file loading keeps the truncation error instead of
@@ -1031,8 +1155,9 @@ func TestFindConfigByDatabaseNameInRepoTruncatedUsesScopedProbe(t *testing.T) {
 
 // A scoped probe that lists the database's configured directories completely
 // and finds no config for it is authoritative: the caller gets a clear
-// not-found error, with no misleading available-databases list (other
-// databases were never enumerated).
+// not-found error naming the directories that were searched, with no
+// misleading available-databases list (other databases were never
+// enumerated).
 func TestFindConfigByDatabaseNameInRepoTruncatedScopedProbeNotFound(t *testing.T) {
 	client, mux := setupConfigTestGitHubServer(t)
 	registerTruncatedRepoWithSchemaSubtree(t, mux, []map[string]any{
@@ -1049,7 +1174,11 @@ func TestFindConfigByDatabaseNameInRepoTruncatedScopedProbeNotFound(t *testing.T
 	var notFound *DatabaseNotFoundError
 	require.ErrorAs(t, err, &notFound)
 	assert.Equal(t, "payments", notFound.DatabaseName)
+	assert.Equal(t, []string{"apps/widgets/schema"}, notFound.SearchedDirs)
+	assert.True(t, notFound.SearchScoped)
+	assert.False(t, notFound.RepositoryNotAccepted())
 	assert.Empty(t, notFound.AvailableDatabases)
+	assert.Contains(t, err.Error(), "configured schema directories: apps/widgets/schema")
 	assert.NotContains(t, err.Error(), "Available databases")
 }
 
@@ -1067,6 +1196,7 @@ func TestFindConfigByDatabaseNameInRepoTruncatedNotExhaustiveFailsClosed(t *test
 	_, _, err := ic.FindConfigByDatabaseNameInRepo(t.Context(), "octocat/hello-world", 1, "widgets")
 
 	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrConfigDiscoveryTruncated)
 	assert.ErrorIs(t, err, ErrGitTreeTruncated)
 }
 

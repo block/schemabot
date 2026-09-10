@@ -139,6 +139,11 @@ type LocalConfig struct {
 	// for PostgreSQL native-safe execution. Zero uses the engine default.
 	PostgresNativeSafeTableSizeLimitBytes int64
 
+	// PostgresConcurrentIndexMaxDuration bounds one PostgreSQL concurrent index
+	// build, including abandoned-index recovery when an invalid leftover index
+	// must be rebuilt. Zero uses the engine default.
+	PostgresConcurrentIndexMaxDuration time.Duration
+
 	// Metadata holds engine-specific configuration as key-value pairs.
 	// The tern layer does not interpret these — it passes them through to the
 	// engine via Credentials.Metadata and reads specific keys as needed.
@@ -333,7 +338,7 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 			Settings:            spiritSettings,
 		}),
 		planetscaleEngine: psEngine,
-		postgresEngine: postgres.NewForTarget(cfg.PostgresNativeSafeTableSizeLimitBytes, cfg.Database, &engine.Credentials{
+		postgresEngine: postgres.NewForTarget(cfg.PostgresNativeSafeTableSizeLimitBytes, cfg.PostgresConcurrentIndexMaxDuration, cfg.Database, &engine.Credentials{
 			DSN:      cfg.TargetDSN,
 			Metadata: maps.Clone(cfg.Metadata),
 		}),
@@ -2974,10 +2979,9 @@ func (c *LocalClient) Progress(ctx context.Context, req *ternv1.ProgressRequest)
 	// engine resume state every tick. Readers never poll the engine — an
 	// instance-local engine has no live result to read, and for an externally-
 	// authoritative engine the drive keeps stored current.
-	var engineMetadata map[string]string
+	engineMetadata := c.loadStoredProgressMetadata(ctx, activeTask)
 	var vitessApplyIsInstant bool
 	if c.config.Type == storage.DatabaseTypeVitess {
-		engineMetadata = c.loadStoredDisplayMetadata(ctx, activeTask)
 		vitessApplyIsInstant = engineMetadata["is_instant"] == "true"
 	}
 
@@ -3256,31 +3260,40 @@ func (c *LocalClient) settledControlRequests(ctx context.Context, apply *storage
 	return settled, nil
 }
 
-// loadStoredDisplayMetadata reads a Vitess apply's deploy display fields
-// (branch_name, deploy_request_url, is_instant, deferred_deploy) from the
-// operation's persisted engine resume state — the drive's write-through is the
-// source, the read path never polls the engine. Returns nil before the first
-// write-through or on a decode/load error, so the response simply omits the
-// display fields until the drive catches up.
-func (c *LocalClient) loadStoredDisplayMetadata(ctx context.Context, task *storage.Task) map[string]string {
+// loadStoredProgressMetadata reads the operation's durable progress display
+// metadata. Vitess resume metadata is overlaid last because its established
+// display keys remain authoritative when both sources contain the same key.
+func (c *LocalClient) loadStoredProgressMetadata(ctx context.Context, task *storage.Task) map[string]string {
 	operationID, err := applyOperationIDForTask(task)
 	if err != nil {
 		c.logger.Debug("progress: no apply operation for display metadata", "task_id", task.TaskIdentifier, "error", err)
 		return nil
 	}
-	rs, err := c.storage.ApplyOperations().GetEngineResumeState(ctx, operationID)
+	op, err := c.storage.ApplyOperations().Get(ctx, operationID)
 	if err != nil {
-		// Not-found is expected before the drive's first write-through.
-		c.logger.Debug("progress: no engine resume state for display metadata", "task_id", task.TaskIdentifier, "apply_operation_id", operationID, "error", err)
+		c.logger.Warn("progress response will omit stored metadata: failed to load apply operation", "task_id", task.TaskIdentifier, "apply_operation_id", operationID, "error", err)
 		return nil
 	}
-	display, err := PSDisplayMetadata(rs.Metadata)
+	if op == nil {
+		c.logger.Debug("progress: no apply operation for stored metadata", "task_id", task.TaskIdentifier, "apply_operation_id", operationID)
+		return nil
+	}
+	metadata, err := op.ParseProgressMetadata()
 	if err != nil {
-		c.logger.Warn("progress response will omit engine display fields: failed to decode engine resume state",
+		c.logger.Warn("progress response will omit persisted progress fields: failed to decode progress metadata",
 			"task_id", task.TaskIdentifier, "apply_operation_id", operationID, "error", err)
-		return nil
+		metadata = make(map[string]string)
 	}
-	return display
+	if c.config.Type == storage.DatabaseTypeVitess && op.EngineResumeMetadata != "" {
+		display, err := PSDisplayMetadata(op.EngineResumeMetadata)
+		if err != nil {
+			c.logger.Warn("progress response will omit Vitess resume display fields: failed to decode engine resume state",
+				"task_id", task.TaskIdentifier, "apply_operation_id", operationID, "error", err)
+			return metadata
+		}
+		maps.Copy(metadata, display)
+	}
+	return metadata
 }
 
 // aggregateStoredShards computes a table's headline figures from its persisted

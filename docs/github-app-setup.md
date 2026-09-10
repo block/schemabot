@@ -5,22 +5,14 @@
 ## Table of Contents
 
 - [1. Create a GitHub App](#1-create-a-github-app)
-  - [Basic Information](#basic-information)
-  - [Webhook](#webhook)
-  - [Permissions](#permissions)
-  - [Subscribe to Events](#subscribe-to-events)
-  - [Where Can This GitHub App Be Installed?](#where-can-this-github-app-be-installed)
-  - [Create the App](#create-the-app)
 - [2. Generate a Private Key](#2-generate-a-private-key)
 - [3. Install the App](#3-install-the-app)
 - [4. Configure SchemaBot](#4-configure-schemabot)
 - [5. Start SchemaBot](#5-start-schemabot)
 - [6. Add `schemabot.yaml` Config to Your Repository](#6-add-schemabotyaml-config-to-your-repository)
-  - [Schema File Layout](#schema-file-layout)
 - [7. Test It](#7-test-it)
 - [Environment Variables Reference](#environment-variables-reference)
 - [Webhook Ingress](#webhook-ingress)
-  - [IP Allowlisting](#ip-allowlisting)
 - [Webhook Signature Validation](#webhook-signature-validation)
 - [Repository-level Webhooks (optional)](#repository-level-webhooks-optional)
 - [Troubleshooting](#troubleshooting)
@@ -191,7 +183,7 @@ type: mysql
 | Field | Required | Description |
 |-------|----------|-------------|
 | `database` | Yes | Must match a database name in your SchemaBot server config |
-| `type` | Yes | `"mysql"`, `"vitess"`, `"strata"` (many MySQL shards behind a shared topology — see [Strata](strata-engine.md)), or `"postgres"` |
+| `type` | Yes | `"mysql"`, `"vitess"`, `"strata"` (experimental; requires server opt-in — see [Strata](strata-engine.md)), or `"postgres"` |
 | `ignore_namespaces` | No | Namespace subdirectories to exclude from plans, applies, and checks (see [Ignoring Namespaces](namespaces.md#ignoring-namespaces)) |
 
 Environment availability and promotion order are configured on the SchemaBot server.
@@ -333,6 +325,12 @@ Follow the [pre-merge workflow](pre-merge-workflow.md) to take your first schema
 
 **"No schemabot.yaml config found" comment**: SchemaBot couldn't find a `schemabot.yaml` file in the PR's changed file directories. Make sure the file exists and is committed to the PR branch.
 
-**"Database Not Found" comment**: A command's `-d` flag named a database that no `schemabot.yaml` in the repository declares. Check the `database` field of the intended `schemabot.yaml`; the comparison is case-insensitive.
+**"Database Not Found" comment**: A command's `-d` flag named a database that no `schemabot.yaml` in the repository declares. Check the `database` field of the intended `schemabot.yaml`; the comparison is case-insensitive. On a repository too large for GitHub to return its full tree, SchemaBot searches only the directories listed under the database's `allowed_dirs` in the server config, and the comment lists the directories it searched.
+
+**"Database Not Available to This Repository" comment**: A command's `-d` flag named a database whose `allowed_repos` in the server config does not include this repository. No `schemabot.yaml` in the repository can manage that database, so none was searched. Add the repository to the database's `allowed_repos` if it should manage the database.
+
+**"Database Not Configured" comment**: A command's `-d` flag named a database that has no key under `databases:` in your SchemaBot server config. The repository's `schemabot.yaml` may be correct; the database still has to be configured on the server before SchemaBot can plan or apply changes for it. On a repository shared by several SchemaBot deployments, only a deployment named with `-t`, or one that is not the aggregate leader, answers this way; the leader keeps searching the repository so a database no deployment serves is still reported.
+
+**"Repository Too Large to Search" comment**: GitHub truncated the repository tree, and the server config gave SchemaBot no exhaustive set of directories to search instead. Give the database an `allowed_dirs` entry naming its schema directory so discovery can probe that directory alone.
 
 **"not configured on this SchemaBot instance" comment**: The `database` field in `schemabot.yaml` doesn't match any key under `databases:` in your SchemaBot server config. The consumer value is folded to lowercase before matching, so only the letters need to agree with the (lowercase) server key.

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -14,9 +15,9 @@ func previewCLIMultiDeploymentApplyInProgress() {
 		{Deployment: "eu-west", Target: "orders-eu-west", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt},
 		{Deployment: "ap-south", Target: "orders-ap-south", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt},
 	}, []TableProgress{
-		{Deployment: "us-east", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.WaitingForCutover, RowsCopied: 80000, RowsTotal: 80000, PercentComplete: 100},
-		{Deployment: "eu-west", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Running, RowsCopied: 42000, RowsTotal: 120000, PercentComplete: 35, ETASeconds: 240},
-		{Deployment: "ap-south", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Pending},
+		{Deployment: "us-east", TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.WaitingForCutover, RowsCopied: 80000, RowsTotal: 80000, PercentComplete: 100},
+		{Deployment: "eu-west", TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Running, RowsCopied: 42000, RowsTotal: 120000, PercentComplete: 35, ETASeconds: 240},
+		{Deployment: "ap-south", TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Pending},
 	}))
 }
 
@@ -26,9 +27,9 @@ func previewCLIMultiDeploymentApplyFailed() {
 		{Deployment: "eu-west", Target: "orders-eu-west", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt, ErrorMessage: "duplicate key name 'idx_orders_source'"},
 		{Deployment: "ap-south", Target: "orders-ap-south", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 	}, []TableProgress{
-		{Deployment: "us-east", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Completed, RowsCopied: 80000, RowsTotal: 80000, PercentComplete: 100},
-		{Deployment: "eu-west", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD INDEX `idx_orders_source` (`source`)", Status: state.Task.Failed, RowsCopied: 0, RowsTotal: 120000, PercentComplete: 0},
-		{Deployment: "ap-south", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: TaskCancelled},
+		{Deployment: "us-east", TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Completed, RowsCopied: 80000, RowsTotal: 80000, PercentComplete: 100},
+		{Deployment: "eu-west", TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `orders` ADD INDEX `idx_orders_source` (`source`)", Status: state.Task.Failed, RowsCopied: 0, RowsTotal: 120000, PercentComplete: 0},
+		{Deployment: "ap-south", TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: TaskCancelled},
 	}))
 }
 
@@ -38,9 +39,9 @@ func previewCLIMultiDeploymentApplyHaltedWithLiveSibling() {
 		{Deployment: "eu-west", Target: "orders-eu-west", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt},
 		{Deployment: "ap-south", Target: "orders-ap-south", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyBarrier, OnFailure: storage.OnFailureHalt},
 	}, []TableProgress{
-		{Deployment: "us-east", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD INDEX `idx_orders_source` (`source`)", Status: state.Task.Failed, RowsCopied: 0, RowsTotal: 80000, PercentComplete: 0},
-		{Deployment: "eu-west", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Running, RowsCopied: 42000, RowsTotal: 120000, PercentComplete: 35, ETASeconds: 240},
-		{Deployment: "ap-south", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Pending},
+		{Deployment: "us-east", TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `orders` ADD INDEX `idx_orders_source` (`source`)", Status: state.Task.Failed, RowsCopied: 0, RowsTotal: 80000, PercentComplete: 0},
+		{Deployment: "eu-west", TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Running, RowsCopied: 42000, RowsTotal: 120000, PercentComplete: 35, ETASeconds: 240},
+		{Deployment: "ap-south", TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Pending},
 	}))
 }
 
@@ -50,9 +51,9 @@ func previewCLIMultiDeploymentApplyCompleted() {
 		{Deployment: "eu-west", Target: "orders-eu-west", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 		{Deployment: "ap-south", Target: "orders-ap-south", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 	}, []TableProgress{
-		{Deployment: "us-east", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Completed, RowsCopied: 80000, RowsTotal: 80000, PercentComplete: 100},
-		{Deployment: "eu-west", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Completed, RowsCopied: 120000, RowsTotal: 120000, PercentComplete: 100},
-		{Deployment: "ap-south", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Completed, RowsCopied: 60000, RowsTotal: 60000, PercentComplete: 100},
+		{Deployment: "us-east", TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Completed, RowsCopied: 80000, RowsTotal: 80000, PercentComplete: 100},
+		{Deployment: "eu-west", TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Completed, RowsCopied: 120000, RowsTotal: 120000, PercentComplete: 100},
+		{Deployment: "ap-south", TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Completed, RowsCopied: 60000, RowsTotal: 60000, PercentComplete: 100},
 	})
 	data.CompletedAt = previewTime.Add(-1 * time.Minute).Format(time.RFC3339)
 	WriteProgress(data)

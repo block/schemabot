@@ -7,15 +7,18 @@ import (
 	"database/sql"
 	"log/slog"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/block/spirit/pkg/utils"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/block/schemabot/pkg/namedlock"
+	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
 )
@@ -473,4 +476,233 @@ func TestEnsureSchemaPostgres_WaitsForAdvisoryLock(t *testing.T) {
 		t.Fatal("bootstrap did not complete after the advisory lock was released")
 	}
 	requireStorageTables(t, db)
+}
+
+// A platform-imposed statement_timeout must not reach SchemaBot's bootstrap.
+// Hosted PostgreSQL providers set one at the role or database level and tune
+// it for API queries; a value far below what a CREATE TABLE run needs would
+// otherwise cancel the bootstrap and crashloop the pod. SchemaBot's own
+// budgets take precedence, so a fresh database still converges to the full
+// storage schema under a deliberately hostile 1ms database default.
+func TestEnsureSchemaPostgres_OverridesHostileDatabaseStatementTimeout(t *testing.T) {
+	dsn, db := startPostgresStorage(t)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// 1ms is below what the bootstrap's own catalog reads take, so a pod that
+	// inherited this value could not even complete its drift scan. That is what
+	// makes the bootstrap's success below evidence of precedence rather than of
+	// a budget that simply never had to bite.
+	_, err := db.ExecContext(t.Context(),
+		`ALTER DATABASE schemabot SET statement_timeout = '1ms'`)
+	require.NoError(t, err)
+
+	// Baseline: the hostile default really does reach a fresh session, so the
+	// bootstrap below is proving precedence rather than a no-op.
+	fresh, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(fresh) })
+	var inherited string
+	require.NoError(t, fresh.QueryRowContext(t.Context(), "SHOW statement_timeout").Scan(&inherited))
+	require.Equal(t, "1ms", inherited)
+
+	// No statement timeout option: the bootstrap's own default has to be what
+	// displaces the hostile value. This is the surface an embedder gets when
+	// it calls EnsureSchema without opting in, so a default of "inherit
+	// whatever the platform set" would fail here rather than in production.
+	require.NoError(t, EnsureSchema(dsn, logger,
+		WithDialect(schema.DialectPostgres)))
+
+	requireStorageTables(t, db)
+}
+
+// The bootstrap's advisory-lock connection runs with no statement budget so a
+// trailing pod can block inside pg_advisory_lock for the leader's whole
+// bootstrap. A platform statement_timeout below that wait would otherwise
+// cancel a legitimate queue and fail the trailing pod's startup. Both pods
+// bootstrap the same database concurrently under a hostile 50ms default; both
+// must succeed.
+func TestEnsureSchemaPostgres_HostileTimeoutDoesNotTruncateLockWait(t *testing.T) {
+	dsn, db := startPostgresStorage(t)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	_, err := db.ExecContext(t.Context(),
+		`ALTER DATABASE schemabot SET statement_timeout = '50ms'`)
+	require.NoError(t, err)
+
+	var g errgroup.Group
+	for range 2 {
+		g.Go(func() error {
+			return EnsureSchema(dsn, logger,
+				WithDialect(schema.DialectPostgres),
+				WithPostgresStatementTimeout(DefaultPostgresStatementTimeout))
+		})
+	}
+	require.NoError(t, g.Wait())
+
+	requireStorageTables(t, db)
+}
+
+// A genuine statement timeout is reported as one. When a bootstrap statement
+// exhausts the budget in force, the error names the timeout and the budget
+// instead of surfacing a bare failure, so an operator sees the cause from the
+// message alone rather than having to recognize SQLSTATE 57014.
+func TestEnsureSchemaPostgres_StatementTimeoutIsClassified(t *testing.T) {
+	dsn, _ := startPostgresStorage(t)
+
+	db, err := postgresconn.Open(dsn, postgresconn.WithStatementTimeout(100*time.Millisecond))
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	require.NoError(t, db.PingContext(t.Context()))
+
+	const budget = 100 * time.Millisecond
+	start := time.Now()
+	_, execErr := db.ExecContext(t.Context(), "SELECT pg_sleep(5)")
+	require.Error(t, execErr)
+
+	classified := postgresStatementTimeoutError(execErr, budget, time.Since(start))
+	assert.ErrorContains(t, classified, "statement timed out")
+	assert.ErrorContains(t, classified, budget.String())
+	// The server's own error is still reachable for anyone matching on it.
+	var pgErr *pgconn.PgError
+	require.ErrorAs(t, classified, &pgErr)
+	assert.Equal(t, "57014", pgErr.Code)
+}
+
+// A convergence DDL statement cancelled with SQLSTATE 57014 reports the budget
+// it ran under, both in the returned error and in the log. The log is the half
+// that matters most: a bootstrap failure crashloops the pod before it serves
+// anything, so the structured budget and elapsed fields are the only artifact
+// left to say whether the statement exhausted SchemaBot's own budget or was
+// cut short by something outside it.
+func TestExecPostgresChanges_ClassifiesCancelledStatement(t *testing.T) {
+	dsn, _ := startPostgresStorage(t)
+
+	db, err := postgresconn.Open(dsn, postgresconn.WithStatementTimeout(DefaultPostgresStatementTimeout))
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	require.NoError(t, db.PingContext(t.Context()))
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// The convergence raises statement_timeout to its own budget before
+	// running a change, so a statement is only cancelled once something
+	// tightens it again — which is what a role- or database-level value
+	// imposed outside SchemaBot does. Reproduce that from inside the change.
+	changes := []postgresSchemaChange{{
+		operation: postgresOpCreateTable,
+		object:    "cancelled_change",
+		ddl:       "SET statement_timeout = '50ms'; SELECT pg_sleep(5);",
+	}}
+
+	execErr := execPostgresChanges(t.Context(), db, "cancelled_change", changes, logger)
+	require.Error(t, execErr)
+
+	// The rendered error names the budget the convergence set, so an operator
+	// can compare it against how long the statement actually ran.
+	assert.ErrorContains(t, execErr, postgresBootstrapDDLStatementTimeout.String())
+	var pgErr *pgconn.PgError
+	require.ErrorAs(t, execErr, &pgErr, "the server's own error must stay reachable")
+	assert.Equal(t, "57014", pgErr.Code)
+
+	assert.Contains(t, logs.String(), "storage schema change failed")
+	assert.Contains(t, logs.String(), `"statement_timeout":`)
+	assert.Contains(t, logs.String(), `"elapsed":`)
+}
+
+// A cancellation that arrives before the budget could have fired did not come
+// from the budget. An operator's pg_cancel_backend raises the same SQLSTATE as
+// statement_timeout, so reporting it as budget exhaustion would send triage
+// after the wrong cause; elapsed time separates them.
+func TestEnsureSchemaPostgres_ExternalCancelIsNotReportedAsTimeout(t *testing.T) {
+	dsn, admin := startPostgresStorage(t)
+
+	db, err := postgresconn.Open(dsn, postgresconn.WithStatementTimeout(0))
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+
+	// Pin one session so the cancel targets the sleeping backend.
+	conn, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(conn) })
+	var pid int
+	require.NoError(t, conn.QueryRowContext(t.Context(), "SELECT pg_backend_pid()").Scan(&pid))
+
+	// Run the sleep on the pinned session and cancel it from the test
+	// goroutine, which is the only one that may assert. The sleeper reports
+	// only its error and how long it ran.
+	type sleepResult struct {
+		err     error
+		elapsed time.Duration
+	}
+	slept := make(chan sleepResult, 1)
+	go func() {
+		start := time.Now()
+		_, err := conn.ExecContext(t.Context(), "SELECT pg_sleep(10)")
+		slept <- sleepResult{err: err, elapsed: time.Since(start)}
+	}()
+
+	// Cancel only once the backend is actually running the sleep: signalling
+	// an idle backend succeeds without cancelling anything, and the sleep
+	// would then run to completion.
+	require.Eventually(t, func() bool {
+		var cancelled bool
+		err := admin.QueryRowContext(t.Context(), `
+			SELECT pg_cancel_backend(pid)
+			FROM pg_stat_activity
+			WHERE pid = $1 AND state = 'active' AND query LIKE '%pg_sleep(10)%'`, pid).Scan(&cancelled)
+		return err == nil && cancelled
+	}, 15*time.Second, 50*time.Millisecond, "backend never started the sleep")
+
+	var res sleepResult
+	select {
+	case res = <-slept:
+	case <-time.After(15 * time.Second):
+		require.Fail(t, "cancelled statement did not return")
+	}
+	require.Error(t, res.err)
+
+	// A budget far larger than the elapsed time: the cancel cannot be the
+	// budget firing, and the message must say so.
+	classified := postgresStatementTimeoutError(res.err, time.Hour, res.elapsed)
+	assert.ErrorContains(t, classified, "something outside SchemaBot cancelled it")
+	assert.NotContains(t, classified.Error(), "statement timed out")
+}
+
+// Convergence DDL runs under its own raised budget, not the connection's
+// ordinary query budget. An index build legitimately takes far longer than a
+// catalog read, so a bootstrap that executed DDL under the query budget would
+// cancel healthy work. The probe runs as real convergence DDL and records the
+// budget the server had in force while executing it; pg_settings reports the
+// value in its base unit (milliseconds), so the assertion is exact rather than
+// dependent on how PostgreSQL formats units.
+func TestExecPostgresChanges_RaisesStatementTimeoutForDDL(t *testing.T) {
+	dsn, admin := startPostgresStorage(t)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// A deliberately small session budget, so the value observed inside the
+	// transaction can only come from the DDL raise.
+	db, err := postgresconn.Open(dsn, postgresconn.WithStatementTimeout(time.Second))
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	require.NoError(t, db.PingContext(t.Context()))
+
+	probe := postgresSchemaChange{
+		operation: postgresOpCreateTable,
+		object:    "ddl_budget_probe",
+		ddl: `CREATE TABLE ddl_budget_probe AS
+		      SELECT setting AS observed FROM pg_settings WHERE name = 'statement_timeout'`,
+	}
+	require.NoError(t, execPostgresChanges(t.Context(), db, "ddl_budget_probe", []postgresSchemaChange{probe}, logger))
+
+	var observed string
+	require.NoError(t, admin.QueryRowContext(t.Context(), "SELECT observed FROM ddl_budget_probe").Scan(&observed))
+	assert.Equal(t, strconv.FormatInt(postgresBootstrapDDLStatementTimeout.Milliseconds(), 10), observed)
+
+	// The raise is transaction-local: the pooled connection goes back to its
+	// ordinary query budget rather than carrying the DDL budget into later use.
+	var after string
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT setting FROM pg_settings WHERE name = 'statement_timeout'").Scan(&after))
+	assert.Equal(t, "1000", after)
 }

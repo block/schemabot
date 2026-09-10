@@ -1263,6 +1263,8 @@ func TestE2EPassingAggregateWithoutAllowedEnvs(t *testing.T) {
 // TestE2EFailingAggregateOnPlanError verifies that when a plan fails for all
 // environments (e.g., database not configured), a failing aggregate check is
 // posted so branch protection shows a clear failure instead of waiting forever.
+// The database here is discovered from the PR's own schemabot.yaml, not named
+// by -d, so the failing aggregate, not a registry answer, is what reports it.
 func TestE2EFailingAggregateOnPlanError(t *testing.T) {
 	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging"})
 
@@ -1300,8 +1302,8 @@ func TestE2EFailingAggregateOnPlanError(t *testing.T) {
 	// Should get a comment with the error
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "Error")
-		assert.Contains(t, body, "unconfigured-db")
+		assert.Contains(t, body, "Database Not Configured")
+		assert.Contains(t, body, "`unconfigured-db`")
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for error comment")
 	}

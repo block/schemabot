@@ -6,6 +6,7 @@ package sqlstore
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -23,7 +24,7 @@ import (
 // applyOperationColumns lists all columns for SELECT queries.
 const applyOperationColumns = `id, apply_id, deployment, operation_key, operation_kind, target, external_id, external_operation_id, state, error_message,
 	cutover_policy, on_failure, attempt, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
-	engine_resume_context, engine_resume_metadata, created_at, updated_at`
+	engine_resume_context, engine_resume_metadata, progress_metadata, created_at, updated_at`
 
 // applyOperationStore implements storage.ApplyOperationStore using MySQL.
 type applyOperationStore struct {
@@ -711,6 +712,30 @@ func (s *applyOperationStore) GetEngineResumeState(ctx context.Context, operatio
 		MigrationContext: contextVal.String,
 		Metadata:         metadata.String,
 	}, nil
+}
+
+// SaveProgressMetadata stores the engine's latest progress display metadata as
+// a JSON object on the operation that owns the execution. The operation write
+// guard preserves OW-2 by rejecting writes from a displaced driver.
+func (s *applyOperationStore) SaveProgressMetadata(ctx context.Context, operationID int64, metadata map[string]string) error {
+	if metadata == nil {
+		metadata = make(map[string]string)
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("encode progress metadata for apply_operation %d: %w", operationID, err)
+	}
+	guard, err := operationWriteGuardFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	args := append([]any{encoded, operationID}, guard.args()...)
+	query := guard.updateStatement(s.dialect, []JoinedUpdateAssignment{{Column: "progress_metadata", Expr: "?"}})
+	result, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("save progress metadata for apply_operation %d: %w", operationID, err)
+	}
+	return s.checkUpdatedOrExists(ctx, result, operationID, guard, false)
 }
 
 // releasedFailureExemptionSQL stops a terminal-failed earlier sibling from
@@ -1703,6 +1728,60 @@ func (s *applyOperationStore) ReleaseClaim(ctx context.Context, lease storage.Op
 	return rows > 0, nil
 }
 
+// ReleaseFinishedClaim clears the lease on an operation whose drive has ended,
+// so a fresh lease on a row means a drive is in progress rather than that one
+// ended here.
+//
+// "Ended" is the settled states plus failed_retryable. Settled is the terminal
+// set minus stopped, matching state.SettledApplyStates: a stopped operation is
+// terminal but still addressable, so a driver may resume writing under its
+// lease and the lease is not this call's to clear. failed_retryable is the
+// state whose leftover lease is indistinguishable from a live retry's, which is
+// what makes the clear worth doing at all; the settled states are here because
+// a lease-only reader cannot tell those leftovers apart either.
+//
+// It carries the heartbeat forward rather than moving it, unlike every other
+// write here. The settling write set updated_at moments ago, so the column
+// already says when the row last moved, and both directions from there are
+// wrong: ReleaseClaim's backdate would report a row that was just written as
+// stalled, and a fresh stamp would push out the crash-recovery arm of
+// FindNextApplyOperation, which re-offers a failed_retryable operation under a
+// stale parent only once the operation's own heartbeat has aged. Carrying it
+// forward leaves re-claim timing exactly as the settling write left it.
+//
+// The assignment is explicit for the same reason it is not a stamp: left out,
+// MySQL's ON UPDATE CURRENT_TIMESTAMP would refresh the heartbeat here and
+// PostgreSQL would not, so the two dialects would recover this row on different
+// schedules.
+//
+// Guarded on both the lease token and the ended states so it cannot clear a
+// lease a peer rotated onto the row, or one belonging to a drive that left the
+// row somewhere a driver may still resume from.
+func (s *applyOperationStore) ReleaseFinishedClaim(ctx context.Context, lease storage.OperationLease) (bool, error) {
+	if !lease.Valid() {
+		return false, fmt.Errorf("release finished claim for apply_operation %d: %w", lease.OperationID, storage.ErrApplyLeaseLost)
+	}
+	endedStates := append([]string{state.ApplyOperation.FailedRetryable}, state.SettledApplyStates...)
+	args := []any{lease.OperationID, lease.Token}
+	for _, s := range endedStates {
+		args = append(args, s)
+	}
+	result, err := s.db.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE apply_operations
+		SET lease_owner = '', lease_token = '', lease_acquired_at = NULL,
+		    updated_at = updated_at
+		WHERE id = ? AND lease_token = ? AND state IN (%s)
+	`, placeholders(len(endedStates))), args...)
+	if err != nil {
+		return false, fmt.Errorf("release finished claim for apply_operation %d: %w", lease.OperationID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read release finished claim rows affected for apply_operation %d: %w", lease.OperationID, err)
+	}
+	return rows > 0, nil
+}
+
 // Heartbeat refreshes updated_at to maintain the claim's lease. Should be
 // called periodically by a driver holding the lease. Silent no-op when the
 // row no longer exists (mirrors ApplyStore.Heartbeat).
@@ -1936,6 +2015,50 @@ func unleasedOperationGate(d Dialect) string {
 		)`, freshLeaseAfter)
 }
 
+// undrivenApplyGate renders the NOT EXISTS admitting only applies with no fresh
+// operation lease. It is the apply-granular counterpart of
+// unleasedOperationGate: that gate excludes one task row by its own operation's
+// lease, this one excludes a whole apply by any operation under it.
+//
+// Whole-apply is the granularity a writer needs when it settles an apply and its
+// rows together. Skipping the rows a live drive holds while writing the apply's
+// own verdict would settle the parent over children the writer just declined to
+// touch, so the two have to be decided as one, and the decision has to be made
+// where the parent is selected.
+//
+// It reads the lease and nothing else, because state does not tell the two
+// meanings of a lease apart. A redispatched operation keeps its failed_retryable
+// state for the whole drive — the claim rotates the lease and leaves the state
+// alone — so any state filter that admits failed_retryable admits an apply a
+// driver is part-way through retrying, which is the one case a whole-apply write
+// must not land under. Filtering it out instead would exclude the retry but not
+// the drive.
+//
+// Reading the lease alone only terminalizes because a drive clears its lease as
+// it ends. A leftover lease is indistinguishable from a live one for a full
+// staleness window, and a single-deployment apply that has just spent its last
+// attempt would be in that window every time, so without the handback this gate
+// would defer the ordinary shape of the work it exists to settle.
+//
+// The gate is a candidate filter, not the decision. An unlocked NOT EXISTS is a
+// read a claim can win the moment after it is evaluated, so a writer relying on
+// this repeats it under lockUndrivenApply, holding every operation row of the
+// apply.
+//
+// An apply with no operations is admitted. Nothing holds a lease over it, so
+// there is nothing here to exclude it by.
+func undrivenApplyGate(d Dialect) string {
+	freshLeaseAfter := d.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+	return fmt.Sprintf(`NOT EXISTS (
+			SELECT 1
+			FROM apply_operations lease_holder
+			WHERE lease_holder.apply_id = applies.id
+				AND lease_holder.lease_owner <> ''
+				AND lease_holder.updated_at >= %s
+		)`, freshLeaseAfter)
+}
+
 // ReapStranded elects one reaper per pass and reaps under the lock. See
 // storage.ApplyOperationStore for the contract.
 func (s *applyOperationStore) ReapStranded(ctx context.Context, limit int) ([]*storage.ReapedOperation, error) {
@@ -2136,13 +2259,13 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 	var errMsg sql.NullString
 	var externalID sql.NullString
 	var externalOperationID sql.NullString
-	var engineResumeContext, engineResumeMetadata sql.NullString
+	var engineResumeContext, engineResumeMetadata, progressMetadata sql.NullString
 	var startedAt, completedAt, leaseAcquiredAt sql.NullTime
 
 	if err := s.Scan(
 		&ad.ID, &ad.ApplyID, &ad.Deployment, &ad.OperationKey, &ad.OperationKind, &ad.Target, &externalID, &externalOperationID, &ad.State, &errMsg,
 		&ad.CutoverPolicy, &ad.OnFailure, &ad.Attempt, &startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
-		&engineResumeContext, &engineResumeMetadata, &ad.CreatedAt, &ad.UpdatedAt,
+		&engineResumeContext, &engineResumeMetadata, &progressMetadata, &ad.CreatedAt, &ad.UpdatedAt,
 	); err != nil {
 		return nil, err
 	}
@@ -2173,6 +2296,9 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 	}
 	if engineResumeMetadata.Valid {
 		ad.EngineResumeMetadata = engineResumeMetadata.String
+	}
+	if progressMetadata.Valid {
+		ad.ProgressMetadata = progressMetadata.String
 	}
 	return &ad, nil
 }

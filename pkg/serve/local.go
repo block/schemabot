@@ -11,11 +11,12 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/auth"
+	"github.com/block/schemabot/pkg/localruntime"
 )
 
-// validateLocalConfig keeps local hosting explicit while leaving engine,
+// ValidateLocalConfig keeps local hosting explicit while leaving engine,
 // routing, and storage selection to the shared server configuration.
-func validateLocalConfig(cfg *api.ServerConfig) error {
+func ValidateLocalConfig(cfg *api.ServerConfig) error {
 	if cfg.Storage.DSN == "" && cfg.Storage.DSNFrom == nil {
 		return fmt.Errorf("local runtime requires explicit storage.dsn or storage.dsn_from")
 	}
@@ -36,17 +37,19 @@ func validateLocalConfig(cfg *api.ServerConfig) error {
 
 // LocalOptions controls the foreground host. Ready runs after storage and the
 // operator are initialized; its endpoint contains the actual allocated port.
+// RegisterConfig runs synchronously before Ready and before the operator starts.
 type LocalOptions struct {
-	Address string
-	Token   string
-	Ready   func(endpoint string) error
+	Address        string
+	Token          string
+	Ready          func(endpoint string) error
+	RegisterConfig func(localruntime.PrepareConfig)
 }
 
 // RunLocal hosts the normal API and operator on an authenticated loopback
 // listener. Cancellation drains the HTTP server and existing operator shutdown
 // path; it does not issue an operator stop or cancel any stored apply.
 func RunLocal(ctx context.Context, config api.ServerConfig, local LocalOptions, opts ...Option) (runErr error) {
-	if err := validateLocalConfig(&config); err != nil {
+	if err := ValidateLocalConfig(&config); err != nil {
 		return err
 	}
 	o := options{logger: slog.Default()}
@@ -84,6 +87,23 @@ func RunLocal(ctx context.Context, config api.ServerConfig, local LocalOptions, 
 	srv, err := Build(ctx, &config, opts...)
 	if err != nil {
 		return fmt.Errorf("build local runtime: %w", err)
+	}
+	if local.RegisterConfig != nil {
+		config.EnableLocalRegistration()
+		local.RegisterConfig(func(data []byte, resolved map[string]map[string]string) (func(), error) {
+			next, err := api.ParseServerConfig(data)
+			if err != nil {
+				return nil, fmt.Errorf("invalid registration configuration")
+			}
+			prospective, publish, err := config.PrepareLocalRegistration(next, resolved)
+			if err != nil {
+				return nil, err
+			}
+			if err := ValidateLocalConfig(prospective); err != nil {
+				return nil, fmt.Errorf("invalid local registration")
+			}
+			return publish, nil
+		})
 	}
 	// Only Close cancels the operator, after it begins draining claims. Passing
 	// the command context to Start would let a signal end drives before their

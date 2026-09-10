@@ -1666,6 +1666,12 @@ func TestLocalClient_PendingCancelFailsClosedForRevertPhase(t *testing.T) {
 // control tests exercise the engine's own typed declines end to end, not a
 // fake standing in for them.
 func newPostgresControlTestClient(apply *storage.Apply, tasks []*storage.Task, controlRequests *testControlRequestStore) *LocalClient {
+	return newPostgresControlTestClientWithEngine(apply, tasks, controlRequests, postgres.New())
+}
+
+// newPostgresControlTestClientWithEngine wires eng as the PostgreSQL engine,
+// for the declines the real engine only issues over an apply it is driving.
+func newPostgresControlTestClientWithEngine(apply *storage.Apply, tasks []*storage.Task, controlRequests *testControlRequestStore, eng engine.Engine) *LocalClient {
 	return &LocalClient{
 		config: LocalConfig{
 			Database:  "testdb",
@@ -1679,7 +1685,7 @@ func newPostgresControlTestClient(apply *storage.Apply, tasks []*storage.Task, c
 			applyOperations: &controlTestApplyOperationStore{},
 			controlRequests: controlRequests,
 		},
-		postgresEngine: postgres.New(),
+		postgresEngine: eng,
 		logger:         slog.Default(),
 	}
 }
@@ -1732,12 +1738,13 @@ func TestLocalClient_PendingStopResolvesPostgresUnsupportedDecline(t *testing.T)
 	assert.False(t, handled, "a resolved decline must not be re-consumed on the next drive claim")
 }
 
-// A durable cancel request against a running PostgreSQL apply is resolved as
-// permanently failed for the same reason as stop: the engine's decline is
-// deterministic, so failing the stored request terminally is the only way to
-// end the operator-owned retry loop without misrepresenting the healthy
-// running change.
-func TestLocalClient_PendingCancelResolvesPostgresUnsupportedDecline(t *testing.T) {
+// A durable cancel request against running PostgreSQL plain DDL is resolved as
+// permanently failed for the same reason as stop: the engine declines cancel
+// for that shape deterministically, so failing the stored request terminally
+// is the only way to end the operator-owned retry loop without
+// misrepresenting the healthy running change. The engine's own tests pin the
+// decline; this pins what the drive does with it.
+func TestLocalClient_PendingCancelResolvesPostgresPlainDDLDecline(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              42,
 		ApplyIdentifier: "apply-postgres-pending-cancel",
@@ -1757,7 +1764,8 @@ func TestLocalClient_PendingCancelResolvesPostgresUnsupportedDecline(t *testing.
 		Status:      storage.ControlRequestPending,
 		RequestedBy: "operator",
 	}}}
-	client := newPostgresControlTestClient(apply, []*storage.Task{task}, controlRequests)
+	eng := &controlCaptureEngine{cancelErr: engine.NewUnsupportedOperationError("cancel is supported for PostgreSQL concurrent index builds only")}
+	client := newPostgresControlTestClientWithEngine(apply, []*storage.Task{task}, controlRequests, eng)
 
 	handled, err := client.processPendingCancelControlRequest(t.Context(), apply)
 
@@ -1907,6 +1915,48 @@ func TestLocalClient_PendingCancelRefusalReportsNoEffectWhenResolvingTheRequestF
 	pending, err := requests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, err)
 	assert.NotNil(t, pending, "the request could not be resolved, so it stays pending for a later claim")
+}
+
+// A durable cancel request against a PostgreSQL apply this process has no live
+// work for — the drive that ran it is gone, so its statement died with that
+// connection — has nothing left to stop: the engine's permanent decline does
+// not surface, the live-work probe reads idle, and the durable cancel
+// completes by terminalizing the task and apply, as it does for every engine.
+func TestLocalClient_PendingCancelCompletesWhenPostgresEngineHasNoLiveWork(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-postgres-cancel-no-live-work",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypePostgres,
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-postgres-cancel-no-live-work",
+		State:          state.Task.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	}}}
+	client := newPostgresControlTestClient(apply, []*storage.Task{task}, controlRequests)
+
+	handled, err := client.processPendingCancelControlRequest(t.Context(), apply)
+
+	require.NoError(t, err)
+	assert.True(t, handled, "a completed cancel is the operator's cancel")
+	assert.Equal(t, state.Apply.Cancelled, apply.State)
+	assert.Equal(t, state.Task.Cancelled, task.State)
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.Nil(t, pending, "the durable cancel request must be resolved, not left pending")
+	resolved, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, storage.ControlRequestCompleted, resolved.Status)
 }
 
 // revertPhaseDeclineFixture stages an apply in its revert window with one

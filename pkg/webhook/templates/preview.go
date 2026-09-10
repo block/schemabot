@@ -637,6 +637,58 @@ func PreviewCommentErrorNotFound() string {
 	})
 }
 
+// PreviewCommentErrorNotFoundScoped renders the "database not found" error
+// comment for a repository too large to search in full, where only the
+// database's configured schema directories were probed.
+func PreviewCommentErrorNotFoundScoped() string {
+	return RenderDatabaseNotFound(SchemaErrorData{
+		RequestedBy:  previewRequestedBy,
+		Timestamp:    "2026-01-15 14:30:00",
+		Environment:  "staging",
+		DatabaseName: "payments",
+		CommandName:  action.Plan,
+		SearchedDirs: []string{"services/payments/schema", "services/payments/legacy-schema"},
+	})
+}
+
+// PreviewCommentErrorDatabaseNotConfigured renders the error comment for a
+// command naming a database the SchemaBot server has no configuration for.
+func PreviewCommentErrorDatabaseNotConfigured() string {
+	return RenderDatabaseNotConfigured(SchemaErrorData{
+		RequestedBy:  previewRequestedBy,
+		Timestamp:    "2026-01-15 14:30:00",
+		Environment:  "staging",
+		DatabaseName: "payments",
+		CommandName:  action.Apply,
+	})
+}
+
+// PreviewCommentErrorDatabaseRepoNotAllowed renders the error comment for a
+// command naming a database the SchemaBot server configures for other
+// repositories only.
+func PreviewCommentErrorDatabaseRepoNotAllowed() string {
+	return RenderDatabaseRepoNotAllowed(SchemaErrorData{
+		RequestedBy:  previewRequestedBy,
+		Timestamp:    "2026-01-15 14:30:00",
+		Environment:  "staging",
+		DatabaseName: "payments",
+		CommandName:  action.Apply,
+	})
+}
+
+// PreviewCommentErrorRepositoryTruncated renders the error comment for a
+// database-scoped command on a repository whose tree GitHub truncated, where
+// the server-side schema directories could not bound the search.
+func PreviewCommentErrorRepositoryTruncated() string {
+	return RenderRepositoryTreeTruncated(SchemaErrorData{
+		RequestedBy:  previewRequestedBy,
+		Timestamp:    "2026-01-15 14:30:00",
+		Environment:  "staging",
+		DatabaseName: "payments",
+		CommandName:  action.Apply,
+	})
+}
+
 // PreviewCommentErrorInvalid renders the "invalid config" error comment.
 func PreviewCommentErrorInvalid() string {
 	return RenderInvalidConfig(SchemaErrorData{
@@ -1000,8 +1052,8 @@ func PreviewCommentUnsafeBlocked() string {
 		},
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "users", Reason: "DROP INDEX idx_email"},
-			{Table: "orders", Reason: "DROP COLUMN notes"},
+			{Table: "users", Reason: "DROP INDEX idx_email", DDL: "ALTER TABLE `users` DROP INDEX `idx_email`", ChangeType: "alter"},
+			{Table: "orders", Reason: "DROP COLUMN notes", DDL: "ALTER TABLE `orders` DROP COLUMN `notes`", ChangeType: "alter"},
 		},
 	})
 }
@@ -1029,8 +1081,10 @@ func PreviewCommentDropColumnBlocked() string {
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
 			{
-				Table:  "customers",
-				Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\"",
+				Table:      "customers",
+				Reason:     "Unsafe operation detected: \"DROP COLUMN `nickname`\"",
+				DDL:        "ALTER TABLE `customers` DROP COLUMN `nickname`",
+				ChangeType: "alter",
 			},
 		},
 	})
@@ -1059,8 +1113,10 @@ func PreviewCommentDropIndexBlocked() string {
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
 			{
-				Table:  "customers",
-				Reason: "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\"",
+				Table:      "customers",
+				Reason:     "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\"",
+				DDL:        "ALTER TABLE `customers` DROP INDEX `idx_customers_email`",
+				ChangeType: "alter",
 			},
 		},
 	})
@@ -1157,8 +1213,8 @@ func PreviewCommentApplyPlanUnsafe() string {
 		HasUnsafeChanges: true,
 		AllowUnsafe:      true,
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "users", Reason: "DROP INDEX idx_email"},
-			{Table: "orders", Reason: "DROP COLUMN notes"},
+			{Table: "users", Reason: "DROP INDEX idx_email", DDL: "ALTER TABLE `users` DROP INDEX `idx_email`", ChangeType: "alter"},
+			{Table: "orders", Reason: "DROP COLUMN notes", DDL: "ALTER TABLE `orders` DROP COLUMN `notes`", ChangeType: "alter"},
 		},
 		IsLocked:     true,
 		LockOwner:    "acme/myapp#42",

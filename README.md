@@ -14,9 +14,8 @@
 
 <p align="center">
   <a href="./docs/vision.md">Vision</a> ·
-  <a href="#the-pr-workflow">The PR workflow</a> ·
-  <a href="#why-schemabot">Why SchemaBot</a> ·
-  <a href="#how-it-works">How it works</a> ·
+  <a href="#the-pr-workflow">PR workflow</a> ·
+  <a href="#from-your-terminal">CLI</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#docs">Docs</a>
 </p>
@@ -33,13 +32,19 @@ Open a PR with your schema changes, and SchemaBot plans, applies, and verifies t
 
 [![SchemaBot PR workflow: plan, apply, progress, completion, checks, and merge](./assets/pr-workflow-demo.gif)](./docs/pre-merge-workflow.md)
 
-*Illustrated using SchemaBot’s actual PR comments*
+[Walk through the illustrated PR workflow](./docs/pre-merge-workflow.md#the-pr-workflow-step-by-step)
 
-[Walk through each step](./docs/pre-merge-workflow.md#the-pr-workflow-step-by-step) at your own pace
+## From your terminal
 
-**The interactive CLI.** The same power from your terminal: plan, apply, and watch schema changes live:
+**Plan and apply a change.** Review the SQL, apply the change, and follow it to completion.
 
-![SchemaBot CLI Demo](./assets/cli-demo.gif)
+<img src="./assets/cli-plan-apply.gif" width="800" alt="Plan and apply a schema change through the CLI">
+
+**Know your database fleet.** Explore live schemas, spot lint issues, and follow changes through their logs.
+
+<img src="./assets/cli-ops.gif" width="800" alt="Inspect fleet status, follow one change, and read its logs">
+
+[Get started with the CLI](./docs/cli.md) · [Explore your database fleet](./docs/schema-intelligence.md)
 
 ## Why SchemaBot
 
@@ -67,31 +72,7 @@ CREATE TABLE users (
 
 **2. Open a PR.** SchemaBot diffs your files against the live database and comments the exact DDL it will run. Review it like any code.
 
-**3. Apply.** Comment `schemabot apply -e staging`, then `-e production`, or run the same from the CLI. Changes run online, with live progress:
-
-```
-$ schemabot plan -s ./schema -e staging
-
-╭─────────────────────────────────────────────╮
-│  MySQL Schema Change Plan                   │
-│                                             │
-│  Database: testapp                          │
-│  Environment: staging                       │
-│  Schema name: testapp                       │
-╰─────────────────────────────────────────────╯
-
-     ~ users
-       ALTER TABLE `users` ADD COLUMN `email` varchar(255) NOT NULL;
-
-📋 Plan: 1 table to alter
-
-$ schemabot apply -s ./schema -e staging -y
-
-  users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜ 65% (1,742,301/2,680,463 rows) ETA 2m 10s
-         ALTER TABLE `users` ADD COLUMN `email` varchar(255) NOT NULL
-
-  users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-```
+**3. Apply.** Comment `schemabot apply -e staging`, then `-e production`, or follow the [CLI walkthrough](./docs/cli.md#plan-and-apply-a-change). Review the plan, confirm the change, and watch its progress.
 
 **4. Merge when green.** The required check passes only when the live schema matches your files. Applied, verified, merged, in that order.
 
@@ -99,7 +80,7 @@ SchemaBot handles the full lifecycle:
 - **Plan**: diff the desired schema against the live database and compute the DDL
 - **Apply**: execute the DDL online using [Spirit](https://github.com/block/spirit) (MySQL), [PlanetScale deploy requests](https://planetscale.com/docs/vitess/schema-changes/deploy-requests) (Vitess), or [pg-sprite](https://github.com/block/pg-sprite) (PostgreSQL)
 - **Progress**: track row copy progress, the ETA, and per-table and per-shard status
-- **Control**: `stop` (pause), `start` (resume), `cutover` (trigger the table swap), `cancel` (end the change), and `revert` (roll back)
+- **Control**: `stop` (pause), `start` (resume), `cutover` (trigger the table swap), `cancel` (end the change), and `rollback` (roll back)
 
 Simple changes (e.g., adding a column) use instant DDL and complete in milliseconds. Operations that require a row copy (e.g., adding an index) run online without blocking reads or writes.
 
@@ -130,10 +111,13 @@ Guides and reference:
 - [Vision](./docs/vision.md): See what we’re building toward
 - [Quick start](#quick-start): Try it on your machine
 - [Pre-merge workflow](./docs/pre-merge-workflow.md): Take a schema change from your first edit to a merged PR
+- [CLI guide](./docs/cli.md): Set up the CLI, inspect your databases, and run changes
 - [Schema intelligence](./docs/schema-intelligence.md): Get to know your fleet and what’s changing
 - [Engines](./docs/engines.md): See how changes run on your database engine
 - [PostgreSQL](./docs/postgresql.md): Find out what’s supported today
 - [Configuration](./docs/configuration.md): Set things up for your environment
+- [Authentication](./docs/auth.md): Choose who can read and change your databases
+- [AI agents](./docs/ai-agents.md): Set clear boundaries for your assistants
 - [Safety invariants](./docs/invariants.md): Understand the guardrails behind each change
 - [Architecture](./docs/architecture.md): Follow a change from start to finish
 - [Contributing](./CONTRIBUTING.md): Come build with us

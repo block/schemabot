@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -349,6 +350,44 @@ func applyOperationIDForTask(task *storage.Task) (int64, error) {
 	return *task.ApplyOperationID, nil
 }
 
+func (c *LocalClient) saveProgressMetadata(ctx context.Context, task *storage.Task, metadata map[string]string) error {
+	operationID, err := applyOperationIDForTask(task)
+	if err != nil {
+		return fmt.Errorf("resolve apply operation for task %s: %w", task.TaskIdentifier, err)
+	}
+	if err := c.storage.ApplyOperations().SaveProgressMetadata(ctx, operationID, metadata); err != nil {
+		return fmt.Errorf("save progress metadata for task %s: %w", task.TaskIdentifier, err)
+	}
+	return nil
+}
+
+func (c *LocalClient) saveApplyProgressMetadata(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, metadata map[string]string) error {
+	operationID, err := c.applyOperationIDForApplyTasks(ctx, apply, tasks)
+	if err != nil {
+		return fmt.Errorf("resolve apply operation for progress metadata: %w", err)
+	}
+	if err := c.storage.ApplyOperations().SaveProgressMetadata(ctx, operationID, metadata); err != nil {
+		return fmt.Errorf("save progress metadata for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return nil
+}
+
+func (c *LocalClient) persistProgressMetadataIfChanged(previous, current map[string]string, leaseLost *bool, save func(map[string]string) error) (map[string]string, error) {
+	if *leaseLost {
+		return previous, nil
+	}
+	if maps.Equal(previous, current) {
+		return previous, nil
+	}
+	if err := save(current); err != nil {
+		if errors.Is(err, storage.ErrApplyLeaseLost) {
+			*leaseLost = true
+		}
+		return previous, err
+	}
+	return maps.Clone(current), nil
+}
+
 // tasksForOperation returns the subset of tasks belonging to the given
 // apply_operation. It is nil-safe: a nil task or one without an
 // apply_operation_id is skipped. Callers use it to scope an apply-wide task set
@@ -676,6 +715,17 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			return true
 		}
 		return false
+	}
+	var saveErr error
+	ps.lastProgressMetadata, saveErr = c.persistProgressMetadataIfChanged(ps.lastProgressMetadata, result.Metadata, &ps.progressMetadataLeaseLost, func(metadata map[string]string) error {
+		return c.saveApplyProgressMetadata(ctx, apply, tasks, metadata)
+	})
+	if errors.Is(saveErr, storage.ErrApplyLeaseLost) {
+		logger.Debug("progress metadata persistence stopped because the operation lease was lost during failover",
+			append(apply.MutableLogAttrs(), "error", saveErr)...)
+	} else if saveErr != nil {
+		logger.Warn("failed to persist engine progress metadata; the drive will retry on the next poll",
+			append(apply.MutableLogAttrs(), "error", saveErr)...)
 	}
 	now := time.Now()
 	newState := taskStateFromProgressResult(result)

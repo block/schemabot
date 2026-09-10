@@ -118,14 +118,43 @@ func (m *mockStorageWithApplyStores) ApplyOperations() storage.ApplyOperationSto
 	return m.operations
 }
 
-type staticApplyOperationStore struct {
+// stubApplyOperationStore is what an operation-store double embeds instead of
+// the bare interface. Embedding the interface alone leaves every method a double
+// does not implement as a nil call, which is the behavior wanted for a method
+// the scenario never reaches — it fails loudly. The handback a drive performs on
+// its way out is the exception: every drive makes that call, so with a bare
+// interface every double would have to implement it, and any that did not would
+// panic inside the drive's own recovery rather than fail its test.
+//
+// The default reports nothing cleared, which is what a real store returns when
+// no row is in an ended state under the drive's lease. A double whose scenario
+// turns on the handback overrides it.
+type stubApplyOperationStore struct {
 	storage.ApplyOperationStore
-	operations      []*storage.ApplyOperation
-	err             error
-	resumeStateByOp map[int64]*storage.EngineResumeState
-	resumeStateErr  error
-	reaped          []*storage.ReapedOperation
-	reapErr         error
+}
+
+func (stubApplyOperationStore) ReleaseFinishedClaim(context.Context, storage.OperationLease) (bool, error) {
+	return false, nil
+}
+
+type staticApplyOperationStore struct {
+	stubApplyOperationStore
+	operations []*storage.ApplyOperation
+	err        error
+	reaped     []*storage.ReapedOperation
+	reapErr    error
+}
+
+func (s *staticApplyOperationStore) Get(_ context.Context, id int64) (*storage.ApplyOperation, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	for _, op := range s.operations {
+		if op.ID == id {
+			return op, nil
+		}
+	}
+	return nil, nil
 }
 
 func (s *staticApplyOperationStore) ListByApply(_ context.Context, applyID int64) ([]*storage.ApplyOperation, error) {
@@ -156,16 +185,6 @@ func (s *staticApplyOperationStore) ListByApplies(_ context.Context, applyIDs []
 		}
 	}
 	return operations, nil
-}
-
-func (s *staticApplyOperationStore) GetEngineResumeState(_ context.Context, operationID int64) (*storage.EngineResumeState, error) {
-	if s.resumeStateErr != nil {
-		return nil, s.resumeStateErr
-	}
-	if rs, ok := s.resumeStateByOp[operationID]; ok {
-		return rs, nil
-	}
-	return nil, storage.ErrEngineResumeStateNotFound
 }
 
 // ReapStranded is called by the stranded-operation reaper, which starts with the
@@ -550,7 +569,7 @@ func (s *capturingApplyStore) CheckLease(context.Context, storage.ApplyLease) er
 	return nil
 }
 
-func (s *capturingApplyStore) ExpireRetryable(context.Context) ([]*storage.RetryableApplyExpiration, error) {
+func (s *capturingApplyStore) ExpireRetryable(context.Context, int) ([]*storage.RetryableApplyExpiration, error) {
 	return nil, nil
 }
 
@@ -564,7 +583,7 @@ const queuedOperationLeaseToken = "op-lease-token"
 // operation claim, which signals the apply store's findCh — one observable
 // signal per tick — and leases the first captured row exactly once.
 type queuedOperationClaimStore struct {
-	storage.ApplyOperationStore
+	stubApplyOperationStore
 	applies    *capturingApplyStore
 	mu         sync.Mutex
 	claimed    bool
@@ -3718,6 +3737,42 @@ func TestExecuteApplyRejectsBlockedStoredPlan(t *testing.T) {
 	assert.Empty(t, tasks.tasks)
 }
 
+func TestExecuteApplyRejectsBlockedUnsafeStoredPlanAsBlocked(t *testing.T) {
+	plan := executeApplyTestPlan()
+	change := &plan.Namespaces["testdb"].Tables[0]
+	change.IsUnsafe = true
+	change.UnsafeReason = "DROP COLUMN removes data"
+	change.ExecutionMode = "blocked"
+	change.ModeReason = "statement cannot be executed safely as written"
+
+	applies := &capturingApplyStore{}
+	tasks := &capturingTaskStore{}
+	applies.taskStore = tasks
+	svc := New(&mockStorageWithApplyStores{
+		plans:     &staticPlanStore{plan: plan},
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
+	}, testServerConfig(), map[string]tern.Client{
+		"default/staging": &mockTernClient{},
+	}, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{
+		PlanID:      "plan-1",
+		Environment: "staging",
+	})
+
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Zero(t, applyID)
+	assert.Contains(t, err.Error(), "blocked change")
+	assert.Contains(t, err.Error(), "cannot be executed safely as written")
+	assert.NotContains(t, err.Error(), "allow_unsafe")
+	assert.Nil(t, applies.apply)
+	assert.Empty(t, tasks.tasks)
+}
+
 func TestExecuteApplyQueuesUnsafeStoredPlanWithOptIn(t *testing.T) {
 	plan := executeApplyTestPlan()
 	plan.Namespaces["testdb"].Tables[0].IsUnsafe = true
@@ -4135,7 +4190,8 @@ func TestProgressFromLocalStorageSingleDeploymentOmitsOperationFields(t *testing
 // display fields (branch, deploy-request URL, instant/deferred flags). The
 // engine is not polled on the storage path, so these are read from the durable
 // engine resume state persisted on the apply's operation — the "let me look at
-// what happened" case must not lose the deploy-request link.
+// what happened" case must not lose the deploy-request link. Where the
+// persisted progress metadata carries the same key, the resume state wins.
 func TestProgressFromLocalStorageOverlaysDisplayMetadataFromResumeState(t *testing.T) {
 	opID := int64(77)
 	apply := &storage.Apply{
@@ -4153,10 +4209,11 @@ func TestProgressFromLocalStorageOverlaysDisplayMetadataFromResumeState(t *testi
 		}},
 		operations: &staticApplyOperationStore{
 			operations: []*storage.ApplyOperation{
-				{ID: opID, ApplyID: apply.ID, Deployment: "testdb", Target: "testdb", State: state.ApplyOperation.Completed},
-			},
-			resumeStateByOp: map[int64]*storage.EngineResumeState{
-				opID: {ApplyOperationID: opID, Metadata: `{"branch_name":"schemabot-testdb-123","deploy_request_url":"https://app.planetscale.com/org/testdb/deploy-requests/42","is_instant":true,"deferred_deploy":true}`},
+				{
+					ID: opID, ApplyID: apply.ID, Deployment: "testdb", Target: "testdb", State: state.ApplyOperation.Completed,
+					ProgressMetadata:     `{"phase":"completed","branch_name":"progress-branch"}`,
+					EngineResumeMetadata: `{"branch_name":"schemabot-testdb-123","deploy_request_url":"https://app.planetscale.com/org/testdb/deploy-requests/42","is_instant":true,"deferred_deploy":true}`,
+				},
 			},
 		},
 	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
@@ -4169,6 +4226,124 @@ func TestProgressFromLocalStorageOverlaysDisplayMetadataFromResumeState(t *testi
 	assert.Equal(t, "https://app.planetscale.com/org/testdb/deploy-requests/42", resp.Metadata["deploy_request_url"])
 	assert.Equal(t, "true", resp.Metadata["is_instant"])
 	assert.Equal(t, "true", resp.Metadata["deferred_deploy"])
+	assert.Equal(t, "completed", resp.Metadata["phase"])
+}
+
+// A completed PostgreSQL apply served from storage surfaces the position the
+// engine last reported (phase, step, statement) from the progress metadata the
+// driver persisted on the operation. The engine is not polled on the storage
+// path and has no resume state to decode, so this is the only source of these
+// fields once the apply has settled.
+func TestProgressFromLocalStorageOverlaysPersistedProgressMetadata(t *testing.T) {
+	opID := int64(78)
+	apply := &storage.Apply{
+		ID:              32,
+		ApplyIdentifier: "apply_pg_completed",
+		Database:        "shop",
+		DatabaseType:    storage.DatabaseTypePostgres,
+		Environment:     "staging",
+		Engine:          storage.EnginePostgres,
+		State:           state.Apply.Completed,
+	}
+	svc := New(&mockStorageWithApplyStores{
+		tasks: &capturingTaskStore{tasks: []*storage.Task{
+			{ApplyID: apply.ID, ApplyOperationID: &opID, TaskIdentifier: "task_orders", TableName: "orders", Namespace: "public", DDLAction: "alter", DDL: "ALTER TABLE public.orders ADD COLUMN note text", State: state.Task.Completed, Database: "shop", DatabaseType: storage.DatabaseTypePostgres, Engine: storage.EnginePostgres, Environment: "staging"},
+		}},
+		operations: &staticApplyOperationStore{
+			operations: []*storage.ApplyOperation{
+				{
+					ID: opID, ApplyID: apply.ID, Deployment: "shop", Target: "shop", State: state.ApplyOperation.Completed,
+					ProgressMetadata: `{"phase":"completed","step":"2","steps_total":"2","statement":"ALTER TABLE public.orders ADD COLUMN note text","elapsed_ms":"1834"}`,
+				},
+			},
+		},
+	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	resp, err := svc.progressFromLocalStorage(t.Context(), apply)
+
+	require.NoError(t, err)
+	resp.Metadata["phase"] = "caller-phase"
+	overlayStoredDisplayMetadata(resp, apply, []*storage.ApplyOperation{{ProgressMetadata: `{"phase":"stored-phase"}`}})
+	assert.Equal(t, map[string]string{
+		"phase": "caller-phase", "step": "2", "steps_total": "2",
+		"statement": "ALTER TABLE public.orders ADD COLUMN note text", "elapsed_ms": "1834",
+	}, resp.Metadata)
+}
+
+// On a multi-operation apply the top-level metadata has one slot per key, so
+// the operations are overlaid in creation order: the first-created operation
+// supplies the generic position fields and later operations fill only the keys
+// it left empty. The same operation wins on every poll, so consecutive reads
+// never flip between deployments.
+func TestProgressFromLocalStorageOverlaysOperationsInCreationOrder(t *testing.T) {
+	firstOpID, secondOpID := int64(80), int64(81)
+	apply := &storage.Apply{
+		ID:              34,
+		ApplyIdentifier: "apply_pg_two_ops",
+		Database:        "shop",
+		DatabaseType:    storage.DatabaseTypePostgres,
+		Environment:     "staging",
+		Engine:          storage.EnginePostgres,
+		State:           state.Apply.Running,
+	}
+	svc := New(&mockStorageWithApplyStores{
+		tasks: &capturingTaskStore{tasks: []*storage.Task{
+			{ApplyID: apply.ID, ApplyOperationID: &firstOpID, TaskIdentifier: "task_orders_a", TableName: "orders", Namespace: "public", DDLAction: "alter", DDL: "ALTER TABLE public.orders ADD COLUMN note text", State: state.Task.Completed, Database: "shop", DatabaseType: storage.DatabaseTypePostgres, Engine: storage.EnginePostgres, Environment: "staging"},
+			{ApplyID: apply.ID, ApplyOperationID: &secondOpID, TaskIdentifier: "task_orders_b", TableName: "orders", Namespace: "public", DDLAction: "alter", DDL: "ALTER TABLE public.orders ADD COLUMN note text", State: state.Task.Running, Database: "shop", DatabaseType: storage.DatabaseTypePostgres, Engine: storage.EnginePostgres, Environment: "staging"},
+		}},
+		operations: &staticApplyOperationStore{
+			operations: []*storage.ApplyOperation{
+				{
+					ID: firstOpID, ApplyID: apply.ID, Deployment: "shop-a", Target: "shop-a", State: state.ApplyOperation.Completed,
+					ProgressMetadata: `{"phase":"completed","step":"2","steps_total":"2"}`,
+				},
+				{
+					ID: secondOpID, ApplyID: apply.ID, Deployment: "shop-b", Target: "shop-b", State: state.ApplyOperation.Running,
+					ProgressMetadata: `{"phase":"preflight","step":"1","steps_total":"2","statement":"ALTER TABLE public.orders ADD COLUMN note text"}`,
+				},
+			},
+		},
+	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	for range 5 {
+		resp, err := svc.progressFromLocalStorage(t.Context(), apply)
+
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{
+			"phase": "completed", "step": "2", "steps_total": "2",
+			"statement": "ALTER TABLE public.orders ADD COLUMN note text",
+		}, resp.Metadata)
+	}
+}
+
+// Malformed persisted progress metadata degrades to a response without those
+// fields; it never fails the progress request.
+func TestProgressFromLocalStorageToleratesMalformedProgressMetadata(t *testing.T) {
+	opID := int64(79)
+	apply := &storage.Apply{
+		ID:              33,
+		ApplyIdentifier: "apply_pg_bad_metadata",
+		Database:        "shop",
+		DatabaseType:    storage.DatabaseTypePostgres,
+		Environment:     "staging",
+		Engine:          storage.EnginePostgres,
+		State:           state.Apply.Failed,
+	}
+	svc := New(&mockStorageWithApplyStores{
+		tasks: &capturingTaskStore{tasks: []*storage.Task{
+			{ApplyID: apply.ID, ApplyOperationID: &opID, TaskIdentifier: "task_orders", TableName: "orders", Namespace: "public", DDLAction: "alter", DDL: "ALTER TABLE public.orders ADD COLUMN note text", State: state.Task.Failed, Database: "shop", DatabaseType: storage.DatabaseTypePostgres, Engine: storage.EnginePostgres, Environment: "staging"},
+		}},
+		operations: &staticApplyOperationStore{
+			operations: []*storage.ApplyOperation{
+				{ID: opID, ApplyID: apply.ID, Deployment: "shop", Target: "shop", State: state.ApplyOperation.Failed, ProgressMetadata: `{"phase":`},
+			},
+		},
+	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	resp, err := svc.progressFromLocalStorage(t.Context(), apply)
+
+	require.NoError(t, err)
+	assert.Empty(t, resp.Metadata["phase"])
 }
 
 // An apply with no engine resume state (e.g. one that predates resume-state

@@ -29,6 +29,7 @@ func writeMultiDeploymentProgress(data ProgressData) {
 	for i, deployment := range model.Deployments {
 		writeDeploymentProgressSection(deployment, data.Operations[i], data)
 	}
+	fmt.Print(FormatThrottleReference(data.Tables))
 }
 
 // progressOperationsForPresentation maps the parsed progress operations to the
