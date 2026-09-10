@@ -1495,16 +1495,21 @@ func (c *ServerConfig) RepoAdmins(repo string) (teams, users []string) {
 // API calls instead of a scan of every configured directory.
 //
 // exhaustive reports whether the returned directories cover every location
-// this database's policy-valid config could live in. It is true with no
-// directories when the database does not exist or does not accept the repo —
-// no policy-valid config location exists, so an empty probe result is
+// this database's policy-valid config could live in. It is false with no
+// directories when the database is not configured on this server: the
+// registry, not a probe of zero directories, is what answers for such a
+// database, and a deployment whose registry is not authoritative for it (an
+// aggregate leader, whose registry covers only its own slice of the fleet)
+// cannot prove the config absent from a repository it could not enumerate. It
+// is true with no directories when the database does not accept the repo — no
+// policy-valid config location exists in it, so an empty probe result is
 // authoritative. It is false when the database has no allowed_dirs
 // restriction or a wildcard ("*") or repo-root (".") entry, where the config
 // could live anywhere and the probe must keep failing closed.
 func (c *ServerConfig) SchemaDirHintsForDatabase(repo, database string) (dirs []string, exhaustive bool) {
 	db, ok := c.DatabaseConfigs()[database]
 	if !ok {
-		return nil, true
+		return nil, false
 	}
 	if len(db.AllowedRepos) > 0 && !repoAllowed(db.AllowedRepos, repo) {
 		return nil, true

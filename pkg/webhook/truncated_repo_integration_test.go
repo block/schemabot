@@ -393,8 +393,10 @@ func TestE2EPlanCommandOnTruncatedRepoWithoutConfiguredDirsFailsClosed(t *testin
 
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "Plan Failed")
+		assert.Contains(t, body, "Repository Too Large to Search")
 		assert.Contains(t, body, "truncated repository tree")
+		assert.Contains(t, body, "`allowed_dirs`")
+		assert.NotContains(t, body, "Database Not Found")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for failure comment")
 	}
