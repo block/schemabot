@@ -539,11 +539,16 @@ type PlanResponse struct {
 	// applying this plan will adopt or discard, one entry per namespace holding
 	// any. Empty when the target is clean, which is the ordinary case.
 	ExistingCopies []*ExistingCopyResponse `json:"existing_copies,omitempty"`
-	// ExemptTables lists live tables intentionally excluded from a plan verdict.
+	// ExemptTables lists live tables the planner intentionally excluded from
+	// the undeclared-table verdict, one entry per namespace holding any. Like
+	// ExistingCopies it describes the target at planning time and is carried
+	// on the response to the plan request only; a stored plan does not retain
+	// it. Empty when nothing was exempted, which is the ordinary case.
 	ExemptTables []*ExemptTablesResponse `json:"exempt_tables,omitempty"`
 }
 
-// ExemptTablesResponse describes live tables exempt from a plan verdict.
+// ExemptTablesResponse describes live tables in one namespace that the planner
+// exempted from the undeclared-table verdict, and why.
 type ExemptTablesResponse struct {
 	Namespace string   `json:"namespace"`
 	Tables    []string `json:"tables"`

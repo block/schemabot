@@ -7,7 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-const exemptLine = `ℹ️ Tables in namespace "app" exempt from the undeclared-table verdict (archive naming): "events_archive_2025_01", "orders_archive_2024"`
+const exemptLine = "ℹ️ Tables in namespace `app` exempt from the undeclared-table verdict (archive naming): `events_archive_2025_01`, `orders_archive_2024`"
 
 func exemptPlanData() PlanCommentData {
 	return PlanCommentData{
@@ -27,13 +27,23 @@ func TestRenderPlanComment_ExemptTablesDisclosedPerNamespace(t *testing.T) {
 	data.ExemptTables = append(data.ExemptTables, ExemptTablesData{Namespace: "audit", Tables: []string{"logs_archive_2023"}, Reason: "archive naming"})
 	out := RenderPlanComment(data)
 	assert.Contains(t, out, exemptLine)
-	assert.Contains(t, out, `ℹ️ Tables in namespace "audit" exempt from the undeclared-table verdict (archive naming): "logs_archive_2023"`)
+	assert.Contains(t, out, "ℹ️ Tables in namespace `audit` exempt from the undeclared-table verdict (archive naming): `logs_archive_2023`")
 }
 
 func TestRenderPlanComment_ExemptTablesDisclosedOnNoChanges(t *testing.T) {
 	out := RenderPlanComment(exemptPlanData())
 	assert.Contains(t, out, "✅ **No schema changes detected**")
 	assert.Contains(t, out, exemptLine)
+}
+
+// The exemption reason is engine prose rather than a catalog identifier, so it
+// is kept to one line and its markdown delimiters are escaped instead of being
+// wrapped in a code span.
+func TestRenderPlanComment_ExemptTablesReasonStaysInline(t *testing.T) {
+	data := exemptPlanData()
+	data.ExemptTables[0].Reason = "archive\nnaming `*_archive_*`"
+	out := RenderPlanComment(data)
+	assert.Contains(t, out, "exempt from the undeclared-table verdict (archive naming \\`\\*\\_archive\\_\\*\\`): `events_archive_2025_01`")
 }
 
 func TestRenderPlanComment_NoExemptTablesNoDisclosure(t *testing.T) {
@@ -67,8 +77,8 @@ func TestRenderMultiEnvPlanComment_ExemptTablesDivergentPerEnv(t *testing.T) {
 		Database: "testapp", Environments: []string{"staging", "production"},
 		Plans: map[string]*PlanCommentData{"staging": &staging, "production": &production},
 	})
-	assert.Contains(t, out, `ℹ️ **Staging**: tables in namespace "app" exempt from the undeclared-table verdict (archive naming): "events_archive_2025_01", "orders_archive_2024"`)
-	assert.Contains(t, out, `ℹ️ **Production**: tables in namespace "app" exempt from the undeclared-table verdict (archive naming): "orders_archive_2024"`)
+	assert.Contains(t, out, "ℹ️ **Staging**: tables in namespace `app` exempt from the undeclared-table verdict (archive naming): `events_archive_2025_01`, `orders_archive_2024`")
+	assert.Contains(t, out, "ℹ️ **Production**: tables in namespace `app` exempt from the undeclared-table verdict (archive naming): `orders_archive_2024`")
 	assert.NotContains(t, out, exemptLine)
 }
 
@@ -82,5 +92,5 @@ func TestRenderMultiEnvPlanComment_ExemptTablesOnlyInOneEnv(t *testing.T) {
 		Plans: map[string]*PlanCommentData{"staging": &staging, "production": &production},
 	})
 	assert.Equal(t, 1, strings.Count(out, "exempt from the undeclared-table verdict"))
-	assert.Contains(t, out, `ℹ️ **Staging**: tables in namespace "app"`)
+	assert.Contains(t, out, "ℹ️ **Staging**: tables in namespace `app`")
 }

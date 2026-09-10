@@ -1416,9 +1416,13 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	}
 	if len(ddlChanges) == 0 && !hasVSchemaChanges {
 		c.logger.Info("Plan: no changes, skipping storage", "plan_id", result.PlanID, "database", c.config.Database)
+		// A clean plan is the case where the disclosure matters most: it is
+		// the only evidence a reviewer has that an exempt table was seen and
+		// deliberately skipped rather than missed.
 		return &ternv1.PlanResponse{
-			PlanId: result.PlanID,
-			Engine: c.protoEngine(),
+			PlanId:       result.PlanID,
+			Engine:       c.protoEngine(),
+			ExemptTables: protoExemptTables(result.ExemptTables),
 		}, nil
 	}
 

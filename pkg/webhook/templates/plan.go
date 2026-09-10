@@ -618,15 +618,21 @@ func writeIgnoredNamespaces(sb *strings.Builder, ignored []string) {
 // writeExemptTables renders one disclosure line per namespace whose live
 // tables the plan exempted from the undeclared-table verdict, so a reviewer
 // can tell an exempted table from a declared one. No-op when nothing was
-// exempted, which is the ordinary case.
+// exempted, which is the ordinary case. The namespace and table names come
+// from the target's catalog, so they render as code spans they cannot break
+// out of; the reason is engine prose and is sanitized like any other.
 func writeExemptTables(sb *strings.Builder, groups []ExemptTablesData) {
 	for _, group := range groups {
 		if len(group.Tables) == 0 {
 			continue
 		}
-		fmt.Fprintf(sb, glyph.Info+" Tables in namespace \"%s\" exempt from the undeclared-table verdict (%s): %s\n\n",
-			group.Namespace, group.Reason, quoteTableNames(group.Tables))
+		fmt.Fprintf(sb, glyph.Info+" Tables in namespace %s exempt from the undeclared-table verdict (%s): %s\n\n",
+			inlineCode(group.Namespace), exemptReason(group.Reason), strings.Join(inlineCodeList(group.Tables), ", "))
 	}
+}
+
+func exemptReason(reason string) string {
+	return escapeInlineMarkdown(SanitizeInlineError(reason))
 }
 
 // writeMultiEnvExemptTables renders the exempt-table disclosure for the
@@ -655,8 +661,8 @@ func writeMultiEnvExemptTables(sb *strings.Builder, data MultiEnvPlanCommentData
 			if len(group.Tables) == 0 {
 				continue
 			}
-			fmt.Fprintf(sb, glyph.Info+" **%s**: tables in namespace \"%s\" exempt from the undeclared-table verdict (%s): %s\n\n",
-				capitalizeFirst(env), group.Namespace, group.Reason, quoteTableNames(group.Tables))
+			fmt.Fprintf(sb, glyph.Info+" **%s**: tables in namespace %s exempt from the undeclared-table verdict (%s): %s\n\n",
+				capitalizeFirst(env), inlineCode(group.Namespace), exemptReason(group.Reason), strings.Join(inlineCodeList(group.Tables), ", "))
 		}
 	}
 }
@@ -685,14 +691,6 @@ func planExemptTables(data MultiEnvPlanCommentData, env string) []ExemptTablesDa
 
 func exemptTablesEqual(a, b ExemptTablesData) bool {
 	return a.Namespace == b.Namespace && a.Reason == b.Reason && slices.Equal(a.Tables, b.Tables)
-}
-
-func quoteTableNames(tables []string) string {
-	quoted := make([]string, len(tables))
-	for i, table := range tables {
-		quoted[i] = fmt.Sprintf("\"%s\"", table)
-	}
-	return strings.Join(quoted, ", ")
 }
 
 // multiEnvHasIgnoredNamespaces reports whether any environment's plan excluded

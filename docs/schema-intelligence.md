@@ -768,10 +768,15 @@ why, and whether it was classified for direct execution. Because a plan is
 stamped with the commit it was computed from, a caller can join it back to the
 repository to inspect the proposed change at that commit. To establish what
 actually ran, inspect the apply's task DDL and outcome through progress.
-When the planner exempts live tables from a verdict, the plan response carries
-`exempt_tables`, grouped by namespace with the table names and exemption reason.
 `schemabot list-plans` and `schemabot list-plans <plan_id>` render
 both, with `--json` for the raw response.
+
+A stored plan records what the planner proposed, not what it declined to
+propose. When the planner exempts live tables from the undeclared-table
+verdict, that disclosure (`exempt_tables`, grouped by namespace with the table
+names and exemption reason) is carried on the response to the plan request
+itself and rendered in the PR comment; it is not retained on the stored plan,
+so `GET /api/plans/{plan_id}` and `list-plans` omit it.
 
 The list defaults to 20 plans and caps at 200. Check `has_more`; there is no
 pagination cursor. Filters narrow the recent results but do not provide an
