@@ -580,3 +580,65 @@ func TestWithStatementTimeoutRoundsSubMillisecondUp(t *testing.T) {
 		})
 	}
 }
+
+// The budget only exists if the hook sends the caller's duration, and only
+// stays a budget if the statement itself is bounded: pgconn runs the hook on
+// the context the pool opens connections with, which carries no deadline, so
+// an endpoint that authenticates and then goes quiet would wedge the one
+// goroutine that opens connections. Both are asserted against the hook the
+// option actually installs rather than against the helper it calls, so a hook
+// wired to the wrong duration is a failure here and not only against a server.
+func TestWithStatementTimeoutHookSendsTheCallersBudgetUnderABound(t *testing.T) {
+	var (
+		gotStmt     string
+		gotDeadline bool
+		gotWithin   time.Duration
+	)
+	original := execStatementTimeout
+	t.Cleanup(func() { execStatementTimeout = original })
+	execStatementTimeout = func(ctx context.Context, _ *pgconn.PgConn, stmt string) error {
+		gotStmt = stmt
+		deadline, ok := ctx.Deadline()
+		gotDeadline = ok
+		if ok {
+			gotWithin = time.Until(deadline)
+		}
+		return nil
+	}
+
+	cfg, err := connectionConfig("postgres://user:pass@localhost:5432/db", WithStatementTimeout(45*time.Second))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.AfterConnect)
+
+	require.NoError(t, cfg.AfterConnect(t.Context(), nil))
+
+	assert.Equal(t, "SET statement_timeout = 45000", gotStmt,
+		"the hook must arm the duration the caller asked for")
+	assert.True(t, gotDeadline, "the hook's statement must be bounded, or a silent endpoint wedges the connection opener")
+	assert.LessOrEqual(t, gotWithin, defaultConnectTimeout,
+		"the bound must be the connect budget, not something longer")
+}
+
+// A caller that sets its own connect budget bounds the session setup by the
+// same value, since the setup runs on the connection that budget just opened.
+func TestWithStatementTimeoutHookBoundIsTheConfiguredConnectTimeout(t *testing.T) {
+	var gotWithin time.Duration
+	original := execStatementTimeout
+	t.Cleanup(func() { execStatementTimeout = original })
+	execStatementTimeout = func(ctx context.Context, _ *pgconn.PgConn, _ string) error {
+		deadline, ok := ctx.Deadline()
+		require.True(t, ok)
+		gotWithin = time.Until(deadline)
+		return nil
+	}
+
+	cfg, err := connectionConfig("postgres://user:pass@localhost:5432/db",
+		WithConnectTimeout(3*time.Second), WithStatementTimeout(time.Second))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.AfterConnect)
+
+	require.NoError(t, cfg.AfterConnect(t.Context(), nil))
+
+	assert.Greater(t, gotWithin, 2*time.Second, "the bound must track the configured connect budget")
+	assert.LessOrEqual(t, gotWithin, 3*time.Second, "the bound must not exceed the configured connect budget")
+}

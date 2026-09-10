@@ -49,7 +49,9 @@ type Option func(*pgx.ConnConfig)
 // override it, and the zero "wait indefinitely" value is deliberately
 // replaced — so an attempt against an unreachable or half-open endpoint fails
 // and is retried instead of blocking its caller indefinitely. pgconn applies
-// it to the whole connection process: dial, TLS, startup, and auth.
+// it to dial, TLS, startup and auth; this package applies the same budget to
+// the session setup it runs on the new connection afterwards, which pgconn
+// leaves on the caller's context.
 const defaultConnectTimeout = 30 * time.Second
 
 // WithConnectTimeout bounds a single connection attempt — pgconn applies it
@@ -109,12 +111,36 @@ func WithStatementTimeout(d time.Duration) Option {
 		stmt := statementTimeoutSQL(d)
 		clearRuntimeParam(cfg, "statement_timeout")
 		cfg.AfterConnect = func(ctx context.Context, conn *pgconn.PgConn) error {
-			if _, err := conn.Exec(ctx, stmt).ReadAll(); err != nil {
+			// pgconn applies ConnectTimeout to the dial, TLS, startup and auth
+			// and then runs this hook on the caller's context, which the pool
+			// supplies with no deadline of its own. An endpoint that finishes
+			// auth and then stops answering — a half-open path, a wedged
+			// pooler backend — would leave this statement waiting forever on
+			// the single goroutine connections are opened on, stalling every
+			// caller queued behind it. Reading the budget here rather than at
+			// option time picks up the package default, which is filled in
+			// after every option has run.
+			if timeout := cfg.ConnectTimeout; timeout > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, timeout)
+				defer cancel()
+			}
+			if err := execStatementTimeout(ctx, conn, stmt); err != nil {
 				return fmt.Errorf("%s: %w", stmt, err)
 			}
 			return nil
 		}
 	}
+}
+
+// execStatementTimeout runs the budget statement on a newly connected session.
+// It is a variable so a unit test can observe the statement the hook actually
+// sends: pgconn's AfterConnect takes a concrete *pgconn.PgConn, so without a
+// seam here the only assertion available off a live server is that some hook
+// was installed — which stays true no matter which statement it carries.
+var execStatementTimeout = func(ctx context.Context, conn *pgconn.PgConn, stmt string) error {
+	_, err := conn.Exec(ctx, stmt).ReadAll()
+	return err
 }
 
 // statementTimeoutSQL is the statement the option runs on each new session to
