@@ -21,7 +21,7 @@ engine is what touches your tables.
 
 | Engine | Target | Built on |
 |---|---|---|
-| Spirit | MySQL | [Spirit](https://github.com/block/spirit) |
+| Spirit | MySQL | [Spirit](spirit.md) |
 | PlanetScale | Vitess | [PlanetScale deploy requests](https://planetscale.com/docs/vitess/schema-changes/deploy-requests) |
 | pg-sprite | PostgreSQL | [pg-sprite](https://github.com/block/pg-sprite) |
 

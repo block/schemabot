@@ -1224,3 +1224,27 @@ func TestPlanCommentDatabaseFlag(t *testing.T) {
 	assert.Equal(t, "payments", planCommentDatabaseFlag("", "payments", true, 2), "an auto-plan on a PR touching several databases names the one its comment plans")
 	assert.Empty(t, planCommentDatabaseFlag("", "payments", true, 1), "an auto-plan on a PR touching one database has nothing to disambiguate")
 }
+
+// Primary-key advice remains reachable for legacy warnings and new-schema
+// errors; the latter still render as Issues and retain their consent gate.
+func TestBuildPlanCommentData_PrimaryKeyGuidance(t *testing.T) {
+	for _, severity := range []string{"warning", "error"} {
+		t.Run(severity, func(t *testing.T) {
+			resp := &apitypes.PlanResponse{
+				Changes:     []*apitypes.SchemaChangeResponse{{Namespace: "app", TableChanges: []*apitypes.TableChangeResponse{{TableName: "customers", DDL: "ALTER TABLE `customers` ADD COLUMN `name` varchar(64)", ChangeType: "alter", IsUnsafe: severity == "error", UnsafeReason: "Primary key uses a discouraged type"}}}},
+				LintResults: []*apitypes.LintViolationResponse{{Table: "customers", Linter: "primary_key", Severity: severity, Message: "Primary key uses a discouraged type"}},
+			}
+			data := buildPlanCommentData(&ghclient.SchemaRequestResult{Database: "app", Type: "mysql"}, resp, "staging", "", "", "")
+			assert.True(t, data.HasPrimaryKeyFindings)
+			if severity == "warning" {
+				require.Len(t, data.LintViolations, 1)
+				assert.Equal(t, "primary_key", data.LintViolations[0].LinterName)
+			} else {
+				assert.Empty(t, data.LintViolations)
+				assert.True(t, data.HasUnsafeChanges)
+			}
+			out := templates.RenderPlanComment(data)
+			assert.Equal(t, 1, strings.Count(out, "docs/spirit.md#choosing-a-primary-key"))
+		})
+	}
+}

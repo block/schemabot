@@ -58,3 +58,43 @@ func TestRenderPlanComment_LintFoldsAndGroupsAboveThreshold(t *testing.T) {
 	assert.Less(t, generalIdx, usersIdx, "untabled findings lead the folded list")
 	assert.Less(t, usersIdx, sessionsIdx, "table groups keep first-appearance order")
 }
+
+// Advice is visible after the folded list, appears only once, and does not
+// attach MySQL-specific explanations to other engines or unrelated findings.
+func TestRenderPlanComment_PrimaryKeyGuidance(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		count      int
+		mysql      bool
+		primaryKey bool
+		locked     bool
+		want       bool
+	}{
+		{"short", 1, true, true, false, true},
+		{"folded", 6, true, true, false, true},
+		{"issues only", 0, true, true, false, true},
+		{"other engine", 1, false, true, false, false},
+		{"other rule", 1, true, false, false, false},
+		{"locked apply", 1, true, true, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			warnings := make([]LintViolationData, tc.count)
+			for i := range warnings {
+				warnings[i] = LintViolationData{Message: "Review this column", Table: "customers"}
+			}
+			data := lintPlanData(warnings)
+			data.IsMySQL = tc.mysql
+			data.HasPrimaryKeyFindings = tc.primaryKey
+			data.IsLocked = tc.locked
+			out := RenderPlanComment(data)
+			if !tc.want {
+				assert.NotContains(t, out, primaryKeyDocURL)
+				return
+			}
+			assert.Equal(t, 1, strings.Count(out, primaryKeyDocURL))
+			if tc.count > lintWarningsFoldThreshold {
+				assert.Greater(t, strings.Index(out, primaryKeyDocURL), strings.Index(out, "</details>"))
+			}
+		})
+	}
+}
