@@ -97,6 +97,11 @@ func TestDiagnose(t *testing.T) {
 			selfConverging: true,
 		},
 		{
+			// The rollup carries nothing that says whether the rows under it
+			// clear on their own. Some do not — a completed rollback leaves a
+			// row only a reconcile clears — and from the rollup that is
+			// indistinguishable from a running apply, so it never promises
+			// SchemaBot will get there alone: selfConverging stays false.
 			name:     "aggregate holding the gate open",
 			check:    &storage.Check{HeadSHA: headSHA, DatabaseType: AggregateSentinel, DatabaseName: AggregateSentinel, Status: StatusInProgress},
 			reason:   ReasonAggregateRollup,
@@ -258,22 +263,6 @@ func TestDiagnoseReadsASettledRowWithoutItsApply(t *testing.T) {
 	assert.Equal(t, ReasonReconciliationOwed, owed.Reason,
 		"a terminal block stays a reconciliation, not an unknown owner")
 	assert.True(t, owed.Blocking)
-}
-
-// The rollup carries nothing that says whether the rows under it clear on their
-// own. Some do not — a completed rollback leaves a row only a reconcile clears
-// — and from the rollup that is indistinguishable from a running apply, so it
-// never promises SchemaBot will get there alone.
-func TestDiagnoseDoesNotPromiseTheRollupConvergesAlone(t *testing.T) {
-	t.Parallel()
-
-	got := Diagnose(&storage.Check{
-		HeadSHA: headSHA, DatabaseType: AggregateSentinel, DatabaseName: AggregateSentinel,
-		Status: StatusInProgress,
-	}, headSHA, nil)
-	require.Equal(t, ReasonAggregateRollup, got.Reason)
-	assert.True(t, got.Blocking)
-	assert.False(t, got.SelfConverging)
 }
 
 // The rollup is identified by both sentinel fields. A database named like the
