@@ -120,6 +120,7 @@ Guides and reference:
 - [AI agents](./docs/ai-agents.md): Set clear boundaries for your assistants
 - [Safety invariants](./docs/invariants.md): Understand the guardrails behind each change
 - [Architecture](./docs/architecture.md): Follow a change from start to finish
+- [Target credential self-heal](./docs/target-credential-self-heal.md): Understand target probes and credential rotation recovery
 - [Contributing](./CONTRIBUTING.md): Come build with us
 
 ## Releases
