@@ -337,7 +337,27 @@ type StuckCheckPR struct {
 	HeadSHA string               `json:"head_sha"`
 	HeadRef string               `json:"head_ref"`
 	Checks  []IncompleteCheckRun `json:"checks"`
+	// StoredRows is the stored check state behind the uncompleted run, read
+	// against this PR's head. An uncompleted Check Run says only that the
+	// gate is open; these rows say what it is open on, and whether that is
+	// something SchemaBot resolves or something a person has to.
+	//
+	// Empty when the scan could not read stored state. That is reported as
+	// absence rather than as a failed scan: the Check Run findings are the
+	// part the backfill acts on, and they are already in hand.
+	StoredRows []InspectedCheck `json:"stored_rows,omitempty"`
+	// WaitingOn classifies the rows: "operator" when any of them needs a
+	// person, "schemabot" when they all resolve on their own, and empty when
+	// there are no rows to read. It is the field that decides whether a stuck
+	// entry in a fleet sweep is worth opening.
+	WaitingOn string `json:"waiting_on,omitempty"`
 }
+
+// Values for StuckCheckPR.WaitingOn.
+const (
+	WaitingOnSchemaBot = "schemabot"
+	WaitingOnOperator  = "operator"
+)
 
 // IncompleteCheckRun describes one Check Run that exists on the PR head but
 // has not completed.

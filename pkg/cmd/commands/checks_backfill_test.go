@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/checkstate"
 )
 
 // The scan progress line always reads as progress toward a bound: PRs scanned
@@ -349,4 +350,85 @@ func TestRateLimitPauseDuration(t *testing.T) {
 
 	_, pause = rateLimitPauseDuration(&apitypes.GitHubRateLimit{Remaining: 0, Limit: 5000, ResetAt: now.Add(-time.Minute).Format(time.RFC3339)}, 20, now)
 	assert.False(t, pause, "a past reset means the next request sees a fresh budget")
+}
+
+// The stuck section carries what the server concluded about each entry, so
+// an operator sweeping a fleet can act on the report itself rather than
+// opening every pull request in it. Rows that already resolved are left out
+// of the reason cell: they explain nothing about why the run is still
+// sitting, and listing them alongside the real cause hides it.
+func TestStuckChecksPastThresholdCarriesTheServerDisposition(t *testing.T) {
+	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+	stuck := stuckChecksPastThreshold("octo/repo", []apitypes.StuckCheckPR{
+		{
+			Number: 5, URL: "https://github.com/octo/repo/pull/5", HeadSHA: "sha5",
+			WaitingOn: apitypes.WaitingOnOperator,
+			StoredRows: []apitypes.InspectedCheck{
+				{Database: "resolved", Reason: checkstate.ReasonResolved, SelfConverging: true},
+				{Database: "owed", Reason: checkstate.ReasonReconciliationOwed, Blocking: true},
+				{Database: "also-owed", Reason: checkstate.ReasonReconciliationOwed, Blocking: true},
+				{Database: "waiting", Reason: checkstate.ReasonApplyRunning, Blocking: true, SelfConverging: true},
+			},
+			Checks: []apitypes.IncompleteCheckRun{
+				{Name: "SchemaBot (production)", CheckRunID: 50, Status: "in_progress", StartedAt: "2026-07-12T08:30:00Z"},
+			},
+		},
+	}, time.Hour, now)
+
+	require.Len(t, stuck, 1)
+	assert.Equal(t, apitypes.WaitingOnOperator, stuck[0].WaitingOn)
+	assert.Equal(t, []string{checkstate.ReasonReconciliationOwed, checkstate.ReasonApplyRunning}, stuck[0].Reasons,
+		"blocking reasons only, deduplicated, in the order the server reported them")
+}
+
+// An entry the server could not explain renders as unknown rather than as
+// self-converging, because the absence of stored rows is not evidence that
+// nothing needs a person.
+func TestWriteChecksBackfillReportRendersStuckDisposition(t *testing.T) {
+	report := &checksBackfillReport{
+		Repos:      []string{"octo/repo"},
+		CheckNames: []string{"SchemaBot (production)"},
+		Scanned:    12,
+		DryRun:     true,
+		StuckAfter: "1h",
+		Stuck: []checksStuckCheck{
+			{
+				Repo: "octo/repo", PR: 5, URL: "https://github.com/octo/repo/pull/5",
+				CheckName: "SchemaBot (production)", Status: "in_progress", Age: "3h30m0s",
+				WaitingOn: apitypes.WaitingOnOperator,
+				Reasons:   []string{checkstate.ReasonReconciliationOwed},
+			},
+			{
+				Repo: "octo/repo", PR: 6, URL: "https://github.com/octo/repo/pull/6",
+				CheckName: "SchemaBot (production)", Status: "in_progress", Age: "2h0m0s",
+			},
+		},
+	}
+
+	var out strings.Builder
+	require.NoError(t, writeChecksBackfillReport(&out, report))
+
+	rendered := out.String()
+	assert.Contains(t, rendered, "WAITING ON")
+	assert.Contains(t, rendered, "REASON")
+	assert.Contains(t, rendered, apitypes.WaitingOnOperator)
+	assert.Contains(t, rendered, checkstate.ReasonReconciliationOwed)
+	assert.Contains(t, rendered, "sq schemabot checks show <owner/repo> <pr>")
+
+	line := lineContaining(t, rendered, "https://github.com/octo/repo/pull/6")
+	assert.Contains(t, line, "-", "an unexplained entry renders as unknown, never as self-converging")
+	assert.NotContains(t, line, apitypes.WaitingOnSchemaBot)
+}
+
+// lineContaining returns the single rendered line carrying needle, so a
+// per-row assertion cannot accidentally be satisfied by a different row.
+func lineContaining(t *testing.T, rendered, needle string) string {
+	t.Helper()
+	for line := range strings.SplitSeq(rendered, "\n") {
+		if strings.Contains(line, needle) {
+			return line
+		}
+	}
+	require.Fail(t, "no rendered line contains "+needle)
+	return ""
 }

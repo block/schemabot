@@ -745,6 +745,31 @@ when findings remain; do not treat every nonzero exit as a transport error.
 This is an admin operation. See [PR recovery](pre-merge-workflow.md) for the
 workflow and automatic recovery behavior.
 
+A sweep that does find unfinished checks says what each one is waiting on, so
+the report can be triaged without opening every pull request in it:
+
+```console
+$ schemabot checks backfill --all-repos --dry-run
+Scanned 148 open PRs in acme/store, acme/ledger for SchemaBot (staging), SchemaBot (production).
+
+Stuck Check Runs — uncompleted for over 1h (backfill does not act on existing Check Runs; investigate the apply or plan that owns each):
+PR                                      CHECK                   STATUS       AGE      WAITING ON  REASON
+https://github.com/acme/store/pull/412  SchemaBot (staging)     in_progress  5h12m0s  schemabot   awaiting_replan_after_apply
+https://github.com/acme/ledger/pull/88  SchemaBot (production)  in_progress  31h0m0s  operator    reconciliation_owed
+https://github.com/acme/ledger/pull/91  SchemaBot (production)  queued       unknown  -           -
+
+A run waiting on an operator will not clear on its own. Read the stored rows behind one with `sq schemabot checks show <owner/repo> <pr>`.
+
+No missing SchemaBot Check Runs found.
+```
+
+`WAITING ON` is `schemabot` when every blocking stored row behind the run
+resolves on its own, and `operator` as soon as one of them does not. A `-`
+means the server read no stored state for that pull request, which is not the
+same as nothing needing a person. `REASON` lists the blocking rows' `reason`
+codes, the same ones `checks show` prints, so an entry worth opening is
+visible from the sweep itself.
+
 ## Use the CLI from scripts and agents
 
 Prefer structured output when another program consumes the result:

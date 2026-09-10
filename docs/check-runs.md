@@ -626,6 +626,15 @@ recreates each by replaying the auto-plan flow server-side. Check Runs that
 exist but never completed are reported for investigation, never acted on — an
 uncompleted run can belong to a genuinely in-flight apply.
 
+Each reported run carries the stored check state behind it, classified the
+same way [`checks show`](#explaining-a-blocked-check) classifies it: the
+sweep says whether the run is waiting on SchemaBot or on an operator, and
+lists the blocking rows' reason codes. That is what separates a run to leave
+alone from one nothing will ever clear, without opening each pull request. A
+run whose stored state could not be read is reported without a
+classification — the missing-check findings the backfill acts on are already
+in hand, so the annotation is dropped rather than the finding.
+
 **The backfill is scoped to the deployment it runs against.** A SchemaBot
 instance scans with its own GitHub App credentials, its own `repos:` config,
 its own `allowed_environments`, and its own storage, so one run converges only

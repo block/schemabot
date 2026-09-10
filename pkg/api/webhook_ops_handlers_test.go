@@ -14,7 +14,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/checkstate"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 type fakeWebhookRedriveDeliveryClient struct {
@@ -439,7 +442,7 @@ func TestRepoTakingEndpointsRefuseAMalformedRepository(t *testing.T) {
 			return err
 		}},
 		{"scan", func(ctx context.Context, repo string) error {
-			_, err := executeChecksScan(ctx, cfg, ChecksScanRequest{Repo: repo}, discardLogger())
+			_, err := executeChecksScan(ctx, cfg, nil, ChecksScanRequest{Repo: repo}, discardLogger())
 			return err
 		}},
 		{"synthesize", func(ctx context.Context, repo string) error {
@@ -484,7 +487,7 @@ func TestExecuteChecksScanRejectsDisallowedEnvironment(t *testing.T) {
 
 	cfg := &ServerConfig{AllowedEnvironments: []string{"staging", "production"}}
 
-	_, err := executeChecksScan(t.Context(), cfg, ChecksScanRequest{Repo: "octo/repo", Environment: "prod"}, discardLogger())
+	_, err := executeChecksScan(t.Context(), cfg, nil, ChecksScanRequest{Repo: "octo/repo", Environment: "prod"}, discardLogger())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `environment "prod" is not one this instance handles`)
 }
@@ -544,7 +547,7 @@ func checksEnvironmentTakingEndpoints(t *testing.T, cfg *ServerConfig) []checksE
 	t.Helper()
 	return []checksEnvironmentEndpoint{
 		{"scan", func(ctx context.Context, environment string) error {
-			_, err := executeChecksScan(ctx, cfg, ChecksScanRequest{Repo: "octo/repo", Environment: environment}, discardLogger())
+			_, err := executeChecksScan(ctx, cfg, nil, ChecksScanRequest{Repo: "octo/repo", Environment: environment}, discardLogger())
 			return err
 		}},
 		{"inspect", func(ctx context.Context, environment string) error {
@@ -700,7 +703,7 @@ func TestScanWebhookMissingChecksReportsOpenPRsMissingConfiguredChecks(t *testin
 		},
 	}
 
-	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0, time.Time{})
+	result, err := scanWebhookMissingChecks(t.Context(), client, nil, "octo/repo", []string{"SchemaBot (production)"}, 0, time.Time{}, discardLogger())
 
 	require.NoError(t, err)
 	assert.Equal(t, 2, result.Scanned)
@@ -742,7 +745,7 @@ func TestScanWebhookMissingChecksReportsUncompletedRuns(t *testing.T) {
 		},
 	}
 
-	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0, time.Time{})
+	result, err := scanWebhookMissingChecks(t.Context(), client, nil, "octo/repo", []string{"SchemaBot (production)"}, 0, time.Time{}, discardLogger())
 
 	require.NoError(t, err)
 	assert.Empty(t, result.Missing, "an existing run is not missing, even when uncompleted")
@@ -771,7 +774,7 @@ func TestScanWebhookMissingChecksReportsUncompletedRunWithoutStartTime(t *testin
 		},
 	}
 
-	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0, time.Time{})
+	result, err := scanWebhookMissingChecks(t.Context(), client, nil, "octo/repo", []string{"SchemaBot (production)"}, 0, time.Time{}, discardLogger())
 
 	require.NoError(t, err)
 	assert.Empty(t, result.Missing)
@@ -803,7 +806,7 @@ func TestScanWebhookMissingChecksStopsAtUpdatedSince(t *testing.T) {
 		},
 	}
 
-	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0, updatedSince)
+	result, err := scanWebhookMissingChecks(t.Context(), client, nil, "octo/repo", []string{"SchemaBot (production)"}, 0, updatedSince, discardLogger())
 
 	require.NoError(t, err)
 	assert.Equal(t, 2, result.Scanned, "only the in-window PRs count as scanned")
@@ -818,7 +821,7 @@ func TestExecuteChecksScanRejectsInvalidUpdatedSince(t *testing.T) {
 
 	cfg := &ServerConfig{AllowedEnvironments: []string{"production"}}
 
-	_, err := executeChecksScan(t.Context(), cfg, ChecksScanRequest{Repo: "octo/repo", UpdatedSince: "yesterday"}, discardLogger())
+	_, err := executeChecksScan(t.Context(), cfg, nil, ChecksScanRequest{Repo: "octo/repo", UpdatedSince: "yesterday"}, discardLogger())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "updated_since")
 }
@@ -909,7 +912,7 @@ func TestExecuteChecksScanSkipsRepoWithChecksDisabled(t *testing.T) {
 		Repos: map[string]RepoConfig{"octo/repo": {GitHubApp: "main", EnableChecks: &checksOff}},
 	}
 
-	response, err := executeChecksScan(t.Context(), cfg, ChecksScanRequest{Repo: "octo/repo"}, discardLogger())
+	response, err := executeChecksScan(t.Context(), cfg, nil, ChecksScanRequest{Repo: "octo/repo"}, discardLogger())
 	require.NoError(t, err)
 	assert.True(t, response.ChecksDisabled)
 	assert.Equal(t, "octo/repo", response.Repo)
@@ -932,10 +935,111 @@ func TestScanWebhookMissingChecksSurfacesUntrustedConflicts(t *testing.T) {
 		},
 	}
 
-	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0, time.Time{})
+	result, err := scanWebhookMissingChecks(t.Context(), client, nil, "octo/repo", []string{"SchemaBot (production)"}, 0, time.Time{}, discardLogger())
 
 	require.NoError(t, err)
 	require.Len(t, result.Missing, 1)
 	assert.Equal(t, []string{"SchemaBot (production)"}, result.Missing[0].MissingNames)
 	assert.Equal(t, []string{"SchemaBot (production)"}, result.Missing[0].UntrustedConflictNames)
+}
+
+// A stuck Check Run carries the stored rows behind it, so a fleet sweep can
+// tell the two stuck shapes apart without opening the pull request: a row a
+// plan or an apply will still resolve, and a row that needs a person. The
+// entry is classified by its worst row, because an entry reported as
+// self-converging when part of it is not reads as safe to leave alone.
+func TestScanWebhookMissingChecksExplainsStuckRunsFromStoredState(t *testing.T) {
+	t.Parallel()
+
+	client := fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 11, Title: "wedged", HeadSHA: "sha11", HeadRef: "feature-11"},
+		},
+		runs: map[string]*ghclient.CheckRunResult{
+			"sha11/SchemaBot (production)": {ID: 110, Name: "SchemaBot (production)", Status: "in_progress"},
+		},
+	}
+	store := &inspectStorage{
+		checks: &inspectCheckStore{checks: []*storage.Check{
+			{Environment: "production", DatabaseName: "widgets", HeadSHA: "older", ApplyID: 5,
+				Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionSuccess},
+			{Environment: "production", DatabaseName: "gadgets", HeadSHA: "sha11", ApplyID: 6,
+				Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionActionRequired,
+				BlockingReason: checkstate.BlockRollbackCompleted},
+		}},
+		applies: &inspectApplyStore{applies: map[int64]*storage.Apply{
+			5: {ApplyIdentifier: "apply-5", State: "completed"},
+			6: {ApplyIdentifier: "apply-6", State: "rolled_back"},
+		}},
+	}
+
+	result, err := scanWebhookMissingChecks(t.Context(), client, store, "octo/repo", []string{"SchemaBot (production)"}, 0, time.Time{}, discardLogger())
+
+	require.NoError(t, err)
+	require.Len(t, result.Stuck, 1)
+	stuck := result.Stuck[0]
+	assert.Equal(t, apitypes.WaitingOnOperator, stuck.WaitingOn, "one row needing a person classifies the whole entry")
+	require.Len(t, stuck.StoredRows, 2)
+	assert.Equal(t, "gadgets", stuck.StoredRows[0].Database, "rows are ordered by environment then database")
+	assert.Equal(t, checkstate.ReasonReconciliationOwed, stuck.StoredRows[0].Reason)
+	assert.Equal(t, "apply-6", stuck.StoredRows[0].ApplyIdentifier)
+	assert.Equal(t, "widgets", stuck.StoredRows[1].Database)
+	assert.Equal(t, checkstate.ReasonAwaitingReplanAfterApply, stuck.StoredRows[1].Reason)
+}
+
+// Every stored row resolving on its own is the shape an operator can skip,
+// and the sweep says so rather than leaving the entry unclassified.
+func TestScanWebhookMissingChecksMarksSelfConvergingStuckRuns(t *testing.T) {
+	t.Parallel()
+
+	client := fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 12, Title: "waiting", HeadSHA: "sha12", HeadRef: "feature-12"},
+		},
+		runs: map[string]*ghclient.CheckRunResult{
+			"sha12/SchemaBot (production)": {ID: 120, Name: "SchemaBot (production)", Status: "in_progress"},
+		},
+	}
+	store := &inspectStorage{
+		checks: &inspectCheckStore{checks: []*storage.Check{
+			{Environment: "production", DatabaseName: "widgets", HeadSHA: "sha12", ApplyID: 7,
+				Status: checkstate.StatusInProgress},
+		}},
+		applies: &inspectApplyStore{applies: map[int64]*storage.Apply{
+			7: {ApplyIdentifier: "apply-7", State: "running"},
+		}},
+	}
+
+	result, err := scanWebhookMissingChecks(t.Context(), client, store, "octo/repo", []string{"SchemaBot (production)"}, 0, time.Time{}, discardLogger())
+
+	require.NoError(t, err)
+	require.Len(t, result.Stuck, 1)
+	assert.Equal(t, apitypes.WaitingOnSchemaBot, result.Stuck[0].WaitingOn)
+	require.Len(t, result.Stuck[0].StoredRows, 1)
+	assert.Equal(t, checkstate.ReasonApplyRunning, result.Stuck[0].StoredRows[0].Reason)
+}
+
+// Stored state that cannot be read costs the entry its explanation and
+// nothing else. The Check Run findings are what the backfill acts on and
+// they are already in hand, so the scan still reports the stuck run.
+func TestScanWebhookMissingChecksReportsStuckRunsWhenStoredStateIsUnreadable(t *testing.T) {
+	t.Parallel()
+
+	client := fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 13, Title: "wedged", HeadSHA: "sha13", HeadRef: "feature-13"},
+		},
+		runs: map[string]*ghclient.CheckRunResult{
+			"sha13/SchemaBot (production)": {ID: 130, Name: "SchemaBot (production)", Status: "in_progress"},
+		},
+	}
+	store := &inspectStorage{checks: &inspectCheckStore{err: errors.New("storage unavailable")}}
+
+	result, err := scanWebhookMissingChecks(t.Context(), client, store, "octo/repo", []string{"SchemaBot (production)"}, 0, time.Time{}, discardLogger())
+
+	require.NoError(t, err)
+	require.Len(t, result.Stuck, 1)
+	assert.Empty(t, result.Stuck[0].StoredRows)
+	assert.Empty(t, result.Stuck[0].WaitingOn)
+	require.Len(t, result.Stuck[0].Checks, 1, "the finding the backfill acts on survives the failed read")
 }

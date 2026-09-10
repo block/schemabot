@@ -99,6 +99,15 @@ type checksStuckCheck struct {
 	// Age is how long the run has been sitting uncompleted at scan time;
 	// "unknown" when GitHub did not report a start time.
 	Age string `json:"age"`
+	// WaitingOn says whether the stored state behind this run resolves on its
+	// own ("schemabot") or needs a person ("operator"). Empty when the server
+	// reported no stored state, which is itself the answer: the run is
+	// holding a gate SchemaBot has nothing recorded for.
+	WaitingOn string `json:"waiting_on,omitempty"`
+	// Reasons are the distinct dispositions of the blocking stored rows, in
+	// the order the server reported them. They are what makes a stuck row
+	// triageable from the sweep instead of only from the PR.
+	Reasons []string `json:"reasons,omitempty"`
 }
 
 type checksBackfillReport struct {
@@ -460,10 +469,29 @@ func stuckChecksPastThreshold(repo string, prs []apitypes.StuckCheckPR, stuckAft
 				Status:     check.Status,
 				StartedAt:  check.StartedAt,
 				Age:        age,
+				WaitingOn:  pr.WaitingOn,
+				Reasons:    blockingReasons(pr.StoredRows),
 			})
 		}
 	}
 	return out
+}
+
+// blockingReasons lists the distinct dispositions of the rows that are
+// holding the gate open, dropping the ones that already resolved. A resolved
+// row explains nothing about why the run is still sitting, and listing it
+// alongside the real cause is what makes a sweep unreadable.
+func blockingReasons(rows []apitypes.InspectedCheck) []string {
+	var reasons []string
+	for _, row := range rows {
+		if !row.Blocking || row.Reason == "" {
+			continue
+		}
+		if !slices.Contains(reasons, row.Reason) {
+			reasons = append(reasons, row.Reason)
+		}
+	}
+	return reasons
 }
 
 // repoPR keys a PR within a multi-repo report.
@@ -619,15 +647,20 @@ func writeChecksStuckSection(w io.Writer, report *checksBackfillReport) error {
 		return err
 	}
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	if _, err := fmt.Fprintln(tw, "PR\tCHECK\tSTATUS\tAGE"); err != nil {
+	if _, err := fmt.Fprintln(tw, "PR\tCHECK\tSTATUS\tAGE\tWAITING ON\tREASON"); err != nil {
 		return err
 	}
 	for _, stuck := range report.Stuck {
-		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", stuck.URL, stuck.CheckName, stuck.Status, stuck.Age); err != nil {
+		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			stuck.URL, stuck.CheckName, stuck.Status, stuck.Age,
+			orDash(stuck.WaitingOn), orDash(strings.Join(stuck.Reasons, ","))); err != nil {
 			return err
 		}
 	}
 	if err := tw.Flush(); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(w, "\nA run waiting on an operator will not clear on its own. Read the stored rows behind one with `sq schemabot checks show <owner/repo> <pr>`."); err != nil {
 		return err
 	}
 	_, err := fmt.Fprintln(w)

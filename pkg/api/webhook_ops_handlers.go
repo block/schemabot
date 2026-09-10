@@ -307,7 +307,7 @@ func (s *Service) handleChecksScan(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := s.extendWebhookOpsDeadline(w, r)
 	defer cancel()
-	response, err := executeChecksScan(ctx, s.config, req, s.logger)
+	response, err := executeChecksScan(ctx, s.config, s.storage, req, s.logger)
 	if err != nil {
 		s.writeWebhookOpsError(w, err)
 		return
@@ -373,7 +373,7 @@ func executeWebhookRedrive(ctx context.Context, cfg *ServerConfig, req WebhookRe
 	return response, nil
 }
 
-func executeChecksScan(ctx context.Context, cfg *ServerConfig, req ChecksScanRequest, logger *slog.Logger) (*ChecksScanResponse, error) {
+func executeChecksScan(ctx context.Context, cfg *ServerConfig, store storage.Storage, req ChecksScanRequest, logger *slog.Logger) (*ChecksScanResponse, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
@@ -411,7 +411,7 @@ func executeChecksScan(ctx context.Context, cfg *ServerConfig, req ChecksScanReq
 	if err != nil {
 		return nil, err
 	}
-	response, err := scanWebhookMissingChecks(ctx, installationClient, req.Repo, webhookMissingCheckNames(cfg, req.Repo, req.Environment, req.CheckName), req.Page, updatedSince)
+	response, err := scanWebhookMissingChecks(ctx, installationClient, store, req.Repo, webhookMissingCheckNames(cfg, req.Repo, req.Environment, req.CheckName), req.Page, updatedSince, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -862,7 +862,7 @@ type webhookMissingCheckScanClient interface {
 	FindCheckRunByName(ctx context.Context, repo, headSHA, checkName string) (*ghclient.CheckRunResult, []string, error)
 }
 
-func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckScanClient, repo string, checkNames []string, page int, updatedSince time.Time) (*ChecksScanResponse, error) {
+func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckScanClient, store storage.Storage, repo string, checkNames []string, page int, updatedSince time.Time, logger *slog.Logger) (*ChecksScanResponse, error) {
 	prs, nextPage, lastPage, err := client.ListOpenPullRequestsPage(ctx, repo, page, webhookScanPRPageSize)
 	if err != nil {
 		return nil, err
@@ -909,14 +909,17 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 			}
 		}
 		if len(incomplete) > 0 {
-			result.Stuck = append(result.Stuck, StuckCheckPR{
+			stuck := StuckCheckPR{
 				Number:  pr.Number,
 				URL:     caller.PullRequestURL(repo, pr.Number),
 				Title:   pr.Title,
 				HeadSHA: pr.HeadSHA,
 				HeadRef: pr.HeadRef,
 				Checks:  incomplete,
-			})
+			}
+			stuck.StoredRows = storedRowsBehindStuckCheck(ctx, store, repo, pr.Number, pr.HeadSHA, logger)
+			stuck.WaitingOn = waitingOnForStoredRows(stuck.StoredRows)
+			result.Stuck = append(result.Stuck, stuck)
 		}
 		if len(missing) == 0 {
 			continue
@@ -948,6 +951,64 @@ func estimateOpenPRCount(page, lastPage, pageLen int) int {
 		page = 1
 	}
 	return (page-1)*webhookScanPRPageSize + pageLen
+}
+
+// storedRowsBehindStuckCheck reads the stored check state behind a Check Run
+// that exists on an open PR's head and never completed.
+//
+// The run alone says the gate is open and nothing else: not which database,
+// not whether an apply owns it, not whether anything will ever close it. The
+// rows say all three, which is what turns a fleet sweep's stuck list from a
+// list of PRs to open into a list of PRs to act on.
+//
+// A read failure costs the entry its rows and nothing else. The Check Run
+// findings are what the backfill acts on and they are already in hand, so
+// failing the whole scan over the explanation would trade the answer for the
+// annotation.
+func storedRowsBehindStuckCheck(ctx context.Context, store storage.Storage, repo string, pr int, headSHA string, logger *slog.Logger) []InspectedCheck {
+	if store == nil {
+		logger.Warn("checks scan reports a stuck Check Run without the stored state behind it: storage is not configured",
+			"repo", repo, "pr", pr, "head_sha", headSHA)
+		return nil
+	}
+	stored, err := store.Checks().GetByPR(ctx, repo, pr)
+	if err != nil {
+		logger.Warn("checks scan reports a stuck Check Run without the stored state behind it: reading stored check state failed",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
+		return nil
+	}
+	if len(stored) == 0 {
+		logger.Debug("no stored check state behind this stuck Check Run",
+			"repo", repo, "pr", pr, "head_sha", headSHA)
+		return nil
+	}
+	rows := make([]InspectedCheck, 0, len(stored))
+	for _, check := range stored {
+		rows = append(rows, inspectedCheck(ctx, store, check, headSHA, logger))
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Environment != rows[j].Environment {
+			return rows[i].Environment < rows[j].Environment
+		}
+		return rows[i].Database < rows[j].Database
+	})
+	return rows
+}
+
+// waitingOnForStoredRows reduces a stuck entry's rows to the one answer that
+// decides whether an operator opens it. One row needing a person makes the
+// whole entry need one: an entry reported as self-converging when part of it
+// is not would be read as safe to leave alone.
+func waitingOnForStoredRows(rows []InspectedCheck) string {
+	if len(rows) == 0 {
+		return ""
+	}
+	for _, row := range rows {
+		if row.Blocking && !row.SelfConverging {
+			return apitypes.WaitingOnOperator
+		}
+	}
+	return apitypes.WaitingOnSchemaBot
 }
 
 // checkRunCompleted reports whether the Check Run's status is "completed".
