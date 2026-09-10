@@ -50,28 +50,38 @@ CI mirrors local dev — every CI test job runs make targets, not bespoke comman
 - **Never bypass pre-commit hooks.** Do not use `--no-verify` or `core.hooksPath=/dev/null`. If the hook fails, fix the issue.
 - **PR summaries should be concise** — a short paragraph or bullet list highlighting key changes and why, not low-level implementation details. Do not include test plans, checklists, or verification details. Never reference internal company details (specific database names, staging environments, team names, internal URLs, deployment hostnames, org names, or test repo names) in PR titles or descriptions — this is a public OSS repo.
 - **Every PR summary carries an ASCII diagram when the change has a shape to show.** Any change to flow, architecture, state transitions, concurrency, lifecycle, or ownership gets one, so a reviewer sees the new behavior without reconstructing it from the diff. Skip it when the change has no such shape — a comment, a test, a copy edit, a dependency bump — or when the shape is small enough that one sentence states it in full, such as a one-line predicate change. Beyond that, "the prose covers it" is not a reason to skip: a flow that takes a paragraph to describe is one the reviewer needs to see.
-- **Show before and after when the change rewrites behavior rather than adding it.** Complex state changes and reworked logic are where the contrast carries the point: an after-diagram alone leaves the reviewer to hold the old behavior in their head and spot the difference themselves, which is exactly the step where a reviewer misses that a transition moved or a branch went away. Label the two, and draw them to the same shape and node order so the difference between them is the only thing that stands out:
+- **Show before and after when the change rewrites behavior rather than adding it.** Complex state changes and reworked logic are where the contrast carries the point: an after-diagram alone leaves the reviewer to hold the old behavior in their head and spot the difference themselves, which is exactly the step where a reviewer misses that a transition moved or a branch went away. Label the two, and draw them to the same shape and node order so the difference between them is the only thing that stands out. Anchor the pair in one concrete example — a realistic input run through both versions — rather than in the mechanism: boxes labelled with roles (cause, remedy, state A, state B) show how the change works and leave what an operator would actually have seen for the reviewer to work out, which is the step the diagram exists to remove. Drawn from an instance, the difference is a fact the reviewer can check against the tests rather than a claim to take on trust. A state diagram is a fine form for this as long as it traces the one apply, not the whole transition graph:
+
+  An apply is 40% through copying `orders` into its shadow table when the operator sends `cancel`.
 
   ```
-  Before                     After
+  Before                                After
 
-  ┌───────────┐              ┌───────────┐
-  │  running  │              │  running  │
-  └─────┬─────┘              └─────┬─────┘
-        │ cancel                   │ cancel
-        ▼                          ▼
-  ┌───────────┐              ┌───────────┐
-  │ cancelled │              │ releasing │
-  └───────────┘              └─────┬─────┘
-                                   │ copy quarantined
-                                   ▼
-                             ┌───────────┐
-                             │ cancelled │
-                             └───────────┘
+  ┌──────────────────────┐              ┌──────────────────────┐
+  │ running              │              │ running              │
+  │ copy 40%             │              │ copy 40%             │
+  └──────────┬───────────┘              └──────────┬───────────┘
+             │ cancel                              │ cancel
+             ▼                                     ▼
+  ┌──────────────────────┐              ┌──────────────────────┐
+  │ cancelled            │              │ releasing            │
+  │ _orders_new left on  │ ✗ orphan     │ _orders_new moved to │
+  │ the target           │              │ pending drops        │
+  └──────────────────────┘              └──────────┬───────────┘
+                                                   │ quarantined
+                                                   ▼
+                                        ┌──────────────────────┐
+                                        │ cancelled            │
+                                        │ target clean         │
+                                        └──────────────────────┘
   ```
-- **Anchor the before/after pair in one concrete example.** Boxes labelled with roles — cause, remedy, state A, state B — show the mechanism and leave the effect for the reviewer to work out. Pick one realistic input, run it through both versions, and draw what each produces, so the difference is a fact the reviewer can check against the tests rather than a claim to take on trust. Use whatever form makes the effect visible — a flow, a state diagram, a timeline, a ruler against a limit, the rendered output side by side — and draw both halves in that same form. Name the example's inputs in the sentence above the diagram, mark on the diagram where the old behavior goes wrong and where the new one differs, and when the surface is text, follow the diagram with the verbatim output of each version (collapsed, per the UX rule below).
+- **A before/after pair is checkable when it does four things.** Pick whatever form makes the effect visible — a flow, a state diagram, a timeline, a ruler against a limit, rendered output side by side — and then:
+  1. Draw both halves in that same form.
+  2. Name the example's inputs in the sentence above the diagram.
+  3. Mark on the diagram where the old behavior goes wrong and where the new one differs.
+  4. When the change is to what users see, follow the diagram with each version's verbatim output; the UX rule below says how to include it.
 - **Align the diagram in a second pass.** Put every diagram in a fenced code block (outside one, Markdown collapses the whitespace the alignment depends on), then re-read the finished block as a grid and fix the columns: box borders and corners line up column-for-column, a box is as wide as its widest content, and every connector meets the edge it points at. Ragged box lines are harder to read than no diagram, and they are invisible while writing one — checking is a separate pass over the rendered result, not something to trust to the first draft.
-- **UX changes show the rendered result, collapsed.** When a PR changes what users see (PR comments, check summaries, CLI output), embed the new rendering in the PR summary inside collapsed `<details>` blocks — one per scenario, using the TEMPLATES.md preview output where one exists — so reviewers see the actual UX without checking out the branch. Links to TEMPLATES.md anchors are not a substitute; the rendering belongs in the summary itself.
+- **UX changes show the rendered result, collapsed.** When a PR changes what users see (PR comments, check summaries, CLI output), embed the new rendering in the PR summary inside collapsed `<details>` blocks — one per scenario, using the TEMPLATES.md preview output where one exists — so reviewers see the actual UX without checking out the branch. When the change rewrites output that already exists, include the prior rendering as well, in its own collapsed block beside the new one, so the before/after pair has both halves. Links to TEMPLATES.md anchors are not a substitute; the rendering belongs in the summary itself.
 - **Agent PR disclosures belong at the bottom.** When an agent writes or updates a PR summary/body, put the agent disclosure line after the summary content, not at the top.
 - **Do not create PRs automatically.** Wait for the user to explicitly ask before running `gh pr create`. Pushing a branch is fine; creating the PR is a separate decision.
 - **Create PRs in draft mode** (`gh pr create --draft`) by default. The author will mark it ready for review.
