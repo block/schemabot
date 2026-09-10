@@ -908,6 +908,16 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		IsMySQL:           schema.Type == "mysql",
 		IgnoredNamespaces: schema.IgnoredNamespaces,
 	}
+	for _, group := range planResp.ExemptTables {
+		if group == nil {
+			continue
+		}
+		data.ExemptTables = append(data.ExemptTables, templates.ExemptTablesData{
+			Namespace: group.Namespace,
+			Tables:    group.Tables,
+			Reason:    group.Reason,
+		})
+	}
 
 	// Per-shard changes, grouped by keyspace, so a sharded keyspace can show what
 	// applies to which shard rather than the collapsed namespace-level view.

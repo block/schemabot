@@ -1416,9 +1416,13 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 	}
 	if len(ddlChanges) == 0 && !hasVSchemaChanges {
 		c.logger.Info("Plan: no changes, skipping storage", "plan_id", result.PlanID, "database", c.config.Database)
+		// A clean plan is the case where the disclosure matters most: it is
+		// the only evidence a reviewer has that an exempt table was seen and
+		// deliberately skipped rather than missed.
 		return &ternv1.PlanResponse{
-			PlanId: result.PlanID,
-			Engine: c.protoEngine(),
+			PlanId:       result.PlanID,
+			Engine:       c.protoEngine(),
+			ExemptTables: protoExemptTables(result.ExemptTables),
 		}, nil
 	}
 
@@ -1465,6 +1469,7 @@ func (c *LocalClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv
 		LintViolations: violations,
 		Shards:         protoShards,
 		ExistingCopies: c.protoExistingCopies(result, c.runningCopiesForPlan(ctx, result, req.Environment, localPlanTarget(req, c.config.Database))),
+		ExemptTables:   protoExemptTables(result.ExemptTables),
 	}, nil
 }
 
@@ -1526,6 +1531,21 @@ func (c *LocalClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*t
 		LintViolations: violations,
 		Shards:         protoShards,
 	}, nil
+}
+
+func protoExemptTables(groups []*engine.ExemptTables) []*ternv1.ExemptTables {
+	result := make([]*ternv1.ExemptTables, 0, len(groups))
+	for _, group := range groups {
+		if group == nil {
+			continue
+		}
+		result = append(result, &ternv1.ExemptTables{
+			Namespace: group.Namespace,
+			Tables:    group.Tables,
+			Reason:    group.Reason,
+		})
+	}
+	return result
 }
 
 // planResultToProtoChanges converts an engine plan result into the proto pieces
@@ -1686,6 +1706,7 @@ func (c *LocalClient) planMySQLNamespacesWithEngine(ctx context.Context, eng eng
 		result.Changes = append(result.Changes, nsResult.Changes...)
 		result.LintViolations = append(result.LintViolations, nsResult.LintViolations...)
 		result.ExistingCopies = append(result.ExistingCopies, nsResult.ExistingCopies...)
+		result.ExemptTables = append(result.ExemptTables, nsResult.ExemptTables...)
 		if !nsResult.NoChanges || len(nsResult.Changes) > 0 {
 			result.NoChanges = false
 		}

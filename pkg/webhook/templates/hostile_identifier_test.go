@@ -33,6 +33,7 @@ func TestHostileIdentifierNeverEscapesItsCodeSpan(t *testing.T) {
 			{Table: hostileIdentifier, Repository: "org/repo", PullRequest: 7},
 			{Table: hostileIdentifier, Unresolved: true},
 		},
+		ExemptTables: []ExemptTablesData{{Namespace: hostileIdentifier, Tables: []string{hostileIdentifier}, Reason: "archive naming"}},
 	}
 	apply := ApplyStatusCommentData{
 		Database: "testapp", Environment: "staging",

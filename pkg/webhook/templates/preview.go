@@ -70,6 +70,21 @@ func PreviewCommentPlanIgnoredNamespaces() string {
 	return RenderPlanComment(data)
 }
 
+// PreviewCommentPlanExemptTables renders a plan with archive-named live tables.
+func PreviewCommentPlanExemptTables() string {
+	return RenderPlanComment(PlanCommentData{
+		Database: "testapp", SchemaName: "app", Environment: "staging",
+		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
+		DatabaseType: "postgres",
+		Changes:      []KeyspaceChangeData{{Keyspace: "app", Statements: []string{"CREATE TABLE app.users (id bigint PRIMARY KEY);"}}},
+		ExemptTables: []ExemptTablesData{{
+			Namespace: "app",
+			Tables:    []string{"events_archive_2025_01", "orders_archive_2024"},
+			Reason:    "archive naming",
+		}},
+	})
+}
+
 // PreviewCommentPlanBlocked renders a sample plan containing a statement the
 // engine deterministically refuses (execution-mode verdict "blocked").
 func PreviewCommentPlanBlocked() string {

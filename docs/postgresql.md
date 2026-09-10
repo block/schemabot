@@ -345,7 +345,10 @@ Archive tables named `<table>_archive_YYYY[_MM[_DD]]` are exempt from the
 verdict, as they are in the MySQL engine's view of a live schema: an archive
 is a retired copy kept outside declarative schema files. That naming
 convention is the only per-table exemption — a leading underscore means
-nothing on PostgreSQL — and `ignore_namespaces` is the per-namespace one.
+nothing on PostgreSQL — and `ignore_namespaces` is the per-namespace one. The
+plan discloses the tables it exempted, by namespace, in the PR comment and in
+`schemabot plan` and `schemabot apply` output, so a reviewer can tell an
+archive the verdict skipped from a table it found declared.
 Tables whose definition lives elsewhere are likewise not enumerated: a
 partition is declared through its parent's `PARTITION BY` and follows the
 parent's verdict wherever the parent lives, and extension-owned tables (such

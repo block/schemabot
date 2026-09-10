@@ -521,6 +521,11 @@ func TestEnginePlanUndeclaredTableIsBlockedDrop(t *testing.T) {
 	assert.False(t, result.NoChanges, "an undeclared live table is a change the reviewer must see")
 	require.Len(t, result.Changes, 1)
 	assert.Equal(t, "public", result.Changes[0].Namespace)
+	require.Len(t, result.ExemptTables, 1)
+	assert.Equal(t, "public", result.ExemptTables[0].Namespace)
+	assert.Equal(t, []string{"audit_log_archive_2019"}, result.ExemptTables[0].Tables)
+	assert.Equal(t, "archive naming", result.ExemptTables[0].Reason)
+	assert.NotContains(t, result.ExemptTables[0].Tables, "legacy_users")
 	require.Len(t, result.Changes[0].TableChanges, 8,
 		"every undeclared table with a definition of its own is reported; the declared table, its partition, the extension-owned table and the archive table are not")
 
