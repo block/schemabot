@@ -191,6 +191,25 @@ jobs:
 
       # LocalScale image — fake PlanetScale API for testing.
       # Published to ghcr.io/block/schemabot/localscale:<sha|latest>
+      #
+      # The binary is built on the runner, not inside a Dockerfile, so it
+      # needs the module's Go toolchain and the shared Go cache the test and
+      # lint workflows populate. Without the cache every run downloads the
+      # full module graph from the proxy, and a single dropped stream fails
+      # the publish; with it the download is a cache hit.
+      - name: "Configure Go"
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: "Restore Go cache"
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum', 'e2e/consumermodule/go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ runner.arch }}-
       - name: "Build LocalScale binary"
         run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/localscale-linux ./cmd/localscale
 
