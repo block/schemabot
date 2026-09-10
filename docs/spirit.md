@@ -15,6 +15,9 @@
 MySQL support. It copies and verifies a replacement table while your application keeps writing,
 then swaps it into place. SchemaBot supplies the reviewed plan, scheduling, and controls.
 
+For engine setup and compatibility, see Spirit's [requirements](https://github.com/block/spirit#requirements)
+and [supported operations and limitations](https://github.com/block/spirit#unsupported-features).
+
 ## How a change runs
 
 If MySQL can execute a change instantly, Spirit uses that path. A change that needs a table copy
@@ -31,6 +34,9 @@ available capacity and backs off under pressure; [throttling](throttle.md) expla
 and what to do when progress slows. Verification and cutover still have to finish after the
 row copy reaches 100%. See [engine capabilities](engines.md) for stop, resume, and revert support,
 and [direct execution](direct-execution.md) for statements routed outside the online engine.
+Spirit documents the underlying [instant DDL path](https://github.com/block/spirit#attempt-instant-ddl),
+[dynamic chunking](https://github.com/block/spirit#dynamic-chunking), and
+[verification around deferred cutover](https://github.com/block/spirit/blob/main/docs/migrate.md#two-checksum-model).
 
 ## Choosing a primary key
 
@@ -83,10 +89,14 @@ A single auto-increment primary key lets Spirit calculate numeric chunk boundari
 composite, and non-auto-increment keys use the general chunker, which reads the index to find
 the next boundary before copying the range. Sparse numeric keys can use lookups too. These extra
 reads matter on large table copies, but do not imply a fixed slowdown or affect instant changes.
+Spirit's [chunker guide](https://github.com/block/spirit/blob/main/pkg/table/README.md) explains both
+strategies, including how numeric chunking handles gaps.
 
 `VARCHAR` keys are supported. Text collation also makes replay more involved: after copying,
 Spirit preserves binlog event order for these keys rather than relying on in-memory key equality.
 The database decides which strings identify the same row, and checksums verify the copied data.
+For the replay optimization and its key-type limits, see Spirit's
+[change row map](https://github.com/block/spirit#change-row-map).
 See Spirit's [chunker selection](https://github.com/block/spirit/blob/1ab2595e45a1b0c3ae4afc62c70449dc28230cc2/pkg/table/chunker.go#L149)
 and [change replay](https://github.com/block/spirit/blob/1ab2595e45a1b0c3ae4afc62c70449dc28230cc2/pkg/change/subscription_buffered.go#L30).
 
@@ -97,6 +107,8 @@ an unchanged existing key is advisory. On a newly created table or a newly added
 column, the rule raises an error; SchemaBot presents it under **Issues**, requiring explicit
 acknowledgement. A missing primary key is also a finding, and Spirit cannot copy a table without
 one. See [lint and safety levels](lint-and-safety-levels.md).
+Spirit's [linter reference](https://github.com/block/spirit/blob/main/docs/lint.md#built-in-linters)
+covers the engine's rules; the SchemaBot guide explains how findings appear in a plan and affect approval.
 
 The type rule is a design check, not a promise of fast copying: `BINARY` can pass lint while still
 using the general chunker. Conversely, a varchar finding does not mean Spirit cannot copy the
@@ -140,6 +152,9 @@ key to debugging stale-progress issues.
 ### What Spirit exposes
 
 `runner.Progress()` returns [`status.Progress`](https://github.com/block/spirit/blob/main/pkg/status/progress.go):
+
+Spirit's [structured progress reference](https://github.com/block/spirit/blob/main/pkg/status/README.md#structured-runner-progress)
+documents the upstream contract. The fields below explain what SchemaBot consumes and displays.
 
 | Field           | Type              | Notes |
 |-----------------|-------------------|-------|
