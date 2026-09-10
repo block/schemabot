@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -3433,18 +3434,10 @@ func TestApplyStore_ExpireRetryable_TakesTheOldestUpToTheLimit(t *testing.T) {
 //
 // Declining costs the apply a pass, not the expiry: expiry is a sweep, so once
 // the lease goes stale the next pass takes the apply and its rows together.
-// Expiry writes an apply's task and operation rows without gating each write on
-// a lease, which is only safe because no driver can start a drive under an apply
-// expiry is taking. The selection excludes a drive already under way; what
-// excludes one that has not started is that starting means passing
-// ClaimApplyByID, and the two predicates are exact complements — expiry wants a
-// spent budget or a lapsed freshness window, the claim wants a live budget and a
-// live window.
-//
-// That pairing is the property, so it is pinned as a pair. Testing either side
-// alone would still pass if someone widened one predicate and left the other
-// where it was, which is precisely the change that would let a driver start
-// under an apply this sweep is about to settle.
+// The single-operation parent claim and expiry have complementary recovery
+// budget predicates. This pins that contract, but does not establish exclusion
+// for operation-only drivers; expiry_claims_test.go covers their row locks and
+// the lease recheck required before expiry can write.
 func TestApplyStore_ExpireRetryableAndTheParentClaimNeverAdmitTheSameApply(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -3566,15 +3559,9 @@ func TestApplyStore_ExpireRetryable_DeclinesAnApplyWhoseOperationADriverHolds(t 
 	assertTaskState(t, store, queuedTask.TaskIdentifier, state.Task.Cancelled)
 }
 
-// A drive that settles its operation into failed_retryable writes that state
-// under its lease and leaves the lease in place, so for a staleness window
-// afterwards the row carries a fresh-looking lease with no drive behind it.
-// That is the ordinary shape of a single-deployment apply that has just used its
-// last attempt, which is the apply expiry exists to terminalize. The gate reads
-// the operation's state alongside its lease for exactly this reason: waiting the
-// lease out would hold every such apply non-terminal for a staleness window,
-// with its target still blocked behind it.
-func TestApplyStore_ExpireRetryable_ExpiresAnApplyWhoseDriveLeftItsLeaseBehind(t *testing.T) {
+// A retryable operation retains its state when reclaimed. Its fresh lease
+// must exclude expiry even before the new drive updates the operation state.
+func TestApplyStore_ExpireRetryable_DefersUntilARetryableOperationsLeaseIsStale(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
 	store := NewMySQL(testDB)
@@ -3596,6 +3583,12 @@ func TestApplyStore_ExpireRetryable_ExpiresAnApplyWhoseDriveLeftItsLeaseBehind(t
 	attachTaskToOperation(t, queuedTask.TaskIdentifier, settled)
 
 	expired, err := store.Applies().ExpireRetryable(ctx, 10)
+	require.NoError(t, err)
+	assert.Empty(t, expired, "a fresh retryable lease may belong to a newly admitted drive")
+	assertTaskState(t, store, failedTask.TaskIdentifier, state.Task.FailedRetryable)
+	assertTaskState(t, store, queuedTask.TaskIdentifier, state.Task.Pending)
+	backdateOperationHeartbeat(t, settled, storage.ApplyLeaseStaleAfter+time.Minute)
+	expired, err = store.Applies().ExpireRetryable(ctx, 10)
 	require.NoError(t, err)
 	require.Len(t, expired, 1)
 	assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
@@ -4833,4 +4826,38 @@ func TestApplyStore_ReleaseClaim_InvalidLeaseIsRefused(t *testing.T) {
 
 	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
 	assert.False(t, released)
+}
+
+// The expiry sweep orders its candidates by updated_at under FOR UPDATE, so
+// the index that serves that ordering is what bounds the work the LIMIT takes.
+// state = ? is an equality predicate, so a btree on (state, updated_at) hands
+// back rows already in the ordering's direction; without it the planner has to
+// sort the whole failed_retryable state before the first page exists, which
+// under FOR UPDATE means locking rows the sweep will never return.
+//
+// This asserts the index as the embedded MySQL schema file declares it, on the
+// MySQL store this package's tests run against, under the name MySQL's
+// table-scoped naming gives it. The PostgreSQL counterpart carries a different
+// name because its index names are schema-wide; the schema parity tests pin it
+// by shape rather than by name.
+func TestApplyExpiryOrderingIsIndexed(t *testing.T) {
+	ctx := t.Context()
+
+	rows, err := testDB.QueryContext(ctx, `
+		SELECT COLUMN_NAME FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'applies' AND INDEX_NAME = 'idx_state_updated'
+		ORDER BY SEQ_IN_INDEX`)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rows)
+
+	var indexColumns []string
+	for rows.Next() {
+		var column string
+		require.NoError(t, rows.Scan(&column))
+		indexColumns = append(indexColumns, column)
+	}
+	require.NoError(t, rows.Err())
+
+	assert.Equal(t, []string{"state", "updated_at"}, indexColumns,
+		"the expiry ordering needs an index on exactly its filter and ordering columns, in that order")
 }

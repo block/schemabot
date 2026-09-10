@@ -96,7 +96,8 @@ import (
 // RetryableExpiryInterval. Because it writes a whole apply's tree at once it
 // cannot decide row by row: it excludes a live driver by taking only applies
 // with no operation a driver is part-way through driving, and then takes the
-// tree whole. See storage.ApplyStore.ExpireRetryable.
+// tree whole. It locks every operation and rechecks leases before writing;
+// a fresh retryable lease is protected too. See storage.ApplyStore.ExpireRetryable.
 
 // StrandedReaperInterval is how often the reaper runs a pass. Override with
 // SetStrandedReaperInterval.

@@ -1728,6 +1728,60 @@ func (s *applyOperationStore) ReleaseClaim(ctx context.Context, lease storage.Op
 	return rows > 0, nil
 }
 
+// ReleaseFinishedClaim clears the lease on an operation whose drive has ended,
+// so a fresh lease on a row means a drive is in progress rather than that one
+// ended here.
+//
+// "Ended" is the settled states plus failed_retryable. Settled is the terminal
+// set minus stopped, matching state.SettledApplyStates: a stopped operation is
+// terminal but still addressable, so a driver may resume writing under its
+// lease and the lease is not this call's to clear. failed_retryable is the
+// state whose leftover lease is indistinguishable from a live retry's, which is
+// what makes the clear worth doing at all; the settled states are here because
+// a lease-only reader cannot tell those leftovers apart either.
+//
+// It carries the heartbeat forward rather than moving it, unlike every other
+// write here. The settling write set updated_at moments ago, so the column
+// already says when the row last moved, and both directions from there are
+// wrong: ReleaseClaim's backdate would report a row that was just written as
+// stalled, and a fresh stamp would push out the crash-recovery arm of
+// FindNextApplyOperation, which re-offers a failed_retryable operation under a
+// stale parent only once the operation's own heartbeat has aged. Carrying it
+// forward leaves re-claim timing exactly as the settling write left it.
+//
+// The assignment is explicit for the same reason it is not a stamp: left out,
+// MySQL's ON UPDATE CURRENT_TIMESTAMP would refresh the heartbeat here and
+// PostgreSQL would not, so the two dialects would recover this row on different
+// schedules.
+//
+// Guarded on both the lease token and the ended states so it cannot clear a
+// lease a peer rotated onto the row, or one belonging to a drive that left the
+// row somewhere a driver may still resume from.
+func (s *applyOperationStore) ReleaseFinishedClaim(ctx context.Context, lease storage.OperationLease) (bool, error) {
+	if !lease.Valid() {
+		return false, fmt.Errorf("release finished claim for apply_operation %d: %w", lease.OperationID, storage.ErrApplyLeaseLost)
+	}
+	endedStates := append([]string{state.ApplyOperation.FailedRetryable}, state.SettledApplyStates...)
+	args := []any{lease.OperationID, lease.Token}
+	for _, s := range endedStates {
+		args = append(args, s)
+	}
+	result, err := s.db.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE apply_operations
+		SET lease_owner = '', lease_token = '', lease_acquired_at = NULL,
+		    updated_at = updated_at
+		WHERE id = ? AND lease_token = ? AND state IN (%s)
+	`, placeholders(len(endedStates))), args...)
+	if err != nil {
+		return false, fmt.Errorf("release finished claim for apply_operation %d: %w", lease.OperationID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read release finished claim rows affected for apply_operation %d: %w", lease.OperationID, err)
+	}
+	return rows > 0, nil
+}
+
 // Heartbeat refreshes updated_at to maintain the claim's lease. Should be
 // called periodically by a driver holding the lease. Silent no-op when the
 // row no longer exists (mirrors ApplyStore.Heartbeat).
@@ -1961,9 +2015,8 @@ func unleasedOperationGate(d Dialect) string {
 		)`, freshLeaseAfter)
 }
 
-// undrivenApplyGate renders the NOT EXISTS admitting only applies with no
-// operation a driver is part-way through driving, and returns its positional
-// arguments alongside the clause. It is the apply-granular counterpart of
+// undrivenApplyGate renders the NOT EXISTS admitting only applies with no fresh
+// operation lease. It is the apply-granular counterpart of
 // unleasedOperationGate: that gate excludes one task row by its own operation's
 // lease, this one excludes a whole apply by any operation under it.
 //
@@ -1973,46 +2026,37 @@ func unleasedOperationGate(d Dialect) string {
 // touch, so the two have to be decided as one, and the decision has to be made
 // where the parent is selected.
 //
-// The lease terms are unleasedOperationGate's, read the same way, plus a
-// state filter that gate deliberately omits.
+// It reads the lease and nothing else, because state does not tell the two
+// meanings of a lease apart. A redispatched operation keeps its failed_retryable
+// state for the whole drive — the claim rotates the lease and leaves the state
+// alone — so any state filter that admits failed_retryable admits an apply a
+// driver is part-way through retrying, which is the one case a whole-apply write
+// must not land under. Filtering it out instead would exclude the retry but not
+// the drive.
 //
-// The filter buys termination. A drive that settles its operation into a
-// resumable state writes that state under its lease and leaves the lease in
-// place, so for a full staleness window afterwards the row reads exactly like a
-// live drive's, and a single-deployment apply that has just used its last
-// attempt is in that window every time. Reading the lease alone would hold every
-// such apply — the ordinary shape of the work this exists to terminalize — for a
-// staleness window before its verdict could land.
+// Reading the lease alone only terminalizes because a drive clears its lease as
+// it ends. A leftover lease is indistinguishable from a live one for a full
+// staleness window, and a single-deployment apply that has just spent its last
+// attempt would be in that window every time, so without the handback this gate
+// would defer the ordinary shape of the work it exists to settle.
 //
-// It buys that at a cost, and the cost is not yet paid for. The states here are
-// claimableApplyStates(), which is not the set that means "a driver is occupying
-// this operation" — that set is driverOccupyingOperationStates(), and the two
-// part at failed_retryable. A redispatched operation keeps that state for its
-// whole drive, so this gate admits an apply whose operation a driver is
-// part-way through retrying, which is the one case a whole-apply write must not
-// land under.
-//
-// Closing it means the gate reads the lease alone, which in turn means a drive
-// clears its lease as it ends rather than leaving it behind — the leftover lease
-// is the only reason the state filter is here — and that a writer relying on the
-// gate re-checks it under a lock on every operation of the apply, since an
-// unfiltered NOT EXISTS evaluated once is a read a claim can race.
+// The gate is a candidate filter, not the decision. An unlocked NOT EXISTS is a
+// read a claim can win the moment after it is evaluated, so a writer relying on
+// this repeats it under lockUndrivenApply, holding every operation row of the
+// apply.
 //
 // An apply with no operations is admitted. Nothing holds a lease over it, so
 // there is nothing here to exclude it by.
-func undrivenApplyGate(d Dialect) (string, []any) {
+func undrivenApplyGate(d Dialect) string {
 	freshLeaseAfter := d.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
 		LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
-	drivingStates := claimableApplyStates()
-
 	return fmt.Sprintf(`NOT EXISTS (
 			SELECT 1
 			FROM apply_operations lease_holder
 			WHERE lease_holder.apply_id = applies.id
 				AND lease_holder.lease_owner <> ''
-				AND lease_holder.state IN (%s)
 				AND lease_holder.updated_at >= %s
-		)`, placeholders(len(drivingStates)), freshLeaseAfter), stringArgs(drivingStates)
+		)`, freshLeaseAfter)
 }
 
 // ReapStranded elects one reaper per pass and reaps under the lock. See

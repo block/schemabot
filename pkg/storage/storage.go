@@ -807,7 +807,10 @@ type ApplyStore interface {
 	// An apply is taken whole or not at all, and only when no driver is part-way
 	// through driving an operation under it. An apply it passes over is offered
 	// again on the next pass, so a live drive keeps its own rows and loses
-	// nothing but the interval.
+	// nothing but the interval. The pass locks the parent and every operation,
+	// then rechecks leases before writing. A fresh lease excludes expiry even
+	// in failed_retryable: a new retry still carries that state. Leases left
+	// behind by finished drives must be released or go stale first.
 	//
 	// One instance expires per pass, guarded by an advisory lock;
 	// ErrRetryableExpiryBusy reports that another instance holds it. The lock is
@@ -1354,6 +1357,33 @@ type ApplyOperationStore interface {
 	// longer matches (another writer rotated or cleared it), in which case the
 	// row has moved on and needs nothing from the caller.
 	ReleaseClaim(ctx context.Context, lease OperationLease) (bool, error)
+
+	// ReleaseFinishedClaim hands back the lease on an operation whose drive has
+	// ended. A drive that finishes leaves its lease in place, so the row it
+	// walks away from is indistinguishable from one a driver just claimed —
+	// same state, same owner, same fresh heartbeat. Anything reading the lease
+	// to decide whether a drive is in progress therefore has to treat the
+	// leftover as live until it goes stale. Clearing it at the point the drive
+	// ends makes a fresh lease mean what it says.
+	//
+	// "Ended" is failed_retryable plus the settled states (SettledApplyStates:
+	// terminal minus stopped). A stopped operation is terminal but still
+	// addressable — a driver may claim it and resume writing under its lease —
+	// so its lease is not this call's to clear.
+	//
+	// Unlike ReleaseClaim it carries the heartbeat forward instead of
+	// backdating it: the write that ended the drive set it, so it already says
+	// when the row last moved, and re-claim timing stays exactly as that write
+	// left it.
+	//
+	// The write is guarded on the lease token and on the ended states, so it is
+	// a no-op when a peer already rotated the lease or the row moved on. Reports
+	// whether the lease was cleared.
+	//
+	// Callers must not invoke this during shutdown drain: an interrupted drive
+	// reaches an ended state without its engine having come down, and the
+	// shutdown handback is the path that waits for the halt before releasing.
+	ReleaseFinishedClaim(ctx context.Context, lease OperationLease) (bool, error)
 
 	// Heartbeat refreshes the child row's updated_at timestamp to extend the
 	// claim's lease while a driver is acting on it. Mirrors ApplyStore.Heartbeat

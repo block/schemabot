@@ -981,8 +981,8 @@ func TestPostgresExpireRetryableDefersToTheOperationLease(t *testing.T) {
 	require.NoError(t, err)
 
 	// A third deployment whose drive settled it into failed_retryable and left
-	// its lease behind: a fresh-looking lease with no drive behind it, which the
-	// gate must not read as live.
+	// its lease behind: indistinguishable from a newly claimed retry, so the
+	// gate must defer until that lease is stale too.
 	settledOpID := insertOperation(t, "region-c", "op-3")
 	_, err = db.ExecContext(t.Context(),
 		`UPDATE apply_operations SET state = $1, updated_at = NOW() WHERE id = $2`,
@@ -1022,12 +1022,10 @@ func TestPostgresExpireRetryableDefersToTheOperationLease(t *testing.T) {
 	assert.Equal(t, state.Task.Pending, taskState(t, "task-expire-queued"))
 	assert.Equal(t, state.Task.FailedRetryable, taskState(t, "task-expire-settled"))
 
-	// The driver dies and its lease ages out. Nothing else changes: the settled
-	// sibling's lease is as fresh as it was, and the gate already reads it for
-	// what it is.
+	// The driver dies and all remaining leases age out.
 	_, err = db.ExecContext(t.Context(),
-		`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id = $2`,
-		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), heldOpID)
+		`UPDATE apply_operations SET updated_at = NOW() - make_interval(secs => $1) WHERE id IN ($2, $3)`,
+		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), heldOpID, settledOpID)
 	require.NoError(t, err)
 
 	expired, err = store.Applies().ExpireRetryable(t.Context(), 10)

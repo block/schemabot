@@ -118,8 +118,27 @@ func (m *mockStorageWithApplyStores) ApplyOperations() storage.ApplyOperationSto
 	return m.operations
 }
 
-type staticApplyOperationStore struct {
+// stubApplyOperationStore is what an operation-store double embeds instead of
+// the bare interface. Embedding the interface alone leaves every method a double
+// does not implement as a nil call, which is the behavior wanted for a method
+// the scenario never reaches — it fails loudly. The handback a drive performs on
+// its way out is the exception: every drive makes that call, so with a bare
+// interface every double would have to implement it, and any that did not would
+// panic inside the drive's own recovery rather than fail its test.
+//
+// The default reports nothing cleared, which is what a real store returns when
+// no row is in an ended state under the drive's lease. A double whose scenario
+// turns on the handback overrides it.
+type stubApplyOperationStore struct {
 	storage.ApplyOperationStore
+}
+
+func (stubApplyOperationStore) ReleaseFinishedClaim(context.Context, storage.OperationLease) (bool, error) {
+	return false, nil
+}
+
+type staticApplyOperationStore struct {
+	stubApplyOperationStore
 	operations []*storage.ApplyOperation
 	err        error
 	reaped     []*storage.ReapedOperation
@@ -564,7 +583,7 @@ const queuedOperationLeaseToken = "op-lease-token"
 // operation claim, which signals the apply store's findCh — one observable
 // signal per tick — and leases the first captured row exactly once.
 type queuedOperationClaimStore struct {
-	storage.ApplyOperationStore
+	stubApplyOperationStore
 	applies    *capturingApplyStore
 	mu         sync.Mutex
 	claimed    bool

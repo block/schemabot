@@ -260,6 +260,9 @@ func (s unreadableOperationStorage) Applies() storage.ApplyStore {
 	return releaseRecordingApplyStore{ApplyStore: s.Storage.Applies(), releases: s.releases}
 }
 
+// Wraps a real store rather than standing in for one, so it embeds the
+// interface directly: the stub's defaults would shadow the real store's
+// behavior for every method this type does not override.
 type unreadableOperationStore struct {
 	storage.ApplyOperationStore
 	releases *releaseLog
