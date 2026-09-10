@@ -15,12 +15,12 @@ docs/github-app-setup.md
 docs/grpc-control-edge-cases.md
 docs/invariants.md
 docs/lint-and-safety-levels.md
+docs/mysql.md
 docs/namespaces.md
 docs/pending-drops.md
 docs/postgresql.md
 docs/pre-merge-workflow.md
 docs/schema-intelligence.md
-docs/spirit.md
 docs/storage-outage-behavior.md
 docs/strata-engine.md
 docs/throttle.md

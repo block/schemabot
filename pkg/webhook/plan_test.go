@@ -1182,7 +1182,7 @@ func TestBuildPlanCommentData_PrimaryKeyGuidance(t *testing.T) {
 				LintResults: []*apitypes.LintViolationResponse{{Table: "customers", Linter: "primary_key", Severity: severity, Message: "Primary key uses a discouraged type"}},
 			}
 			data := buildPlanCommentData(&ghclient.SchemaRequestResult{Database: "app", Type: "mysql"}, resp, "staging", "", "", "")
-			assert.True(t, data.HasPrimaryKeyFindings)
+			assert.Contains(t, data.LintRuleNames, "primary_key")
 			if severity == "warning" {
 				require.Len(t, data.LintViolations, 1)
 				assert.Equal(t, "primary_key", data.LintViolations[0].LinterName)
@@ -1191,7 +1191,7 @@ func TestBuildPlanCommentData_PrimaryKeyGuidance(t *testing.T) {
 				assert.True(t, data.HasUnsafeChanges)
 			}
 			out := templates.RenderPlanComment(data)
-			assert.Equal(t, 1, strings.Count(out, "docs/spirit.md#choosing-a-primary-key"))
+			assert.Equal(t, 1, strings.Count(out, "docs/mysql.md#choosing-a-primary-key"))
 		})
 	}
 }

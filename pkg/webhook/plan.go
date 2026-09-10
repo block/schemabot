@@ -1058,12 +1058,11 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 
 	data.DiscardedCopies, data.AdoptedCopies, data.RunningCopies = splitExistingCopies(planResp.ExistingCopies)
 
-	// Keep the docs link available even when a primary-key finding is an
-	// error rendered under Issues rather than an advisory lint warning.
+	// Preserve rule IDs before splitting findings between Issues and warnings.
+	// The renderer maps these to guides without parsing human-facing messages.
 	for _, finding := range planResp.LintResults {
-		if finding != nil && finding.Linter == "primary_key" {
-			data.HasPrimaryKeyFindings = true
-			break
+		if finding != nil && finding.Linter != "" {
+			data.LintRuleNames = append(data.LintRuleNames, finding.Linter)
 		}
 	}
 

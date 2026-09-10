@@ -1015,7 +1015,7 @@ func PreviewCommentPlanPrimaryKeyWarning() string {
 	return RenderPlanComment(PlanCommentData{
 		Database: "testapp", SchemaName: "testapp", Environment: "staging",
 		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
-		IsMySQL: true, DatabaseType: "mysql", HasPrimaryKeyFindings: true,
+		IsMySQL: true, DatabaseType: "mysql", LintRuleNames: []string{"primary_key"},
 		Changes: []KeyspaceChangeData{{
 			Keyspace:   "testapp",
 			Statements: []string{"ALTER TABLE `customers` ADD INDEX `idx_created_at` (`created_at`);"},
@@ -1033,7 +1033,7 @@ func PreviewCommentPlanPrimaryKeyIssue() string {
 	return RenderPlanComment(PlanCommentData{
 		Database: "testapp", SchemaName: "testapp", Environment: "staging",
 		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
-		IsMySQL: true, DatabaseType: "mysql", HasPrimaryKeyFindings: true,
+		IsMySQL: true, DatabaseType: "mysql", LintRuleNames: []string{"primary_key"},
 		Changes: []KeyspaceChangeData{{
 			Keyspace:   "testapp",
 			Statements: []string{"CREATE TABLE `customers` (\n  `id` varchar(64) NOT NULL,\n  `created_at` datetime(3) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"},
@@ -1045,19 +1045,43 @@ func PreviewCommentPlanPrimaryKeyIssue() string {
 	})
 }
 
+// PreviewCommentPlanRelatedGuidance shows multiple rules contributing distinct
+// guides while repeated primary key warnings contribute only one link.
+func PreviewCommentPlanRelatedGuidance() string {
+	data := PlanCommentData{
+		Database: "testapp", SchemaName: "testapp", Environment: "staging",
+		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
+		IsMySQL: true, DatabaseType: "mysql", LintRuleNames: []string{"rename_column"},
+		HasUnsafeChanges: true,
+		UnsafeChanges:    []UnsafeChangeData{{Table: "users", Reason: `[ERROR] rename_column: Column rename detected in table "users": "email" to "email_address". Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled`}},
+	}
+	change := KeyspaceChangeData{
+		Keyspace: "testapp", Statements: []string{"ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;"},
+	}
+	for _, table := range []string{"customers", "orders", "invoices", "shipments", "sessions", "events"} {
+		change.Statements = append(change.Statements, fmt.Sprintf("ALTER TABLE `%s` ADD INDEX `idx_created_at` (`created_at`);", table))
+		data.LintRuleNames = append(data.LintRuleNames, "primary_key")
+		data.LintViolations = append(data.LintViolations, LintViolationData{
+			Table: table, LinterName: "primary_key", Message: `Primary key column "id" has type "varchar"`,
+		})
+	}
+	data.Changes = []KeyspaceChangeData{change}
+	return RenderPlanComment(data)
+}
+
 // PreviewCommentPlanManyLintWarnings renders a plan whose lint findings exceed
 // the fold threshold, exercising the collapsed details block grouped by table.
 func PreviewCommentPlanManyLintWarnings() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:              "testapp",
-		HasPrimaryKeyFindings: true,
-		SchemaName:            "testapp",
-		Environment:           "staging",
-		HeadSHA:               previewHeadSHA,
-		Repository:            previewRepository,
-		RequestedBy:           previewRequestedBy,
-		IsMySQL:               true,
-		DatabaseType:          "mysql",
+		Database:      "testapp",
+		LintRuleNames: []string{"primary_key"},
+		SchemaName:    "testapp",
+		Environment:   "staging",
+		HeadSHA:       previewHeadSHA,
+		Repository:    previewRepository,
+		RequestedBy:   previewRequestedBy,
+		IsMySQL:       true,
+		DatabaseType:  "mysql",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",

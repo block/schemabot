@@ -489,7 +489,7 @@ full record tree and how it behaves during recovery.
 
 ### Progress Flow And Observers
 
-Tern's progress poller is where raw engine progress becomes SchemaBot state. On each tick, Tern asks the engine for progress, derives task state from the engine response, derives the apply state from those tasks, persists both, and notifies an optional `ProgressObserver`. For the Spirit engine, [Spirit progress architecture](spirit.md#progress-architecture) traces every field in this pipeline from Spirit's in-memory state to what the CLI and PR comment render.
+Tern's progress poller is where raw engine progress becomes SchemaBot state. On each tick, Tern asks the engine for progress, derives task state from the engine response, derives the apply state from those tasks, persists both, and notifies an optional `ProgressObserver`. For the Spirit engine, [Spirit progress architecture](mysql.md#progress-architecture) traces every field in this pipeline from Spirit's in-memory state to what the CLI and PR comment render.
 
 ```
 Engine progress
