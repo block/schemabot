@@ -64,6 +64,9 @@ lint finding
     └─ severity=warning/info ▶ 💡 Lint Warnings (advisory; never gates)
 ```
 
+For primary-key findings, see [Choosing a primary key](spirit.md#choosing-a-primary-key) for
+storage, insert-order, and online-copy tradeoffs.
+
 ## Auto-fixing lint issues (`fix-lint`)
 
 `schemabot fix-lint -s <schema-dir>` rewrites the schema files in place to

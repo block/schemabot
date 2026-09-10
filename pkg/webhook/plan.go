@@ -1058,11 +1058,21 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 
 	data.DiscardedCopies, data.AdoptedCopies, data.RunningCopies = splitExistingCopies(planResp.ExistingCopies)
 
+	// Keep the docs link available even when a primary-key finding is an
+	// error rendered under Issues rather than an advisory lint warning.
+	for _, finding := range planResp.LintResults {
+		if finding != nil && finding.Linter == "primary_key" {
+			data.HasPrimaryKeyFindings = true
+			break
+		}
+	}
+
 	// Add lint violations (error-severity results are shown via UnsafeChanges instead)
 	for _, w := range planResp.LintNonErrors() {
 		data.LintViolations = append(data.LintViolations, templates.LintViolationData{
-			Message: w.Message,
-			Table:   w.Table,
+			Message:    w.Message,
+			Table:      w.Table,
+			LinterName: w.Linter,
 		})
 	}
 

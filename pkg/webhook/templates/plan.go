@@ -110,7 +110,10 @@ type PlanCommentData struct {
 
 	Changes        []KeyspaceChangeData
 	LintViolations []LintViolationData
-	Errors         []string
+
+	// HasPrimaryKeyFindings includes both advisory and error-severity findings.
+	HasPrimaryKeyFindings bool
+	Errors                []string
 
 	// IgnoredNamespaces lists the namespaces whose schema files were excluded
 	// from this plan by the repository's ignore_namespaces config — only entries
@@ -358,6 +361,9 @@ func RenderPlanComment(data PlanCommentData) string {
 	// them at plan time).
 	if len(data.LintViolations) > 0 && !data.IsLocked {
 		writeLintViolations(&sb, data.LintViolations)
+	}
+	if !data.IsLocked {
+		writePrimaryKeyGuidance(&sb, data)
 	}
 
 	// Errors
@@ -1399,6 +1405,19 @@ func dropCountsWithTableFallback(drops unsafeDropCounts, changeType string) unsa
 	return drops
 }
 
+// primaryKeyDocURL uses the canonical public docs, independent of the host
+// serving the user's schema repository, just like the throttle reference link.
+const primaryKeyDocURL = "https://github.com/block/schemabot/blob/main/docs/spirit.md#choosing-a-primary-key"
+
+// writePrimaryKeyGuidance stays outside the optional lint fold and appears
+// once per MySQL plan, including when the finding renders under Issues.
+func writePrimaryKeyGuidance(sb *strings.Builder, data PlanCommentData) {
+	if !data.IsMySQL || !data.HasPrimaryKeyFindings {
+		return
+	}
+	fmt.Fprintf(sb, "[Choosing a MySQL primary key](%s) — storage, insert order, and online copy tradeoffs.\n\n", primaryKeyDocURL)
+}
+
 // lintWarningsFoldThreshold is the warning count above which the lint section
 // collapses into a details block grouped by table. Short lists stay inline so
 // a single advisory finding never needs a click; long lists stop dominating
@@ -1747,6 +1766,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData) {
 	if len(plan.LintViolations) > 0 {
 		writeLintViolations(sb, plan.LintViolations)
 	}
+	writePrimaryKeyGuidance(sb, *plan)
 
 	// Errors
 	if len(plan.Errors) > 0 {

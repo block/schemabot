@@ -169,6 +169,8 @@ ALTER TABLE `order_events` DROP INDEX `idx_events_archived`;
 
 </details>
 
+[Choosing a MySQL primary key](https://github.com/block/schemabot/blob/main/docs/spirit.md#choosing-a-primary-key) — storage, insert order, and online copy tradeoffs.
+
 📋 **Plan**: **2** tables to alter
 
 

@@ -40,6 +40,7 @@ func RenderRollbackPlanComment(data PlanCommentData) string {
 	if len(data.LintViolations) > 0 {
 		writeLintViolations(&sb, data.LintViolations)
 	}
+	writePrimaryKeyGuidance(&sb, data)
 
 	// Errors
 	if len(data.Errors) > 0 {
