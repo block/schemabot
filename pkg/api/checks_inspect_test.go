@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -114,6 +115,22 @@ func TestExecuteChecksInspectValidation(t *testing.T) {
 	assert.Contains(t, err.Error(), "owner/name pair")
 }
 
+// inspectRouteMethodAndPath returns how the inspection is actually registered,
+// so a tier assertion reads the method off the route table instead of restating
+// it. Restated, the assertion holds whatever the route becomes.
+func inspectRouteMethodAndPath(t *testing.T, svc *Service) (string, string) {
+	t.Helper()
+
+	for _, route := range svc.apiRoutes() {
+		method, path, found := strings.Cut(route.pattern, " ")
+		if found && path == "/api/checks/inspect" {
+			return method, path
+		}
+	}
+	t.Fatal("the inspection is not in the route table")
+	return "", ""
+}
+
 // The endpoint is reached the way an operator's CLI reaches it: one GET, with
 // the target in the query string. Nothing else in this package's tests goes
 // through the mux, so the method, the path, and the mapping of a caller's
@@ -133,17 +150,25 @@ func TestChecksInspectRouteAnswersOneGET(t *testing.T) {
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&body))
 	assert.Contains(t, body.Error, "pull_request is required")
 
-	// An inspection stages nothing, so it stays on the read tier. That follows
-	// from the method: were it ever registered as a POST it would classify as
-	// write and the route authorization sweep would demand an authorization
-	// check the handler does not make.
-	assert.Equal(t, auth.TierRead, auth.TierForRequest(http.MethodGet, "/api/checks/inspect"))
-
 	post := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/checks/inspect", nil)
 	postRecorder := httptest.NewRecorder()
 	mux.ServeHTTP(postRecorder, post)
 	assert.Equal(t, http.StatusMethodNotAllowed, postRecorder.Code,
 		"the inspection answers over GET alone")
+}
+
+// An inspection stages nothing, so it stays on the read tier. That follows from
+// the method the route is registered with, so the method is read off the route
+// table: were the inspection ever registered as a POST it would classify as
+// write, and the route authorization sweep would demand an authorization check
+// this handler does not make. It stands alone rather than trailing the route
+// test, so nothing failing ahead of it can stop it from being asked.
+func TestChecksInspectStaysOnTheReadTier(t *testing.T) {
+	svc := New(&inspectStorage{checks: &inspectCheckStore{}, applies: &inspectApplyStore{}},
+		inspectTestConfig(), nil, slog.New(slog.DiscardHandler))
+
+	method, path := inspectRouteMethodAndPath(t, svc)
+	assert.Equal(t, auth.TierRead, auth.TierForRequest(method, path))
 }
 
 // The shape an operator reaches for this command to explain: an apply
@@ -487,4 +512,25 @@ func TestChecksInspectRequestFromQueryFoldsRepositoryCase(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "acme/store", req.Repo)
 	assert.Equal(t, 412, req.PullRequest)
+}
+
+// The environment is matched against the configured names by exact comparison,
+// so it is folded on the way in like every sibling read endpoint folds it.
+// Unfolded, an operator passing the spelling their other commands accept would
+// be told this instance does not handle it.
+func TestChecksInspectAcceptsAnEnvironmentHoweverItIsSpelled(t *testing.T) {
+	t.Parallel()
+
+	req, err := checksInspectRequestFromQuery(url.Values{
+		"repo":         {"acme/store"},
+		"pull_request": {"412"},
+		"environment":  {"Production"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "production", req.Environment)
+
+	store := &inspectStorage{checks: &inspectCheckStore{}, applies: &inspectApplyStore{}}
+	_, err = executeChecksInspect(t.Context(), inspectTestConfig(), store, req, discardLogger())
+	require.Error(t, err, "the request gets as far as needing a GitHub client")
+	assert.NotContains(t, err.Error(), "is not one this instance handles")
 }

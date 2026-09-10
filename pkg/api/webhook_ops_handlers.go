@@ -52,6 +52,23 @@ func webhookOpsRequestErrorf(format string, args ...any) error {
 	return &webhookOpsRequestError{err: fmt.Errorf(format, args...)}
 }
 
+// requireRepoFullName refuses a repository an operator endpoint could never
+// answer for. The shape is checked up front rather than left to the first thing
+// that trips over it: a repository that is not an owner/name pair is the
+// caller's mistake, and letting the installation lookup fail on it reports a
+// server error for a request that was never answerable. Every endpoint taking a
+// repository asks through here, so the same typo reads the same way on all of
+// them.
+func requireRepoFullName(repo string) error {
+	if repo == "" {
+		return webhookOpsRequestErrorf("repo is required")
+	}
+	if !caller.IsRepoFullName(repo) {
+		return webhookOpsRequestErrorf("repo %q is not an owner/name pair", repo)
+	}
+	return nil
+}
+
 // extendWebhookOpsDeadline lifts the server-wide write timeout for a webhook
 // operator request and returns a context bounded to the same budget, so the
 // crawl can outlive the default timeout without running unbounded.
@@ -127,8 +144,8 @@ func executeChecksSynthesize(ctx context.Context, cfg *ServerConfig, backfiller 
 	if cfg == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
-	if req.Repo == "" {
-		return nil, webhookOpsRequestErrorf("repo is required")
+	if err := requireRepoFullName(req.Repo); err != nil {
+		return nil, err
 	}
 	if len(req.PRs) == 0 {
 		return nil, webhookOpsRequestErrorf("prs is required")
@@ -301,8 +318,8 @@ func executeChecksScan(ctx context.Context, cfg *ServerConfig, req ChecksScanReq
 	if cfg == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
-	if req.Repo == "" {
-		return nil, webhookOpsRequestErrorf("repo is required")
+	if err := requireRepoFullName(req.Repo); err != nil {
+		return nil, err
 	}
 	if req.Page < 0 {
 		return nil, webhookOpsRequestErrorf("page must be non-negative")

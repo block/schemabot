@@ -65,8 +65,12 @@ func (s *Service) handleChecksInspect(w http.ResponseWriter, r *http.Request) {
 // a question about a pull request the caller did not ask about.
 func checksInspectRequestFromQuery(query url.Values) (ChecksInspectRequest, error) {
 	req := ChecksInspectRequest{
-		Repo:        strings.TrimSpace(query.Get("repo")),
-		Environment: strings.TrimSpace(query.Get("environment")),
+		Repo: strings.TrimSpace(query.Get("repo")),
+		// Folded, because the environment is matched against the configured
+		// names by exact comparison and every sibling read endpoint folds the
+		// same parameter. Left as typed, "Production" would be refused here
+		// while being accepted everywhere else an operator passes it.
+		Environment: storage.CanonicalKey(strings.TrimSpace(query.Get("environment"))),
 	}
 	reference := strings.TrimSpace(query.Get("pull_request"))
 	if reference == "" {
@@ -111,15 +115,8 @@ func executeChecksInspect(ctx context.Context, cfg *ServerConfig, store storage.
 	if store == nil {
 		return nil, fmt.Errorf("storage is not configured")
 	}
-	if req.Repo == "" {
-		return nil, webhookOpsRequestErrorf("repo is required")
-	}
-	// The shape is checked here rather than left to the first thing that trips
-	// over it: a repository that is not an owner/name pair is the caller's
-	// mistake, and letting the installation lookup fail on it reports a server
-	// error for a request that was never answerable.
-	if !caller.IsRepoFullName(req.Repo) {
-		return nil, webhookOpsRequestErrorf("repo %q is not an owner/name pair", req.Repo)
+	if err := requireRepoFullName(req.Repo); err != nil {
+		return nil, err
 	}
 	if req.PullRequest <= 0 {
 		return nil, webhookOpsRequestErrorf("pull_request must be positive")

@@ -420,6 +420,46 @@ func TestExecuteChecksSynthesizeValidation(t *testing.T) {
 	assert.Contains(t, err.Error(), "no GitHub webhook runtime")
 }
 
+// A repository that is not an owner/name pair is the caller's mistake, and it
+// reads as one on every endpoint that takes a repository. Left to the
+// installation lookup it would surface as a server error, so the same typo
+// would be a 400 on one endpoint and a 500 on the next.
+func TestRepoTakingEndpointsRefuseAMalformedRepository(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{}
+	endpoints := []struct {
+		name string
+		call func(ctx context.Context, repo string) error
+	}{
+		{"inspect", func(ctx context.Context, repo string) error {
+			store := &inspectStorage{checks: &inspectCheckStore{}, applies: &inspectApplyStore{}}
+			_, err := executeChecksInspect(ctx, cfg, store, ChecksInspectRequest{Repo: repo, PullRequest: 7}, discardLogger())
+			return err
+		}},
+		{"scan", func(ctx context.Context, repo string) error {
+			_, err := executeChecksScan(ctx, cfg, ChecksScanRequest{Repo: repo}, discardLogger())
+			return err
+		}},
+		{"synthesize", func(ctx context.Context, repo string) error {
+			_, err := executeChecksSynthesize(ctx, cfg, &fakeCheckRunBackfiller{}, ChecksSynthesizeRequest{Repo: repo, PRs: []int{1}}, discardLogger())
+			return err
+		}},
+	}
+
+	for _, endpoint := range endpoints {
+		t.Run(endpoint.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := endpoint.call(t.Context(), "acme")
+			require.Error(t, err)
+			var requestErr *webhookOpsRequestError
+			require.ErrorAs(t, err, &requestErr, "a malformed repository is a 400, not a 500")
+			assert.Contains(t, err.Error(), "owner/name pair")
+		})
+	}
+}
+
 // A stale or mistyped environment is rejected as a request error before any
 // GitHub work, rather than scanning for a check name that can never exist and
 // reporting every PR as missing it.
