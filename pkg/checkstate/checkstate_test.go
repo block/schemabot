@@ -256,3 +256,18 @@ func TestIsAggregateRequiresBothSentinels(t *testing.T) {
 	assert.Equal(t, ReasonBlocked, Diagnose(blocked, headSHA, nil).Reason,
 		"a database named like the sentinel keeps its own finding")
 }
+
+// Every reader has to agree with Diagnose about which commit a row speaks for.
+// An unknown head reads as covering, so a caller that compares the two SHAs
+// itself would report a row as recorded for another commit while Diagnose
+// reports it as current.
+func TestCoversHeadAgreesWithDiagnoseOnAnUnknownHead(t *testing.T) {
+	t.Parallel()
+
+	row := &storage.Check{HeadSHA: olderSHA, Status: StatusCompleted, Conclusion: ConclusionSuccess}
+	require.True(t, CoversHead(row, ""), "an unknown head is not evidence a row is stale")
+	assert.Equal(t, ReasonResolved, Diagnose(row, "", nil).Reason)
+
+	require.False(t, CoversHead(row, headSHA))
+	assert.Equal(t, ReasonAwaitingPlan, Diagnose(row, headSHA, nil).Reason)
+}

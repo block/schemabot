@@ -190,6 +190,19 @@ type Disposition struct {
 	SelfConverging bool
 }
 
+// CoversHead reports whether a stored row speaks for the commit the pull
+// request is gated on. An unknown head is not evidence that a row is stale, so
+// a row is read as current when no head is known: reporting it as recorded for
+// another commit would invent a staleness nothing observed.
+//
+// Every reader asks this the same way, through here. A caller deriving it from
+// a bare string comparison agrees with Diagnose only until the head is unknown,
+// and then reports a row as recorded for another commit while that same row's
+// disposition says it is current.
+func CoversHead(check *storage.Check, headSHA string) bool {
+	return headSHA == "" || check.HeadSHA == headSHA
+}
+
 // Diagnose reads a stored check row against the commit the PR is gated on.
 //
 // The row's own commit is what makes this a reading rather than a lookup: a row
@@ -203,7 +216,7 @@ type Disposition struct {
 // apply, since the owner's state is the whole difference between waiting and
 // reconciling.
 func Diagnose(check *storage.Check, headSHA string, apply *storage.Apply) Disposition {
-	coversHead := headSHA == "" || check.HeadSHA == headSHA
+	coversHead := CoversHead(check, headSHA)
 
 	// A durable blocking reason outranks everything below it. The writer set it
 	// so the block would survive writes that did not re-evaluate the condition,
