@@ -48,11 +48,12 @@ func (s *inspectStorage) Checks() storage.CheckStore  { return s.checks }
 func (s *inspectStorage) Applies() storage.ApplyStore { return s.applies }
 
 type inspectGitHubClient struct {
-	prInfo  *ghclient.PullRequestInfo
-	prErr   error
-	runs    map[string]*ghclient.CheckRunResult
-	runErr  error
-	prCalls int
+	prInfo        *ghclient.PullRequestInfo
+	prErr         error
+	runs          map[string]*ghclient.CheckRunResult
+	untrustedApps map[string][]string
+	runErr        error
+	prCalls       int
 }
 
 func (c *inspectGitHubClient) FetchPullRequestNoCache(context.Context, string, int) (*ghclient.PullRequestInfo, error) {
@@ -64,7 +65,7 @@ func (c *inspectGitHubClient) FindCheckRunByName(_ context.Context, _, _, name s
 	if c.runErr != nil {
 		return nil, nil, c.runErr
 	}
-	return c.runs[name], nil, nil
+	return c.runs[name], c.untrustedApps[name], nil
 }
 
 func inspectTestConfig() *ServerConfig {
@@ -135,7 +136,7 @@ func TestInspectChecksReportsSuccessfulApplyOnAnOlderCommit(t *testing.T) {
 	require.Len(t, response.Rows, 1)
 	row := response.Rows[0]
 	assert.Equal(t, "widgets", row.Database)
-	assert.Equal(t, applySHA, row.HeadSHA)
+	assert.Equal(t, applySHA, row.RecordedSHA)
 	assert.False(t, row.CoversHead)
 	assert.Equal(t, int64(99), row.CheckRunID)
 	assert.Equal(t, "apply-abc123", row.ApplyIdentifier)
@@ -277,33 +278,56 @@ func TestCheckRunsOnHeadReportEveryExpectedNameSeparately(t *testing.T) {
 		names[0]: {ID: 102754133862, Name: names[0], Status: checkstate.StatusInProgress, StartedAt: started},
 	}}
 
-	found, missing, unreadable := checkRunsOnHead(t.Context(), cfg, client, "octo/repo", "43da12bb", "", discardLogger())
-	require.Len(t, found, 1)
-	assert.Equal(t, names[0], found[0].Name)
-	assert.Equal(t, int64(102754133862), found[0].CheckRunID)
-	assert.Equal(t, checkstate.StatusInProgress, found[0].Status)
-	assert.Equal(t, "2026-09-10T05:16:44Z", found[0].StartedAt)
-	assert.Equal(t, []string{names[1]}, missing,
+	got := checkRunsOnHead(t.Context(), cfg, client, "octo/repo", "43da12bb", "", discardLogger())
+	require.Len(t, got.found, 1)
+	assert.Equal(t, names[0], got.found[0].Name)
+	assert.Equal(t, int64(102754133862), got.found[0].CheckRunID)
+	assert.Equal(t, checkstate.StatusInProgress, got.found[0].Status)
+	assert.Equal(t, "2026-09-10T05:16:44Z", got.found[0].StartedAt)
+	assert.Equal(t, []string{names[1]}, got.missing,
 		"the run that is not there is the finding; the one that is must not hide it")
-	assert.Empty(t, unreadable)
+	assert.Empty(t, got.unreadable)
+	assert.Empty(t, got.untrustedConflicts)
 
-	found, missing, unreadable = checkRunsOnHead(t.Context(), cfg, &inspectGitHubClient{}, "octo/repo", "43da12bb", "", discardLogger())
-	assert.Empty(t, found)
-	assert.Equal(t, names, missing)
-	assert.Empty(t, unreadable)
+	got = checkRunsOnHead(t.Context(), cfg, &inspectGitHubClient{}, "octo/repo", "43da12bb", "", discardLogger())
+	assert.Empty(t, got.found)
+	assert.Equal(t, names, got.missing)
+	assert.Empty(t, got.unreadable)
 
-	found, missing, unreadable = checkRunsOnHead(t.Context(), cfg, client, "octo/repo", "", "", discardLogger())
-	assert.Empty(t, found, "no head commit means no run to report")
-	assert.Empty(t, missing)
-	assert.Empty(t, unreadable)
+	got = checkRunsOnHead(t.Context(), cfg, client, "octo/repo", "", "", discardLogger())
+	assert.Empty(t, got.found, "no head commit means no run to report")
+	assert.Empty(t, got.missing)
+	assert.Empty(t, got.unreadable)
 
 	// A name GitHub could not be read for is unknown, not absent: reporting it
 	// as missing would recommend recreating a Check Run that may be sitting on
 	// the head, and dropping it would let a GitHub outage read as no gap.
-	found, missing, unreadable = checkRunsOnHead(t.Context(), cfg, &inspectGitHubClient{runErr: errors.New("github down")}, "octo/repo", "43da12bb", "", discardLogger())
-	assert.Empty(t, found)
-	assert.Empty(t, missing)
-	assert.Equal(t, names, unreadable)
+	got = checkRunsOnHead(t.Context(), cfg, &inspectGitHubClient{runErr: errors.New("github down")}, "octo/repo", "43da12bb", "", discardLogger())
+	assert.Empty(t, got.found)
+	assert.Empty(t, got.missing)
+	assert.Equal(t, names, got.unreadable)
+}
+
+// A name only an untrusted app has a run under is missing and conflicted at
+// once. The trusted run really is absent, so the backfill is still the action;
+// but branch protection may be reading the untrusted run, which no backfill
+// touches, so an operator told only that the run is missing would recreate it
+// and be left wondering why the gate did not move.
+func TestCheckRunsOnHeadReportsAnUntrustedRunUnderAMissingName(t *testing.T) {
+	t.Parallel()
+
+	cfg := inspectTestConfig()
+	names := webhookMissingCheckNames(cfg, "octo/repo", "", "")
+	require.Len(t, names, 2, "this test needs a deployment publishing one check per environment")
+
+	client := &inspectGitHubClient{untrustedApps: map[string][]string{names[0]: {"other-app"}}}
+	got := checkRunsOnHead(t.Context(), cfg, client, "octo/repo", "43da12bb", "", discardLogger())
+
+	assert.Empty(t, got.found)
+	assert.Equal(t, names, got.missing, "an untrusted run does not make the trusted one present")
+	assert.Equal(t, []string{names[0]}, got.untrustedConflicts,
+		"only the name an untrusted app is sitting under is a conflict")
+	assert.Empty(t, got.unreadable)
 }
 
 // A repository this deployment publishes no Check Runs for has no run to
@@ -316,10 +340,10 @@ func TestCheckRunsOnHeadReportsNoMissingNameWhenChecksAreDisabled(t *testing.T) 
 	cfg := inspectTestConfig()
 	cfg.Repos = map[string]RepoConfig{"octo/repo": {EnableChecks: &checksOff}}
 
-	found, missing, unreadable := checkRunsOnHead(t.Context(), cfg, &inspectGitHubClient{}, "octo/repo", "43da12bb", "", discardLogger())
-	assert.Empty(t, found)
-	assert.Empty(t, missing, "absence is the configuration, not a gap the backfill closes")
-	assert.Empty(t, unreadable)
+	got := checkRunsOnHead(t.Context(), cfg, &inspectGitHubClient{}, "octo/repo", "43da12bb", "", discardLogger())
+	assert.Empty(t, got.found)
+	assert.Empty(t, got.missing, "absence is the configuration, not a gap the backfill closes")
+	assert.Empty(t, got.unreadable)
 }
 
 // An inspection is a read, so it is asked for over GET with the target in the

@@ -396,6 +396,14 @@ type ChecksInspectResponse struct {
 	// Run that may be sitting on the head, and treating the empty result as
 	// "no gap" would report a GitHub outage as a clear gate.
 	UnreadableCheckRunNames []string `json:"unreadable_check_run_names,omitempty"`
+	// UntrustedConflictNames is every missing name that a same-named Check Run
+	// from an app SchemaBot does not trust is already sitting under. Such a
+	// name is still missing, and a backfill still creates the trusted run, but
+	// the operator has a second thing to resolve: the run branch protection
+	// may be reading is not the one SchemaBot writes. Reporting only the
+	// absence would send them to recreate a run and leave them puzzled when
+	// the gate does not move.
+	UntrustedConflictNames []string `json:"untrusted_conflict_names,omitempty"`
 	// Rows is the stored check state, one entry per environment and database.
 	Rows []InspectedCheck `json:"rows"`
 }
@@ -416,9 +424,13 @@ type InspectedCheck struct {
 	Environment  string `json:"environment"`
 	DatabaseType string `json:"database_type"`
 	Database     string `json:"database"`
-	// HeadSHA is the commit this row was recorded for, which is not always the
-	// commit the pull request is gated on.
-	HeadSHA        string `json:"head_sha"`
+	// RecordedSHA is the commit this row was recorded for, which is not always
+	// the commit the pull request is gated on. It is deliberately not named
+	// head_sha: the response carries that too, for the pull request's actual
+	// head, and one name for the two would read as agreement wherever the row
+	// is stale, which is the case worth seeing.
+	RecordedSHA string `json:"recorded_sha"`
+	// CoversHead reports whether this row speaks for the pull request's head.
 	CoversHead     bool   `json:"covers_head"`
 	Status         string `json:"status"`
 	Conclusion     string `json:"conclusion,omitempty"`

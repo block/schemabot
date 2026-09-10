@@ -70,7 +70,7 @@ func checksInspectRequestFromQuery(query url.Values) (ChecksInspectRequest, erro
 	}
 	reference := strings.TrimSpace(query.Get("pull_request"))
 	if reference == "" {
-		return req, webhookOpsRequestErrorf("pull_request is required: its number, or the pull request URL")
+		return req, webhookOpsRequestErrorf("pull_request is required: its number, its URL, or owner/name#number")
 	}
 	if pr, err := strconv.Atoi(reference); err == nil {
 		req.PullRequest = pr
@@ -171,14 +171,26 @@ func inspectChecks(ctx context.Context, cfg *ServerConfig, store storage.Storage
 		}
 		response.Rows = append(response.Rows, inspectedCheck(ctx, store, check, prInfo.HeadSHA, logger))
 	}
+	// Ordered on every field that distinguishes two rows, so the answer does
+	// not depend on the order storage returned them in: a database name is
+	// unique only within its type, and two rows differing in type alone would
+	// otherwise swap between reads of unchanged state.
 	sort.Slice(response.Rows, func(i, j int) bool {
-		if response.Rows[i].Environment != response.Rows[j].Environment {
-			return response.Rows[i].Environment < response.Rows[j].Environment
+		a, b := response.Rows[i], response.Rows[j]
+		if a.Environment != b.Environment {
+			return a.Environment < b.Environment
 		}
-		return response.Rows[i].Database < response.Rows[j].Database
+		if a.Database != b.Database {
+			return a.Database < b.Database
+		}
+		return a.DatabaseType < b.DatabaseType
 	})
 
-	response.CheckRunsOnHead, response.MissingCheckRunNames, response.UnreadableCheckRunNames = checkRunsOnHead(ctx, cfg, client, req.Repo, prInfo.HeadSHA, req.Environment, logger)
+	runs := checkRunsOnHead(ctx, cfg, client, req.Repo, prInfo.HeadSHA, req.Environment, logger)
+	response.CheckRunsOnHead = runs.found
+	response.MissingCheckRunNames = runs.missing
+	response.UnreadableCheckRunNames = runs.unreadable
+	response.UntrustedConflictNames = runs.untrustedConflicts
 	return response, nil
 }
 
@@ -194,8 +206,8 @@ func inspectedCheck(ctx context.Context, store storage.Storage, check *storage.C
 		Environment:    check.Environment,
 		DatabaseType:   check.DatabaseType,
 		Database:       check.DatabaseName,
-		HeadSHA:        check.HeadSHA,
-		CoversHead:     check.HeadSHA == headSHA,
+		RecordedSHA:    check.HeadSHA,
+		CoversHead:     checkstate.CoversHead(check, headSHA),
 		Status:         check.Status,
 		Conclusion:     check.Conclusion,
 		BlockingReason: check.BlockingReason,
@@ -262,18 +274,25 @@ func applyHoldingCheck(ctx context.Context, store storage.Storage, check *storag
 // A deployment that publishes no checks for the repository still has its runs
 // reported, since a stale one left on the head is worth seeing, but no name is
 // called missing there. The absence is the configuration.
-func checkRunsOnHead(ctx context.Context, cfg *ServerConfig, client checksInspectClient, repo, headSHA, environment string, logger *slog.Logger) (found []InspectedCheckRun, missing, unreadable []string) {
+//
+// A name only an untrusted app has a run under is missing and conflicted, not
+// one or the other. The trusted run really is absent, so a backfill is still
+// the action; but branch protection may be reading the untrusted run, which no
+// backfill touches, so reporting the absence alone would leave the operator
+// recreating a run and wondering why the gate did not move.
+func checkRunsOnHead(ctx context.Context, cfg *ServerConfig, client checksInspectClient, repo, headSHA, environment string, logger *slog.Logger) headCheckRuns {
 	names := webhookMissingCheckNames(cfg, repo, environment, "")
 	if len(names) == 0 || headSHA == "" {
-		return nil, nil, nil
+		return headCheckRuns{}
 	}
+	var result headCheckRuns
 	checksEnabled := cfg.AreChecksEnabled(repo)
 	for _, name := range names {
-		run, _, err := client.FindCheckRunByName(ctx, repo, headSHA, name)
+		run, untrustedApps, err := client.FindCheckRunByName(ctx, repo, headSHA, name)
 		if err != nil {
 			logger.Warn("check inspection cannot say whether this Check Run is on the head: reading the run failed",
 				"repo", repo, "head_sha", headSHA, "check_name", name, "error", err)
-			unreadable = append(unreadable, name)
+			result.unreadable = append(result.unreadable, name)
 			continue
 		}
 		if run == nil {
@@ -284,7 +303,12 @@ func checkRunsOnHead(ctx context.Context, cfg *ServerConfig, client checksInspec
 			}
 			logger.Debug("no SchemaBot Check Run under this name on the head commit",
 				"repo", repo, "head_sha", headSHA, "check_name", name)
-			missing = append(missing, name)
+			result.missing = append(result.missing, name)
+			if len(untrustedApps) > 0 {
+				logger.Warn("no SchemaBot Check Run under this name on the head commit, but an untrusted app has one",
+					"repo", repo, "head_sha", headSHA, "check_name", name, "untrusted_apps", untrustedApps)
+				result.untrustedConflicts = append(result.untrustedConflicts, name)
+			}
 			continue
 		}
 		inspected := InspectedCheckRun{
@@ -296,7 +320,18 @@ func checkRunsOnHead(ctx context.Context, cfg *ServerConfig, client checksInspec
 		if !run.StartedAt.IsZero() {
 			inspected.StartedAt = run.StartedAt.UTC().Format(time.RFC3339)
 		}
-		found = append(found, inspected)
+		result.found = append(result.found, inspected)
 	}
-	return found, missing, unreadable
+	return result
+}
+
+// headCheckRuns is what reading the head's Check Runs found, by disposition.
+// The four are kept apart rather than folded into a present/absent pair because
+// each one implies a different action, and the whole point of the inspection is
+// to name that action.
+type headCheckRuns struct {
+	found              []InspectedCheckRun
+	missing            []string
+	unreadable         []string
+	untrustedConflicts []string
 }
