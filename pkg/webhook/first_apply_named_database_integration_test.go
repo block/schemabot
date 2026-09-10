@@ -3,6 +3,7 @@
 package webhook
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log/slog"
@@ -107,19 +108,26 @@ func requireNextComment(t *testing.T, result *planFlowResult, what string) strin
 	case body := <-result.comments:
 		return body
 	case <-time.After(webhookIntegrationPollDeadline):
-		t.Fatalf("timed out waiting for %s", what)
+		require.FailNow(t, "timed out waiting for "+what)
 		return ""
 	}
 }
 
+// Every database call in the polling helpers gets its own short deadline so an
+// unreachable MySQL fails the attempt instead of holding the test past the
+// polling deadline.
+const targetQueryTimeout = 5 * time.Second
+
 func countTable(t *testing.T, dbName, table string) int {
 	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), targetQueryTimeout)
+	defer cancel()
 	db, err := sql.Open("block-mysql", driftDSN(t, dbName))
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
-	require.NoError(t, db.PingContext(t.Context()), "connect to target")
+	require.NoError(t, db.PingContext(ctx), "connect to target")
 	var count int
-	require.NoError(t, db.QueryRowContext(t.Context(),
+	require.NoError(t, db.QueryRowContext(ctx,
 		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
 		dbName, table).Scan(&count))
 	return count
@@ -134,12 +142,7 @@ func requireNoTable(t *testing.T, dbName, table string) {
 // the table, failing at the integration polling deadline.
 func requireTableEventually(t *testing.T, dbName, table string) {
 	t.Helper()
-	deadline := time.Now().Add(webhookIntegrationPollDeadline)
-	for time.Now().Before(deadline) {
-		if countTable(t, dbName, table) == 1 {
-			return
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for the apply to create %s.%s", dbName, table)
+	require.Eventually(t, func() bool {
+		return countTable(t, dbName, table) == 1
+	}, webhookIntegrationPollDeadline, 200*time.Millisecond, "the apply creates %s.%s", dbName, table)
 }
