@@ -72,7 +72,7 @@ func TestRenderNoManagedSchemaChangesChecksRefreshed(t *testing.T) {
 		assert.Contains(t, rendered, "## ✅ No Schema Changes Detected")
 		assert.Contains(t, rendered, "refreshed as passing on [`abcdef1`](https://github.com/acme/payments/commit/abcdef1234567890abcdef1234567890abcdef12).")
 		assert.Contains(t, rendered, "<summary>Expected a plan?</summary>")
-		assert.Contains(t, rendered, "SchemaBot plans only the schema files this PR changes under a configured schema directory.")
+		assert.Contains(t, rendered, "This PR changes none, so no database was compared against its schema directory.")
 		assert.Contains(t, rendered, "```\nschemabot plan -d <database>\n```")
 		assert.NotContains(t, rendered, "schemabot apply")
 		assert.True(t, strings.HasSuffix(rendered, "\n_Requested by @alice_\n"), "attribution closes the comment: %q", rendered)

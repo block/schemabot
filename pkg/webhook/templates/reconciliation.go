@@ -69,7 +69,7 @@ func RenderNoManagedSchemaChangesChecksRefreshed(data NoManagedSchemaChangesChec
 	} else {
 		fmt.Fprintf(&sb, "SchemaBot found no changes to managed schema files in this PR. The SchemaBot checks were refreshed as passing on %s.\n", head)
 		sb.WriteString("\n<details>\n<summary>Expected a plan?</summary>\n\n")
-		sb.WriteString("SchemaBot plans only the schema files this PR changes under a configured schema directory. To plan a directory this PR does not touch, such as the first apply to a new database whose schema already merged, name the database:\n\n")
+		sb.WriteString("SchemaBot plans a database only when a PR changes a file under that database's schema directory. This PR changes none, so no database was compared against its schema directory. To run that comparison anyway, for example for a new database whose schema directory merged before the database was configured, name the database:\n\n")
 		sb.WriteString("```\nschemabot plan -d <database>\n```\n\n</details>\n")
 	}
 	if data.RequestedBy != "" {
