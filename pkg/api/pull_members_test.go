@@ -108,8 +108,17 @@ func TestExecutePullSchema_ReportsPerTargetDivergence(t *testing.T) {
 	assert.Equal(t, pullUsersDDL, resp.Namespaces["testapp"].Tables["users"], "the response body is the primary's schema")
 	assert.Equal(t, []string{"testapp-001", "testapp-002"}, client.pulledTargets(), "every target is pulled")
 
-	require.Len(t, resp.Targets, 1, "only non-primary targets are compared against the primary")
-	diverged := resp.Targets[0]
+	require.Len(t, resp.Targets, 2, "every target the environment addresses is named, primary included")
+
+	primary := resp.Targets[0]
+	assert.True(t, primary.Primary)
+	assert.Equal(t, "eu", primary.Deployment)
+	assert.Equal(t, "testapp-001", primary.Target)
+	assert.Equal(t, int32(1), primary.TableCount)
+	assert.Empty(t, primary.DivergedTables, "the primary is the baseline and never diverges from itself")
+
+	diverged := resp.Targets[1]
+	assert.False(t, diverged.Primary)
 	assert.Equal(t, "eu", diverged.Deployment)
 	assert.Equal(t, "testapp-002", diverged.Target)
 	assert.Equal(t, int32(2), diverged.TableCount)
@@ -117,6 +126,34 @@ func TestExecutePullSchema_ReportsPerTargetDivergence(t *testing.T) {
 		{Namespace: "testapp", Table: "audits", Difference: apitypes.DivergenceOnlyOnTarget},
 		{Namespace: "testapp", Table: "users", Difference: apitypes.DivergenceDiffers},
 	}, diverged.DivergedTables)
+}
+
+// A caller reconciling an environment against its own shard inventory reads the
+// member set off the pull payload, so exactly one target is marked primary and
+// the whole configured list is present in configuration order.
+func TestExecutePullSchema_NamesEveryTargetExactlyOncePrimaryFirst(t *testing.T) {
+	client := newPerTargetPullClient(map[string]*ternv1.PullSchemaResponse{
+		"testapp-001": pulledTables(map[string]string{"users": pullUsersDDL}),
+		"testapp-002": pulledTables(map[string]string{"users": pullUsersDDL}),
+		"testapp-003": pulledTables(map[string]string{"users": pullUsersDDL}),
+	}, nil)
+	env := EnvironmentConfig{Deployment: "eu", Targets: []string{"testapp-001", "testapp-002", "testapp-003"}}
+	svc := pullTargetService(t, env, map[string]tern.Client{"eu/production": client})
+
+	resp, err := svc.ExecutePullSchema(t.Context(), pullRequest())
+	require.NoError(t, err)
+
+	named := make([]string, 0, len(resp.Targets))
+	primaries := 0
+	for _, target := range resp.Targets {
+		named = append(named, target.Target)
+		if target.Primary {
+			primaries++
+		}
+	}
+	assert.Equal(t, []string{"testapp-001", "testapp-002", "testapp-003"}, named)
+	assert.Equal(t, 1, primaries, "exactly one target is the baseline the others are compared against")
+	assert.True(t, resp.Targets[0].Primary)
 }
 
 // Targets that hold the same schema report no diverged tables, which is a
@@ -131,9 +168,9 @@ func TestExecutePullSchema_ConvergedTargetsReportNoDivergedTables(t *testing.T) 
 	resp, err := svc.ExecutePullSchema(t.Context(), pullRequest())
 	require.NoError(t, err)
 
-	require.Len(t, resp.Targets, 1)
-	assert.Equal(t, "testapp-002", resp.Targets[0].Target)
-	assert.Empty(t, resp.Targets[0].DivergedTables)
+	require.Len(t, resp.Targets, 2)
+	assert.Equal(t, "testapp-002", resp.Targets[1].Target)
+	assert.Empty(t, resp.Targets[1].DivergedTables)
 }
 
 // Two targets holding the same schema written differently are not diverged:
@@ -151,8 +188,8 @@ func TestExecutePullSchema_FormattingIsNotDivergence(t *testing.T) {
 	resp, err := svc.ExecutePullSchema(t.Context(), pullRequest())
 	require.NoError(t, err)
 
-	require.Len(t, resp.Targets, 1)
-	assert.Empty(t, resp.Targets[0].DivergedTables, "the same schema written differently is the same schema")
+	require.Len(t, resp.Targets, 2)
+	assert.Empty(t, resp.Targets[1].DivergedTables, "the same schema written differently is the same schema")
 }
 
 // A target that cannot be pulled fails the request. Returning the primary's

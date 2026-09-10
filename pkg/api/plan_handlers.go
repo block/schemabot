@@ -314,7 +314,7 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 	// schema, so the primary's is reported alongside how the others differ from
 	// it. Comparing here, rather than leaving it to the caller, keeps a pull from
 	// presenting one target's schema as the environment's.
-	divergences, err := s.pullMemberDivergence(ctx, req, resolvedTarget, merged, namespaces, catalogDetail)
+	members, err := s.pullMemberDivergence(ctx, req, resolvedTarget, merged, namespaces, catalogDetail)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "compare rollout members")
@@ -328,7 +328,7 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 		"environment", merged.Environment,
 		"table_count", merged.TableCount,
 		"namespace_count", len(merged.Namespaces),
-		"compared_target_count", len(divergences),
+		"member_target_count", len(members),
 	)
 
 	httpResp := pullSchemaResponseFromProto(merged)
@@ -338,7 +338,7 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 	if dbConfig, ok := s.config.DatabaseConfigs()[req.Database]; ok {
 		httpResp.App = dbConfig.App
 	}
-	httpResp.Targets = divergences
+	httpResp.Targets = members
 	if req.Lint {
 		if err := lintPulledNamespaces(httpResp); err != nil {
 			span.RecordError(err)

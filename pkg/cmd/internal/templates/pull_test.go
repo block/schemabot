@@ -233,9 +233,11 @@ func TestWritePullSchema_StylesOutputOnInteractiveTerminals(t *testing.T) {
 
 // A pull of an environment whose targets each hold their own schema reports how
 // every other target differs from the primary, whose schema is the DDL printed
-// below. A converged target says so rather than being omitted, so "they agree"
-// is distinguishable from "not checked". The whole section renders as "--"
-// comments, so a redirected pull stays valid SQL.
+// below. Every target is listed, the primary included: a converged target says
+// so rather than being omitted, so "they agree" is distinguishable from "not
+// checked", and an operator counting members against what they expect the
+// environment to hold does not have to add the primary back. The whole section
+// renders as "--" comments, so a redirected pull stays valid SQL.
 func TestWritePullSchema_RendersPerTargetDivergence(t *testing.T) {
 	setColors(t, false)
 	out := captureStdout(t, func() {
@@ -248,6 +250,7 @@ func TestWritePullSchema_RendersPerTargetDivergence(t *testing.T) {
 				"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
 			},
 			Targets: []*apitypes.TargetDivergence{
+				{Deployment: "eu", Target: "orders-001", TableCount: 1, Primary: true},
 				{Deployment: "eu", Target: "orders-002", TableCount: 2, DivergedTables: []apitypes.DivergedTable{
 					{Namespace: "orders", Table: "audits", Difference: apitypes.DivergenceOnlyOnTarget},
 					{Namespace: "orders", Table: "users", Difference: apitypes.DivergenceDiffers},
@@ -257,12 +260,13 @@ func TestWritePullSchema_RendersPerTargetDivergence(t *testing.T) {
 		})
 	})
 
+	assert.Contains(t, out, "-- Target `orders-001` — primary target, whose schema is below")
 	assert.Contains(t, out, "-- Target `orders-002` — 2 tables differ from the primary target")
 	assert.Contains(t, out, "--   orders.audits: extra")
 	assert.Contains(t, out, "--   orders.users: differs")
 	assert.Contains(t, out, "-- Target `orders-003` — same schema as the primary target")
 	for line := range strings.SplitSeq(out, "\n") {
-		if strings.Contains(line, "orders-002") || strings.Contains(line, "orders-003") || strings.Contains(line, "orders.audits") {
+		if strings.Contains(line, "orders-001") || strings.Contains(line, "orders-002") || strings.Contains(line, "orders-003") || strings.Contains(line, "orders.audits") {
 			assert.True(t, strings.HasPrefix(strings.TrimSpace(line), "--"),
 				"divergence line %q must be a SQL comment", line)
 		}

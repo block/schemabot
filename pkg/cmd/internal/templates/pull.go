@@ -69,22 +69,29 @@ var divergenceLabels = map[string]string{
 	apitypes.DivergenceOnlyOnTarget:  "extra",
 }
 
-// writeTargetDivergence reports how each of an environment's other targets
-// differs from the primary, whose schema is the DDL printed below. It renders as
-// "--" comments like the rest of the pull output, so redirecting a multi-target
-// pull into a .sql file still produces valid SQL.
+// writeTargetDivergence lists every target the environment addresses and how
+// each differs from the primary, whose schema is the DDL printed below. It
+// renders as "--" comments like the rest of the pull output, so redirecting a
+// multi-target pull into a .sql file still produces valid SQL.
 //
 // A target with no diverged tables is still listed: "these two hold the same
 // schema" is the answer an operator is usually looking for, and omitting the
 // converged targets would leave it indistinguishable from not having checked.
-// An environment whose targets are expected to hold the same schema carries no
-// divergence at all and prints nothing.
+// The primary is named on the same list for the same reason — an operator
+// counting targets against what they expect the environment to hold should not
+// have to add one back. An environment whose targets are expected to hold the
+// same schema carries no member list at all and prints nothing.
 func writeTargetDivergence(targets []*apitypes.TargetDivergence) {
 	if len(targets) == 0 {
 		return
 	}
 	for _, target := range targets {
 		fmt.Println()
+		if target.Primary {
+			fmt.Println(annotation(fmt.Sprintf("-- Target %s — primary target, whose schema is below",
+				emphasis("`"+target.Target+"`"))))
+			continue
+		}
 		if len(target.DivergedTables) == 0 {
 			fmt.Println(annotation(fmt.Sprintf("-- Target %s — same schema as the primary target",
 				emphasis("`"+target.Target+"`"))))
