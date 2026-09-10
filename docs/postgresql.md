@@ -399,12 +399,12 @@ change or that depend on the target:
   reason names as many of the missing and owned names as it has room for
   beside the table name and counts the rest, so the remedy stays visible on
   the narrowest CLI surface; the table is left standing for the operator to
-  rename the relation or drop, then re-plan. A read-back that
-  does not complete is also refused permanently, even though pg-sprite marks
-  it retryable: SchemaBot's retry re-runs the whole plan, whose `CREATE
-  TABLE` has already committed, so it could only collide with the table this
-  apply created. The reason directs the operator to compare the table's
-  names against the schema file, then re-plan.
+  rename the relation or drop, then re-plan. A read-back that does not
+  complete is also refused permanently, even though pg-sprite marks it
+  retryable: SchemaBot's retry re-runs the whole plan, whose `CREATE TABLE`
+  has already committed, so it could only collide with the table this apply
+  created. The reason directs the operator to compare the table's names
+  against the schema file, then re-plan.
 - Insufficient privileges are refused permanently before DDL runs. The stored
   failure includes the provisioning `GRANT` derived by pg-sprite.
 - Exhausting the 30-second statement budget is a permanent native-safety
