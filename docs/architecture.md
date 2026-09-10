@@ -981,7 +981,7 @@ For the operator-facing display examples and controls, see the
 
 6. **Estimate-exceeded display.** Spirit can report `RowsCopied > RowsTotal` when MySQL's initial
    estimate is low. SchemaBot preserves the raw copied count, clamps determinate percentages to 100,
-   and switches active row-copy renderers to an `Active` display with copied-so-far rows.
+   and switches active row-copy renderers to a `Finalizing copy` display with copied-so-far rows.
 
 </details>
 
