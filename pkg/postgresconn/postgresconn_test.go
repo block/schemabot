@@ -448,10 +448,16 @@ func TestResolveConnectorAppliesOptionsAndNormalization(t *testing.T) {
 	_, err := resolveConnector(
 		"postgres://schemabot:rotated@database.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app", // sadscan:disable np.postgres.1
 		WithConnectTimeout(7*time.Second),
+		WithStatementTimeout(45*time.Second),
 	)
 	require.NoError(t, err)
 	assert.Equal(t, "rotated", got.Password)
 	assert.Equal(t, 7*time.Second, got.ConnectTimeout, "options must flow through the resolve path")
+	// The long-lived storage pool is the reloadable one, so an option armed on
+	// the new session rather than written into the config has to survive here
+	// too — a reload that dropped it would leave the pool running unbudgeted
+	// with nothing to read differently.
+	assert.NotNil(t, got.AfterConnect, "the statement budget must survive a credential reload")
 	assert.NotNil(t, got.TLSConfig, "a reloaded RDS DSN must get sslmode=require injected")
 	// sslmode=prefer would also set TLSConfig but keep a plaintext fallback;
 	// require is distinguished by that fallback's absence.
