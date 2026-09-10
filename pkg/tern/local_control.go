@@ -1051,7 +1051,7 @@ func (c *LocalClient) settleStopForTasklessApply(ctx context.Context, targetAppl
 func (c *LocalClient) stopStandsDownUnlessStartPending(ctx context.Context, logger *slog.Logger, apply *storage.Apply) (standDown bool, err error) {
 	pendingStart, err := pendingStartControlRequest(ctx, c.storage, apply)
 	if err != nil {
-		return true, fmt.Errorf("check pending start request after stop for apply %s: %w", apply.ApplyIdentifier, err)
+		return false, fmt.Errorf("check pending start request after stop for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if pendingStart != nil {
 		logger.Info("pending stop completed but a start is queued; continuing to resume in the same claim",
@@ -1146,7 +1146,7 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 	// filterable by apply_id/repo/pr without hand-listing the attrs per call.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	if completed, err := completePendingRequestIfStoredApplyResolved(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
-		return true, err
+		return false, err
 	} else if completed {
 		logger.Info("completing pending stop request for resolved apply",
 			"requested_by", controlRequestCaller(controlReq),
@@ -1162,7 +1162,7 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending stop request completed for terminal apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
-			return true, err
+			return false, err
 		}
 		return c.stopStandsDownUnlessStartPending(ctx, logger, apply)
 	}
@@ -1172,7 +1172,7 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 	// so the operator-owned retry loop stops re-running stop. The operator must
 	// revert (undo) or skip-revert (finalize), or wait out an in-flight revert.
 	if revertPhase, err := c.applyRevertPhaseBlock(ctx, apply); err != nil {
-		return true, err
+		return false, err
 	} else if revertPhase != "" {
 		message := revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase)
 		logger.Warn("rejecting pending stop request: schema change is in a revert phase and has already cut over",
@@ -1219,7 +1219,7 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 	}
 	completed, err := completePendingRequestIfStoredApplyResolved(stopCtx, c.storage, apply, storage.ControlOperationStop)
 	if err != nil {
-		return true, err
+		return false, err
 	}
 	if !completed {
 		// The stop was accepted but the apply row has not settled — the settle
@@ -1257,12 +1257,12 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending cancel request completed for terminal apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
-			return true, err
+			return false, err
 		}
 		return true, nil
 	}
 	if revertPhase, err := c.applyRevertPhaseBlock(ctx, apply); err != nil {
-		return true, err
+		return false, err
 	} else if revertPhase != "" {
 		message := revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase)
 		logger.Warn("rejecting pending cancel request: schema change is in a revert phase and has already cut over",
@@ -1303,7 +1303,7 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 	}
 	completed, err := completePendingRequestIfStoredApplyResolved(cancelCtx, c.storage, apply, storage.ControlOperationCancel)
 	if err != nil {
-		return true, err
+		return false, err
 	}
 	if !completed {
 		// The cancel was accepted but the apply row has not settled — the settle

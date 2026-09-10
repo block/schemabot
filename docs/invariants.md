@@ -843,8 +843,8 @@ skip-revert in flight — stop, cancel, and cutover are refused for the whole ph
 keeps driving the phase to its own outcome rather than settling on the refused command, because
 storage must never settle on a state that contradicts what the engine is still doing to the
 database underneath. *Enforced:* revert-phase gates in the control paths
-(`pkg/tern/local_control.go`), and the drive loops that act on their answer
-(`pkg/tern/local_apply_grouped.go`, `pkg/tern/local_apply_sequential.go`,
+(`pkg/tern/local_control.go`, `pkg/tern/grpc_client.go`), and the drive loops that act on their
+answer (`pkg/tern/local_apply_grouped.go`, `pkg/tern/local_apply_sequential.go`,
 `pkg/tern/local_control_resume.go`).
 
 ### CO-6: Commands act only where they have an effect

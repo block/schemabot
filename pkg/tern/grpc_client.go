@@ -1138,7 +1138,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 // apply whose response was lost. Settling locally would report the change
 // stopped or cancelled while it kept running on the target, and because that
 // leaves the apply terminal, nothing would ever revisit it to find out. So this
-// reports the request unhandled and lets the drive continue to the dispatch
+// declines to stand the drive down and lets it continue to the dispatch
 // ambiguity guard, which fails the apply closed and fails the pending stop and
 // cancel requests with the same ambiguity message, so the operator sees the
 // rejection rather than a command no later claim would ever answer. The guard

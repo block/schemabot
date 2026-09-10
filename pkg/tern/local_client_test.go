@@ -3508,8 +3508,7 @@ func TestHandleAtomicProgressTickOperationGate(t *testing.T) {
 // a change that has already cut over. The drive refuses the command — only
 // revert or skip-revert can act from there — and then has to keep polling: the
 // engine is still working underneath, and a drive that exited on the refusal
-// would settle the apply stopped over a live revert window and leave nobody
-// watching it expire (CO-5).
+// would abandon a live revert window with nobody watching it expire (CO-5).
 func TestHandleAtomicProgressTickRefusedCancelInRevertWindowKeepsPolling(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              11,

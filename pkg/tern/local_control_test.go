@@ -1869,6 +1869,38 @@ func TestLocalClient_PendingStopRefusedInRevertWindowLeavesTheDriveRunning(t *te
 		"the failed request must tell the operator which command does what they wanted")
 }
 
+// An operator who sends stop and then cancel on a schema change that has
+// already cut over leaves both requests pending against the same claim. The
+// combined processor refuses the cancel and, because a refusal is not the drive
+// standing down, goes on to refuse the stop in the same pass — so the operator
+// gets a rejection for each command they issued rather than one rejection and
+// one command left pending for a claim that may never come (CO-5).
+func TestLocalClient_BothPendingRefusedInRevertWindowResolveInOneClaim(t *testing.T) {
+	client, apply, task, controlRequests := revertWindowRefusalFixture(storage.ControlOperationCancel)
+	controlRequests.requests = append(controlRequests.requests, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+
+	standDown, err := client.processPendingCancelOrStopControlRequest(t.Context(), apply)
+
+	require.NoError(t, err)
+	assert.False(t, standDown, "neither refusal stops the drive; the revert phase still owns the outcome")
+	assert.Equal(t, state.Apply.Running, apply.State, "the apply must be left for its revert phase to settle")
+	assert.Equal(t, state.Task.RevertWindow, task.State, "the cut-over task keeps its revert window")
+	for _, operation := range []storage.ControlOperation{storage.ControlOperationCancel, storage.ControlOperationStop} {
+		pending, err := controlRequests.GetPending(t.Context(), apply.ID, operation)
+		require.NoError(t, err)
+		assert.Nilf(t, pending, "the durable %s request must be resolved in this claim, not left pending", operation)
+		resolved, err := controlRequests.GetByOperation(t.Context(), apply.ID, operation)
+		require.NoError(t, err)
+		require.NotNilf(t, resolved, "the %s request must be recorded", operation)
+		assert.Equalf(t, storage.ControlRequestFailed, resolved.Status, "a revert-phase %s refusal is a permanent rejection", operation)
+	}
+}
+
 // failPendingErrorStore makes the durable write that resolves a request fail, so
 // a test can reach an error path the drive's own callers never expose.
 type failPendingErrorStore struct {
