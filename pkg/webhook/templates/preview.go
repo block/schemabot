@@ -1009,6 +1009,42 @@ func sampleLintWarnings() []LintViolationData {
 	}
 }
 
+// PreviewCommentPlanPrimaryKeyWarning renders an index addition on an existing
+// table whose unchanged varchar primary key raises an advisory finding.
+func PreviewCommentPlanPrimaryKeyWarning() string {
+	return RenderPlanComment(PlanCommentData{
+		Database: "testapp", SchemaName: "testapp", Environment: "staging",
+		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
+		IsMySQL: true, DatabaseType: "mysql", HasPrimaryKeyFindings: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `customers` ADD INDEX `idx_created_at` (`created_at`);"},
+		}},
+		LintViolations: []LintViolationData{{
+			Table: "customers", LinterName: "primary_key",
+			Message: `Primary key column "id" has type "varchar"`,
+		}},
+	})
+}
+
+// PreviewCommentPlanPrimaryKeyIssue renders a new table whose varchar primary
+// key requires explicit acknowledgement, with the same guide beside the issue.
+func PreviewCommentPlanPrimaryKeyIssue() string {
+	return RenderPlanComment(PlanCommentData{
+		Database: "testapp", SchemaName: "testapp", Environment: "staging",
+		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
+		IsMySQL: true, DatabaseType: "mysql", HasPrimaryKeyFindings: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"CREATE TABLE `customers` (\n  `id` varchar(64) NOT NULL,\n  `created_at` datetime(3) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{{
+			Table: "customers", Reason: `[ERROR] primary_key: Primary key column "id" has type "varchar"`,
+		}},
+	})
+}
+
 // PreviewCommentPlanManyLintWarnings renders a plan whose lint findings exceed
 // the fold threshold, exercising the collapsed details block grouped by table.
 func PreviewCommentPlanManyLintWarnings() string {

@@ -184,6 +184,74 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="mysql-plan-existing-primary-key-warning"></a><strong>MySQL Plan (Existing Primary Key Warning)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `customers` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+💡 **Lint Warnings**: 1 advisory finding
+- `customers`: Primary key column `id` has type `varchar`
+
+[Choosing a MySQL primary key](https://github.com/block/schemabot/blob/main/docs/spirit.md#choosing-a-primary-key) — storage, insert order, and online copy tradeoffs.
+
+📋 **Plan**: **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-new-primary-key-issue"></a><strong>MySQL Plan (New Primary Key Issue)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+CREATE TABLE `customers` (
+    `id` varchar(64) NOT NULL,
+    `created_at` datetime(3) NOT NULL,
+    PRIMARY KEY(`id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+⚠️ **Issues**: 1 unsafe change detected
+1. `customers`: Primary key column `id` has type `varchar`
+
+[Choosing a MySQL primary key](https://github.com/block/schemabot/blob/main/docs/spirit.md#choosing-a-primary-key) — storage, insert order, and online copy tradeoffs.
+
+📋 **Plan**: **1** table to create
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="mysql-plan-engineblocked-change"></a><strong>MySQL Plan (Engine-blocked Change)</strong></summary>
 
 
