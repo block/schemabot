@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/checkstate"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -161,8 +162,7 @@ func filterChecksByEnvironment(checks []*storage.Check, env string) []*storage.C
 // The Environment field is either aggregateSentinel (global aggregate) or a real
 // environment name (per-environment aggregate when allowed_environments is configured).
 func isAggregateCheck(c *storage.Check) bool {
-	return c.DatabaseType == aggregateSentinel &&
-		c.DatabaseName == aggregateSentinel
+	return checkstate.IsAggregate(c)
 }
 
 // checkHasStartedApply returns true once work may already have reached, or may
