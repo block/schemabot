@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
-	"database/sql/driver"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -30,6 +29,14 @@ const undoAcquireUnlockTimeout = 5 * time.Second
 // shared across every database of the instance), so callers must pass the same
 // *sql.Conn to Acquire and Release and keep it open for as long as the lock is
 // held.
+//
+// That binding is a property of the connection, not of this type: it holds
+// against a PostgreSQL server, and against a pooler that gives a client its
+// own server session for the connection's lifetime, and it does not hold
+// behind a transaction-mode pooler, which rebinds the backend per transaction
+// and leaves the lock on a session the client no longer reaches. Callers that
+// depend on the lock for mutual exclusion prove the binding with
+// VerifySessionAffinity before relying on it.
 //
 // Advisory locks are keyed by int64, so name is hashed into the key (see
 // advisoryLockKey). A hash collision between two distinct names makes them
@@ -102,6 +109,11 @@ func (Postgres) Acquire(ctx context.Context, conn *sql.Conn, name string, wait t
 // Release runs pg_advisory_unlock for name. It returns true when this session
 // held the lock and false when it did not (the server also emits a warning in
 // that case, not an error), which maps directly onto released.
+//
+// A caller that believed it held the lock must treat false as a lost-ownership
+// signal rather than as a routine answer: the lock is either still held on a
+// session this connection no longer reaches, or it was never taken on the
+// session the acquire reported.
 func (Postgres) Release(ctx context.Context, conn *sql.Conn, name string) (bool, error) {
 	var released bool
 	if err := conn.QueryRowContext(ctx, "SELECT pg_advisory_unlock($1)", advisoryLockKey(name)).Scan(&released); err != nil {
@@ -134,8 +146,8 @@ func undoAcquire(ctx context.Context, conn *sql.Conn, key int64, err error) erro
 	unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), undoAcquireUnlockTimeout)
 	defer cancel()
 	if _, unlockErr := conn.ExecContext(unlockCtx, "SELECT pg_advisory_unlock($1)", key); unlockErr != nil {
-		if rawErr := conn.Raw(func(any) error { return driver.ErrBadConn }); rawErr != nil && !errors.Is(rawErr, driver.ErrBadConn) {
-			return fmt.Errorf("%w (unlock: %w; discard connection: %w)", err, unlockErr, rawErr)
+		if discardErr := discardConn(conn); discardErr != nil {
+			return fmt.Errorf("%w (unlock: %w; discard connection: %w)", err, unlockErr, discardErr)
 		}
 		return fmt.Errorf("%w (unlock: %w; connection discarded)", err, unlockErr)
 	}
