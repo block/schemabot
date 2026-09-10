@@ -39,14 +39,14 @@ func TestPostgresAdvisoryLockLosesExclusionBehindTransactionPooling(t *testing.T
 
 	holder, err := db.Conn(t.Context())
 	require.NoError(t, err)
-	defer func() { _ = holder.Close() }()
+	defer utils.CloseAndLog(holder)
 	acquired, err := locker.Acquire(t.Context(), holder, name, 0)
 	require.NoError(t, err)
 	require.True(t, acquired, "the first connection should take the lock")
 
 	contender, err := db.Conn(t.Context())
 	require.NoError(t, err)
-	defer func() { _ = contender.Close() }()
+	defer utils.CloseAndLog(contender)
 	acquired, err = locker.Acquire(t.Context(), contender, name, 0)
 	require.NoError(t, err)
 	assert.True(t, acquired,
