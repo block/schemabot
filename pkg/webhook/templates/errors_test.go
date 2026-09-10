@@ -307,11 +307,10 @@ func TestRenderDatabaseNotConfigured(t *testing.T) {
 	assert.NotContains(t, body, "was found in this repository")
 }
 
-// TestRenderRepositoryTreeTruncated pins the comment for a repository GitHub
-// could not return in full: a database-scoped command names the database and
-// the two server-side causes, an unscoped command explains the repo-wide
-// search instead, and the header follows the same database/environment
-// rules as the other schema request errors.
+// TestRenderDatabaseRepoNotAllowed pins the comment for a database whose
+// `allowed_repos` leaves out the requesting repository: it names the policy
+// that stopped the search, says that nothing was searched, and points at the
+// operator remedy rather than at a missing schema file.
 func TestRenderDatabaseRepoNotAllowed(t *testing.T) {
 	body := RenderDatabaseRepoNotAllowed(SchemaErrorData{
 		RequestedBy:  "hubot",
@@ -325,9 +324,15 @@ func TestRenderDatabaseRepoNotAllowed(t *testing.T) {
 	assert.Contains(t, body, "this repository is not in the database's `allowed_repos`")
 	assert.Contains(t, body, "none was searched")
 	assert.Contains(t, body, "add this repository to the database's `allowed_repos`")
+	assert.Contains(t, body, "the database name, from `-d` or from `schemabot.yaml`, names the right database")
 	assert.NotContains(t, body, "was found in this repository")
 }
 
+// TestRenderRepositoryTreeTruncated pins the comment for a repository GitHub
+// could not return in full: a database-scoped command names the database and
+// the two server-side causes, an unscoped command explains the repo-wide
+// search instead, and the header follows the same database/environment
+// rules as the other schema request errors.
 func TestRenderRepositoryTreeTruncated(t *testing.T) {
 	t.Run("database-scoped command", func(t *testing.T) {
 		body := RenderRepositoryTreeTruncated(SchemaErrorData{

@@ -167,7 +167,7 @@ const databaseRepoNotAllowedTemplate = "## " + glyph.Attention + ` Database Not 
 
 The SchemaBot server configures {{.DatabaseNameCode}} to accept schema changes from other repositories only: this repository is not in the database's ` + "`allowed_repos`" + `, so no ` + "`schemabot.yaml`" + ` in it can manage the database and none was searched.
 
-Ask a SchemaBot operator to add this repository to the database's ` + "`allowed_repos`" + ` if it should manage the database, or check that the ` + "`-d`" + ` value names the right database.`
+Ask a SchemaBot operator to add this repository to the database's ` + "`allowed_repos`" + ` if it should manage the database, or check that the database name, from ` + "`-d`" + ` or from ` + "`schemabot.yaml`" + `, names the right database.`
 
 const repositoryTreeTruncatedTemplate = "## " + glyph.Attention + ` Repository Too Large to Search
 
