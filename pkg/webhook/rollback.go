@@ -326,8 +326,10 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 	return false, nil
 }
 
-// buildRollbackPlanCommentData preserves lint rule IDs from every severity for
-// related guidance, while keeping advisory findings in the warning list.
+// buildRollbackPlanCommentData keeps advisory findings in the warning list.
+// Error-severity findings are left out: the rollback comment has no unsafe
+// section to show them in, and a guide linked for a finding the comment never
+// shows is advice about nothing.
 func buildRollbackPlanCommentData(commentData templates.PlanCommentData, planResp *apitypes.PlanResponse) templates.PlanCommentData {
 	for _, sc := range planResp.Changes {
 		nsData := templates.KeyspaceChangeData{
@@ -341,12 +343,6 @@ func buildRollbackPlanCommentData(commentData templates.PlanCommentData, planRes
 			nsData.VSchemaDiff = sc.Metadata[apitypes.VSchemaDiffMetadataKey]
 		}
 		commentData.Changes = append(commentData.Changes, nsData)
-	}
-
-	for _, finding := range planResp.LintResults {
-		if finding != nil && finding.Linter != "" {
-			commentData.LintRuleNames = append(commentData.LintRuleNames, finding.Linter)
-		}
 	}
 
 	for _, w := range planResp.LintNonErrors() {
