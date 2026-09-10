@@ -108,6 +108,14 @@ func WithStatementTimeout(d time.Duration) Option {
 		// session GUC over a protocol the pooler does forward. Any DSN-carried
 		// statement_timeout stays in the startup packet, so it is cleared here to
 		// keep this option the single source of the budget.
+		//
+		// The reach that makes SET work is also its cost. Against a
+		// transaction-mode pooler the GUC lands on a shared server backend and
+		// outlives the client connection, so a storage endpoint that is refused
+		// for lacking session affinity can leave the budget behind on a backend
+		// in its own (database, user) pool. That residue is the price of
+		// connecting at all: the startup-packet form fails every dial through
+		// such a pooler, whatever its pool mode.
 		stmt := statementTimeoutSQL(d)
 		clearRuntimeParam(cfg, "statement_timeout")
 		cfg.AfterConnect = func(ctx context.Context, conn *pgconn.PgConn) error {
