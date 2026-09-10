@@ -242,7 +242,12 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		return
 	}
 
-	if h.answerUnregisteredDatabase(repo, pr, installationID, "", databaseName, tenant, requestedBy, action.Plan, false) {
+	// The registry gate reads databaseName as the command's -d value. An
+	// auto-plan passes the database discovered from the PR instead, and its
+	// answer for an unconfigured database is the failing aggregate the
+	// multi-environment setup below posts, which is what tells branch
+	// protection the plan cannot succeed.
+	if !isAutoPlan && h.answerUnregisteredDatabase(repo, pr, installationID, "", databaseName, tenant, requestedBy, action.Plan, false) {
 		return
 	}
 

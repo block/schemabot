@@ -303,7 +303,7 @@ func TestRenderDatabaseNotConfigured(t *testing.T) {
 	assert.Contains(t, body, "*Requested by @hubot at 2026-07-16 18:56:00 UTC*")
 	assert.Contains(t, body, "has no `payments` entry under `databases` in its server configuration")
 	assert.Contains(t, body, "A `schemabot.yaml` declaring `database: payments` is not enough on its own")
-	assert.Contains(t, body, "ask a SchemaBot operator to configure the database")
+	assert.Contains(t, body, "Check that the database name, from `-d` or from `schemabot.yaml`, matches one this instance serves, or ask a SchemaBot operator to configure the database")
 	assert.NotContains(t, body, "was found in this repository")
 }
 

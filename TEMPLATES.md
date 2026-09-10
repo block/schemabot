@@ -1749,7 +1749,7 @@ This repository is too large for GitHub to return its full tree, so SchemaBot se
 
 This SchemaBot instance has no `payments` entry under `databases` in its server configuration, so it cannot plan or apply schema changes for it. A `schemabot.yaml` declaring `database: payments` is not enough on its own: the database also has to be configured on the SchemaBot server.
 
-Check that the `-d` value names a database this instance serves, or ask a SchemaBot operator to configure the database.
+Check that the database name, from `-d` or from `schemabot.yaml`, matches one this instance serves, or ask a SchemaBot operator to configure the database.
 <!-- schemabot:offer-support-channel -->
 
 </details>

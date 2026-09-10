@@ -157,7 +157,7 @@ const databaseNotConfiguredTemplate = "## " + glyph.Attention + ` Database Not C
 
 This SchemaBot instance has no {{.DatabaseNameCode}} entry under ` + "`databases`" + ` in its server configuration, so it cannot plan or apply schema changes for it. A ` + "`schemabot.yaml`" + ` declaring {{.DatabaseDeclarationCode}} is not enough on its own: the database also has to be configured on the SchemaBot server.
 
-Check that the ` + "`-d`" + ` value names a database this instance serves, or ask a SchemaBot operator to configure the database.`
+Check that the database name, from ` + "`-d`" + ` or from ` + "`schemabot.yaml`" + `, matches one this instance serves, or ask a SchemaBot operator to configure the database.`
 
 const repositoryTreeTruncatedTemplate = "## " + glyph.Attention + ` Repository Too Large to Search
 
