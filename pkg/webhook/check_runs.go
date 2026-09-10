@@ -4,7 +4,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
-	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/checkstate"
 )
 
 // maxCheckRunTextLength is the GitHub API limit for check run output text.
@@ -12,17 +12,17 @@ const maxCheckRunTextLength = 65530
 
 // GitHub Check Run status values.
 const (
-	checkStatusCompleted  = "completed"
-	checkStatusInProgress = "in_progress"
-	checkStatusQueued     = "queued"
+	checkStatusCompleted  = checkstate.StatusCompleted
+	checkStatusInProgress = checkstate.StatusInProgress
+	checkStatusQueued     = checkstate.StatusQueued
 )
 
 // GitHub Check Run conclusion values.
 const (
-	checkConclusionSuccess        = "success"
-	checkConclusionFailure        = "failure"
-	checkConclusionActionRequired = "action_required"
-	checkConclusionNeutral        = "neutral"
+	checkConclusionSuccess        = checkstate.ConclusionSuccess
+	checkConclusionFailure        = checkstate.ConclusionFailure
+	checkConclusionActionRequired = checkstate.ConclusionActionRequired
+	checkConclusionNeutral        = checkstate.ConclusionNeutral
 )
 
 // aggregateCheckName is the default GitHub Check Run base name.
@@ -43,7 +43,7 @@ const (
 // aggregate check state in the checks table. For the environment field,
 // per-environment aggregates use the real environment name while the global
 // aggregate (no allowed_environments) uses aggregateSentinel.
-const aggregateSentinel = "_aggregate"
+const aggregateSentinel = checkstate.AggregateSentinel
 
 type checkBlockReason struct {
 	blockingReason string
@@ -55,7 +55,7 @@ type checkBlockReason struct {
 // machine-readable value stored in checks.blocking_reason; message is shown to
 // users in per-database check state.
 var schemaRemovedAfterApplyBlock = checkBlockReason{
-	blockingReason: "schema_removed_after_apply_started",
+	blockingReason: checkstate.BlockSchemaRemovedAfterApplyStarted,
 	message:        "The current PR no longer contains a schema change whose apply has already started; reconciliation is required before this check can pass.",
 }
 
@@ -63,7 +63,7 @@ var schemaRemovedAfterApplyBlock = checkBlockReason{
 // environment no longer has the schema requested by the PR, so the check must
 // stay blocked until the PR and live schema are reconciled.
 var rollbackCompletedBlock = checkBlockReason{
-	blockingReason: "rollback_completed",
+	blockingReason: checkstate.BlockRollbackCompleted,
 	message:        "Schema changes were rolled back in this environment; apply the PR schema changes again, or reconcile the PR and live schema before this check can pass.",
 }
 
@@ -71,7 +71,7 @@ var rollbackCompletedBlock = checkBlockReason{
 // changes the target environment. The check remains blocked until a plan
 // confirms whether the PR still requests the schema change.
 var applyCancelledBlock = checkBlockReason{
-	blockingReason: "apply_cancelled",
+	blockingReason: checkstate.BlockApplyCancelled,
 	message:        "The apply was cancelled before completion; re-plan and re-apply if the schema change is still wanted, or remove it and re-run `schemabot plan` to converge this check.",
 }
 
@@ -81,7 +81,7 @@ var applyCancelledBlock = checkBlockReason{
 // durable evidence that the target may have changed, so planning alone cannot
 // release the apply-owned merge gate.
 var applyCancelledAfterTaskCompletedBlock = checkBlockReason{
-	blockingReason: "apply_cancelled_after_task_completed",
+	blockingReason: checkstate.BlockApplyCancelledAfterTaskCompleted,
 	message:        "Part of this PR's schema change completed in this environment before the apply was cancelled; reconcile the PR and live schema before this check can pass.",
 }
 
@@ -90,7 +90,7 @@ var applyCancelledAfterTaskCompletedBlock = checkBlockReason{
 // aggregate check must fail closed until SchemaBot can read PR metadata and
 // repository contents.
 var githubConfigDiscoveryUnavailableBlock = checkBlockReason{
-	blockingReason: "github_schema_config_discovery_unavailable",
+	blockingReason: checkstate.BlockConfigDiscoveryUnavailable,
 	message:        "SchemaBot failed this check closed because GitHub was unavailable while inspecting the PR schema files. Retry the check.",
 }
 
@@ -99,7 +99,7 @@ var githubConfigDiscoveryUnavailableBlock = checkBlockReason{
 // other than GitHub availability. The aggregate check must fail closed until
 // SchemaBot can determine the managed schema configuration.
 var configDiscoveryFailedBlock = checkBlockReason{
-	blockingReason: "schema_config_discovery_failed",
+	blockingReason: checkstate.BlockConfigDiscoveryFailed,
 	message:        "SchemaBot failed this check closed because it could not determine the managed schema configuration for this PR. Review the SchemaBot configuration and retry the check.",
 }
 
@@ -111,7 +111,7 @@ var configDiscoveryFailedBlock = checkBlockReason{
 // the failures retrying does not fix — revoked App permissions, a PR that is
 // gone, a response that cannot be read — which nothing else on the PR surfaces.
 var planPublishVerificationFailedBlock = checkBlockReason{
-	blockingReason: "plan_publish_verification_failed",
+	blockingReason: checkstate.BlockPlanPublishVerificationFailed,
 	message:        "SchemaBot failed this check closed because it could not confirm this PR still has the commit and base branch its plan was computed from. Check SchemaBot's access to this repository, then retry the check.",
 }
 
@@ -122,7 +122,7 @@ var planPublishVerificationFailedBlock = checkBlockReason{
 // the PR itself — retrying returns the same truncated list — so the message
 // tells the author how to get a plan instead of asking them to retry the check.
 var prFileCapExceededBlock = checkBlockReason{
-	blockingReason: "pr_file_cap_exceeded",
+	blockingReason: checkstate.BlockPRFileCapExceeded,
 	message: "SchemaBot cannot determine whether this PR contains managed schema changes: the PR changes more files than GitHub will report for a single pull request, so the changed-file list SchemaBot reads is incomplete. " +
 		"SchemaBot fails this check closed rather than planning from a partial diff, and retrying the check returns the same incomplete list. " +
 		"Split this PR so GitHub reports the full changed-file list — if it carries schema changes, move them into their own smaller PR and SchemaBot will plan them there.",
@@ -136,7 +136,7 @@ var prFileCapExceededBlock = checkBlockReason{
 // per-environment message naming the directories and databases is built at the
 // call site.
 var managedDirMissingConfigBlock = checkBlockReason{
-	blockingReason: "managed_dir_missing_config",
+	blockingReason: checkstate.BlockManagedDirMissingConfig,
 	message:        "A schema change under a SchemaBot-managed directory has no schemabot.yaml config.",
 }
 
@@ -147,7 +147,7 @@ var managedDirMissingConfigBlock = checkBlockReason{
 // matching schema. blockingReason is stored so the block survives later writes
 // (e.g. an apply-time plan) that did not re-evaluate drift.
 var reviewTimeDeploymentDriftBlock = checkBlockReason{
-	blockingReason: storage.ReviewTimeDeploymentDriftBlockingReason,
+	blockingReason: checkstate.BlockReviewTimeDeploymentDrift,
 	message:        "One or more deployments differ from the reviewed plan, or could not be confirmed to match it; reconcile the deployment drift or replan once the deployments match before this check can pass.",
 }
 
@@ -156,6 +156,26 @@ var reviewTimeDeploymentDriftBlock = checkBlockReason{
 // service's allowed_environments. SchemaBot cannot safely plan the schema
 // change in that configuration, so the aggregate check must fail closed.
 var noAllowedConfiguredEnvironmentsBlock = checkBlockReason{
-	blockingReason: "no_allowed_configured_environments",
+	blockingReason: checkstate.BlockNoAllowedConfiguredEnvironments,
 	message:        "SchemaBot found schema changes, but no configured environment for this database is allowed for this SchemaBot deployment. Align server environment configuration with allowed_environments, then retry the check.",
+}
+
+// allCheckBlockReasons is every durable block SchemaBot writes. A reader has
+// to know what each one means for the operator, and the reason column is a
+// plain string, so the set is enumerated here rather than left to be
+// rediscovered: the completeness test walks it and fails when a block ships
+// without a classification in `pkg/checkstate`.
+var allCheckBlockReasons = []checkBlockReason{
+	schemaRemovedAfterApplyBlock,
+	rollbackCompletedBlock,
+	applyCancelledBlock,
+	applyCancelledAfterTaskCompletedBlock,
+	githubConfigDiscoveryUnavailableBlock,
+	configDiscoveryFailedBlock,
+	planPublishVerificationFailedBlock,
+	prFileCapExceededBlock,
+	managedDirMissingConfigBlock,
+	reviewTimeDeploymentDriftBlock,
+	noAllowedConfiguredEnvironmentsBlock,
+	{blockingReason: participantUnresolvedBlockingReason},
 }
