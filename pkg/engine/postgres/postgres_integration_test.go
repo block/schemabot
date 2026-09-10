@@ -842,7 +842,7 @@ func TestEngineApplyCreateSetDuplicateNameRefusal(t *testing.T) {
 	progress := awaitPostgresProgress(t, eng, "widgets")
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "refused", progress.Metadata["phase"])
-	assert.Equal(t, `the create set for "widgets" claims the same relation name twice (a CREATE INDEX name repeats the table's implicit constraint-index name or another index); fix the schema file and re-plan`, progress.ErrorMessage)
+	assert.Equal(t, `the create set for "widgets" claims the same relation name twice; rename the index or constraint that repeats it in the schema file, then re-plan against the current schema`, progress.ErrorMessage)
 }
 
 // TestEngineApplyCreateCollisionRefusal proves a CREATE TABLE whose name is

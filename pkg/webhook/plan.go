@@ -36,6 +36,11 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		return
 	}
 
+	if h.answerUnregisteredDatabase(repo, pr, installationID, environment, databaseName, tenant, requestedBy, action.Plan, false) {
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "database not configured handled"})
+		return
+	}
+
 	if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.Plan, environment, databaseName, requestedBy); err != nil {
 		h.logger.Error("failed to check whether plan command needs schema change reconciliation", "repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, err.Error())
@@ -234,6 +239,15 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	if err := h.reconcileStaleChecks(ctx, client, repo, pr); err != nil {
 		h.logger.Error("failed to reconcile stale status checks", "repo", repo, "pr", pr, "error", err)
 		h.postCommandError(repo, pr, installationID, action.Plan, "", requestedBy, "Failed to reconcile stale status checks. Retry, and see server logs if it persists.")
+		return
+	}
+
+	// The registry gate reads databaseName as the command's -d value. An
+	// auto-plan passes the database discovered from the PR instead, and its
+	// answer for an unconfigured database is the failing aggregate the
+	// multi-environment setup below posts, which is what tells branch
+	// protection the plan cannot succeed.
+	if !isAutoPlan && h.answerUnregisteredDatabase(repo, pr, installationID, "", databaseName, tenant, requestedBy, action.Plan, false) {
 		return
 	}
 
@@ -578,7 +592,18 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 
 	var dbNotFoundErr *ghclient.DatabaseNotFoundError
 	if errors.As(err, &dbNotFoundErr) {
-		h.logger.Warn("schema request: database not found", logFields...)
+		// A configured database that accepts no changes from this repository
+		// has no directory the scoped search may probe, so the miss is the
+		// server's policy, not a search result, and the comment says so
+		// instead of blaming a schemabot.yaml that was never looked for.
+		if dbNotFoundErr.RepositoryNotAccepted() {
+			h.logger.Warn("schema request: database accepts no schema changes from this repository", logFields...)
+			metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "database_repo_not_allowed")
+			h.postComment(repo, pr, installationID, templates.RenderDatabaseRepoNotAllowed(data))
+			return true
+		}
+		data.SearchedDirs = dbNotFoundErr.SearchedDirs
+		h.logger.Warn("schema request: database not found", append(logFields, "searched_dirs", dbNotFoundErr.SearchedDirs)...)
 		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "database_not_found")
 		h.postComment(repo, pr, installationID, templates.RenderDatabaseNotFound(data))
 		return true
@@ -621,11 +646,32 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 
 	var dbNotConfiguredErr *api.DatabaseNotConfiguredError
 	if errors.As(err, &dbNotConfiguredErr) {
-		h.logger.Warn("schema request: database not configured on this server", logFields...)
-		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "database_not_configured")
-		data.ErrorDetail = err.Error()
-		h.postComment(repo, pr, installationID, templates.RenderGenericError(data))
+		// The registry miss may name a database discovered from the PR's own
+		// config rather than the -d value (which an unscoped command leaves
+		// empty), so the comment, the log, and the metric all carry the one
+		// the error names.
+		data.DatabaseName = dbNotConfiguredErr.Database
+		h.logger.Warn("schema request: database not configured on this server",
+			"repo", repo, "pr", pr, "environment", environment,
+			"database", data.DatabaseName, "action", commandName, "error", err)
+		metrics.RecordSchemaRequestError(ctx, repo, commandName, data.DatabaseName, environment, "database_not_configured")
+		h.postComment(repo, pr, installationID, templates.RenderDatabaseNotConfigured(data))
 		return true
+	}
+
+	// Config discovery on a truncated repository tree is incomplete discovery,
+	// not the command's answer: the caller keeps it retryable, exactly like an
+	// unexpected error, but the comment explains what the size of the
+	// repository means for discovery instead of quoting the raw error. A
+	// truncated listing below an already discovered config (schema-file
+	// loading) is a different failure and keeps the generic comment.
+	if errors.Is(err, ghclient.ErrConfigDiscoveryTruncated) {
+		h.logger.Error("schema request: repository tree truncated; config discovery incomplete", logFields...)
+		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "config_discovery_truncated")
+		if !suppressRetryComments {
+			h.postComment(repo, pr, installationID, templates.RenderRepositoryTreeTruncated(data))
+		}
+		return false
 	}
 
 	var envNotConfiguredErr *environmentNotConfiguredError

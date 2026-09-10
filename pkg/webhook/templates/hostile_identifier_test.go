@@ -45,17 +45,21 @@ func TestHostileIdentifierNeverEscapesItsCodeSpan(t *testing.T) {
 	writeShardStatusTable(&shardTable, []ShardStatus{{Shard: hostileIdentifier, State: state.Apply.Running}})
 
 	surfaces := map[string]string{
-		"plan comment":                        RenderPlanComment(plan),
-		"unsafe changes rejection":            RenderUnsafeChangesBlocked(plan),
-		"blocked changes rejection":           RenderBlockedChangesApplyRejected(plan),
-		"apply retry row":                     RenderApplyStatusComment(apply),
-		"sharded apply shard table":           shardTable.String(),
-		"config not authorized comment":       RenderConfigNotAuthorized(configNotAuthorized),
-		"config not authorized error line":    RenderConfigNotAuthorizedLine(hostileIdentifier, hostileIdentifier),
-		"unmanaged schema config notice":      RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{{Database: hostileIdentifier, SchemaPath: hostileIdentifier}}),
-		"invalid environment available list":  RenderInvalidEnv("apply", []string{hostileIdentifier}),
-		"database not found for a hostile -d": RenderDatabaseNotFound(SchemaErrorData{DatabaseName: hostileIdentifier}),
-		"no config for a hostile -d":          RenderNoConfig(SchemaErrorData{DatabaseName: hostileIdentifier}),
+		"plan comment":                               RenderPlanComment(plan),
+		"unsafe changes rejection":                   RenderUnsafeChangesBlocked(plan),
+		"blocked changes rejection":                  RenderBlockedChangesApplyRejected(plan),
+		"apply retry row":                            RenderApplyStatusComment(apply),
+		"sharded apply shard table":                  shardTable.String(),
+		"config not authorized comment":              RenderConfigNotAuthorized(configNotAuthorized),
+		"config not authorized error line":           RenderConfigNotAuthorizedLine(hostileIdentifier, hostileIdentifier),
+		"unmanaged schema config notice":             RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{{Database: hostileIdentifier, SchemaPath: hostileIdentifier}}),
+		"invalid environment available list":         RenderInvalidEnv("apply", []string{hostileIdentifier}),
+		"database not found for a hostile -d":        RenderDatabaseNotFound(SchemaErrorData{DatabaseName: hostileIdentifier}),
+		"scoped database not found for a hostile -d": RenderDatabaseNotFound(SchemaErrorData{DatabaseName: hostileIdentifier, SearchedDirs: []string{"schema"}}),
+		"database not configured for a hostile -d":   RenderDatabaseNotConfigured(SchemaErrorData{DatabaseName: hostileIdentifier}),
+		"repository truncated for a hostile -d":      RenderRepositoryTreeTruncated(SchemaErrorData{DatabaseName: hostileIdentifier}),
+		"database rejects the repo for a hostile -d": RenderDatabaseRepoNotAllowed(SchemaErrorData{DatabaseName: hostileIdentifier}),
+		"no config for a hostile -d":                 RenderNoConfig(SchemaErrorData{DatabaseName: hostileIdentifier}),
 	}
 
 	for name, rendered := range surfaces {

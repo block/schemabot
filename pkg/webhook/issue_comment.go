@@ -789,6 +789,11 @@ func (h *Handler) acknowledgeCommandEarlyIfOwned(ctx context.Context, client *gh
 		err       error
 	)
 	if databaseName != "" {
+		if h.unregisteredDatabaseError(repo, databaseName) != nil {
+			h.logger.Debug("early ownership probe: database is not configured on this deployment; nothing to acknowledge",
+				"repo", repo, "pr", pr, "database", databaseName)
+			return false
+		}
 		sbConfig, configDir, err = client.FindConfigByDatabaseName(ctx, repo, pr, databaseName)
 	} else {
 		sbConfig, configDir, err = client.FindConfigForPR(ctx, repo, pr)

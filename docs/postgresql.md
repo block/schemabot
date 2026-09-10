@@ -398,14 +398,16 @@ change or that depend on the target:
 - After a `CREATE TABLE` commits, pg-sprite reads back the constraint-index
   and sequence names the table owns. A table that owns a suffixed name in
   place of one the schema file claims — an occupant took the first choice
-  between the catalog probe and the statement — is refused permanently, with
-  the missing and owned names in the reason; the table is left standing for
-  the operator to rename the relation or drop, then re-plan. A read-back that
-  does not complete is also refused permanently, even though pg-sprite marks
-  it retryable: SchemaBot's retry re-runs the whole plan, whose `CREATE
-  TABLE` has already committed, so it could only collide with the table this
-  apply created. The reason directs the operator to compare the table's
-  names against the schema file, then re-plan.
+  between the catalog probe and the statement — is refused permanently. The
+  reason names as many of the missing and owned names as it has room for
+  beside the table name and counts the rest, so the remedy stays visible on
+  the narrowest CLI surface; the table is left standing for the operator to
+  rename the relation or drop, then re-plan. A read-back that does not
+  complete is also refused permanently, even though pg-sprite marks it
+  retryable: SchemaBot's retry re-runs the whole plan, whose `CREATE TABLE`
+  has already committed, so it could only collide with the table this apply
+  created. The reason directs the operator to compare the table's names
+  against the schema file, then re-plan.
 - Insufficient privileges are refused permanently before DDL runs. The stored
   failure includes the provisioning `GRANT` derived by pg-sprite.
 - Exhausting the 30-second statement budget is a permanent native-safety
