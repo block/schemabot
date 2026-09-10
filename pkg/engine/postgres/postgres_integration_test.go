@@ -14,6 +14,7 @@ import (
 	"github.com/block/pg-sprite/pkg/dbconn"
 	"github.com/block/pg-sprite/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -659,6 +660,12 @@ func TestEnginePlanUndeclaredTablesAcrossNamespaces(t *testing.T) {
 // silently, and a shadowed pull would hand the operator a wrong baseline. The
 // fixture includes a partition and an extension-owned table so the exemption
 // subqueries have rows to get wrong, not a vacuous NOT EXISTS.
+//
+// The pool is plain pgx rather than pg-sprite's: pg-sprite rewrites every new
+// session's search_path to drop a shadowed pg_catalog entry (proven by
+// TestSpritePoolUnshadowsCatalog), which would hide the hostile path from the
+// queries under test. The queries must resolve the catalog correctly on their
+// own, without relying on the pool that happens to carry them in production.
 func TestLiveTablesUnderShadowingSearchPath(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "plan_shadow_test")
 	_, err := db.ExecContext(t.Context(), `
@@ -697,9 +704,7 @@ func TestLiveTablesUnderShadowingSearchPath(t *testing.T) {
 		CREATE FUNCTION hostile.cardinality(anyarray) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT 1';
 		ALTER DATABASE plan_shadow_test SET search_path = hostile, pg_catalog, public`)
 	require.NoError(t, err)
-	poolCfg, err := spritePoolConfig(dsn, "")
-	require.NoError(t, err)
-	pool, err := dbconn.NewPool(t.Context(), poolCfg)
+	pool, err := pgxpool.New(t.Context(), dsn)
 	require.NoError(t, err)
 	defer pool.Close()
 
@@ -729,6 +734,37 @@ func TestLiveTablesUnderShadowingSearchPath(t *testing.T) {
 	objects, err := pullUnmodeledTableObjects(t.Context(), pool, "public", "users")
 	require.NoError(t, err)
 	assert.Equal(t, unmodeledTableObjects{}, objects, "a plain table must not acquire unmodeled objects from decoy catalog rows")
+}
+
+// TestSpritePoolUnshadowsCatalog pins the search_path every pg-sprite pool
+// session arrives with: an explicit pg_catalog entry that a user schema
+// precedes is dropped, every other entry keeps its position, and a path with
+// nothing shadowed is left as configured. The plan, apply, and pull dial
+// sites all build their pool through spritePoolConfig, so this is the session
+// state their queries run under, and a change to it upstream would surface
+// here rather than as a wrong catalog answer on a target with a hardened
+// search_path.
+func TestSpritePoolUnshadowsCatalog(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pool_shadow_test")
+	sessionSearchPath := func(t *testing.T, dsn string) string {
+		t.Helper()
+		poolCfg, err := spritePoolConfig(dsn, "")
+		require.NoError(t, err)
+		pool, err := dbconn.NewPool(t.Context(), poolCfg)
+		require.NoError(t, err)
+		defer pool.Close()
+		var searchPath string
+		require.NoError(t, pool.QueryRow(t.Context(), "SHOW search_path").Scan(&searchPath))
+		return searchPath
+	}
+
+	_, err := db.ExecContext(t.Context(), `ALTER DATABASE pool_shadow_test SET search_path = hostile, pg_catalog, public`)
+	require.NoError(t, err)
+	assert.Equal(t, "hostile, public", sessionSearchPath(t, dsn), "a pg_catalog entry listed behind a user schema is dropped from every pooled session")
+
+	_, err = db.ExecContext(t.Context(), `ALTER DATABASE pool_shadow_test SET search_path = pg_catalog, public`)
+	require.NoError(t, err)
+	assert.Equal(t, "pg_catalog, public", sessionSearchPath(t, dsn), "a leading pg_catalog entry shadows nothing and is kept as configured")
 }
 
 // TestEngineApplyNativeSafe proves a planned metadata-only ALTER runs through
