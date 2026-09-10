@@ -187,7 +187,10 @@ any other required flags filled in.
 You apply while the PR is open. Once the required schema checks pass, merging
 records the desired state the databases already run.
 
-- **No schema edits?** The PR gets a passing `No managed schema changes` check
+- **No schema edits?** The PR gets a passing `No managed schema changes` check.
+  To apply a schema root that is already merged, such as the first apply to a
+  new database, name the database: `schemabot plan -d <database>`, then
+  `schemabot apply -e <environment> -d <database>`
 - **Another PR holds the database lock?** The apply is refused and names the
   holder. Wait for that PR to merge or release the lock
 - **Schema files changed on the base branch?** Rebase before applying so your

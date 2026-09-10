@@ -60,6 +60,33 @@ func TestRenderSchemaChangeReconciliationRequiredCompleted(t *testing.T) {
 	assert.NotContains(t, rendered, "Git reverting")
 }
 
+func TestRenderNoManagedSchemaChangesChecksRefreshed(t *testing.T) {
+	t.Run("plain refresh names the way to plan an already merged root", func(t *testing.T) {
+		rendered := RenderNoManagedSchemaChangesChecksRefreshed(NoManagedSchemaChangesChecksRefreshedData{
+			RequestedBy: "alice",
+			Timestamp:   "2026-06-14 12:34:56",
+			HeadSHA:     "abc123",
+		})
+
+		assert.Contains(t, rendered, "## ✅ No Managed Schema Changes")
+		assert.Contains(t, rendered, "refreshed as passing on `abc123`")
+		assert.Contains(t, rendered, "schema root that is already merged, such as the first apply to a new database")
+		assert.Contains(t, rendered, "`schemabot plan -d <database>`, then `schemabot apply -e <environment> -d <database>`")
+	})
+
+	t.Run("refresh gated on tenants does not offer the named-database plan", func(t *testing.T) {
+		rendered := RenderNoManagedSchemaChangesChecksRefreshed(NoManagedSchemaChangesChecksRefreshedData{
+			RequestedBy:    "alice",
+			Timestamp:      "2026-06-14 12:34:56",
+			HeadSHA:        "abc123",
+			GatedOnTenants: true,
+		})
+
+		assert.Contains(t, rendered, "will pass once every tenant deployment's own check succeeds")
+		assert.NotContains(t, rendered, "schemabot plan -d")
+	})
+}
+
 func TestRenderNoManagedSchemaChanges(t *testing.T) {
 	rendered := RenderNoManagedSchemaChanges(SchemaErrorData{
 		RequestedBy: "alice",

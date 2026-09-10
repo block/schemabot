@@ -66,6 +66,7 @@ func RenderNoManagedSchemaChangesChecksRefreshed(data NoManagedSchemaChangesChec
 		return sb.String()
 	}
 	fmt.Fprintf(&sb, "\nThis PR does not contain schema changes managed by SchemaBot. The SchemaBot checks were refreshed as passing on `%s`.\n", data.HeadSHA)
+	sb.WriteString("\nIf this PR is meant to apply a schema root that is already merged, such as the first apply to a new database, name the database so SchemaBot plans that whole root against the live schema: `schemabot plan -d <database>`, then `schemabot apply -e <environment> -d <database>`.\n")
 	return sb.String()
 }
 

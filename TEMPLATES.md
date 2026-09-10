@@ -595,6 +595,8 @@ This PR does not contain schema changes managed by SchemaBot. SchemaBot did not 
 
 This PR does not contain schema changes managed by SchemaBot. The SchemaBot checks were refreshed as passing on `abcdef1234567890abcdef1234567890abcdef12`.
 
+If this PR is meant to apply a schema root that is already merged, such as the first apply to a new database, name the database so SchemaBot plans that whole root against the live schema: `schemabot plan -d <database>`, then `schemabot apply -e <environment> -d <database>`.
+
 </details>
 
 <details>

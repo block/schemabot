@@ -258,6 +258,19 @@ schemabot plan                  # Plan for all configured environments
 schemabot plan -d mydb          # Plan for a specific database (multi-db repos)
 ```
 
+### First apply for a schema root that is already merged
+
+SchemaBot plans a database when the PR changes a file under its schema root. A PR that changes nothing there gets a passing `No managed schema changes` check, even when the database itself is still empty. That is the usual shape of a new database: the declarative schema files merge first, and the database is configured on the SchemaBot server afterwards, so no PR diff is left to trigger the plan.
+
+Name the database instead. A command that names its database plans the whole schema root at the PR head against the live schema, whether or not the PR touches the root:
+
+```
+schemabot plan -d mydb
+schemabot apply -e staging -d mydb
+```
+
+The `No managed schema changes` comment points at this when it fires.
+
 ## Environment Variables Reference
 
 | Variable | Required | Default | Description |
