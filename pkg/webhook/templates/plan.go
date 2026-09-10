@@ -294,7 +294,7 @@ func RenderPlanComment(data PlanCommentData) string {
 	// genuinely unchanged one.
 	if totalChanges == 0 {
 		writeNoChangesDetected(&sb, data)
-		if len(data.IgnoredNamespaces) > 0 || len(data.ExemptTables) > 0 {
+		if len(data.IgnoredNamespaces) > 0 || hasExemptTables(data.ExemptTables) {
 			sb.WriteString("\n")
 			writeIgnoredNamespaces(&sb, data.IgnoredNamespaces)
 			writeExemptTables(&sb, data.ExemptTables)
@@ -631,6 +631,18 @@ func writeExemptTables(sb *strings.Builder, groups []ExemptTablesData) {
 	}
 }
 
+// hasExemptTables reports whether writeExemptTables would render anything for
+// these groups. It counts tables rather than groups, so a namespace entry
+// that carries no tables does not earn the disclosure its spacing.
+func hasExemptTables(groups []ExemptTablesData) bool {
+	for _, group := range groups {
+		if len(group.Tables) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func exemptReason(reason string) string {
 	return escapeInlineMarkdown(SanitizeInlineError(reason))
 }
@@ -672,7 +684,7 @@ func writeMultiEnvExemptTables(sb *strings.Builder, data MultiEnvPlanCommentData
 // renders at all.
 func multiEnvHasExemptTables(data MultiEnvPlanCommentData) bool {
 	for _, env := range data.Environments {
-		if len(planExemptTables(data, env)) > 0 {
+		if hasExemptTables(planExemptTables(data, env)) {
 			return true
 		}
 	}

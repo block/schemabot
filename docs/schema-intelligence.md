@@ -775,8 +775,29 @@ A stored plan records what the planner proposed, not what it declined to
 propose. When the planner exempts live tables from the undeclared-table
 verdict, that disclosure (`exempt_tables`, grouped by namespace with the table
 names and exemption reason) is carried on the response to the plan request
-itself and rendered in the PR comment; it is not retained on the stored plan,
-so `GET /api/plans/{plan_id}` and `list-plans` omit it.
+itself and rendered in the PR comment and in `schemabot plan` and
+`schemabot apply` output; it is not retained on the stored plan, so
+`GET /api/plans/{plan_id}` and `list-plans` omit it. Only PostgreSQL targets
+populate it today: the MySQL-family engines exempt archive tables from their
+live-schema view without reporting which ones. A plan with nothing exempted
+omits the field.
+
+Response excerpt from the plan request (illustrative values):
+
+```json
+{
+  "plan_id": "plan_01j9x4k8m2",
+  "engine": "postgres",
+  "changes": [],
+  "exempt_tables": [
+    {
+      "namespace": "app",
+      "tables": ["events_archive_2025_01", "orders_archive_2024"],
+      "reason": "archive naming"
+    }
+  ]
+}
+```
 
 The list defaults to 20 plans and caps at 200. Check `has_more`; there is no
 pagination cursor. Filters narrow the recent results but do not provide an
