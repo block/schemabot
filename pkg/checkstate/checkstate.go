@@ -229,15 +229,21 @@ func Diagnose(check *storage.Check, headSHA string, apply *storage.Apply) Dispos
 	if IsAggregate(check) {
 		return aggregateDisposition(check, coversHead)
 	}
-	if check.ApplyID != 0 && apply == nil {
-		return Disposition{
-			Reason:   ReasonApplyOwnerUnknown,
-			Summary:  "An apply owns this check, but that apply could not be read from storage.",
-			Remedy:   "Find the apply for this database and environment with `sq schemabot status`. Until it is known, treat this row as blocking.",
-			Blocking: true,
-		}
-	}
 	if check.Status != StatusCompleted {
+		// An unreadable owner only changes the reading of a row still in
+		// flight, which is the one reading that turns on what the apply is
+		// doing. A settled row already carries its outcome, and a terminal
+		// write can leave ownership behind deliberately, so consulting the
+		// apply there would turn a pruned apply into a blocking answer for a
+		// row that has nothing left to wait for.
+		if check.ApplyID != 0 && apply == nil {
+			return Disposition{
+				Reason:   ReasonApplyOwnerUnknown,
+				Summary:  "An apply owns this check, but that apply could not be read from storage.",
+				Remedy:   "Find the apply for this database and environment with `sq schemabot status`. Until it is known, treat this row as blocking.",
+				Blocking: true,
+			}
+		}
 		return runningDisposition(check, apply, coversHead)
 	}
 	if !terminalOutcomeIsSuccess(check) {
@@ -323,12 +329,16 @@ func aggregateDisposition(check *storage.Check, coversHead bool) Disposition {
 			SelfConverging: true,
 		}
 	}
+	// The rollup clears when the rows below it clear, and it carries nothing
+	// that says whether they will. Some of them do not: a completed rollback
+	// leaves a row only a reconcile clears, and the rollup over it looks the
+	// same from here as one over a running apply. Claiming self-convergence
+	// would tell an operator to wait on a gate no waiting opens.
 	return Disposition{
-		Reason:         ReasonAggregateRollup,
-		Summary:        "The rollup is holding the merge gate open.",
-		Remedy:         "Read the rows below: the rollup clears when every one of them does.",
-		Blocking:       true,
-		SelfConverging: true,
+		Reason:   ReasonAggregateRollup,
+		Summary:  "The rollup is holding the merge gate open.",
+		Remedy:   "Read the rows below: the rollup clears when every one of them does, and they say whether that needs anyone.",
+		Blocking: true,
 	}
 }
 
@@ -408,16 +418,15 @@ func applyIsStopped(apply *storage.Apply) bool {
 	return apply != nil && state.IsState(apply.State, state.Apply.Stopped)
 }
 
-// terminalOutcomeIsSuccess reports whether a settled row concluded without a
-// block. An empty conclusion is not a success: a completed row that names none
-// has not recorded an outcome, and reading it as passing would invent one.
+// terminalOutcomeIsSuccess reports whether a settled row recorded a success.
 //
 // This is a narrower question than ConclusionClearsGate, and the two must not
 // be collapsed. That one asks what GitHub's branch protection accepts from a
-// Check Run, where neutral and skipped pass. This one asks what SchemaBot's own
-// aggregate accepts from a stored row, where only success does: a stored row
-// concluding neutral is a cancelled apply, and reading it as passing would
-// report a row the aggregate holds as blocking as one that clears on its own.
+// Check Run, where neutral and skipped pass. This one asks what a stored row
+// recorded, and success is the only conclusion a writer stores to mean the
+// database's own result was clean. Every other value is either a recorded
+// block or a value no writer produces, and a reading invented for a shape
+// SchemaBot does not write is one nothing would ever correct.
 func terminalOutcomeIsSuccess(check *storage.Check) bool {
 	return check.Conclusion == ConclusionSuccess
 }

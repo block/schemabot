@@ -97,11 +97,10 @@ func TestDiagnose(t *testing.T) {
 			selfConverging: true,
 		},
 		{
-			name:           "aggregate holding the gate open",
-			check:          &storage.Check{HeadSHA: headSHA, DatabaseType: AggregateSentinel, DatabaseName: AggregateSentinel, Status: StatusInProgress},
-			reason:         ReasonAggregateRollup,
-			blocking:       true,
-			selfConverging: true,
+			name:     "aggregate holding the gate open",
+			check:    &storage.Check{HeadSHA: headSHA, DatabaseType: AggregateSentinel, DatabaseName: AggregateSentinel, Status: StatusInProgress},
+			reason:   ReasonAggregateRollup,
+			blocking: true,
 		},
 		{
 			name:           "aggregate passing on the gating commit",
@@ -142,10 +141,11 @@ func TestDiagnoseTreatsAMissingConclusionAsABlock(t *testing.T) {
 }
 
 // Branch protection accepts neutral and skipped from a Check Run, but a stored
-// row concluding either of those is not a passing result: SchemaBot's aggregate
-// clears on success alone, and it writes neutral for a cancelled apply. Reading
-// them as passing would report rows the aggregate holds as blocking as ones
-// that clear on their own.
+// row concluding either of those is not a passing result. Success is the only
+// conclusion a writer stores to mean a database's own result was clean, so a
+// row carrying another value recorded something else or was written by nothing
+// SchemaBot has — and a reading invented for a shape it does not write is one
+// nothing would ever correct.
 func TestDiagnoseClearsOnlyOnSuccess(t *testing.T) {
 	t.Parallel()
 
@@ -235,6 +235,43 @@ func TestDiagnoseReadsAnUnreadableOwnerAsUnknown(t *testing.T) {
 	check := &storage.Check{HeadSHA: headSHA, ApplyID: 42, Status: StatusInProgress}
 	got := Diagnose(check, headSHA, nil)
 	assert.Equal(t, ReasonApplyOwnerUnknown, got.Reason)
+	assert.True(t, got.Blocking)
+	assert.False(t, got.SelfConverging)
+}
+
+// A settled row keeps its own reading when the apply it names has been pruned.
+// A terminal write leaves ownership behind deliberately, so consulting the
+// apply on a row that already recorded its outcome would turn an absent apply
+// into a block on a row with nothing left to wait for.
+func TestDiagnoseReadsASettledRowWithoutItsApply(t *testing.T) {
+	t.Parallel()
+
+	resolved := Diagnose(&storage.Check{
+		HeadSHA: headSHA, ApplyID: 42, Status: StatusCompleted, Conclusion: ConclusionSuccess,
+	}, headSHA, nil)
+	assert.Equal(t, ReasonResolved, resolved.Reason)
+	assert.False(t, resolved.Blocking)
+
+	owed := Diagnose(&storage.Check{
+		HeadSHA: headSHA, ApplyID: 42, Status: StatusCompleted, Conclusion: ConclusionActionRequired,
+	}, headSHA, nil)
+	assert.Equal(t, ReasonReconciliationOwed, owed.Reason,
+		"a terminal block stays a reconciliation, not an unknown owner")
+	assert.True(t, owed.Blocking)
+}
+
+// The rollup carries nothing that says whether the rows under it clear on their
+// own. Some do not — a completed rollback leaves a row only a reconcile clears
+// — and from the rollup that is indistinguishable from a running apply, so it
+// never promises SchemaBot will get there alone.
+func TestDiagnoseDoesNotPromiseTheRollupConvergesAlone(t *testing.T) {
+	t.Parallel()
+
+	got := Diagnose(&storage.Check{
+		HeadSHA: headSHA, DatabaseType: AggregateSentinel, DatabaseName: AggregateSentinel,
+		Status: StatusInProgress,
+	}, headSHA, nil)
+	require.Equal(t, ReasonAggregateRollup, got.Reason)
 	assert.True(t, got.Blocking)
 	assert.False(t, got.SelfConverging)
 }
