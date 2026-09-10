@@ -1415,7 +1415,7 @@ func writePrimaryKeyGuidance(sb *strings.Builder, data PlanCommentData) {
 	if !data.IsMySQL || !data.HasPrimaryKeyFindings {
 		return
 	}
-	fmt.Fprintf(sb, "[Choosing a MySQL primary key](%s) — storage, insert order, and online copy tradeoffs.\n\n", primaryKeyDocURL)
+	fmt.Fprintf(sb, "📖 **Related guidance:** [Primary key tradeoffs](%s)\n\n", primaryKeyDocURL)
 }
 
 // lintWarningsFoldThreshold is the warning count above which the lint section

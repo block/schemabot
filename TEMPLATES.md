@@ -169,7 +169,7 @@ ALTER TABLE `order_events` DROP INDEX `idx_events_archived`;
 
 </details>
 
-[Choosing a MySQL primary key](https://github.com/block/schemabot/blob/main/docs/spirit.md#choosing-a-primary-key) — storage, insert order, and online copy tradeoffs.
+📖 **Related guidance:** [Primary key tradeoffs](https://github.com/block/schemabot/blob/main/docs/spirit.md#choosing-a-primary-key)
 
 📋 **Plan**: **2** tables to alter
 
@@ -200,7 +200,7 @@ ALTER TABLE `customers` ADD INDEX `idx_created_at`(`created_at`);
 💡 **Lint Warnings**: 1 advisory finding
 - `customers`: Primary key column `id` has type `varchar`
 
-[Choosing a MySQL primary key](https://github.com/block/schemabot/blob/main/docs/spirit.md#choosing-a-primary-key) — storage, insert order, and online copy tradeoffs.
+📖 **Related guidance:** [Primary key tradeoffs](https://github.com/block/schemabot/blob/main/docs/spirit.md#choosing-a-primary-key)
 
 📋 **Plan**: **1** table to alter
 
@@ -237,7 +237,7 @@ CREATE TABLE `customers` (
 ⚠️ **Issues**: 1 unsafe change detected
 1. `customers`: Primary key column `id` has type `varchar`
 
-[Choosing a MySQL primary key](https://github.com/block/schemabot/blob/main/docs/spirit.md#choosing-a-primary-key) — storage, insert order, and online copy tradeoffs.
+📖 **Related guidance:** [Primary key tradeoffs](https://github.com/block/schemabot/blob/main/docs/spirit.md#choosing-a-primary-key)
 
 📋 **Plan**: **1** table to create
 
