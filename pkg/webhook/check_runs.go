@@ -160,11 +160,13 @@ var noAllowedConfiguredEnvironmentsBlock = checkBlockReason{
 	message:        "SchemaBot found schema changes, but no configured environment for this database is allowed for this SchemaBot deployment. Align server environment configuration with allowed_environments, then retry the check.",
 }
 
-// allCheckBlockReasons is every durable block SchemaBot writes. A reader has
-// to know what each one means for the operator, and the reason column is a
-// plain string, so the set is enumerated here rather than left to be
-// rediscovered: the completeness test walks it and fails when a block ships
-// without a classification in `pkg/checkstate`.
+// allCheckBlockReasons is every blocking reason a check row can carry: the
+// durable ones SchemaBot writes to storage, plus the marker a synthesized
+// participant row carries in memory. A reader reaches both and has to know
+// what each one means for the operator, and the reason column is a plain
+// string, so the set is enumerated here rather than left to be rediscovered:
+// the completeness test walks it and fails when a reason ships without a
+// classification in `pkg/checkstate`.
 var allCheckBlockReasons = []checkBlockReason{
 	schemaRemovedAfterApplyBlock,
 	rollbackCompletedBlock,

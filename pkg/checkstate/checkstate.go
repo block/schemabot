@@ -398,6 +398,13 @@ func applyIsStopped(apply *storage.Apply) bool {
 // terminalOutcomeIsSuccess reports whether a settled row concluded without a
 // block. An empty conclusion is not a success: a completed row that names none
 // has not recorded an outcome, and reading it as passing would invent one.
+//
+// This is a narrower question than ConclusionClearsGate, and the two must not
+// be collapsed. That one asks what GitHub's branch protection accepts from a
+// Check Run, where neutral and skipped pass. This one asks what SchemaBot's own
+// aggregate accepts from a stored row, where only success does: a stored row
+// concluding neutral is a cancelled apply, and reading it as passing would
+// report a row the aggregate holds as blocking as one that clears on its own.
 func terminalOutcomeIsSuccess(check *storage.Check) bool {
 	return check.Conclusion == ConclusionSuccess
 }

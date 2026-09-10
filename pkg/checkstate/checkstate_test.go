@@ -141,6 +141,26 @@ func TestDiagnoseTreatsAMissingConclusionAsABlock(t *testing.T) {
 	assert.True(t, got.Blocking)
 }
 
+// Branch protection accepts neutral and skipped from a Check Run, but a stored
+// row concluding either of those is not a passing result: SchemaBot's aggregate
+// clears on success alone, and it writes neutral for a cancelled apply. Reading
+// them as passing would report rows the aggregate holds as blocking as ones
+// that clear on their own.
+func TestDiagnoseClearsOnlyOnSuccess(t *testing.T) {
+	t.Parallel()
+
+	for _, conclusion := range []string{ConclusionNeutral, ConclusionSkipped} {
+		t.Run(conclusion, func(t *testing.T) {
+			t.Parallel()
+
+			require.True(t, ConclusionClearsGate(conclusion), "precondition: GitHub accepts %q", conclusion)
+			got := Diagnose(&storage.Check{HeadSHA: headSHA, Status: StatusCompleted, Conclusion: conclusion}, headSHA, nil)
+			assert.Equal(t, ReasonBlocked, got.Reason)
+			assert.True(t, got.Blocking)
+		})
+	}
+}
+
 // An unknown head is not evidence that a row is stale, so it must not turn a
 // resolved row into a blocking one.
 func TestDiagnoseWithoutAHeadReadsRowsAsCurrent(t *testing.T) {
