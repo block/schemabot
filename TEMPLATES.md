@@ -591,11 +591,16 @@ This PR does not contain schema changes managed by SchemaBot. SchemaBot did not 
 
 ## ✅ No Managed Schema Changes
 
-*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
+This PR does not contain schema changes managed by SchemaBot. The SchemaBot checks were refreshed as passing on [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12).
 
-This PR does not contain schema changes managed by SchemaBot. The SchemaBot checks were refreshed as passing on `abcdef1234567890abcdef1234567890abcdef12`.
+If this PR is meant to apply a schema root that is already merged, such as the first apply to a new database, name the database so SchemaBot plans that whole root against the live schema:
 
-If this PR is meant to apply a schema root that is already merged, such as the first apply to a new database, name the database so SchemaBot plans that whole root against the live schema: `schemabot plan -d <database>`, then `schemabot apply -e <environment> -d <database>`.
+```
+schemabot plan -d <database>
+schemabot apply -e <environment> -d <database>
+```
+
+_Requested by @jackjackbits_
 
 </details>
 
@@ -605,9 +610,9 @@ If this PR is meant to apply a schema root that is already merged, such as the f
 
 ## ✅ No Managed Schema Changes
 
-*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
+This PR does not contain schema changes managed by this SchemaBot deployment, but it touches schema paths owned by tenant deployments. The SchemaBot check was refreshed on [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12) and will pass once every tenant deployment's own check succeeds.
 
-This PR does not contain schema changes managed by this SchemaBot deployment, but it touches schema paths owned by tenant deployments. The SchemaBot check was refreshed on `abcdef1234567890abcdef1234567890abcdef12` and will pass once every tenant deployment's own check succeeds.
+_Requested by @jackjackbits_
 
 </details>
 

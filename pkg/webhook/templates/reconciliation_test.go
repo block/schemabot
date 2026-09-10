@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -64,26 +65,28 @@ func TestRenderNoManagedSchemaChangesChecksRefreshed(t *testing.T) {
 	t.Run("plain refresh names the way to plan an already merged root", func(t *testing.T) {
 		rendered := RenderNoManagedSchemaChangesChecksRefreshed(NoManagedSchemaChangesChecksRefreshedData{
 			RequestedBy: "alice",
-			Timestamp:   "2026-06-14 12:34:56",
-			HeadSHA:     "abc123",
+			Repository:  "acme/payments",
+			HeadSHA:     "abcdef1234567890abcdef1234567890abcdef12",
 		})
 
 		assert.Contains(t, rendered, "## ✅ No Managed Schema Changes")
-		assert.Contains(t, rendered, "refreshed as passing on `abc123`")
+		assert.Contains(t, rendered, "refreshed as passing on [`abcdef1`](https://github.com/acme/payments/commit/abcdef1234567890abcdef1234567890abcdef12).")
 		assert.Contains(t, rendered, "schema root that is already merged, such as the first apply to a new database")
-		assert.Contains(t, rendered, "`schemabot plan -d <database>`, then `schemabot apply -e <environment> -d <database>`")
+		assert.Contains(t, rendered, "```\nschemabot plan -d <database>\nschemabot apply -e <environment> -d <database>\n```")
+		assert.True(t, strings.HasSuffix(rendered, "\n_Requested by @alice_\n"), "attribution closes the comment: %q", rendered)
+		assert.NotContains(t, rendered, "UTC")
 	})
 
 	t.Run("refresh gated on tenants does not offer the named-database plan", func(t *testing.T) {
 		rendered := RenderNoManagedSchemaChangesChecksRefreshed(NoManagedSchemaChangesChecksRefreshedData{
 			RequestedBy:    "alice",
-			Timestamp:      "2026-06-14 12:34:56",
 			HeadSHA:        "abc123",
 			GatedOnTenants: true,
 		})
 
-		assert.Contains(t, rendered, "will pass once every tenant deployment's own check succeeds")
+		assert.Contains(t, rendered, "refreshed on `abc123` and will pass once every tenant deployment's own check succeeds")
 		assert.NotContains(t, rendered, "schemabot plan -d")
+		assert.Contains(t, rendered, "\n_Requested by @alice_\n")
 	})
 }
 

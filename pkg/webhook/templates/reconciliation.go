@@ -46,8 +46,10 @@ func RenderNoManagedSchemaChanges(data SchemaErrorData) string {
 // SchemaBot check state instead of running a plan.
 type NoManagedSchemaChangesChecksRefreshedData struct {
 	RequestedBy string
-	Timestamp   string
-	HeadSHA     string
+	// Repository is the owner/name the head SHA links to; when empty the SHA
+	// renders as plain text.
+	Repository string
+	HeadSHA    string
 	// GatedOnTenants marks the aggregate-leader case: the refreshed check
 	// gates on tenant deployments' own checks for the touched schema paths
 	// instead of passing unconditionally.
@@ -60,13 +62,17 @@ type NoManagedSchemaChangesChecksRefreshedData struct {
 func RenderNoManagedSchemaChangesChecksRefreshed(data NoManagedSchemaChangesChecksRefreshedData) string {
 	var sb strings.Builder
 	sb.WriteString("## ✅ No Managed Schema Changes\n\n")
-	writeRequestedLine(&sb, data.RequestedBy, data.Timestamp)
+	head := formatCommitRef(data.Repository, data.HeadSHA)
 	if data.GatedOnTenants {
-		fmt.Fprintf(&sb, "\nThis PR does not contain schema changes managed by this SchemaBot deployment, but it touches schema paths owned by tenant deployments. The SchemaBot check was refreshed on `%s` and will pass once every tenant deployment's own check succeeds.\n", data.HeadSHA)
-		return sb.String()
+		fmt.Fprintf(&sb, "This PR does not contain schema changes managed by this SchemaBot deployment, but it touches schema paths owned by tenant deployments. The SchemaBot check was refreshed on %s and will pass once every tenant deployment's own check succeeds.\n", head)
+	} else {
+		fmt.Fprintf(&sb, "This PR does not contain schema changes managed by SchemaBot. The SchemaBot checks were refreshed as passing on %s.\n", head)
+		sb.WriteString("\nIf this PR is meant to apply a schema root that is already merged, such as the first apply to a new database, name the database so SchemaBot plans that whole root against the live schema:\n\n")
+		sb.WriteString("```\nschemabot plan -d <database>\nschemabot apply -e <environment> -d <database>\n```\n")
 	}
-	fmt.Fprintf(&sb, "\nThis PR does not contain schema changes managed by SchemaBot. The SchemaBot checks were refreshed as passing on `%s`.\n", data.HeadSHA)
-	sb.WriteString("\nIf this PR is meant to apply a schema root that is already merged, such as the first apply to a new database, name the database so SchemaBot plans that whole root against the live schema: `schemabot plan -d <database>`, then `schemabot apply -e <environment> -d <database>`.\n")
+	if data.RequestedBy != "" {
+		fmt.Fprintf(&sb, "\n_Requested by @%s_\n", data.RequestedBy)
+	}
 	return sb.String()
 }
 
