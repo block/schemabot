@@ -601,40 +601,54 @@ schemabot apply -e staging --tenant alpha
 </details>
 
 <details>
-<summary><a name="no-managed-schema-changes"></a><strong>No Managed Schema Changes</strong></summary>
+<summary><a name="no-schema-files-changed"></a><strong>No Schema Files Changed</strong></summary>
 
 
-## ✅ No Managed Schema Changes
+## ℹ️ No Schema Files Changed
 
 **Environment**: `staging`
 
 *Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
-This PR does not contain schema changes managed by SchemaBot. SchemaBot did not find any apply-owned state that requires live database reconciliation.
+SchemaBot found no changes to managed schema files in this PR and no apply-owned state that requires live database reconciliation.
 
 </details>
 
 <details>
-<summary><a name="no-managed-schema-changes-checks-refreshed"></a><strong>No Managed Schema Changes (Checks Refreshed)</strong></summary>
+<summary><a name="no-schema-files-changed-checks-refreshed"></a><strong>No Schema Files Changed (Checks Refreshed)</strong></summary>
 
 
-## ✅ No Managed Schema Changes
+## ℹ️ No Schema Files Changed
 
-*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
+SchemaBot found no changes to managed schema files in this PR. The SchemaBot checks were refreshed as passing on [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12).
 
-This PR does not contain schema changes managed by SchemaBot. The SchemaBot checks were refreshed as passing on `abcdef1234567890abcdef1234567890abcdef12`.
+<details>
+<summary>Expected a plan?</summary>
+
+A PR plan covers the databases whose schema directories the PR changes. This PR changes none, so no database was compared against its schema directory.
+
+Two cases still need a plan even though the files are already correct:
+
+- **A new database.** Its schema directory merged before the database was configured, so no PR ever applied the files and the live database is empty.
+- **An existing database with drift.** The live schema does not match the schema files. The files did not change, so nothing triggers a plan.
+
+In either case, give the PR a change in that database's schema directory: add or toggle a `# nonce` comment line in its `schemabot.yaml` and push. SchemaBot then plans the whole directory against the live schema, and the plan comment carries the apply command.
+
+</details>
+
+_Requested by @jackjackbits_
 
 </details>
 
 <details>
-<summary><a name="no-managed-schema-changes-gated-on-tenants"></a><strong>No Managed Schema Changes (Gated On Tenants)</strong></summary>
+<summary><a name="no-schema-files-changed-gated-on-tenants"></a><strong>No Schema Files Changed (Gated On Tenants)</strong></summary>
 
 
-## ✅ No Managed Schema Changes
+## ℹ️ No Schema Files Changed
 
-*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
+SchemaBot found no changes to schema files managed by this deployment in this PR, but the PR touches schema paths owned by tenant deployments. The SchemaBot check was refreshed on [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12) and will pass once every tenant deployment's own check succeeds.
 
-This PR does not contain schema changes managed by this SchemaBot deployment, but it touches schema paths owned by tenant deployments. The SchemaBot check was refreshed on `abcdef1234567890abcdef1234567890abcdef12` and will pass once every tenant deployment's own check succeeds.
+_Requested by @jackjackbits_
 
 </details>
 

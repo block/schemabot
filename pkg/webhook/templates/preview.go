@@ -545,7 +545,7 @@ func PreviewCommentNoManagedSchemaChanges() string {
 func PreviewCommentNoManagedSchemaChangesChecksRefreshed() string {
 	return RenderNoManagedSchemaChangesChecksRefreshed(NoManagedSchemaChangesChecksRefreshedData{
 		RequestedBy: previewRequestedBy,
-		Timestamp:   "2026-03-15 14:30:00",
+		Repository:  previewRepository,
 		HeadSHA:     previewHeadSHA,
 	})
 }
@@ -556,7 +556,7 @@ func PreviewCommentNoManagedSchemaChangesChecksRefreshed() string {
 func PreviewCommentNoManagedSchemaChangesChecksRefreshedGatedOnTenants() string {
 	return RenderNoManagedSchemaChangesChecksRefreshed(NoManagedSchemaChangesChecksRefreshedData{
 		RequestedBy:    previewRequestedBy,
-		Timestamp:      "2026-03-15 14:30:00",
+		Repository:     previewRepository,
 		HeadSHA:        previewHeadSHA,
 		GatedOnTenants: true,
 	})

@@ -150,7 +150,7 @@ name that can be required in branch protection.
 When the aggregate check is required by branch protection, SchemaBot must create
 a check run with that exact name on every PR head commit. That includes PRs that
 do not touch managed schema files. For those PRs, SchemaBot publishes a passing
-`No managed schema changes` aggregate so GitHub can satisfy the required check
+`No schema files changed` aggregate so GitHub can satisfy the required check
 and allow the PR to merge. Skipping check creation would leave the required
 check missing, which GitHub treats as not passing.
 
@@ -248,7 +248,7 @@ SchemaBot (staging) — 1 apply pending
 ```
 
 If the PR does not add or edit `schemabot.yaml` and does not touch managed SQL
-or `vschema.json` files, SchemaBot publishes `No managed schema changes` instead
+or `vschema.json` files, SchemaBot publishes `No schema files changed` instead
 because the PR does not affect a managed schema directory.
 
 ## Internal Records
