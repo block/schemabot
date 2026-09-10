@@ -65,12 +65,8 @@ func (s *Service) handleChecksInspect(w http.ResponseWriter, r *http.Request) {
 // a question about a pull request the caller did not ask about.
 func checksInspectRequestFromQuery(query url.Values) (ChecksInspectRequest, error) {
 	req := ChecksInspectRequest{
-		Repo: strings.TrimSpace(query.Get("repo")),
-		// Folded, because the environment is matched against the configured
-		// names by exact comparison and every sibling read endpoint folds the
-		// same parameter. Left as typed, "Production" would be refused here
-		// while being accepted everywhere else an operator passes it.
-		Environment: storage.CanonicalKey(strings.TrimSpace(query.Get("environment"))),
+		Repo:        strings.TrimSpace(query.Get("repo")),
+		Environment: canonicalEnvironment(query.Get("environment")),
 	}
 	reference := strings.TrimSpace(query.Get("pull_request"))
 	if reference == "" {

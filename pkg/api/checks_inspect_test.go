@@ -518,19 +518,3 @@ func TestChecksInspectRequestFromQueryFoldsRepositoryCase(t *testing.T) {
 // so it is folded on the way in like every sibling read endpoint folds it.
 // Unfolded, an operator passing the spelling their other commands accept would
 // be told this instance does not handle it.
-func TestChecksInspectAcceptsAnEnvironmentHoweverItIsSpelled(t *testing.T) {
-	t.Parallel()
-
-	req, err := checksInspectRequestFromQuery(url.Values{
-		"repo":         {"acme/store"},
-		"pull_request": {"412"},
-		"environment":  {"Production"},
-	})
-	require.NoError(t, err)
-	assert.Equal(t, "production", req.Environment)
-
-	store := &inspectStorage{checks: &inspectCheckStore{}, applies: &inspectApplyStore{}}
-	_, err = executeChecksInspect(t.Context(), inspectTestConfig(), store, req, discardLogger())
-	require.Error(t, err, "the request gets as far as needing a GitHub client")
-	assert.NotContains(t, err.Error(), "is not one this instance handles")
-}

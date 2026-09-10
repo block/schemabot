@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/url"
 	"testing"
 	"time"
 
@@ -445,6 +446,21 @@ func TestRepoTakingEndpointsRefuseAMalformedRepository(t *testing.T) {
 			_, err := executeChecksSynthesize(ctx, cfg, &fakeCheckRunBackfiller{}, ChecksSynthesizeRequest{Repo: repo, PRs: []int{1}}, discardLogger())
 			return err
 		}},
+		// The redrive crawl takes the repository as an optional filter rather
+		// than as its subject, so a malformed one matches no delivery instead
+		// of failing anything: the crawl walks the whole window and answers
+		// 200 with nothing selected, which reads exactly like a window that
+		// really is empty.
+		{"redrive", func(ctx context.Context, repo string) error {
+			redriveCfg := &ServerConfig{GitHub: GitHubConfig{AppID: "1", PrivateKey: "key"}}
+			_, err := executeWebhookRedrive(ctx, redriveCfg, WebhookRedriveRequest{
+				Repo:        repo,
+				MaxPages:    1,
+				WindowStart: "2026-01-01T00:00:00Z",
+				WindowEnd:   "2026-01-02T00:00:00Z",
+			}, discardLogger())
+			return err
+		}},
 	}
 
 	for _, endpoint := range endpoints {
@@ -471,6 +487,48 @@ func TestExecuteChecksScanRejectsDisallowedEnvironment(t *testing.T) {
 	_, err := executeChecksScan(t.Context(), cfg, ChecksScanRequest{Repo: "octo/repo", Environment: "prod"}, discardLogger())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `environment "prod" is not one this instance handles`)
+}
+
+// An operator investigating one pull request reaches for the inspection and the
+// backfill scan in the same sitting, and types the environment the same way
+// into both. Configured names are lowercase, so the two commands agree on what
+// "Production" means rather than one answering and the other refusing.
+func TestChecksEndpointsAcceptAnEnvironmentHoweverItIsSpelled(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{AllowedEnvironments: []string{"staging", "production"}}
+	endpoints := []struct {
+		name string
+		call func(ctx context.Context, environment string) error
+	}{
+		{"scan", func(ctx context.Context, environment string) error {
+			_, err := executeChecksScan(ctx, cfg, ChecksScanRequest{Repo: "octo/repo", Environment: environment}, discardLogger())
+			return err
+		}},
+		{"inspect", func(ctx context.Context, environment string) error {
+			req, err := checksInspectRequestFromQuery(url.Values{
+				"repo":         {"octo/repo"},
+				"pull_request": {"412"},
+				"environment":  {environment},
+			})
+			require.NoError(t, err)
+			store := &inspectStorage{checks: &inspectCheckStore{}, applies: &inspectApplyStore{}}
+			_, err = executeChecksInspect(ctx, cfg, store, req, discardLogger())
+			return err
+		}},
+	}
+
+	for _, endpoint := range endpoints {
+		t.Run(endpoint.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Both get as far as needing a GitHub client they do not have, so
+			// what is being pinned is the refusal that does not happen.
+			err := endpoint.call(t.Context(), " Production ")
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), "is not one this instance handles")
+		})
+	}
 }
 
 // Redelivery by explicit delivery IDs is a precise continuation of a prior

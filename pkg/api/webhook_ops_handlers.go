@@ -19,6 +19,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/caller"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 const (
@@ -58,7 +59,8 @@ func webhookOpsRequestErrorf(format string, args ...any) error {
 // caller's mistake, and letting the installation lookup fail on it reports a
 // server error for a request that was never answerable. Every endpoint taking a
 // repository asks through here, so the same typo reads the same way on all of
-// them.
+// them; the endpoints where a repository is an optional filter rather than the
+// subject decide for themselves whether it was given, and ask only then.
 func requireRepoFullName(repo string) error {
 	if repo == "" {
 		return webhookOpsRequestErrorf("repo is required")
@@ -67,6 +69,17 @@ func requireRepoFullName(repo string) error {
 		return webhookOpsRequestErrorf("repo %q is not an owner/name pair", repo)
 	}
 	return nil
+}
+
+// canonicalEnvironment folds an environment the way everything it will be
+// compared against is already folded: configured names are validated lowercase,
+// stored check rows canonicalize theirs on write and on lookup, and the Check
+// Run name is interpolated from that same folded value. An operator who types
+// "Production" is naming the environment the instance handles, not a different
+// one. Every operator endpoint taking an environment folds through here, so one
+// spelling cannot be answered on one command and refused on another.
+func canonicalEnvironment(environment string) string {
+	return storage.CanonicalKey(strings.TrimSpace(environment))
 }
 
 // extendWebhookOpsDeadline lifts the server-wide write timeout for a webhook
@@ -274,6 +287,16 @@ func executeWebhookRedrive(ctx context.Context, cfg *ServerConfig, req WebhookRe
 	if req.MaxPages <= 0 {
 		return nil, webhookOpsRequestErrorf("max_pages must be positive")
 	}
+	// The repository is an optional filter here rather than the subject of the
+	// request, but a malformed one is still the caller's mistake and a costly
+	// one: it matches no delivery, so the crawl walks the whole window a page
+	// at a time, fetching every candidate's detail, and answers 200 with
+	// nothing selected — indistinguishable from a window that really is empty.
+	if req.Repo != "" {
+		if err := requireRepoFullName(req.Repo); err != nil {
+			return nil, err
+		}
+	}
 	windowStart, err := time.Parse(time.RFC3339, req.WindowStart)
 	if err != nil {
 		return nil, webhookOpsRequestErrorf("parse window_start %q as RFC3339: %v", req.WindowStart, err)
@@ -324,6 +347,7 @@ func executeChecksScan(ctx context.Context, cfg *ServerConfig, req ChecksScanReq
 	if req.Page < 0 {
 		return nil, webhookOpsRequestErrorf("page must be non-negative")
 	}
+	req.Environment = canonicalEnvironment(req.Environment)
 	// A stale or mistyped environment would otherwise scan for a check name
 	// that can never exist and report every PR as missing it; reject it as a
 	// request error instead.
