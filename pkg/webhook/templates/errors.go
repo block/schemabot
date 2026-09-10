@@ -34,6 +34,16 @@ type SchemaErrorData struct {
 	CommandName        string // "plan" or "apply"
 	ErrorDetail        string
 	AvailableDatabases string
+	// SearchedDirs lists the schema directories a database-scoped search was
+	// limited to when GitHub truncated the repository tree. Empty when the
+	// whole repository was searched.
+	SearchedDirs []string
+}
+
+// SearchedDirsCode renders the directories a scoped search probed as code
+// spans the paths cannot break out of.
+func (d SchemaErrorData) SearchedDirsCode() []string {
+	return inlineCodeList(d.SearchedDirs)
 }
 
 // DatabaseTypeOptions lists supported setup types, with Strata behind server opt-in.
@@ -131,9 +141,45 @@ const databaseNotFoundTemplate = "## " + glyph.Attention + ` Database Not Found
 
 {{.Attribution}}
 
-No ` + "`schemabot.yaml`" + ` configuration with {{.DatabaseDeclarationCode}} was found in this repository.
+{{if .SearchedDirsCode}}No ` + "`schemabot.yaml`" + ` configuration with {{.DatabaseDeclarationCode}} was found in the schema directories configured for this database on the SchemaBot server:
 
-Check that your ` + "`schemabot.yaml`" + ` file has the correct ` + "`database`" + ` field matching the ` + "`-d`" + ` flag value.`
+{{range .SearchedDirsCode}}- {{.}}
+{{end}}
+This repository is too large for GitHub to return its full tree, so SchemaBot searched only those directories. Check that the ` + "`schemabot.yaml`" + ` for this database lives under one of them and that its ` + "`database`" + ` field matches the ` + "`-d`" + ` flag value.{{else}}No ` + "`schemabot.yaml`" + ` configuration with {{.DatabaseDeclarationCode}} was found in this repository.
+
+Check that your ` + "`schemabot.yaml`" + ` file has the correct ` + "`database`" + ` field matching the ` + "`-d`" + ` flag value.{{end}}`
+
+const databaseNotConfiguredTemplate = "## " + glyph.Attention + ` Database Not Configured
+
+**Database**: {{.DatabaseNameCode}}{{with .EnvironmentHeader}} | {{.}}{{end}}
+
+{{.Attribution}}
+
+This SchemaBot instance has no {{.DatabaseNameCode}} entry under ` + "`databases`" + ` in its server configuration, so it cannot plan or apply schema changes for it. A ` + "`schemabot.yaml`" + ` declaring {{.DatabaseDeclarationCode}} is not enough on its own: the database also has to be configured on the SchemaBot server.
+
+Check that the database name, from ` + "`-d`" + ` or from ` + "`schemabot.yaml`" + `, matches one this instance serves, or ask a SchemaBot operator to configure the database.`
+
+const databaseRepoNotAllowedTemplate = "## " + glyph.Attention + ` Database Not Available to This Repository
+
+**Database**: {{.DatabaseNameCode}}{{with .EnvironmentHeader}} | {{.}}{{end}}
+
+{{.Attribution}}
+
+The SchemaBot server configures {{.DatabaseNameCode}} to accept schema changes from other repositories only: this repository is not in the database's ` + "`allowed_repos`" + `, so no ` + "`schemabot.yaml`" + ` in it can manage the database and none was searched.
+
+Ask a SchemaBot operator to add this repository to the database's ` + "`allowed_repos`" + ` if it should manage the database, or check that the database name, from ` + "`-d`" + ` or from ` + "`schemabot.yaml`" + `, names the right database.`
+
+const repositoryTreeTruncatedTemplate = "## " + glyph.Attention + ` Repository Too Large to Search
+
+{{if .DatabaseName}}**Database**: {{.DatabaseNameCode}}{{with .EnvironmentHeader}} | {{.}}{{end}}
+
+{{else}}{{with .EnvironmentHeader}}{{.}}
+
+{{end}}{{end}}{{.Attribution}}
+
+GitHub returned a truncated repository tree, so SchemaBot could not search this repository for ` + "`schemabot.yaml`" + ` configurations. On a repository this large, SchemaBot searches only the schema directories configured on the SchemaBot server{{if .DatabaseName}}, and it has none it can search exhaustively for {{.DatabaseNameCode}}: the database is not configured on this instance, or its ` + "`allowed_dirs`" + ` leave the location of its config open{{else}} for this repository's databases, and those do not bound where every config may live{{end}}.
+
+{{if .DatabaseName}}Ask a SchemaBot operator to configure the database with an ` + "`allowed_dirs`" + ` entry naming its schema directory, or check that the database name, from ` + "`-d`" + ` or from ` + "`schemabot.yaml`" + `, matches one this instance serves.{{else}}Ask a SchemaBot operator to give each of this repository's databases an ` + "`allowed_dirs`" + ` entry naming its schema directory.{{end}}`
 
 const invalidConfigTemplate = "## " + glyph.Attention + ` No Valid SchemaBot Configuration Found
 
@@ -245,6 +291,9 @@ const genericErrorTemplate = "## " + glyph.Failed + ` {{.CommandName}} Failed
 // Compiled templates.
 var (
 	tmplDatabaseNotFound     = template.Must(template.New("databaseNotFound").Parse(databaseNotFoundTemplate))
+	tmplDatabaseNotConfig    = template.Must(template.New("databaseNotConfigured").Parse(databaseNotConfiguredTemplate))
+	tmplRepoTreeTruncated    = template.Must(template.New("repositoryTreeTruncated").Parse(repositoryTreeTruncatedTemplate))
+	tmplDatabaseRepoDenied   = template.Must(template.New("databaseRepoNotAllowed").Parse(databaseRepoNotAllowedTemplate))
 	tmplInvalidConfig        = template.Must(template.New("invalidConfig").Parse(invalidConfigTemplate))
 	tmplNoConfigNoDatabase   = template.Must(template.New("noConfigNoDatabase").Parse(noConfigNoDatabaseTemplate))
 	tmplNoConfigWithDatabase = template.Must(template.New("noConfigWithDatabase").Parse(noConfigWithDatabaseTemplate))
@@ -254,9 +303,34 @@ var (
 	tmplGenericError         = template.Must(template.New("genericError").Parse(genericErrorTemplate))
 )
 
-// RenderDatabaseNotFound renders the "database not found" error comment.
+// RenderDatabaseNotFound renders the "database not found" error comment. When
+// SearchedDirs is set, the search was limited to those directories because the
+// repository tree was truncated, and the comment says so instead of claiming
+// the whole repository was searched.
 func RenderDatabaseNotFound(data SchemaErrorData) string {
 	return offerSupportChannel(renderTemplate(tmplDatabaseNotFound, data))
+}
+
+// RenderDatabaseNotConfigured renders the error shown when a command names a
+// database this SchemaBot instance has no server-side configuration for. It is
+// distinct from Database Not Found: the repository may well hold a correct
+// schemabot.yaml, and the remedy is server-side.
+func RenderDatabaseNotConfigured(data SchemaErrorData) string {
+	return offerSupportChannel(renderTemplate(tmplDatabaseNotConfig, data))
+}
+
+// RenderRepositoryTreeTruncated renders the error shown when GitHub truncated
+// the repository tree and the server-side schema directories could not bound
+// the search, so config discovery failed closed.
+func RenderRepositoryTreeTruncated(data SchemaErrorData) string {
+	return offerSupportChannel(renderTemplate(tmplRepoTreeTruncated, data))
+}
+
+// RenderDatabaseRepoNotAllowed renders the error comment for a database-scoped
+// command naming a database the SchemaBot server configures, but whose
+// allowed_repos exclude this repository.
+func RenderDatabaseRepoNotAllowed(data SchemaErrorData) string {
+	return offerSupportChannel(renderTemplate(tmplDatabaseRepoDenied, data))
 }
 
 // RenderInvalidConfig renders the "invalid config" error comment.
