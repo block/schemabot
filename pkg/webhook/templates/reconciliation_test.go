@@ -75,6 +75,16 @@ func TestRenderNoManagedSchemaChangesChecksRefreshed(t *testing.T) {
 		assert.Contains(t, rendered, "This PR changes none, so no database was compared against its schema directory.")
 		assert.Contains(t, rendered, "```\nschemabot plan -d <database>\n```")
 		assert.NotContains(t, rendered, "schemabot apply")
+	})
+
+	t.Run("plain refresh carries the environment the command named", func(t *testing.T) {
+		rendered := RenderNoManagedSchemaChangesChecksRefreshed(NoManagedSchemaChangesChecksRefreshedData{
+			RequestedBy: "alice",
+			Environment: "staging",
+			HeadSHA:     "abc123",
+		})
+
+		assert.Contains(t, rendered, "```\nschemabot plan -e staging -d <database>\n```")
 		assert.True(t, strings.HasSuffix(rendered, "\n_Requested by @alice_\n"), "attribution closes the comment: %q", rendered)
 		assert.NotContains(t, rendered, "UTC")
 	})

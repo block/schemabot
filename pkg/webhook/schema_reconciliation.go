@@ -67,7 +67,7 @@ func (h *Handler) handleNoManagedSchemaChangesForCommand(ctx context.Context, cl
 	// explicitly named database is an explicit ask for that database's plan
 	// and proceeds through normal config discovery instead.
 	if convergesChecks {
-		if err := h.convergeAggregatesForNoManagedSchemaChanges(ctx, client, repo, pr, installationID, files, requestedBy); err != nil {
+		if err := h.convergeAggregatesForNoManagedSchemaChanges(ctx, client, repo, pr, installationID, files, environment, requestedBy); err != nil {
 			return true, err
 		}
 		return true, nil
@@ -88,7 +88,7 @@ func (h *Handler) handleNoManagedSchemaChangesForCommand(ctx context.Context, cl
 // passing aggregates are posted on the current head. A comment reports the
 // outcome to the user who ran the command. A closed PR is rejected with an
 // explicit error instead: its close-time cleanup owns the stored check state.
-func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, files []ghclient.PRFile, requestedBy string) error {
+func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, files []ghclient.PRFile, environment, requestedBy string) error {
 	prInfo, err := client.FetchPullRequest(ctx, repo, pr)
 	if err != nil {
 		return fmt.Errorf("fetch PR info to refresh checks for PR with no managed schema changes: %w", err)
@@ -140,6 +140,7 @@ func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Contex
 	h.postPassingAggregates(ctx, client, repo, pr, headSHA)
 	h.postComment(repo, pr, installationID, templates.RenderNoManagedSchemaChangesChecksRefreshed(templates.NoManagedSchemaChangesChecksRefreshedData{
 		RequestedBy: requestedBy,
+		Environment: environment,
 		Repository:  repo,
 		HeadSHA:     headSHA,
 	}))

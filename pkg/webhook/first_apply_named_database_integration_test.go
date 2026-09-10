@@ -68,7 +68,7 @@ func TestE2EFirstApplyToBlankDatabaseThroughNamedDatabase(t *testing.T) {
 		assert.Contains(t, body, "No Schema Changes Detected")
 		assert.Contains(t, body, "refreshed as passing")
 		assert.Contains(t, body, "Expected a plan?")
-		assert.Contains(t, body, "schemabot plan -d <database>")
+		assert.Contains(t, body, "schemabot plan -e staging -d <database>")
 		assert.NotContains(t, body, "schemabot apply")
 	})
 

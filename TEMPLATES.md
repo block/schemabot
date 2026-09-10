@@ -599,7 +599,7 @@ SchemaBot found no changes to managed schema files in this PR. The SchemaBot che
 SchemaBot plans a database only when a PR changes a file under that database's schema directory. This PR changes none, so no database was compared against its schema directory. To run that comparison anyway, for example for a new database whose schema directory merged before the database was configured, name the database:
 
 ```
-schemabot plan -d <database>
+schemabot plan -e staging -d <database>
 ```
 
 </details>

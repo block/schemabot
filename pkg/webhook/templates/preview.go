@@ -530,6 +530,7 @@ func PreviewCommentNoManagedSchemaChanges() string {
 func PreviewCommentNoManagedSchemaChangesChecksRefreshed() string {
 	return RenderNoManagedSchemaChangesChecksRefreshed(NoManagedSchemaChangesChecksRefreshedData{
 		RequestedBy: previewRequestedBy,
+		Environment: "staging",
 		Repository:  previewRepository,
 		HeadSHA:     previewHeadSHA,
 	})
