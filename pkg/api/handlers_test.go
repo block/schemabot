@@ -2290,6 +2290,255 @@ func TestPullSchemaHandlerRoutesPrimaryDeployment(t *testing.T) {
 	assert.Nil(t, usClient.pullSchemaReq, "non-primary deployment must not be pulled")
 }
 
+// newAppScopedPullService configures one production deployment with a MySQL
+// database per entry in apps (database name → app identifier, empty for no
+// app), backed by the given tern client, for pull-by-app tests.
+func newAppScopedPullService(t *testing.T, apps map[string]string, client *mockTernClient) *Service {
+	t.Helper()
+	databases := make(map[string]DatabaseConfig, len(apps))
+	for database, app := range apps {
+		databases[database] = DatabaseConfig{
+			Type: storage.DatabaseTypeMySQL,
+			App:  app,
+			Environments: map[string]EnvironmentConfig{
+				"production": {Target: database + "-production", Deployment: "us"},
+			},
+		}
+	}
+	cfg := &ServerConfig{
+		Databases:       databases,
+		TernDeployments: TernConfig{"us": {"production": "tern.example.com:80"}},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	return New(&mockStorage{}, cfg, map[string]tern.Client{"us/production": client}, logger)
+}
+
+// A pull request may select its database by app identifier instead of name.
+// The app resolves through server config to the one database declaring it,
+// the pull routes exactly as a by-name request would, and the response echoes
+// both the resolved database and its app. App matching is case-insensitive
+// like every other request key.
+func TestPullSchemaHandlerSelectsDatabaseByApp(t *testing.T) {
+	client := &mockTernClient{
+		pullSchemaResp: &ternv1.PullSchemaResponse{
+			Database:    "orders",
+			Type:        storage.DatabaseTypeMySQL,
+			Environment: "production",
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			},
+			TableCount: 1,
+		},
+	}
+	svc := newAppScopedPullService(t, map[string]string{"orders": "commerce", "accounts": ""}, client)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"app":"CoMmErCe","environment":"production"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NotNil(t, client.pullSchemaReq, "resolved database should be pulled")
+	assert.Equal(t, "orders", client.pullSchemaReq.Database)
+	assert.Equal(t, "orders-production", client.pullSchemaReq.Target)
+	assert.Contains(t, w.Body.String(), `"database":"orders"`)
+	assert.Contains(t, w.Body.String(), `"app":"commerce"`)
+}
+
+// A by-name pull of a database that declares an app echoes the app, so every
+// pull response carries the grouping identifier regardless of the selector.
+func TestPullSchemaHandlerEchoesAppOnByNamePull(t *testing.T) {
+	client := &mockTernClient{
+		pullSchemaResp: &ternv1.PullSchemaResponse{
+			Database:    "orders",
+			Type:        storage.DatabaseTypeMySQL,
+			Environment: "production",
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			},
+			TableCount: 1,
+		},
+	}
+	svc := newAppScopedPullService(t, map[string]string{"orders": "commerce"}, client)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"database":"orders","environment":"production"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), `"app":"commerce"`)
+}
+
+// An app no configured database declares fails closed instead of guessing,
+// and the request never reaches a data plane.
+func TestPullSchemaHandlerRejectsUnknownApp(t *testing.T) {
+	client := &mockTernClient{}
+	svc := newAppScopedPullService(t, map[string]string{"orders": "commerce"}, client)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"app":"nosuch","environment":"production"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), `app \"nosuch\" has no configured databases`)
+	assert.Nil(t, client.pullSchemaReq, "unresolvable app must not reach the data plane")
+}
+
+// A pull reads one database, so an app declared by several databases is
+// rejected with the candidates named — the caller picks, not the server.
+func TestPullSchemaHandlerRejectsAppNamingSeveralDatabases(t *testing.T) {
+	client := &mockTernClient{}
+	svc := newAppScopedPullService(t, map[string]string{"orders": "commerce", "billing": "commerce"}, client)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"app":"commerce","environment":"production"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "declared by 2 databases")
+	assert.Contains(t, w.Body.String(), "billing, orders")
+	assert.Nil(t, client.pullSchemaReq, "ambiguous app must not reach the data plane")
+}
+
+// Database and app are two ways to select the same target; a request naming
+// both is rejected rather than trusting them to agree.
+func TestPullSchemaHandlerRejectsDatabaseWithApp(t *testing.T) {
+	client := &mockTernClient{}
+	svc := newAppScopedPullService(t, map[string]string{"orders": "commerce"}, client)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"database":"orders","app":"commerce","environment":"production"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "set exactly one")
+	assert.Nil(t, client.pullSchemaReq, "rejected request must not reach the data plane")
+}
+
+// An empty app string is the same as an absent one: a client that always
+// emits the field selects by name without tripping the exactly-one rule, and
+// a request with both selectors empty is told to provide one.
+func TestPullSchemaHandlerTreatsEmptyAppAsUnset(t *testing.T) {
+	client := &mockTernClient{
+		pullSchemaResp: &ternv1.PullSchemaResponse{
+			Database:    "orders",
+			Type:        storage.DatabaseTypeMySQL,
+			Environment: "production",
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			},
+			TableCount: 1,
+		},
+	}
+	svc := newAppScopedPullService(t, map[string]string{"orders": "commerce"}, client)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"database":"orders","app":"","environment":"production"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"database":"","app":"","environment":"production"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "database or app is required")
+}
+
+// Surrounding whitespace on the app selector is trimmed before resolution,
+// matching the list endpoint's ?app= filter, so the same identifier resolves
+// through either surface.
+func TestPullSchemaHandlerTrimsAppWhitespace(t *testing.T) {
+	client := &mockTernClient{
+		pullSchemaResp: &ternv1.PullSchemaResponse{
+			Database:    "orders",
+			Type:        storage.DatabaseTypeMySQL,
+			Environment: "production",
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			},
+			TableCount: 1,
+		},
+	}
+	svc := newAppScopedPullService(t, map[string]string{"orders": "commerce"}, client)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"app":"  CoMmErCe  ","environment":"production"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp apitypes.PullSchemaResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "orders", resp.Database)
+	assert.Equal(t, "commerce", resp.App)
+}
+
+// Environment is validated before the app resolves, so a request missing the
+// environment is told exactly that — not handed a resolution error for a
+// selector the server never needed to look up.
+func TestPullSchemaHandlerRequiresEnvironmentForAppPulls(t *testing.T) {
+	client := &mockTernClient{}
+	svc := newAppScopedPullService(t, map[string]string{"orders": "commerce"}, client)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"app":"nonexistent"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "environment is required")
+	assert.NotContains(t, w.Body.String(), "no configured databases", "the app must not resolve before the request shape is validated")
+}
+
+// A pull of a database that declares no app omits the field from the response
+// instead of reporting an empty grouping value, mirroring the databases list.
+func TestPullSchemaHandlerOmitsAppForUndeclaredDatabase(t *testing.T) {
+	client := &mockTernClient{
+		pullSchemaResp: &ternv1.PullSchemaResponse{
+			Database:    "accounts",
+			Type:        storage.DatabaseTypeMySQL,
+			Environment: "production",
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"accounts": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			},
+			TableCount: 1,
+		},
+	}
+	svc := newAppScopedPullService(t, map[string]string{"accounts": ""}, client)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"database":"accounts","environment":"production"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.NotContains(t, w.Body.String(), `"app"`)
+}
+
 // newTypeVocabularyService configures one database on a single production
 // deployment, backed by the given storage and tern client. Server config is
 // the one source of truth for the type vocabulary, so the database type can be
@@ -3469,6 +3718,129 @@ func TestDatabaseListFiltersByConfiguredCustomType(t *testing.T) {
 	assert.Equal(t, "cockroach", resp.Databases[0].Type)
 }
 
+// The list reports each database's configured app identifier and filters on
+// it, so a caller holding only an app name can find its databases. An app no
+// configured database declares is rejected — fail closed, like the type
+// filter and app-scoped commands — rather than silently matching nothing.
+func TestDatabaseListReportsAndFiltersByApp(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorage{}, &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				Type: storage.DatabaseTypeMySQL,
+				App:  "commerce",
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "orders-prod", Deployment: "us"},
+				},
+			},
+			"billing": {
+				Type: storage.DatabaseTypeMySQL,
+				App:  "commerce",
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "billing-prod", Deployment: "us"},
+				},
+			},
+			"accounts": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "accounts-prod", Deployment: "us"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{"us": {"production": "us.example:9090"}},
+	}, nil, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp apitypes.DatabaseListResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Databases, 3)
+	assert.Equal(t, "accounts", resp.Databases[0].Database)
+	assert.Empty(t, resp.Databases[0].App)
+	assert.Equal(t, "billing", resp.Databases[1].Database)
+	assert.Equal(t, "commerce", resp.Databases[1].App)
+	assert.Equal(t, "orders", resp.Databases[2].Database)
+	assert.Equal(t, "commerce", resp.Databases[2].App)
+
+	// A database with no app omits the field entirely instead of reporting
+	// an empty grouping value.
+	assert.NotContains(t, w.Body.String(), `"app":""`)
+
+	// The app filter is exact and case-insensitive, composing with the
+	// other filters.
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?app=CoMmErCe", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Databases, 2)
+	assert.Equal(t, "billing", resp.Databases[0].Database)
+	assert.Equal(t, "orders", resp.Databases[1].Database)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?app=commerce&name=ord", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Databases, 1)
+	assert.Equal(t, "orders", resp.Databases[0].Database)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?app=nosuch", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), `app \"nosuch\" has no configured databases`)
+}
+
+// The app and type filters compose: each is validated against the whole
+// configured universe, so a valid app narrowed by a valid type it has no
+// databases of returns an empty list, not an error — the same contract the
+// type and name filters already share.
+func TestDatabaseListCombinesAppAndTypeFilters(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorage{}, &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				Type: storage.DatabaseTypeMySQL,
+				App:  "commerce",
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "orders-prod", Deployment: "us"},
+				},
+			},
+			"ledger": {
+				Type: storage.DatabaseTypeVitess,
+				App:  "books",
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "ledger-prod", Deployment: "us"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{"us": {"production": "us.example:9090"}},
+	}, nil, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?app=commerce&type=mysql", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp apitypes.DatabaseListResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Databases, 1)
+	assert.Equal(t, "orders", resp.Databases[0].Database)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?app=commerce&type=vitess", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Empty(t, resp.Databases, "a valid app with no databases of the valid type filters to empty, not to an error")
+}
+
 func TestDatabaseListRejectsInvalidDeploymentTopology(t *testing.T) {
 	_, err := databaseListResponse(&ServerConfig{
 		Databases: map[string]DatabaseConfig{
@@ -3479,7 +3851,7 @@ func TestDatabaseListRejectsInvalidDeploymentTopology(t *testing.T) {
 				},
 			},
 		},
-	}, "", "")
+	}, "", "", "")
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `database "orders" environment "production" deployments map is empty`)

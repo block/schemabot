@@ -52,6 +52,7 @@ func newRateLimitedPullServiceWithAuth(t *testing.T, limits EndpointRateLimitCon
 		Databases: map[string]DatabaseConfig{
 			"orders": {
 				Type: storage.DatabaseTypeMySQL,
+				App:  "commerce",
 				Environments: map[string]EnvironmentConfig{
 					"production": {Target: "orders-production", Deployment: "primary"},
 				},
@@ -219,6 +220,57 @@ func TestPullRateLimitNotSpentOnMalformedRequests(t *testing.T) {
 
 	w = pullAs(t, svc, "operator@example.com", "orders")
 	assert.Equal(t, http.StatusOK, w.Code, "the rejected request must not have spent the budget: %s", w.Body.String())
+}
+
+// pullByAppAs issues a pull selecting its database by app identifier rather
+// than by name, as the given caller.
+func pullByAppAs(t *testing.T, svc *Service, caller, app string) *httptest.ResponseRecorder {
+	t.Helper()
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	ctx := t.Context()
+	if caller != "" {
+		ctx = auth.WithUser(ctx, &auth.User{Subject: caller})
+	}
+	body := `{"app":"` + app + `","environment":"production","type":"mysql"}`
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/api/pull", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	return w
+}
+
+// A request naming an app no database declares still spends the caller's
+// budget, exactly like a request naming an unknown database: resolving either
+// selector is server-side work, and a client looping on unresolvable apps is
+// the same runaway the budget exists to bound.
+func TestPullRateLimitSpentOnUnresolvableApp(t *testing.T) {
+	svc, _ := newRateLimitedPullService(t, EndpointRateLimitConfig{
+		PerCaller: RateLimitBudgetConfig{RequestsPerMinute: 60, Burst: 1},
+		PerTarget: RateLimitBudgetConfig{RequestsPerMinute: 6000, Burst: 100},
+	})
+
+	w := pullByAppAs(t, svc, "operator@example.com", "nonexistent")
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+
+	w = pullAs(t, svc, "operator@example.com", "orders")
+	assert.Equal(t, http.StatusTooManyRequests, w.Code, "the unresolvable app request spent the caller's budget")
+}
+
+// A by-app pull spends the target budget of the database the app resolves to,
+// so both selectors drain one shared per-target bucket rather than each
+// selector minting its own.
+func TestPullRateLimitAppSelectedPullSharesTargetBucket(t *testing.T) {
+	svc, _ := newRateLimitedPullService(t, EndpointRateLimitConfig{
+		PerCaller: RateLimitBudgetConfig{RequestsPerMinute: 6000, Burst: 100},
+		PerTarget: RateLimitBudgetConfig{RequestsPerMinute: 60, Burst: 1},
+	})
+
+	require.Equal(t, http.StatusOK, pullByAppAs(t, svc, "operator@example.com", "commerce").Code)
+
+	w := pullAs(t, svc, "operator@example.com", "orders")
+	assert.Equal(t, http.StatusTooManyRequests, w.Code, "the by-app pull drained the resolved database's target bucket")
 }
 
 // A request naming a database this server does not route still spends budget:

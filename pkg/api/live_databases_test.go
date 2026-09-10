@@ -35,7 +35,7 @@ func TestLocalRegistrationPublishesOnlyAdditions(t *testing.T) {
 	publish()
 	wg.Wait()
 	// One response keeps the database and environment set it started with.
-	response, err := databaseListResponse(snapshot, "", "")
+	response, err := databaseListResponse(snapshot, "", "", "")
 	require.NoError(t, err)
 	require.Len(t, response.Databases, 1)
 	require.Len(t, response.Databases[0].Environments, 1)

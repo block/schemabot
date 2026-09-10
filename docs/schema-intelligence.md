@@ -58,6 +58,7 @@ GET /api/databases
     {
       "database": "shop",
       "type": "mysql",
+      "app": "storefront",
       "environments": [
         {"environment": "staging", "deployments": ["us-east"]},
         {"environment": "production", "deployments": ["us-east", "eu-west"]}
@@ -75,6 +76,19 @@ GET /api/databases
 ```
 
 </details>
+
+Each entry carries `app` when the database's configuration declares an app
+identifier — the grouping that app-scoped commands (`--app <name>`) target.
+Databases sharing an `app` value form one application, so an inventory keyed
+by application joins against this field rather than parsing database names.
+The field is omitted when the database declares no app.
+
+The list accepts three query filters, combinable: `?type=` (exact,
+case-sensitive engine type), `?name=` (case-insensitive substring of the
+database name), and `?app=` (whole app identifier, matched
+case-insensitively). A `type` or `app` value that no configured database
+declares is rejected with `400` rather than returning an empty list, so a
+typo never reads as an empty inventory.
 
 Use a database name and environment from this inventory in the reads below.
 
@@ -113,19 +127,36 @@ Content-Type: application/json
 {"database": "shop", "environment": "production"}
 ```
 
+A caller holding only an app identifier can select the database by app
+instead of by name — set exactly one of the two:
+
+```json
+{"app": "storefront", "environment": "production"}
+```
+
+The app must resolve to exactly one configured database; an app declared by
+several databases is rejected with the candidates named, so the caller picks
+the database rather than the server guessing.
+
 ```json
 {
   "database": "shop",
+  "type": "mysql",
   "environment": "production",
+  "app": "storefront",
   "namespaces": {
     "shop": {
       "tables": {
         "orders": "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
       }
     }
-  }
+  },
+  "table_count": 1
 }
 ```
+
+The response echoes `app` whenever the pulled database declares one,
+whichever selector the request used; it is omitted otherwise.
 
 </details>
 
@@ -1135,6 +1166,9 @@ to discover registered sources, then `pull` with `catalog_detail: detailed`
 where supported to read their table structure without parsing DDL. Store each
 snapshot with its database, environment, namespace, table, and fetch time;
 refresh periodically and respect `Retry-After` when a pull is rate limited.
+When your inventory is keyed by application rather than by database, join on
+the `app` field from `databases` — or pull by `app` directly — instead of
+deriving the link from naming conventions.
 
 Add `history` and `progress` when you need execution context, such as the DDL
 and recorded task timestamps for a SchemaBot-managed change. These records
