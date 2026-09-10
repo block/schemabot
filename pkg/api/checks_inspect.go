@@ -277,6 +277,9 @@ func applyHoldingCheck(ctx context.Context, store storage.Storage, check *storag
 // run and wondering why the gate did not move. When the trusted run is present
 // the conflict is the whole finding, and dropping it would let this inspection
 // state that nothing holds the gate while protection reads a failing duplicate.
+// On a deployment that publishes no checks for the repository no name is
+// conflicted either: a conflict claims another app's run competes with
+// SchemaBot's, and there is none of SchemaBot's here for it to compete with.
 func checkRunsOnHead(ctx context.Context, cfg *ServerConfig, client checksInspectClient, repo, headSHA, environment string, logger *slog.Logger) headCheckRuns {
 	names := webhookMissingCheckNames(cfg, repo, environment, "")
 	if len(names) == 0 || headSHA == "" {

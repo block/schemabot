@@ -155,6 +155,37 @@ func TestRenderChecksInspectionReportsAnUntrustedConflictBesideAMissingRun(t *te
 		"the summary sends the operator to a backfill that leaves the conflict standing")
 }
 
+// Two contested names on one pull request need not be contested the same way:
+// one can have SchemaBot's own run missing under it and the other have it
+// present. The two take opposite advice — a backfill recreates the first and
+// has nothing to do for the second — so a single line covering both would be
+// wrong for one of them whichever way it was written.
+func TestRenderChecksInspectionSplitsConflictsByWhetherItsOwnRunIsThere(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	require.NoError(t, renderChecksInspection(&out, &apitypes.ChecksInspectResponse{
+		Repo: "octo/repo", PullRequest: 709,
+		HeadSHA: "43da12bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", PRState: "open",
+		ChecksEnabled: true,
+		CheckRunsOnHead: []apitypes.InspectedCheckRun{{
+			Name: "SchemaBot (staging)", CheckRunID: 102754133862,
+			Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionSuccess,
+		}},
+		MissingCheckRunNames:   []string{"SchemaBot (production)"},
+		UntrustedConflictNames: []string{"SchemaBot (production)", "SchemaBot (staging)"},
+		Rows:                   []apitypes.InspectedCheck{},
+	}))
+
+	rendered := out.String()
+	assert.Contains(t, rendered, "Held by another app on 43da12bb: SchemaBot (production).",
+		"the name whose own run is absent is the one a backfill recreates")
+	assert.NotContains(t, rendered, "Held by another app on 43da12bb: SchemaBot (production), SchemaBot (staging).",
+		"the name whose own run is present must not be swept into the recreate line")
+	assert.Contains(t, rendered, "Answered by another app too on 43da12bb: SchemaBot (staging).",
+		"the name whose own run is present has nothing for a backfill to recreate")
+}
+
 // A conflict outlives a trusted run that is present and passing: protection
 // may be reading the other app's run instead. Asserting a clear gate over one
 // would be this command stating something it cannot see.
@@ -217,8 +248,66 @@ func TestRenderChecksInspectionReportsItsOwnRunHoldingTheGateBesideAConflict(t *
 
 	rendered := out.String()
 	assert.Contains(t, rendered, "another app answers under SchemaBot (production)")
-	assert.Contains(t, rendered, `Branch protection is also waiting on SchemaBot's own run on 43da12bb: "SchemaBot (production)" concluded failure.`,
+	assert.Contains(t, rendered, `Branch protection is also waiting on a run of SchemaBot's own on 43da12bb: "SchemaBot (production)" concluded failure.`,
 		"resolving the conflict alone leaves SchemaBot's own failed run holding the gate")
+}
+
+// One expected name can be absent while a second sits on the head unconcluded.
+// The missing run is what a backfill fixes; the unconcluded one it will not
+// touch, so a summary that named only the absence would send an operator to a
+// remedy and leave the reason the gate stays shut unaccounted for.
+func TestRenderChecksInspectionNamesItsOwnRunHoldingTheGateBesideAMissingOne(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	require.NoError(t, renderChecksInspection(&out, &apitypes.ChecksInspectResponse{
+		Repo: "octo/repo", PullRequest: 709,
+		HeadSHA: "43da12bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", PRState: "open",
+		ChecksEnabled: true,
+		CheckRunsOnHead: []apitypes.InspectedCheckRun{{
+			Name: "SchemaBot (staging)", CheckRunID: 102754133862,
+			Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionFailure,
+		}},
+		MissingCheckRunNames: []string{"SchemaBot (production)"},
+		Rows: []apitypes.InspectedCheck{{
+			Environment: "staging", Database: "widgets",
+			RecordedSHA: "43da12bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", CoversHead: true,
+			Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionSuccess,
+			Reason: checkstate.ReasonResolved, Summary: "The plan concluded successfully.",
+			Remedy: "Nothing to do.", SelfConverging: true,
+		}},
+	}))
+
+	rendered := out.String()
+	assert.Contains(t, rendered, "branch protection cannot pass without SchemaBot (production)")
+	assert.Contains(t, rendered, `Branch protection is also waiting on a run of SchemaBot's own on 43da12bb: "SchemaBot (staging)" concluded failure.`,
+		"the backfill recreates the missing run and leaves the failed one holding the gate")
+}
+
+// Two of SchemaBot's own runs holding the gate are counted as two.
+func TestRenderChecksInspectionCountsTheOwnRunsHoldingTheGate(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	require.NoError(t, renderChecksInspection(&out, &apitypes.ChecksInspectResponse{
+		Repo: "octo/repo", PullRequest: 709,
+		HeadSHA: "43da12bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", PRState: "open",
+		ChecksEnabled: true,
+		CheckRunsOnHead: []apitypes.InspectedCheckRun{
+			{Name: "SchemaBot (staging)", CheckRunID: 102754133862, Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionFailure},
+			{Name: "SchemaBot (production)", CheckRunID: 102754133863, Status: checkstate.StatusInProgress},
+		},
+		UntrustedConflictNames: []string{"SchemaBot (staging)"},
+		Rows: []apitypes.InspectedCheck{{
+			Environment: "staging", Database: "widgets",
+			RecordedSHA: "43da12bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", CoversHead: true,
+			Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionSuccess,
+			Reason: checkstate.ReasonResolved, Summary: "The plan concluded successfully.",
+			Remedy: "Nothing to do.", SelfConverging: true,
+		}},
+	}))
+
+	assert.Contains(t, out.String(), "Branch protection is also waiting on runs of SchemaBot's own on 43da12bb:")
 }
 
 // A name GitHub could not be read for comes back neither present nor

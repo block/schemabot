@@ -692,6 +692,12 @@ own run is absent it recreates that run and the conflict outlives it, and where
 the run is already there the backfill finds nothing missing and does nothing,
 so the line says so rather than sending an operator to it.
 
+These states coexist, and the closing summary names all of them rather than
+stopping at the first. One expected name can be absent while a second sits on
+the head unconcluded or failed: the backfill recreates the first and will not
+touch the second, so a summary that named only the absence would send an
+operator to a remedy and leave the reason the gate stays shut unaccounted for.
+
 A row marked `(older)` was recorded for a commit the pull request has moved
 past. The aggregate holds those as blocking whatever they concluded, which is
 why a successful apply can leave the gate open.

@@ -323,21 +323,17 @@ func writeChecksNothingBlockingLine(w io.Writer, response *apitypes.ChecksInspec
 			strings.Join(response.MissingCheckRunNames, ", ")); err != nil {
 			return err
 		}
-		return writeAlsoContestedLine(w, response)
+		if err := writeAlsoContestedLine(w, response); err != nil {
+			return err
+		}
+		return writeOwnRunAlsoHoldingGateLine(w, response)
 	}
 	if len(response.UntrustedConflictNames) > 0 {
 		if _, err := fmt.Fprintf(w, "\nNo stored row is holding the merge gate open, but another app answers under %s on %s, so which run branch protection reads is not SchemaBot's to say.\n",
 			strings.Join(response.UntrustedConflictNames, ", "), shortSHA(response.HeadSHA)); err != nil {
 			return err
 		}
-		// SchemaBot's own run can be holding the gate at the same time, and an
-		// operator who resolves only the conflict would find it still closed.
-		if holding := checkRunNamesHoldingGate(response); len(holding) > 0 {
-			_, err := fmt.Fprintf(w, "Branch protection is also waiting on SchemaBot's own run on %s: %s.\n",
-				shortSHA(response.HeadSHA), strings.Join(holding, ", "))
-			return err
-		}
-		return nil
+		return writeOwnRunAlsoHoldingGateLine(w, response)
 	}
 	if holding := checkRunNamesHoldingGate(response); len(holding) > 0 {
 		_, err := fmt.Fprintf(w, "\nNo stored row is holding the merge gate open, but branch protection is, on %s: %s.\n",
@@ -370,6 +366,29 @@ func writeAlsoContestedLine(w io.Writer, response *apitypes.ChecksInspectRespons
 	_, err := fmt.Fprintf(w, "Another app also answers under %s on %s, so recreating SchemaBot's run does not settle which one branch protection reads.\n",
 		strings.Join(response.UntrustedConflictNames, ", "), shortSHA(response.HeadSHA))
 	return err
+}
+
+// writeOwnRunAlsoHoldingGateLine adds the Check Runs of SchemaBot's own that
+// branch protection is still waiting on, to a summary whose headline was
+// something else: a name gone missing, or a name another app answers under. The
+// states coexist — one expected name can be absent while a second sits on the
+// head unconcluded — and an operator who resolves only the headline would find
+// the gate still shut and no line in this summary accounting for it.
+func writeOwnRunAlsoHoldingGateLine(w io.Writer, response *apitypes.ChecksInspectResponse) error {
+	holding := checkRunNamesHoldingGate(response)
+	if len(holding) == 0 {
+		return nil
+	}
+	_, err := fmt.Fprintf(w, "Branch protection is also waiting on %s of SchemaBot's own on %s: %s.\n",
+		ownRunNoun(holding), shortSHA(response.HeadSHA), strings.Join(holding, ", "))
+	return err
+}
+
+func ownRunNoun(names []string) string {
+	if len(names) == 1 {
+		return "a run"
+	}
+	return "runs"
 }
 
 // checkRunNamesHoldingGate reports the Check Runs on the head that branch
