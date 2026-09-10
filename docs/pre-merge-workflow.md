@@ -191,7 +191,7 @@ records the desired state the databases already run.
   SchemaBot plans a database only when the PR changes a file under its schema
   directory, so no database is compared against its schema. To plan a database
   whose files are already correct, such as the first apply to a new database,
-  add or toggle a `# nonce` comment line in its `schemabot.yaml`
+  use a [nonce edit](#if-a-database-is-behind-its-schema-files)
 - **Another PR holds the database lock?** The apply is refused and names the
   holder. Wait for that PR to merge or release the lock
 - **Schema files changed on the base branch?** Rebase before applying so your
@@ -274,6 +274,39 @@ or stuck checks with
 [check-runs.md](check-runs.md#backfilling-missing-check-runs). Disabling the
 required check is the last resort, never the first, because it removes the
 merge gate for every PR in the repository.
+
+### If a database is behind its schema files
+
+Sometimes the files already describe the schema you want and the database is
+the thing that is behind. A new database was configured after its schema files
+merged, so no PR ever applied them. A freshly provisioned copy or tenant starts
+empty. An apply was skipped or never finished. There is nothing to edit, and a
+PR that changes nothing under the schema directory gets the `No schema files
+changed` check rather than a plan.
+
+SchemaBot plans a database only when a PR changes a file under that database's
+schema directory. The trigger is the diff, but the plan is not: once it runs,
+it compares the whole directory at the PR head with the live database, so it
+finds every table and column the database is missing, including ones whose
+files the PR did not touch.
+
+Use that with a **nonce edit**. Open a small PR that adds or toggles a comment
+line in the database's `schemabot.yaml`:
+
+```yaml
+database: mydb
+type: mysql
+# nonce
+```
+
+The comment is inert, but it lives in the schema directory, so SchemaBot plans
+the PR. The plan lists everything the live database needs, for example `N
+tables to create` for an empty one. Apply from the plan comment as usual, let
+the checks pass, and merge. Leave the comment in place afterwards and remove it
+on the next reconcile, so the toggle always produces a diff.
+
+If you run `schemabot plan` on a PR with no schema edits, the `No Schema Files
+Changed` comment describes this edit under "Expected a plan?".
 
 ## Destructive changes: two different workflows
 

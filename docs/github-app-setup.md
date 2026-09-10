@@ -268,7 +268,7 @@ Give a PR that diff with a nonce edit. Add or toggle a `# nonce` comment line in
 schemabot apply -e staging
 ```
 
-The `No Schema Files Changed` comment explains the nonce edit when a user runs a plan on a PR that changes no schema files.
+The same edit reconciles any database that is behind its files, not only a new one. See [If a database is behind its schema files](pre-merge-workflow.md#if-a-database-is-behind-its-schema-files).
 
 ## Environment Variables Reference
 
