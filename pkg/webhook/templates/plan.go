@@ -126,9 +126,9 @@ type PlanCommentData struct {
 	Changes        []KeyspaceChangeData
 	LintViolations []LintViolationData
 
-	// HasPrimaryKeyFindings includes both advisory and error-severity findings.
-	HasPrimaryKeyFindings bool
-	Errors                []string
+	// LintRuleNames includes rule IDs from findings of every severity.
+	LintRuleNames []string
+	Errors        []string
 
 	// IgnoredNamespaces lists the namespaces whose schema files were excluded
 	// from this plan by the repository's ignore_namespaces config — only entries
@@ -427,7 +427,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 		writeLintViolations(&sb, data.LintViolations)
 	}
 	if !data.IsLocked {
-		writePrimaryKeyGuidance(&sb, data)
+		writeRelatedGuidance(&sb, data)
 	}
 
 	// Errors
@@ -1568,19 +1568,6 @@ func dropCountsWithTableFallback(drops unsafeDropCounts, changeType string) unsa
 	return drops
 }
 
-// primaryKeyDocURL uses the canonical public docs, independent of the host
-// serving the user's schema repository, just like the throttle reference link.
-const primaryKeyDocURL = "https://github.com/block/schemabot/blob/main/docs/spirit.md#choosing-a-primary-key"
-
-// writePrimaryKeyGuidance stays outside the optional lint fold and appears
-// once per MySQL plan, including when the finding renders under Issues.
-func writePrimaryKeyGuidance(sb *strings.Builder, data PlanCommentData) {
-	if !data.IsMySQL || !data.HasPrimaryKeyFindings {
-		return
-	}
-	fmt.Fprintf(sb, "📖 **Related guidance:** [Primary key tradeoffs](%s)\n\n", primaryKeyDocURL)
-}
-
 // lintWarningsFoldThreshold is the warning count above which the lint section
 // collapses into a details block grouped by table. Short lists stay inline so
 // a single advisory finding never needs a click; long lists stop dominating
@@ -1815,6 +1802,14 @@ func renderMultiEnvPlanComment(data MultiEnvPlanCommentData, budget *ddlBlockBud
 		}
 	}
 
+	var guidancePlans []PlanCommentData
+	for _, env := range data.Environments {
+		if plan := data.Plans[env]; plan != nil && data.Errors[env] == "" {
+			guidancePlans = append(guidancePlans, *plan)
+		}
+	}
+	writeRelatedGuidance(&sb, guidancePlans...)
+
 	// Footer with apply instructions
 	sb.WriteString("---\n\n")
 	writeMultiEnvFooter(&sb, data)
@@ -1968,7 +1963,6 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	if len(plan.LintViolations) > 0 {
 		writeLintViolations(sb, plan.LintViolations)
 	}
-	writePrimaryKeyGuidance(sb, *plan)
 
 	// Errors
 	if len(plan.Errors) > 0 {

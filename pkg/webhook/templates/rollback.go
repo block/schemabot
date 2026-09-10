@@ -46,7 +46,7 @@ func renderRollbackPlanComment(data PlanCommentData, budget *ddlBlockBudget) str
 	if len(data.LintViolations) > 0 {
 		writeLintViolations(&sb, data.LintViolations)
 	}
-	writePrimaryKeyGuidance(&sb, data)
+	writeRelatedGuidance(&sb, data)
 
 	// Errors
 	if len(data.Errors) > 0 {

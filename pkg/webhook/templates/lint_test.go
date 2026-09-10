@@ -89,7 +89,9 @@ func TestRenderPlanComment_PrimaryKeyGuidance(t *testing.T) {
 			}
 			data := lintPlanData(warnings)
 			data.IsMySQL = tc.mysql
-			data.HasPrimaryKeyFindings = tc.primaryKey
+			if tc.primaryKey {
+				data.LintRuleNames = []string{"primary_key"}
+			}
 			data.IsLocked = tc.locked
 			if tc.primaryKey {
 				data.HasUnsafeChanges = true

@@ -1,7 +1,7 @@
 # Spirit primary key illustration
 
 `spirit-primary-keys.html` is the source for `../spirit-primary-keys.gif`, embedded in
-[the Spirit guide](../../docs/spirit.md#choosing-a-primary-key). It shows primary-key
+[the MySQL guide](../../docs/mysql.md#choosing-a-primary-key). It shows primary-key
 payload in secondary indexes, then numeric and index-query chunk boundaries.
 
 All values are fictional. The animation is not a benchmark: frame timing does not
