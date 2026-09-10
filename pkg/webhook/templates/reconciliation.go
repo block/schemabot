@@ -72,7 +72,7 @@ func RenderNoManagedSchemaChangesChecksRefreshed(data NoManagedSchemaChangesChec
 		sb.WriteString("A PR plan covers the databases whose schema directories the PR changes. This PR changes none, so no database was compared against its schema directory.\n\n")
 		sb.WriteString("Two cases still need a plan even though the files are already correct:\n\n")
 		sb.WriteString("- **A new database.** Its schema directory merged before the database was configured, so no PR ever applied the files and the live database is empty.\n")
-		sb.WriteString("- **An existing database with drift.** The live schema was changed outside SchemaBot: DDL run by hand during an incident, a restore from an older snapshot, or schema files pulled from a different environment. The files did not change, so nothing triggers a plan.\n\n")
+		sb.WriteString("- **An existing database with drift.** The live schema was changed outside SchemaBot: DDL run by hand, a restore from an older snapshot, or schema files pulled from a different environment. The files did not change, so nothing triggers a plan.\n\n")
 		sb.WriteString("In either case, give the PR a change in that database's schema directory: add or toggle a `# nonce` comment line in its `schemabot.yaml` and push. SchemaBot then plans the whole directory against the live schema, and the plan comment carries the apply command.\n\n</details>\n")
 	}
 	if data.RequestedBy != "" {

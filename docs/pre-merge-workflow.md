@@ -285,9 +285,9 @@ branch. It comes in two shapes:
   configured, so no PR ever applied them and the database is empty. A freshly
   provisioned copy or tenant starts the same way.
 - **An existing database.** The live schema was changed outside SchemaBot:
-  DDL run by hand during an incident, a restore from an older snapshot, or
-  schema files pulled from a different environment. The files did not change,
-  so nothing triggers a plan.
+  DDL run by hand, a restore from an older snapshot, or schema files pulled
+  from a different environment. The files did not change, so nothing triggers
+  a plan.
 
 In both cases the files already describe the schema you want, so there is
 nothing to edit, and a PR that changes nothing under the schema directory gets
