@@ -213,7 +213,11 @@ scanning:
 				CheckName:    cmd.CheckName,
 				Page:         page,
 				UpdatedSince: updatedSince,
-				StuckAfter:   cmd.StuckAfter,
+				// Sent normalized, not as typed: this flag accepts operator
+				// spellings the server's own parser does not, so forwarding
+				// "2d" verbatim would fail the first page and abort the
+				// sweep. The report keeps the spelling the operator used.
+				StuckAfter: stuckAfter.String(),
 			})
 			if canceled := backfillCanceledError(err, stopProgress); canceled != nil {
 				return canceled

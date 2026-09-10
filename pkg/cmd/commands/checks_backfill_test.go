@@ -225,6 +225,37 @@ func TestChecksBackfillRunSkipsNamedDisabledRepo(t *testing.T) {
 	assert.Empty(t, report.Actions)
 }
 
+// --stuck-after accepts spellings this CLI understands and the server does
+// not, so the value goes out normalized. Forwarding "2d" as typed fails the
+// server's own parse and takes the whole sweep down on its first page, while
+// the report still shows the operator what they asked for.
+func TestChecksBackfillNormalizesStuckAfterOnTheWire(t *testing.T) {
+	var sent string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req apitypes.ChecksScanRequest
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		sent = req.StuckAfter
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(apitypes.ChecksScanResponse{Repo: "octo/repo", Scanned: 1}))
+	}))
+	t.Cleanup(server.Close)
+
+	cmd := &ChecksBackfillCmd{Repo: "octo/repo", DryRun: true, StuckAfter: "2d", JSON: true}
+	var runErr error
+	output := captureStdout(func() {
+		runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
+	})
+	require.NoError(t, runErr)
+
+	_, err := time.ParseDuration(sent)
+	require.NoError(t, err, "the server parses this with time.ParseDuration, which does not know %q", "2d")
+	assert.Equal(t, (48 * time.Hour).String(), sent)
+
+	var report checksBackfillReport
+	require.NoError(t, json.Unmarshal([]byte(output), &report))
+	assert.Equal(t, "2d", report.StuckAfter, "the report keeps the operator's own spelling")
+}
+
 // checksBackfillScanServer serves a single-page checks scan returning the
 // given missing and stuck PRs, the shape a dry-run sweep consumes.
 func checksBackfillScanServer(t *testing.T, missing []apitypes.MissingCheckPR, stuck []apitypes.StuckCheckPR) *httptest.Server {

@@ -1180,6 +1180,8 @@ func TestScanWebhookMissingChecksSkipsTheAnnotationForAYoungRun(t *testing.T) {
 	assert.Equal(t, "SchemaBot (production)", stuck.Name, "the run is still reported")
 	assert.Empty(t, stuck.StoredRows)
 	assert.Empty(t, stuck.WaitingOn)
+	assert.Zero(t, store.checks.reads,
+		"a pull request whose every run is too young to render pays for no stored read")
 
 	// A run whose age cannot be established is one the caller renders, so it
 	// is annotated whatever the threshold says.
