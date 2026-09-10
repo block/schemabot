@@ -5,9 +5,12 @@ package sqlstore
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -610,4 +613,80 @@ func lockUndrivenApply(ctx context.Context, t *testing.T, store *applyStore, tx 
 	undriven, err := store.lockUndrivenApplies(ctx, tx, []int64{applyID})
 	require.NoError(t, err)
 	return undriven[applyID]
+}
+
+// The batched lease recheck bounds its NOT EXISTS to the candidate set as well as
+// correlating it on the apply. The bound cannot change which applies the gate
+// admits, so it reads as redundant and invites removal; what it buys is the plan.
+// Without it PostgreSQL has no restriction on the inner side of the anti-join and
+// reads every operation row, a cost that grows with the table rather than with the
+// batch and is paid while the expiry transaction holds the blocking parent locks
+// that attaching an operation waits on. MySQL picks the per-apply index either
+// way, so only PostgreSQL can regress here.
+// planGuardDeadline bounds the plan guard's seed and EXPLAIN.
+const planGuardDeadline = 30 * time.Second
+
+func TestPostgresBatchedLeaseRecheckStaysIndexed(t *testing.T) {
+	// The seed is bulk DDL-free INSERTs and two ANALYZEs, all of which finish in
+	// seconds; a budget over the whole sequence fails the test on a stalled
+	// database rather than letting it hang on the test binary's own deadline.
+	ctx, cancel := context.WithTimeout(t.Context(), planGuardDeadline)
+	defer cancel()
+	_, db := testutil.StartPostgres(t, "expiry_gate_plan")
+	applyPostgresTestSchema(t, db)
+	clearPostgresTables(t, db)
+
+	const (
+		applies    = 20000
+		operations = 50000
+		// Matches the expiry pass's batch size, which lives with its caller.
+		batch = 200
+	)
+	_, err := db.ExecContext(ctx, fmt.Sprintf(`
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, options, attempt)
+		SELECT 'apply-' || n, 1, 1, 'db', 'mysql', 'r', 1, 'production', 'spirit',
+		       'failed_retryable', '{}', 3 FROM generate_series(1, %d) AS n`, applies))
+	require.NoError(t, err)
+	// A minority of operations hold a live lease, so the anti-join has real rows
+	// to eliminate rather than being trivially empty.
+	_, err = db.ExecContext(ctx, fmt.Sprintf(`
+		INSERT INTO apply_operations (apply_id, deployment, operation_key, state, lease_owner, updated_at)
+		SELECT (n %% %d) + 1, 'dep', 'k' || n, 'running',
+		       CASE WHEN n %% 20 = 0 THEN 'driver-' || n ELSE '' END, now()
+		FROM generate_series(1, %d) AS n`, applies, operations))
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, `ANALYZE applies`)
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, `ANALYZE apply_operations`)
+	require.NoError(t, err)
+
+	ids := make([]string, 0, batch)
+	for i := 1; i <= batch; i++ {
+		ids = append(ids, fmt.Sprintf("%d", i))
+	}
+	in := strings.Join(ids, ",")
+	plan := explainPlan(ctx, t, db, fmt.Sprintf(`SELECT id FROM applies WHERE id IN (%s) AND %s`,
+		in, undrivenApplyGateBoundedTo(PostgresDialect{}, in)))
+
+	assert.NotContains(t, plan, "Seq Scan on apply_operations",
+		"the batched lease recheck must not read every operation row: %s", plan)
+	assert.Contains(t, plan, "idx_apply_operations_apply_created_id",
+		"the lease lookup must ride the per-apply index: %s", plan)
+}
+
+func explainPlan(ctx context.Context, t *testing.T, db *sql.DB, stmt string) string {
+	t.Helper()
+	rows, err := db.QueryContext(ctx, "EXPLAIN "+stmt)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rows)
+	var b strings.Builder
+	for rows.Next() {
+		var line string
+		require.NoError(t, rows.Scan(&line))
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	require.NoError(t, rows.Err())
+	return b.String()
 }

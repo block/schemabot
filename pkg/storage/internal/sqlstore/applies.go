@@ -2550,6 +2550,11 @@ func (s *applyStore) expireRetryable(ctx context.Context, limit int) ([]*storage
 // of being trusted as the whole set — an aggregate over the same statement
 // would only ever see the rows the lock succeeded on.
 //
+// The lock scan imposes no ordering. Its rows are only counted per apply, and
+// SKIP LOCKED means no lock here ever waits, so acquisition order cannot form a
+// cycle. Ordering it would only add a sort of the whole candidate set, taken
+// while the blocking parent locks are held.
+//
 // Three statements over the whole candidate set rather than three per candidate:
 // the expiry transaction holds blocking parent locks for as long as this runs,
 // and AttachOperationWithTasks waits on those, so the cost of the recheck is
@@ -2571,7 +2576,7 @@ func (s *applyStore) lockUndrivenApplies(ctx context.Context, tx *rebindTx, appl
 	locked := make(map[int64]int, len(applyIDs))
 	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
 		SELECT apply_id FROM apply_operations
-		WHERE apply_id IN (%s) ORDER BY apply_id, id
+		WHERE apply_id IN (%s)
 		FOR UPDATE SKIP LOCKED
 	`, in), args...)
 	if err != nil {
@@ -2615,11 +2620,17 @@ func (s *applyStore) lockUndrivenApplies(ctx context.Context, tx *rebindTx, appl
 		return nil, fmt.Errorf("read operation counts for retryable expiry of %d applies: %w", len(applyIDs), err)
 	}
 
+	// The bound inside the gate repeats the candidate list, so its placeholders
+	// are bound a second time.
+	gateArgs := make([]any, 0, len(args)*2)
+	gateArgs = append(gateArgs, args...)
+	gateArgs = append(gateArgs, args...)
+
 	unleased := make(map[int64]bool, len(applyIDs))
 	gateRows, err := tx.QueryContext(ctx, fmt.Sprintf(`
 		SELECT id FROM applies
 		WHERE id IN (%s) AND %s
-	`, in, undrivenApplyGate(s.dialect)), args...)
+	`, in, undrivenApplyGateBoundedTo(s.dialect, in)), gateArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("recheck operation leases for retryable expiry of %d applies: %w", len(applyIDs), err)
 	}
