@@ -193,10 +193,11 @@ jobs:
       # Published to ghcr.io/block/schemabot/localscale:<sha|latest>
       #
       # The binary is built on the runner, not inside a Dockerfile, so it
-      # needs the module's Go toolchain and the shared Go cache the test and
-      # lint workflows populate. Without the cache every run downloads the
-      # full module graph from the proxy, and a single dropped stream fails
-      # the publish; with it the download is a cache hit.
+      # needs the module's Go toolchain and the Go cache the test workflow
+      # saves (this job, like the lint workflow, only restores it). Without
+      # the cache every run downloads the full module graph from the proxy,
+      # and a single dropped stream fails the publish; with it the download
+      # is a cache hit.
       - name: "Configure Go"
         uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
         with:
