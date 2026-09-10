@@ -72,7 +72,7 @@ func TestWebhookReconcilerReportsMissingInboxRow(t *testing.T) {
 	require.Equal(t, 1, scanned)
 	require.Equal(t, 1, missing)
 	require.Equal(t, 0, synthesized)
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha"))
+	row, err := store.GetByDeliveryID(t.Context(), storage.ProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha"))
 	require.NoError(t, err)
 	require.Nil(t, row, "report-only scan must not synthesize inbox rows")
 }
@@ -80,7 +80,7 @@ func TestWebhookReconcilerReportsMissingInboxRow(t *testing.T) {
 func TestWebhookReconcilerSkipsRecordedHead(t *testing.T) {
 	store := newRecordingWebhookEventStore()
 	_, err := store.Create(t.Context(), &storage.WebhookEvent{
-		Provider:    storage.WebhookProviderGitHub,
+		Provider:    storage.ProviderGitHub,
 		DeliveryID:  "delivery-recorded",
 		Event:       "pull_request",
 		Action:      "synchronize",
@@ -141,7 +141,7 @@ func TestWebhookReconcilerSynthesizesMissingHeadDelivery(t *testing.T) {
 	require.Equal(t, 1, missing)
 	require.Equal(t, 1, synthesized)
 
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha"))
+	row, err := store.GetByDeliveryID(t.Context(), storage.ProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha"))
 	require.NoError(t, err)
 	require.NotNil(t, row)
 	require.Equal(t, "pull_request", row.Event)
@@ -244,7 +244,7 @@ func TestWebhookReconcilerTerminatesStuckProcessingEvent(t *testing.T) {
 	store := newRecordingWebhookEventStore()
 	leaseExpired := time.Now().Add(-time.Minute)
 	_, err := store.Create(t.Context(), &storage.WebhookEvent{
-		Provider:       storage.WebhookProviderGitHub,
+		Provider:       storage.ProviderGitHub,
 		DeliveryID:     "delivery-stuck",
 		Event:          "pull_request",
 		Repository:     "octocat/hello-world",
@@ -262,7 +262,7 @@ func TestWebhookReconcilerTerminatesStuckProcessingEvent(t *testing.T) {
 
 	h.reconcileWebhookInbox(t.Context())
 
-	got, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "delivery-stuck")
+	got, err := store.GetByDeliveryID(t.Context(), storage.ProviderGitHub, "delivery-stuck")
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	require.Equal(t, storage.WebhookEventFailed, got.State)
@@ -340,7 +340,7 @@ func TestWebhookReconcilerSynthesisInsertFailureLeavesHeadRecoverable(t *testing
 	require.Equal(t, 1, scanned)
 	require.Equal(t, 1, missing)
 	require.Equal(t, 0, synthesized, "a rejected insert must not count as synthesized")
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, fullSHA))
+	row, err := store.GetByDeliveryID(t.Context(), storage.ProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, fullSHA))
 	require.NoError(t, err)
 	require.Nil(t, row)
 
@@ -360,7 +360,7 @@ func TestWebhookReconcilerResynthesizesTerminallyFailedRecoveryRow(t *testing.T)
 	store := newRecordingWebhookEventStore()
 	guid := synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha")
 	_, err := store.Create(t.Context(), &storage.WebhookEvent{
-		Provider:    storage.WebhookProviderGitHub,
+		Provider:    storage.ProviderGitHub,
 		DeliveryID:  guid,
 		Event:       "pull_request",
 		Action:      webhookReconcileSynthesizedAction,
@@ -382,7 +382,7 @@ func TestWebhookReconcilerResynthesizesTerminallyFailedRecoveryRow(t *testing.T)
 	require.Equal(t, 1, scanned)
 	require.Equal(t, 1, missing, "a terminally failed row must not cover its head")
 	require.Equal(t, 1, synthesized)
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, guid)
+	row, err := store.GetByDeliveryID(t.Context(), storage.ProviderGitHub, guid)
 	require.NoError(t, err)
 	require.NotNil(t, row)
 	require.Equal(t, storage.WebhookEventPending, row.State, "the failed row must be reopened as a fresh pending delivery")
@@ -399,7 +399,7 @@ func TestWebhookReconcilerDeadLetteredRecoveryRowCoversHead(t *testing.T) {
 	store := newRecordingWebhookEventStore()
 	guid := synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha")
 	_, err := store.Create(t.Context(), &storage.WebhookEvent{
-		Provider:    storage.WebhookProviderGitHub,
+		Provider:    storage.ProviderGitHub,
 		DeliveryID:  guid,
 		Event:       "pull_request",
 		Action:      webhookReconcileSynthesizedAction,
@@ -421,7 +421,7 @@ func TestWebhookReconcilerDeadLetteredRecoveryRowCoversHead(t *testing.T) {
 	require.Equal(t, 1, scanned)
 	require.Equal(t, 0, missing, "a dead-lettered recovery row must cover its head")
 	require.Equal(t, 0, synthesized)
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, guid)
+	row, err := store.GetByDeliveryID(t.Context(), storage.ProviderGitHub, guid)
 	require.NoError(t, err)
 	require.NotNil(t, row)
 	require.Equal(t, storage.WebhookEventFailedPermanent, row.State, "the dead-lettered row must stay dead-lettered")
@@ -436,7 +436,7 @@ func TestWebhookReconcilerDeadLetteredRecoveryRowCoversHead(t *testing.T) {
 func TestWebhookReconcilerFailedOrganicRowCoversHead(t *testing.T) {
 	store := newRecordingWebhookEventStore()
 	_, err := store.Create(t.Context(), &storage.WebhookEvent{
-		Provider:    storage.WebhookProviderGitHub,
+		Provider:    storage.ProviderGitHub,
 		DeliveryID:  "organic-github-guid",
 		Event:       "pull_request",
 		Action:      "synchronize",
@@ -458,7 +458,7 @@ func TestWebhookReconcilerFailedOrganicRowCoversHead(t *testing.T) {
 	require.Equal(t, 1, scanned)
 	require.Equal(t, 0, missing, "a terminally failed organic row must cover its head")
 	require.Equal(t, 0, synthesized)
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha"))
+	row, err := store.GetByDeliveryID(t.Context(), storage.ProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha"))
 	require.NoError(t, err)
 	require.Nil(t, row, "no recovery row may be synthesized over a failed organic delivery")
 }
@@ -472,7 +472,7 @@ func TestWebhookReconcilerFailedOrganicRowCoversHead(t *testing.T) {
 func TestWebhookReconcilerNonPlanRowDoesNotCoverHead(t *testing.T) {
 	store := newRecordingWebhookEventStore()
 	_, err := store.Create(t.Context(), &storage.WebhookEvent{
-		Provider:    storage.WebhookProviderGitHub,
+		Provider:    storage.ProviderGitHub,
 		DeliveryID:  "delivery-closed",
 		Event:       "pull_request",
 		Action:      "closed",
@@ -493,7 +493,7 @@ func TestWebhookReconcilerNonPlanRowDoesNotCoverHead(t *testing.T) {
 	require.Equal(t, 1, scanned)
 	require.Equal(t, 1, missing, "a closed row must not cover the reopened head")
 	require.Equal(t, 1, synthesized)
-	row, err := store.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha"))
+	row, err := store.GetByDeliveryID(t.Context(), storage.ProviderGitHub, synthesizedDeliveryGUID("octocat/hello-world", 7, "head-sha"))
 	require.NoError(t, err)
 	require.NotNil(t, row)
 	require.Equal(t, storage.WebhookEventPending, row.State)
@@ -505,7 +505,7 @@ func TestWebhookReconcilerNonPlanRowDoesNotCoverHead(t *testing.T) {
 func TestWebhookReconcilerCompletedRowStillCoversHead(t *testing.T) {
 	store := newRecordingWebhookEventStore()
 	_, err := store.Create(t.Context(), &storage.WebhookEvent{
-		Provider:    storage.WebhookProviderGitHub,
+		Provider:    storage.ProviderGitHub,
 		DeliveryID:  "delivery-completed",
 		Event:       "pull_request",
 		Action:      "synchronize",

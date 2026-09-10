@@ -120,7 +120,7 @@ func TestIssueCommentGateBlockParity(t *testing.T) {
 // to the delivery's receipt time see a realistic value.
 func durableIssueCommentEvent(comment string) *storage.WebhookEvent {
 	return &storage.WebhookEvent{
-		Provider:    storage.WebhookProviderGitHub,
+		Provider:    storage.ProviderGitHub,
 		DeliveryID:  "delivery-issue-comment-1",
 		Event:       "issue_comment",
 		Action:      "created",
@@ -159,7 +159,7 @@ func TestDurableIssueCommentCommandQueuesAndAcks(t *testing.T) {
 
 			require.Equal(t, http.StatusOK, rr.Code)
 			require.JSONEq(t, fmt.Sprintf(`{"message":%q}`, tt.message), rr.Body.String())
-			event, err := events.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "delivery-issue-comment-1")
+			event, err := events.GetByDeliveryID(t.Context(), storage.ProviderGitHub, "delivery-issue-comment-1")
 			require.NoError(t, err)
 			require.NotNil(t, event)
 			require.Equal(t, "issue_comment", event.Event)
@@ -186,7 +186,7 @@ func TestIssueCommentWebhookCanonicalizesRepository(t *testing.T) {
 	h.DrainInProcessWebhookWork(t.Context())
 
 	require.Equal(t, http.StatusOK, rr.Code)
-	event, err := events.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "mixed-case-issue-comment")
+	event, err := events.GetByDeliveryID(t.Context(), storage.ProviderGitHub, "mixed-case-issue-comment")
 	require.NoError(t, err)
 	require.NotNil(t, event)
 	assert.Equal(t, "mixedcase/sample-repo", event.Repository)

@@ -15,19 +15,20 @@ import (
 
 // Storage implements the storage.Storage interface over database/sql.
 type Storage struct {
-	db              *rebindDB
-	locks           *lockStore
-	plans           *planStore
-	applies         *applyStore
-	tasks           *taskStore
-	applyLogs       *applyLogStore
-	controlRequests *controlRequestStore
-	applyComments   *applyCommentStore
-	planComments    *planCommentStore
-	applyOperations *applyOperationStore
-	checks          *checkStore
-	settings        *settingsStore
-	webhookEvents   *webhookEventStore
+	db                *rebindDB
+	locks             *lockStore
+	plans             *planStore
+	applies           *applyStore
+	tasks             *taskStore
+	applyLogs         *applyLogStore
+	controlRequests   *controlRequestStore
+	applyComments     *applyCommentStore
+	planComments      *planCommentStore
+	applyOperations   *applyOperationStore
+	checks            *checkStore
+	settings          *settingsStore
+	webhookEvents     *webhookEventStore
+	mergeGateRequests *mergeGateRequestStore
 }
 
 var _ storage.Storage = (*Storage)(nil)
@@ -84,19 +85,20 @@ func NewWithDependencies(deps Dependencies) *Storage {
 		maxDriversPerApply = storage.DefaultMaxDriversPerApply
 	}
 	return &Storage{
-		db:              rdb,
-		locks:           &lockStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
-		plans:           &planStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier},
-		applies:         &applyStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier},
-		tasks:           &taskStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker},
-		applyLogs:       &applyLogStore{db: rdb, identity: deps.Identity},
-		controlRequests: &controlRequestStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier, dialect: deps.Dialect},
-		applyComments:   &applyCommentStore{db: rdb, dialect: deps.Dialect},
-		planComments:    &planCommentStore{db: rdb, identity: deps.Identity, dialect: deps.Dialect},
-		applyOperations: &applyOperationStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier, maxDriversPerApply: maxDriversPerApply},
-		checks:          &checkStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
-		settings:        &settingsStore{db: rdb, dialect: deps.Dialect},
-		webhookEvents:   &webhookEventStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
+		db:                rdb,
+		locks:             &lockStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
+		plans:             &planStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier},
+		applies:           &applyStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier},
+		tasks:             &taskStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker},
+		applyLogs:         &applyLogStore{db: rdb, identity: deps.Identity},
+		controlRequests:   &controlRequestStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier, dialect: deps.Dialect},
+		applyComments:     &applyCommentStore{db: rdb, dialect: deps.Dialect},
+		planComments:      &planCommentStore{db: rdb, identity: deps.Identity, dialect: deps.Dialect},
+		applyOperations:   &applyOperationStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier, maxDriversPerApply: maxDriversPerApply},
+		checks:            &checkStore{db: rdb, dialect: deps.Dialect, classifier: deps.Classifier},
+		settings:          &settingsStore{db: rdb, dialect: deps.Dialect},
+		webhookEvents:     &webhookEventStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
+		mergeGateRequests: &mergeGateRequestStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, classifier: deps.Classifier},
 	}
 }
 
@@ -158,6 +160,11 @@ func (s *Storage) Settings() storage.SettingsStore {
 // WebhookEvents returns the durable webhook event inbox store.
 func (s *Storage) WebhookEvents() storage.WebhookEventStore {
 	return s.webhookEvents
+}
+
+// MergeGateRequests returns the durable merge gate request store.
+func (s *Storage) MergeGateRequests() storage.MergeGateRequestStore {
+	return s.mergeGateRequests
 }
 
 // Ping verifies the database connection is alive.

@@ -117,7 +117,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		// Stored-value equality is the cross-dialect check that the repository is canonicalized before persistence.
 		assert.Equal(t, "mixedcase/sample-repo", event.Repository)
 
-		found, err := store.WebhookEvents().HasEventForHead(ctx, storage.WebhookProviderGitHub, "MIXEDCASE/SAMPLE-REPO", 42, "mixed-head")
+		found, err := store.WebhookEvents().HasEventForHead(ctx, storage.ProviderGitHub, "MIXEDCASE/SAMPLE-REPO", 42, "mixed-head")
 		require.NoError(t, err)
 		assert.True(t, found)
 
@@ -153,11 +153,11 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		assert.False(t, inserted)
 
-		stored, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-dedup")
+		stored, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "delivery-dedup")
 		require.NoError(t, err)
 		require.NotNil(t, stored)
 		assert.Equal(t, event.ID, stored.ID)
-		assert.Equal(t, storage.WebhookProviderGitHub, stored.Provider)
+		assert.Equal(t, storage.ProviderGitHub, stored.Provider)
 		assert.Equal(t, storage.WebhookEventPending, stored.State)
 		assert.Equal(t, "block/example", stored.Repository)
 		assert.Equal(t, 123, stored.PullRequest)
@@ -252,7 +252,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 
 		past := time.Now().UTC().Add(-time.Hour)
 		require.NoError(t, store.WebhookEvents().MarkFailed(ctx, claimed.ID, claimed.LeaseToken, "retry now", &past))
-		retryable, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-retry")
+		retryable, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "delivery-retry")
 		require.NoError(t, err)
 		require.NotNil(t, retryable)
 		require.NotNil(t, retryable.RetryAfter)
@@ -267,7 +267,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		assert.Equal(t, 2, reclaimed.Attempts)
 		assert.NotEqual(t, claimed.LeaseToken, reclaimed.LeaseToken)
 
-		persisted, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-retry")
+		persisted, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "delivery-retry")
 		require.NoError(t, err)
 		require.NotNil(t, persisted)
 		assert.Nil(t, persisted.RetryAfter, "claiming consumes the persisted retry window, not just the returned mirror")
@@ -321,7 +321,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 			assert.True(collect, inserted, "the redelivery must reopen the expired processing row")
 		}, pollDeadline, pollInterval)
 
-		reopened, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-reopen-stuck")
+		reopened, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "delivery-reopen-stuck")
 		require.NoError(t, err)
 		require.NotNil(t, reopened)
 		assert.Equal(t, claimed.ID, reopened.ID)
@@ -351,7 +351,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		assert.False(t, inserted, "a processing row with a live lease must deduplicate")
 
-		current, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-live-lease")
+		current, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "delivery-live-lease")
 		require.NoError(t, err)
 		require.NotNil(t, current)
 		assert.Equal(t, storage.WebhookEventProcessing, current.State)
@@ -373,7 +373,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 
 		require.NoError(t, store.WebhookEvents().MarkFailed(ctx, claimed.ID, claimed.LeaseToken, "terminal failure", nil))
 
-		failed, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-failed")
+		failed, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "delivery-failed")
 		require.NoError(t, err)
 		require.NotNil(t, failed)
 		assert.Equal(t, storage.WebhookEventFailed, failed.State)
@@ -396,7 +396,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.NoError(t, store.WebhookEvents().MarkCompleted(ctx, claimed.ID, claimed.LeaseToken))
 		require.NoError(t, store.WebhookEvents().MarkCompleted(ctx, claimed.ID, claimed.LeaseToken))
 
-		completed, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-terminal")
+		completed, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "delivery-terminal")
 		require.NoError(t, err)
 		require.NotNil(t, completed)
 		assert.Equal(t, storage.WebhookEventCompleted, completed.State)
@@ -410,7 +410,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.True(t, inserted)
 		assert.Zero(t, redelivery.ID, "a reopen does not report a fresh insertion ID")
 
-		reopened, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-terminal")
+		reopened, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "delivery-terminal")
 		require.NoError(t, err)
 		require.NotNil(t, reopened)
 		assert.Equal(t, storage.WebhookEventPending, reopened.State)
@@ -478,7 +478,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 			require.False(t, inserted)
 		}
 
-		stored, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-nonpending")
+		stored, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "delivery-nonpending")
 		require.NoError(t, err)
 		require.Nil(t, stored)
 	})
@@ -503,7 +503,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.True(t, inserted)
 
-		reopened, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-reopen-defer")
+		reopened, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "delivery-reopen-defer")
 		require.NoError(t, err)
 		require.NotNil(t, reopened)
 		assert.Equal(t, storage.WebhookEventPending, reopened.State)
@@ -612,7 +612,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.ErrorIs(t, store.WebhookEvents().Release(ctx, claimed.ID, "stale-token"), storage.ErrWebhookEventLeaseLost)
 		require.NoError(t, store.WebhookEvents().Release(ctx, claimed.ID, claimed.LeaseToken))
 
-		released, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-release")
+		released, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "delivery-release")
 		require.NoError(t, err)
 		require.NotNil(t, released)
 		assert.Equal(t, storage.WebhookEventPending, released.State)
@@ -644,7 +644,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.Equal(t, 2, second.Attempts)
 		require.NoError(t, store.WebhookEvents().Release(ctx, second.ID, second.LeaseToken))
 
-		released, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-release-later")
+		released, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "delivery-release-later")
 		require.NoError(t, err)
 		require.NotNil(t, released)
 		assert.Equal(t, storage.WebhookEventPending, released.State, "release must requeue the row regardless of which attempt it undoes")
@@ -669,7 +669,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.ErrorIs(t, store.WebhookEvents().MarkFailedPermanent(ctx, claimed.ID, "stale-token", "unused"), storage.ErrWebhookEventLeaseLost)
 		require.NoError(t, store.WebhookEvents().MarkFailedPermanent(ctx, claimed.ID, claimed.LeaseToken, "PR file listing hit the GitHub cap"))
 
-		deadLettered, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-deadletter")
+		deadLettered, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "delivery-deadletter")
 		require.NoError(t, err)
 		require.NotNil(t, deadLettered)
 		assert.Equal(t, storage.WebhookEventFailedPermanent, deadLettered.State)
@@ -694,7 +694,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.True(t, inserted)
 
-		reopened, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-deadletter")
+		reopened, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "delivery-deadletter")
 		require.NoError(t, err)
 		require.NotNil(t, reopened)
 		assert.Equal(t, storage.WebhookEventPending, reopened.State)
@@ -736,7 +736,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 			event.Event = tc.event
 			createEvent(t, store, event)
 
-			found, err := store.WebhookEvents().HasEventForHead(ctx, storage.WebhookProviderGitHub, "block/example", 7, headSHA)
+			found, err := store.WebhookEvents().HasEventForHead(ctx, storage.ProviderGitHub, "block/example", 7, headSHA)
 			require.NoError(t, err, tc.name)
 			assert.Equal(t, tc.covers, found, tc.name)
 		}
@@ -756,16 +756,16 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 			{"different PR", "block/example", 8, "event-head-0"},
 			{"different repo", "block/other", 7, "event-head-0"},
 		} {
-			found, err = store.WebhookEvents().HasEventForHead(ctx, storage.WebhookProviderGitHub, tc.repo, tc.pr, tc.headSHA)
+			found, err = store.WebhookEvents().HasEventForHead(ctx, storage.ProviderGitHub, tc.repo, tc.pr, tc.headSHA)
 			require.NoError(t, err, tc.name)
 			assert.False(t, found, tc.name)
 		}
 
-		_, err = store.WebhookEvents().HasEventForHead(ctx, storage.WebhookProviderGitHub, "", 7, "event-head-0")
+		_, err = store.WebhookEvents().HasEventForHead(ctx, storage.ProviderGitHub, "", 7, "event-head-0")
 		require.ErrorContains(t, err, "repository, pull request, and head SHA are required", "missing repository must be rejected")
-		_, err = store.WebhookEvents().HasEventForHead(ctx, storage.WebhookProviderGitHub, "block/example", 0, "event-head-0")
+		_, err = store.WebhookEvents().HasEventForHead(ctx, storage.ProviderGitHub, "block/example", 0, "event-head-0")
 		require.ErrorContains(t, err, "repository, pull request, and head SHA are required", "missing pull request must be rejected")
-		_, err = store.WebhookEvents().HasEventForHead(ctx, storage.WebhookProviderGitHub, "block/example", 7, "")
+		_, err = store.WebhookEvents().HasEventForHead(ctx, storage.ProviderGitHub, "block/example", 7, "")
 		require.ErrorContains(t, err, "repository, pull request, and head SHA are required", "missing head SHA must be rejected")
 	})
 
@@ -782,7 +782,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		store := h.NewStorage(t)
 		coversHead := func(headSHA string) bool {
 			t.Helper()
-			found, err := store.WebhookEvents().HasEventForHead(ctx, storage.WebhookProviderGitHub, "block/example", 7, headSHA)
+			found, err := store.WebhookEvents().HasEventForHead(ctx, storage.ProviderGitHub, "block/example", 7, headSHA)
 			require.NoError(t, err)
 			return found
 		}
@@ -838,7 +838,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.True(t, superseded)
 		assert.Equal(t, storage.WebhookEventSuperseded, claimed.State, "the claimed struct must reflect the supersede")
 
-		got, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "old")
+		got, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "old")
 		require.NoError(t, err)
 		require.NotNil(t, got)
 		assert.Equal(t, storage.WebhookEventSuperseded, got.State)
@@ -853,7 +853,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		assert.False(t, superseded)
 
-		got, err = store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "new")
+		got, err = store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "new")
 		require.NoError(t, err)
 		require.NotNil(t, got)
 		assert.Equal(t, storage.WebhookEventProcessing, got.State, "an uncovered claim must stay processing")
@@ -947,7 +947,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		assert.False(t, superseded, "a closed delivery must never be superseded")
 
-		got, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "closed-old")
+		got, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "closed-old")
 		require.NoError(t, err)
 		require.NotNil(t, got)
 		assert.Equal(t, storage.WebhookEventProcessing, got.State)
@@ -970,7 +970,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		assert.False(t, superseded, "a non-pull_request claim must never be superseded")
 
-		got, err = store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "check-run-old")
+		got, err = store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "check-run-old")
 		require.NoError(t, err)
 		require.NotNil(t, got)
 		assert.Equal(t, storage.WebhookEventProcessing, got.State, "the non-pull_request claim must stay processing")
@@ -1008,7 +1008,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		_, err = store.WebhookEvents().SupersedeIfCovered(ctx, &staleToken)
 		require.ErrorIs(t, err, storage.ErrWebhookEventLeaseLost)
 
-		got, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "old")
+		got, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "old")
 		require.NoError(t, err)
 		require.NotNil(t, got)
 		assert.Equal(t, storage.WebhookEventProcessing, got.State, "a stale token must not supersede the row")
@@ -1188,7 +1188,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		assert.Equal(t, int64(1), terminated, "only the cap-exhausted expired-lease row should be terminated")
 
-		got, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "stuck")
+		got, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "stuck")
 		require.NoError(t, err)
 		require.NotNil(t, got)
 		assert.Equal(t, storage.WebhookEventFailed, got.State)
@@ -1202,7 +1202,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 			"below-cap":    storage.WebhookEventProcessing,
 			"pending-row":  storage.WebhookEventPending,
 		} {
-			row, rowErr := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, deliveryID)
+			row, rowErr := store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, deliveryID)
 			require.NoError(t, rowErr, deliveryID)
 			require.NotNil(t, row, deliveryID)
 			assert.Equal(t, wantState, row.State, deliveryID)
@@ -1221,7 +1221,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 
 	t.Run("GetByDeliveryID_DBError", func(t *testing.T) {
 		store := h.NewUnreachableStorage(t)
-		_, err := store.WebhookEvents().GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "delivery-error")
+		_, err := store.WebhookEvents().GetByDeliveryID(t.Context(), storage.ProviderGitHub, "delivery-error")
 		require.Error(t, err)
 	})
 
@@ -1258,7 +1258,7 @@ func TestWebhookEvents(t *testing.T, h Harness) {
 
 	t.Run("HasEventForHead_DBError", func(t *testing.T) {
 		store := h.NewUnreachableStorage(t)
-		_, err := store.WebhookEvents().HasEventForHead(t.Context(), storage.WebhookProviderGitHub, "block/example", 7, "abc123")
+		_, err := store.WebhookEvents().HasEventForHead(t.Context(), storage.ProviderGitHub, "block/example", 7, "abc123")
 		require.Error(t, err)
 	})
 

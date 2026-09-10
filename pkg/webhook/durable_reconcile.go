@@ -221,7 +221,7 @@ pages:
 				continue
 			}
 			scanned++
-			found, err := store.HasEventForHead(ctx, storage.WebhookProviderGitHub, repo, pr.Number, pr.HeadSHA)
+			found, err := store.HasEventForHead(ctx, storage.ProviderGitHub, repo, pr.Number, pr.HeadSHA)
 			if err != nil {
 				h.logger.Warn("webhook reconciler failed to query inbox for PR head",
 					"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA, "error", err)
@@ -319,7 +319,7 @@ func (h *Handler) synthesizeMissingHeadDelivery(ctx context.Context, repo string
 	repo = storage.CanonicalKey(repo)
 	guid := synthesizedDeliveryGUID(repo, pr, headSHA)
 	if store := h.webhookEventStore(); store != nil {
-		prior, err := store.GetByDeliveryID(ctx, storage.WebhookProviderGitHub, guid)
+		prior, err := store.GetByDeliveryID(ctx, storage.ProviderGitHub, guid)
 		if err != nil {
 			return false, false, fmt.Errorf("check for prior synthesized delivery %s for %s#%d@%s: %w", guid, repo, pr, headSHA, err)
 		}
@@ -335,7 +335,7 @@ func (h *Handler) synthesizeMissingHeadDelivery(ctx context.Context, repo string
 		return false, false, fmt.Errorf("encode synthesized pull_request payload for %s#%d@%s: %w", repo, pr, headSHA, err)
 	}
 	inserted, err = h.enqueueDurableWebhookEvent(ctx, &storage.WebhookEvent{
-		Provider:    storage.WebhookProviderGitHub,
+		Provider:    storage.ProviderGitHub,
 		DeliveryID:  guid,
 		Event:       "pull_request",
 		Action:      webhookReconcileSynthesizedAction,

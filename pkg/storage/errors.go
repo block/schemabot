@@ -87,4 +87,10 @@ var (
 
 	// ErrWebhookEventLeaseLost is returned when a driver no longer owns a durable webhook event.
 	ErrWebhookEventLeaseLost = errors.New("webhook event lease lost")
+
+	// ErrMergeGateNotFound is returned when a durable merge gate request does not exist.
+	ErrMergeGateNotFound = errors.New("merge gate request not found")
+
+	// ErrMergeGateLeaseLost is returned when a driver no longer owns a durable merge gate request.
+	ErrMergeGateLeaseLost = errors.New("merge gate request lease lost")
 )

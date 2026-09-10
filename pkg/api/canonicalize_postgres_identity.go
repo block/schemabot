@@ -36,15 +36,16 @@ import (
 // Folding in SQL with lower() and in Go with storage.CanonicalKey agree
 // because identity strings are ASCII, the documented scope of the fold.
 var postgresIdentityKeyColumns = map[string][]string{
-	"applies":            {"database_name", "database_type", "deployment", "environment", "repository"},
-	"apply_operations":   {"deployment"},
-	"apply_target_locks": {"database_name", "database_type", "deployment", "environment"},
-	"checks":             {"database_name", "database_type", "environment", "repository"},
-	"locks":              {"database_name", "database_type", "owner", "repository"},
-	"plan_comments":      {"database_name", "database_type", "repository"},
-	"plans":              {"database_name", "database_type", "deployment", "environment", "repository"},
-	"tasks":              {"database_name", "database_type", "environment", "repository"},
-	"webhook_events":     {"repository"},
+	"applies":             {"database_name", "database_type", "deployment", "environment", "repository"},
+	"apply_operations":    {"deployment"},
+	"apply_target_locks":  {"database_name", "database_type", "deployment", "environment"},
+	"checks":              {"database_name", "database_type", "environment", "repository"},
+	"locks":               {"database_name", "database_type", "owner", "repository"},
+	"merge_gate_requests": {"database_name", "database_type", "environment", "repository"},
+	"plan_comments":       {"database_name", "database_type", "repository"},
+	"plans":               {"database_name", "database_type", "deployment", "environment", "repository"},
+	"tasks":               {"database_name", "database_type", "environment", "repository"},
+	"webhook_events":      {"repository"},
 }
 
 // postgresErrUniqueViolation is PostgreSQL's SQLSTATE for a unique-index

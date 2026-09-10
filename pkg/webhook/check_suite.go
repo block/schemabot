@@ -146,7 +146,7 @@ func (h *Handler) handleCheckSuite(ctx context.Context, metricApp string, w http
 
 	retryAfter := time.Now().Add(h.checkSuiteRecoveryGrace)
 	event := &storage.WebhookEvent{
-		Provider:   storage.WebhookProviderGitHub,
+		Provider:   storage.ProviderGitHub,
 		DeliveryID: deliveryID,
 		Event:      "check_suite",
 		Action:     payload.Action,
@@ -261,7 +261,7 @@ func (h *Handler) processDurableCheckSuite(ctx context.Context, event *storage.W
 
 	var synthesized int
 	for _, pr := range candidates {
-		covered, err := store.HasEventForHead(ctx, storage.WebhookProviderGitHub, repo, pr, headSHA)
+		covered, err := store.HasEventForHead(ctx, storage.ProviderGitHub, repo, pr, headSHA)
 		if err != nil {
 			return true, fmt.Errorf("query inbox coverage for %s#%d@%s (durable check_suite delivery %s): %w",
 				repo, pr, headSHA, event.DeliveryID, err)

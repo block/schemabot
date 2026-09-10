@@ -20,6 +20,7 @@ CREATE TABLE checks (
 );
 CREATE UNIQUE INDEX idx_checks_check_key ON checks (repository, pull_request, environment, database_type, database_name);
 CREATE INDEX idx_checks_repo_env_db ON checks (repository, environment, database_type, database_name);
+CREATE INDEX idx_checks_env_db ON checks (environment, database_type, database_name);
 CREATE INDEX idx_checks_repo_pr ON checks (repository, pull_request);
 CREATE INDEX idx_checks_check_run ON checks (check_run_id);
 CREATE INDEX idx_checks_apply_id ON checks (apply_id);

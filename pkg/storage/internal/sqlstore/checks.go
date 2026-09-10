@@ -718,6 +718,100 @@ func (s *checkStore) GetByDatabase(ctx context.Context, repo, environment, dbTyp
 	return scanChecks(rows)
 }
 
+// GetByTarget returns all checks for a target across all repositories and PRs.
+// The merge gate fan-out uses it: a CLI/gRPC apply carries no repository, so
+// the fan-out must find every PR planned against the target regardless of repo.
+func (s *checkStore) GetByTarget(ctx context.Context, environment, dbType, database string) ([]*storage.Check, error) {
+	environment = storage.CanonicalKey(environment)
+	dbType = storage.CanonicalKey(dbType)
+	database = storage.CanonicalKey(database)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+checkColumns+`
+		FROM checks
+		WHERE environment = ? AND database_type = ? AND database_name = ?
+		ORDER BY repository, pull_request
+	`, environment, dbType, database)
+	if err != nil {
+		return nil, fmt.Errorf("query checks for target %s/%s in %s: %w", dbType, database, environment, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	return scanChecks(rows)
+}
+
+// MarkBlockedForFailedRefresh flips stored check state to a blocking conclusion
+// after a merge gate re-plan failed. The head SHA predicate makes the write
+// optimistic-concurrency: a racing synchronize that already stored a result for
+// a newer commit does not match and is preserved.
+//
+// Two guards keep the write from laundering a block that is already correct:
+// an apply-owned row is never touched, because a started apply's own lifecycle
+// is what releases it; and a row already blocked for review-time deployment
+// drift keeps that reason, because the reviewed plan's block outranks a
+// re-plan failure and the operator resolves it by re-reviewing, not by
+// re-planning. Returns true when the row blocks merge after this call —
+// whether this call wrote the block or one was already stored.
+func (s *checkStore) MarkBlockedForFailedRefresh(ctx context.Context, check *storage.Check) (bool, error) {
+	canonicalizeCheck(check)
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE checks
+		SET has_changes = ?,
+		    status = ?,
+		    conclusion = ?,
+		    blocking_reason = ?,
+		    error_message = ?,
+		    change_summary = ?,
+		    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
+		WHERE repository = ? AND pull_request = ?
+		  AND environment = ? AND database_type = ? AND database_name = ?
+		  AND head_sha = ?
+		  AND apply_id IS NULL
+		  AND COALESCE(blocking_reason, '') != ?
+	`, check.HasChanges, check.Status, check.Conclusion, check.BlockingReason, check.ErrorMessage, nullString(check.ChangeSummary),
+		check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName,
+		check.HeadSHA,
+		storage.ReviewTimeDeploymentDriftBlockingReason)
+	if err != nil {
+		return false, fmt.Errorf("mark check blocked for failed refresh %s#%d %s/%s/%s (head %s): %w",
+			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName, check.HeadSHA, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("rows affected marking check blocked for failed refresh %s#%d %s/%s/%s: %w",
+			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName, err)
+	}
+	if rows > 0 {
+		return true, nil
+	}
+
+	// Under changed-rows semantics, RowsAffected is 0 both when a guard
+	// excluded the row and when the row already held the values this call
+	// would have written. Re-read to tell these apart: a row that already
+	// blocks merge at this head is the outcome the caller asked for, and
+	// reporting it as a failed flip would send the caller looking for a
+	// gate that is in fact closed.
+	current, err := s.Get(ctx, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+	if err != nil {
+		return false, fmt.Errorf("re-read check after no-op blocked-for-failed-refresh update %s#%d %s/%s/%s: %w",
+			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName, err)
+	}
+	if current == nil {
+		return false, fmt.Errorf("check vanished after no-op blocked-for-failed-refresh update %s#%d %s/%s/%s",
+			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+	}
+	return blocksMergeAtHead(current, check.HeadSHA), nil
+}
+
+// blocksMergeAtHead reports whether stored check state blocks merge for the
+// given commit. A block recorded against a different head does not count: the
+// aggregate gate evaluates the current head, so a stale row's block is not the
+// gate the caller is asking about.
+func blocksMergeAtHead(check *storage.Check, headSHA string) bool {
+	return check.HeadSHA == headSHA &&
+		check.Status == "completed" &&
+		check.Conclusion != checkConclusionSuccess
+}
+
 // Delete removes stored check state by ID.
 func (s *checkStore) Delete(ctx context.Context, id int64) error {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM checks WHERE id = ?`, id)

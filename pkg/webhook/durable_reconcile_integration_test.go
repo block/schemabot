@@ -56,7 +56,7 @@ func setupSynthesizedDispatchTest(t *testing.T, dbName, headSHA string) (*Handle
 	require.True(t, inserted)
 	require.False(t, resynthesized, "first synthesis for a head must not be labeled a resynthesis")
 
-	row, err := svc.Storage().WebhookEvents().GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub,
+	row, err := svc.Storage().WebhookEvents().GetByDeliveryID(t.Context(), storage.ProviderGitHub,
 		synthesizedDeliveryGUID("octocat/hello-world", 1, headSHA))
 	require.NoError(t, err)
 	require.NotNil(t, row)

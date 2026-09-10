@@ -1593,9 +1593,10 @@ type EngineResumeState struct {
 	Metadata         string
 }
 
-// Durable webhook event providers.
+// Durable code-host providers, shared by every table that attributes a row
+// to the code host it came from (webhook events, merge gate requests).
 const (
-	WebhookProviderGitHub = "github"
+	ProviderGitHub = "github"
 )
 
 // Durable webhook event states. Two states are terminal failures with
@@ -1686,6 +1687,69 @@ type WebhookInboxStats struct {
 	// StuckProcessing is the number of rows wedged in processing with an expired
 	// lease at the attempt cap — deliveries a driver can no longer reclaim.
 	StuckProcessing int64
+}
+
+// MaxMergeGateAttempts is the claim budget for merge gate requests: how
+// many times a request may be claimed before a failure is recorded as
+// terminal. Attempts increment on claim, so a request that keeps failing (for
+// example against a misconfigured repository) cannot retry forever.
+const MaxMergeGateAttempts = 5
+
+// Merge gate request states.
+const (
+	MergeGatePending    = "pending"
+	MergeGateProcessing = "processing"
+	MergeGateCompleted  = "completed"
+	MergeGateFailed     = "failed"
+)
+
+// MergeGateRequest is a durable request to re-evaluate stored check state
+// for every open change targeting one (environment, database_type,
+// database_name) after an apply successfully changed that target's live
+// schema. Plans and merge-gate statuses on sibling changes were computed
+// against the previous live schema, so each request fans out to those changes
+// and re-plans them; the request row is the durable record that the fan-out
+// must happen, surviving pod restarts and lease handovers.
+//
+// One row exists per originating apply (unique on apply_id), so recording is
+// idempotent and a sweep over recently completed applies can backfill any
+// request lost between the apply's terminal write and its recording.
+type MergeGateRequest struct {
+	ID int64
+	// ApplyID is the internal row id of the originating apply, used only for
+	// the uniqueness guard and sweep join. Logs and operator-facing text use
+	// ApplyIdentifier.
+	ApplyID int64
+	// ApplyIdentifier is the originating apply's user-facing string identifier,
+	// carried for attribution in refreshed check summaries and logs.
+	ApplyIdentifier string
+	Environment     string
+	DatabaseType    string
+	DatabaseName    string
+	// Provider names the code host the originating change lives on (for
+	// example "github"). Empty means the storage default, "github".
+	Provider string
+	// Repository and ChangeKey identify the change that originated the apply,
+	// when there is one. ChangeKey is the provider-scoped handle for the
+	// change within Repository — a PR number rendered as a string on GitHub;
+	// other providers use their own change identity. The fan-out excludes
+	// that change — its own apply lifecycle already updates its stored check
+	// state. Both are empty for CLI/gRPC applies, which have no originating
+	// change and therefore exclude nothing.
+	Repository string
+	ChangeKey  string
+	// RequestedBy is the originating apply's caller, carried for attribution.
+	RequestedBy    string
+	State          string
+	Attempts       int
+	LeaseOwner     string
+	LeaseToken     string
+	LeaseExpiresAt *time.Time
+	RetryAfter     *time.Time
+	LastError      string
+	CompletedAt    *time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // WebhookEvent is a durable inbox row for one SCM/webhook delivery.

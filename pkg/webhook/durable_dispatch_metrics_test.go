@@ -80,7 +80,7 @@ func collectDispatchHistogramPoints(t *testing.T, reader *sdkmetric.ManualReader
 func TestDurableWebhookDispatchMetricsFirstClaimCompleted(t *testing.T) {
 	reader := newDispatchMetricsReader(t)
 	store := newScriptedWebhookEventStore(&storage.WebhookEvent{
-		Provider:   storage.WebhookProviderGitHub,
+		Provider:   storage.ProviderGitHub,
 		DeliveryID: "delivery-metrics-1",
 		Event:      "issue_comment",
 		Payload:    []byte(`{}`),
@@ -113,7 +113,7 @@ func TestDurableWebhookDispatchMetricsDeferredClaimMeasuresLagFromDueTime(t *tes
 	reader := newDispatchMetricsReader(t)
 	notBefore := time.Now().Add(-10 * time.Second)
 	store := newScriptedWebhookEventStore(&storage.WebhookEvent{
-		Provider:   storage.WebhookProviderGitHub,
+		Provider:   storage.ProviderGitHub,
 		DeliveryID: "delivery-metrics-deferred",
 		Event:      "issue_comment",
 		Payload:    []byte(`{}`),
@@ -136,7 +136,7 @@ func TestDurableWebhookDispatchMetricsDeferredClaimMeasuresLagFromDueTime(t *tes
 func TestDurableWebhookDispatchMetricsRetryClaimSkipsInboxLag(t *testing.T) {
 	reader := newDispatchMetricsReader(t)
 	store := newScriptedWebhookEventStore(&storage.WebhookEvent{
-		Provider:   storage.WebhookProviderGitHub,
+		Provider:   storage.ProviderGitHub,
 		DeliveryID: "delivery-metrics-retry",
 		Event:      "issue_comment",
 		Payload:    []byte(`{}`),

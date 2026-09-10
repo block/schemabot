@@ -73,7 +73,7 @@ func TestWebhookEventStore_HasEventForHeadExcludesFailedStateSynthesized(t *test
 		_, err = testDB.ExecContext(ctx, `UPDATE webhook_events SET state = ? WHERE delivery_id = ?`, tc.state, deliveryID)
 		require.NoError(t, err, tc.state)
 
-		found, err := store.WebhookEvents().HasEventForHead(ctx, storage.WebhookProviderGitHub, "block/example", 7, headSHA)
+		found, err := store.WebhookEvents().HasEventForHead(ctx, storage.ProviderGitHub, "block/example", 7, headSHA)
 		require.NoError(t, err, tc.state)
 		assert.Equal(t, tc.covers, found, "state %s", tc.state)
 	}
@@ -109,7 +109,7 @@ func createCoalescingEvent(t *testing.T, store storage.Storage, deliveryID, even
 	_, err = testDB.ExecContext(ctx, `
 		UPDATE webhook_events SET state = ?, attempts = ?, lease_expires_at = `+lease+`
 		WHERE provider = ? AND delivery_id = ?
-	`, state, attempts, storage.WebhookProviderGitHub, deliveryID)
+	`, state, attempts, storage.ProviderGitHub, deliveryID)
 	require.NoError(t, err)
 }
 
@@ -169,7 +169,7 @@ func TestWebhookEventStore_SupersedeIfCoveredSuccessorStates(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, tc.covers, superseded)
 
-			got, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "old")
+			got, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "old")
 			require.NoError(t, err)
 			require.NotNil(t, got)
 			if tc.covers {
@@ -201,7 +201,7 @@ func TestWebhookEventStore_FindNextHonorsPendingNotBefore(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, inserted)
 
-	deferred, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "deferred")
+	deferred, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "deferred")
 	require.NoError(t, err)
 	require.NotNil(t, deferred)
 	require.NotNil(t, deferred.RetryAfter, "the not-before time must be persisted with the row")
@@ -239,7 +239,7 @@ func TestWebhookEventStore_FindNextHonorsPendingNotBefore(t *testing.T) {
 	_, err = testDB.ExecContext(ctx, `
 		UPDATE webhook_events SET retry_after = NOW() - INTERVAL 1 SECOND
 		WHERE provider = ? AND delivery_id = ?
-	`, storage.WebhookProviderGitHub, "deferred")
+	`, storage.ProviderGitHub, "deferred")
 	require.NoError(t, err)
 
 	ready, err := store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
@@ -249,7 +249,7 @@ func TestWebhookEventStore_FindNextHonorsPendingNotBefore(t *testing.T) {
 	assert.Equal(t, storage.WebhookEventProcessing, ready.State)
 	assert.Nil(t, ready.RetryAfter, "the claim consumes the not-before time")
 
-	persisted, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "deferred")
+	persisted, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "deferred")
 	require.NoError(t, err)
 	require.NotNil(t, persisted)
 	assert.Nil(t, persisted.RetryAfter, "the claim consumes the persisted not-before time, not just the returned mirror")
@@ -286,7 +286,7 @@ func TestWebhookEventStore_FindNextClaimsRetryableRowWithoutRetryWindow(t *testi
 	_, err = testDB.ExecContext(ctx, `
 		UPDATE webhook_events SET retry_after = NULL
 		WHERE provider = ? AND delivery_id = ?
-	`, storage.WebhookProviderGitHub, "repaired")
+	`, storage.ProviderGitHub, "repaired")
 	require.NoError(t, err)
 
 	reclaimed, err := store.WebhookEvents().FindNext(ctx, "driver-b", time.Minute)
@@ -358,7 +358,7 @@ func TestWebhookEventStore_CreateReopensStuckProcessingDelivery(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, inserted)
 
-	reopened, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.WebhookProviderGitHub, "delivery-1")
+	reopened, err := store.WebhookEvents().GetByDeliveryID(ctx, storage.ProviderGitHub, "delivery-1")
 	require.NoError(t, err)
 	require.NotNil(t, reopened)
 	assert.Equal(t, storage.WebhookEventPending, reopened.State)
@@ -483,7 +483,7 @@ func TestWebhookEventStore_InboxStatsBacklogMatchesClaimable(t *testing.T) {
 		SET state = ?, attempts = ?, retry_after = NOW() - INTERVAL 1 HOUR,
 			received_at = NOW(6) - INTERVAL 600 SECOND
 		WHERE provider = ? AND delivery_id = ?
-	`, storage.WebhookEventFailedRetryable, storage.MaxWebhookEventAttempts, storage.WebhookProviderGitHub, "cap-exhausted")
+	`, storage.WebhookEventFailedRetryable, storage.MaxWebhookEventAttempts, storage.ProviderGitHub, "cap-exhausted")
 	require.NoError(t, err)
 
 	onlyExhausted, err := store.WebhookEvents().InboxStats(ctx)
@@ -501,7 +501,7 @@ func TestWebhookEventStore_InboxStatsBacklogMatchesClaimable(t *testing.T) {
 			lease_expires_at = NOW(6) - INTERVAL 1 SECOND,
 			received_at = NOW(6) - INTERVAL 200 SECOND
 		WHERE provider = ? AND delivery_id = ?
-	`, storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts-1, storage.WebhookProviderGitHub, "reclaimable")
+	`, storage.WebhookEventProcessing, storage.MaxWebhookEventAttempts-1, storage.ProviderGitHub, "reclaimable")
 	require.NoError(t, err)
 
 	stats, err := store.WebhookEvents().InboxStats(ctx)
