@@ -349,6 +349,98 @@ type IncompleteCheckRun struct {
 	StartedAt string `json:"started_at,omitempty"`
 }
 
+// ChecksInspectRequest asks for the stored check state one pull request holds,
+// read against the commit that pull request is currently gated on.
+type ChecksInspectRequest struct {
+	Repo        string `json:"repo"`
+	PullRequest int    `json:"pull_request"`
+	// Environment, when set, narrows the response to that environment's rows.
+	Environment string `json:"environment,omitempty"`
+}
+
+// ChecksInspectResponse is the stored check state for one pull request beside
+// the Check Run GitHub currently shows, so an operator can see where the two
+// disagree without reading server logs or the database.
+type ChecksInspectResponse struct {
+	Repo        string `json:"repo"`
+	PullRequest int    `json:"pull_request"`
+	// HeadSHA is the commit the pull request is gated on, read uncached.
+	HeadSHA string `json:"head_sha"`
+	PRState string `json:"pr_state,omitempty"`
+	// Environment echoes the environment the response was narrowed to, empty
+	// when it covers every one. A narrowed response cannot speak for the
+	// environments it left out, so anything reported over the whole response
+	// has to say which environment it is reporting on.
+	Environment string `json:"environment,omitempty"`
+	// ChecksEnabled reports whether this deployment publishes Check Runs for
+	// the repository at all. When it is false the absence of a Check Run is a
+	// configuration choice, not a gap to backfill, and saying otherwise would
+	// send an operator after an incident that is not happening.
+	ChecksEnabled bool `json:"checks_enabled"`
+	// CheckRunsOnHead is every Check Run this deployment publishes that was
+	// found on the head, one per expected name.
+	CheckRunsOnHead []InspectedCheckRun `json:"check_runs_on_head,omitempty"`
+	// MissingCheckRunNames is every expected Check Run name GitHub was read
+	// for and reported no run on the head. Branch protection requires each
+	// name on its own, so one present run never says the gate is clear while
+	// another name is absent.
+	//
+	// Empty on a deployment that publishes no checks for the repository:
+	// there the absence is the configuration, and naming it as a gap would
+	// send an operator after an incident that is not happening.
+	MissingCheckRunNames []string `json:"missing_check_run_names,omitempty"`
+	// UnreadableCheckRunNames is every expected name whose lookup failed.
+	// Such a name is neither present nor missing, and the difference decides
+	// what an operator does: a missing run is recreated, an unreadable one is
+	// read again. Reporting it as absent would recommend recreating a Check
+	// Run that may be sitting on the head, and treating the empty result as
+	// "no gap" would report a GitHub outage as a clear gate.
+	UnreadableCheckRunNames []string `json:"unreadable_check_run_names,omitempty"`
+	// Rows is the stored check state, one entry per environment and database.
+	Rows []InspectedCheck `json:"rows"`
+}
+
+// InspectedCheckRun is the state of a Check Run on the pull request head.
+type InspectedCheckRun struct {
+	Name       string `json:"name"`
+	CheckRunID int64  `json:"check_run_id"`
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion,omitempty"`
+	// StartedAt is RFC3339; empty when GitHub did not report a start time.
+	StartedAt string `json:"started_at,omitempty"`
+}
+
+// InspectedCheck is one stored check row and what it means for the commit the
+// pull request is gated on.
+type InspectedCheck struct {
+	Environment  string `json:"environment"`
+	DatabaseType string `json:"database_type"`
+	Database     string `json:"database"`
+	// HeadSHA is the commit this row was recorded for, which is not always the
+	// commit the pull request is gated on.
+	HeadSHA        string `json:"head_sha"`
+	CoversHead     bool   `json:"covers_head"`
+	Status         string `json:"status"`
+	Conclusion     string `json:"conclusion,omitempty"`
+	BlockingReason string `json:"blocking_reason,omitempty"`
+	CheckRunID     int64  `json:"check_run_id,omitempty"`
+	// ApplyIdentifier names the apply that owns this row, empty when none
+	// does. Ownership is what keeps a plan for a newer commit from replacing
+	// the row, so it is the first thing to look at on a row that will not move.
+	ApplyIdentifier string `json:"apply_identifier,omitempty"`
+	ApplyState      string `json:"apply_state,omitempty"`
+	UpdatedAt       string `json:"updated_at,omitempty"`
+	// Reason is the stable diagnosis code for this row; see pkg/checkstate.
+	Reason  string `json:"reason"`
+	Summary string `json:"summary"`
+	Remedy  string `json:"remedy"`
+	// Blocking reports whether this row keeps the aggregate from passing.
+	Blocking bool `json:"blocking"`
+	// SelfConverging reports whether SchemaBot reaches the resolved state on
+	// its own. False means the row is waiting on a person.
+	SelfConverging bool `json:"self_converging"`
+}
+
 // =============================================================================
 // Request Types
 // =============================================================================
