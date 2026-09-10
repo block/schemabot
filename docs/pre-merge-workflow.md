@@ -188,9 +188,10 @@ You apply while the PR is open. Once the required schema checks pass, merging
 records the desired state the databases already run.
 
 - **No schema edits?** The PR gets a passing `No schema files changed` check.
-  SchemaBot plans a database only when the PR changes a file under its schema
-  directory, so no database is compared against its schema. To plan a database
-  whose files are already correct, such as the first apply to a new database,
+  A PR plan covers the databases whose schema directories the PR changes, so a
+  PR with no schema edits compares no database against its schema. To plan a
+  new database, or an existing one whose live schema has drifted from files
+  that are already correct,
   [reconcile drift with a nonce edit](#reconciling-drift-with-a-nonce-edit)
 - **Another PR holds the database lock?** The apply is refused and names the
   holder. Wait for that PR to merge or release the lock
@@ -278,15 +279,20 @@ merge gate for every PR in the repository.
 ### Reconciling drift with a nonce edit
 
 Drift is a live database that no longer matches the schema files on the base
-branch. A new database was configured after its schema files merged, so no PR
-ever applied them. A freshly provisioned copy or tenant starts empty. An apply
-was skipped or never finished. Someone changed the database by hand. In every
-case the files already describe the schema you want, so there is nothing to
-edit, and a PR that changes nothing under the schema directory gets the `No
-schema files changed` check rather than a plan.
+branch. It comes in two shapes:
 
-SchemaBot plans a database only when a PR changes a file under that database's
-schema directory. The trigger is the diff, but the plan is not: once it runs,
+- **A new database.** Its schema files merged before the database was
+  configured, so no PR ever applied them and the database is empty. A freshly
+  provisioned copy or tenant starts the same way.
+- **An existing database.** An apply was skipped or never finished, or someone
+  changed the database by hand.
+
+In both cases the files already describe the schema you want, so there is
+nothing to edit, and a PR that changes nothing under the schema directory gets
+the `No schema files changed` check rather than a plan.
+
+A PR plan covers the databases whose schema directories the PR changes. The
+trigger is the diff, but the plan is not: once it runs,
 it compares the whole directory at the PR head with the live database, so it
 finds every table and column the database is missing, including ones whose
 files the PR did not touch.

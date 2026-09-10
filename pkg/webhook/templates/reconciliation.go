@@ -69,8 +69,11 @@ func RenderNoManagedSchemaChangesChecksRefreshed(data NoManagedSchemaChangesChec
 	} else {
 		fmt.Fprintf(&sb, "SchemaBot found no changes to managed schema files in this PR. The SchemaBot checks were refreshed as passing on %s.\n", head)
 		sb.WriteString("\n<details>\n<summary>Expected a plan?</summary>\n\n")
-		sb.WriteString("SchemaBot plans a database only when a PR changes a file under that database's schema directory. This PR changes none, so no database was compared against its schema directory.\n\n")
-		sb.WriteString("To reconcile drift on a database whose files are already correct, for example a new database whose schema directory merged before the database was configured, give the PR a change in that directory: add or toggle a `# nonce` comment line in the database's `schemabot.yaml` and push. SchemaBot then plans the whole directory against the live schema, and the plan comment carries the apply command.\n\n</details>\n")
+		sb.WriteString("A PR plan covers the databases whose schema directories the PR changes. This PR changes none, so no database was compared against its schema directory.\n\n")
+		sb.WriteString("Two cases still need a plan even though the files are already correct:\n\n")
+		sb.WriteString("- **A new database.** Its schema directory merged before the database was configured, so no PR ever applied the files and the live database is empty.\n")
+		sb.WriteString("- **An existing database with drift.** The live schema no longer matches the files, because an apply was skipped or never finished, or someone changed the database by hand.\n\n")
+		sb.WriteString("In either case, give the PR a change in that database's schema directory: add or toggle a `# nonce` comment line in its `schemabot.yaml` and push. SchemaBot then plans the whole directory against the live schema, and the plan comment carries the apply command.\n\n</details>\n")
 	}
 	if data.RequestedBy != "" {
 		fmt.Fprintf(&sb, "\n_Requested by @%s_\n", data.RequestedBy)
