@@ -1170,6 +1170,7 @@ func TestFindConfigByDatabaseNameInRepoTruncatedNotExhaustiveFailsClosed(t *test
 	_, _, err := ic.FindConfigByDatabaseNameInRepo(t.Context(), "octocat/hello-world", 1, "widgets")
 
 	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrConfigDiscoveryTruncated)
 	assert.ErrorIs(t, err, ErrGitTreeTruncated)
 }
 

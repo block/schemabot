@@ -198,7 +198,7 @@ Schema request errors are mapped to specific GitHub comment templates:
 | `ErrMultipleConfigs` | "Multiple Databases Detected" | Use `-d <database>` |
 | `DatabaseNotFoundError` | "Database Not Found" | Check database name; on a repository too large to search in full, the comment lists the configured directories that were searched |
 | `api.DatabaseNotConfiguredError` | "Database Not Configured" | Ask an operator to configure the database on the server |
-| `ErrGitTreeTruncated` | "Repository Too Large to Search" | Ask an operator to bound the database's config location with `allowed_dirs` |
+| `ErrConfigDiscoveryTruncated` | "Repository Too Large to Search" | Ask an operator to bound the database's config location with `allowed_dirs` |
 | Other | "Plan Failed" | Check error details |
 
 ## Not Implemented In Webhooks

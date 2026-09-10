@@ -206,10 +206,13 @@ func (h *Handler) unownedDiscoveredConfigError(repo string, config *ghclient.Sch
 // is the one fan-out silencing already reads as "another deployment owns
 // this" (isSchemaUnownedByDeploymentError).
 //
-// An aggregate leader keeps discovering instead: its registry covers only its
-// own slice of the fleet, and it owes the fleet-authoritative Database Not
-// Found when no deployment can answer, which only a repository search can
-// establish. Returns nil when the command named no database.
+// Two deployments keep discovering instead. An aggregate leader's registry
+// covers only its own slice of the fleet, and it owes the fleet-authoritative
+// Database Not Found when no deployment can answer, which only a repository
+// search can establish. A deployment that resolves databases dynamically
+// (TargetResolver) does not describe what it manages in the registry at all,
+// the same exception the source policy makes. Returns nil when the command
+// named no database.
 func (h *Handler) unregisteredDatabaseError(repo, databaseName string) error {
 	if databaseName == "" {
 		return nil
@@ -218,7 +221,7 @@ func (h *Handler) unregisteredDatabaseError(repo, databaseName string) error {
 	if !ok {
 		return nil
 	}
-	if config.IsAggregateLeaderForRepo(repo) {
+	if config.IsAggregateLeaderForRepo(repo) || config.TargetResolver.Enabled() {
 		return nil
 	}
 	if config.Database(databaseName) != nil {
@@ -227,6 +230,28 @@ func (h *Handler) unregisteredDatabaseError(repo, databaseName string) error {
 	h.logger.Info("database named by -d is not configured on this deployment; answering from the registry without repository discovery",
 		"repo", repo, "database", databaseName)
 	return &api.DatabaseNotConfiguredError{Database: databaseName}
+}
+
+// answerUnregisteredDatabase is the registry-first gate a command path runs
+// before any GitHub read, including the no-managed-schema-changes preflight:
+// a -d database this deployment does not serve gets its answer from the
+// registry alone (unregisteredDatabaseError), so the response never depends on
+// what the PR happens to touch or on a repository read succeeding. The answer
+// follows the fan-out rules every other discovery outcome follows — silent on
+// an unscoped aggregate fan-out, a comment otherwise. Returns whether the
+// command is answered; the caller stops when it is.
+func (h *Handler) answerUnregisteredDatabase(repo string, pr int, installationID int64, environment, databaseName, tenant, requestedBy, commandName string, suppressRetryComments bool) bool {
+	err := h.unregisteredDatabaseError(repo, databaseName)
+	if err == nil {
+		return false
+	}
+	if h.silentDiscoveryFailureOnUnscopedFanOut(repo, tenant, err) {
+		h.logger.Debug("unscoped fan-out command names a database this deployment does not serve; staying silent",
+			"repo", repo, "pr", pr, "environment", environment, "database", databaseName, "action", commandName)
+		return true
+	}
+	h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, commandName, err, suppressRetryComments)
+	return true
 }
 
 func (h *Handler) createManagedSchemaRequestFromPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, environment, databaseName, source string) (*ghclient.SchemaRequestResult, error) {

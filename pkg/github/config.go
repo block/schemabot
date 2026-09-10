@@ -70,6 +70,15 @@ var (
 	ErrGitTreeTruncated  = fmt.Errorf("GitHub returned a truncated repository tree; config discovery is incomplete")
 	ErrPRFilesIncomplete = fmt.Errorf("GitHub returned the maximum number of pull request files; config discovery is incomplete")
 	ErrDirListingCapped  = fmt.Errorf("GitHub returned the maximum number of directory entries; schema discovery is incomplete")
+
+	// ErrConfigDiscoveryTruncated is the config-discovery case of
+	// ErrGitTreeTruncated, which it wraps: the tree was truncated and the
+	// server-configured schema directories could not bound where a
+	// schemabot.yaml may live, so no scoped probe could stand in for the
+	// whole-repository scan. Schema-file loading below an already discovered
+	// config returns the bare ErrGitTreeTruncated instead, so callers can tell
+	// "could not find the config" from "found it, could not list its files".
+	ErrConfigDiscoveryTruncated = fmt.Errorf("%w; the configured schema directories do not bound where schemabot.yaml may live", ErrGitTreeTruncated)
 )
 
 // DatabaseNotFoundError indicates the specified database was not found in any config.
@@ -149,7 +158,7 @@ type FindAllConfigsResult struct {
 // in the repository. When the repository is too large for the Trees API to
 // list completely, discovery falls back to scanning the server-configured
 // schema directories for the repo; when no such fallback is possible it fails
-// closed with ErrGitTreeTruncated.
+// closed with ErrConfigDiscoveryTruncated.
 func (ic *InstallationClient) FindAllConfigs(ctx context.Context, repo, ref string) (*FindAllConfigsResult, error) {
 	entries, truncated, err := ic.FetchGitTree(ctx, repo, ref)
 	if err != nil {
@@ -161,7 +170,7 @@ func (ic *InstallationClient) FindAllConfigs(ctx context.Context, repo, ref stri
 			return nil, fmt.Errorf("discover schemabot configs in configured schema dirs of repo %s ref %s: %w", repo, ref, hintErr)
 		}
 		if !ok {
-			return nil, fmt.Errorf("discover schemabot configs in repo %s ref %s: %w", repo, ref, ErrGitTreeTruncated)
+			return nil, fmt.Errorf("discover schemabot configs in repo %s ref %s: %w", repo, ref, ErrConfigDiscoveryTruncated)
 		}
 		ic.logger.Info("git tree truncated; discovered configs from configured schema dirs",
 			"repo", repo, "ref", ref,
@@ -212,7 +221,7 @@ func (ic *InstallationClient) collectConfigsFromTree(ctx context.Context, repo, 
 // schema directories (scoped=true, searchedDirs naming them): absence there
 // is authoritative for the database, but the result does not enumerate other
 // databases' configs. When the database's directories cannot be probed
-// exhaustively, it fails closed with ErrGitTreeTruncated.
+// exhaustively, it fails closed with ErrConfigDiscoveryTruncated.
 func (ic *InstallationClient) findAllConfigsForDatabase(ctx context.Context, repo, ref, databaseName string) (result *FindAllConfigsResult, searchedDirs []string, scoped bool, err error) {
 	entries, truncated, err := ic.FetchGitTree(ctx, repo, ref)
 	if err != nil {
@@ -226,7 +235,7 @@ func (ic *InstallationClient) findAllConfigsForDatabase(ctx context.Context, rep
 		return nil, nil, false, fmt.Errorf("discover schemabot config in configured schema dirs of database %s in repo %s ref %s: %w", databaseName, repo, ref, hintErr)
 	}
 	if !ok {
-		return nil, nil, false, fmt.Errorf("discover schemabot config for database %s in repo %s ref %s: %w", databaseName, repo, ref, ErrGitTreeTruncated)
+		return nil, nil, false, fmt.Errorf("discover schemabot config for database %s in repo %s ref %s: %w", databaseName, repo, ref, ErrConfigDiscoveryTruncated)
 	}
 	ic.logger.Info("git tree truncated; scoped config discovery to the database's configured schema dirs",
 		"repo", repo, "ref", ref, "database", databaseName, "searched_dirs", searchedDirs,
