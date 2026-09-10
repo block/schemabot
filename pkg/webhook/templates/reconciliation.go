@@ -28,21 +28,22 @@ type SchemaChangeReconciliationItem struct {
 	InProgress  bool
 }
 
-// RenderNoManagedSchemaChanges renders the clear no-op state for a PR that has
-// no managed schema changes and no apply-owned SchemaBot state.
+// RenderNoManagedSchemaChanges renders the clear no-op state for a PR whose
+// diff touches no managed schema files and that has no apply-owned SchemaBot
+// state.
 func RenderNoManagedSchemaChanges(data SchemaErrorData) string {
 	var sb strings.Builder
-	sb.WriteString("## ✅ No Managed Schema Changes\n\n")
+	sb.WriteString("## ✅ No Schema Changes Detected\n\n")
 	if data.Environment != "" {
 		fmt.Fprintf(&sb, "**Environment**: `%s`\n\n", data.Environment)
 	}
 	writeRequestedLine(&sb, data.RequestedBy, data.Timestamp)
-	sb.WriteString("\nThis PR does not contain schema changes managed by SchemaBot. SchemaBot did not find any apply-owned state that requires live database reconciliation.\n")
+	sb.WriteString("\nSchemaBot found no changes to managed schema files in this PR and no apply-owned state that requires live database reconciliation.\n")
 	return sb.String()
 }
 
 // NoManagedSchemaChangesChecksRefreshedData describes the outcome of a plan
-// command that found no managed schema changes and refreshed the PR's
+// command that found no changes to managed schema files and refreshed the PR's
 // SchemaBot check state instead of running a plan.
 type NoManagedSchemaChangesChecksRefreshedData struct {
 	RequestedBy string
@@ -57,16 +58,16 @@ type NoManagedSchemaChangesChecksRefreshedData struct {
 }
 
 // RenderNoManagedSchemaChangesChecksRefreshed reports that a plan command
-// found no managed schema changes and recreated the PR's SchemaBot check
+// found no changes to managed schema files and recreated the PR's SchemaBot check
 // state on the current head.
 func RenderNoManagedSchemaChangesChecksRefreshed(data NoManagedSchemaChangesChecksRefreshedData) string {
 	var sb strings.Builder
-	sb.WriteString("## ✅ No Managed Schema Changes\n\n")
+	sb.WriteString("## ✅ No Schema Changes Detected\n\n")
 	head := formatCommitRef(data.Repository, data.HeadSHA)
 	if data.GatedOnTenants {
-		fmt.Fprintf(&sb, "This PR does not contain schema changes managed by this SchemaBot deployment, but it touches schema paths owned by tenant deployments. The SchemaBot check was refreshed on %s and will pass once every tenant deployment's own check succeeds.\n", head)
+		fmt.Fprintf(&sb, "SchemaBot found no changes to schema files managed by this deployment in this PR, but the PR touches schema paths owned by tenant deployments. The SchemaBot check was refreshed on %s and will pass once every tenant deployment's own check succeeds.\n", head)
 	} else {
-		fmt.Fprintf(&sb, "This PR does not contain schema changes managed by SchemaBot. The SchemaBot checks were refreshed as passing on %s.\n", head)
+		fmt.Fprintf(&sb, "SchemaBot found no changes to managed schema files in this PR. The SchemaBot checks were refreshed as passing on %s.\n", head)
 		sb.WriteString("\nIf this PR is meant to apply a schema root that is already merged, such as the first apply to a new database, name the database so SchemaBot plans that whole root against the live schema:\n\n")
 		sb.WriteString("```\nschemabot plan -d <database>\nschemabot apply -e <environment> -d <database>\n```\n")
 	}

@@ -372,7 +372,7 @@ func TestE2EPlanCancelledApplyWithNoManagedFilesConvergesPassing(t *testing.T) {
 
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "No Managed Schema Changes")
+		assert.Contains(t, body, "No Schema Changes Detected")
 		assert.Contains(t, body, "refreshed as passing")
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for passing convergence comment")

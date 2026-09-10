@@ -59,9 +59,9 @@ func previewCommentAllOutput() {
 		{"APPLY REJECTED (ENGINE-BLOCKED CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedRejected()) }},
 		{"PLAN COMMENT (TENANT TARGET)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanTenant()) }},
 		{"PLAN COMMENT (NO CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanNoChanges()) }},
-		{"NO MANAGED SCHEMA CHANGES", func() { fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChanges()) }},
-		{"NO MANAGED SCHEMA CHANGES (CHECKS REFRESHED)", func() { fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshed()) }},
-		{"NO MANAGED SCHEMA CHANGES (GATED ON TENANTS)", func() {
+		{"NO SCHEMA CHANGES DETECTED", func() { fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChanges()) }},
+		{"NO SCHEMA CHANGES DETECTED (CHECKS REFRESHED)", func() { fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshed()) }},
+		{"NO SCHEMA CHANGES DETECTED (GATED ON TENANTS)", func() {
 			fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshedGatedOnTenants())
 		}},
 		{"RECONCILIATION REQUIRED (IN PROGRESS)", func() { fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationInProgress()) }},
@@ -164,9 +164,9 @@ func previewCommentPlanAllOutput() {
 		{"APPLY REJECTED (ENGINE-BLOCKED CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedRejected()) }},
 		{"MYSQL PLAN (TENANT TARGET)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanTenant()) }},
 		{"MYSQL PLAN (NO CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanNoChanges()) }},
-		{"NO MANAGED SCHEMA CHANGES", func() { fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChanges()) }},
-		{"NO MANAGED SCHEMA CHANGES (CHECKS REFRESHED)", func() { fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshed()) }},
-		{"NO MANAGED SCHEMA CHANGES (GATED ON TENANTS)", func() {
+		{"NO SCHEMA CHANGES DETECTED", func() { fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChanges()) }},
+		{"NO SCHEMA CHANGES DETECTED (CHECKS REFRESHED)", func() { fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshed()) }},
+		{"NO SCHEMA CHANGES DETECTED (GATED ON TENANTS)", func() {
 			fmt.Print(webhooktemplates.PreviewCommentNoManagedSchemaChangesChecksRefreshedGatedOnTenants())
 		}},
 		{"RECONCILIATION REQUIRED (IN PROGRESS)", func() { fmt.Print(webhooktemplates.PreviewCommentSchemaReconciliationInProgress()) }},

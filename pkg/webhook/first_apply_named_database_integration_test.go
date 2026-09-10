@@ -26,7 +26,7 @@ import (
 // to a database whose declarative schema root is already merged: the live
 // database holds no tables, the schema files sit on the default branch, and the
 // PR touches nothing under the schema root. The PR diff is only what triggers
-// an unscoped plan, so that plan reports no managed schema changes and tells
+// an unscoped plan, so that plan reports that it detected no schema changes and tells
 // the user how to ask for the root anyway. Naming the database is that ask:
 // discovery finds the config in the repository, the desired schema is the whole
 // root at the PR head, and the apply creates the tables on the blank database.
@@ -65,7 +65,7 @@ func TestE2EFirstApplyToBlankDatabaseThroughNamedDatabase(t *testing.T) {
 		assert.Contains(t, rr.Body.String(), "no managed schema changes handled")
 
 		body := requireNextComment(t, result, "no managed schema changes comment")
-		assert.Contains(t, body, "No Managed Schema Changes")
+		assert.Contains(t, body, "No Schema Changes Detected")
 		assert.Contains(t, body, "refreshed as passing")
 		assert.Contains(t, body, "already merged")
 		assert.Contains(t, body, "schemabot plan -d <database>")
@@ -81,7 +81,7 @@ func TestE2EFirstApplyToBlankDatabaseThroughNamedDatabase(t *testing.T) {
 		assert.Contains(t, body, "CREATE TABLE")
 		assert.Contains(t, body, "`users`")
 		assert.Contains(t, body, dbName)
-		assert.NotContains(t, body, "No Managed Schema Changes")
+		assert.NotContains(t, body, "No Schema Changes Detected")
 		assert.NotContains(t, body, "Database Not Found")
 	})
 

@@ -619,8 +619,8 @@ func rewindsConcludedCheckRun(run *ghclient.CheckRunResult, status string) bool 
 // per-database state that still needs operator attention.
 func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string) {
 	const (
-		title   = "No managed schema changes"
-		summary = "This PR does not contain schema changes managed by SchemaBot."
+		title   = "No schema changes detected"
+		summary = "SchemaBot found no changes to managed schema files in this PR."
 	)
 	if !h.shouldPublishChecks(ctx, repo, "aggregate_check_sync") {
 		return

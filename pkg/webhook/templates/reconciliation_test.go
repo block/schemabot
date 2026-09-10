@@ -69,7 +69,7 @@ func TestRenderNoManagedSchemaChangesChecksRefreshed(t *testing.T) {
 			HeadSHA:     "abcdef1234567890abcdef1234567890abcdef12",
 		})
 
-		assert.Contains(t, rendered, "## ✅ No Managed Schema Changes")
+		assert.Contains(t, rendered, "## ✅ No Schema Changes Detected")
 		assert.Contains(t, rendered, "refreshed as passing on [`abcdef1`](https://github.com/acme/payments/commit/abcdef1234567890abcdef1234567890abcdef12).")
 		assert.Contains(t, rendered, "schema root that is already merged, such as the first apply to a new database")
 		assert.Contains(t, rendered, "```\nschemabot plan -d <database>\nschemabot apply -e <environment> -d <database>\n```")
@@ -97,6 +97,6 @@ func TestRenderNoManagedSchemaChanges(t *testing.T) {
 		Environment: "staging",
 	})
 
-	assert.Contains(t, rendered, "## ✅ No Managed Schema Changes")
-	assert.Contains(t, rendered, "SchemaBot did not find any apply-owned state")
+	assert.Contains(t, rendered, "## ✅ No Schema Changes Detected")
+	assert.Contains(t, rendered, "no changes to managed schema files in this PR and no apply-owned state")
 }

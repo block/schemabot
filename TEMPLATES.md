@@ -572,26 +572,26 @@ schemabot apply -e staging --tenant alpha
 </details>
 
 <details>
-<summary><a name="no-managed-schema-changes"></a><strong>No Managed Schema Changes</strong></summary>
+<summary><a name="no-schema-changes-detected"></a><strong>No Schema Changes Detected</strong></summary>
 
 
-## ✅ No Managed Schema Changes
+## ✅ No Schema Changes Detected
 
 **Environment**: `staging`
 
 *Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
-This PR does not contain schema changes managed by SchemaBot. SchemaBot did not find any apply-owned state that requires live database reconciliation.
+SchemaBot found no changes to managed schema files in this PR and no apply-owned state that requires live database reconciliation.
 
 </details>
 
 <details>
-<summary><a name="no-managed-schema-changes-checks-refreshed"></a><strong>No Managed Schema Changes (Checks Refreshed)</strong></summary>
+<summary><a name="no-schema-changes-detected-checks-refreshed"></a><strong>No Schema Changes Detected (Checks Refreshed)</strong></summary>
 
 
-## ✅ No Managed Schema Changes
+## ✅ No Schema Changes Detected
 
-This PR does not contain schema changes managed by SchemaBot. The SchemaBot checks were refreshed as passing on [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12).
+SchemaBot found no changes to managed schema files in this PR. The SchemaBot checks were refreshed as passing on [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12).
 
 If this PR is meant to apply a schema root that is already merged, such as the first apply to a new database, name the database so SchemaBot plans that whole root against the live schema:
 
@@ -605,12 +605,12 @@ _Requested by @jackjackbits_
 </details>
 
 <details>
-<summary><a name="no-managed-schema-changes-gated-on-tenants"></a><strong>No Managed Schema Changes (Gated On Tenants)</strong></summary>
+<summary><a name="no-schema-changes-detected-gated-on-tenants"></a><strong>No Schema Changes Detected (Gated On Tenants)</strong></summary>
 
 
-## ✅ No Managed Schema Changes
+## ✅ No Schema Changes Detected
 
-This PR does not contain schema changes managed by this SchemaBot deployment, but it touches schema paths owned by tenant deployments. The SchemaBot check was refreshed on [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12) and will pass once every tenant deployment's own check succeeds.
+SchemaBot found no changes to schema files managed by this deployment in this PR, but the PR touches schema paths owned by tenant deployments. The SchemaBot check was refreshed on [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12) and will pass once every tenant deployment's own check succeeds.
 
 _Requested by @jackjackbits_
 
