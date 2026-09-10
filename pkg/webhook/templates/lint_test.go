@@ -103,7 +103,7 @@ func TestRenderPlanComment_PrimaryKeyGuidance(t *testing.T) {
 				return
 			}
 			assert.Equal(t, 1, strings.Count(out, primaryKeyDocURL))
-			assert.Contains(t, out, "📖 **Related guidance:** [Primary key tradeoffs]("+primaryKeyDocURL+")")
+			assert.Contains(t, out, "📖 **Related guidance:**\n\n- [Choosing a primary key]("+primaryKeyDocURL+")")
 			if tc.count > lintWarningsFoldThreshold {
 				assert.Greater(t, strings.Index(out, primaryKeyDocURL), strings.Index(out, "</details>"))
 			}

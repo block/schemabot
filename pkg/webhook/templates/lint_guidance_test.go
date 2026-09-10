@@ -28,7 +28,7 @@ func TestRelatedGuidanceAggregatesRulesAcrossEnvironments(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(out, "📖 **Related guidance:**"))
 	assert.Equal(t, 1, strings.Count(out, primaryKeyDocURL))
 	assert.Equal(t, 1, strings.Count(out, "#renaming-a-column-or-table"))
-	assert.Contains(t, out, ") · [Renaming a column or table](")
+	assert.Contains(t, out, ")\n- [Renaming a column or table](")
 	assert.Greater(t, strings.Index(out, "📖 **Related guidance:**"), strings.LastIndex(out, "</details>"))
 	assert.NotContains(t, out, "unknown_rule")
 
