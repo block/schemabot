@@ -428,6 +428,33 @@ func TestCheckRunsOnHeadKeepsAnUntrustedConflictBesideATrustedRun(t *testing.T) 
 		"a present trusted run does not remove the other app's")
 }
 
+// With publishing turned off there is no SchemaBot run for another app's to
+// contest, so what sits under an expected name is simply that app's. Reporting
+// it as contested would put a remedy in the response that the text output drops
+// and the JSON keeps, and would contradict the line saying this deployment
+// maintains no Check Runs for the repository.
+func TestCheckRunsOnHeadReportsNoConflictWhereItPublishesNothing(t *testing.T) {
+	t.Parallel()
+
+	disabled := false
+	cfg := inspectTestConfig()
+	cfg.Repos = map[string]RepoConfig{"octo/repo": {EnableChecks: &disabled}}
+	names := webhookMissingCheckNames(cfg, "octo/repo", "", "")
+	require.NotEmpty(t, names)
+
+	client := &inspectGitHubClient{
+		runs: map[string]*ghclient.CheckRunResult{names[0]: {
+			ID: 7, Name: names[0], Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionSuccess,
+		}},
+		untrustedApps: map[string][]string{names[0]: {"other-app"}},
+	}
+	got := checkRunsOnHead(t.Context(), cfg, client, "octo/repo", "43da12bb", "", discardLogger())
+
+	assert.Empty(t, got.untrustedConflicts, "nothing SchemaBot publishes here can be contested")
+	assert.Empty(t, got.missing, "a deployment that publishes none is missing none")
+	require.Len(t, got.found, 1, "the run on the head is still reported")
+}
+
 // The conflict has to reach the caller, not just the read: the whole point of
 // the field is that a backfill will not move the gate on its own.
 func TestInspectChecksCarriesUntrustedConflictsToTheResponse(t *testing.T) {

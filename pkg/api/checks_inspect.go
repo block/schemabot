@@ -308,10 +308,20 @@ func checkRunsOnHead(ctx context.Context, cfg *ServerConfig, client checksInspec
 			}
 			continue
 		}
+		// A conflict is a claim that another app's run competes with
+		// SchemaBot's. With publishing turned off there is no SchemaBot run for
+		// it to compete with, so what sits under the name is simply another
+		// app's, and calling it contested would contradict the line that says
+		// this deployment maintains none here.
 		if len(untrustedApps) > 0 {
-			logger.Warn("a SchemaBot Check Run is on the head commit under this name, and so is an untrusted app's",
-				"repo", repo, "head_sha", headSHA, "check_name", name, "untrusted_apps", untrustedApps)
-			result.untrustedConflicts = append(result.untrustedConflicts, name)
+			if checksEnabled {
+				logger.Warn("a SchemaBot Check Run is on the head commit under this name, and so is an untrusted app's",
+					"repo", repo, "head_sha", headSHA, "check_name", name, "untrusted_apps", untrustedApps)
+				result.untrustedConflicts = append(result.untrustedConflicts, name)
+			} else {
+				logger.Debug("an untrusted app has a Check Run under this name, and this deployment publishes none for the repository, so there is nothing for it to contest",
+					"repo", repo, "head_sha", headSHA, "check_name", name, "untrusted_apps", untrustedApps)
+			}
 		}
 		inspected := InspectedCheckRun{
 			Name:       run.Name,

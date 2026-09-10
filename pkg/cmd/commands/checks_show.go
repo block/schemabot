@@ -159,13 +159,49 @@ func writeCheckRunLines(w io.Writer, response *apitypes.ChecksInspectResponse) e
 // missing runs the backfill and watches the gate stay closed. The conflict is
 // resolved on GitHub — by removing or renaming the other app's run, or by
 // trusting that app — and this line is the only place the text output says so.
+//
+// What the backfill does depends on whether SchemaBot's own run is there, so
+// the two cases are worded apart. Where it is absent the backfill recreates it
+// and the conflict outlives that; where it is already present the backfill
+// finds nothing missing and does nothing at all, and promising it would be the
+// same wrong turn this line exists to prevent.
 func writeUntrustedConflictLine(w io.Writer, response *apitypes.ChecksInspectResponse) error {
 	if len(response.UntrustedConflictNames) == 0 {
 		return nil
 	}
-	_, err := fmt.Fprintf(w, "Held by another app on %s: %s. A backfill recreates SchemaBot's run but cannot touch the other app's, so remove or rename it, or add its app to the trusted apps, before expecting the gate to move.\n",
-		shortSHA(response.HeadSHA), strings.Join(response.UntrustedConflictNames, ", "))
-	return err
+	absent, present := partitionConflictsByOwnRun(response)
+	if len(absent) > 0 {
+		if _, err := fmt.Fprintf(w, "Held by another app on %s: %s. A backfill recreates SchemaBot's run but cannot touch the other app's, so remove or rename it, or add its app to the trusted apps, before expecting the gate to move.\n",
+			shortSHA(response.HeadSHA), strings.Join(absent, ", ")); err != nil {
+			return err
+		}
+	}
+	if len(present) > 0 {
+		if _, err := fmt.Fprintf(w, "Answered by another app too on %s: %s. SchemaBot's own run is already there, so a backfill has nothing to recreate; remove or rename the other app's run, or add its app to the trusted apps, before expecting the gate to move.\n",
+			shortSHA(response.HeadSHA), strings.Join(present, ", ")); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// partitionConflictsByOwnRun splits the contested names by whether SchemaBot's
+// own run is missing under them. A contested name that is also missing keeps
+// its place in the missing list, so that list is what says which of the two a
+// name is.
+func partitionConflictsByOwnRun(response *apitypes.ChecksInspectResponse) (absent, present []string) {
+	missing := make(map[string]bool, len(response.MissingCheckRunNames))
+	for _, name := range response.MissingCheckRunNames {
+		missing[name] = true
+	}
+	for _, name := range response.UntrustedConflictNames {
+		if missing[name] {
+			absent = append(absent, name)
+			continue
+		}
+		present = append(present, name)
+	}
+	return absent, present
 }
 
 // writeChecksDisabledLine states that the deployment publishes no Check Runs
@@ -283,14 +319,25 @@ func writeChecksBlockingSection(w io.Writer, response *apitypes.ChecksInspectRes
 // claim about the whole pull request would be one this response cannot make.
 func writeChecksNothingBlockingLine(w io.Writer, response *apitypes.ChecksInspectResponse) error {
 	if len(response.MissingCheckRunNames) > 0 && response.ChecksEnabled {
-		_, err := fmt.Fprintf(w, "\nNo stored row is holding the merge gate open, but a missing Check Run is: branch protection cannot pass without %s.\n",
-			strings.Join(response.MissingCheckRunNames, ", "))
-		return err
+		if _, err := fmt.Fprintf(w, "\nNo stored row is holding the merge gate open, but a missing Check Run is: branch protection cannot pass without %s.\n",
+			strings.Join(response.MissingCheckRunNames, ", ")); err != nil {
+			return err
+		}
+		return writeAlsoContestedLine(w, response)
 	}
 	if len(response.UntrustedConflictNames) > 0 {
-		_, err := fmt.Fprintf(w, "\nNo stored row is holding the merge gate open, but another app answers under %s on %s, so which run branch protection reads is not SchemaBot's to say.\n",
-			strings.Join(response.UntrustedConflictNames, ", "), shortSHA(response.HeadSHA))
-		return err
+		if _, err := fmt.Fprintf(w, "\nNo stored row is holding the merge gate open, but another app answers under %s on %s, so which run branch protection reads is not SchemaBot's to say.\n",
+			strings.Join(response.UntrustedConflictNames, ", "), shortSHA(response.HeadSHA)); err != nil {
+			return err
+		}
+		// SchemaBot's own run can be holding the gate at the same time, and an
+		// operator who resolves only the conflict would find it still closed.
+		if holding := checkRunNamesHoldingGate(response); len(holding) > 0 {
+			_, err := fmt.Fprintf(w, "Branch protection is also waiting on SchemaBot's own run on %s: %s.\n",
+				shortSHA(response.HeadSHA), strings.Join(holding, ", "))
+			return err
+		}
+		return nil
 	}
 	if holding := checkRunNamesHoldingGate(response); len(holding) > 0 {
 		_, err := fmt.Fprintf(w, "\nNo stored row is holding the merge gate open, but branch protection is, on %s: %s.\n",
@@ -307,6 +354,21 @@ func writeChecksNothingBlockingLine(w io.Writer, response *apitypes.ChecksInspec
 		return err
 	}
 	_, err := fmt.Fprintln(w, "\nNothing is holding the merge gate open.")
+	return err
+}
+
+// writeAlsoContestedLine adds the conflict to a summary that already named a
+// missing Check Run. The two overlap by construction — a contested name whose
+// own run is absent is reported as missing as well — and the backfill that
+// closes the missing half leaves the conflict standing, so a summary that
+// stopped at the missing half would send an operator to a remedy that does not
+// finish the job.
+func writeAlsoContestedLine(w io.Writer, response *apitypes.ChecksInspectResponse) error {
+	if len(response.UntrustedConflictNames) == 0 {
+		return nil
+	}
+	_, err := fmt.Fprintf(w, "Another app also answers under %s on %s, so recreating SchemaBot's run does not settle which one branch protection reads.\n",
+		strings.Join(response.UntrustedConflictNames, ", "), shortSHA(response.HeadSHA))
 	return err
 }
 

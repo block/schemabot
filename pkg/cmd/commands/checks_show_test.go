@@ -151,6 +151,8 @@ func TestRenderChecksInspectionReportsAnUntrustedConflictBesideAMissingRun(t *te
 	assert.Contains(t, rendered, "Held by another app on 43da12bb: SchemaBot (production).")
 	assert.Contains(t, rendered, "cannot touch the other app's",
 		"the operator has to be told the backfill does not reach the conflicting run")
+	assert.Contains(t, rendered, "Another app also answers under SchemaBot (production) on 43da12bb",
+		"the summary sends the operator to a backfill that leaves the conflict standing")
 }
 
 // A conflict outlives a trusted run that is present and passing: protection
@@ -181,6 +183,42 @@ func TestRenderChecksInspectionDoesNotCallTheGateClearOverAnUntrustedConflict(t 
 	rendered := out.String()
 	assert.Contains(t, rendered, "another app answers under SchemaBot (production)")
 	assert.NotContains(t, rendered, "Nothing is holding the merge gate open.")
+	assert.Contains(t, rendered, "Answered by another app too on 43da12bb: SchemaBot (production).")
+	assert.Contains(t, rendered, "so a backfill has nothing to recreate",
+		"SchemaBot's own run is already on the head, so the scan finds nothing missing to recreate")
+	assert.NotContains(t, rendered, "A backfill recreates SchemaBot's run",
+		"pointing at a backfill that does nothing is the wrong turn this line exists to prevent")
+}
+
+// A conflict and SchemaBot's own unfinished run can hold the gate at once.
+// Reporting only the conflict would have an operator remove the other app's
+// run and find the gate still shut, so the summary names both.
+func TestRenderChecksInspectionReportsItsOwnRunHoldingTheGateBesideAConflict(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	require.NoError(t, renderChecksInspection(&out, &apitypes.ChecksInspectResponse{
+		Repo: "octo/repo", PullRequest: 709,
+		HeadSHA: "43da12bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", PRState: "open",
+		ChecksEnabled: true,
+		CheckRunsOnHead: []apitypes.InspectedCheckRun{{
+			Name: "SchemaBot (production)", CheckRunID: 102754133862,
+			Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionFailure,
+		}},
+		UntrustedConflictNames: []string{"SchemaBot (production)"},
+		Rows: []apitypes.InspectedCheck{{
+			Environment: "production", Database: "widgets",
+			RecordedSHA: "43da12bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", CoversHead: true,
+			Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionSuccess,
+			Reason: checkstate.ReasonResolved, Summary: "The plan concluded successfully.",
+			Remedy: "Nothing to do.", SelfConverging: true,
+		}},
+	}))
+
+	rendered := out.String()
+	assert.Contains(t, rendered, "another app answers under SchemaBot (production)")
+	assert.Contains(t, rendered, `Branch protection is also waiting on SchemaBot's own run on 43da12bb: "SchemaBot (production)" concluded failure.`,
+		"resolving the conflict alone leaves SchemaBot's own failed run holding the gate")
 }
 
 // A name GitHub could not be read for comes back neither present nor

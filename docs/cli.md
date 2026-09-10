@@ -678,13 +678,19 @@ The backfill is only recommended where it will act. It holds a pull request
 whose head still carries an uncompleted Check Run, so while one is in
 progress the line says so rather than naming a command that recreates
 nothing. On a repository the deployment publishes no Check Runs for, nothing
-is reported as missing at all: there the absence is the configuration.
+is reported as missing at all: there the absence is the configuration, and a
+run another app has under an expected name is simply that app's, with no
+SchemaBot run for it to contest.
 
 A name another app is also answering under is reported on its own line,
 whether or not SchemaBot's own run is there. Branch protection reads whichever
 run it picked and no backfill touches the other app's, so that conflict is
 resolved on GitHub — remove or rename the other run, or add its app to the
-trusted apps — and until it is, nothing here claims the gate is clear.
+trusted apps — and until it is, nothing here claims the gate is clear. Which
+of the two the line names decides what the backfill is worth: where SchemaBot's
+own run is absent it recreates that run and the conflict outlives it, and where
+the run is already there the backfill finds nothing missing and does nothing,
+so the line says so rather than sending an operator to it.
 
 A row marked `(older)` was recorded for a commit the pull request has moved
 past. The aggregate holds those as blocking whatever they concluded, which is
