@@ -203,7 +203,7 @@ const reaperPassDeadline = 10 * time.Second
 // gatedApplyOperationStore holds its sweep open until the gate is closed, so a
 // test can observe what the pass does while one sweep is still scanning.
 type gatedApplyOperationStore struct {
-	storage.ApplyOperationStore
+	stubApplyOperationStore
 	gate <-chan struct{}
 }
 
