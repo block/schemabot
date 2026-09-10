@@ -101,9 +101,16 @@ func (s *Service) pullTargetSchema(
 	return merged, nil
 }
 
-// pullMemberDivergence pulls every non-primary rollout member of an environment
-// whose members hold their own schemas and reports how each one's live schema
-// differs from the primary's.
+// pullMemberDivergence reports every rollout member of an environment whose
+// members hold their own schemas: the primary, marked as such and carrying no
+// comparison of its own, and each other member with how its live schema differs
+// from the primary's.
+//
+// The primary is listed rather than left implicit so the response names the
+// whole member set. A caller reconciling an environment against its own shard
+// inventory can then read the members straight off the payload, instead of
+// having to know that the schema in Namespaces belongs to a member the list
+// omits — which would leave a four-target environment describing three.
 //
 // It returns nil for an environment whose members are expected to hold the same
 // schema: pulling them would cost one round trip per member to learn what the
@@ -149,9 +156,18 @@ func (s *Service) pullMemberDivergence(
 		return nil, fmt.Errorf("canonicalize schema of rollout member %s: %w", primary.MemberID(), err)
 	}
 
-	divergences := make([]*apitypes.TargetDivergence, 0, len(targets)-1)
+	members := make([]*apitypes.TargetDivergence, 0, len(targets))
 	for _, target := range targets {
-		if target.Deployment == primary.Deployment && target.Target == primary.Target {
+		// The primary is already pulled — its schema is what every other member
+		// is compared against — so it is recorded from the schema in hand rather
+		// than fetched a second time, and carries no comparison against itself.
+		if target.MemberID() == primary.MemberID() {
+			members = append(members, &apitypes.TargetDivergence{
+				Deployment: target.Deployment,
+				Target:     target.Target,
+				TableCount: primarySchema.TableCount,
+				Primary:    true,
+			})
 			continue
 		}
 		memberSchema, err := s.pullTargetSchema(ctx, req, target, namespaces, catalogDetail)
@@ -162,14 +178,14 @@ func (s *Service) pullMemberDivergence(
 		if err != nil {
 			return nil, fmt.Errorf("canonicalize schema of rollout member %s: %w", target.MemberID(), err)
 		}
-		divergences = append(divergences, &apitypes.TargetDivergence{
+		members = append(members, &apitypes.TargetDivergence{
 			Deployment:     target.Deployment,
 			Target:         target.Target,
 			TableCount:     memberSchema.TableCount,
 			DivergedTables: divergedTables(primaryTables, memberTables),
 		})
 	}
-	return divergences, nil
+	return members, nil
 }
 
 // namespaceTable identifies one pulled table within its namespace.
