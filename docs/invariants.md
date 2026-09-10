@@ -783,7 +783,7 @@ including when what is stored is a task that has outlived its apply's verdict (U
 *Enforced:* lease predicates on the driver's apply and task writes
 (`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/applies.go`), the lease
 gates the reaper's sweeps select and write under (`unleasedOperationGate`, `undrivenApplyGate`,
-`lockUndrivenApply`, `pkg/storage/internal/sqlstore/apply_operations.go`,
+`lockUndrivenApplies`, `pkg/storage/internal/sqlstore/apply_operations.go`,
 `pkg/storage/internal/sqlstore/applies.go`), and a read path that builds progress from
 stored rows without writing them (`pkg/api/progress_handlers.go`).
 
