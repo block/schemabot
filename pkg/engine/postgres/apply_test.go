@@ -653,7 +653,28 @@ func TestNamesWithinRoomAdmitsEveryRenderingThatFits(t *testing.T) {
 
 		assert.Equal(t, count, namesWithinRoom(names, room), "room %d holds all %d names", room, count)
 	}
-	assert.Zero(t, namesWithinRoom([]string{"a"}, -1), "a room already overdrawn holds no names")
+}
+
+// namesWithinRoom is also the ceiling the searches must not run past, so it
+// must turn away every count the room cannot hold: a ceiling that admitted a
+// count the room can never show would spend the work the bound exists to
+// avoid, and a ceiling that went negative would have the searches index a
+// rendering that was never made. The bound is exact at the cheapest
+// rendering — the room that holds n single-character names admits n, not
+// n+1 — and a room already overdrawn by any amount admits none.
+func TestNamesWithinRoomRejectsEveryCountThatCannotFit(t *testing.T) {
+	for count := 1; count <= 8; count++ {
+		names := make([]string, count+1)
+		for i := range names {
+			names[i] = "a"
+		}
+		room := count * len(`"a"`)
+
+		assert.Equal(t, count, namesWithinRoom(names, room), "room %d holds %d names, not %d", room, count, count+1)
+	}
+	for _, room := range []int{-1, -3, -6} {
+		assert.Zero(t, namesWithinRoom([]string{"a"}, room), "a room overdrawn by %d holds no names", -room)
+	}
 }
 
 // The name searches spend work in proportion to the room, not to the width
@@ -672,6 +693,8 @@ func TestMismatchNamesWorkIsBoundedByTheRoom(t *testing.T) {
 	assert.Equal(t, `"ab", "ab", and 9998 more`, missing)
 	assert.Equal(t, `"ab", and 9999 more`, unclaimed)
 	assert.Equal(t, `"ab", "ab", and 9998 more`, alone)
+	assert.Equal(t, 15, namesWithinRoom(names, 46), "the searches visit at most the fifteen counts a 46-byte room could show, not ten thousand")
+	assert.Equal(t, 10, namesWithinRoom(names, 30), "the searches visit at most the ten counts a 30-byte room could show, not ten thousand")
 }
 
 // quotedNames spends its budget on whole names: it shows the most leading
@@ -804,7 +827,10 @@ const widestCreateSet = math.MaxInt32
 // operator reads what to do even when the detail is cut from the tail. The
 // sweep runs over the whole outcome vocabulary and over every refusal
 // refusalForCause decides on a typed error, so a new cause that renders the
-// table name unbounded fails here rather than on an operator's screen.
+// table name unbounded, or renders it raw, fails here rather than on an
+// operator's screen: a table name of legal length is always narrower raw
+// than quoted, so the width check alone cannot tell the two apart, and the
+// detail is also checked for the quoted form itself.
 func TestEveryRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 	widest := strings.Repeat(`"`, maxIdentifierLength)
 	type sweepCase struct {
@@ -812,8 +838,18 @@ func TestEveryRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 		// pastFirstStep marks a refusal a step after the CREATE TABLE can
 		// raise: a name it needs is occupied, an invalid index it cannot
 		// clear holds the name, the statement ran past its budget, or the
-		// engine's own accounting failed while the step ran.
+		// engine's own accounting failed while the step ran. The name
+		// read-back is not among them: pg-sprite's create sequence runs
+		// verifyOwnedNames once, after the first step, and reports its
+		// refusals at that step, so a mismatch or unverified cause is
+		// charged for no later step's clause. A read-back after every step
+		// upstream would give those causes a step clause the room does not
+		// pay for, and this sweep is where that would show.
 		pastFirstStep bool
+		// typedSentence marks a refusal whose cause is pg-sprite's own typed
+		// sentence rendered verbatim, which carries no identifier by
+		// construction, so the table name is not looked for in it.
+		typedSentence bool
 	}
 	cases := map[string]sweepCase{
 		"privilege on the table":     {cause: &preflight.PrivilegeError{Tier: preflight.TierAlterInPlace, Check: "has_table_privilege", Grant: "GRANT"}},
@@ -824,7 +860,7 @@ func TestEveryRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 		"create collision":           {cause: preflight.ErrRelationExists, pastFirstStep: true},
 		"create names unverified":    {cause: fmt.Errorf("%w: %w", executor.ErrCreateNamesUnverified, context.Canceled)},
 		"create name mismatch":       {cause: &executor.CreateNameMismatchError{Schema: "public", Table: widest, Missing: []string{widest}, Unclaimed: []string{widest}}},
-		"statement budget exhausted": {cause: &executor.BudgetError{Cause: executor.CauseStatement, Budget: time.Second}, pastFirstStep: true},
+		"statement budget exhausted": {cause: &executor.BudgetError{Cause: executor.CauseStatement, Budget: time.Second}, pastFirstStep: true, typedSentence: true},
 	}
 	pastFirstStepCodes := map[executor.Code]bool{
 		executor.CodeCreateCollision:          true,
@@ -855,6 +891,10 @@ func TestEveryRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 
 				require.NotNil(t, r)
 				require.NotEmpty(t, r.detail)
+				assert.NotContains(t, r.detail, widest, "no refusal renders the table name raw")
+				if !tc.typedSentence {
+					assert.Contains(t, r.detail, quotedTable(widest), "a refusal that names the table renders it quoted and bounded")
+				}
 				remedy := r.remedy
 				if remedy == "" {
 					if step == nil || step.Step <= 1 {
