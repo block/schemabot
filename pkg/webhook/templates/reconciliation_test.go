@@ -74,7 +74,7 @@ func TestRenderNoManagedSchemaChangesChecksRefreshed(t *testing.T) {
 		assert.Contains(t, rendered, "<summary>Expected a plan?</summary>")
 		assert.Contains(t, rendered, "This PR changes none, so no database was compared against its schema directory.")
 		assert.Contains(t, rendered, "- **A new database.** Its schema directory merged before the database was configured")
-		assert.Contains(t, rendered, "- **An existing database with drift.** The live schema no longer matches the files")
+		assert.Contains(t, rendered, "- **An existing database with drift.** The live schema was changed outside SchemaBot: DDL run by hand during an incident")
 		assert.Contains(t, rendered, "add or toggle a `# nonce` comment line in its `schemabot.yaml` and push")
 		assert.Contains(t, rendered, "the plan comment carries the apply command")
 		assert.True(t, strings.HasSuffix(rendered, "\n_Requested by @alice_\n"), "attribution closes the comment: %q", rendered)
