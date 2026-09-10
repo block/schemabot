@@ -5,7 +5,7 @@ const {chromium}=require('playwright');
 (async()=>{
 const root=path.resolve(__dirname,'..'),out=path.join(root,'assets');
 const framesDir=fs.mkdtempSync(path.join(os.tmpdir(),'spirit-keys-'));
-const browser=await chromium.launch({headless:true,executablePath:process.env.CHROME||'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'});
+const browser=await chromium.launch({headless:true,...(process.env.CHROME ? {executablePath:process.env.CHROME} : {channel:'chrome'})});
 try{
  const page=await browser.newPage({viewport:{width:1100,height:690},deviceScaleFactor:1});
  page.on('pageerror',e=>console.error(e));

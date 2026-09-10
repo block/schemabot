@@ -17,6 +17,7 @@ node scripts/render-spirit-primary-keys.cjs
 
 The renderer logs frame progress and the final GIF size, then writes
 `assets/spirit-primary-keys.gif`. Set `NODE_PATH` if needed to resolve Playwright;
+Playwright discovers the installed Chrome through its `chrome` channel by default;
 `CHROME` overrides the browser executable. Temporary frames are removed after rendering.
 The 26-second loop uses a fixed canvas, reading pauses, and a shared palette to keep
 stationary text from shimmering. Inspect the encoded GIF after changing the source.

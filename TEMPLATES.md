@@ -169,7 +169,9 @@ ALTER TABLE `order_events` DROP INDEX `idx_events_archived`;
 
 </details>
 
-📖 **Related guidance:** [Primary key tradeoffs](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key)
+📖 **Related guidance:**
+
+- [Choosing a primary key](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key)
 
 📋 **Plan**: **2** tables to alter
 
@@ -200,7 +202,9 @@ ALTER TABLE `customers` ADD INDEX `idx_created_at`(`created_at`);
 💡 **Lint Warnings**: 1 advisory finding
 - `customers`: Primary key column `id` has type `varchar`
 
-📖 **Related guidance:** [Primary key tradeoffs](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key)
+📖 **Related guidance:**
+
+- [Choosing a primary key](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key)
 
 📋 **Plan**: **1** table to alter
 
@@ -237,7 +241,9 @@ CREATE TABLE `customers` (
 ⚠️ **Issues**: 1 unsafe change detected
 1. `customers`: Primary key column `id` has type `varchar`
 
-📖 **Related guidance:** [Primary key tradeoffs](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key)
+📖 **Related guidance:**
+
+- [Choosing a primary key](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key)
 
 📋 **Plan**: **1** table to create
 
@@ -303,7 +309,10 @@ ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
 
 </details>
 
-📖 **Related guidance:** [Primary key tradeoffs](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key) · [Renaming a column or table](https://github.com/block/schemabot/blob/main/docs/pre-merge-workflow.md#renaming-a-column-or-table)
+📖 **Related guidance:**
+
+- [Choosing a primary key](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key)
+- [Renaming a column or table](https://github.com/block/schemabot/blob/main/docs/pre-merge-workflow.md#renaming-a-column-or-table)
 
 📋 **Plan**: **7** tables to alter
 

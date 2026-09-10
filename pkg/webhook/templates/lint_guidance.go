@@ -18,7 +18,7 @@ type lintGuide struct {
 // Registry order is display order, independent of finding or environment order.
 // Multiple rules can point to a guide; its URL appears only once per comment.
 var lintGuides = []lintGuide{
-	{rules: []string{"primary_key"}, label: "Primary key tradeoffs", url: primaryKeyDocURL, mysqlOnly: true},
+	{rules: []string{"primary_key"}, label: "Choosing a primary key", url: primaryKeyDocURL, mysqlOnly: true},
 	{rules: []string{"rename_column"}, label: "Renaming a column or table", url: "https://github.com/block/schemabot/blob/main/docs/pre-merge-workflow.md#renaming-a-column-or-table", mysqlOnly: true},
 }
 
@@ -44,6 +44,6 @@ func writeRelatedGuidance(sb *strings.Builder, plans ...PlanCommentData) {
 		}
 	}
 	if len(links) > 0 {
-		fmt.Fprintf(sb, "📖 **Related guidance:** %s\n\n", strings.Join(links, " · "))
+		fmt.Fprintf(sb, "📖 **Related guidance:**\n\n- %s\n\n", strings.Join(links, "\n- "))
 	}
 }
