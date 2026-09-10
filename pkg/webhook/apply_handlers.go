@@ -80,6 +80,10 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	}
 	defer cancel()
 
+	if h.answerUnregisteredDatabase(repo, pr, installationID, environment, databaseName, result.Tenant, requestedBy, action.Apply, result.SuppressRetryComments) {
+		return false, nil
+	}
+
 	if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.Apply, environment, databaseName, requestedBy); err != nil {
 		h.logger.Error("failed to check whether apply command needs schema change reconciliation", "repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 		if !result.SuppressRetryComments {
@@ -600,6 +604,10 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 		return true, fmt.Errorf("apply-confirm command bootstrap %s#%d: %w", repo, pr, err)
 	}
 	defer cancel()
+
+	if h.answerUnregisteredDatabase(repo, pr, installationID, environment, databaseName, result.Tenant, requestedBy, action.ApplyConfirm, result.SuppressRetryComments) {
+		return false, nil
+	}
 
 	if handled, err := h.handleNoManagedSchemaChangesForCommand(ctx, client, repo, pr, installationID, action.ApplyConfirm, environment, databaseName, requestedBy); err != nil {
 		h.logger.Error("failed to check whether apply-confirm command needs schema change reconciliation", "repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)

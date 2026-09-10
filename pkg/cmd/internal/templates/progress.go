@@ -17,8 +17,6 @@ import (
 	"github.com/block/schemabot/pkg/ui"
 )
 
-const maxStatusFailureReasonWidth = 240
-
 // Indentation for progress rendering.
 // indentTable is the prefix for table names. Aligns with keyspace name after "── " in headers.
 const indentTable = "     " // 5 spaces — matches "  ── " in FormatKeyspaceHeader
@@ -1308,10 +1306,10 @@ func compactStatusFailureReason(reason string) string {
 	if reason == "" {
 		return "-"
 	}
-	if len(reason) <= maxStatusFailureReasonWidth {
+	if len(reason) <= apitypes.StatusFailureReasonWidth {
 		return reason
 	}
-	return reason[:maxStatusFailureReasonWidth-3] + "..."
+	return reason[:apitypes.StatusFailureReasonKeptWidth] + apitypes.StatusFailureReasonEllipsis
 }
 
 // formatStartedAt formats the started_at timestamp for display.

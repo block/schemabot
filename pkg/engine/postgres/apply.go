@@ -20,6 +20,7 @@ import (
 	"github.com/block/pg-sprite/pkg/progress"
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
@@ -465,32 +466,50 @@ func classifyRefusal(err error, table string) *refusal {
 	if r == nil {
 		return nil
 	}
+	r.compose(err)
+	return r
+}
+
+// compose sets the detail from the cause, the failed step of a create set
+// when there is one, and the remedy, joined by the clause separator. A
+// refusal without a remedy of its own that failed past the committed CREATE
+// TABLE is told to re-plan, because the plan that produced the sequence no
+// longer matches the target.
+func (r *refusal) compose(err error) {
 	clauses := []string{r.cause}
+	if clause := sequenceStepClause(err); clause != "" {
+		clauses = append(clauses, clause)
+	}
 	remedy := r.remedy
 	var stepErr *executor.SequenceStepError
-	if errors.As(err, &stepErr) && stepErr.Total > 1 {
-		clauses = append(clauses, sequenceStepClause(stepErr))
-		if stepErr.Step > 1 && remedy == "" {
-			remedy = replanRemedy
-		}
+	if remedy == "" && errors.As(err, &stepErr) && stepErr.Step > 1 {
+		remedy = replanRemedy
 	}
 	if remedy != "" {
 		clauses = append(clauses, remedy)
 	}
-	r.detail = sanitizeReasonText(strings.Join(clauses, "; "))
-	return r
+	r.detail = sanitizeReasonText(strings.Join(clauses, clauseSeparator))
 }
 
-const replanRemedy = "re-plan against the current schema"
+const (
+	replanRemedy    = "re-plan against the current schema"
+	clauseSeparator = "; "
+)
 
 // sequenceStepClause names the failed step of a multi-statement create set
-// and, past the first step, that the CREATE TABLE committed. It sits between
-// a cause and a remedy and does not repeat the table: the cause before it
-// names the table where that matters, and every surface renders the detail
-// beside the table it belongs to. Keeping the clause short is what lets the
-// remedy's lead survive the narrowest operator surface, which truncates the
-// detail from the tail, for a table name of any legal length.
-func sequenceStepClause(stepErr *executor.SequenceStepError) string {
+// and, past the first step, that the CREATE TABLE committed; a statement that
+// was not one of several gets no clause. It sits between a cause and a remedy
+// and does not repeat the table: the cause before it names the table where
+// that matters, and every surface renders the detail beside the table it
+// belongs to. Keeping the clause short is what lets the remedy's lead survive
+// the narrowest operator surface, which truncates the detail from the tail,
+// for a table name of any legal length; a cause that spends byte room on
+// identifiers charges the clause's width before the identifiers take theirs.
+func sequenceStepClause(err error) string {
+	var stepErr *executor.SequenceStepError
+	if !errors.As(err, &stepErr) || stepErr.Total <= 1 {
+		return ""
+	}
 	clause := fmt.Sprintf("step %d of %d failed", stepErr.Step, stepErr.Total)
 	if stepErr.Step > 1 {
 		clause += " after the CREATE TABLE committed"
@@ -506,8 +525,8 @@ func committedCreatePrefixDetail(err error, table string) (string, bool) {
 	if !errors.As(err, &stepErr) || stepErr.Step <= 1 {
 		return "", false
 	}
-	detail := fmt.Sprintf("step %d of %d failed after the CREATE TABLE for %q committed; %s",
-		stepErr.Step, stepErr.Total, table, replanRemedy)
+	detail := fmt.Sprintf("step %d of %d failed after the CREATE TABLE for %s committed; %s",
+		stepErr.Step, stepErr.Total, quotedTable(table), replanRemedy)
 	return sanitizeReasonText(detail), true
 }
 
@@ -517,12 +536,12 @@ func committedCreatePrefixDetail(err error, table string) (string, bool) {
 func refusalForCause(err error, table string) *refusal {
 	var privilegeErr *preflight.PrivilegeError
 	if errors.As(err, &privilegeErr) {
-		object := fmt.Sprintf("on table %q", table)
+		object := "on table " + quotedTable(table)
 		if privilegeErr.Tier == preflight.TierCreateTable {
 			// The create tier's grant is schema-scoped: the table does not
 			// exist yet, so pointing the operator at a table-level grant
 			// would send them hunting for an object the target lacks.
-			object = fmt.Sprintf("in the schema that would hold table %q", table)
+			object = "in the schema that would hold table " + quotedTable(table)
 		}
 		remedy := fmt.Sprintf("provision with: %s (verified by: %s)", privilegeErr.Grant, privilegeErr.Check)
 		if privilegeErr.Hint != "" {
@@ -592,18 +611,18 @@ func refusalForCause(err error, table string) *refusal {
 	}
 	if errors.Is(err, preflight.ErrNotTable) {
 		return &refusal{reason: "not-a-table",
-			cause: fmt.Sprintf("%q exists but is not an ordinary or partitioned table", table)}
+			cause: quotedTable(table) + " exists but is not an ordinary or partitioned table"}
 	}
 	if preflight.IsNameOccupied(err) {
 		return createCollisionRefusal(table)
 	}
 	var mismatchErr *executor.CreateNameMismatchError
 	if errors.As(err, &mismatchErr) {
-		return createNameMismatchRefusal(createNameMismatchCause(table, mismatchErr))
+		return createNameMismatchRefusal(createNameMismatchCause(table, mismatchErr, sequenceStepClause(err)))
 	}
 	if errors.Is(err, preflight.ErrSchemaNotFound) {
 		return &refusal{reason: "schema-not-found",
-			cause:  fmt.Sprintf("the schema that would hold table %q does not exist on the target", table),
+			cause:  fmt.Sprintf("the schema that would hold table %s does not exist on the target", quotedTable(table)),
 			remedy: "create the schema first"}
 	}
 	r, _ := refusalForOutcome(executor.OutcomeCode(err), table)
@@ -622,26 +641,37 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 	case executor.CodeCreateCollision:
 		return createCollisionRefusal(table), true
 	case executor.CodeCreateNameMismatch:
-		// The typed error names the relations involved and refusalForCause
-		// prefers it; this arm keeps the vocabulary total for a bare code.
+		// The code is only ever carried by the typed error that names the
+		// relations involved, and refusalForCause decides on that error
+		// before control reaches here; this arm keeps the switch total and
+		// gives the bare code the same verdict, with a cause that knows only
+		// that a name differs.
 		return createNameMismatchRefusal(
-			fmt.Sprintf("the CREATE TABLE for %q committed but the table does not own a constraint-index or sequence name the schema file claims; the server chose a suffixed name instead", table)), true
+			fmt.Sprintf(mismatchCauseFormat, quotedTable(table), "a name")), true
 	case executor.CodeCreateNamesUnverified:
+		// The sentinel is present whenever this code is, so refusalForCause
+		// decides the verdict before control reaches here; this arm keeps
+		// the switch total and gives the bare code the same verdict.
 		return createNamesUnverifiedRefusal(table), true
 	case executor.CodeDuplicateCreateName:
+		// The cause says only what the set did; the remedy names the
+		// relation kinds that can repeat a name — a CREATE INDEX name that
+		// is also the table's implicit constraint-index name, or another
+		// index's — so the cause stays short enough for the remedy to
+		// survive the narrowest surface beside a table name of any length.
 		return &refusal{reason: "duplicate-create-name",
-			cause:  fmt.Sprintf("the create set for %q claims the same relation name twice (a CREATE INDEX name repeats the table's implicit constraint-index name or another index)", table),
-			remedy: "fix the schema file and re-plan"}, true
+			cause:  fmt.Sprintf("the create set for %s claims the same relation name twice", quotedTable(table)),
+			remedy: "rename the index or constraint that repeats it in the schema file, then " + replanRemedy}, true
 	case executor.CodePartitionOfUnsupported:
 		return &refusal{reason: "unsupported-create-step",
-			cause: fmt.Sprintf("the CREATE TABLE for %q attaches a partition to a live parent, which the native-safe create path does not run", table)}, true
+			cause: fmt.Sprintf("the CREATE TABLE for %s attaches a partition to a live parent, which the native-safe create path does not run", quotedTable(table))}, true
 	case executor.CodeIfNotExistsUnsupported:
 		return &refusal{reason: "unsupported-create-step",
-			cause:  fmt.Sprintf("the planned statement for %q carries IF NOT EXISTS, whose no-op outcome the native-safe path cannot prove", table),
+			cause:  fmt.Sprintf("the planned statement for %s carries IF NOT EXISTS, whose no-op outcome the native-safe path cannot prove", quotedTable(table)),
 			remedy: "drop the clause and re-plan"}, true
 	case executor.CodeUnsupportedCreateStep:
 		return &refusal{reason: "unsupported-create-step",
-			cause:  fmt.Sprintf("the CREATE TABLE for %q is not a shape the native-safe create path can run", table),
+			cause:  fmt.Sprintf("the CREATE TABLE for %s is not a shape the native-safe create path can run", quotedTable(table)),
 			remedy: "rewrite the schema file and re-plan"}, true
 	case executor.CodeTableNotFound:
 		return tableNotFoundRefusal(table), true
@@ -651,20 +681,20 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		// Shape refusals: the executor refused the statement's form at
 		// admission, so retrying the identical plan refails the same way.
 		return &refusal{reason: "unsupported-statement-shape",
-			cause:  fmt.Sprintf("the planned statement for %q is not a shape the native-safe path can run", table),
+			cause:  fmt.Sprintf("the planned statement for %s is not a shape the native-safe path can run", quotedTable(table)),
 			remedy: "rewrite the schema change and re-plan"}, true
 	case executor.CodeBudgetStatementExceeded:
 		// Normally consumed upstream by the typed BudgetError arm, which
 		// renders the budget's own figures; this mapping keeps the outcome
 		// vocabulary total.
 		return &refusal{reason: "not-native-safe-budget-exceeded",
-			cause: fmt.Sprintf("the statement for table %q ran past its statement budget and was cancelled", table)}, true
+			cause: fmt.Sprintf("the statement for table %s ran past its statement budget and was cancelled", quotedTable(table))}, true
 	case executor.CodeInvariantViolation:
 		// Never a retry candidate per the executor's contract: an invariant
 		// breach means the engine's own safety accounting failed, so the
 		// apply fails closed until an operator has inspected the target.
 		return &refusal{reason: "engine-invariant-violation",
-			cause:  fmt.Sprintf("the engine's safety invariants did not hold while changing table %q", table),
+			cause:  fmt.Sprintf("the engine's safety invariants did not hold while changing table %s", quotedTable(table)),
 			remedy: "inspect the target and server logs before re-running"}, true
 	case executor.CodeInvalidIndexOtherTable, executor.CodeInvalidIndexNotDroppable:
 		// The permanent members of the invalid-index family: the requested
@@ -675,14 +705,14 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		// The typed-verdict path replaces this cause and remedy with the
 		// code's own advice; this mapping keeps the vocabulary total.
 		return &refusal{reason: "invalid-index-occupied",
-			cause:  fmt.Sprintf("an invalid index already occupies a name the change to %q needs and is not a failed build's leftover", table),
+			cause:  fmt.Sprintf("an invalid index the change to %s cannot clear holds a name it needs", quotedTable(table)),
 			remedy: "rename the index in the schema file and re-plan, or resolve the entry on the target"}, true
 	case executor.CodePoolTooSmall:
 		// The pool is sized by the target DSN, so every retry against the
 		// same configuration is refused at admission the same way; only an
 		// operator raising the pool ceiling changes the outcome.
 		return &refusal{reason: "pool-too-small",
-			cause:  fmt.Sprintf("the target's connection pool cannot hold every session the change to %q needs at once", table),
+			cause:  fmt.Sprintf("the target's connection pool cannot hold every session the change to %s needs at once", quotedTable(table)),
 			remedy: "raise the pool size on the target DSN, then re-run"}, true
 	case executor.CodeBudgetLockExceeded, executor.CodeCancelledByCaller,
 		executor.CodeCancelledExternally, executor.CodeInvalidIndexOwnLeftover,
@@ -719,7 +749,7 @@ const createCollisionRemedy = "re-plan, and if it recurs drop or rename the occu
 func createCollisionRefusal(table string) *refusal {
 	return &refusal{
 		reason: "create-collision",
-		cause:  fmt.Sprintf("a name the create set for %q needs is already occupied (table, view, index, or sequence)", table),
+		cause:  fmt.Sprintf("a name the create set for %s needs is already occupied (table, view, index, or sequence)", quotedTable(table)),
 		remedy: createCollisionRemedy,
 	}
 }
@@ -728,8 +758,15 @@ func createCollisionRefusal(table string) *refusal {
 // committed, so re-running the identical plan collides with the table this
 // apply created, and the table stands under a name the schema file did not
 // choose. Re-planning comes last because only the current schema, with the
-// relation renamed or the table gone, tells the next plan what remains.
-const createNameMismatchRemedy = "free the first-choice name and rename the owned relation to it, or drop the table, then " + replanRemedy
+// relation renamed or the table gone, tells the next plan what remains. The
+// lead is the clause the cause's enumerations make room for: it is what the
+// narrowest operator surface must still show once the detail is cut from
+// the tail, because it alone says the table is standing and needs the name
+// freed.
+const (
+	createNameMismatchLead   = "free the first-choice name"
+	createNameMismatchRemedy = createNameMismatchLead + " and rename the owned relation to it, or drop the table, then " + replanRemedy
+)
 
 // createNameMismatchRefusal takes its cause from the caller because the
 // typed error names the claimed names the table lacks and the names it owns
@@ -750,38 +787,173 @@ func createNameMismatchRefusal(cause string) *refusal {
 // missing name — a table that honoured every claim is not a mismatch — but
 // may own nothing unclaimed when a relation was dropped inside the read-back
 // window, so the owned clause is rendered only when there is one to name.
-func createNameMismatchCause(table string, mismatch *executor.CreateNameMismatchError) string {
-	cause := fmt.Sprintf("the CREATE TABLE for %q committed but the table does not own %s the schema file claims",
-		table, quotedNames(mismatch.Missing))
-	if len(mismatch.Unclaimed) == 0 {
-		return cause
+//
+// The enumerations get the byte room the quoted table name and the step
+// clause the detail will carry leave them; when the owned clause is rendered,
+// its own prose is paid for first and the two lists share what remains.
+func createNameMismatchCause(table string, mismatch *executor.CreateNameMismatchError, stepClause string) string {
+	quoted := quotedTable(table)
+	room := mismatchNamesRoom - len(quoted)
+	if stepClause != "" {
+		room -= len(clauseSeparator) + len(stepClause)
 	}
-	return cause + fmt.Sprintf("; it owns %s instead", quotedNames(mismatch.Unclaimed))
+	if len(mismatch.Unclaimed) == 0 {
+		return fmt.Sprintf(mismatchCauseFormat, quoted, quotedNames(mismatch.Missing, room))
+	}
+	room -= len(mismatchOwnedFormat) - len("%s")
+	missing, unclaimed := mismatchNames(mismatch.Missing, mismatch.Unclaimed, room)
+	return fmt.Sprintf(mismatchCauseFormat+mismatchOwnedFormat, quoted, missing, unclaimed)
 }
 
-// maxQuotedNames bounds how many identifiers a refusal cause enumerates. A
-// wide table can claim a name per constraint and per serial column, and the
-// composed detail is rendered on a surface that truncates from the tail,
-// where the remedy sits; the leading names locate the problem and the count
-// says how much the operator has not been shown.
-const maxQuotedNames = 3
+const (
+	mismatchCauseFormat = "the CREATE TABLE for %s committed but the table does not own %s the schema file claims"
+	mismatchOwnedFormat = "; it owns %s instead"
+)
 
-// quotedNames renders identifiers for a refusal cause, enumerating at most
-// maxQuotedNames and counting the rest.
-func quotedNames(names []string) string {
-	shown := names
-	if len(shown) > maxQuotedNames {
-		shown = shown[:maxQuotedNames]
+// mismatchNamesRoom is the byte room a mismatch cause has for the quoted
+// table name, the failed-step clause, and the identifiers it enumerates
+// together, before the owned clause takes its prose. The narrowest operator
+// surface keeps apitypes.StatusFailureReasonKeptWidth bytes of a refusal
+// detail and cuts the rest from the tail, where the remedy sits, and the
+// remedy is the only clause that says the table is still standing and needs
+// renaming or dropping. The room is what that surface leaves once the fixed
+// prose around the names and the remedy's lead, with the separator before
+// it, have taken theirs, so the enumerations shrink as the table name and
+// the step clause grow and the lead survives for a table name of any legal
+// length and a create set of any size.
+const mismatchNamesRoom = apitypes.StatusFailureReasonKeptWidth -
+	(len(mismatchCauseFormat) - 2*len("%s")) -
+	len(clauseSeparator) - len(createNameMismatchLead)
+
+// quotedTableWidth bounds the rendering of a table name in a refusal cause:
+// the quoted form of an identifier of the maximum legal length whose
+// characters need no escaping.
+const quotedTableWidth = len(`"`) + 63 + len(`"`)
+
+// quotedTable renders a table name for a refusal cause whose remedy is
+// pinned inside the narrowest surface's clamp. The rendering is the quoted
+// identifier, bounded at quotedTableWidth: quoting escapes a quote, a
+// backslash, or a control character into more bytes than the identifier
+// carries, and an identifier of legal length may be made of such characters,
+// so a name is cut on a rune boundary and marked when its quoted form would
+// take more than the room a plain name of the same legal length takes. The
+// cut costs the operator nothing they rely on — every surface renders the
+// detail beside the table it belongs to.
+func quotedTable(table string) string {
+	if q := strconv.Quote(table); len(q) <= quotedTableWidth {
+		return q
 	}
-	quoted := make([]string, len(shown))
-	for i, name := range shown {
-		quoted[i] = fmt.Sprintf("%q", name)
+	const mark = `..."`
+	kept := `"`
+	for i := range table {
+		q := strconv.Quote(table[:i])
+		if len(q)-len(`"`)+len(mark) > quotedTableWidth {
+			break
+		}
+		kept = q[:len(q)-len(`"`)]
+	}
+	return kept + mark
+}
+
+// mismatchNames renders the missing names and the owned names inside one
+// byte room. A missing name and the suffixed name the server chose in its
+// place are the two sides of one comparison, so the room goes to pairs first:
+// the rendering shows as many names from both lists as fit together, and
+// only then spends what is left on further names from one list, the missing
+// names ahead of the owned ones. Pairs first is also what keeps the owned
+// side — the relation the remedy says to rename, and the longer name by its
+// suffix — from losing every tie to the shorter name it displaced.
+//
+// The search runs over the counts a rendering inside the room could show,
+// not over every name the lists hold, and renders each count once, so its
+// work is bounded by the room rather than by the width of the table.
+func mismatchNames(missing, unclaimed []string, room int) (string, string) {
+	missingRenders := leadingNameRenders(missing, room)
+	unclaimedRenders := leadingNameRenders(unclaimed, room)
+	bestI, bestJ := 0, 0
+	for i, rendered := range missingRenders {
+		for j, owned := range unclaimedRenders {
+			if len(rendered)+len(owned) > room {
+				continue
+			}
+			if outranksNamePick(i, j, bestI, bestJ) {
+				bestI, bestJ = i, j
+			}
+		}
+	}
+	return missingRenders[bestI], unclaimedRenders[bestJ]
+}
+
+// leadingNameRenders renders, indexed by count, every count of leading names
+// a rendering inside the room could show, from none up to namesWithinRoom.
+func leadingNameRenders(names []string, room int) []string {
+	renders := make([]string, 0, namesWithinRoom(names, room)+1)
+	for n := range namesWithinRoom(names, room) + 1 {
+		renders = append(renders, leadingNames(names, n))
+	}
+	return renders
+}
+
+// namesWithinRoom bounds the count of names a rendering inside the room can
+// show. A quoted name costs at least its two quotes and one character, so no
+// rendering that fits shows more names than the room holds such names, and
+// a count past that bound is rejected without being rendered.
+func namesWithinRoom(names []string, room int) int {
+	return min(len(names), max(room, 0)/len(`"a"`))
+}
+
+// outranksNamePick orders two ways of showing i missing and j owned names:
+// more pairs first, then more names, then more missing names.
+func outranksNamePick(i, j, bestI, bestJ int) bool {
+	if min(i, j) != min(bestI, bestJ) {
+		return min(i, j) > min(bestI, bestJ)
+	}
+	if i+j != bestI+bestJ {
+		return i+j > bestI+bestJ
+	}
+	return i > bestI
+}
+
+// quotedNames renders identifiers for a refusal cause inside a byte budget:
+// it enumerates the most leading names that fit alongside a count of the
+// rest, and falls back to the count alone when not even the first name fits.
+// The search starts at the most names the budget could hold, not at the end
+// of the list, so its work is bounded by the budget.
+func quotedNames(names []string, budget int) string {
+	for n := namesWithinRoom(names, budget); n > 0; n-- {
+		if rendered := leadingNames(names, n); len(rendered) <= budget {
+			return rendered
+		}
+	}
+	return countedNames(len(names))
+}
+
+// leadingNames renders the first n names quoted, followed by a count of the
+// rest when any remain; n of zero renders the count alone.
+func leadingNames(names []string, n int) string {
+	if n == 0 {
+		return countedNames(len(names))
+	}
+	quoted := make([]string, 0, n)
+	for _, name := range names[:n] {
+		quoted = append(quoted, strconv.Quote(name))
 	}
 	rendered := strings.Join(quoted, ", ")
-	if rest := len(names) - len(shown); rest > 0 {
-		rendered += fmt.Sprintf(", and %d more", rest)
+	if rest := len(names) - n; rest > 0 {
+		rendered += remainingNames(rest)
 	}
 	return rendered
+}
+
+func remainingNames(rest int) string {
+	return fmt.Sprintf(", and %d more", rest)
+}
+
+func countedNames(n int) string {
+	if n == 1 {
+		return "1 name"
+	}
+	return fmt.Sprintf("%d names", n)
 }
 
 // createNamesUnverifiedRefusal is decided by the wrap, not by the cause it
@@ -790,11 +962,13 @@ func quotedNames(names []string) string {
 // read: its retry re-runs the identical plan, whose CREATE TABLE has already
 // committed, so every retry collides with the table this apply created. The
 // table stands with unproven names, and proving them is an operator's
-// comparison, not a retry's.
+// comparison, not a retry's. The cause is kept terse — the remedy, not the
+// cause, names which names to compare — so that the remedy's lead survives
+// the narrowest operator surface for a table name of any legal length.
 func createNamesUnverifiedRefusal(table string) *refusal {
 	return &refusal{
 		reason: "create-names-unverified",
-		cause:  fmt.Sprintf("the CREATE TABLE for %q committed but the relation names the table owns could not be read, so whether the server honoured every claimed name is unproven", table),
+		cause:  fmt.Sprintf("the CREATE TABLE for %s committed but the names it owns could not be read back", quotedTable(table)),
 		remedy: "compare the table's constraint-index and sequence names against the schema file, then " + replanRemedy,
 	}
 }
@@ -802,7 +976,7 @@ func createNamesUnverifiedRefusal(table string) *refusal {
 func tableNotFoundRefusal(table string) *refusal {
 	return &refusal{
 		reason: "table-not-found",
-		cause:  fmt.Sprintf("table %q does not exist on the target", table),
+		cause:  fmt.Sprintf("table %s does not exist on the target", quotedTable(table)),
 		remedy: replanRemedy,
 	}
 }
