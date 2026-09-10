@@ -269,7 +269,7 @@ schemabot plan -d mydb
 schemabot apply -e staging -d mydb
 ```
 
-The `No Schema Changes Detected` comment points at this when it fires.
+The `No Schema Changes Detected` comment points at the plan command when a user runs a plan on such a PR.
 
 ## Environment Variables Reference
 

@@ -593,12 +593,16 @@ SchemaBot found no changes to managed schema files in this PR and no apply-owned
 
 SchemaBot found no changes to managed schema files in this PR. The SchemaBot checks were refreshed as passing on [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12).
 
-If this PR is meant to apply a schema directory that is already merged, such as the first apply to a new database, name the database so SchemaBot plans that whole directory against the live schema:
+<details>
+<summary>Expected a plan?</summary>
+
+SchemaBot plans only the schema files this PR changes under a configured schema directory. To plan a directory this PR does not touch, such as the first apply to a new database whose schema already merged, name the database:
 
 ```
 schemabot plan -d <database>
-schemabot apply -e <environment> -d <database>
 ```
+
+</details>
 
 _Requested by @jackjackbits_
 

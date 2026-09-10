@@ -62,7 +62,7 @@ func TestRenderSchemaChangeReconciliationRequiredCompleted(t *testing.T) {
 }
 
 func TestRenderNoManagedSchemaChangesChecksRefreshed(t *testing.T) {
-	t.Run("plain refresh names the way to plan an already merged root", func(t *testing.T) {
+	t.Run("plain refresh explains why no plan ran and how to plan a named database", func(t *testing.T) {
 		rendered := RenderNoManagedSchemaChangesChecksRefreshed(NoManagedSchemaChangesChecksRefreshedData{
 			RequestedBy: "alice",
 			Repository:  "acme/payments",
@@ -71,8 +71,10 @@ func TestRenderNoManagedSchemaChangesChecksRefreshed(t *testing.T) {
 
 		assert.Contains(t, rendered, "## ✅ No Schema Changes Detected")
 		assert.Contains(t, rendered, "refreshed as passing on [`abcdef1`](https://github.com/acme/payments/commit/abcdef1234567890abcdef1234567890abcdef12).")
-		assert.Contains(t, rendered, "schema directory that is already merged, such as the first apply to a new database")
-		assert.Contains(t, rendered, "```\nschemabot plan -d <database>\nschemabot apply -e <environment> -d <database>\n```")
+		assert.Contains(t, rendered, "<summary>Expected a plan?</summary>")
+		assert.Contains(t, rendered, "SchemaBot plans only the schema files this PR changes under a configured schema directory.")
+		assert.Contains(t, rendered, "```\nschemabot plan -d <database>\n```")
+		assert.NotContains(t, rendered, "schemabot apply")
 		assert.True(t, strings.HasSuffix(rendered, "\n_Requested by @alice_\n"), "attribution closes the comment: %q", rendered)
 		assert.NotContains(t, rendered, "UTC")
 	})
