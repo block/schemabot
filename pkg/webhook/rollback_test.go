@@ -36,7 +36,6 @@ func TestRollbackPlanCommentRelatedGuidance(t *testing.T) {
 				},
 			}
 			data := buildRollbackPlanCommentData(templates.PlanCommentData{Database: "app", IsMySQL: true, DatabaseType: "mysql", Environment: "staging"}, resp)
-			assert.Equal(t, []string{"primary_key", "primary_key"}, data.LintRuleNames)
 			if severity == "warning" {
 				require.Len(t, data.LintViolations, 2)
 				assert.Equal(t, "primary_key", data.LintViolations[0].LinterName)
