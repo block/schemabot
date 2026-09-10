@@ -4321,7 +4321,7 @@ func TestSchemaDirHintsForDatabase(t *testing.T) {
 
 	dirs, exhaustive = cfg.SchemaDirHintsForDatabase("octocat/hello-world", "unknown")
 	assert.Empty(t, dirs)
-	assert.True(t, exhaustive, "an unconfigured database has no policy-valid config location")
+	assert.False(t, exhaustive, "a probe of zero directories cannot prove an unconfigured database's config absent; the registry answers for it")
 }
 
 func TestSchemaDirHintsForRepoNoMatches(t *testing.T) {
