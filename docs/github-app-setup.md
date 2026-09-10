@@ -327,6 +327,8 @@ Follow the [pre-merge workflow](pre-merge-workflow.md) to take your first schema
 
 **"Database Not Found" comment**: A command's `-d` flag named a database that no `schemabot.yaml` in the repository declares. Check the `database` field of the intended `schemabot.yaml`; the comparison is case-insensitive. On a repository too large for GitHub to return its full tree, SchemaBot searches only the directories listed under the database's `allowed_dirs` in the server config, and the comment lists the directories it searched.
 
+**"Database Not Available to This Repository" comment**: A command's `-d` flag named a database whose `allowed_repos` in the server config does not include this repository. No `schemabot.yaml` in the repository can manage that database, so none was searched. Add the repository to the database's `allowed_repos` if it should manage the database.
+
 **"Database Not Configured" comment**: A command's `-d` flag named a database that has no key under `databases:` in your SchemaBot server config. The repository's `schemabot.yaml` may be correct; the database still has to be configured on the server before SchemaBot can plan or apply changes for it. On a repository shared by several SchemaBot deployments, only a deployment named with `-t`, or one that is not the aggregate leader, answers this way; the leader keeps searching the repository so a database no deployment serves is still reported.
 
 **"Repository Too Large to Search" comment**: GitHub truncated the repository tree, and the server config gave SchemaBot no exhaustive set of directories to search instead. Give the database an `allowed_dirs` entry naming its schema directory so discovery can probe that directory alone.

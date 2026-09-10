@@ -663,6 +663,19 @@ func PreviewCommentErrorDatabaseNotConfigured() string {
 	})
 }
 
+// PreviewCommentErrorDatabaseRepoNotAllowed renders the error comment for a
+// command naming a database the SchemaBot server configures for other
+// repositories only.
+func PreviewCommentErrorDatabaseRepoNotAllowed() string {
+	return RenderDatabaseRepoNotAllowed(SchemaErrorData{
+		RequestedBy:  previewRequestedBy,
+		Timestamp:    "2026-01-15 14:30:00",
+		Environment:  "staging",
+		DatabaseName: "payments",
+		CommandName:  action.Apply,
+	})
+}
+
 // PreviewCommentErrorRepositoryTruncated renders the error comment for a
 // database-scoped command on a repository whose tree GitHub truncated, where
 // the server-side schema directories could not bound the search.

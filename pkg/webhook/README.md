@@ -197,6 +197,7 @@ Schema request errors are mapped to specific GitHub comment templates:
 | `ErrInvalidConfig` | "No Valid Configuration Found" | Fix `schemabot.yaml` fields |
 | `ErrMultipleConfigs` | "Multiple Databases Detected" | Use `-d <database>` |
 | `DatabaseNotFoundError` | "Database Not Found" | Check database name; on a repository too large to search in full, the comment lists the configured directories that were searched |
+| `DatabaseNotFoundError` (`RepositoryNotAccepted`) | "Database Not Available to This Repository" | Add the repository to the database's `allowed_repos` if it should manage the database |
 | `api.DatabaseNotConfiguredError` | "Database Not Configured" | Ask an operator to configure the database on the server |
 | `ErrConfigDiscoveryTruncated` | "Repository Too Large to Search" | Ask an operator to bound the database's config location with `allowed_dirs` |
 | Other | "Plan Failed" | Check error details |

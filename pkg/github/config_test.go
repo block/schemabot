@@ -1007,6 +1007,30 @@ func widgetsConfigDirHints(t *testing.T, dirs ...string) ConfigDirHints {
 	return testConfigDirHints{t: t, dirs: dirs, exhaustive: true}
 }
 
+// A database that does not accept changes from the repository has no schema
+// directory the truncated-tree probe may search, and the hints say so with an
+// exhaustive empty answer. The miss then reports the policy, not a search of
+// the repository: nothing in it was read, so nothing in it can be blamed.
+func TestFindConfigByDatabaseNameInRepoTruncatedDatabaseRejectsRepository(t *testing.T) {
+	client, mux := setupConfigTestGitHubServer(t)
+	registerTruncatedRepoWithSchemaSubtree(t, mux, []map[string]any{
+		{"path": "schemabot.yaml", "type": "blob", "sha": "blob-config", "mode": "100644"},
+	})
+	registerConfigTestPullRequest(t, mux)
+
+	ic := NewInstallationClient(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ic.SetConfigDirHints(testConfigDirHints{t: t, exhaustive: true})
+
+	_, _, err := ic.FindConfigByDatabaseNameInRepo(t.Context(), "octocat/hello-world", 1, "payments")
+
+	var notFound *DatabaseNotFoundError
+	require.ErrorAs(t, err, &notFound)
+	assert.Equal(t, "payments", notFound.DatabaseName)
+	assert.True(t, notFound.RepositoryNotAccepted())
+	assert.Empty(t, notFound.SearchedDirs)
+	assert.Contains(t, err.Error(), "database 'payments' accepts no schema changes from this repository")
+}
+
 // A repo-root schema path cannot be recovered through a subtree fetch when
 // the repository tree is truncated — the root tree is the truncated listing
 // itself — so schema-file loading keeps the truncation error instead of
@@ -1151,6 +1175,8 @@ func TestFindConfigByDatabaseNameInRepoTruncatedScopedProbeNotFound(t *testing.T
 	require.ErrorAs(t, err, &notFound)
 	assert.Equal(t, "payments", notFound.DatabaseName)
 	assert.Equal(t, []string{"apps/widgets/schema"}, notFound.SearchedDirs)
+	assert.True(t, notFound.SearchScoped)
+	assert.False(t, notFound.RepositoryNotAccepted())
 	assert.Empty(t, notFound.AvailableDatabases)
 	assert.Contains(t, err.Error(), "configured schema directories: apps/widgets/schema")
 	assert.NotContains(t, err.Error(), "Available databases")

@@ -144,6 +144,28 @@ func TestAggregateLeaderDatabaseScopedCommandKeepsSearchingTheRepository(t *test
 	}
 }
 
+// A -d database this deployment configures for other repositories only has no
+// schema directory the truncated-tree probe may search here. The comment then
+// reports that policy instead of a Database Not Found that blames a
+// schemabot.yaml SchemaBot never looked for.
+func TestDatabaseScopedCommandOnDatabaseRejectingTheRepositoryReportsPolicy(t *testing.T) {
+	cfg := withRegisteredDatabase(nonAggregateConfig(), "payments")
+	payments := cfg.Databases["payments"]
+	payments.AllowedRepos = []string{"octocat/other-repo"}
+	cfg.Databases["payments"] = payments
+	h, mux, comments := newFanOutSkipHandler(t, cfg)
+	serveTruncatedRepoWithChangedSchemaFile(t, mux)
+
+	h.handleMultiEnvPlan("octocat/hello-world", 1, "payments", "", 12345, "hubot", false, true, 0)
+
+	body := requireComment(t, comments, "policy answer for a database that rejects the repository")
+	assert.Contains(t, body, "Database Not Available to This Repository")
+	assert.Contains(t, body, "`payments`")
+	assert.Contains(t, body, "`allowed_repos`")
+	assert.NotContains(t, body, "Database Not Found")
+	assert.NotContains(t, body, "Database Not Configured")
+}
+
 // A deployment that resolves databases dynamically (a data-plane server with a
 // target resolver) does not describe what it manages in the databases
 // registry, so an empty registry says nothing about a -d database there. Such

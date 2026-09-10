@@ -57,6 +57,7 @@ func TestHostileIdentifierNeverEscapesItsCodeSpan(t *testing.T) {
 		"scoped database not found for a hostile -d": RenderDatabaseNotFound(SchemaErrorData{DatabaseName: hostileIdentifier, SearchedDirs: []string{"schema"}}),
 		"database not configured for a hostile -d":   RenderDatabaseNotConfigured(SchemaErrorData{DatabaseName: hostileIdentifier}),
 		"repository truncated for a hostile -d":      RenderRepositoryTreeTruncated(SchemaErrorData{DatabaseName: hostileIdentifier}),
+		"database rejects the repo for a hostile -d": RenderDatabaseRepoNotAllowed(SchemaErrorData{DatabaseName: hostileIdentifier}),
 		"no config for a hostile -d":                 RenderNoConfig(SchemaErrorData{DatabaseName: hostileIdentifier}),
 	}
 

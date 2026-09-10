@@ -159,6 +159,16 @@ This SchemaBot instance has no {{.DatabaseNameCode}} entry under ` + "`databases
 
 Check that the database name, from ` + "`-d`" + ` or from ` + "`schemabot.yaml`" + `, matches one this instance serves, or ask a SchemaBot operator to configure the database.`
 
+const databaseRepoNotAllowedTemplate = "## " + glyph.Attention + ` Database Not Available to This Repository
+
+**Database**: {{.DatabaseNameCode}}{{with .EnvironmentHeader}} | {{.}}{{end}}
+
+{{.Attribution}}
+
+The SchemaBot server configures {{.DatabaseNameCode}} to accept schema changes from other repositories only: this repository is not in the database's ` + "`allowed_repos`" + `, so no ` + "`schemabot.yaml`" + ` in it can manage the database and none was searched.
+
+Ask a SchemaBot operator to add this repository to the database's ` + "`allowed_repos`" + ` if it should manage the database, or check that the ` + "`-d`" + ` value names the right database.`
+
 const repositoryTreeTruncatedTemplate = "## " + glyph.Attention + ` Repository Too Large to Search
 
 {{if .DatabaseName}}**Database**: {{.DatabaseNameCode}}{{with .EnvironmentHeader}} | {{.}}{{end}}
@@ -169,7 +179,7 @@ const repositoryTreeTruncatedTemplate = "## " + glyph.Attention + ` Repository T
 
 GitHub returned a truncated repository tree, so SchemaBot could not search this repository for ` + "`schemabot.yaml`" + ` configurations. On a repository this large, SchemaBot searches only the schema directories configured on the SchemaBot server{{if .DatabaseName}}, and it has none it can search exhaustively for {{.DatabaseNameCode}}: the database is not configured on this instance, or its ` + "`allowed_dirs`" + ` leave the location of its config open{{else}} for this repository's databases, and those do not bound where every config may live{{end}}.
 
-{{if .DatabaseName}}Ask a SchemaBot operator to configure the database with an ` + "`allowed_dirs`" + ` entry naming its schema directory, or check that the ` + "`-d`" + ` value names a database this instance serves.{{else}}Ask a SchemaBot operator to give each of this repository's databases an ` + "`allowed_dirs`" + ` entry naming its schema directory.{{end}}`
+{{if .DatabaseName}}Ask a SchemaBot operator to configure the database with an ` + "`allowed_dirs`" + ` entry naming its schema directory, or check that the database name, from ` + "`-d`" + ` or from ` + "`schemabot.yaml`" + `, matches one this instance serves.{{else}}Ask a SchemaBot operator to give each of this repository's databases an ` + "`allowed_dirs`" + ` entry naming its schema directory.{{end}}`
 
 const invalidConfigTemplate = "## " + glyph.Attention + ` No Valid SchemaBot Configuration Found
 
@@ -283,6 +293,7 @@ var (
 	tmplDatabaseNotFound     = template.Must(template.New("databaseNotFound").Parse(databaseNotFoundTemplate))
 	tmplDatabaseNotConfig    = template.Must(template.New("databaseNotConfigured").Parse(databaseNotConfiguredTemplate))
 	tmplRepoTreeTruncated    = template.Must(template.New("repositoryTreeTruncated").Parse(repositoryTreeTruncatedTemplate))
+	tmplDatabaseRepoDenied   = template.Must(template.New("databaseRepoNotAllowed").Parse(databaseRepoNotAllowedTemplate))
 	tmplInvalidConfig        = template.Must(template.New("invalidConfig").Parse(invalidConfigTemplate))
 	tmplNoConfigNoDatabase   = template.Must(template.New("noConfigNoDatabase").Parse(noConfigNoDatabaseTemplate))
 	tmplNoConfigWithDatabase = template.Must(template.New("noConfigWithDatabase").Parse(noConfigWithDatabaseTemplate))
@@ -313,6 +324,13 @@ func RenderDatabaseNotConfigured(data SchemaErrorData) string {
 // the search, so config discovery failed closed.
 func RenderRepositoryTreeTruncated(data SchemaErrorData) string {
 	return offerSupportChannel(renderTemplate(tmplRepoTreeTruncated, data))
+}
+
+// RenderDatabaseRepoNotAllowed renders the error comment for a database-scoped
+// command naming a database the SchemaBot server configures, but whose
+// allowed_repos exclude this repository.
+func RenderDatabaseRepoNotAllowed(data SchemaErrorData) string {
+	return offerSupportChannel(renderTemplate(tmplDatabaseRepoDenied, data))
 }
 
 // RenderInvalidConfig renders the "invalid config" error comment.

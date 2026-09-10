@@ -312,6 +312,22 @@ func TestRenderDatabaseNotConfigured(t *testing.T) {
 // the two server-side causes, an unscoped command explains the repo-wide
 // search instead, and the header follows the same database/environment
 // rules as the other schema request errors.
+func TestRenderDatabaseRepoNotAllowed(t *testing.T) {
+	body := RenderDatabaseRepoNotAllowed(SchemaErrorData{
+		RequestedBy:  "hubot",
+		Timestamp:    "2026-07-16 18:56:00",
+		Environment:  "staging",
+		DatabaseName: "payments",
+	})
+	assert.Contains(t, body, "## ⚠️ Database Not Available to This Repository")
+	assert.Contains(t, body, "**Database**: `payments` | **Environment**: `staging`")
+	assert.Contains(t, body, "configures `payments` to accept schema changes from other repositories only")
+	assert.Contains(t, body, "this repository is not in the database's `allowed_repos`")
+	assert.Contains(t, body, "none was searched")
+	assert.Contains(t, body, "add this repository to the database's `allowed_repos`")
+	assert.NotContains(t, body, "was found in this repository")
+}
+
 func TestRenderRepositoryTreeTruncated(t *testing.T) {
 	t.Run("database-scoped command", func(t *testing.T) {
 		body := RenderRepositoryTreeTruncated(SchemaErrorData{
@@ -325,7 +341,7 @@ func TestRenderRepositoryTreeTruncated(t *testing.T) {
 		assert.Contains(t, body, "**Database**: `payments` | **Environment**: `staging`")
 		assert.Contains(t, body, "GitHub returned a truncated repository tree")
 		assert.Contains(t, body, "it has none it can search exhaustively for `payments`: the database is not configured on this instance, or its `allowed_dirs` leave the location of its config open")
-		assert.Contains(t, body, "or check that the `-d` value names a database this instance serves")
+		assert.Contains(t, body, "or check that the database name, from `-d` or from `schemabot.yaml`, matches one this instance serves")
 	})
 
 	t.Run("unscoped auto-plan", func(t *testing.T) {

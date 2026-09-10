@@ -592,6 +592,16 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 
 	var dbNotFoundErr *ghclient.DatabaseNotFoundError
 	if errors.As(err, &dbNotFoundErr) {
+		// A configured database that accepts no changes from this repository
+		// has no directory the scoped search may probe, so the miss is the
+		// server's policy, not a search result, and the comment says so
+		// instead of blaming a schemabot.yaml that was never looked for.
+		if dbNotFoundErr.RepositoryNotAccepted() {
+			h.logger.Warn("schema request: database accepts no schema changes from this repository", logFields...)
+			metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "database_repo_not_allowed")
+			h.postComment(repo, pr, installationID, templates.RenderDatabaseRepoNotAllowed(data))
+			return true
+		}
 		data.SearchedDirs = dbNotFoundErr.SearchedDirs
 		h.logger.Warn("schema request: database not found", append(logFields, "searched_dirs", dbNotFoundErr.SearchedDirs)...)
 		metrics.RecordSchemaRequestError(ctx, repo, commandName, databaseName, environment, "database_not_found")

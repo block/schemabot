@@ -90,9 +90,26 @@ type DatabaseNotFoundError struct {
 	// schema directories could be searched. Empty when the whole repository
 	// was searched.
 	SearchedDirs []string
+	// SearchScoped reports that the search was limited to SearchedDirs because
+	// GitHub truncated the repository tree. Scoped with no directories means
+	// the server configures no schema directory for the database in this
+	// repository, which by the ConfigDirHints contract is a database that does
+	// not accept changes from the repository.
+	SearchScoped bool
+}
+
+// RepositoryNotAccepted reports whether the miss is a policy answer rather than
+// a search result: the database is configured on the server but accepts no
+// schema changes from this repository, so no location in it was searched.
+func (e *DatabaseNotFoundError) RepositoryNotAccepted() bool {
+	return e.SearchScoped && len(e.SearchedDirs) == 0
 }
 
 func (e *DatabaseNotFoundError) Error() string {
+	if e.RepositoryNotAccepted() {
+		return fmt.Sprintf("database '%s' accepts no schema changes from this repository; the server configures no schema directories for it here",
+			e.DatabaseName)
+	}
 	if len(e.SearchedDirs) > 0 {
 		return fmt.Sprintf("database '%s' not found in its configured schema directories: %s",
 			e.DatabaseName, strings.Join(e.SearchedDirs, ", "))
@@ -441,7 +458,7 @@ func (ic *InstallationClient) FindConfigByDatabaseNameInRepo(ctx context.Context
 			// names those directories, since the rest of the repository was
 			// never searched. Other databases were not enumerated, so no
 			// available-databases list is offered.
-			return nil, "", &DatabaseNotFoundError{DatabaseName: databaseName, SearchedDirs: searchedDirs}
+			return nil, "", &DatabaseNotFoundError{DatabaseName: databaseName, SearchedDirs: searchedDirs, SearchScoped: true}
 		}
 		ic.logger.Debug("found config for database via scoped truncated-tree probe", "database", databaseName, "path", configDir)
 		return config, configDir, nil

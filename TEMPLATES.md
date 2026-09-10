@@ -1755,6 +1755,23 @@ Check that the database name, from `-d` or from `schemabot.yaml`, matches one th
 </details>
 
 <details>
+<summary><a name="database-not-available-to-this-repository"></a><strong>Database Not Available To This Repository</strong></summary>
+
+
+## ⚠️ Database Not Available to This Repository
+
+**Database**: `payments` | **Environment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
+
+The SchemaBot server configures `payments` to accept schema changes from other repositories only: this repository is not in the database's `allowed_repos`, so no `schemabot.yaml` in it can manage the database and none was searched.
+
+Ask a SchemaBot operator to add this repository to the database's `allowed_repos` if it should manage the database, or check that the `-d` value names the right database.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
 <summary><a name="repository-too-large-to-search"></a><strong>Repository Too Large To Search</strong></summary>
 
 
@@ -1766,7 +1783,7 @@ Check that the database name, from `-d` or from `schemabot.yaml`, matches one th
 
 GitHub returned a truncated repository tree, so SchemaBot could not search this repository for `schemabot.yaml` configurations. On a repository this large, SchemaBot searches only the schema directories configured on the SchemaBot server, and it has none it can search exhaustively for `payments`: the database is not configured on this instance, or its `allowed_dirs` leave the location of its config open.
 
-Ask a SchemaBot operator to configure the database with an `allowed_dirs` entry naming its schema directory, or check that the `-d` value names a database this instance serves.
+Ask a SchemaBot operator to configure the database with an `allowed_dirs` entry naming its schema directory, or check that the database name, from `-d` or from `schemabot.yaml`, matches one this instance serves.
 <!-- schemabot:offer-support-channel -->
 
 </details>
