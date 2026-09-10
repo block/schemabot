@@ -132,31 +132,50 @@ func requireNextComment(t *testing.T, result *planFlowResult, what string) strin
 // polling deadline.
 const targetQueryTimeout = 5 * time.Second
 
-func countTable(t *testing.T, dbName, table string) int {
+// countTable reports how many tables named table exist in dbName. It returns
+// errors instead of asserting so it can run inside an Eventually condition,
+// which testify executes off the test goroutine.
+func countTable(t *testing.T, dbName, table string) (int, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), targetQueryTimeout)
 	defer cancel()
 	db, err := sql.Open("block-mysql", driftDSN(t, dbName))
-	require.NoError(t, err)
+	if err != nil {
+		return 0, fmt.Errorf("open target %s: %w", dbName, err)
+	}
 	defer utils.CloseAndLog(db)
-	require.NoError(t, db.PingContext(ctx), "connect to target")
+	if err := db.PingContext(ctx); err != nil {
+		return 0, fmt.Errorf("connect to target %s: %w", dbName, err)
+	}
 	var count int
-	require.NoError(t, db.QueryRowContext(ctx,
+	if err := db.QueryRowContext(ctx,
 		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
-		dbName, table).Scan(&count))
-	return count
+		dbName, table).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count table %s.%s: %w", dbName, table, err)
+	}
+	return count, nil
 }
 
 func requireNoTable(t *testing.T, dbName, table string) {
 	t.Helper()
-	require.Zero(t, countTable(t, dbName, table), "the database has no %s table", table)
+	count, err := countTable(t, dbName, table)
+	require.NoError(t, err)
+	require.Zero(t, count, "the database has no %s table", table)
 }
 
 // requireTableEventually polls the live database until the apply has created
-// the table, failing at the integration polling deadline.
+// the table. A probe error fails the test at once rather than being retried
+// until the polling deadline.
 func requireTableEventually(t *testing.T, dbName, table string) {
 	t.Helper()
+	var probeErr error
 	require.Eventually(t, func() bool {
-		return countTable(t, dbName, table) == 1
+		count, err := countTable(t, dbName, table)
+		if err != nil {
+			probeErr = err
+			return true
+		}
+		return count == 1
 	}, webhookIntegrationPollDeadline, 200*time.Millisecond, "the apply creates %s.%s", dbName, table)
+	require.NoError(t, probeErr, "probe the target while waiting for %s.%s", dbName, table)
 }
