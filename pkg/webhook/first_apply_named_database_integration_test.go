@@ -23,13 +23,13 @@ import (
 )
 
 // TestE2EFirstApplyToBlankDatabaseThroughNamedDatabase covers the first apply
-// to a database whose declarative schema root is already merged: the live
+// to a database whose declarative schema directory is already merged: the live
 // database holds no tables, the schema files sit on the default branch, and the
-// PR touches nothing under the schema root. The PR diff is only what triggers
+// PR touches nothing under the schema directory. The PR diff is only what triggers
 // an unscoped plan, so that plan reports that it detected no schema changes and tells
-// the user how to ask for the root anyway. Naming the database is that ask:
+// the user how to ask for the directory anyway. Naming the database is that ask:
 // discovery finds the config in the repository, the desired schema is the whole
-// root at the PR head, and the apply creates the tables on the blank database.
+// directory at the PR head, and the apply creates the tables on the blank database.
 func TestE2EFirstApplyToBlankDatabaseThroughNamedDatabase(t *testing.T) {
 	dbName := "webhook_first_apply_named_db"
 	svc := setupE2EService(t, dbName)
@@ -45,7 +45,7 @@ func TestE2EFirstApplyToBlankDatabaseThroughNamedDatabase(t *testing.T) {
 	schemaFiles := map[string]string{
 		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}
-	// The PR changes a file outside the schema root; the root itself is
+	// The PR changes a file outside the schema directory; the directory itself is
 	// already on the default branch at the same content the head carries.
 	prFiles := []*gh.CommitFile{{Filename: new("README.md"), Status: new("modified")}}
 	result := setupFakeGitHubForPlanWithPRFiles(t, mux, schemaFiles, schemabotConfig, dbName, prFiles)
@@ -71,7 +71,7 @@ func TestE2EFirstApplyToBlankDatabaseThroughNamedDatabase(t *testing.T) {
 		assert.Contains(t, body, "schemabot plan -d <database>")
 	})
 
-	t.Run("plan naming the database plans the whole schema root", func(t *testing.T) {
+	t.Run("plan naming the database plans the whole schema directory", func(t *testing.T) {
 		rr := httptest.NewRecorder()
 		h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot plan -d " + dbName, isPR: true}, nil))
 		require.Equal(t, http.StatusOK, rr.Code)

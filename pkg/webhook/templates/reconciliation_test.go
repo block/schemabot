@@ -71,7 +71,7 @@ func TestRenderNoManagedSchemaChangesChecksRefreshed(t *testing.T) {
 
 		assert.Contains(t, rendered, "## ✅ No Schema Changes Detected")
 		assert.Contains(t, rendered, "refreshed as passing on [`abcdef1`](https://github.com/acme/payments/commit/abcdef1234567890abcdef1234567890abcdef12).")
-		assert.Contains(t, rendered, "schema root that is already merged, such as the first apply to a new database")
+		assert.Contains(t, rendered, "schema directory that is already merged, such as the first apply to a new database")
 		assert.Contains(t, rendered, "```\nschemabot plan -d <database>\nschemabot apply -e <environment> -d <database>\n```")
 		assert.True(t, strings.HasSuffix(rendered, "\n_Requested by @alice_\n"), "attribution closes the comment: %q", rendered)
 		assert.NotContains(t, rendered, "UTC")
