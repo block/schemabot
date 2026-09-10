@@ -70,7 +70,7 @@ func RenderNoManagedSchemaChangesChecksRefreshed(data NoManagedSchemaChangesChec
 		fmt.Fprintf(&sb, "SchemaBot found no changes to managed schema files in this PR. The SchemaBot checks were refreshed as passing on %s.\n", head)
 		sb.WriteString("\n<details>\n<summary>Expected a plan?</summary>\n\n")
 		sb.WriteString("SchemaBot plans a database only when a PR changes a file under that database's schema directory. This PR changes none, so no database was compared against its schema directory.\n\n")
-		sb.WriteString("To plan a database whose files are already correct, for example a new database whose schema directory merged before the database was configured, give the PR a change in that directory: add or toggle a `# nonce` comment line in the database's `schemabot.yaml` and push. SchemaBot then plans the whole directory against the live schema, and the plan comment carries the apply command.\n\n</details>\n")
+		sb.WriteString("To reconcile drift on a database whose files are already correct, for example a new database whose schema directory merged before the database was configured, give the PR a change in that directory: add or toggle a `# nonce` comment line in the database's `schemabot.yaml` and push. SchemaBot then plans the whole directory against the live schema, and the plan comment carries the apply command.\n\n</details>\n")
 	}
 	if data.RequestedBy != "" {
 		fmt.Fprintf(&sb, "\n_Requested by @%s_\n", data.RequestedBy)
