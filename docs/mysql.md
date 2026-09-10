@@ -117,7 +117,7 @@ existing primary key may itself need a different execution path.
 
 **Row-copy progress is not whole-change progress.** After the copy finishes, the change may still
 be catching up on writes, restoring indexes, verifying data, or waiting for cutover. Use the named
-phase to understand what remains, rather than treating a full bar as permission to merge.
+phase to understand what remains after the copy reaches 100%.
 
 Row totals and ETA are estimates. Numeric chunking can measure key-space traversal, while the
 general chunker counts copied rows against estimated totals; neither is a promise of a finish
