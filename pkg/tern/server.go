@@ -19,21 +19,84 @@ import (
 type Server struct {
 	client Client
 	logger *slog.Logger
+	// storageSchema answers the storage-schema RPCs for this instance's own
+	// storage database. It is nil unless the embedder supplies one with
+	// WithStorageSchemaService, in which case those RPCs are refused rather
+	// than answered against something else.
+	storageSchema StorageSchemaService
 }
 
 var _ ternv1.TernServer = (*Server)(nil)
+
+// ServerOption customizes the gRPC server's capabilities.
+type ServerOption func(*Server)
+
+// WithStorageSchemaService lets this gRPC endpoint answer for the storage
+// database of the instance serving it. An embedder supplies an adapter bound
+// to its own storage DSN and dialect; without one, the storage-schema RPCs
+// report Unimplemented, which is what tells a caller to upgrade this data
+// plane rather than leaving it to read some other database's schema.
+func WithStorageSchemaService(service StorageSchemaService) ServerOption {
+	return func(s *Server) { s.storageSchema = service }
+}
 
 // NewServer creates a gRPC server wrapping a Client. The logger carries the
 // health-check causes the RPC sanitizes out of its response, so an embedder
 // that wires its own logger sees them with the rest of its structured output
 // and can attach its deployment identifiers to them. A nil logger falls back
 // to the default rather than dropping the only record of the cause.
-func NewServer(client Client, logger *slog.Logger) *Server {
+func NewServer(client Client, logger *slog.Logger, opts ...ServerOption) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{client: client, logger: logger}
+	s := &Server{client: client, logger: logger}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
+
+// StorageSchemaDiff reports the DDL outstanding on this instance's own storage
+// database. Read-only, and correspondingly cheap to serve: no lock, no DDL.
+func (s *Server) StorageSchemaDiff(ctx context.Context, req *ternv1.StorageSchemaDiffRequest) (*ternv1.StorageSchemaDiffResponse, error) {
+	if s.storageSchema == nil {
+		return nil, errStorageSchemaUnsupported
+	}
+	resp, err := s.storageSchema.StorageSchemaDiff(ctx, req)
+	if err != nil {
+		// The caller sees a sanitized message, so this log is the only place
+		// the cause survives — and a diff that cannot be computed is exactly
+		// what an operator is trying to see during a failed deploy.
+		s.logger.ErrorContext(ctx, "storage schema diff failed", "error", err)
+		return nil, status.Error(codes.Internal, "storage schema diff failed; see data plane logs")
+	}
+	return resp, nil
+}
+
+// StorageSchemaApply converges this instance's own storage schema by running
+// its startup bootstrap, under the same advisory lock a boot takes.
+func (s *Server) StorageSchemaApply(ctx context.Context, req *ternv1.StorageSchemaApplyRequest) (*ternv1.StorageSchemaApplyResponse, error) {
+	if s.storageSchema == nil {
+		return nil, errStorageSchemaUnsupported
+	}
+	s.logger.InfoContext(ctx, "converging storage schema on control plane request",
+		"allow_destructive", req.GetAllowDestructive(), "caller", req.GetCaller())
+	resp, err := s.storageSchema.StorageSchemaApply(ctx, req)
+	if err != nil {
+		s.logger.ErrorContext(ctx, "storage schema convergence failed",
+			"allow_destructive", req.GetAllowDestructive(), "caller", req.GetCaller(), "error", err)
+		return nil, status.Error(codes.Internal, "storage schema convergence failed; see data plane logs")
+	}
+	return resp, nil
+}
+
+// errStorageSchemaUnsupported is what an endpoint without a storage-schema
+// adapter answers. Unimplemented rather than Internal or FailedPrecondition:
+// the caller's own Unimplemented branch names the upgrade, and an embedder
+// that never wired the adapter is in exactly the same position as one running
+// a release from before the RPC existed.
+var errStorageSchemaUnsupported = status.Error(codes.Unimplemented,
+	"this deployment does not serve storage schema requests; it is running a release that predates them, or its embedder did not register the storage schema service")
 
 // Register registers the server on the given grpc.Server.
 func (s *Server) Register(srv *grpc.Server) {

@@ -131,6 +131,51 @@ func ChecksRepos(ctx context.Context, endpoint string) (*apitypes.ChecksReposRes
 	return &result, nil
 }
 
+// StorageSchemaDiff reads which storage DDL is outstanding on a SchemaBot
+// instance's own storage database — the server addressed by endpoint, or a data
+// plane reached through it when deployment is set.
+//
+// The server computes the answer from the embedded schema files of the binary
+// that is running, against the live catalog. No version is sent, because a
+// version is the wrong input: it says what a release would converge to, not
+// what the storage actually converged to, and the two differ exactly when a
+// deploy has failed to converge.
+func StorageSchemaDiff(ctx context.Context, endpoint, deployment, environment string, allowDestructive bool) (*apitypes.StorageSchemaDiffResponse, error) {
+	values := url.Values{}
+	if deployment != "" {
+		values.Set("deployment", deployment)
+	}
+	if environment != "" {
+		values.Set("environment", environment)
+	}
+	if allowDestructive {
+		values.Set("allow_destructive", "true")
+	}
+	requestPath := "/api/storage/schema/diff"
+	if encoded := values.Encode(); encoded != "" {
+		requestPath += "?" + encoded
+	}
+	var result apitypes.StorageSchemaDiffResponse
+	if err := doSlowGetIntoCtx(ctx, endpoint, requestPath, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// StorageSchemaApply converges a SchemaBot instance's own storage database by
+// running the startup bootstrap that instance would run on its next boot,
+// under the same advisory lock.
+func StorageSchemaApply(ctx context.Context, endpoint string, req apitypes.StorageSchemaApplyRequest) (*apitypes.StorageSchemaApplyResponse, error) {
+	if req.Caller == "" {
+		req.Caller = GenerateCLIOwner()
+	}
+	var result apitypes.StorageSchemaApplyResponse
+	if err := doSlowPostIntoCtx(ctx, endpoint, "/api/storage/schema/apply", req, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 // PullSchemaOptions controls optional live schema pull request fields.
 type PullSchemaOptions struct {
 	Namespaces    []string

@@ -26,10 +26,30 @@ func TestTierForRequest(t *testing.T) {
 		{http.MethodPost, "/api/checks/synthesize", TierWrite},
 		{http.MethodPost, "/api/settings", TierWrite},
 		{http.MethodDelete, "/api/locks", TierWrite},
+		// SchemaBot's own storage schema is admin territory on both halves:
+		// the diff exposes the internal shape of its bookkeeping database, and
+		// its sibling route converges it. On a deployment configured with only
+		// read and write groups this tier is the whole admin decision, so the
+		// GET must not sit at the read tier.
+		{http.MethodGet, "/api/storage/schema/diff", TierWrite},
+		{http.MethodPost, "/api/storage/schema/apply", TierWrite},
 	}
 	for _, c := range cases {
 		assert.Equalf(t, c.want, TierForRequest(c.method, c.path), "%s %s", c.method, c.path)
 	}
+}
+
+// Every write-tier GET is listed in writePaths, and a GET outside that list
+// stays a read. The list is the only thing standing between a read-tier
+// classification and an endpoint everyone with read access can call, so it has
+// to be exact rather than approximate.
+func TestWritePathsCoverEveryWriteTierGet(t *testing.T) {
+	for path := range writePaths {
+		assert.Equalf(t, TierWrite, TierForRequest(http.MethodGet, path), "GET %s", path)
+		assert.Equalf(t, TierWrite, TierForRequest(http.MethodHead, path), "HEAD %s", path)
+	}
+	assert.Equal(t, TierRead, TierForRequest(http.MethodGet, "/api/storage/schema"),
+		"a prefix of a write path is not itself a write path")
 }
 
 func TestMatchesAnyGroup(t *testing.T) {

@@ -1042,6 +1042,106 @@ storage:
 Leave the flag false during normal operation and revert it after the removal
 converges.
 
+### Ask what storage DDL is outstanding
+
+A deploy that did not converge leaves one question open: which storage DDL is
+still outstanding. Two commands answer it, and both read the live storage
+database. Neither takes a version, because a release tag says what that
+release would converge to, not what the storage converged to, and the two
+answers differ exactly when a deploy has failed.
+
+`storage diff` is read-only. It takes no lock and holds no transaction, so it
+is safe at any time, including against production during an incident.
+
+```console
+$ schemabot storage diff
+schemabot (mysql) needs 3 statements: 3 outstanding, against the schema embedded in v1.2.3.
+
+Outstanding, and run automatically on the next boot or apply (3):
+
+ALTER TABLE `applies` ADD COLUMN `driver_note` varchar(255) NOT NULL DEFAULT '' AFTER `lease_owner`;
+ALTER TABLE `checks` ADD COLUMN `blocked_reason` varchar(64) NOT NULL DEFAULT '' AFTER `state`;
+CREATE TABLE `check_gate_audit` (
+  `id` BIGINT UNSIGNED AUTO_INCREMENT,
+  `check_id` BIGINT UNSIGNED NOT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+Converge it with: schemabot storage apply
+```
+
+The statements are printed bare and one per line so a whole section can be
+pasted into a client as it stands. The exit status is the machine-readable half
+of the answer: `0` when the storage needs nothing, `2` when statements are
+outstanding, and `1` when the read itself failed. A pre-deploy gate needs those
+three apart, since "converged" and "unreachable" call for opposite decisions.
+
+`storage apply` converges the database by running the same bootstrap the next
+boot would run: the same differ, the same refusal of destructive statements,
+and the same advisory lock, so two operators running it at once serialize the
+way two booting pods do. It previews the statements and prompts before running
+them; `--auto-approve` (`-y`) skips the prompt for scripted maintenance.
+
+```console
+$ schemabot storage apply
+schemabot (mysql) needs 1 statement: 1 outstanding, against the schema embedded in v1.2.3.
+
+Outstanding, and run automatically on the next boot or apply (1):
+
+ALTER TABLE `applies` ADD COLUMN `driver_note` varchar(255) NOT NULL DEFAULT '' AFTER `lease_owner`;
+
+Run these statements against schemabot (mysql)? Only 'yes' will be accepted: yes
+Ran 1 statement against schemabot (mysql).
+schemabot (mysql) is converged.
+```
+
+Destructive statements are refused here exactly as they are at startup, and for
+the same reason: a binary older than the storage sees the newer schema's tables
+as surplus. A refusal is reported rather than silently dropped, and
+`--allow-destructive` opts in per invocation, widening the deployment's standing
+`allow_destructive_schema_changes` policy without ever narrowing it.
+
+```console
+$ schemabot storage diff
+schemabot (mysql) needs 1 statement: 1 destructive, against the schema embedded in v1.2.3.
+
+Destructive, and refused; surplus state stays in place (1):
+
+-- check_gate_audit: DROP TABLE destroys data
+DROP TABLE `check_gate_audit`;
+
+Converge it with: schemabot storage apply
+```
+
+### Reach the right storage database
+
+Both commands take a target, and which path applies is stated rather than
+discovered. Nothing falls back from one to the other: a deployment that cannot
+be reached through the API is an error naming the deployment, never a report
+about a different database that happened to be reachable.
+
+| Target | Reads |
+|---|---|
+| no flags | the storage of the server the CLI is pointed at |
+| `--deployment <name> -e <environment>` | that data plane's own storage, over the gRPC connection that already exists between the two |
+| `--dsn <dsn>` or `--config <file>` | the storage database this workstation opens itself |
+
+A data plane owns its storage database and generally sits where a workstation
+cannot dial it, so `--deployment` routes through the control plane: the control
+plane asks the data plane, and the data plane reads its own storage with its own
+embedded schema files. That is also what makes the answer trustworthy, since the
+binary that reports the diff is the binary whose next boot would run it.
+
+The direct path exists for when the server is down, including when it is down
+because its own schema bootstrap is failing. It reads the storage with *this
+CLI's* embedded schema files, so run a binary of the release you are deploying.
+`--dialect` states the storage family when a DSN's form does not say; it applies
+only to a direct connection.
+
+Both routes are admin-only and both sit at the write tier, the read-only diff
+included, because the diff exposes the internal shape of SchemaBot's bookkeeping
+database. See [Authentication and authorization](auth.md#what-read-and-write-access-include).
+
 ## Support Channel
 
 SchemaBot can add an opt-in support link to GitHub PR comments so authors know

@@ -45,13 +45,33 @@ var readPaths = map[string]bool{
 	"/api/pull": true,
 }
 
+// writePaths are GET endpoints that nonetheless require write access. They read
+// SchemaBot's own storage schema — the internal shape of its bookkeeping
+// database — rather than anything about a user's database, and they are the
+// read half of a pair whose other half converges that database. An operator
+// who may inspect the surplus and missing objects in SchemaBot's own storage is
+// the operator who may converge it, so both halves are admitted at one tier.
+//
+// This is the tier that actually decides the question on a deployment
+// configured with nothing but read groups and write groups, which is the common
+// case: the handler-level scoped-write gate is a pass-through until some
+// database configures operator groups, so a route left on the read tier here
+// would be open to every reader regardless of what its handler checked.
+var writePaths = map[string]bool{
+	"/api/storage/schema/diff": true,
+}
+
 // TierForRequest classifies an API request into the access tier it requires.
-// GET/HEAD requests and the explicit read-only endpoints are read; everything
-// else is write, so a newly added mutating-looking endpoint fails closed
-// (requires authorization) until it is classified here. Exported so the
-// route authorization sweep test enforces per-database scoping against the
-// same rule the middleware admits with.
+// GET/HEAD requests are read unless listed in writePaths, the explicit
+// read-only endpoints are read, and everything else is write — so a newly
+// added mutating-looking endpoint fails closed (requires authorization) until
+// it is classified here. Exported so the route authorization sweep test
+// enforces per-database scoping against the same rule the middleware admits
+// with.
 func TierForRequest(method, path string) Tier {
+	if writePaths[path] {
+		return TierWrite
+	}
 	if readPaths[path] {
 		return TierRead
 	}
