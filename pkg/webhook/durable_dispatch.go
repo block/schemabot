@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/drain"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
@@ -87,8 +88,20 @@ func (h *Handler) StartDurableWebhookDispatch(ctx context.Context) {
 	h.logger.Info("durable webhook dispatch started", "drivers", driverCount, "interval", h.durableWebhookPollInterval)
 }
 
-// StopDurableWebhookDispatch stops the durable webhook driver pool and waits for
-// in-flight claimed deliveries to finish their current drive.
+// durableWebhookDrainTimeout bounds how long StopDurableWebhookDispatch waits
+// for the cancelled deliveries to finish their current drive. A delivery that
+// is between HTTP calls returns as soon as its context ends; the bound is for
+// one that does not return at all.
+//
+// A delivery abandoned here is not lost. Its inbox row stays claimed until the
+// claim goes stale, at which point the next process to run the pool picks it up
+// and delivers it — so the cost of stopping the wait is a delivery that arrives
+// late, against the cost of a process that cannot exit.
+const durableWebhookDrainTimeout = 10 * time.Second
+
+// StopDurableWebhookDispatch stops the durable webhook driver pool and waits up
+// to durableWebhookDrainTimeout for in-flight claimed deliveries to finish
+// their current drive.
 func (h *Handler) StopDurableWebhookDispatch() {
 	h.durableWebhookMu.Lock()
 	if h.durableWebhookStop == nil {
@@ -107,7 +120,11 @@ func (h *Handler) StopDurableWebhookDispatch() {
 	if cancel != nil {
 		cancel()
 	}
-	h.durableWebhookWg.Wait()
+	if !drain.Wait(&h.durableWebhookWg, durableWebhookDrainTimeout) {
+		h.logger.Error("durable webhook deliveries did not return within the shutdown drain; their inbox rows stay claimed until the claim goes stale and the next process to run the pool redelivers them",
+			"drain_timeout", durableWebhookDrainTimeout)
+		return
+	}
 	h.logger.Info("durable webhook dispatch stopped")
 }
 

@@ -475,6 +475,10 @@ func ensureMySQLSchema(parent context.Context, dsn string, logger *slog.Logger, 
 	}
 	defer releaseEnsureSchemaLock(ctx, locker, lockConn, logger, schema.DialectMySQL, storageDatabase)
 
+	if err := ensureSchemaBudgetAfterLock(ctx, logger, schema.DialectMySQL, storageDatabase, o.convergenceTimeout); err != nil {
+		return err
+	}
+
 	// Clean up stale Spirit internal tables only while holding the advisory
 	// lock. During a rolling deploy, another pod may be actively applying
 	// SchemaBot storage DDL; cleaning before the lock can delete that pod's
@@ -756,6 +760,44 @@ func ensureSchemaTimeoutError(ctx context.Context, budget time.Duration, ddlCoun
 	)
 	return fmt.Errorf("storage schema change did not complete within %s (%d change(s)); the database may be throttling the online DDL: %w",
 		budget, ddlCount, ctx.Err())
+}
+
+// ensureSchemaBudgetAfterLock stops a convergence that reached the front of the
+// advisory-lock queue with nothing left to converge under it. Reaching the
+// front is not the same as being able to use it: the wait and the work are
+// billed to the same budget, so a long enough queue hands an instance the lock
+// at the moment its budget is gone.
+//
+// Converging anyway is worse than stopping. It starts an online DDL that cannot
+// finish, on a context that is already done, so the failure surfaces as
+// whatever the driver says about a cancelled statement rather than as the queue
+// that actually consumed the budget — and the engine it started does not
+// necessarily stop when the outer lock is released, which is how work outlives
+// the lock that was serializing it. Stopping here holds neither: the caller's
+// deferred release hands the lock to the next instance in the queue
+// immediately, and a boot's retry loop opens the next attempt on a fresh
+// budget, which is the attempt that can actually succeed.
+func ensureSchemaBudgetAfterLock(ctx context.Context, logger *slog.Logger, dialect schema.Dialect, database string, budget time.Duration) error {
+	switch {
+	case ctx.Err() == nil:
+		return nil
+	case errors.Is(ctx.Err(), context.Canceled):
+		logger.Info("acquired the EnsureSchema advisory lock after the convergence was stopped; the lock is released without converging",
+			"lock", ensureSchemaLockName,
+			"dialect", dialect,
+			"database", database,
+		)
+		return fmt.Errorf("acquired advisory lock %q after the convergence was stopped: %w", ensureSchemaLockName, ctx.Err())
+	default:
+		logger.Warn("acquired the EnsureSchema advisory lock with no budget left to converge under it; the wait consumed the whole budget, so the lock is released for the next instance and this attempt converges nothing",
+			"lock", ensureSchemaLockName,
+			"dialect", dialect,
+			"database", database,
+			"budget", budget,
+		)
+		return fmt.Errorf("acquired advisory lock %q with no time left in the %s convergence budget, which the lock wait consumed: %w",
+			ensureSchemaLockName, budget, ctx.Err())
+	}
 }
 
 // refusedStorageChange is storage-schema DDL EnsureSchema refused to execute,
