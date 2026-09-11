@@ -98,7 +98,7 @@ func (s *Service) StopPendingDropsCleaner() {
 	s.pendingDropsMu.Unlock()
 
 	cancel()
-	s.pendingDropsWg.Wait()
+	s.drainMonitor(&s.pendingDropsWg, "pending_drops_cleaner")
 	s.logger.Info("pending drops cleaner stopped")
 }
 

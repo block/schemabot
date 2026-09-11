@@ -1,8 +1,12 @@
 package api
 
 import (
+	"context"
 	"log/slog"
+	"net"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -29,7 +33,7 @@ func TestEnsureSchemaFailsClosedForUnsupportedDialect(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 
 	unsupported := schema.Dialect("sqlite")
-	err := EnsureSchema(closedPortDSN, logger, WithDialect(unsupported))
+	err := EnsureSchema(t.Context(), closedPortDSN, logger, WithDialect(unsupported))
 
 	require.Error(t, err)
 	require.ErrorContains(t, err, "no schema bootstrapper")
@@ -44,7 +48,7 @@ func TestEnsureSchemaRoutesPostgresDialect(t *testing.T) {
 	t.Parallel()
 	logger := slog.New(slog.DiscardHandler)
 
-	err := EnsureSchema("postgres://user:pass@127.0.0.1:1/schemabot", logger, WithDialect(schema.DialectPostgres))
+	err := EnsureSchema(t.Context(), "postgres://user:pass@127.0.0.1:1/schemabot", logger, WithDialect(schema.DialectPostgres))
 
 	require.Error(t, err)
 	require.NotContains(t, err.Error(), "no schema bootstrapper")
@@ -61,11 +65,119 @@ func TestEnsureSchemaDefaultsToMySQLDialect(t *testing.T) {
 	t.Parallel()
 	logger := slog.New(slog.DiscardHandler)
 
-	err := EnsureSchema(closedPortDSN, logger)
+	err := EnsureSchema(t.Context(), closedPortDSN, logger)
 
 	require.Error(t, err)
 	require.NotContains(t, err.Error(), "no schema bootstrapper")
 	require.ErrorContains(t, err, "plan schema")
+}
+
+// bootstrapCancelDeadline bounds how long a cancelled bootstrap may take to
+// return. It is far below EnsureSchemaTimeout, and below the connect timeout
+// every SchemaBot-managed pool carries, so a bootstrap that ignored the
+// caller's context could not satisfy it by any route.
+const bootstrapCancelDeadline = 10 * time.Second
+
+// blackholeListener accepts TCP connections and then never speaks, so a
+// database driver blocks reading the server's handshake until its context
+// ends. It returns the address to point a DSN at, and a channel closed once a
+// connection has been accepted — the point at which a bootstrap is provably
+// inside a blocking call rather than about to enter one.
+func blackholeListener(t *testing.T) (string, <-chan struct{}) {
+	t.Helper()
+	var config net.ListenConfig
+	listener, err := config.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	var mu sync.Mutex
+	var conns []net.Conn
+	t.Cleanup(func() {
+		assert.NoError(t, listener.Close())
+		mu.Lock()
+		defer mu.Unlock()
+		for _, conn := range conns {
+			assert.NoError(t, conn.Close())
+		}
+	})
+
+	accepted := make(chan struct{})
+	var once sync.Once
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				// The listener was closed at test cleanup; nothing left to accept.
+				return
+			}
+			// Hold the connection open and silent. Closing it would let the
+			// driver fail on its own, and a bootstrap that returned for that
+			// reason would prove nothing about cancellation.
+			mu.Lock()
+			conns = append(conns, conn)
+			mu.Unlock()
+			once.Do(func() { close(accepted) })
+		}
+	}()
+	return listener.Addr().String(), accepted
+}
+
+// A bootstrap runs under the caller's context, so an instance told to stop
+// while its storage bootstrap is in flight stops there. The bootstrap carries
+// a budget of its own measured in minutes, and it is the longest step of
+// startup, so an instance that keeps converging past the signal ignores it for
+// minutes while holding its scheduling slot. The failure reported says the
+// bootstrap was canceled rather than naming the timeout, so an operator
+// reading it is not sent looking for a throttled database.
+func TestEnsureSchemaStopsWhenTheCallerCancels(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name    string
+		dialect schema.Dialect
+		dsn     func(addr string) string
+	}{
+		{
+			name:    "mysql",
+			dialect: schema.DialectMySQL,
+			dsn:     func(addr string) string { return "user:pass@tcp(" + addr + ")/schemabot" },
+		},
+		{
+			name:    "postgres",
+			dialect: schema.DialectPostgres,
+			dsn:     func(addr string) string { return "postgres://user:pass@" + addr + "/schemabot?sslmode=disable" },
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			addr, accepted := blackholeListener(t)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			done := make(chan error, 1)
+			go func() {
+				done <- EnsureSchema(ctx, tt.dsn(addr), slog.New(slog.DiscardHandler), WithDialect(tt.dialect))
+			}()
+
+			select {
+			case <-accepted:
+			case err := <-done:
+				t.Fatalf("bootstrap returned before it reached the database: %v", err)
+			case <-time.After(bootstrapCancelDeadline):
+				t.Fatal("bootstrap never connected to the storage database")
+			}
+			cancel()
+
+			select {
+			case err := <-done:
+				require.Error(t, err)
+				require.ErrorIs(t, err, context.Canceled)
+				assert.NotErrorIs(t, err, context.DeadlineExceeded)
+				assert.NotContains(t, err.Error(), EnsureSchemaTimeout.String())
+			case <-time.After(bootstrapCancelDeadline):
+				t.Fatalf("bootstrap did not return within %s of the caller cancelling", bootstrapCancelDeadline)
+			}
+		})
+	}
 }
 
 // partitionDestructiveChanges delegates its refusal vocabulary to Spirit's

@@ -40,8 +40,8 @@ import (
 //	catalog reads      o.postgresStatementTimeout   ordinary queries
 //	convergence DDL    postgresBootstrapDDLStatementTimeout (per transaction)
 //	advisory-lock wait none — must be free to block for the leader
-func ensurePostgresSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, locker namedlock.Locker) error {
-	ctx, cancel := context.WithTimeout(context.Background(), EnsureSchemaTimeout)
+func ensurePostgresSchema(ctx context.Context, dsn string, logger *slog.Logger, o ensureSchemaOptions, locker namedlock.Locker) error {
+	ctx, cancel := context.WithTimeout(ctx, EnsureSchemaTimeout)
 	defer cancel()
 
 	tables, files, err := readEmbeddedPostgresSchemaFiles()
@@ -130,6 +130,10 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions
 	}
 	defer releaseEnsureSchemaLock(ctx, locker, lockConn, logger, schema.DialectPostgres, database)
 
+	if err := ensureSchemaBudgetAfterLock(ctx, logger, schema.DialectPostgres, database); err != nil {
+		return err
+	}
+
 	// Re-check under the lock — another pod may have converged the schema while
 	// this pod waited.
 	drift, err = postgresSchemaDriftFor(ctx, db, tables, files)
@@ -160,20 +164,34 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions
 		}
 		tableStart := time.Now()
 		if err := applyPostgresTableChanges(ctx, db, table, changes, logger); err != nil {
-			// A statement killed by the overall deadline surfaces as a context
-			// cancellation carrying no budget, so name the deadline that ended
-			// it the way the advisory-lock wait names its own. Logged as well
-			// as returned, like the MySQL bootstrap's twin: a crashlooping pod
-			// leaves nothing but the log.
-			//
-			// The two durations are what separate the causes. This branch runs
-			// only once the context is done, so the total is always about the
-			// whole deadline and says nothing on its own. Time spent on the
-			// table that ran out is the discriminator: near the deadline means
-			// that one table's work is pathological, while a small share of a
-			// spent deadline means the earlier tables consumed it and the
-			// deadline is simply too short for the drift set.
-			if ctx.Err() != nil {
+			// A statement killed by the bootstrap context surfaces as a
+			// cancellation carrying no budget, so name what ended it the way
+			// the advisory-lock wait names its own. The caller cancelling
+			// leaves storage partly converged and needs no operator action —
+			// the next start re-discovers the remaining additive drift — while
+			// the deadline firing is a fault to investigate.
+			switch {
+			case errors.Is(ctx.Err(), context.Canceled):
+				logger.Info("storage schema convergence stopped because its caller canceled the bootstrap; the remaining drift is re-discovered on the next start",
+					"database", database,
+					"table", table,
+					"elapsed", time.Since(applyStart),
+					"table_elapsed", time.Since(tableStart),
+					"error", err,
+				)
+				return fmt.Errorf("converge storage table %q: bootstrap stopped because it was canceled: %w", table, err)
+			case ctx.Err() != nil:
+				// Logged as well as returned, like the MySQL bootstrap's twin:
+				// a crashlooping pod leaves nothing but the log.
+				//
+				// The two durations are what separate the causes. This branch
+				// runs only once the deadline is spent, so the total is always
+				// about the whole deadline and says nothing on its own. Time
+				// spent on the table that ran out is the discriminator: near
+				// the deadline means that one table's work is pathological,
+				// while a small share of a spent deadline means the earlier
+				// tables consumed it and the deadline is simply too short for
+				// the drift set.
 				logger.Error("storage schema change did not complete before EnsureSchemaTimeout; SchemaBot storage will not initialize",
 					"database", database,
 					"table", table,
@@ -903,12 +921,12 @@ func acquirePostgresEnsureSchemaLock(ctx context.Context, dsn string, logger *sl
 	acquired, err := locker.Acquire(ctx, conn, ensureSchemaLockName, EnsureSchemaTimeout)
 	if err != nil {
 		utils.CloseAndLog(conn)
-		// The overall EnsureSchema deadline expires before the server-side
-		// lock wait (which starts later, with the same duration), so a
-		// contended timeout surfaces here as a context error — name the
-		// likely cause instead of reporting only the raw cancellation.
+		// The bootstrap context ends before the server-side lock wait (which
+		// starts later, with the same duration), so a wait cut short surfaces
+		// here as a context error — name what ended it instead of reporting
+		// only the raw cancellation.
 		if ctx.Err() != nil {
-			return nil, fmt.Errorf("timed out waiting for advisory lock %q (another pod may be running EnsureSchema): %w", ensureSchemaLockName, err)
+			return nil, ensureSchemaLockWaitError(ctx, err)
 		}
 		return nil, fmt.Errorf("acquire advisory lock: %w", err)
 	}

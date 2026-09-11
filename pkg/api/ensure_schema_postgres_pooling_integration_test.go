@@ -41,7 +41,7 @@ func TestEnsureSchemaPostgres_RefusesTransactionPooledConnection(t *testing.T) {
 	errs := make([]error, 2)
 	for i := range errs {
 		pods.Go(func() error {
-			errs[i] = EnsureSchema(pooledDSN, logger, WithDialect(schema.DialectPostgres))
+			errs[i] = EnsureSchema(t.Context(), pooledDSN, logger, WithDialect(schema.DialectPostgres))
 			return nil
 		})
 	}
@@ -66,7 +66,7 @@ func TestEnsureSchemaPostgres_BootstrapsThroughSessionPooledConnection(t *testin
 	pooledDSN, directDSN := testutil.StartPostgresBehindPgBouncer(t, "schemabot", testutil.PgBouncerSessionPooling)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	require.NoError(t, EnsureSchema(pooledDSN, logger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), pooledDSN, logger, WithDialect(schema.DialectPostgres)))
 
 	requireStorageTables(t, openPostgres(t, directDSN))
 }

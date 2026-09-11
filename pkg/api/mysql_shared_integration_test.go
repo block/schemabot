@@ -162,7 +162,7 @@ func newStorageDatabaseWithSchema(t *testing.T) storageDatabase {
 	t.Helper()
 	sdb := newStorageDatabase(t)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	require.NoError(t, EnsureSchema(sdb.DSN, logger), "ensure storage schema in %s", sdb.Name)
+	require.NoError(t, EnsureSchema(t.Context(), sdb.DSN, logger), "ensure storage schema in %s", sdb.Name)
 	return sdb
 }
 
