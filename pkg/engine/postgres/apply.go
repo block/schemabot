@@ -97,6 +97,7 @@ type nativeApply struct {
 	steps                      int
 	concurrentIndex            bool
 	concurrentIndexMaxDuration time.Duration
+	cancelRequested            func() bool
 }
 
 // targetConn carries one background apply's connection inputs: the raw DSN
@@ -230,6 +231,7 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	if change.concurrentIndex {
 		ceiling = e.concurrentIndexMaxDuration + concurrentIndexHeadroom
 		change.concurrentIndexMaxDuration = e.concurrentIndexMaxDuration
+		change.cancelRequested = func() bool { return e.cancelRequested(key) }
 	}
 	ctx, cancel := context.WithTimeout(ctx, ceiling)
 	defer cancel()
@@ -264,9 +266,12 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 		// that it acted on the apply: a backend cancelled from outside
 		// SchemaBot is a failure the next drive retries, never a cancel
 		// nobody asked for.
-		detail := "Concurrent index build cancelled"
-		if errors.As(err, &invalidErr) {
+		detail := cancelledIndexCleanupDetail(err)
+		if detail == "" && errors.As(err, &invalidErr) {
 			detail = invalidIndexDetail(invalidErr)
+		}
+		if detail == "" {
+			detail = "Concurrent index build cancelled"
 		}
 		publish(progressResult(engine.StateCancelled, "cancelled", started, change, detail))
 		return
@@ -1117,7 +1122,7 @@ func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, 
 	return nil
 }
 
-// concurrentIndexExecutor names the two executor entry points a concurrent
+// concurrentIndexExecutor names the executor entry points a concurrent
 // index build reaches: the build itself and the recovery run over an
 // abandoned invalid index. It is a test seam, so a test can observe the
 // budget and the context deadline the drive hands each one against an
@@ -1130,11 +1135,13 @@ func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, 
 type concurrentIndexExecutor struct {
 	build   func(ctx context.Context, pool *pgxpool.Pool, sql string, budget executor.ConcurrentBudget, tracker *progress.Tracker) (executor.IndexBuildReport, error)
 	rebuild func(ctx context.Context, pool *pgxpool.Pool, sql string, budget executor.ConcurrentBudget) (executor.IndexRecoveryReport, error)
+	drop    func(ctx context.Context, pool *pgxpool.Pool, sql string, budget executor.ConcurrentBudget) (executor.IndexRecoveryReport, error)
 }
 
 var concurrentIndex = concurrentIndexExecutor{
 	build:   executor.BuildIndexConcurrentlyWithProgress,
 	rebuild: executor.RebuildAbandonedIndex,
+	drop:    executor.DropAbandonedIndex,
 }
 
 // buildIndexConcurrently runs a CREATE INDEX CONCURRENTLY through pg-sprite's
@@ -1153,11 +1160,11 @@ var concurrentIndex = concurrentIndexExecutor{
 // drop concurrently, an unverifiable catalog — is returned as the executor
 // typed it.
 //
-// A leftover this drive's own build produced is not recovered here. Its
-// build just ran under the bound this drive holds, and a rebuild inside
-// the same apply ceiling could only degrade to an external cancellation that
-// names nothing; the failure stays operational and retryable, and the next
-// drive meets the leftover as abandoned debris and recovers it.
+// A leftover this drive's own build produced is removed here only when the
+// engine recorded that its operator cancel acted on this apply. That drop gets
+// a detached bounded envelope and never rebuilds the cancelled index. Every
+// other own leftover stays operational and retryable, and the next drive meets
+// it as abandoned debris and recovers it before rebuilding.
 //
 // A recovery that fails without a fresh invalid-index verdict — its proof
 // lock lost to a build still holding the table, a pool with no room for its
@@ -1190,6 +1197,28 @@ func buildIndexConcurrently(ctx context.Context, pool *pgxpool.Pool, change nati
 		return nil
 	}
 	var invalidErr *executor.InvalidIndexError
+	if errors.As(err, &invalidErr) && cancelledBuildLeftOwnIndex(change, err, invalidErr) {
+		// Cancellation ends the build context, but removing the invalid catalog
+		// entry is part of settling the operator's request. Detach that cleanup
+		// from the cancelled apply and give it only the concurrent apply's setup
+		// headroom: dropping debris must not consume another full build bound or
+		// hold the terminal outcome open indefinitely.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), concurrentIndexHeadroom)
+		defer cancel()
+		report, cleanupErr := concurrentIndex.drop(cleanupCtx, pool, change.sql,
+			executor.ConcurrentBudget{CallerOwned: true})
+		if cleanupErr != nil {
+			logger.Error("PostgreSQL operator cancel could not remove the invalid index left by the concurrent build",
+				"namespace", change.namespace, "table", change.table,
+				"index_schema", invalidErr.Schema, "index", invalidErr.Index, "error", cleanupErr)
+			return &cancelledIndexCleanupError{verdict: invalidErr}
+		}
+		logger.Info("PostgreSQL operator cancel removed the invalid index left by the concurrent build",
+			"namespace", change.namespace, "table", change.table,
+			"index_schema", invalidErr.Schema, "index", invalidErr.Index,
+			"dropped", len(report.Dropped), "skipped", len(report.Skipped), "duration", report.Duration)
+		return &cancelledIndexCleanupError{verdict: invalidErr, removed: true}
+	}
 	if !errors.As(err, &invalidErr) || !abandonedBeforeBuild(invalidErr) {
 		return fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", change.table,
 			nameConcurrentIndexBound(err, change.concurrentIndexMaxDuration, time.Since(start)))
@@ -1227,6 +1256,35 @@ func buildIndexConcurrently(ctx context.Context, pool *pgxpool.Pool, change nati
 		"index_schema", invalidErr.Schema, "index", invalidErr.Index,
 		"dropped", len(report.Dropped), "skipped", len(report.Skipped), "duration", report.Duration)
 	return nil
+}
+
+func cancelledBuildLeftOwnIndex(change nativeApply, err error, invalidErr *executor.InvalidIndexError) bool {
+	return change.cancelRequested != nil && change.cancelRequested() && isCancellation(err) &&
+		invalidErr.Code() == executor.CodeInvalidIndexOwnLeftover && invalidErr.Table == change.table
+}
+
+// cancelledIndexCleanupError keeps the executor's cancellation and invalid
+// index verdict reachable while recording whether the bounded cleanup removed
+// the entry. Cleanup failure is deliberately not its cause: cancellation stays
+// the apply outcome, while the server log carries the cleanup error.
+type cancelledIndexCleanupError struct {
+	verdict *executor.InvalidIndexError
+	removed bool
+}
+
+func (e *cancelledIndexCleanupError) Error() string { return e.verdict.Error() }
+func (e *cancelledIndexCleanupError) Unwrap() error { return e.verdict }
+
+func cancelledIndexCleanupDetail(err error) string {
+	var cleanup *cancelledIndexCleanupError
+	if !errors.As(err, &cleanup) {
+		return ""
+	}
+	name := fmt.Sprintf("%q.%q", cleanup.verdict.Schema, cleanup.verdict.Index)
+	if cleanup.removed {
+		return fmt.Sprintf("Concurrent index build cancelled; invalid index %s was removed", name)
+	}
+	return fmt.Sprintf("Concurrent index build cancelled; invalid index %s remains for automatic recovery", name)
 }
 
 // abandonedBeforeBuild reports whether an invalid-index verdict is one the

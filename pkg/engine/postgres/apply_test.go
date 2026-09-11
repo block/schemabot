@@ -1382,15 +1382,15 @@ func TestApplyRegistersExecutorTracker(t *testing.T) {
 }
 
 // An executor cancellation is this apply's operator cancellation only when
-// the engine recorded that it sent the signal. The invalid leftover remains
-// named so the next drive can recover it.
+// the engine recorded that it sent the signal. A successful cleanup is named
+// in the terminal summary without changing the cancelled outcome.
 func TestApplyClassifiesRequestedConcurrentBuildCancel(t *testing.T) {
 	scripted := newScriptedExecutor(func(tracker *progress.Tracker) error {
 		tracker.Finish(errors.New("cancelled"))
-		return &executor.InvalidIndexError{
+		return &cancelledIndexCleanupError{verdict: &executor.InvalidIndexError{
 			Schema: "public", Index: "users_email_idx", Table: "users",
 			Build: executor.ErrCancelledExternally, Cleanup: executor.ErrBuildLeftInvalidIndex,
-		}
+		}, removed: true}
 	})
 	eng := New()
 	const key = "task-a"
@@ -1406,7 +1406,32 @@ func TestApplyClassifiesRequestedConcurrentBuildCancel(t *testing.T) {
 	}, backgroundApplyDeadline, 10*time.Millisecond)
 	terminal := pollProgress(t, eng, key)
 	assert.Equal(t, engine.StateCancelled, terminal.State)
-	assert.Contains(t, terminal.ErrorMessage, "users_email_idx")
+	assert.Equal(t, `Concurrent index build cancelled; invalid index "public"."users_email_idx" was removed`, terminal.ErrorMessage)
+}
+
+func TestApplyKeepsCancelledOutcomeWhenIndexCleanupFails(t *testing.T) {
+	scripted := newScriptedExecutor(func(tracker *progress.Tracker) error {
+		tracker.Finish(errors.New("cancelled"))
+		return &cancelledIndexCleanupError{verdict: &executor.InvalidIndexError{
+			Schema: "public", Index: "users_email_idx", Table: "users",
+			Build: executor.ErrCancelledExternally, Cleanup: executor.ErrBuildLeftInvalidIndex,
+		}}
+	})
+	eng := New()
+	const key = "task-a"
+	applyAlterUsers(t, eng, scripted, key, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	scripted.tracker(t)
+	eng.mu.Lock()
+	eng.progress[key].cancelRequested = true
+	eng.mu.Unlock()
+	scripted.release()
+
+	require.Eventually(t, func() bool {
+		return pollProgress(t, eng, key).State.IsTerminal()
+	}, backgroundApplyDeadline, 10*time.Millisecond)
+	terminal := pollProgress(t, eng, key)
+	assert.Equal(t, engine.StateCancelled, terminal.State)
+	assert.Equal(t, `Concurrent index build cancelled; invalid index "public"."users_email_idx" remains for automatic recovery`, terminal.ErrorMessage)
 }
 
 // A build cancelled from outside SchemaBot — an operator's pg_cancel_backend,
@@ -2226,38 +2251,100 @@ func TestBuildIndexConcurrentlyRefusesAnUnsetBound(t *testing.T) {
 // handed: the budget and the deadline of the context it ran under.
 type concurrentIndexCall struct {
 	budget      executor.ConcurrentBudget
+	sql         string
 	deadline    time.Time
 	hasDeadline bool
 }
 
 type concurrentIndexCalls struct {
-	build, rebuild []concurrentIndexCall
+	build, rebuild, drop []concurrentIndexCall
 }
 
 // scriptConcurrentIndex swaps the concurrent index executor for one whose
 // build and recovery are scripted, restoring the executor's own functions
 // when the test ends. Each call's envelope is recorded before the script
 // answers.
-func scriptConcurrentIndex(t *testing.T, build func() error, rebuild func() error) *concurrentIndexCalls {
+func scriptConcurrentIndex(t *testing.T, build func() error, rebuild func() error, drops ...func() error) *concurrentIndexCalls {
 	t.Helper()
 	calls := &concurrentIndexCalls{}
-	record := func(ctx context.Context, budget executor.ConcurrentBudget) concurrentIndexCall {
+	record := func(ctx context.Context, sql string, budget executor.ConcurrentBudget) concurrentIndexCall {
 		deadline, ok := ctx.Deadline()
-		return concurrentIndexCall{budget: budget, deadline: deadline, hasDeadline: ok}
+		return concurrentIndexCall{budget: budget, sql: sql, deadline: deadline, hasDeadline: ok}
+	}
+	drop := func() error { return errors.New("no drop is expected") }
+	if len(drops) > 0 {
+		drop = drops[0]
 	}
 	previous := concurrentIndex
 	concurrentIndex = concurrentIndexExecutor{
-		build: func(ctx context.Context, _ *pgxpool.Pool, _ string, budget executor.ConcurrentBudget, _ *progress.Tracker) (executor.IndexBuildReport, error) {
-			calls.build = append(calls.build, record(ctx, budget))
+		build: func(ctx context.Context, _ *pgxpool.Pool, sql string, budget executor.ConcurrentBudget, _ *progress.Tracker) (executor.IndexBuildReport, error) {
+			calls.build = append(calls.build, record(ctx, sql, budget))
 			return executor.IndexBuildReport{}, build()
 		},
-		rebuild: func(ctx context.Context, _ *pgxpool.Pool, _ string, budget executor.ConcurrentBudget) (executor.IndexRecoveryReport, error) {
-			calls.rebuild = append(calls.rebuild, record(ctx, budget))
+		rebuild: func(ctx context.Context, _ *pgxpool.Pool, sql string, budget executor.ConcurrentBudget) (executor.IndexRecoveryReport, error) {
+			calls.rebuild = append(calls.rebuild, record(ctx, sql, budget))
 			return executor.IndexRecoveryReport{}, rebuild()
+		},
+		drop: func(ctx context.Context, _ *pgxpool.Pool, sql string, budget executor.ConcurrentBudget) (executor.IndexRecoveryReport, error) {
+			calls.drop = append(calls.drop, record(ctx, sql, budget))
+			return executor.IndexRecoveryReport{}, drop()
 		},
 	}
 	t.Cleanup(func() { concurrentIndex = previous })
 	return calls
+}
+
+func TestBuildIndexConcurrentlyCleansUpAnOperatorCancelledBuild(t *testing.T) {
+	leftover := &executor.InvalidIndexError{Schema: "public", Index: "users_email_idx", Table: "users",
+		Build: executor.ErrCancelledExternally, Cleanup: executor.ErrBuildLeftInvalidIndex}
+	calls := scriptConcurrentIndex(t, func() error { return leftover }, func() error {
+		return errors.New("no rebuild is expected")
+	}, func() error { return nil })
+	change := concurrentIndexChange(3 * time.Hour)
+	change.cancelRequested = func() bool { return true }
+	cancelledCtx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	before := time.Now()
+	err := buildIndexConcurrently(cancelledCtx, nil, change, newTestTracker(t), slog.New(slog.DiscardHandler))
+
+	require.Error(t, err)
+	assert.Equal(t, `Concurrent index build cancelled; invalid index "public"."users_email_idx" was removed`, cancelledIndexCleanupDetail(err))
+	require.Len(t, calls.drop, 1)
+	assert.Equal(t, concurrentIndexDDL, calls.drop[0].sql)
+	assert.Equal(t, executor.ConcurrentBudget{CallerOwned: true}, calls.drop[0].budget)
+	require.True(t, calls.drop[0].hasDeadline)
+	assert.WithinDuration(t, before.Add(concurrentIndexHeadroom), calls.drop[0].deadline, time.Second)
+}
+
+func TestBuildIndexConcurrentlyKeepsCancelledOutcomeWhenCleanupFails(t *testing.T) {
+	leftover := &executor.InvalidIndexError{Schema: "public", Index: "users_email_idx", Table: "users",
+		Build: executor.ErrCancelledExternally, Cleanup: executor.ErrBuildLeftInvalidIndex}
+	calls := scriptConcurrentIndex(t, func() error { return leftover }, func() error { return nil }, func() error {
+		return errors.New("drop failed")
+	})
+	change := concurrentIndexChange(time.Hour)
+	change.cancelRequested = func() bool { return true }
+
+	err := buildIndexConcurrently(t.Context(), nil, change, newTestTracker(t), slog.New(slog.DiscardHandler))
+
+	require.Error(t, err)
+	assert.True(t, isCancellation(err))
+	assert.Equal(t, `Concurrent index build cancelled; invalid index "public"."users_email_idx" remains for automatic recovery`, cancelledIndexCleanupDetail(err))
+	require.Len(t, calls.drop, 1)
+}
+
+func TestBuildIndexConcurrentlyDoesNotCleanUpExternalCancellation(t *testing.T) {
+	leftover := &executor.InvalidIndexError{Schema: "public", Index: "users_email_idx", Table: "users",
+		Build: executor.ErrCancelledExternally, Cleanup: executor.ErrBuildLeftInvalidIndex}
+	calls := scriptConcurrentIndex(t, func() error { return leftover }, func() error { return nil })
+	change := concurrentIndexChange(time.Hour)
+	change.cancelRequested = func() bool { return false }
+
+	err := buildIndexConcurrently(t.Context(), nil, change, newTestTracker(t), slog.New(slog.DiscardHandler))
+
+	require.Error(t, err)
+	assert.Empty(t, calls.drop)
 }
 
 func concurrentIndexChange(bound time.Duration) nativeApply {

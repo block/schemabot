@@ -1134,8 +1134,8 @@ func TestEngineApplyConcurrentIndexBuild(t *testing.T) {
 }
 
 // An operator cancel signals a concurrent build parked behind an open writer,
-// settles the apply as cancelled, and preserves the invalid index entry that
-// the next drive uses for automatic recovery.
+// removes the invalid catalog entry under its bounded cleanup envelope, and
+// settles the apply as cancelled with no debris for the next drive.
 func TestEngineCancelConcurrentIndexBuild(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "cancel_index_build_test")
 	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
@@ -1153,15 +1153,34 @@ func TestEngineCancelConcurrentIndexBuild(t *testing.T) {
 		return err == nil && invalid
 	}, postgresApplyDeadline, 10*time.Millisecond, "the build never parked after creating its invalid catalog entry")
 
-	result, err := eng.Cancel(t.Context(), cancelRequestFor("orders"))
-	require.NoError(t, err)
-	assert.True(t, result.Accepted)
+	type cancelAnswer struct {
+		result *engine.ControlResult
+		err    error
+	}
+	answered := make(chan cancelAnswer, 1)
+	go func() {
+		result, cancelErr := eng.Cancel(t.Context(), cancelRequestFor("orders"))
+		answered <- cancelAnswer{result: result, err: cancelErr}
+	}()
+	// The cleanup proves abandonment with a table lock. Release the writer
+	// once the cancellation has ended the builder so that proof can proceed.
+	require.Eventually(t, func() bool {
+		var builders int
+		err := db.QueryRowContext(t.Context(), `SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND query LIKE 'CREATE INDEX CONCURRENTLY orders_ref_idx%' AND state <> 'idle'`).Scan(&builders)
+		return err == nil && builders == 0
+	}, postgresApplyDeadline, 10*time.Millisecond, "the cancelled build backend did not exit")
 	writer.release(t)
+	answer := <-answered
+	require.NoError(t, answer.err)
+	assert.True(t, answer.result.Accepted)
 
 	got := awaitPostgresProgress(t, eng, "orders")
 	assert.Equal(t, engine.StateCancelled, got.State)
-	assert.Contains(t, got.ErrorMessage, "orders_ref_idx")
-	assertIndexInvalid(t, db, "orders_ref_idx")
+	assert.Contains(t, got.ErrorMessage, `"public"."orders_ref_idx" was removed`)
+	var exists bool
+	err = db.QueryRowContext(t.Context(), `SELECT to_regclass('public.orders_ref_idx') IS NOT NULL`).Scan(&exists)
+	require.NoError(t, err)
+	assert.False(t, exists, "operator cancellation must not leave an invalid index")
 }
 
 // TestEngineCancelConcurrentIndexBuildWithoutABackendSignal proves the cancel
