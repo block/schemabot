@@ -1722,8 +1722,16 @@ func TestLocalClient_ProcessPendingCancelSettlesCompletedEngineChange(t *testing
 	require.NotNil(t, apply.CompletedAt)
 	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, err)
-	assert.Nil(t, controlReq, "the durable cancel request must complete so the operator stops re-running the cancel")
+	assert.Nil(t, controlReq, "the durable cancel request must settle so the operator stops re-running the cancel")
+	settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, storage.ControlRequestFailed, settled.Status,
+		"the change landed, so the cancel did not take effect and must resolve as a rejection the PR comment can surface")
+	assert.Equal(t, "the schema change completed before the cancel could take effect; the change is live on the target",
+		settled.ErrorMessage)
 	assert.True(t, hasLogMessageContaining(logs.logs, "Cancel arrived after the schema change completed on the engine; apply recorded as completed (1 tasks completed, 0 already terminal) (caller: github:alice)"))
+	assert.True(t, hasLogMessageContaining(logs.logs, "Cancel did not take effect: the schema change completed before the cancel could take effect; the change is live on the target (caller: github:alice)"))
 }
 
 // The stop counterpart: a pending stop consumed after the engine's schema

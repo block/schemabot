@@ -201,9 +201,23 @@ context instead, which ends whatever statement the apply is on. Membership in
 it the cancel still takes effect through the apply's context.
 
 The cancel is answered from the outcome the apply settles on, never from the
-signal alone. A build cancelled either way leaves an invalid index, which the
-apply records as the cancelled outcome and the next build under that name
-recovers as abandoned debris. A signal that races the build's completion may
+signal alone. When a cancelled initial or recovery build leaves its own invalid
+index, the drive removes it through pg-sprite's abandonment proof before
+settling the apply.
+That cleanup is detached from the already-cancelled apply context and runs
+under its own bound of seconds, kept well inside the cancel's settle wait so
+that a slow cleanup cannot turn a cancel that is about to succeed into a
+not-settled answer; it cannot spend another full build bound. The summary
+reports what pg-sprite's report proves: the index was removed only when an
+entry was dropped; an entry the server refuses to drop concurrently is named
+under its quarantine name for an operator to remove; an entry already gone is
+reported as such. Cleanup failure does not change the terminal `cancelled`
+outcome. When pg-sprite exposes the leftover's identity, the summary and server
+log name it; otherwise the summary names both the original and quarantine-name
+possibilities and gives the catalog query needed to identify it. The terminal
+apply does not retry cleanup: the entry remains until an operator follows the
+invalid-index recovery guidance. The full cleanup error stays in server logs.
+A signal that races the build's completion may
 find the index already valid: that apply is reported as already completed, not
 cancelled, and the durable request reconciles to the completed outcome. A cancel
 that arrives after the apply has already failed is accepted over the failure,
@@ -304,11 +318,13 @@ database, where every table nobody has written a file for yet is undeclared;
 the same happens when a file is deleted from the PR, or when an imperative
 tool leaves a table behind during coexistence. A namespace is owned whole: the
 schema files declare the set of tables, not just each table's shape, so the
-only convergence for a table with no file is a drop. The planner enumerates
-the target's tables and surfaces each undeclared one as a blocked, destructive
-`DROP TABLE` change: the engine will never run the drop, so the one choice
-left is whether to report the divergence, and hiding it would turn a target
-that does not match its declaration into a passing check.
+only convergence for a table with no file is a drop. The planner surfaces
+each undeclared table as a blocked, destructive `DROP TABLE` change: the
+engine will never run the drop, so the one choice left is whether to report
+the divergence, and hiding it would turn a target that does not match its
+declaration into a passing check. The plan and the schema pull enumerate the
+namespace's tables through the same pg-sprite query, so a pulled baseline
+cannot leave behind a table that the next plan then blocks on.
 Deleting every schema file in one namespace keeps that namespace in the plan
 and surfaces every live table it contains as one of these blocked drops.
 Because the check fails for the whole database while any change is blocked,
@@ -352,7 +368,9 @@ nothing on PostgreSQL — and `ignore_namespaces` is the per-namespace one. The
 plan discloses the tables it exempted, by namespace, in the PR comment and in
 `schemabot plan` and `schemabot apply` output, so a reviewer can tell an
 archive the verdict skipped from a table it found declared.
-Tables whose definition lives elsewhere are likewise not enumerated: a
+The underlying table set is pg-sprite's own view of which tables its
+declarative model manages; SchemaBot adds only that naming policy exemption.
+Tables whose definition lives elsewhere are not enumerated: a
 partition is declared through its parent's `PARTITION BY` and follows the
 parent's verdict wherever the parent lives, and extension-owned tables (such
 as PostGIS's `spatial_ref_sys`) belong to their extension — no file can

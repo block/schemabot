@@ -14,7 +14,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/checkstate"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 type fakeWebhookRedriveDeliveryClient struct {
@@ -439,7 +442,7 @@ func TestRepoTakingEndpointsRefuseAMalformedRepository(t *testing.T) {
 			return err
 		}},
 		{"scan", func(ctx context.Context, repo string) error {
-			_, err := executeChecksScan(ctx, cfg, ChecksScanRequest{Repo: repo}, discardLogger())
+			_, err := executeChecksScan(ctx, cfg, nil, ChecksScanRequest{Repo: repo}, discardLogger())
 			return err
 		}},
 		{"synthesize", func(ctx context.Context, repo string) error {
@@ -484,7 +487,7 @@ func TestExecuteChecksScanRejectsDisallowedEnvironment(t *testing.T) {
 
 	cfg := &ServerConfig{AllowedEnvironments: []string{"staging", "production"}}
 
-	_, err := executeChecksScan(t.Context(), cfg, ChecksScanRequest{Repo: "octo/repo", Environment: "prod"}, discardLogger())
+	_, err := executeChecksScan(t.Context(), cfg, nil, ChecksScanRequest{Repo: "octo/repo", Environment: "prod"}, discardLogger())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `environment "prod" is not one this instance handles`)
 }
@@ -544,7 +547,7 @@ func checksEnvironmentTakingEndpoints(t *testing.T, cfg *ServerConfig) []checksE
 	t.Helper()
 	return []checksEnvironmentEndpoint{
 		{"scan", func(ctx context.Context, environment string) error {
-			_, err := executeChecksScan(ctx, cfg, ChecksScanRequest{Repo: "octo/repo", Environment: environment}, discardLogger())
+			_, err := executeChecksScan(ctx, cfg, nil, ChecksScanRequest{Repo: "octo/repo", Environment: environment}, discardLogger())
 			return err
 		}},
 		{"inspect", func(ctx context.Context, environment string) error {
@@ -642,6 +645,11 @@ func TestExecuteWebhookRedriveTrimsTheRepositoryFilter(t *testing.T) {
 		"trimmed, it names the repository the delivery names")
 }
 
+// productionCheckName is the single environment-scoped Check Run name most
+// scan tests expect, so a stuck run's stored rows are read against the one
+// environment it gates.
+var productionCheckName = []webhookExpectedCheckName{{Name: "SchemaBot (production)", Environment: "production"}}
+
 type fakeWebhookMissingCheckScanClient struct {
 	prs  []ghclient.OpenPullRequest
 	runs map[string]*ghclient.CheckRunResult
@@ -700,7 +708,7 @@ func TestScanWebhookMissingChecksReportsOpenPRsMissingConfiguredChecks(t *testin
 		},
 	}
 
-	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0, time.Time{})
+	result, err := scanWebhookMissingChecks(t.Context(), client, nil, "octo/repo", productionCheckName, 0, time.Time{}, 0, discardLogger())
 
 	require.NoError(t, err)
 	assert.Equal(t, 2, result.Scanned)
@@ -742,7 +750,7 @@ func TestScanWebhookMissingChecksReportsUncompletedRuns(t *testing.T) {
 		},
 	}
 
-	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0, time.Time{})
+	result, err := scanWebhookMissingChecks(t.Context(), client, nil, "octo/repo", productionCheckName, 0, time.Time{}, 0, discardLogger())
 
 	require.NoError(t, err)
 	assert.Empty(t, result.Missing, "an existing run is not missing, even when uncompleted")
@@ -771,7 +779,7 @@ func TestScanWebhookMissingChecksReportsUncompletedRunWithoutStartTime(t *testin
 		},
 	}
 
-	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0, time.Time{})
+	result, err := scanWebhookMissingChecks(t.Context(), client, nil, "octo/repo", productionCheckName, 0, time.Time{}, 0, discardLogger())
 
 	require.NoError(t, err)
 	assert.Empty(t, result.Missing)
@@ -803,7 +811,7 @@ func TestScanWebhookMissingChecksStopsAtUpdatedSince(t *testing.T) {
 		},
 	}
 
-	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0, updatedSince)
+	result, err := scanWebhookMissingChecks(t.Context(), client, nil, "octo/repo", productionCheckName, 0, updatedSince, 0, discardLogger())
 
 	require.NoError(t, err)
 	assert.Equal(t, 2, result.Scanned, "only the in-window PRs count as scanned")
@@ -818,7 +826,7 @@ func TestExecuteChecksScanRejectsInvalidUpdatedSince(t *testing.T) {
 
 	cfg := &ServerConfig{AllowedEnvironments: []string{"production"}}
 
-	_, err := executeChecksScan(t.Context(), cfg, ChecksScanRequest{Repo: "octo/repo", UpdatedSince: "yesterday"}, discardLogger())
+	_, err := executeChecksScan(t.Context(), cfg, nil, ChecksScanRequest{Repo: "octo/repo", UpdatedSince: "yesterday"}, discardLogger())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "updated_since")
 }
@@ -909,7 +917,7 @@ func TestExecuteChecksScanSkipsRepoWithChecksDisabled(t *testing.T) {
 		Repos: map[string]RepoConfig{"octo/repo": {GitHubApp: "main", EnableChecks: &checksOff}},
 	}
 
-	response, err := executeChecksScan(t.Context(), cfg, ChecksScanRequest{Repo: "octo/repo"}, discardLogger())
+	response, err := executeChecksScan(t.Context(), cfg, nil, ChecksScanRequest{Repo: "octo/repo"}, discardLogger())
 	require.NoError(t, err)
 	assert.True(t, response.ChecksDisabled)
 	assert.Equal(t, "octo/repo", response.Repo)
@@ -932,10 +940,449 @@ func TestScanWebhookMissingChecksSurfacesUntrustedConflicts(t *testing.T) {
 		},
 	}
 
-	result, err := scanWebhookMissingChecks(t.Context(), client, "octo/repo", []string{"SchemaBot (production)"}, 0, time.Time{})
+	result, err := scanWebhookMissingChecks(t.Context(), client, nil, "octo/repo", productionCheckName, 0, time.Time{}, 0, discardLogger())
 
 	require.NoError(t, err)
 	require.Len(t, result.Missing, 1)
 	assert.Equal(t, []string{"SchemaBot (production)"}, result.Missing[0].MissingNames)
 	assert.Equal(t, []string{"SchemaBot (production)"}, result.Missing[0].UntrustedConflictNames)
+}
+
+// A stuck Check Run carries the stored rows behind it, so a fleet sweep can
+// tell the two stuck shapes apart without opening the pull request: a row a
+// plan or an apply will still resolve, and a row that needs a person. The
+// entry is classified by its worst row, because an entry reported as
+// self-converging when part of it is not reads as safe to leave alone.
+func TestScanWebhookMissingChecksExplainsStuckRunsFromStoredState(t *testing.T) {
+	t.Parallel()
+
+	client := fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 11, Title: "wedged", HeadSHA: "sha11", HeadRef: "feature-11"},
+		},
+		runs: map[string]*ghclient.CheckRunResult{
+			"sha11/SchemaBot (production)": {ID: 110, Name: "SchemaBot (production)", Status: "in_progress"},
+		},
+	}
+	store := &inspectStorage{
+		checks: &inspectCheckStore{checks: []*storage.Check{
+			{Environment: "production", DatabaseName: "widgets", HeadSHA: "older", ApplyID: 5,
+				Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionSuccess},
+			{Environment: "production", DatabaseName: "gadgets", HeadSHA: "sha11", ApplyID: 6,
+				Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionActionRequired,
+				BlockingReason: checkstate.BlockRollbackCompleted},
+		}},
+		applies: &inspectApplyStore{applies: map[int64]*storage.Apply{
+			5: {ApplyIdentifier: "apply-5", State: "completed"},
+			6: {ApplyIdentifier: "apply-6", State: "rolled_back"},
+		}},
+	}
+
+	result, err := scanWebhookMissingChecks(t.Context(), client, store, "octo/repo", productionCheckName, 0, time.Time{}, 0, discardLogger())
+
+	require.NoError(t, err)
+	require.Len(t, result.Stuck, 1)
+	stuck := result.Stuck[0]
+	assert.Equal(t, apitypes.WaitingOnOperator, stuck.Checks[0].WaitingOn, "one row needing a person classifies the whole entry")
+	require.Len(t, stuck.Checks[0].StoredRows, 2)
+	assert.Equal(t, "gadgets", stuck.Checks[0].StoredRows[0].Database, "rows are ordered by environment then database")
+	assert.Equal(t, checkstate.ReasonReconciliationOwed, stuck.Checks[0].StoredRows[0].Reason)
+	assert.Equal(t, "apply-6", stuck.Checks[0].StoredRows[0].ApplyIdentifier)
+	assert.Equal(t, "widgets", stuck.Checks[0].StoredRows[1].Database)
+	assert.Equal(t, checkstate.ReasonAwaitingReplanAfterApply, stuck.Checks[0].StoredRows[1].Reason)
+}
+
+// Every stored row resolving on its own is the shape an operator can skip,
+// and the sweep says so rather than leaving the entry unclassified.
+func TestScanWebhookMissingChecksMarksSelfConvergingStuckRuns(t *testing.T) {
+	t.Parallel()
+
+	client := fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 12, Title: "waiting", HeadSHA: "sha12", HeadRef: "feature-12"},
+		},
+		runs: map[string]*ghclient.CheckRunResult{
+			"sha12/SchemaBot (production)": {ID: 120, Name: "SchemaBot (production)", Status: "in_progress"},
+		},
+	}
+	store := &inspectStorage{
+		checks: &inspectCheckStore{checks: []*storage.Check{
+			{Environment: "production", DatabaseName: "widgets", HeadSHA: "sha12", ApplyID: 7,
+				Status: checkstate.StatusInProgress},
+		}},
+		applies: &inspectApplyStore{applies: map[int64]*storage.Apply{
+			7: {ApplyIdentifier: "apply-7", State: "running"},
+		}},
+	}
+
+	result, err := scanWebhookMissingChecks(t.Context(), client, store, "octo/repo", productionCheckName, 0, time.Time{}, 0, discardLogger())
+
+	require.NoError(t, err)
+	require.Len(t, result.Stuck, 1)
+	assert.Equal(t, apitypes.WaitingOnSchemaBot, result.Stuck[0].Checks[0].WaitingOn)
+	require.Len(t, result.Stuck[0].Checks[0].StoredRows, 1)
+	assert.Equal(t, checkstate.ReasonApplyRunning, result.Stuck[0].Checks[0].StoredRows[0].Reason)
+}
+
+// A pull request carries one Check Run per environment and each gates merge
+// on its own, so each stuck run is explained by the rows for the environment
+// it gates. Attributing another environment's rows to it would name a cause
+// that has nothing to do with why it is sitting, and would send an operator
+// after the wrong deployment.
+func TestScanWebhookMissingChecksScopesStoredRowsToEachRunsEnvironment(t *testing.T) {
+	t.Parallel()
+
+	client := fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 14, Title: "two gates", HeadSHA: "sha14", HeadRef: "feature-14"},
+		},
+		runs: map[string]*ghclient.CheckRunResult{
+			"sha14/SchemaBot (staging)":    {ID: 140, Name: "SchemaBot (staging)", Status: "in_progress"},
+			"sha14/SchemaBot (production)": {ID: 141, Name: "SchemaBot (production)", Status: "in_progress"},
+		},
+	}
+	store := &inspectStorage{
+		checks: &inspectCheckStore{checks: []*storage.Check{
+			// Staging is waiting out an apply SchemaBot finishes on its own.
+			{Environment: "staging", DatabaseName: "widgets", HeadSHA: "sha14", ApplyID: 8,
+				Status: checkstate.StatusInProgress},
+			// Production owes a person a reconciliation.
+			{Environment: "production", DatabaseName: "widgets", HeadSHA: "sha14", ApplyID: 9,
+				Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionActionRequired,
+				BlockingReason: checkstate.BlockRollbackCompleted},
+		}},
+		applies: &inspectApplyStore{applies: map[int64]*storage.Apply{
+			8: {ApplyIdentifier: "apply-8", State: "running"},
+			9: {ApplyIdentifier: "apply-9", State: "rolled_back"},
+		}},
+	}
+	names := []webhookExpectedCheckName{
+		{Name: "SchemaBot (staging)", Environment: "staging"},
+		{Name: "SchemaBot (production)", Environment: "production"},
+	}
+
+	result, err := scanWebhookMissingChecks(t.Context(), client, store, "octo/repo", names, 0, time.Time{}, 0, discardLogger())
+
+	require.NoError(t, err)
+	require.Len(t, result.Stuck, 1)
+	require.Len(t, result.Stuck[0].Checks, 2)
+
+	staging := result.Stuck[0].Checks[0]
+	require.Equal(t, "SchemaBot (staging)", staging.Name)
+	require.Len(t, staging.StoredRows, 1, "the production row belongs to the other run")
+	assert.Equal(t, "staging", staging.StoredRows[0].Environment)
+	assert.Equal(t, checkstate.ReasonApplyRunning, staging.StoredRows[0].Reason)
+	assert.Equal(t, apitypes.WaitingOnSchemaBot, staging.WaitingOn,
+		"the production reconciliation must not make the staging gate look operator-owned")
+
+	production := result.Stuck[0].Checks[1]
+	require.Equal(t, "SchemaBot (production)", production.Name)
+	require.Len(t, production.StoredRows, 1)
+	assert.Equal(t, "production", production.StoredRows[0].Environment)
+	assert.Equal(t, checkstate.ReasonReconciliationOwed, production.StoredRows[0].Reason)
+	assert.Equal(t, apitypes.WaitingOnOperator, production.WaitingOn)
+
+	// The rows are one pull request's, so they are read once and scoped per
+	// run. Reading them per run instead would return the same annotations at
+	// twice the cost, on a sweep that already pages through every open PR in
+	// the fleet.
+	assert.Equal(t, 1, store.checks.reads,
+		"one read serves every annotated run on a pull request")
+}
+
+// A deployment publishing a single unscoped check gates every environment on
+// one Check Run, so that run is explained by every stored row on the pull
+// request. Narrowing it to one environment would blank the annotation for the
+// deployments that have no per-environment names at all.
+func TestScanWebhookMissingChecksAnnotatesAnUnscopedRunFromEveryRow(t *testing.T) {
+	t.Parallel()
+
+	client := fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 16, Title: "one gate", HeadSHA: "sha16", HeadRef: "feature-16"},
+		},
+		runs: map[string]*ghclient.CheckRunResult{
+			"sha16/SchemaBot": {ID: 160, Name: "SchemaBot", Status: "in_progress"},
+		},
+	}
+	store := &inspectStorage{
+		checks: &inspectCheckStore{checks: []*storage.Check{
+			{Environment: "staging", DatabaseName: "widgets", HeadSHA: "sha16", ApplyID: 8,
+				Status: checkstate.StatusInProgress},
+			{Environment: "production", DatabaseName: "widgets", HeadSHA: "sha16", ApplyID: 9,
+				Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionActionRequired,
+				BlockingReason: checkstate.BlockRollbackCompleted},
+		}},
+		applies: &inspectApplyStore{applies: map[int64]*storage.Apply{
+			8: {ApplyIdentifier: "apply-8", State: "running"},
+			9: {ApplyIdentifier: "apply-9", State: "rolled_back"},
+		}},
+	}
+	names := []webhookExpectedCheckName{{Name: "SchemaBot"}}
+
+	result, err := scanWebhookMissingChecks(t.Context(), client, store, "octo/repo", names, 0, time.Time{}, 0, discardLogger())
+
+	require.NoError(t, err)
+	require.Len(t, result.Stuck, 1)
+	require.Len(t, result.Stuck[0].Checks, 1)
+	stuck := result.Stuck[0].Checks[0]
+	require.Len(t, stuck.StoredRows, 2, "one gate over every environment is explained by every row")
+	assert.Equal(t, apitypes.WaitingOnOperator, stuck.WaitingOn,
+		"a reconciliation anywhere behind the single gate is owed to a person")
+}
+
+// An operator-supplied check name reports on whatever environment they also
+// named. Handing it every environment's rows would attribute one
+// environment's reconciliation to a run gating another.
+func TestWebhookExpectedCheckNamesScopesAnOverrideToTheRequestedEnvironment(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{AllowedEnvironments: []string{"staging", "production"}}
+
+	scoped := webhookExpectedCheckNames(cfg, "octo/repo", "staging", "SchemaBot (staging)")
+	require.Len(t, scoped, 1)
+	assert.Equal(t, "SchemaBot (staging)", scoped[0].Name)
+	assert.Equal(t, "staging", scoped[0].Environment)
+
+	unscoped := webhookExpectedCheckNames(cfg, "octo/repo", "", "Some Other Check")
+	require.Len(t, unscoped, 1)
+	assert.Empty(t, unscoped[0].Environment,
+		"an override with no environment behind it covers whatever the operator meant")
+}
+
+// The stored-row annotation costs a read per pull request and one per apply
+// behind it, and a caller that drops young runs never renders the result. A
+// run below the caller's threshold is still reported, without paying for an
+// explanation nobody sees.
+func TestScanWebhookMissingChecksSkipsTheAnnotationForAYoungRun(t *testing.T) {
+	t.Parallel()
+
+	client := fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 17, Title: "just started", HeadSHA: "sha17", HeadRef: "feature-17"},
+		},
+		runs: map[string]*ghclient.CheckRunResult{
+			"sha17/SchemaBot (production)": {ID: 170, Name: "SchemaBot (production)",
+				Status: "in_progress", StartedAt: time.Now().UTC().Add(-time.Minute)},
+		},
+	}
+	store := &inspectStorage{
+		checks: &inspectCheckStore{checks: []*storage.Check{
+			{Environment: "production", DatabaseName: "widgets", HeadSHA: "sha17", ApplyID: 9,
+				Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionActionRequired,
+				BlockingReason: checkstate.BlockRollbackCompleted},
+		}},
+		applies: &inspectApplyStore{applies: map[int64]*storage.Apply{
+			9: {ApplyIdentifier: "apply-9", State: "rolled_back"},
+		}},
+	}
+	names := []webhookExpectedCheckName{{Name: "SchemaBot (production)", Environment: "production"}}
+
+	result, err := scanWebhookMissingChecks(t.Context(), client, store, "octo/repo", names, 0, time.Time{}, time.Hour, discardLogger())
+
+	require.NoError(t, err)
+	require.Len(t, result.Stuck, 1)
+	require.Len(t, result.Stuck[0].Checks, 1)
+	stuck := result.Stuck[0].Checks[0]
+	assert.Equal(t, "SchemaBot (production)", stuck.Name, "the run is still reported")
+	assert.Empty(t, stuck.StoredRows)
+	assert.Empty(t, stuck.WaitingOn)
+	assert.Zero(t, store.checks.reads,
+		"a pull request whose every run is too young to render pays for no stored read")
+
+	// A run whose age cannot be established is one the caller renders, so it
+	// is annotated whatever the threshold says.
+	client.runs["sha17/SchemaBot (production)"] = &ghclient.CheckRunResult{
+		ID: 170, Name: "SchemaBot (production)", Status: "in_progress",
+	}
+	result, err = scanWebhookMissingChecks(t.Context(), client, store, "octo/repo", names, 0, time.Time{}, time.Hour, discardLogger())
+	require.NoError(t, err)
+	require.Len(t, result.Stuck, 1)
+	require.Len(t, result.Stuck[0].Checks, 1)
+	assert.Equal(t, apitypes.WaitingOnOperator, result.Stuck[0].Checks[0].WaitingOn)
+}
+
+// The caller ages a run from the start time it reads back, applying the same
+// threshold, to decide what to render. The wire carries whole seconds, so a run
+// judged here against the untruncated instant GitHub reported is measured from
+// slightly later than the caller measures it from — and at the boundary that is
+// a run this scan leaves unannotated and the caller renders anyway, with an
+// empty waiting-on column that means no stored row was blocking rather than
+// that none was read.
+func TestCheckRunAgedForAnnotationJudgesTheStartTimeTheCallerReadsBack(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+	// 59m59.6s old by GitHub's clock, a flat hour by the wire's.
+	run := &ghclient.CheckRunResult{StartedAt: now.Add(-time.Hour).Add(400 * time.Millisecond)}
+
+	startedAt, sittingLongEnough := checkRunAgedForAnnotation(run, time.Hour, now)
+
+	require.Equal(t, "2026-07-12T11:00:00Z", startedAt)
+	parsed, err := time.Parse(time.RFC3339, startedAt)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, now.Sub(parsed), time.Hour,
+		"what the caller computes from the reported start time")
+	assert.True(t, sittingLongEnough,
+		"the caller will render this run, so the rows explaining it have to be read")
+}
+
+// The clock a page is judged against is reported at whole-second precision, so
+// it is read at that precision too. Judged finer than it is reported, the
+// caller's copy trails the instant the decision was made on, and a run inside
+// that fraction of a threshold finer than a second is annotated by this scan
+// and then dropped by the caller — losing the annotation on the only surface
+// that shows it.
+func TestScanObservedNowIsReadAtThePrecisionItIsReportedAt(t *testing.T) {
+	t.Parallel()
+
+	observed := scanObservedNow()
+
+	assert.Zero(t, observed.Nanosecond(), "a finer clock than the wire carries cannot be handed back")
+	require.Equal(t, observed, mustParseRFC3339(t, observed.Format(time.RFC3339)),
+		"the reported clock round-trips to the one the runs were judged against")
+}
+
+func mustParseRFC3339(t *testing.T, value string) time.Time {
+	t.Helper()
+	parsed, err := time.Parse(time.RFC3339, value)
+	require.NoError(t, err)
+	return parsed.UTC()
+}
+
+// The clock the runs were aged against is reported, so a caller applying the
+// same threshold after the round trip reaches the same verdict instead of
+// judging every run slightly older than this scan did.
+func TestScanWebhookMissingChecksReportsTheClockItAgedTheRunsAgainst(t *testing.T) {
+	t.Parallel()
+
+	client := fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 23, Title: "one uncompleted run", HeadSHA: "sha23", HeadRef: "feature-23"},
+		},
+		runs: map[string]*ghclient.CheckRunResult{
+			"sha23/SchemaBot": {ID: 230, Name: "SchemaBot", Status: "in_progress",
+				StartedAt: time.Now().UTC().Add(-2 * time.Hour)},
+		},
+	}
+	store := &inspectStorage{checks: &inspectCheckStore{}, applies: &inspectApplyStore{}}
+
+	before := time.Now().UTC().Truncate(time.Second)
+	result, err := scanWebhookMissingChecks(t.Context(), client, store, "octo/repo",
+		[]webhookExpectedCheckName{{Name: "SchemaBot"}}, 0, time.Time{}, time.Hour, discardLogger())
+	require.NoError(t, err)
+
+	observed, parseErr := time.Parse(time.RFC3339, result.ObservedAt)
+	require.NoError(t, parseErr, "the clock the runs were aged against has to be readable")
+	assert.False(t, observed.Before(before), "the reported clock is the one this scan used")
+}
+
+// A pull request can carry an old uncompleted run beside a young one, and the
+// old one is exactly what the caller renders. The age threshold decides each
+// run on its own, so the young one never speaks for both: an operator looking
+// at the old run gets the stored state explaining it.
+func TestScanWebhookMissingChecksAnnotatesAnOldRunBesideAYoungOne(t *testing.T) {
+	t.Parallel()
+
+	client := fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 19, Title: "one old, one young", HeadSHA: "sha19", HeadRef: "feature-19"},
+		},
+		runs: map[string]*ghclient.CheckRunResult{
+			"sha19/SchemaBot (production)": {ID: 190, Name: "SchemaBot (production)",
+				Status: "in_progress", StartedAt: time.Now().UTC().Add(-24 * time.Hour)},
+			"sha19/SchemaBot (staging)": {ID: 191, Name: "SchemaBot (staging)",
+				Status: "in_progress", StartedAt: time.Now().UTC().Add(-time.Minute)},
+		},
+	}
+	store := &inspectStorage{
+		checks: &inspectCheckStore{checks: []*storage.Check{
+			{Environment: "production", DatabaseName: "widgets", HeadSHA: "sha19", ApplyID: 9,
+				Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionActionRequired,
+				BlockingReason: checkstate.BlockRollbackCompleted},
+			{Environment: "staging", DatabaseName: "widgets", HeadSHA: "sha19", ApplyID: 9,
+				Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionActionRequired,
+				BlockingReason: checkstate.BlockRollbackCompleted},
+		}},
+		applies: &inspectApplyStore{applies: map[int64]*storage.Apply{
+			9: {ApplyIdentifier: "apply-9", State: "rolled_back"},
+		}},
+	}
+	names := []webhookExpectedCheckName{
+		{Name: "SchemaBot (production)", Environment: "production"},
+		{Name: "SchemaBot (staging)", Environment: "staging"},
+	}
+
+	result, err := scanWebhookMissingChecks(t.Context(), client, store, "octo/repo", names, 0, time.Time{}, time.Hour, discardLogger())
+
+	require.NoError(t, err)
+	require.Len(t, result.Stuck, 1)
+	require.Len(t, result.Stuck[0].Checks, 2)
+
+	annotated := map[string]string{}
+	for _, run := range result.Stuck[0].Checks {
+		annotated[run.Name] = run.WaitingOn
+	}
+	assert.Equal(t, apitypes.WaitingOnOperator, annotated["SchemaBot (production)"],
+		"the old run is the one the caller renders, so it carries its stored state")
+	assert.Empty(t, annotated["SchemaBot (staging)"],
+		"the young run is still reported, just unannotated")
+}
+
+// The rollup restates the rows beside it, so it is never what an operator
+// acts on. A run whose only blocking row is the rollup has nothing recorded
+// that explains it, and saying "schemabot" there would promise a convergence
+// nothing is going to deliver.
+func TestScanWebhookMissingChecksDoesNotClassifyAStuckRunFromTheRollupAlone(t *testing.T) {
+	t.Parallel()
+
+	client := fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 15, Title: "rollup only", HeadSHA: "sha15", HeadRef: "feature-15"},
+		},
+		runs: map[string]*ghclient.CheckRunResult{
+			"sha15/SchemaBot (production)": {ID: 150, Name: "SchemaBot (production)", Status: "in_progress"},
+		},
+	}
+	store := &inspectStorage{
+		checks: &inspectCheckStore{checks: []*storage.Check{
+			{Environment: "production", DatabaseType: checkstate.AggregateSentinel,
+				DatabaseName: checkstate.AggregateSentinel, HeadSHA: "sha15",
+				Status: checkstate.StatusInProgress},
+		}},
+		applies: &inspectApplyStore{applies: map[int64]*storage.Apply{}},
+	}
+
+	result, err := scanWebhookMissingChecks(t.Context(), client, store, "octo/repo", productionCheckName, 0, time.Time{}, 0, discardLogger())
+
+	require.NoError(t, err)
+	require.Len(t, result.Stuck, 1)
+	require.Len(t, result.Stuck[0].Checks[0].StoredRows, 1, "the rollup is still reported, just never a cause")
+	assert.True(t, result.Stuck[0].Checks[0].StoredRows[0].Aggregate)
+	assert.Empty(t, result.Stuck[0].Checks[0].WaitingOn)
+}
+
+// Stored state that cannot be read costs the entry its explanation and
+// nothing else. The Check Run findings are what the backfill acts on and
+// they are already in hand, so the scan still reports the stuck run.
+func TestScanWebhookMissingChecksReportsStuckRunsWhenStoredStateIsUnreadable(t *testing.T) {
+	t.Parallel()
+
+	client := fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 13, Title: "wedged", HeadSHA: "sha13", HeadRef: "feature-13"},
+		},
+		runs: map[string]*ghclient.CheckRunResult{
+			"sha13/SchemaBot (production)": {ID: 130, Name: "SchemaBot (production)", Status: "in_progress"},
+		},
+	}
+	store := &inspectStorage{checks: &inspectCheckStore{err: errors.New("storage unavailable")}}
+
+	result, err := scanWebhookMissingChecks(t.Context(), client, store, "octo/repo", productionCheckName, 0, time.Time{}, 0, discardLogger())
+
+	require.NoError(t, err)
+	require.Len(t, result.Stuck, 1)
+	assert.Empty(t, result.Stuck[0].Checks[0].StoredRows)
+	assert.Empty(t, result.Stuck[0].Checks[0].WaitingOn)
+	require.Len(t, result.Stuck[0].Checks, 1, "the finding the backfill acts on survives the failed read")
 }

@@ -26,9 +26,13 @@ type inspectCheckStore struct {
 	storage.CheckStore
 	checks []*storage.Check
 	err    error
+	// reads counts GetByPR calls, so a caller that avoids the read can prove
+	// it did rather than pass on an empty result either way.
+	reads int
 }
 
 func (s *inspectCheckStore) GetByPR(context.Context, string, int) ([]*storage.Check, error) {
+	s.reads++
 	return s.checks, s.err
 }
 
@@ -400,6 +404,80 @@ func TestCheckRunsOnHeadReportsAnUntrustedRunUnderAMissingName(t *testing.T) {
 	assert.Equal(t, []string{names[0]}, got.untrustedConflicts,
 		"only the name an untrusted app is sitting under is a conflict")
 	assert.Empty(t, got.unreadable)
+}
+
+// A trusted run under the name does not end the conflict. Branch protection
+// reads whichever run it picked, and no backfill touches the other app's, so
+// the name stays reported and an inspection over it never states the gate is
+// clear on SchemaBot's own record alone.
+func TestCheckRunsOnHeadKeepsAnUntrustedConflictBesideATrustedRun(t *testing.T) {
+	t.Parallel()
+
+	cfg := inspectTestConfig()
+	names := webhookMissingCheckNames(cfg, "octo/repo", "", "")
+	require.Len(t, names, 2, "this test needs a deployment publishing one check per environment")
+
+	client := &inspectGitHubClient{
+		runs: map[string]*ghclient.CheckRunResult{names[0]: {
+			ID: 7, Name: names[0], Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionSuccess,
+		}},
+		untrustedApps: map[string][]string{names[0]: {"other-app"}},
+	}
+	got := checkRunsOnHead(t.Context(), cfg, client, "octo/repo", "43da12bb", "", discardLogger())
+
+	require.Len(t, got.found, 1)
+	assert.Equal(t, names[0], got.found[0].Name)
+	assert.Equal(t, []string{names[1]}, got.missing, "the present run is not missing")
+	assert.Equal(t, []string{names[0]}, got.untrustedConflicts,
+		"a present trusted run does not remove the other app's")
+}
+
+// With publishing turned off there is no SchemaBot run for another app's to
+// contest, so what sits under an expected name is simply that app's. Reporting
+// it as contested would put a remedy in the response that the text output drops
+// and the JSON keeps, and would contradict the line saying this deployment
+// maintains no Check Runs for the repository.
+func TestCheckRunsOnHeadReportsNoConflictWhereItPublishesNothing(t *testing.T) {
+	t.Parallel()
+
+	disabled := false
+	cfg := inspectTestConfig()
+	cfg.Repos = map[string]RepoConfig{"octo/repo": {EnableChecks: &disabled}}
+	names := webhookMissingCheckNames(cfg, "octo/repo", "", "")
+	require.NotEmpty(t, names)
+
+	client := &inspectGitHubClient{
+		runs: map[string]*ghclient.CheckRunResult{names[0]: {
+			ID: 7, Name: names[0], Status: checkstate.StatusCompleted, Conclusion: checkstate.ConclusionSuccess,
+		}},
+		untrustedApps: map[string][]string{names[0]: {"other-app"}},
+	}
+	got := checkRunsOnHead(t.Context(), cfg, client, "octo/repo", "43da12bb", "", discardLogger())
+
+	assert.Empty(t, got.untrustedConflicts, "nothing SchemaBot publishes here can be contested")
+	assert.Empty(t, got.missing, "a deployment that publishes none is missing none")
+	require.Len(t, got.found, 1, "the run on the head is still reported")
+}
+
+// The conflict has to reach the caller, not just the read: the whole point of
+// the field is that a backfill will not move the gate on its own.
+func TestInspectChecksCarriesUntrustedConflictsToTheResponse(t *testing.T) {
+	t.Parallel()
+
+	cfg := inspectTestConfig()
+	names := webhookMissingCheckNames(cfg, "octo/repo", "", "")
+	require.NotEmpty(t, names)
+	client := &inspectGitHubClient{
+		prInfo:        &ghclient.PullRequestInfo{HeadSHA: "43da12bb", State: "open"},
+		untrustedApps: map[string][]string{names[0]: {"other-app"}},
+	}
+	store := &inspectStorage{checks: &inspectCheckStore{}, applies: &inspectApplyStore{}}
+
+	resp, err := inspectChecks(t.Context(), cfg, store, client,
+		ChecksInspectRequest{Repo: "octo/repo", PullRequest: 709}, discardLogger())
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{names[0]}, resp.UntrustedConflictNames)
 }
 
 // A repository this deployment publishes no Check Runs for has no run to

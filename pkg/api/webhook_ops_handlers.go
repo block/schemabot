@@ -307,7 +307,7 @@ func (s *Service) handleChecksScan(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := s.extendWebhookOpsDeadline(w, r)
 	defer cancel()
-	response, err := executeChecksScan(ctx, s.config, req, s.logger)
+	response, err := executeChecksScan(ctx, s.config, s.storage, req, s.logger)
 	if err != nil {
 		s.writeWebhookOpsError(w, err)
 		return
@@ -373,7 +373,7 @@ func executeWebhookRedrive(ctx context.Context, cfg *ServerConfig, req WebhookRe
 	return response, nil
 }
 
-func executeChecksScan(ctx context.Context, cfg *ServerConfig, req ChecksScanRequest, logger *slog.Logger) (*ChecksScanResponse, error) {
+func executeChecksScan(ctx context.Context, cfg *ServerConfig, store storage.Storage, req ChecksScanRequest, logger *slog.Logger) (*ChecksScanResponse, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
@@ -396,6 +396,17 @@ func executeChecksScan(ctx context.Context, cfg *ServerConfig, req ChecksScanReq
 			return nil, webhookOpsRequestErrorf("parse updated_since %q as RFC3339: %v", req.UpdatedSince, err)
 		}
 	}
+	var annotateAfter time.Duration
+	if req.StuckAfter != "" {
+		var err error
+		annotateAfter, err = time.ParseDuration(req.StuckAfter)
+		if err != nil {
+			return nil, webhookOpsRequestErrorf("parse stuck_after %q as a duration: %v", req.StuckAfter, err)
+		}
+		if annotateAfter < 0 {
+			return nil, webhookOpsRequestErrorf("stuck_after must not be negative")
+		}
+	}
 	if logger == nil {
 		logger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	}
@@ -411,7 +422,7 @@ func executeChecksScan(ctx context.Context, cfg *ServerConfig, req ChecksScanReq
 	if err != nil {
 		return nil, err
 	}
-	response, err := scanWebhookMissingChecks(ctx, installationClient, req.Repo, webhookMissingCheckNames(cfg, req.Repo, req.Environment, req.CheckName), req.Page, updatedSince)
+	response, err := scanWebhookMissingChecks(ctx, installationClient, store, req.Repo, webhookExpectedCheckNames(cfg, req.Repo, req.Environment, req.CheckName), req.Page, updatedSince, annotateAfter, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -839,22 +850,45 @@ func webhookRedrivePayloadMetadata(delivery *gh.HookDelivery) (webhookRedrivePay
 	return webhookRedrivePayload{repo: payload.Repository.FullName, prs: prs}, nil
 }
 
-func webhookMissingCheckNames(cfg *ServerConfig, repo, environment, override string) []string {
+// webhookExpectedCheckName is one Check Run name this deployment publishes,
+// together with the environment it reports on. Environment is empty when the
+// name is not scoped to one, which is what lets a caller tell "this run
+// covers everything" apart from "this run covers production".
+type webhookExpectedCheckName struct {
+	Name        string
+	Environment string
+}
+
+func webhookExpectedCheckNames(cfg *ServerConfig, repo, environment, override string) []webhookExpectedCheckName {
 	if override != "" {
-		return []string{override}
+		// An operator-supplied name carries no environment of its own, so the
+		// scope is the one the caller asked for, and nothing when they asked
+		// for nothing. Dropping an environment they did name would hand the
+		// override every environment's rows, which is the mis-attribution
+		// this scoping exists to prevent.
+		return []webhookExpectedCheckName{{Name: override, Environment: environment}}
 	}
 	base := cfg.GitHubCheckNameBaseForRepo(repo)
 	if environment != "" {
-		return []string{fmt.Sprintf("%s (%s)", base, environment)}
+		return []webhookExpectedCheckName{{Name: fmt.Sprintf("%s (%s)", base, environment), Environment: environment}}
 	}
 	if len(cfg.AllowedEnvironments) > 0 {
-		out := make([]string, 0, len(cfg.AllowedEnvironments))
+		out := make([]webhookExpectedCheckName, 0, len(cfg.AllowedEnvironments))
 		for _, env := range cfg.AllowedEnvironments {
-			out = append(out, fmt.Sprintf("%s (%s)", base, env))
+			out = append(out, webhookExpectedCheckName{Name: fmt.Sprintf("%s (%s)", base, env), Environment: env})
 		}
 		return out
 	}
-	return []string{base}
+	return []webhookExpectedCheckName{{Name: base}}
+}
+
+func webhookMissingCheckNames(cfg *ServerConfig, repo, environment, override string) []string {
+	expected := webhookExpectedCheckNames(cfg, repo, environment, override)
+	names := make([]string, 0, len(expected))
+	for _, name := range expected {
+		names = append(names, name.Name)
+	}
+	return names
 }
 
 type webhookMissingCheckScanClient interface {
@@ -862,16 +896,66 @@ type webhookMissingCheckScanClient interface {
 	FindCheckRunByName(ctx context.Context, repo, headSHA, checkName string) (*ghclient.CheckRunResult, []string, error)
 }
 
-func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckScanClient, repo string, checkNames []string, page int, updatedSince time.Time) (*ChecksScanResponse, error) {
+// scanObservedNow is the clock a scan page ages its runs against, at the
+// precision the page reports it.
+//
+// The threshold is applied on both sides: here, to decide which runs are worth
+// reading stored rows for, and by the caller against this same clock, to decide
+// which to render. Judging against a finer instant than is reported would make
+// the caller's copy of the clock trail the one the decision was made on, and a
+// run inside that fraction of a threshold finer than a second would be
+// annotated here and dropped there — losing the annotation on the only surface
+// that shows it.
+func scanObservedNow() time.Time {
+	return time.Now().UTC().Truncate(time.Second)
+}
+
+// checkRunAgedForAnnotation reports an uncompleted run's start time as the
+// caller will read it, and whether it has been sitting long enough to be worth
+// reading the stored rows that explain it.
+//
+// The two answers come from one value on purpose. The caller applies the same
+// threshold to the start time it reads back, to decide what to render, and the
+// wire format carries whole seconds — so a run judged here against the
+// untruncated instant GitHub reported is measured from a fraction of a second
+// later than the caller measures it from. At the boundary that is a run left
+// unannotated and rendered anyway, with an empty waiting-on column that means
+// no stored row was blocking rather than that none was read.
+func checkRunAgedForAnnotation(run *ghclient.CheckRunResult, threshold time.Duration, now time.Time) (startedAt string, sittingLongEnough bool) {
+	asSent := run.StartedAt.UTC().Truncate(time.Second)
+	return formatCheckRunStartedAt(asSent), checkRunSittingLongEnough(asSent, threshold, now)
+}
+
+// checkRunSittingLongEnough reports whether an uncompleted Check Run has been
+// sitting at least as long as the caller's threshold.
+//
+// A start time that is absent or in the future proves nothing about the run's
+// age, so it counts as long enough. The threshold exists to skip work the
+// caller will not display, and a run whose age cannot be established is one
+// the caller displays.
+func checkRunSittingLongEnough(startedAt time.Time, threshold time.Duration, now time.Time) bool {
+	if threshold <= 0 || startedAt.IsZero() || startedAt.After(now) {
+		return true
+	}
+	return now.Sub(startedAt) >= threshold
+}
+
+func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckScanClient, store storage.Storage, repo string, expectedNames []webhookExpectedCheckName, page int, updatedSince time.Time, annotateAfter time.Duration, logger *slog.Logger) (*ChecksScanResponse, error) {
 	prs, nextPage, lastPage, err := client.ListOpenPullRequestsPage(ctx, repo, page, webhookScanPRPageSize)
 	if err != nil {
 		return nil, err
+	}
+	now := scanObservedNow()
+	checkNames := make([]string, 0, len(expectedNames))
+	for _, expected := range expectedNames {
+		checkNames = append(checkNames, expected.Name)
 	}
 	result := &ChecksScanResponse{
 		Repo:             repo,
 		CheckNames:       checkNames,
 		NextPage:         nextPage,
 		EstimatedOpenPRs: estimateOpenPRCount(page, lastPage, len(prs)),
+		ObservedAt:       now.Format(time.RFC3339),
 	}
 	for _, pr := range prs {
 		if !updatedSince.IsZero() && pr.UpdatedAt.Before(updatedSince) {
@@ -884,31 +968,65 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 		var missing []string
 		var untrustedConflicts []string
 		var incomplete []IncompleteCheckRun
-		for _, checkName := range checkNames {
-			run, untrustedApps, err := client.FindCheckRunByName(ctx, repo, pr.HeadSHA, checkName)
+		// The environment each uncompleted run reports on, positionally
+		// aligned with incomplete, so its rows can be narrowed to it once the
+		// PR's stored state has been read.
+		var incompleteEnvironments []string
+		// Whether each uncompleted run has been sitting long enough for the
+		// caller to render it, positionally aligned with incomplete. A run
+		// that has not is not worth annotating, since the caller drops it
+		// before it reaches an operator.
+		//
+		// The decision is per run, not per pull request: a PR can carry an old
+		// run beside a young one, and the old one is exactly what the caller
+		// is about to render. Letting the young one speak for both would send
+		// back the run an operator is looking at with nothing explaining it.
+		var annotate []bool
+		for _, expected := range expectedNames {
+			run, untrustedApps, err := client.FindCheckRunByName(ctx, repo, pr.HeadSHA, expected.Name)
 			if err != nil {
-				return nil, fmt.Errorf("scan %s#%d for check %q at %s: %w", repo, pr.Number, checkName, pr.HeadSHA, err)
+				return nil, fmt.Errorf("scan %s#%d for check %q at %s: %w", repo, pr.Number, expected.Name, pr.HeadSHA, err)
 			}
 			if run != nil {
 				if !checkRunCompleted(run) {
+					startedAt, sittingLongEnough := checkRunAgedForAnnotation(run, annotateAfter, now)
 					incomplete = append(incomplete, IncompleteCheckRun{
 						Name:       run.Name,
 						CheckRunID: run.ID,
 						Status:     run.Status,
-						StartedAt:  formatCheckRunStartedAt(run.StartedAt),
+						StartedAt:  startedAt,
 					})
+					incompleteEnvironments = append(incompleteEnvironments, expected.Environment)
+					annotate = append(annotate, sittingLongEnough)
 				}
 				continue
 			}
-			missing = append(missing, checkName)
+			missing = append(missing, expected.Name)
 			// No trusted check exists, but a same-named one from an untrusted
 			// app does: backfill will still create the trusted check, yet the
 			// operator likely also needs to resolve the conflicting check.
 			if len(untrustedApps) > 0 {
-				untrustedConflicts = append(untrustedConflicts, checkName)
+				untrustedConflicts = append(untrustedConflicts, expected.Name)
 			}
 		}
 		if len(incomplete) > 0 {
+			// One read serves every run on this PR that earned an annotation,
+			// so it is made once and only when at least one did; each run then
+			// keeps only the rows for the environment it gates.
+			var rows []InspectedCheck
+			if slices.Contains(annotate, true) {
+				rows = storedRowsBehindStuckCheck(ctx, store, repo, pr.Number, pr.HeadSHA, logger)
+			}
+			for i := range incomplete {
+				if !annotate[i] {
+					logger.Debug("checks scan reporting an uncompleted Check Run without its stored rows: it has not been sitting long enough for the caller to render",
+						"repo", repo, "pr", pr.Number, "head_sha", pr.HeadSHA, "check_name", incomplete[i].Name)
+					continue
+				}
+				scoped := storedRowsForEnvironment(rows, incompleteEnvironments[i])
+				incomplete[i].StoredRows = scoped
+				incomplete[i].WaitingOn = waitingOnForStoredRows(scoped)
+			}
 			result.Stuck = append(result.Stuck, StuckCheckPR{
 				Number:  pr.Number,
 				URL:     caller.PullRequestURL(repo, pr.Number),
@@ -948,6 +1066,90 @@ func estimateOpenPRCount(page, lastPage, pageLen int) int {
 		page = 1
 	}
 	return (page-1)*webhookScanPRPageSize + pageLen
+}
+
+// storedRowsBehindStuckCheck reads the stored check state behind a Check Run
+// that exists on an open PR's head and never completed.
+//
+// The run alone says the gate is open and nothing else: not which database,
+// not whether an apply owns it, not whether anything will ever close it. The
+// rows say all three, which is what turns a fleet sweep's stuck list from a
+// list of PRs to open into a list of PRs to act on.
+//
+// A read failure costs the entry its rows and nothing else. The Check Run
+// findings are what the backfill acts on and they are already in hand, so
+// failing the whole scan over the explanation would trade the answer for the
+// annotation.
+func storedRowsBehindStuckCheck(ctx context.Context, store storage.Storage, repo string, pr int, headSHA string, logger *slog.Logger) []InspectedCheck {
+	if store == nil {
+		logger.Warn("checks scan reports a stuck Check Run without the stored state behind it: storage is not configured",
+			"repo", repo, "pr", pr, "head_sha", headSHA)
+		return nil
+	}
+	stored, err := store.Checks().GetByPR(ctx, repo, pr)
+	if err != nil {
+		logger.Warn("checks scan reports a stuck Check Run without the stored state behind it: reading stored check state failed",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "error", err)
+		return nil
+	}
+	if len(stored) == 0 {
+		logger.Debug("no stored check state behind this stuck Check Run",
+			"repo", repo, "pr", pr, "head_sha", headSHA)
+		return nil
+	}
+	rows := make([]InspectedCheck, 0, len(stored))
+	for _, check := range stored {
+		rows = append(rows, inspectedCheck(ctx, store, check, headSHA, logger))
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Environment != rows[j].Environment {
+			return rows[i].Environment < rows[j].Environment
+		}
+		return rows[i].Database < rows[j].Database
+	})
+	return rows
+}
+
+// storedRowsForEnvironment narrows a PR's stored rows to the ones a single
+// Check Run gates on. An unscoped run keeps all of them: the deployment
+// publishes one run covering every environment, so every row is its own.
+func storedRowsForEnvironment(rows []InspectedCheck, environment string) []InspectedCheck {
+	if environment == "" {
+		return rows
+	}
+	var scoped []InspectedCheck
+	for _, row := range rows {
+		if row.Environment == environment {
+			scoped = append(scoped, row)
+		}
+	}
+	return scoped
+}
+
+// waitingOnForStoredRows reduces a stuck run's rows to the one answer that
+// decides whether an operator opens it. One row needing a person makes the
+// whole run need one: a run reported as self-converging when part of it is
+// not would be read as safe to leave alone.
+//
+// No blocking row means no stored row explains the run, which is reported as
+// no answer. Calling that "schemabot" would promise a convergence nothing
+// recorded is going to deliver, and that is the reading that leaves a wedged
+// gate sitting.
+//
+// The rollup is a projection of the rows beside it and never a cause of its
+// own, so it decides nothing here.
+func waitingOnForStoredRows(rows []InspectedCheck) string {
+	waiting := ""
+	for _, row := range rows {
+		if row.Aggregate || !row.Blocking {
+			continue
+		}
+		if !row.SelfConverging {
+			return apitypes.WaitingOnOperator
+		}
+		waiting = apitypes.WaitingOnSchemaBot
+	}
+	return waiting
 }
 
 // checkRunCompleted reports whether the Check Run's status is "completed".

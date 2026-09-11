@@ -127,12 +127,28 @@ func doGetInto(endpoint, path string, result any) error {
 
 // doGetIntoCtx is like doGetInto but accepts a context for timeout/cancellation control.
 func doGetIntoCtx(ctx context.Context, endpoint, path string, result any) error {
+	return doGetIntoWithClient(ctx, httpClient, endpoint, path, result)
+}
+
+// doSlowGetIntoCtx is doGetIntoCtx with the long-running webhook ops client,
+// for read endpoints whose server-side work calls out to GitHub and so shares
+// the operator budget rather than the default request timeout.
+func doSlowGetIntoCtx(ctx context.Context, endpoint, path string, result any) error {
+	return doGetIntoWithClient(ctx, webhookOpsHTTPClient, endpoint, path, result)
+}
+
+func doGetIntoWithClient(ctx context.Context, client *http.Client, endpoint, path string, result any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+path, nil)
 	if err != nil {
 		return err
 	}
-	resp, err := httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
+		// Surface a canceled context as-is so callers can tell an operator
+		// cancellation apart from a real connection failure.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return FormatConnectionError(endpoint, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
