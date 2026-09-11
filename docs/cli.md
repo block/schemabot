@@ -11,6 +11,7 @@ to see what is changing across your fleet.
 | Make a schema change | [Plan and apply a change](#plan-and-apply-a-change) |
 | Check an ongoing change | [Follow progress and control the apply](#follow-and-control-a-change) |
 | Manage a PlanetScale deploy request | [Deploy, follow shards, and control cutover](#manage-planetscale-deploy-requests) |
+| Understand a merge check that will not clear | [Explain a blocked check](#explain-a-blocked-check) |
 | Build an integration | [Use structured output](#use-the-cli-from-scripts-and-agents) |
 
 The examples use a MySQL database named `shop` in `staging`.
@@ -620,6 +621,110 @@ In gRPC mode, add it with a deployment name from the apply's progress to read
 remote engine details such as copying, throttling, or cutover. It requires an
 explicit apply ID. See [deployment log examples](schema-intelligence.md#read-deployment-logs).
 
+### Explain a blocked check
+
+A SchemaBot check that will not clear has two records behind it: the Check Run
+GitHub shows, and the stored check state SchemaBot decides it from. When those
+disagree, the Check Run alone cannot say why. `checks show` prints both, and
+what each stored row is waiting on.
+
+Name the pull request however you already have it. A URL pasted from the
+browser works, with whatever trailing path, query, or fragment the page added,
+and so do `acme/store#412` and a repository with the number beside it:
+
+```bash
+schemabot checks show https://github.com/acme/store/pull/412
+schemabot checks show acme/store#412
+schemabot checks show acme/store 412
+```
+
+```console
+$ schemabot checks show acme/store 412
+acme/store#412 is open at 43da12bb.
+Check Run "SchemaBot (staging)" on 43da12bb: in_progress (started 2026-09-10T05:16:44Z).
+Missing on 43da12bb: SchemaBot (production). `sq schemabot checks backfill acme/store` will not recreate it while "SchemaBot (staging)" (in_progress) has not concluded: the backfill holds a pull request whose head still carries an uncompleted Check Run.
+
+ENVIRONMENT  DATABASE    COMMIT            STATUS       CONCLUSION       DISPOSITION
+staging      _aggregate  43da12bb          in_progress  -                aggregate_rollup
+staging      inventory   43da12bb          completed    action_required  reconciliation_owed
+staging      orders      e22e4cef (older)  completed    success          awaiting_replan_after_apply
+staging      shipments   43da12bb          in_progress  -                apply_stopped
+
+Waiting on SchemaBot:
+  staging/_aggregate: The rollup is holding the merge gate open.
+    do: Read the rows below: the rollup clears when every one of them does.
+  staging/orders: An apply succeeded, but its result is recorded for an earlier commit, so the gate holds it as blocking.
+    apply: apply-example-73 (completed)
+    do: SchemaBot re-plans this database when the apply settles. If it has not, comment `schemabot plan -e <environment>` on the pull request to record a result for the current commit.
+
+Waiting on an operator:
+  staging/inventory: A terminal outcome left this check blocking, and the target may not match the pull request.
+    apply: apply-example-68 (rolled_back)
+    blocking reason: rollback_completed
+    do: Reconcile the target environment. No plan and no new commit clears this on its own.
+  staging/shipments: The apply holding this check is stopped, so the check stays in progress and the gate stays closed.
+    apply: apply-example-81 (stopped)
+    do: Start the apply or cancel it. It does not settle on its own, and no plan replaces a stopped apply's result.
+```
+
+Every Check Run name the deployment publishes is reported, present or
+missing. Branch protection requires each name on its own, so a present
+staging run never stands in for an absent production one. A name GitHub could
+not be read for is reported as neither, since absence has to be observed
+before a backfill is the answer, and an unanswered read never renders as a
+clear gate.
+
+The backfill is only recommended where it will act. It holds a pull request
+whose head still carries an uncompleted Check Run, so while one is in
+progress the line says so rather than naming a command that recreates
+nothing. On a repository the deployment publishes no Check Runs for, nothing
+is reported as missing at all: there the absence is the configuration, and a
+run another app has under an expected name is simply that app's, with no
+SchemaBot run for it to contest.
+
+A name another app is also answering under is reported on its own line,
+whether or not SchemaBot's own run is there. Branch protection reads whichever
+run it picked and no backfill touches the other app's, so that conflict is
+resolved on GitHub — remove or rename the other run, or add its app to the
+trusted apps — and until it is, nothing here claims the gate is clear. Which
+of the two the line names decides what the backfill is worth: where SchemaBot's
+own run is absent it recreates that run and the conflict outlives it, and where
+the run is already there the backfill finds nothing missing and does nothing,
+so the line says so rather than sending an operator to it.
+
+These states coexist, and the closing summary names all of them rather than
+stopping at the first. One expected name can be absent while a second sits on
+the head unconcluded or failed: the backfill recreates the first and will not
+touch the second, so a summary that named only the absence would send an
+operator to a remedy and leave the reason the gate stays shut unaccounted for.
+
+A row marked `(older)` was recorded for a commit the pull request has moved
+past. The aggregate holds those as blocking whatever they concluded, which is
+why a successful apply can leave the gate open.
+
+The two headings are the distinction that decides what to do. Rows under
+"Waiting on SchemaBot" clear on their own, or with a `schemabot plan` comment
+on the pull request. Rows under "Waiting on an operator" do not: no plan and
+no new commit clears them. A stopped apply is in that second group even though
+its check reads in progress, because it settles only when someone starts or
+cancels it.
+
+The reading is deliberately pessimistic. A row whose apply cannot be read from
+storage, and a durable blocking reason this version does not recognize, both
+come back as blocking and waiting on a person: reporting either as
+self-converging would tell an operator to wait out something that may never
+resolve.
+
+`-e` narrows the output to one environment, and is refused on a deployment
+that publishes a single check for every environment, since there is nothing
+to narrow to there. A narrowed run that finds nothing blocking says so in
+those terms ("Nothing in production is holding the merge gate open. Other
+environments were not read."), because a clean answer for one environment is
+not a clean answer for the pull request. `--json` gives each row a stable
+`reason` code to branch on. The inspection only reads, so any token that can
+already see a pull request's status can run it; recreating a Check Run with
+`checks backfill` is the admin operation.
+
 ### Recover missing GitHub checks
 
 SchemaBot has automatic reconciliation for missing checks. When you need an
@@ -646,7 +751,7 @@ Prefer structured output when another program consumes the result:
 
 | Commands | JSON option |
 |---|---|
-| `databases`, `status`, `list-plans`, `logs`, `plan`, `init` | `--json` |
+| `databases`, `status`, `list-plans`, `logs`, `plan`, `init`, `checks show` | `--json` |
 | `pull` | `-o json` |
 
 For example:
