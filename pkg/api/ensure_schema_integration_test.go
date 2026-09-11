@@ -29,7 +29,7 @@ func TestEnsureSchema(t *testing.T) {
 	dsn := sdb.DSN
 
 	// First call should create all tables using Spirit
-	require.NoError(t, EnsureSchema(dsn, logger), "First EnsureSchema failed")
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger), "First EnsureSchema failed")
 
 	// Verify tables exist
 	tables := []string{"tasks", "plans", "locks", "checks", "settings", "apply_operations"}
@@ -50,13 +50,13 @@ func TestEnsureSchema_Idempotent(t *testing.T) {
 	dsn := newStorageDatabase(t).DSN
 
 	// First call creates the tables.
-	require.NoError(t, EnsureSchema(dsn, logger), "First EnsureSchema failed")
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger), "First EnsureSchema failed")
 
 	// Second call should succeed without error (idempotent - no changes needed)
-	require.NoError(t, EnsureSchema(dsn, logger), "Second EnsureSchema failed (not idempotent)")
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger), "Second EnsureSchema failed (not idempotent)")
 
 	// Third call for good measure
-	require.NoError(t, EnsureSchema(dsn, logger), "Third EnsureSchema failed (not idempotent)")
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger), "Third EnsureSchema failed (not idempotent)")
 }
 
 func TestEnsureSchema_CleansStaleSpiritTables(t *testing.T) {
@@ -67,7 +67,7 @@ func TestEnsureSchema_CleansStaleSpiritTables(t *testing.T) {
 	dsn := sdb.DSN
 
 	// Bootstrap the schema first so real tables exist.
-	require.NoError(t, EnsureSchema(dsn, logger))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger))
 
 	// Seed stale Spirit internal tables as if a previous pod was killed mid-apply.
 	staleTables := []string{
@@ -83,7 +83,7 @@ func TestEnsureSchema_CleansStaleSpiritTables(t *testing.T) {
 	}
 
 	// EnsureSchema should clean them up and succeed.
-	require.NoError(t, EnsureSchema(dsn, logger))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger))
 
 	// Verify all stale tables were dropped.
 	for _, tbl := range staleTables {
@@ -176,11 +176,12 @@ const ensureSchemaFinishDeadline = 30 * time.Second
 // every later test in the package and stall them until it completed.
 func startEnsureSchema(t *testing.T, dsn string, logger *slog.Logger) <-chan error {
 	t.Helper()
+	ctx := t.Context()
 	errs := make(chan error, 1)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		errs <- EnsureSchema(dsn, logger)
+		errs <- EnsureSchema(ctx, dsn, logger)
 	}()
 	t.Cleanup(func() {
 		select {
@@ -235,19 +236,19 @@ func TestEnsureSchema_RemovesObsoleteVitessTasks(t *testing.T) {
 
 	// Bring the schema up to date, then simulate a pre-existing deployment by
 	// recreating the obsolete table the embedded schema no longer declares.
-	require.NoError(t, EnsureSchema(dsn, logger))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger))
 	_, err := db.ExecContext(ctx,
 		"CREATE TABLE `vitess_tasks` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
 	require.NoError(t, err)
 	require.True(t, testutil.TableExists(t, db, sdb.Name, "vitess_tasks"))
 
 	// EnsureSchema reconciles the obsolete table away without error...
-	require.NoError(t, EnsureSchema(dsn, logger, WithAllowDestructiveSchemaChanges(true)),
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithAllowDestructiveSchemaChanges(true)),
 		"EnsureSchema with an obsolete vitess_tasks table failed")
 	assert.False(t, testutil.TableExists(t, db, sdb.Name, "vitess_tasks"), "obsolete vitess_tasks should be removed")
 
 	// ...and the next run is a clean no-op.
-	require.NoError(t, EnsureSchema(dsn, logger, WithAllowDestructiveSchemaChanges(true)),
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithAllowDestructiveSchemaChanges(true)),
 		"second EnsureSchema not idempotent")
 }
 
@@ -284,7 +285,7 @@ func TestEnsureSchema_RefusesDestructiveChangesByDefault(t *testing.T) {
 	sdb, db := openEnsureSchemaDatabase(t)
 	dsn := sdb.DSN
 
-	require.NoError(t, EnsureSchema(dsn, logger))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger))
 	surplusColumn, surplusTable := seedSurplusStorageState(t, db)
 
 	// Give EnsureSchema additive work alongside the destructive diff: drop an
@@ -292,7 +293,7 @@ func TestEnsureSchema_RefusesDestructiveChangesByDefault(t *testing.T) {
 	_, err := db.ExecContext(ctx, "DROP TABLE `locks`")
 	require.NoError(t, err)
 
-	require.NoError(t, EnsureSchema(dsn, logger),
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger),
 		"EnsureSchema with a destructive diff must not fail startup")
 
 	// The additive change applied; the surplus state survived.
@@ -314,7 +315,7 @@ func TestEnsureSchema_RefusesDestructiveChangesByDefault(t *testing.T) {
 	assert.Contains(t, logs, surplusTable)
 
 	// A repeat run keeps refusing without error or changes.
-	require.NoError(t, EnsureSchema(dsn, logger), "repeat EnsureSchema with refused changes failed")
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger), "repeat EnsureSchema with refused changes failed")
 	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", surplusColumn))
 	assert.True(t, testutil.TableExists(t, db, sdb.Name, surplusTable))
 }
@@ -333,7 +334,7 @@ func TestEnsureSchema_MixedAlterAppliesSafeClauses(t *testing.T) {
 	sdb, db := openEnsureSchemaDatabase(t)
 	dsn := sdb.DSN
 
-	require.NoError(t, EnsureSchema(dsn, logger))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger))
 
 	// Same-table drift in both directions: `tasks` misses an embedded column
 	// the binary requires and holds a surplus column it does not declare.
@@ -343,7 +344,7 @@ func TestEnsureSchema_MixedAlterAppliesSafeClauses(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn))
 
-	require.NoError(t, EnsureSchema(dsn, logger),
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger),
 		"EnsureSchema with a mixed additive/destructive ALTER must not fail startup")
 
 	// The required column was added; the surplus column survived.
@@ -361,7 +362,7 @@ func TestEnsureSchema_MixedAlterAppliesSafeClauses(t *testing.T) {
 
 	// A repeat run converges: the additive work is done, the destructive
 	// remainder keeps being refused without error.
-	require.NoError(t, EnsureSchema(dsn, logger), "repeat EnsureSchema after mixed split failed")
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger), "repeat EnsureSchema after mixed split failed")
 	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn))
 	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", surplusColumn))
 }
@@ -377,7 +378,7 @@ func TestEnsureSchema_RefusesPrimaryKeyChangeWhole(t *testing.T) {
 	sdb, db := openEnsureSchemaDatabase(t)
 	dsn := sdb.DSN
 
-	require.NoError(t, EnsureSchema(dsn, logger))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger))
 
 	// Widen the primary key beyond the embedded schema's declaration. The
 	// AUTO_INCREMENT column stays leftmost so the live table remains valid.
@@ -392,7 +393,7 @@ func TestEnsureSchema_RefusesPrimaryKeyChangeWhole(t *testing.T) {
 	}
 	require.Equal(t, 2, primaryKeyColumns())
 
-	require.NoError(t, EnsureSchema(dsn, logger),
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger),
 		"EnsureSchema with a refused primary-key change must not fail startup")
 	assert.Equal(t, 2, primaryKeyColumns(),
 		"the wider live primary key must survive: an ADD PRIMARY KEY cannot execute without the refused DROP PRIMARY KEY")
@@ -407,10 +408,10 @@ func TestEnsureSchema_AllowDestructiveExecutesDrops(t *testing.T) {
 	sdb, db := openEnsureSchemaDatabase(t)
 	dsn := sdb.DSN
 
-	require.NoError(t, EnsureSchema(dsn, logger))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger))
 	surplusColumn, surplusTable := seedSurplusStorageState(t, db)
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithAllowDestructiveSchemaChanges(true)),
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithAllowDestructiveSchemaChanges(true)),
 		"EnsureSchema with destructive changes allowed failed")
 
 	assert.False(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", surplusColumn),
@@ -418,7 +419,7 @@ func TestEnsureSchema_AllowDestructiveExecutesDrops(t *testing.T) {
 	assert.False(t, testutil.TableExists(t, db, sdb.Name, surplusTable),
 		"surplus table should be dropped when destructive changes are allowed")
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithAllowDestructiveSchemaChanges(true)),
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithAllowDestructiveSchemaChanges(true)),
 		"second EnsureSchema not idempotent")
 }
 

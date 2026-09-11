@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -99,13 +100,21 @@ func WithPostgresStatementTimeout(d time.Duration) EnsureSchemaOption {
 // with WithDialect). It is idempotent — no changes are made if the schema is
 // already up-to-date.
 //
+// Every bootstrapper runs under ctx bounded by EnsureSchemaTimeout, so the
+// attempt ends at whichever comes first: the caller cancelling, or the timeout
+// firing. Cancellation is how a booting instance reacts to a termination
+// signal. The bootstrap is the longest-running step of startup and its own
+// budget is measured in minutes, so an instance that has been told to stop
+// stops converging storage it will never use, instead of holding its slot
+// until that budget is spent.
+//
 // The dispatch fails closed: a dialect without a bootstrapper returns an error
 // instead of running another family's DDL against the storage database. Each
 // bootstrapper owns its dialect end to end — embedded schema files, diff/apply
 // mechanism, and the advisory locker that serializes startup across pods — so
 // adding a dialect means adding a bootstrapper here, not threading
 // dialect-conditionals through the MySQL flow.
-func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) error {
+func EnsureSchema(ctx context.Context, dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) error {
 	o := ensureSchemaOptions{
 		dialect:                  schema.DialectMySQL,
 		postgresStatementTimeout: DefaultPostgresStatementTimeout,
@@ -115,9 +124,9 @@ func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) e
 	}
 	switch o.dialect {
 	case schema.DialectMySQL:
-		return ensureMySQLSchema(dsn, logger, o, namedlock.MySQL{})
+		return ensureMySQLSchema(ctx, dsn, logger, o, namedlock.MySQL{})
 	case schema.DialectPostgres:
-		return ensurePostgresSchema(dsn, logger, o, namedlock.Postgres{})
+		return ensurePostgresSchema(ctx, dsn, logger, o, namedlock.Postgres{})
 	default:
 		return fmt.Errorf("no schema bootstrapper for storage dialect %q (supported: %q, %q)", o.dialect, schema.DialectMySQL, schema.DialectPostgres)
 	}
@@ -145,8 +154,8 @@ func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) e
 // rolling deploy or rollback where a storage table or column was legitimately
 // removed. The invariant is that an old binary can never destroy newer schema
 // state: the surplus table or column stays in place until an operator opts in.
-func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, locker namedlock.Locker) error {
-	ctx, cancel := context.WithTimeout(context.Background(), EnsureSchemaTimeout)
+func ensureMySQLSchema(ctx context.Context, dsn string, logger *slog.Logger, o ensureSchemaOptions, locker namedlock.Locker) error {
+	ctx, cancel := context.WithTimeout(ctx, EnsureSchemaTimeout)
 	defer cancel()
 
 	// Diagnostic preamble: log the actual database target and current state
@@ -312,11 +321,11 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 			Credentials: &engine.Credentials{DSN: dsn},
 		})
 		if err != nil {
-			// A cancelled context surfaces here as an opaque driver error
-			// ("...context canceled"); name the timeout instead so the cause
+			// An ended context surfaces here as an opaque driver error
+			// ("...context canceled"); name what ended it instead so the cause
 			// is clear from the message line alone.
 			if ctx.Err() != nil {
-				return ensureSchemaTimeoutError(ctx, len(tableChanges), logger)
+				return ensureSchemaContextError(ctx, len(tableChanges), logger)
 			}
 			return fmt.Errorf("check progress: %w", err)
 		}
@@ -340,7 +349,7 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 
 		select {
 		case <-ctx.Done():
-			return ensureSchemaTimeoutError(ctx, len(tableChanges), logger)
+			return ensureSchemaContextError(ctx, len(tableChanges), logger)
 		case <-ticker.C:
 		}
 	}
@@ -352,12 +361,26 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 	return nil
 }
 
-// ensureSchemaTimeoutError builds and logs the error returned when
-// EnsureSchemaTimeout fires before the storage schema change completes. Spirit
-// cancels the online DDL mid-apply and storage stays uninitialized, so the
-// message names the timeout and the most likely cause (a backend throttling the
-// online DDL) instead of surfacing a bare "context canceled" from the driver.
-func ensureSchemaTimeoutError(ctx context.Context, ddlCount int, logger *slog.Logger) error {
+// ensureSchemaContextError builds and logs the error returned when the
+// bootstrap context ends before the storage schema change completes. Spirit
+// cancels the online DDL mid-apply and storage stays uninitialized either way,
+// but the two things that end the context call for opposite responses, so they
+// are never reported as one.
+//
+// EnsureSchemaTimeout firing is a fault to investigate, and the message names
+// the timeout and the most likely cause — a backend throttling the online DDL
+// — instead of surfacing a bare "context canceled" from the driver. The caller
+// cancelling is the caller's own decision, on the boot path a termination
+// signal, so it is reported as the cancellation it is and does not send an
+// operator looking for a throttled database.
+func ensureSchemaContextError(ctx context.Context, ddlCount int, logger *slog.Logger) error {
+	if errors.Is(ctx.Err(), context.Canceled) {
+		logger.Info("storage schema change stopped because its caller canceled the bootstrap; SchemaBot storage was left unconverged",
+			"database", "schemabot",
+			"ddl_count", ddlCount,
+		)
+		return fmt.Errorf("storage schema change stopped because the bootstrap was canceled (%d change(s)): %w", ddlCount, ctx.Err())
+	}
 	logger.Error("storage schema change did not complete before EnsureSchemaTimeout; SchemaBot storage will not initialize",
 		"database", "schemabot",
 		"timeout", EnsureSchemaTimeout,
@@ -365,6 +388,21 @@ func ensureSchemaTimeoutError(ctx context.Context, ddlCount int, logger *slog.Lo
 	)
 	return fmt.Errorf("storage schema change did not complete within %s (%d change(s)); the database may be throttling the online DDL: %w",
 		EnsureSchemaTimeout, ddlCount, ctx.Err())
+}
+
+// ensureSchemaLockWaitError explains an advisory-lock acquisition that ended
+// with the bootstrap context rather than with an answer. A trailing instance
+// queues behind the leader here for as long as the leader takes, so the wait
+// is where a bootstrap most often sits when something ends it, and the two
+// causes read nothing alike: the caller cancelling means it gave up queueing
+// on its own decision, which needs no operator action, while the deadline
+// means it outwaited EnsureSchemaTimeout, which points at a leader still
+// converging or a lock nobody released.
+func ensureSchemaLockWaitError(ctx context.Context, err error) error {
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return fmt.Errorf("stopped waiting for advisory lock %q because the bootstrap was canceled: %w", ensureSchemaLockName, err)
+	}
+	return fmt.Errorf("timed out waiting for advisory lock %q (another pod may be running EnsureSchema): %w", ensureSchemaLockName, err)
 }
 
 // refusedStorageChange is a planned storage-schema statement EnsureSchema
@@ -650,12 +688,12 @@ func acquireMySQLEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.
 	acquired, err := locker.Acquire(ctx, conn, ensureSchemaLockName, EnsureSchemaTimeout)
 	if err != nil {
 		utils.CloseAndLog(conn)
-		// The overall EnsureSchema deadline expires before the server-side
-		// lock wait (which starts later, with the same duration), so a
-		// contended timeout surfaces here as a context error — name the
-		// likely cause instead of reporting only the raw cancellation.
+		// The bootstrap context ends before the server-side lock wait (which
+		// starts later, with the same duration), so a wait cut short surfaces
+		// here as a context error — name what ended it instead of reporting
+		// only the raw cancellation.
 		if ctx.Err() != nil {
-			return nil, fmt.Errorf("timed out waiting for advisory lock %q (another pod may be running EnsureSchema): %w", ensureSchemaLockName, err)
+			return nil, ensureSchemaLockWaitError(ctx, err)
 		}
 		return nil, fmt.Errorf("acquire advisory lock: %w", err)
 	}

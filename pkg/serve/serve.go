@@ -504,14 +504,18 @@ func bootStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.Dial
 }
 
 // connectStorage runs a single storage boot attempt: resolve the DSN, apply
-// the storage schema, open the pool, and verify it with a ping.
+// the storage schema, open the pool, and verify it with a ping. Every step
+// that can block runs under ctx, so an instance told to stop mid-attempt stops
+// inside the attempt rather than at the end of it. The schema bootstrap is the
+// longest of the three and carries a budget of its own, which is what makes
+// that difference a minutes-long one.
 func connectStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.Dialect, logger *slog.Logger) (*sql.DB, error) {
 	const pingTimeout = 10 * time.Second
 	dsn, err := cfg.StorageDSN()
 	if err != nil {
 		return nil, fmt.Errorf("resolve storage DSN: %w", err)
 	}
-	if err := api.EnsureSchema(dsn, logger,
+	if err := api.EnsureSchema(ctx, dsn, logger,
 		api.WithAllowDestructiveSchemaChanges(cfg.Storage.AllowDestructiveSchemaChanges),
 		api.WithPostgresStatementTimeout(cfg.Postgres.StatementTimeoutOrDefault()),
 		api.WithDialect(dialect)); err != nil {

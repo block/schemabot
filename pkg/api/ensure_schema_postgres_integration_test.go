@@ -50,7 +50,7 @@ func TestEnsureSchemaPostgres_BootstrapsFreshDatabase(t *testing.T) {
 	dsn, db := startPostgresStorage(t)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres)))
 
 	requireStorageTables(t, db)
 }
@@ -62,8 +62,8 @@ func TestEnsureSchemaPostgres_Idempotent(t *testing.T) {
 	dsn, db := startPostgresStorage(t)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
-	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres)))
 
 	requireStorageTables(t, db)
 }
@@ -75,12 +75,12 @@ func TestEnsureSchemaPostgres_ConvergesMissingColumn(t *testing.T) {
 	dsn, db := startPostgresStorage(t)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres)))
 	_, err := db.ExecContext(ctx, "ALTER TABLE applies DROP COLUMN caller")
 	require.NoError(t, err)
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
-	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres)))
 	columns, err := postgresTableColumns(ctx, db, "applies")
 	require.NoError(t, err)
 	assert.True(t, columns["caller"])
@@ -93,13 +93,13 @@ func TestEnsureSchemaPostgres_AllowsExtraColumn(t *testing.T) {
 	dsn, db := startPostgresStorage(t)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres)))
 	_, err := db.ExecContext(ctx, "ALTER TABLE settings ADD COLUMN future_value text")
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx, "CREATE INDEX idx_settings_future_value ON settings (future_value)")
 	require.NoError(t, err)
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres)))
 	indexes, err := postgresTableIndexes(ctx, db, "settings")
 	require.NoError(t, err)
 	assert.Contains(t, indexes, "idx_settings_future_value")
@@ -112,13 +112,13 @@ func TestEnsureSchemaPostgres_ConvergesMissingNonUniqueIndex(t *testing.T) {
 	dsn, db := startPostgresStorage(t)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres)))
 	_, err := db.ExecContext(ctx, "DROP INDEX idx_apply_logs_level")
 	require.NoError(t, err)
 
 	var logs bytes.Buffer
 	convergeLogger := slog.New(slog.NewTextHandler(&logs, nil))
-	require.NoError(t, EnsureSchema(dsn, convergeLogger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, convergeLogger, WithDialect(schema.DialectPostgres)))
 	indexes, err := postgresTableIndexes(ctx, db, "apply_logs")
 	require.NoError(t, err)
 	assert.Contains(t, indexes, "idx_apply_logs_level")
@@ -132,11 +132,11 @@ func TestEnsureSchemaPostgres_ConvergesMissingUniqueIndex(t *testing.T) {
 	dsn, db := startPostgresStorage(t)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres)))
 	_, err := db.ExecContext(ctx, "DROP INDEX idx_settings_setting_key")
 	require.NoError(t, err)
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres)))
 	indexes, err := postgresTableIndexes(ctx, db, "settings")
 	require.NoError(t, err)
 	assert.Equal(t, postgresLiveIndex{unique: true, valid: true}, indexes["idx_settings_setting_key"])
@@ -149,11 +149,11 @@ func TestEnsureSchemaPostgres_RejectsMissingNotNullColumnWithoutDefault(t *testi
 	dsn, db := startPostgresStorage(t)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres)))
 	_, err := db.ExecContext(ctx, "ALTER TABLE settings DROP COLUMN setting_value")
 	require.NoError(t, err)
 
-	err = EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres))
+	err = EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres))
 	require.ErrorContains(t, err, `storage table "settings" is missing column "setting_value" whose definition is NOT NULL without a DEFAULT`)
 	require.ErrorContains(t, err, "add it manually or ship the column with a DEFAULT")
 }
@@ -167,7 +167,7 @@ func TestEnsureSchemaPostgres_ManualRemediationBlocksAllDDL(t *testing.T) {
 	dsn, db := startPostgresStorage(t)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres)))
 	// "applies" sorts before "settings": without the whole-set gate its
 	// automatic change would commit before the settings failure surfaced.
 	_, err := db.ExecContext(ctx, "ALTER TABLE applies DROP COLUMN caller")
@@ -175,7 +175,7 @@ func TestEnsureSchemaPostgres_ManualRemediationBlocksAllDDL(t *testing.T) {
 	_, err = db.ExecContext(ctx, "ALTER TABLE settings DROP COLUMN setting_value")
 	require.NoError(t, err)
 
-	err = EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres))
+	err = EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres))
 	require.ErrorContains(t, err, `storage table "settings" is missing column "setting_value"`)
 
 	columns, err := postgresTableColumns(ctx, db, "applies")
@@ -194,7 +194,7 @@ func TestEnsureSchemaPostgres_RejectsNonUniqueIndexWhereUniqueRequired(t *testin
 	dsn, db := startPostgresStorage(t)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres)))
 	_, err := db.ExecContext(ctx, "DROP INDEX idx_settings_setting_key")
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx, "CREATE INDEX idx_settings_setting_key ON settings (setting_key)")
@@ -206,7 +206,7 @@ func TestEnsureSchemaPostgres_RejectsNonUniqueIndexWhereUniqueRequired(t *testin
 	_, err = db.ExecContext(ctx, "ALTER TABLE settings DROP COLUMN setting_value")
 	require.NoError(t, err)
 
-	err = EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres))
+	err = EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres))
 	require.ErrorContains(t, err, `storage table "settings" has index "idx_settings_setting_key" whose live state is non-unique where the embedded schema requires a unique index`)
 	require.ErrorContains(t, err, "replace it manually")
 	require.ErrorContains(t, err, `storage table "settings" is missing column "setting_value"`)
@@ -227,7 +227,7 @@ func TestEnsureSchemaPostgres_RefusesManualRemediationWithoutWaitingForLock(t *t
 	dsn, db := startPostgresStorage(t)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres)))
 	_, err := db.ExecContext(ctx, "ALTER TABLE settings DROP COLUMN setting_value")
 	require.NoError(t, err)
 	// An automatic change alongside the manual one proves the refusal logs
@@ -246,7 +246,7 @@ func TestEnsureSchemaPostgres_RefusesManualRemediationWithoutWaitingForLock(t *t
 	refusalLogger := slog.New(slog.NewTextHandler(&logs, nil))
 	done := make(chan error, 1)
 	go func() {
-		done <- EnsureSchema(dsn, refusalLogger, WithDialect(schema.DialectPostgres))
+		done <- EnsureSchema(ctx, dsn, refusalLogger, WithDialect(schema.DialectPostgres))
 	}()
 	select {
 	case err := <-done:
@@ -275,7 +275,7 @@ func TestEnsureSchemaPostgres_RejectsInvalidIndex(t *testing.T) {
 	dsn, db := startPostgresStorage(t)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres)))
 	_, err := db.ExecContext(ctx, "DROP INDEX idx_settings_setting_key")
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx, "INSERT INTO settings (setting_key, setting_value) VALUES ('dup', 'a'), ('dup', 'b')")
@@ -288,7 +288,7 @@ func TestEnsureSchemaPostgres_RejectsInvalidIndex(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, postgresLiveIndex{unique: true, valid: false}, indexes["idx_settings_setting_key"])
 
-	err = EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres))
+	err = EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres))
 	require.ErrorContains(t, err, `storage table "settings" has index "idx_settings_setting_key" whose live state is invalid and no CREATE INDEX CONCURRENTLY is visible building it`)
 	require.ErrorContains(t, err, "DROP INDEX it so startup recreates it")
 
@@ -308,7 +308,7 @@ func TestEnsureSchemaPostgres_ReportsIndexBuildInProgress(t *testing.T) {
 	dsn, db := startPostgresStorage(t)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres)))
 	_, err := db.ExecContext(ctx, "DROP INDEX idx_settings_setting_key")
 	require.NoError(t, err)
 
@@ -333,7 +333,7 @@ func TestEnsureSchemaPostgres_ReportsIndexBuildInProgress(t *testing.T) {
 		return indexes["idx_settings_setting_key"] == postgresLiveIndex{unique: true, valid: false, building: true}
 	}, 30*time.Second, 50*time.Millisecond, "concurrent build never became visible as in progress")
 
-	err = EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres))
+	err = EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres))
 	require.ErrorContains(t, err, `storage table "settings" has index "idx_settings_setting_key" whose live state is invalid because a CREATE INDEX CONCURRENTLY is still building it`)
 	require.ErrorContains(t, err, "startup succeeds once that build completes")
 	require.NotContains(t, err.Error(), "DROP INDEX")
@@ -346,7 +346,7 @@ func TestEnsureSchemaPostgres_ReportsIndexBuildInProgress(t *testing.T) {
 		t.Fatal("concurrent index build did not finish after the writer committed")
 	}
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres)))
 	indexes, err := postgresTableIndexes(ctx, db, "settings")
 	require.NoError(t, err)
 	assert.Equal(t, postgresLiveIndex{unique: true, valid: true}, indexes["idx_settings_setting_key"])
@@ -362,7 +362,7 @@ func TestVerifyPostgresSchemaShape_ReportsUnsatisfiedIndexes(t *testing.T) {
 	dsn, db := startPostgresStorage(t)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres)))
 	tables, files, err := readEmbeddedPostgresSchemaFiles()
 	require.NoError(t, err)
 	require.NoError(t, verifyPostgresSchemaShape(ctx, db, tables, files))
@@ -395,7 +395,7 @@ func TestEnsureSchemaPostgres_CreatesMissingTables(t *testing.T) {
 	dsn, db := startPostgresStorage(t)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres)))
 
 	// Seed a row in a surviving table, then drop another table.
 	_, err := db.ExecContext(ctx, "INSERT INTO settings (setting_key, setting_value) VALUES ('k', 'v')")
@@ -403,7 +403,7 @@ func TestEnsureSchemaPostgres_CreatesMissingTables(t *testing.T) {
 	_, err = db.ExecContext(ctx, "DROP TABLE tasks")
 	require.NoError(t, err)
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres)))
 
 	requireStorageTables(t, db)
 	var value string
@@ -422,7 +422,7 @@ func TestEnsureSchemaPostgres_ConcurrentPods(t *testing.T) {
 	var g errgroup.Group
 	for range 4 {
 		g.Go(func() error {
-			return EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres))
+			return EnsureSchema(t.Context(), dsn, logger, WithDialect(schema.DialectPostgres))
 		})
 	}
 	require.NoError(t, g.Wait())
@@ -446,7 +446,7 @@ func TestEnsureSchemaPostgres_WaitsForAdvisoryLock(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- EnsureSchema(dsn, logger, WithDialect(schema.DialectPostgres))
+		done <- EnsureSchema(ctx, dsn, logger, WithDialect(schema.DialectPostgres))
 	}()
 
 	// Wait until the bootstrap is provably parked on the advisory lock: its
@@ -509,7 +509,7 @@ func TestEnsureSchemaPostgres_OverridesHostileDatabaseStatementTimeout(t *testin
 	// displaces the hostile value. This is the surface an embedder gets when
 	// it calls EnsureSchema without opting in, so a default of "inherit
 	// whatever the platform set" would fail here rather than in production.
-	require.NoError(t, EnsureSchema(dsn, logger,
+	require.NoError(t, EnsureSchema(t.Context(), dsn, logger,
 		WithDialect(schema.DialectPostgres)))
 
 	requireStorageTables(t, db)
@@ -532,7 +532,7 @@ func TestEnsureSchemaPostgres_HostileTimeoutDoesNotTruncateLockWait(t *testing.T
 	var g errgroup.Group
 	for range 2 {
 		g.Go(func() error {
-			return EnsureSchema(dsn, logger,
+			return EnsureSchema(t.Context(), dsn, logger,
 				WithDialect(schema.DialectPostgres),
 				WithPostgresStatementTimeout(DefaultPostgresStatementTimeout))
 		})
