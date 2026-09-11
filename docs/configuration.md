@@ -1016,20 +1016,30 @@ on the storage dialect:
 
 The rest of this section describes the MySQL flow.
 
-By default, destructive statements in that diff — `DROP TABLE`, or an
-`ALTER TABLE` containing `DROP COLUMN` — are refused and skipped. A mixed
-`ALTER TABLE` is split: its additive clauses still execute and only the
+By default, destructive statements in that diff are refused and skipped. Two
+kinds count as destructive:
+
+- Statements that lose data — `DROP TABLE`, or an `ALTER TABLE` containing
+  `DROP COLUMN`.
+- Statements that remove or rename a schema object without losing any data —
+  `DROP INDEX`, `DROP FOREIGN KEY`, `DROP CHECK`, `DROP CONSTRAINT`, and
+  renames of a table, column, or index. An index drop destroys no rows and
+  completes in milliseconds because it is metadata-only, and it can still take
+  the database down by regressing the plan of a query the rest of the fleet is
+  running.
+
+A mixed `ALTER TABLE` is split: its additive clauses still execute and only the
 destructive clauses are refused, except that a clause which cannot run
-without a refused clause (the `ADD PRIMARY KEY` half of a primary-key change)
-is refused with it. The remaining non-destructive statements still apply and
-startup proceeds. This protects
-against rolling deploys and rollbacks: a pod running an older binary sees a
-newer binary's tables and columns as surplus, and without the gate would drop
-them (destroying data the newer pods depend on). Each refused statement is
-logged at warn level with the exact DDL, and counted in the
+without a refused clause (the `ADD PRIMARY KEY` half of a primary-key change,
+or the `ADD INDEX` half of an index redefinition) is refused with it. The
+remaining non-destructive statements still apply and startup proceeds. This
+protects against rolling deploys and rollbacks: a pod running an older binary
+sees a newer binary's tables, columns, and indexes as surplus, and without the
+gate would remove them from under the pods that depend on them. Each refused
+statement is logged at warn level with the exact DDL, and counted in the
 `schemabot.storage_schema.destructive_refusals_total` metric.
 
-To intentionally remove a storage table or column, first make sure every
+To intentionally remove a storage table, column, or index, first make sure every
 running pod is on a binary whose embedded schema no longer declares it, then
 opt in:
 

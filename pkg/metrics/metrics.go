@@ -445,13 +445,13 @@ const (
 // RecordStorageSchemaDestructiveRefusal increments the counter for destructive
 // storage-schema DDL statements EnsureSchema refused to execute at startup.
 // A nonzero rate means a starting binary's embedded schema no longer declares
-// a table or column that exists in the storage database — expected briefly
-// from older pods during a rolling deploy or rollback. The scope attribute
-// says whether the safe clauses of the statement still ran: "split" means a
-// mixed ALTER executed its safe clauses and refused only the destructive
-// remainder; "whole" means nothing in the statement ran. Operator action: if
-// the removal is intended and every pod runs a binary without the table or
-// column, set storage.allow_destructive_schema_changes to true for one
+// a table, column, index, or constraint that exists in the storage database —
+// expected briefly from older pods during a rolling deploy or rollback. The
+// scope attribute says whether the safe clauses of the statement still ran:
+// "split" means a mixed ALTER executed its safe clauses and refused only the
+// destructive remainder; "whole" means nothing in the statement ran. Operator
+// action: if the removal is intended and every pod runs a binary without the
+// object, set storage.allow_destructive_schema_changes to true for one
 // deploy; otherwise investigate which binary is starting against newer
 // storage state.
 func RecordStorageSchemaDestructiveRefusal(ctx context.Context, table, operation, scope string) {

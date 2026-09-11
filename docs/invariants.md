@@ -313,16 +313,18 @@ clamp (`pkg/webhook/plan_drift.go`); the request body limit (`pkg/webhook/handle
 ### AV-9: SchemaBot never destroys its own storage to start
 
 The startup schema bootstrap converges SchemaBot's own storage additively, and decides before it
-writes. On MySQL a destructive statement (a `DROP TABLE`, or an `ALTER TABLE` carrying a `DROP
-COLUMN`) is refused unless destructive storage changes are explicitly allowed, and a statement
-whose destructive clauses cannot be partitioned out is refused *whole*. Refusing the whole
-statement runs strictly less than any split of it, so the fallback can never widen what the
-bootstrap executes, and startup continues on the safe remainder. On PostgreSQL the convergence is
-additive-only and gates on the entire drift set before touching anything, so a change needing
-manual remediation aborts the pass rather than leaving storage half-converged. *Breaks if
-violated:* the first instance of a rolling deploy drops state the rest of the fleet is still
-reading. *Enforced:* the per-dialect bootstrappers (`pkg/api/ensure_schema.go`,
-`pkg/api/ensure_schema_postgres.go`).
+writes. Additively is the whole rule: a statement that loses data and one that removes or renames
+a schema object without losing any are both refusals, because the exposure is the fleet reading
+that storage, not the rows alone. On MySQL such a statement is refused unless destructive storage
+changes are explicitly allowed, and one whose refused clauses cannot be partitioned out is refused
+*whole*. Refusing the whole statement runs strictly less than any split of it, so the fallback can
+never widen what the bootstrap executes, and startup continues on the safe remainder. On
+PostgreSQL the convergence is additive-only and gates on the entire drift set before touching
+anything, so a change needing manual remediation aborts the pass rather than leaving storage
+half-converged. *Breaks if violated:* the first instance of a rolling deploy drops state the rest
+of the fleet is still reading — a table, a column, or an index the fleet's live queries plan
+around. *Enforced:* the per-dialect bootstrappers (`pkg/api/ensure_schema.go`,
+`pkg/api/ensure_schema_postgres.go`), over the refusal vocabulary in `pkg/ddl/unsafe.go`.
 
 ### AV-10: Anything the PR can do, the CLI can do
 
