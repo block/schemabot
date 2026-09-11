@@ -1121,8 +1121,10 @@ func TestUpdateApplyStateFromOperations_ReturnsProjectionResult(t *testing.T) {
 // complete.
 type fakeControlRequestStore struct {
 	storage.ControlRequestStore
-	pending   map[storage.ControlOperation]*storage.ApplyControlRequest
-	completed []storage.ControlOperation
+	pending        map[storage.ControlOperation]*storage.ApplyControlRequest
+	completed      []storage.ControlOperation
+	failed         []storage.ControlOperation
+	failureReasons []string
 }
 
 func (s *fakeControlRequestStore) GetPending(_ context.Context, _ int64, op storage.ControlOperation) (*storage.ApplyControlRequest, error) {
@@ -1131,6 +1133,12 @@ func (s *fakeControlRequestStore) GetPending(_ context.Context, _ int64, op stor
 
 func (s *fakeControlRequestStore) CompletePending(_ context.Context, _ int64, op storage.ControlOperation) error {
 	s.completed = append(s.completed, op)
+	return nil
+}
+
+func (s *fakeControlRequestStore) FailPending(_ context.Context, _ int64, op storage.ControlOperation, reason string) error {
+	s.failed = append(s.failed, op)
+	s.failureReasons = append(s.failureReasons, reason)
 	return nil
 }
 
@@ -1251,6 +1259,21 @@ func TestCompletePendingControlRequestsIfApplyResolved(t *testing.T) {
 		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
 		require.Len(t, control.completed, 1, "a terminal apply with a pending cancel completes the request")
 		assert.Equal(t, storage.ControlOperationCancel, control.completed[0])
+	})
+
+	t.Run("records that the schema change outran the cancel", func(t *testing.T) {
+		applies := &getApplyStore{apply: &storage.Apply{ID: 9, ApplyIdentifier: "apply-outran", State: state.Apply.Completed}}
+		control := &fakeControlRequestStore{pending: map[storage.ControlOperation]*storage.ApplyControlRequest{
+			storage.ControlOperationCancel: pendingRequest(storage.ControlOperationCancel),
+		}}
+		svc := newStopReconcileTestService(applies, &markPendingStoppedRecordingStore{}, control)
+
+		require.NoError(t, svc.completePendingControlRequestsIfApplyResolved(t.Context(), 1, 9))
+		assert.Empty(t, control.completed, "a cancel the schema change outran did not take effect, so it must not read as completed")
+		require.Len(t, control.failed, 1, "the outrun cancel is settled terminally, not left pending")
+		assert.Equal(t, storage.ControlOperationCancel, control.failed[0])
+		assert.Contains(t, control.failureReasons[0], "the schema change completed before the cancel could take effect",
+			"the stored reason is what the operator reads back, so it must say the change is live")
 	})
 
 	t.Run("keeps the cancel pending when the apply settled stopped", func(t *testing.T) {

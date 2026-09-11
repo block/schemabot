@@ -72,17 +72,24 @@ func settlePendingRequestsForTerminalApply(ctx context.Context, store storage.St
 			return err
 		}
 	}
+	return SettlePendingCancelForResolvedApply(ctx, store, logger, apply)
+}
+
+// SettlePendingCancelForResolvedApply settles the pending cancel of an apply
+// that has reached a terminal state, whichever path drove it there. An apply
+// resolves under more than one drive shape, and every one of them owes the
+// operator the same answer about the command they issued, so they share this
+// entry point rather than each deciding for itself what a settled cancel means.
+//
+// The caller must have established that the apply is terminal.
+func SettlePendingCancelForResolvedApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) error {
 	if state.IsState(apply.State, state.Apply.Stopped) {
+		// A stopped apply remains cancellable, so the request stays deliverable
+		// for the drive that resumes it.
+		logger.DebugContext(ctx, "leaving the pending cancel request deliverable for a stopped apply", apply.LogAttrs()...)
 		return nil
 	}
-	controlReq, err := pendingControlRequest(ctx, store, apply, storage.ControlOperationCancel)
-	if err != nil {
-		return err
-	}
-	if controlReq == nil {
-		return nil
-	}
-	return settlePendingCancelForTerminalApply(ctx, store, logger, apply, controlReq)
+	return settlePendingCancelForTerminalApply(ctx, store, logger, apply)
 }
 
 // settlePendingCancelForTerminalApply settles an apply's pending cancel once the
@@ -94,7 +101,21 @@ func settlePendingRequestsForTerminalApply(ctx context.Context, store storage.St
 // instead of reporting it applied.
 //
 // The caller must have established that the apply is terminal.
-func settlePendingCancelForTerminalApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, controlReq *storage.ApplyControlRequest) error {
+//
+// The pending request is read here rather than taken from the caller, because
+// the settle is a conditional update on a still-pending row and a zero-row
+// write reports success: a caller acting on a copy it read before another path
+// settled the same request would otherwise append a second disclosure
+// contradicting the outcome already recorded.
+func settlePendingCancelForTerminalApply(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) error {
+	controlReq, err := pendingControlRequest(ctx, store, apply, storage.ControlOperationCancel)
+	if err != nil {
+		return err
+	}
+	if controlReq == nil {
+		logger.DebugContext(ctx, "no pending cancel request to settle; leaving the recorded outcome as found", apply.LogAttrs()...)
+		return nil
+	}
 	reason := cancelOutrunReason(apply.State)
 	if reason == "" {
 		if err := completePendingControlRequests(ctx, store, apply, storage.ControlOperationCancel); err != nil {
@@ -306,7 +327,7 @@ func ensureApplyLeaseForControlRequest(ctx context.Context, store storage.Storag
 // apply actually reached. A cancel the engine rejected as already completed
 // settles the apply completed, and this is where that outcome resolves the
 // operator's command — as one that did not take effect, not as one applied.
-func settlePendingCancelIfStoredApplyResolved(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply, controlReq *storage.ApplyControlRequest) (bool, error) {
+func settlePendingCancelIfStoredApplyResolved(ctx context.Context, store storage.Storage, logger *slog.Logger, apply *storage.Apply) (bool, error) {
 	if store == nil {
 		return false, fmt.Errorf("storage is not available")
 	}
@@ -320,7 +341,7 @@ func settlePendingCancelIfStoredApplyResolved(ctx context.Context, store storage
 	if !state.IsTerminalApplyState(storedApply.State) {
 		return false, nil
 	}
-	if err := settlePendingCancelForTerminalApply(ctx, store, logger, storedApply, controlReq); err != nil {
+	if err := settlePendingCancelForTerminalApply(ctx, store, logger, storedApply); err != nil {
 		return false, err
 	}
 	*apply = *storedApply

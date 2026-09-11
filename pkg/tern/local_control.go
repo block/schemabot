@@ -1255,7 +1255,7 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 		// The apply already reached a terminal state, so settling its request
 		// decides nothing about what this drive does next: a failed write leaves
 		// the request pending for a later drive rather than standing this one down.
-		if err := settlePendingCancelForTerminalApply(ctx, c.storage, c.logger, apply, controlReq); err != nil {
+		if err := settlePendingCancelForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -1300,7 +1300,7 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 		// drive keeps going because no cancel took effect.
 		return false, c.failRefusedControlRequest(cancelCtx, logger, apply, storage.ControlOperationCancel, storage.LogEventCancelRequested, controlReq, resp.ErrorMessage)
 	}
-	settled, err := settlePendingCancelIfStoredApplyResolved(cancelCtx, c.storage, c.logger, apply, controlReq)
+	settled, err := settlePendingCancelIfStoredApplyResolved(cancelCtx, c.storage, c.logger, apply)
 	if err != nil {
 		return false, err
 	}
@@ -2021,6 +2021,13 @@ func (c *LocalClient) settleControlForCompletedEngineChange(ctx context.Context,
 	}
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 		eventMsg, previousState, state.Apply.Completed)
+	// Settle the cancel the completed schema change outran before the summary is
+	// posted: the terminal comment renders the command-not-applied notice from
+	// the stored request, so a request still pending here posts a summary that
+	// says nothing about the command the operator issued.
+	if err := SettlePendingCancelForResolvedApply(ctx, c.storage, c.logger, apply); err != nil {
+		return 0, fmt.Errorf("settle the pending cancel the completed schema change outran for apply %s: %w", apply.ApplyIdentifier, err)
+	}
 	c.notifyTerminalObserver(apply, tasks)
 	return skippedCount, nil
 }

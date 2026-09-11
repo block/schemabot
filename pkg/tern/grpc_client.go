@@ -1030,7 +1030,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 			logOperationDriveLeavesParentCancel(logger, apply, scope)
 			return true, nil
 		}
-		if err := settlePendingCancelForTerminalApply(ctx, c.storage, c.baseLogger(), apply, controlReq); err != nil {
+		if err := settlePendingCancelForTerminalApply(ctx, c.storage, c.baseLogger(), apply); err != nil {
 			return true, err
 		}
 		c.controlSendGate.clear(controlReq.ID)
@@ -1099,7 +1099,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 			logOperationDriveLeavesParentCancel(logger, apply, scope)
 			return true, nil
 		}
-		if err := settlePendingCancelForTerminalApply(ctx, c.storage, c.baseLogger(), apply, controlReq); err != nil {
+		if err := settlePendingCancelForTerminalApply(ctx, c.storage, c.baseLogger(), apply); err != nil {
 			return true, err
 		}
 		c.controlSendGate.clear(controlReq.ID)
@@ -1338,7 +1338,7 @@ func (c *GRPCClient) completeRemoteCancelFromTerminalProgress(ctx context.Contex
 		logOperationDriveLeavesParentCancel(logger, apply, scope)
 		return true, nil
 	}
-	if err := settlePendingCancelForTerminalApply(ctx, c.storage, c.baseLogger(), apply, controlReq); err != nil {
+	if err := settlePendingCancelForTerminalApply(ctx, c.storage, c.baseLogger(), apply); err != nil {
 		return false, err
 	}
 	c.controlSendGate.clear(controlReq.ID)

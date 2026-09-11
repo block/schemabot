@@ -1547,11 +1547,11 @@ func (s *Service) markPendingOperationsStopped(ctx context.Context, driverID int
 // the requests do not stay pending forever after the rollout resolves. The
 // apply is reloaded because the derived-state write operates on a copy and
 // does not mutate the caller's row. A pending stop completes at any terminal
-// state. A pending cancel completes only when the terminal state is not
-// stopped: a stopped apply remains cancellable, so its pending cancel must
-// stay deliverable for the next drive. A still-non-terminal apply resolves
-// only its stop, and only once that stop has reached every operation. No-op
-// when nothing is pending.
+// state. A pending cancel is handed to the shared settlement, which decides
+// whether the cancel took effect or the schema change outran it, so this path
+// discloses the same outcome as every other drive shape. A still-non-terminal
+// apply resolves only its stop, and only once that stop has reached every
+// operation. No-op when nothing is pending.
 func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Context, driverID int, applyID int64) error {
 	apply, err := s.storage.Applies().Get(ctx, applyID)
 	if err != nil {
@@ -1567,13 +1567,7 @@ func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Cont
 	if err := s.completePendingRequestForResolvedApply(ctx, driverID, apply, storage.ControlOperationStop); err != nil {
 		return err
 	}
-	if state.IsState(apply.State, state.Apply.Stopped) {
-		s.logger.Debug("operator: leaving pending cancel request deliverable for stopped apply",
-			append(apply.LogAttrs(),
-				"driver", driverID)...)
-		return nil
-	}
-	return s.completePendingRequestForResolvedApply(ctx, driverID, apply, storage.ControlOperationCancel)
+	return tern.SettlePendingCancelForResolvedApply(ctx, s.storage, s.logger.With("driver", driverID), apply)
 }
 
 // completeLandedStopForHeldOpenApply completes a pending stop request on an
