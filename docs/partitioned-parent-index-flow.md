@@ -164,8 +164,10 @@ detached partition changes which children are required for validity.
 | 6 | Each child build uses the existing concurrent-build budget and abandoned-index proof. Attached children are never rebuilt or detached by recovery. |
 | 7 | Progress identifies partition `k` of `N` and, while building, preserves PostgreSQL's server phase and work counters. |
 | 8 | Cancellation stops at the active partition, cleans only that build's proven leftover, and leaves already attached children attached. |
-| 9 | Any partition topology change from the admitted snapshot stops the flow with a typed, retryable drift result; it never silently changes `N`. |
+| 9 | Any partition topology change from the admitted snapshot stops the flow with a typed, retryable drift result; it never silently changes `N`. The snapshot fingerprints each direct partition's OID, bound expression, and attachment state. |
 | 10 | SchemaBot displays and drives the work as one logical plan step, with one lease and one final outcome. |
+| 11 | Admission refuses an empty topology and more than 1,024 direct partitions before calculating a deadline. |
+| 12 | SchemaBot durably records the admitted parent table OID and the parent index OID once created; every drive requires both identities to resolve before mutation. |
 
 ## Ownership: pg-sprite owns the sequence
 
@@ -221,11 +223,21 @@ storage parameters, tablespace policy, and predicate where admitted. The first
 implementation deliberately admits a narrower subset below rather than risk an
 attachment mismatch.
 
-Before mutation, pg-sprite snapshots the parent table OID and direct partition
-table OIDs. Before every build, before every attach, and before final success it
-re-reads the direct children and requires the same set. Relation names may be
-re-read by OID so a harmless rename does not redirect work; replacement or
-topology drift stops the flow.
+Before mutation, pg-sprite snapshots the parent table OID and a topology
+fingerprint for every direct partition: its table OID, attachment state, and
+bound expression from `pg_get_expr(relpartbound, oid)`. Before every build,
+before every attach, and before final success it re-reads the fingerprint and
+requires an exact match. Relation names may be re-read by OID so a harmless
+rename does not redirect work; replacement, detach and reattach under different
+bounds, or other topology drift stops the flow.
+
+After creating the shell, pg-sprite snapshots its parent index OID. Before
+every subsequent mutation, including each child build and each attach, it
+resolves the parent name from that OID and proves the OID is still present on
+the admitted parent table with the expected definition. Attachment is
+conditional on that proof. A missing, replaced, or redefined parent fails
+closed rather than allowing name-based SQL to mutate a same-named replacement;
+this is the partition flow's ownership contract under RF-6.
 
 Each transition is catalog-driven:
 
@@ -258,11 +270,13 @@ The parent index must be explicitly named. Generated parent names are refused
 because stable recovery cannot depend on PostgreSQL selecting the same free
 name after catalog changes.
 
-Each child name is `pgsprite_pi_<parent_oid>_<partition_oid>`. Decimal OIDs keep
-the name below PostgreSQL's identifier limit, avoid truncation collisions, and
-remain stable across table and index renames. The executor first proves that an
-occupant under that name belongs to the expected partition and definition; the
-prefix is not permission to remove it.
+Each child name is `pgsprite_pi_<parent_oid>_<partition_oid>`, where
+`<parent_oid>` is the parent index OID, not the parent table OID. Decimal OIDs
+keep the name below PostgreSQL's identifier limit, avoid truncation collisions,
+distinguish successive index builds on the same table, and remain stable across
+table and index renames. The executor first proves that an occupant under that
+name belongs to the expected partition and definition; the prefix is not
+permission to remove it.
 
 Direct partitions run in catalog order: ascending partition relation OID from
 the admitted snapshot. OID order is deterministic for a stable topology and
@@ -293,7 +307,7 @@ shows, for example:
 
 ```text
 Building index on partition 3 of 12 (events_2026_03)
-building index: 1,842 / 7,310 blocks
+building index: 25% of blocks (2,500/10,000)
 ```
 
 The table and partition text is sanitized and clamped before reaching GitHub.
@@ -302,12 +316,19 @@ position and phase without inventing a percentage.
 
 ## Recovery and cancellation
 
-A new driver does not need a separately persisted child checkpoint. It invokes
-the same executor against the live catalog; the catalog is the checkpoint:
+A new driver does not need a separately persisted child cursor. SchemaBot does,
+however, persist the admitted parent table OID and the parent index OID after
+shell creation in the durable apply request. Every drive supplies those
+identities to the executor. If either identity is unavailable or no longer
+resolves to the expected object, the apply refuses mutation and requires a
+fresh plan and apply. This preserves RC-4's durable-request recovery contract
+without making a child cursor authoritative. Subject to those identity proofs,
+the live catalog is the child checkpoint:
 
 | Observed state | Re-drive action |
 | --- | --- |
-| Parent absent | Start with `CREATE INDEX ON ONLY`. |
+| Parent absent, admitted table identity resolves, and no parent index OID has yet been recorded | Start with `CREATE INDEX ON ONLY`, then durably record its OID before continuing. |
+| Parent absent after its OID was recorded, or either durable identity is unavailable or does not resolve | Refuse mutation; require a fresh plan and apply. |
 | Invalid equivalent parent, no attached children | Resume it; drop only through a future explicit parent-abandonment proof if the requested definition no longer exists. |
 | Invalid equivalent parent, some children attached | Treat attached children as complete and continue in catalog order. |
 | Invalid deterministic child | Use the existing `RebuildAbandonedIndex` proof; never drop by prefix or name alone. |
@@ -344,7 +365,10 @@ The first implementation keeps these shapes refused:
 
 | Shape | Reason |
 | --- | --- |
-| Unique or primary-key index that omits any partition-key column, or whose partition key uses an expression | PostgreSQL cannot enforce the requested cross-partition uniqueness. |
+| Parent with no direct partitions (`parent-empty-topology`) | The shell cannot become valid, so the flow cannot meet its success contract. |
+| Parent with more than 1,024 direct partitions (`parent-partition-limit`) | The concrete admission ceiling bounds drive duration, catalog work, and progress cardinality before deadline calculation. |
+| Unique index that omits any partition-key column, or whose partition key uses an expression | PostgreSQL cannot enforce the requested cross-partition uniqueness. |
+| Primary-key and other constraint creation or adoption paths | Constraint-backed parent indexes remain outside this executor's ownership contract. |
 | Expression or partial index | PostgreSQL supports concurrent builds of these shapes, but v1 refuses until definition equivalence, immutable expression rendering, predicate comparison, and attach tests are pinned end to end. |
 | Sub-partitioned direct child or a hierarchy deeper than one level | One-level ownership is explicit; recursive topology snapshots, nested parent validity, progress, and cancellation need a separate design. |
 | Foreign partition | Local concurrent-build, progress, and validity assumptions do not apply. |
@@ -383,6 +407,16 @@ table-size gate: the parent has no storage, and each leaf uses the online
 concurrent path. Plan output may show partition count and per-partition sizes as
 advisory estimates, but apply re-reads them.
 
+Admission occurs before deadline calculation. `N = 0` returns the typed
+`parent-empty-topology` refusal, because an empty shell cannot become valid;
+`N > 1,024` returns `parent-partition-limit`. The 1,024-partition ceiling keeps
+the worst-case serial drive, catalog verification, and progress cardinality
+finite while covering established time- and hash-partitioning layouts. All
+deadline arithmetic is checked and saturating, so multiplication or headroom
+addition can never wrap `time.Duration`; a value above the representable or
+configured flow ceiling clamps to that ceiling and is refused rather than
+admitted with a shorter deadline.
+
 Each child build receives the existing
 `postgres.concurrent_index_max_duration` policy independently, including its
 server-side `statement_timeout` and abandoned-index recovery. The flow-level
@@ -405,9 +439,9 @@ created, and partitions do not run in parallel.
 | SchemaBot loops over N ordinary pg-sprite builds and executes attach SQL | Splits catalog verification and recovery ownership, duplicates partition semantics above the engine, weakens standalone pg-sprite, and needs a second progress state machine. |
 | Store one SchemaBot plan/task step per partition | Freezes plan-time topology, conflicts with parent-owned declarative representation, complicates leases and aggregate success, and still leaves parent validity verification homeless. |
 | Execute recursive `CREATE INDEX ON parent` with a lock budget | Bounds lock acquisition but not the write-blocking build after acquisition; violates RF-6 and the online contract. |
-| Build all children concurrently in parallel | Multiplies I/O and connection pressure, complicates cancellation and recovery, and PostgreSQL permits only one concurrent build per table; serial catalog order is predictable. |
+| Build all children concurrently in parallel | Multiplies I/O and connection pressure and complicates cancellation and recovery; serial catalog order is predictable. |
 | Roll back every attached child on cancellation | Destroys verified useful work, adds more DDL and failure windows, and makes the catalog less truthful rather than more truthful. |
-| Persist the current partition as the authoritative checkpoint | A stored cursor can be stale after pod loss or external DDL; the catalog already records attachment and validity and must remain authoritative. |
+| Persist the current partition as the authoritative checkpoint | A stored cursor can be stale after pod loss or external DDL; durable parent identities establish ownership, while the catalog records child attachment and validity and remains authoritative for sequence position. |
 | Admit all PostgreSQL-equivalent index definitions in v1 | Makes expression, predicate, collation, operator-class, and recursive equivalence part of the first safety proof. Narrow admission can expand after focused fixtures pin each shape. |
 
 ## Compatibility and rollout
