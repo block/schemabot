@@ -191,6 +191,12 @@ func TestCancelOutrunReason(t *testing.T) {
 	assert.Equal(t, "the schema change reached Retrying before the cancel could take effect",
 		cancelOutrunReason(state.Apply.FailedRetryable),
 		"the reason is prose an operator reads, so it names the state the way every other surface does rather than by its stored token")
+
+	unregistered := cancelOutrunReason("some_future_state")
+	assert.Equal(t, "the schema change settled before the cancel could take effect", unregistered,
+		"a state the registry cannot name has no operator vocabulary, so the reason names none")
+	assert.NotContains(t, unregistered, "some_future_state",
+		"the stored token must never reach an operator as if it were the state's name")
 }
 
 // A stopped apply is terminal but remains cancellable: the sweep must complete

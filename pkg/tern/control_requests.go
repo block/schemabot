@@ -149,12 +149,14 @@ func cancelOutrunReason(applyState string) string {
 	default:
 		// The operator's own name for the state, not SchemaBot's stored token:
 		// most states store as a snake_case identifier that reads as internal
-		// spelling in the middle of an English sentence.
-		label := state.Label(state.NormalizeState(applyState))
-		if label == "" {
+		// spelling in the middle of an English sentence. A state the registry
+		// does not carry has no such name, so the sentence names no state rather
+		// than reaching for the token the registry would have translated.
+		info, known := state.LookupApply(state.NormalizeState(applyState))
+		if !known {
 			return "the schema change settled before the cancel could take effect"
 		}
-		return fmt.Sprintf("the schema change reached %s before the cancel could take effect", label)
+		return fmt.Sprintf("the schema change reached %s before the cancel could take effect", info.Label)
 	}
 }
 

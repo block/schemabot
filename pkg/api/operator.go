@@ -1202,19 +1202,22 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 		return
 	}
 
-	// Publish the apply-level terminal summary if this drive's projection won the
-	// swap that terminalized the parent. Do this before control-request cleanup:
-	// the summary depends only on the apply being terminal, and a later cleanup
-	// error must not suppress it.
-	s.publishTerminalSummaryIfWon(operationLeaseCtx, driverID, finalApply, result)
-
+	// Settle what the apply resolved before the summary is published: a command
+	// the apply outran is disclosed by the summary, which is published once and
+	// never re-rendered, so a request still pending here yields a summary that
+	// says nothing about it. A settle failure is logged and the summary published
+	// anyway — an unsettled request is recoverable by a later drive, a summary
+	// this projection alone owed is not.
 	if err := s.completePendingControlRequestsIfApplyResolved(operationLeaseCtx, driverID, finalApply.ID); err != nil {
-		s.logger.Error("operator: failed to complete pending control requests for resolved apply",
+		s.logger.Error("operator: failed to complete pending control requests for resolved apply; terminal summary will omit the command",
 			append(finalApply.LogAttrs(),
 				"driver", driverID, "apply_operation_id", op.ID,
 				"operation_deployment", op.Deployment, "error", err)...)
-		return
 	}
+
+	// Publish the apply-level terminal summary if this drive's projection won the
+	// swap that terminalized the parent.
+	s.publishTerminalSummaryIfWon(operationLeaseCtx, driverID, finalApply, result)
 }
 
 // recoverApplyOperationCutover claims the next barrier-parked operation whose
@@ -1383,17 +1386,18 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 		return true
 	}
 
+	// Settle first so the summary below can disclose a command this apply outran;
+	// see recoverApplyOperation for why a settle failure does not hold it back.
+	if err := s.completePendingControlRequestsIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID); err != nil {
+		s.logger.Error("operator: failed to complete pending control requests after stop reconciliation; terminal summary will omit the command",
+			append(finalApply.LogAttrs(),
+				"driver", driverID, "error", err)...)
+	}
+
 	// A multi-operation apply that settles terminal here (stop reconciliation has
 	// no operation drive to publish on its behalf) still owes its single terminal
 	// summary; publish it if this projection won the terminal swap.
 	s.publishTerminalSummaryIfWon(applyLeaseCtx, driverID, finalApply, result)
-
-	if err := s.completePendingControlRequestsIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID); err != nil {
-		s.logger.Error("operator: failed to complete pending control requests after stop reconciliation",
-			append(finalApply.LogAttrs(),
-				"driver", driverID, "error", err)...)
-		return true
-	}
 	return true
 }
 
@@ -1495,16 +1499,17 @@ func (s *Service) recoverApplyOperationProjection(ctx context.Context, driverID 
 	}
 	metrics.RecordOperatorOperationProjectionRepair(ctx, apply.Database, apply.Deployment, apply.Environment, result.DerivedState)
 
+	// Settle first so the summary below can disclose a command this apply outran;
+	// see recoverApplyOperation for why a settle failure does not hold it back.
+	if err := s.completePendingControlRequestsIfApplyResolved(applyLeaseCtx, driverID, apply.ID); err != nil {
+		s.logger.Error("operator: failed to complete pending control requests after deriving apply state from its settled operations; terminal summary will omit the command",
+			append(apply.LogAttrs(),
+				"driver", driverID, "error", err)...)
+	}
+
 	// No operation drive is left to publish on this apply's behalf, so this
 	// projection owes the single terminal summary if it won the terminal swap.
 	s.publishTerminalSummaryIfWon(applyLeaseCtx, driverID, apply, result)
-
-	if err := s.completePendingControlRequestsIfApplyResolved(applyLeaseCtx, driverID, apply.ID); err != nil {
-		s.logger.Error("operator: failed to complete pending control requests after deriving apply state from its settled operations",
-			append(apply.LogAttrs(),
-				"driver", driverID, "error", err)...)
-		return true
-	}
 	return true
 }
 
@@ -1624,7 +1629,11 @@ func (s *Service) completeLandedStopForHeldOpenApply(ctx context.Context, driver
 // for an apply the caller has already established as resolved for that
 // operation. No-op when no request of that operation is pending.
 func (s *Service) completePendingRequestForResolvedApply(ctx context.Context, driverID int, apply *storage.Apply, op storage.ControlOperation) error {
-	controlReq, err := s.storage.ControlRequests().GetPending(ctx, apply.ID, op)
+	requests := s.storage.ControlRequests()
+	if requests == nil {
+		return fmt.Errorf("complete pending %s request for resolved apply %s (%d): control request store is not available", op, apply.ApplyIdentifier, apply.ID)
+	}
+	controlReq, err := requests.GetPending(ctx, apply.ID, op)
 	if err != nil {
 		return fmt.Errorf("load pending %s request for resolved apply %s (%d): %w", op, apply.ApplyIdentifier, apply.ID, err)
 	}
@@ -1632,7 +1641,7 @@ func (s *Service) completePendingRequestForResolvedApply(ctx context.Context, dr
 		return nil
 	}
 
-	if err := s.storage.ControlRequests().CompletePending(ctx, apply.ID, op); err != nil {
+	if err := requests.CompletePending(ctx, apply.ID, op); err != nil {
 		return fmt.Errorf("complete pending %s request for resolved apply %s (%d): %w", op, apply.ApplyIdentifier, apply.ID, err)
 	}
 	s.logger.Info("operator: completed pending control request for resolved apply",
@@ -1930,6 +1939,17 @@ func (s *Service) failOperationWithoutTasks(opCtx, applyCtx context.Context, dri
 				"driver", driverID, "apply_operation_id", op.ID,
 				"operation_deployment", op.Deployment, "error", err)...)
 		return
+	}
+
+	// A failure the operator did not ask for still answers the command they did:
+	// this path resolves the apply, so it owes any pending stop or cancel the
+	// same settlement every other resolving path gives, before the summary that
+	// discloses it is published.
+	if err := s.completePendingControlRequestsIfApplyResolved(applyCtx, driverID, apply.ID); err != nil {
+		s.logger.Error("operator: failed to complete pending control requests after failing task-less operation; terminal summary will omit the command",
+			append(apply.LogAttrs(),
+				"driver", driverID, "apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment, "error", err)...)
 	}
 
 	// A task-less operation failure that terminalizes a multi-operation apply

@@ -1429,11 +1429,13 @@ type recoverTestStorage struct {
 	mockStorage
 	applies storage.ApplyStore
 	ops     storage.ApplyOperationStore
+	control storage.ControlRequestStore
 }
 
 func (s *recoverTestStorage) Applies() storage.ApplyStore                  { return s.applies }
 func (s *recoverTestStorage) ApplyOperations() storage.ApplyOperationStore { return s.ops }
 func (s *recoverTestStorage) Plans() storage.PlanStore                     { return &staticPlanStore{} }
+func (s *recoverTestStorage) ControlRequests() storage.ControlRequestStore { return s.control }
 
 // When a multi-deployment operation has no tasks, the recover flow fails it
 // closed. By the time it fails, the pre-drive projection has already moved the
@@ -1462,7 +1464,7 @@ func TestRecoverMultiApplyOperation_FailsTaskLessOperationAgainstReloadedParent(
 	deploymentClient := &mockTernClient{resumeErr: tern.ErrNoTasksForApplyOperation}
 
 	svc := New(
-		&recoverTestStorage{applies: applyStore, ops: opStore},
+		&recoverTestStorage{applies: applyStore, ops: opStore, control: &fakeControlRequestStore{}},
 		testServerConfig(),
 		map[string]tern.Client{"west/staging": deploymentClient},
 		logger,
@@ -1579,7 +1581,7 @@ func TestRecoverApplyOperationCutover_RoutesThroughCutoverDrive(t *testing.T) {
 	deploymentClient := &mockTernClient{resumeErr: tern.ErrNoTasksForApplyOperation}
 
 	svc := New(
-		&recoverTestStorage{applies: applyStore, ops: opStore},
+		&recoverTestStorage{applies: applyStore, ops: opStore, control: &fakeControlRequestStore{}},
 		testServerConfig(),
 		map[string]tern.Client{"west/staging": deploymentClient},
 		logger,
