@@ -1227,6 +1227,29 @@ func TestCheckRunAgedForAnnotationJudgesTheStartTimeTheCallerReadsBack(t *testin
 		"the caller will render this run, so the rows explaining it have to be read")
 }
 
+// The clock a page is judged against is reported at whole-second precision, so
+// it is read at that precision too. Judged finer than it is reported, the
+// caller's copy trails the instant the decision was made on, and a run inside
+// that fraction of a threshold finer than a second is annotated by this scan
+// and then dropped by the caller — losing the annotation on the only surface
+// that shows it.
+func TestScanObservedNowIsReadAtThePrecisionItIsReportedAt(t *testing.T) {
+	t.Parallel()
+
+	observed := scanObservedNow()
+
+	assert.Zero(t, observed.Nanosecond(), "a finer clock than the wire carries cannot be handed back")
+	require.Equal(t, observed, mustParseRFC3339(t, observed.Format(time.RFC3339)),
+		"the reported clock round-trips to the one the runs were judged against")
+}
+
+func mustParseRFC3339(t *testing.T, value string) time.Time {
+	t.Helper()
+	parsed, err := time.Parse(time.RFC3339, value)
+	require.NoError(t, err)
+	return parsed.UTC()
+}
+
 // The clock the runs were aged against is reported, so a caller applying the
 // same threshold after the round trip reaches the same verdict instead of
 // judging every run slightly older than this scan did.

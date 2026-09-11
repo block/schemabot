@@ -896,13 +896,20 @@ type webhookMissingCheckScanClient interface {
 	FindCheckRunByName(ctx context.Context, repo, headSHA, checkName string) (*ghclient.CheckRunResult, []string, error)
 }
 
-// checkRunSittingLongEnough reports whether an uncompleted Check Run has been
-// sitting at least as long as the caller's threshold.
+// scanObservedNow is the clock a scan page ages its runs against, at the
+// precision the page reports it.
 //
-// A start time that is absent or in the future proves nothing about the run's
-// age, so it counts as long enough. The threshold exists to skip work the
-// caller will not display, and a run whose age cannot be established is one
-// the caller displays.
+// The threshold is applied on both sides: here, to decide which runs are worth
+// reading stored rows for, and by the caller against this same clock, to decide
+// which to render. Judging against a finer instant than is reported would make
+// the caller's copy of the clock trail the one the decision was made on, and a
+// run inside that fraction of a threshold finer than a second would be
+// annotated here and dropped there — losing the annotation on the only surface
+// that shows it.
+func scanObservedNow() time.Time {
+	return time.Now().UTC().Truncate(time.Second)
+}
+
 // checkRunAgedForAnnotation reports an uncompleted run's start time as the
 // caller will read it, and whether it has been sitting long enough to be worth
 // reading the stored rows that explain it.
@@ -919,6 +926,13 @@ func checkRunAgedForAnnotation(run *ghclient.CheckRunResult, threshold time.Dura
 	return formatCheckRunStartedAt(asSent), checkRunSittingLongEnough(asSent, threshold, now)
 }
 
+// checkRunSittingLongEnough reports whether an uncompleted Check Run has been
+// sitting at least as long as the caller's threshold.
+//
+// A start time that is absent or in the future proves nothing about the run's
+// age, so it counts as long enough. The threshold exists to skip work the
+// caller will not display, and a run whose age cannot be established is one
+// the caller displays.
 func checkRunSittingLongEnough(startedAt time.Time, threshold time.Duration, now time.Time) bool {
 	if threshold <= 0 || startedAt.IsZero() || startedAt.After(now) {
 		return true
@@ -931,7 +945,7 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 	if err != nil {
 		return nil, err
 	}
-	now := time.Now().UTC()
+	now := scanObservedNow()
 	checkNames := make([]string, 0, len(expectedNames))
 	for _, expected := range expectedNames {
 		checkNames = append(checkNames, expected.Name)

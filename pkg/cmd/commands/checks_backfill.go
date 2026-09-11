@@ -449,11 +449,6 @@ func rateLimitPauseDuration(rate *apitypes.GitHubRateLimit, floorPct int, now ti
 	return resetAt.Sub(now) + time.Minute, true
 }
 
-// stuckChecksPastThreshold flattens the scan's uncompleted Check Runs to one
-// row per (PR, check), keeping only runs that have been sitting longer than
-// stuckAfter. A run whose start time is missing, unparseable, or in the
-// future (clock skew) is always kept with an "unknown" age — a start time
-// that cannot prove the run is young must not hide it.
 // scanObservedAt is the clock this page's runs should be aged against: the
 // server's, when it reported one.
 //
@@ -479,6 +474,11 @@ func scanObservedAt(chunk *apitypes.ChecksScanResponse) time.Time {
 	return webhookRedriveNow()
 }
 
+// stuckChecksPastThreshold flattens the scan's uncompleted Check Runs to one
+// row per (PR, check), keeping only runs that have been sitting longer than
+// stuckAfter. A run whose start time is missing, unparseable, or in the
+// future (clock skew) is always kept with an "unknown" age — a start time
+// that cannot prove the run is young must not hide it.
 func stuckChecksPastThreshold(repo string, prs []apitypes.StuckCheckPR, stuckAfter time.Duration, now time.Time) []checksStuckCheck {
 	var out []checksStuckCheck
 	for _, pr := range prs {
