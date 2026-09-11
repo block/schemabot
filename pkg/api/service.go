@@ -829,6 +829,7 @@ func (s *Service) apiRoutes() []apiRoute {
 		{"GET /api/logs", s.handleLogsWithoutDatabase},
 		{"POST /api/webhooks/redrive", s.handleWebhookRedrive},
 		{"POST /api/checks/scan", s.handleChecksScan},
+		{"GET /api/checks/inspect", s.handleChecksInspect},
 		{"POST /api/checks/synthesize", s.handleChecksSynthesize},
 		{"POST /api/checks/repos", s.handleChecksRepos},
 

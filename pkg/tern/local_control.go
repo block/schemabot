@@ -1040,16 +1040,18 @@ func (c *LocalClient) settleStopForTasklessApply(ctx context.Context, targetAppl
 	return &ternv1.StopResponse{Accepted: true}, nil
 }
 
-// stopHandledUnlessStartPending reports a completed stop as handled unless a
-// start request is also pending, in which case it returns not-handled so the
+// stopStandsDownUnlessStartPending stands the drive down on a completed stop
+// unless a start request is also pending, in which case it reports false so the
 // caller resumes the apply from the queued start in the same claim. Without
 // this, a stop and a start that race into the same claim would consume only the
 // stop, leaving the apply stopped with a pending start that the claim
-// lease-freshness gate cannot re-claim until the lease goes stale.
-func (c *LocalClient) stopHandledUnlessStartPending(ctx context.Context, logger *slog.Logger, apply *storage.Apply) (bool, error) {
+// lease-freshness gate cannot re-claim until the lease goes stale. It is why
+// the drive's answer is about standing down rather than about the stop taking
+// effect: here the stop did take effect and the drive still keeps going.
+func (c *LocalClient) stopStandsDownUnlessStartPending(ctx context.Context, logger *slog.Logger, apply *storage.Apply) (standDown bool, err error) {
 	pendingStart, err := pendingStartControlRequest(ctx, c.storage, apply)
 	if err != nil {
-		return true, fmt.Errorf("check pending start request after stop for apply %s: %w", apply.ApplyIdentifier, err)
+		return false, fmt.Errorf("check pending start request after stop for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if pendingStart != nil {
 		logger.Info("pending stop completed but a start is queued; continuing to resume in the same claim",
@@ -1068,9 +1070,8 @@ func (c *LocalClient) stopHandledUnlessStartPending(ctx context.Context, logger 
 // running change settles itself through its own apply path. Returns
 // declined=false when the error is not an unsupported-operation decline, so
 // the caller applies its normal error handling. When declined=true the
-// operation did not take effect: a stop or cancel caller must report the
-// request as not handled, or the drive loop would mark the still-running
-// apply stopped.
+// operation did not take effect: a stop or cancel caller must keep its drive
+// going, or the drive loop would mark the still-running apply stopped.
 func (c *LocalClient) failPendingRequestForUnsupportedOperation(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, opErr error) (bool, error) {
 	unsupported, ok := engine.AsUnsupportedOperation(opErr)
 	if !ok {
@@ -1103,9 +1104,9 @@ func (c *LocalClient) failPendingRequestForUnsupportedOperation(ctx context.Cont
 // running unwatched. Failing it with the stated reason ends that loop and leaves
 // the operator a request whose answer they can read.
 //
-// The refusal means the operation did not take effect, so callers report the
-// request as not handled: the drive would otherwise record an operator stop or
-// cancel over a change that is still running.
+// The refusal means the operation did not take effect, so callers keep their
+// drive going: standing down would otherwise record an operator stop or cancel
+// over a change that is still running.
 func (c *LocalClient) failRefusedControlRequest(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, errorMessage string) error {
 	message := controlRefusalMessage(operation, errorMessage)
 	caller := controlRequestCaller(controlReq)
@@ -1122,7 +1123,18 @@ func (c *LocalClient) failRefusedControlRequest(ctx context.Context, logger *slo
 	return nil
 }
 
-func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply) (bool, error) {
+// processPendingStopControlRequest consumes a durable stop request against this
+// apply. Its return answers one question, and it is a question about the drive
+// rather than about the request: whether this drive must stand down and let the
+// apply settle. Whether the request was resolved is a separate fact the return
+// does not carry, and the two come apart in both directions — a refusal
+// resolves the request and keeps the drive going, an accepted stop can stand
+// the drive down while leaving the request pending on purpose. Nor does the
+// return mean the stop took effect: a completed stop with a start already
+// queued keeps the drive going so the same claim resumes from it. So a new
+// branch owes the drive an answer about its own disposition, not about its
+// bookkeeping.
+func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply) (standDown bool, err error) {
 	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop)
 	if err != nil {
 		return false, err
@@ -1134,14 +1146,14 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 	// filterable by apply_id/repo/pr without hand-listing the attrs per call.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	if completed, err := completePendingRequestIfStoredApplyResolved(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
-		return true, err
+		return false, err
 	} else if completed {
 		logger.Info("completing pending stop request for resolved apply",
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending stop request completed for resolved apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
-		return c.stopHandledUnlessStartPending(ctx, logger, apply)
+		return c.stopStandsDownUnlessStartPending(ctx, logger, apply)
 	}
 	if state.IsTerminalApplyState(apply.State) {
 		logger.Info("completing pending stop request for terminal apply",
@@ -1150,9 +1162,9 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending stop request completed for terminal apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
-			return true, err
+			return false, err
 		}
-		return c.stopHandledUnlessStartPending(ctx, logger, apply)
+		return c.stopStandsDownUnlessStartPending(ctx, logger, apply)
 	}
 
 	// A revert-phase apply has already cut over. Stop is a permanent rejection,
@@ -1160,7 +1172,7 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 	// so the operator-owned retry loop stops re-running stop. The operator must
 	// revert (undo) or skip-revert (finalize), or wait out an in-flight revert.
 	if revertPhase, err := c.applyRevertPhaseBlock(ctx, apply); err != nil {
-		return true, err
+		return false, err
 	} else if revertPhase != "" {
 		message := revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase)
 		logger.Warn("rejecting pending stop request: schema change is in a revert phase and has already cut over",
@@ -1170,9 +1182,15 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending stop request rejected: %s%s", message, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop, message); err != nil {
-			return true, err
+			// Whether or not the request resolved, the refusal already decided
+			// that nothing was stopped, so the drive is owed the same answer.
+			return false, fmt.Errorf("process pending stop for apply %s: refused with %q; fail pending stop request: %w", apply.ApplyIdentifier, message, err)
 		}
-		return true, nil
+		// The request is resolved, but no stop took effect: the change is applied
+		// and its revert phase is still running against the database. Standing the
+		// drive down here would settle the apply stopped, contradicting what the
+		// engine is still doing underneath.
+		return false, nil
 	}
 
 	stopCtx := context.WithoutCancel(ctx)
@@ -1195,13 +1213,13 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 	if !resp.Accepted {
 		// The refusal is the answer, so resolve the request on it. Returning an
 		// error would leave the request pending and every later claim would
-		// collect the same refusal while the schema change kept running.
-		// Report the stop as not handled: none took effect.
+		// collect the same refusal while the schema change kept running. The
+		// drive keeps going: no stop took effect.
 		return false, c.failRefusedControlRequest(stopCtx, logger, apply, storage.ControlOperationStop, storage.LogEventStopRequested, controlReq, resp.ErrorMessage)
 	}
 	completed, err := completePendingRequestIfStoredApplyResolved(stopCtx, c.storage, apply, storage.ControlOperationStop)
 	if err != nil {
-		return true, err
+		return false, err
 	}
 	if !completed {
 		// The stop was accepted but the apply row has not settled — the settle
@@ -1218,7 +1236,11 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 	return true, nil
 }
 
-func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, apply *storage.Apply) (bool, error) {
+// processPendingCancelControlRequest consumes a durable cancel request against
+// this apply. Its return follows the same contract as the stop counterpart:
+// standDown reports what this drive must do, which is independent of both
+// whether the request was resolved and whether a cancel took effect.
+func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, apply *storage.Apply) (standDown bool, err error) {
 	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationCancel)
 	if err != nil {
 		return false, err
@@ -1235,12 +1257,12 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending cancel request completed for terminal apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
-			return true, err
+			return false, err
 		}
 		return true, nil
 	}
 	if revertPhase, err := c.applyRevertPhaseBlock(ctx, apply); err != nil {
-		return true, err
+		return false, err
 	} else if revertPhase != "" {
 		message := revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase)
 		logger.Warn("rejecting pending cancel request: schema change is in a revert phase and has already cut over",
@@ -1248,9 +1270,13 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending cancel request rejected: %s%s", message, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel, message); err != nil {
-			return true, err
+			// See the stop counterpart: the refusal already decided nothing was
+			// cancelled, so a failed write does not change the drive's answer.
+			return false, fmt.Errorf("process pending cancel for apply %s: refused with %q; fail pending cancel request: %w", apply.ApplyIdentifier, message, err)
 		}
-		return true, nil
+		// See the stop counterpart: the request is resolved and nothing was
+		// cancelled, so the drive must not stand down over it.
+		return false, nil
 	}
 
 	cancelCtx := context.WithoutCancel(ctx)
@@ -1272,12 +1298,12 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 	}
 	if !resp.Accepted {
 		// See the stop counterpart: the refusal resolves the request, and the
-		// cancel is reported as not handled because none took effect.
+		// drive keeps going because no cancel took effect.
 		return false, c.failRefusedControlRequest(cancelCtx, logger, apply, storage.ControlOperationCancel, storage.LogEventCancelRequested, controlReq, resp.ErrorMessage)
 	}
 	completed, err := completePendingRequestIfStoredApplyResolved(cancelCtx, c.storage, apply, storage.ControlOperationCancel)
 	if err != nil {
-		return true, err
+		return false, err
 	}
 	if !completed {
 		// The cancel was accepted but the apply row has not settled — the settle
@@ -1293,9 +1319,13 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 	return true, nil
 }
 
-func (c *LocalClient) processPendingCancelOrStopControlRequest(ctx context.Context, apply *storage.Apply) (bool, error) {
-	if handled, err := c.processPendingCancelControlRequest(ctx, apply); handled || err != nil {
-		return handled, err
+// processPendingCancelOrStopControlRequest consumes whichever of the two the
+// operator issued, cancel first because it is the stronger intent. standDown
+// carries whichever processor answered, so the drive stands down only when the
+// apply is really settling stopped or cancelled.
+func (c *LocalClient) processPendingCancelOrStopControlRequest(ctx context.Context, apply *storage.Apply) (standDown bool, err error) {
+	if standDown, err := c.processPendingCancelControlRequest(ctx, apply); standDown || err != nil {
+		return standDown, err
 	}
 	return c.processPendingStopControlRequest(ctx, apply)
 }

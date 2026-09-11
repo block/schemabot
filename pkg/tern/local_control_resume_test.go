@@ -777,6 +777,35 @@ func TestResumeApplyPlanLoadStorageErrorStaysRecoverable(t *testing.T) {
 	assert.Empty(t, observer.terminal, "a transient plan-load failure must not notify the terminal observer")
 }
 
+// A resume claim that finds a pending cancel against a schema change already
+// holding its revert window refuses the cancel — and then keeps going. The
+// refusal resolved the operator's request but paused nothing, so the claim
+// still owes the apply the resume it was admitted for; a drive that exited on
+// the refusal would strand a live revert window with no drive watching it
+// (CO-5). The resume is proven to have continued by the plan-load failure it
+// runs into, which a drive that had stood down would never reach.
+func TestResumeApplyContinuesPastARefusedCancelInTheRevertWindow(t *testing.T) {
+	storageErr := errors.New("storage unavailable")
+	client, apply, tasks, _ := recoveryPlanLoadFixture(&scriptedPlanStore{err: storageErr})
+	tasks[0].State = state.Task.RevertWindow
+	requests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	}}}
+	client.storage.(*exactProgressStorage).controlRequests = requests
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, tasks, nil, false, false)
+
+	require.ErrorIs(t, err, storageErr, "the resume must have continued past the refusal to reach the plan load")
+	assert.Equal(t, state.Task.RevertWindow, tasks[0].State, "the cut-over task keeps its revert window")
+	resolved, err := requests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, storage.ControlRequestFailed, resolved.Status, "the operator's cancel is refused, not left pending")
+}
+
 // A confirmed-missing plan row (a nil plan with no read error) is
 // unrecoverable — the reviewed DDL cannot be rebuilt — so recovery fails the
 // apply with an operator-facing reason and notifies its terminal observer.
