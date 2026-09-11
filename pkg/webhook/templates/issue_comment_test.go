@@ -255,3 +255,23 @@ func TestRenderRevertCommandAccepted(t *testing.T) {
 	assert.Contains(t, rendered, "@alice")
 	assert.Contains(t, rendered, "SchemaBot will undo this schema change")
 }
+
+// The reply to a command no deployment claimed has to do more than say the
+// apply is unknown: the operator got here by pasting an identifier that looked
+// authoritative, so the message names where identifiers that do resolve come
+// from, and that an engine's own identifiers are not among them (UX-4).
+func TestRenderUnclaimedControlCommand(t *testing.T) {
+	rendered := RenderUnclaimedControlCommand(UnclaimedControlCommandData{
+		Command:     "start",
+		ApplyID:     "apply-49ea5a453e9a4f18",
+		Environment: "production",
+		RequestedBy: "alice",
+	})
+	assert.Contains(t, rendered, "No Schema Change Matched This Command")
+	assert.Contains(t, rendered, "`apply-49ea5a453e9a4f18`")
+	assert.Contains(t, rendered, "`production`")
+	assert.Contains(t, rendered, "@alice")
+	assert.Contains(t, rendered, "`start` acted on nothing")
+	assert.Contains(t, rendered, "schemabot status -e production")
+	assert.Contains(t, rendered, "Identifiers reported by a database engine are its own")
+}

@@ -99,15 +99,18 @@ func (h *Handler) loadApplyForPRControl(ctx context.Context, repo string, pr int
 		// On an aggregate repo an unscoped control command fans out to every
 		// deployment, but the apply lives in exactly one tenant's storage. A
 		// deployment that doesn't have it is not the owner and stays silent so
-		// only the owning deployment answers.
+		// only the owning deployment answers. When no deployment owns it, that
+		// leaves the command unanswered, so the leader follows up once it can
+		// see that nothing claimed the comment.
 		if h.silentOnUnscopedFanOut(repo, result.Tenant) {
-			h.logger.Info("unscoped fan-out control command targets an apply not stored on this deployment; staying silent so the owning deployment responds",
+			h.logger.Info("unscoped fan-out control command targets an apply not stored on this deployment; deferring to the deployment that owns it",
 				"command", command,
 				"repo", repo,
 				"pr", pr,
 				"apply_id", result.ApplyID,
 				"environment", result.Environment,
 				"requested_by", requestedBy)
+			h.answerUnclaimedControlCommand(repo, pr, installationID, requestedBy, command, result)
 			return nil, false
 		}
 		h.logger.Warn("PR control command rejected because apply was not found",
