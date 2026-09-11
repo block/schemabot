@@ -138,11 +138,11 @@ func ConnectionDSN(dsn string, opts ...Option) (string, error) {
 	// the required settings and options directly to the parsed config and
 	// reassemble.
 	if cfg.TLSConfig != "" {
-		return requiredSettingsDSN(cfg, opts...), nil
+		return requiredSettingsDSN(cfg, opts...)
 	}
 	tlsMode, ok := tlsModeForHost(cfg.Addr)
 	if !ok {
-		return requiredSettingsDSN(cfg, opts...), nil
+		return requiredSettingsDSN(cfg, opts...)
 	}
 	dbConfig := dbconn.NewDBConfig()
 	dbConfig.TLSMode = tlsMode
@@ -156,7 +156,7 @@ func ConnectionDSN(dsn string, opts ...Option) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("parse enhanced DSN: %w", err)
 	}
-	return requiredSettingsDSN(enhanced, opts...), nil
+	return requiredSettingsDSN(enhanced, opts...)
 }
 
 // requiredSettingsDSN applies any caller-supplied options, then default
@@ -167,7 +167,7 @@ func ConnectionDSN(dsn string, opts ...Option) (string, error) {
 // timeout wins while zero ("no timeout") and negative values — which the
 // driver would silently treat as unbounded — are replaced: a managed
 // connection is never unbounded.
-func requiredSettingsDSN(cfg *mysql.Config, opts ...Option) string {
+func requiredSettingsDSN(cfg *mysql.Config, opts ...Option) (string, error) {
 	for _, opt := range opts {
 		opt(cfg)
 	}
@@ -176,6 +176,18 @@ func requiredSettingsDSN(cfg *mysql.Config, opts ...Option) string {
 	}
 	if cfg.WriteTimeout <= 0 {
 		cfg.WriteTimeout = defaultWriteTimeout
+	}
+	// Read a signed TINYINT(1) as the number it is rather than as a Go bool,
+	// which the driver does by default. The (1) is a display width, not a
+	// range: the column holds -128..127, so the mapping answers true for every
+	// non-zero value and the stored number is gone before the caller sees it.
+	// SchemaBot's own boolean columns are unharmed — they hold 0 or 1 and
+	// database/sql converts the number back on a bool scan, which now also
+	// rejects a value no bool can represent instead of reading it as true. The
+	// setting matters for target databases, whose tinyint(1) columns are
+	// application data this package must hand back unaltered.
+	if err := cfg.Apply(mysql.TinyInt1IsBool(false)); err != nil {
+		return "", fmt.Errorf("disable TINYINT(1) bool mapping: %w", err)
 	}
 	// Interpolate query parameters client-side instead of using server-side
 	// prepared statements. database/sql prepares, executes once, and closes on
@@ -186,7 +198,7 @@ func requiredSettingsDSN(cfg *mysql.Config, opts ...Option) string {
 	// values and refuses to interpolate under charsets where escaping is
 	// unsafe.
 	cfg.InterpolateParams = true
-	return cfg.FormatDSN()
+	return cfg.FormatDSN(), nil
 }
 
 func tlsModeForHost(addr string) (string, bool) {
