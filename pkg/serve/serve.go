@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -87,6 +88,42 @@ func WithBuildInfo(version, commit, date string) Option {
 		o.commit = commit
 		o.date = date
 	}
+}
+
+const (
+	schemabotModulePath = "github.com/block/schemabot"
+	// unknownModuleVersion keeps the log field present when the module graph
+	// cannot name a version, so a query for the field never silently misses a
+	// pod that is running an unidentifiable build.
+	unknownModuleVersion = "unknown"
+)
+
+// moduleVersion reports the SchemaBot version recorded in the running binary's
+// module graph. It resolves only when SchemaBot is a dependency of the main
+// module, which is exactly the embedded case.
+func moduleVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return unknownModuleVersion
+	}
+	return versionFromBuildInfo(info)
+}
+
+// versionFromBuildInfo finds SchemaBot's version among the main module's
+// dependencies. A replace directive wins, so a host pinning a fork or a local
+// path is reported as what it actually runs rather than as the version it
+// nominally requires.
+func versionFromBuildInfo(info *debug.BuildInfo) string {
+	for _, dep := range info.Deps {
+		if dep == nil || dep.Path != schemabotModulePath {
+			continue
+		}
+		if dep.Replace != nil {
+			return dep.Replace.Version
+		}
+		return dep.Version
+	}
+	return unknownModuleVersion
 }
 
 type webhookRuntime struct {
@@ -296,6 +333,13 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		opt(&o)
 	}
 	logger := o.logger
+	if o.version == "" {
+		// A host binary that embeds SchemaBot supplies its own logger and has no
+		// reason to know SchemaBot's version. Read it from the module graph, which
+		// is where an embedded dependency's version lives, so every log line
+		// identifies which SchemaBot the pod is running.
+		logger = logger.With("schemabot_version", moduleVersion())
+	}
 	logger.Info("building server", "version", o.version, "commit", o.commit, "built", o.date)
 
 	// Register PlanetScale mTLS before anything else so a worker with
