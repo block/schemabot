@@ -61,10 +61,14 @@ SchemaBot already builds around that contract:
 - `liveTables` deliberately excludes `relispartition` children because a
   partition is declared through its parent.
 
-The [PostgreSQL guide](postgresql.md#index-builds) documents the same current
-boundary: a parent-level build is permanently refused, an ordinary concurrent
-build uses `postgres.concurrent_index_max_duration`, progress comes from
-pg-sprite's tracker, and a later drive recovers proven abandoned debris.
+The PostgreSQL guide documents the same current boundary. Its
+[Partitioned tables](postgresql.md#partitioned-tables) section records that a
+parent-level build is refused today with pg-sprite's typed
+`capability-boundary` refusal, a class that names a planned capability rather
+than a permanent rule. Its [Index builds](postgresql.md#index-builds) section
+records that an ordinary concurrent build uses
+`postgres.concurrent_index_max_duration`, progress comes from pg-sprite's
+tracker, and a later drive recovers proven abandoned debris.
 
 The contract this design preserves is therefore:
 
@@ -83,8 +87,11 @@ The design relies on these documented PostgreSQL semantics:
   [CREATE INDEX — Building Indexes Concurrently](https://www.postgresql.org/docs/current/sql-createindex.html#SQL-CREATEINDEX-CONCURRENTLY).
 - Concurrent index creation is not supported directly on a partitioned table.
   `CREATE INDEX ... ON ONLY` does not recurse and marks the parent index
-  invalid. Per-partition indexes may be built concurrently and attached; the
-  parent becomes valid after every partition has a matching attached index.
+  invalid when the parent has at least one direct partition; on a parent with
+  none it is valid on commit, and a partition created or attached later gets
+  a matching index through PostgreSQL's own recursion. Per-partition indexes
+  may be built concurrently and attached; the parent becomes valid after every
+  partition has a matching attached index.
   See [CREATE INDEX — Notes](https://www.postgresql.org/docs/current/sql-createindex.html)
   and [Table Partitioning — Partition Maintenance](https://www.postgresql.org/docs/current/ddl-partitioning.html#DDL-PARTITIONING-DECLARATIVE-MAINTENANCE).
 - `ALTER INDEX parent ATTACH PARTITION child` requires the child index to be on
@@ -166,8 +173,8 @@ detached partition changes which children are required for validity.
 | 8 | Cancellation stops at the active partition, cleans only that build's proven leftover, and leaves already attached children attached. |
 | 9 | Any partition topology change from the admitted snapshot stops the flow with a typed, retryable drift result; it never silently changes `N`. The snapshot fingerprints each direct partition's OID, bound expression, and attachment state. |
 | 10 | SchemaBot displays and drives the work as one logical plan step, with one lease and one final outcome. |
-| 11 | Admission refuses an empty topology and more than 1,024 direct partitions before calculating a deadline. |
-| 12 | SchemaBot durably records the admitted parent table OID and the parent index OID once created; every drive requires both identities to resolve before mutation. |
+| 11 | Admission refuses more than 1,024 direct partitions and a flow deadline that would exceed the configured flow ceiling, both before the first mutation. A parent with no direct partitions is admitted: its shell is valid on commit, and the flow ends at final verification. |
+| 12 | SchemaBot durably records the admitted parent table OID and the requested parent index name before the first mutation, and the parent index OID once it is known. Every drive requires the table OID to resolve; a drive without a recorded index OID may resolve the parent index by name under that table-OID proof, requiring an invalid parent with the equivalent definition, and records the OID before continuing. Any identity that resolves to the wrong object refuses mutation. |
 
 ## Ownership: pg-sprite owns the sequence
 
@@ -238,6 +245,19 @@ the admitted parent table with the expected definition. Attachment is
 conditional on that proof. A missing, replaced, or redefined parent fails
 closed rather than allowing name-based SQL to mutate a same-named replacement;
 this is the partition flow's ownership contract under RF-6.
+
+The index OID is durable only once the caller has recorded it, and
+`CREATE INDEX ON ONLY` commits in its own transaction, so a crash between that
+commit and the durable write leaves a real invalid parent that no recorded OID
+names. The requested parent index name, recorded before the first mutation,
+is the identity that bridges that window. A drive that arrives with the table
+OID and the name but no index OID resolves the name under the table-OID proof
+and adopts the object only when it is an invalid index on the admitted parent
+whose definition is equivalent to the requested one; it then records the OID
+before any further mutation. The name is never sufficient on its own: a valid
+index, a non-equivalent definition, an index on another table, or a
+constraint-backed occupant under that name is the same fail-closed occupant
+case as any other name collision.
 
 Each transition is catalog-driven:
 
@@ -312,23 +332,48 @@ building index: 25% of blocks (2,500/10,000)
 
 The table and partition text is sanitized and clamped before reaching GitHub.
 When no server progress row is visible, the comment still shows partition
-position and phase without inventing a percentage.
+position and phase without carrying a previous partition's percentage forward.
+
+The apply-level percent changes contract. Today `retainRunningPercent` floors
+the percent monotonically per progress record on the stated precondition that a
+record hosts one build, and `executorProgressMetadata` lets the percent a
+result already carries stand whenever no server row is visible. Under this
+flow one record hosts `N` builds, so a per-build percent would either regress
+at every partition boundary or, floored, freeze at the previous child's last
+reading. The flow therefore reports one flow-level percent,
+`(k − 1 + childFraction) / N`, where `childFraction` is zero before partition
+`k`'s build starts, the band-scaled fraction from the server row while it is in
+flight, and one once that child is verified and attached. That quantity is
+monotonic across the whole sequence, so the existing floor stays correct without a
+per-partition reset, and the 25% in the example is the child's own fraction
+shown beside the flow-level position rather than the apply row's percent. The
+precondition on `retainRunningPercent` and the pass-through rule in
+`executorProgressMetadata` are updated in the same change that adopts the
+flow call, and the pg-sprite snapshot carries `k`, `N`, and the child fraction
+so SchemaBot derives the flow-level value rather than reconstructing it.
 
 ## Recovery and cancellation
 
 A new driver does not need a separately persisted child cursor. SchemaBot does,
-however, persist the admitted parent table OID and the parent index OID after
-shell creation in the durable apply request. Every drive supplies those
-identities to the executor. If either identity is unavailable or no longer
-resolves to the expected object, the apply refuses mutation and requires a
-fresh plan and apply. This preserves RC-4's durable-request recovery contract
-without making a child cursor authoritative. Subject to those identity proofs,
-the live catalog is the child checkpoint:
+however, persist the admitted parent table OID and the requested parent index
+name in the durable apply request before the first mutation, and the parent
+index OID as soon as shell creation has committed. Every drive supplies those
+identities to the executor. The table OID must resolve on every drive. A drive
+with no recorded index OID resolves the requested name under the table-OID
+proof and adopts only an invalid, definition-equivalent parent index, recording
+its OID before continuing; a drive whose recorded index OID no longer resolves,
+or whose identity resolves to a different object, refuses mutation and
+requires a fresh plan and apply. This keeps recovery on the proven side of
+RC-4: anything uncertain keeps blocking for an operator, and nothing self-heals
+without proof. Subject to those identity proofs, the live catalog is the child
+checkpoint:
 
 | Observed state | Re-drive action |
 | --- | --- |
-| Parent absent, admitted table identity resolves, and no parent index OID has yet been recorded | Start with `CREATE INDEX ON ONLY`, then durably record its OID before continuing. |
-| Parent absent after its OID was recorded, or either durable identity is unavailable or does not resolve | Refuse mutation; require a fresh plan and apply. |
+| No parent index OID recorded; admitted table identity resolves; the requested name is unoccupied on that table | Start with `CREATE INDEX ON ONLY`, then durably record its OID before continuing. |
+| No parent index OID recorded; admitted table identity resolves; the requested name resolves to an invalid, definition-equivalent index on that table | Adopt it: durably record its OID, then continue as an invalid equivalent parent. |
+| No parent index OID recorded; the requested name resolves to a valid index, a non-equivalent definition, an index on another table, or a constraint-backed occupant | Refuse mutation with the existing typed occupant refusal; require a fresh plan and apply. The one exception is an admitted `N` of zero, where a valid, definition-equivalent index on the admitted table is the completed shell: record its OID and proceed to final verification. |
+| Recorded parent index OID does not resolve, resolves to an object on another table, or the admitted table identity is unavailable or does not resolve | Refuse mutation; require a fresh plan and apply. |
 | Invalid equivalent parent, no attached children | Resume it; drop only through a future explicit parent-abandonment proof if the requested definition no longer exists. |
 | Invalid equivalent parent, some children attached | Treat attached children as complete and continue in catalog order. |
 | Invalid deterministic child | Use the existing `RebuildAbandonedIndex` proof; never drop by prefix or name alone. |
@@ -361,21 +406,36 @@ catalog before acting.
 
 ## Refusal boundary
 
-The first implementation keeps these shapes refused:
+The first implementation keeps these shapes refused. Today pg-sprite's
+`RefusesPartitionedParent` derives a partitioned-parent cause from the
+statement alone, so every index build on a partitioned parent reports
+`parent-blocking-index-build` or `parent-concurrent-index-build` regardless of
+shape, and the `--accept-blocking` eligibility registry keys on that cause.
+Lifting the two missing-flow causes "only for admitted shapes" is therefore not
+expressible until each refused shape has a cause of its own. The `Cause`
+column names the cause each row reports once the flow ships; the row that
+reuses an existing cause says so, and the drift row is an executor result
+rather than an admission refusal.
 
-| Shape | Reason |
-| --- | --- |
-| Parent with no direct partitions (`parent-empty-topology`) | The shell cannot become valid, so the flow cannot meet its success contract. |
-| Parent with more than 1,024 direct partitions (`parent-partition-limit`) | The concrete admission ceiling bounds drive duration, catalog work, and progress cardinality before deadline calculation. |
-| Unique index that omits any partition-key column, or whose partition key uses an expression | PostgreSQL cannot enforce the requested cross-partition uniqueness. |
-| Primary-key and other constraint creation or adoption paths | Constraint-backed parent indexes remain outside this executor's ownership contract. |
-| Expression or partial index | PostgreSQL supports concurrent builds of these shapes, but v1 refuses until definition equivalence, immutable expression rendering, predicate comparison, and attach tests are pinned end to end. |
-| Sub-partitioned direct child or a hierarchy deeper than one level | One-level ownership is explicit; recursive topology snapshots, nested parent validity, progress, and cancellation need a separate design. |
-| Foreign partition | Local concurrent-build, progress, and validity assumptions do not apply. |
-| Unnamed parent index, `IF NOT EXISTS`, or a name occupied by a non-equivalent relation | These shapes prevent deterministic identity and verified convergence. |
-| Constraint adoption or an index already backing a constraint | `ADD CONSTRAINT ... USING INDEX` on a partitioned parent remains a separate unsupported PostgreSQL boundary. |
-| Partition added, attached, detached, replaced, or left pending detach during the sequence | Topology no longer matches admission; stop with typed retryable drift instead of silently changing scope. |
-| Any access method, option, collation, operator class, `INCLUDE`, tablespace, or predicate whose equivalent child definition cannot be proved | Attachment equivalence is a prerequisite, not a best effort. |
+| Shape | Cause | Reason |
+| --- | --- | --- |
+| Parent with more than 1,024 direct partitions | `parent-partition-limit` | The concrete admission ceiling bounds drive duration, catalog work, and progress cardinality before deadline calculation. |
+| Unique index that omits any partition-key column, or whose partition key uses an expression | `parent-unique-key-coverage` | PostgreSQL cannot enforce the requested cross-partition uniqueness. |
+| Primary-key and other constraint creation paths | `parent-constraint-index-build` | Constraint-backed parent indexes remain outside this executor's ownership contract. |
+| Expression or partial index | `parent-index-shape-unpinned` | PostgreSQL supports concurrent builds of these shapes, but v1 refuses until definition equivalence, immutable expression rendering, predicate comparison, and attach tests are pinned end to end. |
+| Sub-partitioned direct child or a hierarchy deeper than one level | `parent-nested-topology` | One-level ownership is explicit; recursive topology snapshots, nested parent validity, progress, and cancellation need a separate design. |
+| Foreign partition | `parent-foreign-partition` | Local concurrent-build, progress, and validity assumptions do not apply. |
+| Unnamed parent index, `IF NOT EXISTS`, or a name occupied by a non-equivalent relation | `parent-index-identity` | These shapes prevent deterministic identity and verified convergence. |
+| Constraint adoption or an index already backing a constraint | `parent-index-adoption` (existing) | `ADD CONSTRAINT ... USING INDEX` on a partitioned parent remains a separate unsupported PostgreSQL boundary. |
+| Partition added, attached, detached, replaced, or left pending detach during the sequence | `parent-topology-drift` (retryable, reported by the executor rather than admission) | Topology no longer matches admission; stop with typed retryable drift instead of silently changing scope. |
+| Any access method, option, collation, operator class, `INCLUDE`, tablespace, or predicate whose equivalent child definition cannot be proved | `parent-definition-equivalence` | Attachment equivalence is a prerequisite, not a best effort. |
+
+The cause names are this record's proposal; the pg-sprite change that
+introduces them owns the final spelling and their refusal classes. What the
+record pins is the shape of the taxonomy: one cause per refused shape, derived
+from the catalog snapshot and the parsed definition rather than from the
+statement kind alone, so that the eligibility registry and the capability
+matrix can decide each shape separately.
 
 The operational prerequisite is that partition-maintenance automation is
 paused for the duration. pg-sprite can detect cooperative or external drift,
@@ -387,10 +447,28 @@ limit; it does not claim to undo the external statement.
 The proposed pg-sprite `--accept-blocking` design makes today's
 `parent-blocking-index-build` refusal eligible for an explicit bounded blocking
 run. Once this partition-aware flow ships, the missing capability no longer
-exists for admitted shapes, so that eligibility registry row must be removed in
-the same pg-sprite release. Shapes refused by this new boundary do not inherit
-blocking eligibility automatically; each would require a separate deliberate
-policy decision.
+exists for admitted shapes, and with the per-shape causes above the two
+missing-flow causes are no longer reported for any shape: admitted shapes run
+the flow, and every refused shape reports its own cause. The
+`parent-blocking-index-build` eligibility row is therefore removed in the same
+pg-sprite release rather than narrowed. Because the registry is total over the
+cause vocabulary and its completeness tests reject an undecided cause, each new
+cause receives an explicit eligibility decision in that release. This record's
+default is ineligible for all of them.
+
+That default closes a gap honestly rather than hiding it. Under the proposed
+design, a pg-sprite CLI user with a shape the flow refuses in v1 but PostgreSQL
+can build with a blocking statement, such as an expression or partial index or
+a constraint-backed primary key, would take the `--accept-blocking` escape
+hatch through the shared `parent-blocking-index-build` row; after the release
+those shapes report `parent-index-shape-unpinned` or
+`parent-constraint-index-build` and have no escape hatch until they are
+admitted in a later step. The escape hatch is a pg-sprite CLI affordance only;
+SchemaBot has never exposed `--accept-blocking`, so its users lose nothing at
+that step. Granting blocking eligibility to a new cause is a deliberate policy
+decision for the pg-sprite release that introduces it, made per cause and
+recorded in its refusal taxonomy, not something a shape inherits from the row
+it used to share.
 
 ## Plan, admission, lease, and envelope
 
@@ -407,9 +485,14 @@ table-size gate: the parent has no storage, and each leaf uses the online
 concurrent path. Plan output may show partition count and per-partition sizes as
 advisory estimates, but apply re-reads them.
 
-Admission occurs before deadline calculation. `N = 0` returns the typed
-`parent-empty-topology` refusal, because an empty shell cannot become valid;
-`N > 1,024` returns `parent-partition-limit`. The 1,024-partition ceiling keeps
+Admission occurs before deadline calculation. `N = 0` is admitted, not
+refused: PostgreSQL marks an `ON ONLY` parent index invalid only when the
+parent has direct partitions, so on an empty parent the shell is valid on
+commit, the per-partition loop is empty, and the flow proceeds straight to
+final verification, which the same catalog read satisfies. A partition created
+or attached afterwards gets its matching index through PostgreSQL's own
+recursion, outside this flow. `N > 1,024` returns `parent-partition-limit`.
+The 1,024-partition ceiling keeps
 the worst-case serial drive, catalog verification, and progress cardinality
 finite while covering established time- and hash-partitioning layouts. All
 deadline arithmetic is checked and saturating, so multiplication or headroom
@@ -455,11 +538,13 @@ Implementation is a later cycle; this record changes no runtime behavior.
    existing concurrent build, abandoned-index rebuild/drop, cancellation, and
    catalog verification rather than exposing raw sequence steps to callers.
 3. Update pg-sprite capabilities, limitations, refusal taxonomy, progress
-   format, and RF-6 enforcement. Lift the two missing-flow refusal causes only
-   for admitted shapes.
-4. Remove the admitted partitioned-parent row from `--accept-blocking`
-   eligibility in the same release; retain explicit blocking policy only for
-   shapes still independently classified for it.
+   format, and RF-6 enforcement. Replace the two missing-flow refusal causes
+   with the per-shape causes in the refusal boundary table, so admitted shapes
+   run the flow and every refused shape reports its own cause.
+4. Remove the `parent-blocking-index-build` row from `--accept-blocking`
+   eligibility in the same release and give each new cause its explicit
+   ineligible decision, so the registry's completeness tests pass. Any blocking
+   eligibility for a new cause is a separate, recorded policy decision.
 5. Pin that pg-sprite release in SchemaBot. Extend classification, progress
    metadata, PR rendering, cancel tests, and the `concurrentIndexExecutor` seam
    for the one flow call.

@@ -263,8 +263,10 @@ reconcile that live prefix when the refusal has none.
 The target preflight accepts ordinary tables, leaf partitions, and partitioned
 parents. pg-sprite also defines specific refusals for parent-level index
 builds, index adoption, and `NOT VALID` foreign keys on PostgreSQL versions
-before 18. The SchemaBot PostgreSQL apply path invokes that partition-specific
-admission check immediately before execution. Unsupported changes to a
+before 18. The SchemaBot PostgreSQL apply path's table-change ladder invokes
+that partition-specific admission check immediately before execution; a
+`CREATE TABLE` returns from the optimistic path before the ladder and does not
+reach it. Unsupported changes to a
 partitioned parent therefore fail with pg-sprite's typed refusal rather than a
 raw server error; they remain outside the supported SchemaBot envelope even if
 a plan is otherwise shown as native.
