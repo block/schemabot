@@ -24,6 +24,7 @@ import (
 	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/progress"
 	"github.com/block/pg-sprite/pkg/router"
+	"github.com/block/pg-sprite/pkg/schemadiff"
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
 	spirittable "github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
@@ -753,9 +754,10 @@ type liveTable struct {
 	referencedBy []string
 }
 
-// liveTables lists the tables in the namespace whose definition is their own,
-// in name order, as the catalog names them; the caller decides which of them
-// a schema file is expected to declare.
+// liveTables lists the tables pg-sprite's declarative model manages, in name
+// order, with the foreign key metadata SchemaBot needs to explain blocked
+// drops. The caller decides which managed tables policy exempts from a schema
+// file.
 //
 // Tables whose definition lives elsewhere are omitted. A partition is declared
 // through its parent's PARTITION BY and has no file of its own, so it follows
@@ -766,13 +768,25 @@ type liveTable struct {
 // unlogged tables are ordinary tables with definitions of their own, so they
 // are listed and must carry their own file.
 //
-// The query names every catalog relation, function and operator with an
-// explicit pg_catalog qualification: search_path may list a user schema before
-// pg_catalog, and a user relation named pg_class — or a user operator named
-// = — would otherwise shadow the catalog and turn a fail-closed enumeration
-// into a silent empty set. This protects SchemaBot's own read; pg-sprite's
-// introspection pins its own transaction-local search_path.
+// ListManagedTables is the authoritative table-set query and pg_catalog
+// qualifies every relation, operator, and type so search_path shadowing cannot
+// change its answer. The separate query here only decorates those returned
+// names with constraint metadata and carries the same qualification.
 func liveTables(ctx context.Context, pool *pgxpool.Pool, namespace string) ([]liveTable, error) {
+	names, err := schemadiff.ListManagedTables(ctx, pool, namespace)
+	if err != nil {
+		return nil, fmt.Errorf("list declarable tables in namespace %q: %w", namespace, err)
+	}
+	tables := make([]liveTable, len(names))
+	byName := make(map[string]*liveTable, len(names))
+	for i, name := range names {
+		tables[i].name = name
+		byName[name] = &tables[i]
+	}
+	if len(names) == 0 {
+		return tables, nil
+	}
+
 	rows, err := pool.Query(ctx, `
 		SELECT c.relname,
 		       COALESCE((SELECT pg_catalog.array_agg(con.conname ORDER BY con.conname)
@@ -787,27 +801,24 @@ func liveTables(ctx context.Context, pool *pgxpool.Pool, namespace string) ([]li
 		FROM pg_catalog.pg_class c
 		JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
 		WHERE n.nspname OPERATOR(pg_catalog.=) $1
-		  AND (c.relkind OPERATOR(pg_catalog.=) 'r' OR c.relkind OPERATOR(pg_catalog.=) 'p')
-		  AND NOT c.relispartition
-		  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
-		                  WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass
-		                    AND d.objid OPERATOR(pg_catalog.=) c.oid
-		                    AND d.deptype OPERATOR(pg_catalog.=) 'e')
-		ORDER BY c.relname`, namespace)
+		  AND c.relname OPERATOR(pg_catalog.=) ANY($2::pg_catalog.text[])
+		ORDER BY c.relname`, namespace, names)
 	if err != nil {
-		return nil, fmt.Errorf("list live tables in namespace %q: %w", namespace, err)
+		return nil, fmt.Errorf("list foreign keys for declarable tables in namespace %q: %w", namespace, err)
 	}
 	defer rows.Close()
-	var tables []liveTable
 	for rows.Next() {
-		var live liveTable
-		if err := rows.Scan(&live.name, &live.foreignKeys, &live.referencedBy); err != nil {
-			return nil, fmt.Errorf("scan live table in namespace %q: %w", namespace, err)
+		var name string
+		var foreignKeys, referencedBy []string
+		if err := rows.Scan(&name, &foreignKeys, &referencedBy); err != nil {
+			return nil, fmt.Errorf("scan foreign keys for declarable table in namespace %q: %w", namespace, err)
 		}
-		tables = append(tables, live)
+		live := byName[name]
+		live.foreignKeys = foreignKeys
+		live.referencedBy = referencedBy
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate live tables in namespace %q: %w", namespace, err)
+		return nil, fmt.Errorf("read foreign keys for declarable tables in namespace %q: %w", namespace, err)
 	}
 	return tables, nil
 }

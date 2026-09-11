@@ -17,8 +17,8 @@ import (
 )
 
 // The pull's catalog reads carry the same pg_catalog qualification as
-// liveTables: a search_path that lists a user schema first must not let a
-// decoy relation or operator hand the pull a wrong baseline.
+// schemadiff.ListManagedTables: a search_path that lists a user schema first
+// must not let a decoy relation or operator hand the pull a wrong baseline.
 const listPostgresSchemas = `
 SELECT nspname
 FROM pg_catalog.pg_namespace
@@ -245,13 +245,9 @@ func isContextError(err error) bool {
 // later plan would otherwise report as undeclared. Partitions and
 // extension-owned tables have no file of their own and are left out.
 func pullTables(ctx context.Context, pool *pgxpool.Pool, namespace string) ([]string, error) {
-	live, err := liveTables(ctx, pool, namespace)
+	tables, err := schemadiff.ListManagedTables(ctx, pool, namespace)
 	if err != nil {
-		return nil, err
-	}
-	tables := make([]string, len(live))
-	for i, t := range live {
-		tables[i] = t.name
+		return nil, fmt.Errorf("list tables to pull from namespace %q: %w", namespace, err)
 	}
 	return tables, nil
 }
