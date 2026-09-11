@@ -267,7 +267,7 @@ scanning:
 				}
 				report.Actions = append(report.Actions, action)
 			}
-			report.Stuck = append(report.Stuck, stuckChecksPastThreshold(repo, chunk.Stuck, stuckAfter, webhookRedriveNow())...)
+			report.Stuck = append(report.Stuck, stuckChecksPastThreshold(repo, chunk.Stuck, stuckAfter, scanObservedAt(chunk))...)
 			updateProgress(checksScanProgressLine(i+1, len(repos), repo, repoScanned, repoEstimate, report.Scanned, len(report.Actions), held, len(report.Stuck)))
 			if cmd.Limit > 0 && report.Scanned >= cmd.Limit {
 				break scanning
@@ -454,6 +454,31 @@ func rateLimitPauseDuration(rate *apitypes.GitHubRateLimit, floorPct int, now ti
 // stuckAfter. A run whose start time is missing, unparseable, or in the
 // future (clock skew) is always kept with an "unknown" age — a start time
 // that cannot prove the run is young must not hide it.
+// scanObservedAt is the clock this page's runs should be aged against: the
+// server's, when it reported one.
+//
+// The threshold is applied on both sides — the server decides which runs to
+// read stored rows for, this command decides which to render — and a client
+// clock is a round trip ahead of the server's while the start time it reads
+// back is truncated to whole seconds. Both errors point the same way, so a run
+// the server judged just short of the threshold, and therefore left
+// unannotated, is judged past it here and rendered with an empty WAITING ON
+// and REASON. Those columns read as "no stored row was blocking", which is a
+// finding; "the server did not look" is not one.
+//
+// A server reporting no clock is one that does not annotate either, so there
+// the caller's own is all there is and applying the threshold locally is what
+// keeps it applied at all. An unparseable one is treated the same way rather
+// than trusted: the fallback renders more than it should, never less.
+func scanObservedAt(chunk *apitypes.ChecksScanResponse) time.Time {
+	if chunk.ObservedAt != "" {
+		if observed, err := time.Parse(time.RFC3339, chunk.ObservedAt); err == nil {
+			return observed
+		}
+	}
+	return webhookRedriveNow()
+}
+
 func stuckChecksPastThreshold(repo string, prs []apitypes.StuckCheckPR, stuckAfter time.Duration, now time.Time) []checksStuckCheck {
 	var out []checksStuckCheck
 	for _, pr := range prs {

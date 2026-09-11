@@ -82,6 +82,32 @@ func TestStuckChecksPastThreshold(t *testing.T) {
 	assert.Equal(t, "unknown", stuck[2].Age, "a start time ahead of the scan clock cannot prove the run is young")
 }
 
+// The threshold is applied twice on one run: the server decides whether to
+// read the stored rows explaining it, and this command decides whether to
+// render it. The two must reach the same verdict, so the runs are aged against
+// the clock the server reported rather than the caller's, which is a round
+// trip ahead of it. Aged locally, a run the server judged just short of the
+// threshold would be rendered with an empty WAITING ON and REASON, and those
+// columns mean "no stored row was blocking" — a finding the scan never made.
+func TestScanObservedAtPrefersTheServersClock(t *testing.T) {
+	t.Parallel()
+
+	observed := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+	assert.Equal(t, observed,
+		scanObservedAt(&apitypes.ChecksScanResponse{ObservedAt: "2026-07-12T12:00:00Z"}).UTC())
+
+	// A server reporting no clock is one that does not annotate either, so the
+	// caller's own clock is all there is and the threshold still applies.
+	before := webhookRedriveNow()
+	fallback := scanObservedAt(&apitypes.ChecksScanResponse{})
+	assert.False(t, fallback.Before(before), "an unreported clock falls back to the caller's own")
+
+	// Trusting an unparseable one would age every run from the zero time and
+	// sweep the whole fleet into the report.
+	garbled := scanObservedAt(&apitypes.ChecksScanResponse{ObservedAt: "yesterday"})
+	assert.False(t, garbled.Before(before), "an unparseable clock is not trusted")
+}
+
 // The report renders stuck Check Runs in their own section, telling the
 // operator backfill does not act on them, and still prints it when no checks
 // are missing at all.

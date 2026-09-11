@@ -903,6 +903,22 @@ type webhookMissingCheckScanClient interface {
 // age, so it counts as long enough. The threshold exists to skip work the
 // caller will not display, and a run whose age cannot be established is one
 // the caller displays.
+// checkRunAgedForAnnotation reports an uncompleted run's start time as the
+// caller will read it, and whether it has been sitting long enough to be worth
+// reading the stored rows that explain it.
+//
+// The two answers come from one value on purpose. The caller applies the same
+// threshold to the start time it reads back, to decide what to render, and the
+// wire format carries whole seconds — so a run judged here against the
+// untruncated instant GitHub reported is measured from a fraction of a second
+// later than the caller measures it from. At the boundary that is a run left
+// unannotated and rendered anyway, with an empty waiting-on column that means
+// no stored row was blocking rather than that none was read.
+func checkRunAgedForAnnotation(run *ghclient.CheckRunResult, threshold time.Duration, now time.Time) (startedAt string, sittingLongEnough bool) {
+	asSent := run.StartedAt.UTC().Truncate(time.Second)
+	return formatCheckRunStartedAt(asSent), checkRunSittingLongEnough(asSent, threshold, now)
+}
+
 func checkRunSittingLongEnough(startedAt time.Time, threshold time.Duration, now time.Time) bool {
 	if threshold <= 0 || startedAt.IsZero() || startedAt.After(now) {
 		return true
@@ -925,6 +941,7 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 		CheckNames:       checkNames,
 		NextPage:         nextPage,
 		EstimatedOpenPRs: estimateOpenPRCount(page, lastPage, len(prs)),
+		ObservedAt:       now.Format(time.RFC3339),
 	}
 	for _, pr := range prs {
 		if !updatedSince.IsZero() && pr.UpdatedAt.Before(updatedSince) {
@@ -958,14 +975,15 @@ func scanWebhookMissingChecks(ctx context.Context, client webhookMissingCheckSca
 			}
 			if run != nil {
 				if !checkRunCompleted(run) {
+					startedAt, sittingLongEnough := checkRunAgedForAnnotation(run, annotateAfter, now)
 					incomplete = append(incomplete, IncompleteCheckRun{
 						Name:       run.Name,
 						CheckRunID: run.ID,
 						Status:     run.Status,
-						StartedAt:  formatCheckRunStartedAt(run.StartedAt),
+						StartedAt:  startedAt,
 					})
 					incompleteEnvironments = append(incompleteEnvironments, expected.Environment)
-					annotate = append(annotate, checkRunSittingLongEnough(run.StartedAt, annotateAfter, now))
+					annotate = append(annotate, sittingLongEnough)
 				}
 				continue
 			}

@@ -273,6 +273,14 @@ type ChecksScanResponse struct {
 	// decides how old is old enough to call stuck, because an uncompleted
 	// check is legitimate while an apply or plan is genuinely in flight.
 	Stuck []StuckCheckPR `json:"stuck,omitempty"`
+	// ObservedAt is the clock this page's runs were aged against, RFC3339. The
+	// stuck threshold is applied on both sides — here to decide which runs to
+	// annotate with their stored rows, and by the caller to decide which to
+	// render — and two clocks a round trip apart disagree at the boundary. A
+	// caller that ages the runs against this instead of its own reaches the
+	// same verdict the annotation was written for. Empty from a server that
+	// does not annotate at all, where the caller's own clock is all there is.
+	ObservedAt string `json:"observed_at,omitempty"`
 	// RateLimit reports the GitHub budget left on the installation that
 	// served this page, so the caller can pace itself instead of starving
 	// the live webhook path that shares the same budget. Nil when the rate

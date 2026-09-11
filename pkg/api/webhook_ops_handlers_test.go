@@ -1081,6 +1081,13 @@ func TestScanWebhookMissingChecksScopesStoredRowsToEachRunsEnvironment(t *testin
 	assert.Equal(t, "production", production.StoredRows[0].Environment)
 	assert.Equal(t, checkstate.ReasonReconciliationOwed, production.StoredRows[0].Reason)
 	assert.Equal(t, apitypes.WaitingOnOperator, production.WaitingOn)
+
+	// The rows are one pull request's, so they are read once and scoped per
+	// run. Reading them per run instead would return the same annotations at
+	// twice the cost, on a sweep that already pages through every open PR in
+	// the fleet.
+	assert.Equal(t, 1, store.checks.reads,
+		"one read serves every annotated run on a pull request")
 }
 
 // A deployment publishing a single unscoped check gates every environment on
@@ -1193,6 +1200,58 @@ func TestScanWebhookMissingChecksSkipsTheAnnotationForAYoungRun(t *testing.T) {
 	require.Len(t, result.Stuck, 1)
 	require.Len(t, result.Stuck[0].Checks, 1)
 	assert.Equal(t, apitypes.WaitingOnOperator, result.Stuck[0].Checks[0].WaitingOn)
+}
+
+// The caller ages a run from the start time it reads back, applying the same
+// threshold, to decide what to render. The wire carries whole seconds, so a run
+// judged here against the untruncated instant GitHub reported is measured from
+// slightly later than the caller measures it from — and at the boundary that is
+// a run this scan leaves unannotated and the caller renders anyway, with an
+// empty waiting-on column that means no stored row was blocking rather than
+// that none was read.
+func TestCheckRunAgedForAnnotationJudgesTheStartTimeTheCallerReadsBack(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+	// 59m59.6s old by GitHub's clock, a flat hour by the wire's.
+	run := &ghclient.CheckRunResult{StartedAt: now.Add(-time.Hour).Add(400 * time.Millisecond)}
+
+	startedAt, sittingLongEnough := checkRunAgedForAnnotation(run, time.Hour, now)
+
+	require.Equal(t, "2026-07-12T11:00:00Z", startedAt)
+	parsed, err := time.Parse(time.RFC3339, startedAt)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, now.Sub(parsed), time.Hour,
+		"what the caller computes from the reported start time")
+	assert.True(t, sittingLongEnough,
+		"the caller will render this run, so the rows explaining it have to be read")
+}
+
+// The clock the runs were aged against is reported, so a caller applying the
+// same threshold after the round trip reaches the same verdict instead of
+// judging every run slightly older than this scan did.
+func TestScanWebhookMissingChecksReportsTheClockItAgedTheRunsAgainst(t *testing.T) {
+	t.Parallel()
+
+	client := fakeWebhookMissingCheckScanClient{
+		prs: []ghclient.OpenPullRequest{
+			{Number: 23, Title: "one uncompleted run", HeadSHA: "sha23", HeadRef: "feature-23"},
+		},
+		runs: map[string]*ghclient.CheckRunResult{
+			"sha23/SchemaBot": {ID: 230, Name: "SchemaBot", Status: "in_progress",
+				StartedAt: time.Now().UTC().Add(-2 * time.Hour)},
+		},
+	}
+	store := &inspectStorage{checks: &inspectCheckStore{}, applies: &inspectApplyStore{}}
+
+	before := time.Now().UTC().Truncate(time.Second)
+	result, err := scanWebhookMissingChecks(t.Context(), client, store, "octo/repo",
+		[]webhookExpectedCheckName{{Name: "SchemaBot"}}, 0, time.Time{}, time.Hour, discardLogger())
+	require.NoError(t, err)
+
+	observed, parseErr := time.Parse(time.RFC3339, result.ObservedAt)
+	require.NoError(t, parseErr, "the clock the runs were aged against has to be readable")
+	assert.False(t, observed.Before(before), "the reported clock is the one this scan used")
 }
 
 // A pull request can carry an old uncompleted run beside a young one, and the
