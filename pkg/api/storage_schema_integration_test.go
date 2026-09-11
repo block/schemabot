@@ -182,6 +182,46 @@ func TestDiffStorageSchemaMySQL_RefusesSurplusTable(t *testing.T) {
 	assert.Equal(t, "newer_release_state", allowed.Destructive[0].Table)
 }
 
+// A surplus index is reported as a statement that runs, not as a refused one —
+// unlike a surplus table or column. Dropping an index destroys no data, so it
+// is outside the destructive set that protects newer storage state from an
+// older binary.
+//
+// The asymmetry is what an operator pre-creating an index ahead of a release
+// has to plan around: the index survives only as long as no instance of the
+// earlier release boots, because that boot converges it away. A diff run with
+// the earlier release's binary is what says so before it happens.
+func TestDiffStorageSchemaMySQL_SurplusIndexIsNotProtected(t *testing.T) {
+	sdb, db := openEnsureSchemaDatabase(t)
+	require.NoError(t, EnsureSchema(sdb.DSN, storageSchemaTestLogger()))
+
+	// An index a later release declares, created ahead of that release the way
+	// an operator pre-creates one to keep the startup budget clear.
+	_, err := db.ExecContext(t.Context(), "CREATE INDEX `idx_applies_caller` ON `applies` (`caller`)")
+	require.NoError(t, err, "pre-create an index the embedded schema does not declare")
+	require.True(t, testutil.IndexExists(t, db, sdb.Name, "applies", "idx_applies_caller"))
+
+	report, err := DiffStorageSchema(t.Context(), sdb.DSN, storageSchemaTestLogger())
+	require.NoError(t, err)
+
+	assert.False(t, report.Converged())
+	assert.Empty(t, report.Destructive, "dropping an index destroys no data, so it is not refused")
+	assert.Empty(t, report.Manual)
+	require.Len(t, report.Outstanding, 1, "only the one table diverges: %v", statementTables(report.Outstanding))
+	statement := report.Outstanding[0]
+	assert.Equal(t, "applies", statement.Table)
+	assert.Equal(t, "alter_table", statement.Operation)
+	assert.Contains(t, statement.DDL, "idx_applies_caller")
+
+	// And a convergence removes it, which is exactly what a boot of this binary
+	// would do to an index a later release owns.
+	_, remaining, err := ApplyStorageSchema(t.Context(), sdb.DSN, storageSchemaTestLogger())
+	require.NoError(t, err)
+	assert.True(t, remaining.Converged())
+	assert.False(t, testutil.IndexExists(t, db, sdb.Name, "applies", "idx_applies_caller"),
+		"a surplus index is converged away, unlike a surplus table or column")
+}
+
 // A diff is safe to run against a storage database another process is
 // converging: it takes no advisory lock, so it answers while the bootstrap
 // holds one rather than blocking behind it. During an incident that is the

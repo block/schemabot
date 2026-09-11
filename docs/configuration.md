@@ -1142,6 +1142,85 @@ Both routes are admin-only and both sit at the write tier, the read-only diff
 included, because the diff exposes the internal shape of SchemaBot's bookkeeping
 database. See [Authentication and authorization](auth.md#what-read-and-write-access-include).
 
+### Which binary's schema you are asking about
+
+There is no schema directory to point these commands at, and no flag to
+override one. The schema files are compiled into the binary (`go:embed` over
+`pkg/schema/mysql/` and `pkg/schema/postgres/`), and the diff always uses the
+files of the binary that *answers* the request:
+
+| Path | Whose embedded schema |
+|---|---|
+| through the API, no flags | the server the CLI is pointed at |
+| `--deployment <name> -e <env>` | that data plane |
+| `--dsn` / `--config` | the CLI binary you are running |
+
+That is deliberate, and it is the one thing to keep straight when deploying.
+Through the API, the answer describes the release that is **currently running**.
+Before a roll that is the old release, so the API can report convergence while
+the release you are about to deploy still has work to do. To ask what the next
+release will run, run the command from a binary of that release: the direct
+path with the new CLI, or a one-shot job on the new image.
+
+### Deploying a release that changes the storage schema
+
+Every startup converges the storage schema on its own, so the routine case
+needs none of this. Reach for the commands when the release notes name a
+storage schema change, when the tables involved carry a long history, or when a
+pod is not starting.
+
+1. **Before the roll, ask the new release what it will run.** Use a binary of
+   the release being deployed, not the running one.
+
+   ```bash
+   schemabot storage diff --dsn "$STORAGE_DSN"    # run from the new release's binary
+   ```
+
+   Exit status 0 means its boot has nothing to do and the rest of this does not
+   apply.
+
+2. **Decide whether the boot should do it.** Additive DDL inside the
+   five-minute startup budget is fine when the tables are small. It is not fine
+   when they are not: on MySQL an index added to an existing storage table runs
+   as Spirit online DDL, a table copy whose cost grows with row count, and every
+   pod in the roll pays it. Converge once, ahead of the roll, instead:
+
+   ```bash
+   schemabot storage apply --dsn "$STORAGE_DSN"   # from the new release's binary
+   ```
+
+3. **If you converged ahead of the roll, re-check right before it.** A table or
+   a column you created early survives a boot of the current release, because
+   dropping one is destructive and is refused. **An index does not.** Dropping
+   an index destroys no data, so it falls outside that refusal, and any boot of
+   the still-running older release converges the new index away without
+   comment — a pod restart, a scale-up, a health-check replacement. Re-run the
+   diff from the new release's binary immediately before rolling, and treat a
+   long gap between pre-creating an index and deploying as a gap the index
+   probably did not survive.
+
+4. **After the roll, confirm through the API, per deployment.**
+
+   ```bash
+   schemabot storage diff                                  # this server's storage
+   schemabot storage diff --deployment west -e production  # a data plane's storage
+   ```
+
+   Now the running binary is the new release, so exit status 0 is the
+   confirmation that its storage converged.
+
+5. **If a pod is crashlooping, ask directly.** A failed storage bootstrap keeps
+   the server from accepting traffic at all, so the API cannot answer for it.
+   The direct path can, with the same binary the pod runs, and the statements it
+   prints are the ones the pod is failing on. `storage apply` from there clears
+   it under the same advisory lock the pods are contending for.
+
+During a rollback window the diff reports the newer release's tables and columns
+as refused destructive statements and exits 2. That is the expected steady state
+rather than drift: the surplus state is deliberate, and it is what lets the
+release be rolled forward again. A pre-deploy gate keyed on exit status 0 will
+flag it, which is the correct signal to pause on.
+
 ## Support Channel
 
 SchemaBot can add an opt-in support link to GitHub PR comments so authors know

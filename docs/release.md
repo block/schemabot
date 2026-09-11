@@ -271,6 +271,20 @@ statement (see [configuration.md](./configuration.md)). A destructive
 change is a coordinated operation and belongs in the release notes with
 instructions, not in a routine patch release.
 
+The diff does not have to be read out of the files by hand. A binary of the
+release being deployed answers it against the live database:
+
+```bash
+schemabot storage diff --dsn "$STORAGE_DSN"    # run from the new release's binary
+```
+
+Run it from the *new* release's binary, not the running one: through the API the
+answer describes whatever release is currently serving, which before a roll is
+the old one. Operators pre-creating an index ahead of the roll should also read
+[Deploying a release that changes the storage schema](./configuration.md#deploying-a-release-that-changes-the-storage-schema)
+— a pre-created index is removed again by any boot of the still-running earlier
+release, because dropping an index is not destructive and so is not refused.
+
 ### 3. The public Go API
 
 SchemaBot is importable as a Go library, not only runnable as a binary, so its
