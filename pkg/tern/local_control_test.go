@@ -2062,11 +2062,19 @@ func TestLocalClient_AStorageFailureConsumingAControlRequestKeepsTheClaim(t *tes
 			},
 		},
 		{
-			name:       "settling a cancel against a terminal apply fails",
+			name:       "completing a cancel that settled its own apply fails",
+			operation:  storage.ControlOperationCancel,
+			applyState: state.Apply.Cancelled,
+			breakStore: func(store *controlTestStorage, requests *testControlRequestStore) {
+				store.controlRequests = &completePendingErrorStore{testControlRequestStore: requests, err: failure}
+			},
+		},
+		{
+			name:       "recording that a cancel was outrun by its own apply fails",
 			operation:  storage.ControlOperationCancel,
 			applyState: state.Apply.Failed,
 			breakStore: func(store *controlTestStorage, requests *testControlRequestStore) {
-				store.controlRequests = &completePendingErrorStore{testControlRequestStore: requests, err: failure}
+				store.controlRequests = &failPendingErrorStore{testControlRequestStore: requests, err: failure}
 			},
 		},
 	}
