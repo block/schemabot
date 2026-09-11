@@ -27,11 +27,12 @@ var authTransport = &bearerTransport{base: http.DefaultTransport}
 // Uses a 30s timeout to avoid hanging indefinitely on network stalls.
 var httpClient = &http.Client{Timeout: 30 * time.Second, Transport: authTransport}
 
-// webhookOpsHTTPClient serves the webhook operator endpoints, which crawl
-// GitHub delivery history or every open PR server-side and routinely need far
-// longer than the default client timeout. Matches the server's own budget
-// for these routes.
-var webhookOpsHTTPClient = &http.Client{Timeout: 15 * time.Minute, Transport: authTransport}
+// operatorHTTPClient serves the operator endpoints whose server-side work
+// routinely needs far longer than the default client timeout: the webhook
+// operations that crawl GitHub delivery history or every open PR, and the
+// storage schema convergence that runs a bootstrap against the storage
+// database. Matches the server's own budget for these routes.
+var operatorHTTPClient = &http.Client{Timeout: 15 * time.Minute, Transport: authTransport}
 
 // SetAuthToken configures the Bearer token attached to every CLI request. An
 // empty token leaves requests unauthenticated, which is correct against a
@@ -130,11 +131,12 @@ func doGetIntoCtx(ctx context.Context, endpoint, path string, result any) error 
 	return doGetIntoWithClient(ctx, httpClient, endpoint, path, result)
 }
 
-// doSlowGetIntoCtx is doGetIntoCtx with the long-running webhook ops client,
-// for read endpoints whose server-side work calls out to GitHub and so shares
-// the operator budget rather than the default request timeout.
+// doSlowGetIntoCtx is doGetIntoCtx with the long-running operator client, for
+// read endpoints whose server-side work calls out to GitHub or reads a storage
+// catalog, and so shares the operator budget rather than the default request
+// timeout.
 func doSlowGetIntoCtx(ctx context.Context, endpoint, path string, result any) error {
-	return doGetIntoWithClient(ctx, webhookOpsHTTPClient, endpoint, path, result)
+	return doGetIntoWithClient(ctx, operatorHTTPClient, endpoint, path, result)
 }
 
 func doGetIntoWithClient(ctx context.Context, client *http.Client, endpoint, path string, result any) error {
@@ -203,12 +205,12 @@ func doPostInto(endpoint, path string, body any, result any) error {
 	return doPostIntoWithClient(context.Background(), httpClient, endpoint, path, body, result)
 }
 
-// doSlowPostIntoCtx is doPostInto with the long-running webhook ops client and
+// doSlowPostIntoCtx is doPostInto with the long-running operator client and
 // a caller-supplied context, for operator endpoints whose server-side work
 // legitimately outlives the default timeout and that must stop promptly when
 // the operator cancels (Ctrl+C).
 func doSlowPostIntoCtx(ctx context.Context, endpoint, path string, body any, result any) error {
-	return doPostIntoWithClient(ctx, webhookOpsHTTPClient, endpoint, path, body, result)
+	return doPostIntoWithClient(ctx, operatorHTTPClient, endpoint, path, body, result)
 }
 
 func doPostIntoWithClient(ctx context.Context, client *http.Client, endpoint, path string, body any, result any) error {

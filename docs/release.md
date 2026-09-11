@@ -267,9 +267,23 @@ build is still running fails closed until it completes. A new column whose shape
 needs manual remediation — `NOT NULL` without a `DEFAULT`, generated or
 identity, `UNIQUE`, `REFERENCES` with a `DEFAULT` — fails startup until an
 operator creates it by hand, so it always belongs in the release notes with its
-statement (see [configuration.md](./configuration.md)). A destructive
+statement (see [storage-schema.md](./storage-schema.md)). A destructive
 change is a coordinated operation and belongs in the release notes with
 instructions, not in a routine patch release.
+
+The diff does not have to be read out of the files by hand. Name the release
+being tested and the command answers it against the live database:
+
+```bash
+schemabot storage diff --deployment west -e production --release v1.4.0
+```
+
+Name the release, or run the command from a binary of it — with neither, the
+answer describes whatever release is currently serving, which before a roll is
+the old one. Operators pre-creating an index ahead of the roll should also read
+[Deploying a release that changes the storage schema](./storage-schema.md#deploying-a-release-that-changes-the-storage-schema)
+— a pre-created index is removed again by any boot of the still-running earlier
+release, because dropping an index is not destructive and so is not refused.
 
 ### 3. The public Go API
 

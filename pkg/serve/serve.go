@@ -295,6 +295,14 @@ type Server struct {
 	telemetry  *api.Telemetry
 	authz      auth.Authorizer
 	engines    map[string]tern.EngineFactory
+	// dialect is the storage database's family, resolved once at build time so
+	// every later storage operation — including the operator-facing storage
+	// schema surface — routes to the same family the bootstrap converged.
+	dialect schema.Dialect
+	// version is the build's SchemaBot version. Storage schema reports carry
+	// it for attribution: the diff itself is computed from this binary's
+	// embedded files, and the version only says whose files they were.
+	version string
 }
 
 // registerPlanetScaleMTLS registers the configured planetscale.mtls
@@ -497,7 +505,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	}
 
 	success = true
-	return &Server{
+	srv := &Server{
 		cfg:             cfg,
 		svc:             svc,
 		storage:         store,
@@ -507,7 +515,17 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		telemetry:       telemetry,
 		authz:           authz,
 		engines:         o.engines,
-	}, nil
+		dialect:         dialect,
+		version:         o.version,
+	}
+
+	// The HTTP storage schema routes and the gRPC storage schema service answer
+	// from one adapter bound to the storage this server booted with, so an
+	// operator asking this server directly and a control plane asking it over
+	// gRPC read the same database with the same embedded schema files.
+	svc.SetStorageSchemaService(srv.storageSchemaService())
+
+	return srv, nil
 }
 
 // Storage boot retry policy. The budget is sized so that even a final attempt
@@ -658,7 +676,11 @@ func (s *Server) RegisterGRPC(ctx context.Context, gs *grpc.Server) error {
 		s.svc.SetDefaultTernClient(built)
 		client = built
 	}
-	tern.NewServer(client, s.logger).Register(gs)
+	// The storage-schema service answers for this instance's own storage
+	// database, which is the only way a control plane can read it: a data
+	// plane's storage is reachable from the data plane, and the gRPC endpoint
+	// is the connection that already exists between the two.
+	tern.NewServer(client, s.logger, tern.WithStorageSchemaService(s.storageSchemaService())).Register(gs)
 	return nil
 }
 

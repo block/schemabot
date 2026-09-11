@@ -660,7 +660,7 @@ a MySQL-format DSN and is only supported with the `mysql` storage dialect;
 combining it with `postgres` fails config validation. (This restriction is
 specific to the storage database — `dsn_from` on a `target_resolver` target
 supports both `mysql` and `postgres`.) See
-[Storage Schema Changes](#storage-schema-changes) for how schema
+[docs/storage-schema.md](storage-schema.md) for how schema
 bootstrapping differs between the two dialects.
 
 ### PostgreSQL storage needs a session-per-connection endpoint
@@ -900,138 +900,27 @@ Helm chart, mount the certificate secret with `extraVolumes` /
 ## Storage Schema Changes
 
 SchemaBot's internal storage schema is self-bootstrapping: on every startup,
-`EnsureSchema` converges the live storage database against the embedded schema
-files before the server accepts traffic. How far that convergence goes depends
-on the storage dialect:
+`EnsureSchema` converges the live storage database against the schema files
+embedded in the binary, before the server accepts traffic. Operators never apply
+storage DDL by hand, and there is no schema directory to point the server at.
 
-- **MySQL** diffs the embedded schema files against the live database and
-  applies whatever DDL is needed (via Spirit) — new tables, new columns, and
-  index changes all converge automatically. That convergence is bounded by a
-  hard five-minute startup budget, and an index added to an existing table
-  runs as Spirit online DDL — a table copy, not an in-place build — so its
-  cost grows with the table's row count. On a deployment whose storage
-  tables carry a long history, create a newly declared index by hand before
-  rolling out: the startup diff then finds nothing to do, instead of copying
-  the table inside the budget on every pod.
-- **PostgreSQL** automatically creates missing tables, columns, and standalone
-  indexes. It discovers drift before taking the bootstrap advisory lock, then
-  re-checks and applies each table's changes transactionally under that lock.
-  A missing column converges automatically only when the `ADD COLUMN` is
-  metadata-only. A missing `NOT NULL` column without a `DEFAULT`, a generated
-  or identity column, a `UNIQUE` column, a `REFERENCES` column with a
-  `DEFAULT`, or a column with a constraint shape not explicitly classified as
-  safe fails startup with instructions for manual remediation: generated and
-  identity columns rewrite the populated table, `UNIQUE` builds a unique
-  index over it, and a foreign key with a `DEFAULT` validates every existing
-  row against the referenced table — all under an exclusive lock whose hold
-  time the startup lock timeout does not bound. Startup also fails when
-  additive DDL cannot be parsed or executed, or when re-verification finds
-  unresolved drift.
+**[docs/storage-schema.md](storage-schema.md) is the operator guide** — how the
+convergence works on each dialect, what it refuses, the `storage diff` and
+`storage apply` commands, and what to do when a deploy or a pod start does not
+converge. Every SchemaBot operator should read at least its first three
+sections. This section covers only the settings.
 
-  A live index only counts as present when PostgreSQL reports it valid.
-  PostgreSQL marks an index invalid both while a `CREATE INDEX CONCURRENTLY`
-  is still building it and after one fails part-way — a unique build that
-  hits duplicate keys, a cancelled session — and in either case the planner
-  never uses it. Startup fails closed naming that index rather than reading
-  it as converged or colliding with it on a fresh `CREATE INDEX`, and reads
-  `pg_stat_progress_create_index` to say which situation it is. When a build
-  is in progress — the expected state while an operator pre-creates an index
-  ahead of a release — the error says so and asks for nothing; the pod
-  restarts on its backoff and starts cleanly once the build completes. When
-  no build is visible, the error treats the index as a failed build: remove
-  the cause first — a unique build keeps failing while duplicate keys
-  remain — then drop the index so the next startup recreates it, or
-  `REINDEX INDEX CONCURRENTLY` it by hand. That view only shows other roles'
-  sessions to a caller with `pg_read_all_stats`, so if the storage role
-  lacks it and the build runs under a different role, confirm from a
-  privileged session that no build is running before recovering. A
-  non-unique index under a name the embedded schema requires to be unique
-  fails startup the same way. Every such problem across every table is named
-  in the one startup error, and no DDL runs until all of them are resolved.
+### `allow_destructive_schema_changes`
 
-  Convergence is additive-only: extra columns and indexes remain in place for
-  binary rollback, and `allow_destructive_schema_changes` has no effect because
-  this flow never produces destructive DDL. Column verification remains
-  presence-only, so type, length, and nullability drift is outside its scope and
-  is not detected.
-
-  Indexes added to an embedded schema file after a database was bootstrapped
-  converge on the next startup as plain `CREATE INDEX` statements, each in
-  its own transaction under the bootstrap advisory lock. A plain
-  `CREATE INDEX` holds a `SHARE` lock on the table for the full build and
-  blocks writes to it, and the startup budget is the build's only duration
-  ceiling, so on a deployment whose storage tables carry a long history,
-  pre-create the index by hand before rolling out — the startup diff then
-  finds it present and skips the build. The indexes below are the ones a
-  long-lived database is most likely to be missing.
-
-  A database bootstrapped before `idx_plans_created_at` was added to `plans`
-  needs:
-
-  ```sql
-  CREATE INDEX idx_plans_created_at ON plans (created_at);
-  ```
-
-  Without it, listing recent plans is a sequential scan plus a top-N sort,
-  which gets slower as plan history grows. Likewise, one bootstrapped before
-  the driver claim ordering on `apply_operations` was indexed needs:
-
-  ```sql
-  CREATE INDEX idx_apply_operations_created_id ON apply_operations (created_at, id);
-  ```
-
-  Without it, every driver claim sorts the full claimable set before taking
-  one row, which slows claiming as apply history grows. One bootstrapped
-  before refused applies started naming the schema change holding the
-  database needs:
-
-  ```sql
-  CREATE INDEX idx_apply_operations_external_id ON apply_operations (external_id);
-  ```
-
-  Without it, resolving the holding change behind a refused apply scans the
-  full operation history for one remote identifier. On PostgreSQL the lookup
-  is an optimization, never load-bearing: the refusal still reads correctly,
-  it just gets slower to record as apply history grows. On MySQL the same
-  index is not optional — `EnsureSchema` applies it as a startup `ALTER`
-  under the budget described in the MySQL bullet above, and `apply_operations`
-  grows with total apply history, so large deployments should pre-create it
-  there too. And one bootstrapped before the webhook inbox claim ordering on
-  `webhook_events` was indexed needs:
-
-  ```sql
-  CREATE INDEX idx_webhook_events_created_id ON webhook_events (created_at, id);
-  ```
-
-  Without it, every webhook claim sorts the full claimable inbox before
-  taking one row, which slows claiming as delivery history grows. On MySQL
-  the same index arrives as a startup `ALTER` under the budget described in
-  the MySQL bullet above, and `webhook_events` grows with total delivery
-  history and has no retention sweep, so pre-create it there before rolling
-  out:
-
-  ```sql
-  ALTER TABLE `webhook_events` ADD INDEX `idx_created_id` (`created_at`, `id`);
-  ```
-
-The rest of this section describes the MySQL flow.
-
-By default, destructive statements in that diff — `DROP TABLE`, or an
-`ALTER TABLE` containing `DROP COLUMN` — are refused and skipped. A mixed
-`ALTER TABLE` is split: its additive clauses still execute and only the
-destructive clauses are refused, except that a clause which cannot run
-without a refused clause (the `ADD PRIMARY KEY` half of a primary-key change)
-is refused with it. The remaining non-destructive statements still apply and
-startup proceeds. This protects
-against rolling deploys and rollbacks: a pod running an older binary sees a
-newer binary's tables and columns as surplus, and without the gate would drop
-them (destroying data the newer pods depend on). Each refused statement is
-logged at warn level with the exact DDL, and counted in the
+On MySQL, destructive statements in the startup diff — `DROP TABLE`, or an
+`ALTER TABLE` containing `DROP COLUMN` — are refused and skipped by default,
+because a pod running an older binary sees a newer binary's tables and columns
+as surplus and would otherwise drop data the newer pods depend on. Each refusal
+is logged at warn level with the exact DDL and counted in the
 `schemabot.storage_schema.destructive_refusals_total` metric.
 
-To intentionally remove a storage table or column, first make sure every
-running pod is on a binary whose embedded schema no longer declares it, then
-opt in:
+To intentionally remove a storage table or column, first make sure every running
+pod is on a binary whose embedded schema no longer declares it, then opt in:
 
 ```yaml
 storage:
@@ -1040,7 +929,12 @@ storage:
 ```
 
 Leave the flag false during normal operation and revert it after the removal
-converges.
+converges. `--allow-destructive` on `schemabot storage apply` opts in for one
+invocation instead; it widens this policy and never narrows it.
+
+On PostgreSQL the setting has no effect: that convergence is additive-only and
+never produces destructive DDL. See
+[What is never automatic](storage-schema.md#what-is-never-automatic).
 
 ## Support Channel
 
