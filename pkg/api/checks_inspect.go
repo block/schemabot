@@ -65,7 +65,7 @@ func (s *Service) handleChecksInspect(w http.ResponseWriter, r *http.Request) {
 // a question about a pull request the caller did not ask about.
 func checksInspectRequestFromQuery(query url.Values) (ChecksInspectRequest, error) {
 	req := ChecksInspectRequest{
-		Repo:        strings.TrimSpace(query.Get("repo")),
+		Repo:        canonicalRepo(query.Get("repo")),
 		Environment: canonicalEnvironment(query.Get("environment")),
 	}
 	reference := strings.TrimSpace(query.Get("pull_request"))
@@ -119,21 +119,10 @@ func executeChecksInspect(ctx context.Context, cfg *ServerConfig, store storage.
 	}
 	// A mistyped environment would silently narrow the response to nothing and
 	// read as "this pull request has no check state", which is the opposite of
-	// what an operator is here to find out.
-	//
-	// An instance with no allowed_environments admits every environment name
-	// while storing one global aggregate and publishing one unscoped check, so
-	// filtering it by environment would drop the aggregate and look for a
-	// Check Run whose name that instance never creates. There is nothing to
-	// narrow on such an instance, so the filter is refused rather than honored
-	// into an empty answer.
-	if req.Environment != "" {
-		if len(cfg.AllowedEnvironments) == 0 {
-			return nil, webhookOpsRequestErrorf("this instance publishes one check for every environment, so there is no environment to narrow to; omit the environment")
-		}
-		if !cfg.IsEnvironmentAllowed(req.Environment) {
-			return nil, webhookOpsRequestErrorf("environment %q is not one this instance handles", req.Environment)
-		}
+	// what an operator is here to find out. On an instance that scopes nothing
+	// by environment the filter would also drop the one global aggregate.
+	if err := requireNarrowableEnvironment(cfg, req.Environment); err != nil {
+		return nil, err
 	}
 	if logger == nil {
 		logger = slog.New(slog.NewJSONHandler(os.Stderr, nil))

@@ -513,8 +513,3 @@ func TestChecksInspectRequestFromQueryFoldsRepositoryCase(t *testing.T) {
 	assert.Equal(t, "acme/store", req.Repo)
 	assert.Equal(t, 412, req.PullRequest)
 }
-
-// The environment is matched against the configured names by exact comparison,
-// so it is folded on the way in like every sibling read endpoint folds it.
-// Unfolded, an operator passing the spelling their other commands accept would
-// be told this instance does not handle it.
