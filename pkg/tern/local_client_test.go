@@ -1592,9 +1592,9 @@ func TestLocalClient_ProcessPendingStopControlRequest(t *testing.T) {
 		logger:       slog.Default(),
 	}
 
-	handled, err := client.processPendingStopControlRequest(t.Context(), apply)
+	standDown, err := client.processPendingStopControlRequest(t.Context(), apply)
 	require.NoError(t, err)
-	assert.True(t, handled)
+	assert.True(t, standDown)
 	assert.Equal(t, 1, fakeEngine.stopCount)
 	assert.Equal(t, state.Task.Stopped, task.State)
 	assert.Equal(t, state.Apply.Stopped, apply.State)
@@ -1646,9 +1646,9 @@ func TestLocalClient_ProcessPendingCancelControlRequest(t *testing.T) {
 		logger:       slog.Default(),
 	}
 
-	handled, err := client.processPendingCancelControlRequest(t.Context(), apply)
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply)
 	require.NoError(t, err)
-	assert.True(t, handled)
+	assert.True(t, standDown)
 	assert.Equal(t, 1, fakeEngine.cancelCount)
 	assert.Equal(t, 0, fakeEngine.stopCount)
 	assert.Equal(t, state.Task.Cancelled, task.State)
@@ -1711,9 +1711,9 @@ func TestLocalClient_ProcessPendingCancelSettlesCompletedEngineChange(t *testing
 		logger:       slog.Default(),
 	}
 
-	handled, err := client.processPendingCancelControlRequest(t.Context(), apply)
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply)
 	require.NoError(t, err)
-	assert.True(t, handled)
+	assert.True(t, standDown)
 	assert.Equal(t, 1, fakeEngine.cancelCount)
 	assert.Equal(t, state.Task.Completed, task.State, "the task must adopt the engine's completed outcome, not cancelled")
 	assert.Equal(t, 100, task.ProgressPercent, "a completed task reports full progress")
@@ -1774,9 +1774,9 @@ func TestLocalClient_ProcessPendingStopSettlesCompletedEngineChange(t *testing.T
 		logger:       slog.Default(),
 	}
 
-	handled, err := client.processPendingStopControlRequest(t.Context(), apply)
+	standDown, err := client.processPendingStopControlRequest(t.Context(), apply)
 	require.NoError(t, err)
-	assert.True(t, handled)
+	assert.True(t, standDown)
 	assert.Equal(t, 1, fakeEngine.stopCount)
 	assert.Equal(t, state.Task.Completed, task.State, "the task must adopt the engine's completed outcome, not stopped")
 	assert.Equal(t, 100, task.ProgressPercent, "a completed task reports full progress")
@@ -1859,7 +1859,7 @@ func TestLocalClient_ProcessPendingCancelFailsClosedWhenSettleWriteRefused(t *te
 func TestLocalClient_ProcessPendingStopControlRequestContinuesToQueuedStart(t *testing.T) {
 	// A stop and a start can race into the same operator claim: the apply is
 	// already stopped while a stop request is still pending, and a start request
-	// arrives alongside it. Completing the stop must report not-handled so the
+	// arrives alongside it. Completing the stop must report not-standDown so the
 	// resume continues to the queued start in the same claim, instead of leaving
 	// the apply stopped with a pending start the claim lease-freshness gate
 	// cannot re-claim until the lease goes stale.
@@ -1910,9 +1910,9 @@ func TestLocalClient_ProcessPendingStopControlRequestContinuesToQueuedStart(t *t
 		logger:       slog.Default(),
 	}
 
-	handled, err := client.processPendingStopControlRequest(t.Context(), apply)
+	standDown, err := client.processPendingStopControlRequest(t.Context(), apply)
 	require.NoError(t, err)
-	assert.False(t, handled, "a queued start must keep the claim resuming instead of exiting after the stop")
+	assert.False(t, standDown, "a queued start must keep the claim resuming instead of exiting after the stop")
 
 	stopReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
 	require.NoError(t, err)

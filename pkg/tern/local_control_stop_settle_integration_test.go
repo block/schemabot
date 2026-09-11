@@ -66,9 +66,9 @@ func TestLocalClient_PendingStopCompletesWhenEngineHasNoLiveWork(t *testing.T) {
 	claimed := claimApplyForDrive(t, stor, apply.ID)
 	driveCtx := storage.WithApplyLease(ctx, claimed.Lease())
 
-	handled, err := client.processPendingStopControlRequest(driveCtx, claimed)
+	standDown, err := client.processPendingStopControlRequest(driveCtx, claimed)
 	require.NoError(t, err, "a stop with no live engine work must complete, not abort the drive")
-	assert.True(t, handled, "the pending stop must be consumed by the drive")
+	assert.True(t, standDown, "the pending stop must be consumed by the drive")
 	require.NotNil(t, eng.stopReq, "the drive must attempt the engine stop before deciding it has no live work")
 	require.NotNil(t, eng.progressReq, "the live-work probe must ask the engine before completing the stop")
 
@@ -85,7 +85,7 @@ func TestLocalClient_PendingStopCompletesWhenEngineHasNoLiveWork(t *testing.T) {
 
 	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationStop, storage.ControlRequestCompleted)
 
-	handled, err = client.processPendingStopControlRequest(driveCtx, settled)
+	standDown, err = client.processPendingStopControlRequest(driveCtx, settled)
 	require.NoError(t, err)
-	assert.False(t, handled, "a completed stop request must not be re-consumed on a later claim")
+	assert.False(t, standDown, "a completed stop request must not be re-consumed on a later claim")
 }

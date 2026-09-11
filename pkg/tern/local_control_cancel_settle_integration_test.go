@@ -163,9 +163,9 @@ func TestLocalClient_PendingCancelCompletesWhenEngineHasNoLiveWork(t *testing.T)
 	claimed := claimApplyForDrive(t, stor, apply.ID)
 	driveCtx := storage.WithApplyLease(ctx, claimed.Lease())
 
-	handled, err := client.processPendingCancelControlRequest(driveCtx, claimed)
+	standDown, err := client.processPendingCancelControlRequest(driveCtx, claimed)
 	require.NoError(t, err, "a cancel with no live engine work must complete, not abort the drive")
-	assert.True(t, handled, "the pending cancel must be consumed by the drive")
+	assert.True(t, standDown, "the pending cancel must be consumed by the drive")
 	require.NotNil(t, eng.cancelReq, "the drive must attempt the engine cancel before deciding it has no live work")
 	require.NotNil(t, eng.progressReq, "the live-work probe must ask the engine before completing the cancel")
 
@@ -182,9 +182,9 @@ func TestLocalClient_PendingCancelCompletesWhenEngineHasNoLiveWork(t *testing.T)
 
 	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationCancel, storage.ControlRequestCompleted)
 
-	handled, err = client.processPendingCancelControlRequest(driveCtx, settled)
+	standDown, err = client.processPendingCancelControlRequest(driveCtx, settled)
 	require.NoError(t, err)
-	assert.False(t, handled, "a completed cancel request must not be re-consumed on a later claim")
+	assert.False(t, standDown, "a completed cancel request must not be re-consumed on a later claim")
 
 	reclaimed, err := stor.Applies().ClaimApplyByID(ctx, apply.ID, "test-reclaim-"+t.Name())
 	require.NoError(t, err)
@@ -246,9 +246,9 @@ func TestLocalClient_PendingCancelCarriesStoredResumeStateForCustomEngineType(t 
 	claimed := claimApplyForDrive(t, stor, apply.ID)
 	driveCtx := storage.WithApplyLease(ctx, claimed.Lease())
 
-	handled, err := client.processPendingCancelControlRequest(driveCtx, claimed)
+	standDown, err := client.processPendingCancelControlRequest(driveCtx, claimed)
 	require.NoError(t, err)
-	assert.True(t, handled)
+	assert.True(t, standDown)
 
 	require.NotNil(t, eng.cancelReq, "the drive must deliver the cancel to the engine")
 	require.NotNil(t, eng.cancelReq.ResumeState, "the cancel request must carry the stored engine resume state")
