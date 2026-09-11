@@ -178,10 +178,12 @@ func TestVersionFromBuildInfo(t *testing.T) {
 	}
 }
 
-// moduleVersion always names something. In this repo's own test binary
-// SchemaBot is the main module rather than a dependency, so it reports the
-// fallback; the value is never empty, which is what keeps the log field
-// queryable.
+// moduleVersion always names something. Go records no dependency graph in a
+// test binary, so under test it always reports the fallback and no test can
+// assert a derived version; only a built binary carries the graph the
+// derivation reads. What is checkable here is that the value is never empty,
+// which is what keeps the log field queryable, and versionFromBuildInfo above
+// covers the resolution itself against a synthetic graph.
 func TestModuleVersionIsNeverEmpty(t *testing.T) {
 	assert.NotEmpty(t, moduleVersion())
 }
