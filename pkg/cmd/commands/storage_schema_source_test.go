@@ -31,22 +31,22 @@ func TestStorageSchemaSourceFlags_ValidateSource(t *testing.T) {
 
 	unnamed := (&storageSchemaSourceFlags{}).validateSource()
 	require.Error(t, unnamed, "the desired schema has no default")
-	assert.Contains(t, unnamed.Error(), "name the schema to diff the live database against")
+	assert.Contains(t, unnamed.Error(), "missing flags")
 	assert.Contains(t, unnamed.Error(), "--embedded")
 	assert.Contains(t, unnamed.Error(), "--release")
 	assert.Contains(t, unnamed.Error(), "--schema-dir")
 
 	err := (&storageSchemaSourceFlags{SchemaDir: "./schema/mysql", Release: "v1.4.0"}).validateSource()
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "--schema-dir and --release each name a whole schema")
+	assert.Contains(t, err.Error(), "--schema-dir and --release can't be used together")
 
 	err = (&storageSchemaSourceFlags{Embedded: true, Release: "v1.4.0"}).validateSource()
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "--embedded and --release each name a whole schema")
+	assert.Contains(t, err.Error(), "--embedded and --release can't be used together")
 
 	err = (&storageSchemaSourceFlags{Repo: "example/mirror"}).validateSource()
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "name the schema to diff the live database against")
+	assert.Contains(t, err.Error(), "missing flags")
 
 	err = (&storageSchemaSourceFlags{Embedded: true, Repo: "example/mirror"}).validateSource()
 	require.Error(t, err)

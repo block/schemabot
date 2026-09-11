@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/alecthomas/kong"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -78,17 +79,34 @@ func TestStorageSchemaTargetFlags_Validate(t *testing.T) {
 	}
 }
 
-// A diff names the schema it compares the database against, and refuses before
-// it reads anything when the operator did not. The report would say which
-// schema it used either way; the point of refusing is that the operator has
-// already decided by the time they read it.
+// A diff names the schema it compares the database against: one selector is
+// required, and naming two is refused by the parser. The report would say which
+// schema it used either way; requiring the flag is what makes the operator
+// decide before they read the report rather than after.
 func TestStorageDiffCmd_RequiresADesiredSchema(t *testing.T) {
 	cmd := &StorageDiffCmd{
 		storageSchemaTargetFlags: storageSchemaTargetFlags{DSN: "root@tcp(127.0.0.1:3306)/schemabot"},
 	}
 	err := cmd.Run(t.Context(), &Globals{})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "name the schema to diff the live database against")
+	assert.Contains(t, err.Error(), "missing flags: --embedded or --schema-dir=STRING or --release=STRING")
+
+	parse := func(args ...string) error {
+		var cli struct {
+			Diff StorageDiffCmd `cmd:"" name:"diff"`
+		}
+		parser, err := kong.New(&cli, kong.Name("schemabot"))
+		require.NoError(t, err)
+		_, err = parser.Parse(append([]string{"diff"}, args...))
+		return err
+	}
+	require.NoError(t, parse("--embedded"))
+	require.NoError(t, parse("--release", "v1.4.0"))
+	require.NoError(t, parse("--schema-dir", "."))
+
+	err = parse("--embedded", "--release", "v1.4.0")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--embedded and --release can't be used together")
 }
 
 // Naming a DSN source is what selects the direct path, so a command can tell

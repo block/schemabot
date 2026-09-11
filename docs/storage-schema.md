@@ -243,12 +243,12 @@ schema *files*, and `storage diff` requires you to say which:
 | `--schema-dir <path>` | that directory's `.sql` files, read by the CLI |
 | `--release <tag>` | that tag's `pkg/schema/<dialect>/` files, fetched by the CLI |
 
-There is no default. A diff whose desired side you did not choose is not a
-weaker answer, it is an unusable one: the same storage is converged against the
-release that is running and short of the release about to roll, and an operator
-who assumed the wrong one of those either rolls into a failing bootstrap or
-converges storage they did not mean to touch. Naming more than one selector is
-refused too, rather than resolved by precedence.
+One of the three is required, and naming two is refused rather than resolved by
+precedence. There is no default because a diff whose desired side you did not
+choose is not a weaker answer, it is an unusable one: the same storage is
+converged against the release that is running and short of the release about to
+roll, and an operator who assumed the wrong one of those either rolls into a
+failing bootstrap or converges storage they did not mean to touch.
 
 `--embedded` answers for the release that is **currently running**, so through
 the API it is the server or data plane that answered, and on the direct path it

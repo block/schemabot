@@ -46,13 +46,13 @@ import (
 // running it, so "apply is what a boot does" holds by construction (AV-9). To
 // converge a release's schema, run that release's binary.
 
-// storageSchemaSourceFlags names the desired side of the diff. The three
-// selectors are mutually exclusive: each names a complete schema, and silently
-// preferring one would answer a question the operator did not ask.
+// storageSchemaSourceFlags names the desired side of the diff. Exactly one
+// selector is required: each names a complete schema, so the parser refuses
+// two of them and validateSource refuses none.
 type storageSchemaSourceFlags struct {
-	Embedded  bool   `help:"Diff against the schema built into the binary that answers — through the API that is the release currently running, which is what its next boot would converge to"`
-	SchemaDir string `help:"Diff against the .sql files in this directory instead — a checkout of the release you are about to deploy (e.g. ./pkg/schema/mysql)" name:"schema-dir" type:"path"`
-	Release   string `help:"Diff against the schema files of this published tag, fetched from the SchemaBot repository (e.g. v1.4.0)"`
+	Embedded  bool   `help:"Diff against the schema built into the binary that answers — through the API that is the release currently running, which is what its next boot would converge to" xor:"desired-schema"`
+	SchemaDir string `help:"Diff against the .sql files in this directory instead — a checkout of the release you are about to deploy (e.g. ./pkg/schema/mysql)" name:"schema-dir" type:"path" xor:"desired-schema"`
+	Release   string `help:"Diff against the schema files of this published tag, fetched from the SchemaBot repository (e.g. v1.4.0)" xor:"desired-schema"`
 	Repo      string `help:"Repository to fetch --release schema files from" name:"release-repo" default:"block/schemabot"`
 }
 
@@ -62,8 +62,9 @@ func (f *storageSchemaSourceFlags) suppliesFiles() bool {
 	return strings.TrimSpace(f.SchemaDir) != "" || strings.TrimSpace(f.Release) != ""
 }
 
-// validateSource requires exactly one desired schema: one named, rather than
-// several resolved by precedence, and never none resolved by default.
+// validateSource requires a desired schema and refuses --release-repo without
+// the flag it modifies. Two selectors at once is the parser's own refusal, and
+// restated here for callers that build the command in Go.
 func (f *storageSchemaSourceFlags) validateSource() error {
 	named := make([]string, 0, 3)
 	if f.Embedded {
@@ -77,9 +78,9 @@ func (f *storageSchemaSourceFlags) validateSource() error {
 	}
 	switch {
 	case len(named) == 0:
-		return fmt.Errorf("name the schema to diff the live database against: --embedded for the schema of the binary that answers, which is what its own next boot would converge to; --release <tag> for a published release's schema files; --schema-dir <path> for a checkout's. There is no default because the answer means different things: the same storage is converged against the release that is running and short of the release about to roll")
+		return fmt.Errorf("missing flags: --embedded or --schema-dir=STRING or --release=STRING")
 	case len(named) > 1:
-		return fmt.Errorf("%s each name a whole schema to diff against: pass one. --embedded is the answering binary's own, --release fetches a published tag, --schema-dir reads files you already have", strings.Join(named, " and "))
+		return fmt.Errorf("%s can't be used together", strings.Join(named, " and "))
 	}
 	repo := strings.TrimSpace(f.Repo)
 	if strings.TrimSpace(f.Release) == "" && repo != "" && repo != defaultStorageSchemaRepo {
