@@ -133,6 +133,31 @@ func TestVersionFromBuildInfo(t *testing.T) {
 			want: "v0.2.0-fork",
 		},
 		{
+			name: "reports a local path replacement as a development build",
+			info: &debug.BuildInfo{Deps: []*debug.Module{{
+				Path:    schemabotModulePath,
+				Version: "v0.1.68",
+				Replace: &debug.Module{Path: "../schemabot", Version: "(devel)"},
+			}}},
+			want: "(devel)",
+		},
+		{
+			name: "falls back when a replacement names no version",
+			info: &debug.BuildInfo{Deps: []*debug.Module{{
+				Path:    schemabotModulePath,
+				Version: "v0.1.68",
+				Replace: &debug.Module{Path: "../schemabot"},
+			}}},
+			want: unknownModuleVersion,
+		},
+		{
+			name: "falls back when the dependency names no version",
+			info: &debug.BuildInfo{Deps: []*debug.Module{
+				{Path: schemabotModulePath},
+			}},
+			want: unknownModuleVersion,
+		},
+		{
 			name: "falls back when schemabot is not a dependency",
 			info: &debug.BuildInfo{Deps: []*debug.Module{
 				{Path: "github.com/other/dep", Version: "v1.2.3"},

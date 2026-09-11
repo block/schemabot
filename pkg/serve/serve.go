@@ -112,16 +112,22 @@ func moduleVersion() string {
 // versionFromBuildInfo finds SchemaBot's version among the main module's
 // dependencies. A replace directive wins, so a host pinning a fork or a local
 // path is reported as what it actually runs rather than as the version it
-// nominally requires.
+// nominally requires. A module graph that names no version for the module it
+// selected falls back rather than reporting an empty string, so the field is
+// worth querying however the build info was produced.
 func versionFromBuildInfo(info *debug.BuildInfo) string {
 	for _, dep := range info.Deps {
 		if dep == nil || dep.Path != schemabotModulePath {
 			continue
 		}
+		version := dep.Version
 		if dep.Replace != nil {
-			return dep.Replace.Version
+			version = dep.Replace.Version
 		}
-		return dep.Version
+		if version == "" {
+			return unknownModuleVersion
+		}
+		return version
 	}
 	return unknownModuleVersion
 }
