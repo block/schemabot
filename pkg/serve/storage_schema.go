@@ -19,9 +19,14 @@ import (
 // The bindings are what make the answer trustworthy, so they are fixed at
 // construction and nothing on the wire can move them. There is no target in
 // the request, so no caller — not even the control plane — can point this at a
-// different database. The one thing a caller may influence is whether
-// destructive statements run, and that only ever widens what the local config
-// already allows (see effectiveAllowDestructive).
+// different database.
+//
+// Two things a caller may influence, and neither reaches the database a
+// convergence writes to. Whether destructive statements run only ever widens
+// what the local config already allows (see effectiveAllowDestructive). A
+// desired schema sent with a diff replaces the files the comparison reads, and
+// is accepted only there: the convergence RPC carries no schema, so an apply
+// always runs this binary's own (see desiredSchema).
 type storageSchemaAdapter struct {
 	// resolveDSN re-resolves the storage DSN per call rather than capturing a
 	// string, so a credential rotated since startup is picked up the same way
@@ -62,15 +67,44 @@ func (a *storageSchemaAdapter) StorageSchemaDiff(ctx context.Context, req *ternv
 	if err != nil {
 		return nil, err
 	}
+	desired, err := a.desiredSchema(req)
+	if err != nil {
+		return nil, err
+	}
 	diffCtx, cancel := context.WithTimeout(ctx, api.StorageSchemaDiffTimeout)
 	defer cancel()
 
-	report, err := api.DiffStorageSchema(diffCtx, dsn, a.logger, opts...)
+	report, err := api.DiffStorageSchema(diffCtx, dsn, desired, a.logger, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("diff storage schema (dialect %s): %w", a.dialect, err)
+		return nil, fmt.Errorf("diff storage schema (dialect %s) against %s: %w", a.dialect, desired.Description, err)
 	}
-	report.Version = a.version
+	report.AttributeTo(a.version)
 	return &ternv1.StorageSchemaDiffResponse{Report: api.StorageSchemaReportProto(report)}, nil
+}
+
+// desiredSchema resolves the schema the diff compares the live database
+// against: the files the caller sent, or this binary's own when it sent none.
+//
+// A caller-supplied schema is accepted here and nowhere else. A diff executes
+// nothing, so answering "what would this database need in order to match that
+// release" is a read however the release's files arrived; the convergence RPC
+// has no such field to send, so the schema a convergence runs is always this
+// binary's (AV-9).
+func (a *storageSchemaAdapter) desiredSchema(req *ternv1.StorageSchemaDiffRequest) (*api.StorageSchemaSource, error) {
+	files := req.GetSchemaFiles()
+	if len(files) == 0 {
+		return api.EmbeddedStorageSchema(a.version), nil
+	}
+	desired, err := api.StorageSchemaFromFiles(req.GetSchemaSource(), files)
+	if err != nil {
+		return nil, fmt.Errorf("read the supplied storage schema: %w", err)
+	}
+	a.logger.Info("diffing storage schema against a supplied schema",
+		"dialect", a.dialect,
+		"schema_source", desired.Description,
+		"schema_file_count", len(files),
+	)
+	return desired, nil
 }
 
 func (a *storageSchemaAdapter) StorageSchemaApply(ctx context.Context, req *ternv1.StorageSchemaApplyRequest) (*ternv1.StorageSchemaApplyResponse, error) {
@@ -86,8 +120,8 @@ func (a *storageSchemaAdapter) StorageSchemaApply(ctx context.Context, req *tern
 	if err != nil {
 		return nil, fmt.Errorf("converge storage schema (dialect %s): %w", a.dialect, err)
 	}
-	planned.Version = a.version
-	remaining.Version = a.version
+	planned.AttributeTo(a.version)
+	remaining.AttributeTo(a.version)
 	a.logger.InfoContext(ctx, "storage schema convergence answered",
 		"dialect", a.dialect,
 		"database", remaining.Database,

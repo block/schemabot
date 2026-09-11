@@ -102,6 +102,47 @@ func TestStorageSchemaAdapter_RefusesWithoutStorageDSN(t *testing.T) {
 	require.Error(t, err, "a convergence must not proceed without a database to converge")
 }
 
+// A diff with no schema on it is answered against this binary's own embedded
+// schema, attributed to this binary's version — which is what a boot would
+// converge to, and the answer an operator gets when they ask nothing else.
+func TestStorageSchemaAdapter_DesiredSchemaDefaultsToThisBinary(t *testing.T) {
+	adapter := &storageSchemaAdapter{version: "v1.2.3", logger: slog.New(slog.DiscardHandler)}
+
+	desired, err := adapter.desiredSchema(&ternv1.StorageSchemaDiffRequest{})
+	require.NoError(t, err)
+	assert.Equal(t, "the schema embedded in v1.2.3", desired.Description)
+	assert.Empty(t, desired.Files, "the answering binary's own files are read here, not sent to it")
+}
+
+// A schema on the request replaces the files the comparison reads, so an
+// operator can ask what this storage needs in order to match a release this
+// binary is not running. The attribution is the caller's, because the answer
+// came from the caller's files.
+func TestStorageSchemaAdapter_DesiredSchemaAcceptsASuppliedSchema(t *testing.T) {
+	adapter := &storageSchemaAdapter{version: "v1.2.3", logger: slog.New(slog.DiscardHandler)}
+
+	desired, err := adapter.desiredSchema(&ternv1.StorageSchemaDiffRequest{
+		SchemaSource: "the schema files of release v1.4.0",
+		SchemaFiles:  map[string]string{"applies.sql": "CREATE TABLE `applies` (`id` BIGINT UNSIGNED PRIMARY KEY)"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "the schema files of release v1.4.0", desired.Description)
+	assert.Len(t, desired.Files, 1)
+}
+
+// An unusable supplied schema is refused before anything reads a database. A
+// file set that cannot be read as one .sql file per table would otherwise diff
+// as a storage database full of surplus tables.
+func TestStorageSchemaAdapter_DesiredSchemaRefusesAnUnusableSchema(t *testing.T) {
+	adapter := &storageSchemaAdapter{version: "v1.2.3", logger: slog.New(slog.DiscardHandler)}
+
+	_, err := adapter.desiredSchema(&ternv1.StorageSchemaDiffRequest{
+		SchemaFiles: map[string]string{"applies.sql": "CREATE TABLE `applies` (`id` BIGINT UNSIGNED PRIMARY KEY)"},
+	})
+	require.Error(t, err, "files with no source leave the report unable to attribute its answer")
+	assert.Contains(t, err.Error(), "needs a description")
+}
+
 // A DSN the server cannot resolve — an unreadable credential file, say —
 // surfaces as an error naming what was being resolved, not as a report about
 // an empty database.

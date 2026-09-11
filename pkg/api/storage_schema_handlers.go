@@ -7,8 +7,9 @@
 // that release *would* converge to; it does not tell you what the storage
 // actually converged to, and the two answers differ exactly when a deploy has
 // failed. Since that is the only time anyone asks, a version is never an input
-// here: the diff is computed by the binary that is running, against the live
-// catalog, in one call.
+// here: the live side is always read from the catalog, and the desired side is
+// always files — the answering binary's own, or a release's, sent by the caller
+// and named in the report.
 //
 // That is also why a data plane's storage is reached through the data plane
 // rather than dialed from the control plane. Its storage database usually sits
@@ -119,37 +120,51 @@ func (s *Service) resolveStorageSchemaTarget(deployment, environment string) (*s
 }
 
 // handleStorageSchemaDiff is the HTTP handler for
-// GET /api/storage/schema/diff.
+// POST /api/storage/schema/diff.
 //
-// It is a GET because it only reads: it plans nothing, stores nothing, and
-// takes no lock, so it is safe to call repeatedly against production while an
-// incident is in progress. It is nonetheless admitted at the write tier and
-// gated on admin membership — see storageSchemaOperation below — because what
-// it returns is the internal shape of SchemaBot's own bookkeeping database,
-// and because its sibling route converges that database.
+// It reads and nothing else: it plans no change, stores nothing, and takes no
+// lock, so it is safe to call repeatedly against production while an incident
+// is in progress. It is a POST because the desired schema travels in the body —
+// an operator asking what a database needs in order to match a later release
+// sends that release's files, since the answering binary does not carry them.
+// Being a POST also puts it at the write tier by the default rule, which is
+// where it belongs: what it returns is the internal shape of SchemaBot's own
+// bookkeeping database, and its sibling route converges that database.
 func (s *Service) handleStorageSchemaDiff(w http.ResponseWriter, r *http.Request) {
-	query := r.URL.Query()
-	deployment := query.Get("deployment")
-	environment := query.Get("environment")
-	allowDestructive := query.Get("allow_destructive") == "true"
-
+	req, err := decodeStorageSchemaDiffRequest(r)
+	if err != nil {
+		s.writeBodyDecodeError(w, err)
+		return
+	}
 	if !s.authorizeStorageSchemaOperation(w, r, storageSchemaDiffOperation) {
 		return
 	}
-	target, err := s.resolveStorageSchemaTarget(deployment, environment)
+	if err := validateStorageSchemaDiffRequest(req); err != nil {
+		s.logger.Warn("rejecting storage schema diff because its desired schema is incomplete",
+			"deployment", req.Deployment, "environment", req.Environment, "error", err)
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	target, err := s.resolveStorageSchemaTarget(req.Deployment, req.Environment)
 	if err != nil {
 		s.logger.Warn("rejecting storage schema diff because its target could not be resolved",
-			"deployment", deployment, "environment", environment, "error", err)
+			"deployment", req.Deployment, "environment", req.Environment, "error", err)
 		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	resp, err := target.service.StorageSchemaDiff(r.Context(), &ternv1.StorageSchemaDiffRequest{
-		AllowDestructive: allowDestructive,
+		AllowDestructive: req.AllowDestructive,
+		SchemaFiles:      req.SchemaFiles,
+		SchemaSource:     req.SchemaSource,
 	})
 	if err != nil {
 		s.logger.Error("storage schema diff failed",
-			"deployment", target.deployment, "environment", target.environment, "error", err)
+			"deployment", target.deployment,
+			"environment", target.environment,
+			"schema_source", req.SchemaSource,
+			"schema_file_count", len(req.SchemaFiles),
+			"error", err)
 		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("storage schema diff failed: %v", err))
 		return
 	}
@@ -256,34 +271,67 @@ const (
 //
 // This is the second of two gates and it is not the one that usually bites.
 // The first is the tier the auth middleware admits the route at, and both
-// routes are classified write there (auth.TierForRequest), including the
-// read-only diff. That classification is what makes the admin requirement real
-// on a deployment whose whole authorization model is read groups and write
-// groups: the handler-level scoped-write decision is a pass-through until some
-// database configures operator_groups, so a route left on the read tier would
-// be readable by every reader no matter what this function said.
+// routes are classified write there by auth.TierForRequest's default rule,
+// since both are non-GET. That classification is what makes the admin
+// requirement real on a deployment whose whole authorization model is read
+// groups and write groups: the handler-level scoped-write decision is a
+// pass-through until some database configures operator_groups, so a route left
+// on the read tier would be readable by every reader no matter what this
+// function said.
 func (s *Service) authorizeStorageSchemaOperation(w http.ResponseWriter, r *http.Request, operation string) bool {
 	return s.authorizeDirectAdminWrite(w, r, operation)
 }
 
 // decodeStorageSchemaApplyRequest decodes the apply body, tolerating an empty
-// one. Every field is optional — the defaults name this server's own storage
-// and refuse destructive statements — so a caller sending no body at all gets
-// the safe defaults rather than a decode error. Unknown fields are still
-// rejected, so a misspelled "deployment" cannot quietly become a convergence
-// of the wrong storage.
+// one.
 func decodeStorageSchemaApplyRequest(r *http.Request) (apitypes.StorageSchemaApplyRequest, error) {
-	var req apitypes.StorageSchemaApplyRequest
+	return decodeOptionalStorageSchemaBody[apitypes.StorageSchemaApplyRequest](r)
+}
+
+// decodeStorageSchemaDiffRequest decodes the diff body, tolerating an empty
+// one.
+func decodeStorageSchemaDiffRequest(r *http.Request) (apitypes.StorageSchemaDiffRequest, error) {
+	return decodeOptionalStorageSchemaBody[apitypes.StorageSchemaDiffRequest](r)
+}
+
+// decodeOptionalStorageSchemaBody decodes a storage schema request body,
+// tolerating an empty one. Every field of both requests is optional — the
+// defaults name this server's own storage, its own embedded schema, and refuse
+// destructive statements — so a caller sending no body at all gets the safe
+// defaults rather than a decode error. Unknown fields are still rejected, so a
+// misspelled "deployment" cannot quietly become a report about, or a
+// convergence of, the wrong storage.
+func decodeOptionalStorageSchemaBody[T any](r *http.Request) (T, error) {
+	var req T
 	if r.Body == nil {
 		return req, nil
 	}
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&req); err != nil {
+		var zero T
 		if errors.Is(err, io.EOF) {
-			return apitypes.StorageSchemaApplyRequest{}, nil
+			return zero, nil
 		}
-		return apitypes.StorageSchemaApplyRequest{}, err
+		return zero, err
 	}
 	return req, nil
+}
+
+// validateStorageSchemaDiffRequest refuses a desired schema that is only half
+// supplied. The two fields travel together or not at all: files without a
+// source would produce a report that cannot say what it was diffed against,
+// and a source without files would label this server's own embedded schema
+// with somebody else's name — which is the one way a report of this kind can
+// be actively misleading rather than merely wrong.
+func validateStorageSchemaDiffRequest(req apitypes.StorageSchemaDiffRequest) error {
+	source := strings.TrimSpace(req.SchemaSource)
+	switch {
+	case len(req.SchemaFiles) > 0 && source == "":
+		return fmt.Errorf("schema_files was sent without schema_source: a report has to say which schema it was diffed against, so name the source (a release, a directory) alongside the files")
+	case len(req.SchemaFiles) == 0 && source != "":
+		return fmt.Errorf("schema_source %q was sent without schema_files: with no files the diff would run against this server's own embedded schema and report it under that name; send the files, or drop schema_source to ask about the embedded schema", source)
+	default:
+		return nil
+	}
 }

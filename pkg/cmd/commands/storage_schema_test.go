@@ -192,32 +192,37 @@ func TestStorageSchemaRunnableDDL(t *testing.T) {
 	assert.Equal(t, "", storageSchemaRunnableDDL(""), "nothing to terminate stays untouched")
 }
 
-// The headline is the line an operator reads first, so it names the database
-// and the binary whose embedded schema produced the diff. The version matters:
-// the answer is only meaningful against the schema files it was compared with.
+// The headline is the line an operator reads first, so it names the database,
+// the server it is on, and the schema it was compared against. The schema
+// matters as much as the counts: the same database is converged against one
+// release and short of another, and both answers are correct.
 func TestStorageSchemaHeadline(t *testing.T) {
 	converged := storageSchemaHeadline(&apitypes.StorageSchemaReport{
-		Database:  "schemabot",
-		Dialect:   "mysql",
-		Version:   "v1.2.3",
-		Converged: true,
+		Database:     "schemabot",
+		Host:         "db-1.example",
+		Dialect:      "mysql",
+		SchemaSource: "the schema embedded in v1.2.3",
+		Version:      "v1.2.3",
+		Converged:    true,
 	})
-	assert.Equal(t, "schemabot (mysql) is converged, against the schema embedded in v1.2.3.", converged)
+	assert.Equal(t, "schemabot on db-1.example (mysql) is converged, against the schema embedded in v1.2.3.", converged)
 
 	outstanding := storageSchemaHeadline(&apitypes.StorageSchemaReport{
-		Database:    "schemabot",
-		Dialect:     "postgres",
-		Deployment:  "west",
-		Environment: "production",
-		Version:     "v1.2.3",
-		Outstanding: []apitypes.StorageSchemaStatement{{Table: "applies"}, {Table: "checks"}},
-		Destructive: []apitypes.StorageSchemaStatement{{Table: "stale_state"}},
-		Manual:      []apitypes.StorageSchemaStatement{{Table: "plans"}},
+		Database:     "schemabot",
+		Dialect:      "postgres",
+		Deployment:   "west",
+		Environment:  "production",
+		SchemaSource: "the schema files of release v1.4.0",
+		Version:      "v1.2.3",
+		Outstanding:  []apitypes.StorageSchemaStatement{{Table: "applies"}, {Table: "checks"}},
+		Destructive:  []apitypes.StorageSchemaStatement{{Table: "stale_state"}},
+		Manual:       []apitypes.StorageSchemaStatement{{Table: "plans"}},
 	})
 	assert.Equal(t,
-		"schemabot (postgres) on deployment west in production needs 4 statements: "+
-			"2 outstanding, 1 destructive, 1 needing manual remediation, against the schema embedded in v1.2.3.",
-		outstanding)
+		"schemabot (postgres), deployment west in production needs 4 statements: "+
+			"2 outstanding, 1 destructive, 1 needing manual remediation, against the schema files of release v1.4.0.",
+		outstanding,
+		"the answering binary's version never displaces the schema the diff actually used")
 
 	assert.Equal(t, "the storage database needs 1 statement: 1 outstanding.",
 		storageSchemaHeadline(&apitypes.StorageSchemaReport{
@@ -304,28 +309,48 @@ func TestRenderStorageSchemaReport_ManualSection(t *testing.T) {
 // direct form never echoes the DSN back — it may carry a password, and the
 // operator already has it.
 func TestStorageSchemaDiffHints(t *testing.T) {
-	local := storageSchemaDiffHints(&StorageDiffCmd{})
+	report := &apitypes.StorageSchemaReport{Database: "schemabot", Dialect: "mysql"}
+
+	local := storageSchemaDiffHints(&StorageDiffCmd{}, report)
 	require.Len(t, local, 1)
 	assert.Contains(t, local[0], "storage apply")
 	assert.NotContains(t, local[0], "--deployment")
 
 	deployment := storageSchemaDiffHints(&StorageDiffCmd{
 		storageSchemaTargetFlags: storageSchemaTargetFlags{Deployment: "west", Environment: "production"},
-	})
+	}, report)
 	require.Len(t, deployment, 1)
 	assert.Contains(t, deployment[0], "storage apply --deployment west -e production")
 
 	const secret = "root:hunter2@tcp(db.example:3306)/schemabot"
-	dsn := storageSchemaDiffHints(&StorageDiffCmd{storageSchemaTargetFlags: storageSchemaTargetFlags{DSN: secret}})
+	dsn := storageSchemaDiffHints(&StorageDiffCmd{storageSchemaTargetFlags: storageSchemaTargetFlags{DSN: secret}}, report)
 	require.Len(t, dsn, 1)
 	assert.Contains(t, dsn[0], "--dsn <the same DSN>")
 	assert.NotContains(t, dsn[0], "hunter2")
 
 	config := storageSchemaDiffHints(&StorageDiffCmd{
 		storageSchemaTargetFlags: storageSchemaTargetFlags{Config: "/etc/schemabot/config.yaml"},
-	})
+	}, report)
 	require.Len(t, config, 1)
 	assert.Contains(t, config[0], "--config /etc/schemabot/config.yaml")
+}
+
+// A diff against a release the target is not running must not offer
+// `storage apply` as the next step: an apply converges the schema of the binary
+// that answers, which is not the schema the report describes. The hint names
+// the two ways to converge the release instead.
+func TestStorageSchemaDiffHints_NamedRelease(t *testing.T) {
+	hints := storageSchemaDiffHints(
+		&StorageDiffCmd{storageSchemaSourceFlags: storageSchemaSourceFlags{Release: "v1.4.0"}},
+		&apitypes.StorageSchemaReport{
+			Database:     "schemabot",
+			Dialect:      "mysql",
+			SchemaSource: "the schema files of release v1.4.0",
+		})
+	require.Len(t, hints, 1)
+	assert.Contains(t, hints[0], "the schema files of release v1.4.0")
+	assert.Contains(t, hints[0], "run that release's binary")
+	assert.NotContains(t, hints[0], "storage apply")
 }
 
 // A clean convergence states that nothing is left, rather than leaving an
@@ -376,15 +401,20 @@ func TestRenderStorageSchemaConvergence_LeftBehind(t *testing.T) {
 	assert.NotContains(t, out.String(), "is converged")
 }
 
-// A deployment's report is labelled with the deployment it came from, so an
-// operator reading a control plane's answer can tell whose storage it describes.
+// A report is labelled with the database, the server it is on, and the
+// deployment it came from, so an operator reading a control plane's answer can
+// tell which database it describes without re-deriving it from a DSN or a
+// deployment name.
 func TestStorageSchemaDatabaseLabel(t *testing.T) {
 	assert.Equal(t, "schemabot (mysql)", storageSchemaDatabaseLabel(&apitypes.StorageSchemaReport{
 		Database: "schemabot", Dialect: "mysql",
+	}), "a server that reports no name of its own is left out rather than guessed at")
+	assert.Equal(t, "schemabot on db-1.example (mysql)", storageSchemaDatabaseLabel(&apitypes.StorageSchemaReport{
+		Database: "schemabot", Host: "db-1.example", Dialect: "mysql",
 	}))
-	assert.Equal(t, "schemabot (postgres) on deployment west in production",
+	assert.Equal(t, "schemabot on 10.0.0.7 (postgres), deployment west in production",
 		storageSchemaDatabaseLabel(&apitypes.StorageSchemaReport{
-			Database: "schemabot", Dialect: "postgres", Deployment: "west", Environment: "production",
+			Database: "schemabot", Host: "10.0.0.7", Dialect: "postgres", Deployment: "west", Environment: "production",
 		}))
 	assert.Equal(t, "the storage database", storageSchemaDatabaseLabel(&apitypes.StorageSchemaReport{}),
 		"a report with no database name still reads as a sentence")

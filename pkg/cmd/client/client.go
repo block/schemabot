@@ -135,28 +135,15 @@ func ChecksRepos(ctx context.Context, endpoint string) (*apitypes.ChecksReposRes
 // instance's own storage database — the server addressed by endpoint, or a data
 // plane reached through it when deployment is set.
 //
-// The server computes the answer from the embedded schema files of the binary
-// that is running, against the live catalog. No version is sent, because a
-// version is the wrong input: it says what a release would converge to, not
+// The server reads the live catalog and compares it against schema files:
+// its own embedded ones, or the ones in req.SchemaFiles when the caller is
+// asking about a release the server is not running. No version is sent, because
+// a version is the wrong input: it says what a release would converge to, not
 // what the storage actually converged to, and the two differ exactly when a
 // deploy has failed to converge.
-func StorageSchemaDiff(ctx context.Context, endpoint, deployment, environment string, allowDestructive bool) (*apitypes.StorageSchemaDiffResponse, error) {
-	values := url.Values{}
-	if deployment != "" {
-		values.Set("deployment", deployment)
-	}
-	if environment != "" {
-		values.Set("environment", environment)
-	}
-	if allowDestructive {
-		values.Set("allow_destructive", "true")
-	}
-	requestPath := "/api/storage/schema/diff"
-	if encoded := values.Encode(); encoded != "" {
-		requestPath += "?" + encoded
-	}
+func StorageSchemaDiff(ctx context.Context, endpoint string, req apitypes.StorageSchemaDiffRequest) (*apitypes.StorageSchemaDiffResponse, error) {
 	var result apitypes.StorageSchemaDiffResponse
-	if err := doSlowGetIntoCtx(ctx, endpoint, requestPath, &result); err != nil {
+	if err := doSlowPostIntoCtx(ctx, endpoint, "/api/storage/schema/diff", req, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil

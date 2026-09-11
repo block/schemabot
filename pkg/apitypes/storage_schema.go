@@ -30,9 +30,17 @@ type StorageSchemaReport struct {
 	// Database is the live database that was read, as its server reports it.
 	// It is what makes a report unmistakably about one database.
 	Database string `json:"database"`
-	// Version is the SchemaBot version of the binary whose embedded schema
-	// produced the diff. It is attribution, not an input: the diff came from
-	// the files themselves.
+	// Host is the database server as it names itself. Empty when the server
+	// does not report one.
+	Host string `json:"host,omitempty"`
+	// SchemaSource is where the desired side of the diff came from: the
+	// answering binary's embedded files, a directory, or a release. Always set,
+	// because one live database yields different answers against different
+	// releases.
+	SchemaSource string `json:"schema_source,omitempty"`
+	// Version is the SchemaBot version of the binary that answered. It is
+	// attribution, not an input: the diff came from schema files, and
+	// SchemaSource says which ones.
 	Version string `json:"version,omitempty"`
 	// Converged reports that the storage schema needs nothing at all. A report
 	// carrying only refused destructive statements is not converged.
@@ -43,8 +51,34 @@ type StorageSchemaReport struct {
 	Manual             []StorageSchemaStatement `json:"manual,omitempty"`
 }
 
+// StorageSchemaDiffRequest is the HTTP request for
+// POST /api/storage/schema/diff.
+//
+// The request reads and changes nothing, and is a POST because the desired
+// schema travels in the body: a caller asking what a database needs in order to
+// match a later release sends that release's files, which the answering binary
+// does not have. Every field is optional — the defaults ask the addressed
+// server what its own storage needs to match its own embedded schema.
+type StorageSchemaDiffRequest struct {
+	// Deployment names the data plane whose storage to read. Empty reads the
+	// storage of the server the request is made to.
+	Deployment string `json:"deployment,omitempty"`
+	// Environment is required alongside Deployment, since a deployment serves
+	// one gRPC endpoint per environment.
+	Environment string `json:"environment,omitempty"`
+	// AllowDestructive reports the destructive statements as ones that would
+	// run. It executes nothing either way: a diff never does.
+	AllowDestructive bool `json:"allow_destructive,omitempty"`
+	// SchemaFiles is the desired schema as file name → file contents. Empty
+	// diffs against the answering binary's own embedded schema.
+	SchemaFiles map[string]string `json:"schema_files,omitempty"`
+	// SchemaSource says where SchemaFiles came from, in words, for the report
+	// to attribute the answer to. Required with SchemaFiles and never inferred.
+	SchemaSource string `json:"schema_source,omitempty"`
+}
+
 // StorageSchemaDiffResponse is the HTTP response for
-// GET /api/storage/schema/diff.
+// POST /api/storage/schema/diff.
 type StorageSchemaDiffResponse struct {
 	Report *StorageSchemaReport `json:"report"`
 }

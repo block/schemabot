@@ -271,14 +271,14 @@ statement (see [configuration.md](./configuration.md)). A destructive
 change is a coordinated operation and belongs in the release notes with
 instructions, not in a routine patch release.
 
-The diff does not have to be read out of the files by hand. A binary of the
-release being deployed answers it against the live database:
+The diff does not have to be read out of the files by hand. Name the release
+being tested and the command answers it against the live database:
 
 ```bash
-schemabot storage diff --dsn "$STORAGE_DSN"    # run from the new release's binary
+schemabot storage diff --deployment west -e production --release v1.4.0
 ```
 
-Run it from the *new* release's binary, not the running one: through the API the
+Name the release, or run the command from a binary of it — with neither, the
 answer describes whatever release is currently serving, which before a roll is
 the old one. Operators pre-creating an index ahead of the roll should also read
 [Deploying a release that changes the storage schema](./configuration.md#deploying-a-release-that-changes-the-storage-schema)

@@ -86,15 +86,11 @@ func newStorageSchemaService(t *testing.T, cfg *ServerConfig) *Service {
 	return New(nil, cfg, nil, slog.New(slog.DiscardHandler))
 }
 
-func storageSchemaDiffRequest(t *testing.T, svc *Service, query string) *httptest.ResponseRecorder {
+func storageSchemaDiffRequest(t *testing.T, svc *Service, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
-	path := "/api/storage/schema/diff"
-	if query != "" {
-		path += "?" + query
-	}
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/storage/schema/diff", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 	return rec
@@ -166,7 +162,7 @@ func TestHandleStorageSchemaDiff_ForwardsAllowDestructive(t *testing.T) {
 	}
 	svc.SetStorageSchemaService(local)
 
-	rec := storageSchemaDiffRequest(t, svc, "allow_destructive=true")
+	rec := storageSchemaDiffRequest(t, svc, `{"allow_destructive":true}`)
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	assert.True(t, local.diffReq.GetAllowDestructive())
 }
@@ -199,7 +195,7 @@ func TestHandleStorageSchemaDiff_ReadsDataPlaneStorage(t *testing.T) {
 		fakeStorageSchemaService: remote,
 	})
 
-	rec := storageSchemaDiffRequest(t, svc, "deployment=west&environment=production")
+	rec := storageSchemaDiffRequest(t, svc, `{"deployment":"west","environment":"production"}`)
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 
 	report := decodeDiffResponse(t, rec).Report
@@ -222,7 +218,7 @@ func TestHandleStorageSchemaDiff_UnconfiguredDeploymentDoesNotFallBack(t *testin
 	}
 	svc.SetStorageSchemaService(local)
 
-	rec := storageSchemaDiffRequest(t, svc, "deployment=east&environment=production")
+	rec := storageSchemaDiffRequest(t, svc, `{"deployment":"east","environment":"production"}`)
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 	body := rec.Body.String()
 	assert.Contains(t, body, "no data plane configured for deployment")
@@ -242,7 +238,7 @@ func TestHandleStorageSchemaDiff_RefusesNonRoutableDeployment(t *testing.T) {
 	})
 	svc.RegisterTernClient("west", "production", &mockTernClient{})
 
-	rec := storageSchemaDiffRequest(t, svc, "deployment=west&environment=production")
+	rec := storageSchemaDiffRequest(t, svc, `{"deployment":"west","environment":"production"}`)
 	require.Equal(t, http.StatusBadRequest, rec.Code)
 	assert.Contains(t, rec.Body.String(), "in-process client")
 	assert.Contains(t, rec.Body.String(), "west")
@@ -257,11 +253,11 @@ func TestHandleStorageSchemaDiff_RefusesHalfNamedTarget(t *testing.T) {
 		diffResp: &ternv1.StorageSchemaDiffResponse{Report: storageSchemaReportMessage("control_plane_storage")},
 	})
 
-	deploymentOnly := storageSchemaDiffRequest(t, svc, "deployment=west")
+	deploymentOnly := storageSchemaDiffRequest(t, svc, `{"deployment":"west"}`)
 	require.Equal(t, http.StatusBadRequest, deploymentOnly.Code)
 	assert.Contains(t, deploymentOnly.Body.String(), "needs an environment")
 
-	environmentOnly := storageSchemaDiffRequest(t, svc, "environment=production")
+	environmentOnly := storageSchemaDiffRequest(t, svc, `{"environment":"production"}`)
 	require.Equal(t, http.StatusBadRequest, environmentOnly.Code)
 	assert.Contains(t, environmentOnly.Body.String(), "without a deployment")
 }
@@ -363,7 +359,7 @@ func TestStorageSchemaRoutes_DenyScopedOperator(t *testing.T) {
 		path   string
 		body   string
 	}{
-		{http.MethodGet, "/api/storage/schema/diff", ""},
+		{http.MethodPost, "/api/storage/schema/diff", `{}`},
 		{http.MethodPost, "/api/storage/schema/apply", `{}`},
 	} {
 		t.Run(route.method+" "+route.path, func(t *testing.T) {
@@ -390,7 +386,7 @@ func TestStorageSchemaRoutes_AllowAdmin(t *testing.T) {
 	mux := http.NewServeMux()
 	svc.ConfigureRoutes(mux)
 	admin := auth.WithUser(t.Context(), &auth.User{Subject: "alice", Groups: []string{"schema-admins"}})
-	req := httptest.NewRequestWithContext(admin, http.MethodGet, "/api/storage/schema/diff", nil)
+	req := httptest.NewRequestWithContext(admin, http.MethodPost, "/api/storage/schema/diff", strings.NewReader(`{}`))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 

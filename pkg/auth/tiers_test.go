@@ -29,9 +29,8 @@ func TestTierForRequest(t *testing.T) {
 		// SchemaBot's own storage schema is admin territory on both halves:
 		// the diff exposes the internal shape of its bookkeeping database, and
 		// its sibling route converges it. On a deployment configured with only
-		// read and write groups this tier is the whole admin decision, so the
-		// GET must not sit at the read tier.
-		{http.MethodGet, "/api/storage/schema/diff", TierWrite},
+		// read and write groups this tier is the whole admin decision.
+		{http.MethodPost, "/api/storage/schema/diff", TierWrite},
 		{http.MethodPost, "/api/storage/schema/apply", TierWrite},
 	}
 	for _, c := range cases {
@@ -39,17 +38,16 @@ func TestTierForRequest(t *testing.T) {
 	}
 }
 
-// Every write-tier GET is listed in writePaths, and a GET outside that list
-// stays a read. The list is the only thing standing between a read-tier
-// classification and an endpoint everyone with read access can call, so it has
-// to be exact rather than approximate.
-func TestWritePathsCoverEveryWriteTierGet(t *testing.T) {
-	for path := range writePaths {
-		assert.Equalf(t, TierWrite, TierForRequest(http.MethodGet, path), "GET %s", path)
-		assert.Equalf(t, TierWrite, TierForRequest(http.MethodHead, path), "HEAD %s", path)
+// Only the listed read-only endpoints escape the write tier by name. Every
+// other non-GET path is a write, including one nobody has classified, so a new
+// mutating endpoint is admitted at the write tier before anyone remembers to
+// think about it.
+func TestUnclassifiedNonGetPathsAreWrites(t *testing.T) {
+	for _, path := range []string{"/api/storage/schema/diff", "/api/newly/added/endpoint", "/api/pull/subresource"} {
+		assert.Equalf(t, TierWrite, TierForRequest(http.MethodPost, path), "POST %s", path)
 	}
-	assert.Equal(t, TierRead, TierForRequest(http.MethodGet, "/api/storage/schema"),
-		"a prefix of a write path is not itself a write path")
+	assert.Equal(t, TierRead, TierForRequest(http.MethodPost, "/api/pull"),
+		"the read-only endpoints are listed by exact path")
 }
 
 func TestMatchesAnyGroup(t *testing.T) {

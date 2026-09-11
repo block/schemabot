@@ -966,6 +966,13 @@ message StartResponse {
 // on its own storage database. It deliberately carries no target: the instance
 // answers for the storage it uses, and nothing a caller sends can point it at
 // a different database.
+//
+// The live side of the diff is therefore fixed. The desired side is not: a
+// caller deploying a later release asks what this storage needs in order to
+// match that release, which the serving binary cannot answer from files it does
+// not have. Sending the files is the only way to ask the question, and it is
+// safe to ask because a diff executes nothing. The apply RPC carries no such
+// field, so a convergence can only ever run the serving binary's own schema.
 message StorageSchemaDiffRequest {
   // AllowDestructive reports the destructive statements as allowed rather than
   // refused, matching what an apply carrying the same flag would run. It does
@@ -973,6 +980,16 @@ message StorageSchemaDiffRequest {
   // statements are classified destructive, only whether the report says they
   // would run.
   bool allow_destructive = 1;
+  // SchemaFiles is the desired schema, as file name → file contents (for
+  // example "applies.sql" → "CREATE TABLE ..."). Empty diffs against the
+  // serving binary's own embedded files. The serving instance's dialect selects
+  // how they are read, exactly as it does for the embedded ones.
+  map<string, string> schema_files = 2;
+  // SchemaSource says where schema_files came from, in words, for the report to
+  // carry back. It is required with schema_files and never inferred: a report
+  // that does not say whose schema it was diffed against is one a caller can
+  // misattribute to the serving binary.
+  string schema_source = 3;
 }
 
 // StorageSchemaStatement is one outstanding storage-schema statement.
@@ -998,8 +1015,8 @@ message StorageSchemaReport {
   string dialect = 1;
   // The live database the diff read, as the server reports it.
   string database = 2;
-  // SchemaBot version of the binary whose embedded schema produced the diff.
-  // Reported for attribution only; the diff itself is computed from the files.
+  // SchemaBot version of the binary that answered. Reported for attribution
+  // only; the diff itself is computed from schema files, never from a version.
   string version = 3;
   // Statements that converge the schema and run automatically, in the order
   // the convergence would run them.
@@ -1013,6 +1030,15 @@ message StorageSchemaReport {
   // remediation. Any entry aborts the whole convergence before a single
   // statement executes.
   repeated StorageSchemaStatement manual = 7;
+  // The database server as it names itself, so a report names the machine it
+  // read and not only the database on it. Empty when the server does not
+  // report one.
+  string host = 8;
+  // Where the desired side of the diff came from, in words — the serving
+  // binary's embedded files, a directory, or a release. A report always says
+  // this, because the same live database yields different answers against
+  // different releases.
+  string schema_source = 9;
 }
 
 // StorageSchemaDiffResponse carries the outstanding storage DDL.

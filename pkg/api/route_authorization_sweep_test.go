@@ -114,9 +114,8 @@ func TestMutatingRoutesDenyScopedOperatorByDefault(t *testing.T) {
 		// The storage schema routes take no database — they are about
 		// SchemaBot's own bookkeeping database — so a scoped operator is denied
 		// on the admin requirement itself rather than on a target outside their
-		// grant. The diff route is a GET and still appears here, because
-		// auth.TierForRequest admits it at the write tier.
-		"GET /api/storage/schema/diff":   ``,
+		// grant.
+		"POST /api/storage/schema/diff":  `{}`,
 		"POST /api/storage/schema/apply": `{}`,
 	}
 

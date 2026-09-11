@@ -4,7 +4,9 @@ package api
 
 import (
 	"database/sql"
+	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"strings"
 	"testing"
@@ -51,7 +53,7 @@ func statementTables(statements []StorageSchemaStatement) []string {
 func TestDiffStorageSchemaMySQL_EmptyDatabaseNeedsEveryTable(t *testing.T) {
 	sdb, db := openEnsureSchemaDatabase(t)
 
-	report, err := DiffStorageSchema(t.Context(), sdb.DSN, storageSchemaTestLogger())
+	report, err := DiffStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger())
 	require.NoError(t, err)
 
 	assert.Equal(t, schema.DialectMySQL, report.Dialect)
@@ -97,7 +99,7 @@ func TestApplyStorageSchemaMySQL_ConvergesEmptyDatabase(t *testing.T) {
 	}
 
 	// The confirming read is the same read an operator would run next.
-	after, err := DiffStorageSchema(t.Context(), sdb.DSN, storageSchemaTestLogger())
+	after, err := DiffStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger())
 	require.NoError(t, err)
 	assert.True(t, after.Converged())
 	assert.Empty(t, after.Outstanding)
@@ -117,7 +119,7 @@ func TestDiffStorageSchemaMySQL_ReportsMissingColumn(t *testing.T) {
 	require.NoError(t, err, "drop a column the embedded schema declares")
 	require.False(t, testutil.ColumnExists(t, db, sdb.Name, "applies", "deployment"))
 
-	report, err := DiffStorageSchema(t.Context(), sdb.DSN, storageSchemaTestLogger())
+	report, err := DiffStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger())
 	require.NoError(t, err)
 
 	assert.False(t, report.Converged())
@@ -153,7 +155,7 @@ func TestDiffStorageSchemaMySQL_RefusesSurplusTable(t *testing.T) {
 		"CREATE TABLE `newer_release_state` (`id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
 	require.NoError(t, err, "create a table a newer release would own")
 
-	report, err := DiffStorageSchema(t.Context(), sdb.DSN, storageSchemaTestLogger())
+	report, err := DiffStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger())
 	require.NoError(t, err)
 
 	assert.False(t, report.Converged(), "a refused statement is not convergence")
@@ -175,7 +177,7 @@ func TestDiffStorageSchemaMySQL_RefusesSurplusTable(t *testing.T) {
 
 	// The same report with destructive changes allowed says the statement would
 	// run, which is what the operator opting in is asking to be told.
-	allowed, err := DiffStorageSchema(t.Context(), sdb.DSN, storageSchemaTestLogger(), WithAllowDestructiveSchemaChanges(true))
+	allowed, err := DiffStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger(), WithAllowDestructiveSchemaChanges(true))
 	require.NoError(t, err)
 	assert.True(t, allowed.DestructiveAllowed)
 	require.Len(t, allowed.Destructive, 1)
@@ -201,7 +203,7 @@ func TestDiffStorageSchemaMySQL_SurplusIndexIsNotProtected(t *testing.T) {
 	require.NoError(t, err, "pre-create an index the embedded schema does not declare")
 	require.True(t, testutil.IndexExists(t, db, sdb.Name, "applies", "idx_applies_caller"))
 
-	report, err := DiffStorageSchema(t.Context(), sdb.DSN, storageSchemaTestLogger())
+	report, err := DiffStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger())
 	require.NoError(t, err)
 
 	assert.False(t, report.Converged())
@@ -243,7 +245,7 @@ func TestDiffStorageSchemaMySQL_ReadsWhileBootstrapHoldsLock(t *testing.T) {
 		_ = conn.QueryRowContext(t.Context(), "SELECT RELEASE_LOCK(?)", ensureSchemaLockName).Scan(&released)
 	}()
 
-	report, err := DiffStorageSchema(t.Context(), sdb.DSN, storageSchemaTestLogger())
+	report, err := DiffStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger())
 	require.NoError(t, err, "a diff must not wait on the bootstrap lock")
 	assert.True(t, report.Converged())
 }
@@ -257,7 +259,7 @@ func TestDiffStorageSchemaPostgres_ConvergesEmptyDatabase(t *testing.T) {
 	logger := storageSchemaTestLogger()
 	postgres := WithDialect(schema.DialectPostgres)
 
-	report, err := DiffStorageSchema(t.Context(), dsn, logger, postgres)
+	report, err := DiffStorageSchema(t.Context(), dsn, nil, logger, postgres)
 	require.NoError(t, err)
 	assert.Equal(t, schema.DialectPostgres, report.Dialect)
 	assert.Equal(t, "schemabot", report.Database)
@@ -294,7 +296,7 @@ func TestDiffStorageSchemaPostgres_ReportsMissingColumn(t *testing.T) {
 	_, err := db.ExecContext(t.Context(), `ALTER TABLE "applies" DROP COLUMN "deployment"`)
 	require.NoError(t, err, "drop a column the embedded schema declares")
 
-	report, err := DiffStorageSchema(t.Context(), dsn, logger, postgres)
+	report, err := DiffStorageSchema(t.Context(), dsn, nil, logger, postgres)
 	require.NoError(t, err)
 	assert.False(t, report.Converged())
 	assert.Empty(t, report.Manual)
@@ -319,11 +321,80 @@ func TestDiffStorageSchemaPostgres_ReportsMissingColumn(t *testing.T) {
 	assert.True(t, testutil.PostgresColumnExists(t, db, "public", "applies", "deployment"))
 }
 
+// The question a deploy actually asks is whether the storage is ready for the
+// release about to roll, not whether it matches the release that is running. A
+// database converged against the running schema still reports the next
+// release's column as outstanding when the diff is given that release's schema
+// files, and the report attributes the answer to those files rather than to the
+// binary that read them.
+//
+// The live side is unaffected by any of it: the column is reported because the
+// catalog does not have it, which is why the answer stays correct on a database
+// a failed deploy left half converged.
+func TestDiffStorageSchemaMySQL_DiffsAgainstASuppliedSchema(t *testing.T) {
+	sdb, _ := openEnsureSchemaDatabase(t)
+	require.NoError(t, EnsureSchema(sdb.DSN, storageSchemaTestLogger()))
+
+	converged, err := DiffStorageSchema(t.Context(), sdb.DSN, EmbeddedStorageSchema("v1.2.3"), storageSchemaTestLogger())
+	require.NoError(t, err)
+	require.True(t, converged.Converged(), "outstanding against the running schema: %v", statementTables(converged.Outstanding))
+	assert.Equal(t, "the schema embedded in v1.2.3", converged.SchemaSource)
+
+	// The next release's schema: the running one, plus a column on one table.
+	files, err := storageSchemaFilesForTest()
+	require.NoError(t, err)
+	files["applies.sql"] = strings.Replace(files["applies.sql"],
+		"PRIMARY KEY (`id`)", "`release_note` varchar(255) NOT NULL DEFAULT '',\n  PRIMARY KEY (`id`)", 1)
+	require.Contains(t, files["applies.sql"], "release_note", "the fixture must actually declare the new column")
+	desired, err := StorageSchemaFromFiles("the schema files of release v1.4.0", files)
+	require.NoError(t, err)
+
+	report, err := DiffStorageSchema(t.Context(), sdb.DSN, desired, storageSchemaTestLogger())
+	require.NoError(t, err)
+	assert.False(t, report.Converged(), "the next release's column is not on this database yet")
+	assert.Equal(t, "the schema files of release v1.4.0", report.SchemaSource)
+	assert.Empty(t, report.Destructive)
+	assert.Empty(t, report.Manual)
+	require.Len(t, report.Outstanding, 1, "only the one table diverges: %v", statementTables(report.Outstanding))
+	assert.Equal(t, "applies", report.Outstanding[0].Table)
+	assert.Contains(t, report.Outstanding[0].DDL, "ADD COLUMN")
+	assert.Contains(t, report.Outstanding[0].DDL, "`release_note`")
+
+	// Attribution survives the stamp the responder applies: the answer came
+	// from the supplied files, whoever read them.
+	report.AttributeTo("v1.2.3")
+	assert.Equal(t, "the schema files of release v1.4.0", report.SchemaSource)
+	assert.Equal(t, "v1.2.3", report.Version)
+
+	// A convergence has no way to run the supplied schema, so the column stays
+	// off the database until the release that declares it boots.
+	_, remaining, err := ApplyStorageSchema(t.Context(), sdb.DSN, storageSchemaTestLogger())
+	require.NoError(t, err)
+	assert.True(t, remaining.Converged(), "an apply converges the running binary's schema, not the supplied one")
+	assert.Equal(t, "the schema embedded in this binary", remaining.SchemaSource)
+}
+
+// storageSchemaFilesForTest is the embedded MySQL schema as a file-name map, the
+// shape a caller-supplied schema takes.
+func storageSchemaFilesForTest() (map[string]string, error) {
+	schemaFiles, err := readEmbeddedSchemaFiles()
+	if err != nil {
+		return nil, err
+	}
+	namespace := schemaFiles[storageSchemaNamespace]
+	if namespace == nil {
+		return nil, fmt.Errorf("embedded schema has no %q namespace", storageSchemaNamespace)
+	}
+	files := make(map[string]string, len(namespace.Files))
+	maps.Copy(files, namespace.Files)
+	return files, nil
+}
+
 // A storage dialect with no differ fails closed rather than running another
 // family's catalog queries against it, and the refusal names both the dialect
 // asked for and the ones that exist.
 func TestDiffStorageSchema_UnsupportedDialectFailsClosed(t *testing.T) {
-	_, err := DiffStorageSchema(t.Context(), "unused", storageSchemaTestLogger(), WithDialect(schema.Dialect("sqlite")))
+	_, err := DiffStorageSchema(t.Context(), "unused", nil, storageSchemaTestLogger(), WithDialect(schema.Dialect("sqlite")))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "sqlite")
 	assert.Contains(t, err.Error(), string(schema.DialectMySQL))

@@ -13,16 +13,19 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	cmdclient "github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/cliname"
+	"github.com/block/schemabot/pkg/schema"
 )
 
 // Storage schema commands answer, and then close, the one question a deploy
 // that did not converge leaves open: which storage DDL is still outstanding on
 // this instance's own storage database.
 //
-// Both read the live database. Neither takes a version: a release tag says what
-// that release would converge to, not what the storage converged to, and the
-// two answers differ exactly when a deploy has failed — which is the only time
-// anyone runs these.
+// Both read the live database, always. A release tag can name the schema to
+// compare against (--release, --schema-dir), and it never stands in for the
+// live side: what a release would converge to and what the storage actually
+// converged to differ exactly when a deploy has failed, which is the only time
+// anyone runs these. So the desired side is files — the answering binary's, a
+// checkout's, or a tag's — and the report names which.
 //
 // There are two ways to reach a storage database, and which one applies is the
 // operator's to state rather than the CLI's to discover:
@@ -93,14 +96,22 @@ func (f *storageSchemaTargetFlags) validate() error {
 // storage needs nothing, 2 when statements are outstanding, and 1 when the
 // read itself failed. A pre-deploy gate needs those three apart, because
 // "converged" and "unreachable" call for opposite decisions.
+// The schema it compares against defaults to the answering binary's own, and
+// --schema-dir or --release point it at another release's instead, for the
+// question a deploy actually asks: is this storage ready for the release about
+// to roll.
 type StorageDiffCmd struct {
 	storageSchemaTargetFlags `embed:""`
+	storageSchemaSourceFlags `embed:""`
 	AllowDestructive         bool `help:"Report destructive statements as ones that would run, matching what an apply with the same flag would do" name:"allow-destructive"`
 	JSON                     bool `help:"Output as JSON"`
 }
 
 func (cmd *StorageDiffCmd) Run(ctx context.Context, g *Globals) error {
 	if err := cmd.validate(); err != nil {
+		return err
+	}
+	if err := cmd.validateSource(); err != nil {
 		return err
 	}
 	report, err := cmd.read(ctx, g)
@@ -113,7 +124,7 @@ func (cmd *StorageDiffCmd) Run(ctx context.Context, g *Globals) error {
 		if err := encoder.Encode(apitypes.StorageSchemaDiffResponse{Report: report}); err != nil {
 			return fmt.Errorf("encode storage schema report: %w", err)
 		}
-	} else if err := renderStorageSchemaReport(os.Stdout, report, storageSchemaDiffHints(cmd)); err != nil {
+	} else if err := renderStorageSchemaReport(os.Stdout, report, storageSchemaDiffHints(cmd, report)); err != nil {
 		return err
 	}
 	if report.Converged {
@@ -125,30 +136,65 @@ func (cmd *StorageDiffCmd) Run(ctx context.Context, g *Globals) error {
 // read fetches the report over whichever path the flags selected.
 func (cmd *StorageDiffCmd) read(ctx context.Context, g *Globals) (*apitypes.StorageSchemaReport, error) {
 	if cmd.direct() {
-		target, err := resolveStorageTarget(cmd.DSN, cmd.Config, cmd.Dialect)
-		if err != nil {
-			return nil, err
-		}
-		logger := storageSchemaLogger(g)
-		logger.Info("reading storage schema directly",
-			"source", target.source, "dialect", target.dialect)
-		report, err := api.DiffStorageSchema(ctx, target.dsn, logger,
-			api.WithDialect(target.dialect),
-			api.WithAllowDestructiveSchemaChanges(cmd.AllowDestructive))
-		if err != nil {
-			return nil, fmt.Errorf("diff storage schema on the database from %s: %w", target.source, err)
-		}
-		// The version is this CLI's, because on this path the embedded schema
-		// files that produced the diff are this binary's own.
-		report.Version = g.Version
-		return report.APIType(), nil
+		return cmd.readDirect(ctx, g)
 	}
+	return cmd.readThroughAPI(ctx, g)
+}
 
+// readDirect opens the storage database from this workstation and diffs it
+// here, for when the server is down — including when it is down because its own
+// schema bootstrap is failing.
+func (cmd *StorageDiffCmd) readDirect(ctx context.Context, g *Globals) (*apitypes.StorageSchemaReport, error) {
+	target, err := resolveStorageTarget(cmd.DSN, cmd.Config, cmd.Dialect)
+	if err != nil {
+		return nil, err
+	}
+	// The dialect is already resolved on this path, so a release fetch costs no
+	// extra round trip.
+	desired, err := cmd.resolve(ctx, func() (schema.Dialect, error) { return target.dialect, nil })
+	if err != nil {
+		return nil, err
+	}
+	logger := storageSchemaLogger(g)
+	logger.Info("reading storage schema directly",
+		"source", target.source, "dialect", target.dialect, "schema_source", desired.Describe())
+	report, err := api.DiffStorageSchema(ctx, target.dsn, desired, logger,
+		api.WithDialect(target.dialect),
+		api.WithAllowDestructiveSchemaChanges(cmd.AllowDestructive))
+	if err != nil {
+		return nil, fmt.Errorf("diff storage schema on the database from %s: %w", target.source, err)
+	}
+	// This CLI answered, so the version is this binary's — and so is the
+	// schema, unless the operator named another release's.
+	report.AttributeTo(g.Version)
+	return report.APIType(), nil
+}
+
+// readThroughAPI asks the server, which reads its own storage or has a data
+// plane read its own. A desired schema the operator named travels with the
+// request, because the answering binary does not carry another release's files.
+func (cmd *StorageDiffCmd) readThroughAPI(ctx context.Context, g *Globals) (*apitypes.StorageSchemaReport, error) {
 	endpoint, err := g.Resolve()
 	if err != nil {
 		return nil, err
 	}
-	response, err := cmdclient.StorageSchemaDiff(ctx, endpoint, cmd.Deployment, cmd.Environment, cmd.AllowDestructive)
+	request := apitypes.StorageSchemaDiffRequest{
+		Deployment:       cmd.Deployment,
+		Environment:      cmd.Environment,
+		AllowDestructive: cmd.AllowDestructive,
+	}
+	desired, err := cmd.resolve(ctx, func() (schema.Dialect, error) {
+		return cmd.dialectThroughAPI(ctx, endpoint)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if desired != nil {
+		request.SchemaFiles = desired.Files
+		request.SchemaSource = desired.Description
+	}
+
+	response, err := cmdclient.StorageSchemaDiff(ctx, endpoint, request)
 	if err != nil {
 		return nil, fmt.Errorf("diff storage schema%s: %w", storageSchemaTargetSuffix(cmd.Deployment, cmd.Environment), err)
 	}
@@ -158,6 +204,28 @@ func (cmd *StorageDiffCmd) read(ctx context.Context, g *Globals) (*apitypes.Stor
 	return response.Report, nil
 }
 
+// dialectThroughAPI asks the target which storage family it runs, so a release
+// fetch reads the right one of its schema directories.
+//
+// It is the diff itself, asked with no desired schema: a read-only call that
+// the target answers about its own storage, which is the only authority on the
+// question. Asking costs a round trip and is why only --release pays for it —
+// but asking beats making the operator state a dialect their control plane
+// already knows, and beats guessing one and fetching DDL of the wrong family.
+func (cmd *StorageDiffCmd) dialectThroughAPI(ctx context.Context, endpoint string) (schema.Dialect, error) {
+	response, err := cmdclient.StorageSchemaDiff(ctx, endpoint, apitypes.StorageSchemaDiffRequest{
+		Deployment:  cmd.Deployment,
+		Environment: cmd.Environment,
+	})
+	if err != nil {
+		return "", fmt.Errorf("ask which storage family%s runs: %w", storageSchemaTargetSuffix(cmd.Deployment, cmd.Environment), err)
+	}
+	if response.Report == nil || response.Report.Dialect == "" {
+		return "", fmt.Errorf("the report for the storage%s named no dialect, so there is no way to tell which of a release's schema files apply to it", storageSchemaTargetSuffix(cmd.Deployment, cmd.Environment))
+	}
+	return schema.Dialect(response.Report.Dialect), nil
+}
+
 // StorageApplyCmd converges a SchemaBot instance's storage database by running
 // the schema bootstrap that instance would run on its next boot.
 //
@@ -165,15 +233,27 @@ func (cmd *StorageDiffCmd) read(ctx context.Context, g *Globals) (*apitypes.Stor
 // same refusal of destructive statements, and the same advisory lock — so two
 // operators running this at once serialize exactly the way two booting pods
 // do, and a pre-deploy convergence step is this command with nothing added.
+// It converges to the schema of the binary that runs it, and there is no flag
+// to point it at another release's — see storageSchemaSourceRefusal.
 type StorageApplyCmd struct {
 	storageSchemaTargetFlags `embed:""`
 	AllowDestructive         bool `help:"Permit the destructive statements the convergence would otherwise refuse; it widens the target's standing storage policy and never narrows it" name:"allow-destructive"`
 	AutoApprove              bool `short:"y" help:"Skip confirmation prompt" name:"auto-approve"`
 	JSON                     bool `help:"Output as JSON"`
+	// The diff's schema selectors are accepted here only to be refused with
+	// the reason and the alternative. An operator who has just run the diff
+	// against a release reaches for the same flags on the apply, and Kong's
+	// bare "unknown flag" would leave them guessing at whether the convergence
+	// silently used a different schema.
+	SchemaDir string `hidden:"" name:"schema-dir"`
+	Release   string `hidden:""`
 }
 
 func (cmd *StorageApplyCmd) Run(ctx context.Context, g *Globals) error {
 	if err := cmd.validate(); err != nil {
+		return err
+	}
+	if err := storageSchemaSourceRefusal(cmd.SchemaDir, cmd.Release); err != nil {
 		return err
 	}
 
@@ -291,18 +371,27 @@ func storageSchemaTargetSuffix(deployment, environment string) string {
 }
 
 // storageSchemaDatabaseLabel names the database a report is about, as an
-// operator would say it: the database, its dialect, and the deployment it
-// belongs to when the report came from one.
+// operator would say it: the database, the server it is on, its dialect, and
+// the deployment it belongs to when the report came from one.
+//
+// The server is in the label because "which database does this point at" is the
+// question an operator has before they act on any of it, and the answer has to
+// be legible without re-deriving it from a DSN, a config file, or a deployment
+// name. A server that does not report a name of its own is left out rather than
+// guessed at.
 func storageSchemaDatabaseLabel(report *apitypes.StorageSchemaReport) string {
 	label := report.Database
 	if label == "" {
 		label = "the storage database"
 	}
+	if report.Host != "" {
+		label += " on " + report.Host
+	}
 	if report.Dialect != "" {
 		label += fmt.Sprintf(" (%s)", report.Dialect)
 	}
 	if report.Deployment != "" {
-		label += fmt.Sprintf(" on deployment %s in %s", report.Deployment, report.Environment)
+		label += fmt.Sprintf(", deployment %s in %s", report.Deployment, report.Environment)
 	}
 	return label
 }
@@ -357,14 +446,20 @@ func renderStorageSchemaReport(w io.Writer, report *apitypes.StorageSchemaReport
 }
 
 // storageSchemaHeadline is the one line an operator reads first: which database
-// was read, and whether it needs anything.
+// was read, which schema it was compared against, and whether it needs
+// anything.
+//
+// The schema it was compared against is in the line and not in a footer,
+// because it changes what the rest of the output means. The same database is
+// converged against the release that is running and three statements short of
+// the release about to roll, and both reports are correct.
 func storageSchemaHeadline(report *apitypes.StorageSchemaReport) string {
-	version := ""
-	if report.Version != "" {
-		version = fmt.Sprintf(", against the schema embedded in %s", report.Version)
+	against := ""
+	if report.SchemaSource != "" {
+		against = fmt.Sprintf(", against %s", report.SchemaSource)
 	}
 	if report.Converged {
-		return fmt.Sprintf("%s is converged%s.", storageSchemaDatabaseLabel(report), version)
+		return fmt.Sprintf("%s is converged%s.", storageSchemaDatabaseLabel(report), against)
 	}
 	counts := make([]string, 0, 3)
 	if n := len(report.Outstanding); n > 0 {
@@ -378,7 +473,7 @@ func storageSchemaHeadline(report *apitypes.StorageSchemaReport) string {
 	}
 	total := len(report.Outstanding) + len(report.Destructive) + len(report.Manual)
 	return fmt.Sprintf("%s needs %d %s: %s%s.",
-		storageSchemaDatabaseLabel(report), total, pluralStatements(total), strings.Join(counts, ", "), version)
+		storageSchemaDatabaseLabel(report), total, pluralStatements(total), strings.Join(counts, ", "), against)
 }
 
 // storageSchemaOutstandingTitle says what the statements in the section are:
@@ -399,7 +494,14 @@ func storageSchemaDestructiveTitle(report *apitypes.StorageSchemaReport) string 
 
 // storageSchemaDiffHints names the next step for the report a diff just
 // printed, in the command form the operator invoked the CLI as.
-func storageSchemaDiffHints(cmd *StorageDiffCmd) []string {
+func storageSchemaDiffHints(cmd *StorageDiffCmd, report *apitypes.StorageSchemaReport) []string {
+	if cmd.selected() {
+		// Naming `storage apply` here would be wrong: it converges the schema
+		// of the binary that answers, which is not the schema this report is
+		// about. The two ways to converge the release's schema are the release
+		// itself, and this is where an operator is about to look for them.
+		return []string{fmt.Sprintf("These are what %s needs in order to match %s, not what its own next boot would run. To converge them, run that release's binary against this database — its container image is that release — or let the release's first boot converge them.", storageSchemaDatabaseLabel(report), report.SchemaSource)}
+	}
 	if cmd.direct() {
 		return []string{fmt.Sprintf("Converge it with: %s storage apply %s", cliname.Name(), storageSchemaDirectFlagHint(cmd.DSN, cmd.Config))}
 	}

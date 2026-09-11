@@ -1046,16 +1046,16 @@ converges.
 
 A deploy that did not converge leaves one question open: which storage DDL is
 still outstanding. Two commands answer it, and both read the live storage
-database. Neither takes a version, because a release tag says what that
-release would converge to, not what the storage converged to, and the two
-answers differ exactly when a deploy has failed.
+database. A release tag never stands in for that read: what a release would
+converge to and what the storage actually converged to differ exactly when a
+deploy has failed.
 
 `storage diff` is read-only. It takes no lock and holds no transaction, so it
 is safe at any time, including against production during an incident.
 
 ```console
 $ schemabot storage diff
-schemabot (mysql) needs 3 statements: 3 outstanding, against the schema embedded in v1.2.3.
+schemabot on db-1.example (mysql) needs 3 statements: 3 outstanding, against the schema embedded in v1.2.3.
 
 Outstanding, and run automatically on the next boot or apply (3):
 
@@ -1076,6 +1076,13 @@ of the answer: `0` when the storage needs nothing, `2` when statements are
 outstanding, and `1` when the read itself failed. A pre-deploy gate needs those
 three apart, since "converged" and "unreachable" call for opposite decisions.
 
+The headline answers the two questions that decide what the rest of the output
+means. `schemabot on db-1.example (mysql)` is the database that was read —
+reported by whoever read it, so it is not re-derived from a DSN, a config file,
+or a deployment name. `against the schema embedded in v1.2.3` is the schema it
+was compared against; [Which schema you are asking
+about](#which-schema-you-are-asking-about) is how to change that.
+
 `storage apply` converges the database by running the same bootstrap the next
 boot would run: the same differ, the same refusal of destructive statements,
 and the same advisory lock, so two operators running it at once serialize the
@@ -1084,15 +1091,15 @@ them; `--auto-approve` (`-y`) skips the prompt for scripted maintenance.
 
 ```console
 $ schemabot storage apply
-schemabot (mysql) needs 1 statement: 1 outstanding, against the schema embedded in v1.2.3.
+schemabot on db-1.example (mysql) needs 1 statement: 1 outstanding, against the schema embedded in v1.2.3.
 
 Outstanding, and run automatically on the next boot or apply (1):
 
 ALTER TABLE `applies` ADD COLUMN `driver_note` varchar(255) NOT NULL DEFAULT '' AFTER `lease_owner`;
 
-Run these statements against schemabot (mysql)? Only 'yes' will be accepted: yes
-Ran 1 statement against schemabot (mysql).
-schemabot (mysql) is converged.
+Run these statements against schemabot on db-1.example (mysql)? Only 'yes' will be accepted: yes
+Ran 1 statement against schemabot on db-1.example (mysql).
+schemabot on db-1.example (mysql) is converged.
 ```
 
 Destructive statements are refused here exactly as they are at startup, and for
@@ -1103,7 +1110,7 @@ as surplus. A refusal is reported rather than silently dropped, and
 
 ```console
 $ schemabot storage diff
-schemabot (mysql) needs 1 statement: 1 destructive, against the schema embedded in v1.2.3.
+schemabot on db-1.example (mysql) needs 1 statement: 1 destructive, against the schema embedded in v1.2.3.
 
 Destructive, and refused; surplus state stays in place (1):
 
@@ -1133,34 +1140,79 @@ embedded schema files. That is also what makes the answer trustworthy, since the
 binary that reports the diff is the binary whose next boot would run it.
 
 The direct path exists for when the server is down, including when it is down
-because its own schema bootstrap is failing. It reads the storage with *this
-CLI's* embedded schema files, so run a binary of the release you are deploying.
-`--dialect` states the storage family when a DSN's form does not say; it applies
-only to a direct connection.
+because its own schema bootstrap is failing. `--dialect` states the storage
+family when a DSN's form does not say; it applies only to a direct connection.
 
 Both routes are admin-only and both sit at the write tier, the read-only diff
 included, because the diff exposes the internal shape of SchemaBot's bookkeeping
-database. See [Authentication and authorization](auth.md#what-read-and-write-access-include).
+database. Both are `POST` requests, so they take the write tier by the default
+rule rather than by an exception. See [Authentication and
+authorization](auth.md#what-read-and-write-access-include).
 
-### Which binary's schema you are asking about
+### Which schema you are asking about
 
-There is no schema directory to point these commands at, and no flag to
-override one. The schema files are compiled into the binary (`go:embed` over
-`pkg/schema/mysql/` and `pkg/schema/postgres/`), and the diff always uses the
-files of the binary that *answers* the request:
+The live side of the diff is always a read of the database. The desired side is
+schema *files*, and three things can supply them:
 
-| Path | Whose embedded schema |
+| Desired schema | Where the files come from |
 |---|---|
-| through the API, no flags | the server the CLI is pointed at |
-| `--deployment <name> -e <env>` | that data plane |
-| `--dsn` / `--config` | the CLI binary you are running |
+| no flag | the embedded files of the binary that answers the request |
+| `--schema-dir <path>` | that directory's `.sql` files, read by the CLI |
+| `--release <tag>` | that tag's `pkg/schema/<dialect>/` files, fetched by the CLI |
 
-That is deliberate, and it is the one thing to keep straight when deploying.
-Through the API, the answer describes the release that is **currently running**.
-Before a roll that is the old release, so the API can report convergence while
-the release you are about to deploy still has work to do. To ask what the next
-release will run, run the command from a binary of that release: the direct
-path with the new CLI, or a one-shot job on the new image.
+With no flag, the answer describes the release that is **currently running**:
+the files are compiled in (`go:embed` over `pkg/schema/mysql/` and
+`pkg/schema/postgres/`), so through the API it is the server or data plane that
+answered, and on the direct path it is the CLI binary you are running. That is
+the right default — it is what the next boot would converge — and it is the
+wrong question before a roll, when the running release reports convergence while
+the release about to deploy still has work to do.
+
+`--release` asks that question without a binary of that release:
+
+```console
+$ schemabot storage diff --deployment west -e production --release v1.4.0
+schemabot on db-1.example (mysql), deployment west in production needs 1 statement: 1 outstanding, against the schema files of release v1.4.0 in block/schemabot.
+
+Outstanding, and run automatically on the next boot or apply (1):
+
+ALTER TABLE `applies` ADD COLUMN `driver_note` varchar(255) NOT NULL DEFAULT '' AFTER `lease_owner`;
+
+These are what schemabot on db-1.example (mysql), deployment west in production needs in order to match the schema files of release v1.4.0 in block/schemabot, not what its own next boot would run. To converge them, run that release's binary against this database — its container image is that release — or let the release's first boot converge them.
+```
+
+Because the storage schema is declarative, one diff against the release you are
+rolling to covers however many releases lie between; there is nothing to step
+through.
+
+The report names the schema it used, always, and never relabels a schema you
+supplied as the answering binary's own. That line is the difference between two
+correct reports about the same database, so read it before acting on the
+statements.
+
+Details of the two selectors:
+
+- **`--schema-dir <path>`** reads `*.sql` directly from a checkout or an
+  extracted image layer, one file per storage table. Point it at the dialect
+  directory (`pkg/schema/mysql`), not at its parent. A directory with no `.sql`
+  files is an error naming the path — a diff against an empty schema would
+  report every existing table as surplus.
+- **`--release <tag>`** fetches the files over the repository's contents API at
+  that tag. It reads the schema directory for the dialect the *live storage*
+  runs, which it learns by first asking the target — one extra read-only diff,
+  paid only by this flag. `--release-repo` points at a fork or mirror
+  (`block/schemabot` by default), `GITHUB_API_URL` at a different API host, and
+  `GITHUB_TOKEN` or `GH_TOKEN` authorizes the fetch. A repository the CLI cannot
+  read is an error naming the token to set and `--schema-dir` as the offline
+  alternative. Naming both selectors is refused rather than resolved by
+  precedence.
+
+`storage apply` has neither flag. A convergence runs the schema embedded in the
+binary running it, so that it does exactly what that binary's next boot would
+do — the property that makes it usable as a pre-deploy step at all, and the one
+that keeps an older binary from being handed newer schema to destroy. Passing
+either flag to `apply` is refused with the two real ways to converge a release:
+run that release's binary, or let its first boot do it.
 
 ### Deploying a release that changes the storage schema
 
@@ -1169,15 +1221,20 @@ needs none of this. Reach for the commands when the release notes name a
 storage schema change, when the tables involved carry a long history, or when a
 pod is not starting.
 
-1. **Before the roll, ask the new release what it will run.** Use a binary of
-   the release being deployed, not the running one.
+1. **Before the roll, ask the new release what it will run.** Name the release
+   being deployed, from whatever CLI you have to hand:
+
+   ```bash
+   schemabot storage diff --deployment west -e production --release v1.4.0
+   ```
+
+   Exit status 0 means that release's boot has nothing to do and the rest of
+   this does not apply. A binary of the new release answers the same question
+   with no flag, which is what to use where the tag cannot be fetched:
 
    ```bash
    schemabot storage diff --dsn "$STORAGE_DSN"    # run from the new release's binary
    ```
-
-   Exit status 0 means its boot has nothing to do and the rest of this does not
-   apply.
 
 2. **Decide whether the boot should do it.** Additive DDL inside the
    five-minute startup budget is fine when the tables are small. It is not fine
@@ -1189,15 +1246,20 @@ pod is not starting.
    schemabot storage apply --dsn "$STORAGE_DSN"   # from the new release's binary
    ```
 
+   The convergence has to come from a binary of the new release: `apply` runs the
+   schema embedded in whatever binary runs it, and there is no flag that points
+   it at a release's files. Use that release's container image as a one-shot job
+   if there is no binary to hand.
+
 3. **If you converged ahead of the roll, re-check right before it.** A table or
    a column you created early survives a boot of the current release, because
    dropping one is destructive and is refused. **An index does not.** Dropping
    an index destroys no data, so it falls outside that refusal, and any boot of
    the still-running older release converges the new index away without
    comment — a pod restart, a scale-up, a health-check replacement. Re-run the
-   diff from the new release's binary immediately before rolling, and treat a
-   long gap between pre-creating an index and deploying as a gap the index
-   probably did not survive.
+   step 1 diff immediately before rolling, and treat a long gap between
+   pre-creating an index and deploying as a gap the index probably did not
+   survive.
 
 4. **After the roll, confirm through the API, per deployment.**
 

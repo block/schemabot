@@ -848,9 +848,11 @@ func (s *Service) apiRoutes() []apiRoute {
 		{"GET /api/locks", s.handleLockList},
 
 		// Storage schema API (SchemaBot's own bookkeeping database). Both
-		// routes are admin-only and both are admitted at the write tier —
-		// including the read-only diff, see auth.TierForRequest.
-		{"GET /api/storage/schema/diff", s.handleStorageSchemaDiff},
+		// routes are admin-only, and both are POSTs so both are admitted at the
+		// write tier by auth.TierForRequest's default rule. The diff reads and
+		// nothing else; it carries a body because the schema to diff against
+		// can come from the caller.
+		{"POST /api/storage/schema/diff", s.handleStorageSchemaDiff},
 		{"POST /api/storage/schema/apply", s.handleStorageSchemaApply},
 
 		// Settings API

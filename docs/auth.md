@@ -650,8 +650,8 @@ to writes under `forward_auth`.
 In the route rules, `GET` and `HEAD` requests are reads, as is `POST /api/pull`.
 Other requests require write access by default.
 
-`GET /api/storage/schema/diff` is the exception in the other direction: it
-reads, but it requires write access. It reports the internal shape of
+`POST /api/storage/schema/diff` reads without changing anything, and still
+requires write access under that default. It reports the internal shape of
 SchemaBot's own bookkeeping database, and its sibling route converges that
 database, so both belong to the people who operate the server rather than to
 everyone who can see the schema changes it runs.
