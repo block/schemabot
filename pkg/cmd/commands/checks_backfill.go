@@ -99,6 +99,21 @@ type checksStuckCheck struct {
 	// Age is how long the run has been sitting uncompleted at scan time;
 	// "unknown" when GitHub did not report a start time.
 	Age string `json:"age"`
+	// WaitingOn says whether the stored state behind this run resolves on its
+	// own ("schemabot") or needs a person ("operator").
+	//
+	// Empty means no stored row explains the run, which covers more than an
+	// empty read: rows may exist and none of them block once scoped to this
+	// run's environment, or the only one that does is the aggregate, which
+	// restates the rows beside it rather than naming a cause. Empty also
+	// means unannotated when the scan was given a stuck_after this run is too
+	// young for. A reader that takes it for a failed storage read draws a
+	// conclusion the field does not support.
+	WaitingOn string `json:"waiting_on,omitempty"`
+	// Reasons are the distinct dispositions of the blocking stored rows, in
+	// the order the server reported them. They are what makes a stuck row
+	// triageable from the sweep instead of only from the PR.
+	Reasons []string `json:"reasons,omitempty"`
 }
 
 type checksBackfillReport struct {
@@ -198,6 +213,11 @@ scanning:
 				CheckName:    cmd.CheckName,
 				Page:         page,
 				UpdatedSince: updatedSince,
+				// Sent normalized, not as typed: this flag accepts operator
+				// spellings the server's own parser does not, so forwarding
+				// "2d" verbatim would fail the first page and abort the
+				// sweep. The report keeps the spelling the operator used.
+				StuckAfter: stuckAfter.String(),
 			})
 			if canceled := backfillCanceledError(err, stopProgress); canceled != nil {
 				return canceled
@@ -247,7 +267,7 @@ scanning:
 				}
 				report.Actions = append(report.Actions, action)
 			}
-			report.Stuck = append(report.Stuck, stuckChecksPastThreshold(repo, chunk.Stuck, stuckAfter, webhookRedriveNow())...)
+			report.Stuck = append(report.Stuck, stuckChecksPastThreshold(repo, chunk.Stuck, stuckAfter, scanObservedAt(chunk))...)
 			updateProgress(checksScanProgressLine(i+1, len(repos), repo, repoScanned, repoEstimate, report.Scanned, len(report.Actions), held, len(report.Stuck)))
 			if cmd.Limit > 0 && report.Scanned >= cmd.Limit {
 				break scanning
@@ -429,6 +449,31 @@ func rateLimitPauseDuration(rate *apitypes.GitHubRateLimit, floorPct int, now ti
 	return resetAt.Sub(now) + time.Minute, true
 }
 
+// scanObservedAt is the clock this page's runs should be aged against: the
+// server's, when it reported one.
+//
+// The threshold is applied on both sides — the server decides which runs to
+// read stored rows for, this command decides which to render — and a client
+// clock is a round trip ahead of the server's while the start time it reads
+// back is truncated to whole seconds. Both errors point the same way, so a run
+// the server judged just short of the threshold, and therefore left
+// unannotated, is judged past it here and rendered with an empty WAITING ON
+// and REASON. Those columns read as "no stored row was blocking", which is a
+// finding; "the server did not look" is not one.
+//
+// A server reporting no clock is one that does not annotate either, so there
+// the caller's own is all there is and applying the threshold locally is what
+// keeps it applied at all. An unparseable one is treated the same way rather
+// than trusted: the fallback renders more than it should, never less.
+func scanObservedAt(chunk *apitypes.ChecksScanResponse) time.Time {
+	if chunk.ObservedAt != "" {
+		if observed, err := time.Parse(time.RFC3339, chunk.ObservedAt); err == nil {
+			return observed
+		}
+	}
+	return webhookRedriveNow()
+}
+
 // stuckChecksPastThreshold flattens the scan's uncompleted Check Runs to one
 // row per (PR, check), keeping only runs that have been sitting longer than
 // stuckAfter. A run whose start time is missing, unparseable, or in the
@@ -460,10 +505,33 @@ func stuckChecksPastThreshold(repo string, prs []apitypes.StuckCheckPR, stuckAft
 				Status:     check.Status,
 				StartedAt:  check.StartedAt,
 				Age:        age,
+				WaitingOn:  check.WaitingOn,
+				Reasons:    blockingReasons(check.StoredRows),
 			})
 		}
 	}
 	return out
+}
+
+// blockingReasons lists the distinct dispositions of the rows that are
+// holding the gate open, dropping the ones that already resolved. A resolved
+// row explains nothing about why the run is still sitting, and listing it
+// alongside the real cause is what makes a sweep unreadable.
+//
+// The rollup row is dropped for the same reason. It restates the rows beside
+// it, so it adds a reason that names the symptom the operator is already
+// looking at instead of the cause underneath it.
+func blockingReasons(rows []apitypes.InspectedCheck) []string {
+	var reasons []string
+	for _, row := range rows {
+		if row.Aggregate || !row.Blocking || row.Reason == "" {
+			continue
+		}
+		if !slices.Contains(reasons, row.Reason) {
+			reasons = append(reasons, row.Reason)
+		}
+	}
+	return reasons
 }
 
 // repoPR keys a PR within a multi-repo report.
@@ -619,15 +687,20 @@ func writeChecksStuckSection(w io.Writer, report *checksBackfillReport) error {
 		return err
 	}
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	if _, err := fmt.Fprintln(tw, "PR\tCHECK\tSTATUS\tAGE"); err != nil {
+	if _, err := fmt.Fprintln(tw, "PR\tCHECK\tSTATUS\tAGE\tWAITING ON\tREASON"); err != nil {
 		return err
 	}
 	for _, stuck := range report.Stuck {
-		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", stuck.URL, stuck.CheckName, stuck.Status, stuck.Age); err != nil {
+		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			stuck.URL, stuck.CheckName, stuck.Status, stuck.Age,
+			orDash(stuck.WaitingOn), orDash(strings.Join(stuck.Reasons, ","))); err != nil {
 			return err
 		}
 	}
 	if err := tw.Flush(); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(w, "\nA run waiting on an operator will not clear on its own. Read the stored rows behind one with `sq schemabot checks show <owner/repo> <pr>`."); err != nil {
 		return err
 	}
 	_, err := fmt.Fprintln(w)

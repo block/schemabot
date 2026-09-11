@@ -200,6 +200,7 @@ func inspectedCheck(ctx context.Context, store storage.Storage, check *storage.C
 		Environment:    check.Environment,
 		DatabaseType:   check.DatabaseType,
 		Database:       check.DatabaseName,
+		Aggregate:      checkstate.IsAggregate(check),
 		RecordedSHA:    check.HeadSHA,
 		CoversHead:     checkstate.CoversHead(check, headSHA),
 		Status:         check.Status,

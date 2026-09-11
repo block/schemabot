@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/checkstate"
 )
 
 // The scan progress line always reads as progress toward a bound: PRs scanned
@@ -78,6 +80,32 @@ func TestStuckChecksPastThreshold(t *testing.T) {
 	assert.Equal(t, "unknown", stuck[1].Age)
 	assert.Equal(t, 7, stuck[2].PR)
 	assert.Equal(t, "unknown", stuck[2].Age, "a start time ahead of the scan clock cannot prove the run is young")
+}
+
+// The threshold is applied twice on one run: the server decides whether to
+// read the stored rows explaining it, and this command decides whether to
+// render it. The two must reach the same verdict, so the runs are aged against
+// the clock the server reported rather than the caller's, which is a round
+// trip ahead of it. Aged locally, a run the server judged just short of the
+// threshold would be rendered with an empty WAITING ON and REASON, and those
+// columns mean "no stored row was blocking" — a finding the scan never made.
+func TestScanObservedAtPrefersTheServersClock(t *testing.T) {
+	t.Parallel()
+
+	observed := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+	assert.Equal(t, observed,
+		scanObservedAt(&apitypes.ChecksScanResponse{ObservedAt: "2026-07-12T12:00:00Z"}).UTC())
+
+	// A server reporting no clock is one that does not annotate either, so the
+	// caller's own clock is all there is and the threshold still applies.
+	before := webhookRedriveNow()
+	fallback := scanObservedAt(&apitypes.ChecksScanResponse{})
+	assert.False(t, fallback.Before(before), "an unreported clock falls back to the caller's own")
+
+	// Trusting an unparseable one would age every run from the zero time and
+	// sweep the whole fleet into the report.
+	garbled := scanObservedAt(&apitypes.ChecksScanResponse{ObservedAt: "yesterday"})
+	assert.False(t, garbled.Before(before), "an unparseable clock is not trusted")
 }
 
 // The report renders stuck Check Runs in their own section, telling the
@@ -223,6 +251,37 @@ func TestChecksBackfillRunSkipsNamedDisabledRepo(t *testing.T) {
 	assert.Empty(t, report.Actions)
 }
 
+// --stuck-after accepts spellings this CLI understands and the server does
+// not, so the value goes out normalized. Forwarding "2d" as typed fails the
+// server's own parse and takes the whole sweep down on its first page, while
+// the report still shows the operator what they asked for.
+func TestChecksBackfillNormalizesStuckAfterOnTheWire(t *testing.T) {
+	var sent string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req apitypes.ChecksScanRequest
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+		sent = req.StuckAfter
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(apitypes.ChecksScanResponse{Repo: "octo/repo", Scanned: 1}))
+	}))
+	t.Cleanup(server.Close)
+
+	cmd := &ChecksBackfillCmd{Repo: "octo/repo", DryRun: true, StuckAfter: "2d", JSON: true}
+	var runErr error
+	output := captureStdout(func() {
+		runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL})
+	})
+	require.NoError(t, runErr)
+
+	_, err := time.ParseDuration(sent)
+	require.NoError(t, err, "the server parses this with time.ParseDuration, which does not know %q", "2d")
+	assert.Equal(t, (48 * time.Hour).String(), sent)
+
+	var report checksBackfillReport
+	require.NoError(t, json.Unmarshal([]byte(output), &report))
+	assert.Equal(t, "2d", report.StuckAfter, "the report keeps the operator's own spelling")
+}
+
 // checksBackfillScanServer serves a single-page checks scan returning the
 // given missing and stuck PRs, the shape a dry-run sweep consumes.
 func checksBackfillScanServer(t *testing.T, missing []apitypes.MissingCheckPR, stuck []apitypes.StuckCheckPR) *httptest.Server {
@@ -349,4 +408,104 @@ func TestRateLimitPauseDuration(t *testing.T) {
 
 	_, pause = rateLimitPauseDuration(&apitypes.GitHubRateLimit{Remaining: 0, Limit: 5000, ResetAt: now.Add(-time.Minute).Format(time.RFC3339)}, 20, now)
 	assert.False(t, pause, "a past reset means the next request sees a fresh budget")
+}
+
+// The stuck section carries what the server concluded about each run, so an
+// operator sweeping a fleet can act on the report itself rather than opening
+// every pull request in it. Rows that already resolved are left out of the
+// reason cell, and so is the rollup: neither explains why the run is still
+// sitting, and listing them alongside the real cause hides it.
+func TestStuckChecksPastThresholdCarriesTheServerDisposition(t *testing.T) {
+	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+	stuck := stuckChecksPastThreshold("octo/repo", []apitypes.StuckCheckPR{
+		{
+			Number: 5, URL: "https://github.com/octo/repo/pull/5", HeadSHA: "sha5",
+			Checks: []apitypes.IncompleteCheckRun{
+				{
+					Name: "SchemaBot (production)", CheckRunID: 50, Status: "in_progress", StartedAt: "2026-07-12T08:30:00Z",
+					WaitingOn: apitypes.WaitingOnOperator,
+					StoredRows: []apitypes.InspectedCheck{
+						{Database: checkstate.AggregateSentinel, Aggregate: true, Reason: checkstate.ReasonAggregateRollup, Blocking: true, SelfConverging: true},
+						{Database: "resolved", Reason: checkstate.ReasonResolved, SelfConverging: true},
+						{Database: "owed", Reason: checkstate.ReasonReconciliationOwed, Blocking: true},
+						{Database: "also-owed", Reason: checkstate.ReasonReconciliationOwed, Blocking: true},
+						{Database: "waiting", Reason: checkstate.ReasonApplyRunning, Blocking: true, SelfConverging: true},
+					},
+				},
+			},
+		},
+	}, time.Hour, now)
+
+	require.Len(t, stuck, 1)
+	assert.Equal(t, apitypes.WaitingOnOperator, stuck[0].WaitingOn)
+	assert.Equal(t, []string{checkstate.ReasonReconciliationOwed, checkstate.ReasonApplyRunning}, stuck[0].Reasons,
+		"blocking reasons only, deduplicated, in the order the server reported them")
+}
+
+// An entry the server could not explain renders as unknown rather than as
+// self-converging, because the absence of stored rows is not evidence that
+// nothing needs a person.
+func TestWriteChecksBackfillReportRendersStuckDisposition(t *testing.T) {
+	report := &checksBackfillReport{
+		Repos:      []string{"octo/repo"},
+		CheckNames: []string{"SchemaBot (production)"},
+		Scanned:    12,
+		DryRun:     true,
+		StuckAfter: "1h",
+		Stuck: []checksStuckCheck{
+			{
+				Repo: "octo/repo", PR: 5, URL: "https://github.com/octo/repo/pull/5",
+				CheckName: "SchemaBot (production)", Status: "in_progress", Age: "3h30m0s",
+				WaitingOn: apitypes.WaitingOnOperator,
+				Reasons:   []string{checkstate.ReasonReconciliationOwed},
+			},
+			{
+				Repo: "octo/repo", PR: 6, URL: "https://github.com/octo/repo/pull/6",
+				CheckName: "SchemaBot (production)", Status: "in_progress", Age: "2h0m0s",
+			},
+		},
+	}
+
+	var out strings.Builder
+	require.NoError(t, writeChecksBackfillReport(&out, report))
+
+	rendered := out.String()
+	assert.Contains(t, rendered, "WAITING ON")
+	assert.Contains(t, rendered, "REASON")
+	assert.Contains(t, rendered, apitypes.WaitingOnOperator)
+	assert.Contains(t, rendered, checkstate.ReasonReconciliationOwed)
+	assert.Contains(t, rendered, "sq schemabot checks show <owner/repo> <pr>")
+
+	// A bare substring check would pass on the "in_progress" and "2h0m0s"
+	// cells that already carry a hyphen, so the two cells that matter are
+	// read out of the row and compared whole.
+	cells := renderedCells(lineContaining(t, rendered, "https://github.com/octo/repo/pull/6"))
+	require.Len(t, cells, 6, "PR, check, status, age, waiting-on, reason")
+	assert.Equal(t, "-", cells[4], "an unexplained entry renders as unknown, never as self-converging")
+	assert.Equal(t, "-", cells[5], "no stored row means no reason to name")
+}
+
+// tabwriterCellGap matches the run of padding between two rendered cells. A
+// cell's own text can hold single spaces, so only a longer run separates one
+// cell from the next.
+var tabwriterCellGap = regexp.MustCompile(`\s{2,}`)
+
+// renderedCells splits one tabwriter row back into its cells, so a test can
+// assert on the value of a column rather than on a substring that any column
+// could satisfy.
+func renderedCells(line string) []string {
+	return tabwriterCellGap.Split(strings.TrimSpace(line), -1)
+}
+
+// lineContaining returns the single rendered line carrying needle, so a
+// per-row assertion cannot accidentally be satisfied by a different row.
+func lineContaining(t *testing.T, rendered, needle string) string {
+	t.Helper()
+	for line := range strings.SplitSeq(rendered, "\n") {
+		if strings.Contains(line, needle) {
+			return line
+		}
+	}
+	require.Fail(t, "no rendered line contains "+needle)
+	return ""
 }

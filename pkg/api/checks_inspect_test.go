@@ -26,9 +26,13 @@ type inspectCheckStore struct {
 	storage.CheckStore
 	checks []*storage.Check
 	err    error
+	// reads counts GetByPR calls, so a caller that avoids the read can prove
+	// it did rather than pass on an empty result either way.
+	reads int
 }
 
 func (s *inspectCheckStore) GetByPR(context.Context, string, int) ([]*storage.Check, error) {
+	s.reads++
 	return s.checks, s.err
 }
 

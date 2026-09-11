@@ -745,6 +745,41 @@ when findings remain; do not treat every nonzero exit as a transport error.
 This is an admin operation. See [PR recovery](pre-merge-workflow.md) for the
 workflow and automatic recovery behavior.
 
+A sweep that does find unfinished checks says what each one is waiting on, so
+the report can be triaged without opening every pull request in it:
+
+```console
+$ schemabot checks backfill --all-repos --dry-run
+Scanned 148 open PRs in acme/store, acme/ledger for SchemaBot (staging), SchemaBot (production).
+
+Stuck Check Runs — uncompleted for over 1h (backfill does not act on existing Check Runs; investigate the apply or plan that owns each):
+PR                                      CHECK                   STATUS       AGE      WAITING ON  REASON
+https://github.com/acme/store/pull/412  SchemaBot (staging)     in_progress  5h12m0s  schemabot   awaiting_replan_after_apply
+https://github.com/acme/ledger/pull/88  SchemaBot (production)  in_progress  31h0m0s  operator    reconciliation_owed
+https://github.com/acme/ledger/pull/91  SchemaBot (production)  queued       unknown  -           -
+
+A run waiting on an operator will not clear on its own. Read the stored rows behind one with `sq schemabot checks show <owner/repo> <pr>`.
+
+No missing SchemaBot Check Runs found.
+```
+
+`WAITING ON` is `schemabot` when every blocking stored row behind the run
+resolves on its own, and `operator` as soon as one of them does not. A `-`
+means no stored row explains that run, either because the server could not
+read any or because none of the rows it read is blocking. Neither is the same
+as nothing needing a person. `REASON` lists the blocking rows' `reason` codes,
+the same ones `checks show` prints, so an entry worth opening is visible from
+the sweep itself.
+
+Each row is read against the environment its own Check Run gates, so a pull
+request with a clean staging gate and a production reconciliation shows the
+reconciliation only on the production line.
+
+The stored rows are read only for runs old enough to reach the report, since
+a fleet sweep would otherwise pay a storage read per pull request for runs
+that started minutes ago and never get printed. `--stuck-after` sets that
+threshold, and a run whose start time cannot be read is always explained.
+
 ## Use the CLI from scripts and agents
 
 Prefer structured output when another program consumes the result:
