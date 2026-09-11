@@ -134,7 +134,7 @@ spec:
     spec:
       containers:
         - name: ministack
-          image: ministackorg/ministack:1.3.64
+          image: ministackorg/ministack:1.5.10
           ports: [{ containerPort: 4566 }]
           readinessProbe:
             tcpSocket: { port: 4566 }

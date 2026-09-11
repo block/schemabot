@@ -68,7 +68,7 @@ func TestResolve_LiteralWithColon(t *testing.T) {
 }
 
 // Note: secretsmanager: tests would require mocking AWS SDK or integration tests
-// The AWS functionality is tested via integration tests with LocalStack
+// The AWS functionality is tested via integration tests with MiniStack
 
 func TestValueFromGetSecretOutput(t *testing.T) {
 	// The string form is used when present.

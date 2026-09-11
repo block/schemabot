@@ -34,7 +34,6 @@ require (
 	github.com/square/etre v0.15.0
 	github.com/stretchr/testify v1.12.1
 	github.com/testcontainers/testcontainers-go v0.43.0
-	github.com/testcontainers/testcontainers-go/modules/localstack v0.43.0
 	github.com/testcontainers/testcontainers-go/modules/mysql v0.43.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.43.0
 	github.com/wasilibs/go-pgquery v0.0.0-20260728010200-155ebad2880e
