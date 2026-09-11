@@ -130,6 +130,10 @@ func ensurePostgresSchema(ctx context.Context, dsn string, logger *slog.Logger, 
 	}
 	defer releaseEnsureSchemaLock(ctx, locker, lockConn, logger, schema.DialectPostgres, database)
 
+	if err := ensureSchemaBudgetAfterLock(ctx, logger, schema.DialectPostgres, database); err != nil {
+		return err
+	}
+
 	// Re-check under the lock — another pod may have converged the schema while
 	// this pod waited.
 	drift, err = postgresSchemaDriftFor(ctx, db, tables, files)

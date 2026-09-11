@@ -356,6 +356,30 @@ justified exemption naming the CLI capability that covers it. That test mechaniz
 half only: a CLI command whose behavior drifted from its comment counterpart still passes, so the
 capability half above remains a convention.
 
+### AV-11: An instance that is told to stop, stops
+
+Stopping is bounded from the moment the instance is told to, and startup is inside that: the
+signal that ends a running instance also ends one that is still bringing storage up, rather than
+waiting out a boot budget measured in minutes for a database the instance will never use. On the
+way down, every wait on background work carries a bound of its own, so shutdown ends when those
+bounds are spent rather than when the slowest goroutine decides to return. An instance that cannot
+finish starting exits non-zero rather than lingering, so the platform restarts it instead of
+routing to it.
+
+Stopping at a bound is safe because nothing abandoned at one is lost. An apply whose driver did not
+return keeps its claim, which goes stale and is reclaimed by a peer on the same window that covers
+any driver that disappears (OW-3) — releasing it instead would be the unsafe move, since a peer
+would then be invited onto a target the exiting instance has not let go of. A claimed delivery is
+redelivered, a repair pass that did not finish is rerun by the next instance to start, and storage
+that was not converged is converged by whichever instance boots next. Waiting past the bound buys
+none of that back; it only delays the exit the recovery is waiting on.
+
+*Breaks if violated:* an instance told to stop outlives its termination grace period and is killed
+mid-work, turning a routine restart into an interrupted schema change. *Enforced:* the bounded
+waits on the close path (`pkg/drain`, used by `pkg/api/operator.go`, `pkg/api/shutdown.go`,
+`pkg/webhook/durable_dispatch.go`, and `pkg/serve/serve.go`) and the signal-scoped startup context
+(`pkg/serve/serve.go`, `pkg/cmd/commands/serve.go`).
+
 ## Merge gate (MG)
 
 The GitHub Check Run gate is the tier-0 safety feature: it is what stands between a schema PR

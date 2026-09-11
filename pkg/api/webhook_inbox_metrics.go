@@ -61,7 +61,7 @@ func (s *Service) StopWebhookInboxMonitor() {
 	s.webhookInboxMu.Unlock()
 
 	cancel()
-	s.webhookInboxWg.Wait()
+	s.drainMonitor(&s.webhookInboxWg, "webhook_inbox")
 }
 
 func (s *Service) webhookInboxMonitor(ctx context.Context, interval time.Duration) {

@@ -243,6 +243,10 @@ func ensureMySQLSchema(ctx context.Context, dsn string, logger *slog.Logger, o e
 	}
 	defer releaseEnsureSchemaLock(ctx, locker, lockConn, logger, schema.DialectMySQL, storageDatabase)
 
+	if err := ensureSchemaBudgetAfterLock(ctx, logger, schema.DialectMySQL, storageDatabase); err != nil {
+		return err
+	}
+
 	// Clean up stale Spirit internal tables only while holding the advisory
 	// lock. During a rolling deploy, another pod may be actively applying
 	// SchemaBot storage DDL; cleaning before the lock can delete that pod's
@@ -403,6 +407,44 @@ func ensureSchemaLockWaitError(ctx context.Context, err error) error {
 		return fmt.Errorf("stopped waiting for advisory lock %q because the bootstrap was canceled: %w", ensureSchemaLockName, err)
 	}
 	return fmt.Errorf("timed out waiting for advisory lock %q (another pod may be running EnsureSchema): %w", ensureSchemaLockName, err)
+}
+
+// ensureSchemaBudgetAfterLock stops a bootstrap that reached the front of the
+// advisory-lock queue with nothing left to converge under it. Reaching the
+// front is not the same as being able to use it: the wait and the work are
+// billed to the same deadline, so a long enough queue hands an instance the
+// lock at the moment its budget is gone.
+//
+// Converging anyway is worse than stopping. It starts an online DDL that cannot
+// finish, on a context that is already done, so the failure surfaces as
+// whatever the driver says about a cancelled statement rather than as the queue
+// that actually consumed the budget — and the engine it started does not
+// necessarily stop when the outer lock is released, which is how work outlives
+// the lock that was serializing it. Stopping here holds neither: the caller's
+// deferred release hands the lock to the next instance in the queue
+// immediately, and the boot retry loop opens the next attempt on a fresh
+// deadline, which is the attempt that can actually succeed.
+func ensureSchemaBudgetAfterLock(ctx context.Context, logger *slog.Logger, dialect schema.Dialect, database string) error {
+	switch {
+	case ctx.Err() == nil:
+		return nil
+	case errors.Is(ctx.Err(), context.Canceled):
+		logger.Info("acquired the EnsureSchema advisory lock after the bootstrap was canceled; the lock is released without converging",
+			"lock", ensureSchemaLockName,
+			"dialect", dialect,
+			"database", database,
+		)
+		return fmt.Errorf("acquired advisory lock %q after the bootstrap was canceled: %w", ensureSchemaLockName, ctx.Err())
+	default:
+		logger.Warn("acquired the EnsureSchema advisory lock with no budget left to converge under it; the wait consumed the whole bootstrap deadline, so the lock is released for the next instance and this attempt converges nothing",
+			"lock", ensureSchemaLockName,
+			"dialect", dialect,
+			"database", database,
+			"timeout", EnsureSchemaTimeout,
+		)
+		return fmt.Errorf("acquired advisory lock %q with no time left in the %s bootstrap deadline, which the lock wait consumed: %w",
+			ensureSchemaLockName, EnsureSchemaTimeout, ctx.Err())
+	}
 }
 
 // refusedStorageChange is a planned storage-schema statement EnsureSchema

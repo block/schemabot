@@ -77,7 +77,7 @@ func (s *Service) StopOperatorStuckPendingMonitor() {
 	s.stuckPendingMu.Unlock()
 
 	cancel()
-	s.stuckPendingWg.Wait()
+	s.drainMonitor(&s.stuckPendingWg, "operator_stuck_pending")
 }
 
 func (s *Service) operatorStuckPendingMonitor(ctx context.Context, interval time.Duration) {
