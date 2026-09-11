@@ -14,9 +14,12 @@ import (
 // cancelSettleTimeout bounds how long Cancel waits for a signalled drive to
 // publish its outcome. A cancelled build returns as soon as the server aborts
 // its statement; what follows is the executor's detached catalog verdict,
-// which runs under its own statement timeout, and the terminal publish. A
-// drive that has not settled by then is reported as still running rather
-// than as cancelled, and the next cancel attempt waits for it again.
+// which runs under its own statement timeout, the removal of the invalid
+// index the build left behind, which runs detached under
+// cancelledIndexCleanupBound, and the terminal publish. The settle wait
+// must hold all three, which is why the cleanup bound is kept well inside
+// it. A drive that has not settled by then is reported as still running
+// rather than as cancelled, and the next cancel attempt waits for it again.
 const cancelSettleTimeout = 2 * time.Minute
 
 // Cancel ends this apply's concurrent index build and answers with the
