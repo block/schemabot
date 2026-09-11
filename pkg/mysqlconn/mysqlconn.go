@@ -69,8 +69,8 @@ func WithConnectTimeout(d time.Duration) Option {
 const driverName = "block-mysql"
 
 // Open returns a MySQL connection using the same target-DSN normalization as
-// Spirit. Options customize the DSN (for example WithConnectTimeout) before the
-// pool is opened.
+// Spirit; ConnectionDSN lists the settings that normalization applies. Options
+// customize the DSN (for example WithConnectTimeout) before the pool is opened.
 func Open(dsn string, opts ...Option) (*sql.DB, error) {
 	connectionDSN, err := ConnectionDSN(dsn, opts...)
 	if err != nil {
@@ -125,10 +125,11 @@ func OpenReloadable(dsn string, reload func() (string, error), opts ...Option) (
 }
 
 // ConnectionDSN returns a MySQL DSN with required connection settings applied
-// (RDS TLS, client-side parameter interpolation, default transport timeouts),
-// plus any caller-supplied options (for example WithConnectTimeout). Settings
-// and options are applied on every return path so they take effect regardless
-// of whether the DSN also needs RDS TLS enhancement.
+// (RDS TLS, client-side parameter interpolation, default transport timeouts,
+// and a signed TINYINT(1) read as the number it holds rather than as a Go
+// bool), plus any caller-supplied options (for example WithConnectTimeout).
+// Settings and options are applied on every return path so they take effect
+// regardless of whether the DSN also needs RDS TLS enhancement.
 func ConnectionDSN(dsn string, opts ...Option) (string, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
