@@ -237,8 +237,24 @@ func planResponseFromProto(resp *ternv1.PlanResponse) *apitypes.PlanResponse {
 	}
 
 	httpResp.ExistingCopies = existingCopiesFromProto(resp.ExistingCopies)
+	httpResp.ExemptTables = exemptTablesFromProto(resp.ExemptTables)
 
 	return httpResp
+}
+
+func exemptTablesFromProto(groups []*ternv1.ExemptTables) []*apitypes.ExemptTablesResponse {
+	result := make([]*apitypes.ExemptTablesResponse, 0, len(groups))
+	for _, group := range groups {
+		if group == nil {
+			continue
+		}
+		result = append(result, &apitypes.ExemptTablesResponse{
+			Namespace: group.Namespace,
+			Tables:    group.Tables,
+			Reason:    group.Reason,
+		})
+	}
+	return result
 }
 
 // existingCopiesFromProto carries the target's unfinished copies through to the

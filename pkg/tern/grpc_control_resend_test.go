@@ -2,6 +2,7 @@ package tern
 
 import (
 	"bytes"
+	"errors"
 	"log/slog"
 	"strings"
 	"sync"
@@ -97,9 +98,9 @@ func TestGRPCClient_PendingCancelRetransmissionThrottled(t *testing.T) {
 	}
 
 	for range 3 {
-		handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+		standDown, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
 		require.NoError(t, err)
-		assert.False(t, handled, "a nonterminal remote keeps the cancel pending")
+		assert.False(t, standDown, "a nonterminal remote keeps the cancel pending")
 	}
 	assert.Equal(t, 1, server.getCancelCalls(), "polling passes within the resend interval must not re-send the cancel")
 	assert.Equal(t, 1, countLogMessages(logs.logs, "Remote cancel accepted"), "only the first transmission appends an operator-facing accept event")
@@ -112,9 +113,9 @@ func TestGRPCClient_PendingCancelRetransmissionThrottled(t *testing.T) {
 	}
 	client.controlSendGate.mu.Unlock()
 
-	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
 	require.NoError(t, err)
-	assert.False(t, handled)
+	assert.False(t, standDown)
 	assert.Equal(t, 2, server.getCancelCalls(), "the cancel retransmits after the resend interval elapses")
 	assert.Equal(t, 1, countLogMessages(logs.logs, "Remote cancel accepted"), "retransmissions must not append duplicate accept events")
 }
@@ -169,9 +170,9 @@ func TestGRPCClient_PendingStopRetransmissionThrottled(t *testing.T) {
 	}
 
 	for range 3 {
-		handled, err := client.processPendingStopControlRequest(t.Context(), apply, wholeApplyTaskScope())
+		standDown, err := client.processPendingStopControlRequest(t.Context(), apply, wholeApplyTaskScope())
 		require.NoError(t, err)
-		assert.False(t, handled, "a nonterminal remote keeps the stop pending")
+		assert.False(t, standDown, "a nonterminal remote keeps the stop pending")
 	}
 	assert.Equal(t, 1, server.getStopCalls(), "polling passes within the resend interval must not re-send the stop")
 	assert.Equal(t, 1, countLogMessages(logs.logs, "Remote stop accepted"), "only the first transmission appends an operator-facing accept event")
@@ -190,8 +191,8 @@ func countLogMessages(logs []*storage.ApplyLog, messagePrefix string) int {
 // A data plane that refuses a pending stop has made a decision, not dropped a
 // delivery: the request is already recorded durably there, so re-sending it can
 // only collect the same refusal. The drive resolves the request on the refusal
-// and reports the stop as not handled, because the schema change is still
-// running and no stop took effect.
+// and keeps the drive going, because the schema change is still running and
+// no stop took effect.
 func TestGRPCClient_RefusedStopResolvesTheRequest(t *testing.T) {
 	server := &capturingTernServer{
 		progressState:    ternv1.State_STATE_RUNNING,
@@ -227,9 +228,9 @@ func TestGRPCClient_RefusedStopResolvesTheRequest(t *testing.T) {
 		controlRequests: controlRequests,
 	}
 
-	handled, err := client.processPendingStopControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	standDown, err := client.processPendingStopControlRequest(t.Context(), apply, wholeApplyTaskScope())
 	require.NoError(t, err, "a refusal is an answer, not a drive failure")
-	assert.False(t, handled, "the schema change is still running, so no stop was handled")
+	assert.False(t, standDown, "the schema change is still running, so the drive step must keep going")
 
 	require.Len(t, controlRequests.requests, 1)
 	refused := controlRequests.requests[0]
@@ -247,10 +248,57 @@ func TestGRPCClient_RefusedStopResolvesTheRequest(t *testing.T) {
 	}
 
 	// A resolved request is not re-sent on the next claim.
-	handled, err = client.processPendingStopControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	standDown, err = client.processPendingStopControlRequest(t.Context(), apply, wholeApplyTaskScope())
 	require.NoError(t, err)
-	assert.False(t, handled)
+	assert.False(t, standDown)
 	assert.Equal(t, 1, server.getStopCalls(), "the refused request is not re-sent once it is resolved")
+}
+
+// The data plane's refusal decides that nothing stopped before the drive tries
+// to record it, so a storage failure recording it changes what the operator can
+// read, not what happened to their schema change. The drive is owed the same
+// answer either way.
+func TestGRPCClient_RefusedStopKeepsTheDriveGoingWhenResolvingTheRequestFails(t *testing.T) {
+	server := &capturingTernServer{
+		progressState:    ternv1.State_STATE_RUNNING,
+		progressStateSet: true,
+		stopRefusal:      "schema change remote-grpc-stop-refusal-write-fails is in the revert window and has already been applied: use revert to undo it or skip-revert to finalize it",
+	}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-grpc-stop-refusal-write-fails",
+		ExternalID:      "remote-grpc-stop-refusal-write-fails",
+		PlanID:          99,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "cli:alice",
+		CreatedAt:   time.Now(),
+	}}}
+	storedApply := *apply
+	client.storage = &mockStorage{
+		applies:         &mockApplyStore{apply: &storedApply},
+		tasks:           &mockTaskStore{},
+		logs:            &mockApplyLogStore{},
+		controlRequests: &failPendingErrorStore{testControlRequestStore: controlRequests, err: errors.New("apply lease lost")},
+	}
+
+	standDown, err := client.processPendingStopControlRequest(t.Context(), apply, wholeApplyTaskScope())
+
+	require.ErrorContains(t, err, "apply lease lost", "the storage failure must reach the caller")
+	assert.False(t, standDown, "the refusal already decided nothing stopped, so a failed write must not stand the drive down")
+	require.Len(t, controlRequests.requests, 1)
+	assert.Equal(t, storage.ControlRequestPending, controlRequests.requests[0].Status,
+		"the request could not be resolved, so it stays pending for a later claim")
 }
 
 // The cancel counterpart of the refused-stop case.
@@ -289,9 +337,9 @@ func TestGRPCClient_RefusedCancelResolvesTheRequest(t *testing.T) {
 		controlRequests: controlRequests,
 	}
 
-	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
 	require.NoError(t, err, "a refusal is an answer, not a drive failure")
-	assert.False(t, handled, "the schema change is still running, so no cancel was handled")
+	assert.False(t, standDown, "the schema change is still running, so the drive step must keep going")
 
 	require.Len(t, controlRequests.requests, 1)
 	refused := controlRequests.requests[0]
@@ -364,17 +412,17 @@ func TestGRPCClient_RefusedStopOnOperationOnlyDriveLeavesTheRequestPending(t *te
 	}
 	require.True(t, scope.suppressesDirectParentApplyWrites(), "the scope under test must be one that cannot write the parent apply")
 
-	handled, err := client.processPendingStopControlRequest(t.Context(), apply, scope)
+	standDown, err := client.processPendingStopControlRequest(t.Context(), apply, scope)
 	require.NoError(t, err, "a refusal is an answer, not a drive failure")
-	assert.False(t, handled, "nothing stopped, so the drive step must keep running")
+	assert.False(t, standDown, "nothing stopped, so the drive step must keep running")
 
 	require.Len(t, controlRequests.requests, 1)
 	assert.Equal(t, storage.ControlRequestPending, controlRequests.requests[0].Status,
 		"the shared apply-level request stays pending for the operator projection")
 
-	handled, err = client.processPendingStopControlRequest(t.Context(), apply, scope)
+	standDown, err = client.processPendingStopControlRequest(t.Context(), apply, scope)
 	require.NoError(t, err)
-	assert.False(t, handled)
+	assert.False(t, standDown)
 	assert.Equal(t, 1, server.getStopCalls(), "the refused request is not re-sent on the next claim")
 }
 

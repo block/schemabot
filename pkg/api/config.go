@@ -24,6 +24,7 @@ import (
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/pendingdrops"
+	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/ratelimit"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
@@ -41,6 +42,12 @@ var configIdentifierPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 // ServerConfig holds the server-side SchemaBot configuration.
 // This is loaded from a YAML file specified by SCHEMABOT_CONFIG_FILE.
 type ServerConfig struct {
+	liveDatabases *liveDatabaseRegistry
+
+	// ExperimentalStrataEnabled permits experimental Strata registrations and
+	// setup guidance. This server-only opt-in defaults to false.
+	ExperimentalStrataEnabled bool `yaml:"experimental-strata-enabled,omitempty"`
+
 	// Storage configures SchemaBot's internal storage database.
 	// If not specified, falls back to the STORAGE_DSN environment variable,
 	// then to MYSQL_DSN (legacy name, honored for every dialect).
@@ -988,7 +995,7 @@ type EtreCredentialsConfig struct {
 
 // DatabaseConfig holds configuration for a registered database.
 type DatabaseConfig struct {
-	// Type is the database type: "mysql", "vitess", or "strata".
+	// Type is "mysql", "postgres", "vitess", or "strata" (requires server opt-in).
 	Type string `yaml:"type"`
 
 	// App optionally names the application this database belongs to. Databases
@@ -1091,6 +1098,8 @@ type ReviewPolicyConfig struct {
 
 // EnvironmentConfig holds per-environment database configuration.
 type EnvironmentConfig struct {
+	resolvedLocalDSN string
+
 	// DSN is the database connection string for local mode.
 	// Can be a direct DSN or a reference to a secret (e.g., "env:MYSQL_DSN").
 	DSN string `yaml:"dsn"`
@@ -1283,10 +1292,52 @@ type PlanetScaleMTLSConfig struct {
 // PostgresConfig holds process-wide settings for the PostgreSQL engine.
 type PostgresConfig struct {
 	// NativeSafeTableSizeLimitBytes is the largest table on which the engine
-	// will execute native-safe DDL. When unset,
-	// postgres.DefaultNativeSafeTableSizeLimitBytes applies.
+	// will execute native-safe DDL whose cost scales with the table's existing
+	// data. A concurrent index build is bounded by ConcurrentIndexMaxDuration
+	// instead. When unset, postgres.DefaultNativeSafeTableSizeLimitBytes
+	// applies.
 	NativeSafeTableSizeLimitBytes *int64 `yaml:"native_safe_table_size_limit_bytes,omitempty"`
+
+	// ConcurrentIndexMaxDuration bounds one CREATE INDEX CONCURRENTLY build.
+	// When unset, postgres.DefaultConcurrentIndexMaxDuration applies.
+	ConcurrentIndexMaxDuration string `yaml:"concurrent_index_max_duration,omitempty"`
+
+	// StatementTimeout bounds a single ordinary storage query on the
+	// connections SchemaBot opens to its own PostgreSQL storage database: the
+	// long-lived storage pool and the startup bootstrap's catalog reads. It
+	// does not bound bootstrap DDL, which raises the budget per transaction to
+	// a value derived from EnsureSchemaTimeout, and it does not bound the
+	// bootstrap advisory-lock wait, which must be free to block. When unset,
+	// DefaultPostgresStatementTimeout applies. "0" disables the budget
+	// explicitly, for a deployment whose storage queries legitimately run
+	// longer than any value worth defaulting to.
+	StatementTimeout string `yaml:"statement_timeout,omitempty"`
 }
+
+// DefaultPostgresStatementTimeout bounds an ordinary storage query. Point
+// lookups, small scans, and lease claims against SchemaBot's own tables sit far
+// under it. The webhook inbox claim walk is the exception worth knowing about:
+// it reads across retained terminal rows, so it grows until something purges
+// them. The value exists mostly to displace an ambient one:
+// with no budget set, SchemaBot runs under whatever the platform imposed at the
+// role or database level, which hosted providers tune for API queries rather
+// than for SchemaBot's workload.
+const DefaultPostgresStatementTimeout = 30 * time.Second
+
+// postgresStatementTimeoutLockHeadroom is how far above the apply target lock
+// wait a configured budget must sit. A budget just above the wait already comes
+// out the right way round on its own: the lock acquisition sets its lock_timeout
+// in a separate statement and statement_timeout restarts for each statement, so
+// both clocks start together on the acquisition itself and the shorter
+// lock_timeout is always reached first. That ordering is a property of how the
+// acquisition happens to be written rather than something it guarantees, so
+// requiring real headroom keeps a deployment's budget from resting on it, or on
+// whatever work a later change puts inside the acquisition's own statement.
+const postgresStatementTimeoutLockHeadroom = 5 * time.Second
+
+// MinPostgresStatementTimeout is the smallest budget a deployment may configure
+// without disabling it outright.
+const MinPostgresStatementTimeout = storage.ApplyTargetLockWait + postgresStatementTimeoutLockHeadroom
 
 // NativeSafeTableSizeLimit returns the configured limit or its default.
 func (c PostgresConfig) NativeSafeTableSizeLimit() int64 {
@@ -1296,9 +1347,69 @@ func (c PostgresConfig) NativeSafeTableSizeLimit() int64 {
 	return *c.NativeSafeTableSizeLimitBytes
 }
 
+// ConcurrentIndexMaxDurationOrDefault returns the configured concurrent index bound.
+func (c PostgresConfig) ConcurrentIndexMaxDurationOrDefault() time.Duration {
+	return parseDurationOrDefault(c.ConcurrentIndexMaxDuration, postgresengine.DefaultConcurrentIndexMaxDuration)
+}
+
+// StatementTimeoutOrDefault returns the configured storage statement budget or
+// its default. A configured "0" returns zero, meaning the budget is explicitly
+// disabled — callers pass that through to postgresconn, which writes
+// statement_timeout=0 rather than inheriting the platform's value. It assumes
+// the value has already passed validation.
+func (c PostgresConfig) StatementTimeoutOrDefault() time.Duration {
+	return parseDurationOrDefault(c.StatementTimeout, DefaultPostgresStatementTimeout)
+}
+
 func (c PostgresConfig) validate() error {
 	if c.NativeSafeTableSizeLimitBytes != nil && *c.NativeSafeTableSizeLimitBytes <= 0 {
 		return fmt.Errorf("postgres.native_safe_table_size_limit_bytes must be positive, got %d", *c.NativeSafeTableSizeLimitBytes)
+	}
+	if c.ConcurrentIndexMaxDuration != "" {
+		d, err := time.ParseDuration(c.ConcurrentIndexMaxDuration)
+		if err != nil {
+			return fmt.Errorf("postgres.concurrent_index_max_duration %q is not a valid duration: %w", c.ConcurrentIndexMaxDuration, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("postgres.concurrent_index_max_duration %q must be positive (omit it to use the default)", c.ConcurrentIndexMaxDuration)
+		}
+		if d < postgresengine.MinConcurrentIndexMaxDuration {
+			return fmt.Errorf("postgres.concurrent_index_max_duration %q is below the smallest bound the engine can honor (%s, the server timer's resolution)", c.ConcurrentIndexMaxDuration, postgresengine.MinConcurrentIndexMaxDuration)
+		}
+		if d > postgresengine.MaxConcurrentIndexMaxDuration {
+			return fmt.Errorf("postgres.concurrent_index_max_duration %q exceeds the largest bound the engine can honor (%s)", c.ConcurrentIndexMaxDuration, postgresengine.MaxConcurrentIndexMaxDuration)
+		}
+	}
+	// Zero is a meaningful setting here, unlike the pool durations: it disables
+	// the budget explicitly instead of selecting the default.
+	if c.StatementTimeout != "" {
+		d, err := time.ParseDuration(c.StatementTimeout)
+		if err != nil {
+			return fmt.Errorf("postgres.statement_timeout %q is not a valid duration: %w", c.StatementTimeout, err)
+		}
+		if d < 0 {
+			return fmt.Errorf("postgres.statement_timeout %q must not be negative (omit it to use the default, or set \"0\" to disable the budget)", c.StatementTimeout)
+		}
+		// The storage pool blocks inside a lock acquisition for up to
+		// ApplyTargetLockWait, and statement_timeout bounds a blocked
+		// statement as readily as a computing one. A budget that does not clear
+		// that wait fires first, so the acquisition reports 57014 instead of the
+		// 55P03 the lock timeout would raise, and routine contention for an
+		// apply target surfaces as a failure rather than as "someone else
+		// holds it". Rejecting the value at startup is the only place that
+		// stays visible; in production the symptom appears far from the knob.
+		if d > 0 && d < MinPostgresStatementTimeout {
+			return fmt.Errorf("postgres.statement_timeout %q must be at least %s, leaving headroom above the %s apply target lock wait, or lock contention is reported as a statement timeout instead of a lock conflict (set \"0\" to disable the budget)",
+				c.StatementTimeout, MinPostgresStatementTimeout, storage.ApplyTargetLockWait)
+		}
+		// Above the server's own maximum the budget is not clamped: the server
+		// rejects it when the new session arms it, so every connection fails
+		// at dial and the server never starts. Refusing it here names the
+		// setting instead, since the dial failure names only the parameter.
+		if d > postgresconn.MaxStatementTimeout {
+			return fmt.Errorf("postgres.statement_timeout %q exceeds the %s PostgreSQL accepts, which would fail every connection at dial (set \"0\" to disable the budget)",
+				c.StatementTimeout, postgresconn.MaxStatementTimeout)
+		}
 	}
 	return nil
 }
@@ -1384,16 +1495,21 @@ func (c *ServerConfig) RepoAdmins(repo string) (teams, users []string) {
 // API calls instead of a scan of every configured directory.
 //
 // exhaustive reports whether the returned directories cover every location
-// this database's policy-valid config could live in. It is true with no
-// directories when the database does not exist or does not accept the repo —
-// no policy-valid config location exists, so an empty probe result is
+// this database's policy-valid config could live in. It is false with no
+// directories when the database is not configured on this server: the
+// registry, not a probe of zero directories, is what answers for such a
+// database, and a deployment whose registry is not authoritative for it (an
+// aggregate leader, whose registry covers only its own slice of the fleet)
+// cannot prove the config absent from a repository it could not enumerate. It
+// is true with no directories when the database does not accept the repo — no
+// policy-valid config location exists in it, so an empty probe result is
 // authoritative. It is false when the database has no allowed_dirs
 // restriction or a wildcard ("*") or repo-root (".") entry, where the config
 // could live anywhere and the probe must keep failing closed.
 func (c *ServerConfig) SchemaDirHintsForDatabase(repo, database string) (dirs []string, exhaustive bool) {
-	db, ok := c.Databases[database]
+	db, ok := c.DatabaseConfigs()[database]
 	if !ok {
-		return nil, true
+		return nil, false
 	}
 	if len(db.AllowedRepos) > 0 && !repoAllowed(db.AllowedRepos, repo) {
 		return nil, true
@@ -1422,7 +1538,7 @@ func (c *ServerConfig) SchemaDirHintsForDatabase(repo, database string) (dirs []
 func (c *ServerConfig) SchemaDirHintsForRepo(repo string) (dirs []string, exhaustive bool) {
 	seen := make(map[string]struct{})
 	exhaustive = true
-	for _, db := range c.Databases {
+	for _, db := range c.DatabaseConfigs() {
 		if len(db.AllowedRepos) > 0 && !repoAllowed(db.AllowedRepos, repo) {
 			continue
 		}
@@ -1542,8 +1658,40 @@ func (c *ServerConfig) canonicalizeRepositories() error {
 	return nil
 }
 
+// ValidateExperimentalStrata requires server opt-in for every registration path.
+func (c *ServerConfig) ValidateExperimentalStrata() error {
+	if c.ExperimentalStrataEnabled {
+		return nil
+	}
+	check := func(location, databaseType string) error {
+		if strings.ToLower(strings.TrimSpace(databaseType)) == storage.DatabaseTypeStrata {
+			return fmt.Errorf("%s: Strata is experimental; set experimental-strata-enabled: true in the server configuration to enable it", location)
+		}
+		return nil
+	}
+	for name, db := range c.Databases {
+		if err := check(fmt.Sprintf("database %q", name), db.Type); err != nil {
+			return err
+		}
+	}
+	for name, target := range c.TargetResolver.Targets {
+		if err := check(fmt.Sprintf("target %q", name), target.DatabaseType); err != nil {
+			return err
+		}
+	}
+	for index, resolver := range c.TargetResolver.Etre {
+		if err := check(fmt.Sprintf("target_resolver.etre[%d]", index), resolver.DatabaseType); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Validate checks the configuration for required fields and consistency.
 func (c *ServerConfig) Validate() error {
+	if err := c.ValidateExperimentalStrata(); err != nil {
+		return err
+	}
 	// The database registry is required for the control plane and for a
 	// single-database data plane. A data plane configured with a target_resolver
 	// resolves opaque targets dynamically and has no database registry, so it is
@@ -1629,7 +1777,11 @@ func (c *ServerConfig) Validate() error {
 		switch dbConfig.Type {
 		case storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres:
 		default:
-			return fmt.Errorf("database %q has invalid type %q (must be %s, %s, %s, or %s)", name, dbConfig.Type, storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres)
+			types := "mysql, postgres, or vitess"
+			if c.ExperimentalStrataEnabled {
+				types = "mysql, postgres, vitess, or strata (experimental)"
+			}
+			return fmt.Errorf("database %q has invalid type %q; choose %s", name, dbConfig.Type, types)
 		}
 		if len(dbConfig.Environments) == 0 {
 			return fmt.Errorf("database %q has no environments configured", name)
@@ -2301,7 +2453,7 @@ func (c *ServerConfig) validateRequiredChecksNotAggregate() error {
 // Database returns the database configuration for the given name.
 // Returns nil if not found.
 func (c *ServerConfig) Database(name string) *DatabaseConfig {
-	if db, ok := c.Databases[name]; ok {
+	if db, ok := c.DatabaseConfigs()[name]; ok {
 		return &db
 	}
 	return nil
@@ -2748,7 +2900,7 @@ func (c *ServerConfig) KnownEnvironments() []string {
 	}
 	add(c.AllowedEnvironments...)
 	add(c.PromotionEnvironmentOrder()...)
-	for _, db := range c.Databases {
+	for _, db := range c.DatabaseConfigs() {
 		add(db.EnvironmentOrder...)
 		for env := range db.Environments {
 			add(env)
@@ -2777,7 +2929,7 @@ func (c *ServerConfig) IsEnvironmentKnown(env string) bool {
 	if slices.Contains(c.AllowedEnvironments, env) || slices.Contains(order, env) {
 		return true
 	}
-	for _, db := range c.Databases {
+	for _, db := range c.DatabaseConfigs() {
 		if _, ok := db.Environments[env]; ok {
 			return true
 		}
@@ -3012,6 +3164,9 @@ func (c EnvironmentConfig) validateLocalDSNConfig(context string) error {
 }
 
 func (c EnvironmentConfig) ResolveDSN() (string, error) {
+	if c.resolvedLocalDSN != "" {
+		return c.resolvedLocalDSN, nil
+	}
 	if c.DSNFrom != nil {
 		return c.DSNFrom.Resolve()
 	}

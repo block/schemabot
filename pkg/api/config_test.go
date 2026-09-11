@@ -16,10 +16,12 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
+	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/pendingdrops"
+	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
@@ -4319,7 +4321,7 @@ func TestSchemaDirHintsForDatabase(t *testing.T) {
 
 	dirs, exhaustive = cfg.SchemaDirHintsForDatabase("octocat/hello-world", "unknown")
 	assert.Empty(t, dirs)
-	assert.True(t, exhaustive, "an unconfigured database has no policy-valid config location")
+	assert.False(t, exhaustive, "a probe of zero directories cannot prove an unconfigured database's config absent; the registry answers for it")
 }
 
 func TestSchemaDirHintsForRepoNoMatches(t *testing.T) {
@@ -4574,5 +4576,205 @@ postgres:
 		_, err := LoadServerConfigFromFile(path)
 		require.ErrorContains(t, err, "parse config file")
 		require.ErrorContains(t, err, "cannot unmarshal")
+	})
+}
+
+func TestPostgresConcurrentIndexMaxDuration(t *testing.T) {
+	t.Run("unset uses default", func(t *testing.T) {
+		assert.Equal(t, 24*time.Hour, (PostgresConfig{}).ConcurrentIndexMaxDurationOrDefault())
+	})
+
+	t.Run("configured duration", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(`
+databases:
+  mydb:
+    type: postgres
+    environments:
+      staging:
+        dsn: postgres://localhost/mydb
+postgres:
+  concurrent_index_max_duration: 36h
+`), 0o600))
+
+		cfg, err := LoadServerConfigFromFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, 36*time.Hour, cfg.Postgres.ConcurrentIndexMaxDurationOrDefault())
+	})
+
+	for _, value := range []string{"0", "-1s"} {
+		t.Run("refuses "+value, func(t *testing.T) {
+			cfg := PostgresConfig{ConcurrentIndexMaxDuration: value}
+			err := cfg.validate()
+			require.ErrorContains(t, err, "postgres.concurrent_index_max_duration")
+			require.ErrorContains(t, err, "must be positive")
+		})
+	}
+
+	t.Run("refuses invalid duration", func(t *testing.T) {
+		cfg := PostgresConfig{ConcurrentIndexMaxDuration: "tomorrow"}
+		err := cfg.validate()
+		require.ErrorContains(t, err, "is not a valid duration")
+	})
+
+	t.Run("accepts the engine minimum", func(t *testing.T) {
+		cfg := PostgresConfig{ConcurrentIndexMaxDuration: postgresengine.MinConcurrentIndexMaxDuration.String()}
+		require.NoError(t, cfg.validate())
+		assert.Equal(t, postgresengine.MinConcurrentIndexMaxDuration, cfg.ConcurrentIndexMaxDurationOrDefault())
+	})
+
+	t.Run("refuses duration below the server timer's resolution", func(t *testing.T) {
+		cfg := PostgresConfig{ConcurrentIndexMaxDuration: "500us"}
+		err := cfg.validate()
+		require.ErrorContains(t, err, "postgres.concurrent_index_max_duration")
+		require.ErrorContains(t, err, "below the smallest bound the engine can honor (1ms")
+	})
+
+	t.Run("accepts the engine maximum", func(t *testing.T) {
+		cfg := PostgresConfig{ConcurrentIndexMaxDuration: postgresengine.MaxConcurrentIndexMaxDuration.String()}
+		require.NoError(t, cfg.validate())
+		assert.Equal(t, postgresengine.MaxConcurrentIndexMaxDuration, cfg.ConcurrentIndexMaxDurationOrDefault())
+	})
+
+	t.Run("refuses duration above engine maximum", func(t *testing.T) {
+		cfg := PostgresConfig{ConcurrentIndexMaxDuration: (postgresengine.MaxConcurrentIndexMaxDuration + time.Millisecond).String()}
+		err := cfg.validate()
+		require.ErrorContains(t, err, "exceeds the largest bound the engine can honor")
+	})
+}
+
+// postgres.statement_timeout bounds ordinary storage queries. Unlike the pool
+// durations, zero is a meaningful setting rather than "use the default": it
+// disables the budget explicitly so the connection states that it has no
+// budget instead of inheriting whatever the platform imposed.
+func TestPostgresStatementTimeoutConfig(t *testing.T) {
+	t.Parallel()
+
+	postgresCfg := func(statementTimeout string) ServerConfig {
+		cfg := ServerConfig{Databases: map[string]DatabaseConfig{
+			"mydb": {
+				Type: storage.DatabaseTypePostgres,
+				Environments: map[string]EnvironmentConfig{
+					"staging": {DSN: "postgres://localhost/mydb"},
+				},
+			},
+		}}
+		cfg.Postgres.StatementTimeout = statementTimeout
+		return cfg
+	}
+
+	t.Run("unset uses the default", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("")
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, DefaultPostgresStatementTimeout, cfg.Postgres.StatementTimeoutOrDefault())
+	})
+
+	t.Run("explicit value wins over the default", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("90s")
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, 90*time.Second, cfg.Postgres.StatementTimeoutOrDefault())
+	})
+
+	t.Run("zero disables the budget rather than selecting the default", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("0")
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, time.Duration(0), cfg.Postgres.StatementTimeoutOrDefault())
+	})
+
+	t.Run("negative fails validation", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("-1s")
+		err := cfg.Validate()
+		require.ErrorContains(t, err, "postgres.statement_timeout")
+		require.ErrorContains(t, err, "must not be negative")
+	})
+
+	t.Run("unparseable fails validation", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("soon")
+		err := cfg.Validate()
+		require.ErrorContains(t, err, `postgres.statement_timeout "soon" is not a valid duration`)
+	})
+
+	// A budget that does not clear the apply target lock wait fires before that
+	// lock's own timeout, so an instance waiting its turn reports a statement
+	// timeout instead of a lock conflict and the contention stops looking like
+	// contention. Startup is the last place that is still visible. The floor
+	// sits above the wait rather than at it, so a budget in the band just over
+	// the wait is refused too: it comes out the right way round only because of
+	// how the acquisition is currently written.
+	t.Run("a value below the floor fails validation", func(t *testing.T) {
+		t.Parallel()
+		for _, tooShort := range []string{"1s", "9999ms", "10s", "10001ms", "14999ms"} {
+			cfg := postgresCfg(tooShort)
+			err := cfg.Validate()
+			require.ErrorContains(t, err, "postgres.statement_timeout")
+			require.ErrorContains(t, err, "must be at least 15s")
+			require.ErrorContains(t, err, "10s apply target lock wait")
+		}
+	})
+
+	t.Run("a value at the floor validates", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("15s")
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, 15*time.Second, cfg.Postgres.StatementTimeoutOrDefault())
+	})
+
+	// Disabling the budget outright is not "a very short budget" — nothing can
+	// cut the lock wait short, so the floor does not apply.
+	t.Run("zero is exempt from the lock wait floor", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("0")
+		require.NoError(t, cfg.Validate())
+	})
+
+	// The default has to clear the floor it is validated against, or the
+	// shipped configuration would be one the server rejects.
+	t.Run("the default clears the lock wait floor", func(t *testing.T) {
+		t.Parallel()
+		assert.GreaterOrEqual(t, DefaultPostgresStatementTimeout, MinPostgresStatementTimeout)
+		assert.Greater(t, MinPostgresStatementTimeout, storage.ApplyTargetLockWait)
+	})
+
+	// statement_timeout is a millisecond integer GUC, so a budget past the
+	// signed 32-bit maximum is not clamped: the server rejects it when the new
+	// session arms it and every connection fails at dial. Startup validation
+	// is where the value can still be named.
+	t.Run("a value above what PostgreSQL accepts fails validation", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg("600h")
+		err := cfg.Validate()
+		require.ErrorContains(t, err, "postgres.statement_timeout")
+		require.ErrorContains(t, err, "exceeds the")
+	})
+
+	t.Run("the largest accepted value validates", func(t *testing.T) {
+		t.Parallel()
+		cfg := postgresCfg(postgresconn.MaxStatementTimeout.String())
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, postgresconn.MaxStatementTimeout, cfg.Postgres.StatementTimeoutOrDefault())
+	})
+
+	t.Run("loads from file", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(`
+databases:
+  mydb:
+    type: postgres
+    environments:
+      staging:
+        dsn: postgres://localhost/mydb
+postgres:
+  statement_timeout: 45s
+`), 0o600))
+
+		cfg, err := LoadServerConfigFromFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, 45*time.Second, cfg.Postgres.StatementTimeoutOrDefault())
 	})
 }

@@ -45,11 +45,11 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 	var stoppedByUser bool
 
 	for i, task := range tasks {
-		if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
+		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 			logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 				"error", err)
 			return
-		} else if handled {
+		} else if standDown {
 			stoppedByUser = true
 			break
 		}
@@ -187,11 +187,11 @@ func sequentialEngineApplyRequest(task *storage.Task, options map[string]string,
 // Returns the outcome: taskContinue (completed), taskFailed, taskStopped, taskAbort, or taskHandover.
 func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, task *storage.Task, options map[string]string) taskAction {
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
-	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
+	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		logger.Warn("pending stop request processing failed before sequential engine apply; current apply owner will exit for operator retry",
 			"task_id", task.TaskIdentifier, "error", err)
 		return taskAbort
-	} else if handled {
+	} else if standDown {
 		return taskStopped
 	}
 	taskCreds, err := c.credentialsForTask(task)
@@ -329,6 +329,9 @@ type atomicPollState struct {
 	// engine could not report per-shard/row-copy progress, so the warning is
 	// emitted once per apply rather than on every poll.
 	warnedPerShardUnavailable bool
+
+	lastProgressMetadata      map[string]string
+	progressMetadataLeaseLost bool
 }
 
 // operationLeaseOnlyDrive reports the operation lease of a drive that holds an
@@ -537,6 +540,8 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 
 	var consecutiveErrors int
 	var resumeEventLogged bool
+	var lastProgressMetadata map[string]string
+	var progressMetadataLeaseLost bool
 	lostWork := lostEngineWorkTracker{budget: c.lostEngineWorkPendingBudget(eng)}
 	watchdog := taskStallWatchdog{interval: c.taskStallWarnInterval()}
 
@@ -547,11 +552,11 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				"task_id", task.TaskIdentifier, "table", task.TableName)
 			return taskHandover
 		case <-ticker.C:
-			if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
+			if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 				logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 					"task_id", task.TaskIdentifier, "error", err)
 				return taskAbort
-			} else if handled {
+			} else if standDown {
 				task.State = state.Task.Stopped
 				return taskStopped
 			}
@@ -649,6 +654,17 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 
 			consecutiveErrors = 0
 			c.logEngineResumeOnce(ctx, logger, apply, result.ResumedFromCheckpoint, &resumeEventLogged)
+			var saveErr error
+			lastProgressMetadata, saveErr = c.persistProgressMetadataIfChanged(lastProgressMetadata, result.Metadata, &progressMetadataLeaseLost, func(metadata map[string]string) error {
+				return c.saveProgressMetadata(ctx, task, metadata)
+			})
+			if errors.Is(saveErr, storage.ErrApplyLeaseLost) {
+				logger.Debug("progress metadata persistence stopped because the operation lease was lost during failover",
+					append(task.LogAttrs(), "error", saveErr)...)
+			} else if saveErr != nil {
+				logger.Warn("failed to persist engine progress metadata; the drive will retry on the next poll",
+					append(task.LogAttrs(), "error", saveErr)...)
+			}
 
 			task.State = taskStateWithNoBackwardProgress(prevState, engineTaskState)
 			task.UpdatedAt = now

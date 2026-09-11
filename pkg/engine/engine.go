@@ -332,6 +332,17 @@ type PlanResult struct {
 	// namespace that holds any. Empty when the target holds none, which is the
 	// ordinary case.
 	ExistingCopies []*ExistingCopy
+
+	// ExemptTables lists live tables intentionally excluded from a plan verdict,
+	// grouped by namespace and carrying the engine-agnostic reason for exemption.
+	ExemptTables []*ExemptTables
+}
+
+// ExemptTables describes live tables exempt from a plan verdict in one namespace.
+type ExemptTables struct {
+	Namespace string
+	Tables    []string
+	Reason    string
 }
 
 // HasErrors returns true if any lint warning has error severity.
@@ -686,6 +697,13 @@ type ProgressResult struct {
 	// (e.g. PlanetScale branch_name, deploy_request_url, is_instant). It lets the
 	// engine surface structured status to the renderer without core decoding the
 	// opaque ResumeState.Metadata or reading an engine-specific side table.
+	//
+	// The driver persists Metadata on the apply operation whenever it differs
+	// from the last persisted value, so it is also the durable read model the
+	// API serves once the engine is no longer polled. Engines must keep it
+	// stable between polls while the underlying position is unchanged: a
+	// value that moves on every poll (wall-clock elapsed time, a timestamp)
+	// defeats the change detection and turns every poll into a storage write.
 	Metadata map[string]string
 
 	// PerShardProgressUnavailable is set by sharded engines when a progress poll

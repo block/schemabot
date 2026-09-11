@@ -54,7 +54,7 @@ func (c *ServerConfig) DatabasesForApp(app string) ([]string, error) {
 		return nil, fmt.Errorf("resolve app: app identifier is empty")
 	}
 	var names []string
-	for name, dbConfig := range c.Databases {
+	for name, dbConfig := range c.DatabaseConfigs() {
 		if dbConfig.App == app {
 			names = append(names, name)
 		}
@@ -64,4 +64,19 @@ func (c *ServerConfig) DatabasesForApp(app string) ([]string, error) {
 	}
 	slices.Sort(names)
 	return names, nil
+}
+
+// DatabaseForApp resolves app to the single configured database that declares
+// it. Callers that operate on one database at a time (schema pull) use this
+// instead of DatabasesForApp: an app declared by several databases is an error
+// naming the candidates, so the answer is never an arbitrary pick.
+func (c *ServerConfig) DatabaseForApp(app string) (string, error) {
+	databases, err := c.DatabasesForApp(app)
+	if err != nil {
+		return "", err
+	}
+	if len(databases) > 1 {
+		return "", fmt.Errorf("app %q is declared by %d databases (%s); name the database directly", app, len(databases), strings.Join(databases, ", "))
+	}
+	return databases[0], nil
 }

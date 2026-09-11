@@ -3,6 +3,8 @@
 
 All templates rendered with sample data.
 
+DDL code fences are sized to be longer than any backtick run in their content.
+
 ## Plan & Status
 
 ### PR Comments
@@ -96,6 +98,35 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 ℹ️ Namespaces excluded from this plan by `ignore_namespaces`: `local_fixtures`
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="postgres-plan-exempt-tables"></a><strong>Postgres Plan (Exempt Tables)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `PostgreSQL`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+#### Schema Name: `app`
+```sql
+CREATE TABLE app.users (id bigint PRIMARY KEY);
+```
+
+📋 **Plan**: **1** table to create
+
+ℹ️ Tables in namespace `app` exempt from the undeclared-table verdict (archive naming): `events_archive_2025_01`, `orders_archive_2024`
 
 
 ---
@@ -289,7 +320,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 ⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target
-- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `` ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`) ``
 
 Applying restarts the copy from zero rows. To keep the work already done, apply the schema change that started it.
 
@@ -322,7 +353,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 ℹ️ **This apply destroys work in progress**: 1 unfinished copy on the target
-- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `` ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`) ``
 
 📋 **Plan**: **1** table to alter
 
@@ -350,7 +381,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 ⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target
-- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `` ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`) ``
 
 Applying restarts the copy from zero rows. To keep the work already done, apply the schema change that started it.
 
@@ -390,7 +421,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 ⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target
-- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`
+- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, which was `` ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`) ``
 
 Applying restarts the copy from zero rows. To keep the work already done, apply the schema change that started it.
 
@@ -570,40 +601,54 @@ schemabot apply -e staging --tenant alpha
 </details>
 
 <details>
-<summary><a name="no-managed-schema-changes"></a><strong>No Managed Schema Changes</strong></summary>
+<summary><a name="no-schema-files-changed"></a><strong>No Schema Files Changed</strong></summary>
 
 
-## ✅ No Managed Schema Changes
+## ℹ️ No Schema Files Changed
 
 **Environment**: `staging`
 
 *Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
 
-This PR does not contain schema changes managed by SchemaBot. SchemaBot did not find any apply-owned state that requires live database reconciliation.
+SchemaBot found no changes to managed schema files in this PR and no apply-owned state that requires live database reconciliation.
 
 </details>
 
 <details>
-<summary><a name="no-managed-schema-changes-checks-refreshed"></a><strong>No Managed Schema Changes (Checks Refreshed)</strong></summary>
+<summary><a name="no-schema-files-changed-checks-refreshed"></a><strong>No Schema Files Changed (Checks Refreshed)</strong></summary>
 
 
-## ✅ No Managed Schema Changes
+## ℹ️ No Schema Files Changed
 
-*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
+SchemaBot found no changes to managed schema files in this PR. The SchemaBot checks were refreshed as passing on [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12).
 
-This PR does not contain schema changes managed by SchemaBot. The SchemaBot checks were refreshed as passing on `abcdef1234567890abcdef1234567890abcdef12`.
+<details>
+<summary>Expected a plan?</summary>
+
+A PR plan covers the databases whose schema directories the PR changes. This PR changes none, so no database was compared against its schema directory.
+
+Two cases still need a plan even though the files are already correct:
+
+- **A new database.** Its schema directory merged before the database was configured, so no PR ever applied the files and the live database is empty.
+- **An existing database with drift.** The live schema does not match the schema files. The files did not change, so nothing triggers a plan.
+
+In either case, give the PR a change in that database's schema directory: add or toggle a `# nonce` comment line in its `schemabot.yaml` and push. SchemaBot then plans the whole directory against the live schema, and the plan comment carries the apply command.
+
+</details>
+
+_Requested by @jackjackbits_
 
 </details>
 
 <details>
-<summary><a name="no-managed-schema-changes-gated-on-tenants"></a><strong>No Managed Schema Changes (Gated On Tenants)</strong></summary>
+<summary><a name="no-schema-files-changed-gated-on-tenants"></a><strong>No Schema Files Changed (Gated On Tenants)</strong></summary>
 
 
-## ✅ No Managed Schema Changes
+## ℹ️ No Schema Files Changed
 
-*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
+SchemaBot found no changes to schema files managed by this deployment in this PR, but the PR touches schema paths owned by tenant deployments. The SchemaBot check was refreshed on [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12) and will pass once every tenant deployment's own check succeeds.
 
-This PR does not contain schema changes managed by this SchemaBot deployment, but it touches schema paths owned by tenant deployments. The SchemaBot check was refreshed on `abcdef1234567890abcdef1234567890abcdef12` and will pass once every tenant deployment's own check succeeds.
+_Requested by @jackjackbits_
 
 </details>
 
@@ -710,8 +755,8 @@ Choose one:
 ```sql
 CREATE TABLE `address_seq` (
     `id` tinyint unsigned NOT NULL DEFAULT '0',
-    `next_id` bigint unsigned,
-    `cache` bigint unsigned,
+    `next_id` bigint unsigned DEFAULT NULL,
+    `cache` bigint unsigned DEFAULT NULL,
     PRIMARY KEY(`id`)
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
@@ -893,8 +938,8 @@ schemabot apply -e staging
 ```sql
 CREATE TABLE `address_seq` (
     `id` tinyint unsigned NOT NULL DEFAULT '0',
-    `next_id` bigint unsigned,
-    `cache` bigint unsigned,
+    `next_id` bigint unsigned DEFAULT NULL,
+    `cache` bigint unsigned DEFAULT NULL,
     PRIMARY KEY(`id`)
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
@@ -1660,6 +1705,8 @@ database: your-database-name
 type: mysql
 ```
 
+`type`: `mysql`, `postgres`, or `vitess`
+
 ### If you already have a config
 Use the `-d` flag to specify which database to plan:
 
@@ -1714,6 +1761,77 @@ Check that your `schemabot.yaml` file has the correct `database` field matching 
 </details>
 
 <details>
+<summary><a name="database-not-found-repository-too-large-to-search-in-full"></a><strong>Database Not Found (Repository Too Large To Search In Full)</strong></summary>
+
+
+## ⚠️ Database Not Found
+
+**Database**: `payments` | **Environment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
+
+No `schemabot.yaml` configuration with `database: payments` was found in the schema directories configured for this database on the SchemaBot server:
+
+- `services/payments/schema`
+- `services/payments/legacy-schema`
+
+This repository is too large for GitHub to return its full tree, so SchemaBot searched only those directories. Check that the `schemabot.yaml` for this database lives under one of them and that its `database` field matches the `-d` flag value.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="database-not-configured"></a><strong>Database Not Configured</strong></summary>
+
+
+## ⚠️ Database Not Configured
+
+**Database**: `payments` | **Environment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
+
+This SchemaBot instance has no `payments` entry under `databases` in its server configuration, so it cannot plan or apply schema changes for it. A `schemabot.yaml` declaring `database: payments` is not enough on its own: the database also has to be configured on the SchemaBot server.
+
+Check that the database name, from `-d` or from `schemabot.yaml`, matches one this instance serves, or ask a SchemaBot operator to configure the database.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="database-not-available-to-this-repository"></a><strong>Database Not Available To This Repository</strong></summary>
+
+
+## ⚠️ Database Not Available to This Repository
+
+**Database**: `payments` | **Environment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
+
+The SchemaBot server configures `payments` to accept schema changes from other repositories only: this repository is not in the database's `allowed_repos`, so no `schemabot.yaml` in it can manage the database and none was searched.
+
+Ask a SchemaBot operator to add this repository to the database's `allowed_repos` if it should manage the database, or check that the database name, from `-d` or from `schemabot.yaml`, names the right database.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="repository-too-large-to-search"></a><strong>Repository Too Large To Search</strong></summary>
+
+
+## ⚠️ Repository Too Large to Search
+
+**Database**: `payments` | **Environment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
+
+GitHub returned a truncated repository tree, so SchemaBot could not search this repository for `schemabot.yaml` configurations. On a repository this large, SchemaBot searches only the schema directories configured on the SchemaBot server, and it has none it can search exhaustively for `payments`: the database is not configured on this instance, or its `allowed_dirs` leave the location of its config open.
+
+Ask a SchemaBot operator to configure the database with an `allowed_dirs` entry naming its schema directory, or check that the database name, from `-d` or from `schemabot.yaml`, matches one this instance serves.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
 <summary><a name="invalid-config"></a><strong>Invalid Config</strong></summary>
 
 
@@ -1731,7 +1849,7 @@ type: mysql
 ```
 
 - **database** (required): The database name
-- **type** (required): `vitess` or `mysql`
+- **type** (required): `mysql`, `postgres`, or `vitess`
 <!-- schemabot:offer-support-channel -->
 
 </details>
@@ -2501,8 +2619,8 @@ schemabot unlock
 ```sql
 CREATE TABLE `address_seq` (
     `id` tinyint unsigned NOT NULL DEFAULT '0',
-    `next_id` bigint unsigned,
-    `cache` bigint unsigned,
+    `next_id` bigint unsigned DEFAULT NULL,
+    `cache` bigint unsigned DEFAULT NULL,
     PRIMARY KEY(`id`)
 ) ENGINE InnoDB,
   CHARSET utf8mb4,
@@ -3566,6 +3684,9 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **Status**: In Progress
 
+step 2 of 3 · `CREATE INDEX CONCURRENTLY idx_users_last_seen_at ON public.users (last_seen_at)`
+building index: 25% of blocks (2,500/10,000)
+
 📊 1/3 complete · 1 running · 1 queued
 
 **Schema `public`**
@@ -3754,7 +3875,7 @@ Deploy request: https://app.planetscale.com/acme/myapp/deploy-requests/42
 **`users`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
 ```sql
-ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 ```
 
 
@@ -4967,7 +5088,7 @@ Applied by namespace:
 
 **`users`**
 ```sql
-ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 ```
 
 
@@ -5113,7 +5234,7 @@ ALTER TABLE `addresses` ADD INDEX `idx_zip`(`zip_code`);
 
 **`users`** — Completed
 ```sql
-ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 ```
 
 
@@ -5199,7 +5320,7 @@ ALTER TABLE `payments` ADD INDEX `idx_order_id`(`order_id`);
 
 **`users`**
 ```sql
-ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 ```
 
 **`addresses`**
@@ -5583,6 +5704,8 @@ Sequential mode: First complete, second paused by the engine's throttler
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
+  Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
+
 
 ```
 </details>
@@ -5942,7 +6065,7 @@ Use 'schemabot start' to resume from checkpoint.
   ── myapp_sharded ──
 
      ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Running...
-       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+       ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 
 
 ```
@@ -5967,7 +6090,7 @@ Use 'schemabot start' to resume from checkpoint.
   ── myapp_sharded ──
 
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+       ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 
 
 ```
@@ -6027,7 +6150,7 @@ Use 'schemabot start' to resume from checkpoint.
   ── myapp_sharded ──
 
      ~ users: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
-       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+       ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 
 
 To recover: Fix the issue above, then run a new apply.
@@ -6166,7 +6289,7 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
   ── commerce_sharded ──
 
      ~ transactions: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜ 57.21%
-       ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+       ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL;
        • Rows: 110,573,340 / 193,280,000 · ETA: 4m 40s
        • Shards: 256 (30 waiting for cutover, 226 copying)
            ● -01: waiting for cutover
@@ -6202,7 +6325,7 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
   ── commerce_sharded ──
 
      ~ transactions: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜ 67.89%
-       ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+       ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL;
        • Rows: 29,435,000 / 43,360,000 · ETA: 2m 37s
        • Shards: 32 (12 waiting for cutover, 20 copying)
            ● -08: waiting for cutover
@@ -6219,31 +6342,31 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
   ── commerce_001 ──
 
      ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ⚡ Applied instantly
-       ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+       ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL;
 
 
   ── commerce_002 ──
 
      ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ⚡ Applied instantly
-       ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+       ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL;
 
 
   ── commerce_003 ──
 
      ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ⚡ Applied instantly
-       ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+       ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL;
 
 
   ── commerce_004 ──
 
      ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ⚡ Applied instantly
-       ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+       ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL;
 
 
   ── commerce_005 ──
 
      ~ transactions: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ⚡ Applied instantly
-       ALTER TABLE `transactions` ADD COLUMN `region_id` int;
+       ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL;
 
 
   ... and 27 more keyspaces (all completed)
@@ -6327,7 +6450,7 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
   ── myapp_sharded ──
 
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+       ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 
 
 ```
@@ -6352,7 +6475,7 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
   ── myapp_sharded ──
 
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+       ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 
     ~ VSchema (myapp_sharded): Applying...
        + "xxhash": {"type": "xxhash"}
@@ -6586,7 +6709,7 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
   ── myapp_sharded ──
 
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ⚡ Applied instantly
-       ALTER TABLE `users` ADD COLUMN `phone` varchar(20);
+       ALTER TABLE `users` ADD COLUMN `phone` varchar(20) DEFAULT NULL;
 
 
 ```
@@ -7878,20 +8001,20 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 🟢 us-east — ready for cutover — next in order (orders-us-east)
 
      ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
 🔄 eu-west — running table copy (orders-eu-west)
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.00%
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
        • Rows: 42,000 / 120,000 · ETA: 4m 0s
 
 
 ⏳ ap-south — waiting for eu-west (orders-ap-south)
 
      ~ orders: ⏳ Queued
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
 
@@ -7921,7 +8044,7 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 ✅ us-east — completed (orders-us-east)
 
      ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
 ❌ eu-west — failed (orders-eu-west)
@@ -7934,7 +8057,7 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 ⏸️ ap-south — halted — eu-west failed (orders-ap-south)
 
      ~ orders: 🚫 Cancelled (not started)
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
 
@@ -7971,14 +8094,14 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 🔄 eu-west — running table copy (orders-eu-west)
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.00%
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
        • Rows: 42,000 / 120,000 · ETA: 4m 0s
 
 
 ⏸️ ap-south — halted — us-east failed (orders-ap-south)
 
      ~ orders: ⏳ Queued
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
 
@@ -8004,19 +8127,19 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 ✅ us-east — completed (orders-us-east)
 
      ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
 ✅ eu-west — completed (orders-eu-west)
 
      ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
 ✅ ap-south — completed (orders-ap-south)
 
      ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
 ```
@@ -8616,7 +8739,7 @@ Environment: production
   External apply ID: remote-apply-us-east-001
 
      ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
 🔄 eu-west — running table copy (orders-eu-west)
@@ -8624,14 +8747,14 @@ Environment: production
   External apply ID: remote-apply-eu-west-001
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 35.42%
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
        • Rows: 42,500 / 120,000 · ETA: 4m 0s
 
 
 ⏳ ap-south — waiting for eu-west (orders-ap-south)
 
      ~ orders: ⏳ Queued
-       ALTER TABLE `orders` ADD COLUMN `source` varchar(32);
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
 ESC to detach

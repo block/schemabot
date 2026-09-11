@@ -178,10 +178,10 @@ func RenderUnsafeChangesBlocked(data PlanCommentData) string {
 	fmt.Fprintf(&sb, "**"+glyph.Refused+" Apply rejected**: %d unsafe %s detected\n", unsafeCount, pluralize("change", unsafeCount))
 	item := 0
 	for _, c := range data.UnsafeChanges {
-		writeUnsafeChangeItem(&sb, &item, "`"+c.Table+"`", c.Reason, c.ChangeType)
+		writeUnsafeChangeItem(&sb, &item, inlineCode(c.Table), c.Reason, c.ChangeType)
 	}
 	sb.WriteString("\n")
-	writeUnsafeDropGuidance(&sb, data.UnsafeChanges, data.IsMySQL)
+	writeUnsafeDropGuidance(&sb, data.UnsafeChanges, data.DatabaseType, data.IsMySQL)
 
 	// Attribution comes before the opt-in this comment coaches: --allow-unsafe
 	// is consent to destroy the data, and whether the change is this pull
@@ -228,7 +228,7 @@ func RenderBlockedChangesApplyRejected(data PlanCommentData) string {
 	n := len(data.BlockedChanges)
 	fmt.Fprintf(&sb, "**"+glyph.Refused+" Apply rejected**: %d planned %s the engine refuses to execute\n", n, pluralize("change", n))
 	for _, c := range data.BlockedChanges {
-		table := "`" + c.Table + "`"
+		table := inlineCode(c.Table)
 		if len(c.Shards) > 0 {
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
 		}
@@ -502,7 +502,7 @@ func RenderBaseSchemaFreshnessRejection(data BaseSchemaFreshnessRejectionData) s
 		sb.WriteString("SchemaBot could not verify whether this PR includes the current base branch's schema changes. The apply was rejected to avoid reverting a change that may already be on the base branch.\n\n")
 		sb.WriteString("Retry the command. If verification continues to fail, contact a SchemaBot operator.\n")
 	} else {
-		fmt.Fprintf(&sb, "The base branch contains newer changes to the schema directory `%s` that are not included in this PR. Applying this branch could revert those changes.\n\n", data.SchemaPath)
+		fmt.Fprintf(&sb, "The base branch contains newer changes to the schema directory %s that are not included in this PR. Applying this branch could revert those changes.\n\n", inlineCode(data.SchemaPath))
 		sb.WriteString("Merge or rebase the current base branch into this PR, review the updated plan, then run `apply` again.\n")
 	}
 
@@ -569,7 +569,7 @@ func RenderApplyBlockedByNonPassingChecks(environment string, notPassing []Block
 	sb.WriteString("| Check | Status |\n")
 	sb.WriteString("|-------|--------|\n")
 	for _, f := range notPassing {
-		fmt.Fprintf(&sb, "| `%s` | %s |\n", f.Name, f.State)
+		fmt.Fprintf(&sb, "| %s | %s |\n", inlineCodeCell(f.Name), f.State)
 	}
 	sb.WriteString("\nGet the checks passing — fix failures and re-run cancelled or stale checks — then retry:\n")
 	fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
@@ -661,7 +661,7 @@ func RenderApplyBlockedByInProgressChecks(environment string, inProgress, notRep
 		sb.WriteString("| Check | Status |\n")
 		sb.WriteString("|-------|--------|\n")
 		for _, c := range inProgress {
-			fmt.Fprintf(&sb, "| `%s` | %s |\n", c.Name, c.State)
+			fmt.Fprintf(&sb, "| %s | %s |\n", inlineCodeCell(c.Name), c.State)
 		}
 		sb.WriteString("\nWait for checks to complete and retry:\n")
 		fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
@@ -675,7 +675,7 @@ func RenderApplyBlockedByInProgressChecks(environment string, inProgress, notRep
 		sb.WriteString("| Check | Status |\n")
 		sb.WriteString("|-------|--------|\n")
 		for _, c := range notReported {
-			fmt.Fprintf(&sb, "| `%s` | %s |\n", c.Name, c.State)
+			fmt.Fprintf(&sb, "| %s | %s |\n", inlineCodeCell(c.Name), c.State)
 		}
 		sb.WriteString("\nIf a check never reports, waiting will not unblock the apply. ")
 		sb.WriteString("Verify the name in `required_checks` matches the check exactly and that it runs on this PR, then retry:\n")

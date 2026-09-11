@@ -6,17 +6,11 @@
 
 - [What databases exist?](#what-databases-exist)
 - [What’s in this database?](#whats-in-this-database)
-  - [Read structured columns and indexes](#read-structured-columns-and-indexes)
-  - [Find schema issues](#find-schema-issues)
-  - [Engine support](#engine-support)
-  - [What a pull costs](#what-a-pull-costs)
 - [What changed in this database?](#what-changed-in-this-database)
 - [What happened in this change?](#what-happened-in-this-change)
-  - [Watch a change live](#watch-a-change-live)
 - [What’s running across the fleet?](#whats-running-across-the-fleet)
 - [Inspect a stored plan](#inspect-a-stored-plan)
 - [Read the lifecycle log](#read-the-lifecycle-log)
-  - [Read deployment logs](#read-deployment-logs)
 - [Check locks](#check-locks)
 - [Give a tool read-only access](#give-a-tool-read-only-access)
 - [What SchemaBot does not remember](#what-schemabot-does-not-remember)
@@ -64,6 +58,7 @@ GET /api/databases
     {
       "database": "shop",
       "type": "mysql",
+      "app": "storefront",
       "environments": [
         {"environment": "staging", "deployments": ["us-east"]},
         {"environment": "production", "deployments": ["us-east", "eu-west"]}
@@ -81,6 +76,20 @@ GET /api/databases
 ```
 
 </details>
+
+Each entry carries `app` when the database's configuration declares an app
+identifier — the grouping the `?app=` filter below and the pull endpoint's
+`app` selector target. Databases sharing an `app` value form one application,
+so an inventory keyed by application joins against this field rather than
+parsing database names. The field is omitted when the database declares no
+app.
+
+The list accepts three query filters, combinable: `?type=` (exact,
+case-sensitive engine type), `?name=` (case-insensitive substring of the
+database name), and `?app=` (whole app identifier, matched
+case-insensitively). A `type` or `app` value that no configured database
+declares is rejected with `400` rather than returning an empty list, so a
+typo never reads as an empty inventory.
 
 Use a database name and environment from this inventory in the reads below.
 
@@ -119,19 +128,36 @@ Content-Type: application/json
 {"database": "shop", "environment": "production"}
 ```
 
+A caller holding only an app identifier can select the database by app
+instead of by name — set exactly one of the two:
+
+```json
+{"app": "storefront", "environment": "production"}
+```
+
+The app must resolve to exactly one configured database; an app declared by
+several databases is rejected with the candidates named, so the caller picks
+the database rather than the server guessing.
+
 ```json
 {
   "database": "shop",
+  "type": "mysql",
   "environment": "production",
+  "app": "storefront",
   "namespaces": {
     "shop": {
       "tables": {
         "orders": "CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
       }
     }
-  }
+  },
+  "table_count": 1
 }
 ```
+
+The response echoes `app` whenever the pulled database declares one,
+whichever selector the request used; it is omitted otherwise.
 
 </details>
 
@@ -452,17 +478,31 @@ live view:
   ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
   • Rows: 6,000,000 / 10,000,000 · ETA: 42m 0s
   • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
+
+  Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
 ```
 
-Use `schemabot status apply-example-73` for a single snapshot.
+Use `schemabot status apply-example-73` for a single snapshot. SQL rendering
+uses the target database dialect and preserves quoted names and values. If
+`database_type` is missing or unrecognized, the CLI displays the original SQL
+without choosing another dialect.
 
 While an apply runs, `GET /api/progress/apply/{apply_id}` is the live view.
 Table entries identify the DDL and task state. Available metrics depend on the
 engine and execution phase: copying can report rows and percent complete;
 `eta_seconds` is an estimate and may be omitted. Do not interpret an absent ETA
 as zero time remaining. Throttled tasks can include `throttle_reason`.
+A PostgreSQL concurrent index build reports a whole-build percentage estimated
+from the server's build phase and its counters; it stays below 100 until the
+apply completes and holds its last value between phases (see
+[postgresql.md](postgresql.md)).
 Sharded engines can add per-shard progress, and multi-deployment applies list
 operations with their deployment, target, state, and cutover policy.
+The top-level `metadata` object carries engine-specific display fields when the
+engine reports them: PostgreSQL applies report their position through `phase`,
+`step`, `steps_total`, and `statement`; PlanetScale applies report deploy
+request fields such as `branch_name` and `deploy_request_url`. Spirit applies
+currently report progress on the table entries and do not report position fields.
 
 <details>
 <summary>Request and response example</summary>
@@ -498,10 +538,71 @@ Response excerpt (illustrative values):
 
 </details>
 
+<details>
+<summary>PostgreSQL response example</summary>
+
+```http
+GET /api/progress/apply/apply-example-74
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "apply_id": "apply-example-74",
+  "database": "shop",
+  "environment": "production",
+  "engine": "postgres",
+  "state": "running",
+  "metadata": {
+    "phase": "preflight",
+    "step": "2",
+    "steps_total": "2",
+    "statement": "CREATE INDEX CONCURRENTLY orders_status_idx ON public.orders (status)"
+  },
+  "tables": [
+    {
+      "table_name": "orders",
+      "keyspace": "public",
+      "ddl": "ALTER TABLE public.orders ADD COLUMN status text; CREATE INDEX CONCURRENTLY orders_status_idx ON public.orders (status)",
+      "status": "running",
+      "rows_copied": 0,
+      "rows_total": 0,
+      "percent_complete": 0
+    }
+  ]
+}
+```
+
+</details>
+
+The PostgreSQL phase stays `preflight` for the whole run — PostgreSQL DDL has
+no copy or cutover phase to report — and the statement position is what moves.
+The PR comment renders that position under each running deployment, and the
+CLI renders it for a single-deployment apply, as
+`step 2 of 2 · CREATE INDEX CONCURRENTLY orders_status_idx ON public.orders (status)`.
+The top-level `metadata` has one slot per key, so on a multi-deployment apply it
+carries the first-created deployment's position; the CLI's per-deployment view
+omits the position rather than show one deployment's under every heading.
+
+While the running statement is a concurrent index build, the next line shows
+the server's build work for the phase in flight. A scan reports its blocks,
+the tuple load reports its tuples, a wait reports the lockers still
+outstanding, and a sort names itself; the line is labelled `building index`
+until validation starts and `validating index` after. PostgreSQL carries a
+completed phase's counters into the next phase, so only the counter the
+current phase owns is shown, and the attempt is included after a retry. For
+example: `building index: 25% of blocks (2,500/10,000) · attempt 2` while the
+heap is scanned, then `building index: sorting live tuples`, then
+`building index: 12,000/50,000 tuples`, and later
+`validating index: 93% of blocks (930/1,000)` or `waiting on 2 of 3 lockers`.
+
 The numbers come from the engine while the apply is active, so they are as
 fresh as the last poll. Once the apply is terminal, the same endpoint answers
 from storage: rows, throttle state, and checksum counts are preserved on the
-task record; ETA and per-shard rows are not persisted in this view.
+task record, and `metadata` holds the last position the engine reported; ETA
+and per-shard rows are not persisted in this view. A new attempt can display
+the prior attempt's position until its first progress save.
 
 ## What’s running across the fleet?
 
@@ -534,6 +635,8 @@ Output excerpt:
   ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
   • Rows: 6,000,000 / 10,000,000 · ETA: 42m 0s
   • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
+
+  Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
 ```
 
 Here, `orders` is 60% copied with an estimated 42 minutes remaining. Copying
@@ -627,6 +730,9 @@ Response excerpt (illustrative values):
 
 ## Inspect a stored plan
 
+The CLI uses the plan’s `database_type` when it displays SQL. PostgreSQL plans
+retain PostgreSQL grammar; unknown types retain their original statements.
+
 List recent plans across the databases in an environment:
 
 ```sh
@@ -696,6 +802,34 @@ repository to inspect the proposed change at that commit. To establish what
 actually ran, inspect the apply's task DDL and outcome through progress.
 `schemabot list-plans` and `schemabot list-plans <plan_id>` render
 both, with `--json` for the raw response.
+
+A stored plan records what the planner proposed, not what it declined to
+propose. When the planner exempts live tables from the undeclared-table
+verdict, that disclosure (`exempt_tables`, grouped by namespace with the table
+names and exemption reason) is carried on the response to the plan request
+itself and rendered in the PR comment and in `schemabot plan` and
+`schemabot apply` output; it is not retained on the stored plan, so
+`GET /api/plans/{plan_id}` and `list-plans` omit it. Only PostgreSQL targets
+populate it today: the MySQL-family engines exempt archive tables from their
+live-schema view without reporting which ones. A plan with nothing exempted
+omits the field.
+
+Response excerpt from the plan request (illustrative values):
+
+```json
+{
+  "plan_id": "plan_01j9x4k8m2",
+  "engine": "postgres",
+  "changes": [],
+  "exempt_tables": [
+    {
+      "namespace": "app",
+      "tables": ["events_archive_2025_01", "orders_archive_2024"],
+      "reason": "archive naming"
+    }
+  ]
+}
+```
 
 The list defaults to 20 plans and caps at 200. Check `has_more`; there is no
 pagination cursor. Filters narrow the recent results but do not provide an
@@ -1033,6 +1167,9 @@ to discover registered sources, then `pull` with `catalog_detail: detailed`
 where supported to read their table structure without parsing DDL. Store each
 snapshot with its database, environment, namespace, table, and fetch time;
 refresh periodically and respect `Retry-After` when a pull is rate limited.
+When your inventory is keyed by application rather than by database, join on
+the `app` field from `databases` — or pull by `app` directly — instead of
+deriving the link from naming conventions.
 
 Add `history` and `progress` when you need execution context, such as the DDL
 and recorded task timestamps for a SchemaBot-managed change. These records

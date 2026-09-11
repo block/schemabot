@@ -248,12 +248,12 @@ func TestE2EPlanCommandOnNoSchemaChangesPRRecreatesPassingCheck(t *testing.T) {
 
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "No Managed Schema Changes")
+		assert.Contains(t, body, "No Schema Files Changed")
 		assert.Contains(t, body, "abc123")
 		assert.NotContains(t, body, "truncated repository tree")
 		assert.NotContains(t, body, "Plan Failed")
 	case <-time.After(30 * time.Second):
-		t.Fatal(`timed out waiting for the "No Managed Schema Changes" comment`)
+		t.Fatal(`timed out waiting for the "No Schema Files Changed" comment`)
 	}
 
 	select {
@@ -393,8 +393,10 @@ func TestE2EPlanCommandOnTruncatedRepoWithoutConfiguredDirsFailsClosed(t *testin
 
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "Plan Failed")
+		assert.Contains(t, body, "Repository Too Large to Search")
 		assert.Contains(t, body, "truncated repository tree")
+		assert.Contains(t, body, "`allowed_dirs`")
+		assert.NotContains(t, body, "Database Not Found")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for failure comment")
 	}

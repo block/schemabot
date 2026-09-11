@@ -1,8 +1,10 @@
 package postgres
 
 import (
+	"strconv"
 	"testing"
 
+	"github.com/block/pg-sprite/pkg/executor"
 	pgplan "github.com/block/pg-sprite/pkg/plan"
 	"github.com/block/pg-sprite/pkg/planner"
 	"github.com/block/pg-sprite/pkg/preflight"
@@ -18,18 +20,20 @@ import (
 
 func TestExecutionVerdict(t *testing.T) {
 	tests := []struct {
-		name       string
-		version    int
-		statement  pgplan.Statement
-		wantMode   string
-		wantReason string
+		name             string
+		version          int
+		statement        pgplan.Statement
+		wantMode         string
+		wantReason       string
+		wantUnrecognized *unrecognizedPlannerVocabulary
 	}{
 		{
-			name:       "unrecognized plan contract",
-			version:    pgplan.FormatVersion + 1,
-			statement:  pgplan.Statement{Disposition: router.DispositionExecute},
-			wantMode:   engine.ExecutionModeBlocked,
-			wantReason: `statement for table "users" has an unrecognized plan contract`,
+			name:             "unrecognized plan contract",
+			version:          pgplan.FormatVersion + 1,
+			statement:        pgplan.Statement{Disposition: router.DispositionExecute},
+			wantMode:         engine.ExecutionModeBlocked,
+			wantReason:       `statement for table "users" has an unrecognized plan contract`,
+			wantUnrecognized: &unrecognizedPlannerVocabulary{kind: "plan_contract", value: strconv.Itoa(pgplan.FormatVersion + 1)},
 		},
 		{
 			name: "native safe",
@@ -63,17 +67,19 @@ func TestExecutionVerdict(t *testing.T) {
 			wantReason: `statement for table "users" is refused: it cannot be executed safely as written`,
 		},
 		{
-			name:       "unrecognized disposition",
-			statement:  pgplan.Statement{Disposition: router.Disposition("future")},
-			wantMode:   engine.ExecutionModeBlocked,
-			wantReason: `statement for table "users" has an unrecognized planner verdict`,
+			name:             "unrecognized disposition",
+			statement:        pgplan.Statement{Disposition: router.Disposition("future")},
+			wantMode:         engine.ExecutionModeBlocked,
+			wantReason:       `statement for table "users" has an unrecognized planner verdict`,
+			wantUnrecognized: &unrecognizedPlannerVocabulary{kind: "disposition", value: "future"},
 		},
 		{
 			name: "execute without authoritative steps",
 			statement: pgplan.Statement{Route: planner.RouteNative, Backend: router.BackendNative,
 				Disposition: router.DispositionExecute},
-			wantMode:   engine.ExecutionModeBlocked,
-			wantReason: `statement for table "users" has an unrecognized planner verdict`,
+			wantMode:         engine.ExecutionModeBlocked,
+			wantReason:       `statement for table "users" has an unrecognized planner verdict`,
+			wantUnrecognized: &unrecognizedPlannerVocabulary{kind: "execute_shape", value: "route=native backend=native steps=0"},
 		},
 	}
 
@@ -83,11 +89,79 @@ func TestExecutionVerdict(t *testing.T) {
 			if version == 0 {
 				version = pgplan.FormatVersion
 			}
-			mode, reason := executionVerdict(version, tt.statement, "users")
-			assert.Equal(t, tt.wantMode, mode)
-			assert.Equal(t, tt.wantReason, reason)
+			assert.Equal(t, stepVerdict{
+				mode:         tt.wantMode,
+				reason:       tt.wantReason,
+				unrecognized: tt.wantUnrecognized,
+			}, executionVerdict(version, tt.statement, "users"))
 		})
 	}
+}
+
+// createShapeRefusalSentences is the operator-facing sentence for every create
+// shape cause the planner can report, keyed by the cause so each one is pinned
+// to its own text: an author told to remove a clause is told about the clause
+// their statement actually has, never a neighbouring cause's remedy. The test
+// below derives completeness from the planner's closed set rather than from
+// this table, so a cause added upstream fails with the cause's name.
+var createShapeRefusalSentences = map[executor.CreateShapeCause]string{
+	executor.CreateShapePartitionOf:        `statement for table "users" declares PARTITION OF against a live parent, which SchemaBot's PostgreSQL create path does not support; create the partition outside SchemaBot or re-model the table`,
+	executor.CreateShapeInherits:           `statement for table "users" declares INHERITS against a live parent, which SchemaBot's PostgreSQL create path does not support; create the inheritance relationship outside SchemaBot or model a standalone table`,
+	executor.CreateShapeLike:               `statement for table "users" declares LIKE against a live source table, which SchemaBot's PostgreSQL create path does not support; declare the new table's columns and constraints explicitly`,
+	executor.CreateShapeOfType:             `statement for table "users" declares OF against a live composite type, which SchemaBot's PostgreSQL create path does not support; declare the new table's columns explicitly`,
+	executor.CreateShapeIfNotExists:        `statement for table "users" declares IF NOT EXISTS, which cannot verify that an existing relation has the requested shape; remove the clause and ensure the relation name is available`,
+	executor.CreateShapeConcurrently:       `statement for table "users" declares CONCURRENTLY for an index on a new table, which SchemaBot's PostgreSQL create path does not support; remove CONCURRENTLY so the index can be built before the table receives traffic`,
+	executor.CreateShapeDuplicateName:      `statement for table "users" declares the same relation name more than once; give every table, index, constraint, and sequence a unique name`,
+	executor.CreateShapeMultipleOperations: `statement for table "users" contains multiple create operations in one statement; split them into separate CREATE TABLE or CREATE INDEX statements`,
+	executor.CreateShapeUnsupportedKind:    `statement for table "users" uses a statement kind SchemaBot's PostgreSQL create path does not support; use CREATE TABLE or CREATE INDEX, or create the object outside SchemaBot`,
+}
+
+// Every create shape cause the planner can report renders as the sentence
+// written for that cause, through the same verdict path the plan uses, and
+// without the placeholder record an unmapped cause would carry.
+func TestCreateShapeRefusalReasonCoversEveryCause(t *testing.T) {
+	causes := executor.CreateShapeCauses()
+	assert.Len(t, createShapeRefusalSentences, len(causes), "golden table carries a cause the planner no longer reports")
+	for _, cause := range causes {
+		t.Run(string(cause), func(t *testing.T) {
+			want, ok := createShapeRefusalSentences[cause]
+			require.True(t, ok, "no expected sentence for cause %q", cause)
+
+			got, ok := createShapeRefusalReason(cause, "users")
+			assert.True(t, ok)
+			assert.Equal(t, want, got)
+
+			assert.Equal(t, stepVerdict{mode: engine.ExecutionModeBlocked, reason: want},
+				executionVerdict(pgplan.FormatVersion, pgplan.Statement{
+					Disposition: router.DispositionRefuse,
+					Cause:       cause,
+				}, "users"))
+		})
+	}
+}
+
+// A cause this build has no sentence for renders the generic refusal and
+// reports the cause for the server log, since the planner's vocabulary grew.
+func TestExecutionVerdictUnknownCreateShapeCause(t *testing.T) {
+	assert.Equal(t, stepVerdict{
+		mode:         engine.ExecutionModeBlocked,
+		reason:       `statement for table "users" is refused: it cannot be executed safely as written`,
+		unrecognized: &unrecognizedPlannerVocabulary{kind: "create_shape_cause", value: "unknown"},
+	}, executionVerdict(pgplan.FormatVersion, pgplan.Statement{
+		Disposition: router.DispositionRefuse,
+		Cause:       executor.CreateShapeCause("unknown"),
+	}, "users"))
+}
+
+// A refusal with no cause comes from outside the create path; the generic
+// sentence is the right one and nothing about the vocabulary has moved.
+func TestExecutionVerdictEmptyCreateShapeCause(t *testing.T) {
+	assert.Equal(t, stepVerdict{
+		mode:   engine.ExecutionModeBlocked,
+		reason: `statement for table "users" is refused: it cannot be executed safely as written`,
+	}, executionVerdict(pgplan.FormatVersion, pgplan.Statement{
+		Disposition: router.DispositionRefuse,
+	}, "users"))
 }
 
 func TestTableChangesMapsDestructiveSafety(t *testing.T) {
@@ -113,7 +187,7 @@ func TestTableChangesMapsDestructiveSafety(t *testing.T) {
 		},
 	}
 
-	changes, _, err := tableChanges(report, parser)
+	changes, _, _, err := tableChanges(report, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 2)
 	assert.True(t, changes[0].IsUnsafe)
@@ -140,7 +214,7 @@ func TestTableChangesRendersOrderedExecutionSteps(t *testing.T) {
 		},
 	}}
 
-	changes, tiers, err := tableChanges(report, parser)
+	changes, tiers, _, err := tableChanges(report, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 2)
 	assert.Equal(t, "ALTER TABLE public.users ADD COLUMN email text", changes[0].DDL)
@@ -168,7 +242,7 @@ func TestTableChangesCollapsesGreenfieldCreateSet(t *testing.T) {
 		{SQL: "CREATE INDEX widgets_id_idx ON public.widgets (id)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionExecute, ExecSQL: []string{"CREATE INDEX CONCURRENTLY widgets_id_idx ON public.widgets (id)"}},
 	}
 
-	changes, tiers, err := tableChanges(report, parser)
+	changes, tiers, _, err := tableChanges(report, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 1)
 	assert.Equal(t, "CREATE TABLE public.widgets (id bigint PRIMARY KEY, name text);\nCREATE UNIQUE INDEX widgets_name_key ON public.widgets (name);\nCREATE INDEX widgets_id_idx ON public.widgets (id)", changes[0].DDL)
@@ -192,7 +266,7 @@ func TestTableChangesKeepsGreenfieldVerdictsPerStatement(t *testing.T) {
 		{SQL: "CREATE INDEX widgets_id_idx ON public.widgets (id)", Route: planner.RouteNative, Backend: router.BackendNative, Disposition: router.DispositionExecute, ExecSQL: []string{"CREATE INDEX CONCURRENTLY widgets_id_idx ON public.widgets (id)"}},
 	}
 
-	changes, tiers, err := tableChanges(report, parser)
+	changes, tiers, _, err := tableChanges(report, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 3)
 	blockAbsentTableDependents(changes, tiers, report.Table)
@@ -211,11 +285,11 @@ func TestIsGreenfieldCreateSetRejectsUnsafeStatements(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		verdicts []string
+		verdicts []stepVerdict
 		mutate   func(*pgplan.Report)
 	}{
-		{name: "destructive verdict", verdicts: []string{"destructive statement"}},
-		{name: "destructive term", verdicts: []string{""}, mutate: func(report *pgplan.Report) {
+		{name: "destructive verdict", verdicts: []stepVerdict{{mode: engine.ExecutionModeBlocked, reason: "destructive statement"}}},
+		{name: "destructive term", verdicts: []stepVerdict{{}}, mutate: func(report *pgplan.Report) {
 			report.Statements[0].Destructive = true
 		}},
 	}
@@ -266,12 +340,48 @@ func TestTableChangesMixedVerdictsFailClosedPerStatement(t *testing.T) {
 			Backend: router.BackendCopyAndSwap, Disposition: router.DispositionUnavailable},
 	}
 
-	changes, _, err := tableChanges(report, parser)
+	changes, _, _, err := tableChanges(report, parser)
 	require.NoError(t, err)
 	require.Len(t, changes, 2)
 	assert.Empty(t, changes[0].ExecutionMode)
 	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
 	assert.NotContains(t, changes[1].ModeReason, changes[1].DDL)
+}
+
+// A statement whose verdict is a placeholder for planner vocabulary this
+// build does not map is reported exactly once, in statement order, alongside
+// the rendered changes; statements with a known verdict report nothing. A
+// statement that renders as several steps still counts once, since the
+// vocabulary moved once per planned statement, not once per rendered line.
+func TestTableChangesReportsUnrecognizedPlannerVocabularyOncePerStatement(t *testing.T) {
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+	report := pgplan.NewReport(pgplan.SourceDiff)
+	report.Table = "users"
+	report.Statements = []pgplan.Statement{
+		{SQL: "CREATE TABLE public.users (id bigint)", Disposition: router.DispositionRefuse,
+			Cause: executor.CreateShapeCause("future-cause")},
+		{SQL: "ALTER TABLE public.users ADD COLUMN email text", Route: planner.RouteNative,
+			Backend: router.BackendNative, Disposition: router.DispositionExecute,
+			ExecSQL: []string{"ALTER TABLE public.users ADD COLUMN email text"}},
+		{SQL: "ALTER TABLE public.users ALTER COLUMN email TYPE bigint", Disposition: router.Disposition("future"),
+			ExecSQL: []string{
+				"ALTER TABLE public.users ADD COLUMN email_new bigint",
+				"ALTER TABLE public.users DROP COLUMN email",
+			}},
+	}
+
+	changes, _, unrecognized, err := tableChanges(report, parser)
+	require.NoError(t, err)
+	require.Len(t, changes, 4)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
+	assert.Empty(t, changes[1].ExecutionMode)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[2].ExecutionMode)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[3].ExecutionMode)
+	assert.Equal(t, []unrecognizedPlannerVocabulary{
+		{kind: "create_shape_cause", value: "future-cause"},
+		{kind: "disposition", value: "future"},
+	}, unrecognized)
 }
 
 func TestTableChangesRejectsUnparseablePlanSQL(t *testing.T) {
@@ -281,7 +391,7 @@ func TestTableChangesRejectsUnparseablePlanSQL(t *testing.T) {
 	report.Table = "users"
 	report.Statements = []pgplan.Statement{{SQL: "not ddl", Disposition: router.DispositionRefuse}}
 
-	_, _, err = tableChanges(report, parser)
+	_, _, _, err = tableChanges(report, parser)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `classify planned statement for table "users"`)
 }
@@ -375,6 +485,77 @@ func TestBlockMissingPrivilegesRequiresTargetTableWhenAbsent(t *testing.T) {
 	_, err := blockMissingPrivileges(t.Context(), nil, report, changes, []preflight.Tier{0, preflight.TierIndexBuild})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "names no target table")
+}
+
+// TestConcurrentIndexStatement pins the one statement shape admitted under the
+// concurrent index duration envelope instead of the table size ceiling, over
+// the shapes the privilege tier derivation lets reach the ceiling: a blocking
+// index build and a plain ALTER stay inside it, and so does a concurrent
+// partition detach — CONCURRENTLY alone does not move a statement out of the
+// ceiling, the statement must build an index. A statement the parser rejects
+// is an error, never a silent classification either way.
+func TestConcurrentIndexStatement(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want bool
+	}{
+		{name: "concurrent index build", sql: "CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)", want: true},
+		{name: "blocking index build", sql: "CREATE INDEX users_email_idx ON public.users (email)"},
+		{name: "alter table", sql: "ALTER TABLE public.users ADD COLUMN email text"},
+		{name: "concurrent partition detach", sql: "ALTER TABLE public.events DETACH PARTITION public.events_2024 CONCURRENTLY"},
+		{name: "concurrent index drop", sql: "DROP INDEX CONCURRENTLY public.users_email_idx"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := concurrentIndexStatement(tt.sql)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+
+	_, err := concurrentIndexStatement("CREATE INDEX CONCURRENTLY ON")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parse PostgreSQL statement")
+}
+
+// TestBlockRewriteStepsKeepsEarlierVerdictsAndConcurrentBuilds proves the size
+// verdict lands only on the steps it is about: a step an earlier gate already
+// blocked keeps that gate's reason, so an operator missing a grant is not told
+// to shrink the table instead, and a concurrent index build stays executable
+// under its own bound while the native step beside it is blocked.
+func TestBlockRewriteStepsKeepsEarlierVerdictsAndConcurrentBuilds(t *testing.T) {
+	changes := []engine.TableChange{
+		{
+			Table:         "users",
+			DDL:           "ALTER TABLE public.users ADD CONSTRAINT users_email_key UNIQUE (email)",
+			ExecutionMode: engine.ExecutionModeBlocked,
+			ModeReason:    "privilege verdict",
+		},
+		{Table: "users", DDL: "ALTER TABLE public.users ADD COLUMN email text"},
+		{Table: "users", DDL: "CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)"},
+	}
+
+	require.NoError(t, blockRewriteSteps(changes, "size verdict"))
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
+	assert.Equal(t, "privilege verdict", changes[0].ModeReason)
+	assert.Equal(t, engine.ExecutionModeBlocked, changes[1].ExecutionMode)
+	assert.Equal(t, "size verdict", changes[1].ModeReason)
+	assert.Empty(t, changes[2].ExecutionMode)
+	assert.Empty(t, changes[2].ModeReason)
+}
+
+// TestBlockRewriteStepsFailsClosedOnUnparseableStep proves an executable step
+// whose statement the parser rejects fails the plan rather than being blocked
+// or exempted on a guess: the tier derivation parsed every executable step
+// already, so reaching one here that does not parse is an invariant violation.
+func TestBlockRewriteStepsFailsClosedOnUnparseableStep(t *testing.T) {
+	changes := []engine.TableChange{{Table: "users", DDL: "ALTER TABLE public.users ADD"}}
+
+	err := blockRewriteSteps(changes, "size verdict")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `classify planned statement for table "users"`)
+	assert.Empty(t, changes[0].ExecutionMode)
 }
 
 // TestBlockMissingPrivilegesRequiresMatchingTiers proves a tier slice that
@@ -471,7 +652,7 @@ func TestPlanRejectsInvalidInputsBeforeConnecting(t *testing.T) {
 	assert.Contains(t, err.Error(), "DSN credentials are required")
 }
 
-// Every lifecycle control declines with a typed unsupported-operation error:
+// Lifecycle controls without a PostgreSQL execution phase decline with a typed unsupported-operation error:
 // PostgreSQL DDL runs each statement as a single transactional statement with
 // no engine phase to pause, resume, swap, revert, or retune. The typed decline
 // is what lets the durable control path resolve a request terminally instead
@@ -485,11 +666,6 @@ func TestLifecycleControlsDeclineAsUnsupported(t *testing.T) {
 	}{
 		{"stop", func(t *testing.T) error {
 			result, err := eng.Stop(t.Context(), &engine.ControlRequest{})
-			assert.Nil(t, result)
-			return err
-		}},
-		{"cancel", func(t *testing.T) error {
-			result, err := eng.Cancel(t.Context(), &engine.ControlRequest{})
 			assert.Nil(t, result)
 			return err
 		}},

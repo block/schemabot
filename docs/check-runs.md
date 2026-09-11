@@ -9,38 +9,13 @@
 - [Cross-Deployment Trust Model](#cross-deployment-trust-model)
 - [Published Checks](#published-checks)
 - [Managed Schema Configs](#managed-schema-configs)
-  - [Onboarding a schema directory](#onboarding-a-schema-directory)
 - [Internal Records](#internal-records)
 - [Lifecycle](#lifecycle)
-  - [Pull Request Events](#pull-request-events)
-  - [Merge Queue Events](#merge-queue-events)
-  - [Auto-Plan](#auto-plan)
-  - [Apply](#apply)
-  - [Rollback](#rollback)
-  - [Unlock And Close](#unlock-and-close)
 - [Check States](#check-states)
 - [Blocking Reasons](#blocking-reasons)
 - [Operator Guidance](#operator-guidance)
-  - [Backfilling missing Check Runs](#backfilling-missing-check-runs)
 - [SHA Handling](#sha-handling)
 - [Edge Cases](#edge-cases)
-  - [PR opened](#pr-opened)
-  - [PR touches no managed schema files](#pr-touches-no-managed-schema-files)
-  - [Config discovery fails](#config-discovery-fails)
-  - [GitHub unavailable](#github-unavailable)
-  - [New commit pushed](#new-commit-pushed)
-  - [New commit pushed while an apply is in progress](#new-commit-pushed-while-an-apply-is-in-progress)
-  - [PR closed](#pr-closed)
-  - [PR reopened](#pr-reopened)
-  - [Manual plan](#manual-plan)
-  - [Apply requested](#apply-requested)
-  - [Apply confirmed](#apply-confirmed)
-  - [Automatic apply](#automatic-apply)
-  - [Rollback requested](#rollback-requested)
-  - [Rollback confirmed](#rollback-confirmed)
-  - [Unlock](#unlock)
-  - [Schema changes but no configured environments are allowed](#schema-changes-but-no-configured-environments-are-allowed)
-  - [Stale in-progress check](#stale-in-progress-check)
 - [Stale Check Reconciliation](#stale-check-reconciliation)
 - [Race Safety](#race-safety)
 - [Environment Ordering](#environment-ordering)
@@ -175,7 +150,7 @@ name that can be required in branch protection.
 When the aggregate check is required by branch protection, SchemaBot must create
 a check run with that exact name on every PR head commit. That includes PRs that
 do not touch managed schema files. For those PRs, SchemaBot publishes a passing
-`No managed schema changes` aggregate so GitHub can satisfy the required check
+`No schema files changed` aggregate so GitHub can satisfy the required check
 and allow the PR to merge. Skipping check creation would leave the required
 check missing, which GitHub treats as not passing.
 
@@ -273,7 +248,7 @@ SchemaBot (staging) — 1 apply pending
 ```
 
 If the PR does not add or edit `schemabot.yaml` and does not touch managed SQL
-or `vschema.json` files, SchemaBot publishes `No managed schema changes` instead
+or `vschema.json` files, SchemaBot publishes `No schema files changed` instead
 because the PR does not affect a managed schema directory.
 
 ## Internal Records

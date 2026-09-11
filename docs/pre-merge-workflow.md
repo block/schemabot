@@ -6,17 +6,8 @@
 
 - [Why apply before merge](#why-apply-before-merge)
 - [The dev loop](#the-dev-loop)
-  - [Converging a local database](#converging-a-local-database)
-  - [Where the data-access layer fits](#where-the-data-access-layer-fits)
-  - [When to ship the schema](#when-to-ship-the-schema)
 - [The PR workflow, step by step](#the-pr-workflow-step-by-step)
-  - [Applies happen before merge](#applies-happen-before-merge)
-  - [What the check means](#what-the-check-means)
-  - [Promotion order](#promotion-order)
-  - [If the check is stuck](#if-the-check-is-stuck)
 - [Destructive changes: two different workflows](#destructive-changes-two-different-workflows)
-  - [Renaming a column or table](#renaming-a-column-or-table)
-  - [Habits for a shared staging database](#habits-for-a-shared-staging-database)
 - [The safety gates in the loop](#the-safety-gates-in-the-loop)
 - [The CLI in the loop](#the-cli-in-the-loop)
 - [Where to go next](#where-to-go-next)
@@ -196,7 +187,12 @@ any other required flags filled in.
 You apply while the PR is open. Once the required schema checks pass, merging
 records the desired state the databases already run.
 
-- **No schema edits?** The PR gets a passing `No managed schema changes` check
+- **No schema edits?** The PR gets a passing `No schema files changed` check.
+  A PR plan covers the databases whose schema directories the PR changes, so a
+  PR with no schema edits compares no database against its schema. To plan a
+  new database, or an existing one whose live schema has drifted from files
+  that are already correct,
+  [reconcile drift with a nonce edit](#reconciling-drift-with-a-nonce-edit)
 - **Another PR holds the database lock?** The apply is refused and names the
   holder. Wait for that PR to merge or release the lock
 - **Schema files changed on the base branch?** Rebase before applying so your
@@ -279,6 +275,45 @@ or stuck checks with
 [check-runs.md](check-runs.md#backfilling-missing-check-runs). Disabling the
 required check is the last resort, never the first, because it removes the
 merge gate for every PR in the repository.
+
+### Reconciling drift with a nonce edit
+
+Drift is a live database that no longer matches the schema files on the base
+branch. It comes in two shapes:
+
+- **A new database.** Its schema files merged before the database was
+  configured, so no PR ever applied them and the database is empty. A freshly
+  provisioned copy or tenant starts the same way.
+- **An existing database.** The live schema does not match the schema files.
+  The files did not change, so nothing triggers a plan.
+
+In both cases the files already describe the schema you want, so there is
+nothing to edit, and a PR that changes nothing under the schema directory gets
+the `No schema files changed` check rather than a plan.
+
+A PR plan covers the databases whose schema directories the PR changes. The
+trigger is the diff, but the plan is not: once it runs,
+it compares the whole directory at the PR head with the live database, so it
+finds every table and column the database is missing, including ones whose
+files the PR did not touch.
+
+To reconcile drift, use a **nonce edit**. Open a small PR that adds or toggles
+a comment line in the database's `schemabot.yaml`:
+
+```yaml
+database: mydb
+type: mysql
+# nonce
+```
+
+The comment is inert, but it lives in the schema directory, so SchemaBot plans
+the PR. The plan lists the drift, for example `N tables to create` for an
+empty database. Apply from the plan comment as usual, let the checks pass, and
+merge. Leave the comment in place afterwards and remove it the next time you
+reconcile drift, so the toggle always produces a diff.
+
+If you run `schemabot plan` on a PR with no schema edits, the `No Schema Files
+Changed` comment describes this edit under "Expected a plan?".
 
 ## Destructive changes: two different workflows
 
@@ -410,6 +445,8 @@ One frame from the live output (illustrative values):
   ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
   • Rows: 6,000,000 / 10,000,000 · ETA: 42m 0s
   • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
+
+  Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
 ```
 
 The view refreshes until the apply finishes. Here, copying is slowing down

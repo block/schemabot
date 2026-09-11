@@ -2,6 +2,7 @@ package storage
 
 import (
 	"encoding/json"
+	"fmt"
 	"slices"
 	"sort"
 	"strings"
@@ -16,6 +17,18 @@ import (
 // in operator-facing progress (the PR comment's retry counter) and enforced by
 // the storage claim/expiry paths.
 const MaxRecoveryAttempts = 10
+
+// ApplyTargetLockWait is how long a claim blocks waiting for another instance
+// to release an apply target's advisory lock. It is the longest a statement on
+// the storage pool legitimately blocks, which makes it the floor any
+// statement budget configured for that pool must stay above: the wait blocks
+// inside a lock acquisition, and statement_timeout bounds a blocked statement
+// as readily as a computing one. A budget below this wait cancels the
+// acquisition with SQLSTATE 57014 before the lock timeout can report the
+// ordinary 55P03 "someone else holds it", turning routine contention into a
+// failure that looks nothing like a lock conflict. Exported so config
+// validation can enforce that floor.
+const ApplyTargetLockWait = 10 * time.Second
 
 // MaxWebhookEventAttempts is the claim budget for webhook inbox rows: how many
 // times FindNext will hand out a given delivery (each claim increments
@@ -939,6 +952,10 @@ type ApplyOperation struct {
 	// replays them but does not interpret them for control/progress calls.
 	EngineResumeContext  string
 	EngineResumeMetadata string
+	// ProgressMetadata is the latest engine progress display metadata encoded as
+	// JSON. It is durable read-model state and is not replayed into the engine.
+	// A new attempt can display the prior attempt's position until its first progress save.
+	ProgressMetadata string
 
 	// CreatedAt is when the child row was inserted (typically at apply create).
 	CreatedAt time.Time
@@ -1220,6 +1237,25 @@ func (opts ApplyOptions) Map() map[string]string {
 		options["rollback"] = "true"
 	}
 	return options
+}
+
+// ParseProgressMetadata decodes the operation's persisted progress display
+// metadata. An operation that has never persisted metadata, or whose stored
+// value is a JSON null, yields an empty non-nil map so callers can overlay
+// into it directly; malformed JSON is an error, because a row that cannot be
+// decoded is worth a log line rather than a silently empty progress view.
+func (op *ApplyOperation) ParseProgressMetadata() (map[string]string, error) {
+	metadata := make(map[string]string)
+	if op.ProgressMetadata == "" {
+		return metadata, nil
+	}
+	if err := json.Unmarshal([]byte(op.ProgressMetadata), &metadata); err != nil {
+		return nil, fmt.Errorf("decode apply operation progress metadata: %w", err)
+	}
+	if metadata == nil {
+		metadata = make(map[string]string)
+	}
+	return metadata, nil
 }
 
 // ParseApplyOptions parses the JSON options into ApplyOptions.

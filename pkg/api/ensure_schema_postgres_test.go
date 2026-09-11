@@ -4,11 +4,15 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -20,9 +24,27 @@ func TestEnsurePostgresSchema_MalformedDSNFailsAtOpen(t *testing.T) {
 	t.Parallel()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	err := ensurePostgresSchema("postgres://user@host:notaport/db", logger, nil)
+	err := ensurePostgresSchema("postgres://user@host:notaport/db", logger, ensureSchemaOptions{}, nil)
 	require.Error(t, err)
 	require.ErrorContains(t, err, "open storage database")
+}
+
+// unverifiableLocker takes locks but cannot say whether the session they live
+// on is the session its caller keeps reaching.
+type unverifiableLocker struct{ namedlock.Locker }
+
+// The bootstrap's cross-instance exclusion is only as good as the guarantee
+// that a lock stays on a session the pod can reach. A locker that cannot
+// establish that guarantee leaves the bootstrap unable to tell an exclusive
+// convergence from a concurrent one, so startup refuses rather than assuming
+// the favorable case.
+func TestVerifyStorageSessionAffinity_RefusesLockerThatCannotVerify(t *testing.T) {
+	t.Parallel()
+
+	err := verifyStorageSessionAffinity(t.Context(), nil, unverifiableLocker{}, "schemabot")
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "refusing to bootstrap storage database \"schemabot\" without cross-instance exclusion")
 }
 
 // The embedded PostgreSQL schema files are the source of truth for the
@@ -192,4 +214,87 @@ func TestPostgresExpectationsFor_EmbeddedFiles(t *testing.T) {
 		require.NoError(t, err, "table %s", table)
 		assert.NotEmpty(t, expected.columns, "table %s", table)
 	}
+}
+
+// The bootstrap DDL budget is derived from EnsureSchemaTimeout, and that
+// derivation is what makes it safe: it can only end a statement the overall
+// deadline was going to end anyway. If it ever crept above the overall
+// deadline it would stop bounding anything; if it were set independently it
+// could start failing statements that converge today.
+func TestPostgresBootstrapDDLBudgetStaysUnderEnsureSchemaTimeout(t *testing.T) {
+	t.Parallel()
+
+	assert.Positive(t, postgresBootstrapDDLStatementTimeout)
+	assert.Less(t, postgresBootstrapDDLStatementTimeout, EnsureSchemaTimeout,
+		"the DDL budget must expire before the overall bootstrap deadline so the failure names a budget")
+	assert.Greater(t, postgresBootstrapDDLStatementTimeout, DefaultPostgresStatementTimeout,
+		"bootstrap DDL must get a longer budget than an ordinary storage query")
+}
+
+// A budget of 0 disables statement_timeout rather than making it strict, so
+// the derivation must never reach one however far the bootstrap ceiling is
+// shortened. The shipped ceiling sits far above the margin, so the floor that
+// guarantees this is only exercised at ceilings nobody ships — which is
+// exactly why it is worth pinning here instead of trusting it on inspection.
+func TestPostgresBootstrapDDLBudgetNeverDerivesADisabledBudget(t *testing.T) {
+	t.Parallel()
+
+	const margin = 15 * time.Second
+	const floor = 5 * time.Second
+
+	for _, tc := range []struct {
+		name    string
+		ceiling time.Duration
+		want    time.Duration
+	}{
+		{name: "a roomy ceiling keeps the margin below it", ceiling: 5 * time.Minute, want: 4*time.Minute + 45*time.Second},
+		{name: "a ceiling just above the margin still subtracts", ceiling: 25 * time.Second, want: 10 * time.Second},
+		{name: "a ceiling at the margin would derive a disable", ceiling: margin, want: floor},
+		{name: "a ceiling under the margin would derive a negative", ceiling: 5 * time.Second, want: floor},
+		{name: "a zero ceiling cannot disable the budget", ceiling: 0, want: floor},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := postgresBootstrapDDLBudget(tc.ceiling, margin, floor)
+			assert.Equal(t, tc.want, got)
+			assert.Positive(t, got, "a derived budget of 0 or less disables statement_timeout")
+		})
+	}
+}
+
+// 57014 is raised both by statement_timeout expiring and by an operator's
+// pg_cancel_backend, so elapsed time is what tells them apart: a cancellation
+// that arrives before the budget could have fired came from outside SchemaBot.
+// Getting this backwards would tell an operator to look for an external cause
+// during their own timeout, and vice versa.
+func TestPostgresStatementTimeoutError(t *testing.T) {
+	t.Parallel()
+
+	cancelled := &pgconn.PgError{Code: postgresQueryCanceled, Message: "canceling statement due to statement timeout"}
+
+	t.Run("exhausting the budget names the budget", func(t *testing.T) {
+		t.Parallel()
+		err := postgresStatementTimeoutError(cancelled, 30*time.Second, 30*time.Second)
+		assert.ErrorContains(t, err, "exhausting its 30s statement_timeout")
+		assert.ErrorIs(t, err, cancelled)
+	})
+
+	t.Run("cancelled early points outside SchemaBot", func(t *testing.T) {
+		t.Parallel()
+		err := postgresStatementTimeoutError(cancelled, 30*time.Second, time.Second)
+		assert.ErrorContains(t, err, "something outside SchemaBot cancelled it")
+		assert.ErrorIs(t, err, cancelled)
+	})
+
+	t.Run("a disabled budget cannot have fired early", func(t *testing.T) {
+		t.Parallel()
+		err := postgresStatementTimeoutError(cancelled, 0, time.Second)
+		assert.ErrorContains(t, err, "exhausting its 0s statement_timeout")
+	})
+
+	t.Run("another error passes through untouched", func(t *testing.T) {
+		t.Parallel()
+		other := &pgconn.PgError{Code: "55P03", Message: "lock not available"}
+		assert.Equal(t, other, postgresStatementTimeoutError(other, 30*time.Second, time.Second))
+	})
 }

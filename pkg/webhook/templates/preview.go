@@ -70,6 +70,21 @@ func PreviewCommentPlanIgnoredNamespaces() string {
 	return RenderPlanComment(data)
 }
 
+// PreviewCommentPlanExemptTables renders a plan with archive-named live tables.
+func PreviewCommentPlanExemptTables() string {
+	return RenderPlanComment(PlanCommentData{
+		Database: "testapp", SchemaName: "app", Environment: "staging",
+		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
+		DatabaseType: "postgres",
+		Changes:      []KeyspaceChangeData{{Keyspace: "app", Statements: []string{"CREATE TABLE app.users (id bigint PRIMARY KEY);"}}},
+		ExemptTables: []ExemptTablesData{{
+			Namespace: "app",
+			Tables:    []string{"events_archive_2025_01", "orders_archive_2024"},
+			Reason:    "archive naming",
+		}},
+	})
+}
+
 // PreviewCommentPlanBlocked renders a sample plan containing a statement the
 // engine deterministically refuses (execution-mode verdict "blocked").
 func PreviewCommentPlanBlocked() string {
@@ -530,7 +545,7 @@ func PreviewCommentNoManagedSchemaChanges() string {
 func PreviewCommentNoManagedSchemaChangesChecksRefreshed() string {
 	return RenderNoManagedSchemaChangesChecksRefreshed(NoManagedSchemaChangesChecksRefreshedData{
 		RequestedBy: previewRequestedBy,
-		Timestamp:   "2026-03-15 14:30:00",
+		Repository:  previewRepository,
 		HeadSHA:     previewHeadSHA,
 	})
 }
@@ -541,7 +556,7 @@ func PreviewCommentNoManagedSchemaChangesChecksRefreshed() string {
 func PreviewCommentNoManagedSchemaChangesChecksRefreshedGatedOnTenants() string {
 	return RenderNoManagedSchemaChangesChecksRefreshed(NoManagedSchemaChangesChecksRefreshedData{
 		RequestedBy:    previewRequestedBy,
-		Timestamp:      "2026-03-15 14:30:00",
+		Repository:     previewRepository,
 		HeadSHA:        previewHeadSHA,
 		GatedOnTenants: true,
 	})
@@ -634,6 +649,58 @@ func PreviewCommentErrorNotFound() string {
 		Environment:  "staging",
 		DatabaseName: "nonexistent-db",
 		CommandName:  action.Plan,
+	})
+}
+
+// PreviewCommentErrorNotFoundScoped renders the "database not found" error
+// comment for a repository too large to search in full, where only the
+// database's configured schema directories were probed.
+func PreviewCommentErrorNotFoundScoped() string {
+	return RenderDatabaseNotFound(SchemaErrorData{
+		RequestedBy:  previewRequestedBy,
+		Timestamp:    "2026-01-15 14:30:00",
+		Environment:  "staging",
+		DatabaseName: "payments",
+		CommandName:  action.Plan,
+		SearchedDirs: []string{"services/payments/schema", "services/payments/legacy-schema"},
+	})
+}
+
+// PreviewCommentErrorDatabaseNotConfigured renders the error comment for a
+// command naming a database the SchemaBot server has no configuration for.
+func PreviewCommentErrorDatabaseNotConfigured() string {
+	return RenderDatabaseNotConfigured(SchemaErrorData{
+		RequestedBy:  previewRequestedBy,
+		Timestamp:    "2026-01-15 14:30:00",
+		Environment:  "staging",
+		DatabaseName: "payments",
+		CommandName:  action.Apply,
+	})
+}
+
+// PreviewCommentErrorDatabaseRepoNotAllowed renders the error comment for a
+// command naming a database the SchemaBot server configures for other
+// repositories only.
+func PreviewCommentErrorDatabaseRepoNotAllowed() string {
+	return RenderDatabaseRepoNotAllowed(SchemaErrorData{
+		RequestedBy:  previewRequestedBy,
+		Timestamp:    "2026-01-15 14:30:00",
+		Environment:  "staging",
+		DatabaseName: "payments",
+		CommandName:  action.Apply,
+	})
+}
+
+// PreviewCommentErrorRepositoryTruncated renders the error comment for a
+// database-scoped command on a repository whose tree GitHub truncated, where
+// the server-side schema directories could not bound the search.
+func PreviewCommentErrorRepositoryTruncated() string {
+	return RenderRepositoryTreeTruncated(SchemaErrorData{
+		RequestedBy:  previewRequestedBy,
+		Timestamp:    "2026-01-15 14:30:00",
+		Environment:  "staging",
+		DatabaseName: "payments",
+		CommandName:  action.Apply,
 	})
 }
 
@@ -1000,8 +1067,8 @@ func PreviewCommentUnsafeBlocked() string {
 		},
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "users", Reason: "DROP INDEX idx_email"},
-			{Table: "orders", Reason: "DROP COLUMN notes"},
+			{Table: "users", Reason: "DROP INDEX idx_email", DDL: "ALTER TABLE `users` DROP INDEX `idx_email`", ChangeType: "alter"},
+			{Table: "orders", Reason: "DROP COLUMN notes", DDL: "ALTER TABLE `orders` DROP COLUMN `notes`", ChangeType: "alter"},
 		},
 	})
 }
@@ -1029,8 +1096,10 @@ func PreviewCommentDropColumnBlocked() string {
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
 			{
-				Table:  "customers",
-				Reason: "Unsafe operation detected: \"DROP COLUMN `nickname`\"",
+				Table:      "customers",
+				Reason:     "Unsafe operation detected: \"DROP COLUMN `nickname`\"",
+				DDL:        "ALTER TABLE `customers` DROP COLUMN `nickname`",
+				ChangeType: "alter",
 			},
 		},
 	})
@@ -1059,8 +1128,10 @@ func PreviewCommentDropIndexBlocked() string {
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
 			{
-				Table:  "customers",
-				Reason: "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\"",
+				Table:      "customers",
+				Reason:     "Unsafe operation detected: \"DROP INDEX `idx_customers_email`\"",
+				DDL:        "ALTER TABLE `customers` DROP INDEX `idx_customers_email`",
+				ChangeType: "alter",
 			},
 		},
 	})
@@ -1157,8 +1228,8 @@ func PreviewCommentApplyPlanUnsafe() string {
 		HasUnsafeChanges: true,
 		AllowUnsafe:      true,
 		UnsafeChanges: []UnsafeChangeData{
-			{Table: "users", Reason: "DROP INDEX idx_email"},
-			{Table: "orders", Reason: "DROP COLUMN notes"},
+			{Table: "users", Reason: "DROP INDEX idx_email", DDL: "ALTER TABLE `users` DROP INDEX `idx_email`", ChangeType: "alter"},
+			{Table: "orders", Reason: "DROP COLUMN notes", DDL: "ALTER TABLE `orders` DROP COLUMN `notes`", ChangeType: "alter"},
 		},
 		IsLocked:     true,
 		LockOwner:    "acme/myapp#42",

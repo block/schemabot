@@ -20,6 +20,25 @@ func TestAdvisoryLockKeyIsStable(t *testing.T) {
 	assert.Equal(t, int64(-3035819114795400762), advisoryLockKey("schemabot_pending_drops_0011223344556677"))
 }
 
+// pg_locks reports a single-argument advisory key split across two unsigned
+// OID columns, so the split has to survive the sign bit: a key whose high half
+// looks negative as an int32 must still round-trip, or the affinity probe
+// would find no row for a lock it is holding and refuse a healthy connection.
+func TestAdvisoryLockCatalogKeyRoundTrips(t *testing.T) {
+	for _, key := range []int64{
+		0,
+		1,
+		-1,
+		advisoryLockKey("schemabot_ensure_schema"),
+		advisoryLockKey("schemabot_stranded_reaper"),
+	} {
+		classID, objID := advisoryLockCatalogKey(key)
+		assert.GreaterOrEqual(t, classID, int64(0), "classid is an unsigned OID")
+		assert.GreaterOrEqual(t, objID, int64(0), "objid is an unsigned OID")
+		assert.Equal(t, key, int64(uint64(classID)<<32|uint64(objID)), "key %d did not round-trip", key)
+	}
+}
+
 // Distinct lock names derive distinct keys, so unrelated coordination points
 // do not contend on the same advisory lock.
 func TestAdvisoryLockKeyDistinguishesNames(t *testing.T) {

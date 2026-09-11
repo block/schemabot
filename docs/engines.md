@@ -7,12 +7,6 @@
 - [Capability matrix](#capability-matrix)
 - [What the terms mean](#what-the-terms-mean)
 - [Why the differences exist](#why-the-differences-exist)
-  - [The cheap native path](#the-cheap-native-path)
-  - [Copy and swap](#copy-and-swap)
-  - [Pausing](#pausing)
-  - [The revert window](#the-revert-window)
-  - [Direct execution](#direct-execution)
-  - [PostgreSQL today](#postgresql-today)
 - [What GA and early alpha mean](#what-ga-and-early-alpha-mean)
 - [Load management](#load-management)
 - [Dropped tables](#dropped-tables)
@@ -61,7 +55,7 @@ stay put, where this page moves as engines gain features.
 | **`stop`** | yes | no | planned |
 | **`start`** | yes | deferred deploys only | planned |
 | **Deferred cutover** | yes | yes | planned |
-| **`cancel`** | yes | yes | planned |
+| **`cancel`** | yes | yes | concurrent index builds only |
 | **`revert` / `skip-revert`** | no | yes | no |
 | **Throttling** | automatic, on live target signals | automatic, on live cluster signals; plus an operator-set rate on a running change | planned, on replica and slot lag; meanwhile a statement is cancelled at its budget rather than slowed |
 | **Adaptive pacing** | yes | no | planned |

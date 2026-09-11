@@ -11,13 +11,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/block/pg-sprite/pkg/dbconn"
 	"github.com/block/pg-sprite/pkg/executor"
 	"github.com/block/pg-sprite/pkg/preflight"
+	"github.com/block/pg-sprite/pkg/progress"
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
@@ -32,41 +35,68 @@ const (
 	// Server-side statement/lock timeouts bound queries once a session is
 	// healthy, but they cannot unwedge a hung dial or a black-holed
 	// connection — the ceiling guarantees the drive always reaches a
-	// terminal progress state. Above the worst legitimate run on either
-	// execution path — generously above the retry path's (retry attempts x
-	// statement limit plus backoffs), and above the concurrent index
-	// budget with enough headroom for session setup and the post-failure
-	// catalog verdict — so it only fires on genuine hangs.
+	// terminal progress state. Generously above the worst legitimate run of
+	// the retry path (retry attempts x statement limit plus backoffs) so it
+	// only fires on genuine hangs. A concurrent index build does not run
+	// under this constant: its ceiling is the configured build bound plus
+	// concurrentIndexHeadroom. The constructor seeds the engine's field of
+	// the same name from it; the apply reads the field.
 	optimisticApplyCeiling = 5 * time.Minute
 
-	// concurrentIndexBudget bounds one CREATE INDEX CONCURRENTLY build.
-	// Concurrent builds get their own budget instead of the per-statement
-	// limit: their snapshot waits are lock waits by implementation, so the
-	// executor runs them with lock_timeout disabled under one overall
-	// statement deadline. Deliberately below the apply ceiling so the
-	// server-side deadline fires before the client-side ceiling cancels
-	// the session — exhaustion then surfaces as the typed budget verdict
-	// rather than an ambiguous external cancellation.
-	concurrentIndexBudget = 4 * time.Minute
+	// executorProgressReadTimeout bounds one read of the executor's tracker.
+	// For an active concurrent index build that read is a single-row query
+	// on the session the executor reserved for the build's failure verdict,
+	// and the tracker serializes it against the executor's own end-of-build
+	// fence — so a poll that hangs on a half-open socket would hold up the
+	// apply's verdict and its terminal publish. A deadline of the engine's
+	// own keeps that coupling bounded regardless of what the caller's
+	// context does.
+	//
+	// The bound sits above the statement_timeout the apply pool runs its
+	// sessions under (spritePoolConfig leaves it at pg-sprite's default) so
+	// that on a live connection the server ends a slow read first: a
+	// statement_timeout cancels the query and hands the session back
+	// intact, whereas a client deadline expiring mid-query closes the
+	// connection — and that connection is the one the build's failure
+	// verdict needs. The engine's deadline is therefore the bound of last
+	// resort, for the socket the server's cancellation can no longer reach.
+	executorProgressReadTimeout = dbconn.DefaultStatementTimeout + executorProgressReadHeadroom
 
-	// concurrentIndexHeadroom is the least the apply ceiling must exceed
-	// the concurrent index budget by. The ceiling wraps the whole apply,
-	// so the gap has to absorb everything that shares the ceiling with the
-	// build — pool dial, the privilege check, the preflight table read, the
-	// partition admission facts lookup, and the rest of the session setup
-	// executeOptimistic runs before the build — and, after the budget has
-	// already expired, the catalog verdict that names an invalid leftover
-	// index. If the ceiling fires first the verdict has no live context to
-	// run in and the failure degrades to an external cancellation that
-	// names no index, which is the outcome the verdict exists to prevent.
-	concurrentIndexHeadroom = time.Minute
+	// executorProgressReadHeadroom is how far the read deadline sits past
+	// the session's statement_timeout: long enough that the server's
+	// cancellation error reaches the client before the client gives up on
+	// the socket.
+	executorProgressReadHeadroom = 5 * time.Second
+
+	// concurrentIndexHeadroom is how far a concurrent index apply's ceiling
+	// sits above the configured build bound. The ceiling wraps the whole
+	// apply while the build bound — the build's server-side statement
+	// timeout, or the recovery's deadline — starts only when the build
+	// starts, so the gap is the time granted to everything executeOptimistic
+	// runs before the build: the pool dial, the privilege check, the
+	// preflight table read and the partition admission facts lookup. As long
+	// as that setup finishes within the headroom, the bound is what ends an
+	// over-long build — the server's timer fires first and exhaustion
+	// surfaces as the typed budget verdict — and the build gets the full
+	// bound the operator configured; setup that outruns the headroom shortens
+	// the build by the excess, because the ceiling then fires first and the
+	// outcome degrades to a cancellation. Nothing after the build
+	// depends on the gap: pg-sprite runs its post-failure catalog verdict on
+	// a detached context of its own, and the terminal publish reads the
+	// tracker the same way. The bound is sized to cover setup even when
+	// every one of its steps runs to the server-side limit the pool sets
+	// for it — the connect timeout for the dial, the statement_timeout for
+	// each preflight read.
+	concurrentIndexHeadroom = 2 * time.Minute
 )
 
 type nativeApply struct {
-	namespace string
-	table     string
-	sql       string
-	steps     int
+	namespace                  string
+	table                      string
+	sql                        string
+	steps                      int
+	concurrentIndex            bool
+	concurrentIndexMaxDuration time.Duration
 }
 
 // targetConn carries one background apply's connection inputs: the raw DSN
@@ -102,16 +132,33 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		}
 	}
 
-	started := time.Now()
-	key := progressIdentity(req.ResumeState)
-	e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""))
-	bgCtx := context.WithoutCancel(ctx)
-	conn := targetConn{dsn: req.Credentials.DSN, caCertPath: caPath}
+	// One tracker per apply: pg-sprite's executor records each step it
+	// starts on it, and Progress reads the position back, so the poller
+	// sees the step in flight rather than only the accept and terminal
+	// states the engine itself publishes.
+	tracker, err := progress.NewTracker(progress.WallClock{})
+	if err != nil {
+		return nil, fmt.Errorf("apply PostgreSQL database %q: %w", req.Database, err)
+	}
+
 	logger := req.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	e.wg.Go(func() { e.runOptimisticApply(bgCtx, conn, change, key, started, logger) })
+	started := time.Now()
+	key := progressIdentity(req.ResumeState)
+	// An accepted apply must survive the request that accepted it, so the
+	// drive's context is detached from the caller. It is cancellable so the
+	// engine itself can end the drive — a cancel of last resort, and the
+	// halt on shutdown.
+	applyCtx, cancelApply := context.WithCancel(context.WithoutCancel(ctx))
+	done := e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""), tracker, logger, change.concurrentIndex, cancelApply)
+	conn := targetConn{dsn: req.Credentials.DSN, caCertPath: caPath}
+	e.wg.Go(func() {
+		defer close(done)
+		defer cancelApply()
+		e.runOptimisticApply(applyCtx, conn, change, key, started, logger, tracker)
+	})
 
 	return &engine.ApplyResult{
 		Accepted:    true,
@@ -148,7 +195,17 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	if _, err := preflight.RequiredTier(statements); err != nil {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: SchemaBot's PostgreSQL support does not execute this statement shape yet", tc.Table)
 	}
-	return nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL, steps: len(statements)}, nil
+	concurrentIndex := false
+	if len(statements) == 1 {
+		// The tier derivation above parsed this statement already, so a
+		// parse failure here is an invariant guard; the message stays curated
+		// like the refusals above because it reaches the operator surface.
+		concurrentIndex, err = concurrentIndexStatement(statements[0])
+		if err != nil {
+			return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: planned statement could not be classified", tc.Table)
+		}
+	}
+	return nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL, steps: len(statements), concurrentIndex: concurrentIndex}, nil
 }
 
 // postgresCreateSetStatements parses one statement or a greenfield create set
@@ -165,47 +222,94 @@ func postgresCreateSetStatements(script string) ([]string, error) {
 	return statements, nil
 }
 
-func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change nativeApply, key string, started time.Time, logger *slog.Logger) {
+func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change nativeApply, key string, started time.Time, logger *slog.Logger, tracker *progress.Tracker) {
 	// The context arrives detached from the caller (an accepted apply must
-	// survive the request), so boundedness comes from the ceiling instead.
-	ctx, cancel := context.WithTimeout(ctx, optimisticApplyCeiling)
+	// survive the request) and ends only when the engine cancels the drive,
+	// so boundedness comes from the ceiling instead.
+	ceiling := e.optimisticApplyCeiling
+	if change.concurrentIndex {
+		ceiling = e.concurrentIndexMaxDuration + concurrentIndexHeadroom
+		change.concurrentIndexMaxDuration = e.concurrentIndexMaxDuration
+	}
+	ctx, cancel := context.WithTimeout(ctx, ceiling)
 	defer cancel()
-	err := executeOptimistic(ctx, conn, change, e.tableSizeLimit)
+	// Every terminal result carries the executor's final position: the
+	// executor finishes its tracker before it returns, so the read is
+	// memory-only and a failed create reports the step that failed, not the
+	// sequence's first step. The error branch is an invariant guard, not an
+	// expected outcome — a tracker still reporting a live build here means
+	// the executor returned without finishing it, and the terminal result
+	// then carries the tracker's last-known position instead of a fresh
+	// read the reserved session can no longer answer.
+	publish := func(result *engine.ProgressResult) {
+		if err := executorProgressMetadata(ctx, tracker, result); err != nil {
+			logger.Warn("PostgreSQL apply terminal progress reports the last-known executor position",
+				"namespace", change.namespace, "table", change.table, "task_id", key, "error", err)
+		}
+		e.publishProgress(key, result, logger)
+	}
+	execute := e.execute
+	if execute == nil {
+		execute = executeOptimistic
+	}
+	err := execute(ctx, conn, change, e.tableSizeLimit, tracker, logger)
 	if err == nil {
-		e.publishProgress(key, progressResult(engine.StateCompleted, "completed", started, change, ""), logger)
+		publish(progressResult(engine.StateCompleted, "completed", started, change, ""))
 		return
 	}
 
 	var invalidErr *executor.InvalidIndexError
-	if errors.As(err, &invalidErr) {
-		// An invalid index — pre-existing or a build's own unrecovered
-		// leftover — is operational: an operator clears it and a retry can
-		// succeed. Checked before the refusal and budget arms because the
-		// verdict wraps the build failure that produced it (a budget-
-		// cancelled build leaves its own invalid index), and that inner
-		// cause must not be read as the outcome — the index the operator
-		// clears is. The detail is built from the typed identifiers and
-		// verdict code, never the wrapped build or cleanup errors, which
-		// may carry raw server text; the full cause lands in the server
-		// log below it.
+	if isCancellation(err) && e.cancelRequested(key) {
+		// The cancellation is the operator's only when this engine recorded
+		// that it acted on the apply: a backend cancelled from outside
+		// SchemaBot is a failure the next drive retries, never a cancel
+		// nobody asked for.
+		detail := "Concurrent index build cancelled"
+		if errors.As(err, &invalidErr) {
+			detail = invalidIndexDetail(invalidErr)
+		}
+		publish(progressResult(engine.StateCancelled, "cancelled", started, change, detail))
+		return
+	}
+	if errors.As(err, &invalidErr) && !invalidErr.Code().Permanent() {
+		// An invalid index a retry recovers or an operator clears — a build's
+		// own leftover, abandoned debris, another backend's build to wait
+		// out, or a builder this role cannot observe — is operational: once
+		// it is gone a retry can succeed. Checked before the refusal and
+		// budget arms because the verdict wraps the build failure that
+		// produced it (a budget-cancelled build leaves its own invalid
+		// index), and that inner cause must not be read as the outcome — the
+		// index the retry acts on is. The permanent verdicts (the name is occupied
+		// on another table, or by an index the server will not drop
+		// concurrently) fall through to classifyRefusal: retrying unchanged
+		// reproduces them. The detail is built from the typed identifiers
+		// and verdict code, never the wrapped build or cleanup errors, which
+		// may carry raw server text; the full cause lands in the server log
+		// below it.
 		logger.Error("PostgreSQL concurrent index build left or found an invalid index",
 			"namespace", change.namespace, "table", change.table,
 			"index_schema", invalidErr.Schema, "index", invalidErr.Index, "error", err)
 		result := progressResult(engine.StateFailed, "failed", started, change,
 			invalidIndexDetail(invalidErr))
 		result.Retryable = true
-		e.publishProgress(key, result, logger)
+		publish(result)
 		return
 	}
 
 	if r := classifyRefusal(err, change.table); r != nil {
 		// The taxonomy's reason survives in the operator-facing detail; no
 		// metadata carries it because nothing downstream consumes one yet.
-		e.publishProgress(key, progressResult(engine.StateFailed, "refused", started, change, r.detail), logger)
+		// The server error is what identifies the occupant or the missing
+		// grant, and only the log carries it: the detail is kept generic
+		// because it is published to GitHub.
+		logger.Warn("PostgreSQL schema change refused",
+			"namespace", change.namespace, "table", change.table, "reason", r.reason, "error", err)
+		publish(progressResult(engine.StateFailed, "refused", started, change, recoveryContextDetail(err, r.detail)))
 		return
 	}
 
 	failure := classifyApplyFailure(err, change.table)
+	failure.detail = recoveryContextDetail(err, failure.detail)
 	switch {
 	case failure.committedPrefix:
 		logger.Error("PostgreSQL create set failed after committing a prefix",
@@ -218,7 +322,7 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	}
 	result := progressResult(engine.StateFailed, "failed", started, change, failure.detail)
 	result.Retryable = failure.retryable
-	e.publishProgress(key, result, logger)
+	publish(result)
 }
 
 // applyFailure is the drive-facing disposition of an operational apply
@@ -254,121 +358,236 @@ func classifyApplyFailure(err error, table string) applyFailure {
 	return applyFailure{detail: "PostgreSQL schema change failed; see server logs", retryable: true}
 }
 
-// invalidIndexDetail renders the operator-facing next step for an
-// invalid-index verdict, matching pg-sprite's own ownership standard: a drop
-// is named only when the entry is proven this build's own leftover. A
-// pre-existing invalid entry may be another actor's still-running build, and
-// an unproven verdict may sit on a healthy index — both get investigation
-// steps, never a statement to run. Only the typed identifiers are
-// interpolated, never the wrapped build or cleanup errors, which may carry
-// raw server text.
-func invalidIndexDetail(invalidErr *executor.InvalidIndexError) string {
+// invalidIndexAdvice renders the operator-facing cause and next step for an
+// invalid-index verdict, matching pg-sprite's own ownership standard: a
+// removal is named only where the recovery proves the entry is a failed
+// build's debris on the target table before it drops — this build's own
+// leftover, an abandoned entry with no builder, or an entry whose builder
+// this role cannot see, which the recovery settles under the table's lock —
+// and there the retry performs it, so the operator's step is to let the
+// retry run. A build still in flight says wait; an entry on another table,
+// one the server will not drop concurrently, and an unproven verdict get
+// investigation steps, never a statement to run — the index under the name
+// may be healthy or may be exactly what it is meant to be. Only the typed
+// identifiers are interpolated, never the wrapped build or cleanup errors,
+// which may carry raw server text. The two halves leave unsanitized so
+// classifyRefusal can compose a sequence-step clause between them and
+// sanitize the whole; the operational path composes them through
+// invalidIndexDetail.
+func invalidIndexAdvice(invalidErr *executor.InvalidIndexError) (cause, remedy string) {
 	name := fmt.Sprintf("%q.%q", invalidErr.Schema, invalidErr.Index)
-	var advice string
 	switch invalidErr.Code() {
 	case executor.CodeInvalidIndexOwnLeftover:
-		advice = fmt.Sprintf("this build left its own invalid index %s on the target; drop the invalid index, then retry", name)
-	case executor.CodeInvalidIndexPreexisting:
-		advice = fmt.Sprintf("an invalid index %s already occupies the name on the target and may be another actor's build still in progress; check pg_stat_activity before any recovery, then retry", name)
+		// A leftover the bound's statement timeout produced says so: the
+		// retry rebuilds under the same bound, so the operator's step is to
+		// raise it, and the budget the verdict carries is that bound.
+		var budgetErr *executor.BudgetError
+		if errors.As(invalidErr.Build, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
+			return fmt.Sprintf("this build left its own invalid index %s on the target after running past %s (%s)", name, concurrentIndexBoundOption, budgetErr.Budget),
+				fmt.Sprintf("the retry removes it and rebuilds the index under the same bound, so raise %s first; drop it yourself only if the retries are exhausted", concurrentIndexBoundOption)
+		}
+		return fmt.Sprintf("this build left its own invalid index %s on the target", name),
+			"the retry removes it and rebuilds the index; drop it yourself only if the retries are exhausted"
+	case executor.CodeInvalidIndexAbandoned:
+		return fmt.Sprintf("an abandoned invalid index %s occupies the name on the target table with no backend building it", name),
+			"the retry removes it and rebuilds the index; drop it yourself only if the retries are exhausted"
+	case executor.CodeInvalidIndexBuildInFlight:
+		return fmt.Sprintf("an invalid index %s occupies the name and backend %d is still building it", name, invalidErr.BuilderPID),
+			"wait for that build to finish or fail, then retry"
+	case executor.CodeInvalidIndexBuilderUnobservable:
+		return fmt.Sprintf("an invalid index %s occupies the name on the target table and the engine role cannot observe whether a backend is building it", name),
+			"the retry proves it abandoned under the table's lock, removes it, and rebuilds the index; a build still holding the table stops that retry at its lock budget instead"
+	case executor.CodeInvalidIndexOtherTable:
+		return fmt.Sprintf("an invalid index %s already occupies the name on a different table%s", name, invalidIndexTableSuffix(invalidErr)),
+			"this change cannot claim it — rename the index in the schema file and re-plan, or clear the entry through that table's own change"
+	case executor.CodeInvalidIndexNotDroppable:
+		return fmt.Sprintf("an invalid index %s occupies the name and is a partitioned table's index, an index partition, or a constraint's index rather than a failed build's leftover", name),
+			"an operator must resolve it on the target, or rename the index in the schema file and re-plan"
 	default:
 		// CodeInvalidIndexUnproven and any future verdict fail safe with
 		// investigation steps: the index under the name may be healthy.
-		advice = fmt.Sprintf("index %s may be invalid but its catalog state could not be verified; inspect pg_index.indisvalid on the target before any recovery, then retry", name)
+		return fmt.Sprintf("index %s may be invalid but its catalog state could not be verified", name),
+			"inspect pg_index.indisvalid on the target before any recovery, then retry"
 	}
-	return sanitizeReasonText(advice)
+}
+
+// invalidIndexDetail composes the advice for the operational (retryable)
+// publish path, where no sequence-step clause intervenes.
+func invalidIndexDetail(invalidErr *executor.InvalidIndexError) string {
+	cause, remedy := invalidIndexAdvice(invalidErr)
+	return sanitizeReasonText(cause + "; " + remedy)
+}
+
+// invalidIndexTableSuffix names the table the invalid index sits on when the
+// catalog inspection saw it; the verdict carries no table when the state
+// could not be inspected.
+func invalidIndexTableSuffix(invalidErr *executor.InvalidIndexError) string {
+	if invalidErr.Table == "" {
+		return ""
+	}
+	return fmt.Sprintf(" (%q)", invalidErr.Table)
 }
 
 // refusal is a typed apply outcome that retrying cannot fix: the schema
 // change, the target table, or role provisioning must change first.
+//
+// cause names what failed and remedy names what the operator changes; they
+// are kept apart so the failed sequence step can be placed between them
+// without parsing the rendered text. detail is the operator-facing line
+// classifyRefusal composes from them — the only field consumers read.
 type refusal struct {
 	reason string
+	cause  string
+	remedy string
 	detail string
 }
 
 // classifyRefusal maps pg-sprite's typed refusal inputs to permanent
 // refusals, for both the plan-time privilege check and the apply path — one
-// classifier so the same underlying failure reads identically on both
-// surfaces. A nil result means the failure is operational — a retry may
-// succeed once conditions change. Lock-budget exhaustion is deliberately
+// classifier so the same underlying failure carries the same reason and
+// detail on both surfaces; the plan surface prefixes the detail with the
+// statement it blocks, the apply surface publishes it bare. A nil result
+// means the failure is operational — a retry may succeed once conditions
+// change. Lock-budget exhaustion is deliberately
 // operational: the statement is native-safe and only lost a bounded race
-// with concurrent lock holders. Every detail string is built from typed
-// error fields and identifiers, never from wrapped server output, and every
-// detail is sanitized at this single exit — a refusal is safe to render on
-// operator-facing surfaces by construction, whichever branch produced it.
+// with concurrent lock holders. Every cause and remedy is built from typed
+// error fields and identifiers, never from wrapped server output, and the
+// composed detail is sanitized at this single exit — a refusal is safe to
+// render on operator-facing surfaces by construction, whichever branch
+// produced it.
+//
+// The detail reads cause, then the failed sequence step when the statement
+// was one of several, then the remedy, so the remedy stays the last clause
+// the operator reads. A failure past the first step leaves the CREATE TABLE
+// committed; a refusal that carries no remedy of its own then gets a re-plan,
+// because the plan that produced the sequence no longer matches the target.
 func classifyRefusal(err error, table string) *refusal {
 	r := refusalForCause(err, table)
 	if r == nil {
 		return nil
 	}
-	r.detail = sanitizeReasonText(r.detail)
-	var stepErr *executor.SequenceStepError
-	if errors.As(err, &stepErr) && stepErr.Total > 1 {
-		if stepErr.Step > 1 {
-			r.detail = strings.TrimSuffix(r.detail, "; re-plan against the current schema")
-		}
-		r.detail = sanitizeReasonText(r.detail + "; " + sequenceStepDetail(stepErr, table))
-	}
+	r.compose(err)
 	return r
 }
 
-func sequenceStepDetail(stepErr *executor.SequenceStepError, table string) string {
-	detail := fmt.Sprintf("step %d of %d failed", stepErr.Step, stepErr.Total)
-	if stepErr.Step > 1 {
-		detail += fmt.Sprintf(" after the CREATE TABLE for %q committed; re-plan against the current schema", table)
+// compose sets the detail from the cause, the failed step of a create set
+// when there is one, and the remedy, joined by the clause separator. A
+// refusal without a remedy of its own that failed past the committed CREATE
+// TABLE is told to re-plan, because the plan that produced the sequence no
+// longer matches the target.
+func (r *refusal) compose(err error) {
+	clauses := []string{r.cause}
+	if clause := sequenceStepClause(err); clause != "" {
+		clauses = append(clauses, clause)
 	}
-	return detail
+	remedy := r.remedy
+	var stepErr *executor.SequenceStepError
+	if remedy == "" && errors.As(err, &stepErr) && stepErr.Step > 1 {
+		remedy = replanRemedy
+	}
+	if remedy != "" {
+		clauses = append(clauses, remedy)
+	}
+	r.detail = sanitizeReasonText(strings.Join(clauses, clauseSeparator))
+}
+
+const (
+	replanRemedy    = "re-plan against the current schema"
+	clauseSeparator = "; "
+)
+
+// sequenceStepClause names the failed step of a multi-statement create set
+// and, past the first step, that the CREATE TABLE committed; a statement that
+// was not one of several gets no clause. It sits between a cause and a remedy
+// and does not repeat the table: the cause before it names the table where
+// that matters, and every surface renders the detail beside the table it
+// belongs to. Keeping the clause short is what lets the remedy's lead survive
+// the narrowest operator surface, which truncates the detail from the tail,
+// for a table name of any legal length; a cause that spends byte room on
+// identifiers charges the clause's width before the identifiers take theirs.
+func sequenceStepClause(err error) string {
+	var stepErr *executor.SequenceStepError
+	if !errors.As(err, &stepErr) || stepErr.Total <= 1 {
+		return ""
+	}
+	clause := fmt.Sprintf("step %d of %d failed", stepErr.Step, stepErr.Total)
+	if stepErr.Step > 1 {
+		clause += " after the CREATE TABLE committed"
+	}
+	return clause
 }
 
 // committedCreatePrefixDetail reports the non-retryable recovery action for a
-// create sequence that failed after at least one earlier step committed.
+// create sequence that failed after at least one earlier step committed. No
+// cause precedes this detail, so it names the table itself.
 func committedCreatePrefixDetail(err error, table string) (string, bool) {
 	var stepErr *executor.SequenceStepError
 	if !errors.As(err, &stepErr) || stepErr.Step <= 1 {
 		return "", false
 	}
-	detail := sequenceStepDetail(stepErr, table)
+	detail := fmt.Sprintf("step %d of %d failed after the CREATE TABLE for %s committed; %s",
+		stepErr.Step, stepErr.Total, quotedTable(table), replanRemedy)
 	return sanitizeReasonText(detail), true
 }
 
-// refusalForCause holds classifyRefusal's cause-to-refusal mapping; details
-// leave unsanitized and classifyRefusal sanitizes them at its return.
+// refusalForCause holds classifyRefusal's cause-to-refusal mapping; causes
+// and remedies leave unsanitized and classifyRefusal sanitizes the composed
+// detail at its return.
 func refusalForCause(err error, table string) *refusal {
 	var privilegeErr *preflight.PrivilegeError
 	if errors.As(err, &privilegeErr) {
-		object := fmt.Sprintf("on table %q", table)
+		object := "on table " + quotedTable(table)
 		if privilegeErr.Tier == preflight.TierCreateTable {
 			// The create tier's grant is schema-scoped: the table does not
 			// exist yet, so pointing the operator at a table-level grant
 			// would send them hunting for an object the target lacks.
-			object = fmt.Sprintf("in the schema that would hold table %q", table)
+			object = "in the schema that would hold table " + quotedTable(table)
 		}
-		detail := fmt.Sprintf("the engine role lacks access for %s %s; provision with: %s (verified by: %s)",
-			privilegeErr.Tier, object, privilegeErr.Grant, privilegeErr.Check)
+		remedy := fmt.Sprintf("provision with: %s (verified by: %s)", privilegeErr.Grant, privilegeErr.Check)
 		if privilegeErr.Hint != "" {
-			detail += "; " + privilegeErr.Hint
+			remedy += "; " + privilegeErr.Hint
 		}
-		return &refusal{reason: "insufficient-privileges", detail: detail}
+		return &refusal{reason: "insufficient-privileges",
+			cause:  fmt.Sprintf("the engine role lacks access for %s %s", privilegeErr.Tier, object),
+			remedy: remedy}
 	}
-	// An invalid-index verdict is operational even when the build failure it
-	// wraps would classify as a refusal on its own — a budget-cancelled
-	// concurrent build leaves its own invalid index, and the index the
-	// operator clears is the outcome, not the inner budget exhaustion.
-	// Declined before the budget arm so the nested cause can never shadow
-	// the verdict.
+	// An invalid-index verdict is decided by its own code, never by the build
+	// failure it wraps — a budget-cancelled concurrent build leaves its own
+	// invalid index, and the index a retry recovers or an operator clears is
+	// the outcome, not the inner budget exhaustion. Decided before the budget arm so the
+	// nested cause can never shadow the verdict. Only the permanent members
+	// of the family refuse: the name is occupied on another table, or by an
+	// index the server will not drop concurrently, so retrying unchanged
+	// reproduces the verdict. Every other member is operational.
 	var invalidErr *executor.InvalidIndexError
 	if errors.As(err, &invalidErr) {
-		return nil
+		r, _ := refusalForOutcome(invalidErr.Code(), table)
+		if r != nil {
+			r.cause, r.remedy = invalidIndexAdvice(invalidErr)
+		}
+		return r
+	}
+	// A concurrent build that ran past its bound and provably left nothing
+	// is refused like any other statement exhaustion — retrying unchanged
+	// spends the same bound again — but names the option that grants more
+	// time, since the bound is the operator's to set. The wrapper is decided
+	// on its own: the bound also ends the executor's catalog reads ahead of
+	// the build, which carry no typed budget verdict.
+	var boundErr *concurrentIndexBoundError
+	if errors.As(err, &boundErr) {
+		return &refusal{reason: "concurrent-index-bound-exceeded", cause: boundErr.Error(),
+			remedy: fmt.Sprintf("raise %s and re-run", concurrentIndexBoundOption)}
 	}
 	var budgetErr *executor.BudgetError
 	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
-		return &refusal{reason: "not-native-safe-budget-exceeded", detail: budgetErr.Error()}
+		return &refusal{reason: "not-native-safe-budget-exceeded", cause: budgetErr.Error()}
 	}
 	var partitionErr *preflight.UnsupportedPartitionedParentError
 	if errors.As(err, &partitionErr) {
 		// The typed error's message is a fixed English sentence with no
 		// interpolated identifiers or server text — a deliberate pg-sprite
 		// property — so rendering it verbatim is safe by construction.
-		return &refusal{reason: "unsupported-partitioned-parent", detail: partitionErr.Error()}
+		return &refusal{reason: "unsupported-partitioned-parent", cause: partitionErr.Error()}
 	}
 	var sizeErr *preflight.SizeError
 	if errors.As(err, &sizeErr) {
@@ -376,23 +595,35 @@ func refusalForCause(err error, table string) *refusal {
 		// property of PostgreSQL or of the change, when it is SchemaBot's
 		// own conservatism for the native-safe path.
 		return &refusal{reason: "table-too-large",
-			detail: sizeErr.Error() + "; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit"}
+			cause: sizeErr.Error() + "; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit"}
+	}
+	// Decided before the bare table sentinels below: the unverified-create
+	// wrap carries the read-back's own cause inside it, and a table no longer
+	// at its name or no longer a table are two of those causes. The outcome
+	// is the state the step left — a committed table whose names are
+	// unproven — not the fault that kept them from being proven, so the
+	// inner sentinel must not claim the verdict.
+	if errors.Is(err, executor.ErrCreateNamesUnverified) {
+		return createNamesUnverifiedRefusal(table)
 	}
 	if errors.Is(err, preflight.ErrTableNotFound) {
-		return &refusal{reason: "table-not-found",
-			detail: fmt.Sprintf("table %q does not exist on the target; re-plan against the current schema", table)}
+		return tableNotFoundRefusal(table)
 	}
 	if errors.Is(err, preflight.ErrNotTable) {
 		return &refusal{reason: "not-a-table",
-			detail: fmt.Sprintf("%q exists but is not an ordinary or partitioned table", table)}
+			cause: quotedTable(table) + " exists but is not an ordinary or partitioned table"}
 	}
 	if preflight.IsNameOccupied(err) {
-		return &refusal{reason: "create-collision",
-			detail: fmt.Sprintf("a relation already occupies a name the create set for %q claims (the table, or one of its index names); re-plan against the current schema", table)}
+		return createCollisionRefusal(table)
+	}
+	var mismatchErr *executor.CreateNameMismatchError
+	if errors.As(err, &mismatchErr) {
+		return createNameMismatchRefusal(createNameMismatchCause(table, mismatchErr, sequenceStepClause(err)))
 	}
 	if errors.Is(err, preflight.ErrSchemaNotFound) {
 		return &refusal{reason: "schema-not-found",
-			detail: fmt.Sprintf("the schema that would hold table %q does not exist on the target; create the schema first", table)}
+			cause:  fmt.Sprintf("the schema that would hold table %s does not exist on the target", quotedTable(table)),
+			remedy: "create the schema first"}
 	}
 	r, _ := refusalForOutcome(executor.OutcomeCode(err), table)
 	return r
@@ -408,56 +639,352 @@ func refusalForCause(err error, table string) *refusal {
 func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 	switch code {
 	case executor.CodeCreateCollision:
-		return &refusal{reason: "create-collision",
-			detail: fmt.Sprintf("a relation already occupies a name the create set for %q claims (the table, or one of its index names); re-plan against the current schema", table)}, true
+		return createCollisionRefusal(table), true
+	case executor.CodeCreateNameMismatch:
+		// The code is only ever carried by the typed error that names the
+		// relations involved, and refusalForCause decides on that error
+		// before control reaches here; this arm keeps the switch total and
+		// gives the bare code the same verdict, with a cause that knows only
+		// that a name differs.
+		return createNameMismatchRefusal(
+			fmt.Sprintf(mismatchCauseFormat, quotedTable(table), "a name")), true
+	case executor.CodeCreateNamesUnverified:
+		// The sentinel is present whenever this code is, so refusalForCause
+		// decides the verdict before control reaches here; this arm keeps
+		// the switch total and gives the bare code the same verdict.
+		return createNamesUnverifiedRefusal(table), true
 	case executor.CodeDuplicateCreateName:
+		// The cause says only what the set did; the remedy names the
+		// relation kinds that can repeat a name — a CREATE INDEX name that
+		// is also the table's implicit constraint-index name, or another
+		// index's — so the cause stays short enough for the remedy to
+		// survive the narrowest surface beside a table name of any length.
 		return &refusal{reason: "duplicate-create-name",
-			detail: fmt.Sprintf("the create set for %q claims the same relation name twice (a CREATE INDEX name repeats the table's implicit constraint-index name or another index); fix the schema file and re-plan", table)}, true
+			cause:  fmt.Sprintf("the create set for %s claims the same relation name twice", quotedTable(table)),
+			remedy: "rename the index or constraint that repeats it in the schema file, then " + replanRemedy}, true
 	case executor.CodePartitionOfUnsupported:
 		return &refusal{reason: "unsupported-create-step",
-			detail: fmt.Sprintf("the CREATE TABLE for %q attaches a partition to a live parent, which the native-safe create path does not run", table)}, true
+			cause: fmt.Sprintf("the CREATE TABLE for %s attaches a partition to a live parent, which the native-safe create path does not run", quotedTable(table))}, true
 	case executor.CodeIfNotExistsUnsupported:
 		return &refusal{reason: "unsupported-create-step",
-			detail: fmt.Sprintf("the planned statement for %q carries IF NOT EXISTS, whose no-op outcome the native-safe path cannot prove; drop the clause and re-plan", table)}, true
+			cause:  fmt.Sprintf("the planned statement for %s carries IF NOT EXISTS, whose no-op outcome the native-safe path cannot prove", quotedTable(table)),
+			remedy: "drop the clause and re-plan"}, true
 	case executor.CodeUnsupportedCreateStep:
 		return &refusal{reason: "unsupported-create-step",
-			detail: fmt.Sprintf("the CREATE TABLE for %q is not a shape the native-safe create path can run; rewrite the schema file and re-plan", table)}, true
+			cause:  fmt.Sprintf("the CREATE TABLE for %s is not a shape the native-safe create path can run", quotedTable(table)),
+			remedy: "rewrite the schema file and re-plan"}, true
 	case executor.CodeTableNotFound:
-		return &refusal{reason: "table-not-found",
-			detail: fmt.Sprintf("table %q does not exist on the target; re-plan against the current schema", table)}, true
+		return tableNotFoundRefusal(table), true
 	case executor.CodeEmptySequence, executor.CodeUnsupportedSequenceStep,
 		executor.CodeUnsupportedPartitionedParent, executor.CodeNotConcurrentIndexBuild,
 		executor.CodeUnnamedIndex, executor.CodeUnqualifiedTable:
 		// Shape refusals: the executor refused the statement's form at
 		// admission, so retrying the identical plan refails the same way.
 		return &refusal{reason: "unsupported-statement-shape",
-			detail: fmt.Sprintf("the planned statement for %q is not a shape the native-safe path can run; rewrite the schema change and re-plan", table)}, true
+			cause:  fmt.Sprintf("the planned statement for %s is not a shape the native-safe path can run", quotedTable(table)),
+			remedy: "rewrite the schema change and re-plan"}, true
 	case executor.CodeBudgetStatementExceeded:
 		// Normally consumed upstream by the typed BudgetError arm, which
 		// renders the budget's own figures; this mapping keeps the outcome
 		// vocabulary total.
 		return &refusal{reason: "not-native-safe-budget-exceeded",
-			detail: fmt.Sprintf("the statement for table %q ran past its statement budget and was cancelled", table)}, true
+			cause: fmt.Sprintf("the statement for table %s ran past its statement budget and was cancelled", quotedTable(table))}, true
 	case executor.CodeInvariantViolation:
 		// Never a retry candidate per the executor's contract: an invariant
 		// breach means the engine's own safety accounting failed, so the
 		// apply fails closed until an operator has inspected the target.
 		return &refusal{reason: "engine-invariant-violation",
-			detail: fmt.Sprintf("the engine's safety invariants did not hold while changing table %q; inspect the target and server logs before re-running", table)}, true
-	case executor.CodeBudgetLockExceeded, executor.CodeCancelledExternally,
-		executor.CodeInvalidIndexOwnLeftover, executor.CodeInvalidIndexPreexisting,
-		executor.CodeInvalidIndexUnproven, executor.CodePoolTooSmall,
+			cause:  fmt.Sprintf("the engine's safety invariants did not hold while changing table %s", quotedTable(table)),
+			remedy: "inspect the target and server logs before re-running"}, true
+	case executor.CodeInvalidIndexOtherTable, executor.CodeInvalidIndexNotDroppable:
+		// The permanent members of the invalid-index family: the requested
+		// name is held by an entry this change can never clear — an invalid
+		// index on a different table, or one the server will not drop
+		// concurrently (a partitioned table's index, an index partition, a
+		// constraint's index). Retrying unchanged reproduces the verdict.
+		// The typed-verdict path replaces this cause and remedy with the
+		// code's own advice; this mapping keeps the vocabulary total.
+		return &refusal{reason: "invalid-index-occupied",
+			cause:  fmt.Sprintf("an invalid index the change to %s cannot clear holds a name it needs", quotedTable(table)),
+			remedy: "rename the index in the schema file and re-plan, or resolve the entry on the target"}, true
+	case executor.CodePoolTooSmall:
+		// The pool is sized by the target DSN, so every retry against the
+		// same configuration is refused at admission the same way; only an
+		// operator raising the pool ceiling changes the outcome.
+		return &refusal{reason: "pool-too-small",
+			cause:  fmt.Sprintf("the target's connection pool cannot hold every session the change to %s needs at once", quotedTable(table)),
+			remedy: "raise the pool size on the target DSN, then re-run"}, true
+	case executor.CodeBudgetLockExceeded, executor.CodeCancelledByCaller,
+		executor.CodeCancelledExternally, executor.CodeInvalidIndexOwnLeftover,
+		executor.CodeInvalidIndexAbandoned, executor.CodeInvalidIndexBuildInFlight,
+		executor.CodeInvalidIndexBuilderUnobservable, executor.CodeInvalidIndexUnproven,
 		executor.CodeExecutionFailed:
-		// Operational outcomes: a bounded lock race, an external stop, an
-		// invalid-index state an operator clears, engine pool sizing, or a
-		// failure outside the typed set. A retry can succeed once
-		// conditions change, so none is a permanent refusal.
+		// Operational outcomes: a bounded lock race, the caller's own
+		// context ending or an external stop, an invalid-index state a retry
+		// recovers or an operator clears or waits out, or a failure outside
+		// the typed set.
+		// A retry can succeed once conditions change, so none is a permanent
+		// refusal.
 		return nil, true
 	}
 	return nil, false
 }
 
-func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64) error {
+// createCollisionRemedy leads with a re-plan because that alone resolves a
+// lost race for the table name: the next plan sees the occupant and diffs
+// against it. Only a collision that survives a re-plan is a schema-file
+// problem — an explicitly named constraint or index claims a name another
+// relation holds (an unnamed one picks a free name on its own), or a serial
+// column's auto-named sequence lands on a standalone type of that name —
+// and then the operator changes the name on one side or the other.
+const createCollisionRemedy = "re-plan, and if it recurs drop or rename the occupant or give the constraint, index, or sequence another name"
+
+// createCollisionRefusal names the kinds of relation that can hold a name
+// the create set claims, so the operator knows where to look; the server
+// error identifying the occupant stays in the logs. The list is the
+// occupant's side, not the claimant's — a named constraint claims a name
+// through the index it creates, so the index is what occupies it. The
+// wording is kept short because the composed detail must survive the
+// narrowest operator surface with its remedy's lead intact.
+func createCollisionRefusal(table string) *refusal {
+	return &refusal{
+		reason: "create-collision",
+		cause:  fmt.Sprintf("a name the create set for %s needs is already occupied (table, view, index, or sequence)", quotedTable(table)),
+		remedy: createCollisionRemedy,
+	}
+}
+
+// createNameMismatchRemedy is an operator's, not a retry's: the CREATE TABLE
+// committed, so re-running the identical plan collides with the table this
+// apply created, and the table stands under a name the schema file did not
+// choose. Re-planning comes last because only the current schema, with the
+// relation renamed or the table gone, tells the next plan what remains. The
+// lead is the clause the cause's enumerations make room for: it is what the
+// narrowest operator surface must still show once the detail is cut from
+// the tail, because it alone says the table is standing and needs the name
+// freed.
+const (
+	createNameMismatchLead   = "free the first-choice name"
+	createNameMismatchRemedy = createNameMismatchLead + " and rename the owned relation to it, or drop the table, then " + replanRemedy
+)
+
+// createNameMismatchRefusal takes its cause from the caller because the
+// typed error names the claimed names the table lacks and the names it owns
+// instead, while the bare outcome code knows only that the two differ.
+func createNameMismatchRefusal(cause string) *refusal {
+	return &refusal{
+		reason: "create-name-mismatch",
+		cause:  cause,
+		remedy: createNameMismatchRemedy,
+	}
+}
+
+// createNameMismatchCause names the constraint-index or sequence names the
+// committed table lacks and the suffixed names the server chose instead, so
+// the operator knows which relation to rename. The names come from the
+// schema file and the catalog, the same provenance as the table name every
+// refusal already renders. The typed error always carries at least one
+// missing name — a table that honoured every claim is not a mismatch — but
+// may own nothing unclaimed when a relation was dropped inside the read-back
+// window, so the owned clause is rendered only when there is one to name.
+//
+// The enumerations get the byte room the quoted table name and the step
+// clause the detail will carry leave them; when the owned clause is rendered,
+// its own prose is paid for first and the two lists share what remains.
+func createNameMismatchCause(table string, mismatch *executor.CreateNameMismatchError, stepClause string) string {
+	quoted := quotedTable(table)
+	room := mismatchNamesRoom - len(quoted)
+	if stepClause != "" {
+		room -= len(clauseSeparator) + len(stepClause)
+	}
+	if len(mismatch.Unclaimed) == 0 {
+		return fmt.Sprintf(mismatchCauseFormat, quoted, quotedNames(mismatch.Missing, room))
+	}
+	room -= len(mismatchOwnedFormat) - len("%s")
+	missing, unclaimed := mismatchNames(mismatch.Missing, mismatch.Unclaimed, room)
+	return fmt.Sprintf(mismatchCauseFormat+mismatchOwnedFormat, quoted, missing, unclaimed)
+}
+
+const (
+	mismatchCauseFormat = "the CREATE TABLE for %s committed but the table does not own %s the schema file claims"
+	mismatchOwnedFormat = "; it owns %s instead"
+)
+
+// mismatchNamesRoom is the byte room a mismatch cause has for the quoted
+// table name, the failed-step clause, and the identifiers it enumerates
+// together, before the owned clause takes its prose. The narrowest operator
+// surface keeps apitypes.StatusFailureReasonKeptWidth bytes of a refusal
+// detail and cuts the rest from the tail, where the remedy sits, and the
+// remedy is the only clause that says the table is still standing and needs
+// renaming or dropping. The room is what that surface leaves once the fixed
+// prose around the names and the remedy's lead, with the separator before
+// it, have taken theirs, so the enumerations shrink as the table name and
+// the step clause grow and the lead survives for a table name of any legal
+// length and a create set of any size.
+const mismatchNamesRoom = apitypes.StatusFailureReasonKeptWidth -
+	(len(mismatchCauseFormat) - 2*len("%s")) -
+	len(clauseSeparator) - len(createNameMismatchLead)
+
+// quotedTableWidth bounds the rendering of a table name in a refusal cause:
+// the quoted form of an identifier of the maximum legal length whose
+// characters need no escaping.
+const quotedTableWidth = len(`"`) + 63 + len(`"`)
+
+// quotedTable renders a table name for a refusal cause whose remedy is
+// pinned inside the narrowest surface's clamp. The rendering is the quoted
+// identifier, bounded at quotedTableWidth: quoting escapes a quote, a
+// backslash, or a control character into more bytes than the identifier
+// carries, and an identifier of legal length may be made of such characters,
+// so a name is cut on a rune boundary and marked when its quoted form would
+// take more than the room a plain name of the same legal length takes. The
+// cut costs the operator nothing they rely on — every surface renders the
+// detail beside the table it belongs to.
+func quotedTable(table string) string {
+	if q := strconv.Quote(table); len(q) <= quotedTableWidth {
+		return q
+	}
+	const mark = `..."`
+	kept := `"`
+	for i := range table {
+		q := strconv.Quote(table[:i])
+		if len(q)-len(`"`)+len(mark) > quotedTableWidth {
+			break
+		}
+		kept = q[:len(q)-len(`"`)]
+	}
+	return kept + mark
+}
+
+// mismatchNames renders the missing names and the owned names inside one
+// byte room. A missing name and the suffixed name the server chose in its
+// place are the two sides of one comparison, so the room goes to pairs first:
+// the rendering shows as many names from both lists as fit together, and
+// only then spends what is left on further names from one list, the missing
+// names ahead of the owned ones. Pairs first is also what keeps the owned
+// side — the relation the remedy says to rename, and the longer name by its
+// suffix — from losing every tie to the shorter name it displaced.
+//
+// The search runs over the counts a rendering inside the room could show,
+// not over every name the lists hold, and renders each count once, so its
+// work is bounded by the room rather than by the width of the table.
+func mismatchNames(missing, unclaimed []string, room int) (string, string) {
+	missingRenders := leadingNameRenders(missing, room)
+	unclaimedRenders := leadingNameRenders(unclaimed, room)
+	bestI, bestJ := 0, 0
+	for i, rendered := range missingRenders {
+		for j, owned := range unclaimedRenders {
+			if len(rendered)+len(owned) > room {
+				continue
+			}
+			if outranksNamePick(i, j, bestI, bestJ) {
+				bestI, bestJ = i, j
+			}
+		}
+	}
+	return missingRenders[bestI], unclaimedRenders[bestJ]
+}
+
+// leadingNameRenders renders, indexed by count, every count of leading names
+// a rendering inside the room could show, from none up to namesWithinRoom.
+func leadingNameRenders(names []string, room int) []string {
+	renders := make([]string, 0, namesWithinRoom(names, room)+1)
+	for n := range namesWithinRoom(names, room) + 1 {
+		renders = append(renders, leadingNames(names, n))
+	}
+	return renders
+}
+
+// namesWithinRoom bounds the count of names a rendering inside the room can
+// show. A quoted name costs at least its two quotes and one character, so no
+// rendering that fits shows more names than the room holds such names, and
+// a count past that bound is rejected without being rendered.
+func namesWithinRoom(names []string, room int) int {
+	return min(len(names), max(room, 0)/len(`"a"`))
+}
+
+// outranksNamePick orders two ways of showing i missing and j owned names:
+// more pairs first, then more names, then more missing names.
+func outranksNamePick(i, j, bestI, bestJ int) bool {
+	if min(i, j) != min(bestI, bestJ) {
+		return min(i, j) > min(bestI, bestJ)
+	}
+	if i+j != bestI+bestJ {
+		return i+j > bestI+bestJ
+	}
+	return i > bestI
+}
+
+// quotedNames renders identifiers for a refusal cause inside a byte budget:
+// it enumerates the most leading names that fit alongside a count of the
+// rest, and falls back to the count alone when not even the first name fits.
+// The search starts at the most names the budget could hold, not at the end
+// of the list, so its work is bounded by the budget.
+func quotedNames(names []string, budget int) string {
+	for n := namesWithinRoom(names, budget); n > 0; n-- {
+		if rendered := leadingNames(names, n); len(rendered) <= budget {
+			return rendered
+		}
+	}
+	return countedNames(len(names))
+}
+
+// leadingNames renders the first n names quoted, followed by a count of the
+// rest when any remain; n of zero renders the count alone.
+func leadingNames(names []string, n int) string {
+	if n == 0 {
+		return countedNames(len(names))
+	}
+	quoted := make([]string, 0, n)
+	for _, name := range names[:n] {
+		quoted = append(quoted, strconv.Quote(name))
+	}
+	rendered := strings.Join(quoted, ", ")
+	if rest := len(names) - n; rest > 0 {
+		rendered += remainingNames(rest)
+	}
+	return rendered
+}
+
+func remainingNames(rest int) string {
+	return fmt.Sprintf(", and %d more", rest)
+}
+
+func countedNames(n int) string {
+	if n == 1 {
+		return "1 name"
+	}
+	return fmt.Sprintf("%d names", n)
+}
+
+// createNamesUnverifiedRefusal is decided by the wrap, not by the cause it
+// carries. pg-sprite leaves the outcome retryable because the read that
+// failed could be repeated on its own. SchemaBot cannot repeat only the
+// read: its retry re-runs the identical plan, whose CREATE TABLE has already
+// committed, so every retry collides with the table this apply created. The
+// table stands with unproven names, and proving them is an operator's
+// comparison, not a retry's. The cause is kept terse — the remedy, not the
+// cause, names which names to compare — so that the remedy's lead survives
+// the narrowest operator surface for a table name of any legal length.
+func createNamesUnverifiedRefusal(table string) *refusal {
+	return &refusal{
+		reason: "create-names-unverified",
+		cause:  fmt.Sprintf("the CREATE TABLE for %s committed but the names it owns could not be read back", quotedTable(table)),
+		remedy: "compare the table's constraint-index and sequence names against the schema file, then " + replanRemedy,
+	}
+}
+
+func tableNotFoundRefusal(table string) *refusal {
+	return &refusal{
+		reason: "table-not-found",
+		cause:  fmt.Sprintf("table %s does not exist on the target", quotedTable(table)),
+		remedy: replanRemedy,
+	}
+}
+
+// executeOptimistic runs the planned change through pg-sprite's executors,
+// each feeding the tracker so a concurrent Progress poll reads the step and
+// statement in flight.
+func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64, tracker *progress.Tracker, logger *slog.Logger) error {
 	poolCfg, err := spritePoolConfig(conn.dsn, conn.caCertPath)
 	if err != nil {
 		return fmt.Errorf("prepare pg-sprite apply pool for table %q: %w", change.table, err)
@@ -480,7 +1007,7 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		// The off-ladder create tier has its own preflight sequence: the
 		// ladder checks below state facts about an existing table, and a
 		// greenfield target has none.
-		return executeCreate(ctx, pool, change, statements)
+		return executeCreate(ctx, pool, change, statements, tracker)
 	}
 	if len(statements) != 1 {
 		return fmt.Errorf("execute PostgreSQL table %q: privilege tier %s requires exactly one statement, got %d", change.table, tier, len(statements))
@@ -492,7 +1019,11 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	if _, err := preflight.CheckPrivileges(ctx, pool, change.namespace, change.table, preflight.Requirement{Tier: tier}); err != nil {
 		return fmt.Errorf("check privileges for PostgreSQL table %q: %w", change.table, err)
 	}
-	table, err := preflight.CheckTable(ctx, pool, change.namespace, change.table, tableSizeLimit)
+	// Concurrent index builds are bounded by their caller-owned duration
+	// envelope rather than the rewrite ceiling. NoSizeLimit still proves the
+	// target exists and is an ordinary or partitioned table.
+	preflightLimit := applyTablePreflightLimit(change, tableSizeLimit)
+	table, err := preflight.CheckTable(ctx, pool, change.namespace, change.table, preflightLimit)
 	if err != nil {
 		return fmt.Errorf("preflight PostgreSQL table %q: %w", change.table, err)
 	}
@@ -510,17 +1041,10 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 			return fmt.Errorf("admit statement for partitioned PostgreSQL table %q: %w", change.table, err)
 		}
 	}
-	if statement.Kind() == pgstatement.KindCreateIndex && statement.Concurrent() {
+	if change.concurrentIndex {
 		// A concurrent build cannot run inside a transaction block, so it
-		// must not reach the transactional optimistic executor: pg-sprite's
-		// dedicated index-build executor runs it under the CONCURRENTLY
-		// budget policy and returns a catalog-verified verdict — including
-		// the invalid-index recovery a failed build needs.
-		if _, err := executor.BuildIndexConcurrently(ctx, pool, change.sql,
-			executor.ConcurrentBudget{Overall: concurrentIndexBudget}); err != nil {
-			return fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", change.table, err)
-		}
-		return nil
+		// must not reach the transactional optimistic executor.
+		return buildIndexConcurrently(ctx, pool, change, tracker, logger)
 	}
 	// Every other statement runs exactly as reviewed, under the
 	// per-statement and lock limits. The apply never rewrites a statement
@@ -539,12 +1063,19 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 	// where greenfieldCreateSet keeps the blocking form on purpose — a
 	// table born in the run has no readers, and CONCURRENTLY cannot run
 	// inside its create sequence.
-	if err := executor.ExecuteNative(ctx, pool, table, statement, executor.Budget{
+	if err := executor.ExecuteNativeWithProgress(ctx, pool, table, statement, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
-	}, executor.DefaultRetryPolicy()); err != nil {
+	}, executor.DefaultRetryPolicy(), tracker); err != nil {
 		return fmt.Errorf("execute native-safe PostgreSQL statement on table %q: %w", change.table, err)
 	}
 	return nil
+}
+
+func applyTablePreflightLimit(change nativeApply, tableSizeLimit int64) int64 {
+	if change.concurrentIndex {
+		return preflight.NoSizeLimit
+	}
+	return tableSizeLimit
 }
 
 // executeCreate runs a greenfield create set through pg-sprite's create path:
@@ -554,7 +1085,7 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 // nothing about apply time. The table size gate deliberately does not run:
 // it bounds rewrites of existing data, and a table that does not exist yet
 // has none.
-func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, statements []string) error {
+func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, statements []string, tracker *progress.Tracker) error {
 	// The planned statements arrive schema-qualified; the desired-schema
 	// contract wants the unqualified form and the executor pins the schema
 	// from the absence proof instead.
@@ -578,44 +1109,434 @@ func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, 
 	if err != nil {
 		return fmt.Errorf("verify PostgreSQL table %q is absent: %w", change.table, err)
 	}
-	if _, err := executor.ExecuteCreate(ctx, pool, absent, role, desired, executor.Budget{
+	if _, err := executor.ExecuteCreateWithProgress(ctx, pool, absent, role, desired, executor.Budget{
 		LockTimeout: optimisticLockTimeout, StatementTimeout: optimisticStatementLimit,
-	}, executor.DefaultRetryPolicy()); err != nil {
+	}, executor.DefaultRetryPolicy(), tracker); err != nil {
 		return fmt.Errorf("execute PostgreSQL CREATE TABLE %q: %w", change.table, err)
 	}
 	return nil
 }
 
-// Progress reports phase, elapsed time, and statement position for the apply
+// concurrentIndexExecutor names the two executor entry points a concurrent
+// index build reaches: the build itself and the recovery run over an
+// abandoned invalid index. It is a test seam, so a test can observe the
+// budget and the context deadline the drive hands each one against an
+// executor it scripts instead of a target to dial; the package default is
+// the executor's own functions. The engine's execute seam cannot reach these
+// calls, since it replaces the whole of executeOptimistic. The seam is
+// package state shared by every drive in the process, so swapping it is not
+// safe from a test that runs in parallel with another; scriptConcurrentIndex
+// restores it when each test ends.
+type concurrentIndexExecutor struct {
+	build   func(ctx context.Context, pool *pgxpool.Pool, sql string, budget executor.ConcurrentBudget, tracker *progress.Tracker) (executor.IndexBuildReport, error)
+	rebuild func(ctx context.Context, pool *pgxpool.Pool, sql string, budget executor.ConcurrentBudget) (executor.IndexRecoveryReport, error)
+}
+
+var concurrentIndex = concurrentIndexExecutor{
+	build:   executor.BuildIndexConcurrentlyWithProgress,
+	rebuild: executor.RebuildAbandonedIndex,
+}
+
+// buildIndexConcurrently runs a CREATE INDEX CONCURRENTLY through pg-sprite's
+// dedicated index-build executor, which runs it outside a transaction block
+// under the CONCURRENTLY budget policy and returns a catalog-verified
+// verdict. When the executor refuses before building because an invalid
+// index occupies the requested name, or sits quarantined on the table, that
+// pg-sprite's recovery can prove abandoned — an earlier build's leftover with
+// no backend behind it, debris an interrupted recovery renamed, or an entry
+// whose builder this role cannot see through the progress view — the build
+// is re-run through pg-sprite's recovery, which removes the entry under a
+// lock-held proof of abandonment and then builds. That is the state a
+// re-driven apply meets after a crash or cancellation mid-build, and it
+// converges without an operator; every verdict the recovery cannot prove —
+// a build in flight, another table's entry, an index the server will not
+// drop concurrently, an unverifiable catalog — is returned as the executor
+// typed it.
+//
+// A leftover this drive's own build produced is not recovered here. Its
+// build just ran under the bound this drive holds, and a rebuild inside
+// the same apply ceiling could only degrade to an external cancellation that
+// names nothing; the failure stays operational and retryable, and the next
+// drive meets the leftover as abandoned debris and recovers it.
+//
+// A recovery that fails without a fresh invalid-index verdict — its proof
+// lock lost to a build still holding the table, a pool with no room for its
+// extra session — is returned as an indexRecoveryError carrying the verdict
+// it acted on, so the operator detail still names the index the retry acts
+// on.
+func buildIndexConcurrently(ctx context.Context, pool *pgxpool.Pool, change nativeApply, tracker *progress.Tracker, logger *slog.Logger) error {
+	if change.concurrentIndexMaxDuration <= 0 {
+		// The bound is the build's server-side statement timeout and the
+		// recovery's only deadline; a non-positive one would be refused by
+		// the executor as unbounded, or end every recovery before it starts
+		// and report it as a cancellation, so an unset bound is refused
+		// before any session is acquired. The drive cannot reach this
+		// branch — the engine constructor normalizes its option and
+		// runOptimisticApply stamps the result on every change — so it
+		// guards a nativeApply built without going through the drive.
+		return fmt.Errorf("build PostgreSQL index concurrently on table %q: build bound is unset", change.table)
+	}
+	// The build runs under a server-side statement_timeout of the configured
+	// bound, with the apply ceiling — the bound plus the setup headroom — as
+	// the client-side backstop above it. The server's timer is what ends an
+	// over-long build, so exhaustion arrives as the executor's typed budget
+	// verdict rather than an ambiguous cancellation, and a cancel request
+	// that never reaches the server still cannot leave the statement running
+	// unbounded on the target.
+	start := time.Now()
+	_, err := concurrentIndex.build(ctx, pool, change.sql,
+		executor.ConcurrentBudget{Overall: change.concurrentIndexMaxDuration}, tracker)
+	if err == nil {
+		return nil
+	}
+	var invalidErr *executor.InvalidIndexError
+	if !errors.As(err, &invalidErr) || !abandonedBeforeBuild(invalidErr) {
+		return fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", change.table,
+			nameConcurrentIndexBound(err, change.concurrentIndexMaxDuration, time.Since(start)))
+	}
+	logger.Info("PostgreSQL concurrent index build found an abandoned invalid index under the requested name or quarantined on the table; recovering it before the build",
+		"namespace", change.namespace, "table", change.table,
+		"index_schema", invalidErr.Schema, "index", invalidErr.Index, "verdict", invalidErr.Code())
+
+	// The recovery is one envelope — abandonment proof, quarantine drops,
+	// then the build — bounded as a whole by one deadline of the configured
+	// bound, so the ceiling headroom pinned for the build holds for the
+	// recovery too. The executor's served mode would spend that bound once
+	// on the drops and once more on the build, which no ceiling built on a
+	// single bound can hold; caller-owned mode makes this deadline the only
+	// bound on both, and the build's own catalog verdict still runs after it
+	// on the executor's detached context. Caller-owned mode runs the drops
+	// and the build with no server-side statement timeout, so a cancellation
+	// the server never receives leaves the statement running on the target
+	// until it finishes on its own, bounded only by the lock timeouts the
+	// recovery sets for itself. The refused build charged only catalog reads
+	// against the ceiling, so the recovery starts with the full bound ahead
+	// of it; that rests on abandonedBeforeBuild admitting only verdicts with
+	// no build attached, since a verdict reached after a build ran would
+	// arrive here with the bound already spent once.
+	recoveryCtx, cancel := context.WithTimeout(ctx, change.concurrentIndexMaxDuration)
+	defer cancel()
+	report, err := concurrentIndex.rebuild(recoveryCtx, pool, change.sql,
+		executor.ConcurrentBudget{CallerOwned: true})
+	if err != nil {
+		return fmt.Errorf("rebuild PostgreSQL index concurrently on table %q: %w", change.table,
+			&indexRecoveryError{verdict: invalidErr, err: err})
+	}
+	logger.Info("PostgreSQL concurrent index build recovered an abandoned invalid index and built the index",
+		"namespace", change.namespace, "table", change.table,
+		"index_schema", invalidErr.Schema, "index", invalidErr.Index,
+		"dropped", len(report.Dropped), "skipped", len(report.Skipped), "duration", report.Duration)
+	return nil
+}
+
+// abandonedBeforeBuild reports whether an invalid-index verdict is one the
+// build refused on before running, over an entry this actor may have
+// pg-sprite's recovery remove: no build failure is wrapped, and the verdict
+// is one of the two the recovery settles on this drive's behalf — an entry
+// proven abandoned on the target table, or one there whose builder this
+// role cannot observe, which the recovery decides under the table's lock
+// rather than through the progress view, so a hidden build still holding
+// the table stops it at the lock budget instead of losing its index. The
+// verdicts are named rather than taken from pg-sprite's Recoverable set:
+// this drive's own leftover is recoverable upstream but stays with the
+// failure that produced it, and the permanent verdicts are never this
+// actor's to clear.
+func abandonedBeforeBuild(invalidErr *executor.InvalidIndexError) bool {
+	if invalidErr.Build != nil {
+		return false
+	}
+	switch invalidErr.Code() {
+	case executor.CodeInvalidIndexAbandoned, executor.CodeInvalidIndexBuilderUnobservable:
+		return true
+	default:
+		return false
+	}
+}
+
+// indexRecoveryError reports that the recovery run over an abandoned invalid
+// index failed before the index was built, keeping the verdict the recovery
+// acted on beside the failure. pg-sprite types a recovery that lost its
+// proof lock or found the pool too small as a budget or pool outcome with no
+// index in it, yet the index under the name is still the state the retry
+// acts on, so the operator detail needs the name from here. The failure
+// stays reachable to errors.As, so a recovery that ends in a fresh
+// invalid-index verdict is classified by that verdict, not by this wrapper.
+type indexRecoveryError struct {
+	verdict *executor.InvalidIndexError
+	err     error
+}
+
+func (e *indexRecoveryError) Error() string {
+	return fmt.Sprintf("recover abandoned invalid index %q.%q before the build: %v", e.verdict.Schema, e.verdict.Index, e.err)
+}
+
+func (e *indexRecoveryError) Unwrap() error { return e.err }
+
+// concurrentIndexBoundOption is the configuration key an operator changes
+// when a concurrent index build needs more time than the bound allows.
+const concurrentIndexBoundOption = "postgres.concurrent_index_max_duration"
+
+// concurrentIndexBoundError reports that a concurrent index build ran past
+// the configured bound. pg-sprite types the exhaustion as a statement budget
+// verdict, whose text reads like the per-statement budget an ordinary
+// native-safe statement runs under; this wrapper names the option the
+// operator changes instead. The verdict stays reachable to errors.As, so an
+// invalid-index verdict wrapping the same exhaustion is still decided by its
+// own code.
+type concurrentIndexBoundError struct {
+	bound time.Duration
+	err   error
+}
+
+func (e *concurrentIndexBoundError) Error() string {
+	return fmt.Sprintf("the concurrent index build ran past %s (%s) and was cancelled", concurrentIndexBoundOption, e.bound)
+}
+
+func (e *concurrentIndexBoundError) Unwrap() error { return e.err }
+
+// sqlstateQueryCanceled is the SQLSTATE the server raises when a statement
+// is cancelled, whether by its statement_timeout or by a cancel request.
+const sqlstateQueryCanceled = "57014"
+
+// nameConcurrentIndexBound wraps a build failure caused by the bound's
+// statement timeout firing so the operator detail names the option; every
+// other failure passes through unchanged. A lock budget cannot be the cause
+// here — the build runs with lock_timeout disabled — so only the statement
+// cause is the bound's.
+//
+// The bound is the build session's statement_timeout, so its timer ends
+// whichever statement the session is running when it fires. For the build
+// itself the executor types that as its statement budget verdict. For the
+// catalog reads the executor runs in the same session ahead of the build —
+// resolving the target, inspecting the requested name for an invalid entry,
+// listing quarantined debris — the cancellation comes back as the server's
+// raw query_canceled, and it is the bound's only when the bound has elapsed
+// since the build was requested, since the timer cannot fire sooner; a raw
+// cancellation before that came from outside the bound and passes through.
+// A cancellation the executor already attributed to the caller or to an
+// outside party keeps that attribution. pg-sprite typing its pre-build
+// reads under the served budget as the same statement budget verdict
+// retires the raw-code arm.
+func nameConcurrentIndexBound(err error, bound, elapsed time.Duration) error {
+	var budgetErr *executor.BudgetError
+	if errors.As(err, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
+		return &concurrentIndexBoundError{bound: bound, err: err}
+	}
+	if errors.Is(err, executor.ErrCancelledByCaller) || errors.Is(err, executor.ErrCancelledExternally) {
+		return err
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == sqlstateQueryCanceled && elapsed >= bound {
+		return &concurrentIndexBoundError{bound: bound, err: err}
+	}
+	return err
+}
+
+// recoveryContextDetail prefixes an operator-facing detail with the abandoned
+// invalid index a failed recovery was clearing, so a failure typed without
+// the index — a lock budget lost to a build still holding the table, a pool
+// too small for the recovery's extra session — still names the entry the
+// retry acts on. A failure that is itself an invalid-index verdict never
+// reaches here: that arm is decided first and already names the index. The
+// prefix is kept short so the remedy's lead survives the narrowest operator
+// surface, which truncates the detail from the tail.
+func recoveryContextDetail(err error, detail string) string {
+	var recoveryErr *indexRecoveryError
+	if !errors.As(err, &recoveryErr) {
+		return detail
+	}
+	return sanitizeReasonText(fmt.Sprintf("recovering abandoned invalid index %q.%q failed: %s",
+		recoveryErr.verdict.Schema, recoveryErr.verdict.Index, detail))
+}
+
+// Progress reports phase and statement position for the apply
 // the caller identifies via ResumeState.MigrationContext. Every accepted apply
 // is tracked under its own identity, so a caller always reads its own schema
 // change's state and never a sibling's — one engine is shared for the lifetime
 // of a target, and answering with whichever apply wrote last would report
 // another schema change's state, including a terminal one, for work that is
 // still in flight. A caller asking about an apply the engine is not tracking
-// gets the idle sentinel. Rich server progress is intentionally absent until
-// the PostgreSQL executor exposes it.
-func (e *Engine) Progress(_ context.Context, req *engine.ProgressRequest) (*engine.ProgressResult, error) {
+// gets the idle sentinel.
+//
+// While the apply runs, the step position and statement come from the
+// pg-sprite tracker its executor feeds; the engine's own record only moves at
+// accept and at the terminal outcome. The tracker read happens outside the
+// engine lock: for an active concurrent index build it queries the server's
+// progress view, and a poll must never hold up Apply or publishProgress on
+// a database round trip. The coupling runs the other way too: the tracker
+// serializes that query against the executor's own end-of-build fence, so
+// a read still on the wire delays the apply's failure verdict and the
+// terminal publish behind it. executorProgressMetadata bounds every read
+// with the engine's own deadline so that delay is never open-ended.
+func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*engine.ProgressResult, error) {
 	var key string
 	if req != nil {
 		key = progressIdentity(req.ResumeState)
 	}
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	tracked := e.progress[key]
 	if tracked == nil {
+		e.mu.Unlock()
 		// The exact idle message is a cross-engine contract: stale-task
 		// recovery compares against it verbatim to auto-resolve work
 		// abandoned by a crashed server.
 		return &engine.ProgressResult{State: engine.StatePending, Message: "No active schema change"}, nil
 	}
-	result := *tracked
-	result.Metadata = cloneMetadata(tracked.Metadata)
-	result.Tables = cloneTables(tracked.Tables)
-	if len(result.Tables) > 0 && result.Tables[0].StartedAt != nil && !result.State.IsTerminal() {
-		result.Metadata["elapsed"] = time.Since(*result.Tables[0].StartedAt).Round(time.Millisecond).String()
+	source := tracked.result
+	result := *source
+	result.Metadata = cloneMetadata(source.Metadata)
+	result.Tables = cloneTables(source.Tables)
+	tracker, logger := tracked.tracker, tracked.logger
+	e.mu.Unlock()
+
+	if result.State.IsTerminal() {
+		// A terminal result already carries the executor's final position,
+		// folded in when it was published.
+		return &result, nil
 	}
+	if err := executorProgressMetadata(ctx, tracker, &result); err != nil {
+		// The poll still answers with the last-known position: a progress
+		// view the engine cannot read this instant is not a reason to tell
+		// the driver its apply is unobservable.
+		logger.Warn("PostgreSQL apply progress reports the last-known executor position",
+			"task_id", key, "error", err)
+	}
+	e.retainRunningPercent(key, source, &result)
 	return &result, nil
+}
+
+// retainRunningPercent carries a poll's derived percent forward on the
+// running record it was cloned from, so the percent is part of the
+// last-known position the next poll starts from. The server publishes a
+// build row only while the build is in flight: a poll that lands between the
+// executor's steps, after the build session is released, or on a tolerated
+// read failure derives nothing, and without the write-back it would answer
+// with the record's pre-execution zero. The write-back is skipped when the
+// record was replaced while the tracker was being read, whether by a terminal
+// publish or a re-claim. Both the floor and the write-back target the cloned
+// record, so neither applies once that record is no longer the one the engine
+// serves. This write is on the writer side of the UX-3 boundary: the drive
+// loop's poll path mutates only the engine's in-memory record, while operator
+// reads use stored rows that only the drive persists.
+//
+// The percent never regresses within a record. A record hosts one build —
+// a concurrent index apply is a single statement, and the executor's
+// bounded retries apply to transactional statements, not to a build — and
+// the band scale only advances as the build moves through its phases, so a
+// poll whose row derives a lower percent than the record carries read the
+// server before a poller that has already carried a later row forward. The
+// tracker serializes the reads but not the write-backs, so the earlier
+// reading lands here second; it adopts the record's percent rather than
+// pinning a position the build has left behind.
+func (e *Engine) retainRunningPercent(key string, source, result *engine.ProgressResult) {
+	if len(result.Tables) == 0 {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	tracked := e.progress[key]
+	if tracked == nil || tracked.result != source || len(source.Tables) == 0 {
+		return
+	}
+	if result.Progress < source.Progress {
+		result.Progress = source.Progress
+		result.Tables[0].Progress = source.Tables[0].Progress
+		return
+	}
+	source.Progress = result.Progress
+	source.Tables[0].Progress = result.Tables[0].Progress
+}
+
+// executorProgressMetadata folds the tracker's current position and operation
+// detail into the published result: the 1-based step the executor is running,
+// the sequence length it announced, the statement text of that step, the
+// executor's operation class, the attempt, and — while PostgreSQL publishes a
+// progress row for a concurrent index build — the server's phase with its
+// block, tuple and locker counters. Each key is written only once the
+// executor has reported it, so before execution starts the metadata keeps
+// progressResult's pre-execution position. The counters are the exception:
+// once the server publishes a row every counter is written, zeros included,
+// because a zero is a reading (no lockers cleared yet) and an absent key
+// means the server has not published one. A running result's percent is
+// derived from the server phase and counters through concurrentIndexPercent;
+// without a row, or in a phase the band table does not know, the percent the
+// result already carries stands. The statement passes through
+// sanitizeStatementText and the server phase through sanitizeReasonText
+// because the metadata is destined for operator-facing single-line rendering
+// and is stored at a bounded width, and the value must satisfy both the
+// moment one starts reading it.
+//
+// For an active concurrent index build the tracker queries the session the
+// executor reserved for the build's failure verdict. The read runs on its
+// own bounded context, detached from the caller's cancellation: a poller or
+// drive context cancelled mid-query would otherwise tear down that session
+// and leave the build's verdict indeterminate. The deadline starts before
+// the tracker takes its observer lock, so the wait behind another observer's
+// read counts against the same budget as the read itself — the poller is not
+// always the apply's own driver, since another apply's conflict probe reads
+// this tracker too, and a read parked behind one must not hold the
+// executor's fence for longer than the engine allows any single read. A
+// tracker read fails only when the server's progress view cannot be queried;
+// the snapshot still carries the last-known position, which is written
+// before the error is returned for the caller to log. Every tracked apply
+// carries the tracker Apply created for it, so the caller never passes none.
+func executorProgressMetadata(ctx context.Context, tracker buildTracker, result *engine.ProgressResult) error {
+	if result.Metadata == nil {
+		result.Metadata = make(map[string]string)
+	}
+	metadata := result.Metadata
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), executorProgressReadTimeout)
+	defer cancel()
+	snapshot, err := tracker.Progress(readCtx)
+	if snapshot.TotalSteps > 0 {
+		metadata["steps_total"] = strconv.Itoa(snapshot.TotalSteps)
+	}
+	if snapshot.Step > 0 {
+		metadata["step"] = strconv.Itoa(snapshot.Step)
+	}
+	if statement := sanitizeStatementText(snapshot.Detail.Statement); statement != "" {
+		metadata["statement"] = statement
+	}
+	if snapshot.Detail.Operation != "" {
+		metadata["executor_operation"] = string(snapshot.Detail.Operation)
+	}
+	if serverPhase := sanitizeReasonText(snapshot.Detail.ServerPhase); serverPhase != "" {
+		metadata["server_phase"] = serverPhase
+	}
+	if snapshot.Detail.Attempt > 0 {
+		metadata["attempt"] = strconv.Itoa(snapshot.Detail.Attempt)
+	}
+	if work := snapshot.Detail.Work; work != nil {
+		metadata["blocks_done"] = strconv.FormatUint(work.BlocksDone, 10)
+		metadata["blocks_total"] = strconv.FormatUint(work.BlocksTotal, 10)
+		metadata["tuples_done"] = strconv.FormatUint(work.TuplesDone, 10)
+		metadata["tuples_total"] = strconv.FormatUint(work.TuplesTotal, 10)
+		metadata["lockers_done"] = strconv.FormatUint(work.LockersDone, 10)
+		metadata["lockers_total"] = strconv.FormatUint(work.LockersTotal, 10)
+		// A build row describes work in flight, so it only refines a running
+		// result's percent. A terminal result's percent is decided by its
+		// state; a stale build snapshot must not pull a completed apply
+		// below 100.
+		if !result.State.IsTerminal() {
+			setRunningPercent(result, snapshot.Detail.ServerPhase, *work)
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("read pg-sprite executor progress: %w", err)
+	}
+	return nil
+}
+
+// setRunningPercent writes the whole-build percent derived from a build row
+// onto both the apply and its single table, so the two never disagree. A
+// phase the band table does not know leaves both as they were.
+func setRunningPercent(result *engine.ProgressResult, serverPhase string, work progress.Work) {
+	percent, ok := concurrentIndexPercent(serverPhase, work)
+	if !ok || len(result.Tables) == 0 {
+		return
+	}
+	result.Progress = percent
+	result.Tables[0].Progress = percent
 }
 
 // progressIdentity extracts the apply identity that keys engine progress.
@@ -642,12 +1563,14 @@ func progressResult(state engine.State, phase string, started time.Time, change 
 		State: state, Progress: progress, Message: "PostgreSQL schema change " + phase,
 		ErrorMessage: detail,
 		Metadata: map[string]string{
-			"phase": phase, "elapsed": time.Since(started).Round(time.Millisecond).String(),
-			// Per-step position is deliberately not tracked yet: the apply
-			// publishes progress only at accept and at the terminal outcome,
-			// and nothing observes the executor's step transitions in
-			// between, so the position stays at the sequence's first step
-			// while the total reports the real create-set length.
+			"phase": phase,
+			// The position the record carries before the executor has
+			// reported one: the first step of the planned sequence, with the
+			// total taken from the plan. executorProgressMetadata replaces
+			// each key as the tracker reports it — the total once the
+			// executor announces its sequence, the step once it starts one —
+			// so through the executor's admission checks the record still
+			// shows the planned first step.
 			"step": "1", "steps_total": strconv.Itoa(steps),
 		},
 		Tables: []engine.TableProgress{{
@@ -675,18 +1598,26 @@ func progressResult(state engine.State, phase string, started time.Time, change 
 // Entries for applies that are still running are never retired, so an
 // in-flight change always answers for itself no matter how many siblings the
 // engine accepts.
-func (e *Engine) claimProgress(key string, result *engine.ProgressResult) {
+//
+// The returned channel is the drive's to close once its terminal result is
+// published; Cancel waits on it for the outcome.
+func (e *Engine) claimProgress(key string, result *engine.ProgressResult, tracker *progress.Tracker, logger *slog.Logger, concurrentIndex bool, cancelApply context.CancelFunc) chan struct{} {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.progress == nil {
-		e.progress = make(map[string]*engine.ProgressResult)
+		e.progress = make(map[string]*trackedApply)
 	}
-	for tracked, progress := range e.progress {
-		if tracked != key && progress.State.IsTerminal() {
-			delete(e.progress, tracked)
+	for id, tracked := range e.progress {
+		if id != key && tracked.result.State.IsTerminal() {
+			delete(e.progress, id)
 		}
 	}
-	e.progress[key] = result
+	done := make(chan struct{})
+	e.progress[key] = &trackedApply{
+		result: result, tracker: tracker, logger: logger,
+		concurrentIndex: concurrentIndex, cancelApply: cancelApply, done: done,
+	}
+	return done
 }
 
 // publishProgress stores a background apply's progress unless the engine has
@@ -697,12 +1628,13 @@ func (e *Engine) claimProgress(key string, result *engine.ProgressResult) {
 func (e *Engine) publishProgress(key string, result *engine.ProgressResult, logger *slog.Logger) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if _, tracked := e.progress[key]; !tracked {
+	tracked, ok := e.progress[key]
+	if !ok {
 		logger.Warn("PostgreSQL apply progress discarded: the engine no longer tracks this schema change",
 			"task_id", key, "state", result.State)
 		return
 	}
-	e.progress[key] = result
+	tracked.result = result
 }
 
 func cloneMetadata(metadata map[string]string) map[string]string {

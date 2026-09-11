@@ -236,9 +236,13 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 	}
 
 	// Check if there are any changes (DDL or VSchema)
+	// The exempt-table disclosure renders on both branches: a clean result is
+	// exactly where a reader needs to tell an exempted live table from one the
+	// plan simply found declared.
 	tables := result.FlatTables()
 	if len(tables) == 0 && len(vschemaChanges) == 0 {
 		templates.WriteNoChanges()
+		templates.WriteExemptTables(result.ExemptTables)
 		return
 	}
 
@@ -292,7 +296,7 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 			}
 			nsChanges = append(nsChanges, nc)
 		}
-		templates.WriteNamespaceChanges(nsChanges, !isVitess, result.Database)
+		templates.WriteNamespaceChanges(nsChanges, !isVitess, result.Database, schema.DialectForDatabaseType(result.DatabaseType))
 	}
 
 	// Check for unsafe changes and show with ⚠️ (attention — the changes await consent)
@@ -315,6 +319,7 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 	default:
 		templates.WritePlanSummary(allChanges)
 	}
+	templates.WriteExemptTables(result.ExemptTables)
 }
 
 // hasResultChanges returns true if the result has schema changes (DDL or VSchema).
@@ -345,7 +350,10 @@ func sortEnvironments(envs []string) {
 }
 
 // planFingerprint creates a string fingerprint of a plan result for deduplication.
-// Plans with identical DDL statements and VSchema updates are considered the same.
+// Plans with identical DDL statements, VSchema updates, and exempt-table
+// disclosures are considered the same; the disclosure is part of what the
+// reader sees, so two environments that exempted different live tables render
+// their own sections.
 func planFingerprint(result *apitypes.PlanResponse) string {
 	// Check for errors first
 	if len(result.Errors) > 0 {
@@ -367,14 +375,24 @@ func planFingerprint(result *apitypes.PlanResponse) string {
 		return "no-changes"
 	}
 
+	var exempt []string
+	for _, group := range result.ExemptTables {
+		if group == nil || len(group.Tables) == 0 {
+			continue
+		}
+		exempt = append(exempt, group.Namespace+":"+group.Reason+":"+strings.Join(group.Tables, ","))
+	}
+
 	// Sort to make the fingerprint order-independent
 	sort.Strings(ddls)
 	sort.Strings(vschemas)
+	sort.Strings(exempt)
 
 	data, _ := json.Marshal(struct {
 		DDLs     []string `json:"ddls"`
 		VSchemas []string `json:"vschemas"`
-	}{ddls, vschemas})
+		Exempt   []string `json:"exempt"`
+	}{ddls, vschemas, exempt})
 	return string(data)
 }
 

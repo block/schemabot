@@ -7,6 +7,7 @@ import (
 
 	"github.com/block/schemabot/pkg/cmd/cliname"
 
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -22,6 +23,7 @@ func previewDeferRunningOutput() {
 		Tables: []TableProgress{
 			{
 				TableName:       "orders",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)",
 				RowsCopied:      1800000,
 				RowsTotal:       2500000,
@@ -30,6 +32,7 @@ func previewDeferRunningOutput() {
 			},
 			{
 				TableName:       "products",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `products` ADD INDEX `idx_category` (`category`)",
 				RowsCopied:      450000,
 				RowsTotal:       1000000,
@@ -38,6 +41,7 @@ func previewDeferRunningOutput() {
 			},
 			{
 				TableName:       "users",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
 				RowsCopied:      6400000,
 				RowsTotal:       7200000,
@@ -65,6 +69,7 @@ func previewDeferSingleOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "users",
+				Dialect:   schema.DialectMySQL,
 				DDL:       "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
 				Status:    state.Apply.WaitingForCutover,
 			},
@@ -90,16 +95,19 @@ func previewDeferWaitingOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "orders",
+				Dialect:   schema.DialectMySQL,
 				DDL:       "ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)",
 				Status:    state.Apply.WaitingForCutover,
 			},
 			{
 				TableName: "products",
+				Dialect:   schema.DialectMySQL,
 				DDL:       "ALTER TABLE `products` ADD INDEX `idx_category` (`category`)",
 				Status:    state.Apply.WaitingForCutover,
 			},
 			{
 				TableName: "users",
+				Dialect:   schema.DialectMySQL,
 				DDL:       "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
 				Status:    state.Apply.WaitingForCutover,
 			},
@@ -126,16 +134,19 @@ func previewDeferSeqWaitOutput() {
 		Tables: []TableProgress{
 			{
 				TableName: "users",
+				Dialect:   schema.DialectMySQL,
 				DDL:       seqDDLs[0].ddl,
 				Status:    state.Apply.Completed,
 			},
 			{
 				TableName: "orders",
+				Dialect:   schema.DialectMySQL,
 				DDL:       seqDDLs[1].ddl,
 				Status:    state.Apply.WaitingForCutover,
 			},
 			{
 				TableName: "products",
+				Dialect:   schema.DialectMySQL,
 				DDL:       seqDDLs[2].ddl,
 				Status:    state.Apply.Pending,
 			},
@@ -162,6 +173,7 @@ func previewDeferStoppedOutput() {
 		Tables: []TableProgress{
 			{
 				TableName:       "orders",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)",
 				Status:          state.Apply.Stopped,
 				RowsCopied:      1800000,
@@ -170,6 +182,7 @@ func previewDeferStoppedOutput() {
 			},
 			{
 				TableName:       "products",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `products` ADD INDEX `idx_category` (`category`)",
 				Status:          state.Apply.Stopped,
 				RowsCopied:      450000,
@@ -178,6 +191,7 @@ func previewDeferStoppedOutput() {
 			},
 			{
 				TableName:       "users",
+				Dialect:         schema.DialectMySQL,
 				DDL:             "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)",
 				Status:          state.Apply.Stopped,
 				RowsCopied:      6400000,
@@ -220,9 +234,9 @@ func previewDeferCuttingOutput() {
 		ApplyID:   "apply-a1b2c3d4e5f6",
 		StartedAt: previewTime.Add(-15 * time.Minute).Format(time.RFC3339),
 		Tables: []TableProgress{
-			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)", Status: state.Apply.CuttingOver},
-			{TableName: "products", DDL: "ALTER TABLE `products` ADD INDEX `idx_category` (`category`)", Status: state.Apply.CuttingOver},
-			{TableName: "users", DDL: "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)", Status: state.Apply.CuttingOver},
+			{TableName: "orders", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_status` (`user_id`, `status`)", Status: state.Apply.CuttingOver},
+			{TableName: "products", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `products` ADD INDEX `idx_category` (`category`)", Status: state.Apply.CuttingOver},
+			{TableName: "users", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `users` ADD INDEX `idx_email_created` (`email`, `created_at`)", Status: state.Apply.CuttingOver},
 		},
 	}
 	WriteProgress(data)

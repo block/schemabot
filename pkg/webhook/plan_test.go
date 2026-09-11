@@ -43,6 +43,27 @@ func TestBuildPlanCommentData_CarriesPerShardChanges(t *testing.T) {
 	assert.Equal(t, []string{mutesDrift}, data.Changes[0].Shards[1].Statements, "the drifted shard keeps its own DDL")
 }
 
+// Every exempt-table group on the plan response reaches the comment data with
+// its namespace, tables, and reason intact, in response order; a nil entry is
+// skipped rather than rendered as an empty group.
+func TestBuildPlanCommentData_CarriesExemptTables(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "app", Type: "postgres"}
+	planResp := &apitypes.PlanResponse{
+		ExemptTables: []*apitypes.ExemptTablesResponse{
+			{Namespace: "app", Tables: []string{"orders_archive_2024", "events_archive_2025_01"}, Reason: "archive naming"},
+			nil,
+			{Namespace: "audit", Tables: []string{"logs_archive_2023"}, Reason: "archive naming"},
+		},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+
+	assert.Equal(t, []templates.ExemptTablesData{
+		{Namespace: "app", Tables: []string{"orders_archive_2024", "events_archive_2025_01"}, Reason: "archive naming"},
+		{Namespace: "audit", Tables: []string{"logs_archive_2023"}, Reason: "archive naming"},
+	}, data.ExemptTables)
+}
+
 // An unsafe change on a single shard (per-shard plan) is surfaced with its shard,
 // even when the collapsed namespace-level Changes don't carry it.
 func TestBuildPlanCommentData_PerShardUnsafe(t *testing.T) {
@@ -69,6 +90,110 @@ func TestBuildPlanCommentData_PerShardUnsafe(t *testing.T) {
 	assert.Equal(t, "mutes", data.UnsafeChanges[0].Table)
 	assert.Equal(t, []string{"40-80"}, data.UnsafeChanges[0].Shards, "the unsafe change is scoped to the drifted shard")
 	assert.Equal(t, 2, data.UnsafeChanges[0].TotalShards, "coverage is stated against every planned shard")
+}
+
+// Two drifted shards that drop the same column for the same reason are one
+// unsafe change covering both shards, not two. The rendered header counts one
+// change and the drop guidance names one column, because the shard-level DDL
+// (which differs only in what else the drifted shard rewrites) is carried from
+// the first shard and parsed once per grouped change. The reason deliberately
+// carries no "DROP" words so the count can only come from the parsed DDL.
+func TestBuildPlanCommentData_PerShardUnsafeDriftGroupsOneDrop(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "cdb_resolute", Type: "strata"}
+	const reason = "destructive change on a drifted shard"
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace:    "cdb_resolute_sharded",
+			TableChanges: []*apitypes.TableChangeResponse{{TableName: "mutes", DDL: "ALTER TABLE `mutes` DROP COLUMN x", ChangeType: "alter"}},
+		}},
+		Shards: []*apitypes.ShardPlanResponse{
+			{Namespace: "cdb_resolute_sharded", Shard: "-40", Changes: []*apitypes.TableChangeResponse{
+				{TableName: "mutes", DDL: "ALTER TABLE `mutes` DROP COLUMN x", ChangeType: "alter", IsUnsafe: true, UnsafeReason: reason},
+			}},
+			{Namespace: "cdb_resolute_sharded", Shard: "40-80", Changes: []*apitypes.TableChangeResponse{
+				{TableName: "mutes", DDL: "ALTER TABLE `mutes` ADD INDEX a, DROP COLUMN x", ChangeType: "alter", IsUnsafe: true, UnsafeReason: reason},
+			}},
+		},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+
+	require.Len(t, data.UnsafeChanges, 1, "same table and reason across shards is one unsafe change")
+	assert.Equal(t, []string{"-40", "40-80"}, data.UnsafeChanges[0].Shards)
+	assert.Equal(t, "ALTER TABLE `mutes` DROP COLUMN x", data.UnsafeChanges[0].DDL, "the first shard's DDL is what the guidance classifies")
+
+	rendered := templates.RenderPlanComment(data)
+	assert.Contains(t, rendered, "**Issues**: 1 unsafe change detected")
+	assert.Contains(t, rendered, "no longer reads from or writes to the dropped column.")
+	assert.NotContains(t, rendered, "any dropped columns")
+}
+
+// A Postgres unsafe change whose reason never says "DROP" is still classified
+// as a column drop, because the plan comment carries the change's DDL and the
+// database type through to the guidance, which parses the DDL with the
+// Postgres parser. Dropping either the DDL or the database type on the way
+// through buildPlanCommentData would leave the fallback with nothing to count
+// and the guidance would disappear.
+func TestBuildPlanCommentData_PostgresDropGuidanceClassifiedFromDDL(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "billing", Type: "postgres"}
+	const ddl = `ALTER TABLE "customers" DROP COLUMN "nickname"`
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "public",
+			TableChanges: []*apitypes.TableChangeResponse{{
+				TableName:    "customers",
+				DDL:          ddl,
+				ChangeType:   "alter",
+				IsUnsafe:     true,
+				UnsafeReason: `statement removes live structure from table "customers"`,
+			}},
+		}},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+
+	assert.Equal(t, "postgres", data.DatabaseType)
+	require.Len(t, data.UnsafeChanges, 1)
+	assert.Equal(t, ddl, data.UnsafeChanges[0].DDL, "the DDL is threaded so the guidance can parse it")
+
+	rendered := templates.RenderPlanComment(data)
+	assert.Contains(t, rendered, "**Destructive drop guidance:**")
+	assert.Contains(t, rendered, "no longer reads from or writes to the dropped column.")
+}
+
+// The multi-environment comment renders each environment's unsafe section
+// through the same guidance path, so a Postgres drop classified from DDL
+// shows up there too.
+func TestRenderMultiEnvPlanComment_PostgresDropGuidanceClassifiedFromDDL(t *testing.T) {
+	data := templates.MultiEnvPlanCommentData{
+		Database:     "billing",
+		DatabaseType: "postgres",
+		Environments: []string{"staging"},
+		Plans: map[string]*templates.PlanCommentData{
+			"staging": {
+				Database:     "billing",
+				Environment:  "staging",
+				DatabaseType: "postgres",
+				Changes: []templates.KeyspaceChangeData{{
+					Keyspace:   "public",
+					Statements: []string{`DROP TABLE "customers"`},
+				}},
+				HasUnsafeChanges: true,
+				UnsafeChanges: []templates.UnsafeChangeData{{
+					Table:      "customers",
+					Reason:     `statement removes live structure from table "customers"`,
+					DDL:        `DROP TABLE "customers"`,
+					ChangeType: "alter",
+				}},
+			},
+		},
+		Errors: map[string]string{},
+	}
+
+	rendered := templates.RenderMultiEnvPlanComment(data)
+
+	assert.Contains(t, rendered, "**Destructive drop guidance:**")
+	assert.Contains(t, rendered, "no longer reads from or writes to the dropped table.")
 }
 
 // A shard that already matches the desired schema while siblings change is

@@ -158,9 +158,14 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 	req.Database = storage.CanonicalKey(req.Database)
 	req.Environment = storage.CanonicalKey(req.Environment)
 	req.Type = storage.CanonicalKey(req.Type)
+	req.App = storage.CanonicalKey(strings.TrimSpace(req.App))
 
-	if req.Database == "" {
-		s.writeError(w, http.StatusBadRequest, "database is required")
+	if req.App != "" && req.Database != "" {
+		s.writeError(w, http.StatusBadRequest, "database and app both select the database; set exactly one")
+		return
+	}
+	if req.Database == "" && req.App == "" {
+		s.writeError(w, http.StatusBadRequest, "database or app is required")
 		return
 	}
 	if req.Environment == "" {
@@ -172,20 +177,43 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Spend the request's budget once the request is well-formed and before it
-	// reaches a target, so a malformed request costs nothing while every
-	// request that could load a database is counted. A request naming a
-	// database this server does not route still spends budget: route
-	// resolution is server-side work, and a client looping on an unknown
-	// database is exactly the runaway the budget exists to bound.
-	if !s.checkPullRateLimit(w, r, req.Database, req.Environment) {
+	// Spend the caller's budget once the request is well-formed and before
+	// either selector resolves, so a malformed request costs nothing while
+	// every request that puts the server to work is counted. A request naming
+	// a database this server does not route — or an app no database declares —
+	// still spends budget: route resolution is server-side work, and a client
+	// looping on unresolvable names is exactly the runaway the budget exists
+	// to bound.
+	if !s.checkPullCallerBudget(w, r, req.Database, req.App, req.Environment) {
+		return
+	}
+
+	// App is an alternate selector, not an additional filter: resolving it to
+	// a database here means everything downstream — the target budget, routing,
+	// authorization of the route — sees the same request shape either way. The
+	// resolution itself was paid for by the caller budget above, so cycling
+	// through unresolvable apps is bounded exactly like cycling through
+	// unknown database names.
+	if req.App != "" {
+		database, err := s.config.withDatabaseSnapshot().DatabaseForApp(req.App)
+		if err != nil {
+			s.logger.Warn("pull schema rejected for unresolvable app", "app", req.App, "environment", req.Environment, "error", err)
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		req.Database = database
+	}
+
+	// The target budget is keyed on the resolved database, so a by-app pull
+	// and a by-name pull of the same database drain one shared bucket rather
+	// than each selector minting its own.
+	if !s.checkPullTargetBudget(w, r, req.Database, req.Environment) {
 		return
 	}
 
 	resp, err := s.ExecutePullSchema(r.Context(), req)
 	if err != nil {
-		var typeMismatchErr *databaseTypeMismatchError
-		if errors.As(err, &typeMismatchErr) {
+		if typeMismatchErr, ok := errors.AsType[*databaseTypeMismatchError](err); ok {
 			s.logger.Warn("pull schema rejected for mismatched database type", "database", req.Database, "environment", req.Environment, "request_type", typeMismatchErr.RequestType, "config_type", typeMismatchErr.ConfigType)
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
@@ -195,26 +223,22 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		var unsupportedErr *unsupportedPullSchemaError
-		if errors.As(err, &unsupportedErr) {
+		if unsupportedErr, ok := errors.AsType[*unsupportedPullSchemaError](err); ok {
 			s.logger.Warn("pull schema rejected for unsupported database type", "database", req.Database, "environment", req.Environment, "type", unsupportedErr.DatabaseType)
 			s.writeError(w, http.StatusNotImplemented, err.Error())
 			return
 		}
-		var lintDialectErr *unsupportedLintDialectError
-		if errors.As(err, &lintDialectErr) {
+		if lintDialectErr, ok := errors.AsType[*unsupportedLintDialectError](err); ok {
 			s.logger.Warn("pull schema lint rejected for unsupported dialect", "database", req.Database, "environment", req.Environment, "type", lintDialectErr.DatabaseType)
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		var unlintableErr *unlintablePulledTableError
-		if errors.As(err, &unlintableErr) {
+		if unlintableErr, ok := errors.AsType[*unlintablePulledTableError](err); ok {
 			s.logger.Warn("pull schema lint rejected unlintable pulled table", "database", req.Database, "environment", req.Environment, "namespace", unlintableErr.Namespace, "table", unlintableErr.Table, "detail", unlintableErr.Detail)
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		var unavailableErr *RemoteDeploymentUnavailableError
-		if errors.As(err, &unavailableErr) {
+		if unavailableErr, ok := errors.AsType[*RemoteDeploymentUnavailableError](err); ok {
 			s.logger.Error("pull schema failed because remote deployment is unavailable",
 				"database", req.Database,
 				"environment", req.Environment,
@@ -365,6 +389,12 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 	)
 
 	httpResp := pullSchemaResponseFromProto(merged)
+	// Echo the database's app identifier whether the request selected it by
+	// name or by app, so callers joining on the app never need a second
+	// lookup. The proto carries no app: it is config metadata, not tern's.
+	if dbConfig, ok := s.config.DatabaseConfigs()[req.Database]; ok {
+		httpResp.App = dbConfig.App
+	}
 	if req.Lint {
 		if err := lintPulledNamespaces(httpResp); err != nil {
 			span.RecordError(err)
@@ -563,8 +593,7 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.ExecutePlan(r.Context(), req)
 	if err != nil {
-		var typeMismatchErr *databaseTypeMismatchError
-		if errors.As(err, &typeMismatchErr) {
+		if typeMismatchErr, ok := errors.AsType[*databaseTypeMismatchError](err); ok {
 			s.logger.Warn("plan rejected for mismatched database type", "database", req.Database, "environment", req.Environment, "request_type", typeMismatchErr.RequestType, "config_type", typeMismatchErr.ConfigType)
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
@@ -574,8 +603,7 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		var policyErr *SourcePolicyError
-		if errors.As(err, &policyErr) {
+		if _, ok := errors.AsType[*SourcePolicyError](err); ok {
 			s.writeErrorCode(w, http.StatusForbidden, apitypes.ErrCodeSourcePolicyDenied, "plan failed: "+err.Error())
 			return
 		}
@@ -930,13 +958,11 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusConflict, apitypes.ErrCodeActiveApplyExists, "apply blocked by active apply: "+err.Error())
 			return
 		}
-		var policyErr *SourcePolicyError
-		if errors.As(err, &policyErr) {
+		if _, ok := errors.AsType[*SourcePolicyError](err); ok {
 			s.writeErrorCode(w, http.StatusForbidden, apitypes.ErrCodeSourcePolicyDenied, "apply failed: "+err.Error())
 			return
 		}
-		var featureErr *UnsupportedFeatureError
-		if errors.As(err, &featureErr) {
+		if _, ok := errors.AsType[*UnsupportedFeatureError](err); ok {
 			s.logger.Warn("apply rejected because the database type does not support a requested feature", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
 			return
@@ -1237,10 +1263,12 @@ func (s *Service) createStoredApply(
 ) (*storage.Apply, int64, error) {
 	now := time.Now()
 	applyOpts := storage.ApplyOptionsFromMap(options)
-	if err := rejectUnsafeStoredPlanWithoutOptIn(plan, applyOpts); err != nil {
+	// Blocked changes reject before unsafe changes because no opt-in can make a
+	// statement the engine refuses executable.
+	if err := rejectBlockedStoredPlan(plan); err != nil {
 		return nil, 0, err
 	}
-	if err := rejectBlockedStoredPlan(plan); err != nil {
+	if err := rejectUnsafeStoredPlanWithoutOptIn(plan, applyOpts); err != nil {
 		return nil, 0, err
 	}
 

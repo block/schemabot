@@ -578,7 +578,7 @@ func TestE2EPlanCleansStalePlanOnlyChecksBeforeConvergingAggregates(t *testing.T
 
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "No Managed Schema Changes")
+		assert.Contains(t, body, "No Schema Files Changed")
 		assert.Contains(t, body, "refreshed as passing")
 		assert.Contains(t, body, "abc123")
 	case <-time.After(10 * time.Second):

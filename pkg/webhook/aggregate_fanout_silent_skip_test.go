@@ -178,7 +178,8 @@ func TestUnscopedApplyOnUnregisteredDatabaseStaysSilent(t *testing.T) {
 		h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply, Tenant: "tenant-b"})
 
 		body := requireComment(t, comments, "database-not-configured apply error")
-		assert.Contains(t, body, `database &#34;orders&#34; is not configured on this server`)
+		assert.Contains(t, body, "Database Not Configured")
+		assert.Contains(t, body, "`orders`")
 	})
 
 	t.Run("non-aggregate repo still reports the error", func(t *testing.T) {
@@ -188,7 +189,8 @@ func TestUnscopedApplyOnUnregisteredDatabaseStaysSilent(t *testing.T) {
 		h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
 
 		body := requireComment(t, comments, "database-not-configured apply error")
-		assert.Contains(t, body, `database &#34;orders&#34; is not configured on this server`)
+		assert.Contains(t, body, "Database Not Configured")
+		assert.Contains(t, body, "`orders`")
 	})
 }
 
@@ -241,7 +243,8 @@ func TestUnscopedMultiEnvPlanOnUnregisteredDatabaseStaysSilent(t *testing.T) {
 		barePlan(h, "", "tenant-b")
 
 		body := requireComment(t, comments, "database-not-configured plan error")
-		assert.Contains(t, body, `database &#34;orders&#34; is not configured on this server`)
+		assert.Contains(t, body, "Database Not Configured")
+		assert.Contains(t, body, "`orders`")
 	})
 
 	t.Run("non-aggregate repo still reports the error", func(t *testing.T) {
@@ -251,7 +254,8 @@ func TestUnscopedMultiEnvPlanOnUnregisteredDatabaseStaysSilent(t *testing.T) {
 		barePlan(h, "", "")
 
 		body := requireComment(t, comments, "database-not-configured plan error")
-		assert.Contains(t, body, `database &#34;orders&#34; is not configured on this server`)
+		assert.Contains(t, body, "Database Not Configured")
+		assert.Contains(t, body, "`orders`")
 	})
 }
 

@@ -32,7 +32,11 @@ import (
 //
 // The same constant bounds the PostgreSQL bootstrap flow — its existence
 // checks, advisory-lock wait, and transactional table creation — so tuning it
-// for MySQL/Spirit reasons also changes how long a PostgreSQL pod waits.
+// for MySQL/Spirit reasons also changes how long a PostgreSQL pod waits. It is
+// also the base of a fourth derivation: postgresBootstrapDDLStatementTimeout
+// subtracts a margin from it to bound one convergence DDL statement
+// server-side, so lowering this shortens that budget too, down to its own
+// floor.
 const EnsureSchemaTimeout = 5 * time.Minute
 
 // EnsureSchemaOption customizes EnsureSchema behavior.
@@ -41,6 +45,13 @@ type EnsureSchemaOption func(*ensureSchemaOptions)
 type ensureSchemaOptions struct {
 	allowDestructive bool
 	dialect          schema.Dialect
+	// postgresStatementTimeout bounds a single ordinary query on the
+	// PostgreSQL bootstrap's connection. Zero disables the budget explicitly;
+	// negative means "not set", leaving the platform's ambient value in place.
+	// It defaults to DefaultPostgresStatementTimeout rather than to "not set",
+	// so a caller that never considered the question still bootstraps under a
+	// budget SchemaBot states instead of one the platform imposed.
+	postgresStatementTimeout time.Duration
 }
 
 // WithAllowDestructiveSchemaChanges controls whether EnsureSchema may execute
@@ -69,6 +80,20 @@ func WithDialect(dialect schema.Dialect) EnsureSchemaOption {
 	return func(o *ensureSchemaOptions) { o.dialect = dialect }
 }
 
+// WithPostgresStatementTimeout bounds a single ordinary query the PostgreSQL
+// bootstrap issues — its catalog reads and existence checks. It deliberately
+// does not bound the two statement classes the bootstrap runs that are
+// expected to be slow: convergence DDL raises the budget per transaction to
+// postgresBootstrapDDLStatementTimeout, and the advisory-lock wait runs with
+// no statement budget at all. A zero duration disables the budget explicitly
+// rather than inheriting the platform's, and a negative one leaves the
+// platform's value in place. Unset, the budget is
+// DefaultPostgresStatementTimeout. Wire this from
+// PostgresConfig.StatementTimeoutOrDefault.
+func WithPostgresStatementTimeout(d time.Duration) EnsureSchemaOption {
+	return func(o *ensureSchemaOptions) { o.postgresStatementTimeout = d }
+}
+
 // EnsureSchema converges SchemaBot's own storage schema at startup, routing to
 // the bootstrapper for the storage database's dialect (MySQL unless overridden
 // with WithDialect). It is idempotent — no changes are made if the schema is
@@ -81,7 +106,10 @@ func WithDialect(dialect schema.Dialect) EnsureSchemaOption {
 // adding a dialect means adding a bootstrapper here, not threading
 // dialect-conditionals through the MySQL flow.
 func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) error {
-	o := ensureSchemaOptions{dialect: schema.DialectMySQL}
+	o := ensureSchemaOptions{
+		dialect:                  schema.DialectMySQL,
+		postgresStatementTimeout: DefaultPostgresStatementTimeout,
+	}
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -89,7 +117,7 @@ func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) e
 	case schema.DialectMySQL:
 		return ensureMySQLSchema(dsn, logger, o, namedlock.MySQL{})
 	case schema.DialectPostgres:
-		return ensurePostgresSchema(dsn, logger, namedlock.Postgres{})
+		return ensurePostgresSchema(dsn, logger, o, namedlock.Postgres{})
 	default:
 		return fmt.Errorf("no schema bootstrapper for storage dialect %q (supported: %q, %q)", o.dialect, schema.DialectMySQL, schema.DialectPostgres)
 	}
@@ -125,9 +153,11 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 	// before doing any work. This is critical for debugging bootstrap issues
 	// in embedded environments (e.g., Tern) where the DSN is constructed
 	// dynamically and we need to confirm we're hitting the right database.
+	var storageDatabase string
 	if diag, err := diagnoseStorageTarget(ctx, dsn); err != nil {
 		logger.Warn("storage target diagnostic failed", "error", err)
 	} else {
+		storageDatabase = diag.database
 		logger.Info("EnsureSchema storage target",
 			"hostname", diag.hostname,
 			"database", diag.database,
@@ -202,7 +232,7 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 	if err != nil {
 		return fmt.Errorf("acquire schema lock: %w", err)
 	}
-	defer utils.CloseAndLog(lockConn)
+	defer releaseEnsureSchemaLock(ctx, locker, lockConn, logger, schema.DialectMySQL, storageDatabase)
 
 	// Clean up stale Spirit internal tables only while holding the advisory
 	// lock. During a rolling deploy, another pod may be actively applying
@@ -636,6 +666,41 @@ func acquireMySQLEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.
 
 	logger.Info("acquired EnsureSchema advisory lock")
 	return conn, nil
+}
+
+// ensureSchemaLockReleaseTimeout bounds the release issued as the bootstrap
+// returns, so a storage database that has become unreachable delays startup by
+// a bounded amount rather than by whatever the driver would wait.
+const ensureSchemaLockReleaseTimeout = 10 * time.Second
+
+// releaseEnsureSchemaLock releases the bootstrap advisory lock and closes the
+// connection holding it. Closing alone already drops the lock — the pool behind
+// this connection was closed at acquire time, so closing ends the session — but
+// the release runs first for its answer: it is the only reading of whether the
+// session SchemaBot converged storage under is still the session that took the
+// lock.
+//
+// A negative answer is not a routine "the lock was not held". It means this pod
+// converged storage without the exclusion the lock was supposed to give it, so
+// another pod may have been converging the same schema alongside it, and it is
+// reported with the identifiers needed to find the pod and database involved.
+// It runs on a context detached from the bootstrap deadline, which is usually
+// spent by the time a release is due.
+func releaseEnsureSchemaLock(ctx context.Context, locker namedlock.Locker, conn *sql.Conn, logger *slog.Logger, dialect schema.Dialect, database string) {
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ensureSchemaLockReleaseTimeout)
+	defer cancel()
+
+	released, err := locker.Release(releaseCtx, conn, ensureSchemaLockName)
+	switch {
+	case err != nil:
+		logger.Warn("failed to release the EnsureSchema advisory lock",
+			"lock", ensureSchemaLockName, "dialect", dialect, "database", database, "error", err)
+	case !released:
+		logger.Warn("the EnsureSchema advisory lock was not held at release; storage was converged without cross-instance exclusion and another instance may have been converging it at the same time",
+			"lock", ensureSchemaLockName, "dialect", dialect, "database", database)
+	}
+
+	utils.CloseAndLog(conn)
 }
 
 // cleanStaleSpiritTables drops any Spirit internal tables left behind by a

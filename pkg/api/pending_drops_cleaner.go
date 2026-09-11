@@ -160,7 +160,7 @@ func (s *Service) runPendingDropsCleanupPass(ctx context.Context, retention time
 // startup, so it is only reachable for an embedder that skips validation, and
 // counting it as routed would claim a deployment reaps it when none does.
 func (s *Service) pendingDropsTargetCounts() (local, routed int) {
-	for _, dbConfig := range s.config.Databases {
+	for _, dbConfig := range s.config.DatabaseConfigs() {
 		if dbConfig.Type != storage.DatabaseTypeMySQL {
 			continue
 		}
@@ -188,7 +188,7 @@ func (s *Service) pendingDropsTargetCounts() (local, routed int) {
 func (s *Service) pendingDropsTargets(ctx context.Context) ([]pendingdrops.Target, int) {
 	var targets []pendingdrops.Target
 	var unresolved int
-	for dbName, dbConfig := range s.config.Databases {
+	for dbName, dbConfig := range s.config.DatabaseConfigs() {
 		if dbConfig.Type != storage.DatabaseTypeMySQL {
 			continue
 		}

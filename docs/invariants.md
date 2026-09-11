@@ -10,91 +10,20 @@
 - [Three principles](#three-principles)
 - [What these invariants do not promise](#what-these-invariants-do-not-promise)
 - [Availability and blast radius (AV)](#availability-and-blast-radius-av)
-  - [AV-1: Schema changes run without GitHub](#av-1-schema-changes-run-without-github)
-  - [AV-2: Outages degrade, never destroy](#av-2-outages-degrade-never-destroy)
-  - [AV-3: Liveness is process-only](#av-3-liveness-is-process-only)
-  - [AV-4: A transient failure never fails the work](#av-4-a-transient-failure-never-fails-the-work)
-  - [AV-5: Panics are contained and permanent](#av-5-panics-are-contained-and-permanent)
-  - [AV-6: Mixed versions are survivable by contract, not by guesswork](#av-6-mixed-versions-are-survivable-by-contract-not-by-guesswork)
-  - [AV-7: An acknowledged delivery is a promise](#av-7-an-acknowledged-delivery-is-a-promise)
-  - [AV-8: Untrusted text never reaches operator surfaces raw](#av-8-untrusted-text-never-reaches-operator-surfaces-raw)
-  - [AV-9: SchemaBot never destroys its own storage to start](#av-9-schemabot-never-destroys-its-own-storage-to-start)
-  - [AV-10: Anything the PR can do, the CLI can do](#av-10-anything-the-pr-can-do-the-cli-can-do)
 - [Merge gate (MG)](#merge-gate-mg)
-  - [MG-1: Uncertainty is never converted into a passing check](#mg-1-uncertainty-is-never-converted-into-a-passing-check)
-  - [MG-2: Absence never passes](#mg-2-absence-never-passes)
-  - [MG-3: The rollup is conservative](#mg-3-the-rollup-is-conservative)
-  - [MG-4: A check belongs to exactly one commit](#mg-4-a-check-belongs-to-exactly-one-commit)
-  - [MG-5: Apply-owned check rows are released only by their owner](#mg-5-apply-owned-check-rows-are-released-only-by-their-owner)
-  - [MG-6: Started applies keep blocking after the change disappears](#mg-6-started-applies-keep-blocking-after-the-change-disappears)
-  - [MG-7: A completed rollback never shows green](#mg-7-a-completed-rollback-never-shows-green)
-  - [MG-8: Check trust is by App identity, never by name](#mg-8-check-trust-is-by-app-identity-never-by-name)
-  - [MG-9: GitHub being down never invents state](#mg-9-github-being-down-never-invents-state)
-  - [MG-10: A blocked aggregate converges without an external event](#mg-10-a-blocked-aggregate-converges-without-an-external-event)
-  - [MG-11: A terminal outcome lands on the commit the PR is gated on](#mg-11-a-terminal-outcome-lands-on-the-commit-the-pr-is-gated-on)
 - [Apply state machine (ST)](#apply-state-machine-st)
-  - [ST-1: A finished apply stays finished](#st-1-a-finished-apply-stays-finished)
-  - [ST-2: Recovery from permanent failure is a fresh plan and apply](#st-2-recovery-from-permanent-failure-is-a-fresh-plan-and-apply)
-  - [ST-3: Apply state flows upward, never downward](#st-3-apply-state-flows-upward-never-downward)
-  - [ST-4: Stored task state never moves backward](#st-4-stored-task-state-never-moves-backward)
-  - [ST-5: Unknown engine states are visible and blocking](#st-5-unknown-engine-states-are-visible-and-blocking)
-  - [ST-6: Engine truth is scoped](#st-6-engine-truth-is-scoped)
-  - [ST-7: Stop checkpoints conservatively](#st-7-stop-checkpoints-conservatively)
-  - [ST-8: Every state has a recovery story](#st-8-every-state-has-a-recovery-story)
-  - [ST-9: The retry budget is bounded and never re-runs finished work](#st-9-the-retry-budget-is-bounded-and-never-re-runs-finished-work)
-  - [ST-10: Rollouts respect order and fail closed on policy](#st-10-rollouts-respect-order-and-fail-closed-on-policy)
 - [Ownership and leases (OW)](#ownership-and-leases-ow)
-  - [OW-1: Every drive runs under a claim](#ow-1-every-drive-runs-under-a-claim)
-  - [OW-2: Lease-scoped writes must hold the current token](#ow-2-lease-scoped-writes-must-hold-the-current-token)
-  - [OW-3: A driver stops before a peer may reclaim](#ow-3-a-driver-stops-before-a-peer-may-reclaim)
-  - [OW-4: Lease loss is proven, never inferred](#ow-4-lease-loss-is-proven-never-inferred)
-  - [OW-5: One active apply per deployment](#ow-5-one-active-apply-per-deployment)
-  - [OW-6: There is one way to claim work](#ow-6-there-is-one-way-to-claim-work)
-  - [OW-7: Ownership uncertainty fails closed](#ow-7-ownership-uncertainty-fails-closed)
-  - [OW-8: Only drivers and elected reapers write apply and task rows](#ow-8-only-drivers-and-elected-reapers-write-apply-and-task-rows)
 - [Control operations (CO)](#control-operations-co)
-  - [CO-1: Durable before acknowledged](#co-1-durable-before-acknowledged)
-  - [CO-2: Every command resolves; none wedges](#co-2-every-command-resolves-none-wedges)
-  - [CO-3: Engine terminal truth outranks a queued command](#co-3-engine-terminal-truth-outranks-a-queued-command)
-  - [CO-4: Stop wins](#co-4-stop-wins)
-  - [CO-5: The revert phase owns the outcome](#co-5-the-revert-phase-owns-the-outcome)
-  - [CO-6: Commands act only where they have an effect](#co-6-commands-act-only-where-they-have-an-effect)
-  - [CO-7: ID namespaces are never conflated](#co-7-id-namespaces-are-never-conflated)
-  - [CO-8: A stop that cannot pause is refused, never quietly made permanent](#co-8-a-stop-that-cannot-pause-is-refused-never-quietly-made-permanent)
-  - [CO-9: Control operations are stateless](#co-9-control-operations-are-stateless)
-  - [CO-10: A retired operation settles; it is never mistaken for a newer peer's](#co-10-a-retired-operation-settles-it-is-never-mistaken-for-a-newer-peers)
 - [Operator surfaces (UX)](#operator-surfaces-ux)
-  - [UX-1: An operator's command shows its effect at the bottom of the PR](#ux-1-an-operators-command-shows-its-effect-at-the-bottom-of-the-pr)
-  - [UX-2: Acknowledgment means a deployment is acting, not that a packet arrived](#ux-2-acknowledgment-means-a-deployment-is-acting-not-that-a-packet-arrived)
-  - [UX-3: Progress is a projection; reading it never changes it](#ux-3-progress-is-a-projection-reading-it-never-changes-it)
-  - [UX-4: A refusal says what to do next](#ux-4-a-refusal-says-what-to-do-next)
-  - [UX-5: One vocabulary, one meaning, every surface](#ux-5-one-vocabulary-one-meaning-every-surface)
 - [Recovery (RC)](#recovery-rc)
-  - [RC-1: Nothing is orphaned](#rc-1-nothing-is-orphaned)
-  - [RC-2: Settled applies stop changing](#rc-2-settled-applies-stop-changing)
-  - [RC-3: Loading nothing is not owning nothing](#rc-3-loading-nothing-is-not-owning-nothing)
-  - [RC-4: Self-healing needs proof](#rc-4-self-healing-needs-proof)
-  - [RC-5: A terminal summary is never lost, and never silently duplicated](#rc-5-a-terminal-summary-is-never-lost-and-never-silently-duplicated)
 - [Review integrity and data safety (RV)](#review-integrity-and-data-safety-rv)
-  - [RV-1: What gets applied is what was reviewed](#rv-1-what-gets-applied-is-what-was-reviewed)
-  - [RV-2: Stale plans never apply](#rv-2-stale-plans-never-apply)
-  - [RV-3: Consent is explicit, specific, and re-checked](#rv-3-consent-is-explicit-specific-and-re-checked)
-  - [RV-4: Engine refusals are known at plan time and gate the apply](#rv-4-engine-refusals-are-known-at-plan-time-and-gate-the-apply)
-  - [RV-5: A drop is never silent, and where a recovery window exists it is honored](#rv-5-a-drop-is-never-silent-and-where-a-recovery-window-exists-it-is-honored)
-  - [RV-6: Every statement parses under its own dialect, or it is an error](#rv-6-every-statement-parses-under-its-own-dialect-or-it-is-an-error)
-  - [RV-7: Rollback needs the originals](#rv-7-rollback-needs-the-originals)
-  - [RV-8: The plan sees the whole schema, or nothing](#rv-8-the-plan-sees-the-whole-schema-or-nothing)
 - [Routing and authorization (AZ)](#routing-and-authorization-az)
-  - [AZ-1: The server decides where a change runs](#az-1-the-server-decides-where-a-change-runs)
-  - [AZ-2: Authorization fails closed at every tier](#az-2-authorization-fails-closed-at-every-tier)
-  - [AZ-3: Identity comes from a verified lane](#az-3-identity-comes-from-a-verified-lane)
-  - [AZ-4: Applying takes an authorized actor](#az-4-applying-takes-an-authorized-actor)
-  - [AZ-5: Commands never guess](#az-5-commands-never-guess)
-  - [AZ-6: Local hosting preserves its boundaries](#az-6-local-hosting-preserves-its-boundaries)
 - [Structural enforcement](#structural-enforcement)
 - [Engineering rules live in AGENTS.md](#engineering-rules-live-in-agentsmd)
 
 <!-- END TOC (auto-generated by `make docs-toc`) -->
+
+Looking for a specific invariant? Search this page for its ID, such as `MG-5`.
 
 The canonical registry of **runtime safety invariants**: the MUST-statements that make SchemaBot
 safe to put in front of tier-0 databases. This document states what must never be false at
@@ -372,9 +301,14 @@ be careful. The unredacted error goes to the server log next to the repo, PR, en
 database, and command, so nothing is lost for triage. Inbound webhook payloads are size-bounded
 before decode. *Enforced:* the comment and table-cell sanitizers in
 `pkg/webhook/templates/common.go`, applied by the error renderers themselves
-(`pkg/webhook/templates/errors.go`); the Check Run summary sanitizer and its markup escaper
-(`pkg/webhook/check_publisher.go`); the drift summary clamp (`pkg/webhook/plan_drift.go`); the
-request body limit (`pkg/webhook/handler.go`).
+(`pkg/webhook/templates/errors.go`); the code fences sized past any backtick run in their
+content, DDL fences drawing on a budget shared across the comment, and the code span that holds
+an identifier read from the PR's schema files, its `schemabot.yaml`, or a command's `-d` flag —
+table, namespace, keyspace, shard, schema path, database, check name — flattened to one line and
+delimited past any backtick run inside it (`pkg/webhook/templates/fence.go`, exercised across
+its rendering surfaces by `pkg/webhook/templates/hostile_identifier_test.go`); the Check Run
+summary sanitizer and its markup escaper (`pkg/webhook/check_publisher.go`); the drift summary
+clamp (`pkg/webhook/plan_drift.go`); the request body limit (`pkg/webhook/handler.go`).
 
 ### AV-9: SchemaBot never destroys its own storage to start
 
@@ -453,7 +387,7 @@ publish path (`pkg/webhook/check_publisher.go`, `pkg/webhook/check_aggregate.go`
 ### MG-2: Absence never passes
 
 The aggregate check is created on every PR head commit. A PR that touches no managed schema files
-still gets one: an explicit passing "no managed schema changes". GitHub treats a missing required
+still gets one: an explicit passing "no schema files changed". GitHub treats a missing required
 check as not passing, so having nothing to say has to be said rather than left empty. The same
 logic applies in reverse. When SchemaBot expects a check, environment, or config and cannot find
 it, that reads as blocking, never as not-applicable. A gate must not be removable by the very
@@ -548,9 +482,15 @@ and CLI flows do not write passing checks.
 
 Aggregates blocked on unresolved or stale state are re-evaluated by SchemaBot itself, not left
 waiting for a lucky comment or push. The exception is a block that no retry can lift (untrusted
-App, misconfigured check name), which blocks immediately and permanently. *Enforced:* stale-check
-reconciliation (`pkg/webhook/check_records.go`) and aggregate re-evaluation
-(`pkg/webhook/check_aggregate.go`, `pkg/webhook/checks_backfill.go`).
+App, misconfigured check name), which blocks immediately and permanently.
+
+A block an operator owes a target a reconciliation for is not an exception to this. It converges
+too, by the operator reconciling the target — what it must not do is converge on its own, since
+that would clear the block without the divergence behind it being addressed.
+
+*Enforced:* stale-check reconciliation (`pkg/webhook/check_records.go`), aggregate re-evaluation
+(`pkg/webhook/check_aggregate.go`, `pkg/webhook/checks_backfill.go`), and the re-plan a settled
+apply owes a PR whose head moved past the commit its check names (`pkg/webhook/handler.go`).
 
 ### MG-11: A terminal outcome lands on the commit the PR is gated on
 
@@ -678,7 +618,8 @@ completeness test over it (`pkg/state/metadata.go`).
 `failed_retryable` is active, not terminal: recovery re-drives it automatically. Only
 `failed_retryable` tasks reset to `pending`, so completed tasks are never re-run, and the apply
 settles to permanent `failed` when the attempt budget is spent or the recovery window closes.
-*Enforced:* retry preparation and expiry (`pkg/api/operator.go`); budget semantics in
+*Enforced:* retry preparation in the drive loop (`pkg/api/operator.go`) and the expiry sweep
+(`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`); budget semantics in
 [apply-lifecycle.md](apply-lifecycle.md).
 
 ### ST-10: Rollouts respect order and fail closed on policy
@@ -790,7 +731,8 @@ rather than the operation is the unit of reconciliation.
 
 The check runs whenever an apply is created or moved back into an active state, serialized across
 instances by an advisory lock keyed on (database, database type, environment) and held for the
-transaction that decides. It does not depend on a user-facing database lock being held: direct API
+transaction that decides. That lock excludes only while the connection holding it keeps one
+server session, which OW-9 covers. It does not depend on a user-facing database lock being held: direct API
 callers and `--no-lock` flows are equally bound. *Enforced:* the exclusivity check in the storage
 apply create and activate paths, under the apply target lock
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/locks.go`).
@@ -845,18 +787,44 @@ classes exclude each other by one mechanism rather than by two that have to be k
 and a row can still be attributed by reading it. A reader's job is to report what is stored,
 including when what is stored is a task that has outlived its apply's verdict (UX-3).
 
-One writer stands outside this: `ExpireRetryable` terminalizes the task rows of an apply whose
-retry budget or recovery freshness has run out, selected by `apply_id` alone under a `FOR UPDATE`
-on the parent. The parent lock serializes it against a driver claiming that apply, but it reads no
-operation lease, so it is the one task write not covered by the sentence above. It is named here
-rather than left for a reader to discover, because an entry that overstates its own coverage is
-what makes the registry unreliable.
-
 *Enforced:* lease predicates on the driver's apply and task writes
-(`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/applies.go`), the
-reaper's task sweeps (`unleasedOperationGate`,
-`pkg/storage/internal/sqlstore/apply_operations.go`), and a read path that builds progress from
+(`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/applies.go`), the lease
+gates the reaper's sweeps select and write under (`unleasedOperationGate`, `undrivenApplyGate`,
+`lockUndrivenApplies`, `pkg/storage/internal/sqlstore/apply_operations.go`,
+`pkg/storage/internal/sqlstore/applies.go`), and a read path that builds progress from
 stored rows without writing them (`pkg/api/progress_handlers.go`).
+
+### OW-9: An advisory lock is only exclusion where the session holds still
+
+Every guarantee SchemaBot has across instances that is not a lease predicate is one advisory
+lock: the storage bootstrap, the apply target lock behind OW-5, and reaper election. All three
+are session-scoped, so all three are exclusion only while a connection keeps reaching the same
+server session.
+
+That is a property of the connection and not of the lock. It holds against a database, and
+against a pooler that gives a client its own session for the connection's lifetime. It does not
+hold behind a transaction-mode pooler, which rebinds the backend per transaction: the lock lands
+on a session the client stops mapping to, a second caller reaching that backend takes the same
+lock, and the release comes back false because the connection asking is no longer the session
+holding it. Nothing about that reads as an error: both callers are told they hold the lock.
+
+So on PostgreSQL the property is proven at startup rather than assumed, and a proof that fails
+refuses the process rather than converging storage or driving applies without exclusion. A lock
+whose release reports it was not held is reported as lost ownership, because a caller that
+believed it held the lock has just learned it did not.
+
+The proof is one-sided by construction: it observes facts about the pool in front of it, so it
+has no false positive, and an idle pooler with spare backends can still answer every reading the
+healthy way. It is the guard against the connection string a hosted platform hands out by
+default, not a substitute for the direct endpoint.
+
+*Breaks if violated:* two pods converge the same storage schema, and later drive the same apply,
+each believing it holds the lock. *Enforced:* the session affinity probe
+(`Postgres.VerifySessionAffinity`, `pkg/namedlock/postgres_affinity.go`), refused at bootstrap
+(`verifyStorageSessionAffinity`, `pkg/api/ensure_schema_postgres.go`); the release-answer
+warnings on every advisory lock caller (`releaseEnsureSchemaLock`, `pkg/api/ensure_schema.go`;
+`releaseApplyTargetLockConn`, `pkg/storage/internal/sqlstore/applies.go`; `reapUnderElection`,
+`pkg/storage/internal/sqlstore/reaper.go`).
 
 ## Control operations (CO)
 
@@ -909,10 +877,14 @@ resolved by drive ordering. *Enforced:* pending-stop checks in pollers and the c
 
 ### CO-5: The revert phase owns the outcome
 
-Once an apply is `reverting` or `skipping_revert`, stop, cancel, and cutover are refused for the
-whole phase, because storage must never settle on a state that contradicts what the engine is
-still doing to the database underneath. *Enforced:* revert-phase gates in the control paths
-(`pkg/tern/local_control.go`).
+Once an apply has entered its revert phase — the window held open after cutover, or a revert or
+skip-revert in flight — stop, cancel, and cutover are refused for the whole phase, and its drive
+keeps driving the phase to its own outcome rather than settling on the refused command, because
+storage must never settle on a state that contradicts what the engine is still doing to the
+database underneath. *Enforced:* the revert-phase gate on the control path
+(`pkg/tern/local_control.go`), and the drive loops that act on its answer
+(`pkg/tern/local_apply_grouped.go`, `pkg/tern/local_apply_sequential.go`,
+`pkg/tern/local_control_resume.go`, `pkg/tern/grpc_client.go`).
 
 ### CO-6: Commands act only where they have an effect
 
@@ -1198,7 +1170,8 @@ empty handling on recovery load paths (`pkg/api/operator.go`).
 
 Automatic cleanup acts only where the record provably carries no engine work, as with a `pending`
 task, which has no checkpoint by construction. Anything uncertain keeps blocking for an operator.
-*Enforced:* narrow eligibility conditions on every self-heal path (`pkg/api/reaper.go`).
+*Enforced:* narrow eligibility conditions on every self-heal path (`pkg/api/reaper.go`,
+`pkg/engine/postgres/apply.go`).
 
 ### RC-5: A terminal summary is never lost, and never silently duplicated
 
@@ -1381,16 +1354,42 @@ command discovery and the unowned-command policy (`pkg/webhook/commands.go`).
 
 ### AZ-6: Local hosting preserves its boundaries
 
-The internal local host reserves a numeric loopback listener before storage bootstrap or
-operator startup. Every route, including probes, requires its private credential. Local hosting
-rejects service authentication configuration and GitHub Apps rather than silently changing their
-authorization behavior. Its credential identifies the runtime, not an independently approved human.
+The local host accepts only authenticated loopback traffic. It rejects service authentication
+and GitHub Apps rather than changing their authorization behavior. Its credential identifies
+the runtime, not an independently approved human.
 
-State storage must use an explicit connection and a different database name from each locally
-configured target in the same database family. This conservative name check does not establish
-isolation for dynamically resolved targets. Local hosting never opts into destructive storage
-bootstrap. *Enforced:* `pkg/serve/local.go`, `pkg/auth/local.go`, and
-`pkg/api/storage_isolation.go`; process recovery is covered in `integration/localruntime`.
+State storage must use an explicit connection and a different database name from each configured
+target in the same database family. This name check does not establish isolation for dynamically
+resolved targets. Local hosting never permits destructive storage bootstrap.
+
+*Enforced:* `pkg/serve/local.go`, `pkg/auth/local.go`, and `pkg/api/storage_isolation.go`.
+
+### AZ-7: Local registration preserves existing work
+
+Adding a database or environment must preserve existing targets, server settings, durable state,
+and active applies. Every addition passes the local host's safety checks, and concurrent registrations
+must not overwrite one another. The running host must accept configuration changes before they are
+published. Secret references remain references on disk.
+
+*Enforced:* `pkg/localsetup/register.go`, `pkg/localruntime/config.go`,
+`pkg/localruntime/manager.go`, `pkg/localruntime/host.go`, and `pkg/api/live_databases.go`.
+
+### AZ-8: Profile registration preserves connection identity
+
+Registering a local profile must not replace a different connection, change the default profile,
+or overwrite a concurrent configuration update. Retrying an identical registration is safe.
+
+*Enforced:* `pkg/cmd/client/local_profile.go` and `pkg/cmd/client/config.go`.
+
+### AZ-9: Initialization preserves the target and existing files
+
+Initialization verifies the imported schema before publishing it and never applies changes to the
+target. It must not overwrite existing schema files or redirect an existing profile to another
+connection. A retry may reuse identical imported files. Failed setup preserves the runtime and
+its state so the retry uses the same execution authority.
+
+*Enforced:* `pkg/cmd/commands/init.go`, `pkg/cmd/commands/init_publish_darwin.go`,
+`pkg/cmd/commands/init_publish_linux.go`, and `pkg/cmd/commands/init_publish_other.go`.
 
 ## Structural enforcement
 

@@ -38,6 +38,11 @@ const (
 	// operator claim, so a slow or hung storage layer cannot delay the resume
 	// the claim is about to drive.
 	ApplyClaimLogTimeout = 5 * time.Second
+
+	// finishedClaimReleaseTimeout bounds the lease clear a drive performs on its
+	// way out. It runs detached from the driver context, so the bound is what
+	// keeps a hung storage layer from holding the drive open.
+	finishedClaimReleaseTimeout = 5 * time.Second
 )
 
 // StartOperator starts the background operator driver pool.
@@ -70,6 +75,10 @@ func (s *Service) StartOperator(ctx context.Context) {
 	if reaperEvery <= 0 {
 		reaperEvery = StrandedReaperInterval
 	}
+	expiryEvery := s.retryableExpiryEvery
+	if expiryEvery <= 0 {
+		expiryEvery = RetryableExpiryInterval
+	}
 	s.stopRecovery = stop
 	s.cancelRecovery = cancel
 	s.operatorWake = wake
@@ -88,11 +97,14 @@ func (s *Service) StartOperator(ctx context.Context) {
 		})
 	}
 
-	// The reaper is maintenance, not claim work, so it runs on its own slow
-	// cadence outside the driver pool. It shares the driver lifecycle: one
-	// goroutine per process, stopped by StopOperator.
+	// The reaper is maintenance, not claim work, so it runs outside the driver
+	// pool on cadences of its own. It shares the driver lifecycle: one goroutine
+	// per pass per process, stopped by StopOperator.
 	s.recoveryWg.Go(func() {
-		s.strandedReaperLoop(driverCtx, stop, reaperEvery)
+		s.reaperLoop(driverCtx, stop, reaperEvery, "stranded rows", s.runStrandedReaperPass)
+	})
+	s.recoveryWg.Go(func() {
+		s.reaperLoop(driverCtx, stop, expiryEvery, "retryable expiry", s.runRetryableExpiryPass)
 	})
 
 	// The fan-out cap only means something relative to the pool it bounds, and
@@ -103,7 +115,8 @@ func (s *Service) StartOperator(ctx context.Context) {
 		"drivers", driverCount,
 		"max_drivers_per_apply", storage.BuildOptions(storage.WithMaxDriversPerApply(s.config.MaxDriversPerApply)).MaxDriversPerApply,
 		"interval", s.operatorPollInterval,
-		"stranded_reaper_interval", reaperEvery)
+		"stranded_reaper_interval", reaperEvery,
+		"retryable_expiry_interval", expiryEvery)
 }
 
 // StopOperator stops the background operator and waits for all drivers to finish.
@@ -590,8 +603,8 @@ func (s *Service) driveTick(ctx context.Context, driverID int) {
 	metrics.RecordRecoveredPanic(ctx, "operator_tick")
 }
 
-// logClaimFailure reports a failed claim or maintenance pass, separating the
-// two ways a rung of the ladder fails. A pass cut short by shutdown is a
+// logClaimFailure reports a failed claim, separating the two ways a rung of the
+// ladder fails. A pass cut short by shutdown is a
 // routine deploy: the driver context is cancelled between polls, so whichever
 // rung was mid-query reports it and the rungs behind it report the same
 // cancellation moments later, while a successor driver reclaims all of it. Like
@@ -616,49 +629,6 @@ func (s *Service) logClaimFailure(ctx context.Context, msg, reason string, attrs
 	}
 	s.logger.Error(msg, attrs...)
 	metrics.RecordOperatorClaimFailure(ctx, reason)
-}
-
-// expireRetryableApplies runs the retryable-apply expiry maintenance pass,
-// terminalizing failed_retryable applies that have exhausted their attempts or
-// freshness window. It is best-effort: a storage error is logged and recorded
-// but not returned, so the caller can still claim new work in the same tick.
-func (s *Service) expireRetryableApplies(ctx context.Context, driverID int) {
-	expired, err := s.storage.Applies().ExpireRetryable(ctx)
-	if err != nil {
-		s.logClaimFailure(ctx, "operator: failed to expire retryable applies", "expire_retryable_error",
-			"driver", driverID, "error", err)
-		return
-	}
-	for _, expiration := range expired {
-		apply := expiration.Apply
-		s.logger.Error("operator: retryable apply expired",
-			append(apply.LogAttrs(),
-				"driver", driverID,
-				"attempt", apply.Attempt,
-				"reason", expiration.Reason)...)
-		metrics.RecordOperatorResumeFailure(ctx, apply.Database, apply.Deployment, apply.Environment, string(expiration.Reason))
-		s.logApplyExpiration(ctx, apply, expiration.Reason)
-	}
-}
-
-// logApplyExpiration appends a durable apply log entry recording that operator
-// recovery gave up on the apply. Expiry is what makes a retryable failure
-// permanent, so without it the apply log ends on the last paused attempt and an
-// operator reading the CLI or the PR summary sees the apply reach a terminal
-// state with nothing stating why. Best-effort: a failed append must not stop
-// the driver from expiring the remaining applies.
-func (s *Service) logApplyExpiration(ctx context.Context, apply *storage.Apply, reason storage.RetryableExpirationReason) {
-	s.appendApplyLog(ctx, s.logger, &storage.ApplyLog{
-		ApplyID:   apply.ID,
-		Level:     storage.LogLevelError,
-		EventType: storage.LogEventError,
-		Source:    storage.LogSourceSchemaBot,
-		Message: fmt.Sprintf("Operator recovery gave up on the apply after %d of %d attempts (%s); it will not be retried automatically",
-			apply.Attempt, storage.MaxRecoveryAttempts, reason),
-		OldState:  state.Apply.FailedRetryable,
-		NewState:  state.Apply.Failed,
-		CreatedAt: s.clock.Now(),
-	}, "why recovery stopped", apply.LogAttrs()...)
 }
 
 // appendApplyLog writes one entry to the apply's own log stream, bounded so a
@@ -697,12 +667,6 @@ func (s *Service) markDriverBusy(ctx context.Context) func() {
 // claims at most one unit — a pending-stop reconciliation, a barrier-parked
 // cutover, or an apply operation — to keep the drive loop responsive.
 func (s *Service) recoverApplies(ctx context.Context, driverID int) {
-	// Retryable-apply expiry is best-effort maintenance: run it first, but a
-	// storage failure here must not stop the driver from claiming new pending
-	// work in the same tick, or a transient expiry error would starve every
-	// queued apply behind it.
-	s.expireRetryableApplies(ctx, driverID)
-
 	owner := driverLeaseOwner(driverID)
 
 	// Service a pending stop with no claimable operation to carry it before
@@ -769,6 +733,10 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 	// Registered once here, before the branch: every drive below runs under this
 	// operation lease, and shutdown has to hand it back whichever path it took.
 	defer s.trackHeldOperationClaim(op, opLease)()
+	// Registered after the tracker so it runs first: the lease is handed back
+	// while this drive still owns it, and the tracker then deregisters a claim
+	// that is already clear.
+	defer s.releaseFinishedOperationClaim(ctx, driverID, op, opLease)
 
 	// Choose the drive mode. A single-operation apply keeps the legacy
 	// parent-lease drive byte-for-byte. A multi-operation apply — by attached
@@ -1285,6 +1253,13 @@ func (s *Service) recoverApplyOperationCutover(ctx context.Context, driverID int
 		metrics.RecordOperatorClaimFailure(ctx, "missing_operation_cutover_lease_token")
 		return true
 	}
+	// The cutover drive holds an operation lease exactly as the copy drive does,
+	// so it hands it back the same way: registered for shutdown to drain, and
+	// cleared when the drive ends so the row does not read as driven to the
+	// lease-only expiry gate. Registered after the tracker so LIFO runs the
+	// release first, while this drive still owns the lease.
+	defer s.trackHeldOperationClaim(op, opLease)()
+	defer s.releaseFinishedOperationClaim(ctx, driverID, op, opLease)
 
 	// The cutover predicate already gates to multi-operation barrier applies, but
 	// the operation-lease-only drive (and its parent-write suppression) is only
@@ -1761,6 +1736,68 @@ func (s *Service) releaseOperationClaimBeforeDrive(ctx context.Context, driverID
 	}
 	s.logger.Info("operator: released the operation lease this driver will not drive under; the operation is offered on the next poll",
 		append(op.LogAttrs(), "driver", driverID)...)
+}
+
+// releaseFinishedOperationClaim clears the operation lease a drive leaves
+// behind when it ends.
+//
+// A drive that has ended is finished with the row, but its lease stays fresh
+// for a full staleness window, and for that window nothing can tell the
+// leftover apart from the lease a driver just took: same state, same shape of
+// owner, same recent heartbeat. Any reader that consults the lease to ask
+// whether a drive is in progress has to assume the pessimistic answer. Clearing
+// the lease at the point the drive actually ends makes a fresh lease mean what
+// it says.
+//
+// This runs as the drive returns rather than inside the state write, because
+// the multi-operation drive projects the parent apply's state under this same
+// operation lease after the operation reaches its own state.
+//
+// A no-op on every other way out: the store write is guarded on the ended
+// states and on this driver's lease token, so an operation a driver may still
+// resume, or one a peer has re-leased, is left alone.
+func (s *Service) releaseFinishedOperationClaim(ctx context.Context, driverID int, op *storage.ApplyOperation, opLease storage.OperationLease) {
+	// Shutdown owns the handback from the moment the drain opens. A drive
+	// returning now is one StopOperator cancelled, and its engine is still up:
+	// the halt runs after every drive has returned. Clearing the lease here
+	// would advertise the operation as undriven while this process still holds
+	// the target's lock, and with the expiry gate reading the lease alone that
+	// is enough for a peer to settle the tree mid-change. The claim stays
+	// registered instead, and releaseHeldOperationClaims hands it back after
+	// the halt, refusing any deployment that did not come down cleanly.
+	if s.claimDrainInProgress() {
+		s.logger.Debug("operator: leaving this operation's lease registered for shutdown to hand back after its engine is halted",
+			append(op.LogAttrs(), "driver", driverID)...)
+		return
+	}
+
+	// Detached from the driver context: an ordinary drive can return with its
+	// context already cancelled, and the clear is what keeps the row from
+	// deferring expiry for a staleness window.
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finishedClaimReleaseTimeout)
+	defer cancel()
+
+	released, err := s.storage.ApplyOperations().ReleaseFinishedClaim(releaseCtx, opLease)
+	if err != nil {
+		s.logger.Warn("operator: failed to clear the lease on the operation this driver finished; the leftover lease defers this apply's retryable expiry until it goes stale",
+			append(op.LogAttrs(), "driver", driverID, "error", err)...)
+		return
+	}
+	if !released {
+		s.logger.Debug("operator: no finished lease to clear for this operation; it is not in an ended state under this driver's lease",
+			append(op.LogAttrs(), "driver", driverID)...)
+		return
+	}
+	s.logger.Info("operator: cleared the lease on an operation this driver is no longer driving",
+		append(op.LogAttrs(), "driver", driverID)...)
+}
+
+// claimDrainInProgress reports whether shutdown has taken ownership of handing
+// this process's operation claims back.
+func (s *Service) claimDrainInProgress() bool {
+	s.heldOperationClaimsMu.Lock()
+	defer s.heldOperationClaimsMu.Unlock()
+	return s.heldOperationClaimsDraining
 }
 
 // releaseParentApplyClaim hands back a parent apply lease this driver acquired

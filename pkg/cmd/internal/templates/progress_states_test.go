@@ -672,6 +672,7 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 		Throttled: true,
 	})
 	assert.Contains(t, noReason, "45.00% (throttled)")
+	assert.NotContains(t, noReason, ui.ThrottleDocURL)
 	assert.NotContains(t, noReason, "ℹ️ Throttled", "no tooltip without a reason")
 
 	unknownSignal := FormatTableProgress(TableProgress{
@@ -691,6 +692,8 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 	assert.Contains(t, checksumming, "🔍 Checksumming to verify data (21.92%) (throttled)")
 	assert.Contains(t, checksumming, "ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget")
 
+	assert.NotContains(t, unknownSignal, ui.ThrottleDocURL)
+
 	notThrottled := FormatTableProgress(TableProgress{
 		TableName: "orders", ChangeType: "alter", Status: state.Apply.Running,
 		RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
@@ -703,7 +706,20 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 		RowsCopied: 100000, RowsTotal: 100000, PercentComplete: 100,
 		Throttled: true, ThrottleReason: "replica-lag 12s > 10s",
 	})
+	assert.NotContains(t, completed, ui.ThrottleDocURL)
+	assert.NotContains(t, notThrottled, ui.ThrottleDocURL)
 	assert.NotContains(t, completed, "Throttled", "a terminal table never renders a stale throttle flag")
+}
+
+// Interactive throttle hints use the same labeled terminal links as CLI lists.
+func TestFormatTableProgress_ThrottleHyperlink(t *testing.T) {
+	enableHyperlinks(t)
+	output := FormatThrottleReference([]TableProgress{{
+		TableName: "orders", ChangeType: "alter", Status: state.Apply.Running,
+		RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
+		Throttled: true, ThrottleReason: "commit-latency 120ms >= 100ms",
+	}})
+	assert.Contains(t, output, "Docs: "+ui.Link("Throttle reference", ui.ThrottleDocURL))
 }
 
 func TestFormatTableProgress_InstantDDL(t *testing.T) {
@@ -1074,4 +1090,23 @@ func TestFormatTableProgressOperatorHaltedBars(t *testing.T) {
 	})
 	assert.Contains(t, failed, "❌ Failed")
 	assert.Contains(t, failed, ui.ColorRed)
+}
+
+func TestThrottleReferenceRequiresActiveRecognizedSignal(t *testing.T) {
+	for _, status := range []string{state.Task.Running, state.Task.Checksumming} {
+		t.Run(status, func(t *testing.T) {
+			table := TableProgress{Status: status, Throttled: true, ThrottleReason: "redo-aware 4 > 3"}
+			assert.Contains(t, FormatThrottleReference([]TableProgress{table}), ui.ThrottleDocURL)
+		})
+	}
+
+	for _, table := range []TableProgress{
+		{Status: state.Task.Running, ThrottleReason: "redo-aware 4 > 3"},
+		{Status: state.Task.Running, Throttled: true, ThrottleReason: "unknown"},
+		{Status: state.Task.Running, Throttled: true},
+		{Status: state.Task.Completed, Throttled: true, ThrottleReason: "redo-aware 4 > 3"},
+		{Status: state.Task.Stopped, Throttled: true, ThrottleReason: "redo-aware 4 > 3"},
+	} {
+		assert.Empty(t, FormatThrottleReference([]TableProgress{table}))
+	}
 }
