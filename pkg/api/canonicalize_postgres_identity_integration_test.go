@@ -21,7 +21,7 @@ import (
 func startCanonicalizeStorage(t *testing.T) *sql.DB {
 	t.Helper()
 	dsn, db := testutil.StartPostgres(t, "schemabot")
-	require.NoError(t, EnsureSchema(dsn, slog.New(slog.DiscardHandler), WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, slog.New(slog.DiscardHandler), WithDialect(schema.DialectPostgres)))
 	return db
 }
 

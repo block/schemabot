@@ -119,7 +119,7 @@ func TestResyncPostgresIdentitySequences_RejectsTargetWithoutStorageTables(t *te
 // stored maximum, letting default inserts resume above the loaded ids.
 func TestResyncPostgresIdentitySequences_UnblocksDefaultInsertsAfterExplicitIDLoad(t *testing.T) {
 	dsn, db := startPostgresStorage(t)
-	require.NoError(t, EnsureSchema(dsn, slog.New(slog.DiscardHandler), WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, slog.New(slog.DiscardHandler), WithDialect(schema.DialectPostgres)))
 	logger, logs := resyncLogger(t)
 
 	insertSettingWithID(t, db, 1, "loaded-1")
@@ -153,7 +153,7 @@ func TestResyncPostgresIdentitySequences_UnblocksDefaultInsertsAfterExplicitIDLo
 // no earlier default insert to have positioned the sequence.
 func TestResyncPostgresIdentitySequences_AdvancesNeverUsedSequence(t *testing.T) {
 	dsn, db := startPostgresStorage(t)
-	require.NoError(t, EnsureSchema(dsn, slog.New(slog.DiscardHandler), WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, slog.New(slog.DiscardHandler), WithDialect(schema.DialectPostgres)))
 	logger, logs := resyncLogger(t)
 
 	insertSettingWithID(t, db, 1, "loaded-1")
@@ -177,7 +177,7 @@ func TestResyncPostgresIdentitySequences_AdvancesNeverUsedSequence(t *testing.T)
 // fresh ids rather than reusing a deleted row's id.
 func TestResyncPostgresIdentitySequences_NeverRewindsAheadSequences(t *testing.T) {
 	dsn, db := startPostgresStorage(t)
-	require.NoError(t, EnsureSchema(dsn, slog.New(slog.DiscardHandler), WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, slog.New(slog.DiscardHandler), WithDialect(schema.DialectPostgres)))
 	logger, logs := resyncLogger(t)
 
 	first, err := insertSettingDefaultID(t, db, "kept")
@@ -208,7 +208,7 @@ func TestResyncPostgresIdentitySequences_NeverRewindsAheadSequences(t *testing.T
 // parked position may be reserved deliberately as headroom.
 func TestResyncPostgresIdentitySequences_NeverRewindsParkedAheadSequence(t *testing.T) {
 	dsn, db := startPostgresStorage(t)
-	require.NoError(t, EnsureSchema(dsn, slog.New(slog.DiscardHandler), WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, slog.New(slog.DiscardHandler), WithDialect(schema.DialectPostgres)))
 	logger, logs := resyncLogger(t)
 
 	insertSettingWithID(t, db, 1, "loaded-1")
@@ -235,7 +235,7 @@ func TestResyncPostgresIdentitySequences_NeverRewindsParkedAheadSequence(t *test
 // sequence is behind its stored maximum.
 func TestResyncPostgresIdentitySequences_IgnoresForeignTables(t *testing.T) {
 	dsn, db := startPostgresStorage(t)
-	require.NoError(t, EnsureSchema(dsn, slog.New(slog.DiscardHandler), WithDialect(schema.DialectPostgres)))
+	require.NoError(t, EnsureSchema(t.Context(), dsn, slog.New(slog.DiscardHandler), WithDialect(schema.DialectPostgres)))
 	logger, logs := resyncLogger(t)
 
 	_, err := db.ExecContext(t.Context(),

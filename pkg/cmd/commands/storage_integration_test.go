@@ -24,7 +24,7 @@ import (
 func startResyncStorage(t *testing.T) (string, *sql.DB) {
 	t.Helper()
 	dsn, db := testutil.StartPostgres(t, "schemabot")
-	require.NoError(t, api.EnsureSchema(dsn, slog.New(slog.DiscardHandler), api.WithDialect(schema.DialectPostgres)))
+	require.NoError(t, api.EnsureSchema(t.Context(), dsn, slog.New(slog.DiscardHandler), api.WithDialect(schema.DialectPostgres)))
 	for id, key := range map[int64]string{1: "loaded-1", 2: "loaded-2", 3: "loaded-3"} {
 		_, err := db.ExecContext(t.Context(),
 			`INSERT INTO settings (id, setting_key, setting_value) VALUES ($1, $2, '')`, id, key)
@@ -107,7 +107,7 @@ storage:
 // carry the canonical lowercase spelling the folded lookups expect.
 func TestCanonicalizeIdentityKeysCmd_DSNFlag(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "schemabot")
-	require.NoError(t, api.EnsureSchema(dsn, slog.New(slog.DiscardHandler), api.WithDialect(schema.DialectPostgres)))
+	require.NoError(t, api.EnsureSchema(t.Context(), dsn, slog.New(slog.DiscardHandler), api.WithDialect(schema.DialectPostgres)))
 	_, err := db.ExecContext(t.Context(),
 		`INSERT INTO locks (database_name, database_type, repository, pull_request, owner)
 		 VALUES ('MyDB', 'MySQL', 'Org/Repo', 42, 'Org/Repo#42')`)
