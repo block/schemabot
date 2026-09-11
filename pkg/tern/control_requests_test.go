@@ -89,6 +89,62 @@ func TestSettlePendingRequestsForTerminalApplyFailsAnOutrunCancel(t *testing.T) 
 		logs.logs[0].Message)
 }
 
+// The settle is a conditional update on a still-pending row, and a write that
+// matches no row reports success — so a second settle must not append a second
+// disclosure. Two settles of the same outrun cancel leave one recorded outcome
+// and one apply event, rather than an operator reading the same warning twice.
+func TestSettlingAnAlreadySettledCancelRecordsNothingFurther(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-resettled-cancel",
+		Database:        "testdb",
+		Environment:     "staging",
+		State:           state.Apply.Completed,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+		{ApplyID: apply.ID, Operation: storage.ControlOperationCancel, Status: storage.ControlRequestPending, RequestedBy: "armand"},
+	}}
+	logs := &mockApplyLogStore{}
+	store := &mockStorage{controlRequests: controlRequests, logs: logs}
+
+	require.NoError(t, SettlePendingCancelForResolvedApply(t.Context(), store, discardLogger(), apply))
+	require.NoError(t, SettlePendingCancelForResolvedApply(t.Context(), store, discardLogger(), apply))
+
+	settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, storage.ControlRequestFailed, settled.Status)
+	assert.Len(t, logs.logs, 1, "the second settle found nothing pending, so it must add no further history")
+}
+
+// A drive settles the cancel it consumed only once the stored apply has
+// resolved. While the apply is still live the request stays pending, so a
+// sibling drive still has the command to deliver — settling it here would
+// answer a command that has not been carried out.
+func TestSettlePendingCancelIfStoredApplyResolvedLeavesALiveApplyAlone(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              7,
+		ApplyIdentifier: "apply-still-running",
+		Database:        "testdb",
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+		{ApplyID: apply.ID, Operation: storage.ControlOperationCancel, Status: storage.ControlRequestPending, RequestedBy: "armand"},
+	}}
+	logs := &mockApplyLogStore{}
+	store := &mockStorage{applies: &mockApplyStore{apply: apply}, controlRequests: controlRequests, logs: logs}
+
+	settled, err := settlePendingCancelIfStoredApplyResolved(t.Context(), store, discardLogger(), apply)
+
+	require.NoError(t, err)
+	assert.False(t, settled, "a live apply has not answered the cancel yet")
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.NotNil(t, pending, "the cancel stays deliverable while the apply is still running")
+	assert.Empty(t, logs.logs, "nothing was settled, so the history must not claim an outcome")
+}
+
 // An apply that settles cancelled resolved its pending cancel rather than
 // outrunning it, so the request completes and the history records that the
 // command took effect.
@@ -118,19 +174,23 @@ func TestSettlePendingRequestsForCancelledApplyCompletesTheCancel(t *testing.T) 
 }
 
 // A cancel outrun by a terminal state other than completed names that state
-// without claiming the change is live: a failed or reverted apply left nothing
-// on the target, so the reason must not tell the operator to go look for it. A
-// cancelled apply is the cancel having taken effect, and a stopped apply stays
-// cancellable, so neither outran the command.
+// without claiming the whole change is live: only a completed apply is known to
+// have landed every table, so the reason sends the operator to look at the
+// target only there. A cancelled apply is the cancel having taken effect, and a
+// stopped apply stays cancellable, so neither outran the command.
 func TestCancelOutrunReason(t *testing.T) {
 	reason := cancelOutrunReason(state.Apply.Failed)
-	assert.Equal(t, "the schema change reached failed before the cancel could take effect", reason)
+	assert.Equal(t, "the schema change reached Failed before the cancel could take effect", reason)
 	assert.NotContains(t, reason, "live on the target")
 	assert.Empty(t, cancelOutrunReason(state.Apply.Cancelled))
 	assert.Empty(t, cancelOutrunReason(state.Apply.Stopped))
 
 	assert.Equal(t, reason, cancelOutrunReason("STATE_FAILED"),
 		"a proto-form state must reach the operator in the same vocabulary as every other surface")
+
+	assert.Equal(t, "the schema change reached Retrying before the cancel could take effect",
+		cancelOutrunReason(state.Apply.FailedRetryable),
+		"the reason is prose an operator reads, so it names the state the way every other surface does rather than by its stored token")
 }
 
 // A stopped apply is terminal but remains cancellable: the sweep must complete

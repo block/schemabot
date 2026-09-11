@@ -3785,9 +3785,16 @@ func TestGRPCClient_ProcessPendingCancelReconcilesFailedRemoteWithErrorMessage(t
 	assert.True(t, standDown)
 	assert.Equal(t, state.Apply.Failed, applyStore.apply.State)
 	assert.Equal(t, "copy row chunk: disk full", applyStore.apply.ErrorMessage)
-	cancelReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, err)
-	assert.Nil(t, cancelReq)
+	assert.Nil(t, pending)
+	cancelReq, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, cancelReq)
+	assert.Equal(t, storage.ControlRequestFailed, cancelReq.Status,
+		"the remote failed before the cancel landed, so the command did not take effect")
+	assert.Contains(t, cancelReq.ErrorMessage, "before the cancel could take effect",
+		"the stored reason is what the operator reads back when they look for the command's effect")
 }
 
 func TestGRPCClient_ProcessPendingCancelProgressFailureKeepsRequestPending(t *testing.T) {

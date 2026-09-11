@@ -147,7 +147,14 @@ func cancelOutrunReason(applyState string) string {
 	case state.IsState(applyState, state.Apply.Completed):
 		return "the schema change completed before the cancel could take effect; the change is live on the target"
 	default:
-		return fmt.Sprintf("the schema change reached %s before the cancel could take effect", state.NormalizeState(applyState))
+		// The operator's own name for the state, not SchemaBot's stored token:
+		// most states store as a snake_case identifier that reads as internal
+		// spelling in the middle of an English sentence.
+		label := state.Label(state.NormalizeState(applyState))
+		if label == "" {
+			return "the schema change settled before the cancel could take effect"
+		}
+		return fmt.Sprintf("the schema change reached %s before the cancel could take effect", label)
 	}
 }
 

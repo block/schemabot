@@ -1338,6 +1338,15 @@ func (c *GRPCClient) completeRemoteCancelFromTerminalProgress(ctx context.Contex
 		logOperationDriveLeavesParentCancel(logger, apply, scope)
 		return true, nil
 	}
+	// The settle writes the apply event that tells the operator whether their
+	// cancel took effect. What it cannot say is that this outcome was recovered
+	// from the remote's progress after the Cancel call itself errored, which is
+	// the context someone triaging the failed call needs.
+	logger.InfoContext(ctx, "remote gRPC cancel error reconciled from terminal progress; settling the durable cancel request",
+		append(apply.MutableLogAttrs(),
+			"remote_apply_id", remoteID,
+			"requested_by", controlRequestCaller(controlReq),
+			"remote_state", remoteState)...)
 	if err := settlePendingCancelForTerminalApply(ctx, c.storage, c.baseLogger(), apply); err != nil {
 		return false, err
 	}
