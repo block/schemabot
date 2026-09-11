@@ -204,9 +204,14 @@ The cancel is answered from the outcome the apply settles on, never from the
 signal alone. When a cancelled initial or recovery build leaves its own invalid
 index, the drive removes it through pg-sprite's abandonment proof before
 settling the apply.
-That cleanup is detached from the already-cancelled apply context and bounded
-by the concurrent index envelope's setup headroom; it cannot spend another
-full build bound. Cleanup failure does not change the terminal `cancelled`
+That cleanup is detached from the already-cancelled apply context and runs
+under its own bound of seconds, kept well inside the cancel's settle wait so
+that a slow cleanup cannot turn a cancel that is about to succeed into a
+not-settled answer; it cannot spend another full build bound. The summary
+reports what pg-sprite's report proves: the index was removed only when an
+entry was dropped; an entry the server refuses to drop concurrently is named
+under its quarantine name for an operator to remove; an entry already gone is
+reported as such. Cleanup failure does not change the terminal `cancelled`
 outcome. When pg-sprite exposes the leftover's identity, the summary and server
 log name it; otherwise the summary names both the original and quarantine-name
 possibilities and gives the catalog query needed to identify it. The terminal

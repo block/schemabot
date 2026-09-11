@@ -81,13 +81,27 @@ const (
 	// bound the operator configured; setup that outruns the headroom shortens
 	// the build by the excess, because the ceiling then fires first and the
 	// outcome degrades to a cancellation. Nothing after the build
-	// depends on the gap: pg-sprite runs its post-failure catalog verdict on
-	// a detached context of its own, and the terminal publish reads the
-	// tracker the same way. The bound is sized to cover setup even when
-	// every one of its steps runs to the server-side limit the pool sets
-	// for it — the connect timeout for the dial, the statement_timeout for
-	// each preflight read.
+	// charges the gap: pg-sprite runs its post-failure catalog verdict on
+	// a detached context of its own, the cleanup of an operator-cancelled
+	// build runs detached under cancelledIndexCleanupBound, and the terminal
+	// publish reads the tracker the same way. The bound is sized to cover
+	// setup even when every one of its steps runs to the server-side limit
+	// the pool sets for it — the connect timeout for the dial, the
+	// statement_timeout for each preflight read.
 	concurrentIndexHeadroom = 2 * time.Minute
+
+	// cancelledIndexCleanupBound is the whole budget for removing the
+	// invalid index an operator-cancelled build left behind. The cleanup
+	// runs after the apply context is cancelled and before the terminal
+	// outcome is published, so Cancel's settle wait spans it: the bound
+	// must stay well inside cancelSettleTimeout, or a slow cleanup would
+	// turn a cancel that is about to succeed into a not-settled answer.
+	// The work it covers is a session dial, catalog reads, and the
+	// abandonment proof and drop, each of which pg-sprite runs under its
+	// own short lock timeout, so the bound is seconds; when it is spent the
+	// entry stays for the invalid-index recovery guidance and the apply
+	// still settles cancelled.
+	cancelledIndexCleanupBound = 30 * time.Second
 )
 
 type nativeApply struct {
@@ -1249,10 +1263,10 @@ func cleanupCancelledConcurrentIndex(ctx context.Context, pool *pgxpool.Pool, ch
 	}
 	// Cancellation ends the build context, but removing the invalid catalog
 	// entry is part of settling the operator's request. Detach that cleanup
-	// from the cancelled apply and give it only the concurrent apply's setup
-	// headroom: dropping debris must not consume another full build bound or
-	// hold the terminal outcome open indefinitely.
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), concurrentIndexHeadroom)
+	// from the cancelled apply and bound it on its own: dropping debris must
+	// not consume another full build bound or hold the terminal outcome
+	// open past the cancel's settle wait.
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cancelledIndexCleanupBound)
 	defer cancel()
 	report, cleanupErr := concurrentIndex.drop(cleanupCtx, pool, change.sql,
 		executor.ConcurrentBudget{CallerOwned: true})
@@ -1267,11 +1281,28 @@ func cleanupCancelledConcurrentIndex(ctx context.Context, pool *pgxpool.Pool, ch
 			"index_schema", existing.Schema, "index", existing.Index, "error", cleanupErr)
 		return &cancelledIndexCleanupError{verdict: invalidErr, existing: existing, identityUncertain: existing == invalidErr}
 	}
-	logger.Info("PostgreSQL operator cancel removed the invalid index left by the concurrent build",
-		"namespace", change.namespace, "table", change.table,
-		"index_schema", invalidErr.Schema, "index", invalidErr.Index,
-		"dropped", len(report.Dropped), "skipped", len(report.Skipped), "duration", report.Duration)
-	return &cancelledIndexCleanupError{verdict: invalidErr, removed: true}
+	// A clean return is not proof of a removal: the sweep steps over an
+	// entry the server refuses to drop concurrently and reports it skipped,
+	// and an entry already gone drops nothing. Only the report says what
+	// happened, and the summary claims exactly that.
+	outcome := &cancelledIndexCleanupError{verdict: invalidErr, cleaned: true, dropped: report.Dropped, skipped: report.Skipped}
+	switch {
+	case len(report.Dropped) > 0:
+		logger.Info("PostgreSQL operator cancel removed the invalid index left by the concurrent build",
+			"namespace", change.namespace, "table", change.table,
+			"index_schema", invalidErr.Schema, "index", invalidErr.Index,
+			"dropped", len(report.Dropped), "skipped", len(report.Skipped), "duration", report.Duration)
+	case len(report.Skipped) > 0:
+		logger.Warn("PostgreSQL operator cancel could not drop the invalid index left by the concurrent build concurrently; it stays quarantined for an operator to remove",
+			"namespace", change.namespace, "table", change.table,
+			"index_schema", invalidErr.Schema, "index", invalidErr.Index,
+			"skipped", len(report.Skipped), "duration", report.Duration)
+	default:
+		logger.Info("PostgreSQL operator cancel found the invalid index left by the concurrent build already gone",
+			"namespace", change.namespace, "table", change.table,
+			"index_schema", invalidErr.Schema, "index", invalidErr.Index, "duration", report.Duration)
+	}
+	return outcome
 }
 
 func cancelledBuildLeftOwnIndex(change nativeApply, err error, invalidErr *executor.InvalidIndexError) bool {
@@ -1293,14 +1324,18 @@ func cancelledBuildMayHaveLeftIndex(code executor.Code) bool {
 }
 
 // cancelledIndexCleanupError keeps the executor's cancellation and invalid
-// index verdict reachable while recording whether the bounded cleanup removed
-// the entry. Cleanup failure is deliberately not its cause: cancellation stays
+// index verdict reachable while recording what the bounded cleanup did with
+// the entry: when the cleanup ran to completion, dropped and skipped are the
+// executor's own account of it, and the summary claims no more than they
+// prove. Cleanup failure is deliberately not its cause: cancellation stays
 // the apply outcome, while the server log carries the cleanup error.
 type cancelledIndexCleanupError struct {
 	verdict           *executor.InvalidIndexError
 	existing          *executor.InvalidIndexError
-	removed           bool
 	identityUncertain bool
+	cleaned           bool
+	dropped           []executor.DroppedIndex
+	skipped           []executor.QuarantinedIndex
 }
 
 func (e *cancelledIndexCleanupError) Error() string { return e.verdict.Error() }
@@ -1312,14 +1347,35 @@ func cancelledIndexCleanupDetail(err error) string {
 		return ""
 	}
 	name := fmt.Sprintf("%q.%q", cleanup.verdict.Schema, cleanup.verdict.Index)
-	if cleanup.removed {
-		return sanitizeReasonText(fmt.Sprintf("Concurrent index build cancelled; invalid index %s was removed", name))
+	if cleanup.cleaned {
+		return sanitizeReasonText(cleanedIndexDetail(name, cleanup.dropped, cleanup.skipped))
 	}
 	if cleanup.existing != nil && !cleanup.identityUncertain {
 		name = fmt.Sprintf("%q.%q", cleanup.existing.Schema, cleanup.existing.Index)
 		return sanitizeReasonText(fmt.Sprintf("Concurrent index build cancelled; invalid index %s remains until an operator removes it; see the PostgreSQL invalid-index recovery guidance", name))
 	}
 	return sanitizeReasonText(fmt.Sprintf("Concurrent index build cancelled; the invalid index remains under %s or an identity-derived pgsprite_abandoned_<oid> name; query pg_index joined to pg_class for invalid indexes on the table, then follow the PostgreSQL invalid-index recovery guidance", name))
+}
+
+// cleanedIndexDetail words a completed cleanup from the executor's report: a
+// removal only when an entry was dropped; the quarantine names when the
+// server refused to drop the entry concurrently and the sweep stepped over
+// it, since that is where an operator finds it; and an already-gone entry
+// when the cleanup found nothing to remove.
+func cleanedIndexDetail(name string, dropped []executor.DroppedIndex, skipped []executor.QuarantinedIndex) string {
+	switch {
+	case len(dropped) > 0:
+		return fmt.Sprintf("Concurrent index build cancelled; invalid index %s was removed", name)
+	case len(skipped) > 0:
+		quarantined := make([]string, 0, len(skipped))
+		for _, entry := range skipped {
+			quarantined = append(quarantined, fmt.Sprintf("%q.%q", entry.Schema, entry.Index))
+		}
+		return fmt.Sprintf("Concurrent index build cancelled; invalid index %s remains quarantined as %s because the server refuses to drop it concurrently; an operator must remove it, see the PostgreSQL invalid-index recovery guidance",
+			name, strings.Join(quarantined, ", "))
+	default:
+		return fmt.Sprintf("Concurrent index build cancelled; invalid index %s was already gone when the cleanup ran", name)
+	}
 }
 
 // abandonedBeforeBuild reports whether an invalid-index verdict is one the
