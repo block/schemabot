@@ -78,6 +78,19 @@ func TestStorageSchemaTargetFlags_Validate(t *testing.T) {
 	}
 }
 
+// A diff names the schema it compares the database against, and refuses before
+// it reads anything when the operator did not. The report would say which
+// schema it used either way; the point of refusing is that the operator has
+// already decided by the time they read it.
+func TestStorageDiffCmd_RequiresADesiredSchema(t *testing.T) {
+	cmd := &StorageDiffCmd{
+		storageSchemaTargetFlags: storageSchemaTargetFlags{DSN: "root@tcp(127.0.0.1:3306)/schemabot"},
+	}
+	err := cmd.Run(t.Context(), &Globals{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "name the schema to diff the live database against")
+}
+
 // Naming a DSN source is what selects the direct path, so a command can tell
 // which path it is on without inspecting what happened to resolve.
 func TestStorageSchemaTargetFlags_Direct(t *testing.T) {
@@ -311,7 +324,9 @@ func TestRenderStorageSchemaReport_ManualSection(t *testing.T) {
 func TestStorageSchemaDiffHints(t *testing.T) {
 	report := &apitypes.StorageSchemaReport{Database: "schemabot", Dialect: "mysql"}
 
-	local := storageSchemaDiffHints(&StorageDiffCmd{}, report)
+	local := storageSchemaDiffHints(&StorageDiffCmd{
+		storageSchemaSourceFlags: storageSchemaSourceFlags{Embedded: true},
+	}, report)
 	require.Len(t, local, 1)
 	assert.Contains(t, local[0], "storage apply")
 	assert.NotContains(t, local[0], "--deployment")

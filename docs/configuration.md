@@ -660,7 +660,7 @@ a MySQL-format DSN and is only supported with the `mysql` storage dialect;
 combining it with `postgres` fails config validation. (This restriction is
 specific to the storage database — `dsn_from` on a `target_resolver` target
 supports both `mysql` and `postgres`.) See
-[Storage Schema Changes](#storage-schema-changes) for how schema
+[docs/storage-schema.md](storage-schema.md) for how schema
 bootstrapping differs between the two dialects.
 
 ### PostgreSQL storage needs a session-per-connection endpoint
@@ -900,138 +900,27 @@ Helm chart, mount the certificate secret with `extraVolumes` /
 ## Storage Schema Changes
 
 SchemaBot's internal storage schema is self-bootstrapping: on every startup,
-`EnsureSchema` converges the live storage database against the embedded schema
-files before the server accepts traffic. How far that convergence goes depends
-on the storage dialect:
+`EnsureSchema` converges the live storage database against the schema files
+embedded in the binary, before the server accepts traffic. Operators never apply
+storage DDL by hand, and there is no schema directory to point the server at.
 
-- **MySQL** diffs the embedded schema files against the live database and
-  applies whatever DDL is needed (via Spirit) — new tables, new columns, and
-  index changes all converge automatically. That convergence is bounded by a
-  hard five-minute startup budget, and an index added to an existing table
-  runs as Spirit online DDL — a table copy, not an in-place build — so its
-  cost grows with the table's row count. On a deployment whose storage
-  tables carry a long history, create a newly declared index by hand before
-  rolling out: the startup diff then finds nothing to do, instead of copying
-  the table inside the budget on every pod.
-- **PostgreSQL** automatically creates missing tables, columns, and standalone
-  indexes. It discovers drift before taking the bootstrap advisory lock, then
-  re-checks and applies each table's changes transactionally under that lock.
-  A missing column converges automatically only when the `ADD COLUMN` is
-  metadata-only. A missing `NOT NULL` column without a `DEFAULT`, a generated
-  or identity column, a `UNIQUE` column, a `REFERENCES` column with a
-  `DEFAULT`, or a column with a constraint shape not explicitly classified as
-  safe fails startup with instructions for manual remediation: generated and
-  identity columns rewrite the populated table, `UNIQUE` builds a unique
-  index over it, and a foreign key with a `DEFAULT` validates every existing
-  row against the referenced table — all under an exclusive lock whose hold
-  time the startup lock timeout does not bound. Startup also fails when
-  additive DDL cannot be parsed or executed, or when re-verification finds
-  unresolved drift.
+**[docs/storage-schema.md](storage-schema.md) is the operator guide** — how the
+convergence works on each dialect, what it refuses, the `storage diff` and
+`storage apply` commands, and what to do when a deploy or a pod start does not
+converge. Every SchemaBot operator should read at least its first three
+sections. This section covers only the settings.
 
-  A live index only counts as present when PostgreSQL reports it valid.
-  PostgreSQL marks an index invalid both while a `CREATE INDEX CONCURRENTLY`
-  is still building it and after one fails part-way — a unique build that
-  hits duplicate keys, a cancelled session — and in either case the planner
-  never uses it. Startup fails closed naming that index rather than reading
-  it as converged or colliding with it on a fresh `CREATE INDEX`, and reads
-  `pg_stat_progress_create_index` to say which situation it is. When a build
-  is in progress — the expected state while an operator pre-creates an index
-  ahead of a release — the error says so and asks for nothing; the pod
-  restarts on its backoff and starts cleanly once the build completes. When
-  no build is visible, the error treats the index as a failed build: remove
-  the cause first — a unique build keeps failing while duplicate keys
-  remain — then drop the index so the next startup recreates it, or
-  `REINDEX INDEX CONCURRENTLY` it by hand. That view only shows other roles'
-  sessions to a caller with `pg_read_all_stats`, so if the storage role
-  lacks it and the build runs under a different role, confirm from a
-  privileged session that no build is running before recovering. A
-  non-unique index under a name the embedded schema requires to be unique
-  fails startup the same way. Every such problem across every table is named
-  in the one startup error, and no DDL runs until all of them are resolved.
+### `allow_destructive_schema_changes`
 
-  Convergence is additive-only: extra columns and indexes remain in place for
-  binary rollback, and `allow_destructive_schema_changes` has no effect because
-  this flow never produces destructive DDL. Column verification remains
-  presence-only, so type, length, and nullability drift is outside its scope and
-  is not detected.
-
-  Indexes added to an embedded schema file after a database was bootstrapped
-  converge on the next startup as plain `CREATE INDEX` statements, each in
-  its own transaction under the bootstrap advisory lock. A plain
-  `CREATE INDEX` holds a `SHARE` lock on the table for the full build and
-  blocks writes to it, and the startup budget is the build's only duration
-  ceiling, so on a deployment whose storage tables carry a long history,
-  pre-create the index by hand before rolling out — the startup diff then
-  finds it present and skips the build. The indexes below are the ones a
-  long-lived database is most likely to be missing.
-
-  A database bootstrapped before `idx_plans_created_at` was added to `plans`
-  needs:
-
-  ```sql
-  CREATE INDEX idx_plans_created_at ON plans (created_at);
-  ```
-
-  Without it, listing recent plans is a sequential scan plus a top-N sort,
-  which gets slower as plan history grows. Likewise, one bootstrapped before
-  the driver claim ordering on `apply_operations` was indexed needs:
-
-  ```sql
-  CREATE INDEX idx_apply_operations_created_id ON apply_operations (created_at, id);
-  ```
-
-  Without it, every driver claim sorts the full claimable set before taking
-  one row, which slows claiming as apply history grows. One bootstrapped
-  before refused applies started naming the schema change holding the
-  database needs:
-
-  ```sql
-  CREATE INDEX idx_apply_operations_external_id ON apply_operations (external_id);
-  ```
-
-  Without it, resolving the holding change behind a refused apply scans the
-  full operation history for one remote identifier. On PostgreSQL the lookup
-  is an optimization, never load-bearing: the refusal still reads correctly,
-  it just gets slower to record as apply history grows. On MySQL the same
-  index is not optional — `EnsureSchema` applies it as a startup `ALTER`
-  under the budget described in the MySQL bullet above, and `apply_operations`
-  grows with total apply history, so large deployments should pre-create it
-  there too. And one bootstrapped before the webhook inbox claim ordering on
-  `webhook_events` was indexed needs:
-
-  ```sql
-  CREATE INDEX idx_webhook_events_created_id ON webhook_events (created_at, id);
-  ```
-
-  Without it, every webhook claim sorts the full claimable inbox before
-  taking one row, which slows claiming as delivery history grows. On MySQL
-  the same index arrives as a startup `ALTER` under the budget described in
-  the MySQL bullet above, and `webhook_events` grows with total delivery
-  history and has no retention sweep, so pre-create it there before rolling
-  out:
-
-  ```sql
-  ALTER TABLE `webhook_events` ADD INDEX `idx_created_id` (`created_at`, `id`);
-  ```
-
-The rest of this section describes the MySQL flow.
-
-By default, destructive statements in that diff — `DROP TABLE`, or an
-`ALTER TABLE` containing `DROP COLUMN` — are refused and skipped. A mixed
-`ALTER TABLE` is split: its additive clauses still execute and only the
-destructive clauses are refused, except that a clause which cannot run
-without a refused clause (the `ADD PRIMARY KEY` half of a primary-key change)
-is refused with it. The remaining non-destructive statements still apply and
-startup proceeds. This protects
-against rolling deploys and rollbacks: a pod running an older binary sees a
-newer binary's tables and columns as surplus, and without the gate would drop
-them (destroying data the newer pods depend on). Each refused statement is
-logged at warn level with the exact DDL, and counted in the
+On MySQL, destructive statements in the startup diff — `DROP TABLE`, or an
+`ALTER TABLE` containing `DROP COLUMN` — are refused and skipped by default,
+because a pod running an older binary sees a newer binary's tables and columns
+as surplus and would otherwise drop data the newer pods depend on. Each refusal
+is logged at warn level with the exact DDL and counted in the
 `schemabot.storage_schema.destructive_refusals_total` metric.
 
-To intentionally remove a storage table or column, first make sure every
-running pod is on a binary whose embedded schema no longer declares it, then
-opt in:
+To intentionally remove a storage table or column, first make sure every running
+pod is on a binary whose embedded schema no longer declares it, then opt in:
 
 ```yaml
 storage:
@@ -1040,248 +929,12 @@ storage:
 ```
 
 Leave the flag false during normal operation and revert it after the removal
-converges.
+converges. `--allow-destructive` on `schemabot storage apply` opts in for one
+invocation instead; it widens this policy and never narrows it.
 
-### Ask what storage DDL is outstanding
-
-A deploy that did not converge leaves one question open: which storage DDL is
-still outstanding. Two commands answer it, and both read the live storage
-database. A release tag never stands in for that read: what a release would
-converge to and what the storage actually converged to differ exactly when a
-deploy has failed.
-
-`storage diff` is read-only. It takes no lock and holds no transaction, so it
-is safe at any time, including against production during an incident.
-
-```console
-$ schemabot storage diff
-schemabot on db-1.example (mysql) needs 3 statements: 3 outstanding, against the schema embedded in v1.2.3.
-
-Outstanding, and run automatically on the next boot or apply (3):
-
-ALTER TABLE `applies` ADD COLUMN `driver_note` varchar(255) NOT NULL DEFAULT '' AFTER `lease_owner`;
-ALTER TABLE `checks` ADD COLUMN `blocked_reason` varchar(64) NOT NULL DEFAULT '' AFTER `state`;
-CREATE TABLE `check_gate_audit` (
-  `id` BIGINT UNSIGNED AUTO_INCREMENT,
-  `check_id` BIGINT UNSIGNED NOT NULL,
-  PRIMARY KEY (`id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
-
-Converge it with: schemabot storage apply
-```
-
-The statements are printed bare and one per line so a whole section can be
-pasted into a client as it stands. The exit status is the machine-readable half
-of the answer: `0` when the storage needs nothing, `2` when statements are
-outstanding, and `1` when the read itself failed. A pre-deploy gate needs those
-three apart, since "converged" and "unreachable" call for opposite decisions.
-
-The headline answers the two questions that decide what the rest of the output
-means. `schemabot on db-1.example (mysql)` is the database that was read —
-reported by whoever read it, so it is not re-derived from a DSN, a config file,
-or a deployment name. `against the schema embedded in v1.2.3` is the schema it
-was compared against; [Which schema you are asking
-about](#which-schema-you-are-asking-about) is how to change that.
-
-`storage apply` converges the database by running the same bootstrap the next
-boot would run: the same differ, the same refusal of destructive statements,
-and the same advisory lock, so two operators running it at once serialize the
-way two booting pods do. It previews the statements and prompts before running
-them; `--auto-approve` (`-y`) skips the prompt for scripted maintenance.
-
-```console
-$ schemabot storage apply
-schemabot on db-1.example (mysql) needs 1 statement: 1 outstanding, against the schema embedded in v1.2.3.
-
-Outstanding, and run automatically on the next boot or apply (1):
-
-ALTER TABLE `applies` ADD COLUMN `driver_note` varchar(255) NOT NULL DEFAULT '' AFTER `lease_owner`;
-
-Run these statements against schemabot on db-1.example (mysql)? Only 'yes' will be accepted: yes
-Ran 1 statement against schemabot on db-1.example (mysql).
-schemabot on db-1.example (mysql) is converged.
-```
-
-Destructive statements are refused here exactly as they are at startup, and for
-the same reason: a binary older than the storage sees the newer schema's tables
-as surplus. A refusal is reported rather than silently dropped, and
-`--allow-destructive` opts in per invocation, widening the deployment's standing
-`allow_destructive_schema_changes` policy without ever narrowing it.
-
-```console
-$ schemabot storage diff
-schemabot on db-1.example (mysql) needs 1 statement: 1 destructive, against the schema embedded in v1.2.3.
-
-Destructive, and refused; surplus state stays in place (1):
-
--- check_gate_audit: DROP TABLE destroys data
-DROP TABLE `check_gate_audit`;
-
-Converge it with: schemabot storage apply
-```
-
-### Reach the right storage database
-
-Both commands take a target, and which path applies is stated rather than
-discovered. Nothing falls back from one to the other: a deployment that cannot
-be reached through the API is an error naming the deployment, never a report
-about a different database that happened to be reachable.
-
-| Target | Reads |
-|---|---|
-| no flags | the storage of the server the CLI is pointed at |
-| `--deployment <name> -e <environment>` | that data plane's own storage, over the gRPC connection that already exists between the two |
-| `--dsn <dsn>` or `--config <file>` | the storage database this workstation opens itself |
-
-A data plane owns its storage database and generally sits where a workstation
-cannot dial it, so `--deployment` routes through the control plane: the control
-plane asks the data plane, and the data plane reads its own storage with its own
-embedded schema files. That is also what makes the answer trustworthy, since the
-binary that reports the diff is the binary whose next boot would run it.
-
-The direct path exists for when the server is down, including when it is down
-because its own schema bootstrap is failing. `--dialect` states the storage
-family when a DSN's form does not say; it applies only to a direct connection.
-
-Both routes are admin-only and both sit at the write tier, the read-only diff
-included, because the diff exposes the internal shape of SchemaBot's bookkeeping
-database. Both are `POST` requests, so they take the write tier by the default
-rule rather than by an exception. See [Authentication and
-authorization](auth.md#what-read-and-write-access-include).
-
-### Which schema you are asking about
-
-The live side of the diff is always a read of the database. The desired side is
-schema *files*, and three things can supply them:
-
-| Desired schema | Where the files come from |
-|---|---|
-| no flag | the embedded files of the binary that answers the request |
-| `--schema-dir <path>` | that directory's `.sql` files, read by the CLI |
-| `--release <tag>` | that tag's `pkg/schema/<dialect>/` files, fetched by the CLI |
-
-With no flag, the answer describes the release that is **currently running**:
-the files are compiled in (`go:embed` over `pkg/schema/mysql/` and
-`pkg/schema/postgres/`), so through the API it is the server or data plane that
-answered, and on the direct path it is the CLI binary you are running. That is
-the right default — it is what the next boot would converge — and it is the
-wrong question before a roll, when the running release reports convergence while
-the release about to deploy still has work to do.
-
-`--release` asks that question without a binary of that release:
-
-```console
-$ schemabot storage diff --deployment west -e production --release v1.4.0
-schemabot on db-1.example (mysql), deployment west in production needs 1 statement: 1 outstanding, against the schema files of release v1.4.0 in block/schemabot.
-
-Outstanding, and run automatically on the next boot or apply (1):
-
-ALTER TABLE `applies` ADD COLUMN `driver_note` varchar(255) NOT NULL DEFAULT '' AFTER `lease_owner`;
-
-These are what schemabot on db-1.example (mysql), deployment west in production needs in order to match the schema files of release v1.4.0 in block/schemabot, not what its own next boot would run. To converge them, run that release's binary against this database — its container image is that release — or let the release's first boot converge them.
-```
-
-Because the storage schema is declarative, one diff against the release you are
-rolling to covers however many releases lie between; there is nothing to step
-through.
-
-The report names the schema it used, always, and never relabels a schema you
-supplied as the answering binary's own. That line is the difference between two
-correct reports about the same database, so read it before acting on the
-statements.
-
-Details of the two selectors:
-
-- **`--schema-dir <path>`** reads `*.sql` directly from a checkout or an
-  extracted image layer, one file per storage table. Point it at the dialect
-  directory (`pkg/schema/mysql`), not at its parent. A directory with no `.sql`
-  files is an error naming the path — a diff against an empty schema would
-  report every existing table as surplus.
-- **`--release <tag>`** fetches the files over the repository's contents API at
-  that tag. It reads the schema directory for the dialect the *live storage*
-  runs, which it learns by first asking the target — one extra read-only diff,
-  paid only by this flag. `--release-repo` points at a fork or mirror
-  (`block/schemabot` by default), `GITHUB_API_URL` at a different API host, and
-  `GITHUB_TOKEN` or `GH_TOKEN` authorizes the fetch. A repository the CLI cannot
-  read is an error naming the token to set and `--schema-dir` as the offline
-  alternative. Naming both selectors is refused rather than resolved by
-  precedence.
-
-`storage apply` has neither flag. A convergence runs the schema embedded in the
-binary running it, so that it does exactly what that binary's next boot would
-do — the property that makes it usable as a pre-deploy step at all, and the one
-that keeps an older binary from being handed newer schema to destroy. Passing
-either flag to `apply` is refused with the two real ways to converge a release:
-run that release's binary, or let its first boot do it.
-
-### Deploying a release that changes the storage schema
-
-Every startup converges the storage schema on its own, so the routine case
-needs none of this. Reach for the commands when the release notes name a
-storage schema change, when the tables involved carry a long history, or when a
-pod is not starting.
-
-1. **Before the roll, ask the new release what it will run.** Name the release
-   being deployed, from whatever CLI you have to hand:
-
-   ```bash
-   schemabot storage diff --deployment west -e production --release v1.4.0
-   ```
-
-   Exit status 0 means that release's boot has nothing to do and the rest of
-   this does not apply. A binary of the new release answers the same question
-   with no flag, which is what to use where the tag cannot be fetched:
-
-   ```bash
-   schemabot storage diff --dsn "$STORAGE_DSN"    # run from the new release's binary
-   ```
-
-2. **Decide whether the boot should do it.** Additive DDL inside the
-   five-minute startup budget is fine when the tables are small. It is not fine
-   when they are not: on MySQL an index added to an existing storage table runs
-   as Spirit online DDL, a table copy whose cost grows with row count, and every
-   pod in the roll pays it. Converge once, ahead of the roll, instead:
-
-   ```bash
-   schemabot storage apply --dsn "$STORAGE_DSN"   # from the new release's binary
-   ```
-
-   The convergence has to come from a binary of the new release: `apply` runs the
-   schema embedded in whatever binary runs it, and there is no flag that points
-   it at a release's files. Use that release's container image as a one-shot job
-   if there is no binary to hand.
-
-3. **If you converged ahead of the roll, re-check right before it.** A table or
-   a column you created early survives a boot of the current release, because
-   dropping one is destructive and is refused. **An index does not.** Dropping
-   an index destroys no data, so it falls outside that refusal, and any boot of
-   the still-running older release converges the new index away without
-   comment — a pod restart, a scale-up, a health-check replacement. Re-run the
-   step 1 diff immediately before rolling, and treat a long gap between
-   pre-creating an index and deploying as a gap the index probably did not
-   survive.
-
-4. **After the roll, confirm through the API, per deployment.**
-
-   ```bash
-   schemabot storage diff                                  # this server's storage
-   schemabot storage diff --deployment west -e production  # a data plane's storage
-   ```
-
-   Now the running binary is the new release, so exit status 0 is the
-   confirmation that its storage converged.
-
-5. **If a pod is crashlooping, ask directly.** A failed storage bootstrap keeps
-   the server from accepting traffic at all, so the API cannot answer for it.
-   The direct path can, with the same binary the pod runs, and the statements it
-   prints are the ones the pod is failing on. `storage apply` from there clears
-   it under the same advisory lock the pods are contending for.
-
-During a rollback window the diff reports the newer release's tables and columns
-as refused destructive statements and exits 2. That is the expected steady state
-rather than drift: the surplus state is deliberate, and it is what lets the
-release be rolled forward again. A pre-deploy gate keyed on exit status 0 will
-flag it, which is the correct signal to pause on.
+On PostgreSQL the setting has no effect: that convergence is additive-only and
+never produces destructive DDL. See
+[What is never automatic](storage-schema.md#what-is-never-automatic).
 
 ## Support Channel
 

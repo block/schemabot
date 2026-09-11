@@ -19,30 +19,46 @@ import (
 // for the cases where resolving it is not what is under test.
 func mysqlDialect() (schema.Dialect, error) { return schema.DialectMySQL, nil }
 
-// The two schema selectors each name a complete schema, so naming both is
-// refused rather than resolved by precedence: silently preferring one would
-// answer a question the operator did not ask.
+// Exactly one schema is named. Naming several is refused rather than resolved
+// by precedence, and naming none is refused rather than resolved by default: a
+// report whose desired side the operator did not choose is the one report that
+// can be read as the opposite of what it says.
 func TestStorageSchemaSourceFlags_ValidateSource(t *testing.T) {
-	require.NoError(t, (&storageSchemaSourceFlags{}).validateSource())
+	require.NoError(t, (&storageSchemaSourceFlags{Embedded: true}).validateSource())
 	require.NoError(t, (&storageSchemaSourceFlags{SchemaDir: "./schema/mysql"}).validateSource())
 	require.NoError(t, (&storageSchemaSourceFlags{Release: "v1.4.0", Repo: defaultStorageSchemaRepo}).validateSource())
 	require.NoError(t, (&storageSchemaSourceFlags{Release: "v1.4.0", Repo: "example/mirror"}).validateSource())
 
+	unnamed := (&storageSchemaSourceFlags{}).validateSource()
+	require.Error(t, unnamed, "the desired schema has no default")
+	assert.Contains(t, unnamed.Error(), "name the schema to diff the live database against")
+	assert.Contains(t, unnamed.Error(), "--embedded")
+	assert.Contains(t, unnamed.Error(), "--release")
+	assert.Contains(t, unnamed.Error(), "--schema-dir")
+
 	err := (&storageSchemaSourceFlags{SchemaDir: "./schema/mysql", Release: "v1.4.0"}).validateSource()
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "both name a schema to diff against")
+	assert.Contains(t, err.Error(), "--schema-dir and --release each name a whole schema")
+
+	err = (&storageSchemaSourceFlags{Embedded: true, Release: "v1.4.0"}).validateSource()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--embedded and --release each name a whole schema")
 
 	err = (&storageSchemaSourceFlags{Repo: "example/mirror"}).validateSource()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "name the schema to diff the live database against")
+
+	err = (&storageSchemaSourceFlags{Embedded: true, Repo: "example/mirror"}).validateSource()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "--release-repo only applies with --release")
 }
 
-// With no selector the diff is against the schema of the binary that answers,
-// which is what a boot would converge to. Resolving that needs no files and no
-// dialect, so nothing is read and nothing is fetched.
-func TestStorageSchemaSourceFlags_ResolveDefaultsToTheAnsweringBinary(t *testing.T) {
-	desired, err := (&storageSchemaSourceFlags{}).resolve(t.Context(), func() (schema.Dialect, error) {
-		t.Fatal("the dialect must not be resolved when no schema was named")
+// --embedded is the schema of the binary that answers, which already has those
+// files: resolving it reads nothing, fetches nothing, and needs no dialect, so
+// the target is asked about its own schema rather than handed a copy of it.
+func TestStorageSchemaSourceFlags_ResolveEmbedded(t *testing.T) {
+	desired, err := (&storageSchemaSourceFlags{Embedded: true}).resolve(t.Context(), func() (schema.Dialect, error) {
+		t.Fatal("the dialect must not be resolved for the answering binary's own schema")
 		return "", nil
 	})
 	require.NoError(t, err)
@@ -222,8 +238,9 @@ func TestStorageSchemaFromRelease_SendsTheToken(t *testing.T) {
 }
 
 // A convergence runs the schema embedded in the binary running it, so the
-// diff's selectors are refused on `storage apply` — with the two ways to
+// diff's file selectors are refused on `storage apply` — with the two ways to
 // converge a release named, since that is what the operator is reaching for.
+// --embedded is not refused: it names what the convergence already does.
 func TestStorageSchemaSourceRefusal(t *testing.T) {
 	require.NoError(t, storageSchemaSourceRefusal("", ""))
 

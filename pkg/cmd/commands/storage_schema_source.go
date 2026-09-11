@@ -24,39 +24,62 @@ import (
 // question is whether the storage is ready for the release about to roll, and
 // the release about to roll is by definition not the one running.
 //
-// So the desired side is selectable, two ways, and the report always says which
-// one was used:
+// So the desired side is named, always, one of three ways, and the report
+// repeats which one was used:
 //
+//	--embedded            the schema built into the binary that answers — what
+//	                      its own next boot would converge to
 //	--schema-dir <path>   the .sql files in a directory — a checkout of the
 //	                      release, or an unreleased commit, and offline
 //	--release <tag>       the .sql files of a published tag, fetched from the
 //	                      repository
 //
-// Neither is available on `storage apply`, and that is the safety property
-// rather than an omission: a convergence runs the schema of the binary running
-// it, so "apply is what a boot does" holds by construction (AV-9). To converge
-// a release's schema, run that release's binary.
+// There is deliberately no default. A diff read without knowing which schema it
+// compared against is not a weaker answer, it is an unusable one: the same
+// database is converged against the release that is running and three
+// statements short of the release about to roll, and an operator who assumed
+// the wrong side of that either rolls into a failing bootstrap or converges
+// storage they did not mean to touch.
+//
+// Only --embedded is available on `storage apply`, and that is the safety
+// property rather than an omission: a convergence runs the schema of the binary
+// running it, so "apply is what a boot does" holds by construction (AV-9). To
+// converge a release's schema, run that release's binary.
 
-// storageSchemaSourceFlags selects the desired side of the diff. The two
+// storageSchemaSourceFlags names the desired side of the diff. The three
 // selectors are mutually exclusive: each names a complete schema, and silently
 // preferring one would answer a question the operator did not ask.
 type storageSchemaSourceFlags struct {
-	SchemaDir string `help:"Diff against the .sql files in this directory instead of the schema built into the binary that answers — a checkout of the release you are about to deploy (e.g. ./pkg/schema/mysql)" name:"schema-dir" type:"path"`
+	Embedded  bool   `help:"Diff against the schema built into the binary that answers — through the API that is the release currently running, which is what its next boot would converge to"`
+	SchemaDir string `help:"Diff against the .sql files in this directory instead — a checkout of the release you are about to deploy (e.g. ./pkg/schema/mysql)" name:"schema-dir" type:"path"`
 	Release   string `help:"Diff against the schema files of this published tag, fetched from the SchemaBot repository (e.g. v1.4.0)"`
 	Repo      string `help:"Repository to fetch --release schema files from" name:"release-repo" default:"block/schemabot"`
 }
 
-// selected reports whether the operator named a desired schema other than the
-// answering binary's own.
-func (f *storageSchemaSourceFlags) selected() bool {
+// suppliesFiles reports whether the desired schema is files the CLI carries to
+// the target, rather than the schema the answering binary already has.
+func (f *storageSchemaSourceFlags) suppliesFiles() bool {
 	return strings.TrimSpace(f.SchemaDir) != "" || strings.TrimSpace(f.Release) != ""
 }
 
-// validateSource refuses selector combinations rather than resolving them by
-// precedence.
+// validateSource requires exactly one desired schema: one named, rather than
+// several resolved by precedence, and never none resolved by default.
 func (f *storageSchemaSourceFlags) validateSource() error {
-	if strings.TrimSpace(f.SchemaDir) != "" && strings.TrimSpace(f.Release) != "" {
-		return fmt.Errorf("--schema-dir and --release both name a schema to diff against: pass one; --schema-dir reads files you already have, --release fetches a published tag")
+	named := make([]string, 0, 3)
+	if f.Embedded {
+		named = append(named, "--embedded")
+	}
+	if strings.TrimSpace(f.SchemaDir) != "" {
+		named = append(named, "--schema-dir")
+	}
+	if strings.TrimSpace(f.Release) != "" {
+		named = append(named, "--release")
+	}
+	switch {
+	case len(named) == 0:
+		return fmt.Errorf("name the schema to diff the live database against: --embedded for the schema of the binary that answers, which is what its own next boot would converge to; --release <tag> for a published release's schema files; --schema-dir <path> for a checkout's. There is no default because the answer means different things: the same storage is converged against the release that is running and short of the release about to roll")
+	case len(named) > 1:
+		return fmt.Errorf("%s each name a whole schema to diff against: pass one. --embedded is the answering binary's own, --release fetches a published tag, --schema-dir reads files you already have", strings.Join(named, " and "))
 	}
 	repo := strings.TrimSpace(f.Repo)
 	if strings.TrimSpace(f.Release) == "" && repo != "" && repo != defaultStorageSchemaRepo {
@@ -65,8 +88,10 @@ func (f *storageSchemaSourceFlags) validateSource() error {
 	return nil
 }
 
-// storageSchemaSourceRefusal refuses the diff's schema selectors on a
+// storageSchemaSourceRefusal refuses the diff's file selectors on a
 // convergence, and names the two ways to converge a release's schema instead.
+// --embedded is not refused: it is the schema a convergence runs, so naming it
+// is the operator stating what they are about to do.
 //
 // The refusal is the invariant, stated where an operator meets it. A
 // convergence runs the schema embedded in the binary running it, which is what
@@ -87,8 +112,9 @@ func storageSchemaSourceRefusal(schemaDir, release string) error {
 	return fmt.Errorf("%s cannot be used with a convergence: an apply runs the schema embedded in the binary running it, so that it converges exactly what that binary's next boot would. To converge a release's schema, run that release's binary — its container image is that release — or let the release's own first boot converge it. To see what it would do, use the same flag on `storage diff`", selector)
 }
 
-// resolve reads the desired schema the flags selected, or returns nil for the
-// answering binary's own embedded schema.
+// resolve reads the desired schema the flags named, or returns nil for
+// --embedded: the answering binary already has those files, so carrying a copy
+// of them to it would only create a way for the two to disagree.
 //
 // dialect is resolved lazily, by calling it, because only one selector needs
 // it: a release's schema files live in a per-dialect directory of the

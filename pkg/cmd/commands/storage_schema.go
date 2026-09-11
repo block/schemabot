@@ -96,10 +96,11 @@ func (f *storageSchemaTargetFlags) validate() error {
 // storage needs nothing, 2 when statements are outstanding, and 1 when the
 // read itself failed. A pre-deploy gate needs those three apart, because
 // "converged" and "unreachable" call for opposite decisions.
-// The schema it compares against defaults to the answering binary's own, and
-// --schema-dir or --release point it at another release's instead, for the
-// question a deploy actually asks: is this storage ready for the release about
-// to roll.
+//
+// The schema it compares against is always named — --embedded, --schema-dir, or
+// --release — because the question a deploy asks is whether the storage is
+// ready for the release about to roll, and that is a different question from
+// whether it matches the release now running.
 type StorageDiffCmd struct {
 	storageSchemaTargetFlags `embed:""`
 	storageSchemaSourceFlags `embed:""`
@@ -240,10 +241,15 @@ type StorageApplyCmd struct {
 	AllowDestructive         bool `help:"Permit the destructive statements the convergence would otherwise refuse; it widens the target's standing storage policy and never narrows it" name:"allow-destructive"`
 	AutoApprove              bool `short:"y" help:"Skip confirmation prompt" name:"auto-approve"`
 	JSON                     bool `help:"Output as JSON"`
-	// The diff's schema selectors are accepted here only to be refused with
-	// the reason and the alternative. An operator who has just run the diff
-	// against a release reaches for the same flags on the apply, and Kong's
-	// bare "unknown flag" would leave them guessing at whether the convergence
+	// Embedded names the one schema a convergence can run, so an operator
+	// moving from a diff to an apply can carry the flag over and have it mean
+	// what it said. It changes nothing, because there is nothing else to
+	// converge.
+	Embedded bool `help:"Converge the schema built into the binary that runs the convergence — the only schema a convergence can run; see storage diff for the others"`
+	// The diff's file selectors are accepted here only to be refused with the
+	// reason and the alternative. An operator who has just run the diff against
+	// a release reaches for the same flags on the apply, and Kong's bare
+	// "unknown flag" would leave them guessing at whether the convergence
 	// silently used a different schema.
 	SchemaDir string `hidden:"" name:"schema-dir"`
 	Release   string `hidden:""`
@@ -265,6 +271,7 @@ func (cmd *StorageApplyCmd) Run(ctx context.Context, g *Globals) error {
 	if !cmd.AutoApprove {
 		preview := &StorageDiffCmd{
 			storageSchemaTargetFlags: cmd.storageSchemaTargetFlags,
+			storageSchemaSourceFlags: storageSchemaSourceFlags{Embedded: true},
 			AllowDestructive:         cmd.AllowDestructive,
 		}
 		report, err := preview.read(ctx, g)
@@ -495,7 +502,7 @@ func storageSchemaDestructiveTitle(report *apitypes.StorageSchemaReport) string 
 // storageSchemaDiffHints names the next step for the report a diff just
 // printed, in the command form the operator invoked the CLI as.
 func storageSchemaDiffHints(cmd *StorageDiffCmd, report *apitypes.StorageSchemaReport) []string {
-	if cmd.selected() {
+	if cmd.suppliesFiles() {
 		// Naming `storage apply` here would be wrong: it converges the schema
 		// of the binary that answers, which is not the schema this report is
 		// about. The two ways to converge the release's schema are the release
