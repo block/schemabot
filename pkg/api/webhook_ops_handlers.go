@@ -19,6 +19,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/caller"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 const (
@@ -50,6 +51,70 @@ func (e *webhookOpsRequestError) Unwrap() error { return e.err }
 
 func webhookOpsRequestErrorf(format string, args ...any) error {
 	return &webhookOpsRequestError{err: fmt.Errorf(format, args...)}
+}
+
+// requireRepoFullName refuses a repository an operator endpoint could never
+// answer for. The shape is checked up front rather than left to the first thing
+// that trips over it: a repository that is not an owner/name pair is the
+// caller's mistake, and letting the installation lookup fail on it reports a
+// server error for a request that was never answerable. Every endpoint taking a
+// repository asks through here, so the same typo reads the same way on all of
+// them; the endpoints where a repository is an optional filter rather than the
+// subject decide for themselves whether it was given, and ask only then.
+func requireRepoFullName(repo string) error {
+	if repo == "" {
+		return webhookOpsRequestErrorf("repo is required")
+	}
+	if !caller.IsRepoFullName(repo) {
+		return webhookOpsRequestErrorf("repo %q is not an owner/name pair", repo)
+	}
+	return nil
+}
+
+// canonicalEnvironment folds an environment the way everything it will be
+// compared against is already folded: configured names are validated lowercase,
+// stored check rows canonicalize theirs on write and on lookup, and the Check
+// Run name is interpolated from that same folded value. An operator who types
+// "Production" is naming the environment the instance handles, not a different
+// one. Every operator endpoint taking an environment folds through here, so one
+// spelling cannot be answered on one command and refused on another.
+func canonicalEnvironment(environment string) string {
+	return storage.CanonicalKey(strings.TrimSpace(environment))
+}
+
+// canonicalRepo trims an operator-supplied repository. The owner/name shape
+// check tolerates surrounding whitespace — a trailing space lands inside the
+// name half and the pair still parses — but every use of the value afterwards
+// is an exact comparison, against a configured repository or against the one a
+// delivery names. A padded repository therefore clears the guard and then
+// matches nothing, which is the silent answer the guard exists to prevent.
+func canonicalRepo(repo string) string {
+	return strings.TrimSpace(repo)
+}
+
+// requireNarrowableEnvironment refuses an environment this instance cannot
+// narrow a checks query by.
+//
+// An instance with no configured environments publishes one check that is not
+// environment-scoped and stores one aggregate beside it, so there is no
+// environment to select: narrowing by any name looks for a Check Run that
+// instance never creates. An instance that does scope its checks refuses a name
+// it does not handle for the same reason. Either way the query would be
+// answered from a name that cannot exist — every pull request reported as
+// missing its check, and on a sweep that acts, every one of them re-planned.
+//
+// An empty environment is always allowed; it is what asks for the unscoped check.
+func requireNarrowableEnvironment(cfg *ServerConfig, environment string) error {
+	if environment == "" {
+		return nil
+	}
+	if len(cfg.AllowedEnvironments) == 0 {
+		return webhookOpsRequestErrorf("this instance publishes one check for every environment, so there is no environment to narrow to; omit the environment")
+	}
+	if !cfg.IsEnvironmentAllowed(environment) {
+		return webhookOpsRequestErrorf("environment %q is not one this instance handles", environment)
+	}
+	return nil
 }
 
 // extendWebhookOpsDeadline lifts the server-wide write timeout for a webhook
@@ -127,8 +192,8 @@ func executeChecksSynthesize(ctx context.Context, cfg *ServerConfig, backfiller 
 	if cfg == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
-	if req.Repo == "" {
-		return nil, webhookOpsRequestErrorf("repo is required")
+	if err := requireRepoFullName(req.Repo); err != nil {
+		return nil, err
 	}
 	if len(req.PRs) == 0 {
 		return nil, webhookOpsRequestErrorf("prs is required")
@@ -251,11 +316,22 @@ func (s *Service) handleChecksScan(w http.ResponseWriter, r *http.Request) {
 }
 
 func executeWebhookRedrive(ctx context.Context, cfg *ServerConfig, req WebhookRedriveRequest, logger *slog.Logger) (*WebhookRedriveResponse, error) {
+	req.Repo = canonicalRepo(req.Repo)
 	if len(req.DeliveryIDs) > 0 {
 		return executeWebhookRedriveByIDs(ctx, cfg, req, logger)
 	}
 	if req.MaxPages <= 0 {
 		return nil, webhookOpsRequestErrorf("max_pages must be positive")
+	}
+	// The repository is an optional filter here rather than the subject of the
+	// request, but a malformed one is still the caller's mistake and a costly
+	// one: it matches no delivery, so the crawl walks the whole window a page
+	// at a time, fetching every candidate's detail, and answers 200 with
+	// nothing selected — indistinguishable from a window that really is empty.
+	if req.Repo != "" {
+		if err := requireRepoFullName(req.Repo); err != nil {
+			return nil, err
+		}
 	}
 	windowStart, err := time.Parse(time.RFC3339, req.WindowStart)
 	if err != nil {
@@ -301,17 +377,16 @@ func executeChecksScan(ctx context.Context, cfg *ServerConfig, req ChecksScanReq
 	if cfg == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
-	if req.Repo == "" {
-		return nil, webhookOpsRequestErrorf("repo is required")
+	req.Repo = canonicalRepo(req.Repo)
+	if err := requireRepoFullName(req.Repo); err != nil {
+		return nil, err
 	}
 	if req.Page < 0 {
 		return nil, webhookOpsRequestErrorf("page must be non-negative")
 	}
-	// A stale or mistyped environment would otherwise scan for a check name
-	// that can never exist and report every PR as missing it; reject it as a
-	// request error instead.
-	if req.Environment != "" && !cfg.IsEnvironmentAllowed(req.Environment) {
-		return nil, webhookOpsRequestErrorf("environment %q is not one this instance handles", req.Environment)
+	req.Environment = canonicalEnvironment(req.Environment)
+	if err := requireNarrowableEnvironment(cfg, req.Environment); err != nil {
+		return nil, err
 	}
 	var updatedSince time.Time
 	if req.UpdatedSince != "" {
@@ -426,6 +501,14 @@ func executeWebhookRedriveByIDs(ctx context.Context, cfg *ServerConfig, req Webh
 	}
 	if req.DryRun {
 		return nil, webhookOpsRequestErrorf("delivery_ids redelivery has no dry run; the listing pass already reported the selection")
+	}
+	// delivery_ids names the deliveries exactly, so the crawl's filters have
+	// nothing left to narrow and this path never reads them. Refusing them is
+	// how a typo in one reads as a mistake on both shapes: honored silently
+	// here, the same malformed repository that the crawl refuses outright would
+	// answer 200 with every named delivery redelivered regardless of it.
+	if req.Repo != "" || req.PR != 0 {
+		return nil, webhookOpsRequestErrorf("delivery_ids names the deliveries to redrive, so the repo and pr filters have nothing to narrow")
 	}
 	apps, err := webhookRedriveApps(cfg, req.App)
 	if err != nil {

@@ -168,6 +168,63 @@ func TestPollTaskToCompletion_RefinesPostCopyPhases(t *testing.T) {
 	}, taskStore.states)
 }
 
+// An operator can cancel a schema change that has already cut over and is
+// holding its revert window: nothing gates the command, and the drive refuses it
+// there because only revert or skip-revert can act at that point. The refusal
+// must leave the drive exactly as it found it. Standing the drive down would
+// settle the apply stopped while the change is applied and the engine is still
+// working underneath (CO-5), and it would abandon the revert window with no
+// driver left to see it expire. The poll therefore keeps polling and the task
+// finishes on the engine's own outcome.
+func TestPollTaskToCompletion_RefusedCancelInTheRevertWindowKeepsPolling(t *testing.T) {
+	task := &storage.Task{
+		ID: 1, ApplyID: 1, TaskIdentifier: "task-1",
+		Database: "appdb", DatabaseType: storage.DatabaseTypeVitess,
+		TableName: "mutes", State: state.Task.RevertWindow,
+	}
+	apply := &storage.Apply{
+		ID: 1, ApplyIdentifier: "apply-1", Database: "appdb",
+		DatabaseType: storage.DatabaseTypeVitess, Environment: "staging",
+		State: state.Apply.Running,
+	}
+	taskStore := &stateRecordingTaskStore{
+		exactProgressTaskStore: &exactProgressTaskStore{tasks: []*storage.Task{task}},
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	}}}
+	eng := &phaseSequenceEngine{results: []*engine.ProgressResult{
+		{State: engine.StateRevertWindow},
+		{State: engine.StateCompleted},
+	}}
+	client := &LocalClient{
+		config:                   LocalConfig{Database: "appdb", Type: storage.DatabaseTypeVitess},
+		planetscaleEngine:        eng,
+		taskPollIntervalOverride: time.Millisecond,
+		storage: &exactProgressStorage{
+			tasks:           taskStore,
+			controlRequests: controlRequests,
+			logs:            &mockApplyLogStore{},
+		},
+		logger: slog.Default(),
+	}
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskContinue, action, "a refused cancel is not an operator stop, so the drive must not stand down")
+	assert.Equal(t, state.Task.Completed, task.State, "the task settles on the engine's outcome, not on the refused command")
+	assert.Equal(t, []string{state.Task.RevertWindow, state.Task.Completed}, taskStore.states,
+		"the stored task holds its revert window across the refusal and then records the engine's outcome, with no stop in between")
+	resolved, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, storage.ControlRequestFailed, resolved.Status,
+		"the refusal still resolves the durable request, so no later claim re-sends it")
+}
+
 // A drive claim that reattaches to an engine's durable checkpoint must surface
 // that in the apply timeline exactly once, even though the engine reports the
 // resume flag on every subsequent poll — so an operator reading the timeline

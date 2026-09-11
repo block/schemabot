@@ -305,9 +305,9 @@ func TestLocalClient_CancelTasklessApplyWithLostApplyLeaseSettlesOperationRow(t 
 	reloaded, err := stor.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
 	require.NotNil(t, reloaded)
-	handled, err := client.processPendingCancelControlRequest(opCtx, reloaded)
+	standDown, err := client.processPendingCancelControlRequest(opCtx, reloaded)
 	require.NoError(t, err)
-	require.True(t, handled, "the drive must consume the pending cancel")
+	require.True(t, standDown, "the drive must consume the pending cancel")
 
 	settledOp, err := stor.ApplyOperations().Get(ctx, op.ID)
 	require.NoError(t, err)
@@ -371,9 +371,9 @@ func TestLocalClient_StopTasklessApplyWithLostApplyLeaseSettlesOperationRow(t *t
 	reloaded, err := stor.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
 	require.NotNil(t, reloaded)
-	handled, err := client.processPendingStopControlRequest(opCtx, reloaded)
+	standDown, err := client.processPendingStopControlRequest(opCtx, reloaded)
 	require.NoError(t, err)
-	require.True(t, handled, "the drive must consume the pending stop")
+	require.True(t, standDown, "the drive must consume the pending stop")
 
 	settledOp, err := stor.ApplyOperations().Get(ctx, op.ID)
 	require.NoError(t, err)
