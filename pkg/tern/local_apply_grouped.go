@@ -78,11 +78,11 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		logger.Error("failed to set started_at", append(apply.MutableLogAttrs(), "error", err)...)
 	}
-	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
+	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		logger.Warn("pending stop request processing failed before grouped engine apply; current apply owner will exit for operator retry",
 			append(apply.MutableLogAttrs(), "error", err)...)
 		return
-	} else if handled {
+	} else if standDown {
 		return
 	}
 
@@ -672,11 +672,11 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	if c.driveCancelled(ctx, apply, "before a progress tick") {
 		return true
 	}
-	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
+	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 			"error", err)
 		return true
-	} else if handled {
+	} else if standDown {
 		return true
 	}
 
@@ -832,11 +832,11 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 
 	// Update all tasks with engine progress
 	c.syncAtomicTaskProgress(ctx, logger, tasks, result, newState, now, settled)
-	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
+	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		logger.Warn("pending stop request processing failed after progress sync; current apply owner will exit for operator retry",
 			"error", err)
 		return true
-	} else if handled {
+	} else if standDown {
 		return true
 	}
 	if err := c.processPendingCutoverControlRequest(ctx, apply); err != nil {
