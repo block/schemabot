@@ -121,6 +121,7 @@ Guides and reference:
 - [Safety invariants](./docs/invariants.md): Understand the guardrails behind each change
 - [Architecture](./docs/architecture.md): Follow a change from start to finish
 - [Target credential self-heal](./docs/target-credential-self-heal.md): Understand target probes and credential rotation recovery
+- [Partition-aware index builds](./docs/partitioned-parent-index-flow.md): See the decision for online indexes on partitioned PostgreSQL tables
 - [Contributing](./CONTRIBUTING.md): Come build with us
 
 ## Releases
