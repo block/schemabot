@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/url"
 	"testing"
 	"time"
 
@@ -420,6 +421,61 @@ func TestExecuteChecksSynthesizeValidation(t *testing.T) {
 	assert.Contains(t, err.Error(), "no GitHub webhook runtime")
 }
 
+// A repository that is not an owner/name pair is the caller's mistake, and it
+// reads as one on every endpoint that takes a repository. Left to the
+// installation lookup it would surface as a server error, so the same typo
+// would be a 400 on one endpoint and a 500 on the next.
+func TestRepoTakingEndpointsRefuseAMalformedRepository(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{}
+	endpoints := []struct {
+		name string
+		call func(ctx context.Context, repo string) error
+	}{
+		{"inspect", func(ctx context.Context, repo string) error {
+			store := &inspectStorage{checks: &inspectCheckStore{}, applies: &inspectApplyStore{}}
+			_, err := executeChecksInspect(ctx, cfg, store, ChecksInspectRequest{Repo: repo, PullRequest: 7}, discardLogger())
+			return err
+		}},
+		{"scan", func(ctx context.Context, repo string) error {
+			_, err := executeChecksScan(ctx, cfg, ChecksScanRequest{Repo: repo}, discardLogger())
+			return err
+		}},
+		{"synthesize", func(ctx context.Context, repo string) error {
+			_, err := executeChecksSynthesize(ctx, cfg, &fakeCheckRunBackfiller{}, ChecksSynthesizeRequest{Repo: repo, PRs: []int{1}}, discardLogger())
+			return err
+		}},
+		// The redrive crawl takes the repository as an optional filter rather
+		// than as its subject, so a malformed one matches no delivery instead
+		// of failing anything: the crawl walks the whole window and answers
+		// 200 with nothing selected, which reads exactly like a window that
+		// really is empty.
+		{"redrive", func(ctx context.Context, repo string) error {
+			redriveCfg := &ServerConfig{GitHub: GitHubConfig{AppID: "1", PrivateKey: "key"}}
+			_, err := executeWebhookRedrive(ctx, redriveCfg, WebhookRedriveRequest{
+				Repo:        repo,
+				MaxPages:    1,
+				WindowStart: "2026-01-01T00:00:00Z",
+				WindowEnd:   "2026-01-02T00:00:00Z",
+			}, discardLogger())
+			return err
+		}},
+	}
+
+	for _, endpoint := range endpoints {
+		t.Run(endpoint.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := endpoint.call(t.Context(), "acme")
+			require.Error(t, err)
+			var requestErr *webhookOpsRequestError
+			require.ErrorAs(t, err, &requestErr, "a malformed repository is a 400, not a 500")
+			assert.Contains(t, err.Error(), "owner/name pair")
+		})
+	}
+}
+
 // A stale or mistyped environment is rejected as a request error before any
 // GitHub work, rather than scanning for a check name that can never exist and
 // reporting every PR as missing it.
@@ -431,6 +487,78 @@ func TestExecuteChecksScanRejectsDisallowedEnvironment(t *testing.T) {
 	_, err := executeChecksScan(t.Context(), cfg, ChecksScanRequest{Repo: "octo/repo", Environment: "prod"}, discardLogger())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `environment "prod" is not one this instance handles`)
+}
+
+// An operator investigating one pull request reaches for the inspection and the
+// backfill scan in the same sitting, and types the environment the same way
+// into both. Configured names are lowercase, so the two commands agree on what
+// "Production" means rather than one answering and the other refusing.
+func TestChecksEndpointsAcceptAnEnvironmentHoweverItIsSpelled(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{AllowedEnvironments: []string{"staging", "production"}}
+
+	for _, endpoint := range checksEnvironmentTakingEndpoints(t, cfg) {
+		t.Run(endpoint.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Both get as far as needing a GitHub client they do not have, so
+			// what is being pinned is the refusal that does not happen.
+			err := endpoint.call(t.Context(), " Production ")
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), "is not one this instance handles")
+		})
+	}
+}
+
+// An instance with no configured environments publishes one check that is not
+// environment-scoped, so there is no environment to narrow by. Both commands
+// say so rather than searching for a check name that instance never creates —
+// which would report every open pull request as missing it, and on a sweep that
+// acts, re-plan all of them.
+func TestChecksEndpointsRefuseAnEnvironmentWhenTheInstanceScopesNoneOfItsChecks(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{}
+
+	for _, endpoint := range checksEnvironmentTakingEndpoints(t, cfg) {
+		t.Run(endpoint.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := endpoint.call(t.Context(), "production")
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "there is no environment to narrow to")
+		})
+	}
+}
+
+type checksEnvironmentEndpoint struct {
+	name string
+	call func(ctx context.Context, environment string) error
+}
+
+// checksEnvironmentTakingEndpoints is every checks endpoint an operator can
+// hand an environment to, so a rule about environments is stated once over all
+// of them instead of once per endpoint — which is how the two came to disagree.
+func checksEnvironmentTakingEndpoints(t *testing.T, cfg *ServerConfig) []checksEnvironmentEndpoint {
+	t.Helper()
+	return []checksEnvironmentEndpoint{
+		{"scan", func(ctx context.Context, environment string) error {
+			_, err := executeChecksScan(ctx, cfg, ChecksScanRequest{Repo: "octo/repo", Environment: environment}, discardLogger())
+			return err
+		}},
+		{"inspect", func(ctx context.Context, environment string) error {
+			req, err := checksInspectRequestFromQuery(url.Values{
+				"repo":         {"octo/repo"},
+				"pull_request": {"412"},
+				"environment":  {environment},
+			})
+			require.NoError(t, err)
+			store := &inspectStorage{checks: &inspectCheckStore{}, applies: &inspectApplyStore{}}
+			_, err = executeChecksInspect(ctx, cfg, store, req, discardLogger())
+			return err
+		}},
+	}
 }
 
 // Redelivery by explicit delivery IDs is a precise continuation of a prior
@@ -451,6 +579,67 @@ func TestExecuteWebhookRedriveByIDsValidation(t *testing.T) {
 	_, err = executeWebhookRedrive(t.Context(), cfg, WebhookRedriveRequest{DeliveryIDs: []int64{1}, App: "default", DryRun: true}, discardLogger())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no dry run")
+
+	// The crawl's filters have nothing to narrow once the deliveries are named
+	// outright, and this path never reads them. Honored silently, a repository
+	// the crawl refuses outright would redeliver every named delivery anyway.
+	_, err = executeWebhookRedrive(t.Context(), cfg, WebhookRedriveRequest{DeliveryIDs: []int64{1}, App: "default", Repo: "acme"}, discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "nothing to narrow")
+
+	_, err = executeWebhookRedrive(t.Context(), cfg, WebhookRedriveRequest{DeliveryIDs: []int64{1}, App: "default", PR: 412}, discardLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "nothing to narrow")
+}
+
+// The redrive repository is an optional filter: an incident redrive replays a
+// whole window across every repository, and passing no repository is how that
+// is asked for. A guard on the filter's shape must not turn into a requirement.
+func TestExecuteWebhookRedriveLeavesTheRepositoryOptional(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{GitHub: GitHubConfig{AppID: "1", PrivateKey: "key"}}
+
+	// The crawl gets as far as needing a GitHub client it cannot build from
+	// this key, so what is pinned is the refusal that does not happen first.
+	_, err := executeWebhookRedrive(t.Context(), cfg, WebhookRedriveRequest{
+		MaxPages:    1,
+		WindowStart: "2026-01-01T00:00:00Z",
+		WindowEnd:   "2026-01-02T00:00:00Z",
+	}, discardLogger())
+
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "repo is required")
+	assert.NotContains(t, err.Error(), "owner/name pair")
+}
+
+// A repository carrying surrounding whitespace clears the owner/name shape
+// check — the padding lands inside the name half — and is then compared
+// verbatim against the repository each delivery names, matching nothing. The
+// crawl would walk the whole window and answer 200 with nothing selected, which
+// reads exactly like a window that really is empty.
+func TestExecuteWebhookRedriveTrimsTheRepositoryFilter(t *testing.T) {
+	t.Parallel()
+
+	windowStart := time.Date(2026, 7, 7, 19, 40, 0, 0, time.UTC)
+	windowEnd := time.Date(2026, 7, 7, 19, 50, 0, 0, time.UTC)
+	newClient := func() *fakeWebhookRedriveDeliveryClient {
+		return &fakeWebhookRedriveDeliveryClient{
+			pages:   [][]*gh.HookDelivery{{webhookRedriveTestDelivery(101, windowEnd.Add(-time.Minute), "pull_request", "opened", "ERROR", 500)}},
+			details: map[int64]*gh.HookDelivery{101: webhookRedriveTestDeliveryDetail(101, "acme/store", 412)},
+		}
+	}
+	selectWith := func(t *testing.T, repo string) []WebhookRedriveSelection {
+		t.Helper()
+		result, err := redriveWebhookAppDeliveries(t.Context(), newClient(), "default", "", windowStart, windowEnd, 10, true, repo, 0, discardLogger())
+		require.NoError(t, err)
+		return result.Selected
+	}
+
+	assert.Empty(t, selectWith(t, " acme/store "),
+		"the filter is compared verbatim, so the padding is what makes it match nothing")
+	require.Len(t, selectWith(t, canonicalRepo(" acme/store ")), 1,
+		"trimmed, it names the repository the delivery names")
 }
 
 type fakeWebhookMissingCheckScanClient struct {
