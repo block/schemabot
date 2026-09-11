@@ -1818,6 +1818,48 @@ func revertWindowRefusalFixture(operation storage.ControlOperation) (*LocalClien
 	return client, apply, task, controlRequests
 }
 
+// cancelRequestAtTerminalObserver reads the stored cancel request at the moment
+// the terminal summary is posted, which is when that comment renders its
+// command-not-applied notice from the request.
+type cancelRequestAtTerminalObserver struct {
+	ctx      context.Context
+	requests *testControlRequestStore
+	applyID  int64
+	seen     *storage.ApplyControlRequest
+	seenErr  error
+	notified bool
+}
+
+func (o *cancelRequestAtTerminalObserver) OnProgress(*storage.Apply, []*storage.Task) {}
+func (o *cancelRequestAtTerminalObserver) OnTerminal(*storage.Apply, []*storage.Task) {
+	o.notified = true
+	o.seen, o.seenErr = o.requests.GetByOperation(o.ctx, o.applyID, storage.ControlOperationCancel)
+}
+
+// An operator can send cancel to a schema change that completes on the engine
+// before the command arrives. The apply settles completed, and the operator has
+// to learn from the summary comment that lands on their PR that the command did
+// not take effect and the change is live — so the cancel must be settled with
+// that reason before the summary is posted, not after it.
+func TestLocalClient_ACancelTheEngineOutranIsSettledBeforeTheTerminalSummary(t *testing.T) {
+	client, apply, task, controlRequests := revertWindowRefusalFixture(storage.ControlOperationCancel)
+	task.State = state.Task.Running
+	observer := &cancelRequestAtTerminalObserver{ctx: t.Context(), requests: controlRequests, applyID: apply.ID}
+	client.SetObserver(apply.ID, observer)
+
+	rejection := engine.NewAlreadyCompletedError("schema change already completed on the engine")
+	_, err := client.settleControlForCompletedEngineChange(t.Context(), "cancel", nil, apply.ID, apply, "operator", rejection)
+	require.NoError(t, err)
+
+	require.True(t, observer.notified, "settling a completed schema change posts the terminal summary")
+	require.NoError(t, observer.seenErr)
+	require.NotNil(t, observer.seen, "the cancel request must already be settled when the summary renders")
+	assert.Equal(t, storage.ControlRequestFailed, observer.seen.Status,
+		"a cancel the schema change outran did not take effect, so the summary must not render it as applied")
+	assert.Contains(t, observer.seen.ErrorMessage, "the schema change completed before the cancel could take effect",
+		"the notice the summary renders comes from this message")
+}
+
 // A durable cancel can land on a schema change that has already cut over and is
 // holding its revert window. The drive refuses it permanently — the operator has
 // to choose revert or skip-revert — and that refusal must change nothing else:
@@ -2062,11 +2104,19 @@ func TestLocalClient_AStorageFailureConsumingAControlRequestKeepsTheClaim(t *tes
 			},
 		},
 		{
-			name:       "settling a cancel against a terminal apply fails",
+			name:       "completing a cancel that settled its own apply fails",
+			operation:  storage.ControlOperationCancel,
+			applyState: state.Apply.Cancelled,
+			breakStore: func(store *controlTestStorage, requests *testControlRequestStore) {
+				store.controlRequests = &completePendingErrorStore{testControlRequestStore: requests, err: failure}
+			},
+		},
+		{
+			name:       "recording that a cancel was outrun by its own apply fails",
 			operation:  storage.ControlOperationCancel,
 			applyState: state.Apply.Failed,
 			breakStore: func(store *controlTestStorage, requests *testControlRequestStore) {
-				store.controlRequests = &completePendingErrorStore{testControlRequestStore: requests, err: failure}
+				store.controlRequests = &failPendingErrorStore{testControlRequestStore: requests, err: failure}
 			},
 		},
 	}

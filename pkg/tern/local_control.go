@@ -1252,11 +1252,10 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 	// filterable by apply_id/repo/pr without hand-listing the attrs per call.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
-		logger.Info("completing pending cancel request for terminal apply",
-			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
-		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
-			fmt.Sprintf("Pending cancel request completed for terminal apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
-		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
+		// The apply already reached a terminal state, so settling its request
+		// decides nothing about what this drive does next: a failed write leaves
+		// the request pending for a later drive rather than standing this one down.
+		if err := settlePendingCancelForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -1301,11 +1300,11 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 		// drive keeps going because no cancel took effect.
 		return false, c.failRefusedControlRequest(cancelCtx, logger, apply, storage.ControlOperationCancel, storage.LogEventCancelRequested, controlReq, resp.ErrorMessage)
 	}
-	completed, err := completePendingRequestIfStoredApplyResolved(cancelCtx, c.storage, apply, storage.ControlOperationCancel)
+	settled, err := settlePendingCancelIfStoredApplyResolved(cancelCtx, c.storage, c.logger, apply)
 	if err != nil {
 		return false, err
 	}
-	if !completed {
+	if !settled {
 		// The cancel was accepted but the apply row has not settled — the settle
 		// lost the apply lease and moved only the drive's own operation row, so
 		// the apply-state projection owns the rest. The request stays pending on
@@ -2022,6 +2021,13 @@ func (c *LocalClient) settleControlForCompletedEngineChange(ctx context.Context,
 	}
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 		eventMsg, previousState, state.Apply.Completed)
+	// Settle the cancel the completed schema change outran before the summary is
+	// posted: the terminal comment renders the command-not-applied notice from
+	// the stored request, so a request still pending here posts a summary that
+	// says nothing about the command the operator issued.
+	if err := SettlePendingCancelForResolvedApply(ctx, c.storage, c.logger, apply); err != nil {
+		return 0, fmt.Errorf("settle the pending cancel the completed schema change outran for apply %s: %w", apply.ApplyIdentifier, err)
+	}
 	c.notifyTerminalObserver(apply, tasks)
 	return skippedCount, nil
 }

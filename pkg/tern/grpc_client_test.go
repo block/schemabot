@@ -3654,9 +3654,9 @@ func TestGRPCClient_ProcessPendingCancelReconcilesCompletedRemote(t *testing.T) 
 	// A cancel can lose the race against the remote finishing: the remote
 	// settles completed before the cancel lands, and the re-sent Cancel is
 	// rejected as already terminal. The reconcile must adopt the remote's
-	// actual outcome — completed, not cancelled — and record which remote
-	// terminal state settled the request so operators reading the apply log
-	// are not misled into thinking the cancel won.
+	// actual outcome — completed, not cancelled — and resolve the operator's
+	// cancel as a command that did not take effect, so neither the apply log
+	// nor the PR comment implies the cancel won.
 	server := &capturingTernServer{
 		cancelErr:        status.Error(codes.Internal, "apply remote-grpc-cancel is already terminal (state: completed)"),
 		progressState:    ternv1.State_STATE_COMPLETED,
@@ -3711,13 +3711,22 @@ func TestGRPCClient_ProcessPendingCancelReconcilesCompletedRemote(t *testing.T) 
 	cancelReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, err)
 	assert.Nil(t, cancelReq)
-	var eventMessage string
+	settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, storage.ControlRequestFailed, settled.Status,
+		"a cancel the remote outran did not take effect, so it must resolve as a rejection the PR comment can surface")
+	assert.Contains(t, settled.ErrorMessage, "the schema change completed before the cancel could take effect")
+	var event *storage.ApplyLog
 	for _, log := range logs.logs {
 		if log.EventType == storage.LogEventCancelRequested {
-			eventMessage = log.Message
+			event = log
 		}
 	}
-	assert.Contains(t, eventMessage, fmt.Sprintf("remote state: %s", state.Apply.Completed))
+	require.NotNil(t, event)
+	assert.Equal(t, storage.LogLevelWarn, event.Level)
+	assert.Contains(t, event.Message, "Cancel did not take effect")
+	assert.Contains(t, event.Message, "(caller: cli:alice)")
 }
 
 func TestGRPCClient_ProcessPendingCancelReconcilesFailedRemoteWithErrorMessage(t *testing.T) {
@@ -3776,9 +3785,16 @@ func TestGRPCClient_ProcessPendingCancelReconcilesFailedRemoteWithErrorMessage(t
 	assert.True(t, standDown)
 	assert.Equal(t, state.Apply.Failed, applyStore.apply.State)
 	assert.Equal(t, "copy row chunk: disk full", applyStore.apply.ErrorMessage)
-	cancelReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, err)
-	assert.Nil(t, cancelReq)
+	assert.Nil(t, pending)
+	cancelReq, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, cancelReq)
+	assert.Equal(t, storage.ControlRequestFailed, cancelReq.Status,
+		"the remote failed before the cancel landed, so the command did not take effect")
+	assert.Contains(t, cancelReq.ErrorMessage, "before the cancel could take effect",
+		"the stored reason is what the operator reads back when they look for the command's effect")
 }
 
 func TestGRPCClient_ProcessPendingCancelProgressFailureKeepsRequestPending(t *testing.T) {
