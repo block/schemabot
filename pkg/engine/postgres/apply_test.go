@@ -609,6 +609,121 @@ func TestQuotedTableBoundsEscapedNames(t *testing.T) {
 	}
 }
 
+// A cut never lands inside an escape sequence, because the kept prefix is
+// requoted rather than sliced out of the quoted form, and a width too narrow
+// for anything but the mark still gets the mark, so a cause always shows
+// where a name stood.
+func TestBoundedQuoteCutsBetweenEscapes(t *testing.T) {
+	tests := []struct {
+		name  string
+		ident string
+		width int
+		want  string
+	}{
+		{name: "fits", ident: `ab"cd`, width: 8, want: `"ab\"cd"`},
+		{name: "cut before the escape it cannot fit", ident: `ab"cd`, width: 7, want: `"ab..."`},
+		{name: "cut keeps a whole escape when it fits", ident: `ab"cdef`, width: 9, want: `"ab\"..."`},
+		{name: "width below the mark still gets the mark", ident: "users", width: 3, want: `"..."`},
+		{name: "empty name", ident: "", width: 2, want: `""`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := boundedQuote(tt.ident, tt.width)
+
+			assert.Equal(t, tt.want, got)
+			assert.True(t, utf8.ValidString(got))
+		})
+	}
+}
+
+// The identifiers an invalid-index cause names give way in a fixed order
+// when they do not all fit the room: the schema is cut first, the table the
+// entry sits on next, and the index name — the one the remedy tells the
+// operator to rename or resolve — last, each keeping at least its cut mark.
+func TestInvalidIndexNamesCutsTheIndexLast(t *testing.T) {
+	longest := strings.Repeat("a", maxIdentifierLength)
+	tests := []struct {
+		name      string
+		err       *executor.InvalidIndexError
+		withTable bool
+		room      int
+		want      string
+	}{
+		{
+			name:      "everything fits",
+			err:       &executor.InvalidIndexError{Schema: "public", Index: "orders_ref_idx", Table: "orders"},
+			withTable: true, room: 40,
+			want: `"public"."orders_ref_idx" ("orders")`,
+		},
+		{
+			name: "no table when the cause does not name one",
+			err:  &executor.InvalidIndexError{Schema: "public", Index: "orders_ref_idx", Table: "orders"},
+			room: 25,
+			want: `"public"."orders_ref_idx"`,
+		},
+		{
+			name: "the schema is cut first",
+			err:  &executor.InvalidIndexError{Schema: "reporting_archive", Index: "orders_ref_idx"},
+			room: 30,
+			want: `"reportin..."."orders_ref_idx"`,
+		},
+		{
+			name:      "the table is cut before the index, the schema before the table",
+			err:       &executor.InvalidIndexError{Schema: "public", Index: "orders_customer_id_idx", Table: "shipments_archive_2024"},
+			withTable: true, room: 50,
+			want: `"..."."orders_customer_id_idx" ("shipments_ar...")`,
+		},
+		{
+			name: "the index is cut last and keeps what the others leave",
+			err:  &executor.InvalidIndexError{Schema: "public", Index: longest},
+			room: 30,
+			want: `"..."."` + strings.Repeat("a", 19) + `..."`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := invalidIndexNames(tt.err, tt.withTable, tt.room)
+
+			assert.Equal(t, tt.want, got)
+			assert.LessOrEqual(t, len(got), tt.room)
+		})
+	}
+}
+
+// Every invalid-index verdict published on the operational path keeps its
+// remedy's lead inside the narrowest surface's clamp, and renders no
+// identifier raw, for a schema, index, and table of the widest legal
+// spelling and a builder of the widest PID; the two permanent verdicts are
+// swept as refusals, with the step clauses they can carry, by
+// TestEveryRefusalLeadSurvivesStatusReasonClamp.
+func TestInvalidIndexDetailKeepsItsRemedyLeadInsideTheClamp(t *testing.T) {
+	widest := strings.Repeat(`"`, maxIdentifierLength)
+	verdicts := map[string]*executor.InvalidIndexError{
+		"own leftover":                     {Cleanup: executor.ErrBuildLeftInvalidIndex},
+		"own leftover the bound cancelled": {Build: &executor.BudgetError{Cause: executor.CauseStatement, Budget: 36 * time.Hour}, Cleanup: executor.ErrBuildLeftInvalidIndex},
+		"abandoned":                        {Cleanup: executor.ErrAbandonedInvalidIndex},
+		"build in flight":                  {BuilderPID: math.MaxUint32, Cleanup: executor.ErrInvalidIndexBuildInFlight},
+		"builder unobservable":             {Cleanup: executor.ErrInvalidIndexBuilderUnobservable},
+		"on another table":                 {Cleanup: executor.ErrInvalidIndexOnOtherTable},
+		"the server will not drop":         {Cleanup: executor.ErrInvalidIndexNotDroppable},
+		"unproven":                         {Cleanup: errors.New("catalog read failed")},
+	}
+	for name, verdict := range verdicts {
+		t.Run(name, func(t *testing.T) {
+			verdict.Schema, verdict.Index, verdict.Table = widest, widest, widest
+
+			detail := invalidIndexDetail(verdict)
+			_, remedy := invalidIndexAdvice(verdict, "")
+
+			assert.NotContains(t, detail, widest, "no verdict renders an identifier raw")
+			lead := clauseSeparator + remedyLead(remedy)
+			at := strings.Index(detail, lead)
+			require.GreaterOrEqual(t, at, 0, detail)
+			assert.LessOrEqual(t, at+len(lead), statusReasonKeptWidth, detail)
+		})
+	}
+}
+
 // mismatchNames spends a shared room on pairs before it spends on either
 // list alone, so a rendering that shows a missing name beside the owned name
 // that displaced it wins over one that shows more names from one side, and
@@ -653,7 +768,28 @@ func TestNamesWithinRoomAdmitsEveryRenderingThatFits(t *testing.T) {
 
 		assert.Equal(t, count, namesWithinRoom(names, room), "room %d holds all %d names", room, count)
 	}
-	assert.Zero(t, namesWithinRoom([]string{"a"}, -1), "a room already overdrawn holds no names")
+}
+
+// namesWithinRoom is also the ceiling the searches must not run past, so it
+// must turn away every count the room cannot hold: a ceiling that admitted a
+// count the room can never show would spend the work the bound exists to
+// avoid, and a ceiling that went negative would have the searches index a
+// rendering that was never made. The bound is exact at the cheapest
+// rendering — the room that holds n single-character names admits n, not
+// n+1 — and a room already overdrawn by any amount admits none.
+func TestNamesWithinRoomRejectsEveryCountThatCannotFit(t *testing.T) {
+	for count := 1; count <= 8; count++ {
+		names := make([]string, count+1)
+		for i := range names {
+			names[i] = "a"
+		}
+		room := count * len(`"a"`)
+
+		assert.Equal(t, count, namesWithinRoom(names, room), "room %d holds %d names, not %d", room, count, count+1)
+	}
+	for _, room := range []int{-1, -3, -6} {
+		assert.Zero(t, namesWithinRoom([]string{"a"}, room), "a room overdrawn by %d holds no names", -room)
+	}
 }
 
 // The name searches spend work in proportion to the room, not to the width
@@ -672,6 +808,8 @@ func TestMismatchNamesWorkIsBoundedByTheRoom(t *testing.T) {
 	assert.Equal(t, `"ab", "ab", and 9998 more`, missing)
 	assert.Equal(t, `"ab", and 9999 more`, unclaimed)
 	assert.Equal(t, `"ab", "ab", and 9998 more`, alone)
+	assert.Equal(t, 15, namesWithinRoom(names, 46), "the searches visit at most the fifteen counts a 46-byte room could show, not ten thousand")
+	assert.Equal(t, 10, namesWithinRoom(names, 30), "the searches visit at most the ten counts a 30-byte room could show, not ten thousand")
 }
 
 // quotedNames spends its budget on whole names: it shows the most leading
@@ -803,8 +941,16 @@ const widestCreateSet = math.MaxInt32
 // conjunction or punctuation, which is the verb and its object — so the
 // operator reads what to do even when the detail is cut from the tail. The
 // sweep runs over the whole outcome vocabulary and over every refusal
-// refusalForCause decides on a typed error, so a new cause that renders the
-// table name unbounded fails here rather than on an operator's screen.
+// refusalForCause decides on a typed error — including the invalid-index
+// verdicts, whose typed error replaces the outcome code's cause with advice
+// naming the index — so a new cause that renders an identifier unbounded, or
+// renders it raw, fails here rather than on an operator's screen: an
+// identifier of legal length is always narrower raw than quoted, so the
+// width check alone cannot tell the two apart, and the detail is also
+// checked for the quoted form itself. The raw-form check discriminates
+// because the fixture is made of quote characters, which quoting escapes: a
+// plain fixture's quoted form would contain the fixture verbatim, so this
+// spelling is what the check relies on.
 func TestEveryRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 	widest := strings.Repeat(`"`, maxIdentifierLength)
 	type sweepCase struct {
@@ -812,8 +958,24 @@ func TestEveryRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 		// pastFirstStep marks a refusal a step after the CREATE TABLE can
 		// raise: a name it needs is occupied, an invalid index it cannot
 		// clear holds the name, the statement ran past its budget, or the
-		// engine's own accounting failed while the step ran.
+		// engine's own accounting failed while the step ran. The name
+		// read-back is not among them: pg-sprite reads the names the CREATE
+		// TABLE owns back once, as part of the first step, and reports a
+		// mismatch or an unverified read at that step, so those causes are
+		// charged for no later step's clause. A read-back reported at a
+		// later step upstream would give them a step clause the room does
+		// not pay for, and this sweep is where that would show.
 		pastFirstStep bool
+		// typedSentence marks a refusal whose cause is pg-sprite's own typed
+		// sentence rendered verbatim, which carries no identifier by
+		// construction, so the table name is not looked for in it.
+		typedSentence bool
+		// namesIndex marks a refusal whose cause names the index a verdict
+		// is about, and the table that entry sits on, in place of the table
+		// under change; those identifiers share one room, so the detail is
+		// checked for no raw identifier rather than for the table's own
+		// bounded form.
+		namesIndex bool
 	}
 	cases := map[string]sweepCase{
 		"privilege on the table":     {cause: &preflight.PrivilegeError{Tier: preflight.TierAlterInPlace, Check: "has_table_privilege", Grant: "GRANT"}},
@@ -824,7 +986,11 @@ func TestEveryRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 		"create collision":           {cause: preflight.ErrRelationExists, pastFirstStep: true},
 		"create names unverified":    {cause: fmt.Errorf("%w: %w", executor.ErrCreateNamesUnverified, context.Canceled)},
 		"create name mismatch":       {cause: &executor.CreateNameMismatchError{Schema: "public", Table: widest, Missing: []string{widest}, Unclaimed: []string{widest}}},
-		"statement budget exhausted": {cause: &executor.BudgetError{Cause: executor.CauseStatement, Budget: time.Second}, pastFirstStep: true},
+		"statement budget exhausted": {cause: &executor.BudgetError{Cause: executor.CauseStatement, Budget: time.Second}, pastFirstStep: true, typedSentence: true},
+		"invalid index on another table": {cause: &executor.InvalidIndexError{Schema: widest, Index: widest, Table: widest, Cleanup: executor.ErrInvalidIndexOnOtherTable},
+			pastFirstStep: true, namesIndex: true},
+		"invalid index the server will not drop": {cause: &executor.InvalidIndexError{Schema: widest, Index: widest, Table: widest, Cleanup: executor.ErrInvalidIndexNotDroppable},
+			pastFirstStep: true, namesIndex: true},
 	}
 	pastFirstStepCodes := map[executor.Code]bool{
 		executor.CodeCreateCollision:          true,
@@ -855,6 +1021,10 @@ func TestEveryRefusalLeadSurvivesStatusReasonClamp(t *testing.T) {
 
 				require.NotNil(t, r)
 				require.NotEmpty(t, r.detail)
+				assert.NotContains(t, r.detail, widest, "no refusal renders an identifier raw")
+				if !tc.typedSentence && !tc.namesIndex {
+					assert.Contains(t, r.detail, quotedTable(widest), "a refusal that names the table renders it quoted and bounded")
+				}
 				remedy := r.remedy
 				if remedy == "" {
 					if step == nil || step.Step <= 1 {
@@ -1028,7 +1198,7 @@ func TestRefusalAfterCommittedCreateStepKeepsOwnRemedy(t *testing.T) {
 			err: &executor.InvalidIndexError{Schema: "public", Index: "users_ref_idx", Table: "shipments",
 				Cleanup: executor.ErrInvalidIndexOnOtherTable},
 			wantReason: "invalid-index-occupied",
-			wantRemedy: "this change cannot claim it — rename the index in the schema file and re-plan, or clear the entry through that table's own change",
+			wantRemedy: "rename the index in the schema file and re-plan, or clear the entry through that table's own change; this change cannot claim it",
 		},
 	}
 	for _, tt := range tests {
