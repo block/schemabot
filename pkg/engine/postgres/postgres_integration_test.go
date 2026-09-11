@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/block/pg-sprite/pkg/dbconn"
+	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/block/pg-sprite/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -720,7 +721,7 @@ func TestLiveTablesUnderShadowingSearchPath(t *testing.T) {
 		{name: "users", foreignKeys: []string{}, referencedBy: []string{"orders_user_id_fkey"}},
 	}, tables, "every live table and its foreign keys must be enumerated, and only the partition and the extension-owned table left out, despite the shadowing search_path")
 
-	pulled, err := pullTables(t.Context(), pool, "public")
+	pulled, err := schemadiff.ListManagedTables(t.Context(), pool, "public")
 	require.NoError(t, err)
 	assert.Equal(t, []string{"events", "orders", "users"}, pulled, "the pull must render the same set the plan holds files accountable for")
 

@@ -108,7 +108,11 @@ func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) 
 	}
 	var renderErrors []error
 	for _, namespace := range namespaces {
-		tables, err := pullTables(ctx, pool, namespace)
+		// The pull renders the same table set the plan holds schema files
+		// accountable for, so a pulled baseline declares exactly what a later
+		// plan would otherwise report as undeclared. Partitions and
+		// extension-owned tables have no file of their own and are left out.
+		tables, err := schemadiff.ListManagedTables(ctx, pool, namespace)
 		if err != nil {
 			return nil, fmt.Errorf("list PostgreSQL tables in schema %q: %w", namespace, err)
 		}
@@ -238,16 +242,4 @@ func unmodeledTableObjectsError(namespace, table string, objects unmodeledTableO
 
 func isContextError(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
-}
-
-// pullTables names the tables a pull renders: the same set the plan holds
-// schema files accountable for, so a pulled baseline declares exactly what a
-// later plan would otherwise report as undeclared. Partitions and
-// extension-owned tables have no file of their own and are left out.
-func pullTables(ctx context.Context, pool *pgxpool.Pool, namespace string) ([]string, error) {
-	tables, err := schemadiff.ListManagedTables(ctx, pool, namespace)
-	if err != nil {
-		return nil, fmt.Errorf("list tables to pull from namespace %q: %w", namespace, err)
-	}
-	return tables, nil
 }
