@@ -24,6 +24,7 @@ import (
 	"github.com/block/pg-sprite/pkg/preflight"
 	"github.com/block/pg-sprite/pkg/progress"
 	"github.com/block/pg-sprite/pkg/router"
+	"github.com/block/pg-sprite/pkg/schemadiff"
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
 	spirittable "github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
@@ -753,9 +754,10 @@ type liveTable struct {
 	referencedBy []string
 }
 
-// liveTables lists the tables in the namespace whose definition is their own,
-// in name order, as the catalog names them; the caller decides which of them
-// a schema file is expected to declare.
+// liveTables lists the tables pg-sprite's declarative model manages, in name
+// order, with the foreign key metadata SchemaBot needs to explain blocked
+// drops. The caller decides which managed tables policy exempts from a schema
+// file.
 //
 // Tables whose definition lives elsewhere are omitted. A partition is declared
 // through its parent's PARTITION BY and has no file of its own, so it follows
@@ -766,13 +768,43 @@ type liveTable struct {
 // unlogged tables are ordinary tables with definitions of their own, so they
 // are listed and must carry their own file.
 //
-// The query names every catalog relation, function and operator with an
-// explicit pg_catalog qualification: search_path may list a user schema before
-// pg_catalog, and a user relation named pg_class — or a user operator named
-// = — would otherwise shadow the catalog and turn a fail-closed enumeration
-// into a silent empty set. This protects SchemaBot's own read; pg-sprite's
-// introspection pins its own transaction-local search_path.
+// ListManagedTables is the authoritative table-set query and pg_catalog
+// qualifies every relation, operator, and type so search_path shadowing cannot
+// change its answer. The separate query here only decorates those returned
+// names with constraint metadata and carries the same qualification.
+//
+// The two reads are separate statements on separate snapshots, because
+// ListManagedTables opens its own connection from the pool; a variant that
+// runs inside a caller-supplied transaction would let both reads share one
+// snapshot and retire the skew check in joinForeignKeys.
 func liveTables(ctx context.Context, pool *pgxpool.Pool, namespace string) ([]liveTable, error) {
+	names, err := schemadiff.ListManagedTables(ctx, pool, namespace)
+	if err != nil {
+		return nil, fmt.Errorf("list declarable tables in namespace %q: %w", namespace, err)
+	}
+	if len(names) == 0 {
+		return []liveTable{}, nil
+	}
+	keys, err := foreignKeysFor(ctx, pool, namespace, names)
+	if err != nil {
+		return nil, err
+	}
+	return joinForeignKeys(namespace, names, keys)
+}
+
+// tableForeignKeys is one table's foreign key constraint names on each side,
+// as the catalog reports them.
+type tableForeignKeys struct {
+	name         string
+	foreignKeys  []string
+	referencedBy []string
+}
+
+// foreignKeysFor reads the foreign key constraint names on each side of every
+// named table in the namespace. The result is restricted to names, so the
+// join in joinForeignKeys can treat any row outside it as a broken query
+// rather than a table to add.
+func foreignKeysFor(ctx context.Context, pool *pgxpool.Pool, namespace string, names []string) ([]tableForeignKeys, error) {
 	rows, err := pool.Query(ctx, `
 		SELECT c.relname,
 		       COALESCE((SELECT pg_catalog.array_agg(con.conname ORDER BY con.conname)
@@ -787,27 +819,57 @@ func liveTables(ctx context.Context, pool *pgxpool.Pool, namespace string) ([]li
 		FROM pg_catalog.pg_class c
 		JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
 		WHERE n.nspname OPERATOR(pg_catalog.=) $1
-		  AND (c.relkind OPERATOR(pg_catalog.=) 'r' OR c.relkind OPERATOR(pg_catalog.=) 'p')
-		  AND NOT c.relispartition
-		  AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
-		                  WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass
-		                    AND d.objid OPERATOR(pg_catalog.=) c.oid
-		                    AND d.deptype OPERATOR(pg_catalog.=) 'e')
-		ORDER BY c.relname`, namespace)
+		  AND c.relname OPERATOR(pg_catalog.=) ANY($2::pg_catalog.text[])`, namespace, names)
 	if err != nil {
-		return nil, fmt.Errorf("list live tables in namespace %q: %w", namespace, err)
+		return nil, fmt.Errorf("list foreign keys for declarable tables in namespace %q: %w", namespace, err)
 	}
 	defer rows.Close()
-	var tables []liveTable
+	keys := make([]tableForeignKeys, 0, len(names))
 	for rows.Next() {
-		var live liveTable
-		if err := rows.Scan(&live.name, &live.foreignKeys, &live.referencedBy); err != nil {
-			return nil, fmt.Errorf("scan live table in namespace %q: %w", namespace, err)
+		var key tableForeignKeys
+		if err := rows.Scan(&key.name, &key.foreignKeys, &key.referencedBy); err != nil {
+			return nil, fmt.Errorf("scan foreign keys for declarable table in namespace %q: %w", namespace, err)
 		}
-		tables = append(tables, live)
+		keys = append(keys, key)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate live tables in namespace %q: %w", namespace, err)
+		return nil, fmt.Errorf("read foreign keys for declarable tables in namespace %q: %w", namespace, err)
+	}
+	return keys, nil
+}
+
+// joinForeignKeys attaches each table's foreign key metadata to the managed
+// table set, preserving the set's order. The join must be total in both
+// directions: a key for a name outside the set means the decoration query no
+// longer restricts itself to the set, and a name with no key means the table
+// left the catalog between the two reads. Either way the verdict's input is
+// uncertain, and a reason sentence built from a missing row would describe a
+// table with no foreign keys when the truth is that nothing was read, so the
+// plan fails instead of guessing.
+func joinForeignKeys(namespace string, names []string, keys []tableForeignKeys) ([]liveTable, error) {
+	tables := make([]liveTable, len(names))
+	byName := make(map[string]*liveTable, len(names))
+	for i, name := range names {
+		tables[i].name = name
+		byName[name] = &tables[i]
+	}
+	decorated := make(map[string]bool, len(names))
+	for _, key := range keys {
+		live, ok := byName[key.name]
+		if !ok {
+			return nil, fmt.Errorf("foreign key metadata for table %q in namespace %q is outside the managed table set", key.name, namespace)
+		}
+		if decorated[key.name] {
+			return nil, fmt.Errorf("foreign key metadata for table %q in namespace %q was returned more than once", key.name, namespace)
+		}
+		decorated[key.name] = true
+		live.foreignKeys = key.foreignKeys
+		live.referencedBy = key.referencedBy
+	}
+	for _, name := range names {
+		if !decorated[name] {
+			return nil, fmt.Errorf("table %q in namespace %q left the catalog while the plan was reading it; retry the plan", name, namespace)
+		}
 	}
 	return tables, nil
 }

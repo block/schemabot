@@ -315,11 +315,13 @@ database, where every table nobody has written a file for yet is undeclared;
 the same happens when a file is deleted from the PR, or when an imperative
 tool leaves a table behind during coexistence. A namespace is owned whole: the
 schema files declare the set of tables, not just each table's shape, so the
-only convergence for a table with no file is a drop. The planner enumerates
-the target's tables and surfaces each undeclared one as a blocked, destructive
-`DROP TABLE` change: the engine will never run the drop, so the one choice
-left is whether to report the divergence, and hiding it would turn a target
-that does not match its declaration into a passing check.
+only convergence for a table with no file is a drop. The planner surfaces
+each undeclared table as a blocked, destructive `DROP TABLE` change: the
+engine will never run the drop, so the one choice left is whether to report
+the divergence, and hiding it would turn a target that does not match its
+declaration into a passing check. The plan and the schema pull enumerate the
+namespace's tables through the same pg-sprite query, so a pulled baseline
+cannot leave behind a table that the next plan then blocks on.
 Deleting every schema file in one namespace keeps that namespace in the plan
 and surfaces every live table it contains as one of these blocked drops.
 Because the check fails for the whole database while any change is blocked,
@@ -363,7 +365,9 @@ nothing on PostgreSQL — and `ignore_namespaces` is the per-namespace one. The
 plan discloses the tables it exempted, by namespace, in the PR comment and in
 `schemabot plan` and `schemabot apply` output, so a reviewer can tell an
 archive the verdict skipped from a table it found declared.
-Tables whose definition lives elsewhere are likewise not enumerated: a
+The underlying table set is pg-sprite's own view of which tables its
+declarative model manages; SchemaBot adds only that naming policy exemption.
+Tables whose definition lives elsewhere are not enumerated: a
 partition is declared through its parent's `PARTITION BY` and follows the
 parent's verdict wherever the parent lives, and extension-owned tables (such
 as PostGIS's `spatial_ref_sys`) belong to their extension — no file can
