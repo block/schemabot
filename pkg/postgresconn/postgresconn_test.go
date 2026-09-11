@@ -448,10 +448,16 @@ func TestResolveConnectorAppliesOptionsAndNormalization(t *testing.T) {
 	_, err := resolveConnector(
 		"postgres://schemabot:rotated@database.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app", // sadscan:disable np.postgres.1
 		WithConnectTimeout(7*time.Second),
+		WithStatementTimeout(45*time.Second),
 	)
 	require.NoError(t, err)
 	assert.Equal(t, "rotated", got.Password)
 	assert.Equal(t, 7*time.Second, got.ConnectTimeout, "options must flow through the resolve path")
+	// The long-lived storage pool is the reloadable one, so an option armed on
+	// the new session rather than written into the config has to survive here
+	// too — a reload that dropped it would leave the pool running unbudgeted
+	// with nothing to read differently.
+	assert.NotNil(t, got.AfterConnect, "the statement budget must survive a credential reload")
 	assert.NotNil(t, got.TLSConfig, "a reloaded RDS DSN must get sslmode=require injected")
 	// sslmode=prefer would also set TLSConfig but keep a plaintext fallback;
 	// require is distinguished by that fallback's absence.
@@ -508,45 +514,45 @@ func TestDSNParseErrorsRedactCredentials(t *testing.T) {
 	})
 }
 
-// GUC names are case-insensitive on the server and pgx preserves DSN key case,
-// so a DSN-carried statement_timeout under a different spelling must be
-// replaced rather than left beside the option's value: two spellings of one
-// parameter in the startup packet would let map iteration order decide which
-// budget the session runs under.
-func TestWithStatementTimeoutReplacesCaseVariantDSNValue(t *testing.T) {
+// The budget is armed on the session, so the startup packet must not also
+// carry one. GUC names are case-insensitive on the server and pgx preserves
+// DSN key case, so a DSN-carried statement_timeout is cleared under whatever
+// spelling it arrived in — left behind, it would set the session's budget
+// before the option's SET and be the value in force for any statement the
+// pooler routes to a connection the SET never reached.
+func TestWithStatementTimeoutClearsCaseVariantDSNValue(t *testing.T) {
 	t.Parallel()
 
 	cfg, err := connectionConfig("postgres://user:pass@host:5432/db?statement_TIMEOUT=1000", WithStatementTimeout(45*time.Second))
 	require.NoError(t, err)
 
-	var found []string
-	for k, v := range cfg.RuntimeParams {
-		if strings.EqualFold(k, "statement_timeout") {
-			found = append(found, k+"="+v)
-		}
+	for k := range cfg.RuntimeParams {
+		assert.False(t, strings.EqualFold(k, "statement_timeout"),
+			"no spelling of statement_timeout may survive in the startup packet, found %q", k)
 	}
-	require.Len(t, found, 1, "exactly one spelling of statement_timeout survives")
-	assert.Equal(t, "statement_timeout=45000", found[0])
+	assert.NotNil(t, cfg.AfterConnect, "the budget must be armed on the new session")
 }
 
 // A negative duration means "no budget chosen": the option must leave a
-// DSN-carried statement_timeout exactly as it found it.
+// DSN-carried statement_timeout exactly as it found it, and arm nothing.
 func TestWithStatementTimeoutNegativeLeavesDSNValue(t *testing.T) {
 	t.Parallel()
 
 	cfg, err := connectionConfig("postgres://user:pass@host:5432/db?statement_timeout=1000", WithStatementTimeout(-1))
 	require.NoError(t, err)
 	assert.Equal(t, "1000", cfg.RuntimeParams["statement_timeout"])
+	assert.Nil(t, cfg.AfterConnect)
 }
 
-// Zero writes the parameter rather than omitting it, so the session runs with
-// the budget explicitly disabled instead of inheriting the platform's value.
-func TestWithStatementTimeoutZeroWritesExplicitDisable(t *testing.T) {
+// Zero arms the budget rather than skipping it, so the session runs with the
+// budget explicitly disabled instead of inheriting the platform's value.
+func TestWithStatementTimeoutZeroArmsExplicitDisable(t *testing.T) {
 	t.Parallel()
 
 	cfg, err := connectionConfig("postgres://user:pass@host:5432/db", WithStatementTimeout(0))
 	require.NoError(t, err)
-	assert.Equal(t, "0", cfg.RuntimeParams["statement_timeout"])
+	assert.NotNil(t, cfg.AfterConnect)
+	assert.Equal(t, "SET statement_timeout = 0", statementTimeoutSQL(0))
 }
 
 // statement_timeout is expressed in whole milliseconds, so a finer duration
@@ -570,9 +576,69 @@ func TestWithStatementTimeoutRoundsSubMillisecondUp(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			cfg, err := connectionConfig("postgres://user:pass@host:5432/db", WithStatementTimeout(tc.d))
-			require.NoError(t, err)
-			assert.Equal(t, tc.want, cfg.RuntimeParams["statement_timeout"])
+			assert.Equal(t, "SET statement_timeout = "+tc.want, statementTimeoutSQL(tc.d))
 		})
 	}
+}
+
+// The budget only exists if the hook sends the caller's duration, and only
+// stays a budget if the statement itself is bounded: pgconn runs the hook on
+// the context the pool opens connections with, which carries no deadline, so
+// an endpoint that authenticates and then goes quiet would wedge the one
+// goroutine that opens connections. Both are asserted against the hook the
+// option actually installs rather than against the helper it calls, so a hook
+// wired to the wrong duration is a failure here and not only against a server.
+func TestWithStatementTimeoutHookSendsTheCallersBudgetUnderABound(t *testing.T) {
+	var (
+		gotStmt     string
+		gotDeadline bool
+		gotWithin   time.Duration
+	)
+	original := execStatementTimeout
+	t.Cleanup(func() { execStatementTimeout = original })
+	execStatementTimeout = func(ctx context.Context, _ *pgconn.PgConn, stmt string) error {
+		gotStmt = stmt
+		deadline, ok := ctx.Deadline()
+		gotDeadline = ok
+		if ok {
+			gotWithin = time.Until(deadline)
+		}
+		return nil
+	}
+
+	cfg, err := connectionConfig("postgres://user:pass@localhost:5432/db", WithStatementTimeout(45*time.Second))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.AfterConnect)
+
+	require.NoError(t, cfg.AfterConnect(t.Context(), nil))
+
+	assert.Equal(t, "SET statement_timeout = 45000", gotStmt,
+		"the hook must arm the duration the caller asked for")
+	assert.True(t, gotDeadline, "the hook's statement must be bounded, or a silent endpoint wedges the connection opener")
+	assert.LessOrEqual(t, gotWithin, defaultConnectTimeout,
+		"the bound must be the connect budget, not something longer")
+}
+
+// A caller that sets its own connect budget bounds the session setup by the
+// same value, since the setup runs on the connection that budget just opened.
+func TestWithStatementTimeoutHookBoundIsTheConfiguredConnectTimeout(t *testing.T) {
+	var gotWithin time.Duration
+	original := execStatementTimeout
+	t.Cleanup(func() { execStatementTimeout = original })
+	execStatementTimeout = func(ctx context.Context, _ *pgconn.PgConn, _ string) error {
+		deadline, ok := ctx.Deadline()
+		require.True(t, ok)
+		gotWithin = time.Until(deadline)
+		return nil
+	}
+
+	cfg, err := connectionConfig("postgres://user:pass@localhost:5432/db",
+		WithConnectTimeout(3*time.Second), WithStatementTimeout(time.Second))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.AfterConnect)
+
+	require.NoError(t, cfg.AfterConnect(t.Context(), nil))
+
+	assert.Greater(t, gotWithin, 2*time.Second, "the bound must track the configured connect budget")
+	assert.LessOrEqual(t, gotWithin, 3*time.Second, "the bound must not exceed the configured connect budget")
 }

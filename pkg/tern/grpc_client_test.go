@@ -957,7 +957,7 @@ type mockStorage struct {
 	tasks           *mockTaskStore
 	plans           *mockPlanStore
 	logs            *mockApplyLogStore
-	controlRequests *testControlRequestStore
+	controlRequests storage.ControlRequestStore
 	operations      *mockApplyOperationStore
 }
 
@@ -2997,9 +2997,9 @@ func TestGRPCClient_DriverForwardsTheOperatorOnStopAndCancel(t *testing.T) {
 		apply := newApply("apply-grpc-cancel-caller", "remote-grpc-cancel-caller")
 		client.storage = newStorage(apply, storage.ControlOperationCancel)
 
-		handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+		standDown, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
 		require.NoError(t, err)
-		require.True(t, handled)
+		require.True(t, standDown)
 		assert.Equal(t, "cli:alice", server.getCancelCaller(),
 			"the data plane must record the operator who issued the cancel, not the forwarding path")
 	})
@@ -3052,9 +3052,9 @@ func TestGRPCClient_ProcessPendingCancelControlRequestCompletesWholeApply(t *tes
 		controlRequests: controlRequests,
 	}
 
-	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
 	require.NoError(t, err)
-	assert.True(t, handled)
+	assert.True(t, standDown)
 	assert.Equal(t, "remote-grpc-cancel", server.getCancelApplyID())
 	assert.Equal(t, state.Apply.Cancelled, applyStore.apply.State)
 	assert.Equal(t, state.Task.Cancelled, task.State)
@@ -3151,9 +3151,9 @@ func TestGRPCClient_CancelPathMirrorsSettledControlRejections(t *testing.T) {
 		controlRequests: controlRequests,
 	}
 
-	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
 	require.NoError(t, err)
-	require.True(t, handled)
+	require.True(t, standDown)
 
 	rejected, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationRevert)
 	require.NoError(t, err)
@@ -3222,9 +3222,9 @@ func TestGRPCClient_ProcessPendingCancelOperationLeavesApplyCancelPending(t *tes
 	}
 	scope := applyTaskScope{applyOperationID: operationID, operation: operation, multiOperation: true}
 
-	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, scope)
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply, scope)
 	require.NoError(t, err)
-	assert.True(t, handled)
+	assert.True(t, standDown)
 	assert.Equal(t, "remote-op-west", server.getCancelApplyID())
 	assert.Equal(t, state.Task.Cancelled, task.State)
 	assert.Equal(t, state.Apply.Running, apply.State)
@@ -3287,9 +3287,9 @@ func TestGRPCClient_ProcessPendingCancelReconcilesAlreadyTerminalRemote(t *testi
 		controlRequests: controlRequests,
 	}
 
-	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
 	require.NoError(t, err)
-	assert.True(t, handled)
+	assert.True(t, standDown)
 	assert.Equal(t, state.Apply.Cancelled, applyStore.apply.State)
 	assert.Equal(t, state.Task.Cancelled, task.State)
 	assert.True(t, hasLogEvent(logs.logs, storage.LogEventCancelRequested))
@@ -3340,9 +3340,9 @@ func TestGRPCClient_ProcessPendingCancelKeepsRequestWhenRemoteStillActive(t *tes
 		controlRequests: controlRequests,
 	}
 
-	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
 	require.Error(t, err)
-	assert.True(t, handled)
+	assert.True(t, standDown)
 	assert.Equal(t, state.Apply.Running, applyStore.apply.State)
 	cancelReq, getErr := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, getErr)
@@ -3408,9 +3408,9 @@ func TestGRPCClient_ProcessPendingCancelAlreadyTerminalRemoteLeavesApplyCancelPe
 	}
 	scope := applyTaskScope{applyOperationID: operationID, operation: operation, multiOperation: true}
 
-	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, scope)
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply, scope)
 	require.NoError(t, err)
-	assert.True(t, handled)
+	assert.True(t, standDown)
 	assert.Equal(t, state.Task.Cancelled, task.State)
 	assert.Equal(t, state.Apply.Running, apply.State)
 	cancelReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
@@ -3462,9 +3462,9 @@ func TestGRPCClient_ProcessPendingCancelKeepsRequestWhenRemoteStopped(t *testing
 		controlRequests: controlRequests,
 	}
 
-	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
 	require.Error(t, err)
-	assert.True(t, handled)
+	assert.True(t, standDown)
 	assert.Equal(t, state.Apply.Stopped, applyStore.apply.State)
 	cancelReq, getErr := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, getErr)
@@ -3475,7 +3475,7 @@ func TestGRPCClient_ProcessPendingCancelStaysPendingWhileAcceptedRemoteStillStop
 	// The success-path counterpart of the stopped-remote guard: the remote
 	// accepts the Cancel and stores it durably, but its progress still reads
 	// stopped — the cancel has not taken effect there yet. The request must
-	// stay pending (handled=false) so a later drive reconciles once the
+	// stay pending (standDown=false) so a later drive reconciles once the
 	// remote's own driver consumes the cancel; completing it here would
 	// freeze the stored apply at stopped after the remote cancels.
 	server := &capturingTernServer{
@@ -3515,9 +3515,9 @@ func TestGRPCClient_ProcessPendingCancelStaysPendingWhileAcceptedRemoteStillStop
 		controlRequests: controlRequests,
 	}
 
-	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
 	require.NoError(t, err)
-	assert.False(t, handled, "a stopped remote keeps the accepted cancel pending; the drive must not complete it")
+	assert.False(t, standDown, "a stopped remote keeps the accepted cancel pending; the drive must not complete it")
 	assert.Equal(t, 1, server.getCancelCalls(), "the cancel must be forwarded to the remote")
 	assert.Equal(t, state.Apply.Stopped, applyStore.apply.State)
 	cancelReq, getErr := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
@@ -3578,9 +3578,9 @@ func TestGRPCClient_ProcessPendingCancelSyncsTasksWhenCancelStepObservesRemoteSt
 		controlRequests: controlRequests,
 	}
 
-	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
 	require.NoError(t, err)
-	assert.False(t, handled, "a stopped remote keeps the accepted cancel pending; the drive must not complete it")
+	assert.False(t, standDown, "a stopped remote keeps the accepted cancel pending; the drive must not complete it")
 	assert.Equal(t, state.Apply.Stopped, applyStore.apply.State, "the parent apply must be persisted with the stopped snapshot")
 	assert.Equal(t, state.Task.Stopped, task.State, "the stored task must be synced to the remote's stopped state alongside the parent")
 	cancelReq, getErr := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
@@ -3654,9 +3654,9 @@ func TestGRPCClient_ProcessPendingCancelReconcilesCompletedRemote(t *testing.T) 
 	// A cancel can lose the race against the remote finishing: the remote
 	// settles completed before the cancel lands, and the re-sent Cancel is
 	// rejected as already terminal. The reconcile must adopt the remote's
-	// actual outcome — completed, not cancelled — and record which remote
-	// terminal state settled the request so operators reading the apply log
-	// are not misled into thinking the cancel won.
+	// actual outcome — completed, not cancelled — and resolve the operator's
+	// cancel as a command that did not take effect, so neither the apply log
+	// nor the PR comment implies the cancel won.
 	server := &capturingTernServer{
 		cancelErr:        status.Error(codes.Internal, "apply remote-grpc-cancel is already terminal (state: completed)"),
 		progressState:    ternv1.State_STATE_COMPLETED,
@@ -3704,20 +3704,29 @@ func TestGRPCClient_ProcessPendingCancelReconcilesCompletedRemote(t *testing.T) 
 		controlRequests: controlRequests,
 	}
 
-	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
 	require.NoError(t, err)
-	assert.True(t, handled)
+	assert.True(t, standDown)
 	assert.Equal(t, state.Apply.Completed, applyStore.apply.State)
 	cancelReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, err)
 	assert.Nil(t, cancelReq)
-	var eventMessage string
+	settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, storage.ControlRequestFailed, settled.Status,
+		"a cancel the remote outran did not take effect, so it must resolve as a rejection the PR comment can surface")
+	assert.Contains(t, settled.ErrorMessage, "the schema change completed before the cancel could take effect")
+	var event *storage.ApplyLog
 	for _, log := range logs.logs {
 		if log.EventType == storage.LogEventCancelRequested {
-			eventMessage = log.Message
+			event = log
 		}
 	}
-	assert.Contains(t, eventMessage, fmt.Sprintf("remote state: %s", state.Apply.Completed))
+	require.NotNil(t, event)
+	assert.Equal(t, storage.LogLevelWarn, event.Level)
+	assert.Contains(t, event.Message, "Cancel did not take effect")
+	assert.Contains(t, event.Message, "(caller: cli:alice)")
 }
 
 func TestGRPCClient_ProcessPendingCancelReconcilesFailedRemoteWithErrorMessage(t *testing.T) {
@@ -3771,14 +3780,21 @@ func TestGRPCClient_ProcessPendingCancelReconcilesFailedRemoteWithErrorMessage(t
 		controlRequests: controlRequests,
 	}
 
-	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
 	require.NoError(t, err)
-	assert.True(t, handled)
+	assert.True(t, standDown)
 	assert.Equal(t, state.Apply.Failed, applyStore.apply.State)
 	assert.Equal(t, "copy row chunk: disk full", applyStore.apply.ErrorMessage)
-	cancelReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, err)
-	assert.Nil(t, cancelReq)
+	assert.Nil(t, pending)
+	cancelReq, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, cancelReq)
+	assert.Equal(t, storage.ControlRequestFailed, cancelReq.Status,
+		"the remote failed before the cancel landed, so the command did not take effect")
+	assert.Contains(t, cancelReq.ErrorMessage, "before the cancel could take effect",
+		"the stored reason is what the operator reads back when they look for the command's effect")
 }
 
 func TestGRPCClient_ProcessPendingCancelProgressFailureKeepsRequestPending(t *testing.T) {
@@ -3818,9 +3834,9 @@ func TestGRPCClient_ProcessPendingCancelProgressFailureKeepsRequestPending(t *te
 		controlRequests: controlRequests,
 	}
 
-	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
 	require.Error(t, err)
-	assert.True(t, handled)
+	assert.True(t, standDown)
 	assert.Equal(t, state.Apply.Running, applyStore.apply.State)
 	cancelReq, getErr := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, getErr)
@@ -5886,9 +5902,9 @@ func TestGRPCClient_ProcessPendingStopSyncDoesNotTerminalizeDuringRetryablePause
 		controlRequests: controlRequests,
 	}
 
-	handled, err := client.processPendingStopControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	standDown, err := client.processPendingStopControlRequest(t.Context(), apply, wholeApplyTaskScope())
 	require.NoError(t, err)
-	assert.False(t, handled, "a paused remote is not settled: the drive must keep polling for the stop to land")
+	assert.False(t, standDown, "a paused remote is not settled: the drive must keep polling for the stop to land")
 	assert.False(t, state.IsTerminalApplyState(apply.State),
 		"the in-memory apply must not be terminalized from a paused remote snapshot, got %s", apply.State)
 	for _, update := range applyStore.updates {
@@ -5946,9 +5962,9 @@ func TestGRPCClient_ProcessPendingCancelSyncDoesNotTerminalizeDuringRetryablePau
 		controlRequests: controlRequests,
 	}
 
-	handled, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply, wholeApplyTaskScope())
 	require.NoError(t, err)
-	assert.False(t, handled, "a paused remote is not settled: the drive must keep polling for the cancel to land")
+	assert.False(t, standDown, "a paused remote is not settled: the drive must keep polling for the cancel to land")
 	assert.Equal(t, 1, server.cancelCalls, "the cancel must still be relayed to the data plane")
 	assert.False(t, state.IsTerminalApplyState(apply.State),
 		"the in-memory apply must not be terminalized from a paused remote snapshot, got %s", apply.State)

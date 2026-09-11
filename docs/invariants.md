@@ -387,7 +387,7 @@ publish path (`pkg/webhook/check_publisher.go`, `pkg/webhook/check_aggregate.go`
 ### MG-2: Absence never passes
 
 The aggregate check is created on every PR head commit. A PR that touches no managed schema files
-still gets one: an explicit passing "no managed schema changes". GitHub treats a missing required
+still gets one: an explicit passing "no schema files changed". GitHub treats a missing required
 check as not passing, so having nothing to say has to be said rather than left empty. The same
 logic applies in reverse. When SchemaBot expects a check, environment, or config and cannot find
 it, that reads as blocking, never as not-applicable. A gate must not be removable by the very
@@ -482,9 +482,15 @@ and CLI flows do not write passing checks.
 
 Aggregates blocked on unresolved or stale state are re-evaluated by SchemaBot itself, not left
 waiting for a lucky comment or push. The exception is a block that no retry can lift (untrusted
-App, misconfigured check name), which blocks immediately and permanently. *Enforced:* stale-check
-reconciliation (`pkg/webhook/check_records.go`) and aggregate re-evaluation
-(`pkg/webhook/check_aggregate.go`, `pkg/webhook/checks_backfill.go`).
+App, misconfigured check name), which blocks immediately and permanently.
+
+A block an operator owes a target a reconciliation for is not an exception to this. It converges
+too, by the operator reconciling the target — what it must not do is converge on its own, since
+that would clear the block without the divergence behind it being addressed.
+
+*Enforced:* stale-check reconciliation (`pkg/webhook/check_records.go`), aggregate re-evaluation
+(`pkg/webhook/check_aggregate.go`, `pkg/webhook/checks_backfill.go`), and the re-plan a settled
+apply owes a PR whose head moved past the commit its check names (`pkg/webhook/handler.go`).
 
 ### MG-11: A terminal outcome lands on the commit the PR is gated on
 
@@ -725,7 +731,8 @@ rather than the operation is the unit of reconciliation.
 
 The check runs whenever an apply is created or moved back into an active state, serialized across
 instances by an advisory lock keyed on (database, database type, environment) and held for the
-transaction that decides. It does not depend on a user-facing database lock being held: direct API
+transaction that decides. That lock excludes only while the connection holding it keeps one
+server session, which OW-9 covers. It does not depend on a user-facing database lock being held: direct API
 callers and `--no-lock` flows are equally bound. *Enforced:* the exclusivity check in the storage
 apply create and activate paths, under the apply target lock
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/locks.go`).
@@ -783,9 +790,41 @@ including when what is stored is a task that has outlived its apply's verdict (U
 *Enforced:* lease predicates on the driver's apply and task writes
 (`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/applies.go`), the lease
 gates the reaper's sweeps select and write under (`unleasedOperationGate`, `undrivenApplyGate`,
-`lockUndrivenApply`, `pkg/storage/internal/sqlstore/apply_operations.go`,
+`lockUndrivenApplies`, `pkg/storage/internal/sqlstore/apply_operations.go`,
 `pkg/storage/internal/sqlstore/applies.go`), and a read path that builds progress from
 stored rows without writing them (`pkg/api/progress_handlers.go`).
+
+### OW-9: An advisory lock is only exclusion where the session holds still
+
+Every guarantee SchemaBot has across instances that is not a lease predicate is one advisory
+lock: the storage bootstrap, the apply target lock behind OW-5, and reaper election. All three
+are session-scoped, so all three are exclusion only while a connection keeps reaching the same
+server session.
+
+That is a property of the connection and not of the lock. It holds against a database, and
+against a pooler that gives a client its own session for the connection's lifetime. It does not
+hold behind a transaction-mode pooler, which rebinds the backend per transaction: the lock lands
+on a session the client stops mapping to, a second caller reaching that backend takes the same
+lock, and the release comes back false because the connection asking is no longer the session
+holding it. Nothing about that reads as an error: both callers are told they hold the lock.
+
+So on PostgreSQL the property is proven at startup rather than assumed, and a proof that fails
+refuses the process rather than converging storage or driving applies without exclusion. A lock
+whose release reports it was not held is reported as lost ownership, because a caller that
+believed it held the lock has just learned it did not.
+
+The proof is one-sided by construction: it observes facts about the pool in front of it, so it
+has no false positive, and an idle pooler with spare backends can still answer every reading the
+healthy way. It is the guard against the connection string a hosted platform hands out by
+default, not a substitute for the direct endpoint.
+
+*Breaks if violated:* two pods converge the same storage schema, and later drive the same apply,
+each believing it holds the lock. *Enforced:* the session affinity probe
+(`Postgres.VerifySessionAffinity`, `pkg/namedlock/postgres_affinity.go`), refused at bootstrap
+(`verifyStorageSessionAffinity`, `pkg/api/ensure_schema_postgres.go`); the release-answer
+warnings on every advisory lock caller (`releaseEnsureSchemaLock`, `pkg/api/ensure_schema.go`;
+`releaseApplyTargetLockConn`, `pkg/storage/internal/sqlstore/applies.go`; `reapUnderElection`,
+`pkg/storage/internal/sqlstore/reaper.go`).
 
 ## Control operations (CO)
 
@@ -838,10 +877,14 @@ resolved by drive ordering. *Enforced:* pending-stop checks in pollers and the c
 
 ### CO-5: The revert phase owns the outcome
 
-Once an apply is `reverting` or `skipping_revert`, stop, cancel, and cutover are refused for the
-whole phase, because storage must never settle on a state that contradicts what the engine is
-still doing to the database underneath. *Enforced:* revert-phase gates in the control paths
-(`pkg/tern/local_control.go`).
+Once an apply has entered its revert phase — the window held open after cutover, or a revert or
+skip-revert in flight — stop, cancel, and cutover are refused for the whole phase, and its drive
+keeps driving the phase to its own outcome rather than settling on the refused command, because
+storage must never settle on a state that contradicts what the engine is still doing to the
+database underneath. *Enforced:* the revert-phase gate on the control path
+(`pkg/tern/local_control.go`), and the drive loops that act on its answer
+(`pkg/tern/local_apply_grouped.go`, `pkg/tern/local_apply_sequential.go`,
+`pkg/tern/local_control_resume.go`, `pkg/tern/grpc_client.go`).
 
 ### CO-6: Commands act only where they have an effect
 

@@ -43,6 +43,27 @@ func TestBuildPlanCommentData_CarriesPerShardChanges(t *testing.T) {
 	assert.Equal(t, []string{mutesDrift}, data.Changes[0].Shards[1].Statements, "the drifted shard keeps its own DDL")
 }
 
+// Every exempt-table group on the plan response reaches the comment data with
+// its namespace, tables, and reason intact, in response order; a nil entry is
+// skipped rather than rendered as an empty group.
+func TestBuildPlanCommentData_CarriesExemptTables(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "app", Type: "postgres"}
+	planResp := &apitypes.PlanResponse{
+		ExemptTables: []*apitypes.ExemptTablesResponse{
+			{Namespace: "app", Tables: []string{"orders_archive_2024", "events_archive_2025_01"}, Reason: "archive naming"},
+			nil,
+			{Namespace: "audit", Tables: []string{"logs_archive_2023"}, Reason: "archive naming"},
+		},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+
+	assert.Equal(t, []templates.ExemptTablesData{
+		{Namespace: "app", Tables: []string{"orders_archive_2024", "events_archive_2025_01"}, Reason: "archive naming"},
+		{Namespace: "audit", Tables: []string{"logs_archive_2023"}, Reason: "archive naming"},
+	}, data.ExemptTables)
+}
+
 // An unsafe change on a single shard (per-shard plan) is surfaced with its shard,
 // even when the collapsed namespace-level Changes don't carry it.
 func TestBuildPlanCommentData_PerShardUnsafe(t *testing.T) {

@@ -239,6 +239,17 @@ type ChecksScanRequest struct {
 	// the scan stops paging as soon as it crosses the cutoff — bounding an
 	// incident-window sweep by the window instead of the repo's PR count.
 	UpdatedSince string `json:"updated_since,omitempty"`
+	// StuckAfter, when set (a Go duration such as "1h"), limits the stored-row
+	// annotation on uncompleted Check Runs to runs that have been sitting at
+	// least this long. Every uncompleted run is still reported; a young one
+	// simply comes back unannotated, since the annotation costs a storage read
+	// per pull request and one per apply behind it, and a caller that drops
+	// young runs before rendering never shows the result.
+	//
+	// A run whose start time is missing, unparseable, or in the future is
+	// annotated: a start time that cannot prove a run is young must not be
+	// read as deciding that it is.
+	StuckAfter string `json:"stuck_after,omitempty"`
 }
 
 type ChecksScanResponse struct {
@@ -262,6 +273,14 @@ type ChecksScanResponse struct {
 	// decides how old is old enough to call stuck, because an uncompleted
 	// check is legitimate while an apply or plan is genuinely in flight.
 	Stuck []StuckCheckPR `json:"stuck,omitempty"`
+	// ObservedAt is the clock this page's runs were aged against, RFC3339. The
+	// stuck threshold is applied on both sides — here to decide which runs to
+	// annotate with their stored rows, and by the caller to decide which to
+	// render — and two clocks a round trip apart disagree at the boundary. A
+	// caller that ages the runs against this instead of its own reaches the
+	// same verdict the annotation was written for. Empty from a server that
+	// does not annotate at all, where the caller's own clock is all there is.
+	ObservedAt string `json:"observed_at,omitempty"`
 	// RateLimit reports the GitHub budget left on the installation that
 	// served this page, so the caller can pace itself instead of starving
 	// the live webhook path that shares the same budget. Nil when the rate
@@ -339,6 +358,12 @@ type StuckCheckPR struct {
 	Checks  []IncompleteCheckRun `json:"checks"`
 }
 
+// Values for IncompleteCheckRun.WaitingOn.
+const (
+	WaitingOnSchemaBot = "schemabot"
+	WaitingOnOperator  = "operator"
+)
+
 // IncompleteCheckRun describes one Check Run that exists on the PR head but
 // has not completed.
 type IncompleteCheckRun struct {
@@ -347,6 +372,147 @@ type IncompleteCheckRun struct {
 	Status     string `json:"status"`
 	// StartedAt is RFC3339; empty when GitHub did not report a start time.
 	StartedAt string `json:"started_at,omitempty"`
+	// StoredRows is the stored check state behind this uncompleted run, read
+	// against the PR's head and narrowed to the environment this run reports
+	// on. An uncompleted Check Run says only that the gate is open; these
+	// rows say what it is open on, and whether that is something SchemaBot
+	// resolves or something a person has to.
+	//
+	// A PR carries one run per environment and each gates merge on its own,
+	// so the rows are per run rather than per PR: attributing another
+	// environment's rows to this run would name a cause that has nothing to
+	// do with why it is sitting.
+	//
+	// Empty when the scan could not read stored state. That is reported as
+	// absence rather than as a failed scan: the Check Run findings are the
+	// part the backfill acts on, and they are already in hand.
+	StoredRows []InspectedCheck `json:"stored_rows,omitempty"`
+	// WaitingOn classifies the rows: "operator" when any of them needs a
+	// person, "schemabot" when they all resolve on their own, and empty when
+	// no row explains the run — whether because none was read, none blocks
+	// once scoped to this run's environment, or the only blocking one is the
+	// aggregate. It is the field that decides whether a stuck entry in a
+	// fleet sweep is worth opening.
+	WaitingOn string `json:"waiting_on,omitempty"`
+}
+
+// ChecksInspectRequest asks for the stored check state one pull request holds,
+// read against the commit that pull request is currently gated on.
+type ChecksInspectRequest struct {
+	Repo        string `json:"repo"`
+	PullRequest int    `json:"pull_request"`
+	// Environment, when set, narrows the response to that environment's rows.
+	Environment string `json:"environment,omitempty"`
+}
+
+// ChecksInspectResponse is the stored check state for one pull request beside
+// the Check Run GitHub currently shows, so an operator can see where the two
+// disagree without reading server logs or the database.
+type ChecksInspectResponse struct {
+	Repo        string `json:"repo"`
+	PullRequest int    `json:"pull_request"`
+	// HeadSHA is the commit the pull request is gated on, read uncached.
+	HeadSHA string `json:"head_sha"`
+	PRState string `json:"pr_state,omitempty"`
+	// Environment echoes the environment the response was narrowed to, empty
+	// when it covers every one. A narrowed response cannot speak for the
+	// environments it left out, so anything reported over the whole response
+	// has to say which environment it is reporting on.
+	Environment string `json:"environment,omitempty"`
+	// ChecksEnabled reports whether this deployment publishes Check Runs for
+	// the repository at all. When it is false the absence of a Check Run is a
+	// configuration choice, not a gap to backfill, and saying otherwise would
+	// send an operator after an incident that is not happening.
+	ChecksEnabled bool `json:"checks_enabled"`
+	// CheckRunsOnHead is every Check Run this deployment publishes that was
+	// found on the head, one per expected name.
+	CheckRunsOnHead []InspectedCheckRun `json:"check_runs_on_head,omitempty"`
+	// MissingCheckRunNames is every expected Check Run name GitHub was read
+	// for and reported no run on the head. Branch protection requires each
+	// name on its own, so one present run never says the gate is clear while
+	// another name is absent.
+	//
+	// Empty on a deployment that publishes no checks for the repository:
+	// there the absence is the configuration, and naming it as a gap would
+	// send an operator after an incident that is not happening.
+	MissingCheckRunNames []string `json:"missing_check_run_names,omitempty"`
+	// UnreadableCheckRunNames is every expected name whose lookup failed.
+	// Such a name is neither present nor missing, and the difference decides
+	// what an operator does: a missing run is recreated, an unreadable one is
+	// read again. Reporting it as absent would recommend recreating a Check
+	// Run that may be sitting on the head, and treating the empty result as
+	// "no gap" would report a GitHub outage as a clear gate.
+	UnreadableCheckRunNames []string `json:"unreadable_check_run_names,omitempty"`
+	// UntrustedConflictNames is every expected name a same-named Check Run
+	// from an app SchemaBot does not trust is also sitting under, whether or
+	// not the trusted run exists. The operator has something to resolve either
+	// way: the run branch protection reads may not be the one SchemaBot
+	// writes, and no backfill touches the other app's. When the name is also
+	// missing, reporting only the absence would send them to recreate a run
+	// and leave them puzzled when the gate does not move; when the trusted run
+	// is present, dropping the conflict would report a clear gate over a
+	// duplicate holding it closed.
+	//
+	// Empty on a deployment that publishes no checks for the repository, for
+	// the same reason MissingCheckRunNames is: a conflict is a claim that
+	// another app's run competes with SchemaBot's, and there is no SchemaBot
+	// run there to compete with. What sits under the name is simply another
+	// app's. A consumer reading this field to find a squatting app should read
+	// ChecksEnabled first, since an empty list there means the question was
+	// not asked rather than answered no.
+	UntrustedConflictNames []string `json:"untrusted_conflict_names,omitempty"`
+	// Rows is the stored check state, one entry per environment and database.
+	Rows []InspectedCheck `json:"rows"`
+}
+
+// InspectedCheckRun is the state of a Check Run on the pull request head.
+type InspectedCheckRun struct {
+	Name       string `json:"name"`
+	CheckRunID int64  `json:"check_run_id"`
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion,omitempty"`
+	// StartedAt is RFC3339; empty when GitHub did not report a start time.
+	StartedAt string `json:"started_at,omitempty"`
+}
+
+// InspectedCheck is one stored check row and what it means for the commit the
+// pull request is gated on.
+type InspectedCheck struct {
+	Environment  string `json:"environment"`
+	DatabaseType string `json:"database_type"`
+	Database     string `json:"database"`
+	// Aggregate marks the rollup row rather than a database's own row. The
+	// rollup restates the rows beside it, so it is never an independent
+	// cause: a reader looking for what is holding the gate open reads the
+	// database rows and lets this one alone.
+	Aggregate bool `json:"aggregate,omitempty"`
+	// RecordedSHA is the commit this row was recorded for, which is not always
+	// the commit the pull request is gated on. It is deliberately not named
+	// head_sha: the response carries that too, for the pull request's actual
+	// head, and one name for the two would read as agreement wherever the row
+	// is stale, which is the case worth seeing.
+	RecordedSHA string `json:"recorded_sha"`
+	// CoversHead reports whether this row speaks for the pull request's head.
+	CoversHead     bool   `json:"covers_head"`
+	Status         string `json:"status"`
+	Conclusion     string `json:"conclusion,omitempty"`
+	BlockingReason string `json:"blocking_reason,omitempty"`
+	CheckRunID     int64  `json:"check_run_id,omitempty"`
+	// ApplyIdentifier names the apply that owns this row, empty when none
+	// does. Ownership is what keeps a plan for a newer commit from replacing
+	// the row, so it is the first thing to look at on a row that will not move.
+	ApplyIdentifier string `json:"apply_identifier,omitempty"`
+	ApplyState      string `json:"apply_state,omitempty"`
+	UpdatedAt       string `json:"updated_at,omitempty"`
+	// Reason is the stable diagnosis code for this row; see pkg/checkstate.
+	Reason  string `json:"reason"`
+	Summary string `json:"summary"`
+	Remedy  string `json:"remedy"`
+	// Blocking reports whether this row keeps the aggregate from passing.
+	Blocking bool `json:"blocking"`
+	// SelfConverging reports whether SchemaBot reaches the resolved state on
+	// its own. False means the row is waiting on a person.
+	SelfConverging bool `json:"self_converging"`
 }
 
 // =============================================================================
@@ -428,9 +594,17 @@ type ForeignKeyCatalog struct {
 
 // PullSchemaRequest is the HTTP request body for POST /api/pull.
 type PullSchemaRequest struct {
-	Database      string   `json:"database"`
-	Environment   string   `json:"environment"`
-	Type          string   `json:"type"`
+	Database    string `json:"database"`
+	Environment string `json:"environment"`
+	Type        string `json:"type"`
+	// App selects the database by its configured app identifier instead of
+	// its name. Exactly one of Database or App must be set, and App must
+	// resolve to exactly one configured database: a pull reads one database,
+	// so an app declared by several databases is an error naming the
+	// candidates, never an arbitrary pick. The pull endpoint enforces the
+	// exactly-one rule and resolves App to a database before execution;
+	// callers invoking the execution layer directly must set Database.
+	App           string   `json:"app,omitempty"`
 	Namespaces    []string `json:"namespaces,omitempty"`
 	CatalogDetail string   `json:"catalog_detail,omitempty"`
 	// Lint runs the schema linters over every pulled table and attaches the
@@ -441,11 +615,15 @@ type PullSchemaRequest struct {
 
 // PullSchemaResponse is the HTTP response body for POST /api/pull.
 type PullSchemaResponse struct {
-	Database    string                      `json:"database"`
-	Type        string                      `json:"type"`
-	Environment string                      `json:"environment"`
-	Namespaces  map[string]*PulledNamespace `json:"namespaces"`
-	TableCount  int32                       `json:"table_count"`
+	Database    string `json:"database"`
+	Type        string `json:"type"`
+	Environment string `json:"environment"`
+	// App is the database's configured app identifier, echoed whether the
+	// request selected the database by name or by app. Empty when the
+	// database declares no app.
+	App        string                      `json:"app,omitempty"`
+	Namespaces map[string]*PulledNamespace `json:"namespaces"`
+	TableCount int32                       `json:"table_count"`
 }
 
 // DatabaseListResponse is the HTTP response body for GET /api/databases.
@@ -456,8 +634,12 @@ type DatabaseListResponse struct {
 // DatabaseResponse describes one server-side database without
 // exposing connection strings, opaque execution targets, or endpoint addresses.
 type DatabaseResponse struct {
-	Database     string                         `json:"database"`
-	Type         string                         `json:"type"`
+	Database string `json:"database"`
+	Type     string `json:"type"`
+	// App is the database's configured app identifier, so callers can group
+	// databases into applications and join this inventory against systems
+	// that know only the app. Empty when the database declares no app.
+	App          string                         `json:"app,omitempty"`
 	Environments []*DatabaseEnvironmentResponse `json:"environments"`
 }
 
@@ -539,6 +721,20 @@ type PlanResponse struct {
 	// applying this plan will adopt or discard, one entry per namespace holding
 	// any. Empty when the target is clean, which is the ordinary case.
 	ExistingCopies []*ExistingCopyResponse `json:"existing_copies,omitempty"`
+	// ExemptTables lists live tables the planner intentionally excluded from
+	// the undeclared-table verdict, one entry per namespace holding any. Like
+	// ExistingCopies it describes the target at planning time and is carried
+	// on the response to the plan request only; a stored plan does not retain
+	// it. Empty when nothing was exempted, which is the ordinary case.
+	ExemptTables []*ExemptTablesResponse `json:"exempt_tables,omitempty"`
+}
+
+// ExemptTablesResponse describes live tables in one namespace that the planner
+// exempted from the undeclared-table verdict, and why.
+type ExemptTablesResponse struct {
+	Namespace string   `json:"namespace"`
+	Tables    []string `json:"tables"`
+	Reason    string   `json:"reason"`
 }
 
 // Dispositions an ExistingCopyResponse can carry. These mirror the engine's

@@ -332,6 +332,17 @@ type PlanResult struct {
 	// namespace that holds any. Empty when the target holds none, which is the
 	// ordinary case.
 	ExistingCopies []*ExistingCopy
+
+	// ExemptTables lists live tables intentionally excluded from a plan verdict,
+	// grouped by namespace and carrying the engine-agnostic reason for exemption.
+	ExemptTables []*ExemptTables
+}
+
+// ExemptTables describes live tables exempt from a plan verdict in one namespace.
+type ExemptTables struct {
+	Namespace string
+	Tables    []string
+	Reason    string
 }
 
 // HasErrors returns true if any lint warning has error severity.

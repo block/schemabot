@@ -12,8 +12,10 @@ import (
 	"time"
 
 	"github.com/block/pg-sprite/pkg/dbconn"
+	"github.com/block/pg-sprite/pkg/schemadiff"
 	"github.com/block/pg-sprite/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -521,6 +523,11 @@ func TestEnginePlanUndeclaredTableIsBlockedDrop(t *testing.T) {
 	assert.False(t, result.NoChanges, "an undeclared live table is a change the reviewer must see")
 	require.Len(t, result.Changes, 1)
 	assert.Equal(t, "public", result.Changes[0].Namespace)
+	require.Len(t, result.ExemptTables, 1)
+	assert.Equal(t, "public", result.ExemptTables[0].Namespace)
+	assert.Equal(t, []string{"audit_log_archive_2019"}, result.ExemptTables[0].Tables)
+	assert.Equal(t, "archive naming", result.ExemptTables[0].Reason)
+	assert.NotContains(t, result.ExemptTables[0].Tables, "legacy_users")
 	require.Len(t, result.Changes[0].TableChanges, 8,
 		"every undeclared table with a definition of its own is reported; the declared table, its partition, the extension-owned table and the archive table are not")
 
@@ -654,6 +661,12 @@ func TestEnginePlanUndeclaredTablesAcrossNamespaces(t *testing.T) {
 // silently, and a shadowed pull would hand the operator a wrong baseline. The
 // fixture includes a partition and an extension-owned table so the exemption
 // subqueries have rows to get wrong, not a vacuous NOT EXISTS.
+//
+// The pool is plain pgx rather than pg-sprite's: pg-sprite rewrites every new
+// session's search_path to drop a shadowed pg_catalog entry (proven by
+// TestSpritePoolUnshadowsCatalog), which would hide the hostile path from the
+// queries under test. The queries must resolve the catalog correctly on their
+// own, without relying on the pool that happens to carry them in production.
 func TestLiveTablesUnderShadowingSearchPath(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "plan_shadow_test")
 	_, err := db.ExecContext(t.Context(), `
@@ -692,9 +705,7 @@ func TestLiveTablesUnderShadowingSearchPath(t *testing.T) {
 		CREATE FUNCTION hostile.cardinality(anyarray) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT 1';
 		ALTER DATABASE plan_shadow_test SET search_path = hostile, pg_catalog, public`)
 	require.NoError(t, err)
-	poolCfg, err := spritePoolConfig(dsn, "")
-	require.NoError(t, err)
-	pool, err := dbconn.NewPool(t.Context(), poolCfg)
+	pool, err := pgxpool.New(t.Context(), dsn)
 	require.NoError(t, err)
 	defer pool.Close()
 
@@ -710,7 +721,7 @@ func TestLiveTablesUnderShadowingSearchPath(t *testing.T) {
 		{name: "users", foreignKeys: []string{}, referencedBy: []string{"orders_user_id_fkey"}},
 	}, tables, "every live table and its foreign keys must be enumerated, and only the partition and the extension-owned table left out, despite the shadowing search_path")
 
-	pulled, err := pullTables(t.Context(), pool, "public")
+	pulled, err := schemadiff.ListManagedTables(t.Context(), pool, "public")
 	require.NoError(t, err)
 	assert.Equal(t, []string{"events", "orders", "users"}, pulled, "the pull must render the same set the plan holds files accountable for")
 
@@ -724,6 +735,37 @@ func TestLiveTablesUnderShadowingSearchPath(t *testing.T) {
 	objects, err := pullUnmodeledTableObjects(t.Context(), pool, "public", "users")
 	require.NoError(t, err)
 	assert.Equal(t, unmodeledTableObjects{}, objects, "a plain table must not acquire unmodeled objects from decoy catalog rows")
+}
+
+// TestSpritePoolUnshadowsCatalog pins the search_path every pg-sprite pool
+// session arrives with: an explicit pg_catalog entry that a user schema
+// precedes is dropped, every other entry keeps its position, and a path with
+// nothing shadowed is left as configured. The plan, apply, and pull dial
+// sites all build their pool through spritePoolConfig, so this is the session
+// state their queries run under, and a change to it upstream would surface
+// here rather than as a wrong catalog answer on a target with a hardened
+// search_path.
+func TestSpritePoolUnshadowsCatalog(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pool_shadow_test")
+	sessionSearchPath := func(t *testing.T, dsn string) string {
+		t.Helper()
+		poolCfg, err := spritePoolConfig(dsn, "")
+		require.NoError(t, err)
+		pool, err := dbconn.NewPool(t.Context(), poolCfg)
+		require.NoError(t, err)
+		defer pool.Close()
+		var searchPath string
+		require.NoError(t, pool.QueryRow(t.Context(), "SHOW search_path").Scan(&searchPath))
+		return searchPath
+	}
+
+	_, err := db.ExecContext(t.Context(), `ALTER DATABASE pool_shadow_test SET search_path = hostile, pg_catalog, public`)
+	require.NoError(t, err)
+	assert.Equal(t, "hostile, public", sessionSearchPath(t, dsn), "a pg_catalog entry listed behind a user schema is dropped from every pooled session")
+
+	_, err = db.ExecContext(t.Context(), `ALTER DATABASE pool_shadow_test SET search_path = pg_catalog, public`)
+	require.NoError(t, err)
+	assert.Equal(t, "pg_catalog, public", sessionSearchPath(t, dsn), "a leading pg_catalog entry shadows nothing and is kept as configured")
 }
 
 // TestEngineApplyNativeSafe proves a planned metadata-only ALTER runs through
@@ -1093,8 +1135,8 @@ func TestEngineApplyConcurrentIndexBuild(t *testing.T) {
 }
 
 // An operator cancel signals a concurrent build parked behind an open writer,
-// settles the apply as cancelled, and preserves the invalid index entry that
-// the next drive uses for automatic recovery.
+// removes the invalid catalog entry under its bounded cleanup envelope, and
+// settles the apply as cancelled with no debris for the next drive.
 func TestEngineCancelConcurrentIndexBuild(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "cancel_index_build_test")
 	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
@@ -1112,15 +1154,85 @@ func TestEngineCancelConcurrentIndexBuild(t *testing.T) {
 		return err == nil && invalid
 	}, postgresApplyDeadline, 10*time.Millisecond, "the build never parked after creating its invalid catalog entry")
 
-	result, err := eng.Cancel(t.Context(), cancelRequestFor("orders"))
-	require.NoError(t, err)
-	assert.True(t, result.Accepted)
+	type cancelAnswer struct {
+		result *engine.ControlResult
+		err    error
+	}
+	answered := make(chan cancelAnswer, 1)
+	go func() {
+		result, cancelErr := eng.Cancel(t.Context(), cancelRequestFor("orders"))
+		answered <- cancelAnswer{result: result, err: cancelErr}
+	}()
+	// The cleanup proves abandonment with a table lock. Release the writer
+	// once the cancellation has ended the builder so that proof can proceed.
+	require.Eventually(t, func() bool {
+		var builders int
+		err := db.QueryRowContext(t.Context(), `SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND query LIKE 'CREATE INDEX CONCURRENTLY orders_ref_idx%' AND state <> 'idle'`).Scan(&builders)
+		return err == nil && builders == 0
+	}, postgresApplyDeadline, 10*time.Millisecond, "the cancelled build backend did not exit")
 	writer.release(t)
+	answer := <-answered
+	require.NoError(t, answer.err)
+	assert.True(t, answer.result.Accepted)
 
 	got := awaitPostgresProgress(t, eng, "orders")
 	assert.Equal(t, engine.StateCancelled, got.State)
-	assert.Contains(t, got.ErrorMessage, "orders_ref_idx")
-	assertIndexInvalid(t, db, "orders_ref_idx")
+	assert.Contains(t, got.ErrorMessage, `"public"."orders_ref_idx" was removed`)
+	var exists bool
+	err = db.QueryRowContext(t.Context(), `SELECT to_regclass('public.orders_ref_idx') IS NOT NULL`).Scan(&exists)
+	require.NoError(t, err)
+	assert.False(t, exists, "operator cancellation must not leave an invalid index")
+}
+
+// An operator cancel during a recovery build removes both the pre-existing
+// debris and the recovery build's own invalid index before settling cancelled.
+func TestEngineCancelConcurrentIndexRecoveryBuild(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "cancel_index_recovery_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text);
+		INSERT INTO public.orders (id, ref) SELECT n, 'ref-' || n FROM generate_series(2, 200001) AS n;
+		CREATE INDEX orders_ref_idx ON public.orders (ref);
+		UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'public.orders_ref_idx'::regclass`)
+	require.NoError(t, err)
+	var seededOID uint32
+	err = db.QueryRowContext(t.Context(), `SELECT 'public.orders_ref_idx'::regclass::oid`).Scan(&seededOID)
+	require.NoError(t, err)
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders",
+		"CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		var invalid bool
+		var currentOID uint32
+		err := db.QueryRowContext(t.Context(), `SELECT NOT indisvalid, indexrelid FROM pg_index WHERE indexrelid = to_regclass('public.orders_ref_idx')`).Scan(&invalid, &currentOID)
+		return err == nil && invalid && currentOID != seededOID
+	}, postgresApplyDeadline, 10*time.Millisecond, "the recovery build never parked after replacing the seeded debris")
+	writer := holdOrdersWriter(t, db)
+	defer writer.release(t)
+
+	type cancelAnswer struct {
+		result *engine.ControlResult
+		err    error
+	}
+	answered := make(chan cancelAnswer, 1)
+	go func() {
+		result, cancelErr := eng.Cancel(t.Context(), cancelRequestFor("orders"))
+		answered <- cancelAnswer{result: result, err: cancelErr}
+	}()
+	require.Eventually(t, func() bool {
+		var builders int
+		err := db.QueryRowContext(t.Context(), `SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND query LIKE 'CREATE INDEX CONCURRENTLY orders_ref_idx%' AND state <> 'idle'`).Scan(&builders)
+		return err == nil && builders == 0
+	}, postgresApplyDeadline, 10*time.Millisecond, "the cancelled recovery build backend did not exit")
+	writer.release(t)
+	answer := <-answered
+	require.NoError(t, answer.err)
+	assert.True(t, answer.result.Accepted)
+
+	got := awaitPostgresProgress(t, eng, "orders")
+	assert.Equal(t, engine.StateCancelled, got.State)
+	assert.Contains(t, got.ErrorMessage, `"public"."orders_ref_idx" was removed`)
+	assertIndexAbsentWithoutDebris(t, db, "orders", "orders_ref_idx")
 }
 
 // TestEngineCancelConcurrentIndexBuildWithoutABackendSignal proves the cancel
@@ -1131,7 +1243,7 @@ func TestEngineCancelConcurrentIndexBuild(t *testing.T) {
 // stop the statement on the server: the cancel settles while the writer the
 // build is waiting on is still open, so nothing but the context ended the
 // build, and the operator is answered with a cancelled apply whose leftover
-// index the next drive recovers.
+// identity remains explicit for recovery.
 func TestEngineCancelConcurrentIndexBuildWithoutABackendSignal(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "cancel_fallback_test")
 	_, err := db.ExecContext(t.Context(), "ALTER DATABASE cancel_fallback_test SET track_activities = off")
@@ -1169,7 +1281,7 @@ func TestEngineCancelConcurrentIndexBuildWithoutABackendSignal(t *testing.T) {
 	got := awaitPostgresProgress(t, eng, "orders")
 	assert.Equal(t, engine.StateCancelled, got.State, "progress: %+v", got)
 	assert.Equal(t, "cancelled", got.Metadata["phase"])
-	assert.Contains(t, got.ErrorMessage, "orders_ref_idx")
+	assert.Equal(t, `index "public"."orders_ref_idx" may be invalid but its catalog state could not be verified; inspect pg_index.indisvalid on the target before any recovery, then retry`, got.ErrorMessage)
 	assertBackendGone(t, db, builderPID)
 
 	writer.release(t)
@@ -1503,6 +1615,18 @@ func assertIndexValidWithoutDebris(t *testing.T, db *sql.DB, table, index string
 		WHERE i.indrelid = to_regclass($1) AND c.relname LIKE 'pgsprite\_abandoned\_%'`, "public."+table).Scan(&debris)
 	require.NoError(t, err)
 	assert.Zero(t, debris, "the recovery must not leave quarantined entries on the table")
+}
+
+func assertIndexAbsentWithoutDebris(t *testing.T, db *sql.DB, table, index string) {
+	t.Helper()
+	var indexes int
+	err := db.QueryRowContext(t.Context(), `
+		SELECT count(*) FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indexrelid
+		WHERE i.indrelid = to_regclass($1) AND (c.relname = $2 OR c.relname LIKE 'pgsprite\_abandoned\_%')`,
+		"public."+table, index).Scan(&indexes)
+	require.NoError(t, err)
+	assert.Zero(t, indexes, "the cancelled build must leave neither its requested index nor quarantined debris")
 }
 
 // TestEngineApplyConcurrentIndexOnOtherTableRefused proves an invalid index

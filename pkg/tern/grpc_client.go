@@ -793,8 +793,8 @@ func logOperationDriveLeavesParentCancel(logger *slog.Logger, apply *storage.App
 // while the schema change keeps running and the operator's command never
 // resolves. Failing it with the stated reason ends that loop.
 //
-// The refusal means the operation did not take effect, so this reports the
-// request as not handled, and it drops the resolved request's send-gate entry
+// The refusal means the operation did not take effect, so this keeps the
+// caller's drive going, and it drops the resolved request's send-gate entry
 // so a re-issued command transmits at once. There is one control request row
 // per apply and operation, and re-requesting reuses that row rather than
 // inserting a new one, so the send gate would otherwise still hold the failed
@@ -807,10 +807,9 @@ func logOperationDriveLeavesParentCancel(logger *slog.Logger, apply *storage.App
 // caller's — a drive that reported the same sentence twice per tick would read
 // as two drives. It records the transmission on its way out: the request stays
 // pending by design there, so without the record every later tick would re-send
-// a command already refused. It reports the request as not handled for the same
-// reason the resolving branch does, which matters more here: an operation-only
-// drive returning handled would stand its whole drive step down over a refusal
-// that changed nothing.
+// a command already refused. It keeps the caller's drive going for the same
+// reason the resolving branch does, which matters more here: standing down
+// would stand the whole drive step down over a refusal that changed nothing.
 func (c *GRPCClient) failRefusedControlRequest(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, scope applyTaskScope, remoteID, errorMessage string) (bool, error) {
 	message := controlRefusalMessage(operation, errorMessage)
 	if scope.suppressesDirectParentApplyWrites() {
@@ -836,13 +835,28 @@ func (c *GRPCClient) failRefusedControlRequest(ctx context.Context, logger *slog
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, eventType,
 		fmt.Sprintf("Pending %s request rejected by the data plane: %s%s", operation, apply.OperatorFacingMessage(message, remoteID), callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 	if err := failPendingControlRequests(ctx, c.storage, apply, operation, message, remoteID); err != nil {
-		return true, fmt.Errorf("request remote gRPC %s for apply %s remote %s: refused with %q; fail pending %s request: %w", operation, apply.ApplyIdentifier, remoteID, message, operation, err)
+		// Whether or not the request resolved, the refusal already decided that
+		// nothing took effect, so the drive is owed the same answer.
+		return false, fmt.Errorf("request remote gRPC %s for apply %s remote %s: refused with %q; fail pending %s request: %w", operation, apply.ApplyIdentifier, remoteID, message, operation, err)
 	}
 	c.controlSendGate.clear(controlReq.ID)
 	return false, nil
 }
 
-func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (bool, error) {
+// processPendingStopControlRequest consumes a durable stop request against this
+// apply. Its return answers one question, and it is a question about the drive
+// rather than about the request: whether this drive step must stand down and
+// let the apply settle. Whether the request was resolved is a separate fact the
+// return does not carry, and on this client the two are especially loose,
+// because only a drive that owns the shared apply-level request resolves it: an
+// operation-only drive leaves it pending for the operator projection whether it
+// stands down or keeps going, and several branches stand down over a request
+// they deliberately left pending. Nor does the return mean the stop took
+// effect: an accepted stop the data plane is still working through keeps the
+// drive going, and a completed stop with a start already queued keeps it going
+// so the same claim resumes from there. So a new branch owes the drive an
+// answer about its own disposition, not about its bookkeeping.
+func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (standDown bool, err error) {
 	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop)
 	if err != nil {
 		return false, err
@@ -998,7 +1012,11 @@ func (c *GRPCClient) processPendingStopControlRequest(ctx context.Context, apply
 	return false, nil
 }
 
-func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (bool, error) {
+// processPendingCancelControlRequest consumes a durable cancel request against
+// this apply. Its return follows the same contract as the stop counterpart:
+// standDown reports what this drive step must do, which is independent of both
+// whether the request was resolved and whether a cancel took effect.
+func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (standDown bool, err error) {
 	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationCancel)
 	if err != nil {
 		return false, err
@@ -1012,7 +1030,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 			logOperationDriveLeavesParentCancel(logger, apply, scope)
 			return true, nil
 		}
-		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
+		if err := settlePendingCancelForTerminalApply(ctx, c.storage, c.baseLogger(), apply); err != nil {
 			return true, err
 		}
 		c.controlSendGate.clear(controlReq.ID)
@@ -1081,7 +1099,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 			logOperationDriveLeavesParentCancel(logger, apply, scope)
 			return true, nil
 		}
-		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
+		if err := settlePendingCancelForTerminalApply(ctx, c.storage, c.baseLogger(), apply); err != nil {
 			return true, err
 		}
 		c.controlSendGate.clear(controlReq.ID)
@@ -1120,7 +1138,7 @@ func (c *GRPCClient) processPendingCancelControlRequest(ctx context.Context, app
 // apply whose response was lost. Settling locally would report the change
 // stopped or cancelled while it kept running on the target, and because that
 // leaves the apply terminal, nothing would ever revisit it to find out. So this
-// reports the request unhandled and lets the drive continue to the dispatch
+// declines to stand the drive down and lets it continue to the dispatch
 // ambiguity guard, which fails the apply closed and fails the pending stop and
 // cancel requests with the same ambiguity message, so the operator sees the
 // rejection rather than a command no later claim would ever answer. The guard
@@ -1179,9 +1197,13 @@ func (c *GRPCClient) controlPathProgress(ctx context.Context, apply *storage.App
 	return progress, nil
 }
 
-func (c *GRPCClient) processPendingCancelOrStopControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (bool, error) {
-	if handled, err := c.processPendingCancelControlRequest(ctx, apply, scope); handled || err != nil {
-		return handled, err
+// processPendingCancelOrStopControlRequest consumes whichever of the two the
+// operator issued, cancel first because it is the stronger intent. standDown
+// carries whichever processor answered, so the drive stands down only when the
+// apply is really settling stopped or cancelled.
+func (c *GRPCClient) processPendingCancelOrStopControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) (standDown bool, err error) {
+	if standDown, err := c.processPendingCancelControlRequest(ctx, apply, scope); standDown || err != nil {
+		return standDown, err
 	}
 	return c.processPendingStopControlRequest(ctx, apply, scope)
 }
@@ -1316,12 +1338,19 @@ func (c *GRPCClient) completeRemoteCancelFromTerminalProgress(ctx context.Contex
 		logOperationDriveLeavesParentCancel(logger, apply, scope)
 		return true, nil
 	}
-	if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
+	// The settle writes the apply event that tells the operator whether their
+	// cancel took effect. What it cannot say is that this outcome was recovered
+	// from the remote's progress after the Cancel call itself errored, which is
+	// the context someone triaging the failed call needs.
+	logger.InfoContext(ctx, "remote gRPC cancel error reconciled from terminal progress; settling the durable cancel request",
+		append(apply.MutableLogAttrs(),
+			"remote_apply_id", remoteID,
+			"requested_by", controlRequestCaller(controlReq),
+			"remote_state", remoteState)...)
+	if err := settlePendingCancelForTerminalApply(ctx, c.storage, c.baseLogger(), apply); err != nil {
 		return false, err
 	}
 	c.controlSendGate.clear(controlReq.ID)
-	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested,
-		fmt.Sprintf("Remote cancel request completed from terminal progress (remote state: %s) after cancel error%s", remoteState, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 	return true, nil
 }
 
@@ -2270,7 +2299,7 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 		if target == "" {
 			target = apply.Database
 		}
-		if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
+		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); standDown || err != nil {
 			return err
 		}
 		changes := make([]*ternv1.TableChange, 0, len(namespaces))
@@ -2468,7 +2497,7 @@ func (c *GRPCClient) ResumeApplyOperationCutover(ctx context.Context, apply *sto
 		return fmt.Errorf("apply_operation %d (apply %s): no remote apply id for cutover drive", applyOperationID, apply.ApplyIdentifier)
 	}
 	// Honor a stop that raced in after the cutover claim before forcing the swap.
-	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
+	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); standDown || err != nil {
 		return err
 	}
 	poll, err := c.triggerRemoteOperationCutover(ctx, apply, scope, remoteID)
@@ -2567,7 +2596,7 @@ func (c *GRPCClient) triggerRemoteOperationCutover(ctx context.Context, apply *s
 		return false, fmt.Errorf("preflight remote cutover for apply_operation %d (apply %s): remote is %s, not parked at the cutover barrier", scope.applyOperationID, apply.ApplyIdentifier, remoteState)
 	}
 	// Re-check a raced stop immediately before forcing the swap.
-	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
+	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); standDown || err != nil {
 		return false, err
 	}
 	cutoverResp, err := c.client.Cutover(ctx, &ternv1.CutoverRequest{
@@ -2603,7 +2632,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 		return fmt.Errorf("apply is required")
 	}
 	logger := c.applyLogger(apply)
-	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
+	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); standDown || err != nil {
 		return err
 	}
 	if err := c.processPendingCutoverControlRequest(ctx, apply, scope); err != nil {
@@ -2646,7 +2675,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 		}
 	}
 	if startRequested && state.IsState(apply.State, state.Apply.WaitingForDeploy) {
-		if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
+		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); standDown || err != nil {
 			return err
 		}
 		if err := c.processPendingStartControlRequest(ctx, apply, scope); err != nil {
@@ -2656,7 +2685,7 @@ func (c *GRPCClient) resumeApply(ctx context.Context, apply *storage.Apply, scop
 
 	remoteID := scope.remoteApplyID(apply)
 	if remoteID != "" && state.IsState(apply.State, state.Apply.Pending) && !startRequested {
-		if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
+		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); standDown || err != nil {
 			return err
 		}
 		_, err := c.client.Start(ctx, &ternv1.StartRequest{
@@ -2899,7 +2928,7 @@ func (c *GRPCClient) waitForPendingStopBeforeStart(ctx context.Context, apply *s
 			// Stop this operation's own remote work once, then defer: the
 			// operation-only drive must not spin waiting for a parent stop it
 			// will never complete.
-			handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope)
+			standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope)
 			if err != nil {
 				return false, err
 			}
@@ -2910,7 +2939,7 @@ func (c *GRPCClient) waitForPendingStopBeforeStart(ctx context.Context, apply *s
 			if stillPending == nil {
 				return false, nil
 			}
-			if !handled {
+			if !standDown {
 				logOperationDriveLeavesParentStop(logger, apply, scope)
 			}
 			logger.InfoContext(ctx, "operation-only drive deferring pending gRPC start until apply-level stop resolves",
@@ -3109,7 +3138,7 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 	if target == "" {
 		target = apply.Database
 	}
-	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); handled || err != nil {
+	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); standDown || err != nil {
 		return err
 	}
 
@@ -4362,11 +4391,11 @@ func (c *GRPCClient) pollForCompletion(ctx context.Context, apply *storage.Apply
 				return stopErr
 			}
 		case <-ticker.C:
-			if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); err != nil {
+			if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply, scope); err != nil {
 				logger.Warn("pending gRPC stop request processing failed; current apply owner will exit for operator retry",
 					append(apply.MutableLogAttrs(), "error", err)...)
 				return err
-			} else if handled {
+			} else if standDown {
 				return nil
 			}
 			if err := c.processPendingCutoverControlRequest(ctx, apply, scope); err != nil {

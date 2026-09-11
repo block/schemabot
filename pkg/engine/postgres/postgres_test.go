@@ -765,6 +765,65 @@ func TestUndeclaredTableReasonNamesRemedyPerForeignKeySide(t *testing.T) {
 	}
 }
 
+// The managed table set decides membership and order; the foreign key read
+// only decorates it. The join keeps the set's order whatever order the
+// decoration rows arrive in, and a table with no constraints on either side
+// is one the catalog confirmed, not one the read missed.
+func TestJoinForeignKeysPreservesManagedOrder(t *testing.T) {
+	tables, err := joinForeignKeys("public", []string{"invoices", "orders", "users"}, []tableForeignKeys{
+		{name: "users"},
+		{name: "orders", foreignKeys: []string{"orders_user_id_fkey"}, referencedBy: []string{"invoices_order_id_fkey"}},
+		{name: "invoices", foreignKeys: []string{"invoices_order_id_fkey"}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []liveTable{
+		{name: "invoices", foreignKeys: []string{"invoices_order_id_fkey"}},
+		{name: "orders", foreignKeys: []string{"orders_user_id_fkey"}, referencedBy: []string{"invoices_order_id_fkey"}},
+		{name: "users"},
+	}, tables)
+}
+
+// The two catalog reads run on separate snapshots, so the join is checked in
+// both directions rather than trusted: a managed table with no decoration row
+// left the catalog between the reads, and a decoration row outside the
+// managed set means the read stopped restricting itself to it. Neither is
+// turned into a table with no foreign keys; the plan fails so it can be
+// retried against one catalog state.
+func TestJoinForeignKeysFailsClosedOnSkew(t *testing.T) {
+	tests := []struct {
+		name    string
+		names   []string
+		keys    []tableForeignKeys
+		wantErr string
+	}{
+		{
+			name:    "managed table left the catalog between the reads",
+			names:   []string{"orders", "users"},
+			keys:    []tableForeignKeys{{name: "users"}},
+			wantErr: `table "orders" in namespace "public" left the catalog while the plan was reading it; retry the plan`,
+		},
+		{
+			name:    "decoration row outside the managed set",
+			names:   []string{"orders"},
+			keys:    []tableForeignKeys{{name: "orders"}, {name: "orders_p2024"}},
+			wantErr: `foreign key metadata for table "orders_p2024" in namespace "public" is outside the managed table set`,
+		},
+		{
+			name:    "decoration row returned twice",
+			names:   []string{"orders"},
+			keys:    []tableForeignKeys{{name: "orders"}, {name: "orders", foreignKeys: []string{"orders_user_id_fkey"}}},
+			wantErr: `foreign key metadata for table "orders" in namespace "public" was returned more than once`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tables, err := joinForeignKeys("public", tt.names, tt.keys)
+			require.EqualError(t, err, tt.wantErr)
+			assert.Nil(t, tables)
+		})
+	}
+}
+
 func TestPullNamespacesRejectsReservedSchema(t *testing.T) {
 	_, err := pullNamespaces(t.Context(), nil, "pg_catalog")
 	require.Error(t, err)

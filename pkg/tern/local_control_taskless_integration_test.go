@@ -146,6 +146,21 @@ func requireControlRequestStatus(t *testing.T, stor storage.Storage, applyID int
 	assert.Equal(t, want, req.Status, "the %s control request must be %s", operation, want)
 }
 
+// requireOutrunCancelSettled asserts a cancel the schema change outran resolved
+// as a command that did not take effect, carrying the reason the PR comment's
+// not-applied notice renders. Resolving it as applied would tell the operator
+// the change was taken back when it is live on the target.
+func requireOutrunCancelSettled(t *testing.T, stor storage.Storage, applyID int64) {
+	t.Helper()
+	req, err := stor.ControlRequests().GetByOperation(t.Context(), applyID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, req, "the cancel control request must exist")
+	assert.Equal(t, storage.ControlRequestFailed, req.Status,
+		"a cancel the schema change outran must not resolve as applied")
+	assert.Contains(t, req.ErrorMessage, "the schema change completed before the cancel could take effect")
+	assert.Contains(t, req.ErrorMessage, "the change is live on the target")
+}
+
 // A queued apply can be claimed by an operator driver before its first drive
 // has created any tasks, and a cancel can land while it is still queued. The
 // drive that claims it must settle the apply to cancelled directly — there is
@@ -305,9 +320,9 @@ func TestLocalClient_CancelTasklessApplyWithLostApplyLeaseSettlesOperationRow(t 
 	reloaded, err := stor.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
 	require.NotNil(t, reloaded)
-	handled, err := client.processPendingCancelControlRequest(opCtx, reloaded)
+	standDown, err := client.processPendingCancelControlRequest(opCtx, reloaded)
 	require.NoError(t, err)
-	require.True(t, handled, "the drive must consume the pending cancel")
+	require.True(t, standDown, "the drive must consume the pending cancel")
 
 	settledOp, err := stor.ApplyOperations().Get(ctx, op.ID)
 	require.NoError(t, err)
@@ -371,9 +386,9 @@ func TestLocalClient_StopTasklessApplyWithLostApplyLeaseSettlesOperationRow(t *t
 	reloaded, err := stor.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
 	require.NotNil(t, reloaded)
-	handled, err := client.processPendingStopControlRequest(opCtx, reloaded)
+	standDown, err := client.processPendingStopControlRequest(opCtx, reloaded)
 	require.NoError(t, err)
-	require.True(t, handled, "the drive must consume the pending stop")
+	require.True(t, standDown, "the drive must consume the pending stop")
 
 	settledOp, err := stor.ApplyOperations().Get(ctx, op.ID)
 	require.NoError(t, err)
