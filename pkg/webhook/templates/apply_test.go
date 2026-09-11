@@ -1966,11 +1966,12 @@ func TestRenderApplySummaryComment_NonTerminalTableOutcomeVocabulary(t *testing.
 // and must direct the operator to open a new schema change.
 func TestRenderApplySummaryComment_Cancelled(t *testing.T) {
 	data := ApplyStatusCommentData{
-		Database:    "testapp",
-		Environment: "staging",
-		RequestedBy: "aparajon",
-		State:       state.Apply.Cancelled,
-		Engine:      "PlanetScale",
+		Database:     "testapp",
+		Environment:  "staging",
+		RequestedBy:  "aparajon",
+		State:        state.Apply.Cancelled,
+		Engine:       "PlanetScale",
+		ErrorMessage: "Concurrent index build cancelled; invalid index \"public\".\"orders_ref_idx\" was removed",
 		Tables: []TableProgressData{
 			{TableName: "orders", DDL: "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", Status: "cancelled"},
 		},
@@ -1981,6 +1982,7 @@ func TestRenderApplySummaryComment_Cancelled(t *testing.T) {
 	assert.Contains(t, result, "## 🚫 Schema Change Cancelled")
 	assert.Contains(t, result, "cannot be resumed")
 	assert.Contains(t, result, "Open a new schema change")
+	assert.Contains(t, result, "Concurrent index build cancelled; invalid index &#34;public&#34;.&#34;orders_ref_idx&#34; was removed")
 	assert.NotContains(t, result, "schemabot start", "a cancelled change is permanent — no resume affordance")
 }
 

@@ -1183,6 +1183,57 @@ func TestEngineCancelConcurrentIndexBuild(t *testing.T) {
 	assert.False(t, exists, "operator cancellation must not leave an invalid index")
 }
 
+// An operator cancel during a recovery build removes both the pre-existing
+// debris and the recovery build's own invalid index before settling cancelled.
+func TestEngineCancelConcurrentIndexRecoveryBuild(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "cancel_index_recovery_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text);
+		INSERT INTO public.orders (id, ref) SELECT n, 'ref-' || n FROM generate_series(2, 200001) AS n;
+		CREATE INDEX orders_ref_idx ON public.orders (ref);
+		UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'public.orders_ref_idx'::regclass`)
+	require.NoError(t, err)
+	var seededOID uint32
+	err = db.QueryRowContext(t.Context(), `SELECT 'public.orders_ref_idx'::regclass::oid`).Scan(&seededOID)
+	require.NoError(t, err)
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders",
+		"CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		var invalid bool
+		var currentOID uint32
+		err := db.QueryRowContext(t.Context(), `SELECT NOT indisvalid, indexrelid FROM pg_index WHERE indexrelid = to_regclass('public.orders_ref_idx')`).Scan(&invalid, &currentOID)
+		return err == nil && invalid && currentOID != seededOID
+	}, postgresApplyDeadline, 10*time.Millisecond, "the recovery build never parked after replacing the seeded debris")
+	writer := holdOrdersWriter(t, db)
+	defer writer.release(t)
+
+	type cancelAnswer struct {
+		result *engine.ControlResult
+		err    error
+	}
+	answered := make(chan cancelAnswer, 1)
+	go func() {
+		result, cancelErr := eng.Cancel(t.Context(), cancelRequestFor("orders"))
+		answered <- cancelAnswer{result: result, err: cancelErr}
+	}()
+	require.Eventually(t, func() bool {
+		var builders int
+		err := db.QueryRowContext(t.Context(), `SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND query LIKE 'CREATE INDEX CONCURRENTLY orders_ref_idx%' AND state <> 'idle'`).Scan(&builders)
+		return err == nil && builders == 0
+	}, postgresApplyDeadline, 10*time.Millisecond, "the cancelled recovery build backend did not exit")
+	writer.release(t)
+	answer := <-answered
+	require.NoError(t, answer.err)
+	assert.True(t, answer.result.Accepted)
+
+	got := awaitPostgresProgress(t, eng, "orders")
+	assert.Equal(t, engine.StateCancelled, got.State)
+	assert.Contains(t, got.ErrorMessage, `"public"."orders_ref_idx" was removed`)
+	assertIndexAbsentWithoutDebris(t, db, "orders", "orders_ref_idx")
+}
+
 // TestEngineCancelConcurrentIndexBuildWithoutABackendSignal proves the cancel
 // of last resort against a live build. With activity tracking off on the
 // target the server reports every backend's state as disabled, so the
@@ -1191,7 +1242,7 @@ func TestEngineCancelConcurrentIndexBuild(t *testing.T) {
 // stop the statement on the server: the cancel settles while the writer the
 // build is waiting on is still open, so nothing but the context ended the
 // build, and the operator is answered with a cancelled apply whose leftover
-// index the next drive recovers.
+// identity remains explicit for recovery.
 func TestEngineCancelConcurrentIndexBuildWithoutABackendSignal(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "cancel_fallback_test")
 	_, err := db.ExecContext(t.Context(), "ALTER DATABASE cancel_fallback_test SET track_activities = off")
@@ -1229,7 +1280,7 @@ func TestEngineCancelConcurrentIndexBuildWithoutABackendSignal(t *testing.T) {
 	got := awaitPostgresProgress(t, eng, "orders")
 	assert.Equal(t, engine.StateCancelled, got.State, "progress: %+v", got)
 	assert.Equal(t, "cancelled", got.Metadata["phase"])
-	assert.Contains(t, got.ErrorMessage, "orders_ref_idx")
+	assert.Equal(t, `index "public"."orders_ref_idx" may be invalid but its catalog state could not be verified; inspect pg_index.indisvalid on the target before any recovery, then retry`, got.ErrorMessage)
 	assertBackendGone(t, db, builderPID)
 
 	writer.release(t)
@@ -1563,6 +1614,18 @@ func assertIndexValidWithoutDebris(t *testing.T, db *sql.DB, table, index string
 		WHERE i.indrelid = to_regclass($1) AND c.relname LIKE 'pgsprite\_abandoned\_%'`, "public."+table).Scan(&debris)
 	require.NoError(t, err)
 	assert.Zero(t, debris, "the recovery must not leave quarantined entries on the table")
+}
+
+func assertIndexAbsentWithoutDebris(t *testing.T, db *sql.DB, table, index string) {
+	t.Helper()
+	var indexes int
+	err := db.QueryRowContext(t.Context(), `
+		SELECT count(*) FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indexrelid
+		WHERE i.indrelid = to_regclass($1) AND (c.relname = $2 OR c.relname LIKE 'pgsprite\_abandoned\_%')`,
+		"public."+table, index).Scan(&indexes)
+	require.NoError(t, err)
+	assert.Zero(t, indexes, "the cancelled build must leave neither its requested index nor quarantined debris")
 }
 
 // TestEngineApplyConcurrentIndexOnOtherTableRefused proves an invalid index

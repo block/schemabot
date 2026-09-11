@@ -201,14 +201,18 @@ context instead, which ends whatever statement the apply is on. Membership in
 it the cancel still takes effect through the apply's context.
 
 The cancel is answered from the outcome the apply settles on, never from the
-signal alone. When the cancelled build leaves its own invalid index, the drive
-removes it through pg-sprite's abandonment proof before settling the apply.
+signal alone. When a cancelled initial or recovery build leaves its own invalid
+index, the drive removes it through pg-sprite's abandonment proof before
+settling the apply.
 That cleanup is detached from the already-cancelled apply context and bounded
 by the concurrent index envelope's setup headroom; it cannot spend another
 full build bound. Cleanup failure does not change the terminal `cancelled`
-outcome: the summary names the invalid index that remains so the next drive can
-recover it as abandoned debris, and the full cleanup error stays in server
-logs. A signal that races the build's completion may
+outcome. When pg-sprite exposes the leftover's identity, the summary and server
+log name it; otherwise the summary names both the original and quarantine-name
+possibilities and gives the catalog query needed to identify it. The terminal
+apply does not retry cleanup: the entry remains until an operator follows the
+invalid-index recovery guidance. The full cleanup error stays in server logs.
+A signal that races the build's completion may
 find the index already valid: that apply is reported as already completed, not
 cancelled, and the durable request reconciles to the completed outcome. A cancel
 that arrives after the apply has already failed is accepted over the failure,

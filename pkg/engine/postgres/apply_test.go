@@ -1415,7 +1415,7 @@ func TestApplyKeepsCancelledOutcomeWhenIndexCleanupFails(t *testing.T) {
 		return &cancelledIndexCleanupError{verdict: &executor.InvalidIndexError{
 			Schema: "public", Index: "users_email_idx", Table: "users",
 			Build: executor.ErrCancelledExternally, Cleanup: executor.ErrBuildLeftInvalidIndex,
-		}}
+		}, existing: &executor.InvalidIndexError{Schema: "public", Index: "pgsprite_abandoned_42"}}
 	})
 	eng := New()
 	const key = "task-a"
@@ -1431,7 +1431,7 @@ func TestApplyKeepsCancelledOutcomeWhenIndexCleanupFails(t *testing.T) {
 	}, backgroundApplyDeadline, 10*time.Millisecond)
 	terminal := pollProgress(t, eng, key)
 	assert.Equal(t, engine.StateCancelled, terminal.State)
-	assert.Equal(t, `Concurrent index build cancelled; invalid index "public"."users_email_idx" remains for automatic recovery`, terminal.ErrorMessage)
+	assert.Equal(t, `Concurrent index build cancelled; invalid index "public"."pgsprite_abandoned_42" remains until an operator removes it; see the PostgreSQL invalid-index recovery guidance`, terminal.ErrorMessage)
 }
 
 // A build cancelled from outside SchemaBot — an operator's pg_cancel_backend,
@@ -2321,7 +2321,26 @@ func TestBuildIndexConcurrentlyKeepsCancelledOutcomeWhenCleanupFails(t *testing.
 	leftover := &executor.InvalidIndexError{Schema: "public", Index: "users_email_idx", Table: "users",
 		Build: executor.ErrCancelledExternally, Cleanup: executor.ErrBuildLeftInvalidIndex}
 	calls := scriptConcurrentIndex(t, func() error { return leftover }, func() error { return nil }, func() error {
-		return errors.New("drop failed")
+		return &executor.InvalidIndexError{Schema: "public", Index: "pgsprite_abandoned_42", Table: "users", Cleanup: errors.New("drop failed")}
+	})
+	change := concurrentIndexChange(time.Hour)
+	change.cancelRequested = func() bool { return true }
+	var logs bytes.Buffer
+
+	err := buildIndexConcurrently(t.Context(), nil, change, newTestTracker(t), slog.New(slog.NewTextHandler(&logs, nil)))
+
+	require.Error(t, err)
+	assert.True(t, isCancellation(err))
+	assert.Equal(t, `Concurrent index build cancelled; invalid index "public"."pgsprite_abandoned_42" remains until an operator removes it; see the PostgreSQL invalid-index recovery guidance`, cancelledIndexCleanupDetail(err))
+	assert.Contains(t, logs.String(), `index=pgsprite_abandoned_42`)
+	require.Len(t, calls.drop, 1)
+}
+
+func TestBuildIndexConcurrentlyDescribesBothNamesWhenCleanupDoesNotExposeIdentity(t *testing.T) {
+	leftover := &executor.InvalidIndexError{Schema: "public", Index: "users_email_idx", Table: "users",
+		Build: executor.ErrCancelledExternally, Cleanup: executor.ErrBuildLeftInvalidIndex}
+	scriptConcurrentIndex(t, func() error { return leftover }, func() error { return nil }, func() error {
+		return &executor.BudgetError{Cause: executor.CauseLock, Budget: time.Second}
 	})
 	change := concurrentIndexChange(time.Hour)
 	change.cancelRequested = func() bool { return true }
@@ -2329,8 +2348,46 @@ func TestBuildIndexConcurrentlyKeepsCancelledOutcomeWhenCleanupFails(t *testing.
 	err := buildIndexConcurrently(t.Context(), nil, change, newTestTracker(t), slog.New(slog.DiscardHandler))
 
 	require.Error(t, err)
-	assert.True(t, isCancellation(err))
-	assert.Equal(t, `Concurrent index build cancelled; invalid index "public"."users_email_idx" remains for automatic recovery`, cancelledIndexCleanupDetail(err))
+	assert.Equal(t, `Concurrent index build cancelled; the invalid index remains under "public"."users_email_idx" or an identity-derived pgsprite_abandoned_<oid> name; query pg_index joined to pg_class for invalid indexes on the table, then follow the PostgreSQL invalid-index recovery guidance`, cancelledIndexCleanupDetail(err))
+}
+
+func TestCancelledIndexCleanupDetailSanitizesIdentifier(t *testing.T) {
+	err := &cancelledIndexCleanupError{
+		verdict: &executor.InvalidIndexError{Schema: "public", Index: "users|email\nidx", Table: "users"},
+		removed: true,
+	}
+
+	assert.Equal(t, `Concurrent index build cancelled; invalid index "public"."users/email\nidx" was removed`, cancelledIndexCleanupDetail(err))
+}
+
+func TestBuildIndexConcurrentlyCleansUpCancelledBuildWithUnobservableBuilder(t *testing.T) {
+	leftover := &executor.InvalidIndexError{Schema: "public", Index: "users_email_idx", Table: "users",
+		Build: executor.ErrCancelledByCaller, Cleanup: executor.ErrInvalidIndexBuilderUnobservable}
+	calls := scriptConcurrentIndex(t, func() error { return leftover }, func() error { return nil }, func() error { return nil })
+	change := concurrentIndexChange(time.Hour)
+	change.cancelRequested = func() bool { return true }
+
+	err := buildIndexConcurrently(t.Context(), nil, change, newTestTracker(t), slog.New(slog.DiscardHandler))
+
+	require.Error(t, err)
+	assert.Equal(t, `Concurrent index build cancelled; invalid index "public"."users_email_idx" was removed`, cancelledIndexCleanupDetail(err))
+	require.Len(t, calls.drop, 1)
+}
+
+func TestBuildIndexConcurrentlyCleansUpAnOperatorCancelledRebuild(t *testing.T) {
+	abandoned := &executor.InvalidIndexError{Schema: "public", Index: "users_email_idx", Table: "users",
+		Cleanup: executor.ErrAbandonedInvalidIndex}
+	rebuildLeftover := &executor.InvalidIndexError{Schema: "public", Index: "users_email_idx", Table: "users",
+		Build: executor.ErrCancelledByCaller, Cleanup: executor.ErrBuildLeftInvalidIndex}
+	calls := scriptConcurrentIndex(t, func() error { return abandoned }, func() error { return rebuildLeftover }, func() error { return nil })
+	change := concurrentIndexChange(time.Hour)
+	change.cancelRequested = func() bool { return true }
+
+	err := buildIndexConcurrently(t.Context(), nil, change, newTestTracker(t), slog.New(slog.DiscardHandler))
+
+	require.Error(t, err)
+	assert.Equal(t, `Concurrent index build cancelled; invalid index "public"."users_email_idx" was removed`, cancelledIndexCleanupDetail(err))
+	require.Len(t, calls.rebuild, 1)
 	require.Len(t, calls.drop, 1)
 }
 

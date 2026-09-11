@@ -1196,29 +1196,10 @@ func buildIndexConcurrently(ctx context.Context, pool *pgxpool.Pool, change nati
 	if err == nil {
 		return nil
 	}
-	var invalidErr *executor.InvalidIndexError
-	if errors.As(err, &invalidErr) && cancelledBuildLeftOwnIndex(change, err, invalidErr) {
-		// Cancellation ends the build context, but removing the invalid catalog
-		// entry is part of settling the operator's request. Detach that cleanup
-		// from the cancelled apply and give it only the concurrent apply's setup
-		// headroom: dropping debris must not consume another full build bound or
-		// hold the terminal outcome open indefinitely.
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), concurrentIndexHeadroom)
-		defer cancel()
-		report, cleanupErr := concurrentIndex.drop(cleanupCtx, pool, change.sql,
-			executor.ConcurrentBudget{CallerOwned: true})
-		if cleanupErr != nil {
-			logger.Error("PostgreSQL operator cancel could not remove the invalid index left by the concurrent build",
-				"namespace", change.namespace, "table", change.table,
-				"index_schema", invalidErr.Schema, "index", invalidErr.Index, "error", cleanupErr)
-			return &cancelledIndexCleanupError{verdict: invalidErr}
-		}
-		logger.Info("PostgreSQL operator cancel removed the invalid index left by the concurrent build",
-			"namespace", change.namespace, "table", change.table,
-			"index_schema", invalidErr.Schema, "index", invalidErr.Index,
-			"dropped", len(report.Dropped), "skipped", len(report.Skipped), "duration", report.Duration)
-		return &cancelledIndexCleanupError{verdict: invalidErr, removed: true}
+	if cleanupErr := cleanupCancelledConcurrentIndex(ctx, pool, change, err, logger); cleanupErr != nil {
+		return cleanupErr
 	}
+	var invalidErr *executor.InvalidIndexError
 	if !errors.As(err, &invalidErr) || !abandonedBeforeBuild(invalidErr) {
 		return fmt.Errorf("build PostgreSQL index concurrently on table %q: %w", change.table,
 			nameConcurrentIndexBound(err, change.concurrentIndexMaxDuration, time.Since(start)))
@@ -1248,6 +1229,9 @@ func buildIndexConcurrently(ctx context.Context, pool *pgxpool.Pool, change nati
 	report, err := concurrentIndex.rebuild(recoveryCtx, pool, change.sql,
 		executor.ConcurrentBudget{CallerOwned: true})
 	if err != nil {
+		if cleanupErr := cleanupCancelledConcurrentIndex(ctx, pool, change, err, logger); cleanupErr != nil {
+			return cleanupErr
+		}
 		return fmt.Errorf("rebuild PostgreSQL index concurrently on table %q: %w", change.table,
 			&indexRecoveryError{verdict: invalidErr, err: err})
 	}
@@ -1258,9 +1242,54 @@ func buildIndexConcurrently(ctx context.Context, pool *pgxpool.Pool, change nati
 	return nil
 }
 
+func cleanupCancelledConcurrentIndex(ctx context.Context, pool *pgxpool.Pool, change nativeApply, buildErr error, logger *slog.Logger) error {
+	var invalidErr *executor.InvalidIndexError
+	if !errors.As(buildErr, &invalidErr) || !cancelledBuildLeftOwnIndex(change, buildErr, invalidErr) {
+		return nil
+	}
+	// Cancellation ends the build context, but removing the invalid catalog
+	// entry is part of settling the operator's request. Detach that cleanup
+	// from the cancelled apply and give it only the concurrent apply's setup
+	// headroom: dropping debris must not consume another full build bound or
+	// hold the terminal outcome open indefinitely.
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), concurrentIndexHeadroom)
+	defer cancel()
+	report, cleanupErr := concurrentIndex.drop(cleanupCtx, pool, change.sql,
+		executor.ConcurrentBudget{CallerOwned: true})
+	if cleanupErr != nil {
+		existing := invalidErr
+		var cleanupVerdict *executor.InvalidIndexError
+		if errors.As(cleanupErr, &cleanupVerdict) {
+			existing = cleanupVerdict
+		}
+		logger.Error("PostgreSQL operator cancel could not remove the invalid index left by the concurrent build",
+			"namespace", change.namespace, "table", change.table,
+			"index_schema", existing.Schema, "index", existing.Index, "error", cleanupErr)
+		return &cancelledIndexCleanupError{verdict: invalidErr, existing: existing, identityUncertain: existing == invalidErr}
+	}
+	logger.Info("PostgreSQL operator cancel removed the invalid index left by the concurrent build",
+		"namespace", change.namespace, "table", change.table,
+		"index_schema", invalidErr.Schema, "index", invalidErr.Index,
+		"dropped", len(report.Dropped), "skipped", len(report.Skipped), "duration", report.Duration)
+	return &cancelledIndexCleanupError{verdict: invalidErr, removed: true}
+}
+
 func cancelledBuildLeftOwnIndex(change nativeApply, err error, invalidErr *executor.InvalidIndexError) bool {
 	return change.cancelRequested != nil && change.cancelRequested() && isCancellation(err) &&
-		invalidErr.Code() == executor.CodeInvalidIndexOwnLeftover && invalidErr.Table == change.table
+		cancelledBuildMayHaveLeftIndex(invalidErr.Code()) && invalidErr.Table == change.table
+}
+
+// cancelledBuildMayHaveLeftIndex identifies verdicts that can describe the
+// invalid entry created by the cancelled build. When activity is hidden, the
+// cleanup's table lock proves abandonment and refuses to act while a hidden
+// builder is still alive.
+func cancelledBuildMayHaveLeftIndex(code executor.Code) bool {
+	switch code {
+	case executor.CodeInvalidIndexOwnLeftover, executor.CodeInvalidIndexBuilderUnobservable:
+		return true
+	default:
+		return false
+	}
 }
 
 // cancelledIndexCleanupError keeps the executor's cancellation and invalid
@@ -1268,8 +1297,10 @@ func cancelledBuildLeftOwnIndex(change nativeApply, err error, invalidErr *execu
 // the entry. Cleanup failure is deliberately not its cause: cancellation stays
 // the apply outcome, while the server log carries the cleanup error.
 type cancelledIndexCleanupError struct {
-	verdict *executor.InvalidIndexError
-	removed bool
+	verdict           *executor.InvalidIndexError
+	existing          *executor.InvalidIndexError
+	removed           bool
+	identityUncertain bool
 }
 
 func (e *cancelledIndexCleanupError) Error() string { return e.verdict.Error() }
@@ -1282,9 +1313,13 @@ func cancelledIndexCleanupDetail(err error) string {
 	}
 	name := fmt.Sprintf("%q.%q", cleanup.verdict.Schema, cleanup.verdict.Index)
 	if cleanup.removed {
-		return fmt.Sprintf("Concurrent index build cancelled; invalid index %s was removed", name)
+		return sanitizeReasonText(fmt.Sprintf("Concurrent index build cancelled; invalid index %s was removed", name))
 	}
-	return fmt.Sprintf("Concurrent index build cancelled; invalid index %s remains for automatic recovery", name)
+	if cleanup.existing != nil && !cleanup.identityUncertain {
+		name = fmt.Sprintf("%q.%q", cleanup.existing.Schema, cleanup.existing.Index)
+		return sanitizeReasonText(fmt.Sprintf("Concurrent index build cancelled; invalid index %s remains until an operator removes it; see the PostgreSQL invalid-index recovery guidance", name))
+	}
+	return sanitizeReasonText(fmt.Sprintf("Concurrent index build cancelled; the invalid index remains under %s or an identity-derived pgsprite_abandoned_<oid> name; query pg_index joined to pg_class for invalid indexes on the table, then follow the PostgreSQL invalid-index recovery guidance", name))
 }
 
 // abandonedBeforeBuild reports whether an invalid-index verdict is one the
