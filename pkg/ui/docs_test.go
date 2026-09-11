@@ -39,13 +39,14 @@ func TestDocLinksResolve(t *testing.T) {
 
 var (
 	headingPattern    = regexp.MustCompile(`(?m)^#{1,6} +(.+?) *$`)
-	nonAnchorRune     = regexp.MustCompile("[^a-z0-9 -]")
-	markdownFormatter = regexp.MustCompile("[`*_]")
+	nonAnchorRune     = regexp.MustCompile("[^a-z0-9 _-]")
+	markdownFormatter = regexp.MustCompile("[`*]")
 )
 
 // headingAnchors returns the GitHub-generated anchor for every heading in a
-// markdown document: lowercased, formatting and punctuation dropped, spaces
-// turned into hyphens.
+// markdown document: lowercased, code and emphasis markers and punctuation
+// dropped, spaces turned into hyphens. Underscores survive, as they do on
+// GitHub, so a heading naming a snake_case identifier keeps its anchor.
 func headingAnchors(doc string) []string {
 	var anchors []string
 	for _, match := range headingPattern.FindAllStringSubmatch(doc, -1) {
