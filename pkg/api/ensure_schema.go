@@ -106,13 +106,7 @@ func WithPostgresStatementTimeout(d time.Duration) EnsureSchemaOption {
 // adding a dialect means adding a bootstrapper here, not threading
 // dialect-conditionals through the MySQL flow.
 func EnsureSchema(dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) error {
-	o := ensureSchemaOptions{
-		dialect:                  schema.DialectMySQL,
-		postgresStatementTimeout: DefaultPostgresStatementTimeout,
-	}
-	for _, opt := range opts {
-		opt(&o)
-	}
+	o := newEnsureSchemaOptions(opts...)
 	switch o.dialect {
 	case schema.DialectMySQL:
 		return ensureMySQLSchema(dsn, logger, o, namedlock.MySQL{})
@@ -189,7 +183,7 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 	// Fast path: plan without a lock. If no changes, return immediately.
 	// This is the common case (99% of deploys) and avoids lock overhead.
 	planResult, err := eng.Plan(ctx, &engine.PlanRequest{
-		Database:    "schemabot",
+		Database:    storageSchemaNamespace,
 		SchemaFiles: schemaFiles,
 		Credentials: &engine.Credentials{DSN: dsn},
 	})
@@ -247,7 +241,7 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 	// removed above.
 	eng = spirit.New(spirit.Config{Logger: spiritLogger})
 	planResult, err = eng.Plan(ctx, &engine.PlanRequest{
-		Database:    "schemabot",
+		Database:    storageSchemaNamespace,
 		SchemaFiles: schemaFiles,
 		Credentials: &engine.Credentials{DSN: dsn},
 	})
@@ -272,7 +266,7 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 		}
 		if len(allowed) == 0 {
 			logger.Warn("all planned storage schema changes are destructive and refused; storage schema left unchanged",
-				"database", "schemabot",
+				"database", storageSchemaNamespace,
 				"refused_count", len(refused),
 			)
 			return nil
@@ -293,7 +287,7 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 	// Apply all DDL via Spirit (starts async schema change)
 	applyStart := time.Now()
 	_, err = eng.Apply(ctx, &engine.ApplyRequest{
-		Database:    "schemabot",
+		Database:    storageSchemaNamespace,
 		Changes:     changes,
 		Credentials: &engine.Credentials{DSN: dsn},
 	})
@@ -308,7 +302,7 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 
 	for {
 		progress, err := eng.Progress(ctx, &engine.ProgressRequest{
-			Database:    "schemabot",
+			Database:    storageSchemaNamespace,
 			Credentials: &engine.Credentials{DSN: dsn},
 		})
 		if err != nil {
@@ -327,7 +321,7 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 			// log search. Include the DDL count and the underlying message so a
 			// failed bootstrap is triageable from the message line alone.
 			logger.Error("storage schema change failed; SchemaBot storage will not initialize",
-				"database", "schemabot",
+				"database", storageSchemaNamespace,
 				"ddl_count", len(tableChanges),
 				"error", progress.ErrorMessage,
 			)
@@ -359,7 +353,7 @@ func ensureMySQLSchema(dsn string, logger *slog.Logger, o ensureSchemaOptions, l
 // online DDL) instead of surfacing a bare "context canceled" from the driver.
 func ensureSchemaTimeoutError(ctx context.Context, ddlCount int, logger *slog.Logger) error {
 	logger.Error("storage schema change did not complete before EnsureSchemaTimeout; SchemaBot storage will not initialize",
-		"database", "schemabot",
+		"database", storageSchemaNamespace,
 		"timeout", EnsureSchemaTimeout,
 		"ddl_count", ddlCount,
 	)
@@ -388,7 +382,7 @@ type refusedStorageChange struct {
 // unsplittable ALTER carries the error that prevented the split.
 func (r refusedStorageChange) refusalTelemetry() (scope, message string, attrs []any) {
 	attrs = []any{
-		"database", "schemabot",
+		"database", storageSchemaNamespace,
 		"table", r.change.Table,
 		"operation", ddl.StatementTypeToOp(r.change.Operation),
 		"reason", r.reason,
@@ -547,7 +541,7 @@ func readEmbeddedSchemaFiles() (schema.SchemaFiles, error) {
 	}
 
 	return schema.SchemaFiles{
-		"schemabot": &schema.Namespace{Files: files},
+		storageSchemaNamespace: &schema.Namespace{Files: files},
 	}, nil
 }
 
