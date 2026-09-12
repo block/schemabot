@@ -44,22 +44,42 @@ func TestTypeRoutingResolverDispatchesByType(t *testing.T) {
 	assert.Empty(t, mysql.gotReq.Target, "the mysql resolver is not consulted for a vitess request")
 }
 
+// A startup probe walks every enumerable child in database-type order, so the
+// combined request list and the list of types that cannot be probed are the
+// same on every run regardless of how the type map iterates. Each child keeps
+// its own internal order; only the concatenation order is the router's.
 func TestTypeRoutingResolverEnumerate(t *testing.T) {
-	enumerable := &fakeEnumerableResolver{requests: []ProbeRequest{
-		{Target: "target-1", DatabaseType: "mysql"},
+	mysql := &fakeEnumerableResolver{requests: []ProbeRequest{
+		{Target: "mysql-z", DatabaseType: "mysql"},
+		{Target: "mysql-a", DatabaseType: "mysql"},
 	}}
-	nonEnumerable := &fakeResolver{}
-	_, offersEnumeration := any(nonEnumerable).(Enumerator)
+	strata := &fakeEnumerableResolver{requests: []ProbeRequest{
+		{Target: "strata-1", DatabaseType: "strata"},
+	}}
+	vitess := &fakeEnumerableResolver{requests: []ProbeRequest{
+		{Target: "vitess-1", DatabaseType: "vitess"},
+	}}
+	postgres := &fakeResolver{}
+	planetscale := &fakeResolver{}
+	_, offersEnumeration := any(postgres).(Enumerator)
 	assert.False(t, offersEnumeration)
 
 	r, err := NewTypeRoutingResolver(map[string]Resolver{
-		"postgres": nonEnumerable,
-		"mysql":    enumerable,
+		"vitess":      vitess,
+		"postgres":    postgres,
+		"strata":      strata,
+		"planetscale": planetscale,
+		"mysql":       mysql,
 	})
 	require.NoError(t, err)
 
-	assert.Equal(t, enumerable.requests, r.Enumerate())
-	assert.Equal(t, []string{"postgres"}, r.UnenumerableDatabaseTypes())
+	assert.Equal(t, []ProbeRequest{
+		{Target: "mysql-z", DatabaseType: "mysql"},
+		{Target: "mysql-a", DatabaseType: "mysql"},
+		{Target: "strata-1", DatabaseType: "strata"},
+		{Target: "vitess-1", DatabaseType: "vitess"},
+	}, r.Enumerate())
+	assert.Equal(t, []string{"planetscale", "postgres"}, r.UnenumerableDatabaseTypes())
 }
 
 func TestTypeRoutingResolverRequiresDatabaseType(t *testing.T) {
