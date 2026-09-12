@@ -35,6 +35,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/targetauth"
 )
 
 // Engine implements engine.Engine for PostgreSQL databases.
@@ -222,8 +223,10 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, fmt.Errorf("open PostgreSQL database %q for planning: %w", req.Database, err)
 	}
 	defer utils.CloseAndLog(db)
+	// Open only parsed the DSN; this ping is the first dial, so it is where the
+	// target can refuse the session and the only error worth classifying.
 	if err := db.PingContext(ctx); err != nil {
-		return nil, fmt.Errorf("ping PostgreSQL database %q for planning: %w", req.Database, err)
+		return nil, fmt.Errorf("ping PostgreSQL database %q for planning: %w", req.Database, targetauth.Wrap(err))
 	}
 
 	poolCfg, err := spritePoolConfig(req.Credentials.DSN, caPath)

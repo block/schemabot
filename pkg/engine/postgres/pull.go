@@ -14,6 +14,7 @@ import (
 	"github.com/block/schemabot/pkg/postgresconn"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/targetauth"
 )
 
 // The pull's catalog reads carry the same pg_catalog qualification as
@@ -82,8 +83,10 @@ func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) 
 		return nil, fmt.Errorf("open PostgreSQL database %q for schema pull: %w", e.pullDatabase, err)
 	}
 	defer utils.CloseAndLog(db)
+	// Open only parsed the DSN; this ping is the first dial, so it is where the
+	// target can refuse the session and the only error worth classifying.
 	if err := db.PingContext(ctx); err != nil {
-		return nil, fmt.Errorf("ping PostgreSQL database %q for schema pull: %w", e.pullDatabase, err)
+		return nil, fmt.Errorf("ping PostgreSQL database %q for schema pull: %w", e.pullDatabase, targetauth.Wrap(err))
 	}
 	poolCfg, err := spritePoolConfig(e.pullCredentials.DSN, caPath)
 	if err != nil {
