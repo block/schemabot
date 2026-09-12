@@ -6,6 +6,7 @@
 
 - [How a change runs](#how-a-change-runs)
 - [Why adding an index can copy the table](#why-adding-an-index-can-copy-the-table)
+- [Checkpointing and resuming a change](#checkpointing-and-resuming-a-change)
 - [Choosing a primary key](#choosing-a-primary-key)
 - [Reading progress](#reading-progress)
 - [TUI rendering reference](#tui-rendering-reference)
@@ -24,11 +25,7 @@ and [supported operations and limitations](https://github.com/block/spirit#unsup
 If MySQL can execute a change instantly, Spirit uses that path. A change that needs a table copy
 runs through a longer sequence:
 
-```diagram
-Copy rows → Catch up on writes → Verify → Catch up → Cut over
-                                                    ↑
-                                    wait for the chosen time, if deferred
-```
+![Spirit copies rows, catches up on writes, verifies the data, waits for a scheduled cutover, and swaps the tables](../assets/spirit-change-lifecycle.gif)
 
 The application keeps using the original table during the copy. Spirit adapts its work to the
 available capacity and backs off under pressure; [throttling](throttle.md) explains the signals
@@ -58,6 +55,30 @@ Spirit's copy uses automatic write-thread scaling by default in SchemaBot, incre
 when capacity permits and backing off under pressure. It still needs room for the replacement
 table and a lock at cutover. For a long-running change, plan for the application's load as well
 as the copy; see [capacity and automatic scaling](throttle.md#capacity-and-automatic-scaling).
+
+## Checkpointing and resuming a change
+
+**An interrupted copy does not have to start over.** SchemaBot coordinates the plan, scheduling,
+and recovery; Spirit drives the online copy. Spirit runs in the process executing the change,
+outside MySQL. It reads rows and binary log events from the target database and writes the
+replacement table back to that database. Both tables and the checkpoints live there, so the
+copy adds work to the same database serving your application.
+
+![SchemaBot coordinates Spirit while the target database keeps the live table, replacement table, and checkpoint through an interruption and resume](../assets/spirit-checkpoint-resume.gif)
+
+Spirit periodically saves the copy position and binary log position. On a compatible restart,
+it uses that checkpoint to continue the copy and replay writes made since the saved position.
+Some work after the last checkpoint may repeat. The application keeps using the original table
+until cutover; finishing the copy still leaves verification and the final swap.
+
+Resume needs the same DDL and Spirit binary version, the replacement and checkpoint tables,
+and the required binary logs. Keep those logs long enough to cover an interruption and recovery.
+SchemaBot defaults to a maximum checkpoint age of three days; a checkpoint older than the
+configured limit causes a fresh copy. Drain in-flight copies before upgrading Spirit.
+See Spirit's [resume requirements](https://github.com/block/spirit#resume-from-checkpoint) and
+[checkpoint age and version compatibility](https://github.com/block/spirit/blob/main/docs/migrate.md#checkpoint-max-age).
+
+For an intentional pause, use SchemaBot's [stop and start controls](engines.md#pausing).
 
 ## Choosing a primary key
 
