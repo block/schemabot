@@ -572,3 +572,50 @@ func TestPostgresConnectionAssemblerRequiredInputs(t *testing.T) {
 	_, _, err = a.Assemble("db.example.rds.amazonaws.com", nil, creds)
 	assert.ErrorContains(t, err, `requires the "dbname" endpoint attribute`)
 }
+
+// ConnectionMetadataKeys is complete for every assembler: with no configured
+// pass-through metadata, the keys an assembler writes from the resolved
+// endpoint and credentials are exactly the keys listed for its database type,
+// so a comparison of two resolutions over those keys misses no field that
+// changes what the client reaches or authenticates as.
+func TestConnectionMetadataKeysCoverEveryAssembledKey(t *testing.T) {
+	cases := []struct {
+		name      string
+		assembler ConnectionAssembler
+		host      string
+		attrs     map[string]string
+		creds     *Credentials
+	}{
+		{
+			name:      "mysql",
+			assembler: MySQLConnectionAssembler{DefaultPort: "3306"},
+			host:      "orders.example",
+			creds:     &Credentials{Username: "ddl", Password: "secret"},
+		},
+		{
+			name:      "vitess",
+			assembler: VitessConnectionAssembler{APIURL: "https://localscale.test"},
+			attrs:     map[string]string{MetadataOrganization: "acme", DefaultDatabaseAttribute: "acme_main"},
+			creds:     &Credentials{Metadata: map[string]string{MetadataTokenName: "tok-id", MetadataTokenValue: "tok-secret"}},
+		},
+		{
+			name:      "postgres",
+			assembler: PostgresConnectionAssembler{DefaultPort: "5432"},
+			host:      "orders.cluster-abc.us-east-1.rds.amazonaws.com",
+			attrs:     map[string]string{PostgresDBNameAttribute: "orders"},
+			creds:     &Credentials{Username: "ddl", Password: "secret"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, meta, err := tc.assembler.Assemble(tc.host, tc.attrs, tc.creds)
+			require.NoError(t, err)
+			assembled := make([]string, 0, len(meta))
+			for key := range meta {
+				assembled = append(assembled, key)
+			}
+			assert.ElementsMatch(t, ConnectionMetadataKeys(tc.assembler.DatabaseType()), assembled,
+				"every key the assembler writes is a connection identity key, and every listed key is written")
+		})
+	}
+}
