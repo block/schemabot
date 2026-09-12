@@ -54,6 +54,8 @@ type targetRouterApplyStore struct {
 	storage.ApplyStore
 	byID         map[int64]*storage.Apply
 	byIdentifier map[string]*storage.Apply
+	// lookupErr, when set, fails every lookup by identifier.
+	lookupErr error
 }
 
 func (s targetRouterApplyStore) Get(_ context.Context, id int64) (*storage.Apply, error) {
@@ -66,6 +68,9 @@ func (s targetRouterApplyStore) Get(_ context.Context, id int64) (*storage.Apply
 }
 
 func (s targetRouterApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentifier string) (*storage.Apply, error) {
+	if s.lookupErr != nil {
+		return nil, s.lookupErr
+	}
 	apply := s.byIdentifier[applyIdentifier]
 	if apply == nil {
 		return nil, nil
@@ -88,6 +93,10 @@ type targetRouterRecordingClient struct {
 	pendingObserverSet bool
 	observerApplyID    int64
 	closed             bool
+	halted             bool
+	// onPlan runs inside Plan, while the router still holds this client for
+	// the request, so a test can observe the router mid-dispatch.
+	onPlan func()
 }
 
 func (c *targetRouterRecordingClient) PullSchema(_ context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
@@ -97,6 +106,9 @@ func (c *targetRouterRecordingClient) PullSchema(_ context.Context, req *ternv1.
 
 func (c *targetRouterRecordingClient) Plan(_ context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
 	c.planReq = req
+	if c.onPlan != nil {
+		c.onPlan()
+	}
 	return &ternv1.PlanResponse{PlanId: "plan-routed"}, nil
 }
 
@@ -174,6 +186,11 @@ func (c *targetRouterRecordingClient) SetObserver(applyID int64, _ ProgressObser
 
 func (c *targetRouterRecordingClient) Close() error {
 	c.closed = true
+	return nil
+}
+
+func (c *targetRouterRecordingClient) HaltForShutdown(context.Context) error {
+	c.halted = true
 	return nil
 }
 
