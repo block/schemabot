@@ -169,7 +169,152 @@ ALTER TABLE `order_events` DROP INDEX `idx_events_archived`;
 
 </details>
 
+📖 **Related guidance:**
+
+- [Choosing a primary key](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key)
+
 📋 **Plan**: **2** tables to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-existing-primary-key-warning"></a><strong>MySQL Plan (Existing Primary Key Warning)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `customers` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+💡 **Lint Warnings**: 1 advisory finding
+- `customers`: Primary key column `id` has type `varchar`
+
+📖 **Related guidance:**
+
+- [Choosing a primary key](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key)
+
+📋 **Plan**: **1** table to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-new-primary-key-issue"></a><strong>MySQL Plan (New Primary Key Issue)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+CREATE TABLE `customers` (
+    `id` varchar(64) NOT NULL,
+    `created_at` datetime(3) NOT NULL,
+    PRIMARY KEY(`id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+⚠️ **Issues**: 1 unsafe change detected
+1. `customers`: Primary key column `id` has type `varchar`
+
+📖 **Related guidance:**
+
+- [Choosing a primary key](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key)
+
+📋 **Plan**: **1** table to create
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-related-guidance"></a><strong>MySQL Plan (Related Guidance)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
+
+ALTER TABLE `customers` ADD INDEX `idx_created_at`(`created_at`);
+
+ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
+
+ALTER TABLE `invoices` ADD INDEX `idx_created_at`(`created_at`);
+
+ALTER TABLE `shipments` ADD INDEX `idx_created_at`(`created_at`);
+
+ALTER TABLE `sessions` ADD INDEX `idx_created_at`(`created_at`);
+
+ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+⚠️ **Issues**: 1 unsafe change detected
+1. `users`: Column rename detected in table `users`: `email` to `email_address`. Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled
+
+<details>
+<summary>💡 <b>Lint Warnings</b>: 6 advisory findings</summary>
+
+**`customers`**
+- Primary key column `id` has type `varchar`
+
+**`orders`**
+- Primary key column `id` has type `varchar`
+
+**`invoices`**
+- Primary key column `id` has type `varchar`
+
+**`shipments`**
+- Primary key column `id` has type `varchar`
+
+**`sessions`**
+- Primary key column `id` has type `varchar`
+
+**`events`**
+- Primary key column `id` has type `varchar`
+
+</details>
+
+📖 **Related guidance:**
+
+- [Choosing a primary key](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key)
+- [Renaming a column or table](https://github.com/block/schemabot/blob/main/docs/pre-merge-workflow.md#renaming-a-column-or-table)
+
+📋 **Plan**: **7** tables to alter
 
 
 ---
@@ -1513,6 +1658,14 @@ ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
 ```
 
 📋 **Plan**: **2** tables to alter
+
+💡 **Lint Warnings**: 1 advisory finding
+- `orders`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+
+📖 **Related guidance:**
+
+- [Choosing a primary key](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key)
+- [Renaming a column or table](https://github.com/block/schemabot/blob/main/docs/pre-merge-workflow.md#renaming-a-column-or-table)
 
 ---
 

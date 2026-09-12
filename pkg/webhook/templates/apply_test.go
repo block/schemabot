@@ -494,6 +494,35 @@ func TestRenderUnsafeChangesBlockedIncludesDropIndexGuidance(t *testing.T) {
 	assert.NotContains(t, rendered, "reads from or writes to the dropped index")
 }
 
+// An apply blocked for unsafe changes is where the operator decides whether to
+// pass --allow-unsafe, so the comment carries the same reading the plan comment
+// carried: the lint fold, and the guides for the rules its findings name. An
+// error-severity finding reaches the comment as an unsafe change carrying the
+// lint message, so its guide has text above it explaining the link.
+func TestRenderUnsafeChangesBlockedCarriesLintFindingsAndTheirGuides(t *testing.T) {
+	rendered := RenderUnsafeChangesBlocked(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{Keyspace: "testapp", Statements: []string{"CREATE TABLE `orders` (`id` varchar(36) NOT NULL, PRIMARY KEY (`id`));"}},
+		},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "orders", Reason: `Primary key column "id" has type "varchar"`},
+		},
+		LintRuleNames:  []string{"primary_key", "rename_column"},
+		LintViolations: []LintViolationData{{Table: "customers", LinterName: "rename_column", Message: "Column rename detected"}},
+	})
+
+	assert.Contains(t, rendered, "Column rename detected", "the lint fold reaches the decision point")
+	assert.Contains(t, rendered, primaryKeyDocURL, "the blocking finding links its guide")
+	assert.Contains(t, rendered, "#renaming-a-column-or-table")
+	assert.Less(t, strings.Index(rendered, "📖 **Related guidance:**"), strings.Index(rendered, "--allow-unsafe`:**"),
+		"the reading comes before the command it informs")
+}
+
 // The apply-blocked comment classifies drops with the target's parser: a
 // PostgreSQL statement whose reason never says DROP still gets the guidance.
 // Passing an empty database type here would fall back to the reason and
