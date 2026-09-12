@@ -264,6 +264,21 @@ func postgresExpectationsFor(parser ddl.StatementParser, table, file string) (po
 	if len(statements) == 0 {
 		return postgresTableExpectations{}, fmt.Errorf("schema file for table %q has no statements", table)
 	}
+	// The convergence takes a file's table identity from its name, so a file
+	// that creates a different relation than it is named for would have every
+	// later check — columns, indexes, existence — run against one table while
+	// the CREATE TABLE it would run created another. The index check below
+	// holds standalone indexes to the same rule; this holds the table itself.
+	statementType, created, err := parser.Classify(statements[0])
+	if err != nil {
+		return postgresTableExpectations{}, fmt.Errorf("classify the first statement of the schema file for table %q: %w", table, err)
+	}
+	if statementType != ddl.StatementCreateTable {
+		return postgresTableExpectations{}, fmt.Errorf("schema file for table %q must begin with CREATE TABLE; it begins with %s", table, statementType)
+	}
+	if created != table {
+		return postgresTableExpectations{}, fmt.Errorf("schema file for table %q declares table %q", table, created)
+	}
 	columns, err := parser.CreateTableColumns(statements[0])
 	if err != nil {
 		return postgresTableExpectations{}, fmt.Errorf("extract expected columns for table %q: %w", table, err)
