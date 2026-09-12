@@ -62,8 +62,12 @@ type ProgressOperation struct {
 
 // TableProgress represents progress for a single table schema change.
 type TableProgress struct {
-	TableName       string
-	Deployment      string
+	TableName  string
+	Deployment string
+	// Target is the address within Deployment this table's copy ran against. One
+	// deployment can address several targets, each copying the same table
+	// separately, so a section scoped to a deployment alone would merge them.
+	Target          string
 	Namespace       string // Keyspace (Vitess) or schema name (MySQL)
 	Dialect         schema.Dialect
 	ChangeType      string // create, alter, drop
@@ -199,6 +203,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		tp := TableProgress{
 			TableName:           tbl.TableName,
 			Deployment:          tbl.Deployment,
+			Target:              tbl.Target,
 			Namespace:           tbl.Keyspace,
 			Dialect:             dialect,
 			ChangeType:          tbl.ChangeType,
