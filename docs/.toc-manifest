@@ -16,6 +16,7 @@ docs/grpc-control-edge-cases.md
 docs/invariants.md
 docs/lint-and-safety-levels.md
 docs/namespaces.md
+docs/partitioned-parent-index-flow.md
 docs/pending-drops.md
 docs/postgresql.md
 docs/pre-merge-workflow.md

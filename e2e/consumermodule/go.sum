@@ -52,8 +52,8 @@ github.com/block/mysql v0.0.0-20260906224346-ee0a93fe50d6 h1:GvubwsqXHanJkhBotCs
 github.com/block/mysql v0.0.0-20260906224346-ee0a93fe50d6/go.mod h1:KEo73lbxXs9cFlq+x3Z35UqGg3MTxAPfjDOR/ob/iik=
 github.com/block/pg-sprite v0.3.2 h1:AxOHuBHjwghJKhwkWiTLQx1ca0I7ZL5elXoI1K8qXJg=
 github.com/block/pg-sprite v0.3.2/go.mod h1:vZxHdTMrCOPAYgswveB7PSjOaOuRgnDLGRw6WoOizRg=
-github.com/block/spirit v0.17.1-0.20260908172838-1ab2595e45a1 h1:h3yk5FadYLQ4WfwR12mglqHYpbUqPtsTdljJwwSKlYM=
-github.com/block/spirit v0.17.1-0.20260908172838-1ab2595e45a1/go.mod h1:Lg97/e4zr2X3AQXRUrDVAQZOVqFDZ09px503h4v/Yss=
+github.com/block/spirit v0.17.1-0.20260911050857-16c62ef306a1 h1:8WRlZtL9oF76gZb/1Y7ZAxNNl1jWjWrKUV0pYtXq/tk=
+github.com/block/spirit v0.17.1-0.20260911050857-16c62ef306a1/go.mod h1:Lg97/e4zr2X3AQXRUrDVAQZOVqFDZ09px503h4v/Yss=
 github.com/block/vitess v0.0.0-20260907005807-88d15fda31ea h1:t9VROoN/aCzwwh7Ap90TLijZz3rZHZ6HUgWymC+yVS8=
 github.com/block/vitess v0.0.0-20260907005807-88d15fda31ea/go.mod h1:193fxGVSfNHDStC08wSg/RzROVHmMh6XoT+QdfSoLjY=
 github.com/bradleyfalzon/ghinstallation/v2 v2.18.0 h1:WPqnN6NS9XvYlOgZQAIseN7Z1uAiE+UxgDKlW7FvFuU=
