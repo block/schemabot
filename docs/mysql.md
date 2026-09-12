@@ -5,6 +5,7 @@
 ## Table of Contents
 
 - [How a change runs](#how-a-change-runs)
+- [Why adding an index can copy the table](#why-adding-an-index-can-copy-the-table)
 - [Choosing a primary key](#choosing-a-primary-key)
 - [Reading progress](#reading-progress)
 - [TUI rendering reference](#tui-rendering-reference)
@@ -37,6 +38,26 @@ and [direct execution](direct-execution.md) for statements routed outside the on
 Spirit documents the underlying [instant DDL path](https://github.com/block/spirit#attempt-instant-ddl),
 [dynamic chunking](https://github.com/block/spirit#dynamic-chunking), and
 [verification around deferred cutover](https://github.com/block/spirit/blob/main/docs/migrate.md#two-checksum-model).
+
+## Why adding an index can copy the table
+
+**A full copy for an index add is expected.** Spirit tries instant DDL first, then a conservative
+subset of native `INPLACE` operations. Adding an index falls outside that subset, even when
+MySQL could build it in place. The copy does more work, but gives Spirit control over pacing,
+[checkpoint recovery](https://github.com/block/spirit#resume-from-checkpoint), verification,
+and the timing of the final swap.
+
+Native `INPLACE` can be faster, but `LOCK=NONE` does not mean there are no locks. It permits
+concurrent reads and writes during the build; exclusive metadata locks are still needed, and
+a waiting lock can hold up application queries. A short
+[`lock_wait_timeout`](https://dev.mysql.com/doc/refman/8.4/en/server-system-variables.html#sysvar_lock_wait_timeout)
+bounds each metadata lock wait, not the build's duration or resource use. See MySQL's
+[online DDL concurrency guide](https://dev.mysql.com/doc/refman/8.4/en/innodb-online-ddl-performance.html).
+
+Spirit's copy uses automatic write-thread scaling by default in SchemaBot, increasing throughput
+when capacity permits and backing off under pressure. It still needs room for the replacement
+table and a lock at cutover. For a long-running change, plan for the application's load as well
+as the copy; see [capacity and automatic scaling](throttle.md#capacity-and-automatic-scaling).
 
 ## Choosing a primary key
 
