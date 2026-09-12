@@ -165,10 +165,14 @@ finishes on it:
 - The router records which generation owns each apply when `Apply`,
   `ResumeApply`, or an operation resume starts on it, and routes progress,
   observer attachment, and in-process recovery for that apply to the owning
-  generation until the apply is terminal. Two generations in one process must
-  never drive the same apply; that is the same hazard OW-3 bounds across
-  processes, and here it is prevented outright by ownership. New pulls, plans,
-  and new applies go to the current generation.
+  generation until the apply is terminal. An apply that is still queued when
+  the operator claims it has no drive on the generation that dispatched it, so
+  the claim resolves the route again and drives it on the current generation,
+  moving ownership there; the credential a schema change opens with is the one
+  resolved when it starts, not the one resolved when it was queued. Two
+  generations in one process must never drive the same apply; that is the same
+  hazard OW-3 bounds across processes, and here it is prevented outright by
+  ownership. New pulls, plans, and new applies go to the current generation.
 - Control operations keep their existing routing. They act by writing durable
   state, never by reaching into a generation's memory (CO-9), so which
   generation serves them does not matter.

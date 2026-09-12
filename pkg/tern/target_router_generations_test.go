@@ -350,6 +350,109 @@ func TestTargetRouterResumeOfStoppedApplyMovesToCurrentGeneration(t *testing.T) 
 	assert.Nil(t, first.progressReq)
 }
 
+// queueOrdersApply dispatches the orders apply through the router with a
+// pending observer and leaves it queued for the operator's claim, returning
+// the generation that accepted it.
+func queueOrdersApply(t *testing.T, router *TargetRouter, apply *storage.Apply, created map[string]*targetRouterRecordingClient) *targetRouterRecordingClient {
+	t.Helper()
+	apply.State = state.Apply.Pending
+	require.NoError(t, router.SetPendingObserverForRequest(inventory.Request{
+		Target:       "dsid-orders-prod",
+		DatabaseType: storage.DatabaseTypeMySQL,
+		Environment:  "production",
+	}, targetRouterNoopObserver{}))
+	resp, err := router.Apply(t.Context(), &ternv1.ApplyRequest{
+		Database:    "orders",
+		Type:        storage.DatabaseTypeMySQL,
+		Environment: "production",
+		Target:      "dsid-orders-prod",
+	})
+	require.NoError(t, err)
+	require.Equal(t, apply.ApplyIdentifier, resp.ApplyId)
+	dispatcher := created["orders"]
+	require.NotNil(t, dispatcher)
+	require.True(t, dispatcher.pendingObserverSet, "the dispatching generation receives the pending observer")
+	return dispatcher
+}
+
+// An apply queued before a credential rotation has not opened a connection
+// yet, so the operator's claim drives it on the current generation and the
+// credential resolved at claim time rather than on the retired one; the
+// dispatching generation gives the apply up and, owning nothing else, closes.
+// The observer handed to the dispatching generation attaches to the driving
+// one, and the apply's later requests follow the drive.
+func TestTargetRouterQueuedApplyDrivesOnCurrentGenerationAfterRotation(t *testing.T) {
+	resolver := &rotatingResolver{dsn: rotationOldDSN}
+	created := make(map[string]*targetRouterRecordingClient)
+	apply, store := runningOrdersApply(t, "apply-routed")
+	router := newTargetRouterForTest(t, resolver, store, nil, created)
+	first := queueOrdersApply(t, router, apply, created)
+
+	resolver.dsn = rotationNewDSN
+	planOrders(t, router)
+	second := created["orders#2"]
+	require.NotNil(t, second)
+	assert.False(t, first.closed, "the queued apply keeps its dispatching generation open until the claim")
+
+	require.NoError(t, router.ResumeApply(t.Context(), apply))
+	assert.Equal(t, apply.ApplyIdentifier, second.resumeApply.ApplyIdentifier, "the drive opens with the rotated credential")
+	assert.Nil(t, first.resumeApply, "the retired generation never drives the apply")
+	assert.Equal(t, apply.ID, second.observerApplyID, "the observer follows the drive to the current generation")
+	assert.True(t, first.closed, "the dispatching generation closes once the apply moves off it")
+	assert.False(t, second.closed)
+
+	apply.State = state.Apply.Running
+	_, err := router.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: apply.ApplyIdentifier, Environment: "production"})
+	require.NoError(t, err)
+	assert.Equal(t, apply.ApplyIdentifier, second.progressReq.GetApplyId(), "the driving generation owns the apply")
+	assert.Nil(t, first.progressReq)
+}
+
+// Without a rotation between dispatch and claim, a queued apply drives on
+// the generation that dispatched it, which stays open and owns it.
+func TestTargetRouterQueuedApplyDrivesOnDispatchingGenerationWithoutRotation(t *testing.T) {
+	resolver := &rotatingResolver{dsn: rotationOldDSN}
+	created := make(map[string]*targetRouterRecordingClient)
+	apply, store := runningOrdersApply(t, "apply-routed")
+	router := newTargetRouterForTest(t, resolver, store, nil, created)
+	first := queueOrdersApply(t, router, apply, created)
+
+	require.NoError(t, router.ResumeApply(t.Context(), apply))
+	assert.Equal(t, apply.ApplyIdentifier, first.resumeApply.ApplyIdentifier)
+	assert.Len(t, created, 1, "no second generation is built for the same connection identity")
+	assert.False(t, first.closed)
+
+	apply.State = state.Apply.Running
+	_, err := router.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: apply.ApplyIdentifier, Environment: "production"})
+	require.NoError(t, err)
+	assert.Equal(t, apply.ApplyIdentifier, first.progressReq.GetApplyId())
+}
+
+// A resume of an apply that is already driving — an operation resume or a
+// cutover after the drive started — stays on the generation driving it even
+// when a rotation has published a newer one: only a queued apply moves, since
+// a driving one has in-process state on its generation (AV-2).
+func TestTargetRouterDrivingApplyResumeStaysOnOwnerAfterRotation(t *testing.T) {
+	resolver := &rotatingResolver{dsn: rotationOldDSN}
+	created := make(map[string]*targetRouterRecordingClient)
+	apply, store := runningOrdersApply(t, "apply-42")
+	router := newTargetRouterForTest(t, resolver, store, nil, created)
+
+	require.NoError(t, router.ResumeApply(t.Context(), apply))
+	first := created["orders"]
+	require.NotNil(t, first)
+
+	resolver.dsn = rotationNewDSN
+	planOrders(t, router)
+	second := created["orders#2"]
+	require.NotNil(t, second)
+
+	require.NoError(t, router.ResumeApplyOperationCutover(t.Context(), apply, 7))
+	assert.Equal(t, apply.ApplyIdentifier, first.resumeApply.ApplyIdentifier, "the cutover drives on the owning generation")
+	assert.Nil(t, second.resumeApply, "the current generation never touches a running apply")
+	assert.False(t, first.closed)
+}
+
 // A rotation sweeps retiring generations: one whose owned apply finished
 // without any further request for it is closed at the rotation rather than
 // staying open until a request happens to arrive.

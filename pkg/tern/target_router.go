@@ -265,7 +265,8 @@ func (r *TargetRouter) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*te
 		return nil, err
 	}
 	defer r.release(gen)
-	if observer := r.takePendingObserver(cacheKeyForResolvedTarget(resolved, environment, namespace)); observer != nil {
+	observer := r.takePendingObserver(cacheKeyForResolvedTarget(resolved, environment, namespace))
+	if observer != nil {
 		gen.client.SetPendingObserver(observer)
 	}
 	routedReq := proto.Clone(req).(*ternv1.ApplyRequest)
@@ -281,17 +282,50 @@ func (r *TargetRouter) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*te
 	if err != nil {
 		return nil, err
 	}
-	// The generation that queued an apply holds its pending observer and is
-	// where the operator's claim drives it, so it owns the apply until that
-	// apply is terminal (AV-2): a later credential rotation publishes a new
-	// generation for new work without pulling this one out from under a
-	// running schema change. An accepted response also comes back for a
-	// re-dispatch that adopted an apply already queued or driving, so
-	// acceptance never moves ownership off a generation that already has it.
+	// The generation that queued an apply owns it until the operator's claim
+	// starts the drive, which re-resolves the route and moves a still-queued
+	// apply to the current generation; from then on the driving generation
+	// owns the apply until it is terminal (AV-2), and a later credential
+	// rotation publishes a new generation for new work without pulling this
+	// one out from under a running schema change. An accepted response also
+	// comes back for a re-dispatch that adopted an apply already queued or
+	// driving, so acceptance never moves ownership off a generation that
+	// already has it. The router keeps the pending observer it handed the
+	// client so that a drive starting on another generation attaches it too.
 	if resp.GetAccepted() && resp.GetApplyId() != "" {
 		r.recordOwner(gen, resp.GetApplyId())
+		if observer != nil {
+			r.retainDispatchedObserver(ctx, resp.GetApplyId(), observer)
+		}
 	}
 	return resp, nil
+}
+
+// retainDispatchedObserver records, under the apply's stored ID, an observer
+// the router handed to the dispatching client as a pending observer, so
+// attachObserver finds it when the drive starts on a different generation.
+// The dispatching client already registered the observer for the drive it
+// runs itself, so a failed lookup here only loses the attachment on a
+// generation other than the dispatching one.
+func (r *TargetRouter) retainDispatchedObserver(ctx context.Context, applyIdentifier string, observer ProgressObserver) {
+	apply, err := r.storage.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
+	if err != nil {
+		r.logger.Warn("target router: failed to load dispatched apply to retain its observer; a drive on another client generation will run without it",
+			"apply_id", applyIdentifier, "error", err)
+		return
+	}
+	if apply == nil {
+		r.logger.Warn("target router: dispatched apply not found to retain its observer; a drive on another client generation will run without it",
+			"apply_id", applyIdentifier)
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, registered := r.activeObservers[apply.ID]; registered {
+		r.logger.Debug("target router: observer already registered for dispatched apply; keeping it", "apply_id", applyIdentifier)
+		return
+	}
+	r.activeObservers[apply.ID] = observer
 }
 
 // applyRequestCarriesPlanPayload reports whether a dispatched apply request
@@ -429,7 +463,7 @@ func (r *TargetRouter) ResumeApplyOperationCutover(ctx context.Context, apply *s
 // returns an error: a drive the engine detached may still be running on it,
 // and the apply's terminal state is what releases it.
 func (r *TargetRouter) resumeOnOwner(ctx context.Context, apply *storage.Apply, resume func(client Client, ctx context.Context, apply *storage.Apply) error) error {
-	gen, err := r.clientForStoredApply(ctx, apply)
+	gen, err := r.clientForDrive(ctx, apply)
 	if err != nil {
 		return err
 	}
@@ -437,6 +471,47 @@ func (r *TargetRouter) resumeOnOwner(ctx context.Context, apply *storage.Apply, 
 	r.recordOwner(gen, apply.ApplyIdentifier)
 	r.attachObserver(gen.client, apply.ID)
 	return resume(gen.client, ctx, apply)
+}
+
+// clientForDrive returns the generation a claimed apply drives on, acquired;
+// the caller must release it. An apply that is still queued has no drive, so
+// nothing on the generation that queued it — no engine runner, no progress
+// poller — binds the apply to that generation's credential; the drive opens
+// its connections now, so it starts on the route's current generation and
+// the connection identity resolved now, and ownership moves with it. Any
+// other non-terminal apply stays with the generation driving it.
+func (r *TargetRouter) clientForDrive(ctx context.Context, apply *storage.Apply) (*targetClientGeneration, error) {
+	if apply == nil {
+		return nil, fmt.Errorf("stored apply is required for target routing")
+	}
+	if !state.IsState(apply.State, state.Apply.Pending) {
+		return r.clientForStoredApply(ctx, apply)
+	}
+	gen, err := r.currentClientForStoredApply(ctx, apply)
+	if err != nil {
+		return nil, err
+	}
+	r.moveQueuedApplyOwnership(apply, gen)
+	return gen, nil
+}
+
+// moveQueuedApplyOwnership releases a queued apply from the generation that
+// dispatched it, when that is not the generation about to drive it, so the
+// dispatching generation can retire once it owns nothing else.
+func (r *TargetRouter) moveQueuedApplyOwnership(apply *storage.Apply, gen *targetClientGeneration) {
+	r.mu.Lock()
+	prior := r.applyOwners[apply.ApplyIdentifier]
+	if prior == nil || prior == gen {
+		r.mu.Unlock()
+		return
+	}
+	closePrior := r.releaseOwnershipLocked(prior, apply.ApplyIdentifier)
+	r.mu.Unlock()
+	r.logger.Info("target router: queued apply was dispatched on a replaced client generation; driving it on the current generation",
+		append(apply.LogAttrs(), "dispatched_dsn_hash", prior.dsnHash, "drive_dsn_hash", gen.dsnHash)...)
+	if closePrior {
+		r.closeGeneration(prior)
+	}
 }
 
 // Endpoint returns a descriptive endpoint for the router.
@@ -609,6 +684,13 @@ func (r *TargetRouter) clientForStoredApply(ctx context.Context, apply *storage.
 	if owner := r.ownerOf(apply); owner != nil {
 		return owner, nil
 	}
+	return r.currentClientForStoredApply(ctx, apply)
+}
+
+// currentClientForStoredApply resolves a stored apply's route and returns the
+// route's current generation, acquired, regardless of which generation owns
+// the apply.
+func (r *TargetRouter) currentClientForStoredApply(ctx context.Context, apply *storage.Apply) (*targetClientGeneration, error) {
 	target := apply.GetOptions().Target
 	if target == "" {
 		planTarget, err := r.planTargetForStoredApply(ctx, apply)
