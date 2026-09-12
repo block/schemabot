@@ -15,13 +15,38 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 )
 
-// StorageCmd groups operator commands that act directly on SchemaBot's own
-// storage database. Unlike the API-client commands, these connect to storage
-// themselves and work while the server is down — they exist for maintenance
-// windows such as a cross-dialect data move or a restore from a dump.
+// StorageCmd groups operator commands that act on SchemaBot's own storage
+// database rather than on a user's database.
+//
+// The maintenance commands connect to storage themselves and work while the
+// server is down, for windows such as a cross-dialect data move or a restore
+// from a dump. The schema commands do both: they read a storage database
+// through the API by default, so an operator can reach a data plane's storage
+// that no workstation can dial, and connect directly when the server is down —
+// including when it is down because its own schema bootstrap is failing.
 type StorageCmd struct {
+	Plan                     StoragePlanCmd              `cmd:"" help:"Show the storage DDL outstanding between a live storage database and the release you name; read-only, safe at any time. Exits 0 when converged and 2 when statements are outstanding."`
+	Apply                    StorageApplyCmd             `cmd:"" help:"Converge a SchemaBot instance's storage database by running the schema bootstrap it would run on its next boot, under the same advisory lock and the same destructive-statement refusal."`
 	ResyncIdentitySequences  ResyncIdentitySequencesCmd  `cmd:"" name:"resync-identity-sequences" help:"Advance PostgreSQL identity sequences on storage tables past their columns' stored maxima after an explicit-id bulk load; run after the load has fully committed and before default inserts resume — advance-only and safe to rerun."`
 	CanonicalizeIdentityKeys CanonicalizeIdentityKeysCmd `cmd:"" name:"canonicalize-identity-keys" help:"Fold stored identity strings (repository, database, environment, deployment, lock owner) on PostgreSQL storage tables to canonical lowercase; run once, in a quiesced maintenance window, after every writer runs a release that folds identity strings at the write boundaries. The rewrite is one-way — original spellings are not recorded — so the command prompts unless --auto-approve is set; it only rewrites non-canonical rows, safe to rerun."`
+}
+
+// UsesAPI reports whether the named storage subcommand will reach its target
+// through the API, and so needs an endpoint resolved before it runs.
+//
+// Only the schema commands have both paths, and the flags say which is in use.
+// The maintenance commands open the storage database themselves and never call
+// the API, so an unknown subcommand answering false is the safe default: the
+// cost is a command that resolves no endpoint it was not going to use.
+func (c *StorageCmd) UsesAPI(subcommand string) bool {
+	switch subcommand {
+	case "plan":
+		return !c.Plan.direct()
+	case "apply":
+		return !c.Apply.direct()
+	default:
+		return false
+	}
 }
 
 // ResyncIdentitySequencesCmd resyncs the identity sequences of SchemaBot's
@@ -159,74 +184,26 @@ func (cmd *CanonicalizeIdentityKeysCmd) Run(ctx context.Context, g *Globals) err
 }
 
 // resolveStorageDSN returns the storage DSN and a loggable description of
-// where it came from. A direct --dsn is used after verifying it parses as a
-// PostgreSQL DSN; otherwise the server config (--config, then
-// $SCHEMABOT_CONFIG_FILE) is loaded and its resolved storage DSN is used,
-// failing closed when the configured storage dialect is not postgres —
-// purpose names the operation in these errors. The source never contains
-// the DSN itself, which may embed credentials.
+// where it came from, for the commands that only apply to PostgreSQL storage —
+// purpose names the operation in the refusal. The source never contains the
+// DSN itself, which may embed credentials.
 func resolveStorageDSN(dsnFlag, configFlag, purpose string) (string, string, error) {
-	directDSN := strings.TrimSpace(dsnFlag)
-	if directDSN != "" && configFlag != "" {
-		return "", "", fmt.Errorf("--dsn and --config are mutually exclusive; pass the storage DSN directly or resolve it from a server config, not both")
-	}
-	if dsnFlag != "" {
-		if directDSN == "" {
-			return "", "", fmt.Errorf("storage DSN not configured: --dsn contains only whitespace")
-		}
-		// The config path refuses non-postgres storage via the configured
-		// dialect; the direct path has no dialect field, so refuse any DSN
-		// that does not parse as PostgreSQL instead of failing later with an
-		// opaque connection error — or worse, against the wrong server.
+	// A direct DSN is checked against the PostgreSQL grammar rather than handed
+	// to the generic family inference: these commands take no --dialect, so
+	// there is nothing for an ambiguous DSN to be resolved by, and the refusal
+	// that helps is the one naming the operation that does not apply to it.
+	if directDSN := strings.TrimSpace(dsnFlag); directDSN != "" && configFlag == "" {
 		if _, err := postgresconn.ConnectionDSN(directDSN); err != nil {
 			return "", "", fmt.Errorf("storage DSN from --dsn is not a PostgreSQL DSN; %s only applies to %q storage: %w", purpose, schema.DialectPostgres, err)
 		}
 		return directDSN, "--dsn flag", nil
 	}
-
-	configPath := configFlag
-	source := fmt.Sprintf("server config %s", configPath)
-	if configPath == "" {
-		configPath = os.Getenv("SCHEMABOT_CONFIG_FILE")
-		if configPath == "" {
-			return "", "", fmt.Errorf("no storage DSN source: set --dsn, --config, or the SCHEMABOT_CONFIG_FILE environment variable")
-		}
-		source = fmt.Sprintf("server config %s ($SCHEMABOT_CONFIG_FILE)", configPath)
-	}
-
-	var cfg *api.ServerConfig
-	var err error
-	if configFlag == "" {
-		cfg, err = api.LoadServerConfig()
-	} else {
-		cfg, err = api.LoadServerConfigFromFile(configPath)
-	}
+	target, err := resolveStorageTarget(dsnFlag, configFlag, "")
 	if err != nil {
-		return "", "", fmt.Errorf("load %s: %w", source, err)
+		return "", "", err
 	}
-
-	dialect, err := cfg.Storage.ResolveDialect()
-	if err != nil {
-		return "", "", fmt.Errorf("resolve storage dialect from %s: %w", source, err)
+	if target.dialect != schema.DialectPostgres {
+		return "", "", fmt.Errorf("storage dialect in %s is %q; %s only applies to %q storage", target.source, target.dialect, purpose, schema.DialectPostgres)
 	}
-	if dialect != schema.DialectPostgres {
-		return "", "", fmt.Errorf("storage dialect in %s is %q; %s only applies to %q storage", source, dialect, purpose, schema.DialectPostgres)
-	}
-
-	dsn, err := cfg.StorageDSN()
-	if err != nil {
-		return "", "", fmt.Errorf("resolve storage DSN from %s: %w", source, err)
-	}
-	dsn = strings.TrimSpace(dsn)
-	if dsn == "" {
-		return "", "", fmt.Errorf("storage DSN not configured (set --dsn, config storage.dsn or storage.dsn_from, STORAGE_DSN, or MYSQL_DSN)")
-	}
-	if cfg.Storage.DSN == "" && cfg.Storage.DSNFrom == nil {
-		if strings.TrimSpace(os.Getenv("STORAGE_DSN")) != "" {
-			source = "STORAGE_DSN environment variable"
-		} else if strings.TrimSpace(os.Getenv("MYSQL_DSN")) != "" {
-			source = "MYSQL_DSN environment variable"
-		}
-	}
-	return dsn, source, nil
+	return target.dsn, target.source, nil
 }
