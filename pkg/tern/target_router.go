@@ -18,6 +18,7 @@ import (
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/targetauth"
 )
 
 // LocalClientFactory builds a deployment-local client from a resolved target.
@@ -47,6 +48,11 @@ type TargetRouterConfig struct {
 // applies it drives, so it keeps every apply it started until that apply
 // settles (AV-2), stays visible to Close and HaltForShutdown (OW-3), and is
 // closed once it owns nothing and no request is in flight on it.
+//
+// PullSchema, Plan, and PlanDiff also evict the exact generation that reports
+// a classified target authentication failure, re-resolve the target, and retry
+// once. Apply, resume, and control operations deliberately remain on their
+// existing non-retrying paths.
 type TargetRouter struct {
 	resolver inventory.Resolver
 	storage  storage.Storage
@@ -148,16 +154,18 @@ func (r *TargetRouter) PullSchema(ctx context.Context, req *ternv1.PullSchemaReq
 	if req.GetNamespace() != "" {
 		localDatabase = req.GetNamespace()
 	}
-	gen, resolved, err := r.clientForTarget(ctx, targetOrDatabase(req.Target, req.Database), req.Type, req.Environment, localDatabase)
-	if err != nil {
-		return nil, err
-	}
-	defer r.release(gen)
-	routedReq := proto.Clone(req).(*ternv1.PullSchemaRequest)
-	routedReq.Database = req.Database
-	routedReq.Type = resolved.DatabaseType
-	routedReq.Target = resolved.Target
-	return gen.client.PullSchema(ctx, routedReq)
+	var response *ternv1.PullSchemaResponse
+	err := r.routeReadWithAuthRetry(ctx, "pull_schema", targetOrDatabase(req.Target, req.Database), req.Type, req.Environment, localDatabase,
+		func(gen *targetClientGeneration, resolved *inventory.Target) error {
+			routedReq := proto.Clone(req).(*ternv1.PullSchemaRequest)
+			routedReq.Database = req.Database
+			routedReq.Type = resolved.DatabaseType
+			routedReq.Target = resolved.Target
+			var dispatchErr error
+			response, dispatchErr = gen.client.PullSchema(ctx, routedReq)
+			return dispatchErr
+		})
+	return response, err
 }
 
 // Plan generates a plan on the resolved target.
@@ -165,16 +173,18 @@ func (r *TargetRouter) Plan(ctx context.Context, req *ternv1.PlanRequest) (*tern
 	if req == nil {
 		return nil, fmt.Errorf("plan request is required")
 	}
-	gen, resolved, err := r.clientForTarget(ctx, targetOrDatabase(req.Target, req.Database), req.Type, req.Environment, req.Database)
-	if err != nil {
-		return nil, err
-	}
-	defer r.release(gen)
-	routedReq := proto.Clone(req).(*ternv1.PlanRequest)
-	routedReq.Database = req.Database
-	routedReq.Type = resolved.DatabaseType
-	routedReq.Target = resolved.Target
-	return gen.client.Plan(ctx, routedReq)
+	var response *ternv1.PlanResponse
+	err := r.routeReadWithAuthRetry(ctx, "plan", targetOrDatabase(req.Target, req.Database), req.Type, req.Environment, req.Database,
+		func(gen *targetClientGeneration, resolved *inventory.Target) error {
+			routedReq := proto.Clone(req).(*ternv1.PlanRequest)
+			routedReq.Database = req.Database
+			routedReq.Type = resolved.DatabaseType
+			routedReq.Target = resolved.Target
+			var dispatchErr error
+			response, dispatchErr = gen.client.Plan(ctx, routedReq)
+			return dispatchErr
+		})
+	return response, err
 }
 
 // PlanDiff routes a non-persisting desired-vs-live diff to the resolved target,
@@ -183,16 +193,91 @@ func (r *TargetRouter) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*
 	if req == nil {
 		return nil, fmt.Errorf("plan diff request is required")
 	}
-	gen, resolved, err := r.clientForTarget(ctx, targetOrDatabase(req.Target, req.Database), req.Type, req.Environment, req.Database)
+	var response *ternv1.PlanDiffResponse
+	err := r.routeReadWithAuthRetry(ctx, "plan_diff", targetOrDatabase(req.Target, req.Database), req.Type, req.Environment, req.Database,
+		func(gen *targetClientGeneration, resolved *inventory.Target) error {
+			routedReq := proto.Clone(req).(*ternv1.PlanRequest)
+			routedReq.Database = req.Database
+			routedReq.Type = resolved.DatabaseType
+			routedReq.Target = resolved.Target
+			var dispatchErr error
+			response, dispatchErr = gen.client.PlanDiff(ctx, routedReq)
+			return dispatchErr
+		})
+	return response, err
+}
+
+// routeReadWithAuthRetry dispatches a routed read on the route's current
+// generation and, when the dispatch fails with a classified target
+// authentication error, evicts that exact generation, re-resolves the target,
+// and dispatches once more. Only reads are routed through here: Apply, resume,
+// and control operations must not retry, because an authentication-looking
+// failure from them is not proof that no target mutation began. Plan is a read
+// for this purpose because only its engine phase opens the target and can carry
+// targetauth.Error; a failure after the plan is persisted comes from storage and
+// never carries it, so a retry here always precedes any persisted plan.
+//
+// Eviction is compare-and-delete on the generation pointer: a request that
+// failed on an old generation never evicts a newer one a concurrent request
+// already published. Each acquired generation is released exactly once, and the
+// failed one is released only after it has left the current map, so the release
+// closes it when it owns nothing (a generation still driving an apply retires
+// instead and keeps its apply, per AV-2 and OW-3).
+func (r *TargetRouter) routeReadWithAuthRetry(ctx context.Context, operation, target, databaseType, environment, namespace string, dispatch func(*targetClientGeneration, *inventory.Target) error) error {
+	gen, resolved, err := r.clientForTarget(ctx, target, databaseType, environment, namespace)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	defer r.release(gen)
-	routedReq := proto.Clone(req).(*ternv1.PlanRequest)
-	routedReq.Database = req.Database
-	routedReq.Type = resolved.DatabaseType
-	routedReq.Target = resolved.Target
-	return gen.client.PlanDiff(ctx, routedReq)
+	dispatchErr := dispatch(gen, resolved)
+	classification, retry := targetauth.ClassificationOf(dispatchErr)
+	if !retry {
+		r.release(gen)
+		return dispatchErr
+	}
+
+	r.mu.Lock()
+	evicted := r.current[gen.key] == gen
+	if evicted {
+		delete(r.current, gen.key)
+		r.retiring[gen] = struct{}{}
+	}
+	r.mu.Unlock()
+	if evicted {
+		metrics.RecordTargetClientEviction(ctx, resolved.DatabaseType, environment, classification.Label())
+	} else {
+		r.logger.Debug("target router: peer already replaced authentication-failed client generation; retry uses the current generation",
+			"target", target, "database_type", resolved.DatabaseType, "environment", environment,
+			"namespace", namespace, "operation", operation, "classification", classification.Label(),
+			"old_dsn_hash", gen.dsnHash)
+	}
+	oldHash := gen.dsnHash
+	r.release(gen)
+
+	retryGen, retryResolved, resolveErr := r.clientForTarget(ctx, target, databaseType, environment, namespace)
+	if resolveErr != nil {
+		metrics.RecordTargetAuthRetry(ctx, operation, databaseType, environment, classification.Label(), "resolve_error")
+		r.logger.Warn("target router: authentication self-heal retry could not resolve target",
+			"target", target, "database_type", databaseType, "environment", environment, "namespace", namespace,
+			"operation", operation, "classification", classification.Label(), "attempt", 2,
+			"old_dsn_hash", oldHash, "new_dsn_hash", "", "outcome", "resolve_error")
+		return fmt.Errorf("re-resolve target %q for %s after authentication failure: %w; resolve target again: %w", target, operation, dispatchErr, resolveErr)
+	}
+	retryErr := dispatch(retryGen, retryResolved)
+	r.release(retryGen)
+	outcome := "success"
+	if retryErr != nil {
+		outcome = "failed"
+	}
+	metrics.RecordTargetAuthRetry(ctx, operation, retryResolved.DatabaseType, environment, classification.Label(), outcome)
+	attrs := []any{"target", target, "database_type", retryResolved.DatabaseType, "environment", environment, "namespace", namespace,
+		"operation", operation, "classification", classification.Label(), "attempt", 2,
+		"old_dsn_hash", oldHash, "new_dsn_hash", retryGen.dsnHash, "outcome", outcome}
+	if retryErr != nil {
+		r.logger.Warn("target router: authentication self-heal retry failed", attrs...)
+		return fmt.Errorf("retry %s on re-resolved target %q: %w", operation, target, retryErr)
+	}
+	r.logger.Info("target router: authentication self-heal retry succeeded", attrs...)
+	return nil
 }
 
 // Apply starts a stored plan on the resolved target.
