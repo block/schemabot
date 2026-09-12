@@ -217,6 +217,14 @@ type Service struct {
 
 	pendingObserverMu sync.Mutex
 	pendingObservers  map[pendingObserverKey]tern.ProgressObserver
+
+	// storageSchemaService answers the storage schema routes for this server's
+	// own storage database. An embedder registers it with
+	// SetStorageSchemaService once it has resolved the storage DSN and dialect
+	// it booted with; it is nil in builds that never resolve one, and the
+	// routes refuse rather than guess at a database.
+	storageSchemaMu      sync.RWMutex
+	storageSchemaService tern.StorageSchemaService
 }
 
 // SetApplyObserver sets a progress observer on the tern client for an apply.
@@ -838,6 +846,14 @@ func (s *Service) apiRoutes() []apiRoute {
 		{"DELETE /api/locks", s.handleLockRelease},
 		{"GET /api/locks/{database}/{dbtype}", s.handleLockGet},
 		{"GET /api/locks", s.handleLockList},
+
+		// Storage schema API (SchemaBot's own bookkeeping database). Both
+		// routes are admin-only, and both are POSTs so both are admitted at the
+		// write tier by auth.TierForRequest's default rule. The diff reads and
+		// nothing else; it carries a body because the schema to diff against
+		// can come from the caller.
+		{"POST /api/storage/schema/plan", s.handleStorageSchemaPlan},
+		{"POST /api/storage/schema/apply", s.handleStorageSchemaApply},
 
 		// Settings API
 		{"GET /api/settings", s.handleSettingsList},
