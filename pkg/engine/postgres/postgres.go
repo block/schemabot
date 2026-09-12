@@ -35,6 +35,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/targetauth"
 )
 
 // Engine implements engine.Engine for PostgreSQL databases.
@@ -219,11 +220,11 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	// policy, before adapting the same normalized DSN to pg-sprite's pool API.
 	db, err := postgresconn.Open(req.Credentials.DSN, validationOpts...)
 	if err != nil {
-		return nil, fmt.Errorf("open PostgreSQL database %q for planning: %w", req.Database, err)
+		return nil, fmt.Errorf("open PostgreSQL database %q for planning: %w", req.Database, targetauth.Wrap(err))
 	}
 	defer utils.CloseAndLog(db)
 	if err := db.PingContext(ctx); err != nil {
-		return nil, fmt.Errorf("ping PostgreSQL database %q for planning: %w", req.Database, err)
+		return nil, fmt.Errorf("ping PostgreSQL database %q for planning: %w", req.Database, targetauth.Wrap(err))
 	}
 
 	poolCfg, err := spritePoolConfig(req.Credentials.DSN, caPath)

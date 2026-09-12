@@ -804,6 +804,34 @@ func RecordControlOperation(ctx context.Context, operation, database, deployment
 	)
 }
 
+// RecordTargetClientEviction counts data-plane client generations the target
+// router replaced, by reason. A rotated credential surfaces as `dsn_changed`
+// once per route and namespace, so a rate on one environment far above its
+// rotation cadence means a resolver is returning an unstable DSN and the
+// router is rebuilding clients on every request; the paired info log names
+// the target and both connection identity hashes. Target is omitted to bound
+// cardinality.
+func RecordTargetClientEviction(ctx context.Context, databaseType, environment, reason string) {
+	addCounter(ctx, "schemabot.target.client_evictions.total",
+		"Target router client generations replaced, by reason", "{eviction}",
+		attribute.String("database_type", databaseType),
+		EnvironmentAttribute(environment),
+		attribute.String("reason", reason),
+	)
+}
+
+// RecordTargetAuthRetry counts bounded target authentication recovery attempts.
+func RecordTargetAuthRetry(ctx context.Context, operation, databaseType, environment, classification, outcome string) {
+	addCounter(ctx, "schemabot.target.auth_retries.total",
+		"Single automatic retries of routed reads after an authentication-classified target failure, by outcome", "{retry}",
+		attribute.String("operation", operation),
+		attribute.String("database_type", databaseType),
+		EnvironmentAttribute(environment),
+		attribute.String("classification", classification),
+		attribute.String("outcome", outcome),
+	)
+}
+
 // RecordRemoteControlRequestStale counts retransmissions of a durable
 // stop/cancel control request that the data plane accepted but has not
 // consumed within the stale threshold. A non-zero rate means an accepted
