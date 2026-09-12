@@ -22,8 +22,12 @@ and [supported operations and limitations](https://github.com/block/spirit#unsup
 
 ## How a change runs
 
-If MySQL can execute a change instantly, Spirit uses that path. A change that needs a table copy
-runs through a longer sequence:
+Spirit first tries instant DDL, then its supported subset of native in-place operations.
+The operation and the actual target table determine which path can run:
+
+![Three DDL examples show Spirit choosing instant column addition, native index rename, or an online copy for an index add](../assets/spirit-ddl-selection.gif)
+
+When the change needs a table copy, Spirit carries it through the full workflow:
 
 ![Spirit copies rows, catches up on writes, verifies the data, waits for a scheduled cutover, and swaps the tables](../assets/spirit-change-lifecycle.gif)
 
