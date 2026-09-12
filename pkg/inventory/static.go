@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -129,6 +130,7 @@ type staticTargetEntry struct {
 }
 
 var _ Resolver = (*StaticResolver)(nil)
+var _ Enumerator = (*StaticResolver)(nil)
 
 // NewStaticResolver creates a static target resolver.
 func NewStaticResolver(config StaticConfig) (*StaticResolver, error) {
@@ -188,6 +190,18 @@ func (r *StaticResolver) ResolveTarget(ctx context.Context, req Request) (*Targe
 		Metadata:        metadata,
 		SchemaOverrides: maps.Clone(entry.schemaOverrides),
 	}, nil
+}
+
+// Enumerate returns every configured target in target-name order.
+func (r *StaticResolver) Enumerate() []ProbeRequest {
+	requests := make([]ProbeRequest, 0, len(r.targets))
+	for target, entry := range r.targets {
+		requests = append(requests, ProbeRequest{Target: target, DatabaseType: entry.databaseType})
+	}
+	sort.Slice(requests, func(i, j int) bool {
+		return requests[i].Target < requests[j].Target
+	})
+	return requests
 }
 
 // newStaticTargetEntry prepares one static target: it validates the entry, and

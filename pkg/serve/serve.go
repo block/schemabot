@@ -31,6 +31,7 @@ import (
 	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/engine/planetscale"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/schemabot/pkg/panicsafe"
@@ -39,6 +40,7 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/storage/postgresstore"
+	"github.com/block/schemabot/pkg/targetprobe"
 	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/webhook"
 )
@@ -286,6 +288,7 @@ type Server struct {
 	storage         storage.Storage
 	logger          *slog.Logger
 	dataPlaneClient tern.Client
+	targetResolver  inventory.Resolver
 	// grpcClient is the single-database client RegisterGRPC builds when no
 	// target resolver is configured. It is owned here (not by the service) so
 	// Close releases it; the resolver-backed dataPlaneClient is the service's
@@ -496,6 +499,10 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		return nil, fmt.Errorf("setup telemetry: %w", err)
 	}
 
+	var targetResolver inventory.Resolver
+	if router, ok := dataPlaneClient.(*tern.TargetRouter); ok {
+		targetResolver = router.Resolver()
+	}
 	success = true
 	return &Server{
 		cfg:             cfg,
@@ -503,6 +510,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		storage:         store,
 		logger:          logger,
 		dataPlaneClient: dataPlaneClient,
+		targetResolver:  targetResolver,
 		webhook:         webhookRuntime,
 		telemetry:       telemetry,
 		authz:           authz,
@@ -693,7 +701,7 @@ func (s *Server) MetricsHandler() http.Handler {
 // Start launches the server's background work: the operator driver pool
 // (dispatches queued applies and recovers stale ones), the remote-deployment
 // health monitor, the webhook inbox monitor (emits durable-inbox depth/backlog
-// metrics), and the pending-drops cleaner — all of which run until ctx is
+// metrics), the startup target probe, and the pending-drops cleaner — all of which run until ctx is
 // canceled or Close is called. It also kicks off a one-shot missing-summary
 // reconciliation that, once started, runs to completion independently of ctx (it
 // repairs interrupted terminal comments and must not be cut short by a request
@@ -701,6 +709,19 @@ func (s *Server) MetricsHandler() http.Handler {
 // first.
 func (s *Server) Start(ctx context.Context) {
 	s.webhook.StartMissingSummaryReconciliation(ctx, s.logger)
+	if s.targetResolver != nil {
+		probe := targetprobe.New(s.targetResolver, s.logger, 0, 0)
+		go func() {
+			err := panicsafe.Call(func() error {
+				probe.Run(ctx)
+				return nil
+			})
+			if err != nil {
+				s.logger.Error("target probe: recovered panic", "error", err)
+				metrics.RecordRecoveredPanic(ctx, "target_probe")
+			}
+		}()
+	}
 	if s.webhook.startDurableWebhookDispatch != nil {
 		s.webhook.startDurableWebhookDispatch(ctx)
 	}

@@ -10,6 +10,59 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestStaticResolverEnumerate(t *testing.T) {
+	t.Setenv("TARGET_CONFIG", `{"host":"db.example","port":3306}`)
+	t.Setenv("TARGET_PASSWORD", "secret")
+
+	tests := []struct {
+		name     string
+		resolver *StaticResolver
+		want     []ProbeRequest
+	}{
+		{name: "zero", resolver: &StaticResolver{}, want: []ProbeRequest{}},
+		{
+			name: "one",
+			resolver: &StaticResolver{targets: map[string]staticTargetEntry{
+				"orders": {target: "orders", databaseType: "mysql"},
+			}},
+			want: []ProbeRequest{{Target: "orders", DatabaseType: "mysql"}},
+		},
+	}
+
+	resolver, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
+		"z-postgres": {DatabaseType: "postgres", DSN: "postgres://user:pass@db.example:5432/app?sslmode=disable"},
+		"a-mysql":    {DatabaseType: "mysql", DSN: "root@tcp(localhost:3306)/"},
+		"m-from": {
+			DatabaseType: "mysql",
+			DSNFrom: &StaticDSNFromConfig{
+				ConfigRef:   "env:TARGET_CONFIG",
+				Username:    "user",
+				PasswordRef: "env:TARGET_PASSWORD",
+			},
+		},
+	}})
+	require.NoError(t, err)
+	tests = append(tests, struct {
+		name     string
+		resolver *StaticResolver
+		want     []ProbeRequest
+	}{
+		name:     "mixed targets",
+		resolver: resolver,
+		want: []ProbeRequest{
+			{Target: "a-mysql", DatabaseType: "mysql"},
+			{Target: "m-from", DatabaseType: "mysql"},
+			{Target: "z-postgres", DatabaseType: "postgres"},
+		},
+	})
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.resolver.Enumerate())
+		})
+	}
+}
+
 func TestStaticResolverResolveTarget(t *testing.T) {
 	t.Setenv("TARGET_DSN", "user:pass@tcp(db.example:3306)/")
 	resolver, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
