@@ -831,6 +831,18 @@ func RecordTargetProbe(ctx context.Context, databaseType, environment, outcome s
 	)
 }
 
+// RecordTargetAuthRetry counts bounded target authentication recovery attempts.
+func RecordTargetAuthRetry(ctx context.Context, operation, databaseType, environment, classification, outcome string) {
+	addCounter(ctx, "schemabot.target.auth_retries.total",
+		"Single automatic retries of routed reads after an authentication-classified target failure, by outcome", "{retry}",
+		attribute.String("operation", operation),
+		attribute.String("database_type", databaseType),
+		EnvironmentAttribute(environment),
+		attribute.String("classification", classification),
+		attribute.String("outcome", outcome),
+	)
+}
+
 // RecordRemoteControlRequestStale counts retransmissions of a durable
 // stop/cancel control request that the data plane accepted but has not
 // consumed within the stale threshold. A non-zero rate means an accepted
