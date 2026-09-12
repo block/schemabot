@@ -247,10 +247,11 @@ inspecting the driver error: SchemaBot's own storage is MySQL or PostgreSQL too,
 so an `errors.As` against the driver error types at the router would match a
 storage credential failure surfacing through `Plan`, evict a healthy target
 generation, and re-run target planning for nothing. Classification therefore
-happens where the target connection is opened. The `mysqlconn.Open` and
-`postgresconn.Open` call sites that open target sessions wrap a classified
-failure in a typed target-authentication error carrying the classification; the
-router matches only that type. Storage errors never pass through those call
+happens where the target session is first dialed. `mysqlconn.Open` and
+`postgresconn.Open` only parse the DSN, so the first `PingContext` after each
+target open is where the server can refuse the session; those ping sites wrap a
+classified failure in a typed target-authentication error carrying the
+classification, and the router matches only that type. Storage errors never pass through those call
 sites, so they cannot carry it and stay on the existing failure path.
 
 An implementation may retry a pre-apply connection acquisition only if it is
@@ -281,20 +282,20 @@ A shared, dialect-aware classifier returns a small closed enum:
 | Classification | MySQL driver code | PostgreSQL SQLSTATE | Meaning |
 | --- | --- | --- | --- |
 | `AuthInvalidCredentials` | 1045 | `28P01` | User/password rejected. |
-| `AuthNoGrant` | 1044 | `28000`, `42501` | Authorization rejected: the role may not authorize as requested (`28000`), or lacks `CONNECT` on the database or the privilege the probe statement needs (`42501`). |
-| `AuthNoDatabase` | 1049 | `3D000` | Selected database does not exist. |
+| `AuthNoAccess` | 1044 | `42501` | The user cannot reach the selected database: MySQL 1044 does not say whether the database is missing or merely not granted to this user, and PostgreSQL `42501` at connection time means the role lacks `CONNECT`. |
+| `AuthNoDatabase` | 1049 | `3D000` | The server confirmed the selected database does not exist. Only privileged MySQL users see 1049; a scoped user sees 1044 instead. |
 | `NotAuth` | everything else | everything else | Preserve the existing failure path. |
 
 Classification uses `errors.As` against `*mysql.MySQLError` from the Go MySQL
 driver and `*pgconn.PgError` from pgx. It never matches error strings. Wrapping
 therefore preserves classification while redaction and contextual error text
 remain independent. The classifier runs at the target connection boundary, on
-the error from the open and first ping of a target session, and its result
+the error from the first ping of a target session, and its result
 travels in the typed target-authentication error described above; it is not
 applied to arbitrary errors at the router, where a storage failure could carry
 the same driver type.
 
-`AuthNoDatabase` and `AuthNoGrant` trigger the same single repair attempt as
+`AuthNoDatabase` and `AuthNoAccess` trigger the same single repair attempt as
 invalid credentials because rotation can change the selected database, role, or
 grant together with the password. If re-resolution returns the same bad shape,
 the bounded retry fails without a loop. The enum remains distinct so operators
@@ -302,7 +303,12 @@ can distinguish secret mismatch from provisioning and configuration errors.
 
 Network refusal, DNS failure, context cancellation, timeout, TLS negotiation or
 certificate failure, protocol errors, query errors, and all other SQLSTATE or
-MySQL codes are `NotAuth`. They do not evict a valid credential generation and
+MySQL codes are `NotAuth`. PostgreSQL `28000` is deliberately among them: a
+rejected password or an unknown role both arrive as `28P01`, while `28000` at
+connection time comes from `pg_hba.conf` policy or an unsatisfied client
+certificate requirement, which a rotation retry cannot repair. The storage
+pool's own reload still treats `28000` as a rotation signature; target eviction
+does not. `NotAuth` errors never evict a valid credential generation and
 continue through the operation's existing error handling.
 
 **Rejected alternatives.** String matching was rejected because driver wording
@@ -321,8 +327,8 @@ recipe's form rather than either neighbor's.
 
 | Metric | Attributes | Meaning |
 | --- | --- | --- |
-| `schemabot.target.probe.total` | `target`, `database_type`, `environment`, `outcome` | One startup result per enumerated target. Outcomes: `success`, `auth_invalid_credentials`, `auth_no_grant`, `auth_no_database`, `resolve_error`, `timeout`, `connection_error`. |
-| `schemabot.target.client_evictions.total` | `database_type`, `environment`, `reason` | Replaced generations. Reasons: `dsn_changed`, `auth_invalid_credentials`, `auth_no_grant`, `auth_no_database`. Target is omitted from this hot-path counter to bound cardinality. |
+| `schemabot.target.probe.total` | `target`, `database_type`, `environment`, `outcome` | One startup result per enumerated target. Outcomes: `success`, `auth_invalid_credentials`, `auth_no_access`, `auth_no_database`, `resolve_error`, `timeout`, `connection_error`. |
+| `schemabot.target.client_evictions.total` | `database_type`, `environment`, `reason` | Replaced generations. Reasons: `dsn_changed`, `auth_invalid_credentials`, `auth_no_access`, `auth_no_database`. Target is omitted from this hot-path counter to bound cardinality. |
 | `schemabot.target.auth_retries.total` | `operation`, `database_type`, `environment`, `classification`, `outcome` | Eligible single retries and whether they succeeded, failed, or could not re-resolve. |
 
 The target label is acceptable on the startup probe because configured

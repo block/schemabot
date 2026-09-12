@@ -33,6 +33,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/mysqlconn"
+	"github.com/block/schemabot/pkg/targetauth"
 )
 
 // DefaultThreads is the default number of concurrent copier threads. Spirit's
@@ -1041,12 +1042,14 @@ func progressState(rm *runningSchemaChange, spiritState status.State) engine.Sta
 func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, _ string) ([]table.TableSchema, error) {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("open database: %w", err)
+		return nil, fmt.Errorf("open target database: %w", err)
 	}
 	defer utils.CloseAndLog(db)
 
+	// Open only parsed the DSN; this ping is the first dial, so it is where the
+	// target can refuse the session and the only error worth classifying.
 	if err := db.PingContext(ctx); err != nil {
-		return nil, fmt.Errorf("ping database: %w", err)
+		return nil, fmt.Errorf("ping target database: %w", targetauth.Wrap(err))
 	}
 
 	tables, err := table.LoadSchemaFromDB(ctx, db, table.WithoutUnderscoreTables, table.WithoutArchiveTables, table.WithStrippedAutoIncrement)
