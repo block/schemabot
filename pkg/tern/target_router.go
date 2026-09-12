@@ -56,6 +56,12 @@ type TargetRouter struct {
 	mu sync.Mutex
 	// current is the generation new work on a route goes to.
 	current map[targetClientKey]*targetClientGeneration
+	// creating marks routes with a client build in progress; it is closed when
+	// the build publishes or fails. One build per route at a time means two
+	// requests that miss together cannot each publish, with the slower one
+	// replacing the faster one's generation on the strength of an older
+	// resolution.
+	creating map[targetClientKey]chan struct{}
 	// retiring holds replaced generations that still own an apply or serve
 	// an in-flight request.
 	retiring map[*targetClientGeneration]struct{}
@@ -89,18 +95,15 @@ func (g *targetClientGeneration) idle() bool {
 }
 
 // connectionIdentityHash is a short one-way digest of what a resolved target
-// connects with, safe to compare and to log. It covers the DSN, or for Vitess
-// the API metadata that stands in for one, so a rotated password or service
-// token changes the hash and nothing else about the route does.
+// connects with, safe to compare and to log. It covers the DSN and the
+// engine's connection metadata — for Vitess the API fields that stand in for
+// a DSN, for PostgreSQL the CA the connection verifies against — so a rotated
+// password, service token, or certificate changes the hash and nothing else
+// about the route does.
 func connectionIdentityHash(resolved *inventory.Target) string {
 	parts := []string{resolved.DSN}
-	if resolved.DatabaseType == storage.DatabaseTypeVitess {
-		parts = append(parts,
-			resolved.Metadata[inventory.MetadataOrganization],
-			resolved.Metadata[inventory.MetadataTokenName],
-			resolved.Metadata[inventory.MetadataTokenValue],
-			resolved.Metadata[inventory.MetadataAPIURL],
-		)
+	for _, key := range inventory.ConnectionMetadataKeys(resolved.DatabaseType) {
+		parts = append(parts, resolved.Metadata[key])
 	}
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return hex.EncodeToString(sum[:6])
@@ -132,6 +135,7 @@ func NewTargetRouter(config TargetRouterConfig) (*TargetRouter, error) {
 		logger:           logger,
 		factory:          factory,
 		current:          make(map[targetClientKey]*targetClientGeneration),
+		creating:         make(map[targetClientKey]chan struct{}),
 		retiring:         make(map[*targetClientGeneration]struct{}),
 		applyOwners:      make(map[string]*targetClientGeneration),
 		activeObservers:  make(map[int64]ProgressObserver),
@@ -277,10 +281,13 @@ func (r *TargetRouter) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*te
 	if err != nil {
 		return nil, err
 	}
-	// The generation that started an apply drives it in-process, so it owns
-	// the apply until that apply is terminal (AV-2): a later credential
-	// rotation publishes a new generation for new work without pulling this
-	// one out from under a running schema change.
+	// The generation that queued an apply holds its pending observer and is
+	// where the operator's claim drives it, so it owns the apply until that
+	// apply is terminal (AV-2): a later credential rotation publishes a new
+	// generation for new work without pulling this one out from under a
+	// running schema change. An accepted response also comes back for a
+	// re-dispatch that adopted an apply already queued or driving, so
+	// acceptance never moves ownership off a generation that already has it.
 	if resp.GetAccepted() && resp.GetApplyId() != "" {
 		r.recordOwner(gen, resp.GetApplyId())
 	}
@@ -413,22 +420,23 @@ func (r *TargetRouter) ResumeApplyOperationCutover(ctx context.Context, apply *s
 }
 
 // resumeOnOwner routes a resume to the generation that already drives the
-// apply, or to the current generation when none does, and records the
-// generation that accepted the resume as the apply's owner. Ownership is
-// recorded before the acquisition is released so the generation can never be
-// closed between accepting the drive and being recorded as driving it.
+// apply, or to the current generation when none does, and records that
+// generation as the apply's owner before handing it the drive. A local drive
+// runs inside the resume call for as long as the schema change takes, and
+// the requests that arrive meanwhile — progress, stop, observer attachment —
+// must find the owner already recorded so they reach the client whose
+// in-process state they act on. The owner stays recorded when the resume
+// returns an error: a drive the engine detached may still be running on it,
+// and the apply's terminal state is what releases it.
 func (r *TargetRouter) resumeOnOwner(ctx context.Context, apply *storage.Apply, resume func(client Client, ctx context.Context, apply *storage.Apply) error) error {
 	gen, err := r.clientForStoredApply(ctx, apply)
 	if err != nil {
 		return err
 	}
 	defer r.release(gen)
-	r.attachObserver(gen.client, apply.ID)
-	if err := resume(gen.client, ctx, apply); err != nil {
-		return err
-	}
 	r.recordOwner(gen, apply.ApplyIdentifier)
-	return nil
+	r.attachObserver(gen.client, apply.ID)
+	return resume(gen.client, ctx, apply)
 }
 
 // Endpoint returns a descriptive endpoint for the router.
@@ -651,13 +659,13 @@ func (r *TargetRouter) clientForTarget(ctx context.Context, target, databaseType
 	}
 	key := cacheKeyForResolvedTarget(resolved, environment, namespace)
 	dsnHash := connectionIdentityHash(resolved)
-	r.mu.Lock()
-	if gen := r.current[key]; gen != nil && gen.dsnHash == dsnHash {
-		gen.inflight++
-		r.mu.Unlock()
+	gen, publish, err := r.acquireCurrentOrCreationSlot(ctx, key, dsnHash)
+	if err != nil {
+		return nil, nil, fmt.Errorf("route target %q database %q: %w", target, namespace, err)
+	}
+	if gen != nil {
 		return gen, resolved, nil
 	}
-	r.mu.Unlock()
 
 	client, err := r.factory(LocalConfig{
 		Database:        namespace,
@@ -667,34 +675,23 @@ func (r *TargetRouter) clientForTarget(ctx context.Context, target, databaseType
 		SchemaOverrides: maps.Clone(resolved.SchemaOverrides),
 	}, r.storage, r.logger)
 	if err != nil {
+		publish.done()
 		return nil, nil, fmt.Errorf("create local client for target %q database %q: %w", target, namespace, err)
 	}
 
-	gen := &targetClientGeneration{key: key, dsnHash: dsnHash, client: client, owned: make(map[string]struct{})}
+	gen = &targetClientGeneration{key: key, dsnHash: dsnHash, client: client, owned: make(map[string]struct{})}
 
 	r.mu.Lock()
-	if existing := r.current[key]; existing != nil && existing.dsnHash == dsnHash {
-		existing.inflight++
-		r.mu.Unlock()
-		if err := client.Close(); err != nil {
-			r.logger.Warn("target router: failed to close duplicate local client", "target", target, "error", err)
-		}
-		return existing, resolved, nil
-	}
 	replaced := r.current[key]
 	r.current[key] = gen
 	gen.inflight++
 	var replacedOwned int
-	var closeReplaced bool
 	if replaced != nil {
 		replacedOwned = len(replaced.owned)
-		if replaced.idle() {
-			closeReplaced = true
-		} else {
-			r.retiring[replaced] = struct{}{}
-		}
+		r.retiring[replaced] = struct{}{}
 	}
 	r.mu.Unlock()
+	publish.done()
 
 	if replaced == nil {
 		return gen, resolved, nil
@@ -709,12 +706,57 @@ func (r *TargetRouter) clientForTarget(ctx context.Context, target, databaseType
 		"retiring_owned_applies", replacedOwned,
 	)
 	metrics.RecordTargetClientEviction(ctx, resolved.DatabaseType, environment, "dsn_changed")
-	if closeReplaced {
-		r.closeGeneration(replaced)
-	} else {
-		r.sweepRetiring(ctx)
-	}
+	// The replaced generation joined the retiring set above; the sweep closes
+	// it now if it is idle, and with it any older generation whose applies
+	// have finished since the rotation that retired it.
+	r.sweepOwnership(ctx)
 	return gen, resolved, nil
+}
+
+// creationSlot is the exclusive right to build and publish a client for one
+// route. Requests that miss on the same route wait for it to finish, then
+// re-check the published generation rather than building one of their own.
+type creationSlot struct {
+	router *TargetRouter
+	key    targetClientKey
+	built  chan struct{}
+}
+
+func (s creationSlot) done() {
+	s.router.mu.Lock()
+	delete(s.router.creating, s.key)
+	s.router.mu.Unlock()
+	close(s.built)
+}
+
+// acquireCurrentOrCreationSlot returns the route's current generation,
+// acquired, when it was opened with the resolved connection identity.
+// Otherwise it returns the slot the caller must build and publish under,
+// after waiting out any build already in progress on the route. Only one
+// build runs per route at a time, so a slow build cannot publish over a
+// newer generation another request published while it ran.
+func (r *TargetRouter) acquireCurrentOrCreationSlot(ctx context.Context, key targetClientKey, dsnHash string) (*targetClientGeneration, creationSlot, error) {
+	for {
+		r.mu.Lock()
+		if gen := r.current[key]; gen != nil && gen.dsnHash == dsnHash {
+			gen.inflight++
+			r.mu.Unlock()
+			return gen, creationSlot{}, nil
+		}
+		inProgress := r.creating[key]
+		if inProgress == nil {
+			slot := creationSlot{router: r, key: key, built: make(chan struct{})}
+			r.creating[key] = slot.built
+			r.mu.Unlock()
+			return nil, slot, nil
+		}
+		r.mu.Unlock()
+		select {
+		case <-inProgress:
+		case <-ctx.Done():
+			return nil, creationSlot{}, fmt.Errorf("wait for a concurrent client build: %w", ctx.Err())
+		}
+	}
 }
 
 // release ends one request's hold on a generation. A retiring generation
@@ -753,23 +795,22 @@ func (r *TargetRouter) closeGeneration(gen *targetClientGeneration) {
 	}
 }
 
-// recordOwner marks gen as the generation driving an apply. An apply has one
-// owner: when a resume lands on a different generation than the one recorded
-// — a stopped apply restarted after a rotation — the prior owner gives it up.
+// recordOwner marks gen as the generation driving an apply unless another
+// generation already does. An apply has one owner for as long as it is not
+// terminal, and that owner is the client holding the apply's in-process
+// state — a drive, its cancel handle, its observer — so a later request that
+// lands elsewhere, such as a re-dispatch adopting the queued apply on the
+// current generation, cannot take the apply away from the one driving it.
 func (r *TargetRouter) recordOwner(gen *targetClientGeneration, applyIdentifier string) {
 	r.mu.Lock()
-	var closePrior bool
-	prior := r.applyOwners[applyIdentifier]
-	if prior != nil && prior != gen {
-		delete(prior.owned, applyIdentifier)
-		closePrior = r.retireIfIdleLocked(prior)
+	defer r.mu.Unlock()
+	if prior := r.applyOwners[applyIdentifier]; prior != nil && prior != gen {
+		r.logger.Debug("target router: apply already owned by another client generation; leaving ownership with it",
+			"apply_id", applyIdentifier, "owner_dsn_hash", prior.dsnHash, "requested_dsn_hash", gen.dsnHash)
+		return
 	}
 	gen.owned[applyIdentifier] = struct{}{}
 	r.applyOwners[applyIdentifier] = gen
-	r.mu.Unlock()
-	if closePrior {
-		r.closeGeneration(prior)
-	}
 }
 
 // ownerOf returns the generation driving a stored apply, acquired, or nil
@@ -806,63 +847,64 @@ func (r *TargetRouter) releaseOwnershipLocked(owner *targetClientGeneration, app
 	return r.retireIfIdleLocked(owner)
 }
 
-// sweepRetiring releases retiring generations whose owned applies have since
-// reached a terminal state. Ownership is otherwise released only when a
-// request for the apply arrives, so a rotation that finds an old generation
-// still holding long-finished applies would keep it open until one did.
-// A storage error keeps the ownership: closing a generation that may still be
+// sweepOwnership closes retiring generations that are idle and releases, from
+// every generation, the applies that have since reached a terminal state.
+// Ownership is otherwise released only when a request for the apply arrives,
+// so without the sweep a rotation would leave an old generation open for
+// long-finished applies until one did, and a current generation would keep
+// an entry for every apply it ever drove. One storage read lists every apply
+// still in progress, so the cost does not grow with the number owned. A
+// storage error keeps the ownership: closing a generation that may still be
 // driving an apply is the failure this bookkeeping exists to prevent.
-func (r *TargetRouter) sweepRetiring(ctx context.Context) {
-	type retiringOwner struct {
-		gen   *targetClientGeneration
-		owned []string
-	}
+func (r *TargetRouter) sweepOwnership(ctx context.Context) {
 	r.mu.Lock()
-	candidates := make([]retiringOwner, 0, len(r.retiring))
+	var toClose []*targetClientGeneration
 	for gen := range r.retiring {
-		if len(gen.owned) == 0 {
-			continue
+		if r.retireIfIdleLocked(gen) {
+			toClose = append(toClose, gen)
 		}
-		owned := make([]string, 0, len(gen.owned))
-		for id := range gen.owned {
-			owned = append(owned, id)
-		}
-		candidates = append(candidates, retiringOwner{gen: gen, owned: owned})
 	}
+	owned := len(r.applyOwners)
 	r.mu.Unlock()
-	if len(candidates) == 0 {
-		return
+	for _, gen := range toClose {
+		r.closeGeneration(gen)
 	}
-	applies := r.storage.Applies()
-	if applies == nil {
-		r.logger.Warn("target router: apply store unavailable; retiring client generations keep their applies until a request for one arrives")
+	if owned == 0 {
 		return
 	}
 
-	var toClose []*targetClientGeneration
-	for _, candidate := range candidates {
-		for _, applyIdentifier := range candidate.owned {
-			apply, err := applies.GetByApplyIdentifier(ctx, applyIdentifier)
-			if err != nil {
-				r.logger.Warn("target router: failed to load owned apply while sweeping retiring client generations; keeping its owner open",
-					"apply_id", applyIdentifier, "dsn_hash", candidate.gen.dsnHash, "error", err)
-				continue
-			}
-			if apply != nil && !state.IsTerminalApplyState(apply.State) {
-				continue
-			}
-			if apply == nil {
-				r.logger.Warn("target router: owned apply not found while sweeping retiring client generations; releasing it",
-					"apply_id", applyIdentifier, "dsn_hash", candidate.gen.dsnHash)
-			}
-			r.mu.Lock()
-			if r.applyOwners[applyIdentifier] == candidate.gen && r.releaseOwnershipLocked(candidate.gen, applyIdentifier) {
-				toClose = append(toClose, candidate.gen)
-			}
-			r.mu.Unlock()
+	applies := r.storage.Applies()
+	if applies == nil {
+		r.logger.Warn("target router: apply store unavailable; client generations keep their applies until a request for one arrives")
+		return
+	}
+	inProgress, err := applies.GetInProgress(ctx)
+	if err != nil {
+		r.logger.Warn("target router: failed to list in-progress applies while sweeping client generations; keeping every owner open", "error", err)
+		return
+	}
+	active := make(map[string]struct{}, len(inProgress))
+	for _, apply := range inProgress {
+		active[apply.ApplyIdentifier] = struct{}{}
+	}
+
+	r.mu.Lock()
+	var settled []*targetClientGeneration
+	released := 0
+	for applyIdentifier, owner := range r.applyOwners {
+		if _, driving := active[applyIdentifier]; driving {
+			continue
+		}
+		released++
+		if r.releaseOwnershipLocked(owner, applyIdentifier) {
+			settled = append(settled, owner)
 		}
 	}
-	for _, gen := range toClose {
+	r.mu.Unlock()
+	if released > 0 {
+		r.logger.Debug("target router: released client generation ownership of applies no longer in progress", "released", released)
+	}
+	for _, gen := range settled {
 		r.closeGeneration(gen)
 	}
 }

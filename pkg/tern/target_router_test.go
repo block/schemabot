@@ -11,6 +11,7 @@ import (
 
 	"github.com/block/schemabot/pkg/inventory"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -79,6 +80,21 @@ func (s targetRouterApplyStore) GetByApplyIdentifier(_ context.Context, applyIde
 	return &copy, nil
 }
 
+func (s targetRouterApplyStore) GetInProgress(context.Context) ([]*storage.Apply, error) {
+	if s.lookupErr != nil {
+		return nil, s.lookupErr
+	}
+	var inProgress []*storage.Apply
+	for _, apply := range s.byIdentifier {
+		if state.IsTerminalApplyState(apply.State) {
+			continue
+		}
+		copy := *apply
+		inProgress = append(inProgress, &copy)
+	}
+	return inProgress, nil
+}
+
 type targetRouterRecordingClient struct {
 	pullReq            *ternv1.PullSchemaRequest
 	planReq            *ternv1.PlanRequest
@@ -97,6 +113,9 @@ type targetRouterRecordingClient struct {
 	// onPlan runs inside Plan, while the router still holds this client for
 	// the request, so a test can observe the router mid-dispatch.
 	onPlan func()
+	// onResume runs inside each resume, standing in for the drive a local
+	// client runs to completion within the call.
+	onResume func()
 }
 
 func (c *targetRouterRecordingClient) PullSchema(_ context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
@@ -158,17 +177,22 @@ func (c *targetRouterRecordingClient) SkipRevert(context.Context, *ternv1.SkipRe
 func (c *targetRouterRecordingClient) Health(context.Context) error { return nil }
 
 func (c *targetRouterRecordingClient) ResumeApply(_ context.Context, apply *storage.Apply) error {
-	c.resumeApply = apply
-	return nil
+	return c.recordResume(apply)
 }
 
 func (c *targetRouterRecordingClient) ResumeApplyOperation(_ context.Context, apply *storage.Apply, _ int64) error {
-	c.resumeApply = apply
-	return nil
+	return c.recordResume(apply)
 }
 
 func (c *targetRouterRecordingClient) ResumeApplyOperationCutover(_ context.Context, apply *storage.Apply, _ int64) error {
+	return c.recordResume(apply)
+}
+
+func (c *targetRouterRecordingClient) recordResume(apply *storage.Apply) error {
 	c.resumeApply = apply
+	if c.onResume != nil {
+		c.onResume()
+	}
 	return nil
 }
 

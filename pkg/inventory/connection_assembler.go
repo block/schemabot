@@ -310,6 +310,22 @@ const (
 	MetadataAPIURL = "api_url"
 )
 
+// ConnectionMetadataKeys lists the metadata keys a resolved Target of the given
+// database type connects with, in a fixed order: every key an assembler writes
+// from the resolved endpoint and credentials, so a caller comparing two
+// resolutions of one target sees each field that changes what the client
+// reaches or authenticates as. Configured pass-through metadata is not listed.
+func ConnectionMetadataKeys(databaseType string) []string {
+	switch databaseType {
+	case "vitess":
+		return []string{MetadataOrganization, MetadataDatabase, MetadataTokenName, MetadataTokenValue, MetadataAPIURL}
+	case "postgres":
+		return []string{MetadataPostgresCARef}
+	default:
+		return nil
+	}
+}
+
 // DefaultPlanetScaleAPIURL is the public PlanetScale API endpoint, used when the
 // assembler is not configured with an override (for example a LocalScale URL in
 // tests).
