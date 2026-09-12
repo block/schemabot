@@ -3,6 +3,7 @@
 package serve
 
 import (
+	"fmt"
 	"log/slog"
 	"testing"
 
@@ -43,7 +44,7 @@ func TestConnectStoragePostgresBootsEndToEnd(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, schema.DialectPostgres, dialect)
 
-	db, err := connectStorage(t.Context(), cfg, dialect, logger)
+	db, _, err := connectStorage(t.Context(), cfg, dialect, logger)
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 
@@ -101,7 +102,7 @@ func TestConnectStoragePostgresPoolCarriesStatementBudget(t *testing.T) {
 				Storage:  api.StorageConfig{DSN: dsn, Dialect: "postgres"},
 				Postgres: api.PostgresConfig{StatementTimeout: tc.configured},
 			}
-			db, err := connectStorage(t.Context(), cfg, schema.DialectPostgres, logger)
+			db, _, err := connectStorage(t.Context(), cfg, schema.DialectPostgres, logger)
 			require.NoError(t, err)
 			t.Cleanup(func() { utils.CloseAndLog(db) })
 
@@ -120,7 +121,9 @@ func TestStorageDialectDispatchFailsClosed(t *testing.T) {
 	assert.Contains(t, err.Error(), `no storage implementation for storage dialect "oracle"`)
 
 	cfg := &api.ServerConfig{Storage: api.StorageConfig{DSN: "unused"}}
-	_, err = openStoragePool(schema.Dialect("oracle"), "unused", cfg)
+	_, err = openStoragePool(schema.Dialect("oracle"), "unused", cfg, func() (string, error) {
+		return "", fmt.Errorf("the dispatch fails before any reload")
+	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `no storage connector for storage dialect "oracle"`)
 }

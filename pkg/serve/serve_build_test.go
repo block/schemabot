@@ -28,9 +28,11 @@ type stubTernClient struct{ tern.Client }
 // Run own the listener.
 func TestServerRegisterGRPCRegistersTernService(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
+	cfg := &api.ServerConfig{}
 	srv := &Server{
+		cfg:             cfg,
 		dataPlaneClient: stubTernClient{},
-		svc:             api.New(mysqlstore.New(nil), &api.ServerConfig{}, nil, logger),
+		svc:             api.New(mysqlstore.New(nil), cfg, nil, logger),
 		logger:          logger,
 	}
 
