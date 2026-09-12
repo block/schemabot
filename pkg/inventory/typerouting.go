@@ -3,6 +3,7 @@ package inventory
 import (
 	"context"
 	"fmt"
+	"sort"
 )
 
 // TypeRoutingResolver routes a request to the Resolver registered for its
@@ -15,6 +16,7 @@ type TypeRoutingResolver struct {
 }
 
 var _ Resolver = (*TypeRoutingResolver)(nil)
+var _ Enumerator = (*TypeRoutingResolver)(nil)
 
 // NewTypeRoutingResolver builds a resolver that dispatches by database type. The
 // keys are database types (for example "mysql", "vitess"); each value resolves
@@ -50,4 +52,39 @@ func (r *TypeRoutingResolver) ResolveTarget(ctx context.Context, req Request) (*
 		return nil, fmt.Errorf("resolve target %q: no resolver registered for database type %q", req.Target, req.DatabaseType)
 	}
 	return resolver.ResolveTarget(ctx, req)
+}
+
+// Enumerate concatenates targets from child resolvers that support enumeration.
+// Children are visited in database-type order for deterministic results.
+func (r *TypeRoutingResolver) Enumerate() []ProbeRequest {
+	var requests []ProbeRequest
+	for _, databaseType := range r.databaseTypes() {
+		enumerator, ok := r.byType[databaseType].(Enumerator)
+		if ok {
+			requests = append(requests, enumerator.Enumerate()...)
+		}
+	}
+	return requests
+}
+
+// UnenumerableDatabaseTypes returns the database types whose resolvers cannot
+// enumerate targets.
+func (r *TypeRoutingResolver) UnenumerableDatabaseTypes() []string {
+	var unenumerable []string
+	for _, databaseType := range r.databaseTypes() {
+		_, ok := r.byType[databaseType].(Enumerator)
+		if !ok {
+			unenumerable = append(unenumerable, databaseType)
+		}
+	}
+	return unenumerable
+}
+
+func (r *TypeRoutingResolver) databaseTypes() []string {
+	databaseTypes := make([]string, 0, len(r.byType))
+	for databaseType := range r.byType {
+		databaseTypes = append(databaseTypes, databaseType)
+	}
+	sort.Strings(databaseTypes)
+	return databaseTypes
 }
