@@ -43,7 +43,7 @@ func TestConnectStoragePostgresBootsEndToEnd(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, schema.DialectPostgres, dialect)
 
-	db, err := connectStorage(t.Context(), cfg, dialect, logger)
+	db, _, err := connectStorage(t.Context(), cfg, dialect, logger)
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 
@@ -101,7 +101,7 @@ func TestConnectStoragePostgresPoolCarriesStatementBudget(t *testing.T) {
 				Storage:  api.StorageConfig{DSN: dsn, Dialect: "postgres"},
 				Postgres: api.PostgresConfig{StatementTimeout: tc.configured},
 			}
-			db, err := connectStorage(t.Context(), cfg, schema.DialectPostgres, logger)
+			db, _, err := connectStorage(t.Context(), cfg, schema.DialectPostgres, logger)
 			require.NoError(t, err)
 			t.Cleanup(func() { utils.CloseAndLog(db) })
 
