@@ -57,3 +57,18 @@ func PostgresTableExists(t *testing.T, db *sql.DB, schemaName, tableName string)
 	require.NoError(t, err)
 	return count > 0
 }
+
+// PostgresColumnExists reports whether columnName exists on schemaName.tableName
+// on a PostgreSQL connection. It mirrors ColumnExists, whose `?` placeholders
+// only bind on MySQL.
+func PostgresColumnExists(t *testing.T, db *sql.DB, schemaName, tableName, columnName string) bool {
+	t.Helper()
+
+	var count int
+	err := db.QueryRowContext(t.Context(),
+		"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND column_name = $3",
+		schemaName, tableName, columnName,
+	).Scan(&count)
+	require.NoError(t, err)
+	return count > 0
+}

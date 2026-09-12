@@ -188,6 +188,46 @@ func TestPostgresExpectationsFor_RejectsUntrackableStatements(t *testing.T) {
 			file: "CREATE TABLE settings (id bigint);\nCREATE INDEX idx_other ON other (id);",
 			want: `declares index "idx_other" on table "other"`,
 		},
+		{
+			// The file's name is the table's identity for the whole
+			// convergence, so a file that creates a different relation would
+			// have every check run against one table and the DDL create
+			// another.
+			name: "creates a different table than it is named for",
+			file: "CREATE TABLE other (id bigint);",
+			want: `schema file for table "settings" declares table "other"`,
+		},
+		{
+			name: "does not begin with CREATE TABLE",
+			file: "CREATE INDEX idx_settings_id ON settings (id);",
+			want: "must begin with CREATE TABLE",
+		},
+		{
+			// The bare name matches, so the identity check above passes while
+			// the DDL targets a relation the convergence never looks at: it
+			// resolves existence, columns and indexes through the connection's
+			// current schema, so the table this file is named for would stay
+			// missing on every boot.
+			name: "creates the table in another schema",
+			file: "CREATE TABLE archive.settings (id bigint);",
+			want: `declares table settings in schema "archive"`,
+		},
+		{
+			// The same reasoning for the index: qualified here, unqualified
+			// everywhere the convergence looks for it.
+			name: "creates the index in another schema",
+			file: "CREATE TABLE settings (id bigint);\nCREATE INDEX idx_settings_id ON archive.settings (id);",
+			want: `declares index idx_settings_id in schema "archive"`,
+		},
+		{
+			// Naming the schema the convergence happens to be pointed at is
+			// refused too. Whether it matches depends on the connection's
+			// search_path, which the parser cannot see and the file cannot
+			// promise, so an agreement here would be a coincidence.
+			name: "creates the table in the public schema explicitly",
+			file: "CREATE TABLE public.settings (id bigint);",
+			want: `declares table settings in schema "public"`,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
