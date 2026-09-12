@@ -355,6 +355,10 @@ func (r *TargetRouter) Endpoint() string { return "target-router" }
 // IsRemote reports false because the router delegates to in-process LocalClients.
 func (r *TargetRouter) IsRemote() bool { return false }
 
+// Resolver returns the inventory resolver this router routes through, so the
+// startup probe can enumerate the same targets requests resolve against.
+func (r *TargetRouter) Resolver() inventory.Resolver { return r.resolver }
+
 // SetPendingObserver stores an observer for the next apply only when callers use
 // the target-aware SetPendingObserverForTarget helper. The Client interface lacks
 // a target parameter, so this method cannot safely attach observers in a
