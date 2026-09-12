@@ -99,6 +99,13 @@ type DeploymentRollupEntry struct {
 type PlanRollup struct {
 	Entries []DeploymentRollupEntry
 	Clean   bool
+	// Planning is the contract the members were classified under, and decides
+	// what Clean means. Under PlanMirrored a clean rollup says every member
+	// would run the same plan. Under PlanIndependent it says every member
+	// produced a plan of its own, which are not expected to match — so a reader
+	// of the rollup cannot describe it without knowing which contract produced
+	// it.
+	Planning MemberPlanning
 }
 
 // RollupDeploymentDiffs classifies each rollout member's review-time diff
@@ -227,7 +234,7 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing
 		entries[i] = entry
 	}
 
-	return PlanRollup{Entries: entries, Clean: clean}, nil
+	return PlanRollup{Entries: entries, Clean: clean, Planning: planning}, nil
 }
 
 // rollupIndependentMembers classifies members that were each planned against
@@ -263,5 +270,5 @@ func rollupIndependentMembers(diffs []DeploymentPlanDiff) PlanRollup {
 		}
 		entries[i] = entry
 	}
-	return PlanRollup{Entries: entries, Clean: clean}
+	return PlanRollup{Entries: entries, Clean: clean, Planning: PlanIndependent}
 }

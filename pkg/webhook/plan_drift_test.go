@@ -173,3 +173,22 @@ func TestDeploymentDriftPreview_DivergedAndErroredDetails(t *testing.T) {
 	assert.Equal(t, erroredDriftDetail, preview.Deployments[2].Detail)
 	assert.NotContains(t, preview.Deployments[2].Detail, assert.AnError.Error())
 }
+
+// A rollup where one deployment addresses several targets names each failing
+// member by its routing pair, so the check's Change column identifies exactly
+// which member to reconcile rather than a deployment with two of them.
+func TestSummarizeReviewDrift_NamesMultiTargetMembers(t *testing.T) {
+	rollup := api.PlanRollup{
+		Planning: api.PlanIndependent,
+		Entries: []api.DeploymentRollupEntry{
+			{Deployment: "primary", Target: "testapp-001", Class: api.DeploymentPlanned},
+			{Deployment: "primary", Target: "testapp-002", Class: api.DeploymentErrored},
+			{Deployment: "eu-west", Target: "orders-eu", Class: api.DeploymentErrored},
+		},
+	}
+	summary := summarizeReviewDrift(rollup)
+	// Independent targets are never expected to agree, so an unplannable one is
+	// not drift between them.
+	assert.Contains(t, summary, "could not plan: primary/testapp-002, eu-west")
+	assert.NotContains(t, summary, "drift blocks apply")
+}

@@ -89,6 +89,7 @@ func deploymentDriftPreview(rollup api.PlanRollup) *templates.DeploymentDriftDat
 	for i, e := range rollup.Entries {
 		entry := templates.DeploymentDriftEntry{
 			Deployment: e.Deployment,
+			Target:     e.Target,
 			Primary:    i == 0,
 			Class:      e.Class.String(),
 		}
@@ -108,6 +109,7 @@ func deploymentDriftPreview(rollup api.PlanRollup) *templates.DeploymentDriftDat
 		Deployments: entries,
 		Clean:       rollup.Clean,
 		Computed:    true,
+		Independent: rollup.Planning == api.PlanIndependent,
 	}
 }
 
@@ -135,6 +137,16 @@ func describeDriftDiff(diff tern.ChangeSetDiff) string {
 	return strings.Join(parts, ", ") + " change(s) vs the reviewed plan"
 }
 
+// rollupMemberNames renders each rollup entry the way an operator addresses it,
+// index-parallel to rollup.Entries.
+func rollupMemberNames(rollup api.PlanRollup) []string {
+	members := make([]routing.ExecutionTarget, len(rollup.Entries))
+	for i, e := range rollup.Entries {
+		members[i] = routing.ExecutionTarget{Deployment: e.Deployment, Target: e.Target}
+	}
+	return routing.DisplayNames(members)
+}
+
 // maxDriftSummaryLen bounds the stored drift summary to the checks table's
 // change_summary column width. The summary is truncated on a rune boundary so it
 // never exceeds the column or splits a multibyte character.
@@ -145,13 +157,18 @@ const maxDriftSummaryLen = 255
 // from the reviewed plan and those that could not be diffed or compared, so the
 // check's Change column tells an operator exactly which deployment to reconcile.
 func summarizeReviewDrift(rollup api.PlanRollup) string {
+	independent := rollup.Planning == api.PlanIndependent
+	// One deployment can address several targets, so the deployment name alone
+	// does not always say which member failed. The shared naming rule adds the
+	// target only where it disambiguates.
+	names := rollupMemberNames(rollup)
 	var diverged, errored []string
-	for _, entry := range rollup.Entries {
+	for i, entry := range rollup.Entries {
 		switch entry.Class {
 		case api.DeploymentDiverged:
-			diverged = append(diverged, entry.Deployment)
+			diverged = append(diverged, names[i])
 		case api.DeploymentErrored:
-			errored = append(errored, entry.Deployment)
+			errored = append(errored, names[i])
 		}
 	}
 
@@ -160,12 +177,27 @@ func summarizeReviewDrift(rollup api.PlanRollup) string {
 		parts = append(parts, fmt.Sprintf("diverged: %s", strings.Join(diverged, ", ")))
 	}
 	if len(errored) > 0 {
-		parts = append(parts, fmt.Sprintf("could not verify: %s", strings.Join(errored, ", ")))
+		// An errored member means different things under the two contracts: a
+		// mirrored member's diff could not be confirmed against the reviewed plan,
+		// while an independent member has no plan of its own at all.
+		reason := "could not verify"
+		if independent {
+			reason = "could not plan"
+		}
+		parts = append(parts, fmt.Sprintf("%s: %s", reason, strings.Join(errored, ", ")))
 	}
 	if len(parts) == 0 {
-		// A not-clean rollup always has at least one non-matching entry; guard
+		// A not-clean rollup always has at least one non-passing entry; guard
 		// anyway so the check never records an empty, uninformative reason.
+		if independent {
+			return "blocks apply: not every target could be planned"
+		}
 		return "drift blocks apply: deployments differ from the reviewed plan"
+	}
+	// Targets that hold their own schemas are never expected to agree, so their
+	// failure is an unplanned target, not drift between them.
+	if independent {
+		return clampDriftSummary("blocks apply — " + strings.Join(parts, "; "))
 	}
 	return clampDriftSummary("drift blocks apply — " + strings.Join(parts, "; "))
 }

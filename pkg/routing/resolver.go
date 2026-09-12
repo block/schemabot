@@ -32,6 +32,42 @@ func (t ExecutionTarget) MemberID() string {
 	return t.Deployment + "/" + t.Target
 }
 
+// DisplayNames returns the operator-facing name of each member of a rollout, in
+// the order given. MemberID is the identity every comparison must use, but it is
+// not always the right thing to show: a deployment that addresses exactly one
+// target is already unambiguous, and naming it "deployment/target" everywhere
+// would add a second half that never distinguishes anything. So a member is
+// named by its deployment alone unless its deployment addresses more than one
+// distinct target in this rollout, in which case every member of that deployment
+// is named by its full MemberID.
+//
+// Keying on distinct targets, rather than on how many members a deployment has,
+// is what keeps a keyed or sharded apply — several operations of one deployment
+// against the same target — named by the deployment, where the extra half would
+// be noise that still did not tell the operations apart.
+func DisplayNames(members []ExecutionTarget) []string {
+	targetsByDeployment := make(map[string]map[string]struct{}, len(members))
+	for _, m := range members {
+		if m.Target == "" {
+			continue
+		}
+		if targetsByDeployment[m.Deployment] == nil {
+			targetsByDeployment[m.Deployment] = make(map[string]struct{}, 1)
+		}
+		targetsByDeployment[m.Deployment][m.Target] = struct{}{}
+	}
+
+	names := make([]string, len(members))
+	for i, m := range members {
+		if len(targetsByDeployment[m.Deployment]) > 1 {
+			names[i] = m.MemberID()
+			continue
+		}
+		names[i] = m.Deployment
+	}
+	return names
+}
+
 // Resolver resolves logical SchemaBot targets to concrete execution targets.
 type Resolver interface {
 	ResolveTargets(ctx context.Context, req Request) ([]ExecutionTarget, error)
