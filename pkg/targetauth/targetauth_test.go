@@ -22,11 +22,10 @@ func TestClassify(t *testing.T) {
 		want Classification
 	}{
 		{name: "MySQL invalid credentials", err: &mysql.MySQLError{Number: 1045}, want: AuthInvalidCredentials},
-		{name: "MySQL no grant", err: &mysql.MySQLError{Number: 1044}, want: AuthNoGrant},
+		{name: "MySQL access denied to database", err: &mysql.MySQLError{Number: 1044}, want: AuthNoAccess},
 		{name: "MySQL no database", err: &mysql.MySQLError{Number: 1049}, want: AuthNoDatabase},
 		{name: "PostgreSQL invalid credentials", err: &pgconn.PgError{Code: "28P01"}, want: AuthInvalidCredentials},
-		{name: "PostgreSQL invalid authorization", err: &pgconn.PgError{Code: "28000"}, want: AuthNoGrant},
-		{name: "PostgreSQL insufficient privilege", err: &pgconn.PgError{Code: "42501"}, want: AuthNoGrant},
+		{name: "PostgreSQL permission denied for database", err: &pgconn.PgError{Code: "42501"}, want: AuthNoAccess},
 		{name: "PostgreSQL no database", err: &pgconn.PgError{Code: "3D000"}, want: AuthNoDatabase},
 	}
 
@@ -60,6 +59,7 @@ func TestClassifyNotAuth(t *testing.T) {
 		{name: "deadline", err: context.DeadlineExceeded},
 		{name: "certificate verification", err: &tls.CertificateVerificationError{Err: errors.New("unknown authority")}},
 		{name: "TLS negotiation", err: errors.New("TLS negotiation failed")},
+		{name: "PostgreSQL invalid authorization specification", err: &pgconn.PgError{Code: "28000"}},
 		{name: "PostgreSQL lock unavailable", err: &pgconn.PgError{Code: "55P03"}},
 		{name: "PostgreSQL undefined table", err: &pgconn.PgError{Code: "42P01"}},
 		{name: "MySQL duplicate entry", err: &mysql.MySQLError{Number: 1062}},
@@ -95,9 +95,10 @@ func TestClassificationStrings(t *testing.T) {
 		label          string
 	}{
 		{classification: AuthInvalidCredentials, name: "AuthInvalidCredentials", label: "auth_invalid_credentials"},
-		{classification: AuthNoGrant, name: "AuthNoGrant", label: "auth_no_grant"},
+		{classification: AuthNoAccess, name: "AuthNoAccess", label: "auth_no_access"},
 		{classification: AuthNoDatabase, name: "AuthNoDatabase", label: "auth_no_database"},
 		{classification: NotAuth, name: "NotAuth", label: "not_auth"},
+		{classification: Classification(200), name: "unknown", label: "unknown"},
 	}
 
 	for _, test := range tests {

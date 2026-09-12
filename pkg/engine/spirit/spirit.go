@@ -1042,10 +1042,12 @@ func progressState(rm *runningSchemaChange, spiritState status.State) engine.Sta
 func (e *Engine) fetchCurrentSchema(ctx context.Context, dsn, _ string) ([]table.TableSchema, error) {
 	db, err := mysqlconn.Open(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("open target database: %w", targetauth.Wrap(err))
+		return nil, fmt.Errorf("open target database: %w", err)
 	}
 	defer utils.CloseAndLog(db)
 
+	// Open only parsed the DSN; this ping is the first dial, so it is where the
+	// target can refuse the session and the only error worth classifying.
 	if err := db.PingContext(ctx); err != nil {
 		return nil, fmt.Errorf("ping target database: %w", targetauth.Wrap(err))
 	}

@@ -3,6 +3,8 @@
 package tern
 
 import (
+	"context"
+	"database/sql"
 	"log/slog"
 	"testing"
 
@@ -87,5 +89,58 @@ func TestLocalClient_PullSchemaNamespaceClassifiesTargetAuthFailure(t *testing.T
 	t.Run("missing database", func(t *testing.T) {
 		err := pullSchemaWithTargetDSN(t, dsnWithDatabase(t, dsn, "target_auth_missing_db"))
 		assertTargetAuthClassification(t, err, targetauth.AuthNoDatabase)
+	})
+}
+
+// dsnWithUser returns the DSN with its user and password replaced.
+func dsnWithUser(t *testing.T, dsn, user, password string) string {
+	t.Helper()
+	cfg, err := drivermysql.ParseDSN(dsn)
+	require.NoError(t, err)
+	cfg.User = user
+	cfg.Passwd = password
+	return cfg.FormatDSN()
+}
+
+// A user granted only its own database cannot tell a database it is not
+// granted from one that does not exist: MySQL refuses both with the same
+// access-denied error rather than confirming the absence to an unprivileged
+// user. Both pulls therefore fail as a missing grant, never as a missing
+// database, so an operator is told to check the grant rather than sent to
+// create a database that may already be there.
+func TestLocalClient_PullSchemaScopedUserClassifiesTargetAuthFailure(t *testing.T) {
+	_, rootDSN := setupMySQLContainer(t)
+	const (
+		scopedUser     = "target_auth_scoped"
+		scopedPassword = "scoped-secret"
+		otherDatabase  = "target_auth_other_db"
+	)
+
+	db, err := sql.Open("block-mysql", rootDSN)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		ctx := context.WithoutCancel(t.Context())
+		_, _ = db.ExecContext(ctx, "DROP DATABASE IF EXISTS `"+otherDatabase+"`")
+		_, _ = db.ExecContext(ctx, "DROP USER IF EXISTS '"+scopedUser+"'@'%'")
+		utils.CloseAndLog(db)
+	})
+	for _, stmt := range []string{
+		"CREATE USER IF NOT EXISTS '" + scopedUser + "'@'%' IDENTIFIED BY '" + scopedPassword + "'",
+		"GRANT ALL ON `testdb`.* TO '" + scopedUser + "'@'%'",
+		"CREATE DATABASE IF NOT EXISTS `" + otherDatabase + "`",
+	} {
+		_, err := db.ExecContext(t.Context(), stmt)
+		require.NoError(t, err, stmt)
+	}
+
+	scopedDSN := dsnWithUser(t, rootDSN, scopedUser, scopedPassword)
+
+	t.Run("database not granted", func(t *testing.T) {
+		err := pullSchemaWithTargetDSN(t, dsnWithDatabase(t, scopedDSN, otherDatabase))
+		assertTargetAuthClassification(t, err, targetauth.AuthNoAccess)
+	})
+	t.Run("database missing", func(t *testing.T) {
+		err := pullSchemaWithTargetDSN(t, dsnWithDatabase(t, scopedDSN, "target_auth_missing_db"))
+		assertTargetAuthClassification(t, err, targetauth.AuthNoAccess)
 	})
 }

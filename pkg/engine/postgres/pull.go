@@ -80,9 +80,11 @@ func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) 
 	// policy, before adapting the same normalized DSN to pg-sprite's pool API.
 	db, err := postgresconn.Open(e.pullCredentials.DSN, validationOpts...)
 	if err != nil {
-		return nil, fmt.Errorf("open PostgreSQL database %q for schema pull: %w", e.pullDatabase, targetauth.Wrap(err))
+		return nil, fmt.Errorf("open PostgreSQL database %q for schema pull: %w", e.pullDatabase, err)
 	}
 	defer utils.CloseAndLog(db)
+	// Open only parsed the DSN; this ping is the first dial, so it is where the
+	// target can refuse the session and the only error worth classifying.
 	if err := db.PingContext(ctx); err != nil {
 		return nil, fmt.Errorf("ping PostgreSQL database %q for schema pull: %w", e.pullDatabase, targetauth.Wrap(err))
 	}

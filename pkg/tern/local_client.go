@@ -782,9 +782,11 @@ func (c *LocalClient) discoverPullNamespaces(ctx context.Context) ([]string, err
 
 	db, err := mysqlconn.Open(c.config.TargetDSN)
 	if err != nil {
-		return nil, fmt.Errorf("open database target for namespace discovery: %w", targetauth.Wrap(err))
+		return nil, fmt.Errorf("open database target for namespace discovery: %w", err)
 	}
 	defer utils.CloseAndLog(db)
+	// Open only parsed the DSN; this ping is the first dial, so it is where the
+	// target can refuse the session and the only error worth classifying.
 	if err := db.PingContext(ctx); err != nil {
 		return nil, fmt.Errorf("ping database target for namespace discovery: %w", targetauth.Wrap(err))
 	}
@@ -839,10 +841,12 @@ func (c *LocalClient) pullSchemaNamespace(ctx context.Context, req *ternv1.PullS
 
 	db, err := mysqlconn.Open(targetDSN)
 	if err != nil {
-		return nil, fmt.Errorf("open database %s namespace %s for schema pull: %w", c.config.Database, namespace, targetauth.Wrap(err))
+		return nil, fmt.Errorf("open database %s namespace %s for schema pull: %w", c.config.Database, namespace, err)
 	}
 	defer utils.CloseAndLog(db)
 
+	// Open only parsed the DSN; this ping is the first dial, so it is where the
+	// target can refuse the session and the only error worth classifying.
 	if err := db.PingContext(ctx); err != nil {
 		return nil, fmt.Errorf("ping database %s namespace %s for schema pull: %w", c.config.Database, namespace, targetauth.Wrap(err))
 	}
