@@ -576,6 +576,34 @@ func (c *GRPCClient) Cutover(ctx context.Context, req *ternv1.CutoverRequest) (*
 	return c.client.Cutover(ctx, req)
 }
 
+// StorageSchemaPlan forwards the storage-schema diff to the data plane this
+// client dials, so the answer is computed by that deployment's own binary
+// against that deployment's own storage database.
+//
+// A data plane running a release from before the RPC existed answers
+// Unimplemented. Naming the upgrade is the whole response an operator needs:
+// there is no second way to read that storage from here, and silently
+// answering from the control plane's storage instead would report the wrong
+// database as if it were the right one.
+func (c *GRPCClient) StorageSchemaPlan(ctx context.Context, req *ternv1.StorageSchemaPlanRequest) (*ternv1.StorageSchemaPlanResponse, error) {
+	resp, err := c.client.StorageSchemaPlan(ctx, req)
+	if status.Code(err) == codes.Unimplemented {
+		return nil, fmt.Errorf("selected data plane does not support storage schema reads; upgrade that data plane: %w", err)
+	}
+	return resp, err
+}
+
+// StorageSchemaApply forwards the convergence to the data plane this client
+// dials, which runs its own startup bootstrap against its own storage under
+// its own advisory lock. See StorageSchemaPlan for the Unimplemented case.
+func (c *GRPCClient) StorageSchemaApply(ctx context.Context, req *ternv1.StorageSchemaApplyRequest) (*ternv1.StorageSchemaApplyResponse, error) {
+	resp, err := c.client.StorageSchemaApply(ctx, req)
+	if status.Code(err) == codes.Unimplemented {
+		return nil, fmt.Errorf("selected data plane does not support storage schema convergence; upgrade that data plane: %w", err)
+	}
+	return resp, err
+}
+
 func (c *GRPCClient) processPendingCutoverControlRequest(ctx context.Context, apply *storage.Apply, scope applyTaskScope) error {
 	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationCutover)
 	if err != nil {
