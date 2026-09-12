@@ -46,11 +46,11 @@ var readPaths = map[string]bool{
 }
 
 // TierForRequest classifies an API request into the access tier it requires.
-// GET/HEAD requests and the explicit read-only endpoints are read; everything
-// else is write, so a newly added mutating-looking endpoint fails closed
-// (requires authorization) until it is classified here. Exported so the
-// route authorization sweep test enforces per-database scoping against the
-// same rule the middleware admits with.
+// GET/HEAD requests are read, the explicit read-only endpoints are read, and
+// everything else is write — so a newly added mutating-looking endpoint fails
+// closed (requires authorization) until it is classified here. Exported so the
+// route authorization sweep test enforces per-database scoping against the same
+// rule the middleware admits with.
 func TierForRequest(method, path string) Tier {
 	if readPaths[path] {
 		return TierRead
