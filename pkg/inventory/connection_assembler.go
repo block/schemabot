@@ -315,11 +315,13 @@ const (
 // from the resolved endpoint and credentials, so a caller comparing two
 // resolutions of one target sees each field that changes what the client
 // reaches or authenticates as. Configured pass-through metadata is not listed.
+// The cases are keyed by the assemblers' own type names so the list cannot
+// drift from the assembler it describes.
 func ConnectionMetadataKeys(databaseType string) []string {
 	switch databaseType {
-	case "vitess":
+	case VitessConnectionAssembler{}.DatabaseType():
 		return []string{MetadataOrganization, MetadataDatabase, MetadataTokenName, MetadataTokenValue, MetadataAPIURL}
-	case "postgres":
+	case PostgresConnectionAssembler{}.DatabaseType():
 		return []string{MetadataPostgresCARef}
 	default:
 		return nil

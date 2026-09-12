@@ -65,11 +65,36 @@ type TargetRouter struct {
 	// retiring holds replaced generations that still own an apply or serve
 	// an in-flight request.
 	retiring map[*targetClientGeneration]struct{}
-	// applyOwners maps an apply identifier to the generation driving it.
-	applyOwners      map[string]*targetClientGeneration
+	// applyOwners maps an apply identifier to the generation that owns it.
+	applyOwners map[string]*targetClientGeneration
+	// sweepAt is the applyOwners size at which the next ownership sweep runs.
+	// Ownership is otherwise released only by a rotation or by a request for
+	// the apply, and a finished apply usually gets neither, so the sweep also
+	// runs whenever the map has doubled since it last ran; that keeps it
+	// within a small factor of the applies actually in progress on a route
+	// whose connection identity never changes.
+	sweepAt          int
 	activeObservers  map[int64]ProgressObserver
 	pendingObservers map[targetClientKey]ProgressObserver
 }
+
+// ownership is how a generation holds an apply.
+type ownership int
+
+const (
+	// ownershipQueued marks the generation that dispatched an apply the
+	// operator has not claimed yet. Nothing on it — no engine runner, no
+	// progress poller — binds the apply to its credential, so the drive may
+	// start on another generation and take the apply with it.
+	ownershipQueued ownership = iota
+	// ownershipDriving marks the generation a drive started on. It holds the
+	// apply's in-process state, so the apply stays with it until terminal.
+	ownershipDriving
+)
+
+// minimumSweepThreshold is the smallest applyOwners size at which a
+// size-triggered ownership sweep runs.
+const minimumSweepThreshold = 64
 
 type targetClientKey struct {
 	target       string
@@ -81,13 +106,13 @@ type targetClientKey struct {
 // targetClientGeneration is one published client for a route and namespace,
 // pinned to the connection identity it was opened with. A generation is
 // acquired for the duration of each request dispatched on it and owns the
-// applies it started or resumed; it may be closed only when neither holds.
+// applies it dispatched or drives; it may be closed only when neither holds.
 type targetClientGeneration struct {
 	key      targetClientKey
 	dsnHash  string
 	client   Client
 	inflight int
-	owned    map[string]struct{}
+	owned    map[string]ownership
 }
 
 func (g *targetClientGeneration) idle() bool {
@@ -138,6 +163,7 @@ func NewTargetRouter(config TargetRouterConfig) (*TargetRouter, error) {
 		creating:         make(map[targetClientKey]chan struct{}),
 		retiring:         make(map[*targetClientGeneration]struct{}),
 		applyOwners:      make(map[string]*targetClientGeneration),
+		sweepAt:          minimumSweepThreshold,
 		activeObservers:  make(map[int64]ProgressObserver),
 		pendingObservers: make(map[targetClientKey]ProgressObserver),
 	}, nil
@@ -293,7 +319,7 @@ func (r *TargetRouter) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*te
 	// already has it. The router keeps the pending observer it handed the
 	// client so that a drive starting on another generation attaches it too.
 	if resp.GetAccepted() && resp.GetApplyId() != "" {
-		r.recordOwner(gen, resp.GetApplyId())
+		r.recordDispatch(ctx, gen, resp.GetApplyId())
 		if observer != nil {
 			r.retainDispatchedObserver(ctx, resp.GetApplyId(), observer)
 		}
@@ -455,62 +481,108 @@ func (r *TargetRouter) ResumeApplyOperationCutover(ctx context.Context, apply *s
 
 // resumeOnOwner routes a resume to the generation that already drives the
 // apply, or to the current generation when none does, and records that
-// generation as the apply's owner before handing it the drive. A local drive
-// runs inside the resume call for as long as the schema change takes, and
-// the requests that arrive meanwhile — progress, stop, observer attachment —
-// must find the owner already recorded so they reach the client whose
-// in-process state they act on. The owner stays recorded when the resume
-// returns an error: a drive the engine detached may still be running on it,
-// and the apply's terminal state is what releases it.
+// generation as the apply's driving owner before handing it the drive. A
+// local drive runs inside the resume call for as long as the schema change
+// takes, and the requests that arrive meanwhile — progress, stop, observer
+// attachment — must find the owner already recorded so they reach the client
+// whose in-process state they act on. The owner stays recorded when the
+// resume returns an error: a drive the engine detached may still be running
+// on it, and the apply's terminal state is what releases it.
 func (r *TargetRouter) resumeOnOwner(ctx context.Context, apply *storage.Apply, resume func(client Client, ctx context.Context, apply *storage.Apply) error) error {
 	gen, err := r.clientForDrive(ctx, apply)
 	if err != nil {
 		return err
 	}
 	defer r.release(gen)
-	r.recordOwner(gen, apply.ApplyIdentifier)
 	r.attachObserver(gen.client, apply.ID)
 	return resume(gen.client, ctx, apply)
 }
 
-// clientForDrive returns the generation a claimed apply drives on, acquired;
-// the caller must release it. An apply that is still queued has no drive, so
-// nothing on the generation that queued it — no engine runner, no progress
-// poller — binds the apply to that generation's credential; the drive opens
-// its connections now, so it starts on the route's current generation and
-// the connection identity resolved now, and ownership moves with it. Any
-// other non-terminal apply stays with the generation driving it.
+// clientForDrive returns the generation a claimed apply drives on, acquired
+// and recorded as the apply's driving owner; the caller must release it.
+//
+// A drive that already started on a generation binds the apply to it: the
+// engine runner, its cancel handle, and its progress poller live there, so
+// every later drive of the apply — a sibling operation, a cutover, an
+// operation resume — goes to that generation even when a rotation has
+// published a newer one. The stored apply state cannot make that call on
+// its own: a multi-operation apply derives pending again between its
+// operations, after one of them has already driven. Only an apply that no
+// generation drives yet is free to move, and it moves to the route's current
+// generation because the drive opens its connections now, with the
+// connection identity resolved now.
 func (r *TargetRouter) clientForDrive(ctx context.Context, apply *storage.Apply) (*targetClientGeneration, error) {
 	if apply == nil {
 		return nil, fmt.Errorf("stored apply is required for target routing")
 	}
-	if !state.IsState(apply.State, state.Apply.Pending) {
-		return r.clientForStoredApply(ctx, apply)
+	if owner := r.ownerOf(apply); owner != nil {
+		if !r.awaitingFirstDrive(apply, owner) {
+			return r.adoptDrive(ctx, apply, owner), nil
+		}
+		r.release(owner)
 	}
 	gen, err := r.currentClientForStoredApply(ctx, apply)
 	if err != nil {
 		return nil, err
 	}
-	r.moveQueuedApplyOwnership(apply, gen)
-	return gen, nil
+	return r.adoptDrive(ctx, apply, gen), nil
 }
 
-// moveQueuedApplyOwnership releases a queued apply from the generation that
-// dispatched it, when that is not the generation about to drive it, so the
-// dispatching generation can retire once it owns nothing else.
-func (r *TargetRouter) moveQueuedApplyOwnership(apply *storage.Apply, gen *targetClientGeneration) {
-	r.mu.Lock()
-	prior := r.applyOwners[apply.ApplyIdentifier]
-	if prior == nil || prior == gen {
-		r.mu.Unlock()
-		return
+// awaitingFirstDrive reports whether a stored apply is still queued on the
+// generation that dispatched it: its state is pending and no drive has
+// started on any generation.
+func (r *TargetRouter) awaitingFirstDrive(apply *storage.Apply, owner *targetClientGeneration) bool {
+	if !state.IsState(apply.State, state.Apply.Pending) {
+		return false
 	}
-	closePrior := r.releaseOwnershipLocked(prior, apply.ApplyIdentifier)
-	r.mu.Unlock()
-	r.logger.Info("target router: queued apply was dispatched on a replaced client generation; driving it on the current generation",
-		append(apply.LogAttrs(), "dispatched_dsn_hash", prior.dsnHash, "drive_dsn_hash", gen.dsnHash)...)
-	if closePrior {
-		r.closeGeneration(prior)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return owner.owned[apply.ApplyIdentifier] == ownershipQueued
+}
+
+// adoptDrive records gen, acquired by the caller, as the generation driving
+// an apply and returns the generation the drive runs on, still acquired. The
+// generation that dispatched the apply gives it up when the drive starts
+// elsewhere, so it can retire once it owns nothing else. A drive that began
+// on another generation between the caller's routing decision and this
+// record keeps the apply: the returned generation is that one, and gen is
+// released.
+func (r *TargetRouter) adoptDrive(ctx context.Context, apply *storage.Apply, gen *targetClientGeneration) *targetClientGeneration {
+	applyIdentifier := apply.ApplyIdentifier
+	r.mu.Lock()
+	prior := r.applyOwners[applyIdentifier]
+	switch {
+	case prior == nil || prior == gen:
+		gen.owned[applyIdentifier] = ownershipDriving
+		r.applyOwners[applyIdentifier] = gen
+		sweep := r.sweepDueLocked()
+		r.mu.Unlock()
+		if sweep {
+			r.sweepOwnership(ctx)
+		}
+		return gen
+	case prior.owned[applyIdentifier] == ownershipDriving:
+		prior.inflight++
+		gen.inflight--
+		closeGen := r.retireIfIdleLocked(gen)
+		r.mu.Unlock()
+		r.logger.Info("target router: a drive of this apply started on another client generation while this claim was routed; driving it there",
+			append(apply.LogAttrs(), "routed_dsn_hash", gen.dsnHash, "drive_dsn_hash", prior.dsnHash)...)
+		if closeGen {
+			r.closeGeneration(gen)
+		}
+		return prior
+	default:
+		closePrior := r.releaseOwnershipLocked(prior, applyIdentifier)
+		gen.owned[applyIdentifier] = ownershipDriving
+		r.applyOwners[applyIdentifier] = gen
+		r.mu.Unlock()
+		r.logger.Info("target router: queued apply was dispatched on a replaced client generation; driving it on the current generation",
+			append(apply.LogAttrs(), "dispatched_dsn_hash", prior.dsnHash, "drive_dsn_hash", gen.dsnHash)...)
+		if closePrior {
+			r.closeGeneration(prior)
+		}
+		return gen
 	}
 }
 
@@ -584,13 +656,19 @@ func (r *TargetRouter) SetObserver(applyID int64, observer ProgressObserver) {
 	gen.client.SetObserver(applyID, observer)
 }
 
-// Close closes every generation the router holds, current and retiring.
+// Close closes every generation the router holds, current and retiring, and
+// drops the ownership and observer bookkeeping that referred to them.
 func (r *TargetRouter) Close() error {
 	r.mu.Lock()
 	gens := r.allGenerationsLocked()
+	for _, gen := range gens {
+		gen.owned = make(map[string]ownership)
+	}
 	r.current = make(map[targetClientKey]*targetClientGeneration)
 	r.retiring = make(map[*targetClientGeneration]struct{})
 	r.applyOwners = make(map[string]*targetClientGeneration)
+	r.activeObservers = make(map[int64]ProgressObserver)
+	r.sweepAt = minimumSweepThreshold
 	r.mu.Unlock()
 
 	var closeErr error
@@ -711,6 +789,15 @@ func (r *TargetRouter) clientOnlyForTarget(ctx context.Context, target, database
 // acquired for one request; the caller must release it once the dispatch
 // returns. A resolved connection identity that differs from the current
 // generation's publishes a fresh generation and retires the prior one.
+//
+// The route is resolved twice on a miss. The first resolution decides
+// whether the current generation serves the request; a miss then waits for
+// the route's creation slot, and a build another request published while
+// this one waited may have used a newer credential than this one resolved.
+// Publishing from the first resolution would replace that generation with
+// an older identity, so the build resolves again under the slot, when no
+// other build can publish on the route, and it is the second resolution's
+// identity that decides whether to reuse the published generation or build.
 func (r *TargetRouter) clientForTarget(ctx context.Context, target, databaseType, environment, namespace string) (*targetClientGeneration, *inventory.Target, error) {
 	if target == "" {
 		return nil, nil, fmt.Errorf("target is required")
@@ -719,33 +806,34 @@ func (r *TargetRouter) clientForTarget(ctx context.Context, target, databaseType
 		return nil, nil, fmt.Errorf("database is required for target %q", target)
 	}
 
-	resolved, err := r.resolver.ResolveTarget(ctx, inventory.Request{Target: target, DatabaseType: databaseType, Environment: environment})
+	resolved, err := r.resolveConnectableTarget(ctx, target, databaseType, environment)
 	if err != nil {
 		return nil, nil, err
 	}
-	// Fail closed on a nil or incomplete resolver result rather than building a
-	// client that surfaces a confusing connection error later. Keep the causes
-	// separate so the log names the missing field, and never log the DSN or
-	// secret values — only field names.
-	if resolved == nil {
-		return nil, nil, fmt.Errorf("resolver returned no target for %q", target)
-	}
-	if resolved.Target == "" {
-		return nil, nil, fmt.Errorf("resolver returned a target with no identifier for %q", target)
-	}
-	if resolved.DatabaseType == "" {
-		return nil, nil, fmt.Errorf("resolver returned a target with no database type for %q", target)
-	}
-	if err := resolvedTargetConnectable(resolved); err != nil {
-		return nil, nil, fmt.Errorf("resolver returned an incomplete target for %q (type=%q): %w", target, resolved.DatabaseType, err)
-	}
 	key := cacheKeyForResolvedTarget(resolved, environment, namespace)
-	dsnHash := connectionIdentityHash(resolved)
-	gen, publish, err := r.acquireCurrentOrCreationSlot(ctx, key, dsnHash)
+	gen, publish, err := r.acquireCurrentOrCreationSlot(ctx, key, connectionIdentityHash(resolved))
 	if err != nil {
 		return nil, nil, fmt.Errorf("route target %q database %q: %w", target, namespace, err)
 	}
 	if gen != nil {
+		return gen, resolved, nil
+	}
+
+	resolved, err = r.resolveConnectableTarget(ctx, target, databaseType, environment)
+	if err != nil {
+		publish.done()
+		return nil, nil, err
+	}
+	if rekeyed := cacheKeyForResolvedTarget(resolved, environment, namespace); rekeyed != key {
+		publish.done()
+		return nil, nil, fmt.Errorf("route target %q database %q: resolver changed the route between resolutions (type %q → %q, target %q → %q)",
+			target, namespace, key.databaseType, rekeyed.databaseType, key.target, rekeyed.target)
+	}
+	dsnHash := connectionIdentityHash(resolved)
+	if gen = r.acquireCurrent(key, dsnHash); gen != nil {
+		publish.done()
+		r.logger.Debug("target router: a concurrent build published the connection identity this request resolved; reusing it",
+			"target", resolved.Target, "database_type", resolved.DatabaseType, "environment", environment, "database", namespace, "dsn_hash", dsnHash)
 		return gen, resolved, nil
 	}
 
@@ -761,7 +849,7 @@ func (r *TargetRouter) clientForTarget(ctx context.Context, target, databaseType
 		return nil, nil, fmt.Errorf("create local client for target %q database %q: %w", target, namespace, err)
 	}
 
-	gen = &targetClientGeneration{key: key, dsnHash: dsnHash, client: client, owned: make(map[string]struct{})}
+	gen = &targetClientGeneration{key: key, dsnHash: dsnHash, client: client, owned: make(map[string]ownership)}
 
 	r.mu.Lock()
 	replaced := r.current[key]
@@ -811,6 +899,49 @@ func (s creationSlot) done() {
 	close(s.built)
 }
 
+// resolveConnectableTarget resolves a route and fails closed on a nil or
+// incomplete resolver result rather than building a client that surfaces a
+// confusing connection error later. The causes stay separate so the error
+// names the missing field, and neither the DSN nor secret values are logged —
+// only field names.
+func (r *TargetRouter) resolveConnectableTarget(ctx context.Context, target, databaseType, environment string) (*inventory.Target, error) {
+	resolved, err := r.resolver.ResolveTarget(ctx, inventory.Request{Target: target, DatabaseType: databaseType, Environment: environment})
+	if err != nil {
+		return nil, err
+	}
+	if resolved == nil {
+		return nil, fmt.Errorf("resolver returned no target for %q", target)
+	}
+	if resolved.Target == "" {
+		return nil, fmt.Errorf("resolver returned a target with no identifier for %q", target)
+	}
+	if resolved.DatabaseType == "" {
+		return nil, fmt.Errorf("resolver returned a target with no database type for %q", target)
+	}
+	if err := resolvedTargetConnectable(resolved); err != nil {
+		return nil, fmt.Errorf("resolver returned an incomplete target for %q (type=%q): %w", target, resolved.DatabaseType, err)
+	}
+	return resolved, nil
+}
+
+// acquireCurrent returns the route's current generation, acquired, when it
+// was opened with the given connection identity, and nil otherwise.
+func (r *TargetRouter) acquireCurrent(key targetClientKey, dsnHash string) *targetClientGeneration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.acquireCurrentLocked(key, dsnHash)
+}
+
+// acquireCurrentLocked is acquireCurrent with r.mu held by the caller.
+func (r *TargetRouter) acquireCurrentLocked(key targetClientKey, dsnHash string) *targetClientGeneration {
+	gen := r.current[key]
+	if gen == nil || gen.dsnHash != dsnHash {
+		return nil
+	}
+	gen.inflight++
+	return gen
+}
+
 // acquireCurrentOrCreationSlot returns the route's current generation,
 // acquired, when it was opened with the resolved connection identity.
 // Otherwise it returns the slot the caller must build and publish under,
@@ -820,8 +951,7 @@ func (s creationSlot) done() {
 func (r *TargetRouter) acquireCurrentOrCreationSlot(ctx context.Context, key targetClientKey, dsnHash string) (*targetClientGeneration, creationSlot, error) {
 	for {
 		r.mu.Lock()
-		if gen := r.current[key]; gen != nil && gen.dsnHash == dsnHash {
-			gen.inflight++
+		if gen := r.acquireCurrentLocked(key, dsnHash); gen != nil {
 			r.mu.Unlock()
 			return gen, creationSlot{}, nil
 		}
@@ -877,22 +1007,34 @@ func (r *TargetRouter) closeGeneration(gen *targetClientGeneration) {
 	}
 }
 
-// recordOwner marks gen as the generation driving an apply unless another
-// generation already does. An apply has one owner for as long as it is not
-// terminal, and that owner is the client holding the apply's in-process
-// state — a drive, its cancel handle, its observer — so a later request that
-// lands elsewhere, such as a re-dispatch adopting the queued apply on the
-// current generation, cannot take the apply away from the one driving it.
-func (r *TargetRouter) recordOwner(gen *targetClientGeneration, applyIdentifier string) {
+// recordDispatch marks gen as the generation that queued an apply, unless a
+// generation already owns it. An apply has one owner for as long as it is not
+// terminal, and a re-dispatch that adopted an apply already queued or driving
+// elsewhere lands on whichever generation is current, so acceptance never
+// moves ownership off the generation that has it.
+func (r *TargetRouter) recordDispatch(ctx context.Context, gen *targetClientGeneration, applyIdentifier string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if prior := r.applyOwners[applyIdentifier]; prior != nil && prior != gen {
+		r.mu.Unlock()
 		r.logger.Debug("target router: apply already owned by another client generation; leaving ownership with it",
 			"apply_id", applyIdentifier, "owner_dsn_hash", prior.dsnHash, "requested_dsn_hash", gen.dsnHash)
 		return
 	}
-	gen.owned[applyIdentifier] = struct{}{}
-	r.applyOwners[applyIdentifier] = gen
+	if _, owned := gen.owned[applyIdentifier]; !owned {
+		gen.owned[applyIdentifier] = ownershipQueued
+		r.applyOwners[applyIdentifier] = gen
+	}
+	sweep := r.sweepDueLocked()
+	r.mu.Unlock()
+	if sweep {
+		r.sweepOwnership(ctx)
+	}
+}
+
+// sweepDueLocked reports whether the ownership map has grown to the size at
+// which the next sweep runs. The caller holds r.mu.
+func (r *TargetRouter) sweepDueLocked() bool {
+	return len(r.applyOwners) >= r.sweepAt
 }
 
 // ownerOf returns the generation driving a stored apply, acquired, or nil
@@ -934,10 +1076,12 @@ func (r *TargetRouter) releaseOwnershipLocked(owner *targetClientGeneration, app
 // Ownership is otherwise released only when a request for the apply arrives,
 // so without the sweep a rotation would leave an old generation open for
 // long-finished applies until one did, and a current generation would keep
-// an entry for every apply it ever drove. One storage read lists every apply
-// still in progress, so the cost does not grow with the number owned. A
-// storage error keeps the ownership: closing a generation that may still be
-// driving an apply is the failure this bookkeeping exists to prevent.
+// an entry for every apply it ever drove. It runs on every rotation and
+// whenever the ownership map reaches its next size threshold. One storage
+// read lists every apply still in progress, so the cost does not grow with
+// the number owned. A storage error keeps the ownership: closing a generation
+// that may still be driving an apply is the failure this bookkeeping exists
+// to prevent.
 func (r *TargetRouter) sweepOwnership(ctx context.Context) {
 	r.mu.Lock()
 	var toClose []*targetClientGeneration
@@ -958,11 +1102,13 @@ func (r *TargetRouter) sweepOwnership(ctx context.Context) {
 	applies := r.storage.Applies()
 	if applies == nil {
 		r.logger.Warn("target router: apply store unavailable; client generations keep their applies until a request for one arrives")
+		r.deferNextSweep(owned)
 		return
 	}
 	inProgress, err := applies.GetInProgress(ctx)
 	if err != nil {
 		r.logger.Warn("target router: failed to list in-progress applies while sweeping client generations; keeping every owner open", "error", err)
+		r.deferNextSweep(owned)
 		return
 	}
 	active := make(map[string]struct{}, len(inProgress))
@@ -982,6 +1128,7 @@ func (r *TargetRouter) sweepOwnership(ctx context.Context) {
 			settled = append(settled, owner)
 		}
 	}
+	r.setNextSweepLocked(len(r.applyOwners))
 	r.mu.Unlock()
 	if released > 0 {
 		r.logger.Debug("target router: released client generation ownership of applies no longer in progress", "released", released)
@@ -989,6 +1136,22 @@ func (r *TargetRouter) sweepOwnership(ctx context.Context) {
 	for _, gen := range settled {
 		r.closeGeneration(gen)
 	}
+}
+
+// deferNextSweep schedules the next size-triggered sweep from the ownership
+// map's size when a sweep could not read storage, so a storage outage does
+// not turn every dispatch into another failed read.
+func (r *TargetRouter) deferNextSweep(owned int) {
+	r.mu.Lock()
+	r.setNextSweepLocked(owned)
+	r.mu.Unlock()
+}
+
+// setNextSweepLocked arms the next size-triggered sweep for when the
+// ownership map has doubled from owned, so a route with many applies in
+// progress is not swept on every dispatch. The caller holds r.mu.
+func (r *TargetRouter) setNextSweepLocked(owned int) {
+	r.sweepAt = max(minimumSweepThreshold, 2*owned)
 }
 
 func (r *TargetRouter) planTargetForStoredApply(ctx context.Context, apply *storage.Apply) (string, error) {

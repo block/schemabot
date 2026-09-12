@@ -3,6 +3,7 @@ package tern
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"testing"
 
@@ -20,14 +21,22 @@ import (
 // re-synced after a credential rotation.
 type rotatingResolver struct {
 	dsn string
+	// onResolved runs after a resolution has read the DSN and before it
+	// returns, so a test can act between a request's resolution and its use
+	// of the result.
+	onResolved func()
 }
 
 func (r *rotatingResolver) ResolveTarget(_ context.Context, req inventory.Request) (*inventory.Target, error) {
-	return &inventory.Target{
+	resolved := &inventory.Target{
 		Target:       req.Target,
 		DatabaseType: storage.DatabaseTypeMySQL,
 		DSN:          r.dsn,
-	}, nil
+	}
+	if r.onResolved != nil {
+		r.onResolved()
+	}
+	return resolved, nil
 }
 
 const (
@@ -219,9 +228,9 @@ func TestTargetRouterRequestsDuringDriveReachDrivingGeneration(t *testing.T) {
 	assert.False(t, first.closed, "the apply is still running, so its generation stays open after the resume returns")
 }
 
-// Two requests that miss on the same route at once build one client between
-// them: the second waits for the first build to publish and reuses it, so a
-// slower build can never publish a stale identity over a newer generation.
+// Two requests that resolve the same connection identity and miss on the
+// route at once build one client between them: the second waits for the
+// first build to publish and reuses it.
 func TestTargetRouterConcurrentMissesBuildOneClient(t *testing.T) {
 	resolver := &rotatingResolver{dsn: rotationOldDSN}
 	entered := make(chan struct{})
@@ -261,6 +270,94 @@ func TestTargetRouterConcurrentMissesBuildOneClient(t *testing.T) {
 	assert.NotNil(t, client.planReq)
 	assert.NotNil(t, client.pullReq)
 	assert.False(t, client.closed)
+}
+
+// A request that resolved the old credential just before a rotation, and
+// only then reached the route's creation slot, must not publish a client
+// opened with that credential over the generation another request built with
+// the rotated one: the build resolves again under the slot and reuses the
+// generation the second resolution matches.
+func TestTargetRouterBuildUnderSlotResolvesAgain(t *testing.T) {
+	resolver := &rotatingResolver{dsn: rotationOldDSN}
+	created := make(map[string]*targetRouterRecordingClient)
+	router := newTargetRouterForTest(t, resolver, nil, nil, created)
+
+	resolvedOld := make(chan struct{})
+	proceed := make(chan struct{})
+	resolver.onResolved = func() {
+		resolver.onResolved = nil
+		close(resolvedOld)
+		<-proceed
+	}
+	staleDone := make(chan error, 1)
+	go func() {
+		_, err := router.Plan(t.Context(), &ternv1.PlanRequest{Database: "orders", Type: storage.DatabaseTypeMySQL, Environment: "production", Target: "dsid-orders-prod"})
+		staleDone <- err
+	}()
+	<-resolvedOld
+
+	resolver.dsn = rotationNewDSN
+	planOrders(t, router)
+	rotated := created["orders"]
+	require.NotNil(t, rotated)
+	require.Equal(t, rotationNewDSN, rotated.targetDSN)
+
+	close(proceed)
+	require.NoError(t, <-staleDone)
+
+	assert.Len(t, created, 1, "the request that resolved before the rotation reuses the rotated generation instead of building its own")
+	assert.False(t, rotated.closed, "the rotated generation is not replaced by the older resolution")
+	router.mu.Lock()
+	defer router.mu.Unlock()
+	current := router.current[targetClientKey{target: "dsid-orders-prod", databaseType: storage.DatabaseTypeMySQL, environment: "production", database: "orders"}]
+	require.NotNil(t, current)
+	assert.Equal(t, connectionIdentityHash(&inventory.Target{Target: "dsid-orders-prod", DatabaseType: storage.DatabaseTypeMySQL, DSN: rotationNewDSN}), current.dsnHash)
+	assert.Zero(t, current.inflight, "both requests released the generation")
+}
+
+// A request waiting for another request's build gives up when its context
+// ends, reporting the wait and the context error, and the build it waited on
+// is unaffected: the next request reuses it.
+func TestTargetRouterSlotWaitHonorsContext(t *testing.T) {
+	resolver := &rotatingResolver{dsn: rotationOldDSN}
+	entered := make(chan struct{})
+	proceed := make(chan struct{})
+	var builds int
+	var client targetRouterRecordingClient
+	router, err := NewTargetRouter(TargetRouterConfig{
+		Resolver: resolver,
+		Storage:  targetRouterStorage{applies: targetRouterApplyStore{}},
+		LocalClientFactory: func(LocalConfig, storage.Storage, *slog.Logger) (Client, error) {
+			builds++
+			if builds == 1 {
+				close(entered)
+				<-proceed
+			}
+			return &client, nil
+		},
+	})
+	require.NoError(t, err)
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := router.Plan(t.Context(), &ternv1.PlanRequest{Database: "orders", Type: storage.DatabaseTypeMySQL, Environment: "production", Target: "dsid-orders-prod"})
+		firstDone <- err
+	}()
+	<-entered
+
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err = router.PullSchema(cancelled, &ternv1.PullSchemaRequest{Database: "orders", Type: storage.DatabaseTypeMySQL, Environment: "production", Target: "dsid-orders-prod"})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.ErrorContains(t, err, "wait for a concurrent client build")
+
+	close(proceed)
+	require.NoError(t, <-firstDone)
+	_, err = router.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "orders", Type: storage.DatabaseTypeMySQL, Environment: "production", Target: "dsid-orders-prod"})
+	require.NoError(t, err)
+	assert.Equal(t, 1, builds, "the abandoned wait neither builds nor disturbs the published generation")
+	assert.NotNil(t, client.pullReq)
 }
 
 // Every rotation sweeps: a generation retired two rotations ago whose apply
@@ -317,6 +414,122 @@ func TestTargetRouterSweepReclaimsFinishedAppliesFromCurrentGeneration(t *testin
 	assert.NotContains(t, router.applyOwners, apply.ApplyIdentifier, "a rotation on another route sweeps the finished apply off its owner")
 	assert.Empty(t, router.current[targetClientKey{target: "dsid-orders-prod", databaseType: storage.DatabaseTypeMySQL, environment: "production", database: "orders"}].owned)
 	assert.False(t, orders.closed, "the current generation of the orders route stays open")
+}
+
+// ordersApplies returns n distinct stored applies on the orders route, all
+// running, registered in one apply store.
+func ordersApplies(n int, firstID int64) ([]*storage.Apply, targetRouterApplyStore) {
+	store := targetRouterApplyStore{byID: make(map[int64]*storage.Apply), byIdentifier: make(map[string]*storage.Apply)}
+	applies := make([]*storage.Apply, 0, n)
+	for i := range n {
+		apply := &storage.Apply{
+			ID:              firstID + int64(i),
+			ApplyIdentifier: fmt.Sprintf("apply-%d", firstID+int64(i)),
+			Database:        "orders",
+			DatabaseType:    storage.DatabaseTypeMySQL,
+			Environment:     "production",
+			State:           state.Apply.Running,
+		}
+		apply.SetOptions(storage.ApplyOptions{Target: "dsid-orders-prod"})
+		store.byID[apply.ID] = apply
+		store.byIdentifier[apply.ApplyIdentifier] = apply
+		applies = append(applies, apply)
+	}
+	return applies, store
+}
+
+// A route whose credential never rotates still sheds the applies it drove:
+// once the ownership map reaches the sweep threshold, recording the next
+// drive sweeps the finished applies out. The threshold then doubles from
+// what survived, so a route with that many applies genuinely in progress is
+// not swept on every drive.
+func TestTargetRouterOwnershipDrainsWithoutRotation(t *testing.T) {
+	resolver := &rotatingResolver{dsn: rotationOldDSN}
+	created := make(map[string]*targetRouterRecordingClient)
+	applies, store := ordersApplies(2*minimumSweepThreshold, 100)
+	router := newTargetRouterForTest(t, resolver, store, nil, created)
+	ownedCount := func() int {
+		router.mu.Lock()
+		defer router.mu.Unlock()
+		return len(router.applyOwners)
+	}
+
+	finished := applies[:minimumSweepThreshold-1]
+	for _, apply := range finished {
+		require.NoError(t, router.ResumeApply(t.Context(), apply))
+	}
+	require.Equal(t, minimumSweepThreshold-1, ownedCount())
+	for _, apply := range finished {
+		apply.State = state.Apply.Completed
+	}
+
+	survivor := applies[minimumSweepThreshold-1]
+	require.NoError(t, router.ResumeApply(t.Context(), survivor))
+	assert.Equal(t, 1, ownedCount(), "reaching the threshold sweeps the finished applies off the generation")
+	router.mu.Lock()
+	assert.Contains(t, router.applyOwners, survivor.ApplyIdentifier)
+	assert.Equal(t, minimumSweepThreshold, router.sweepAt, "a nearly empty map keeps the minimum threshold")
+	router.mu.Unlock()
+	assert.Len(t, created, 1)
+	assert.False(t, created["orders"].closed, "the current generation stays open")
+
+	for _, apply := range applies[minimumSweepThreshold : 2*minimumSweepThreshold-1] {
+		require.NoError(t, router.ResumeApply(t.Context(), apply))
+	}
+	assert.Equal(t, minimumSweepThreshold, ownedCount(), "every apply is still in progress, so the sweep at the threshold releases none")
+	router.mu.Lock()
+	assert.Equal(t, 2*minimumSweepThreshold, router.sweepAt, "the next sweep waits for the map to double")
+	router.mu.Unlock()
+}
+
+// A multi-operation apply derives a pending state again between its
+// operations, after one of them has already driven on a generation. The
+// next operation's resume must stay on that generation even when a rotation
+// has published a newer one: the drive's in-process state lives there, and
+// only an apply that has never driven is free to move (AV-2).
+func TestTargetRouterPendingBetweenOperationsStaysOnDrivingGeneration(t *testing.T) {
+	resolver := &rotatingResolver{dsn: rotationOldDSN}
+	created := make(map[string]*targetRouterRecordingClient)
+	apply, store := runningOrdersApply(t, "apply-42")
+	router := newTargetRouterForTest(t, resolver, store, nil, created)
+
+	require.NoError(t, router.ResumeApply(t.Context(), apply))
+	first := created["orders"]
+	require.NotNil(t, first)
+
+	resolver.dsn = rotationNewDSN
+	planOrders(t, router)
+	second := created["orders#2"]
+	require.NotNil(t, second)
+
+	apply.State = state.Apply.Pending
+	first.resumeApply = nil
+	require.NoError(t, router.ResumeApplyOperation(t.Context(), apply, 7))
+	assert.Equal(t, apply.ApplyIdentifier, first.resumeApply.ApplyIdentifier, "the next operation drives on the generation that already drove the apply")
+	assert.Nil(t, second.resumeApply, "the current generation never drives an apply another generation started")
+	assert.False(t, first.closed)
+	assert.Len(t, created, 2, "no further generation is built")
+}
+
+// The pending observer handed to a dispatching generation is kept for a drive
+// on another generation, but never displaces an observer already registered
+// for the apply.
+func TestTargetRouterDispatchKeepsRegisteredObserver(t *testing.T) {
+	resolver := &rotatingResolver{dsn: rotationOldDSN}
+	created := make(map[string]*targetRouterRecordingClient)
+	apply, store := runningOrdersApply(t, "apply-routed")
+	router := newTargetRouterForTest(t, resolver, store, nil, created)
+
+	registered := &targetRouterNoopObserver{}
+	router.mu.Lock()
+	router.activeObservers[apply.ID] = registered
+	router.mu.Unlock()
+
+	queueOrdersApply(t, router, apply, created)
+
+	router.mu.Lock()
+	defer router.mu.Unlock()
+	assert.Same(t, registered, router.activeObservers[apply.ID], "the dispatch keeps the observer already registered for the apply")
 }
 
 // A stopped apply is terminal: its drive has exited, so a resume after a
