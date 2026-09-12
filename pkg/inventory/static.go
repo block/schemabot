@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -129,6 +130,7 @@ type staticTargetEntry struct {
 }
 
 var _ Resolver = (*StaticResolver)(nil)
+var _ Enumerator = (*StaticResolver)(nil)
 
 // NewStaticResolver creates a static target resolver.
 func NewStaticResolver(config StaticConfig) (*StaticResolver, error) {
@@ -188,6 +190,28 @@ func (r *StaticResolver) ResolveTarget(ctx context.Context, req Request) (*Targe
 		Metadata:        metadata,
 		SchemaOverrides: maps.Clone(entry.schemaOverrides),
 	}, nil
+}
+
+// Enumerate returns every configured target in target-name order. Static
+// resolution does not scope by environment, so the requests carry none.
+func (r *StaticResolver) Enumerate(context.Context) ([]ProbeRequest, error) {
+	if r == nil {
+		return nil, fmt.Errorf("static target resolver is nil")
+	}
+	var requests []ProbeRequest
+	for target, entry := range r.targets {
+		requests = append(requests, ProbeRequest{Target: target, DatabaseType: entry.databaseType})
+	}
+	sort.Slice(requests, func(i, j int) bool {
+		return requests[i].Target < requests[j].Target
+	})
+	return requests, nil
+}
+
+// UnenumerableDatabaseTypes returns nil: a static resolver lists every target
+// it serves.
+func (r *StaticResolver) UnenumerableDatabaseTypes() []string {
+	return nil
 }
 
 // newStaticTargetEntry prepares one static target: it validates the entry, and
