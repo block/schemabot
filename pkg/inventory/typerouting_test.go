@@ -13,6 +13,17 @@ type fakeResolver struct {
 	gotReq Request
 }
 
+type fakeEnumerableResolver struct {
+	fakeResolver
+	requests []ProbeRequest
+}
+
+func (f *fakeEnumerableResolver) Enumerate() []ProbeRequest {
+	return f.requests
+}
+
+var _ Enumerator = (*fakeEnumerableResolver)(nil)
+
 func (f *fakeResolver) ResolveTarget(_ context.Context, req Request) (*Target, error) {
 	f.gotReq = req
 	return f.target, nil
@@ -31,6 +42,24 @@ func TestTypeRoutingResolverDispatchesByType(t *testing.T) {
 	assert.Equal(t, "v", got.Target)
 	assert.Equal(t, "dsid-1", vitess.gotReq.Target, "the request is passed through to the engine resolver")
 	assert.Empty(t, mysql.gotReq.Target, "the mysql resolver is not consulted for a vitess request")
+}
+
+func TestTypeRoutingResolverEnumerate(t *testing.T) {
+	enumerable := &fakeEnumerableResolver{requests: []ProbeRequest{
+		{Target: "target-1", DatabaseType: "mysql"},
+	}}
+	nonEnumerable := &fakeResolver{}
+	_, offersEnumeration := any(nonEnumerable).(Enumerator)
+	assert.False(t, offersEnumeration)
+
+	r, err := NewTypeRoutingResolver(map[string]Resolver{
+		"postgres": nonEnumerable,
+		"mysql":    enumerable,
+	})
+	require.NoError(t, err)
+
+	assert.Equal(t, enumerable.requests, r.Enumerate())
+	assert.Equal(t, []string{"postgres"}, r.UnenumerableDatabaseTypes())
 }
 
 func TestTypeRoutingResolverRequiresDatabaseType(t *testing.T) {

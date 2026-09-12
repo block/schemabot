@@ -31,3 +31,16 @@ type Target struct {
 type Resolver interface {
 	ResolveTarget(ctx context.Context, req Request) (*Target, error)
 }
+
+// ProbeRequest identifies an inventory target that can be checked without an
+// incoming operation request.
+type ProbeRequest struct {
+	Target       string
+	DatabaseType string
+}
+
+// Enumerator is an optional capability for resolvers whose targets are known
+// without an incoming operation request.
+type Enumerator interface {
+	Enumerate() []ProbeRequest
+}
