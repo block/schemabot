@@ -1389,7 +1389,8 @@ connection. A retry may reuse identical imported files. Failed setup preserves t
 its state so the retry uses the same execution authority.
 
 *Enforced:* `pkg/cmd/commands/init.go`, `pkg/cmd/commands/init_publish_darwin.go`,
-`pkg/cmd/commands/init_publish_linux.go`, and `pkg/cmd/commands/init_publish_other.go`.
+`pkg/cmd/commands/init_publish_linux.go`, `pkg/cmd/commands/init_publish_other.go`, and
+`pkg/cmd/commands/init_empty_dir_unix.go`.
 
 ## Structural enforcement
 

@@ -23,7 +23,15 @@ quick start uses `testapp`; it does not create the `shop` database shown here.
 `init` connects to your database, imports its schema, and stores a plan proving
 that the files match. It does not apply changes to the application database.
 Set `APP_DSN` and `STATE_DSN` in your shell first. The state connection must name
-a separate, existing database where SchemaBot can store its own metadata.
+a separate, existing database where SchemaBot can store its own metadata. In a
+terminal, the wizard asks for everything else:
+
+```console
+$ schemabot init
+```
+
+[Initialize a database](init.md) walks through each step. Scripts and agents
+pass the same decisions as flags:
 
 ```console
 $ schemabot init -d shop -e staging --type mysql --dsn env:APP_DSN --storage-dsn env:STATE_DSN --namespace shop --schema-dir schema --json
