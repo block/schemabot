@@ -238,6 +238,31 @@ func createSetRelation(p StatementParser, stmt, classifiedTable string) (relatio
 	return relationIdentity{Name: classifiedTable}, nil
 }
 
+// CreateTargetQualifier returns the schema qualifier written on a CREATE TABLE
+// or CREATE INDEX statement's target relation, and whether the parser's grammar
+// can carry one at all.
+//
+// The two results are separate on purpose. A parser with no schema-aware seam
+// reports carried=false rather than an empty qualifier, so a caller can never
+// read "this grammar cannot tell me" as "the statement named no schema" — which
+// is the reading that turns a missing capability into a silent pass. Classify
+// returns the bare relation name by contract, so a caller that compares only
+// that name accepts a statement targeting an entirely different relation.
+//
+// The qualifier is reported exactly as written and is never resolved against a
+// search_path, because the parser has no session to resolve it against.
+func CreateTargetQualifier(p StatementParser, stmt string) (qualifier string, carried bool, err error) {
+	relationParser, ok := p.(createSetRelationParser)
+	if !ok {
+		return "", false, nil
+	}
+	identity, err := relationParser.createSetRelation(stmt)
+	if err != nil {
+		return "", true, err
+	}
+	return identity.Schema, true, nil
+}
+
 // CreateSetStatements has the same admission rules as ParseCreateSet. It is
 // retained for callers that need only the split statements. Multi-statement
 // create sets are a PostgreSQL-parser capability; see ParseCreateSet for why

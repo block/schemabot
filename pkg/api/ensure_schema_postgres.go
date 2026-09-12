@@ -250,6 +250,29 @@ type postgresTableExpectations struct {
 	indexes     []postgresIndexExpectation
 }
 
+// refuseQualifiedRelation refuses a CREATE statement that names a schema on its
+// target relation. The convergence resolves every relation through the
+// connection's own current schema, so it has no way to act on a qualifier: it
+// would run the qualified DDL and then keep checking the unqualified name,
+// leaving the table the file is named for missing on every boot.
+//
+// Refusing is the only safe disposition. Resolving the qualifier would mean
+// deciding which of the two relations the file meant, and both readings write
+// to a database — one creating a table nobody asked for, the other silently
+// converging a different one.
+func refuseQualifiedRelation(parser ddl.StatementParser, statement, table, subject string) error {
+	qualifier, carried, err := ddl.CreateTargetQualifier(parser, statement)
+	if err != nil {
+		return fmt.Errorf("read the target relation of the schema file for table %q: %w", table, err)
+	}
+	if !carried || qualifier == "" {
+		return nil
+	}
+	return fmt.Errorf(
+		"schema file for table %q declares %s in schema %q; a storage schema file names its relations unqualified, because the convergence resolves them through the connection's own current schema",
+		table, subject, qualifier)
+}
+
 // postgresExpectationsFor parses one table's embedded schema file into the
 // expectations the drift scan and the shape verification both consume. A
 // trailing statement that is not a named standalone CREATE INDEX on the
@@ -263,6 +286,30 @@ func postgresExpectationsFor(parser ddl.StatementParser, table, file string) (po
 	}
 	if len(statements) == 0 {
 		return postgresTableExpectations{}, fmt.Errorf("schema file for table %q has no statements", table)
+	}
+	// The convergence takes a file's table identity from its name, so a file
+	// that creates a different relation than it is named for would have every
+	// later check — columns, indexes, existence — run against one table while
+	// the CREATE TABLE it would run created another. The index check below
+	// holds standalone indexes to the same rule; this holds the table itself.
+	statementType, created, err := parser.Classify(statements[0])
+	if err != nil {
+		return postgresTableExpectations{}, fmt.Errorf("classify the first statement of the schema file for table %q: %w", table, err)
+	}
+	if statementType != ddl.StatementCreateTable {
+		return postgresTableExpectations{}, fmt.Errorf("schema file for table %q must begin with CREATE TABLE; it begins with %s", table, statementType)
+	}
+	if created != table {
+		return postgresTableExpectations{}, fmt.Errorf("schema file for table %q declares table %q", table, created)
+	}
+	// Classify returns the bare relation name by contract, so the comparison
+	// above passes for a CREATE TABLE that qualifies its target. The
+	// convergence has no such qualifier anywhere: it checks existence, columns
+	// and indexes against the connection's current schema, so a qualified
+	// CREATE TABLE would create one relation while every later check read
+	// another — and the table the file is named for would stay missing.
+	if err := refuseQualifiedRelation(parser, statements[0], table, "table "+table); err != nil {
+		return postgresTableExpectations{}, err
 	}
 	columns, err := parser.CreateTableColumns(statements[0])
 	if err != nil {
@@ -281,6 +328,9 @@ func postgresExpectationsFor(parser ddl.StatementParser, table, file string) (po
 		}
 		if indexTable != table {
 			return postgresTableExpectations{}, fmt.Errorf("schema file for table %q declares index %q on table %q", table, indexName, indexTable)
+		}
+		if err := refuseQualifiedRelation(parser, statement, table, fmt.Sprintf("index %s", indexName)); err != nil {
+			return postgresTableExpectations{}, err
 		}
 		expectations.indexes = append(expectations.indexes, postgresIndexExpectation{name: indexName, unique: unique, ddl: statement})
 	}
