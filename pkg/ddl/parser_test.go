@@ -6,6 +6,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/schema"
 )
 
 // The default parser must be the TiDB/Spirit implementation so MySQL and Vitess
@@ -338,4 +340,39 @@ func TestTiDBDropTargets(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+// The qualifier and whether the grammar carries one at all are separate
+// answers, so a parser that cannot see a schema qualifier never reports the
+// absence of one. Conflating the two is what turns a missing capability into a
+// silent pass for a statement targeting a relation nobody asked about.
+func TestCreateTargetQualifier(t *testing.T) {
+	postgres, err := ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+
+	qualifier, carried, err := CreateTargetQualifier(postgres, "CREATE TABLE archive.settings (id bigint)")
+	require.NoError(t, err)
+	assert.True(t, carried)
+	assert.Equal(t, "archive", qualifier)
+
+	qualifier, carried, err = CreateTargetQualifier(postgres, "CREATE TABLE settings (id bigint)")
+	require.NoError(t, err)
+	assert.True(t, carried)
+	assert.Empty(t, qualifier, "an unqualified name is reported as written, never resolved against a search_path")
+
+	qualifier, carried, err = CreateTargetQualifier(postgres, "CREATE INDEX idx ON archive.settings (id)")
+	require.NoError(t, err)
+	assert.True(t, carried)
+	assert.Equal(t, "archive", qualifier)
+
+	mysql, err := ParserForDialect(schema.DialectMySQL)
+	require.NoError(t, err)
+	qualifier, carried, err = CreateTargetQualifier(mysql, "CREATE TABLE `settings` (`id` BIGINT UNSIGNED PRIMARY KEY)")
+	require.NoError(t, err)
+	assert.False(t, carried, "a grammar with no schema-aware seam says so rather than reporting no qualifier")
+	assert.Empty(t, qualifier)
+
+	_, carried, err = CreateTargetQualifier(postgres, "CREATE TABLE (")
+	assert.True(t, carried)
+	require.Error(t, err, "a parse failure is an error, not an unqualified answer")
 }
