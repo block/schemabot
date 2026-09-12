@@ -188,6 +188,20 @@ func TestPostgresExpectationsFor_RejectsUntrackableStatements(t *testing.T) {
 			file: "CREATE TABLE settings (id bigint);\nCREATE INDEX idx_other ON other (id);",
 			want: `declares index "idx_other" on table "other"`,
 		},
+		{
+			// The file's name is the table's identity for the whole
+			// convergence, so a file that creates a different relation would
+			// have every check run against one table and the DDL create
+			// another.
+			name: "creates a different table than it is named for",
+			file: "CREATE TABLE other (id bigint);",
+			want: `schema file for table "settings" declares table "other"`,
+		},
+		{
+			name: "does not begin with CREATE TABLE",
+			file: "CREATE INDEX idx_settings_id ON settings (id);",
+			want: "must begin with CREATE TABLE",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
