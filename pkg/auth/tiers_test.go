@@ -26,10 +26,28 @@ func TestTierForRequest(t *testing.T) {
 		{http.MethodPost, "/api/checks/synthesize", TierWrite},
 		{http.MethodPost, "/api/settings", TierWrite},
 		{http.MethodDelete, "/api/locks", TierWrite},
+		// SchemaBot's own storage schema is admin territory on both halves:
+		// the diff exposes the internal shape of its bookkeeping database, and
+		// its sibling route converges it. On a deployment configured with only
+		// read and write groups this tier is the whole admin decision.
+		{http.MethodPost, "/api/storage/schema/plan", TierWrite},
+		{http.MethodPost, "/api/storage/schema/apply", TierWrite},
 	}
 	for _, c := range cases {
 		assert.Equalf(t, c.want, TierForRequest(c.method, c.path), "%s %s", c.method, c.path)
 	}
+}
+
+// Only the listed read-only endpoints escape the write tier by name. Every
+// other non-GET path is a write, including one nobody has classified, so a new
+// mutating endpoint is admitted at the write tier before anyone remembers to
+// think about it.
+func TestUnclassifiedNonGetPathsAreWrites(t *testing.T) {
+	for _, path := range []string{"/api/storage/schema/plan", "/api/newly/added/endpoint", "/api/pull/subresource"} {
+		assert.Equalf(t, TierWrite, TierForRequest(http.MethodPost, path), "POST %s", path)
+	}
+	assert.Equal(t, TierRead, TierForRequest(http.MethodPost, "/api/pull"),
+		"the read-only endpoints are listed by exact path")
 }
 
 func TestMatchesAnyGroup(t *testing.T) {
