@@ -3,7 +3,7 @@ package inventory
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 )
 
 // TypeRoutingResolver routes a request to the Resolver registered for its
@@ -55,29 +55,42 @@ func (r *TypeRoutingResolver) ResolveTarget(ctx context.Context, req Request) (*
 }
 
 // Enumerate concatenates targets from child resolvers that support enumeration.
-// Children are visited in database-type order for deterministic results.
-func (r *TypeRoutingResolver) Enumerate() []ProbeRequest {
+// Children are visited in database-type order for deterministic results. A
+// child that fails to enumerate fails the whole enumeration, because a partial
+// list would report the failed child's targets as absent rather than unknown.
+func (r *TypeRoutingResolver) Enumerate(ctx context.Context) ([]ProbeRequest, error) {
 	var requests []ProbeRequest
 	for _, databaseType := range r.databaseTypes() {
 		enumerator, ok := r.byType[databaseType].(Enumerator)
-		if ok {
-			requests = append(requests, enumerator.Enumerate()...)
+		if !ok {
+			continue
 		}
+		childRequests, err := enumerator.Enumerate(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("enumerate %s targets: %w", databaseType, err)
+		}
+		requests = append(requests, childRequests...)
 	}
-	return requests
+	return requests, nil
 }
 
-// UnenumerableDatabaseTypes returns the database types whose resolvers cannot
-// enumerate targets.
+// UnenumerableDatabaseTypes returns the database types whose targets no
+// resolver under this one can list: the types registered to a child without
+// the capability, plus whatever an enumerable child reports of its own, so a
+// nested router's gaps reach the outer report. The result is sorted and
+// deduplicated.
 func (r *TypeRoutingResolver) UnenumerableDatabaseTypes() []string {
 	var unenumerable []string
 	for _, databaseType := range r.databaseTypes() {
-		_, ok := r.byType[databaseType].(Enumerator)
+		enumerator, ok := r.byType[databaseType].(Enumerator)
 		if !ok {
 			unenumerable = append(unenumerable, databaseType)
+			continue
 		}
+		unenumerable = append(unenumerable, enumerator.UnenumerableDatabaseTypes()...)
 	}
-	return unenumerable
+	slices.Sort(unenumerable)
+	return slices.Compact(unenumerable)
 }
 
 func (r *TypeRoutingResolver) databaseTypes() []string {
@@ -85,6 +98,6 @@ func (r *TypeRoutingResolver) databaseTypes() []string {
 	for databaseType := range r.byType {
 		databaseTypes = append(databaseTypes, databaseType)
 	}
-	sort.Strings(databaseTypes)
+	slices.Sort(databaseTypes)
 	return databaseTypes
 }

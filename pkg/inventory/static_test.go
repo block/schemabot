@@ -14,22 +14,13 @@ func TestStaticResolverEnumerate(t *testing.T) {
 	t.Setenv("TARGET_CONFIG", `{"host":"db.example","port":3306}`)
 	t.Setenv("TARGET_PASSWORD", "secret")
 
-	tests := []struct {
+	type enumerateCase struct {
 		name     string
 		resolver *StaticResolver
 		want     []ProbeRequest
-	}{
-		{name: "zero", resolver: &StaticResolver{}, want: []ProbeRequest{}},
-		{
-			name: "one",
-			resolver: &StaticResolver{targets: map[string]staticTargetEntry{
-				"orders": {target: "orders", databaseType: "mysql"},
-			}},
-			want: []ProbeRequest{{Target: "orders", DatabaseType: "mysql"}},
-		},
 	}
 
-	resolver, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
+	mixed, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
 		"z-postgres": {DatabaseType: "postgres", DSN: "postgres://user:pass@db.example:5432/app?sslmode=disable"},
 		"a-mysql":    {DatabaseType: "mysql", DSN: "root@tcp(localhost:3306)/"},
 		"m-from": {
@@ -42,25 +33,47 @@ func TestStaticResolverEnumerate(t *testing.T) {
 		},
 	}})
 	require.NoError(t, err)
-	tests = append(tests, struct {
-		name     string
-		resolver *StaticResolver
-		want     []ProbeRequest
-	}{
-		name:     "mixed targets",
-		resolver: resolver,
-		want: []ProbeRequest{
-			{Target: "a-mysql", DatabaseType: "mysql"},
-			{Target: "m-from", DatabaseType: "mysql"},
-			{Target: "z-postgres", DatabaseType: "postgres"},
+
+	tests := []enumerateCase{
+		// The constructor rejects an empty target set; the zero value only
+		// guards a resolver built without it, which enumerates nothing.
+		{name: "zero value", resolver: &StaticResolver{}, want: nil},
+		{
+			name: "one",
+			resolver: &StaticResolver{targets: map[string]staticTargetEntry{
+				"orders": {target: "orders", databaseType: "mysql"},
+			}},
+			want: []ProbeRequest{{Target: "orders", DatabaseType: "mysql"}},
 		},
-	})
+		{
+			name:     "mixed targets",
+			resolver: mixed,
+			want: []ProbeRequest{
+				{Target: "a-mysql", DatabaseType: "mysql"},
+				{Target: "m-from", DatabaseType: "mysql"},
+				{Target: "z-postgres", DatabaseType: "postgres"},
+			},
+		},
+	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, tt.resolver.Enumerate())
+			got, err := tt.resolver.Enumerate(t.Context())
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+			assert.Nil(t, tt.resolver.UnenumerableDatabaseTypes())
 		})
 	}
+}
+
+// A nil resolver reports itself the same way from every method, so a caller
+// holding a typed nil sees an error rather than a panic.
+func TestStaticResolverNilEnumerate(t *testing.T) {
+	var resolver *StaticResolver
+	got, err := resolver.Enumerate(t.Context())
+	require.Error(t, err)
+	assert.Nil(t, got)
+	assert.EqualError(t, err, "static target resolver is nil")
 }
 
 func TestStaticResolverResolveTarget(t *testing.T) {

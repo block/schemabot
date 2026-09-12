@@ -78,13 +78,23 @@ operation. A static inventory can enumerate its configured map, but a discovery
 resolver such as the Etre resolver finds a target by querying for it on demand
 and, when an environment label is configured, refuses to resolve without an
 environment. The probe therefore adds an optional `inventory.Enumerator`
-capability: `StaticResolver` implements it by returning one request per
-configured target (target and database type; static resolution does not use
-the environment), and the type-routing resolver implements it by concatenating
-the enumerations of the child resolvers that offer one. A resolver without the
-capability is skipped with one Info log naming the database type it serves, so
-an operator can see that discovery-resolved targets are outside probe coverage.
-Their credentials are still repaired at use time by the second decision.
+capability. It takes a context and can fail, because a discovery resolver's
+target set lives behind the same client as its lookups; a failed enumeration
+means coverage is unknown, never empty. Each `ProbeRequest` carries the
+target, database type, and environment a `Request` needs to resolve the same
+target again, so an environment-scoped resolver can round-trip its own
+enumeration. `StaticResolver` implements the capability by returning one
+request per configured target with no environment, and the type-routing
+resolver implements it by concatenating the enumerations of the child
+resolvers that offer one, failing closed on the first child error. The
+capability also reports the database types it cannot list: the router names
+the types registered to a child without the capability and merges what an
+enumerable child reports of its own, so a nested router's gaps reach the
+outer report. The probe logs those types once at Info, so an operator can see
+that discovery-resolved targets are outside probe coverage. Today no
+discovery resolver enumerates, so a data plane whose targets all come from
+discovery has no probe coverage; those credentials are still repaired at use
+time by the second decision.
 
 The guarantee is deliberately narrow. A successful probe proves that the
 resolved credentials authenticate, that the session can select the database
