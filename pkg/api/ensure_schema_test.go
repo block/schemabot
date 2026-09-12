@@ -68,13 +68,15 @@ func TestEnsureSchemaDefaultsToMySQLDialect(t *testing.T) {
 	require.ErrorContains(t, err, "plan schema")
 }
 
-// partitionDestructiveChanges delegates its refusal vocabulary to Spirit's
-// UnsafeLinter, so these cases pin the accept/refuse boundary the
-// storage-schema bootstrap relies on: statements that destroy data are
-// refused, statements that lose nothing execute, an ALTER that mixes both is
-// split so only its destructive clauses are refused, and a statement Spirit
-// cannot classify fails the bootstrap rather than executing unclassified.
-func TestPartitionDestructiveChangesPinsUnsafeVocabulary(t *testing.T) {
+// partitionDestructiveChanges delegates its refusal vocabulary to
+// ddl.StorageDestructiveStatement, so these cases pin the accept/refuse
+// boundary the storage-schema bootstrap relies on: statements that destroy
+// data are refused, so are those that remove or rename a schema object without
+// destroying any, statements that add or converge execute, an ALTER that mixes
+// both is split so only its destructive clauses are refused, and a statement
+// Spirit cannot classify fails the bootstrap rather than executing
+// unclassified.
+func TestPartitionDestructiveChangesPinsDestructiveVocabulary(t *testing.T) {
 	t.Parallel()
 
 	single := func(ddlStmt string) []engine.SchemaChange {
@@ -94,6 +96,12 @@ func TestPartitionDestructiveChangesPinsUnsafeVocabulary(t *testing.T) {
 		{name: "DROP PRIMARY KEY", ddl: "ALTER TABLE `applies` DROP PRIMARY KEY"},
 		{name: "DROP PARTITION", ddl: "ALTER TABLE `applies` DROP PARTITION p2020"},
 		{name: "TRUNCATE PARTITION", ddl: "ALTER TABLE `applies` TRUNCATE PARTITION p2020"},
+		{name: "DROP INDEX", ddl: "ALTER TABLE `applies` DROP INDEX `idx_state`"},
+		{name: "DROP FOREIGN KEY", ddl: "ALTER TABLE `applies` DROP FOREIGN KEY `fk_plan`"},
+		{name: "DROP CHECK", ddl: "ALTER TABLE `applies` DROP CHECK `chk_state`"},
+		{name: "DROP CONSTRAINT", ddl: "ALTER TABLE `applies` DROP CONSTRAINT `uq_identifier`"},
+		{name: "RENAME COLUMN", ddl: "ALTER TABLE `applies` RENAME COLUMN `caller` TO `requester`"},
+		{name: "RENAME INDEX", ddl: "ALTER TABLE `applies` RENAME INDEX `idx_state` TO `idx_apply_state`"},
 	}
 	for _, tt := range refusedCases {
 		t.Run("refuses "+tt.name, func(t *testing.T) {
@@ -114,7 +122,8 @@ func TestPartitionDestructiveChangesPinsUnsafeVocabulary(t *testing.T) {
 		ddl  string
 	}{
 		{name: "ADD COLUMN", ddl: "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64)"},
-		{name: "DROP INDEX loses no data", ddl: "ALTER TABLE `applies` DROP INDEX `idx_state`"},
+		{name: "ADD INDEX", ddl: "ALTER TABLE `applies` ADD INDEX `idx_state` (`state`)"},
+		{name: "a table option", ddl: "ALTER TABLE `applies` ENGINE=InnoDB"},
 		{name: "CREATE TABLE", ddl: "CREATE TABLE `audit` (`id` BIGINT UNSIGNED AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"},
 	}
 	for _, tt := range allowedCases {
@@ -144,6 +153,46 @@ func TestPartitionDestructiveChangesPinsUnsafeVocabulary(t *testing.T) {
 		scope, _, attrs := refused[0].refusalTelemetry()
 		assert.Equal(t, metrics.StorageSchemaRefusalSplit, scope)
 		assert.Contains(t, attrs, "split_from_ddl")
+	})
+
+	// Spirit's diff emits one combined ALTER per table, so an index drop
+	// almost always arrives bundled with additive clauses rather than alone.
+	// The split has to refuse the drop out of the middle of that statement:
+	// classifying only the whole statement would leave the drop riding along
+	// in the executed partition.
+	t.Run("a DROP INDEX bundled with additive clauses is refused out of the middle", func(t *testing.T) {
+		t.Parallel()
+		mixed := "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64), DROP INDEX `idx_state`"
+		allowed, refused, err := partitionDestructiveChanges(single(mixed))
+		require.NoError(t, err)
+		require.Len(t, allowed, 1)
+		require.Len(t, allowed[0].TableChanges, 1)
+		assert.Equal(t, "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64)", allowed[0].TableChanges[0].DDL)
+		require.Len(t, refused, 1)
+		assert.Equal(t, "ALTER TABLE `applies` DROP INDEX `idx_state`", refused[0].change.DDL)
+		assert.Contains(t, refused[0].reason, "DROP INDEX")
+		assert.Contains(t, refused[0].reason, "idx_state")
+		assert.Equal(t, mixed, refused[0].splitFrom)
+		scope, _, attrs := refused[0].refusalTelemetry()
+		assert.Equal(t, metrics.StorageSchemaRefusalSplit, scope)
+		assert.Contains(t, attrs, "split_from_ddl")
+	})
+
+	// An index whose definition changed diffs to a drop and a re-add under the
+	// same name. The add is only executable after the drop, so refusing the
+	// drop must refuse the add with it rather than leave the bootstrap a
+	// statement the database rejects on a duplicate key name.
+	t.Run("an index redefinition is refused whole because its ADD half cannot run alone", func(t *testing.T) {
+		t.Parallel()
+		redefinition := "ALTER TABLE `applies` DROP INDEX `idx_state`, ADD INDEX `idx_state` (`state`, `deployment`)"
+		allowed, refused, err := partitionDestructiveChanges(single(redefinition))
+		require.NoError(t, err)
+		assert.Empty(t, allowed)
+		require.Len(t, refused, 1)
+		assert.Equal(t, redefinition, refused[0].change.DDL)
+		assert.Empty(t, refused[0].splitFrom)
+		scope, _, _ := refused[0].refusalTelemetry()
+		assert.Equal(t, metrics.StorageSchemaRefusalWhole, scope)
 	})
 
 	t.Run("a primary-key change is refused whole because its ADD half cannot run alone", func(t *testing.T) {
