@@ -25,6 +25,14 @@ type PlanHeaderData struct {
 	Environment string
 	IsMySQL     bool
 	IsApply     bool
+	// EngineLabel names the database family in the title for a surface whose
+	// family IsMySQL cannot express — SchemaBot's own storage is MySQL or
+	// PostgreSQL. Empty keeps the MySQL/Vitess wording every other plan uses.
+	EngineLabel string
+	// SchemaLabel names the row carrying SchemaName. Empty says "Schema name",
+	// which is the directory a plan was built from; a surface whose desired
+	// schema is something else says what it is instead.
+	SchemaLabel string
 }
 
 // WritePlanHeader writes the common plan header to stdout.
@@ -32,6 +40,9 @@ func WritePlanHeader(data PlanHeaderData) {
 	dbType := "Vitess"
 	if data.IsMySQL {
 		dbType = "MySQL"
+	}
+	if data.EngineLabel != "" {
+		dbType = data.EngineLabel
 	}
 
 	action := "Plan"
@@ -49,9 +60,13 @@ func WritePlanHeader(data PlanHeaderData) {
 		lines = append(lines, fmt.Sprintf("Environment: %s", data.Environment))
 	}
 	// Show schema name (directory) for MySQL. Vitess uses keyspace headers instead.
-	showSchemaName := data.IsMySQL && data.SchemaName != ""
+	showSchemaName := data.SchemaName != "" && (data.IsMySQL || data.EngineLabel != "")
+	schemaLabel := "Schema name"
+	if data.SchemaLabel != "" {
+		schemaLabel = data.SchemaLabel
+	}
 	if showSchemaName {
-		lines = append(lines, fmt.Sprintf("Schema name: %s", data.SchemaName))
+		lines = append(lines, fmt.Sprintf("%s: %s", schemaLabel, data.SchemaName))
 	}
 	boxWidth := minBoxWidth
 	for _, line := range lines {
@@ -69,7 +84,7 @@ func WritePlanHeader(data PlanHeaderData) {
 		fmt.Printf("│  %-*s│\n", boxWidth-2, fmt.Sprintf("Environment: %s", data.Environment))
 	}
 	if showSchemaName {
-		fmt.Printf("│  %-*s│\n", boxWidth-2, fmt.Sprintf("Schema name: %s", data.SchemaName))
+		fmt.Printf("│  %-*s│\n", boxWidth-2, fmt.Sprintf("%s: %s", schemaLabel, data.SchemaName))
 	}
 	fmt.Printf("╰%s╯\n", strings.Repeat("─", boxWidth))
 	fmt.Println()
@@ -510,6 +525,21 @@ func WriteUnsafeChangesWarning(changes []UnsafeChange) {
 		return
 	}
 	fmt.Println(glyph.Attention + " Unsafe Changes Detected:")
+	writeUnsafeChangesList(changes)
+	fmt.Println()
+}
+
+// WriteChangeNotice writes a list of changes under a heading and the severity
+// glyph the heading earns — Attention while a change is only disclosed,
+// Refused once something has been refused, Escalation when destructive consent
+// is in effect (see pkg/glyph). It is the unsafe-change list under another
+// name, because a reader wants the same things of a change that will not run as
+// of one that might: which table, what it would do, and what stands in the way.
+func WriteChangeNotice(severity, heading string, changes []UnsafeChange) {
+	if len(changes) == 0 {
+		return
+	}
+	fmt.Println(severity + " " + heading)
 	writeUnsafeChangesList(changes)
 	fmt.Println()
 }
