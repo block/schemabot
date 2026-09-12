@@ -267,9 +267,28 @@ build is still running fails closed until it completes. A new column whose shape
 needs manual remediation — `NOT NULL` without a `DEFAULT`, generated or
 identity, `UNIQUE`, `REFERENCES` with a `DEFAULT` — fails startup until an
 operator creates it by hand, so it always belongs in the release notes with its
-statement (see [configuration.md](./configuration.md)). A destructive
+statement (see [storage-schema.md](./storage-schema.md)). A destructive
 change is a coordinated operation and belongs in the release notes with
 instructions, not in a routine patch release.
+
+The diff does not have to be read out of the files by hand. Name the release
+being tested and the command answers it against the live database:
+
+```bash
+schemabot storage plan --deployment west -e production --release v1.4.0
+```
+
+`storage plan` requires the release to be named — `--release`, or `--schema-dir`
+pointed at a checkout — so there is no way to get an answer about a release you
+did not choose. `storage apply` is the command that runs the schema embedded in
+the binary running it, and it takes no selector at all. Operators pre-creating an
+index ahead of the roll should also read [Deploying a release that changes the
+storage
+schema](./storage-schema.md#deploying-a-release-that-changes-the-storage-schema)
+— on MySQL a pre-created index is removed again by any boot of the
+still-running earlier release, because dropping an index is not destructive and
+so is not refused. PostgreSQL's convergence is additive-only and leaves it
+alone.
 
 ### 3. The public Go API
 
