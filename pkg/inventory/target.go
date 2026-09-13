@@ -57,3 +57,9 @@ type Enumerator interface {
 	// target it serves returns nil.
 	UnenumerableDatabaseTypes() []string
 }
+
+// TypeReporter is an optional capability for resolvers that serve exactly one
+// database type, so a caller can name that type without resolving a target.
+type TypeReporter interface {
+	DatabaseType() string
+}

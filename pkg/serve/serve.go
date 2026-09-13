@@ -298,6 +298,11 @@ type Server struct {
 	telemetry  *api.Telemetry
 	authz      auth.Authorizer
 	engines    map[string]tern.EngineFactory
+	// probeCancel and probeDone are set by Start when a startup target probe is
+	// launched; Close cancels the probe and waits on probeDone so an in-flight
+	// probe never outlives the resolver and clients svc.Close tears down.
+	probeCancel context.CancelFunc
+	probeDone   chan struct{}
 }
 
 // registerPlanetScaleMTLS registers the configured planetscale.mtls
@@ -710,17 +715,7 @@ func (s *Server) MetricsHandler() http.Handler {
 func (s *Server) Start(ctx context.Context) {
 	s.webhook.StartMissingSummaryReconciliation(ctx, s.logger)
 	if s.targetResolver != nil {
-		probe := targetprobe.New(s.targetResolver, s.logger, 0, 0)
-		go func() {
-			err := panicsafe.Call(func() error {
-				probe.Run(ctx)
-				return nil
-			})
-			if err != nil {
-				s.logger.Error("target probe: recovered panic", "error", err)
-				metrics.RecordRecoveredPanic(ctx, "target_probe")
-			}
-		}()
+		s.startTargetProbe(ctx)
 	}
 	if s.webhook.startDurableWebhookDispatch != nil {
 		s.webhook.startDurableWebhookDispatch(ctx)
@@ -732,8 +727,49 @@ func (s *Server) Start(ctx context.Context) {
 	s.svc.StartPendingDropsCleaner(ctx)
 }
 
+// startTargetProbe launches the startup target probe on its own goroutine
+// under a context Close can cancel. Per-target probes contain their own panics
+// on the pool workers (AV-5); the boundary here covers enumeration and pool
+// setup, which run on the probe goroutine itself. probeDone closes when the
+// goroutine exits, whichever way it exits, so Close's wait is bounded by the
+// per-target timeout once the context is cancelled.
+func (s *Server) startTargetProbe(ctx context.Context) {
+	probeCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	s.probeCancel = cancel
+	s.probeDone = done
+	probe := targetprobe.New(s.targetResolver, s.logger, 0, 0)
+	go func() {
+		defer close(done)
+		probePanic, _ := panicsafe.Catch(func() error {
+			probe.Run(probeCtx)
+			return nil
+		})
+		if probePanic == nil {
+			return
+		}
+		s.logger.Error("target probe: enumeration panicked; the remaining startup work continues",
+			"panic", fmt.Sprint(probePanic.Value),
+			"stack", string(probePanic.Stack))
+		metrics.RecordRecoveredPanic(probeCtx, "target_probe")
+	}()
+}
+
+// stopTargetProbe cancels a running startup probe and waits for its goroutine
+// to exit. In-flight dials observe the cancellation through their context, and
+// the prober discards results cut short by it rather than recording them.
+func (s *Server) stopTargetProbe() {
+	if s.probeCancel == nil {
+		return
+	}
+	s.probeCancel()
+	<-s.probeDone
+	s.logger.Info("target probe stopped")
+}
+
 // Close releases the resources the Server owns and returns all cleanup errors
-// encountered, joined together. It stops the pending-drops cleaner, stops the
+// encountered, joined together. It stops the startup target probe and the
+// pending-drops cleaner, stops the
 // operator (before closing the gRPC client it built, see below), shuts down
 // telemetry (best-effort: flush failures are logged, not returned), closes
 // that gRPC fallback client, and closes the service. svc.Close
@@ -742,6 +778,7 @@ func (s *Server) Start(ctx context.Context) {
 // no-op. It does not stop any gRPC server the embedder owns. Safe to call once
 // after Start.
 func (s *Server) Close() error {
+	s.stopTargetProbe()
 	s.svc.StopPendingDropsCleaner()
 	if s.webhook.stopDurableWebhookDispatch != nil {
 		s.webhook.stopDurableWebhookDispatch()

@@ -69,6 +69,21 @@ func caCertPath(creds *engine.Credentials) (string, error) {
 	}
 }
 
+// ConnectionOptions resolves the credentials' CA reference into the
+// postgresconn options a SchemaBot-managed connection to the target dials
+// with. It is the trust policy the engine applies before every plan, apply,
+// and pull, exported so a caller that opens the target outside the engine (the
+// startup probe) verifies the server under the same roots rather than under
+// whatever the DSN alone would trust. A reference the engine would refuse is
+// refused here too.
+func ConnectionOptions(creds *engine.Credentials) ([]postgresconn.Option, error) {
+	caPath, err := caCertPath(creds)
+	if err != nil {
+		return nil, err
+	}
+	return validationRootCAs(caPath)
+}
+
 // spritePoolConfig builds the pg-sprite pool configuration the plan, apply,
 // and pull dial sites share: the normalized DSN plus the CA bundle path the pool
 // verifies the target against — empty when the embedded RDS trust or the

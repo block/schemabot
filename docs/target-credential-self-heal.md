@@ -71,7 +71,13 @@ semantic. PostgreSQL is the first target fleet using per-request `dsn_from`.
 The data plane will issue `SELECT 1` once for every target its inventory can
 enumerate when its server starts. The probe resolves each target through the
 same inventory path as a request and opens it through `mysqlconn.Open` or
-`postgresconn.Open`, including the normal transport policy.
+`postgresconn.Open`, including the normal transport policy. For PostgreSQL that
+policy includes the target's certificate-authority reference: the probe resolves
+the resolved target's `postgres_ca_ref` metadata through the engine's own trust
+policy (`postgres.ConnectionOptions`), so a target pinned to a file bundle is
+verified under those roots exactly as its plans and applies are, and a reference
+the engine would refuse fails the probe before any dial rather than dialing
+under a different trust root.
 
 The `inventory.Resolver` contract resolves one supplied request; it has no list
 operation. A static inventory can enumerate its configured map, but a discovery
@@ -110,7 +116,24 @@ Each probe has its own context timeout. A fixed-size goroutine pool bounds
 concurrency, so target count cannot create an unbounded connection burst and a
 slow target occupies at most one slot until its timeout. Completion, refusal,
 resolution failure, and timeout each produce one metric observation and one
-structured log entry. DSNs, passwords, and raw secret values are never logged.
+structured log entry; the deadline wins over the failure it caused, so a
+resolver or dial that ran past it reports `timeout` rather than the error the
+interruption produced. DSNs, passwords, and raw secret values are never logged.
+
+Targets whose database type has no DSN the probe can dial — Vitess, which
+connects through the PlanetScale API, and any type the probe does not know —
+are skipped before resolution with a Debug log and left out of the outcome
+counts; a skipped target is not a connection failure.
+
+Each target's probe runs inside its own panic containment boundary (AV-5): a
+panic in resolution, dialing, or recording costs that target its result, the
+value and stack are logged, and the remaining targets are still probed.
+
+`Server.Close` cancels a probe still in flight and waits for it to exit before
+tearing down the resolver and clients it uses. A probe interrupted by that
+cancellation says nothing about its target, so the prober discards its result
+instead of recording a connection failure; the target reports a real outcome on
+the next start.
 
 The exact lifecycle hook is `pkg/serve/serve.go` `Server.Start`, alongside the
 other background startup work and after `Build` has constructed the shared
