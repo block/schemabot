@@ -389,12 +389,56 @@ func classifyApplyFailure(err error, table string) applyFailure {
 // investigation steps, never a statement to run — the index under the name
 // may be healthy or may be exactly what it is meant to be. Only the typed
 // identifiers are interpolated, never the wrapped build or cleanup errors,
-// which may carry raw server text. The two halves leave unsanitized so
-// classifyRefusal can compose a sequence-step clause between them and
-// sanitize the whole; the operational path composes them through
-// invalidIndexDetail.
-func invalidIndexAdvice(invalidErr *executor.InvalidIndexError) (cause, remedy string) {
-	name := fmt.Sprintf("%q.%q", invalidErr.Schema, invalidErr.Index)
+// which may carry raw server text, and they are rendered inside the room the
+// narrowest operator surface leaves them once the prose, the step clause the
+// detail will carry, and the remedy's lead have taken theirs, so the lead
+// survives that surface for identifiers of any legal length and spelling.
+// The two halves leave unsanitized so classifyRefusal can compose a
+// sequence-step clause between them and sanitize the whole; the operational
+// path composes them through invalidIndexDetail.
+func invalidIndexAdvice(invalidErr *executor.InvalidIndexError, stepClause string) (cause, remedy string) {
+	w := invalidIndexWordingFor(invalidErr)
+	names := invalidIndexNames(invalidErr, w.namesTable, w.namesRoom(stepClause))
+	return w.causeBefore + names + w.causeAfter, w.lead + w.remedyRest
+}
+
+// invalidIndexWording is the operator-facing prose of one invalid-index
+// verdict: the cause on either side of the identifiers it names, and the
+// remedy split at its lead — the first clause, the verb and its object,
+// which the narrowest operator surface must still show once the detail is
+// cut from the tail. Keeping the lead apart is what lets the identifiers be
+// given the room that surface leaves rather than a guess at it.
+type invalidIndexWording struct {
+	causeBefore, causeAfter string
+	// namesTable marks a cause that names the table the entry sits on,
+	// beside the index name, because that table is where the operator acts.
+	namesTable bool
+	lead       string
+	remedyRest string
+}
+
+// namesRoom is the byte room the wording leaves the identifiers inside the
+// narrowest operator surface's clamp: what remains of the kept width once
+// the cause's prose, the step clause the detail will carry with its
+// separator, and the remedy's lead with the separator before it have taken
+// theirs.
+func (w invalidIndexWording) namesRoom(stepClause string) int {
+	room := apitypes.StatusFailureReasonKeptWidth -
+		len(w.causeBefore) - len(w.causeAfter) - len(clauseSeparator) - len(w.lead)
+	if stepClause != "" {
+		room -= len(clauseSeparator) + len(stepClause)
+	}
+	return room
+}
+
+// invalidIndexRetryRemovesRemedy is the remedy for the verdicts whose
+// entry the retry itself removes and rebuilds.
+const (
+	invalidIndexRetryRemovesLead   = "the retry removes it"
+	invalidIndexRetryRemovesRemedy = " and rebuilds the index; drop it yourself only if the retries are exhausted"
+)
+
+func invalidIndexWordingFor(invalidErr *executor.InvalidIndexError) invalidIndexWording {
 	switch invalidErr.Code() {
 	case executor.CodeInvalidIndexOwnLeftover:
 		// A leftover the bound's statement timeout produced says so: the
@@ -402,49 +446,106 @@ func invalidIndexAdvice(invalidErr *executor.InvalidIndexError) (cause, remedy s
 		// raise it, and the budget the verdict carries is that bound.
 		var budgetErr *executor.BudgetError
 		if errors.As(invalidErr.Build, &budgetErr) && budgetErr.Cause == executor.CauseStatement {
-			return fmt.Sprintf("this build left its own invalid index %s on the target after running past %s (%s)", name, concurrentIndexBoundOption, budgetErr.Budget),
-				fmt.Sprintf("the retry removes it and rebuilds the index under the same bound, so raise %s first; drop it yourself only if the retries are exhausted", concurrentIndexBoundOption)
+			return invalidIndexWording{
+				causeBefore: "this build left its own invalid index ",
+				causeAfter:  fmt.Sprintf(" on the target after running past %s (%s)", concurrentIndexBoundOption, budgetErr.Budget),
+				lead:        invalidIndexRetryRemovesLead,
+				remedyRest: fmt.Sprintf(" and rebuilds the index under the same bound, so raise %s first; drop it yourself only if the retries are exhausted",
+					concurrentIndexBoundOption),
+			}
 		}
-		return fmt.Sprintf("this build left its own invalid index %s on the target", name),
-			"the retry removes it and rebuilds the index; drop it yourself only if the retries are exhausted"
+		return invalidIndexWording{
+			causeBefore: "this build left its own invalid index ",
+			causeAfter:  " on the target",
+			lead:        invalidIndexRetryRemovesLead,
+			remedyRest:  invalidIndexRetryRemovesRemedy,
+		}
 	case executor.CodeInvalidIndexAbandoned:
-		return fmt.Sprintf("an abandoned invalid index %s occupies the name on the target table with no backend building it", name),
-			"the retry removes it and rebuilds the index; drop it yourself only if the retries are exhausted"
+		return invalidIndexWording{
+			causeBefore: "an abandoned invalid index ",
+			causeAfter:  " occupies the name on the target table with no backend building it",
+			lead:        invalidIndexRetryRemovesLead,
+			remedyRest:  invalidIndexRetryRemovesRemedy,
+		}
 	case executor.CodeInvalidIndexBuildInFlight:
-		return fmt.Sprintf("an invalid index %s occupies the name and backend %d is still building it", name, invalidErr.BuilderPID),
-			"wait for that build to finish or fail, then retry"
+		return invalidIndexWording{
+			causeBefore: "an invalid index ",
+			causeAfter:  fmt.Sprintf(" occupies the name and backend %d is still building it", invalidErr.BuilderPID),
+			lead:        "wait for that build to finish",
+			remedyRest:  " or fail, then retry",
+		}
 	case executor.CodeInvalidIndexBuilderUnobservable:
-		return fmt.Sprintf("an invalid index %s occupies the name on the target table and the engine role cannot observe whether a backend is building it", name),
-			"the retry proves it abandoned under the table's lock, removes it, and rebuilds the index; a build still holding the table stops that retry at its lock budget instead"
+		return invalidIndexWording{
+			causeBefore: "an invalid index ",
+			causeAfter:  " occupies the name on the target table with a builder the engine role cannot observe",
+			lead:        "the retry proves it abandoned under the table's lock",
+			remedyRest:  ", removes it, and rebuilds the index; a build still holding the table stops that retry at its lock budget instead",
+		}
 	case executor.CodeInvalidIndexOtherTable:
-		return fmt.Sprintf("an invalid index %s already occupies the name on a different table%s", name, invalidIndexTableSuffix(invalidErr)),
-			"this change cannot claim it — rename the index in the schema file and re-plan, or clear the entry through that table's own change"
+		return invalidIndexWording{
+			causeBefore: "an invalid index ",
+			causeAfter:  " already occupies the name on a different table",
+			namesTable:  invalidErr.Table != "",
+			lead:        "rename the index in the schema file",
+			remedyRest:  " and re-plan, or clear the entry through that table's own change; this change cannot claim it",
+		}
 	case executor.CodeInvalidIndexNotDroppable:
-		return fmt.Sprintf("an invalid index %s occupies the name and is a partitioned table's index, an index partition, or a constraint's index rather than a failed build's leftover", name),
-			"an operator must resolve it on the target, or rename the index in the schema file and re-plan"
+		// The kinds of index the server will not drop concurrently are
+		// named after the lead, not in the cause: they are why an operator
+		// is needed, and the cause has to leave the lead its room.
+		return invalidIndexWording{
+			causeBefore: "an invalid index ",
+			causeAfter:  " occupies the name and is not a failed build's leftover",
+			lead:        "an operator must resolve it on the target",
+			remedyRest:  ", since it is a partitioned table's index, an index partition, or a constraint's index, or rename the index in the schema file and re-plan",
+		}
 	default:
 		// CodeInvalidIndexUnproven and any future verdict fail safe with
 		// investigation steps: the index under the name may be healthy.
-		return fmt.Sprintf("index %s may be invalid but its catalog state could not be verified", name),
-			"inspect pg_index.indisvalid on the target before any recovery, then retry"
+		return invalidIndexWording{
+			causeBefore: "index ",
+			causeAfter:  " may be invalid but its catalog state could not be verified",
+			lead:        "inspect pg_index.indisvalid on the target before any recovery",
+			remedyRest:  ", then retry",
+		}
 	}
+}
+
+// invalidIndexNames renders the identifiers an invalid-index cause carries —
+// the index name qualified by its schema and, when the cause names it, the
+// table the entry sits on — quoted inside one byte room. When the quoted
+// forms do not all fit, the index name is cut last: it is the name the
+// remedy tells the operator to rename or resolve. The table is cut next and
+// the schema first, each keeping at least its cut mark, so the cause always
+// shows where a name stood. A cut costs the operator little — the server
+// log beside the failure carries the identifiers whole.
+func invalidIndexNames(invalidErr *executor.InvalidIndexError, withTable bool, room int) string {
+	const dot, openParen, closeParen = ".", " (", ")"
+	schema, index := strconv.Quote(invalidErr.Schema), strconv.Quote(invalidErr.Index)
+	table := ""
+	if withTable {
+		table = openParen + strconv.Quote(invalidErr.Table) + closeParen
+	}
+	if len(schema)+len(dot)+len(index)+len(table) <= room {
+		return schema + dot + index + table
+	}
+	reserved := len(dot) + quotedCutWidth
+	if withTable {
+		reserved += len(openParen) + quotedCutWidth + len(closeParen)
+	}
+	index = boundedQuote(invalidErr.Index, room-reserved)
+	if withTable {
+		table = openParen + boundedQuote(invalidErr.Table, room-len(index)-len(dot)-quotedCutWidth-len(openParen)-len(closeParen)) + closeParen
+	}
+	schema = boundedQuote(invalidErr.Schema, room-len(index)-len(dot)-len(table))
+	return schema + dot + index + table
 }
 
 // invalidIndexDetail composes the advice for the operational (retryable)
 // publish path, where no sequence-step clause intervenes.
 func invalidIndexDetail(invalidErr *executor.InvalidIndexError) string {
-	cause, remedy := invalidIndexAdvice(invalidErr)
-	return sanitizeReasonText(cause + "; " + remedy)
-}
-
-// invalidIndexTableSuffix names the table the invalid index sits on when the
-// catalog inspection saw it; the verdict carries no table when the state
-// could not be inspected.
-func invalidIndexTableSuffix(invalidErr *executor.InvalidIndexError) string {
-	if invalidErr.Table == "" {
-		return ""
-	}
-	return fmt.Sprintf(" (%q)", invalidErr.Table)
+	cause, remedy := invalidIndexAdvice(invalidErr, "")
+	return sanitizeReasonText(cause + clauseSeparator + remedy)
 }
 
 // refusal is a typed apply outcome that retrying cannot fix: the schema
@@ -582,7 +683,7 @@ func refusalForCause(err error, table string) *refusal {
 	if errors.As(err, &invalidErr) {
 		r, _ := refusalForOutcome(invalidErr.Code(), table)
 		if r != nil {
-			r.cause, r.remedy = invalidIndexAdvice(invalidErr)
+			r.cause, r.remedy = invalidIndexAdvice(invalidErr, sequenceStepClause(err))
 		}
 		return r
 	}
@@ -854,24 +955,41 @@ const quotedTableWidth = len(`"`) + 63 + len(`"`)
 // identifier, bounded at quotedTableWidth: quoting escapes a quote, a
 // backslash, or a control character into more bytes than the identifier
 // carries, and an identifier of legal length may be made of such characters,
-// so a name is cut on a rune boundary and marked when its quoted form would
-// take more than the room a plain name of the same legal length takes. The
-// cut costs the operator nothing they rely on — every surface renders the
-// detail beside the table it belongs to.
+// so a name is cut when its quoted form would take more than the room a
+// plain name of the same legal length takes. The cut costs the operator
+// nothing they rely on — every surface renders the detail beside the table
+// it belongs to.
 func quotedTable(table string) string {
-	if q := strconv.Quote(table); len(q) <= quotedTableWidth {
+	return boundedQuote(table, quotedTableWidth)
+}
+
+// quotedCutMark ends a quoted identifier that was cut to fit its width, in
+// place of the closing quote; quotedCutWidth is the narrowest rendering a
+// cut can leave, an opening quote and the mark, which a width below it
+// still gets.
+const (
+	quotedCutMark  = `..."`
+	quotedCutWidth = len(`"`) + len(quotedCutMark)
+)
+
+// boundedQuote renders an identifier quoted inside a byte width: the quoted
+// form when it fits, otherwise the longest prefix that fits with the cut
+// mark in place of its closing quote. The prefix is cut on a rune boundary,
+// and by requoting rather than slicing the quoted form, so a cut never
+// splits an escape sequence.
+func boundedQuote(name string, width int) string {
+	if q := strconv.Quote(name); len(q) <= width {
 		return q
 	}
-	const mark = `..."`
 	kept := `"`
-	for i := range table {
-		q := strconv.Quote(table[:i])
-		if len(q)-len(`"`)+len(mark) > quotedTableWidth {
+	for i := range name {
+		q := strconv.Quote(name[:i])
+		if len(q)-len(`"`)+len(quotedCutMark) > width {
 			break
 		}
 		kept = q[:len(q)-len(`"`)]
 	}
-	return kept + mark
+	return kept + quotedCutMark
 }
 
 // mismatchNames renders the missing names and the owned names inside one
