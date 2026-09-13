@@ -38,15 +38,16 @@ type StaticTarget struct {
 	// Secrets Operator) is picked up without restarting the worker. Mutually
 	// exclusive with DSN.
 	//
+	// The target router keys its client cache on a hash of the assembled DSN,
+	// so the first request after a rotation misses deterministically and opens
+	// a fresh client; applies already running keep the client they started on.
+	//
 	// Intended backend: file: secret references (the ESO-synced case). The
-	// per-request assembly runs before the target router's client-cache lookup,
-	// and on a cache hit the freshly assembled DSN is discarded (the cached client
-	// serves the request), so today dsn_from buys rotation-safety only at the next
-	// cache miss. With secretsmanager: refs that means every routed request pays a
-	// GetSecretValue call (two, for the split config/password refs) and gains a
-	// per-request dependency on secret-backend availability with no offsetting
-	// benefit until the DSN-aware client cache lands; with file: refs the cost and
-	// availability risk are negligible. Prefer file: refs until that follow-up.
+	// per-request assembly runs on every routed request, so with secretsmanager:
+	// refs each request pays a GetSecretValue call (two, for the split
+	// config/password refs) and takes a per-request dependency on secret-backend
+	// availability; with file: refs the cost and availability risk are
+	// negligible. Prefer file: refs.
 	DSNFrom  *StaticDSNFromConfig `yaml:"dsn_from,omitempty"`
 	Metadata map[string]string    `yaml:"metadata,omitempty"`
 	// SchemaOverrides maps a requested (canonical) MySQL namespace to the
