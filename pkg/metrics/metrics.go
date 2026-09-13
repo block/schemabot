@@ -820,6 +820,17 @@ func RecordTargetClientEviction(ctx context.Context, databaseType, environment, 
 	)
 }
 
+// RecordTargetProbe increments startup connectivity probe outcomes. Target is
+// omitted to bound cardinality; the paired log names it.
+func RecordTargetProbe(ctx context.Context, databaseType, environment, outcome string) {
+	addCounter(ctx, "schemabot.target.probe.total",
+		"Startup connectivity probes of enumerated targets, by outcome", "{probe}",
+		attribute.String("database_type", databaseType),
+		EnvironmentAttribute(environment),
+		attribute.String("outcome", outcome),
+	)
+}
+
 // RecordRemoteControlRequestStale counts retransmissions of a durable
 // stop/cancel control request that the data plane accepted but has not
 // consumed within the stale threshold. A non-zero rate means an accepted
@@ -1365,6 +1376,7 @@ var knownRecoveredPanicOperations = map[string]bool{
 	"summary_reconciliation": true,
 	"observer_poll":          true,
 	"grpc_handler":           true,
+	"target_probe":           true,
 }
 
 // RecordRecoveredPanic increments the recovered-panic counter for a background

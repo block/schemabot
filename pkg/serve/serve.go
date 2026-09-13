@@ -31,6 +31,7 @@ import (
 	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/engine/planetscale"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/schemabot/pkg/panicsafe"
@@ -39,6 +40,7 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/storage/postgresstore"
+	"github.com/block/schemabot/pkg/targetprobe"
 	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/webhook"
 )
@@ -286,6 +288,7 @@ type Server struct {
 	storage         storage.Storage
 	logger          *slog.Logger
 	dataPlaneClient tern.Client
+	targetResolver  inventory.Resolver
 	// grpcClient is the single-database client RegisterGRPC builds when no
 	// target resolver is configured. It is owned here (not by the service) so
 	// Close releases it; the resolver-backed dataPlaneClient is the service's
@@ -295,6 +298,11 @@ type Server struct {
 	telemetry  *api.Telemetry
 	authz      auth.Authorizer
 	engines    map[string]tern.EngineFactory
+	// probeCancel and probeDone are set by Start when a startup target probe is
+	// launched; Close cancels the probe and waits on probeDone so an in-flight
+	// probe never outlives the resolver and clients svc.Close tears down.
+	probeCancel context.CancelFunc
+	probeDone   chan struct{}
 }
 
 // registerPlanetScaleMTLS registers the configured planetscale.mtls
@@ -496,6 +504,10 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		return nil, fmt.Errorf("setup telemetry: %w", err)
 	}
 
+	var targetResolver inventory.Resolver
+	if router, ok := dataPlaneClient.(*tern.TargetRouter); ok {
+		targetResolver = router.Resolver()
+	}
 	success = true
 	return &Server{
 		cfg:             cfg,
@@ -503,6 +515,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		storage:         store,
 		logger:          logger,
 		dataPlaneClient: dataPlaneClient,
+		targetResolver:  targetResolver,
 		webhook:         webhookRuntime,
 		telemetry:       telemetry,
 		authz:           authz,
@@ -693,7 +706,7 @@ func (s *Server) MetricsHandler() http.Handler {
 // Start launches the server's background work: the operator driver pool
 // (dispatches queued applies and recovers stale ones), the remote-deployment
 // health monitor, the webhook inbox monitor (emits durable-inbox depth/backlog
-// metrics), and the pending-drops cleaner — all of which run until ctx is
+// metrics), the startup target probe, and the pending-drops cleaner — all of which run until ctx is
 // canceled or Close is called. It also kicks off a one-shot missing-summary
 // reconciliation that, once started, runs to completion independently of ctx (it
 // repairs interrupted terminal comments and must not be cut short by a request
@@ -701,6 +714,9 @@ func (s *Server) MetricsHandler() http.Handler {
 // first.
 func (s *Server) Start(ctx context.Context) {
 	s.webhook.StartMissingSummaryReconciliation(ctx, s.logger)
+	if s.targetResolver != nil {
+		s.startTargetProbe(ctx)
+	}
 	if s.webhook.startDurableWebhookDispatch != nil {
 		s.webhook.startDurableWebhookDispatch(ctx)
 	}
@@ -711,8 +727,52 @@ func (s *Server) Start(ctx context.Context) {
 	s.svc.StartPendingDropsCleaner(ctx)
 }
 
+// startTargetProbe launches the startup target probe on its own goroutine
+// under a context Close can cancel. Per-target probes contain their own panics
+// on the pool workers (AV-5); the boundary here covers enumeration and pool
+// setup, which run on the probe goroutine itself. probeDone closes when the
+// goroutine exits, whichever way it exits. Enumeration and every per-target
+// step run under the prober's per-target timeout, so once the context is
+// cancelled Close's wait is bounded by that timeout whichever step is in
+// flight.
+func (s *Server) startTargetProbe(ctx context.Context) {
+	probeCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	s.probeCancel = cancel
+	s.probeDone = done
+	probe := targetprobe.New(s.targetResolver, s.logger, 0, 0)
+	go func() {
+		defer close(done)
+		probePanic, _ := panicsafe.Catch(func() error {
+			probe.Run(probeCtx)
+			return nil
+		})
+		if probePanic == nil {
+			return
+		}
+		s.logger.Error("target probe: enumeration panicked; the remaining startup work continues",
+			"panic", fmt.Sprint(probePanic.Value),
+			"stack", string(probePanic.Stack))
+		metrics.RecordRecoveredPanic(probeCtx, "target_probe")
+	}()
+}
+
+// stopTargetProbe cancels a running startup probe and waits for its goroutine
+// to exit. In-flight dials observe the cancellation through their context, and
+// the prober discards results cut short by it rather than recording them.
+func (s *Server) stopTargetProbe() {
+	if s.probeCancel == nil {
+		s.logger.Debug("target probe: no startup probe was started; nothing to stop")
+		return
+	}
+	s.probeCancel()
+	<-s.probeDone
+	s.logger.Info("target probe stopped")
+}
+
 // Close releases the resources the Server owns and returns all cleanup errors
-// encountered, joined together. It stops the pending-drops cleaner, stops the
+// encountered, joined together. It stops the startup target probe and the
+// pending-drops cleaner, stops the
 // operator (before closing the gRPC client it built, see below), shuts down
 // telemetry (best-effort: flush failures are logged, not returned), closes
 // that gRPC fallback client, and closes the service. svc.Close
@@ -721,6 +781,7 @@ func (s *Server) Start(ctx context.Context) {
 // no-op. It does not stop any gRPC server the embedder owns. Safe to call once
 // after Start.
 func (s *Server) Close() error {
+	s.stopTargetProbe()
 	s.svc.StopPendingDropsCleaner()
 	if s.webhook.stopDurableWebhookDispatch != nil {
 		s.webhook.stopDurableWebhookDispatch()

@@ -251,8 +251,9 @@ log, a durable apply-log entry, and a metric. One bad row must never crash-loop 
 bad RPC must never take the server process down with it. The panic value stays server-side: a
 caller gets a fixed internal error, never the panic text or a stack. *Enforced:* the recover
 boundary in `pkg/panicsafe/panicsafe.go`, applied around webhook work units
-(`pkg/webhook/handler.go`, `pkg/webhook/durable_dispatch.go`) and local drives
-(`pkg/tern/local_apply.go`).
+(`pkg/webhook/handler.go`, `pkg/webhook/durable_dispatch.go`), local drives
+(`pkg/tern/local_apply.go`), and the startup target probe (`pkg/serve/serve.go`
+around enumeration, `pkg/targetprobe/targetprobe.go` around each target).
 
 ### AV-6: Mixed versions are survivable by contract, not by guesswork
 
