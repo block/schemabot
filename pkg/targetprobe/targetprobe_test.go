@@ -10,6 +10,7 @@ import (
 	"database/sql"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/big"
 	"os"
@@ -27,7 +28,10 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-const testTimeout = 5 * time.Second
+const (
+	testTimeout  = 5 * time.Second
+	testPoolSize = 2
+)
 
 type fakeResolver struct {
 	requests []inventory.ProbeRequest
@@ -80,7 +84,7 @@ func (r typedResolverOnly) DatabaseType() string { return r.databaseType }
 func newTestProber(resolver inventory.Resolver, timeout time.Duration) (*Prober, *bytes.Buffer) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
-	return New(resolver, logger, timeout, 2), &logs
+	return New(resolver, logger, timeout, testPoolSize), &logs
 }
 
 // newDebugTestProber is newTestProber at debug level, for scenarios whose
@@ -88,7 +92,7 @@ func newTestProber(resolver inventory.Resolver, timeout time.Duration) (*Prober,
 func newDebugTestProber(resolver inventory.Resolver, timeout time.Duration) (*Prober, *bytes.Buffer) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	return New(resolver, logger, timeout, 2), &logs
+	return New(resolver, logger, timeout, testPoolSize), &logs
 }
 
 func TestRunResolverWithoutEnumerator(t *testing.T) {
@@ -173,6 +177,87 @@ func TestRunResolveTimeout(t *testing.T) {
 	prober.Run(t.Context())
 	assert.Contains(t, logs.String(), "outcome=timeout")
 	assert.NotContains(t, logs.String(), "outcome=resolve_error")
+}
+
+// A resolver that scopes targets by environment refuses a request without one,
+// so the probe resolves each enumerated target under the environment it was
+// enumerated with, and the outcome it records carries that environment.
+func TestRunPropagatesEnumeratedEnvironment(t *testing.T) {
+	resolver := &funcResolver{
+		requests: []inventory.ProbeRequest{{Target: "target-a", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging"}},
+		resolve: func(_ context.Context, req inventory.Request) (*inventory.Target, error) {
+			if req.Environment != "staging" {
+				return nil, fmt.Errorf("target %q is scoped to an environment; got %q", req.Target, req.Environment)
+			}
+			return &inventory.Target{Target: req.Target, DatabaseType: req.DatabaseType, DSN: "secretpw"}, nil
+		},
+	}
+	prober, logs := newTestProber(resolver, time.Second)
+	prober.open = func(context.Context, *inventory.Target) (*sql.DB, error) {
+		return nil, errors.New("dial failed")
+	}
+	prober.Run(t.Context())
+	assert.Contains(t, logs.String(), "environment=staging")
+	assert.Contains(t, logs.String(), "outcome=connection_error")
+	assert.NotContains(t, logs.String(), "outcome=resolve_error")
+	assert.NotContains(t, logs.String(), "secretpw")
+}
+
+// A resolver that answers with neither a target nor an error has not resolved
+// anything; the probe records that as a resolver failure instead of dialing
+// nothing and reporting the target healthy.
+func TestRunResolverReturnsNoTarget(t *testing.T) {
+	resolver := &funcResolver{
+		requests: []inventory.ProbeRequest{{Target: "target-a", DatabaseType: storage.DatabaseTypeMySQL}},
+		resolve: func(context.Context, inventory.Request) (*inventory.Target, error) {
+			return nil, nil
+		},
+	}
+	prober, logs := newTestProber(resolver, time.Second)
+	opened := false
+	prober.open = func(context.Context, *inventory.Target) (*sql.DB, error) {
+		opened = true
+		return nil, errors.New("must not open an unresolved target")
+	}
+	prober.Run(t.Context())
+	assert.False(t, opened)
+	assert.Contains(t, logs.String(), "outcome=resolve_error")
+	assert.Contains(t, logs.String(), "returned no target")
+}
+
+// blockingEnumerator enumerates only when its context lets it, standing in for
+// an inventory that does not answer.
+type blockingEnumerator struct {
+	resolverOnly
+}
+
+func (blockingEnumerator) Enumerate(ctx context.Context) ([]inventory.ProbeRequest, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (blockingEnumerator) UnenumerableDatabaseTypes() []string { return nil }
+
+// Enumeration runs under the per-target bound, so an inventory that never
+// answers fails the run within that bound instead of holding the probe
+// goroutine, and the shutdown that waits on it, open indefinitely.
+func TestRunBoundsEnumeration(t *testing.T) {
+	prober, logs := newTestProber(blockingEnumerator{}, time.Millisecond)
+	done := make(chan struct{})
+	go func() {
+		prober.Run(t.Context())
+		close(done)
+	}()
+	waitCtx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+	select {
+	case <-done:
+	case <-waitCtx.Done():
+		require.NoError(t, waitCtx.Err(), "waiting for the bounded enumeration to fail the run")
+	}
+	assert.Contains(t, logs.String(), "enumerate targets failed")
+	assert.Contains(t, logs.String(), context.DeadlineExceeded.Error())
+	assert.NotContains(t, logs.String(), "probing enumerated targets")
 }
 
 // Targets whose database type has no DSN the probe can dial are skipped before
@@ -273,6 +358,9 @@ func TestRunContainsPerTargetPanic(t *testing.T) {
 	assert.NotContains(t, logs.String(), "secretpw")
 }
 
+// The pool admits at most its size in probes at once: with two probes held open,
+// the remaining targets wait for a worker rather than dialing alongside them,
+// and every target is still probed once the held probes return.
 func TestRunBoundsConcurrency(t *testing.T) {
 	requests := make([]inventory.ProbeRequest, 5)
 	for i := range requests {
@@ -284,10 +372,12 @@ func TestRunBoundsConcurrency(t *testing.T) {
 	entered := make(chan struct{}, len(requests))
 	var current atomic.Int32
 	var maximum atomic.Int32
+	var probed atomic.Int32
 	prober.open = func(context.Context, *inventory.Target) (*sql.DB, error) {
 		now := current.Add(1)
 		for old := maximum.Load(); now > old && !maximum.CompareAndSwap(old, now); old = maximum.Load() {
 		}
+		probed.Add(1)
 		entered <- struct{}{}
 		<-release
 		current.Add(-1)
@@ -300,21 +390,30 @@ func TestRunBoundsConcurrency(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
 	defer cancel()
-	for range 2 {
+	for range testPoolSize {
 		select {
 		case <-entered:
 		case <-ctx.Done():
-			require.NoError(t, ctx.Err(), "waiting for bounded probes")
+			require.NoError(t, ctx.Err(), "waiting for the pool to fill")
 		}
 	}
-	assert.Equal(t, int32(2), maximum.Load())
+	// With both workers held, the pool is full: a third probe entering now is
+	// the bound being ignored, whatever the goroutine scheduling. The window is
+	// long enough for an unbounded pool to dial the remaining targets.
+	select {
+	case <-entered:
+		t.Fatal("a probe entered while the pool was full")
+	case <-time.After(100 * time.Millisecond):
+	}
+	assert.Equal(t, int32(testPoolSize), current.Load(), "probes in flight while the pool is held")
 	close(release)
 	select {
 	case <-done:
 	case <-ctx.Done():
 		require.NoError(t, ctx.Err(), "waiting for probes to complete")
 	}
-	assert.LessOrEqual(t, maximum.Load(), int32(2))
+	assert.Equal(t, int32(testPoolSize), maximum.Load(), "most probes ever in flight at once")
+	assert.Equal(t, int32(len(requests)), probed.Load(), "every enumerated target is probed")
 	assert.NotContains(t, logs.String(), "secretpw")
 }
 

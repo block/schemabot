@@ -112,9 +112,15 @@ on a missing grant. A grant-level check would have to run per namespace with
 the operation's own statements; that is what the routed operations already do,
 and their typed failures are the signal for provisioning defects.
 
-Each probe has its own context timeout. A fixed-size goroutine pool bounds
-concurrency, so target count cannot create an unbounded connection burst and a
-slow target occupies at most one slot until its timeout. Completion, refusal,
+Each probe has its own context timeout, and enumeration runs under the same
+bound, since a discovery-backed inventory lists its targets remotely; a listing
+that outlasts it fails the run rather than holding the probe goroutine open. A
+fixed-size goroutine pool bounds concurrency, so target count cannot create an
+unbounded connection burst and a slow target occupies at most one slot until
+its timeout. The probe resolves each enumerated target with the environment its
+enumerator reported, so a resolver that scopes by environment resolves the same
+target the request path would, and reports that environment on its metric and
+log. Completion, refusal,
 resolution failure, and timeout each produce one metric observation and one
 structured log entry; the deadline wins over the failure it caused, so a
 resolver or dial that ran past it reports `timeout` rather than the error the
@@ -354,14 +360,18 @@ recipe's form rather than either neighbor's.
 
 | Metric | Attributes | Meaning |
 | --- | --- | --- |
-| `schemabot.target.probe.total` | `target`, `database_type`, `environment`, `outcome` | One startup result per enumerated target. Outcomes: `success`, `auth_invalid_credentials`, `auth_no_access`, `auth_no_database`, `resolve_error`, `timeout`, `connection_error`. |
+| `schemabot.target.probe.total` | `database_type`, `environment`, `outcome` | One startup result per enumerated target. Outcomes: `success`, `auth_invalid_credentials`, `auth_no_access`, `auth_no_database`, `resolve_error`, `timeout`, `connection_error`. |
 | `schemabot.target.client_evictions.total` | `database_type`, `environment`, `reason` | Replaced generations. Reasons: `dsn_changed`, `auth_invalid_credentials`, `auth_no_access`, `auth_no_database`. Target is omitted from this hot-path counter to bound cardinality. |
 | `schemabot.target.auth_retries.total` | `operation`, `database_type`, `environment`, `classification`, `outcome` | Eligible single retries and whether they succeeded, failed, or could not re-resolve. |
 
-The target label is acceptable on the startup probe because configured
-inventory is bounded and each target emits once per process start. Retry and
-eviction can occur on a hot path, so their counters omit target and rely on logs
-for attribution. The retry counter earns a separate instrument because a rate
+None of the three counters carries a target label; every log beside them names
+the target, so the series count is bounded by outcomes and environments rather
+than by inventory size. The probe counter is the one instrument here that does
+not earn its place on volume — it emits once per target per process start — and
+it earns it as a deploy-time alert instead: a rollout produces a burst of
+observations at once, and a non-`success` outcome in that burst is a rotated
+credential, dropped grant, or unreachable target found before the first schema
+change reaches it. The retry counter earns a separate instrument because a rate
 or storm is an actionable signal that rotation or provisioning is unhealthy.
 
 Every probe log includes `target`, `database_type`, `environment`, `outcome`, and

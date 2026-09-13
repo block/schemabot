@@ -731,8 +731,10 @@ func (s *Server) Start(ctx context.Context) {
 // under a context Close can cancel. Per-target probes contain their own panics
 // on the pool workers (AV-5); the boundary here covers enumeration and pool
 // setup, which run on the probe goroutine itself. probeDone closes when the
-// goroutine exits, whichever way it exits, so Close's wait is bounded by the
-// per-target timeout once the context is cancelled.
+// goroutine exits, whichever way it exits. Enumeration and every per-target
+// step run under the prober's per-target timeout, so once the context is
+// cancelled Close's wait is bounded by that timeout whichever step is in
+// flight.
 func (s *Server) startTargetProbe(ctx context.Context) {
 	probeCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
@@ -760,6 +762,7 @@ func (s *Server) startTargetProbe(ctx context.Context) {
 // the prober discards results cut short by it rather than recording them.
 func (s *Server) stopTargetProbe() {
 	if s.probeCancel == nil {
+		s.logger.Debug("target probe: no startup probe was started; nothing to stop")
 		return
 	}
 	s.probeCancel()

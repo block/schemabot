@@ -820,11 +820,11 @@ func RecordTargetClientEviction(ctx context.Context, databaseType, environment, 
 	)
 }
 
-// RecordTargetProbe increments startup connectivity probe outcomes.
-func RecordTargetProbe(ctx context.Context, target, databaseType, environment, outcome string) {
+// RecordTargetProbe increments startup connectivity probe outcomes. Target is
+// omitted to bound cardinality; the paired log names it.
+func RecordTargetProbe(ctx context.Context, databaseType, environment, outcome string) {
 	addCounter(ctx, "schemabot.target.probe.total",
 		"Startup connectivity probes of enumerated targets, by outcome", "{probe}",
-		attribute.String("target", target),
 		attribute.String("database_type", databaseType),
 		EnvironmentAttribute(environment),
 		attribute.String("outcome", outcome),

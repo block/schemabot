@@ -76,7 +76,13 @@ func (p *Prober) Run(ctx context.Context) {
 		return
 	}
 	p.logUnenumerableTypes()
-	requests, err := enumerator.Enumerate(ctx)
+	// Enumeration may reach a remote inventory, so it runs under the same
+	// bound as each target's probe: a listing that outlasts it fails the run
+	// rather than holding the probe goroutine — and with it Close — open for
+	// as long as the inventory takes to answer.
+	enumerateCtx, cancelEnumerate := context.WithTimeout(ctx, p.perTargetTimeout)
+	requests, err := enumerator.Enumerate(enumerateCtx)
+	cancelEnumerate()
 	if err != nil {
 		p.logger.Error("target probe: enumerate targets failed; no targets will be probed", "error", err)
 		return
@@ -110,6 +116,7 @@ func (p *Prober) Run(ctx context.Context) {
 func (p *Prober) logUnenumerableTypes() {
 	router, ok := p.resolver.(*inventory.TypeRoutingResolver)
 	if !ok {
+		p.logger.Debug("target probe: resolver enumerates every target it serves; no database type is outside probe coverage")
 		return
 	}
 	types := router.UnenumerableDatabaseTypes()
@@ -152,7 +159,10 @@ func (p *Prober) probe(parent context.Context, request inventory.ProbeRequest) (
 	ctx, cancel := context.WithTimeout(parent, p.perTargetTimeout)
 	defer cancel()
 	started := time.Now()
-	resolved, err := p.resolver.ResolveTarget(ctx, inventory.Request{Target: request.Target, DatabaseType: request.DatabaseType})
+	// The enumerated request carries every field the resolver needs to resolve
+	// the same target again, including the environment a resolver that scopes
+	// by it refuses to resolve without; the conversion hands all of them over.
+	resolved, err := p.resolver.ResolveTarget(ctx, inventory.Request(request))
 	if err != nil {
 		err = fmt.Errorf("resolve target %q for startup probe: %w", request.Target, err)
 		outcome, classification := classifyResolve(ctx)
@@ -227,10 +237,12 @@ func classifyResolve(ctx context.Context) (string, string) {
 }
 
 func (p *Prober) record(ctx context.Context, request inventory.ProbeRequest, outcome, classification string, started time.Time, err error) {
-	// Static resolution does not use an environment, so the probe has none to
-	// report; EnvironmentAttribute renders the empty value as unknown.
-	metrics.RecordTargetProbe(ctx, request.Target, request.DatabaseType, "", outcome)
-	attrs := []any{"target", request.Target, "database_type", request.DatabaseType, "environment", "", "outcome", outcome, "duration_ms", time.Since(started).Milliseconds()}
+	// The metric omits the target so its series count is bounded by outcomes
+	// rather than by inventory size; the paired log names the target. A
+	// resolver that does not scope by environment enumerates none, and
+	// EnvironmentAttribute renders that as unknown.
+	metrics.RecordTargetProbe(ctx, request.DatabaseType, request.Environment, outcome)
+	attrs := []any{"target", request.Target, "database_type", request.DatabaseType, "environment", request.Environment, "outcome", outcome, "duration_ms", time.Since(started).Milliseconds()}
 	if err == nil {
 		p.logger.Info("target probe: succeeded", attrs...)
 		return
