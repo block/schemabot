@@ -124,6 +124,9 @@ func TestTargetRouterAuthRetryEligibleReads(t *testing.T) {
 	assert.Equal(t, "auth_invalid_credentials", counterAttr(t, evictionPoints[0], "reason"))
 }
 
+// A rebuilt client the target refuses again ends the retry: the error names
+// both refusals and keeps the classified cause, and the route's cooldown is
+// armed because re-resolution did not fix the failure.
 func TestTargetRouterAuthRetryStopsAfterSecondFailure(t *testing.T) {
 	reader := newTernMetricsReader(t)
 	resolver := &authRetryResolver{dsn: rotationOldDSN}
@@ -131,13 +134,155 @@ func TestTargetRouterAuthRetryStopsAfterSecondFailure(t *testing.T) {
 	router, clients := newAuthRetryRouter(t, resolver, func(_ int, client *targetRouterRecordingClient) {
 		client.onPlanResult = func() (*ternv1.PlanResponse, error) { dispatches++; return nil, authRetryError() }
 	}, nil)
+	var logged bytes.Buffer
+	router.logger = slog.New(slog.NewTextHandler(&logged, nil))
 	_, err := router.Plan(t.Context(), &ternv1.PlanRequest{Database: "orders", Target: "target", Type: storage.DatabaseTypeMySQL})
 	require.Error(t, err)
+	var authErr *targetauth.Error
+	require.ErrorAs(t, err, &authErr)
+	assert.Equal(t, targetauth.AuthInvalidCredentials, authErr.Classification)
+	assert.ErrorContains(t, err, "failed authentication")
+	assert.ErrorContains(t, err, "original failure")
 	assert.Equal(t, 2, dispatches)
 	assert.Len(t, *clients, 2)
 	points := collectCounterPoints(t, reader, "schemabot.target.auth_retries.total")
 	require.Len(t, points, 1)
 	assert.Equal(t, "failed", counterAttr(t, points[0], "outcome"))
+	assert.Contains(t, selfHealLogLine(t, logged.String()), "cooldown_armed=true")
+	router.mu.Lock()
+	assert.Len(t, router.authRetryBlockedUntil, 1)
+	router.mu.Unlock()
+}
+
+// A retry that fails for a reason the classifier does not recognise says
+// nothing about the re-resolved credential, so it does not arm the cooldown:
+// the returned error still carries the classified original cause, and the next
+// classified failure on the route evicts and retries as if the first retry had
+// never run.
+func TestTargetRouterUnclassifiedRetryFailureLeavesRouteEligible(t *testing.T) {
+	reader := newTernMetricsReader(t)
+	resolver := &authRetryResolver{dsn: rotationOldDSN}
+	dispatches := 0
+	router, clients := newAuthRetryRouter(t, resolver, func(index int, client *targetRouterRecordingClient) {
+		calls := 0
+		client.onPlanResult = func() (*ternv1.PlanResponse, error) {
+			dispatches++
+			calls++
+			switch {
+			case index == 0:
+				return nil, authRetryError()
+			case index == 1 && calls == 1:
+				return nil, errors.New("plan on rebuilt client: context deadline exceeded")
+			case index == 1:
+				return nil, authRetryError()
+			default:
+				return &ternv1.PlanResponse{PlanId: "healed"}, nil
+			}
+		}
+	}, nil)
+	var logged bytes.Buffer
+	router.logger = slog.New(slog.NewTextHandler(&logged, nil))
+	plan := func() (*ternv1.PlanResponse, error) {
+		return router.Plan(t.Context(), &ternv1.PlanRequest{Database: "orders", Target: "target", Type: storage.DatabaseTypeMySQL})
+	}
+
+	// The first read is refused, evicts, and its retry on the rebuilt client
+	// hits an unclassified failure.
+	_, err := plan()
+	require.Error(t, err)
+	var authErr *targetauth.Error
+	require.ErrorAs(t, err, &authErr)
+	assert.Equal(t, targetauth.AuthInvalidCredentials, authErr.Classification)
+	assert.ErrorContains(t, err, "context deadline exceeded")
+	assert.ErrorContains(t, err, "access denied")
+	assert.Equal(t, 2, dispatches)
+	require.Len(t, *clients, 2)
+	assert.Contains(t, selfHealLogLine(t, logged.String()), "cooldown_armed=false")
+	router.mu.Lock()
+	assert.Empty(t, router.authRetryBlockedUntil)
+	router.mu.Unlock()
+
+	// The next classified failure on the route is not suppressed: it evicts
+	// the rebuilt client and its retry on a third client succeeds.
+	logged.Reset()
+	resp, err := plan()
+	require.NoError(t, err)
+	assert.Equal(t, "healed", resp.PlanId)
+	assert.Equal(t, 4, dispatches)
+	require.Len(t, *clients, 3)
+	assert.True(t, (*clients)[1].closed)
+	assert.NotContains(t, logged.String(), "within the self-heal cooldown")
+
+	outcomes := map[string]int64{}
+	for _, point := range collectCounterPoints(t, reader, "schemabot.target.auth_retries.total") {
+		outcomes[counterAttr(t, point, "outcome")] += point.Value
+	}
+	assert.Equal(t, map[string]int64{"failed": 1, "success": 1}, outcomes)
+}
+
+// A retry that cannot re-resolve the target arms the cooldown like a refused
+// rebuild does: until it lapses, a classified failure on the route is returned
+// without another eviction even once the resolver has recovered.
+func TestTargetRouterAuthRetryResolveFailureArmsCooldown(t *testing.T) {
+	reader := newTernMetricsReader(t)
+	// The first build consumes two resolutions; the third is the retry's.
+	resolver := &authRetryResolver{dsn: rotationOldDSN, failAfter: 3}
+	dispatches := 0
+	router, clients := newAuthRetryRouter(t, resolver, func(_ int, client *targetRouterRecordingClient) {
+		client.onPlanResult = func() (*ternv1.PlanResponse, error) { dispatches++; return nil, authRetryError() }
+	}, nil)
+	plan := func() (*ternv1.PlanResponse, error) {
+		return router.Plan(t.Context(), &ternv1.PlanRequest{Database: "orders", Target: "target", Type: storage.DatabaseTypeMySQL})
+	}
+	_, err := plan()
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "secret backend unavailable")
+	assert.Equal(t, 1, dispatches)
+	require.Len(t, *clients, 1)
+
+	// The resolver recovers. The route has no current generation, so this
+	// read builds one; its classified failure is then suppressed rather than
+	// evicting the generation it just built.
+	resolver.failAfter = 0
+	_, err = plan()
+	require.Error(t, err)
+	var authErr *targetauth.Error
+	require.ErrorAs(t, err, &authErr)
+	assert.Equal(t, 2, dispatches)
+	require.Len(t, *clients, 2)
+	assert.False(t, (*clients)[1].closed)
+
+	outcomes := map[string]int64{}
+	for _, point := range collectCounterPoints(t, reader, "schemabot.target.auth_retries.total") {
+		outcomes[counterAttr(t, point, "outcome")] += point.Value
+	}
+	assert.Equal(t, map[string]int64{"resolve_error": 1, "suppressed": 1}, outcomes)
+}
+
+// A successful retry drops a cooldown that a concurrent request on the same
+// route armed after this request passed the eligibility check: the success
+// shows the re-resolved credential works, so the route stays eligible. The
+// peer's arming is modelled from inside the retry's dispatch.
+func TestTargetRouterSuccessfulRetryClearsConcurrentlyArmedCooldown(t *testing.T) {
+	resolver := &authRetryResolver{dsn: rotationOldDSN}
+	var router *TargetRouter
+	key := targetClientKey{target: "target", databaseType: storage.DatabaseTypeMySQL, database: "orders"}
+	router, clients := newAuthRetryRouter(t, resolver, func(index int, client *targetRouterRecordingClient) {
+		client.onPlanResult = func() (*ternv1.PlanResponse, error) {
+			if index == 0 {
+				return nil, authRetryError()
+			}
+			router.armAuthRetryCooldown(key)
+			return &ternv1.PlanResponse{PlanId: "healed"}, nil
+		}
+	}, nil)
+	resp, err := router.Plan(t.Context(), &ternv1.PlanRequest{Database: "orders", Target: "target", Type: storage.DatabaseTypeMySQL})
+	require.NoError(t, err)
+	assert.Equal(t, "healed", resp.PlanId)
+	require.Len(t, *clients, 2)
+	router.mu.Lock()
+	assert.Empty(t, router.authRetryBlockedUntil)
+	router.mu.Unlock()
 }
 
 func TestTargetRouterDoesNotRetryUnclassifiedFailure(t *testing.T) {
@@ -183,8 +328,9 @@ func TestTargetRouterAuthRetryResolveFailurePreservesCauses(t *testing.T) {
 // A retry that does not repair the failure arms a per-route cooldown: until it
 // lapses, a classified failure on the route is returned as it is, without
 // evicting the generation or re-resolving the target, so a secret the server
-// keeps rejecting costs one resolution per window rather than one per read. A
-// retry that succeeds clears the cooldown.
+// keeps rejecting costs one resolution per window rather than one per read.
+// The lapse alone re-enables the route; the retry it then permits leaves no
+// cooldown entry behind when it succeeds.
 func TestTargetRouterAuthRetryCooldownBoundsResolverLoad(t *testing.T) {
 	reader := newTernMetricsReader(t)
 	resolver := &authRetryResolver{dsn: rotationOldDSN}

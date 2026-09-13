@@ -14,7 +14,6 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	"github.com/block/schemabot/pkg/connreload"
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -64,11 +63,18 @@ type TargetRouter struct {
 
 	mu sync.Mutex
 	// authRetryBlockedUntil holds, per route, the end of the cooldown armed
-	// when a self-heal retry failed. A classified failure on the route before
-	// then is returned as it is, without evicting or re-resolving: whatever the
-	// resolver returned did not fix the failure, so re-resolving it once per
-	// request would only multiply resolver and secret load for as long as the
-	// misconfiguration lasts. A retry that succeeds clears the route's entry.
+	// when a self-heal retry proved that re-resolution does not fix the
+	// failure: the target could not be re-resolved, or the rebuilt client was
+	// refused with a classified failure of its own. A classified failure on
+	// the route before then is returned as it is, without evicting or
+	// re-resolving, so a misconfiguration costs one resolution per window
+	// rather than one per read. A retry that fails for any other reason
+	// (a deadline, a dial error, a plan-phase error) proves nothing about the
+	// credential and leaves the route eligible. The cooldown check drops a
+	// lapsed entry, so in a serial sequence the lapse is what makes the route
+	// eligible again; a successful retry also deletes the entry, which matters
+	// only when a concurrent request armed it after this one passed the
+	// check, and then the two resolve last-writer-wins in either direction.
 	authRetryBlockedUntil map[targetClientKey]time.Time
 	// current is the generation new work on a route goes to.
 	current map[targetClientKey]*targetClientGeneration
@@ -112,12 +118,14 @@ const (
 // size-triggered ownership sweep runs.
 const minimumSweepThreshold = 64
 
-// authRetryCooldown is how long a route whose self-heal retry failed returns
-// classified authentication failures without another eviction and
-// re-resolution. It is the storage pools' reload cooldown: both re-read the
-// same secrets machinery on a refused credential, and a stale secret or a
-// dropped grant costs one resolution per window on either path.
-const authRetryCooldown = connreload.DefaultCooldown
+// authRetryCooldown is how long a route whose self-heal retry was refused
+// again returns classified authentication failures without another eviction
+// and re-resolution. It matches the storage pools' reload cooldown by intent,
+// since both re-read the same secrets machinery on a refused credential, but
+// it is a routed read's window, not the pools': changing how often storage
+// retries a reload must not change how long a PR check keeps returning a
+// credential error.
+const authRetryCooldown = 30 * time.Second
 
 type targetClientKey struct {
 	target       string
@@ -268,10 +276,15 @@ func (r *TargetRouter) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*
 //
 // Every classification is eligible once, because a rotation can change the
 // database, role, or grant together with the password. What bounds the cost of
-// a failure no re-resolution fixes is the cooldown: a retry that fails arms
-// authRetryCooldown on the route, and until it lapses a classified failure on
-// that route is returned without eviction or re-resolution, so a stale secret
-// or a dropped grant costs one resolution per window rather than one per read.
+// a failure no re-resolution fixes is the cooldown: a retry that cannot
+// re-resolve the target, or whose rebuilt client is refused with a classified
+// failure again, arms authRetryCooldown on the route, and until it lapses a
+// classified failure on that route is returned without eviction or
+// re-resolution, so a stale secret or a dropped grant costs one resolution per
+// window rather than one per read. A retry that fails for an unclassified
+// reason does not arm it: a deadline or a dial error on the rebuilt client
+// says nothing about whether the re-resolved credential is right, and a
+// rotation is a burst of failures, so the next classified one stays eligible.
 //
 // Eviction is compare-and-delete on the generation pointer: a request that
 // failed on an old generation never evicts a newer one a concurrent request
@@ -337,21 +350,20 @@ func (r *TargetRouter) routeReadWithAuthRetry(ctx context.Context, operation, ta
 	}
 	retryErr := dispatch(retryGen, retryResolved)
 	r.release(retryGen)
-	outcome := "success"
-	if retryErr != nil {
-		outcome = "failed"
-		r.armAuthRetryCooldown(gen.key)
-	} else {
+	if retryErr == nil {
 		r.clearAuthRetryCooldown(gen.key)
+		metrics.RecordTargetAuthRetry(ctx, operation, resolved.DatabaseType, environment, classification.Label(), "success")
+		r.logger.Info("target router: authentication self-heal retry succeeded", logAttrs(2, evicted, oldHash, retryGen.dsnHash, "success")...)
+		return nil
 	}
-	metrics.RecordTargetAuthRetry(ctx, operation, retryResolved.DatabaseType, environment, classification.Label(), outcome)
-	attrs := logAttrs(2, evicted, oldHash, retryGen.dsnHash, outcome)
-	if retryErr != nil {
-		r.logger.Warn("target router: authentication self-heal retry failed", attrs...)
-		return fmt.Errorf("retry %s on re-resolved target %q: %w", operation, target, retryErr)
+	_, refusedAgain := targetauth.ClassificationOf(retryErr)
+	if refusedAgain {
+		r.armAuthRetryCooldown(gen.key)
 	}
-	r.logger.Info("target router: authentication self-heal retry succeeded", attrs...)
-	return nil
+	metrics.RecordTargetAuthRetry(ctx, operation, resolved.DatabaseType, environment, classification.Label(), "failed")
+	r.logger.Warn("target router: authentication self-heal retry failed",
+		append(logAttrs(2, evicted, oldHash, retryGen.dsnHash, "failed"), "cooldown_armed", refusedAgain)...)
+	return fmt.Errorf("%s on target %q failed authentication and the retry on the re-resolved target failed: %w (original failure: %w)", operation, target, retryErr, dispatchErr)
 }
 
 // authRetryCoolingDown reports whether a route's self-heal cooldown is still
@@ -373,15 +385,19 @@ func (r *TargetRouter) authRetryCoolingDown(key targetClientKey) (time.Duration,
 }
 
 // armAuthRetryCooldown starts a route's self-heal cooldown after a retry that
-// did not repair the failure.
+// showed re-resolution does not repair the failure.
 func (r *TargetRouter) armAuthRetryCooldown(key targetClientKey) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.authRetryBlockedUntil[key] = r.now().Add(authRetryCooldown)
 }
 
-// clearAuthRetryCooldown ends a route's self-heal cooldown after a retry that
-// repaired the failure, so the next failure on the route is eligible again.
+// clearAuthRetryCooldown drops a route's self-heal cooldown after a retry that
+// repaired the failure. A request only reaches its retry after
+// authRetryCoolingDown found no live entry, so in a serial sequence there is
+// nothing here to drop; the entry it removes is one a concurrent request on the
+// same route armed in the meantime, whose failed retry the success has just
+// contradicted.
 func (r *TargetRouter) clearAuthRetryCooldown(key targetClientKey) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

@@ -334,15 +334,30 @@ grant together with the password. If re-resolution returns the same bad shape,
 the bounded retry fails without a loop. The enum remains distinct so operators
 can distinguish secret mismatch from provisioning and configuration errors.
 
-A retry that fails, because re-resolution errors or because the rebuilt client
-is refused too, arms a per-route cooldown equal to the storage pools' reload
-cooldown (`connreload.DefaultCooldown`). Until it lapses, a classified failure
-on that route is returned to the caller as it is: no eviction, no
-re-resolution, no rebuild. A secret the server keeps rejecting, a dropped
-grant, or a database that does not exist therefore costs one re-resolution per
-window rather than one per read, and the suppressed reads are counted so the
-condition stays visible. A retry that succeeds clears the cooldown, so the next
-failure on the route is eligible immediately.
+A retry that shows re-resolution does not fix the failure, because
+re-resolution errors or because the rebuilt client is refused with a classified
+failure of its own, arms a per-route cooldown of thirty seconds. Until it
+lapses, a classified failure on that route is returned to the caller as it is:
+no eviction, no re-resolution, no rebuild. A secret the server keeps rejecting,
+a dropped grant, or a database that does not exist therefore costs one
+re-resolution per window rather than one per read, and the suppressed reads are
+counted so the condition stays visible. A retry that fails for any other reason
+(a deadline, a dial error, an error after the connection opened) does not arm
+the cooldown: it proves nothing about the re-resolved credential, and a rotation
+is a burst of failures, so the next classified failure on the route is still
+eligible to evict and retry.
+
+The cooldown ends by lapsing. The eligibility check drops a lapsed entry before
+a retry can run, so in a serial sequence of requests nothing else re-enables the
+route. A successful retry also deletes the route's entry, which only has an
+effect when a concurrent request armed the cooldown after this request passed
+the check; the two then resolve last-writer-wins in either direction, and the
+worst case is one window of suppression on a route whose credential now works.
+
+The window is the same length as the storage pools' reload cooldown by intent,
+since both re-read the same secrets machinery on a refused credential, but it is
+its own constant: the reload cadence of storage must not silently change how
+long a PR check keeps returning a credential error.
 
 Network refusal, DNS failure, context cancellation, timeout, TLS negotiation or
 certificate failure, protocol errors, query errors, and all other SQLSTATE or
@@ -372,7 +387,7 @@ recipe's form rather than either neighbor's.
 | --- | --- | --- |
 | `schemabot.target.probe.total` | `database_type`, `environment`, `outcome` | One startup result per enumerated target. Outcomes: `success`, `auth_invalid_credentials`, `auth_no_access`, `auth_no_database`, `resolve_error`, `timeout`, `connection_error`. |
 | `schemabot.target.client_evictions.total` | `database_type`, `environment`, `reason` | Replaced generations. Reasons: `dsn_changed`, `auth_invalid_credentials`, `auth_no_access`, `auth_no_database`. Target is omitted from this hot-path counter to bound cardinality. |
-| `schemabot.target.auth_retries.total` | `operation`, `database_type`, `environment`, `classification`, `outcome` | Eligible single retries by outcome: `success`, `failed`, `resolve_error` (the target could not be re-resolved or its client rebuilt), or `suppressed` (the route's cooldown was running, so the failure was returned without a retry). |
+| `schemabot.target.auth_retries.total` | `operation`, `database_type`, `environment`, `classification`, `outcome` | Eligible single retries by outcome: `success`, `failed` (the rebuilt client's dispatch failed; the paired log's `cooldown_armed` says whether it was refused again), `resolve_error` (the target could not be re-resolved or its client rebuilt), or `suppressed` (the route's cooldown was running, so the failure was returned without a retry). |
 
 None of the three counters carries a target label; every log beside them names
 the target, so the series count is bounded by outcomes and environments rather
@@ -389,9 +404,10 @@ Every probe log includes `target`, `database_type`, `environment`, `outcome`, an
 self-heal log includes those routing fields plus `namespace`, `operation`,
 `classification`, `attempt`, `evicted`, `old_dsn_hash`, `new_dsn_hash`, and
 `outcome`; `evicted` records whether this request replaced the failed
-generation or found a concurrent request had already done so. A read the
-cooldown suppresses logs the same fields with `attempt` 1 and
-`cooldown_remaining_ms`.
+generation or found a concurrent request had already done so. A failed retry
+adds `cooldown_armed`, which is true only when the rebuilt client was refused
+with a classified failure. A read the cooldown suppresses logs the same fields
+with `attempt` 1 and `cooldown_remaining_ms`.
 Hashes are short correlation identifiers, never reversible credentials. Raw
 DSNs and secret values are forbidden. Apply-scoped logs continue to use the
 existing `LogAttrs()` helpers and add only these call-specific fields.
