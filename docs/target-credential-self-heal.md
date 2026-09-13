@@ -334,6 +334,16 @@ grant together with the password. If re-resolution returns the same bad shape,
 the bounded retry fails without a loop. The enum remains distinct so operators
 can distinguish secret mismatch from provisioning and configuration errors.
 
+A retry that fails, because re-resolution errors or because the rebuilt client
+is refused too, arms a per-route cooldown equal to the storage pools' reload
+cooldown (`connreload.DefaultCooldown`). Until it lapses, a classified failure
+on that route is returned to the caller as it is: no eviction, no
+re-resolution, no rebuild. A secret the server keeps rejecting, a dropped
+grant, or a database that does not exist therefore costs one re-resolution per
+window rather than one per read, and the suppressed reads are counted so the
+condition stays visible. A retry that succeeds clears the cooldown, so the next
+failure on the route is eligible immediately.
+
 Network refusal, DNS failure, context cancellation, timeout, TLS negotiation or
 certificate failure, protocol errors, query errors, and all other SQLSTATE or
 MySQL codes are `NotAuth`. PostgreSQL `28000` is deliberately among them: a
@@ -362,7 +372,7 @@ recipe's form rather than either neighbor's.
 | --- | --- | --- |
 | `schemabot.target.probe.total` | `database_type`, `environment`, `outcome` | One startup result per enumerated target. Outcomes: `success`, `auth_invalid_credentials`, `auth_no_access`, `auth_no_database`, `resolve_error`, `timeout`, `connection_error`. |
 | `schemabot.target.client_evictions.total` | `database_type`, `environment`, `reason` | Replaced generations. Reasons: `dsn_changed`, `auth_invalid_credentials`, `auth_no_access`, `auth_no_database`. Target is omitted from this hot-path counter to bound cardinality. |
-| `schemabot.target.auth_retries.total` | `operation`, `database_type`, `environment`, `classification`, `outcome` | Eligible single retries and whether they succeeded, failed, or could not re-resolve. |
+| `schemabot.target.auth_retries.total` | `operation`, `database_type`, `environment`, `classification`, `outcome` | Eligible single retries by outcome: `success`, `failed`, `resolve_error` (the target could not be re-resolved or its client rebuilt), or `suppressed` (the route's cooldown was running, so the failure was returned without a retry). |
 
 None of the three counters carries a target label; every log beside them names
 the target, so the series count is bounded by outcomes and environments rather
@@ -377,7 +387,11 @@ or storm is an actionable signal that rotation or provisioning is unhealthy.
 Every probe log includes `target`, `database_type`, `environment`, `outcome`, and
 `duration_ms`; failures also include `classification` and `error`. Every
 self-heal log includes those routing fields plus `namespace`, `operation`,
-`classification`, `attempt`, `old_dsn_hash`, `new_dsn_hash`, and `outcome`.
+`classification`, `attempt`, `evicted`, `old_dsn_hash`, `new_dsn_hash`, and
+`outcome`; `evicted` records whether this request replaced the failed
+generation or found a concurrent request had already done so. A read the
+cooldown suppresses logs the same fields with `attempt` 1 and
+`cooldown_remaining_ms`.
 Hashes are short correlation identifiers, never reversible credentials. Raw
 DSNs and secret values are forbidden. Apply-scoped logs continue to use the
 existing `LogAttrs()` helpers and add only these call-specific fields.

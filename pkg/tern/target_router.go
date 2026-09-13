@@ -10,9 +10,11 @@ import (
 	"maps"
 	"strings"
 	"sync"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 
+	"github.com/block/schemabot/pkg/connreload"
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -58,8 +60,16 @@ type TargetRouter struct {
 	storage  storage.Storage
 	logger   *slog.Logger
 	factory  LocalClientFactory
+	now      func() time.Time
 
 	mu sync.Mutex
+	// authRetryBlockedUntil holds, per route, the end of the cooldown armed
+	// when a self-heal retry failed. A classified failure on the route before
+	// then is returned as it is, without evicting or re-resolving: whatever the
+	// resolver returned did not fix the failure, so re-resolving it once per
+	// request would only multiply resolver and secret load for as long as the
+	// misconfiguration lasts. A retry that succeeds clears the route's entry.
+	authRetryBlockedUntil map[targetClientKey]time.Time
 	// current is the generation new work on a route goes to.
 	current map[targetClientKey]*targetClientGeneration
 	// creating marks routes with a client build in progress; it is closed when
@@ -101,6 +111,13 @@ const (
 // minimumSweepThreshold is the smallest applyOwners size at which a
 // size-triggered ownership sweep runs.
 const minimumSweepThreshold = 64
+
+// authRetryCooldown is how long a route whose self-heal retry failed returns
+// classified authentication failures without another eviction and
+// re-resolution. It is the storage pools' reload cooldown: both re-read the
+// same secrets machinery on a refused credential, and a stale secret or a
+// dropped grant costs one resolution per window on either path.
+const authRetryCooldown = connreload.DefaultCooldown
 
 type targetClientKey struct {
 	target       string
@@ -161,17 +178,19 @@ func NewTargetRouter(config TargetRouterConfig) (*TargetRouter, error) {
 		}
 	}
 	return &TargetRouter{
-		resolver:         config.Resolver,
-		storage:          config.Storage,
-		logger:           logger,
-		factory:          factory,
-		current:          make(map[targetClientKey]*targetClientGeneration),
-		creating:         make(map[targetClientKey]chan struct{}),
-		retiring:         make(map[*targetClientGeneration]struct{}),
-		applyOwners:      make(map[string]*targetClientGeneration),
-		sweepAt:          minimumSweepThreshold,
-		activeObservers:  make(map[int64]ProgressObserver),
-		pendingObservers: make(map[targetClientKey]ProgressObserver),
+		resolver:              config.Resolver,
+		storage:               config.Storage,
+		logger:                logger,
+		factory:               factory,
+		now:                   time.Now,
+		authRetryBlockedUntil: make(map[targetClientKey]time.Time),
+		current:               make(map[targetClientKey]*targetClientGeneration),
+		creating:              make(map[targetClientKey]chan struct{}),
+		retiring:              make(map[*targetClientGeneration]struct{}),
+		applyOwners:           make(map[string]*targetClientGeneration),
+		sweepAt:               minimumSweepThreshold,
+		activeObservers:       make(map[int64]ProgressObserver),
+		pendingObservers:      make(map[targetClientKey]ProgressObserver),
 	}, nil
 }
 
@@ -247,6 +266,13 @@ func (r *TargetRouter) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*
 // targetauth.Error; a failure after the plan is persisted comes from storage and
 // never carries it, so a retry here always precedes any persisted plan.
 //
+// Every classification is eligible once, because a rotation can change the
+// database, role, or grant together with the password. What bounds the cost of
+// a failure no re-resolution fixes is the cooldown: a retry that fails arms
+// authRetryCooldown on the route, and until it lapses a classified failure on
+// that route is returned without eviction or re-resolution, so a stale secret
+// or a dropped grant costs one resolution per window rather than one per read.
+//
 // Eviction is compare-and-delete on the generation pointer: a request that
 // failed on an old generation never evicts a newer one a concurrent request
 // already published. Each acquired generation is released exactly once, and the
@@ -264,6 +290,19 @@ func (r *TargetRouter) routeReadWithAuthRetry(ctx context.Context, operation, ta
 		r.release(gen)
 		return dispatchErr
 	}
+	logAttrs := func(attempt int, evicted bool, oldHash, newHash, outcome string) []any {
+		return []any{"target", target, "database_type", resolved.DatabaseType, "environment", environment, "namespace", namespace,
+			"operation", operation, "classification", classification.Label(), "attempt", attempt, "evicted", evicted,
+			"old_dsn_hash", oldHash, "new_dsn_hash", newHash, "outcome", outcome}
+	}
+
+	if remaining, cooling := r.authRetryCoolingDown(gen.key); cooling {
+		r.release(gen)
+		metrics.RecordTargetAuthRetry(ctx, operation, resolved.DatabaseType, environment, classification.Label(), "suppressed")
+		r.logger.Warn("target router: authentication failure within the self-heal cooldown; returning it without evicting or re-resolving",
+			append(logAttrs(1, false, gen.dsnHash, "", "suppressed"), "cooldown_remaining_ms", remaining.Milliseconds())...)
+		return dispatchErr
+	}
 
 	r.mu.Lock()
 	evicted := r.current[gen.key] == gen
@@ -274,40 +313,79 @@ func (r *TargetRouter) routeReadWithAuthRetry(ctx context.Context, operation, ta
 	r.mu.Unlock()
 	if evicted {
 		metrics.RecordTargetClientEviction(ctx, resolved.DatabaseType, environment, classification.Label())
-	} else {
-		r.logger.Debug("target router: peer already replaced authentication-failed client generation; retry uses the current generation",
-			"target", target, "database_type", resolved.DatabaseType, "environment", environment,
-			"namespace", namespace, "operation", operation, "classification", classification.Label(),
-			"old_dsn_hash", gen.dsnHash)
 	}
+	// A peer may already have replaced the failed generation (a rotation
+	// observed by a concurrent request); the retry then reuses the current
+	// generation. The single self-heal log below says which via evicted, so
+	// every self-heal emits exactly one log carrying the full field contract.
 	oldHash := gen.dsnHash
 	r.release(gen)
+	if evicted {
+		// The evicted generation joined the retiring set, as a replaced one
+		// does on rotation; the same sweep closes it once its applies have
+		// settled rather than leaving it to the next size-triggered sweep.
+		r.sweepOwnership(ctx)
+	}
 
-	retryGen, retryResolved, resolveErr := r.clientForTarget(ctx, target, databaseType, environment, namespace)
-	if resolveErr != nil {
-		metrics.RecordTargetAuthRetry(ctx, operation, databaseType, environment, classification.Label(), "resolve_error")
-		r.logger.Warn("target router: authentication self-heal retry could not resolve target",
-			"target", target, "database_type", databaseType, "environment", environment, "namespace", namespace,
-			"operation", operation, "classification", classification.Label(), "attempt", 2,
-			"old_dsn_hash", oldHash, "new_dsn_hash", "", "outcome", "resolve_error")
-		return fmt.Errorf("re-resolve target %q for %s after authentication failure: %w; resolve target again: %w", target, operation, dispatchErr, resolveErr)
+	retryGen, retryResolved, rerouteErr := r.clientForTarget(ctx, target, databaseType, environment, namespace)
+	if rerouteErr != nil {
+		r.armAuthRetryCooldown(gen.key)
+		metrics.RecordTargetAuthRetry(ctx, operation, resolved.DatabaseType, environment, classification.Label(), "resolve_error")
+		r.logger.Warn("target router: authentication self-heal retry could not re-resolve the target or rebuild its client",
+			append(logAttrs(2, evicted, oldHash, "", "resolve_error"), "error", rerouteErr)...)
+		return fmt.Errorf("%s on target %q failed authentication and the retry could not re-resolve the target or rebuild its client: %w (original failure: %w)", operation, target, rerouteErr, dispatchErr)
 	}
 	retryErr := dispatch(retryGen, retryResolved)
 	r.release(retryGen)
 	outcome := "success"
 	if retryErr != nil {
 		outcome = "failed"
+		r.armAuthRetryCooldown(gen.key)
+	} else {
+		r.clearAuthRetryCooldown(gen.key)
 	}
 	metrics.RecordTargetAuthRetry(ctx, operation, retryResolved.DatabaseType, environment, classification.Label(), outcome)
-	attrs := []any{"target", target, "database_type", retryResolved.DatabaseType, "environment", environment, "namespace", namespace,
-		"operation", operation, "classification", classification.Label(), "attempt", 2,
-		"old_dsn_hash", oldHash, "new_dsn_hash", retryGen.dsnHash, "outcome", outcome}
+	attrs := logAttrs(2, evicted, oldHash, retryGen.dsnHash, outcome)
 	if retryErr != nil {
 		r.logger.Warn("target router: authentication self-heal retry failed", attrs...)
 		return fmt.Errorf("retry %s on re-resolved target %q: %w", operation, target, retryErr)
 	}
 	r.logger.Info("target router: authentication self-heal retry succeeded", attrs...)
 	return nil
+}
+
+// authRetryCoolingDown reports whether a route's self-heal cooldown is still
+// running and how much of it remains. A lapsed entry is dropped so the map
+// holds only routes under an active cooldown.
+func (r *TargetRouter) authRetryCoolingDown(key targetClientKey) (time.Duration, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	until, armed := r.authRetryBlockedUntil[key]
+	if !armed {
+		return 0, false
+	}
+	remaining := until.Sub(r.now())
+	if remaining <= 0 {
+		delete(r.authRetryBlockedUntil, key)
+		return 0, false
+	}
+	return remaining, true
+}
+
+// armAuthRetryCooldown starts a route's self-heal cooldown after a retry that
+// did not repair the failure.
+func (r *TargetRouter) armAuthRetryCooldown(key targetClientKey) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.authRetryBlockedUntil[key] = r.now().Add(authRetryCooldown)
+}
+
+// clearAuthRetryCooldown ends a route's self-heal cooldown after a retry that
+// repaired the failure, so the next failure on the route is eligible again.
+func (r *TargetRouter) clearAuthRetryCooldown(key targetClientKey) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.authRetryBlockedUntil, key)
 }
 
 // Apply starts a stored plan on the resolved target.

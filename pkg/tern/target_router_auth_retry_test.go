@@ -1,11 +1,14 @@
 package tern
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/block/mysql"
 	"github.com/stretchr/testify/assert"
@@ -95,7 +98,11 @@ func TestTargetRouterAuthRetryEligibleReads(t *testing.T) {
 			default:
 				require.Fail(t, "unknown operation", operation)
 			}
-			assert.Equal(t, 2, resolver.calls)
+			// Each cache miss resolves twice: once for the route key and
+			// once under the creation slot to publish the identity it
+			// resolved; the failed first build and the retry's build make
+			// two misses.
+			assert.Equal(t, 4, resolver.calls)
 			assert.Equal(t, 2, dispatches)
 			require.Len(t, *clients, 2)
 			assert.True(t, (*clients)[0].closed)
@@ -146,19 +153,148 @@ func TestTargetRouterDoesNotRetryUnclassifiedFailure(t *testing.T) {
 	assert.False(t, (*clients)[0].closed)
 }
 
+// A retry whose re-resolution fails reports both causes, and its metric and
+// log carry the database type the first resolution established even when the
+// request left the type for the resolver to fill in.
 func TestTargetRouterAuthRetryResolveFailurePreservesCauses(t *testing.T) {
 	reader := newTernMetricsReader(t)
-	resolver := &authRetryResolver{dsn: rotationOldDSN, failAfter: 2}
+	// The first build consumes two resolutions; the third is the retry's.
+	resolver := &authRetryResolver{dsn: rotationOldDSN, failAfter: 3}
 	router, _ := newAuthRetryRouter(t, resolver, func(_ int, client *targetRouterRecordingClient) {
 		client.onPlanResult = func() (*ternv1.PlanResponse, error) { return nil, authRetryError() }
 	}, nil)
-	_, err := router.Plan(t.Context(), &ternv1.PlanRequest{Database: "orders", Target: "target", Type: storage.DatabaseTypeMySQL})
+	var logged bytes.Buffer
+	router.logger = slog.New(slog.NewTextHandler(&logged, nil))
+	_, err := router.Plan(t.Context(), &ternv1.PlanRequest{Database: "orders", Target: "target"})
 	require.Error(t, err)
-	assert.ErrorContains(t, err, "authentication failure")
+	assert.ErrorContains(t, err, "failed authentication")
 	assert.ErrorContains(t, err, "secret backend unavailable")
+	assert.ErrorContains(t, err, "access denied")
 	points := collectCounterPoints(t, reader, "schemabot.target.auth_retries.total")
 	require.Len(t, points, 1)
 	assert.Equal(t, "resolve_error", counterAttr(t, points[0], "outcome"))
+	assert.Equal(t, storage.DatabaseTypeMySQL, counterAttr(t, points[0], "database_type"))
+	selfHeal := selfHealLogLine(t, logged.String())
+	assert.Contains(t, selfHeal, "database_type="+storage.DatabaseTypeMySQL)
+	assert.Contains(t, selfHeal, "outcome=resolve_error")
+	assert.Contains(t, selfHeal, "evicted=true")
+}
+
+// A retry that does not repair the failure arms a per-route cooldown: until it
+// lapses, a classified failure on the route is returned as it is, without
+// evicting the generation or re-resolving the target, so a secret the server
+// keeps rejecting costs one resolution per window rather than one per read. A
+// retry that succeeds clears the cooldown.
+func TestTargetRouterAuthRetryCooldownBoundsResolverLoad(t *testing.T) {
+	reader := newTernMetricsReader(t)
+	resolver := &authRetryResolver{dsn: rotationOldDSN}
+	dispatches := 0
+	router, clients := newAuthRetryRouter(t, resolver, func(index int, client *targetRouterRecordingClient) {
+		client.onPlanResult = func() (*ternv1.PlanResponse, error) {
+			dispatches++
+			if index < 2 {
+				return nil, authRetryError()
+			}
+			return &ternv1.PlanResponse{PlanId: "healed"}, nil
+		}
+	}, nil)
+	clock := time.Unix(1_700_000_000, 0)
+	router.now = func() time.Time { return clock }
+	var logged bytes.Buffer
+	router.logger = slog.New(slog.NewTextHandler(&logged, nil))
+	plan := func() (*ternv1.PlanResponse, error) {
+		return router.Plan(t.Context(), &ternv1.PlanRequest{Database: "orders", Target: "target", Type: storage.DatabaseTypeMySQL})
+	}
+
+	// The first failure evicts and retries; the retry fails too and arms the
+	// cooldown.
+	_, err := plan()
+	require.Error(t, err)
+	assert.Equal(t, 2, dispatches)
+	assert.Equal(t, 4, resolver.calls)
+	require.Len(t, *clients, 2)
+	assert.True(t, (*clients)[0].closed)
+
+	// Inside the cooldown the failure comes straight back: one dispatch on
+	// the current generation, only the routing resolution that every read
+	// pays, no eviction, no rebuild, typed error intact.
+	logged.Reset()
+	_, err = plan()
+	require.Error(t, err)
+	var authErr *targetauth.Error
+	require.ErrorAs(t, err, &authErr)
+	assert.Equal(t, targetauth.AuthInvalidCredentials, authErr.Classification)
+	assert.Equal(t, 3, dispatches)
+	assert.Equal(t, 5, resolver.calls)
+	assert.Len(t, *clients, 2)
+	assert.False(t, (*clients)[1].closed)
+	suppressed := logged.String()
+	assert.Contains(t, suppressed, "within the self-heal cooldown")
+	assert.Contains(t, suppressed, "outcome=suppressed")
+	assert.Contains(t, suppressed, "attempt=1")
+	assert.Contains(t, suppressed, "cooldown_remaining_ms="+fmt.Sprint(authRetryCooldown.Milliseconds()))
+	assert.NotContains(t, suppressed, rotationOldDSN)
+
+	// Just short of the window's end the failure is still suppressed.
+	clock = clock.Add(authRetryCooldown - time.Millisecond)
+	_, err = plan()
+	require.Error(t, err)
+	assert.Equal(t, 4, dispatches)
+	assert.Equal(t, 6, resolver.calls)
+
+	// Once it lapses the route is eligible again: the routing resolution,
+	// then the eviction and the retry's two-resolution rebuild. This retry
+	// repairs the failure and clears the cooldown.
+	clock = clock.Add(time.Millisecond)
+	resp, err := plan()
+	require.NoError(t, err)
+	assert.Equal(t, "healed", resp.PlanId)
+	assert.Equal(t, 6, dispatches)
+	assert.Equal(t, 9, resolver.calls)
+	require.Len(t, *clients, 3)
+	assert.True(t, (*clients)[1].closed)
+	router.mu.Lock()
+	assert.Empty(t, router.authRetryBlockedUntil)
+	router.mu.Unlock()
+
+	outcomes := map[string]int64{}
+	for _, point := range collectCounterPoints(t, reader, "schemabot.target.auth_retries.total") {
+		outcomes[counterAttr(t, point, "outcome")] += point.Value
+	}
+	assert.Equal(t, map[string]int64{"failed": 1, "suppressed": 2, "success": 1}, outcomes)
+}
+
+// The generation an authentication failure evicts is swept like one a
+// rotation replaced: when the apply it owns has already finished, the
+// eviction closes it instead of leaving it open until the next
+// size-triggered sweep.
+func TestTargetRouterAuthEvictionSweepsSettledOwnership(t *testing.T) {
+	resolver := &authRetryResolver{dsn: rotationOldDSN}
+	apply, store := runningOrdersApply(t, "apply-routed")
+	router, clients := newAuthRetryRouter(t, resolver, func(index int, client *targetRouterRecordingClient) {
+		client.onPlanResult = func() (*ternv1.PlanResponse, error) {
+			if index == 0 {
+				return nil, authRetryError()
+			}
+			return &ternv1.PlanResponse{PlanId: "plan"}, nil
+		}
+	}, store)
+	_, err := router.Apply(t.Context(), &ternv1.ApplyRequest{Database: "orders", Target: "dsid-orders-prod", Type: storage.DatabaseTypeMySQL})
+	require.NoError(t, err)
+	router.mu.Lock()
+	assert.Len(t, router.applyOwners, 1)
+	router.mu.Unlock()
+
+	apply.State = state.Apply.Completed
+	_, err = router.Plan(t.Context(), &ternv1.PlanRequest{Database: "orders", Target: "dsid-orders-prod", Type: storage.DatabaseTypeMySQL})
+	require.NoError(t, err)
+	require.Len(t, *clients, 2)
+	assert.True(t, (*clients)[0].closed)
+	assert.False(t, (*clients)[1].closed)
+	router.mu.Lock()
+	assert.Empty(t, router.applyOwners)
+	assert.Empty(t, router.retiring)
+	router.mu.Unlock()
 }
 
 func TestTargetRouterAuthRetryDoesNotEvictPeerReplacement(t *testing.T) {
@@ -178,6 +314,8 @@ func TestTargetRouterAuthRetryDoesNotEvictPeerReplacement(t *testing.T) {
 			return nil, authRetryError()
 		}
 	}, nil)
+	var logged bytes.Buffer
+	router.logger = slog.New(slog.NewTextHandler(&logged, nil))
 	resp, err := router.Plan(t.Context(), &ternv1.PlanRequest{Database: "orders", Target: "target", Type: storage.DatabaseTypeMySQL})
 	require.NoError(t, err)
 	assert.Equal(t, "peer", resp.PlanId)
@@ -186,6 +324,33 @@ func TestTargetRouterAuthRetryDoesNotEvictPeerReplacement(t *testing.T) {
 	assert.Same(t, peer, router.current[peer.key])
 	router.mu.Unlock()
 	assert.False(t, (*clients)[1].closed)
+
+	// The self-heal log carries its full field contract even when a peer
+	// already replaced the failed generation: one definitive log per
+	// self-heal, with evicted saying whether this request did the replacing.
+	selfHeal := selfHealLogLine(t, logged.String())
+	assert.Contains(t, selfHeal, "authentication self-heal retry succeeded")
+	assert.Contains(t, selfHeal, "evicted=false")
+	assert.Contains(t, selfHeal, "attempt=2")
+	assert.Contains(t, selfHeal, "outcome=success")
+	assert.Contains(t, selfHeal, "old_dsn_hash="+connectionIdentityHash(&inventory.Target{Target: "target", DatabaseType: storage.DatabaseTypeMySQL, DSN: rotationOldDSN}))
+	assert.Contains(t, selfHeal, "new_dsn_hash="+peer.dsnHash)
+	assert.NotContains(t, logged.String(), rotationOldDSN)
+	assert.NotContains(t, logged.String(), rotationNewDSN)
+}
+
+// selfHealLogLine returns the single authentication self-heal log line from
+// captured text-handler output, failing when there is not exactly one.
+func selfHealLogLine(t *testing.T, logs string) string {
+	t.Helper()
+	var lines []string
+	for line := range strings.SplitSeq(strings.TrimSpace(logs), "\n") {
+		if strings.Contains(line, "authentication self-heal retry") {
+			lines = append(lines, line)
+		}
+	}
+	require.Len(t, lines, 1, "expected exactly one self-heal log, got:\n%s", logs)
+	return lines[0]
 }
 
 func TestTargetRouterApplyAuthenticationFailureIsNotRetried(t *testing.T) {
