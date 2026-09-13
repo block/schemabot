@@ -115,11 +115,18 @@ type targetRouterRecordingClient struct {
 	onPlan func()
 	// onResume runs inside each resume, standing in for the drive a local
 	// client runs to completion within the call.
-	onResume func()
+	onResume     func()
+	onPullSchema func() (*ternv1.PullSchemaResponse, error)
+	onPlanResult func() (*ternv1.PlanResponse, error)
+	onPlanDiff   func() (*ternv1.PlanDiffResponse, error)
+	onApply      func() (*ternv1.ApplyResponse, error)
 }
 
 func (c *targetRouterRecordingClient) PullSchema(_ context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
 	c.pullReq = req
+	if c.onPullSchema != nil {
+		return c.onPullSchema()
+	}
 	return &ternv1.PullSchemaResponse{Database: req.Database, Type: req.Type}, nil
 }
 
@@ -128,16 +135,25 @@ func (c *targetRouterRecordingClient) Plan(_ context.Context, req *ternv1.PlanRe
 	if c.onPlan != nil {
 		c.onPlan()
 	}
+	if c.onPlanResult != nil {
+		return c.onPlanResult()
+	}
 	return &ternv1.PlanResponse{PlanId: "plan-routed"}, nil
 }
 
 func (c *targetRouterRecordingClient) PlanDiff(_ context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
 	c.planDiffReq = req
+	if c.onPlanDiff != nil {
+		return c.onPlanDiff()
+	}
 	return &ternv1.PlanDiffResponse{Engine: ternv1.Engine_ENGINE_PLANETSCALE}, nil
 }
 
 func (c *targetRouterRecordingClient) Apply(_ context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
 	c.applyReq = req
+	if c.onApply != nil {
+		return c.onApply()
+	}
 	return &ternv1.ApplyResponse{Accepted: true, ApplyId: "apply-routed"}, nil
 }
 
