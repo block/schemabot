@@ -32,20 +32,18 @@ func (t ExecutionTarget) MemberID() string {
 	return t.Deployment + "/" + t.Target
 }
 
-// DisplayNames returns the operator-facing name of each member of a rollout, in
-// the order given. MemberID is the identity every comparison must use, but it is
-// not always the right thing to show: a deployment that addresses exactly one
-// target is already unambiguous, and naming it "deployment/target" everywhere
-// would add a second half that never distinguishes anything. So a member is
-// named by its deployment alone unless its deployment addresses more than one
-// distinct target in this rollout, in which case every member of that deployment
-// is named by its full MemberID.
+// MultiTargetDeployments reports which deployments of a member set address more
+// than one distinct target.
 //
-// Keying on distinct targets, rather than on how many members a deployment has,
-// is what keeps a keyed or sharded apply — several operations of one deployment
-// against the same target — named by the deployment, where the extra half would
-// be noise that still did not tell the operations apart.
-func DisplayNames(members []ExecutionTarget) []string {
+// It is the point at which a deployment name stops identifying one member, and
+// so the one place anything qualifies itself with the target: the name an
+// operator reads, and the key an operation is stored under. Deriving both from
+// this keeps them from disagreeing about when a target is worth naming.
+//
+// Distinct targets rather than member count is the test on purpose. A keyed or
+// sharded apply has several members on one target, and naming the target there
+// would add a component that still does not tell them apart.
+func MultiTargetDeployments(members []ExecutionTarget) map[string]bool {
 	targetsByDeployment := make(map[string]map[string]struct{}, len(members))
 	for _, m := range members {
 		if m.Target == "" {
@@ -56,10 +54,28 @@ func DisplayNames(members []ExecutionTarget) []string {
 		}
 		targetsByDeployment[m.Deployment][m.Target] = struct{}{}
 	}
+	multi := make(map[string]bool, len(targetsByDeployment))
+	for deployment, targets := range targetsByDeployment {
+		if len(targets) > 1 {
+			multi[deployment] = true
+		}
+	}
+	return multi
+}
 
+// DisplayNames returns the operator-facing name of each member of a rollout, in
+// the order given. MemberID is the identity every comparison must use, but it is
+// not always the right thing to show: a deployment that addresses exactly one
+// target is already unambiguous, and naming it "deployment/target" everywhere
+// would add a second half that never distinguishes anything. So a member is
+// named by its deployment alone unless its deployment addresses more than one
+// distinct target in this rollout, in which case every member of that deployment
+// is named by its full MemberID.
+func DisplayNames(members []ExecutionTarget) []string {
+	multi := MultiTargetDeployments(members)
 	names := make([]string, len(members))
 	for i, m := range members {
-		if len(targetsByDeployment[m.Deployment]) > 1 {
+		if multi[m.Deployment] {
 			names[i] = m.MemberID()
 			continue
 		}
