@@ -77,7 +77,7 @@ the startup path                        the CLI path
                   nothing else
 ```
 
-Three consequences worth holding onto:
+Four consequences worth holding onto:
 
 - **`storage apply` is what a boot does.** Not an equivalent of it — the same
   differ, the same refusal, the same lock. So converging ahead of a roll cannot
@@ -388,6 +388,12 @@ $ schemabot storage apply
 Do you want to apply these changes to schemabot on db-1.example (mysql)? Only 'yes' will be accepted: yes
 ✓ Ran 1 statement against schemabot on db-1.example. Nothing is outstanding.
 ```
+
+A preview that finds nothing outstanding still offers the run, and taking it is
+worth a moment: the bootstrap converges more than the catalog. It also clears
+the schema change engine's leftover tables, which outlive a convergence that was
+interrupted and which a diff of the catalog cannot see, so a database whose
+catalog matches can still be carrying them.
 
 The preview names the schema embedded in the binary that will run the
 convergence, which is the one thing on this screen the operator cannot choose.
