@@ -575,6 +575,47 @@ Common fail-closed scenarios:
 | Schema changes were removed while an apply may still be running | The live database may still change even though the current PR no longer represents that change. | Inspect the in-flight apply in Tern or with the CLI. If the change reached the live database, either put the schema change back in the PR and comment `schemabot plan -e <environment>` before applying again, or roll back/reconcile the live schema first. |
 | Stale in-progress row after a pod crash | Stored check state says an apply is running, but the watcher may have died before publishing the terminal result. | Comment `schemabot plan -e <environment>` or `schemabot apply -e <environment>` to trigger stale-check reconciliation. If reconciliation fails, inspect SchemaBot storage and the latest apply for that database. |
 
+### Explaining a blocked check
+
+`schemabot checks show <pull-request>` prints the Check Run on the pull
+request head beside every stored check row, and reads each row against the
+commit the pull request is gated on. That last part is what a Check Run cannot
+tell you: a row recorded for an earlier commit contributes to the aggregate as
+blocking whatever it concluded, so a successful apply and a blocked merge gate
+are not a contradiction.
+
+The pull request is named however you already have it: by URL, by
+`owner/name#number`, or by `owner/name` with the number as a second argument.
+
+Each row carries a stable `reason` code, and the two that decide what to do
+next are `awaiting_replan_after_apply`, which SchemaBot converges on its own,
+and `reconciliation_owed`, which it never will. The command separates them
+under "Waiting on SchemaBot" and "Waiting on an operator" so the distinction
+does not have to be inferred from a status and a conclusion. The full set of
+codes is defined in `pkg/checkstate`, and `--json` emits them alongside the
+`blocking` and `self_converging` flags for a script or an agent to branch on.
+
+A durable `blocking_reason` decides the reading before status or ownership
+does, because that is how the publisher treats it: the block was recorded to
+survive writes that did not re-evaluate the condition. A completed rollback
+clears its apply ownership on the way out, so reading ownership first would
+report a reconciliation as an ordinary plan verdict a newer plan supersedes.
+Every blocking reason SchemaBot writes is classified in `pkg/checkstate`, and
+a test over the writers' own registry fails when a new one ships without a
+classification; one this version does not recognize is read as needing a
+person, which is the safe direction for a block whose remedy is unknown.
+
+The classification is about what clears the block, not how it was written.
+Review-time deployment drift is stored to survive a plan that did not
+re-evaluate it, but a plan that does re-evaluate the rollup lifts it once the
+deployments match, so it reads as a guard rather than as a reconciliation.
+Calling it a reconciliation would tell an operator that the one action that
+clears it does not.
+
+It reads state and never writes: recreating a missing Check Run is
+`checks backfill` below, and clearing a `reconciliation_owed` row means
+reconciling the target environment, not running a command.
+
 ### Backfilling missing Check Runs
 
 `schemabot checks backfill` converges Check Run state across open PRs — after
@@ -584,6 +625,15 @@ whose expected SchemaBot Check Run is missing and (outside `--dry-run`)
 recreates each by replaying the auto-plan flow server-side. Check Runs that
 exist but never completed are reported for investigation, never acted on — an
 uncompleted run can belong to a genuinely in-flight apply.
+
+Each reported run carries the stored check state behind it, classified the
+same way [`checks show`](#explaining-a-blocked-check) classifies it: the
+sweep says whether the run is waiting on SchemaBot or on an operator, and
+lists the blocking rows' reason codes. That is what separates a run to leave
+alone from one nothing will ever clear, without opening each pull request. A
+run whose stored state could not be read is reported without a
+classification — the missing-check findings the backfill acts on are already
+in hand, so the annotation is dropped rather than the finding.
 
 **The backfill is scoped to the deployment it runs against.** A SchemaBot
 instance scans with its own GitHub App credentials, its own `repos:` config,
