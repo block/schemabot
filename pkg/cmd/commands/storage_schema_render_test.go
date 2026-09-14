@@ -84,7 +84,7 @@ func TestOutputStorageSchemaPlan_DestructiveSeverity(t *testing.T) {
 		runs    bool
 	}{
 		{name: "a plan discloses", glyph: glyph.Attention, heading: "refused unless destructive storage changes are allowed"},
-		{name: "an apply refuses", isApply: true, glyph: glyph.Refused, heading: "the surplus state stays in place"},
+		{name: "an apply refuses", isApply: true, glyph: glyph.Refused, heading: "Destructive changes refused. To proceed with them, re-run with --allow-unsafe"},
 		{name: "consent in effect", allowed: true, glyph: glyph.Escalation, heading: "running because destructive storage changes are allowed", runs: true},
 	}
 	for _, tc := range tests {

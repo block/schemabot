@@ -122,8 +122,12 @@ func writeStorageSchemaBody(report *apitypes.StorageSchemaReport, isApply bool, 
 				"Destructive changes, running because destructive storage changes are allowed:",
 				storageSchemaNotices(report.Destructive))
 		case isApply:
+			// Said without claiming what else happened, because an apply prints
+			// this at two moments: before it runs anything, where the refusal is
+			// what stops the convergence, and after a convergence that ran the
+			// rest. The flag is the way through from either one.
 			templates.WriteChangeNotice(glyph.Refused,
-				"Destructive changes refused; the surplus state stays in place. To proceed with them, re-run with --allow-unsafe:",
+				"Destructive changes refused. To proceed with them, re-run with --allow-unsafe:",
 				storageSchemaNotices(report.Destructive))
 		default:
 			templates.WriteChangeNotice(glyph.Attention,
