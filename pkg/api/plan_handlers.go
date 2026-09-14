@@ -1469,8 +1469,9 @@ func buildApplyOperationGroups(
 	// instance-local sharded engine (Strata) produces those, so an
 	// externally-authoritative engine (e.g. PlanetScale) — whose plans never
 	// carry per-shard changes — is never fanned out, regardless of transport.
+	keys := newMemberOperationKeys(members)
 	if canBuildShardedOperationGroups(plan, taskChanges) {
-		groups, err := buildShardedApplyOperationGroups(plan, members, environment, applyOpts, cutoverPolicy, onFailure, now)
+		groups, err := buildShardedApplyOperationGroups(plan, members, keys, environment, applyOpts, cutoverPolicy, onFailure, now)
 		if err != nil {
 			return nil, false, err
 		}
@@ -1489,7 +1490,11 @@ func buildApplyOperationGroups(
 	if len(taskChanges) == 0 && len(plan.VSchemaNamespaces()) > 0 {
 		groups := make([]*storage.ApplyOperationWithTasks, 0, len(members))
 		for _, member := range members {
-			operation := newPendingApplyOperation(member, plan, finalizerOperationKeySegment, cutoverPolicy, onFailure, now)
+			operationKey, err := keys.qualify(member, finalizerOperationKeySegment)
+			if err != nil {
+				return nil, false, err
+			}
+			operation := newPendingApplyOperation(member, plan, operationKey, cutoverPolicy, onFailure, now)
 			operation.OperationKind = storage.ApplyOperationKindGroupFinalizer
 			groups = append(groups, &storage.ApplyOperationWithTasks{Operation: operation})
 		}
@@ -1502,12 +1507,38 @@ func buildApplyOperationGroups(
 		// its target holds a schema the apply plan never described.
 		memberChanges := applyTaskChanges(member.Plan)
 		tasks := buildApplyTasks(member.Plan, memberChanges, environment, applyOpts, "", now)
+		operationKey, err := keys.qualify(member, "")
+		if err != nil {
+			return nil, false, err
+		}
+		operation := newPendingApplyOperation(member, plan, operationKey, cutoverPolicy, onFailure, now)
+		if len(tasks) == 0 {
+			// A member planned on its own can already hold the reviewed change,
+			// so its plan has nothing left to run. The member still belongs to
+			// the rollout: dropping it would make the apply silently address
+			// fewer targets than the operator asked for, and a work operation
+			// with no tasks can never be driven, so it is recorded as the
+			// already-settled work it is.
+			settleConvergedMemberOperation(operation, now)
+		}
 		groups = append(groups, &storage.ApplyOperationWithTasks{
-			Operation: newPendingApplyOperation(member, plan, "", cutoverPolicy, onFailure, now),
+			Operation: operation,
 			Tasks:     tasks,
 		})
 	}
 	return groups, false, nil
+}
+
+// settleConvergedMemberOperation records a member that had nothing left to run
+// as completed at creation. It is the one operation shape that is terminal
+// before a driver ever claims it: there is no work to drive, and the alternative
+// shapes are both wrong — a pending row that no drive can satisfy halts the
+// rollout, and omitting the member entirely removes it from every per-member
+// surface the operator reads.
+func settleConvergedMemberOperation(operation *storage.ApplyOperation, now time.Time) {
+	operation.State = state.ApplyOperation.Completed
+	operation.StartedAt = &now
+	operation.CompletedAt = &now
 }
 
 // buildNamespaceFinalizerOperations builds one task-less group_finalizer per
@@ -1519,6 +1550,7 @@ func buildApplyOperationGroups(
 func buildNamespaceFinalizerOperations(
 	applyPlan *storage.Plan,
 	member applyMember,
+	keys memberOperationKeys,
 	cutoverPolicy string,
 	onFailure string,
 	now time.Time,
@@ -1529,7 +1561,10 @@ func buildNamespaceFinalizerOperations(
 		if err := validateOperationKeyPart("namespace", namespace); err != nil {
 			return nil, err
 		}
-		operationKey := finalizerOperationKey(namespace)
+		operationKey, err := keys.qualify(member, finalizerOperationKey(namespace))
+		if err != nil {
+			return nil, err
+		}
 		if len(operationKey) > applyOperationKeyMaxLen {
 			return nil, fmt.Errorf("operation key for namespace %q finalizer exceeds %d characters", namespace, applyOperationKeyMaxLen)
 		}
@@ -1566,6 +1601,7 @@ func canBuildShardedOperationGroups(plan *storage.Plan, taskChanges []storage.Ta
 func buildShardedApplyOperationGroups(
 	applyPlan *storage.Plan,
 	members []applyMember,
+	keys memberOperationKeys,
 	environment string,
 	applyOpts storage.ApplyOptions,
 	cutoverPolicy string,
@@ -1604,7 +1640,10 @@ func buildShardedApplyOperationGroups(
 					if err := validateShardOperationKeyParts(namespace, shard.Shard, ddlChange.Table); err != nil {
 						return nil, err
 					}
-					operationKey := storage.ShardOperationKey(namespace, shard.Shard, ddlChange.Table)
+					operationKey, err := keys.qualify(member, storage.ShardOperationKey(namespace, shard.Shard, ddlChange.Table))
+					if err != nil {
+						return nil, err
+					}
 					if len(operationKey) > applyOperationKeyMaxLen {
 						return nil, fmt.Errorf("operation key for namespace %q shard %q table %q exceeds %d characters", namespace, shard.Shard, ddlChange.Table, applyOperationKeyMaxLen)
 					}
@@ -1621,13 +1660,55 @@ func buildShardedApplyOperationGroups(
 				}
 			}
 		}
-		finalizers, err := buildNamespaceFinalizerOperations(applyPlan, member, cutoverPolicy, onFailure, now)
+		finalizers, err := buildNamespaceFinalizerOperations(applyPlan, member, keys, cutoverPolicy, onFailure, now)
 		if err != nil {
 			return nil, err
 		}
 		groups = append(groups, finalizers...)
 	}
 	return groups, nil
+}
+
+// memberOperationKeys decides how one apply's operation keys are qualified.
+//
+// An operation is unique on (apply, deployment, operation key), so a deployment
+// addressing several targets needs the target in the key or its members collide
+// on one row. A deployment addressing one target does not: its key is already
+// unique, and naming the target would change the shape of every key every
+// existing reader parses, for no gain. So the target leads the key exactly where
+// the deployment stops identifying the member — the same rule that decides
+// whether an operator sees a member named "eu" or "eu/shop-002".
+//
+// Keeping both shapes live is what makes widening the rule later a change to
+// this one predicate: readers already recover the scoped key by matching the
+// operation's own target rather than by counting components.
+type memberOperationKeys struct {
+	multiTargetDeployments map[string]bool
+}
+
+func newMemberOperationKeys(members []applyMember) memberOperationKeys {
+	targets := make([]routing.ExecutionTarget, len(members))
+	for i, member := range members {
+		targets[i] = member.Target
+	}
+	return memberOperationKeys{multiTargetDeployments: routing.MultiTargetDeployments(targets)}
+}
+
+// qualify returns the operation key for one member's scoped work. scopedKey is
+// the key within the member — a shard key, a finalizer key, or empty for work
+// covering the whole target.
+func (k memberOperationKeys) qualify(member applyMember, scopedKey string) (string, error) {
+	if !k.multiTargetDeployments[member.Target.Deployment] {
+		return scopedKey, nil
+	}
+	// The config that admits a target refuses the delimiter in its name, but a
+	// stored plan can carry a target from a config that no longer applies. A key
+	// that cannot be split back into the target it came from is not recoverable
+	// once written, so it is refused here too.
+	if err := validateOperationKeyPart("target", member.Target.Target); err != nil {
+		return "", err
+	}
+	return storage.TargetOperationKey(member.Target.Target, scopedKey), nil
 }
 
 func validateShardOperationKeyParts(namespace, shard, table string) error {
@@ -1647,8 +1728,8 @@ func validateShardOperationKeyParts(namespace, shard, table string) error {
 }
 
 func validateOperationKeyPart(label, value string) error {
-	if strings.Contains(value, "/") {
-		return fmt.Errorf("operation key %s component %q contains reserved delimiter %q", label, value, "/")
+	if strings.Contains(value, storage.OperationKeyDelimiter) {
+		return fmt.Errorf("operation key %s component %q contains reserved delimiter %q", label, value, storage.OperationKeyDelimiter)
 	}
 	return nil
 }

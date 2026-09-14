@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/routing"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
 )
@@ -23,11 +24,17 @@ type listingPlanStore struct {
 	listErr error
 }
 
-func (s *listingPlanStore) List(context.Context, storage.ListPlansOptions) ([]*storage.Plan, error) {
+func (s *listingPlanStore) List(_ context.Context, opts storage.ListPlansOptions) ([]*storage.Plan, error) {
 	if s.listErr != nil {
 		return nil, s.listErr
 	}
-	return s.plans, nil
+	var matched []*storage.Plan
+	for _, plan := range s.plans {
+		if plan.PrimaryPlanIdentifier == opts.PrimaryPlanIdentifier {
+			matched = append(matched, plan)
+		}
+	}
+	return matched, nil
 }
 
 func memberResolutionService(t *testing.T, env EnvironmentConfig, plans storage.PlanStore) *Service {
@@ -69,6 +76,16 @@ func primaryPlanRow(target string) *storage.Plan {
 	}
 }
 
+// memberPlanRow is a plan stored for a non-primary member, stamped with the
+// reviewed plan it was produced alongside.
+func memberPlanRow(identifier, target, primaryPlanIdentifier string) *storage.Plan {
+	plan := primaryPlanRow(target)
+	plan.ID = 0
+	plan.PlanIdentifier = identifier
+	plan.PrimaryPlanIdentifier = primaryPlanIdentifier
+	return plan
+}
+
 func targetsFor(t *testing.T, svc *Service) []routing.ExecutionTarget {
 	t.Helper()
 	targets, err := svc.config.ResolveDatabaseTargets("testapp", "production")
@@ -76,11 +93,10 @@ func targetsFor(t *testing.T, svc *Service) []routing.ExecutionTarget {
 	return targets
 }
 
-// Members that are expected to hold the same schema all run the plan the
-// operator reviewed, so every member is paired with the apply's own plan and no
-// member-plan lookup is needed.
+// Members that are expected to hold the same schema store no plans of their
+// own, because every one of them runs the plan the operator reviewed.
 func TestResolveApplyMembers_MirroredMembersShareTheApplyPlan(t *testing.T) {
-	plans := &listingPlanStore{listErr: errors.New("List must not be called for mirrored members")}
+	plans := &listingPlanStore{}
 	svc := memberResolutionService(t, mirroredEnv(), plans)
 	plan := primaryPlanRow("testapp")
 
@@ -98,7 +114,7 @@ func TestResolveApplyMembers_MirroredMembersShareTheApplyPlan(t *testing.T) {
 // apply's plan without consulting config for a contract that could not change
 // the outcome.
 func TestResolveApplyMembers_SingleMemberNeedsNoDatabaseConfig(t *testing.T) {
-	plans := &listingPlanStore{listErr: errors.New("List must not be called for a single member")}
+	plans := &listingPlanStore{listErr: errors.New("a single member needs no member-plan lookup")}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	svc := New(&mockStorageWithPlanLookup{plans: plans}, &ServerConfig{}, map[string]tern.Client{}, logger)
 	plan := primaryPlanRow("testapp-001")
@@ -113,11 +129,10 @@ func TestResolveApplyMembers_SingleMemberNeedsNoDatabaseConfig(t *testing.T) {
 }
 
 // Each target of a multi-target environment runs the plan stored for that
-// target in the same review round, matched on the head SHA the apply's plan was
-// created for.
+// target in the review round the apply's own plan is the reviewed plan of.
 func TestResolveApplyMembers_IndependentMembersRunTheirOwnPlans(t *testing.T) {
 	plan := primaryPlanRow("testapp-001")
-	secondPlan := &storage.Plan{ID: 11, PlanIdentifier: "plan-second", Deployment: "eu", Target: "testapp-002", HeadSHA: "abc123"}
+	secondPlan := memberPlanRow("plan-second", "testapp-002", "plan-primary")
 	plans := &listingPlanStore{plans: []*storage.Plan{secondPlan}}
 	svc := memberResolutionService(t, multiTargetEnv(), plans)
 
@@ -130,12 +145,12 @@ func TestResolveApplyMembers_IndependentMembersRunTheirOwnPlans(t *testing.T) {
 	assert.Same(t, secondPlan, members[1].Plan)
 }
 
-// A plan stored for an earlier push is a different review round. Matching it to
-// this apply would run DDL the operator never reviewed on this commit, so the
-// member counts as unplanned and apply creation fails.
+// A plan stored in another review round of the same pull request — an earlier
+// push, or a re-plan of this very commit — would run DDL the operator never
+// approved, so the member counts as unplanned and apply creation fails.
 func TestResolveApplyMembers_MemberPlanFromAnotherRoundIsNotUsed(t *testing.T) {
 	plan := primaryPlanRow("testapp-001")
-	stale := &storage.Plan{ID: 9, PlanIdentifier: "plan-stale", Deployment: "eu", Target: "testapp-002", HeadSHA: "older"}
+	stale := memberPlanRow("plan-stale", "testapp-002", "plan-earlier-round")
 	plans := &listingPlanStore{plans: []*storage.Plan{stale}}
 	svc := memberResolutionService(t, multiTargetEnv(), plans)
 
@@ -156,9 +171,10 @@ func TestResolveApplyMembers_MissingMemberPlanFailsClosed(t *testing.T) {
 	assert.Contains(t, err.Error(), "no stored plan for rollout member eu/testapp-002")
 }
 
-// Member plans are only written by a pull request review, so a plan with no head
-// SHA has no round to match against and cannot drive a multi-target apply.
-func TestResolveApplyMembers_PlanWithoutHeadSHAFailsClosed(t *testing.T) {
+// Member plans are only written by a pull request review, so a CLI apply against
+// a multi-target environment has none and fails closed rather than running the
+// primary's DDL against every target.
+func TestResolveApplyMembers_PlanWithoutPullRequestReviewFailsClosed(t *testing.T) {
 	plan := primaryPlanRow("testapp-001")
 	plan.HeadSHA = ""
 	plans := &listingPlanStore{}
@@ -166,7 +182,24 @@ func TestResolveApplyMembers_PlanWithoutHeadSHAFailsClosed(t *testing.T) {
 
 	_, err := svc.resolveApplyMembers(t.Context(), plan, "production", targetsFor(t, svc))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no head SHA to match member plans against")
+	assert.Contains(t, err.Error(), "was not produced by a pull request review")
+}
+
+// An environment respelled as mirrored after its review still applies what was
+// reviewed: the round stored a plan per member, and those plans are what the
+// operator approved. Current config cannot reinterpret a finished review.
+func TestResolveApplyMembers_ReviewedRoundOutranksCurrentConfig(t *testing.T) {
+	plan := primaryPlanRow("testapp")
+	secondPlan := memberPlanRow("plan-second", "testapp", "plan-primary")
+	secondPlan.Deployment = "us"
+	plans := &listingPlanStore{plans: []*storage.Plan{secondPlan}}
+	svc := memberResolutionService(t, mirroredEnv(), plans)
+
+	members, err := svc.resolveApplyMembers(t.Context(), plan, "production", targetsFor(t, svc))
+	require.NoError(t, err)
+	require.Len(t, members, 2)
+	assert.Same(t, plan, members[0].Plan, "the primary runs the plan the apply was created from")
+	assert.Same(t, secondPlan, members[1].Plan, "a member planned on its own keeps its reviewed plan")
 }
 
 // A storage failure while loading member plans is not an absence of members: it
@@ -225,10 +258,81 @@ func TestBuildApplyOperationGroups_TargetsOfOneDeploymentGetOwnOperations(t *tes
 	assert.Equal(t, int64(11), groups[1].Operation.PlanID)
 }
 
-// A sharded plan produces the same operation key for the same (namespace, shard,
-// table) on every member, so operations are grouped by member and key together.
-// Two targets of one deployment each get their own operation for that key rather
-// than one target's shard work being folded into the other's.
+// An operation key is unique per deployment, so it only has to name a target
+// where the deployment addresses more than one. A deployment with a single
+// target leaves the key alone, keeping it the shape every reader already parses.
+func TestMemberOperationKeys_QualifiesOnlyMultiTargetDeployments(t *testing.T) {
+	members := []applyMember{
+		{Target: routing.ExecutionTarget{Deployment: "eu", Target: "testapp-001"}},
+		{Target: routing.ExecutionTarget{Deployment: "eu", Target: "testapp-002"}},
+		{Target: routing.ExecutionTarget{Deployment: "us", Target: "testapp"}},
+	}
+	keys := newMemberOperationKeys(members)
+
+	qualified, err := keys.qualify(members[0], "testapp/-80/mutes")
+	require.NoError(t, err)
+	assert.Equal(t, "testapp-001/testapp/-80/mutes", qualified)
+
+	whole, err := keys.qualify(members[0], "")
+	require.NoError(t, err)
+	assert.Equal(t, "testapp-001", whole, "a member with no scoped work is named by its target alone")
+
+	sole, err := keys.qualify(members[2], "testapp/-80/mutes")
+	require.NoError(t, err)
+	assert.Equal(t, "testapp/-80/mutes", sole, "a deployment with one target needs no target component")
+}
+
+// Config refuses the delimiter in a target's name, but an apply can be created
+// from a plan stored under a config that no longer applies. A target that would
+// make its members' operation keys ambiguous to split fails apply creation
+// rather than producing keys no reader can take apart.
+func TestMemberOperationKeys_RefusesTargetCarryingTheDelimiter(t *testing.T) {
+	members := []applyMember{
+		{Target: routing.ExecutionTarget{Deployment: "eu", Target: "testapp/001"}},
+		{Target: routing.ExecutionTarget{Deployment: "eu", Target: "testapp-002"}},
+	}
+	keys := newMemberOperationKeys(members)
+
+	_, err := keys.qualify(members[0], "testapp/users")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "target")
+}
+
+// A member whose own plan found nothing to change is already converged. Its
+// operation is recorded as completed so the apply covers every member it
+// addressed, rather than leaving a pending operation no driver can ever finish.
+func TestBuildApplyOperationGroups_ConvergedMemberIsCompletedOnCreation(t *testing.T) {
+	usersDDL := "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
+	applyPlan := primaryPlanRow("testapp-001")
+	applyPlan.Namespaces = map[string]*storage.NamespacePlanData{
+		"testapp": {Tables: []storage.TableChange{{Namespace: "testapp", Table: "users", DDL: usersDDL, Operation: "alter"}}},
+	}
+	convergedPlan := &storage.Plan{ID: 11, Deployment: "eu", Target: "testapp-002"}
+	members := []applyMember{
+		{Target: routing.ExecutionTarget{Deployment: "eu", Target: "testapp-001"}, Plan: applyPlan},
+		{Target: routing.ExecutionTarget{Deployment: "eu", Target: "testapp-002"}, Plan: convergedPlan},
+	}
+	taskChanges := applyTaskChanges(applyPlan)
+
+	groups, _, err := buildApplyOperationGroups(applyPlan, taskChanges, members, "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	require.NoError(t, err)
+	require.Len(t, groups, 2)
+
+	assert.Equal(t, state.ApplyOperation.Pending, groups[0].Operation.State)
+	require.Len(t, groups[0].Tasks, 1)
+
+	converged := groups[1].Operation
+	assert.Empty(t, groups[1].Tasks, "a converged member has no work to drive")
+	assert.Equal(t, state.ApplyOperation.Completed, converged.State)
+	require.NotNil(t, converged.StartedAt)
+	require.NotNil(t, converged.CompletedAt)
+	assert.Equal(t, pershardTestTime(), *converged.CompletedAt)
+}
+
+// A sharded plan describes the same (namespace, shard, table) work on every
+// member, and the operation key is unique per deployment. Two targets of one
+// deployment therefore lead their keys with the target's name, so each gets its
+// own operation rather than one target's shard work being folded into the other's.
 func TestBuildShardedApplyOperationGroups_TargetsOfOneDeploymentDoNotShareOperations(t *testing.T) {
 	mutesDDL := "ALTER TABLE `mutes` ADD INDEX (`created_at`)"
 	applyPlan := &storage.Plan{
@@ -246,7 +350,7 @@ func TestBuildShardedApplyOperationGroups_TargetsOfOneDeploymentDoNotShareOperat
 		{Target: routing.ExecutionTarget{Deployment: "eu", Target: "testapp-002"}, Plan: secondPlan},
 	}
 
-	groups, err := buildShardedApplyOperationGroups(applyPlan, members, "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	groups, err := buildShardedApplyOperationGroups(applyPlan, members, newMemberOperationKeys(members), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
 	require.NoError(t, err)
 	require.Len(t, groups, 2, "each target needs its own operation for the shard's table")
 
@@ -257,7 +361,7 @@ func TestBuildShardedApplyOperationGroups_TargetsOfOneDeploymentDoNotShareOperat
 	require.Contains(t, byTarget, "testapp-001")
 	require.Contains(t, byTarget, "testapp-002")
 	for target, group := range byTarget {
-		assert.Equal(t, pershardNamespace+"/-80/mutes", group.Operation.OperationKey)
+		assert.Equal(t, target+"/"+pershardNamespace+"/-80/mutes", group.Operation.OperationKey)
 		assert.Equal(t, "eu", group.Operation.Deployment)
 		require.Len(t, group.Tasks, 1, "target %s must carry its shard's work exactly once", target)
 		assert.Equal(t, mutesDDL, group.Tasks[0].DDL)
