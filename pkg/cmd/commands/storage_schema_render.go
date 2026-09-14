@@ -106,6 +106,9 @@ func writeStorageSchemaBody(report *apitypes.StorageSchemaReport, isApply bool, 
 	if err != nil {
 		return err
 	}
+	// Set when the refusal below is one that stops the run, so it can be
+	// written after the summary.
+	var blocked func()
 	if gated {
 		templates.WriteChangeNotice(glyph.Attention,
 			"Gated behind the manual remediation below; none of these run until it is resolved:",
@@ -126,7 +129,13 @@ func writeStorageSchemaBody(report *apitypes.StorageSchemaReport, isApply bool, 
 			templates.WriteUnsafeWarningAllowed(storageSchemaNotices(report.Destructive),
 				"destructive storage changes allowed")
 		case isApply:
-			templates.WriteUnsafeChangesBlocked(storageSchemaNotices(report.Destructive), rerun)
+			// Held until after the summary, which is where `apply` prints its
+			// own refusal. It carries the command an operator copies, so it
+			// belongs last on screen rather than above a summary of tables the
+			// run is not going to touch.
+			blocked = func() {
+				templates.WriteUnsafeChangesBlocked(storageSchemaNotices(report.Destructive), rerun)
+			}
 		default:
 			templates.WriteUnsafeChangesWarning(storageSchemaNotices(report.Destructive))
 		}
@@ -146,6 +155,9 @@ func writeStorageSchemaBody(report *apitypes.StorageSchemaReport, isApply bool, 
 	}
 
 	templates.WritePlanSummary(storageSchemaRunnable(report, outstanding, destructive))
+	if blocked != nil {
+		blocked()
+	}
 	writeStorageSchemaHints(hints)
 	return nil
 }

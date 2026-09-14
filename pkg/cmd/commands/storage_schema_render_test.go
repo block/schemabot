@@ -475,6 +475,18 @@ func TestOutputStorageSchemaPlan_SectionOrder(t *testing.T) {
 	})
 
 	assert.Less(t, strings.Index(out, "~ applies"), strings.Index(out, "Unsafe Changes Detected"))
+	assert.Less(t, strings.Index(out, "Unsafe Changes Detected"), strings.Index(out, "📋 Plan:"),
+		"a plan discloses before it summarizes, the order `plan` prints them in")
+
+	// An apply's refusal is the exception: it carries the command that permits
+	// what was refused, so it goes last, where `apply` prints its own. A
+	// summary of tables the run will not touch must not be the final word.
+	out = captureStdout(func() {
+		require.NoError(t, outputStorageSchemaPlan(report, true, "storage apply --allow-unsafe", nil))
+	})
+
+	assert.Less(t, strings.Index(out, "📋 Plan:"), strings.Index(out, "Apply blocked"))
+	assert.Less(t, strings.Index(out, "Apply blocked"), strings.Index(out, "schemabot storage apply --allow-unsafe"))
 }
 
 // A manual entry gates the whole drift set, so a plan carrying one prints no
