@@ -101,6 +101,35 @@ func resolveStorageTarget(dsnFlag, configFlag, dialectFlag string) (*storageTarg
 		return &storageTarget{dsn: directDSN, dialect: dialect, source: "--dsn flag"}, nil
 	}
 
+	configured, err := resolveStorageConfig(configFlag)
+	if err != nil {
+		return nil, err
+	}
+	if asserted := strings.TrimSpace(strings.ToLower(dialectFlag)); asserted != "" && schema.Dialect(asserted) != configured.dialect {
+		return nil, fmt.Errorf("--dialect says %q but %s configures %q storage; drop --dialect, which only applies to a DSN passed with --dsn", asserted, configured.source, configured.dialect)
+	}
+	return configured.target()
+}
+
+// storageConfig is a server config resolved as far as its storage family,
+// before the DSN itself is fetched.
+//
+// The two steps are separate because a caller can be done after the first one.
+// Fetching the DSN is not free of consequence — storage.dsn_from reads a
+// secret, which is a call to someone else's system with its own audit trail —
+// and a command that only applies to one family has already reached its answer
+// once the family is known. Refusing there names the family as the reason and
+// fetches nothing; refusing after the fetch would report whatever went wrong
+// resolving a DSN the command was never going to use.
+type storageConfig struct {
+	cfg     *api.ServerConfig
+	dialect schema.Dialect
+	source  string
+}
+
+// resolveStorageConfig loads the server config named by --config, or by
+// $SCHEMABOT_CONFIG_FILE, and reads the storage dialect it states.
+func resolveStorageConfig(configFlag string) (*storageConfig, error) {
 	configPath := configFlag
 	source := fmt.Sprintf("server config %s", configPath)
 	if configPath == "" {
@@ -126,31 +155,34 @@ func resolveStorageTarget(dsnFlag, configFlag, dialectFlag string) (*storageTarg
 	if err != nil {
 		return nil, fmt.Errorf("resolve storage dialect from %s: %w", source, err)
 	}
-	if asserted := strings.TrimSpace(strings.ToLower(dialectFlag)); asserted != "" && schema.Dialect(asserted) != dialect {
-		return nil, fmt.Errorf("--dialect says %q but %s configures %q storage; drop --dialect, which only applies to a DSN passed with --dsn", asserted, source, dialect)
-	}
+	return &storageConfig{cfg: cfg, dialect: dialect, source: source}, nil
+}
 
-	dsn, err := cfg.StorageDSN()
+// target fetches the configured DSN and returns the storage database it names,
+// under the policy the config states for it.
+func (c *storageConfig) target() (*storageTarget, error) {
+	dsn, err := c.cfg.StorageDSN()
 	if err != nil {
-		return nil, fmt.Errorf("resolve storage DSN from %s: %w", source, err)
+		return nil, fmt.Errorf("resolve storage DSN from %s: %w", c.source, err)
 	}
 	dsn = strings.TrimSpace(dsn)
 	if dsn == "" {
 		return nil, fmt.Errorf("storage DSN not configured (set --dsn, config storage.dsn or storage.dsn_from, STORAGE_DSN, or MYSQL_DSN)")
 	}
-	if cfg.Storage.DSN == "" && cfg.Storage.DSNFrom == nil {
+	source := c.source
+	if c.cfg.Storage.DSN == "" && c.cfg.Storage.DSNFrom == nil {
 		if strings.TrimSpace(os.Getenv("STORAGE_DSN")) != "" {
 			source = "STORAGE_DSN environment variable"
 		} else if strings.TrimSpace(os.Getenv("MYSQL_DSN")) != "" {
 			source = "MYSQL_DSN environment variable"
 		}
 	}
-	statementTimeout := cfg.Postgres.StatementTimeoutOrDefault()
+	statementTimeout := c.cfg.Postgres.StatementTimeoutOrDefault()
 	return &storageTarget{
 		dsn:                      dsn,
-		dialect:                  dialect,
+		dialect:                  c.dialect,
 		source:                   source,
-		allowDestructive:         cfg.Storage.AllowDestructiveSchemaChanges,
+		allowDestructive:         c.cfg.Storage.AllowDestructiveSchemaChanges,
 		postgresStatementTimeout: &statementTimeout,
 	}, nil
 }

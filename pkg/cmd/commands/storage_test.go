@@ -84,6 +84,26 @@ storage:
 	require.ErrorContains(t, err, `only applies to "postgres" storage`)
 }
 
+// A command that only applies to one storage family refuses on the family,
+// before the DSN is fetched. Fetching is not free of consequence — storage
+// dsn_from reads a secret, a call to another system with its own audit trail —
+// and the refusal that helps names the family rather than whatever went wrong
+// resolving a connection this command was never going to open.
+func TestResolveStorageDSN_RefusesTheDialectBeforeFetchingTheDSN(t *testing.T) {
+	path := writeStorageTestConfig(t, `
+storage:
+  dialect: mysql
+  dsn_from:
+    config_ref: file:/nonexistent/storage-connection.yaml
+    username: schemabot
+    password_ref: file:/nonexistent/storage-password
+`)
+	_, _, err := resolveStorageDSN("", path, "the identity sequence resync")
+	require.ErrorContains(t, err, `the identity sequence resync only applies to "postgres" storage`)
+	assert.NotContains(t, err.Error(), "nonexistent",
+		"the secret is never read, so nothing about resolving it can be the reported cause")
+}
+
 func TestResolveStorageDSN_EmptyConfigDSN(t *testing.T) {
 	t.Setenv("STORAGE_DSN", "")
 	t.Setenv("MYSQL_DSN", "")

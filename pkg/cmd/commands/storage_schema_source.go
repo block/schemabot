@@ -92,13 +92,15 @@ func (f *storageSchemaSourceFlags) validateSource() error {
 // converge storage ahead of a deploy without the fleet's own boots then
 // disagreeing with it (AV-9). A convergence to files named on the command line
 // would be a second implementation of the one path that must not have two.
-func storageSchemaSourceRefusal(schemaDir, release string) error {
+func storageSchemaSourceRefusal(schemaDir, release, repo string) error {
 	selector := ""
 	switch {
 	case strings.TrimSpace(release) != "":
 		selector = "--release"
 	case strings.TrimSpace(schemaDir) != "":
 		selector = "--schema-dir"
+	case strings.TrimSpace(repo) != "":
+		selector = "--release-repo"
 	default:
 		return nil
 	}
