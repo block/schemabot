@@ -1508,6 +1508,7 @@ const (
 	GitHubOperationGraphQLMinimizeComment        = "graphql_minimize_comment"
 	GitHubOperationGraphQLStatusCheckRollup      = "graphql_status_check_rollup"
 	GitHubOperationListCheckRunsForRef           = "list_check_runs_for_ref"
+	GitHubOperationListCommentReactions          = "list_comment_reactions"
 	GitHubOperationListPRFiles                   = "list_pr_files"
 	GitHubOperationListReviews                   = "list_reviews"
 	GitHubOperationListTeamMembers               = "list_team_members"
@@ -1707,6 +1708,7 @@ func isKnownGitHubOperation(operation string) bool {
 		GitHubOperationGraphQLMinimizeComment,
 		GitHubOperationGraphQLStatusCheckRollup,
 		GitHubOperationListCheckRunsForRef,
+		GitHubOperationListCommentReactions,
 		GitHubOperationListPRFiles,
 		GitHubOperationListReviews,
 		GitHubOperationListTeamMembers,
