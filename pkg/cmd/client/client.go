@@ -145,6 +145,11 @@ func CallPullSchemaAPI(endpoint, database, dbType, environment string, namespace
 
 // CallPullSchemaAPIWithOptions fetches live schema with optional namespace and catalog controls.
 func CallPullSchemaAPIWithOptions(endpoint, database, dbType, environment string, opts PullSchemaOptions) (*apitypes.PullSchemaResponse, error) {
+	return CallPullSchemaAPIWithContext(context.Background(), endpoint, database, dbType, environment, opts)
+}
+
+// CallPullSchemaAPIWithContext cancels the live-schema request with its caller.
+func CallPullSchemaAPIWithContext(ctx context.Context, endpoint, database, dbType, environment string, opts PullSchemaOptions) (*apitypes.PullSchemaResponse, error) {
 	req := apitypes.PullSchemaRequest{
 		Database:      database,
 		Type:          dbType,
@@ -154,7 +159,7 @@ func CallPullSchemaAPIWithOptions(endpoint, database, dbType, environment string
 		Lint:          opts.Lint,
 	}
 	var result apitypes.PullSchemaResponse
-	if err := doPostInto(endpoint, "/api/pull", req, &result); err != nil {
+	if err := doPostIntoWithClient(ctx, httpClient, endpoint, "/api/pull", req, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -172,6 +177,14 @@ func CallPullSchemaAPIWithOptions(endpoint, database, dbType, environment string
 // predicts about work already on the target; a caller that has not chosen yet
 // passes false, the shape an apply runs without asking for anything else.
 func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string, pr int, ignoreNamespaces []string, groupedExecution bool) (*apitypes.PlanResponse, []string, error) {
+	return CallPlanAPIWithContext(context.Background(), endpoint, database, dbType, environment, schemaDir, repo, pr, ignoreNamespaces, groupedExecution)
+}
+
+// CallPlanAPIWithContext cancels baseline planning with its caller.
+func CallPlanAPIWithContext(ctx context.Context, endpoint, database, dbType, environment, schemaDir, repo string, pr int, ignoreNamespaces []string, groupedExecution bool) (*apitypes.PlanResponse, []string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	schemaFiles, ignored, err := ReadSchemaFiles(schemaDir, environment, ignoreNamespaces)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read schema files: %w", err)
@@ -182,7 +195,7 @@ func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string
 		}
 		return nil, nil, fmt.Errorf("no .sql files found in %s", schemaDir)
 	}
-	resp, err := postPlanRequest(endpoint, database, dbType, environment, schemaFiles, repo, pr, ignored, groupedExecution)
+	resp, err := postPlanRequestWithContext(ctx, endpoint, database, dbType, environment, schemaFiles, repo, pr, ignored, groupedExecution)
 	if err != nil {
 		return nil, ignored, err
 	}
@@ -198,6 +211,10 @@ func CallPlanAPIWithFiles(endpoint, database, dbType, environment string, schema
 // namespaces removed from schemaFiles before the call — the server needs
 // them to refuse engine shapes that cannot honor the exclusion.
 func postPlanRequest(endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int, ignoredNamespaces []string, groupedExecution bool) (*apitypes.PlanResponse, error) {
+	return postPlanRequestWithContext(context.Background(), endpoint, database, dbType, environment, schemaFiles, repo, pr, ignoredNamespaces, groupedExecution)
+}
+
+func postPlanRequestWithContext(ctx context.Context, endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int, ignoredNamespaces []string, groupedExecution bool) (*apitypes.PlanResponse, error) {
 	req := apitypes.PlanRequest{
 		Database:          database,
 		Type:              dbType,
@@ -212,7 +229,7 @@ func postPlanRequest(endpoint, database, dbType, environment string, schemaFiles
 		req.PullRequest = &prVal
 	}
 	var result apitypes.PlanResponse
-	if err := doPostInto(endpoint, "/api/plan", req, &result); err != nil {
+	if err := doPostIntoWithClient(ctx, httpClient, endpoint, "/api/plan", req, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
