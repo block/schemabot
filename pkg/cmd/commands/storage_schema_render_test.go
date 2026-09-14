@@ -28,7 +28,7 @@ func TestOutputStorageSchemaPlan_RendersAsAPlan(t *testing.T) {
 	}
 
 	out := captureStdout(func() {
-		require.NoError(t, outputStorageSchemaPlan(report, false, storageSchemaPlanHints(report)))
+		require.NoError(t, outputStorageSchemaPlan(report, false, "", storageSchemaPlanHints(report)))
 	})
 
 	assert.Contains(t, out, "MySQL Schema Change Plan")
@@ -54,7 +54,7 @@ func TestOutputStorageSchemaPlan_Converged(t *testing.T) {
 	}
 
 	out := captureStdout(func() {
-		require.NoError(t, outputStorageSchemaPlan(report, false, storageSchemaPlanHints(report)))
+		require.NoError(t, outputStorageSchemaPlan(report, false, "", storageSchemaPlanHints(report)))
 	})
 
 	assert.Contains(t, out, "PostgreSQL Schema Change Plan")
@@ -79,13 +79,13 @@ func TestOutputStorageSchemaPlan_DestructiveSeverity(t *testing.T) {
 		name    string
 		allowed bool
 		isApply bool
-		glyph   string
 		heading string
 		runs    bool
+		rerun   bool
 	}{
-		{name: "a plan discloses", glyph: glyph.Attention, heading: "refused unless destructive storage changes are allowed"},
-		{name: "an apply refuses", isApply: true, glyph: glyph.Refused, heading: "Destructive changes refused. To proceed with them, re-run with --allow-unsafe"},
-		{name: "consent in effect", allowed: true, glyph: glyph.Escalation, heading: "running because destructive storage changes are allowed", runs: true},
+		{name: "a plan discloses", heading: glyph.Attention + " Unsafe Changes Detected:"},
+		{name: "an apply refuses", isApply: true, heading: glyph.Refused + " Apply blocked: 1 unsafe change(s) detected", rerun: true},
+		{name: "consent in effect", allowed: true, heading: glyph.Escalation + " Unsafe Changes (destructive storage changes allowed)", runs: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -97,12 +97,15 @@ func TestOutputStorageSchemaPlan_DestructiveSeverity(t *testing.T) {
 				DestructiveAllowed: tc.allowed,
 			}
 			out := captureStdout(func() {
-				require.NoError(t, outputStorageSchemaPlan(report, tc.isApply, nil))
+				require.NoError(t, outputStorageSchemaPlan(report, tc.isApply, "storage apply --allow-unsafe", nil))
 			})
 
-			assert.Contains(t, out, tc.glyph+" Destructive changes")
 			assert.Contains(t, out, tc.heading)
 			assert.Contains(t, out, "1. stale_state: DROP TABLE destroys data")
+			if tc.rerun {
+				assert.Contains(t, out, "schemabot storage apply --allow-unsafe",
+					"a blocked apply names the command that permits what it refused, carrying this one's target flags")
+			}
 			if tc.runs {
 				assert.Contains(t, out, "- stale_state", "a statement that will run is shown as a change")
 				assert.Contains(t, out, "📋 Plan: 1 table to drop")
@@ -135,7 +138,7 @@ func TestOutputStorageSchemaPlan_ManualBlocksEverything(t *testing.T) {
 	}
 
 	out := captureStdout(func() {
-		require.NoError(t, outputStorageSchemaPlan(report, false, nil))
+		require.NoError(t, outputStorageSchemaPlan(report, false, "storage apply --allow-unsafe", nil))
 	})
 
 	assert.Contains(t, out, "Database: schemabot (deployment west)")
@@ -162,7 +165,7 @@ func TestOutputStorageSchemaConvergence_Clean(t *testing.T) {
 	remaining := &apitypes.StorageSchemaReport{Dialect: "mysql", Database: "schemabot", Host: "db-1.example", Converged: true}
 
 	out := captureStdout(func() {
-		require.NoError(t, outputStorageSchemaConvergence(planned, remaining, false))
+		require.NoError(t, outputStorageSchemaConvergence(planned, remaining, false, "storage apply --allow-unsafe"))
 	})
 
 	assert.Equal(t, "✓ Ran 2 statements against schemabot on db-1.example. Nothing is outstanding.\n\n", out)
@@ -183,7 +186,7 @@ func TestOutputStorageSchemaConvergence_PrintsThePlanItRan(t *testing.T) {
 	remaining := &apitypes.StorageSchemaReport{Dialect: "mysql", Database: "schemabot", Host: "db-1.example", Converged: true}
 
 	out := captureStdout(func() {
-		require.NoError(t, outputStorageSchemaConvergence(planned, remaining, true))
+		require.NoError(t, outputStorageSchemaConvergence(planned, remaining, true, "storage apply --allow-unsafe"))
 	})
 
 	assert.Contains(t, out, "MySQL Schema Change Apply")
@@ -214,15 +217,19 @@ func TestOutputStorageSchemaConvergence_LeftBehind(t *testing.T) {
 		}},
 	}
 
+	// The re-run command is the one that addressed this storage, target flags
+	// and all: it is printed to be copied, and one that named a different
+	// database than the refusal is about would be worse than none.
+	rerun := "storage apply --deployment shard-a -e production --allow-unsafe"
 	out := captureStdout(func() {
-		require.NoError(t, outputStorageSchemaConvergence(planned, remaining, false))
+		require.NoError(t, outputStorageSchemaConvergence(planned, remaining, false, rerun))
 	})
 
 	assert.Contains(t, out, "✓ Ran 1 statement against schemabot on db-1.example.")
 	assert.NotContains(t, out, "Nothing is outstanding")
-	assert.Contains(t, out, glyph.Refused+" Destructive changes refused")
+	assert.Contains(t, out, glyph.Refused+" Apply blocked")
 	assert.Contains(t, out, "1. stale_state: DROP TABLE destroys data")
-	assert.Contains(t, out, "--allow-unsafe")
+	assert.Contains(t, out, "schemabot "+rerun)
 }
 
 // A convergence that ran nothing and left everything says so as a refusal. A ✓
@@ -250,14 +257,14 @@ func TestOutputStorageSchemaConvergence_RefusedRunsSayNothingRan(t *testing.T) {
 	}
 
 	out := captureStdout(func() {
-		require.NoError(t, outputStorageSchemaConvergence(gated, gated, false))
+		require.NoError(t, outputStorageSchemaConvergence(gated, gated, false, "storage apply --allow-unsafe"))
 	})
 	assert.Contains(t, out, glyph.Refused+" Ran no statements against schemabot on db-1.example; the storage schema is unchanged.")
 	assert.NotContains(t, out, "✓ Ran", "nothing ran, so nothing succeeded")
 	assert.Equal(t, 1, strings.Count(out, "Needs manual remediation"))
 
 	withPlan := captureStdout(func() {
-		require.NoError(t, outputStorageSchemaConvergence(gated, gated, true))
+		require.NoError(t, outputStorageSchemaConvergence(gated, gated, true, "storage apply --allow-unsafe"))
 	})
 	assert.Contains(t, withPlan, "PostgreSQL Schema Change Apply")
 	assert.Contains(t, withPlan, glyph.Refused+" Ran no statements against")
@@ -407,7 +414,7 @@ func TestOutputStorageSchemaPlan_GatedListIsOneLinePerStatement(t *testing.T) {
 	}
 
 	out := captureStdout(func() {
-		require.NoError(t, outputStorageSchemaPlan(report, false, nil))
+		require.NoError(t, outputStorageSchemaPlan(report, false, "storage apply --allow-unsafe", nil))
 	})
 
 	gated := out[strings.Index(out, "Gated behind"):strings.Index(out, "Needs manual remediation")]
@@ -424,6 +431,34 @@ func TestOutputStorageSchemaPlan_GatedListIsOneLinePerStatement(t *testing.T) {
 	assert.NotContains(t, out, "2. checks:")
 }
 
+// A destructive statement's reason is one finding, however it is punctuated.
+// The convergence writes one for a statement whose destructive clauses could
+// not be partitioned, and it names the classification and then what that meant
+// for the statement — two halves of one sentence. Numbered as two findings, the
+// second would read as a separate statement that was also refused.
+func TestOutputStorageSchemaPlan_DestructiveReasonIsOneFinding(t *testing.T) {
+	reason := "DROP COLUMN destroys data; refused whole because its clauses could not be partitioned: unsupported clause"
+	report := &apitypes.StorageSchemaReport{
+		Dialect:      "mysql",
+		Database:     "schemabot",
+		SchemaSource: "the schema embedded in v1.4.0",
+		Destructive: []apitypes.StorageSchemaStatement{{
+			Table:     "applies",
+			Operation: "alter_table",
+			DDL:       "ALTER TABLE `applies` DROP COLUMN `caller`",
+			Reason:    reason,
+		}},
+	}
+
+	out := captureStdout(func() {
+		require.NoError(t, outputStorageSchemaPlan(report, true, "storage apply --allow-unsafe", nil))
+	})
+
+	assert.Contains(t, out, "1 unsafe change(s) detected", "one statement is one finding")
+	assert.Contains(t, out, "  1. applies: "+reason+"\n")
+	assert.NotContains(t, out, "2. applies:")
+}
+
 // A plan's sections come out in a fixed order — what runs, what is refused,
 // what needs a person — so two plans of the same database read the same way.
 func TestOutputStorageSchemaPlan_SectionOrder(t *testing.T) {
@@ -436,10 +471,10 @@ func TestOutputStorageSchemaPlan_SectionOrder(t *testing.T) {
 	}
 
 	out := captureStdout(func() {
-		require.NoError(t, outputStorageSchemaPlan(report, false, nil))
+		require.NoError(t, outputStorageSchemaPlan(report, false, "storage apply --allow-unsafe", nil))
 	})
 
-	assert.Less(t, strings.Index(out, "~ applies"), strings.Index(out, "Destructive changes"))
+	assert.Less(t, strings.Index(out, "~ applies"), strings.Index(out, "Unsafe Changes Detected"))
 }
 
 // A manual entry gates the whole drift set, so a plan carrying one prints no
@@ -457,7 +492,7 @@ func TestOutputStorageSchemaPlan_ManualGatesRunnableSQL(t *testing.T) {
 	}
 
 	out := captureStdout(func() {
-		require.NoError(t, outputStorageSchemaPlan(report, false, nil))
+		require.NoError(t, outputStorageSchemaPlan(report, false, "storage apply --allow-unsafe", nil))
 	})
 
 	assert.NotContains(t, out, "~ applies",
@@ -493,7 +528,7 @@ func TestStorageSchemaRunnable_SummarizesInTables(t *testing.T) {
 	assert.Len(t, runnable, 2, "one entry per table and kind, not one per statement")
 
 	out := captureStdout(func() {
-		require.NoError(t, outputStorageSchemaPlan(report, false, nil))
+		require.NoError(t, outputStorageSchemaPlan(report, false, "storage apply --allow-unsafe", nil))
 	})
 	assert.Contains(t, out, "📋 Plan: 1 table to create, 1 table to alter")
 	assert.Contains(t, out, "COLUMN driver", "every statement is still printed")
