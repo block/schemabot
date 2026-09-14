@@ -3,6 +3,7 @@ package commands
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -16,12 +17,17 @@ import (
 // command takes before it does anything: which database to open, which family
 // it belongs to, and under which storage policy.
 //
-// It is deliberately the only place that decides. A command that inferred its
-// own dialect, or read its own environment variable, would be a second answer
-// to a question that has to have one — and the failure mode of getting it wrong
-// is connecting one family's driver to the other's port, which fails with a
-// protocol error that says nothing about the real problem to an operator who is
-// usually mid-incident.
+// Every command that can address either family resolves it here, and none of
+// them infers a dialect or reads an environment variable of its own: that would
+// be a second answer to a question that has to have one, and the failure mode
+// of getting it wrong is connecting one family's driver to the other's port,
+// which fails with a protocol error that says nothing about the real problem to
+// an operator who is usually mid-incident.
+//
+// The two PostgreSQL-only repair commands resolve their DSN through
+// resolveStorageDSN instead, which refuses anything but PostgreSQL rather than
+// deciding between families. It answers a narrower question, so it is not a
+// competing answer to this one.
 
 // storageTarget is a resolved direct connection to a storage database: where to
 // connect, which family the database belongs to, the storage policy that
@@ -152,16 +158,18 @@ func resolveStorageTarget(dsnFlag, configFlag, dialectFlag string) (*storageTarg
 // directStorageDialect decides which database family a DSN passed straight on
 // the command line addresses.
 //
-// An explicit --dialect settles it. Without one, the two families' own
-// connection-string parsers do: each one either accepts the string or does not,
-// which is the same judgement that will be made when the command connects.
-// Reading the string for family-specific substrings instead would misclassify a
-// MySQL password containing "port=" and reject libpq forms spelled with
-// keywords nobody thought to list.
+// An explicit --dialect settles it. Without one, a DSN written in either
+// family's own form is settled by that form — a postgres:// URL by its scheme,
+// a user@net(addr)/db string by the Go MySQL driver's grammar — and a DSN that
+// does not parse within the family it is written for is reported as the broken
+// DSN of that family, with its own parser's reason. Only a string in neither
+// form is offered to both parsers, which is the same judgement that will be
+// made when the command connects.
 //
-// A postgres:// URL is settled by its scheme before either parser runs, so a
-// malformed one is reported as the broken PostgreSQL DSN it is rather than as a
-// string of no recognizable family.
+// The order matters more than it looks. The two parsers do not partition
+// between them: libpq's keyword grammar accepts a MySQL DSN whole, so asking
+// "which parser accepts this" moves a MySQL DSN with one bad parameter into
+// the other family rather than reporting the parameter (see hasMySQLDSNForm).
 //
 // A DSN neither parser accepts is refused naming --dialect: connecting a MySQL
 // driver to a PostgreSQL port fails with a protocol error that says nothing
@@ -181,6 +189,12 @@ func directStorageDialect(dsn, dialectFlag string) (schema.Dialect, error) {
 			return "", fmt.Errorf("--dsn is a PostgreSQL connection URL but does not parse as one: %w", err)
 		}
 		return schema.DialectPostgres, nil
+	}
+	if hasMySQLDSNForm(dsn) {
+		if _, err := mysqlconn.ConnectionDSN(dsn); err != nil {
+			return "", fmt.Errorf("--dsn is written as a Go MySQL driver DSN but does not parse as one: %w", err)
+		}
+		return schema.DialectMySQL, nil
 	}
 	// MySQL first, and the order carries the decision. The Go MySQL driver's
 	// grammar is the narrow one — it wants user:pass@proto(addr)/dbname — while
@@ -205,4 +219,29 @@ func directStorageDialect(dsn, dialectFlag string) (schema.Dialect, error) {
 func hasPostgresURLScheme(dsn string) bool {
 	lowered := strings.ToLower(strings.TrimSpace(dsn))
 	return strings.HasPrefix(lowered, "postgres://") || strings.HasPrefix(lowered, "postgresql://")
+}
+
+// mysqlDSNForm matches the Go MySQL driver's grammar as far as the database
+// name: an optional user[:password], an "@", an optional network and address,
+// and the "/" that introduces the database. Everything before that "/" carries
+// no "=" and no space, which a libpq keyword/value string always has.
+var mysqlDSNForm = regexp.MustCompile(`^[^=\s/]*@[a-zA-Z0-9]*(\([^()]*\))?/`)
+
+// hasMySQLDSNForm reports whether a DSN is written in the Go MySQL driver's own
+// form, the way hasPostgresURLScheme reports the other family's.
+//
+// Settling the family on the form rather than on which parser accepts the
+// string is what keeps a bad parameter from moving a DSN between families. The
+// two parsers do not partition: libpq's keyword grammar accepts a MySQL DSN
+// whole, reading it as a set of words it does not recognize, so a MySQL DSN the
+// MySQL parser rejects for `?timeout=30` or `?parseTime=yes` is still accepted
+// by the PostgreSQL one — as a connection to a local socket under the operator's
+// own account, naming no database they chose. Nothing about the command then
+// mentions MySQL, and with --allow-destructive the wrong family's bootstrap
+// converges against whatever that resolves to.
+//
+// Recognizing the form first turns that into what it is: a MySQL DSN with a
+// broken parameter, reported with the parser's own reason.
+func hasMySQLDSNForm(dsn string) bool {
+	return mysqlDSNForm.MatchString(strings.TrimSpace(dsn))
 }

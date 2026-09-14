@@ -70,6 +70,26 @@ func TestDirectStorageDialect(t *testing.T) {
 			wantErr: "does not parse as one",
 		},
 		{
+			// libpq's keyword grammar accepts a MySQL DSN whole, so a DSN the
+			// MySQL parser rejects for one parameter is still accepted by the
+			// PostgreSQL one — as a local socket under the operator's own
+			// account, naming no database they chose. The form settles the
+			// family, so what comes back is the parameter, not the other family.
+			name:    "a MySQL DSN with a duration parameter missing its unit",
+			dsn:     "root:secret@tcp(db.example:3306)/schemabot?timeout=30",
+			wantErr: "Go MySQL driver DSN but does not parse as one",
+		},
+		{
+			name:    "a MySQL DSN with an unreadable boolean parameter",
+			dsn:     "root:secret@tcp(db.example:3306)/schemabot?parseTime=yes",
+			wantErr: "Go MySQL driver DSN but does not parse as one",
+		},
+		{
+			name:    "a MySQL DSN naming a TLS profile the driver has no registration for",
+			dsn:     "root:secret@tcp(db.example:3306)/schemabot?tls=custom-profile",
+			wantErr: "Go MySQL driver DSN but does not parse as one",
+		},
+		{
 			name:    "a DSN in neither family",
 			dsn:     "jdbc:mysql://db.example:3306/schemabot",
 			wantErr: "cannot tell which database family --dsn addresses",
@@ -183,7 +203,31 @@ func TestStorageTargetAllowsDestructive_RequestOnlyWidens(t *testing.T) {
 	assert.False(t, strict.allowsDestructive(false))
 	assert.True(t, strict.allowsDestructive(true),
 		"the request flag widens a target with no standing policy")
-	assert.Len(t, strict.ensureSchemaOptions(false), 2,
-		"a target with no config statement budget leaves the package default in place")
-	assert.Len(t, permissive.ensureSchemaOptions(false), 2)
+}
+
+// A target converges or diffs under the policy it resolved: the family whose
+// differ runs, whether destructive statements are permitted, and the statement
+// budget its config asked for. A target with no config behind it passes no
+// budget option at all, which is what leaves the package default in place
+// rather than overriding it with a zero — and zero, for PostgreSQL, means "no
+// budget" rather than "the default".
+func TestStorageTargetEnsureSchemaOptions_CarryTheResolvedPolicy(t *testing.T) {
+	budget := 45 * time.Second
+	configured := &storageTarget{
+		dialect:                  schema.DialectPostgres,
+		allowDestructive:         true,
+		postgresStatementTimeout: &budget,
+	}
+	assert.Equal(t, schema.DialectPostgres, configured.dialect)
+	assert.True(t, configured.allowsDestructive(false), "the config's own policy converges without a flag")
+	assert.Len(t, configured.ensureSchemaOptions(false), 3,
+		"dialect, destructive policy, and the config's statement budget")
+
+	direct := &storageTarget{dialect: schema.DialectMySQL}
+	assert.False(t, direct.allowsDestructive(false))
+	assert.Nil(t, direct.postgresStatementTimeout, "a DSN on the command line carries no config budget")
+	assert.Len(t, direct.ensureSchemaOptions(false), 2,
+		"dialect and destructive policy only, so the package default budget stands")
+	assert.Len(t, direct.ensureSchemaOptions(true), 2,
+		"the request flag widens the policy without adding a budget")
 }
