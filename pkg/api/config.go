@@ -2799,13 +2799,8 @@ func (c *ServerConfig) MemberPlanningFor(database, environment string) (MemberPl
 	if !ok {
 		return PlanMirrored, &EnvironmentNotConfiguredError{Database: database, Environment: environment}
 	}
-	if envConfig.Targets != nil {
+	if envConfig.UsesTargetsList() {
 		return PlanIndependent, nil
-	}
-	for _, dt := range envConfig.Deployments {
-		if dt.Targets != nil {
-			return PlanIndependent, nil
-		}
 	}
 	return PlanMirrored, nil
 }
