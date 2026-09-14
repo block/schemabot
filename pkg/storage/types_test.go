@@ -413,6 +413,64 @@ func TestTargetOperationKey(t *testing.T) {
 	}
 }
 
+// TestCutTargetPrefix covers how a reader recovers the scoped part of an
+// operation key. Both key shapes are live at once, so the cut reports what it
+// did rather than deciding, and a target named after a component of an
+// unqualified key is the case that proves the caller must parse unqualified
+// first.
+func TestCutTargetPrefix(t *testing.T) {
+	cases := []struct {
+		name          string
+		target        string
+		operationKey  string
+		wantScoped    string
+		wantQualified bool
+	}{
+		{
+			name:          "a qualified key cuts down to its scoped part",
+			target:        "orders-002",
+			operationKey:  TargetOperationKey("orders-002", ShardOperationKey("main", "-80", "customers")),
+			wantScoped:    "main/-80/customers",
+			wantQualified: true,
+		},
+		{
+			name:          "an unqualified key is returned whole",
+			target:        "orders-002",
+			operationKey:  ShardOperationKey("main", "-80", "customers"),
+			wantScoped:    "main/-80/customers",
+			wantQualified: false,
+		},
+		{
+			name:          "another member's key is not this member's prefix",
+			target:        "orders-003",
+			operationKey:  TargetOperationKey("orders-002", ShardOperationKey("main", "-80", "customers")),
+			wantScoped:    "orders-002/main/-80/customers",
+			wantQualified: false,
+		},
+		{
+			name:          "an operation with no target cuts nothing",
+			target:        "",
+			operationKey:  ShardOperationKey("main", "-80", "customers"),
+			wantScoped:    "main/-80/customers",
+			wantQualified: false,
+		},
+		{
+			name:          "a target named for its namespace cuts a real component",
+			target:        "main",
+			operationKey:  ShardOperationKey("main", "-80", "customers"),
+			wantScoped:    "-80/customers",
+			wantQualified: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scoped, qualified := CutTargetPrefix(tc.target, tc.operationKey)
+			assert.Equal(t, tc.wantScoped, scoped)
+			assert.Equal(t, tc.wantQualified, qualified)
+		})
+	}
+}
+
 // TestPlanIDForOperation covers which plan a member executes: members planned
 // together share their apply's plan, a member planned against its own live
 // schema carries its own, and a member with neither is not executable and must

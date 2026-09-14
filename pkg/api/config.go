@@ -1654,6 +1654,13 @@ func (c EnvironmentConfig) validateMultiTargetSupport(context, databaseType stri
 // alongside a target is reported as the conflict it is rather than as an empty
 // list. An entry that names neither returns an empty list without an error,
 // leaving the caller to report the missing target in its own terms.
+//
+// A listed target may not contain the operation key delimiter. A deployment
+// addressing several targets names each one in its members' operation keys, and
+// a target carrying the delimiter would write a key no reader can split back
+// into the target it came from. Refusing the name is the only point at which
+// that is still recoverable: once such a key is written, the ambiguity is in the
+// data.
 func resolveTargetList(what, target string, targets []string) ([]string, error) {
 	if target != "" && targets != nil {
 		return nil, fmt.Errorf("%s cannot configure both target and targets", what)
@@ -1671,6 +1678,9 @@ func resolveTargetList(what, target string, targets []string) ([]string, error) 
 	for i, t := range targets {
 		if t == "" {
 			return nil, fmt.Errorf("%s targets entry %d is empty", what, i)
+		}
+		if strings.Contains(t, storage.OperationKeyDelimiter) {
+			return nil, fmt.Errorf("%s targets entry %d %q contains reserved delimiter %q; a target's name leads the operation keys of the members that address it, so it cannot contain the character that separates their components", what, i, t, storage.OperationKeyDelimiter)
 		}
 		if seen[t] {
 			return nil, fmt.Errorf("%s lists target %q more than once; a rollout member is identified by its deployment and target together, so one deployment cannot address the same target twice", what, t)
@@ -2773,13 +2783,8 @@ func (c *ServerConfig) MemberPlanningFor(database, environment string) (MemberPl
 	if !ok {
 		return PlanMirrored, &EnvironmentNotConfiguredError{Database: database, Environment: environment}
 	}
-	if envConfig.Targets != nil {
+	if envConfig.UsesTargetsList() {
 		return PlanIndependent, nil
-	}
-	for _, dt := range envConfig.Deployments {
-		if dt.Targets != nil {
-			return PlanIndependent, nil
-		}
 	}
 	return PlanMirrored, nil
 }

@@ -320,6 +320,11 @@ const (
 	ApplyOperationKindGroupFinalizer = "group_finalizer"
 )
 
+// OperationKeyDelimiter separates the components of an operation key. A
+// component containing it would make the key ambiguous to split, so producers
+// refuse the delimiter inside a component rather than escaping it.
+const OperationKeyDelimiter = "/"
+
 // ShardOperationKey builds the operation key for one shard's work on one table
 // ("<namespace>/<shard>/<table>"). It is the canonical key for shard-scoped
 // work operations: the control plane's sharded fan-out stamps it on each
@@ -327,7 +332,7 @@ const (
 // plane's operation row, and the task loaders match shard-tagged task rows
 // against it to distinguish drive tasks from reflected per-shard progress rows.
 func ShardOperationKey(namespace, shard, table string) string {
-	return namespace + "/" + shard + "/" + table
+	return namespace + OperationKeyDelimiter + shard + OperationKeyDelimiter + table
 }
 
 // TargetOperationKey builds the operation key for one target's work when a
@@ -345,7 +350,25 @@ func TargetOperationKey(target, scopedKey string) string {
 	if scopedKey == "" {
 		return target
 	}
-	return target + "/" + scopedKey
+	return target + OperationKeyDelimiter + scopedKey
+}
+
+// CutTargetPrefix removes an operation key's leading target component, reporting
+// whether the key carried one.
+//
+// A key names its target only when that target's deployment addresses more than
+// one, so a reader meets both shapes and cannot tell them apart by inspection: a
+// target named after the namespace it holds produces the same leading component
+// either way. The operation row carries its target, so the prefix is matched
+// rather than guessed — but matching it is not proof that the key is qualified,
+// which is why this reports what it did instead of deciding. Parse the key
+// unqualified first and only fall back to the cut form, so a shape that already
+// reads as a whole key is never mistaken for a qualified one.
+func CutTargetPrefix(target, operationKey string) (scopedKey string, qualified bool) {
+	if target == "" {
+		return operationKey, false
+	}
+	return strings.CutPrefix(operationKey, target+OperationKeyDelimiter)
 }
 
 // PlanIDForOperation resolves which plan an operation executes: its own when it
