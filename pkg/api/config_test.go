@@ -2305,6 +2305,15 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			wantErrSub: `lists target "payments-001" more than once`,
 		},
 		{
+			name: "environment target containing the operation key delimiter is rejected",
+			envConfig: EnvironmentConfig{
+				Deployment: "payments-a",
+				Targets:    []string{"payments-001", "payments/002"},
+			},
+			tern:       baseTern,
+			wantErrSub: `targets entry 1 "payments/002" contains reserved delimiter "/"`,
+		},
+		{
 			name: "environment targets without a deployment is rejected",
 			envConfig: EnvironmentConfig{
 				Targets: []string{"payments-001", "payments-002"},
@@ -2351,6 +2360,16 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			},
 			tern:       baseTern,
 			wantErrSub: `deployment "payments-a" lists target "payments-001" more than once`,
+		},
+		{
+			name: "deployment target containing the operation key delimiter is rejected",
+			envConfig: EnvironmentConfig{
+				Deployments: map[string]DeploymentTarget{
+					"payments-a": {Targets: []string{"payments/001", "payments-002"}},
+				},
+			},
+			tern:       baseTern,
+			wantErrSub: `deployment "payments-a" targets entry 0 "payments/001" contains reserved delimiter "/"`,
 		},
 		{
 			name: "the same target under different deployments is accepted",
