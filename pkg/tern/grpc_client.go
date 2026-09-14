@@ -2224,9 +2224,12 @@ func (c *GRPCClient) ResumeApplyOperation(ctx context.Context, apply *storage.Ap
 		// modelled as a task row. Dispatch it as a VSchema-only apply, which the
 		// data plane applies via its own task-less VSchema-only path, mirroring
 		// LocalClient.ResumeApplyOperation.
+		// A plan is what makes a task-less work operation valid, so an operation
+		// that resolves to none fails closed on the same signal as one whose plan
+		// carries no VSchema work, with the resolution failure as context.
 		planID, err := scope.planID(apply)
 		if err != nil {
-			return fmt.Errorf("resolve plan for task-less apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, err)
+			return fmt.Errorf("apply_operation %d (apply %s) resolves to no plan (%w): %w", applyOperationID, apply.ApplyIdentifier, err, ErrNoTasksForApplyOperation)
 		}
 		plan, err := c.storage.Plans().GetByID(ctx, planID)
 		if err != nil {
