@@ -69,6 +69,12 @@ func TestConnectionDSN(t *testing.T) {
 			// every SchemaBot-managed connection, so parameterized queries
 			// never create server-side prepared statements.
 			assert.True(t, cfg.InterpolateParams)
+			// A signed tinyint(1) is read as the number stored in it rather
+			// than as a Go bool. The driver keeps the parsed field unexported,
+			// so the assertion is on the DSN the pool is opened with — which is
+			// also what a driver that stopped emitting the parameter would
+			// change, rather than reverting the behavior silently.
+			assert.Contains(t, got, "tinyInt1IsBool=false")
 			// Caller-supplied params survive the reassembly.
 			assert.Equal(t, tt.wantParseTime, cfg.ParseTime)
 			_, err = mysql.NewConnector(cfg)
