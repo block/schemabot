@@ -535,12 +535,26 @@ func WriteUnsafeChangesWarning(changes []UnsafeChange) {
 // is in effect (see pkg/glyph). It is the unsafe-change list under another
 // name, because a reader wants the same things of a change that will not run as
 // of one that might: which table, what it would do, and what stands in the way.
+//
+// One change is one numbered line, and its reason is printed as it was written.
+// The unsafe-change list splits a reason into findings because a lint reason is
+// a concatenation of them; a reason written for one change is one sentence, and
+// splitting it renders half of it as a finding of its own — "NOT NULL without a
+// DEFAULT" and "add it manually" as two separate things to fix, the second of
+// them the remedy for the first. A change carrying no reason is named by what it
+// would do, which keeps an entry a line rather than a block of DDL.
 func WriteChangeNotice(severity, heading string, changes []UnsafeChange) {
 	if len(changes) == 0 {
 		return
 	}
 	fmt.Println(severity + " " + heading)
-	writeUnsafeChangesList(changes)
+	for i, c := range changes {
+		reason := c.Reason
+		if reason == "" {
+			reason = c.ChangeType
+		}
+		fmt.Printf("  %d. %s: %s\n", i+1, c.Table, reason)
+	}
 	fmt.Println()
 }
 
