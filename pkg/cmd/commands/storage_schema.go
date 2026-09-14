@@ -253,16 +253,19 @@ type StorageApplyCmd struct {
 	// reason and the alternative. An operator who has just run the diff against
 	// a release reaches for the same flags on the apply, and Kong's bare
 	// "unknown flag" would leave them guessing at whether the convergence
-	// silently used a different schema.
+	// silently used a different schema. --release-repo is accepted for the same
+	// reason: it is the flag most likely to be left on the line after the one
+	// it modifies has been dropped.
 	SchemaDir string `hidden:"" name:"schema-dir"`
 	Release   string `hidden:""`
+	Repo      string `hidden:"" name:"release-repo"`
 }
 
 func (cmd *StorageApplyCmd) Run(ctx context.Context, g *Globals) error {
 	if err := cmd.validate(); err != nil {
 		return err
 	}
-	if err := storageSchemaSourceRefusal(cmd.SchemaDir, cmd.Release); err != nil {
+	if err := storageSchemaSourceRefusal(cmd.SchemaDir, cmd.Release, cmd.Repo); err != nil {
 		return err
 	}
 
@@ -285,16 +288,11 @@ func (cmd *StorageApplyCmd) Run(ctx context.Context, g *Globals) error {
 		if err := outputStorageSchemaPlan(report, true, nil); err != nil {
 			return err
 		}
-		if report.Converged {
-			// Nothing to converge and nothing to approve. Returning success is
-			// the honest answer: the storage already matches.
-			return nil
-		}
 		if len(report.Manual) > 0 {
 			return fmt.Errorf("refusing to converge storage schema on %s: %d change(s) need manual remediation first (listed above)", storageSchemaDatabaseLabel(report), len(report.Manual))
 		}
 		confirmed, err := confirmAction(
-			fmt.Sprintf("\nDo you want to apply these changes to %s? Only 'yes' will be accepted: ", storageSchemaDatabaseLabel(report)),
+			storageSchemaConfirmation(report),
 			"\nApply cancelled.",
 		)
 		if err != nil {
@@ -319,6 +317,24 @@ func (cmd *StorageApplyCmd) Run(ctx context.Context, g *Globals) error {
 		return err
 	}
 	return storageSchemaConvergenceOutcome(remaining)
+}
+
+// storageSchemaConfirmation asks for the convergence the operator is about to
+// run, which is not always a set of statements.
+//
+// A preview that found nothing outstanding does not end the command. The
+// bootstrap converges more than the catalog: it also clears the schema change
+// engine's leftover tables, which outlive an interrupted convergence and are
+// invisible to a diff of the catalog (see api.ApplyStorageSchema). Stopping
+// here would leave them on the database and make an interactive apply do less
+// than the same command with --auto-approve — and the one an operator reaches
+// for mid-incident is the interactive one.
+func storageSchemaConfirmation(report *apitypes.StorageSchemaReport) string {
+	label := storageSchemaDatabaseLabel(report)
+	if report.Converged {
+		return fmt.Sprintf("\nThe catalog of %s already matches. Run the bootstrap anyway, to clear any engine state a catalog diff cannot see? Only 'yes' will be accepted: ", label)
+	}
+	return fmt.Sprintf("\nDo you want to apply these changes to %s? Only 'yes' will be accepted: ", label)
 }
 
 // storageSchemaConvergenceOutcome is whether a convergence counts as having
@@ -358,8 +374,7 @@ func (cmd *StorageApplyCmd) converge(ctx context.Context, g *Globals) (planned, 
 		if err != nil {
 			return nil, nil, fmt.Errorf("converge storage schema on the database from %s: %w", target.source, err)
 		}
-		plannedReport.Version = g.Version
-		remainingReport.Version = g.Version
+		attributeStorageSchemaConvergence(g.Version, plannedReport, remainingReport)
 		return plannedReport.APIType(), remainingReport.APIType(), nil
 	}
 
@@ -382,6 +397,19 @@ func (cmd *StorageApplyCmd) converge(ctx context.Context, g *Globals) (planned, 
 		return nil, nil, fmt.Errorf("storage schema convergence%s returned an incomplete result; check the target's logs for whether it converged", storageSchemaTargetSuffix(cmd.Deployment, cmd.Environment))
 	}
 	return response.Planned, response.Remaining, nil
+}
+
+// attributeStorageSchemaConvergence says which release a convergence ran, on
+// both halves of it.
+//
+// A convergence names no schema source of its own — that is the invariant, not
+// an omission (AV-9) — so the attribution is what turns "the embedded schema"
+// into this binary's release. Both halves take it, and by the same call the
+// preview took: a run whose plan header named a release and whose result header
+// named a placeholder would read as two runs against two schemas.
+func attributeStorageSchemaConvergence(version string, planned, remaining *api.StorageSchemaReport) {
+	planned.AttributeTo(version)
+	remaining.AttributeTo(version)
 }
 
 // storageSchemaLogger builds the diagnostics logger for a direct connection. A

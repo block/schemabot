@@ -188,22 +188,41 @@ func (cmd *CanonicalizeIdentityKeysCmd) Run(ctx context.Context, g *Globals) err
 // purpose names the operation in the refusal. The source never contains the
 // DSN itself, which may embed credentials.
 func resolveStorageDSN(dsnFlag, configFlag, purpose string) (string, string, error) {
+	if dsnFlag != "" && configFlag != "" {
+		return "", "", fmt.Errorf("--dsn and --config are mutually exclusive; pass the storage DSN directly or resolve it from a server config, not both")
+	}
 	// A direct DSN is checked against the PostgreSQL grammar rather than handed
 	// to the generic family inference: these commands take no --dialect, so
 	// there is nothing for an ambiguous DSN to be resolved by, and the refusal
 	// that helps is the one naming the operation that does not apply to it.
-	if directDSN := strings.TrimSpace(dsnFlag); directDSN != "" && configFlag == "" {
+	//
+	// Presence routes, not content: a --dsn of whitespace is a malformed direct
+	// connection and is refused as one, because reading it as "no DSN" would
+	// resolve the config instead and operate on a database the operator never
+	// named (AZ-5).
+	if dsnFlag != "" {
+		directDSN := strings.TrimSpace(dsnFlag)
+		if directDSN == "" {
+			return "", "", fmt.Errorf("storage DSN not configured: --dsn contains only whitespace")
+		}
 		if _, err := postgresconn.ConnectionDSN(directDSN); err != nil {
 			return "", "", fmt.Errorf("storage DSN from --dsn is not a PostgreSQL DSN; %s only applies to %q storage: %w", purpose, schema.DialectPostgres, err)
 		}
 		return directDSN, "--dsn flag", nil
 	}
-	target, err := resolveStorageTarget(dsnFlag, configFlag, "")
+	// The family is read from the config before the DSN is fetched, so a
+	// command that does not apply to it refuses on the family — naming the
+	// reason, and reading no secret for a connection it will never open.
+	configured, err := resolveStorageConfig(configFlag)
 	if err != nil {
 		return "", "", err
 	}
-	if target.dialect != schema.DialectPostgres {
-		return "", "", fmt.Errorf("storage dialect in %s is %q; %s only applies to %q storage", target.source, target.dialect, purpose, schema.DialectPostgres)
+	if configured.dialect != schema.DialectPostgres {
+		return "", "", fmt.Errorf("storage dialect in %s is %q; %s only applies to %q storage", configured.source, configured.dialect, purpose, schema.DialectPostgres)
+	}
+	target, err := configured.target()
+	if err != nil {
+		return "", "", err
 	}
 	return target.dsn, target.source, nil
 }
