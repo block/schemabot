@@ -43,7 +43,7 @@ type storageTarget struct {
 	// convergence against the same database must too — otherwise "apply is what
 	// a boot does" (AV-9) stops being true on exactly the deployments that
 	// opted in. A DSN passed on the command line carries no config and so no
-	// policy, leaving --allow-destructive as the only way to widen it.
+	// policy, leaving --allow-unsafe as the only way to widen it.
 	allowDestructive bool
 	// postgresStatementTimeout is the config's statement budget, for the same
 	// reason: a convergence run here has to read and write under the budget the
@@ -237,7 +237,7 @@ var mysqlDSNForm = regexp.MustCompile(`^[^=\s/]*@[a-zA-Z0-9]*(\([^()]*\))?/`)
 // MySQL parser rejects for `?timeout=30` or `?parseTime=yes` is still accepted
 // by the PostgreSQL one — as a connection to a local socket under the operator's
 // own account, naming no database they chose. Nothing about the command then
-// mentions MySQL, and with --allow-destructive the wrong family's bootstrap
+// mentions MySQL, and with --allow-unsafe the wrong family's bootstrap
 // converges against whatever that resolves to.
 //
 // Recognizing the form first turns that into what it is: a MySQL DSN with a
