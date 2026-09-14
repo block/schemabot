@@ -190,6 +190,11 @@ Presentation notes:
   fail-closed on a transient verification error (retry unchanged can succeed),
   and ⚠️ a stale-base rejection cleared by rebasing.
 - The severity vocabulary (🚨 ⛔ ❌ ⚠️ ℹ️) lives in `pkg/glyph`. The other
-  icons in this table — and state/consent icons such as ✅, 💡, ⚙️, and 🛑
-  (**Check before applying**, the unattributed-destructive-change gate) — are
+  icons in this table — and state/consent icons such as ✅, 💡, and ⚙️ — are
   deliberately outside it: they mark states and disclosures, not severities.
+  An icon qualifies for that exemption by reading as neutral next to the
+  severity glyphs. A stop sign does not, which is why **Check before
+  applying** — the unattributed-destructive-change gate — carries ⚠️ rather
+  than an icon of its own: it asks the operator to look before proceeding,
+  which is what ⚠️ already means, and a second glyph for that meaning would
+  sit at a severity the reader has no way to place against the five.
