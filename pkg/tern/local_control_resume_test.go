@@ -766,7 +766,7 @@ func TestResumeApplyPlanLoadStorageErrorStaysRecoverable(t *testing.T) {
 	observer := &terminalRecordingObserver{}
 	client.SetObserver(apply.ID, observer)
 
-	err := client.resumeApplyWithTasks(t.Context(), apply, tasks, nil, false, false)
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
 
 	require.ErrorIs(t, err, storageErr)
 	assert.ErrorContains(t, err, "apply-recover-plan")
@@ -796,7 +796,7 @@ func TestResumeApplyContinuesPastARefusedCancelInTheRevertWindow(t *testing.T) {
 	}}}
 	client.storage.(*exactProgressStorage).controlRequests = requests
 
-	err := client.resumeApplyWithTasks(t.Context(), apply, tasks, nil, false, false)
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
 
 	require.ErrorIs(t, err, storageErr, "the resume must have continued past the refusal to reach the plan load")
 	assert.Equal(t, state.Task.RevertWindow, tasks[0].State, "the cut-over task keeps its revert window")
@@ -814,7 +814,7 @@ func TestResumeApplyMissingPlanFailsApply(t *testing.T) {
 	observer := &terminalRecordingObserver{}
 	client.SetObserver(apply.ID, observer)
 
-	err := client.resumeApplyWithTasks(t.Context(), apply, tasks, nil, false, false)
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
 
 	require.NoError(t, err)
 	assert.True(t, state.IsState(applyStore.apply.State, state.Apply.Failed),
@@ -842,7 +842,7 @@ func TestResumeApplyMissingPlanAdoptsConcurrentTerminalState(t *testing.T) {
 	observer := &terminalRecordingObserver{}
 	client.SetObserver(apply.ID, observer)
 
-	err := client.resumeApplyWithTasks(t.Context(), apply, tasks, nil, false, false)
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
 
 	require.NoError(t, err)
 	assert.True(t, state.IsState(applyStore.apply.State, state.Apply.Stopped),
@@ -1204,7 +1204,7 @@ func TestResumeApplyWithTasks_RefusesSequentialResumeOfRevertPhaseTask(t *testin
 			tasks[0].State = tc.taskState
 			taskStore.tasks = tasks
 
-			err := c.resumeApplyWithTasks(t.Context(), apply, tasks, nil, false, false)
+			err := c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
 
 			require.ErrorIs(t, err, errRevertPhaseTaskInSequentialResume)
 			assert.True(t, state.IsState(tasks[0].State, tc.taskState),
@@ -1251,7 +1251,7 @@ func TestResumeApplyWithTasks_RevertPhaseSiblingDoesNotVouchForLandedStatement(t
 			tasks[1].State = siblingState
 			taskStore.tasks = tasks
 
-			err := c.resumeApplyWithTasks(t.Context(), apply, tasks, nil, false, false)
+			err := c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
 
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "sibling task task_name ("+siblingState+"), which will not run it")
