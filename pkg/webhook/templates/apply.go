@@ -1508,6 +1508,10 @@ func writeSummaryCancelled(sb *strings.Builder, data ApplyStatusCommentData, com
 	writeApplyHeader(sb, data)
 	writeSummaryMetadata(sb, data)
 
+	if data.ErrorMessage != "" {
+		writeErrorBlock(sb, glyph.Attention, data.ErrorMessage)
+	}
+
 	if completedCount > 0 {
 		fmt.Fprintf(sb, "\n%d of %d %s completed before cancellation.\n", completedCount, totalTables, pluralize(progressUnit(data.Tables), totalTables))
 	}

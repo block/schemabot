@@ -251,8 +251,9 @@ log, a durable apply-log entry, and a metric. One bad row must never crash-loop 
 bad RPC must never take the server process down with it. The panic value stays server-side: a
 caller gets a fixed internal error, never the panic text or a stack. *Enforced:* the recover
 boundary in `pkg/panicsafe/panicsafe.go`, applied around webhook work units
-(`pkg/webhook/handler.go`, `pkg/webhook/durable_dispatch.go`) and local drives
-(`pkg/tern/local_apply.go`).
+(`pkg/webhook/handler.go`, `pkg/webhook/durable_dispatch.go`), local drives
+(`pkg/tern/local_apply.go`), and the startup target probe (`pkg/serve/serve.go`
+around enumeration, `pkg/targetprobe/targetprobe.go` around each target).
 
 ### AV-6: Mixed versions are survivable by contract, not by guesswork
 
@@ -877,10 +878,14 @@ resolved by drive ordering. *Enforced:* pending-stop checks in pollers and the c
 
 ### CO-5: The revert phase owns the outcome
 
-Once an apply is `reverting` or `skipping_revert`, stop, cancel, and cutover are refused for the
-whole phase, because storage must never settle on a state that contradicts what the engine is
-still doing to the database underneath. *Enforced:* revert-phase gates in the control paths
-(`pkg/tern/local_control.go`).
+Once an apply has entered its revert phase — the window held open after cutover, or a revert or
+skip-revert in flight — stop, cancel, and cutover are refused for the whole phase, and its drive
+keeps driving the phase to its own outcome rather than settling on the refused command, because
+storage must never settle on a state that contradicts what the engine is still doing to the
+database underneath. *Enforced:* the revert-phase gate on the control path
+(`pkg/tern/local_control.go`), and the drive loops that act on its answer
+(`pkg/tern/local_apply_grouped.go`, `pkg/tern/local_apply_sequential.go`,
+`pkg/tern/local_control_resume.go`, `pkg/tern/grpc_client.go`).
 
 ### CO-6: Commands act only where they have an effect
 
