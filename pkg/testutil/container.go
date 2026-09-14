@@ -83,7 +83,10 @@ func ColumnExists(t *testing.T, db *sql.DB, schemaName, tableName, columnName st
 	return count > 0
 }
 
-// IndexExists reports whether indexName exists on schemaName.tableName.
+// IndexExists reports whether indexName exists on schemaName.tableName on a
+// MySQL connection. Both the `information_schema.statistics` view it reads and
+// its `?` placeholders are MySQL-only; PostgreSQL names indexes database-wide
+// and needs its own query.
 func IndexExists(t *testing.T, db *sql.DB, schemaName, tableName, indexName string) bool {
 	t.Helper()
 
