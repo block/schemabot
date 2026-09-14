@@ -53,7 +53,7 @@ func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, pr
 	// apply has no single plan that covers them. Storing them here, before the
 	// rollup is reported, keeps "the review says this member is fine" and "this
 	// member has a plan to run" from being separately true.
-	if err := s.persistMemberPlans(ctx, req, planning, diffs, &rollup); err != nil {
+	if err := s.persistMemberPlans(ctx, req, planning, primaryPlan.GetPlanId(), diffs, &rollup); err != nil {
 		return PlanRollup{}, fmt.Errorf("persist member plans for %s/%s: %w", req.Database, req.Environment, err)
 	}
 
