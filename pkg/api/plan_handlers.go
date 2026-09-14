@@ -828,18 +828,31 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	return resp, planResp, nil
 }
 
-// normalizeExecutionVerdicts validates every table change's execution-mode
+// normalizeExecutionVerdicts normalizes a whole plan response, for the paths
+// that hold one. A nil response is a no-op so callers that may not have reached
+// a planner do not have to guard the call themselves.
+func (s *Service) normalizeExecutionVerdicts(resp *ternv1.PlanResponse, database, deployment string) {
+	if resp == nil {
+		return
+	}
+	s.normalizePlanExecutionVerdicts(resp.Changes, resp.Shards, database, deployment)
+}
+
+// normalizePlanExecutionVerdicts validates every table change's execution-mode
 // verdict against its closed vocabulary — empty (executable), "blocked", or
 // "direct" — before the plan is stored or returned. The verdict crosses the
 // wire as a free-form string and everything except "blocked" executes as the
 // engine's default path downstream, so a value this build does not recognize
 // (a skewed remote planner, a newer plan contract) must fail closed rather
 // than run.
-func (s *Service) normalizeExecutionVerdicts(resp *ternv1.PlanResponse, database, deployment string) {
-	if resp == nil {
-		return
-	}
-	for _, change := range resp.Changes {
+//
+// It takes the plan's parts rather than a response because not every path that
+// stores a plan holds one: a member planned against its own live schema arrives
+// from the non-persisting diff RPC, and its changes reach storage through the
+// same shared writer. Normalizing there is what keeps the vocabulary enforced
+// once for every plan row, whichever RPC produced it.
+func (s *Service) normalizePlanExecutionVerdicts(changes []*ternv1.SchemaChange, shards []*ternv1.ShardPlan, database, deployment string) {
+	for _, change := range changes {
 		if change == nil {
 			continue
 		}
@@ -847,7 +860,7 @@ func (s *Service) normalizeExecutionVerdicts(resp *ternv1.PlanResponse, database
 			s.normalizeExecutionVerdict(tc, database, deployment)
 		}
 	}
-	for _, shard := range resp.Shards {
+	for _, shard := range shards {
 		if shard == nil {
 			continue
 		}
@@ -880,10 +893,18 @@ func recognizedExecutionMode(mode string) bool {
 		strings.EqualFold(mode, engine.ExecutionModeDirect)
 }
 
+// storedPlanRoute is what a stored plan row is stamped with beyond the request:
+// the member the plan was produced for, and — for a member planned against its
+// own live schema — the reviewed plan it was produced alongside.
 type storedPlanRoute struct {
 	DatabaseType string
 	Deployment   string
 	Target       string
+
+	// PrimaryPlanIdentifier names the reviewed plan of this member's review
+	// round. Empty for the reviewed plan itself and for every plan of an
+	// environment whose members all run it.
+	PrimaryPlanIdentifier string
 }
 
 func (s *Service) storePlanResponse(ctx context.Context, req PlanRequest, resp *ternv1.PlanResponse, route storedPlanRoute) error {
@@ -918,6 +939,7 @@ func (s *Service) storePlan(ctx context.Context, req PlanRequest, planIdentifier
 	if req.HeadSHA != nil {
 		headSHA = *req.HeadSHA
 	}
+	s.normalizePlanExecutionVerdicts(changes, shards, req.Database, route.Deployment)
 	namespaces, err := protoChangesToNamespaces(changes, req.SchemaFiles)
 	if err != nil {
 		return fmt.Errorf("convert plan namespaces: %w", err)
@@ -927,20 +949,21 @@ func (s *Service) storePlan(ctx context.Context, req PlanRequest, planIdentifier
 		return fmt.Errorf("convert plan shards: %w", err)
 	}
 	storedPlan := &storage.Plan{
-		PlanIdentifier: planIdentifier,
-		Database:       req.Database,
-		DatabaseType:   route.DatabaseType,
-		Deployment:     route.Deployment,
-		Target:         route.Target,
-		Repository:     req.Repository,
-		PullRequest:    prInt,
-		SchemaPath:     trustedSchemaPath,
-		Environment:    req.Environment,
-		SchemaFiles:    protoToSchemaFiles(req.SchemaFiles),
-		Namespaces:     namespaces,
-		Shards:         storedShards,
-		HeadSHA:        headSHA,
-		CreatedAt:      time.Now(),
+		PlanIdentifier:        planIdentifier,
+		Database:              req.Database,
+		DatabaseType:          route.DatabaseType,
+		Deployment:            route.Deployment,
+		Target:                route.Target,
+		Repository:            req.Repository,
+		PullRequest:           prInt,
+		SchemaPath:            trustedSchemaPath,
+		Environment:           req.Environment,
+		SchemaFiles:           protoToSchemaFiles(req.SchemaFiles),
+		Namespaces:            namespaces,
+		Shards:                storedShards,
+		HeadSHA:               headSHA,
+		PrimaryPlanIdentifier: route.PrimaryPlanIdentifier,
+		CreatedAt:             time.Now(),
 	}
 	if _, err := s.storage.Plans().Create(ctx, storedPlan); err != nil && !errors.Is(err, storage.ErrPlanIDExists) {
 		return fmt.Errorf("store plan %s: %w", planIdentifier, err)
