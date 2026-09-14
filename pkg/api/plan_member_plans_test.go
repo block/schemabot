@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
@@ -123,6 +124,71 @@ func TestRollupReviewTimeDrift_IndependentMemberPlanIsPersisted(t *testing.T) {
 	require.Len(t, stored.Namespaces["testapp"].Tables, 1)
 	assert.Equal(t, "users", stored.Namespaces["testapp"].Tables[0].Table)
 	assert.Contains(t, stored.Namespaces["testapp"].Tables[0].DDL, "ADD COLUMN `phone`")
+	assert.Equal(t, reviewed.PlanId, stored.PrimaryPlanIdentifier,
+		"a member's plan is bound to the reviewed plan it was produced alongside")
+}
+
+// A commit can be planned more than once, and each round stores its own plan per
+// member with the same route and the same head SHA. The reviewed plan's
+// identifier is what tells the rounds apart, so a member plan that cannot be
+// attributed to one is not stored at all: the member then has no plan for the
+// round and blocks the review, rather than being paired with a plan from a round
+// the operator never saw.
+func TestRollupReviewTimeDrift_MemberPlanNeedsAReviewRoundToBindTo(t *testing.T) {
+	reviewed := reviewedUsersPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+	reviewed.PlanId = ""
+	plans := &recordingPlanStore{}
+	svc := multiTargetService(t, &mockTernClient{planDiffResp: alterUsersDiff("ALTER TABLE `users` ADD COLUMN `phone` varchar(32)")}, plans)
+
+	_, err := svc.RollupReviewTimeDrift(t.Context(), planDiffReq(t), reviewed, multiTargetMember("testapp-001"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no identifier to bind member plans to")
+	assert.Empty(t, plans.created)
+}
+
+// A namespace the caller withheld per the config's ignore_namespaces is
+// excluded from the desired state, not absent from it. A member planned against
+// its own live schema is planned from the same partial desired state as the
+// primary, or the data plane reads the omission as intent to remove and the
+// member's stored plan carries DROPs for namespaces the configuration excludes.
+func TestRollupReviewTimeDrift_MemberDiffCarriesTheRequestContract(t *testing.T) {
+	client := &mockTernClient{planDiffResp: alterUsersDiff("ALTER TABLE `users` ADD COLUMN `phone` varchar(32)")}
+	svc := multiTargetService(t, client, &recordingPlanStore{})
+
+	req := planDiffReq(t)
+	req.IgnoredNamespaces = []string{"legacy_reports"}
+	req.GroupedExecution = true
+
+	_, err := svc.RollupReviewTimeDrift(t.Context(), req, reviewedUsersPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)"), multiTargetMember("testapp-001"))
+	require.NoError(t, err)
+
+	require.NotNil(t, client.planDiffReq)
+	assert.Equal(t, []string{"legacy_reports"}, client.planDiffReq.IgnoredNamespaces)
+	require.NotNil(t, client.planDiffReq.GroupedExecution, "the grouping choice is always stated, never left absent")
+	assert.True(t, *client.planDiffReq.GroupedExecution)
+}
+
+// The execution-mode verdict crosses the wire as free-form text and everything
+// except "blocked" runs on the engine's default path. A member's plan reaches
+// storage from the diff RPC rather than the plan RPC, so the vocabulary is
+// enforced where plan rows are written and an unrecognized verdict is persisted
+// blocked rather than applyable.
+func TestRollupReviewTimeDrift_MemberPlanBlocksUnrecognizedVerdict(t *testing.T) {
+	diff := alterUsersDiff("ALTER TABLE `users` ADD COLUMN `phone` varchar(32)")
+	diff.Changes[0].TableChanges[0].ExecutionMode = "future-mode"
+	diff.Changes[0].TableChanges[0].ModeReason = "untrusted planner reason"
+	plans := &recordingPlanStore{}
+	svc := multiTargetService(t, &mockTernClient{planDiffResp: diff}, plans)
+
+	rollup, err := svc.RollupReviewTimeDrift(t.Context(), planDiffReq(t), reviewedUsersPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)"), multiTargetMember("testapp-001"))
+	require.NoError(t, err)
+	require.Len(t, rollup.Entries, 2)
+
+	require.Len(t, plans.created, 1)
+	table := plans.created[0].Namespaces["testapp"].Tables[0]
+	assert.Equal(t, engine.ExecutionModeBlocked, table.ExecutionMode)
+	assert.Contains(t, table.ModeReason, `"future-mode"`)
+	assert.NotContains(t, table.ModeReason, "untrusted planner reason")
 }
 
 // A member whose plan cannot be stored has nothing an apply could run, so it is
