@@ -110,6 +110,33 @@ func TestStoragePlanCmd_RequiresADesiredSchema(t *testing.T) {
 	assert.Contains(t, err.Error(), "--release and --schema-dir can't be used together")
 }
 
+// Destructive storage statements are permitted with --allow-unsafe, the flag
+// the rest of the CLI already uses for destructive changes, and the convergence
+// is the only command that takes it. The plan discloses those statements and
+// names the flag; seeing them as statements that will run means running the
+// apply, which is where the normal plan/apply flow puts the same question.
+func TestStorageSchemaCommands_PermitDestructiveStatementsWithAllowUnsafe(t *testing.T) {
+	parse := func(command string, target any, args ...string) error {
+		parser, err := kong.New(target, kong.Name("schemabot"))
+		require.NoError(t, err)
+		_, err = parser.Parse(append([]string{command}, args...))
+		return err
+	}
+
+	var applyCLI struct {
+		Apply StorageApplyCmd `cmd:"" name:"apply"`
+	}
+	require.NoError(t, parse("apply", &applyCLI, "--dsn", "postgres://localhost/schemabot", "--allow-unsafe"))
+	assert.True(t, applyCLI.Apply.AllowUnsafe, "the flag has to reach the convergence that acts on it")
+
+	var planCLI struct {
+		Plan StoragePlanCmd `cmd:"" name:"plan"`
+	}
+	err := parse("plan", &planCLI, "--schema-dir", ".", "--allow-unsafe")
+	require.Error(t, err, "the plan runs nothing, so there is no consent for it to take")
+	assert.Contains(t, err.Error(), "unknown flag --allow-unsafe")
+}
+
 // Passing a DSN source is what selects the direct path, so a command can tell
 // which path it is on without inspecting what happened to resolve.
 func TestStorageSchemaTargetFlags_Direct(t *testing.T) {
