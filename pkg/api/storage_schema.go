@@ -66,14 +66,34 @@ func PlanStorageSchema(ctx context.Context, dsn string, desired *StorageSchemaSo
 	defer cancel()
 
 	o := newEnsureSchemaOptions(opts...)
+	var report *StorageSchemaReport
+	var err error
 	switch o.dialect {
 	case schema.DialectMySQL:
-		return planMySQLStorageSchema(ctx, dsn, desired, o)
+		report, err = planMySQLStorageSchema(ctx, dsn, desired, o)
 	case schema.DialectPostgres:
-		return planPostgresStorageSchema(ctx, dsn, desired, o)
+		report, err = planPostgresStorageSchema(ctx, dsn, desired, o)
 	default:
 		return nil, fmt.Errorf("no storage schema differ for storage dialect %q (supported: %q, %q)", o.dialect, schema.DialectMySQL, schema.DialectPostgres)
 	}
+	if err != nil {
+		return nil, err
+	}
+	// The differs themselves stay quiet — the MySQL one is handed a discarding
+	// handler so Spirit's planning chatter does not read as a schema change
+	// engine running — so this is the one place a diff leaves a server-side
+	// trace. Without it a drifting storage database is visible only to whoever
+	// ran the command.
+	logger.Info("planned storage schema",
+		"dialect", report.Dialect,
+		"database", report.Database,
+		"schema_source", report.SchemaSource,
+		"outstanding_count", len(report.Outstanding),
+		"destructive_count", len(report.Destructive),
+		"manual_count", len(report.Manual),
+		"destructive_allowed", report.DestructiveAllowed,
+	)
+	return report, nil
 }
 
 // ApplyStorageSchema converges the storage database at dsn and reports what it
@@ -101,6 +121,12 @@ func PlanStorageSchema(ctx context.Context, dsn string, desired *StorageSchemaSo
 // destructive statements when the database holds state this binary's schema
 // does not declare, which is the expected steady state during a rollback
 // (AV-9) rather than a failure.
+//
+// ctx bounds the two diffs, not the convergence between them: EnsureSchema
+// builds its own context from EnsureSchemaTimeout so that a cancelled request
+// cannot abandon a table copy half-done. A caller whose own deadline is shorter
+// than that budget will therefore return before the convergence does, and must
+// not read its own timeout as the apply having stopped.
 func ApplyStorageSchema(ctx context.Context, dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) (planned, remaining *StorageSchemaReport, err error) {
 	planned, err = PlanStorageSchema(ctx, dsn, nil, logger, opts...)
 	if err != nil {
@@ -146,7 +172,7 @@ func ApplyStorageSchema(ctx context.Context, dsn string, logger *slog.Logger, op
 		"dialect", remaining.Dialect,
 		"database", remaining.Database,
 		"applied_count", planned.appliedCount(),
-		"remaining_count", len(remaining.Outstanding)+len(remaining.Destructive),
+		"remaining_count", remaining.remainingCount(),
 	)
 	return planned, remaining, nil
 }

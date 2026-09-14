@@ -102,6 +102,14 @@ func (r *StorageSchemaReport) appliedCount() int {
 	return len(r.Outstanding) + len(r.Destructive)
 }
 
+// remainingCount is how many statements a report still holds, under the same
+// definition Converged uses. A count that omitted one of the three sets would
+// log zero beside a report Converged calls false — on PostgreSQL a manual
+// entry alone does exactly that.
+func (r *StorageSchemaReport) remainingCount() int {
+	return len(r.Outstanding) + len(r.Destructive) + len(r.Manual)
+}
+
 // APIType converts a report to the HTTP response shape, which the CLI renders
 // from. Deployment and Environment are left to the caller: only whoever routed
 // the request knows which storage was asked for, and a report has to name the
