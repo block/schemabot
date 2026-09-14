@@ -543,16 +543,9 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		version:         version,
 	}
 
-	// The HTTP storage schema routes and the gRPC storage schema service answer
-	// from one adapter bound to the storage this server booted with, so an
-	// operator asking this server directly and a control plane asking it over
-	// gRPC read the same database with the same embedded schema files.
-	storageSchema, err := srv.newStorageSchemaService()
-	if err != nil {
-		return nil, fmt.Errorf("build storage schema service: %w", err)
+	if err := srv.registerStorageSchema(svc); err != nil {
+		return nil, err
 	}
-	srv.storageSchema = storageSchema
-	svc.SetStorageSchemaService(storageSchema)
 
 	success = true
 	return srv, nil

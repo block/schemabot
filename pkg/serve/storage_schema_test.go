@@ -3,13 +3,18 @@ package serve
 import (
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/api"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
 )
 
@@ -142,6 +147,39 @@ func TestStorageSchemaAdapter_TargetRefusesAMovedDatabase(t *testing.T) {
 			require.Error(t, err, "a convergence must not write to a database this instance did not boot on")
 		})
 	}
+}
+
+// Building a server registers one storage-schema adapter on both surfaces that
+// answer for its storage: the HTTP routes an operator reaches directly, and the
+// field the gRPC endpoint registers from. Either surface left unregistered
+// refuses every request as unsupported, which an operator reads as a data plane
+// too old to serve them.
+//
+// The adapter is bound to the DSN the storage pool was opened with, so the
+// configured storage naming a different database than this server booted
+// against is refused by both surfaces rather than answered from either.
+func TestRegisterStorageSchemaBindsBothSurfacesToTheBootStorage(t *testing.T) {
+	const bootDSN = "root:pw@tcp(127.0.0.1:3306)/schemabot"
+	logger := slog.New(slog.DiscardHandler)
+	cfg := &api.ServerConfig{Storage: api.StorageConfig{DSN: "root:pw@tcp(127.0.0.1:3306)/schemabot_staging"}}
+	svc := api.New(mysqlstore.New(nil), cfg, nil, logger)
+	srv := &Server{cfg: cfg, svc: svc, dialect: schema.DialectMySQL, storageDSN: bootDSN, version: "v1.2.3", logger: logger}
+
+	require.NoError(t, srv.registerStorageSchema(svc))
+
+	require.NotNil(t, srv.storageSchema, "the gRPC endpoint registers the service from this field")
+	_, err := srv.storageSchema.StorageSchemaPlan(t.Context(), &ternv1.StorageSchemaPlanRequest{})
+	require.Error(t, err, "the configured storage names a database this server did not boot on")
+	assert.Contains(t, err.Error(), "booted against", "the adapter is bound to the DSN the storage pool was opened with")
+
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/storage/schema/plan", strings.NewReader(`{}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	assert.NotContains(t, rec.Body.String(), "does not expose its own storage schema",
+		"the HTTP routes answer from the registered adapter, not as an unregistered surface")
+	assert.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
 }
 
 func bootTargetFor(t *testing.T, dialect schema.Dialect, dsn string) storageTarget {
