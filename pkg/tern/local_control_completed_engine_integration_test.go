@@ -19,10 +19,11 @@ import (
 // its backend: the drive that consumes the durable cancel request gets an
 // already-completed rejection from the engine. The drive must adopt the
 // engine's authoritative outcome — settle the apply and its tasks to completed,
-// not cancelled — and complete the durable cancel request. Without the settle
-// the rejection would surface as a retryable drive error, the request would
-// stay pending, and the operator would re-claim the apply and re-run the
-// doomed cancel on every poll forever.
+// not cancelled — and resolve the durable cancel request as a command that did
+// not take effect, so the PR comment tells the operator the change is live on
+// the target. Without the settle the rejection would surface as a retryable
+// drive error, the request would stay pending, and the operator would re-claim
+// the apply and re-run the doomed cancel on every poll forever.
 func TestLocalClient_CancelAfterEngineChangeCompletedSettlesCompleted(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -78,7 +79,7 @@ func TestLocalClient_CancelAfterEngineChangeCompletedSettlesCompleted(t *testing
 	assert.Equal(t, 100, settledTasks[0].ProgressPercent, "a completed task reports full progress")
 	assert.NotNil(t, settledTasks[0].CompletedAt, "a completed task must carry its completion time")
 
-	requireControlRequestStatus(t, stor, apply.ID, storage.ControlOperationCancel, storage.ControlRequestCompleted)
+	requireOutrunCancelSettled(t, stor, apply.ID)
 	assert.Contains(t, eng.recorded(), "Cancel", "the drive must consult the engine before settling")
 
 	reclaimed, err := stor.Applies().ClaimApplyByID(ctx, apply.ID, "test-reclaim-"+t.Name())
