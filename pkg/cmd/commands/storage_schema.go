@@ -113,8 +113,17 @@ func (f *storageSchemaTargetFlags) validate() error {
 type StoragePlanCmd struct {
 	storageSchemaTargetFlags `embed:""`
 	storageSchemaSourceFlags `embed:""`
-	AllowDestructive         bool `help:"Report destructive statements as ones that would run, matching what an apply with the same flag would do" name:"allow-destructive"`
 	JSON                     bool `help:"Output as JSON"`
+	// AllowUnsafe is deliberately not a flag on the plan. The normal
+	// plan/apply flow has no way to preview an apply's --allow-unsafe either:
+	// the plan discloses the destructive statements and names the flag, and the
+	// way to see them as statements that will run is to run the apply and
+	// decline its prompt. The apply's own preview is that path, and sets this.
+	//
+	// A plan can still report them as running without it, because a target's
+	// standing storage policy can allow destructive changes with no flag on the
+	// line at all.
+	AllowUnsafe bool `kong:"-"`
 }
 
 func (cmd *StoragePlanCmd) Run(ctx context.Context, g *Globals) error {
@@ -169,7 +178,7 @@ func (cmd *StoragePlanCmd) readDirect(ctx context.Context, g *Globals) (*apitype
 	logger.Info("reading storage schema directly",
 		"source", target.source, "dialect", target.dialect, "schema_source", desired.Describe())
 	report, err := api.PlanStorageSchema(ctx, target.dsn, desired, logger,
-		target.ensureSchemaOptions(cmd.AllowDestructive)...)
+		target.ensureSchemaOptions(cmd.AllowUnsafe)...)
 	if err != nil {
 		return nil, fmt.Errorf("diff storage schema on the database from %s: %w", target.source, err)
 	}
@@ -190,7 +199,7 @@ func (cmd *StoragePlanCmd) readThroughAPI(ctx context.Context, g *Globals) (*api
 	request := apitypes.StorageSchemaPlanRequest{
 		Deployment:       cmd.Deployment,
 		Environment:      cmd.Environment,
-		AllowDestructive: cmd.AllowDestructive,
+		AllowDestructive: cmd.AllowUnsafe,
 	}
 	desired, err := cmd.resolve(ctx, func() (schema.Dialect, error) {
 		return cmd.dialectThroughAPI(ctx, endpoint)
@@ -246,7 +255,7 @@ func (cmd *StoragePlanCmd) dialectThroughAPI(ctx context.Context, endpoint strin
 // to point it at another release's — see storageSchemaSourceRefusal.
 type StorageApplyCmd struct {
 	storageSchemaTargetFlags `embed:""`
-	AllowDestructive         bool `help:"Permit the destructive statements the convergence would otherwise refuse; it widens the target's standing storage policy and never narrows it" name:"allow-destructive"`
+	AllowUnsafe              bool `help:"Permit the destructive statements the convergence would otherwise refuse; it widens the target's standing storage policy and never narrows it" name:"allow-unsafe"`
 	AutoApprove              bool `short:"y" help:"Skip confirmation prompt" name:"auto-approve"`
 	JSON                     bool `help:"Output as JSON"`
 	// The diff's file selectors are accepted here only to be refused with the
@@ -279,7 +288,7 @@ func (cmd *StorageApplyCmd) Run(ctx context.Context, g *Globals) error {
 		// schema, which is the schema this convergence is about to run.
 		preview := &StoragePlanCmd{
 			storageSchemaTargetFlags: cmd.storageSchemaTargetFlags,
-			AllowDestructive:         cmd.AllowDestructive,
+			AllowUnsafe:              cmd.AllowUnsafe,
 		}
 		report, err := preview.read(ctx, g)
 		if err != nil {
@@ -367,10 +376,10 @@ func (cmd *StorageApplyCmd) converge(ctx context.Context, g *Globals) (planned, 
 		logger.Info("converging storage schema directly",
 			"source", target.source,
 			"dialect", target.dialect,
-			"allow_destructive", target.allowDestructive || cmd.AllowDestructive,
+			"allow_destructive", target.allowDestructive || cmd.AllowUnsafe,
 			"config_allows_destructive", target.allowDestructive)
 		plannedReport, remainingReport, err := api.ApplyStorageSchema(ctx, target.dsn, logger,
-			target.ensureSchemaOptions(cmd.AllowDestructive)...)
+			target.ensureSchemaOptions(cmd.AllowUnsafe)...)
 		if err != nil {
 			return nil, nil, fmt.Errorf("converge storage schema on the database from %s: %w", target.source, err)
 		}
@@ -385,7 +394,7 @@ func (cmd *StorageApplyCmd) converge(ctx context.Context, g *Globals) (planned, 
 	response, err := cmdclient.StorageSchemaApply(ctx, endpoint, apitypes.StorageSchemaApplyRequest{
 		Deployment:       cmd.Deployment,
 		Environment:      cmd.Environment,
-		AllowDestructive: cmd.AllowDestructive,
+		AllowDestructive: cmd.AllowUnsafe,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("converge storage schema%s: %w", storageSchemaTargetSuffix(cmd.Deployment, cmd.Environment), err)
