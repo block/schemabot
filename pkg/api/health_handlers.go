@@ -1,10 +1,12 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/storage"
@@ -71,6 +73,23 @@ func (s *Service) writeJSON(w http.ResponseWriter, status int, v any) {
 // writeError writes a JSON error response without an error code.
 func (s *Service) writeError(w http.ResponseWriter, status int, message string) {
 	s.writeJSON(w, status, apitypes.ErrorResponse{Error: message})
+}
+
+// extendOperatorWriteDeadline lifts the server-wide write timeout for one
+// operator request and returns a context bounded to the same budget, so work
+// that legitimately outlives the default timeout gets its answer back without
+// running unbounded.
+//
+// A route that needs this and does not have it fails in a way that looks like
+// nothing: the work runs to completion server-side while the connection is
+// closed under it at the server-wide deadline, so the operator sees a truncated
+// response or a hang and has no way to tell whether anything happened.
+func (s *Service) extendOperatorWriteDeadline(w http.ResponseWriter, r *http.Request, budget time.Duration) (context.Context, context.CancelFunc) {
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(budget)); err != nil {
+		s.logger.Warn("failed to extend the operator write deadline; the server-wide write timeout still applies",
+			"path", r.URL.Path, "budget", budget, "error", err)
+	}
+	return context.WithTimeout(r.Context(), budget)
 }
 
 // writeErrorCode writes a JSON error response with an error code.

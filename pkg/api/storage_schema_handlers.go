@@ -26,6 +26,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -163,7 +164,10 @@ func (s *Service) handleStorageSchemaPlan(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	resp, err := target.service.StorageSchemaPlan(r.Context(), &ternv1.StorageSchemaPlanRequest{
+	ctx, cancel := s.extendOperatorWriteDeadline(w, r, storageSchemaPlanWriteBudget)
+	defer cancel()
+
+	resp, err := target.service.StorageSchemaPlan(ctx, &ternv1.StorageSchemaPlanRequest{
 		AllowDestructive: req.AllowDestructive,
 		SchemaFiles:      req.SchemaFiles,
 		SchemaSource:     req.SchemaSource,
@@ -214,7 +218,10 @@ func (s *Service) handleStorageSchemaApply(w http.ResponseWriter, r *http.Reques
 		"allow_destructive", req.AllowDestructive,
 		"caller", operator)
 
-	resp, err := target.service.StorageSchemaApply(r.Context(), &ternv1.StorageSchemaApplyRequest{
+	ctx, cancel := s.extendOperatorWriteDeadline(w, r, storageSchemaApplyWriteBudget)
+	defer cancel()
+
+	resp, err := target.service.StorageSchemaApply(ctx, &ternv1.StorageSchemaApplyRequest{
 		AllowDestructive: req.AllowDestructive,
 		Caller:           operator,
 	})
@@ -355,6 +362,23 @@ func storageSchemaReportResponse(target *storageSchemaTarget, report *ternv1.Sto
 const (
 	storageSchemaPlanOperation  = "storage_schema_plan"
 	storageSchemaApplyOperation = "storage_schema_apply"
+)
+
+// The write deadlines the storage schema routes lift the server-wide one to.
+//
+// Each is the budget the work is already bounded by, plus room to write the
+// answer. The server-wide write timeout is exactly the diff's own budget and a
+// fraction of the convergence's, so without a lift neither route can return
+// what it computed: the work runs on server-side while the connection closes
+// under it, and the operator cannot tell whether their storage was converged.
+//
+// A convergence is three bounded steps — the diff before it, the bootstrap
+// itself, and the diff after it — so its budget is their sum rather than the
+// bootstrap's alone.
+const (
+	storageSchemaResponseMargin   = 30 * time.Second
+	storageSchemaPlanWriteBudget  = StorageSchemaPlanTimeout + storageSchemaResponseMargin
+	storageSchemaApplyWriteBudget = EnsureSchemaTimeout + 2*StorageSchemaPlanTimeout + storageSchemaResponseMargin
 )
 
 // authorizeStorageSchemaOperation gates both storage schema routes on admin

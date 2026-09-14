@@ -257,6 +257,57 @@ func TestStorageSchemaFromRelease_RefusalNamesTheRemedy(t *testing.T) {
 	assert.Contains(t, err.Error(), "--schema-dir")
 }
 
+// A rate limit and a permission failure arrive as the same status, and only the
+// headers separate them. They get different remediations because they have
+// different fixes: an operator told to re-issue a token mid-deploy will retry
+// with a new one and be refused again, while waiting or authenticating for the
+// larger budget is what actually clears it.
+func TestStorageSchemaFromRelease_RateLimitIsNotAPermissionFailure(t *testing.T) {
+	tests := []struct {
+		name    string
+		status  int
+		headers map[string]string
+	}{
+		{"primary limit spent", http.StatusForbidden, map[string]string{"X-RateLimit-Remaining": "0"}},
+		{"secondary limit", http.StatusTooManyRequests, map[string]string{"Retry-After": "60"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				for key, value := range tc.headers {
+					w.Header().Set(key, value)
+				}
+				w.WriteHeader(tc.status)
+			}))
+			t.Cleanup(server.Close)
+			t.Setenv("GITHUB_API_URL", server.URL)
+
+			_, err := (&storageSchemaSourceFlags{Release: "v1.4.0", Repo: "example/schemabot"}).resolve(t.Context(), mysqlDialect)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "rate-limited")
+			assert.Contains(t, err.Error(), "--schema-dir")
+			assert.NotContains(t, err.Error(), "not allowed to read",
+				"a spent budget is not a permission the operator can grant")
+		})
+	}
+}
+
+// A permission failure with budget left is still a permission failure: the
+// remediation is the token, not the wait.
+func TestStorageSchemaFromRelease_PermissionFailureWithBudgetLeft(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-RateLimit-Remaining", "4999")
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	t.Cleanup(server.Close)
+	t.Setenv("GITHUB_API_URL", server.URL)
+
+	_, err := (&storageSchemaSourceFlags{Release: "v1.4.0", Repo: "example/private"}).resolve(t.Context(), mysqlDialect)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not allowed to read")
+	assert.NotContains(t, err.Error(), "rate-limited")
+}
+
 // The fetch is authorized when a token is available, so a private mirror works
 // without a flag of its own.
 func TestStorageSchemaFromRelease_SendsTheToken(t *testing.T) {
