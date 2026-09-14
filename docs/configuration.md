@@ -931,7 +931,7 @@ storage:
 ```
 
 Leave the flag false during normal operation and revert it after the removal
-converges. `--allow-destructive` on `schemabot storage apply` opts in for one
+converges. `--allow-unsafe` on `schemabot storage apply` opts in for one
 invocation instead; it widens this policy and never narrows it.
 
 On PostgreSQL the setting has no effect: that convergence is additive-only and

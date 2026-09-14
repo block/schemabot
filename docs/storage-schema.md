@@ -200,7 +200,7 @@ To intentionally remove a storage table or column, first make sure every running
 pod is on a binary whose embedded schema no longer declares it, then opt in with
 [`allow_destructive_schema_changes`](configuration.md#allow_destructive_schema_changes).
 Leave the flag false during normal operation and revert it after the removal
-converges. `--allow-destructive` on the CLI opts in for one invocation; it
+converges. `--allow-unsafe` on the CLI opts in for one invocation; it
 widens the deployment's standing policy and never narrows it.
 
 ## Ask what storage DDL is outstanding
