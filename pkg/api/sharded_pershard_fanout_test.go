@@ -66,7 +66,7 @@ func TestBuildShardedApplyOperationGroupsUsesPerShardDDL(t *testing.T) {
 		},
 	}
 
-	groups, err := buildShardedApplyOperationGroups(plan, pershardMembers(plan), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	groups, err := buildShardedApplyOperationGroups(plan, pershardMembers(plan), newMemberOperationKeys(pershardMembers(plan)), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
 	require.NoError(t, err)
 
 	got := operationDDLByKey(groups)
@@ -96,7 +96,7 @@ func TestBuildShardedApplyOperationGroupsSkipsShardsWithoutChanges(t *testing.T)
 		},
 	}
 
-	groups, err := buildShardedApplyOperationGroups(plan, pershardMembers(plan), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	groups, err := buildShardedApplyOperationGroups(plan, pershardMembers(plan), newMemberOperationKeys(pershardMembers(plan)), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
 	require.NoError(t, err)
 
 	assert.Equal(t, map[string][]string{
@@ -140,7 +140,7 @@ func TestBuildShardedApplyOperationGroupsFailsClosedOnMalformedChange(t *testing
 			Changes: []storage.TableChange{{Namespace: pershardNamespace, Table: "", DDL: "ALTER TABLE `mutes` ADD INDEX (`x`)", Operation: "alter"}},
 		}},
 	}
-	_, err := buildShardedApplyOperationGroups(plan, pershardMembers(plan), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	_, err := buildShardedApplyOperationGroups(plan, pershardMembers(plan), newMemberOperationKeys(pershardMembers(plan)), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "empty table")
 }
