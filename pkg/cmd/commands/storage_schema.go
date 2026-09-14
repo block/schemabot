@@ -278,25 +278,36 @@ func (cmd *StorageApplyCmd) Run(ctx context.Context, g *Globals) error {
 		return err
 	}
 
-	// Confirm against a fresh read rather than against a description of the
-	// command: an operator approving DDL on SchemaBot's own storage should see
-	// the statements, and the read is free of side effects. With --auto-approve
-	// the convergence's own planned report says what ran, so there is nothing
-	// this preview would add.
+	// Every convergence plans first, attended or not, the way `apply` does.
+	// The plan is a fresh read rather than a description of the command: an
+	// operator approving DDL on SchemaBot's own storage should see the
+	// statements, and the read is free of side effects. Unattended, it is what
+	// the destructive gate below decides from.
+	//
+	// No selector on the preview asks the target about its own embedded schema,
+	// which is the schema this convergence is about to run.
+	preview := &StoragePlanCmd{
+		storageSchemaTargetFlags: cmd.storageSchemaTargetFlags,
+		AllowUnsafe:              cmd.AllowUnsafe,
+	}
+	report, err := preview.read(ctx, g)
+	if err != nil {
+		return err
+	}
+	// With --auto-approve the convergence's own planned report says what ran,
+	// so the plan is printed after the fact instead — unless the gate stops the
+	// run, which prints it itself.
 	if !cmd.AutoApprove {
-		// No selector on the preview asks the target about its own embedded
-		// schema, which is the schema this convergence is about to run.
-		preview := &StoragePlanCmd{
-			storageSchemaTargetFlags: cmd.storageSchemaTargetFlags,
-			AllowUnsafe:              cmd.AllowUnsafe,
-		}
-		report, err := preview.read(ctx, g)
-		if err != nil {
-			return err
-		}
 		if err := outputStorageSchemaPlan(report, true, nil); err != nil {
 			return err
 		}
+	}
+
+	if err := blockDestructiveStorageApply(report, cmd.AutoApprove); err != nil {
+		return err
+	}
+
+	if !cmd.AutoApprove {
 		if len(report.Manual) > 0 {
 			return fmt.Errorf("refusing to converge storage schema on %s: %d change(s) need manual remediation first (listed above)", storageSchemaDatabaseLabel(report), len(report.Manual))
 		}
@@ -328,6 +339,41 @@ func (cmd *StorageApplyCmd) Run(ctx context.Context, g *Globals) error {
 	return storageSchemaConvergenceOutcome(remaining)
 }
 
+// blockDestructiveStorageApply stops a convergence that would have to destroy
+// storage state nothing has permitted, before it runs anything.
+//
+// This is the gate `apply` puts in front of a destructive schema change, in the
+// same place and behind the same flag: the plan is on screen, the statements
+// are named, and --allow-unsafe is the way through. It is in front of the
+// confirmation rather than after it because --auto-approve skips a prompt, and
+// consenting to a convergence is not consenting to destroy state.
+//
+// A deployment that already allows destructive storage changes has permitted
+// them, so there is nothing here to ask: the report says so and the statements
+// run. The gate narrows no standing policy (AV-9), and where it does stop a run
+// it runs strictly less than the convergence would have — the bootstrap refuses
+// the same statements on its own and converges the safe remainder. What changes
+// is when the operator finds out: before a DROP against SchemaBot's own storage
+// is decided, rather than in a report of what was already done.
+//
+// withPlan prints the plan for an unattended run, which has not printed one
+// yet. Naming refused statements without showing them would send the operator
+// back to `storage plan` to find out what was refused.
+func blockDestructiveStorageApply(report *apitypes.StorageSchemaReport, withPlan bool) error {
+	if report.DestructiveAllowed || len(report.Destructive) == 0 {
+		return nil
+	}
+	if withPlan {
+		if err := outputStorageSchemaPlan(report, true, nil); err != nil {
+			return err
+		}
+	}
+	// The plan above carries the refusal, the statements, and the flag, so this
+	// asks only for the exit status — an "Error:" line restating it would be
+	// the third time the same refusal is on screen.
+	return ErrSilent
+}
+
 // storageSchemaConfirmation asks for the convergence the operator is about to
 // run, which is not always a set of statements.
 //
@@ -356,7 +402,10 @@ func storageSchemaConfirmation(report *apitypes.StorageSchemaReport) string {
 //
 // Refused destructive statements are the other case, and they are not a
 // failure: the surplus state is left in place on purpose (AV-9), everything
-// else converged, and a rollback is expected to sit there.
+// else converged, and a rollback is expected to sit there. An operator reaching
+// this having permitted none of them is what blockDestructiveStorageApply
+// stops, so the only way here is a target that gained surplus state between the
+// plan and the convergence — where leaving it in place is still the answer.
 func storageSchemaConvergenceOutcome(remaining *apitypes.StorageSchemaReport) error {
 	if len(remaining.Manual) == 0 {
 		return nil
