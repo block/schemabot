@@ -273,6 +273,66 @@ func TestWritePullSchema_RendersPerTargetDivergence(t *testing.T) {
 	}
 }
 
+// The two one-sided differences read as opposites from the primary's point of
+// view: a table only the primary holds is missing from the other target, and a
+// table only the other target holds is extra. Rendering either label for the
+// other would tell the operator to change the wrong schema.
+func TestWritePullSchema_RendersBothOneSidedDifferences(t *testing.T) {
+	setColors(t, false)
+	out := captureStdout(t, func() {
+		WritePullSchema(&apitypes.PullSchemaResponse{
+			Database:    "orders-db",
+			Type:        "mysql",
+			Environment: "production",
+			TableCount:  2,
+			Namespaces: map[string]*apitypes.PulledNamespace{
+				"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			},
+			Targets: []*apitypes.TargetDivergence{
+				{Deployment: "eu", Target: "orders-001", TableCount: 2, Primary: true},
+				{Deployment: "eu", Target: "orders-002", TableCount: 2, DivergedTables: []apitypes.DivergedTable{
+					{Namespace: "orders", Table: "audits", Difference: apitypes.DivergenceOnlyOnPrimary},
+					{Namespace: "orders", Table: "receipts", Difference: apitypes.DivergenceOnlyOnTarget},
+				}},
+			},
+		})
+	})
+
+	assert.Contains(t, out, "--   orders.audits: missing")
+	assert.Contains(t, out, "--   orders.receipts: extra")
+}
+
+// A target name is opaque and only unique within its deployment, so two
+// deployments addressing the same name would render the same header twice. Such
+// a target is named by its full member identity so the operator can tell which
+// member a divergence belongs to.
+func TestWritePullSchema_NamesTargetsThatShareANameByMember(t *testing.T) {
+	setColors(t, false)
+	out := captureStdout(t, func() {
+		WritePullSchema(&apitypes.PullSchemaResponse{
+			Database:    "orders-db",
+			Type:        "mysql",
+			Environment: "production",
+			TableCount:  1,
+			Namespaces: map[string]*apitypes.PulledNamespace{
+				"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			},
+			Targets: []*apitypes.TargetDivergence{
+				{Deployment: "eu", Target: "orders", TableCount: 1, Primary: true},
+				{Deployment: "us", Target: "orders", TableCount: 1, DivergedTables: []apitypes.DivergedTable{
+					{Namespace: "orders", Table: "users", Difference: apitypes.DivergenceDiffers},
+				}},
+				{Deployment: "ap", Target: "orders-ap", TableCount: 1},
+			},
+		})
+	})
+
+	assert.Contains(t, out, "-- Target `eu/orders` — primary target, whose schema is below")
+	assert.Contains(t, out, "-- Target `us/orders` — 1 table differs from the primary target")
+	assert.Contains(t, out, "-- Target `orders-ap` — same schema as the primary target",
+		"a target whose name is already unique keeps the bare name")
+}
+
 // An environment whose targets are expected to hold the same schema carries no
 // divergence, and a pull of it renders exactly as it always did.
 func TestWritePullSchema_NoDivergenceSectionWithoutTargets(t *testing.T) {
