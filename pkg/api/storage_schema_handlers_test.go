@@ -375,6 +375,20 @@ func TestStorageSchemaRoutes_FailureStatusSaysWhoseProblemItIs(t *testing.T) {
 			wantBody:    "see the answering deployment's logs",
 			wantNotBody: "db.example",
 		},
+		{
+			name:        "a data plane that does not serve these RPCs",
+			err:         status.Error(codes.Unimplemented, "unknown service tern.v1.Tern"),
+			wantCode:    http.StatusNotImplemented,
+			wantBody:    "upgrade that deployment",
+			wantNotBody: "see the answering deployment's logs",
+		},
+		{
+			name:        "a data plane that could not be reached",
+			err:         status.Error(codes.Unavailable, "dial tcp 10.0.0.1:9090: connection refused"),
+			wantCode:    http.StatusServiceUnavailable,
+			wantBody:    "check that it is healthy and retry",
+			wantNotBody: "10.0.0.1",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -396,10 +410,9 @@ func TestStorageSchemaRoutes_FailureStatusSaysWhoseProblemItIs(t *testing.T) {
 }
 
 // Both routes are admin-only, and the read-only diff is no exception. A scoped
-// database operator is denied on it even though it is a GET, because the tier
-// rule admits it as a write — the storage database is SchemaBot's own
-// bookkeeping, not any team's database, so there is nothing for a per-database
-// grant to scope to.
+// database operator is denied on it even though it reads and changes nothing:
+// the storage database is SchemaBot's own bookkeeping, not any team's database,
+// so there is nothing for a per-database grant to scope to.
 func TestStorageSchemaRoutes_DenyScopedOperator(t *testing.T) {
 	svc := newStorageSchemaService(t, scopedWriteConfig())
 	local := &fakeStorageSchemaService{

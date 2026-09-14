@@ -108,7 +108,13 @@ func (s *Service) resolveStorageSchemaTarget(deployment, environment string) (*s
 	}
 	client, err := s.TernClient(deployment, environment)
 	if err != nil {
-		return nil, fmt.Errorf("resolve data plane client for deployment %q environment %q: %w", deployment, environment, err)
+		// The cause names this deployment's own infrastructure — the configured
+		// endpoint, a TLS material path, a dial failure — and that does not
+		// travel back over a route an operator's workstation calls. The caller
+		// gets the fact and where to look; the cause stays here.
+		s.logger.Error("could not resolve the data plane client for a storage schema request",
+			"deployment", deployment, "environment", environment, "error", err)
+		return nil, fmt.Errorf("the data plane for deployment %q in environment %q could not be reached: its endpoint is configured but the client could not be built, so check this server's logs for the cause", deployment, environment)
 	}
 	service, ok := client.(tern.StorageSchemaService)
 	if !ok {
@@ -254,12 +260,27 @@ func (s *Service) handleStorageSchemaApply(w http.ResponseWriter, r *http.Reques
 // serves an adapter in this process and one reached over gRPC: in-process the
 // sentinel arrives intact, and over the wire the data plane's gRPC server has
 // already turned it into an InvalidArgument status.
+//
+// Two failures of the data plane itself are worth more than a 500, because each
+// names a remedy the operator can act on without reading anyone's logs: a data
+// plane that does not serve these RPCs needs upgrading, and one that cannot be
+// reached needs looking at. Collapsing either into "see the logs" sends an
+// operator to read logs that say the same thing the status code already did.
 func (s *Service) writeStorageSchemaFailure(w http.ResponseWriter, err error, summary string) {
 	if errors.Is(err, tern.ErrInvalidStorageSchemaRequest) || status.Code(err) == codes.InvalidArgument {
 		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("%s: %v", summary, err))
 		return
 	}
-	s.writeError(w, http.StatusInternalServerError, summary+"; see the answering deployment's logs")
+	switch status.Code(err) {
+	case codes.Unimplemented:
+		s.writeError(w, http.StatusNotImplemented,
+			summary+": the answering deployment does not serve storage schema requests; it is running a release that predates them, so upgrade that deployment and retry")
+	case codes.Unavailable:
+		s.writeErrorCode(w, http.StatusServiceUnavailable, apitypes.ErrCodeEngineUnavailable,
+			summary+": the answering deployment could not be reached; check that it is healthy and retry")
+	default:
+		s.writeError(w, http.StatusInternalServerError, summary+"; see the answering deployment's logs")
+	}
 }
 
 // storageSchemaReportResponse converts one wire report to its HTTP form,
