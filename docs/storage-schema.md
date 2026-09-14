@@ -203,6 +203,14 @@ Leave the flag false during normal operation and revert it after the removal
 converges. `--allow-unsafe` on the CLI opts in for one invocation; it
 widens the deployment's standing policy and never narrows it.
 
+A startup bootstrap and `storage apply` differ in what they do about a
+statement nothing has permitted, and the difference is the point. A booting pod
+skips it and converges the safe remainder, because refusing to start over
+surplus state a rollback left behind would take the deployment down to protect a
+table nobody asked it to drop. `storage apply` stops instead and converges
+nothing, because an operator at a terminal is who should decide — the same call
+`apply` makes about a destructive schema change.
+
 ## Ask what storage DDL is outstanding
 
 A deploy that did not converge leaves one question open: which storage DDL is
@@ -414,12 +422,37 @@ $ schemabot storage plan --release v1.4.0
 │  Schema: the schema files of release v1.4.0  │
 ╰──────────────────────────────────────────────╯
 
-⚠️ Destructive changes, refused unless destructive storage changes are allowed:
+⚠️ Unsafe Changes Detected:
   1. check_gate_audit: DROP TABLE destroys data
 
 
 These are what schemabot on db-1.example needs in order to match the schema files of release v1.4.0. To converge them, run that release's binary against this database — its container image is that release — or let the release's first boot converge them.
 ```
+
+`storage apply` then stops on it, exactly the way `apply` stops on a destructive
+schema change, and converges nothing until you say otherwise — including under
+`--auto-approve`, because skipping the prompt is not permitting a `DROP`:
+
+```console
+$ schemabot storage apply
+╭─────────────────────────────────────────────╮
+│  MySQL Schema Change Apply                  │
+│                                             │
+│  Database: schemabot on db-1.example        │
+│  Schema: the schema embedded in v1.4.0      │
+╰─────────────────────────────────────────────╯
+
+⛔ Apply blocked: 1 unsafe change(s) detected
+  1. check_gate_audit: DROP TABLE destroys data
+
+🚨 To proceed with these destructive changes, re-run with --allow-unsafe:
+
+  schemabot storage apply --allow-unsafe
+```
+
+The offered command carries whichever flags addressed this storage database, so
+it converges the one the refusal is about. A `--dsn` is named rather than
+repeated, since it carries the storage credentials.
 
 On PostgreSQL a change that needs manual remediation stops the convergence
 before it runs anything, the same way it stops a startup:
@@ -447,16 +480,21 @@ not, so a maintenance script keyed on the status gets them right:
 | Outcome | Exit |
 |---|---|
 | converged, or already converged | `0` |
-| everything converged, destructive statements left refused | `0` |
+| converged the destructive statements too, under `--allow-unsafe` | `0` |
 | declined at the confirmation prompt, nothing run | `0` |
+| a destructive statement was not permitted, so nothing ran | non-zero |
 | a change needs manual remediation, so nothing ran | non-zero |
 | the target could not be read, or the DDL failed | non-zero |
 
-Refused destructive statements are not a failure: the surplus state is left in
-place deliberately, everything else converged, and a rollback window is expected
-to sit exactly there. A manual-remediation entry is the opposite — the bootstrap
-refuses the whole drift set while one is outstanding, so an unattended run that
-exited 0 would report a convergence that never happened.
+Both non-zero refusals mean the same thing: nothing converged, and a person has
+to decide something before anything does. A script keyed on the status can
+therefore treat them alike and re-read the plan for which one it hit.
+
+The one place a refused destructive statement is *not* a failure is a startup
+bootstrap, which skips it and converges the safe remainder (AV-9). That
+asymmetry is deliberate: a pod that refused to boot over surplus state a
+rollback left behind would take the deployment down to protect a table nobody
+asked it to drop, while an operator at a terminal is exactly who should decide.
 
 ## Deploying a release that changes the storage schema
 
