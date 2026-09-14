@@ -105,6 +105,22 @@ func ChecksSynthesize(ctx context.Context, endpoint string, req apitypes.ChecksS
 	return &result, nil
 }
 
+// ChecksInspect reads one pull request's stored check state beside the Check
+// Run on its head commit, with the disposition of each row.
+func ChecksInspect(ctx context.Context, endpoint string, req apitypes.ChecksInspectRequest) (*apitypes.ChecksInspectResponse, error) {
+	values := url.Values{}
+	values.Set("repo", req.Repo)
+	values.Set("pull_request", strconv.Itoa(req.PullRequest))
+	if req.Environment != "" {
+		values.Set("environment", req.Environment)
+	}
+	var result apitypes.ChecksInspectResponse
+	if err := doSlowGetIntoCtx(ctx, endpoint, "/api/checks/inspect?"+values.Encode(), &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 // ChecksRepos lists the repositories declared in the server's repos config —
 // the inventory a fleet-wide checks scan iterates.
 func ChecksRepos(ctx context.Context, endpoint string) (*apitypes.ChecksReposResponse, error) {

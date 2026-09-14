@@ -55,7 +55,17 @@ type EtreResolver struct {
 	cfg EtreResolverConfig
 }
 
-var _ inventory.Resolver = (*EtreResolver)(nil)
+var (
+	_ inventory.Resolver     = (*EtreResolver)(nil)
+	_ inventory.TypeReporter = (*EtreResolver)(nil)
+)
+
+// DatabaseType names the one engine this resolver serves: the type its
+// assembler builds connections for, and the type ResolveTarget refuses to
+// deviate from.
+func (r *EtreResolver) DatabaseType() string {
+	return r.cfg.Assembler.DatabaseType()
+}
 
 // NewEtreResolver validates the config and builds a resolver.
 func NewEtreResolver(cfg EtreResolverConfig) (*EtreResolver, error) {

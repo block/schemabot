@@ -92,7 +92,7 @@ func parseLocalConfig(data []byte) (api.ServerConfig, error) {
 }
 
 func runLocalServer(ctx context.Context, cfg api.ServerConfig, token, address string, g *Globals, ready func(string) error, register ...func(localruntime.PrepareConfig)) error {
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel()}))
+	logger := newServerLogger(os.Stderr, g.Version)
 	slog.SetDefault(logger)
 	options := serve.LocalOptions{Address: address, Token: token, Ready: ready}
 	if len(register) > 0 {

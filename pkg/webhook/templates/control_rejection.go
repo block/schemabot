@@ -45,6 +45,11 @@ func RenderControlRejections(rejections []ControlRejectionData) string {
 		}
 		sb.WriteString("\n")
 	}
-	sb.WriteString(">\n> The schema change is otherwise unaffected. Re-issue the command or reconcile the target environment.\n")
+	// Neither half of a "re-issue it, the change is otherwise unaffected"
+	// closing survives contact with the commands that reach this notice: a
+	// change that outran a cancel is live on the target, and a command refused
+	// because the apply is already terminal or in its revert phase is refused
+	// again the same way. The operator's reliable move is the target itself.
+	sb.WriteString(">\n> The schema change reached the state shown on its own. Reconcile the target environment if that is not the outcome you wanted.\n")
 	return sb.String()
 }

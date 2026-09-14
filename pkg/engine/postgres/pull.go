@@ -14,11 +14,12 @@ import (
 	"github.com/block/schemabot/pkg/postgresconn"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/targetauth"
 )
 
 // The pull's catalog reads carry the same pg_catalog qualification as
-// liveTables: a search_path that lists a user schema first must not let a
-// decoy relation or operator hand the pull a wrong baseline.
+// schemadiff.ListManagedTables: a search_path that lists a user schema first
+// must not let a decoy relation or operator hand the pull a wrong baseline.
 const listPostgresSchemas = `
 SELECT nspname
 FROM pg_catalog.pg_namespace
@@ -82,8 +83,10 @@ func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) 
 		return nil, fmt.Errorf("open PostgreSQL database %q for schema pull: %w", e.pullDatabase, err)
 	}
 	defer utils.CloseAndLog(db)
+	// Open only parsed the DSN; this ping is the first dial, so it is where the
+	// target can refuse the session and the only error worth classifying.
 	if err := db.PingContext(ctx); err != nil {
-		return nil, fmt.Errorf("ping PostgreSQL database %q for schema pull: %w", e.pullDatabase, err)
+		return nil, fmt.Errorf("ping PostgreSQL database %q for schema pull: %w", e.pullDatabase, targetauth.Wrap(err))
 	}
 	poolCfg, err := spritePoolConfig(e.pullCredentials.DSN, caPath)
 	if err != nil {
@@ -108,7 +111,11 @@ func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) 
 	}
 	var renderErrors []error
 	for _, namespace := range namespaces {
-		tables, err := pullTables(ctx, pool, namespace)
+		// The pull renders the same table set the plan holds schema files
+		// accountable for, so a pulled baseline declares exactly what a later
+		// plan would otherwise report as undeclared. Partitions and
+		// extension-owned tables have no file of their own and are left out.
+		tables, err := schemadiff.ListManagedTables(ctx, pool, namespace)
 		if err != nil {
 			return nil, fmt.Errorf("list PostgreSQL tables in schema %q: %w", namespace, err)
 		}
@@ -238,20 +245,4 @@ func unmodeledTableObjectsError(namespace, table string, objects unmodeledTableO
 
 func isContextError(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
-}
-
-// pullTables names the tables a pull renders: the same set the plan holds
-// schema files accountable for, so a pulled baseline declares exactly what a
-// later plan would otherwise report as undeclared. Partitions and
-// extension-owned tables have no file of their own and are left out.
-func pullTables(ctx context.Context, pool *pgxpool.Pool, namespace string) ([]string, error) {
-	live, err := liveTables(ctx, pool, namespace)
-	if err != nil {
-		return nil, err
-	}
-	tables := make([]string, len(live))
-	for i, t := range live {
-		tables[i] = t.name
-	}
-	return tables, nil
 }
