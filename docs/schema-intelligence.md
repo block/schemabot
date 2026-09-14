@@ -585,7 +585,12 @@ from the server's build phase and its counters; it stays below 100 until the
 apply completes and holds its last value between phases (see
 [postgresql.md](postgresql.md)).
 Sharded engines can add per-shard progress, and multi-deployment applies list
-operations with their deployment, target, state, and cutover policy.
+operations with their deployment, target, state, and cutover policy. A rollout's
+table entries carry `deployment` and `target`, naming the member whose copy the
+row reports. Attribute a table by the pair, never by `deployment` alone: one
+deployment can address several targets, each running its own copy of the change,
+so several rows for the same table share a deployment and differ only in their
+target. Both fields are absent on an apply that runs against a single target.
 The top-level `metadata` object carries engine-specific display fields when the
 engine reports them: PostgreSQL applies report their position through `phase`,
 `step`, `steps_total`, and `statement`; PlanetScale applies report deploy
@@ -623,6 +628,54 @@ Response excerpt (illustrative values):
   ]
 }
 ```
+
+</details>
+
+<details>
+<summary>Multi-target rollout response example</summary>
+
+```http
+GET /api/progress/apply/apply-example-75
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "apply_id": "apply-example-75",
+  "database": "shop",
+  "environment": "production",
+  "engine": "spirit",
+  "state": "running",
+  "operations": [
+    {"deployment": "commerce-a", "target": "shop-001", "state": "completed", "cutover_policy": "rolling"},
+    {"deployment": "commerce-a", "target": "shop-002", "state": "running", "cutover_policy": "rolling"}
+  ],
+  "tables": [
+    {
+      "table_name": "orders",
+      "deployment": "commerce-a",
+      "target": "shop-001",
+      "ddl": "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)",
+      "status": "completed",
+      "percent_complete": 100
+    },
+    {
+      "table_name": "orders",
+      "deployment": "commerce-a",
+      "target": "shop-002",
+      "ddl": "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)",
+      "status": "running",
+      "rows_copied": 2000000,
+      "rows_total": 8000000,
+      "percent_complete": 25
+    }
+  ]
+}
+```
+
+Both rows report the same table under the same deployment, and only `target`
+tells them apart.
 
 </details>
 
