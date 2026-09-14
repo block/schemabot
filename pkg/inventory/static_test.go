@@ -10,6 +10,72 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestStaticResolverEnumerate(t *testing.T) {
+	t.Setenv("TARGET_CONFIG", `{"host":"db.example","port":3306}`)
+	t.Setenv("TARGET_PASSWORD", "secret")
+
+	type enumerateCase struct {
+		name     string
+		resolver *StaticResolver
+		want     []ProbeRequest
+	}
+
+	mixed, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
+		"z-postgres": {DatabaseType: "postgres", DSN: "postgres://user:pass@db.example:5432/app?sslmode=disable"},
+		"a-mysql":    {DatabaseType: "mysql", DSN: "root@tcp(localhost:3306)/"},
+		"m-from": {
+			DatabaseType: "mysql",
+			DSNFrom: &StaticDSNFromConfig{
+				ConfigRef:   "env:TARGET_CONFIG",
+				Username:    "user",
+				PasswordRef: "env:TARGET_PASSWORD",
+			},
+		},
+	}})
+	require.NoError(t, err)
+
+	tests := []enumerateCase{
+		// The constructor rejects an empty target set; the zero value only
+		// guards a resolver built without it, which enumerates nothing.
+		{name: "zero value", resolver: &StaticResolver{}, want: nil},
+		{
+			name: "one",
+			resolver: &StaticResolver{targets: map[string]staticTargetEntry{
+				"orders": {target: "orders", databaseType: "mysql"},
+			}},
+			want: []ProbeRequest{{Target: "orders", DatabaseType: "mysql"}},
+		},
+		{
+			name:     "mixed targets",
+			resolver: mixed,
+			want: []ProbeRequest{
+				{Target: "a-mysql", DatabaseType: "mysql"},
+				{Target: "m-from", DatabaseType: "mysql"},
+				{Target: "z-postgres", DatabaseType: "postgres"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tt.resolver.Enumerate(t.Context())
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+			assert.Nil(t, tt.resolver.UnenumerableDatabaseTypes())
+		})
+	}
+}
+
+// A nil resolver reports itself the same way from every method, so a caller
+// holding a typed nil sees an error rather than a panic.
+func TestStaticResolverNilEnumerate(t *testing.T) {
+	var resolver *StaticResolver
+	got, err := resolver.Enumerate(t.Context())
+	require.Error(t, err)
+	assert.Nil(t, got)
+	assert.EqualError(t, err, "static target resolver is nil")
+}
+
 func TestStaticResolverResolveTarget(t *testing.T) {
 	t.Setenv("TARGET_DSN", "user:pass@tcp(db.example:3306)/")
 	resolver, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{

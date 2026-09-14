@@ -45,11 +45,11 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 	var stoppedByUser bool
 
 	for i, task := range tasks {
-		if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
+		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 			logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 				"error", err)
 			return
-		} else if handled {
+		} else if standDown {
 			stoppedByUser = true
 			break
 		}
@@ -187,11 +187,11 @@ func sequentialEngineApplyRequest(task *storage.Task, options map[string]string,
 // Returns the outcome: taskContinue (completed), taskFailed, taskStopped, taskAbort, or taskHandover.
 func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, task *storage.Task, options map[string]string) taskAction {
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
-	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
+	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		logger.Warn("pending stop request processing failed before sequential engine apply; current apply owner will exit for operator retry",
 			"task_id", task.TaskIdentifier, "error", err)
 		return taskAbort
-	} else if handled {
+	} else if standDown {
 		return taskStopped
 	}
 	taskCreds, err := c.credentialsForTask(task)
@@ -552,11 +552,11 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				"task_id", task.TaskIdentifier, "table", task.TableName)
 			return taskHandover
 		case <-ticker.C:
-			if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
+			if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 				logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 					"task_id", task.TaskIdentifier, "error", err)
 				return taskAbort
-			} else if handled {
+			} else if standDown {
 				task.State = state.Task.Stopped
 				return taskStopped
 			}
@@ -1015,8 +1015,8 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		logger.Info("apply already terminal in storage, not overwriting during sequential finalization",
 			"stored_state", freshApply.State)
 		*apply = *freshApply
-		if err := completePendingRequestsForTerminalApply(ctx, c.storage, apply); err != nil {
-			logger.Warn("failed to complete pending control requests for terminal sequential apply",
+		if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
+			logger.Warn("failed to settle pending control requests for terminal sequential apply",
 				"error", err)
 		}
 		return
@@ -1044,8 +1044,8 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		}
 	}
 	if state.IsTerminalApplyState(apply.State) {
-		if err := completePendingRequestsForTerminalApply(ctx, c.storage, apply); err != nil {
-			logger.Warn("failed to complete pending control requests after sequential finalization",
+		if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
+			logger.Warn("failed to settle pending control requests after sequential finalization",
 				append(apply.MutableLogAttrs(), "error", err)...)
 			return
 		}
