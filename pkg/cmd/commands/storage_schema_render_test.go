@@ -222,7 +222,7 @@ func TestOutputStorageSchemaConvergence_LeftBehind(t *testing.T) {
 	assert.NotContains(t, out, "Nothing is outstanding")
 	assert.Contains(t, out, glyph.Refused+" Destructive changes refused")
 	assert.Contains(t, out, "1. stale_state: DROP TABLE destroys data")
-	assert.Contains(t, out, "--allow-destructive")
+	assert.Contains(t, out, "--allow-unsafe")
 }
 
 // A convergence that ran nothing and left everything says so as a refusal. A ✓
