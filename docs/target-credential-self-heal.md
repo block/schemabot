@@ -71,20 +71,36 @@ semantic. PostgreSQL is the first target fleet using per-request `dsn_from`.
 The data plane will issue `SELECT 1` once for every target its inventory can
 enumerate when its server starts. The probe resolves each target through the
 same inventory path as a request and opens it through `mysqlconn.Open` or
-`postgresconn.Open`, including the normal transport policy.
+`postgresconn.Open`, including the normal transport policy. For PostgreSQL that
+policy includes the target's certificate-authority reference: the probe resolves
+the resolved target's `postgres_ca_ref` metadata through the engine's own trust
+policy (`postgres.ConnectionOptions`), so a target pinned to a file bundle is
+verified under those roots exactly as its plans and applies are, and a reference
+the engine would refuse fails the probe before any dial rather than dialing
+under a different trust root.
 
 The `inventory.Resolver` contract resolves one supplied request; it has no list
 operation. A static inventory can enumerate its configured map, but a discovery
 resolver such as the Etre resolver finds a target by querying for it on demand
 and, when an environment label is configured, refuses to resolve without an
 environment. The probe therefore adds an optional `inventory.Enumerator`
-capability: `StaticResolver` implements it by returning one request per
-configured target (target and database type; static resolution does not use
-the environment), and the type-routing resolver implements it by concatenating
-the enumerations of the child resolvers that offer one. A resolver without the
-capability is skipped with one Info log naming the database type it serves, so
-an operator can see that discovery-resolved targets are outside probe coverage.
-Their credentials are still repaired at use time by the second decision.
+capability. It takes a context and can fail, because a discovery resolver's
+target set lives behind the same client as its lookups; a failed enumeration
+means coverage is unknown, never empty. Each `ProbeRequest` carries the
+target, database type, and environment a `Request` needs to resolve the same
+target again, so an environment-scoped resolver can round-trip its own
+enumeration. `StaticResolver` implements the capability by returning one
+request per configured target with no environment, and the type-routing
+resolver implements it by concatenating the enumerations of the child
+resolvers that offer one, failing closed on the first child error. The
+capability also reports the database types it cannot list: the router names
+the types registered to a child without the capability and merges what an
+enumerable child reports of its own, so a nested router's gaps reach the
+outer report. The probe logs those types once at Info, so an operator can see
+that discovery-resolved targets are outside probe coverage. Today no
+discovery resolver enumerates, so a data plane whose targets all come from
+discovery has no probe coverage; those credentials are still repaired at use
+time by the second decision.
 
 The guarantee is deliberately narrow. A successful probe proves that the
 resolved credentials authenticate, that the session can select the database
@@ -96,11 +112,34 @@ on a missing grant. A grant-level check would have to run per namespace with
 the operation's own statements; that is what the routed operations already do,
 and their typed failures are the signal for provisioning defects.
 
-Each probe has its own context timeout. A fixed-size goroutine pool bounds
-concurrency, so target count cannot create an unbounded connection burst and a
-slow target occupies at most one slot until its timeout. Completion, refusal,
+Each probe has its own context timeout, and enumeration runs under the same
+bound, since a discovery-backed inventory lists its targets remotely; a listing
+that outlasts it fails the run rather than holding the probe goroutine open. A
+fixed-size goroutine pool bounds concurrency, so target count cannot create an
+unbounded connection burst and a slow target occupies at most one slot until
+its timeout. The probe resolves each enumerated target with the environment its
+enumerator reported, so a resolver that scopes by environment resolves the same
+target the request path would, and reports that environment on its metric and
+log. Completion, refusal,
 resolution failure, and timeout each produce one metric observation and one
-structured log entry. DSNs, passwords, and raw secret values are never logged.
+structured log entry; the deadline wins over the failure it caused, so a
+resolver or dial that ran past it reports `timeout` rather than the error the
+interruption produced. DSNs, passwords, and raw secret values are never logged.
+
+Targets whose database type has no DSN the probe can dial — Vitess, which
+connects through the PlanetScale API, and any type the probe does not know —
+are skipped before resolution with a Debug log and left out of the outcome
+counts; a skipped target is not a connection failure.
+
+Each target's probe runs inside its own panic containment boundary (AV-5): a
+panic in resolution, dialing, or recording costs that target its result, the
+value and stack are logged, and the remaining targets are still probed.
+
+`Server.Close` cancels a probe still in flight and waits for it to exit before
+tearing down the resolver and clients it uses. A probe interrupted by that
+cancellation says nothing about its target, so the prober discards its result
+instead of recording a connection failure; the target reports a real outcome on
+the next start.
 
 The exact lifecycle hook is `pkg/serve/serve.go` `Server.Start`, alongside the
 other background startup work and after `Build` has constructed the shared
@@ -165,10 +204,14 @@ finishes on it:
 - The router records which generation owns each apply when `Apply`,
   `ResumeApply`, or an operation resume starts on it, and routes progress,
   observer attachment, and in-process recovery for that apply to the owning
-  generation until the apply is terminal. Two generations in one process must
-  never drive the same apply; that is the same hazard OW-3 bounds across
-  processes, and here it is prevented outright by ownership. New pulls, plans,
-  and new applies go to the current generation.
+  generation until the apply is terminal. An apply that is still queued when
+  the operator claims it has no drive on the generation that dispatched it, so
+  the claim resolves the route again and drives it on the current generation,
+  moving ownership there; the credential a schema change opens with is the one
+  resolved when it starts, not the one resolved when it was queued. Two
+  generations in one process must never drive the same apply; that is the same
+  hazard OW-3 bounds across processes, and here it is prevented outright by
+  ownership. New pulls, plans, and new applies go to the current generation.
 - Control operations keep their existing routing. They act by writing durable
   state, never by reaching into a generation's memory (CO-9), so which
   generation serves them does not matter.
@@ -237,10 +280,11 @@ inspecting the driver error: SchemaBot's own storage is MySQL or PostgreSQL too,
 so an `errors.As` against the driver error types at the router would match a
 storage credential failure surfacing through `Plan`, evict a healthy target
 generation, and re-run target planning for nothing. Classification therefore
-happens where the target connection is opened. The `mysqlconn.Open` and
-`postgresconn.Open` call sites that open target sessions wrap a classified
-failure in a typed target-authentication error carrying the classification; the
-router matches only that type. Storage errors never pass through those call
+happens where the target session is first dialed. `mysqlconn.Open` and
+`postgresconn.Open` only parse the DSN, so the first `PingContext` after each
+target open is where the server can refuse the session; those ping sites wrap a
+classified failure in a typed target-authentication error carrying the
+classification, and the router matches only that type. Storage errors never pass through those call
 sites, so they cannot carry it and stay on the existing failure path.
 
 An implementation may retry a pre-apply connection acquisition only if it is
@@ -271,28 +315,58 @@ A shared, dialect-aware classifier returns a small closed enum:
 | Classification | MySQL driver code | PostgreSQL SQLSTATE | Meaning |
 | --- | --- | --- | --- |
 | `AuthInvalidCredentials` | 1045 | `28P01` | User/password rejected. |
-| `AuthNoGrant` | 1044 | `28000`, `42501` | Authorization rejected: the role may not authorize as requested (`28000`), or lacks `CONNECT` on the database or the privilege the probe statement needs (`42501`). |
-| `AuthNoDatabase` | 1049 | `3D000` | Selected database does not exist. |
+| `AuthNoAccess` | 1044 | `42501` | The user cannot reach the selected database: MySQL 1044 does not say whether the database is missing or merely not granted to this user, and PostgreSQL `42501` at connection time means the role lacks `CONNECT`. |
+| `AuthNoDatabase` | 1049 | `3D000` | The server confirmed the selected database does not exist. Only privileged MySQL users see 1049; a scoped user sees 1044 instead. |
 | `NotAuth` | everything else | everything else | Preserve the existing failure path. |
 
 Classification uses `errors.As` against `*mysql.MySQLError` from the Go MySQL
 driver and `*pgconn.PgError` from pgx. It never matches error strings. Wrapping
 therefore preserves classification while redaction and contextual error text
 remain independent. The classifier runs at the target connection boundary, on
-the error from the open and first ping of a target session, and its result
+the error from the first ping of a target session, and its result
 travels in the typed target-authentication error described above; it is not
 applied to arbitrary errors at the router, where a storage failure could carry
 the same driver type.
 
-`AuthNoDatabase` and `AuthNoGrant` trigger the same single repair attempt as
+`AuthNoDatabase` and `AuthNoAccess` trigger the same single repair attempt as
 invalid credentials because rotation can change the selected database, role, or
 grant together with the password. If re-resolution returns the same bad shape,
 the bounded retry fails without a loop. The enum remains distinct so operators
 can distinguish secret mismatch from provisioning and configuration errors.
 
+A retry that shows re-resolution does not fix the failure, because
+re-resolution errors or because the rebuilt client is refused with a classified
+failure of its own, arms a per-route cooldown of thirty seconds. Until it
+lapses, a classified failure on that route is returned to the caller as it is:
+no eviction, no re-resolution, no rebuild. A secret the server keeps rejecting,
+a dropped grant, or a database that does not exist therefore costs one
+re-resolution per window rather than one per read, and the suppressed reads are
+counted so the condition stays visible. A retry that fails for any other reason
+(a deadline, a dial error, an error after the connection opened) does not arm
+the cooldown: it proves nothing about the re-resolved credential, and a rotation
+is a burst of failures, so the next classified failure on the route is still
+eligible to evict and retry.
+
+The cooldown ends by lapsing. The eligibility check drops a lapsed entry before
+a retry can run, so in a serial sequence of requests nothing else re-enables the
+route. A successful retry also deletes the route's entry, which only has an
+effect when a concurrent request armed the cooldown after this request passed
+the check; the two then resolve last-writer-wins in either direction, and the
+worst case is one window of suppression on a route whose credential now works.
+
+The window is the same length as the storage pools' reload cooldown by intent,
+since both re-read the same secrets machinery on a refused credential, but it is
+its own constant: the reload cadence of storage must not silently change how
+long a PR check keeps returning a credential error.
+
 Network refusal, DNS failure, context cancellation, timeout, TLS negotiation or
 certificate failure, protocol errors, query errors, and all other SQLSTATE or
-MySQL codes are `NotAuth`. They do not evict a valid credential generation and
+MySQL codes are `NotAuth`. PostgreSQL `28000` is deliberately among them: a
+rejected password or an unknown role both arrive as `28P01`, while `28000` at
+connection time comes from `pg_hba.conf` policy or an unsatisfied client
+certificate requirement, which a rotation retry cannot repair. The storage
+pool's own reload still treats `28000` as a rotation signature; target eviction
+does not. `NotAuth` errors never evict a valid credential generation and
 continue through the operation's existing error handling.
 
 **Rejected alternatives.** String matching was rejected because driver wording
@@ -311,20 +385,29 @@ recipe's form rather than either neighbor's.
 
 | Metric | Attributes | Meaning |
 | --- | --- | --- |
-| `schemabot.target.probe.total` | `target`, `database_type`, `environment`, `outcome` | One startup result per enumerated target. Outcomes: `success`, `auth_invalid_credentials`, `auth_no_grant`, `auth_no_database`, `resolve_error`, `timeout`, `connection_error`. |
-| `schemabot.target.client_evictions.total` | `database_type`, `environment`, `reason` | Replaced generations. Reasons: `dsn_changed`, `auth_invalid_credentials`, `auth_no_grant`, `auth_no_database`. Target is omitted from this hot-path counter to bound cardinality. |
-| `schemabot.target.auth_retries.total` | `operation`, `database_type`, `environment`, `classification`, `outcome` | Eligible single retries and whether they succeeded, failed, or could not re-resolve. |
+| `schemabot.target.probe.total` | `database_type`, `environment`, `outcome` | One startup result per enumerated target. Outcomes: `success`, `auth_invalid_credentials`, `auth_no_access`, `auth_no_database`, `resolve_error`, `timeout`, `connection_error`. |
+| `schemabot.target.client_evictions.total` | `database_type`, `environment`, `reason` | Replaced generations. Reasons: `dsn_changed`, `auth_invalid_credentials`, `auth_no_access`, `auth_no_database`. Target is omitted from this hot-path counter to bound cardinality. |
+| `schemabot.target.auth_retries.total` | `operation`, `database_type`, `environment`, `classification`, `outcome` | Eligible single retries by outcome: `success`, `failed` (the rebuilt client's dispatch failed; the paired log's `cooldown_armed` says whether it was refused again), `resolve_error` (the target could not be re-resolved or its client rebuilt), or `suppressed` (the route's cooldown was running, so the failure was returned without a retry). |
 
-The target label is acceptable on the startup probe because configured
-inventory is bounded and each target emits once per process start. Retry and
-eviction can occur on a hot path, so their counters omit target and rely on logs
-for attribution. The retry counter earns a separate instrument because a rate
+None of the three counters carries a target label; every log beside them names
+the target, so the series count is bounded by outcomes and environments rather
+than by inventory size. The probe counter is the one instrument here that does
+not earn its place on volume — it emits once per target per process start — and
+it earns it as a deploy-time alert instead: a rollout produces a burst of
+observations at once, and a non-`success` outcome in that burst is a rotated
+credential, dropped grant, or unreachable target found before the first schema
+change reaches it. The retry counter earns a separate instrument because a rate
 or storm is an actionable signal that rotation or provisioning is unhealthy.
 
 Every probe log includes `target`, `database_type`, `environment`, `outcome`, and
 `duration_ms`; failures also include `classification` and `error`. Every
 self-heal log includes those routing fields plus `namespace`, `operation`,
-`classification`, `attempt`, `old_dsn_hash`, `new_dsn_hash`, and `outcome`.
+`classification`, `attempt`, `evicted`, `old_dsn_hash`, `new_dsn_hash`, and
+`outcome`; `evicted` records whether this request replaced the failed
+generation or found a concurrent request had already done so. A failed retry
+adds `cooldown_armed`, which is true only when the rebuilt client was refused
+with a classified failure. A read the cooldown suppresses logs the same fields
+with `attempt` 1 and `cooldown_remaining_ms`.
 Hashes are short correlation identifiers, never reversible credentials. Raw
 DSNs and secret values are forbidden. Apply-scoped logs continue to use the
 existing `LogAttrs()` helpers and add only these call-specific fields.

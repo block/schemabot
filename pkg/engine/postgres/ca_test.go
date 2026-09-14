@@ -163,6 +163,41 @@ func TestValidationRootCAs(t *testing.T) {
 	})
 }
 
+// ConnectionOptions is the trust policy a caller outside the engine dials
+// under: it follows the CA reference exactly as the engine's own dial sites
+// do, so a reference the engine refuses is refused here, a readable pinned
+// bundle yields the pinning option, and the embedded RDS trust needs none.
+func TestConnectionOptions(t *testing.T) {
+	verifyFullDSN := "postgres://user:pw@db.example.com:5432/app?sslmode=verify-full"
+
+	t.Run("embedded RDS trust needs no options", func(t *testing.T) {
+		opts, err := ConnectionOptions(&engine.Credentials{DSN: verifyFullDSN, Metadata: map[string]string{metadataCARef: caRefEmbeddedRDSGlobal}})
+		require.NoError(t, err)
+		assert.Empty(t, opts)
+	})
+
+	t.Run("pinned bundle yields the pinning option", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "ca.pem")
+		require.NoError(t, os.WriteFile(path, testCAPEM(t), 0o600))
+		opts, err := ConnectionOptions(&engine.Credentials{DSN: verifyFullDSN, Metadata: map[string]string{metadataCARef: caRefFilePrefix + path}})
+		require.NoError(t, err)
+		assert.Len(t, opts, 1)
+	})
+
+	t.Run("missing bundle fails closed", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "absent.pem")
+		_, err := ConnectionOptions(&engine.Credentials{DSN: verifyFullDSN, Metadata: map[string]string{metadataCARef: caRefFilePrefix + path}})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "read PostgreSQL CA bundle")
+	})
+
+	t.Run("unsupported reference fails closed", func(t *testing.T) {
+		_, err := ConnectionOptions(&engine.Credentials{DSN: verifyFullDSN, Metadata: map[string]string{metadataCARef: "vault:corp-ca"}})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unsupported reference")
+	})
+}
+
 func TestPlanRefusesUnknownCAReferenceBeforeConnecting(t *testing.T) {
 	eng := New()
 	_, err := eng.Plan(t.Context(), &engine.PlanRequest{

@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/checkstate"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
@@ -48,7 +49,7 @@ func (o participantCheckOutcome) unresolved() bool {
 // unresolved participant reads as "waiting to report" / "not reported" rather
 // than as a pending or failed apply. Synthesized rows are never persisted, so
 // the marker never reaches stored check state.
-const participantUnresolvedBlockingReason = "participant_unresolved"
+const participantUnresolvedBlockingReason = checkstate.BlockParticipantUnresolved
 
 // synthesizeParticipantCheck maps a resolved participant outcome to a stored
 // Check shape so computeAggregate folds it exactly like a per-database check.
