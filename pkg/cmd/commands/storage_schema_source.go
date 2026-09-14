@@ -401,12 +401,30 @@ func getReleaseContents(ctx context.Context, client *http.Client, repo, tag, pat
 // cannot read, and a rate limit — each with a different fix, and all three
 // solved for good by --schema-dir.
 func releaseContentsError(response *http.Response, repo, tag, path string) error {
-	switch response.StatusCode {
-	case http.StatusNotFound:
+	switch {
+	case response.StatusCode == http.StatusNotFound:
 		return fmt.Errorf("release %s in %s has no %s: check the tag spelling, or pass --release-repo if the release is published elsewhere", tag, repo, path)
-	case http.StatusUnauthorized, http.StatusForbidden:
+	case releaseFetchRateLimited(response):
+		return fmt.Errorf("GitHub rate-limited the fetch of %s at %s from %s (HTTP %d): wait for the limit to reset, or set GITHUB_TOKEN for the larger authenticated budget — or use --schema-dir to read the files from a checkout and not spend any budget at all", path, tag, repo, response.StatusCode)
+	case response.StatusCode == http.StatusUnauthorized, response.StatusCode == http.StatusForbidden:
 		return fmt.Errorf("not allowed to read %s at %s in %s (HTTP %d): set GITHUB_TOKEN to a token that can read the repository, or use --schema-dir to read the files from a checkout instead", path, tag, repo, response.StatusCode)
 	default:
 		return fmt.Errorf("fetching %s at %s from %s failed with HTTP %d; --schema-dir reads the same files from a checkout without the network", path, tag, repo, response.StatusCode)
 	}
+}
+
+// releaseFetchRateLimited reports whether GitHub refused the request for budget
+// rather than for permission. The two arrive as the same status, so only the
+// headers separate them: a spent primary budget answers with its remaining
+// count at zero, and a secondary limit answers with when to come back.
+//
+// Telling them apart is the whole point of asking. A rate limit is fixed by
+// waiting or by authenticating for a larger budget; the permission message
+// sends an operator mid-deploy to re-issue a token that was never the problem,
+// and it will not work when they retry with it.
+func releaseFetchRateLimited(response *http.Response) bool {
+	if response.StatusCode != http.StatusForbidden && response.StatusCode != http.StatusTooManyRequests {
+		return false
+	}
+	return response.Header.Get("X-RateLimit-Remaining") == "0" || response.Header.Get("Retry-After") != ""
 }
