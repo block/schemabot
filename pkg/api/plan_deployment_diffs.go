@@ -174,6 +174,14 @@ func (s *Service) planDeploymentDiff(ctx context.Context, req PlanRequest, targe
 		Environment: req.Environment,
 		Target:      target.Target,
 		SchemaPath:  trustedSchemaPath,
+		// The desired state is partial in exactly the way the primary's is: a
+		// namespace the caller withheld is excluded, not absent. Without this
+		// the data plane reads the omission as intent to remove and plans DROPs
+		// for namespaces the configuration excluded on purpose.
+		IgnoredNamespaces: req.IgnoredNamespaces,
+		// Always stated, never left absent: absence tells the data plane the
+		// caller predates the grouping choice, and this caller has made one.
+		GroupedExecution: new(req.GroupedExecution),
 	}
 	if req.PullRequest != nil {
 		ternReq.PullRequest = *req.PullRequest

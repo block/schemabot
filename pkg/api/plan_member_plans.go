@@ -25,12 +25,24 @@ import (
 // review. An apply dispatches each member against its stored plan, so a member
 // with no stored plan has nothing to run; letting the rollup stay clean would
 // gate the PR on a member that could not have been applied.
-func (s *Service) persistMemberPlans(ctx context.Context, req PlanRequest, planning MemberPlanning, diffs []DeploymentPlanDiff, rollup *PlanRollup) error {
+//
+// Every member plan is stamped with the reviewed plan's identifier, which is
+// what durably binds it to this review round. A commit can be planned more than
+// once — a re-plan, or two deliveries racing — and each round stores its own row
+// per member with the same route and the same head SHA. Without the stamp an
+// apply created from one round's reviewed plan could pair its members with
+// another round's plans, dispatching DDL the operator never saw.
+func (s *Service) persistMemberPlans(ctx context.Context, req PlanRequest, planning MemberPlanning, primaryPlanIdentifier string, diffs []DeploymentPlanDiff, rollup *PlanRollup) error {
 	if planning != PlanIndependent {
 		return nil
 	}
 	if len(diffs) != len(rollup.Entries) {
 		return fmt.Errorf("persist member plans for %s/%s: %d member diffs for %d rollup entries", req.Database, req.Environment, len(diffs), len(rollup.Entries))
+	}
+	if primaryPlanIdentifier == "" {
+		// A member plan that cannot be attributed to a review round is exactly
+		// what the stamp exists to prevent, so it is not stored at all.
+		return fmt.Errorf("persist member plans for %s/%s: the reviewed plan has no identifier to bind member plans to", req.Database, req.Environment)
 	}
 
 	// Index 0 is the primary, whose reviewed plan is already stored.
@@ -50,9 +62,10 @@ func (s *Service) persistMemberPlans(ctx context.Context, req PlanRequest, plann
 		// identifier and gets one minted here.
 		planIdentifier := engine.NewPlanID()
 		route := storedPlanRoute{
-			DatabaseType: entry.DatabaseType,
-			Deployment:   entry.Deployment,
-			Target:       entry.Target,
+			DatabaseType:          entry.DatabaseType,
+			Deployment:            entry.Deployment,
+			Target:                entry.Target,
+			PrimaryPlanIdentifier: primaryPlanIdentifier,
 		}
 		if err := s.storePlan(ctx, req, planIdentifier, diffs[i].Changes, diffs[i].Shards, route); err != nil {
 			s.logger.Error("failed to store a rollout member's plan; the member will block the review because an apply would have no plan to run for it",
