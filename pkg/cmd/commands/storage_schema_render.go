@@ -77,7 +77,7 @@ func storageSchemaEngineLabel(dialect string) string {
 // writeStorageSchemaBody writes everything under the header: the statements,
 // the disposition of the ones that will not simply run, the summary, and any
 // hint naming the next step.
-func writeStorageSchemaBody(report *apitypes.StorageSchemaReport, isApply bool, hints []string) error {
+func writeStorageSchemaBody(report *apitypes.StorageSchemaReport, isApply bool, rerun string, hints []string) error {
 	if report.Converged {
 		// No hints under a converged plan: every one of them names a next step,
 		// and there is no next step to take.
@@ -112,27 +112,23 @@ func writeStorageSchemaBody(report *apitypes.StorageSchemaReport, isApply bool, 
 			storageSchemaNotices(append(append([]apitypes.StorageSchemaStatement{}, report.Outstanding...), report.Destructive...)))
 	}
 	if len(destructive) > 0 && !gated {
-		// The glyph follows the severity vocabulary: consent already in effect is
-		// an escalation, a statement an apply has refused is a refusal, and the
-		// same statement merely disclosed by a plan is attention.
+		// The three dispositions a destructive change can be in are the three
+		// the rest of the CLI already renders, so they are rendered by the same
+		// templates: a plan disclosing one, an apply refusing one, and consent
+		// already in effect. Each carries the severity glyph its own heading
+		// earns, and each lists a statement the way `plan` and `apply` list an
+		// unsafe change.
 		switch {
 		case report.DestructiveAllowed:
 			templates.WriteSQLChanges(destructive, dialect)
-			templates.WriteChangeNotice(glyph.Escalation,
-				"Destructive changes, running because destructive storage changes are allowed:",
-				storageSchemaNotices(report.Destructive))
+			// The consent is not necessarily a flag: a deployment's storage
+			// policy can permit these with nothing on the command line.
+			templates.WriteUnsafeWarningAllowed(storageSchemaNotices(report.Destructive),
+				"destructive storage changes allowed")
 		case isApply:
-			// Said without claiming what else happened, because an apply prints
-			// this at two moments: before it runs anything, where the refusal is
-			// what stops the convergence, and after a convergence that ran the
-			// rest. The flag is the way through from either one.
-			templates.WriteChangeNotice(glyph.Refused,
-				"Destructive changes refused. To proceed with them, re-run with --allow-unsafe:",
-				storageSchemaNotices(report.Destructive))
+			templates.WriteUnsafeChangesBlocked(storageSchemaNotices(report.Destructive), rerun)
 		default:
-			templates.WriteChangeNotice(glyph.Attention,
-				"Destructive changes, refused unless destructive storage changes are allowed:",
-				storageSchemaNotices(report.Destructive))
+			templates.WriteUnsafeChangesWarning(storageSchemaNotices(report.Destructive))
 		}
 	}
 
@@ -199,9 +195,9 @@ func storageSchemaSummaryTables(changes []templates.DDLChange) []templates.DDLCh
 }
 
 // outputStorageSchemaPlan prints a storage plan the way `plan` prints one.
-func outputStorageSchemaPlan(report *apitypes.StorageSchemaReport, isApply bool, hints []string) error {
+func outputStorageSchemaPlan(report *apitypes.StorageSchemaReport, isApply bool, rerun string, hints []string) error {
 	writeStorageSchemaHeader(report, isApply)
-	return writeStorageSchemaBody(report, isApply, hints)
+	return writeStorageSchemaBody(report, isApply, rerun, hints)
 }
 
 // outputStorageSchemaConvergence prints what a convergence ran and what it left
@@ -211,10 +207,10 @@ func outputStorageSchemaPlan(report *apitypes.StorageSchemaReport, isApply bool,
 // withPlan prints the plan that ran, for the unattended path where no preview
 // was shown before it. The planned report is that plan, so printing it after
 // the fact costs nothing and leaves every run self-describing.
-func outputStorageSchemaConvergence(planned, remaining *apitypes.StorageSchemaReport, withPlan bool) error {
+func outputStorageSchemaConvergence(planned, remaining *apitypes.StorageSchemaReport, withPlan bool, rerun string) error {
 	if withPlan {
 		writeStorageSchemaHeader(planned, true)
-		if err := writeStorageSchemaBody(planned, true, nil); err != nil {
+		if err := writeStorageSchemaBody(planned, true, rerun, nil); err != nil {
 			return err
 		}
 	}
@@ -240,7 +236,7 @@ func outputStorageSchemaConvergence(planned, remaining *apitypes.StorageSchemaRe
 	} else {
 		fmt.Printf("✓ Ran %d %s against %s.\n\n", applied, ui.Pluralize("statement", applied), database)
 	}
-	return writeStorageSchemaBody(remaining, true, []string{
+	return writeStorageSchemaBody(remaining, true, rerun, []string{
 		"These were not run. A destructive statement is refused unless --allow-unsafe is passed; a manual entry has to be resolved by hand before anything else converges.",
 	})
 }
@@ -309,12 +305,19 @@ func storageSchemaNotices(statements []apitypes.StorageSchemaStatement) []apityp
 	}
 	notices := make([]apitypes.UnsafeChange, 0, len(statements))
 	for _, statement := range statements {
-		notices = append(notices, apitypes.UnsafeChange{
+		notice := apitypes.UnsafeChange{
 			Table:      statement.Table,
 			Reason:     statement.Reason,
 			DDL:        statement.DDL,
 			ChangeType: storageSchemaOperationLabel(statement.Operation),
-		})
+		}
+		if statement.Reason != "" {
+			// One statement's reason is one finding. Declaring it keeps the
+			// shared list from splitting a sentence at its semicolon and
+			// numbering each half as something separate to fix.
+			notice.Reasons = []string{statement.Reason}
+		}
+		notices = append(notices, notice)
 	}
 	return notices
 }

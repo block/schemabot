@@ -840,8 +840,18 @@ func (r *PlanResponse) HasErrors() bool {
 
 // UnsafeChange represents a table change that is potentially destructive.
 type UnsafeChange struct {
-	Table      string
-	Reason     string
+	Table  string
+	Reason string
+	// Reasons is the change's findings, already separated. Renderers list and
+	// count these when they are set.
+	//
+	// It exists because Reason carries the engine-reported form, which joins a
+	// table's findings with "; ", so a renderer given only that has to split it
+	// back apart to list them. A reason written for one change is one sentence,
+	// and splitting it renders half of it as a finding of its own. Setting this
+	// is how a producer that knows its own findings says what they are; leaving
+	// it unset keeps the splitting, which is what an engine's plan needs.
+	Reasons    []string `json:",omitempty"`
 	DDL        string
 	ChangeType string
 }
