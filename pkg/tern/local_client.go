@@ -118,6 +118,7 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/targetauth"
 )
 
 // LocalConfig holds configuration for the local Tern client.
@@ -784,8 +785,10 @@ func (c *LocalClient) discoverPullNamespaces(ctx context.Context) ([]string, err
 		return nil, fmt.Errorf("open database target for namespace discovery: %w", err)
 	}
 	defer utils.CloseAndLog(db)
+	// Open only parsed the DSN; this ping is the first dial, so it is where the
+	// target can refuse the session and the only error worth classifying.
 	if err := db.PingContext(ctx); err != nil {
-		return nil, fmt.Errorf("ping database target for namespace discovery: %w", err)
+		return nil, fmt.Errorf("ping database target for namespace discovery: %w", targetauth.Wrap(err))
 	}
 	rows, err := db.QueryContext(ctx, `SELECT schema_name FROM information_schema.schemata ORDER BY schema_name`)
 	if err != nil {
@@ -842,8 +845,10 @@ func (c *LocalClient) pullSchemaNamespace(ctx context.Context, req *ternv1.PullS
 	}
 	defer utils.CloseAndLog(db)
 
+	// Open only parsed the DSN; this ping is the first dial, so it is where the
+	// target can refuse the session and the only error worth classifying.
 	if err := db.PingContext(ctx); err != nil {
-		return nil, fmt.Errorf("ping database %s namespace %s for schema pull: %w", c.config.Database, namespace, err)
+		return nil, fmt.Errorf("ping database %s namespace %s for schema pull: %w", c.config.Database, namespace, targetauth.Wrap(err))
 	}
 
 	tables, err := spirittable.LoadSchemaFromDB(ctx, db, spirittable.WithoutUnderscoreTables, spirittable.WithoutArchiveTables, spirittable.WithStrippedAutoIncrement)

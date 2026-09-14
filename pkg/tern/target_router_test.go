@@ -11,6 +11,7 @@ import (
 
 	"github.com/block/schemabot/pkg/inventory"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -54,6 +55,8 @@ type targetRouterApplyStore struct {
 	storage.ApplyStore
 	byID         map[int64]*storage.Apply
 	byIdentifier map[string]*storage.Apply
+	// lookupErr, when set, fails every lookup by identifier.
+	lookupErr error
 }
 
 func (s targetRouterApplyStore) Get(_ context.Context, id int64) (*storage.Apply, error) {
@@ -66,12 +69,30 @@ func (s targetRouterApplyStore) Get(_ context.Context, id int64) (*storage.Apply
 }
 
 func (s targetRouterApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentifier string) (*storage.Apply, error) {
+	if s.lookupErr != nil {
+		return nil, s.lookupErr
+	}
 	apply := s.byIdentifier[applyIdentifier]
 	if apply == nil {
 		return nil, nil
 	}
 	copy := *apply
 	return &copy, nil
+}
+
+func (s targetRouterApplyStore) GetInProgress(context.Context) ([]*storage.Apply, error) {
+	if s.lookupErr != nil {
+		return nil, s.lookupErr
+	}
+	var inProgress []*storage.Apply
+	for _, apply := range s.byIdentifier {
+		if state.IsTerminalApplyState(apply.State) {
+			continue
+		}
+		copy := *apply
+		inProgress = append(inProgress, &copy)
+	}
+	return inProgress, nil
 }
 
 type targetRouterRecordingClient struct {
@@ -88,25 +109,51 @@ type targetRouterRecordingClient struct {
 	pendingObserverSet bool
 	observerApplyID    int64
 	closed             bool
+	halted             bool
+	// onPlan runs inside Plan, while the router still holds this client for
+	// the request, so a test can observe the router mid-dispatch.
+	onPlan func()
+	// onResume runs inside each resume, standing in for the drive a local
+	// client runs to completion within the call.
+	onResume     func()
+	onPullSchema func() (*ternv1.PullSchemaResponse, error)
+	onPlanResult func() (*ternv1.PlanResponse, error)
+	onPlanDiff   func() (*ternv1.PlanDiffResponse, error)
+	onApply      func() (*ternv1.ApplyResponse, error)
 }
 
 func (c *targetRouterRecordingClient) PullSchema(_ context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
 	c.pullReq = req
+	if c.onPullSchema != nil {
+		return c.onPullSchema()
+	}
 	return &ternv1.PullSchemaResponse{Database: req.Database, Type: req.Type}, nil
 }
 
 func (c *targetRouterRecordingClient) Plan(_ context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
 	c.planReq = req
+	if c.onPlan != nil {
+		c.onPlan()
+	}
+	if c.onPlanResult != nil {
+		return c.onPlanResult()
+	}
 	return &ternv1.PlanResponse{PlanId: "plan-routed"}, nil
 }
 
 func (c *targetRouterRecordingClient) PlanDiff(_ context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
 	c.planDiffReq = req
+	if c.onPlanDiff != nil {
+		return c.onPlanDiff()
+	}
 	return &ternv1.PlanDiffResponse{Engine: ternv1.Engine_ENGINE_PLANETSCALE}, nil
 }
 
 func (c *targetRouterRecordingClient) Apply(_ context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
 	c.applyReq = req
+	if c.onApply != nil {
+		return c.onApply()
+	}
 	return &ternv1.ApplyResponse{Accepted: true, ApplyId: "apply-routed"}, nil
 }
 
@@ -146,17 +193,22 @@ func (c *targetRouterRecordingClient) SkipRevert(context.Context, *ternv1.SkipRe
 func (c *targetRouterRecordingClient) Health(context.Context) error { return nil }
 
 func (c *targetRouterRecordingClient) ResumeApply(_ context.Context, apply *storage.Apply) error {
-	c.resumeApply = apply
-	return nil
+	return c.recordResume(apply)
 }
 
 func (c *targetRouterRecordingClient) ResumeApplyOperation(_ context.Context, apply *storage.Apply, _ int64) error {
-	c.resumeApply = apply
-	return nil
+	return c.recordResume(apply)
 }
 
 func (c *targetRouterRecordingClient) ResumeApplyOperationCutover(_ context.Context, apply *storage.Apply, _ int64) error {
+	return c.recordResume(apply)
+}
+
+func (c *targetRouterRecordingClient) recordResume(apply *storage.Apply) error {
 	c.resumeApply = apply
+	if c.onResume != nil {
+		c.onResume()
+	}
 	return nil
 }
 
@@ -174,6 +226,11 @@ func (c *targetRouterRecordingClient) SetObserver(applyID int64, _ ProgressObser
 
 func (c *targetRouterRecordingClient) Close() error {
 	c.closed = true
+	return nil
+}
+
+func (c *targetRouterRecordingClient) HaltForShutdown(context.Context) error {
+	c.halted = true
 	return nil
 }
 

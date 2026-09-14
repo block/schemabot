@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/checkstate"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -86,7 +87,7 @@ func filterNonPassingNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, confi
 		if s.Status != "completed" {
 			continue
 		}
-		if isPassingCheckConclusion(s.Conclusion) {
+		if checkstate.ConclusionClearsGate(s.Conclusion) {
 			continue
 		}
 		notPassing = append(notPassing, templates.BlockingCheck{
@@ -95,18 +96,6 @@ func filterNonPassingNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, confi
 		})
 	}
 	return notPassing
-}
-
-// isPassingCheckConclusion reports whether a completed check's conclusion
-// allows apply to proceed. Only "success", "neutral", and "skipped" pass;
-// every other conclusion blocks apply.
-func isPassingCheckConclusion(conclusion string) bool {
-	switch conclusion {
-	case "success", "neutral", "skipped":
-		return true
-	default:
-		return false
-	}
 }
 
 // enforcePassingChecks verifies that all non-SchemaBot PR checks are passing.
