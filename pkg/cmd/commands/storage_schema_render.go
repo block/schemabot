@@ -8,6 +8,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // A storage schema plan is rendered the way every other plan in this CLI is
@@ -215,13 +216,26 @@ func outputStorageSchemaConvergence(planned, remaining *apitypes.StorageSchemaRe
 	}
 
 	applied := len(planned.AppliedStatements())
+	database := storageSchemaHeaderDatabase(planned)
 	if remaining.Converged {
 		fmt.Printf("✓ Ran %d %s against %s. Nothing is outstanding.\n\n",
-			applied, pluralStatements(applied), storageSchemaHeaderDatabase(planned))
+			applied, ui.Pluralize("statement", applied), database)
 		return nil
 	}
-	fmt.Printf("✓ Ran %d %s against %s.\n\n",
-		applied, pluralStatements(applied), storageSchemaHeaderDatabase(planned))
+	if applied == 0 {
+		// Nothing ran and something is still outstanding, so the convergence
+		// refused the whole set — a ✓ over a run that changed nothing reads as
+		// a success an operator has to disprove from the sections below it.
+		fmt.Printf("%s Ran no statements against %s; the storage schema is unchanged.\n\n", glyph.Refused, database)
+		if withPlan {
+			// What remains is what was planned, which the plan above already
+			// listed with the apply's own severity. Printing the same sections
+			// again would report one refusal twice.
+			return nil
+		}
+	} else {
+		fmt.Printf("✓ Ran %d %s against %s.\n\n", applied, ui.Pluralize("statement", applied), database)
+	}
 	return writeStorageSchemaBody(remaining, true, []string{
 		"These were not run. A destructive statement is refused unless --allow-destructive is passed; a manual entry has to be resolved by hand before anything else converges.",
 	})
@@ -276,35 +290,39 @@ func storageSchemaChangeType(operation string) (string, error) {
 }
 
 // storageSchemaNotices renders statements as the list entries a change notice
-// numbers, carrying the reason the statement will not simply run.
+// numbers: one line per statement, carrying the reason it will not simply run.
+//
+// A statement with no reason of its own is named by what it would do, not by
+// its DDL. The gated list is where that matters: a gated set is every statement
+// in the report, and the outstanding ones among them are unremarkable — nothing
+// is wrong with them beyond the gate — so they carry no reason at all. Printing
+// their DDL instead would put a whole CREATE TABLE, newlines and indentation
+// included, on one numbered line, and the list an operator is counting through
+// would be lost inside it.
 func storageSchemaNotices(statements []apitypes.StorageSchemaStatement) []apitypes.UnsafeChange {
 	if len(statements) == 0 {
 		return nil
 	}
 	notices := make([]apitypes.UnsafeChange, 0, len(statements))
 	for _, statement := range statements {
-		reason := statement.Reason
-		if reason == "" {
-			// Every destructive and manual statement carries a reason; a report
-			// that somehow has none still has to name what the statement does
-			// rather than print a table with an empty line beside it.
-			reason = statement.DDL
-		}
 		notices = append(notices, apitypes.UnsafeChange{
 			Table:      statement.Table,
-			Reason:     reason,
+			Reason:     statement.Reason,
 			DDL:        statement.DDL,
-			ChangeType: statement.Operation,
+			ChangeType: storageSchemaOperationLabel(statement.Operation),
 		})
 	}
 	return notices
 }
 
-func pluralStatements(n int) string {
-	if n == 1 {
-		return "statement"
+// storageSchemaOperationLabel says what a statement does, in the words the
+// report itself uses, for a list entry that has no reason to print instead.
+func storageSchemaOperationLabel(operation string) string {
+	label := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(operation)), "_", " ")
+	if label == "" {
+		return "change"
 	}
-	return "statements"
+	return label
 }
 
 // storageSchemaDatabaseLabel names the database a report is about, as an

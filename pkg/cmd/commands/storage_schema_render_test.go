@@ -225,6 +225,47 @@ func TestOutputStorageSchemaConvergence_LeftBehind(t *testing.T) {
 	assert.Contains(t, out, "--allow-destructive")
 }
 
+// A convergence that ran nothing and left everything says so as a refusal. A ✓
+// over a run that changed nothing is a success an operator has to disprove from
+// the sections below it, and the one mid-incident reads the first line.
+//
+// Under --yes the plan is printed above the result, and what remains is what was
+// planned, so the refusal is reported once rather than as two identical
+// sections either side of the result line.
+func TestOutputStorageSchemaConvergence_RefusedRunsSayNothingRan(t *testing.T) {
+	gated := &apitypes.StorageSchemaReport{
+		Dialect:      "postgres",
+		Database:     "schemabot",
+		Host:         "db-1.example",
+		SchemaSource: "the schema embedded in v1.4.0",
+		Outstanding: []apitypes.StorageSchemaStatement{
+			{Table: "applies", Operation: "add_column", DDL: "ALTER TABLE applies ADD COLUMN caller text"},
+		},
+		Manual: []apitypes.StorageSchemaStatement{{
+			Table:     "checks",
+			Operation: "add_column",
+			DDL:       "ALTER TABLE checks ADD COLUMN head_sha varchar(64) NOT NULL",
+			Reason:    "definition is NOT NULL without a DEFAULT",
+		}},
+	}
+
+	out := captureStdout(func() {
+		require.NoError(t, outputStorageSchemaConvergence(gated, gated, false))
+	})
+	assert.Contains(t, out, glyph.Refused+" Ran no statements against schemabot on db-1.example; the storage schema is unchanged.")
+	assert.NotContains(t, out, "✓ Ran", "nothing ran, so nothing succeeded")
+	assert.Equal(t, 1, strings.Count(out, "Needs manual remediation"))
+
+	withPlan := captureStdout(func() {
+		require.NoError(t, outputStorageSchemaConvergence(gated, gated, true))
+	})
+	assert.Contains(t, withPlan, "PostgreSQL Schema Change Apply")
+	assert.Contains(t, withPlan, glyph.Refused+" Ran no statements against")
+	assert.Equal(t, 1, strings.Count(withPlan, "Needs manual remediation"),
+		"the plan above already carries the refusal; repeating it below reports one refusal twice")
+	assert.Equal(t, 1, strings.Count(withPlan, "Gated behind the manual remediation below"))
+}
+
 // The summary line counts what the convergence would actually run. Promising
 // tables it will refuse to touch is worse than promising nothing.
 func TestStorageSchemaRunnable(t *testing.T) {
@@ -326,18 +367,61 @@ func TestStorageSchemaHeaderDatabase(t *testing.T) {
 		"a report with no database name still reads as a sentence")
 }
 
-// Every list entry names what stands in the way of its statement. A report that
-// somehow carried no reason still says what the statement does, rather than
-// printing a table name against an empty line.
+// Every list entry names what stands in the way of its statement. A statement
+// with no reason of its own — a gated one, held only by the remediation below
+// it — is named by what it would do, so the entry is a line rather than a table
+// name against a blank one or a block of DDL.
 func TestStorageSchemaNotices(t *testing.T) {
 	notices := storageSchemaNotices([]apitypes.StorageSchemaStatement{
 		{Table: "stale_state", Operation: "drop_table", DDL: "DROP TABLE `stale_state`", Reason: "DROP TABLE destroys data"},
-		{Table: "plans", Operation: "drop_table", DDL: "DROP TABLE `plans_old`"},
+		{Table: "plans", Operation: "create_table", DDL: "CREATE TABLE `plans` (\n  `id` bigint\n)"},
 	})
 	require.Len(t, notices, 2)
 	assert.Equal(t, "DROP TABLE destroys data", notices[0].Reason)
-	assert.Equal(t, "DROP TABLE `plans_old`", notices[1].Reason)
+	assert.Empty(t, notices[1].Reason)
+	assert.Equal(t, "create table", notices[1].ChangeType,
+		"a statement with no reason is named by what it does, not by the DDL that does it")
 	assert.Empty(t, storageSchemaNotices(nil))
+}
+
+// A gated list is every statement in the report, and the outstanding ones among
+// them carry no reason — nothing is wrong with them beyond the gate. Each is one
+// numbered line naming what it would do: a CREATE TABLE printed there instead
+// would put a whole schema file, newlines and all, on one line of a list the
+// operator is counting through.
+func TestOutputStorageSchemaPlan_GatedListIsOneLinePerStatement(t *testing.T) {
+	report := &apitypes.StorageSchemaReport{
+		Dialect:      "postgres",
+		Database:     "schemabot",
+		SchemaSource: "the schema embedded in v1.4.0",
+		Outstanding: []apitypes.StorageSchemaStatement{
+			{Table: "plans", Operation: "create_table", DDL: "CREATE TABLE plans (\n  id bigint PRIMARY KEY,\n  created_at timestamptz NOT NULL\n)"},
+			{Table: "applies", Operation: "add_column", DDL: "ALTER TABLE applies ADD COLUMN caller text"},
+		},
+		Manual: []apitypes.StorageSchemaStatement{{
+			Table:     "checks",
+			Operation: "add_column",
+			DDL:       "ALTER TABLE checks ADD COLUMN head_sha varchar(64) NOT NULL",
+			Reason:    "definition is NOT NULL without a DEFAULT; add it manually or ship the column with a DEFAULT",
+		}},
+	}
+
+	out := captureStdout(func() {
+		require.NoError(t, outputStorageSchemaPlan(report, false, nil))
+	})
+
+	gated := out[strings.Index(out, "Gated behind"):strings.Index(out, "Needs manual remediation")]
+	assert.Contains(t, gated, "1. plans: create table")
+	assert.Contains(t, gated, "2. applies: add column")
+	assert.NotContains(t, gated, "CREATE TABLE",
+		"the gated list names statements; it does not print the DDL of one on a numbered line")
+	assert.NotContains(t, gated, "3.", "one entry per statement, so the numbering ends where the list does")
+
+	// A manual reason is one sentence written for one change. Split on its
+	// semicolon it would read as two separate things to fix, one of them the
+	// remedy for the other.
+	assert.Contains(t, out, "1. checks: definition is NOT NULL without a DEFAULT; add it manually or ship the column with a DEFAULT")
+	assert.NotContains(t, out, "2. checks:")
 }
 
 // A plan's sections come out in a fixed order — what runs, what is refused,
