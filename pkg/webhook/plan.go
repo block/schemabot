@@ -765,7 +765,13 @@ const msgDeferCutoverAllDirectConfirm = "`--defer-cutover` has no effect on this
 // not name the flag that skips the stop — the point of stopping is that the
 // operator reads the disclosure first, so the bypass does not belong next to
 // it.
-const msgCopyDiscardDowngrade = "Applying destroys work in progress on the target"
+//
+// It must also stay distinct from the wording of the disclosure it points at.
+// Both lines carry the attention glyph, so a footer that repeats the
+// disclosure's own heading spends a second warning on a sentence the reader
+// has already read, and the one fact the footer adds — that a decision is now
+// required — competes with a copy of the cause for the same attention.
+const msgCopyDiscardDowngrade = "An unfinished copy on the target would be discarded"
 
 // shardedDirectChanges collects direct-execution per-shard changes, grouped by
 // (table, reason) so a change present on several shards lists them together

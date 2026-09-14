@@ -48,7 +48,7 @@ func TestRenderPlanComment_DiscardedCopyWarnsWhileTheDecisionIsTheOperators(t *t
 	// copy is still there and confirming is what destroys it, so the warning
 	// and its remedy belong on the comment the confirmation acts on.
 	data.IsLocked = true
-	data.AutoConfirmDowngradeReason = "Applying destroys work in progress on the target"
+	data.AutoConfirmDowngradeReason = "An unfinished copy on the target would be discarded"
 	paused := RenderPlanComment(data)
 	assert.Contains(t, paused, "⚠️ **Applying destroys work in progress**")
 	assert.Contains(t, paused, "apply the schema change that started it")

@@ -249,7 +249,7 @@ func PreviewCommentPlanCopyDiscardedPaused() string {
 				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
 			},
 		},
-		AutoConfirmDowngradeReason: "Applying destroys work in progress on the target",
+		AutoConfirmDowngradeReason: "An unfinished copy on the target would be discarded",
 	})
 }
 
@@ -287,7 +287,7 @@ func PreviewCommentPlanCopyDiscardedStopped() string {
 				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
 			},
 		},
-		AutoConfirmDowngradeReason: "Applying destroys work in progress on the target",
+		AutoConfirmDowngradeReason: "An unfinished copy on the target would be discarded",
 		StoppedConfirmedApply:      true,
 	})
 }

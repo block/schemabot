@@ -390,7 +390,7 @@ Applying restarts the copy from zero rows. To keep the work already done, apply 
 
 ---
 
-⚠️ **Automatic apply paused**: Applying destroys work in progress on the target
+⚠️ **Automatic apply paused**: An unfinished copy on the target would be discarded
 
 Review the plan above, then confirm manually:
 ```
@@ -430,7 +430,7 @@ Applying restarts the copy from zero rows. To keep the work already done, apply 
 
 ---
 
-⚠️ **Apply stopped**: Applying destroys work in progress on the target
+⚠️ **Apply stopped**: An unfinished copy on the target would be discarded
 
 Review the plan above, then confirm manually:
 ```
