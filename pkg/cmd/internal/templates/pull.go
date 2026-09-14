@@ -69,6 +69,32 @@ var divergenceLabels = map[string]string{
 	apitypes.DivergenceOnlyOnTarget:  "extra",
 }
 
+// targetDivergenceNames names each target of a pull so no two members of the
+// report read alike. A target name is opaque to SchemaBot and only unique
+// within the deployment that addresses it, so an environment whose deployments
+// address targets of the same name would otherwise print the same header twice
+// and leave the operator unable to tell which member a divergence belongs to.
+// Such a target is named by its full member identity; every other target keeps
+// the bare name, which is already the thing that distinguishes it.
+func targetDivergenceNames(targets []*apitypes.TargetDivergence) []string {
+	deploymentsByTarget := make(map[string]map[string]struct{}, len(targets))
+	for _, target := range targets {
+		if deploymentsByTarget[target.Target] == nil {
+			deploymentsByTarget[target.Target] = make(map[string]struct{}, 1)
+		}
+		deploymentsByTarget[target.Target][target.Deployment] = struct{}{}
+	}
+	names := make([]string, len(targets))
+	for i, target := range targets {
+		if len(deploymentsByTarget[target.Target]) > 1 {
+			names[i] = target.Deployment + "/" + target.Target
+			continue
+		}
+		names[i] = target.Target
+	}
+	return names
+}
+
 // writeTargetDivergence lists every target the environment addresses and how
 // each differs from the primary, whose schema is the DDL printed below. It
 // renders as "--" comments like the rest of the pull output, so redirecting a
@@ -85,22 +111,23 @@ func writeTargetDivergence(targets []*apitypes.TargetDivergence) {
 	if len(targets) == 0 {
 		return
 	}
-	for _, target := range targets {
+	names := targetDivergenceNames(targets)
+	for i, target := range targets {
+		name := emphasis("`" + names[i] + "`")
 		fmt.Println()
 		if target.Primary {
-			fmt.Println(annotation(fmt.Sprintf("-- Target %s — primary target, whose schema is below",
-				emphasis("`"+target.Target+"`"))))
+			fmt.Println(annotation(fmt.Sprintf("-- Target %s — primary target, whose schema is below", name)))
 			continue
 		}
 		if len(target.DivergedTables) == 0 {
-			fmt.Println(annotation(fmt.Sprintf("-- Target %s — same schema as the primary target",
-				emphasis("`"+target.Target+"`"))))
+			fmt.Println(annotation(fmt.Sprintf("-- Target %s — same schema as the primary target", name)))
 			continue
 		}
-		fmt.Println(annotation(fmt.Sprintf("-- Target %s — %d %s differ from the primary target",
-			emphasis("`"+target.Target+"`"),
+		fmt.Println(annotation(fmt.Sprintf("-- Target %s — %d %s %s from the primary target",
+			name,
 			len(target.DivergedTables),
-			ui.Pluralize("table", len(target.DivergedTables)))))
+			ui.Pluralize("table", len(target.DivergedTables)),
+			ui.PluralizeLabel("differs", "differ", len(target.DivergedTables)))))
 		for _, table := range target.DivergedTables {
 			label, ok := divergenceLabels[table.Difference]
 			if !ok {

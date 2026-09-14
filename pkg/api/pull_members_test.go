@@ -128,6 +128,29 @@ func TestExecutePullSchema_ReportsPerTargetDivergence(t *testing.T) {
 	}, diverged.DivergedTables)
 }
 
+// A table the primary holds and another target does not is the opposite
+// one-sided case from an extra table, and the two must never be confused: one
+// says the target is behind the schema being materialized, the other says it
+// carries something the primary does not.
+func TestExecutePullSchema_ReportsTablesMissingFromATarget(t *testing.T) {
+	client := newPerTargetPullClient(map[string]*ternv1.PullSchemaResponse{
+		"testapp-001": pulledTables(map[string]string{"users": pullUsersDDL, "audits": pullAuditsDDL}),
+		"testapp-002": pulledTables(map[string]string{"users": pullUsersDDL}),
+	}, nil)
+	svc := pullTargetService(t, multiTargetPullEnv(), map[string]tern.Client{"eu/production": client})
+
+	resp, err := svc.ExecutePullSchema(t.Context(), pullRequest())
+	require.NoError(t, err)
+
+	require.Len(t, resp.Targets, 2)
+	diverged := resp.Targets[1]
+	assert.Equal(t, "testapp-002", diverged.Target)
+	assert.Equal(t, int32(1), diverged.TableCount)
+	assert.Equal(t, []apitypes.DivergedTable{
+		{Namespace: "testapp", Table: "audits", Difference: apitypes.DivergenceOnlyOnPrimary},
+	}, diverged.DivergedTables)
+}
+
 // A caller reconciling an environment against its own shard inventory reads the
 // member set off the pull payload, so exactly one target is marked primary and
 // the whole configured list is present in configuration order.

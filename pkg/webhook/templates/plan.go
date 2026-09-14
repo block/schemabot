@@ -1131,7 +1131,11 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 		return
 	}
 
-	names := driftMemberNames(drift.Deployments)
+	// A member name is assembled from server config, so it reaches this comment
+	// as text SchemaBot did not choose. Rendering every one as a code span keeps
+	// a name carrying a backtick or a line break from closing the span it sits
+	// in and writing markdown of its own into a comment operators act on.
+	names := inlineCodeList(driftMemberNames(drift.Deployments))
 	if drift.Clean {
 		if drift.Independent {
 			fmt.Fprintf(sb, "✅ **Planned separately for all %d targets** (%s) — each target holds its own schema, so their plans are not expected to match.\n\n",
@@ -1153,7 +1157,7 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 		sb.WriteString(glyph.Attention + " **Deployment drift detected** — some deployments no longer match the reviewed plan, so the plan check is failing closed:\n\n")
 	}
 	for i, d := range drift.Deployments {
-		name := "`" + names[i] + "`"
+		name := names[i]
 		if d.Primary {
 			name += " (primary)"
 		}
