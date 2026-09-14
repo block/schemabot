@@ -1517,7 +1517,7 @@ func (c *LocalClient) ResumeApply(ctx context.Context, apply *storage.Apply) err
 	// apply is handled inside the shared resume path: VSchema-only plans are
 	// re-driven so the VSchema is applied, and any other task-less shape (e.g. a
 	// sharded dispatch whose shard already matches) completes as a no-op.
-	return c.resumeApplyWithTasks(ctx, apply, tasks, apply.GetOptions().Map(), false, false)
+	return c.resumeApplyWithTasks(ctx, apply, nil, tasks, apply.GetOptions().Map(), false, false)
 }
 
 // ResumeApplyOperation starts or resumes a single apply_operation (one
@@ -1571,7 +1571,7 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 		if !op.IsTasklessVSchemaOnlyWork(plan) {
 			return fmt.Errorf("apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, ErrNoTasksForApplyOperation)
 		}
-		return c.driveApplyTasks(ctx, apply, op, tasks, apply.GetOptions().Map(), false, false)
+		return c.resumeApplyWithTasks(ctx, apply, op, tasks, apply.GetOptions().Map(), false, false)
 	}
 	siblings, err := c.storage.ApplyOperations().ListByApply(ctx, apply.ID)
 	if err != nil {
@@ -1584,7 +1584,7 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 	// unchanged.
 	releaseAtCutoverBarrier := shouldReleaseAtCutoverBarrier(apply, multiOperation, op)
 	options := effectiveCopyDriveOptions(apply, multiOperation, op).Map()
-	return c.driveApplyTasks(ctx, apply, op, tasks, options, releaseAtCutoverBarrier, false)
+	return c.resumeApplyWithTasks(ctx, apply, op, tasks, options, releaseAtCutoverBarrier, false)
 }
 
 // ResumeApplyOperationCutover drives a single apply_operation parked at the
@@ -1640,7 +1640,7 @@ func (c *LocalClient) ResumeApplyOperationCutover(ctx context.Context, apply *st
 	// the parked engine checkpoint before driving.
 	opts := apply.GetOptions()
 	opts.DeferCutover = false
-	return c.driveApplyTasks(ctx, apply, op, tasks, opts.Map(), false, true)
+	return c.resumeApplyWithTasks(ctx, apply, op, tasks, opts.Map(), false, true)
 }
 
 // finalizerOperationKeySuffix is the trailing segment of a namespace-scoped
@@ -1892,23 +1892,16 @@ func (c *LocalClient) drivePlanID(apply *storage.Apply, op *storage.ApplyOperati
 	return storage.PlanIDForOperation(apply, op)
 }
 
-// resumeApplyWithTasks drives a whole apply from the set of tasks the caller has
-// loaded. Whole-apply scope has no operation to name a plan, so the drive runs
-// the apply's own plan; a drive scoped to one operation calls driveApplyTasks
-// with that operation instead.
-func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, options map[string]string, releaseAtCutoverBarrier bool, forceCutoverResume bool) error {
-	return c.driveApplyTasks(ctx, apply, nil, tasks, options, releaseAtCutoverBarrier, forceCutoverResume)
-}
-
-// driveApplyTasks drives an apply (or one of its operations) from the set of
-// tasks the caller has loaded. Callers choose whether tasks are scoped to the
+// resumeApplyWithTasks drives an apply (or one of its operations) from the set
+// of tasks the caller has loaded. Callers choose whether tasks are scoped to the
 // whole apply or to a single operation.
 //
 // op is the operation being driven, or nil for a whole-apply drive. It names the
 // plan this drive runs: a rollout member planned against its own live schema
 // stores its plan on its operation row, and running the apply's plan there would
-// dispatch another target's DDL.
-func (c *LocalClient) driveApplyTasks(ctx context.Context, apply *storage.Apply, op *storage.ApplyOperation, tasks []*storage.Task, options map[string]string, releaseAtCutoverBarrier bool, forceCutoverResume bool) error {
+// dispatch another target's DDL. A whole-apply drive has no operation to name
+// one, so it runs the apply's plan.
+func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.Apply, op *storage.ApplyOperation, tasks []*storage.Task, options map[string]string, releaseAtCutoverBarrier bool, forceCutoverResume bool) error {
 	// Bind the apply's identity once so every line of this resume is
 	// filterable by apply_id/repo/pr without hand-listing the attrs per call.
 	// Mutable attrs (state, deployment) stay per-call so the bound logger
