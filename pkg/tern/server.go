@@ -21,8 +21,8 @@ type Server struct {
 	logger *slog.Logger
 	// storageSchema answers the storage-schema RPCs for this instance's own
 	// storage database. It is nil unless the embedder supplies one with
-	// WithStorageSchemaService, in which case those RPCs are refused rather
-	// than answered against something else.
+	// WithStorageSchemaService, and while it is nil those RPCs are refused
+	// rather than answered against something else.
 	storageSchema StorageSchemaService
 }
 
@@ -60,7 +60,7 @@ func NewServer(client Client, logger *slog.Logger, opts ...ServerOption) *Server
 // database. Read-only, and correspondingly cheap to serve: no lock, no DDL.
 func (s *Server) StorageSchemaPlan(ctx context.Context, req *ternv1.StorageSchemaPlanRequest) (*ternv1.StorageSchemaPlanResponse, error) {
 	if s.storageSchema == nil {
-		return nil, errStorageSchemaUnsupported
+		return nil, s.refuseStorageSchema(ctx, "StorageSchemaPlan")
 	}
 	resp, err := s.storageSchema.StorageSchemaPlan(ctx, req)
 	if err != nil {
@@ -77,7 +77,7 @@ func (s *Server) StorageSchemaPlan(ctx context.Context, req *ternv1.StorageSchem
 // its startup bootstrap, under the same advisory lock a boot takes.
 func (s *Server) StorageSchemaApply(ctx context.Context, req *ternv1.StorageSchemaApplyRequest) (*ternv1.StorageSchemaApplyResponse, error) {
 	if s.storageSchema == nil {
-		return nil, errStorageSchemaUnsupported
+		return nil, s.refuseStorageSchema(ctx, "StorageSchemaApply", "caller", req.GetCaller())
 	}
 	s.logger.InfoContext(ctx, "converging storage schema on control plane request",
 		"allow_destructive", req.GetAllowDestructive(), "caller", req.GetCaller())
@@ -114,6 +114,18 @@ func storageSchemaStatus(err error, summary string) error {
 // a release from before the RPC existed.
 var errStorageSchemaUnsupported = status.Error(codes.Unimplemented,
 	"this deployment does not serve storage schema requests; it is running a release that predates them, or its embedder did not register the storage schema service")
+
+// refuseStorageSchema records a storage-schema RPC arriving at an endpoint
+// with no adapter, and returns the refusal. The caller's Unimplemented branch
+// cannot distinguish the two causes the refusal names — an older release, or
+// an embedder that registered nothing — but this deployment's own logs can:
+// a release that predates the RPC never reaches this line, so a record of it
+// here says the binary serves the RPC and the wiring is what is missing.
+func (s *Server) refuseStorageSchema(ctx context.Context, rpc string, attrs ...any) error {
+	s.logger.WarnContext(ctx, "refusing storage schema request: no storage schema service registered on this endpoint",
+		append([]any{"rpc", rpc}, attrs...)...)
+	return errStorageSchemaUnsupported
+}
 
 // Register registers the server on the given grpc.Server.
 func (s *Server) Register(srv *grpc.Server) {

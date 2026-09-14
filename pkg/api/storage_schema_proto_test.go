@@ -14,9 +14,11 @@ import (
 // dropped in conversion would be a statement an operator never sees.
 func TestStorageSchemaReport_ProtoRoundTrip(t *testing.T) {
 	report := &StorageSchemaReport{
-		Dialect:  schema.DialectPostgres,
-		Database: "schemabot",
-		Version:  "v0.1.67",
+		Dialect:      schema.DialectPostgres,
+		Database:     "schemabot",
+		Host:         "storage.db.example:5432",
+		SchemaSource: "release v0.1.68",
+		Version:      "v0.1.67",
 		Outstanding: []StorageSchemaStatement{{
 			Table:     "apply_operations",
 			Operation: postgresOpAddColumn,
@@ -49,5 +51,4 @@ func TestStorageSchemaReport_ProtoRoundTrip(t *testing.T) {
 func TestStorageSchemaReport_NilProtoIsNotConvergence(t *testing.T) {
 	assert.Nil(t, StorageSchemaReportProto(nil))
 	assert.Nil(t, StorageSchemaReportFromProto(nil))
-
 }
