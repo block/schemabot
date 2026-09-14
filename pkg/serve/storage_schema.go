@@ -73,6 +73,24 @@ func (s *Server) newStorageSchemaService() (*storageSchemaAdapter, error) {
 	}, nil
 }
 
+// registerStorageSchema binds this server's own storage to both surfaces that
+// answer for it: the HTTP routes an operator's commands reach, and — through
+// the field RegisterGRPC reads — the gRPC endpoint a control plane reaches.
+// One adapter serves both, so the answer an operator gets by asking this
+// server directly and the answer a control plane gets over gRPC come from one
+// implementation rather than two that can drift. A surface left unregistered
+// refuses every request as unsupported, which reads as a release too old to
+// serve them rather than as wiring that was never done.
+func (s *Server) registerStorageSchema(svc *api.Service) error {
+	storageSchema, err := s.newStorageSchemaService()
+	if err != nil {
+		return fmt.Errorf("build storage schema service: %w", err)
+	}
+	s.storageSchema = storageSchema
+	svc.SetStorageSchemaService(storageSchema)
+	return nil
+}
+
 func (a *storageSchemaAdapter) StorageSchemaPlan(ctx context.Context, req *ternv1.StorageSchemaPlanRequest) (*ternv1.StorageSchemaPlanResponse, error) {
 	dsn, opts, err := a.target(req.GetAllowDestructive())
 	if err != nil {
@@ -82,10 +100,10 @@ func (a *storageSchemaAdapter) StorageSchemaPlan(ctx context.Context, req *ternv
 	if err != nil {
 		return nil, err
 	}
-	diffCtx, cancel := context.WithTimeout(ctx, api.StorageSchemaPlanTimeout)
-	defer cancel()
-
-	report, err := api.PlanStorageSchema(diffCtx, dsn, desired, a.logger, opts...)
+	// No budget of its own: PlanStorageSchema imposes StorageSchemaPlanTimeout
+	// on whatever context it is handed, so every caller of it — this adapter,
+	// the HTTP handler, a boot — gets the same one.
+	report, err := api.PlanStorageSchema(ctx, dsn, desired, a.logger, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("diff storage schema (dialect %s) against %s: %w", a.dialect, desired.Description, err)
 	}
