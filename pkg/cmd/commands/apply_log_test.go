@@ -35,6 +35,26 @@ func captureOutput(t *testing.T, fn func()) string {
 	return buf.String()
 }
 
+// captureStderr captures stderr during fn execution. Warnings go there rather
+// than to stdout so that a report piped to a consumer stays machine-readable.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	defer utils.CloseAndLog(r)
+	defer func() { os.Stderr = old }()
+
+	os.Stderr = w
+	fn()
+	utils.CloseAndLog(w)
+
+	var buf bytes.Buffer
+	_, err = io.Copy(&buf, r)
+	require.NoError(t, err)
+	return buf.String()
+}
+
 // ansiPattern matches ANSI escape sequences.
 var ansiPattern = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 

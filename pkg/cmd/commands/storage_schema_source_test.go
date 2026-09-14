@@ -342,6 +342,59 @@ func TestStorageSchemaRelease_RefusesTokenOverPlaintext(t *testing.T) {
 	assert.Contains(t, err.Error(), "unset GITHUB_TOKEN and GH_TOKEN")
 }
 
+// An unauthenticated fetch over plaintext is allowed and said out loud. There
+// is no token to leak, and a plaintext mirror is a legitimate thing to point
+// $GITHUB_API_URL at — but the desired side of the diff then arrives over a
+// channel anyone on the path can rewrite, and a report built on a rewritten
+// schema reads exactly like a real one. The fetch still has to fail on its own
+// terms afterwards; the warning is not a substitute for the error.
+func TestStorageSchemaRelease_WarnsOnPlaintextWithoutAToken(t *testing.T) {
+	t.Setenv("GITHUB_API_URL", "http://ghe.example")
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("GH_TOKEN", "")
+
+	stderr := captureStderr(t, func() {
+		_, err := (&storageSchemaSourceFlags{Release: "v1.4.0"}).resolve(t.Context(), mysqlDialect)
+		require.Error(t, err, "the host does not answer; the warning does not stand in for that")
+	})
+	assert.Contains(t, stderr, "read from http://ghe.example over plaintext")
+	assert.Contains(t, stderr, "treat this report as unverified")
+}
+
+// The warning follows the token refusal's definition of an insecure host, so a
+// loopback mirror — which every test in this file runs against — does not
+// carry it. There is no network path for anything to sit on.
+func TestStorageSchemaRelease_QuietOnLoopback(t *testing.T) {
+	_, refs := releaseSchemaServer(t, "pkg/schema/mysql", map[string]string{
+		"applies.sql": "CREATE TABLE `applies` (`id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY)",
+	})
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("GH_TOKEN", "")
+
+	stderr := captureStderr(t, func() {
+		flags := &storageSchemaSourceFlags{Release: "v1.4.0", Repo: "example/schemabot"}
+		source, err := flags.resolve(t.Context(), mysqlDialect)
+		require.NoError(t, err)
+		require.NotNil(t, source)
+	})
+	assert.Empty(t, stderr, "a loopback mirror is not a plaintext network path")
+	assert.NotEmpty(t, *refs, "the fetch really ran")
+}
+
+// A repository and a path are both multi-segment, and their separators are
+// structure rather than content: escaping them would point every fetch at a
+// path that does not exist. A segment carrying a character the path grammar
+// reserves is still encoded.
+func TestEscapePathSegments(t *testing.T) {
+	assert.Equal(t, "block/schemabot", escapePathSegments("block/schemabot"),
+		"an owner/name repository keeps its separator")
+	assert.Equal(t, "pkg/schema/mysql", escapePathSegments("pkg/schema/mysql"),
+		"a directory path keeps its separators")
+	assert.Equal(t, "block/schema%20bot", escapePathSegments("block/schema bot"),
+		"a reserved character inside one segment is encoded")
+	assert.Equal(t, "", escapePathSegments(""))
+}
+
 // A convergence runs the schema embedded in the binary running it, so the
 // diff's release selectors are refused on `storage apply` — with the two ways
 // to converge a release named, since that is what the operator is reaching
