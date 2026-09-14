@@ -1177,7 +1177,12 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 	// One deployment can address several targets, so the deployment name alone
 	// does not always say which member a line belongs to. The shared naming rule
 	// adds the target only where it disambiguates.
-	names := driftMemberNames(drift.Deployments)
+	//
+	// A member name is assembled from server config, so it reaches this comment
+	// as text SchemaBot did not choose. Rendering every one as a code span keeps
+	// a name carrying a backtick or a line break from closing the span it sits
+	// in and writing markdown of its own into a comment operators act on.
+	names := inlineCodeList(driftMemberNames(drift.Deployments))
 	switch {
 	case drift.Clean && drift.Independent:
 		// Independent members were deliberately never compared to each other, so
@@ -1204,7 +1209,7 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData) {
 		return
 	}
 	for i, d := range drift.Deployments {
-		name := "`" + names[i] + "`"
+		name := names[i]
 		if d.Primary {
 			name += " (primary)"
 		}

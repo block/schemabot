@@ -1333,7 +1333,7 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-✅ **Same plan on all 3 deployments** (eu, au, us).
+✅ **Same plan on all 3 deployments** (`eu`, `au`, `us`).
 
 ```sql
 CREATE TABLE `users` (
@@ -1382,7 +1382,7 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-✅ **Same plan on all 3 deployments** (eu, au, us).
+✅ **Same plan on all 3 deployments** (`eu`, `au`, `us`).
 
 - `eu` (primary) ✅ matches the reviewed plan
 - `au` ✅ matches the reviewed plan · blocked: 1
