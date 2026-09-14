@@ -1555,9 +1555,14 @@ func (c *LocalClient) ResumeApplyOperation(ctx context.Context, apply *storage.A
 		if op.OperationKind == storage.ApplyOperationKindGroupFinalizer {
 			return c.driveGroupFinalizer(ctx, apply, op)
 		}
+		// A plan is what makes a task-less work operation valid, so an operation
+		// that resolves to none is the same fail-closed signal as one whose plan
+		// carries no VSchema work: an invalid or stale claim, terminalized on this
+		// operation rather than failing the whole parent apply. The resolution
+		// failure rides along as context so the cause stays triageable.
 		planID, planErr := storage.PlanIDForOperation(apply, op)
 		if planErr != nil {
-			return fmt.Errorf("resolve plan for task-less apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, planErr)
+			return fmt.Errorf("apply_operation %d (apply %s) resolves to no plan (%w): %w", applyOperationID, apply.ApplyIdentifier, planErr, ErrNoTasksForApplyOperation)
 		}
 		plan, planErr := c.storage.Plans().GetByID(ctx, planID)
 		if planErr != nil {
