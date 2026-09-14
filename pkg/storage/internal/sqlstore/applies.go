@@ -877,6 +877,17 @@ func insertApplyTasksAndOperations(ctx context.Context, tx *rebindTx, identity i
 	return nil
 }
 
+// needsTasksToBeDrivable reports whether an operation has to carry tasks for a
+// drive to have work to claim. A group_finalizer rebuilds its work from the
+// plan, and an operation stored already terminal is never claimed at all, so
+// neither can strand a driver by arriving empty.
+func needsTasksToBeDrivable(op *storage.ApplyOperation) bool {
+	if op.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+		return false
+	}
+	return !state.IsApplyOperationTerminal(op.State)
+}
+
 func insertApplyGroupedOperations(ctx context.Context, tx *rebindTx, identity identityInserter, classifier ErrorClassifier, apply *storage.Apply, applyID int64, groups []*storage.ApplyOperationWithTasks) error {
 	if len(groups) == 0 {
 		return fmt.Errorf("create apply %s: grouped operations are empty", apply.ApplyIdentifier)
@@ -893,10 +904,13 @@ func insertApplyGroupedOperations(ctx context.Context, tx *rebindTx, identity id
 			return fmt.Errorf("create apply %s deployment %s: grouped operation is missing its operation row", apply.ApplyIdentifier, deployment)
 		}
 		// A group_finalizer carries no tasks — it applies namespace-level work
-		// reconstructed from the plan at drive time. Every work operation must
-		// have at least one task so operation-scoped drives fail closed on bad
-		// scoping.
-		if len(group.Tasks) == 0 && group.Operation.OperationKind != storage.ApplyOperationKindGroupFinalizer {
+		// reconstructed from the plan at drive time. A rollout member whose own
+		// plan found nothing to change carries none either, and is recorded
+		// already terminal so the apply covers every member it addressed.
+		// Every other work operation must have at least one task, so an
+		// operation-scoped drive fails closed on bad scoping rather than
+		// claiming work it cannot find.
+		if len(group.Tasks) == 0 && needsTasksToBeDrivable(group.Operation) {
 			return fmt.Errorf("create apply %s deployment %s: grouped work operation has no tasks", apply.ApplyIdentifier, deployment)
 		}
 
