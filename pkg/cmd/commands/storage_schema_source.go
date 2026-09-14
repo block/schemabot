@@ -14,6 +14,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	cmdclient "github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -246,6 +247,8 @@ func storageSchemaFromRelease(ctx context.Context, repo, tag string, dialect sch
 	ctx, cancel := context.WithTimeout(ctx, storageSchemaFetchTimeout)
 	defer cancel()
 
+	warnIfReleaseHostIsPlaintext()
+
 	client := &http.Client{CheckRedirect: refuseInsecureRedirect}
 	listing, err := listReleaseSchemaFiles(ctx, client, repo, tag, directory)
 	if err != nil {
@@ -311,6 +314,58 @@ func storageSchemaReleaseDirectory(dialect schema.Dialect) (string, error) {
 	}
 }
 
+// warnIfReleaseHostIsPlaintext says so when the desired side of the diff is
+// about to be read over a channel anyone on the path can rewrite.
+//
+// It warns rather than refuses. With no token there is nothing to leak, and a
+// plaintext mirror is a legitimate thing for an operator to point
+// $GITHUB_API_URL at; refusing would take away a working configuration to
+// protect against a tampered report. What the warning buys is that the report
+// is not read as authoritative: a rewritten desired schema makes a plan
+// describe work the release does not need, and nothing downstream can tell,
+// because the files parsed and diffed exactly as a real schema would.
+//
+// A convergence is a different matter and needs no warning here: apply refuses
+// --release and --schema-dir by construction (AV-9), so a binary only ever
+// converges the schema it embeds. Nothing fetched over this path can be
+// applied to a database.
+//
+// It asks GuardInsecureToken what counts as insecure rather than testing the
+// scheme itself, so "plaintext host" has one definition in the CLI â including
+// its loopback carve-out, which is right here for the same reason: a mirror on
+// the loopback interface has no network path for anything to sit on.
+func warnIfReleaseHostIsPlaintext() {
+	base := storageSchemaReleaseAPIBase()
+	if storageSchemaReleaseToken() != "" {
+		// A token makes this a refusal instead, at the request that would
+		// carry it â see getReleaseContents.
+		return
+	}
+	parsed, err := url.Parse(base)
+	if err != nil || cmdclient.GuardInsecureToken(parsed) == nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s The schema being compared against is read from %s over plaintext, so anything on the network path can change it before it arrives: treat this report as unverified.\n\n",
+		glyph.Attention, base)
+}
+
+// escapePathSegments escapes a value for use inside a URL path while leaving
+// its separators alone.
+//
+// Escaping the whole value is wrong here: both values this is called with are
+// legitimately multi-segment â an owner/name repository and a directory path
+// within it â and PathEscape would turn their separators into %2F, so every
+// fetch would 404 against a path that does exist. Escaping per segment keeps
+// the structure and still encodes a segment carrying a character the path
+// grammar reserves.
+func escapePathSegments(value string) string {
+	segments := strings.Split(value, "/")
+	for i, segment := range segments {
+		segments[i] = url.PathEscape(segment)
+	}
+	return strings.Join(segments, "/")
+}
+
 // releaseSchemaEntry is the one part of a repository listing this needs.
 type releaseSchemaEntry struct {
 	Name string `json:"name"`
@@ -360,7 +415,7 @@ func fetchReleaseSchemaFile(ctx context.Context, client *http.Client, repo, tag,
 // authorization header cover a public repository and a private mirror alike.
 func getReleaseContents(ctx context.Context, client *http.Client, repo, tag, path, accept string) ([]byte, error) {
 	endpoint := fmt.Sprintf("%s/repos/%s/contents/%s?ref=%s",
-		storageSchemaReleaseAPIBase(), repo, path, url.QueryEscape(tag))
+		storageSchemaReleaseAPIBase(), escapePathSegments(repo), escapePathSegments(path), url.QueryEscape(tag))
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build the request for %s at %s in %s: %w", path, tag, repo, err)
