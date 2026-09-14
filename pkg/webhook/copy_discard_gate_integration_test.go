@@ -344,7 +344,7 @@ func TestE2EDiscardingCopyDowngradesToConfirm(t *testing.T) {
 			"the locked comment discloses the copy the apply would destroy")
 		assert.Contains(t, body, "`events`")
 		assert.Contains(t, body, "the schema change differs from the one that started it")
-		assert.Contains(t, body, "⚠️ **Automatic apply paused**: Applying destroys work in progress on the target\n")
+		assert.Contains(t, body, "⚠️ **Automatic apply paused**: An unfinished copy on the target would be discarded\n")
 		assert.Contains(t, body, "schemabot apply-confirm -e staging",
 			"the paused comment carries the confirm command copy-pasteably rather than describing it")
 	case <-time.After(webhookIntegrationPollDeadline):
@@ -482,7 +482,7 @@ func TestE2EReplanDiscardingCopyDowngradesToConfirm(t *testing.T) {
 		assert.Contains(t, body, "⚠️ **Applying destroys work in progress**",
 			"the downgraded comment discloses the copy the reviewed comment never showed")
 		assert.Contains(t, body, "`events`")
-		assert.Contains(t, body, "⚠️ **Automatic apply paused**: Applying destroys work in progress on the target\n")
+		assert.Contains(t, body, "⚠️ **Automatic apply paused**: An unfinished copy on the target would be discarded\n")
 		assert.Contains(t, body, "schemabot apply-confirm -e staging")
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for the downgraded plan comment")
@@ -536,7 +536,7 @@ func TestE2EApplyConfirmStopsWhenCopyAppearedAfterDisclosure(t *testing.T) {
 		assert.Contains(t, body, "⚠️ **Applying destroys work in progress**",
 			"the confirm stops and discloses the copy instead of dispatching over it")
 		assert.Contains(t, body, "`events`")
-		assert.Contains(t, body, "⚠️ **Apply stopped**: Applying destroys work in progress on the target\n",
+		assert.Contains(t, body, "⚠️ **Apply stopped**: An unfinished copy on the target would be discarded\n",
 			"the operator issued this apply themselves, so nothing automatic was paused")
 		assert.NotContains(t, body, "Automatic apply paused")
 		assert.Contains(t, body, "schemabot apply-confirm -e staging")
