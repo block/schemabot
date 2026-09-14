@@ -123,7 +123,7 @@ func writeStorageSchemaBody(report *apitypes.StorageSchemaReport, isApply bool, 
 				storageSchemaNotices(report.Destructive))
 		case isApply:
 			templates.WriteChangeNotice(glyph.Refused,
-				"Destructive changes refused; the surplus state stays in place. Re-run with --allow-destructive to run them:",
+				"Destructive changes refused; the surplus state stays in place. To proceed with them, re-run with --allow-unsafe:",
 				storageSchemaNotices(report.Destructive))
 		default:
 			templates.WriteChangeNotice(glyph.Attention,
@@ -237,7 +237,7 @@ func outputStorageSchemaConvergence(planned, remaining *apitypes.StorageSchemaRe
 		fmt.Printf("✓ Ran %d %s against %s.\n\n", applied, ui.Pluralize("statement", applied), database)
 	}
 	return writeStorageSchemaBody(remaining, true, []string{
-		"These were not run. A destructive statement is refused unless --allow-destructive is passed; a manual entry has to be resolved by hand before anything else converges.",
+		"These were not run. A destructive statement is refused unless --allow-unsafe is passed; a manual entry has to be resolved by hand before anything else converges.",
 	})
 }
 
