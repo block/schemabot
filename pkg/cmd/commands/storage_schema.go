@@ -389,6 +389,15 @@ func blockDestructiveStorageApply(report *apitypes.StorageSchemaReport, withPlan
 	if report.DestructiveAllowed || len(report.Destructive) == 0 {
 		return nil
 	}
+	if len(report.Manual) > 0 {
+		// A manual entry gates the whole drift set, so it is the refusal to
+		// report: it has to be resolved before a destructive statement is even
+		// reachable. The plan renders every statement as gated while one is
+		// outstanding and prints no refusal for the destructive ones, so
+		// stopping here would exit non-zero with nothing on screen saying why.
+		// The manual refusal names itself on both paths.
+		return nil
+	}
 	if withPlan {
 		if err := outputStorageSchemaPlan(report, true, rerun, nil); err != nil {
 			return err

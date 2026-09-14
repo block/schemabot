@@ -414,6 +414,42 @@ func TestStorageApplyCmd_DestructiveStatementsBlockTheConvergence(t *testing.T) 
 	}
 }
 
+// A manual-remediation entry is the refusal an operator is told about, even
+// when destructive statements are outstanding too. It gates the whole drift
+// set, so the destructive ones are not yet reachable — and the plan renders
+// everything as gated while one is outstanding, so stopping on the destructive
+// statements instead would exit non-zero with nothing on screen saying why.
+func TestStorageApplyCmd_ManualRemediationOutranksTheDestructiveRefusal(t *testing.T) {
+	plan := &apitypes.StorageSchemaReport{
+		Dialect:      "mysql",
+		Database:     "schemabot",
+		Host:         "db-1.example",
+		SchemaSource: "the schema embedded in v1.4.0",
+		Destructive: []apitypes.StorageSchemaStatement{
+			{Table: "stale_state", Operation: "drop_table", DDL: "DROP TABLE `stale_state`", Reason: "DROP TABLE destroys data"},
+		},
+		Manual: []apitypes.StorageSchemaStatement{{
+			Table:     "checks",
+			Operation: "add_column",
+			DDL:       "ALTER TABLE `checks` ADD COLUMN `head_sha` varchar(64) NOT NULL",
+			Reason:    "definition is NOT NULL without a DEFAULT",
+		}},
+	}
+	endpoint, routes := storageSchemaTestServer(t, plan, nil, nil)
+
+	var err error
+	out := captureStdout(func() {
+		cmd := StorageApplyCmd{}
+		err = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "need manual remediation first",
+		"the refusal an operator can act on is named, not left to an exit status")
+	assert.Contains(t, out, "Needs manual remediation")
+	assert.Equal(t, []string{"POST /api/storage/schema/plan"}, *routes, "nothing converges either way")
+}
+
 // The command a refusal offers addresses the same storage database the refusal
 // is about, so it carries the target flags forward. It never carries the DSN:
 // that is a credential, and the refusal is printed to a terminal.
