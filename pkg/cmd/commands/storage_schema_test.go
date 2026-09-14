@@ -360,6 +360,91 @@ func TestStorageApplyCmd_ManualRemediationRefusesBeforeThePrompt(t *testing.T) {
 	assert.Equal(t, []string{"POST /api/storage/schema/plan"}, *routes)
 }
 
+// A destructive statement nothing has permitted stops the convergence before it
+// runs, the way `apply` stops a destructive schema change: the plan is shown,
+// the statement is named, --allow-unsafe is named as the way through, and
+// nothing converges. The gate is in front of --auto-approve too, because
+// skipping the prompt is not consenting to destroy storage state.
+func TestStorageApplyCmd_DestructiveStatementsBlockTheConvergence(t *testing.T) {
+	plan := &apitypes.StorageSchemaReport{
+		Dialect:      "mysql",
+		Database:     "schemabot",
+		Host:         "db-1.example",
+		SchemaSource: "the schema embedded in v1.4.0",
+		Outstanding: []apitypes.StorageSchemaStatement{
+			{Table: "applies", Operation: "alter_table", DDL: "ALTER TABLE `applies` ADD COLUMN `caller` varchar(255) NOT NULL DEFAULT ''"},
+		},
+		Destructive: []apitypes.StorageSchemaStatement{
+			{Table: "stale_state", Operation: "drop_table", DDL: "DROP TABLE `stale_state`", Reason: "DROP TABLE destroys data"},
+		},
+	}
+
+	for _, tc := range []struct {
+		name        string
+		autoApprove bool
+	}{
+		{name: "attended"},
+		{name: "unattended", autoApprove: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			endpoint, routes := storageSchemaTestServer(t, plan, nil, nil)
+			// An answer is staged for the attended run to prove the prompt is
+			// never reached: a gate that asked first and blocked afterwards
+			// would consume this and still pass an output assertion.
+			answerPrompt(t, "yes")
+
+			var err error
+			out := captureStdout(func() {
+				cmd := StorageApplyCmd{AutoApprove: tc.autoApprove}
+				err = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
+			})
+
+			require.Error(t, err)
+			assert.ErrorIs(t, err, ErrSilent, "the plan carries the refusal, so an error line under it would repeat it")
+			assert.Equal(t, []string{"POST /api/storage/schema/plan"}, *routes,
+				"the convergence must not run; the safe remainder is not a reason to proceed past a refused DROP")
+			assert.Contains(t, out, "Destructive changes refused")
+			assert.Contains(t, out, "--allow-unsafe", "the refusal has to name the way through")
+			assert.Contains(t, out, "1. stale_state: DROP TABLE destroys data")
+			assert.NotContains(t, out, "Only 'yes' will be accepted",
+				"consent to a convergence is not consent to destroy state, so the gate is in front of the prompt")
+		})
+	}
+}
+
+// Destructive statements the target has permitted are not gated: the report
+// says they will run, and blocking them would narrow a standing storage policy
+// the CLI has no business narrowing (AV-9).
+func TestStorageApplyCmd_PermittedDestructiveStatementsConverge(t *testing.T) {
+	permitted := &apitypes.StorageSchemaReport{
+		Dialect:      "mysql",
+		Database:     "schemabot",
+		Host:         "db-1.example",
+		SchemaSource: "the schema embedded in v1.4.0",
+		Destructive: []apitypes.StorageSchemaStatement{
+			{Table: "stale_state", Operation: "drop_table", DDL: "DROP TABLE `stale_state`", Reason: "DROP TABLE destroys data"},
+		},
+		DestructiveAllowed: true,
+	}
+	converged := &apitypes.StorageSchemaReport{
+		Dialect:      "mysql",
+		Database:     "schemabot",
+		Host:         "db-1.example",
+		SchemaSource: "the schema embedded in v1.4.0",
+		Converged:    true,
+	}
+	endpoint, routes := storageSchemaTestServer(t, permitted, permitted, converged)
+
+	var err error
+	out := captureStdout(func() {
+		cmd := StorageApplyCmd{AllowUnsafe: true, AutoApprove: true}
+		err = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"POST /api/storage/schema/plan", "POST /api/storage/schema/apply"}, *routes)
+	assert.Contains(t, out, "Nothing is outstanding.")
+}
+
 // Both halves of a direct convergence name the release that ran it, the same
 // way the preview named it. Stamping only the version would leave the result
 // header carrying the placeholder the preview had already expanded, so one run
