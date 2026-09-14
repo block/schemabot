@@ -2195,14 +2195,18 @@ func (c *GRPCClient) ResumeApplyOperation(ctx context.Context, apply *storage.Ap
 		// modelled as a task row. Dispatch it as a VSchema-only apply, which the
 		// data plane applies via its own task-less VSchema-only path, mirroring
 		// LocalClient.ResumeApplyOperation.
-		plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+		planID, err := scope.planID(apply)
 		if err != nil {
-			return fmt.Errorf("load plan %d for task-less apply_operation %d (apply %s): %w", apply.PlanID, applyOperationID, apply.ApplyIdentifier, err)
+			return fmt.Errorf("resolve plan for task-less apply_operation %d (apply %s): %w", applyOperationID, apply.ApplyIdentifier, err)
+		}
+		plan, err := c.storage.Plans().GetByID(ctx, planID)
+		if err != nil {
+			return fmt.Errorf("load plan %d for task-less apply_operation %d (apply %s): %w", planID, applyOperationID, apply.ApplyIdentifier, err)
 		}
 		// A missing plan row is its own cause, separate from a claim that resolved
 		// to the wrong operation, so name it rather than reporting a stale claim.
 		if plan == nil {
-			return fmt.Errorf("plan %d for task-less apply_operation %d (apply %s): %w", apply.PlanID, applyOperationID, apply.ApplyIdentifier, ErrPlanMissingForApplyOperation)
+			return fmt.Errorf("plan %d for task-less apply_operation %d (apply %s): %w", planID, applyOperationID, apply.ApplyIdentifier, ErrPlanMissingForApplyOperation)
 		}
 		// Fail closed before any dispatch or state mutation on every other
 		// task-less work shape: it is an invalid or stale claim. The shared resume
@@ -2239,12 +2243,16 @@ func (c *GRPCClient) dispatchRemoteGroupFinalizer(ctx context.Context, apply *st
 	if namespace == "" && op.OperationKey != finalizerDeploymentScopedKey {
 		return fmt.Errorf("group_finalizer apply_operation %d (apply %s): malformed operation key %q", op.ID, apply.ApplyIdentifier, op.OperationKey)
 	}
-	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+	planID, err := scope.planID(apply)
 	if err != nil {
-		return fmt.Errorf("load plan %d for group_finalizer apply_operation %d (apply %s): %w", apply.PlanID, op.ID, apply.ApplyIdentifier, err)
+		return fmt.Errorf("resolve plan for group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
+	}
+	plan, err := c.storage.Plans().GetByID(ctx, planID)
+	if err != nil {
+		return fmt.Errorf("load plan %d for group_finalizer apply_operation %d (apply %s): %w", planID, op.ID, apply.ApplyIdentifier, err)
 	}
 	if plan == nil {
-		return fmt.Errorf("plan %d for group_finalizer apply_operation %d (apply %s): %w", apply.PlanID, op.ID, apply.ApplyIdentifier, ErrPlanMissingForApplyOperation)
+		return fmt.Errorf("plan %d for group_finalizer apply_operation %d (apply %s): %w", planID, op.ID, apply.ApplyIdentifier, ErrPlanMissingForApplyOperation)
 	}
 	// Fail closed if the operation's scope carries no VSchema artifact,
 	// mirroring the local finalizer drive.
