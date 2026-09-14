@@ -143,7 +143,7 @@ func (cmd *StoragePlanCmd) Run(ctx context.Context, g *Globals) error {
 		if err := encoder.Encode(apitypes.StorageSchemaPlanResponse{Report: report}); err != nil {
 			return fmt.Errorf("encode storage schema report: %w", err)
 		}
-	} else if err := outputStorageSchemaPlan(report, false, storageSchemaPlanHints(report)); err != nil {
+	} else if err := outputStorageSchemaPlan(report, false, "", storageSchemaPlanHints(report)); err != nil {
 		return err
 	}
 	if report.Converged {
@@ -298,12 +298,12 @@ func (cmd *StorageApplyCmd) Run(ctx context.Context, g *Globals) error {
 	// so the plan is printed after the fact instead — unless the gate stops the
 	// run, which prints it itself.
 	if !cmd.AutoApprove {
-		if err := outputStorageSchemaPlan(report, true, nil); err != nil {
+		if err := outputStorageSchemaPlan(report, true, cmd.rerunWithAllowUnsafe(), nil); err != nil {
 			return err
 		}
 	}
 
-	if err := blockDestructiveStorageApply(report, cmd.AutoApprove); err != nil {
+	if err := blockDestructiveStorageApply(report, cmd.AutoApprove, cmd.rerunWithAllowUnsafe()); err != nil {
 		return err
 	}
 
@@ -333,10 +333,36 @@ func (cmd *StorageApplyCmd) Run(ctx context.Context, g *Globals) error {
 		if err := encoder.Encode(apitypes.StorageSchemaApplyResponse{Planned: planned, Remaining: remaining}); err != nil {
 			return fmt.Errorf("encode storage schema convergence: %w", err)
 		}
-	} else if err := outputStorageSchemaConvergence(planned, remaining, cmd.AutoApprove); err != nil {
+	} else if err := outputStorageSchemaConvergence(planned, remaining, cmd.AutoApprove, cmd.rerunWithAllowUnsafe()); err != nil {
 		return err
 	}
 	return storageSchemaConvergenceOutcome(remaining)
+}
+
+// rerunWithAllowUnsafe is the command that permits what this one refused, for
+// an operator to copy off a refusal.
+//
+// It carries the target flags forward because the command has to address the
+// same storage database the refusal is about. Dropping them would suggest a
+// convergence of the storage of the server the CLI happens to point at, which
+// during a rollback is a different database than the one being looked at.
+//
+// A DSN is named rather than repeated: it carries the storage database's
+// credentials, and this is printed to a terminal and scrolled back through.
+func (cmd *StorageApplyCmd) rerunWithAllowUnsafe() string {
+	parts := []string{"storage", "apply"}
+	switch {
+	case strings.TrimSpace(cmd.DSN) != "":
+		parts = append(parts, "--dsn <the same DSN>")
+	case cmd.Config != "":
+		parts = append(parts, "--config", cmd.Config)
+	case cmd.Deployment != "":
+		parts = append(parts, "--deployment", cmd.Deployment, "-e", cmd.Environment)
+	}
+	if cmd.Dialect != "" {
+		parts = append(parts, "--dialect", cmd.Dialect)
+	}
+	return strings.Join(append(parts, "--allow-unsafe"), " ")
 }
 
 // blockDestructiveStorageApply stops a convergence that would have to destroy
@@ -359,12 +385,12 @@ func (cmd *StorageApplyCmd) Run(ctx context.Context, g *Globals) error {
 // withPlan prints the plan for an unattended run, which has not printed one
 // yet. Naming refused statements without showing them would send the operator
 // back to `storage plan` to find out what was refused.
-func blockDestructiveStorageApply(report *apitypes.StorageSchemaReport, withPlan bool) error {
+func blockDestructiveStorageApply(report *apitypes.StorageSchemaReport, withPlan bool, rerun string) error {
 	if report.DestructiveAllowed || len(report.Destructive) == 0 {
 		return nil
 	}
 	if withPlan {
-		if err := outputStorageSchemaPlan(report, true, nil); err != nil {
+		if err := outputStorageSchemaPlan(report, true, rerun, nil); err != nil {
 			return err
 		}
 	}

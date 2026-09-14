@@ -403,11 +403,54 @@ func TestStorageApplyCmd_DestructiveStatementsBlockTheConvergence(t *testing.T) 
 			assert.ErrorIs(t, err, ErrSilent, "the plan carries the refusal, so an error line under it would repeat it")
 			assert.Equal(t, []string{"POST /api/storage/schema/plan"}, *routes,
 				"the convergence must not run; the safe remainder is not a reason to proceed past a refused DROP")
-			assert.Contains(t, out, "Destructive changes refused")
-			assert.Contains(t, out, "--allow-unsafe", "the refusal has to name the way through")
+			assert.Contains(t, out, "Apply blocked: 1 unsafe change(s) detected",
+				"the same heading a blocked schema change apply prints")
+			assert.Contains(t, out, "schemabot storage apply --allow-unsafe",
+				"the refusal names the command that permits what it refused")
 			assert.Contains(t, out, "1. stale_state: DROP TABLE destroys data")
 			assert.NotContains(t, out, "Only 'yes' will be accepted",
 				"consent to a convergence is not consent to destroy state, so the gate is in front of the prompt")
+		})
+	}
+}
+
+// The command a refusal offers addresses the same storage database the refusal
+// is about, so it carries the target flags forward. It never carries the DSN:
+// that is a credential, and the refusal is printed to a terminal.
+func TestStorageApplyCmd_RerunCommandAddressesTheSameTarget(t *testing.T) {
+	tests := []struct {
+		name  string
+		cmd   StorageApplyCmd
+		rerun string
+	}{
+		{
+			name:  "the server's own storage",
+			rerun: "storage apply --allow-unsafe",
+		},
+		{
+			name:  "a data plane's storage",
+			cmd:   StorageApplyCmd{storageSchemaTargetFlags: storageSchemaTargetFlags{Deployment: "shard-a", Environment: "production"}},
+			rerun: "storage apply --deployment shard-a -e production --allow-unsafe",
+		},
+		{
+			name:  "resolved from a config file",
+			cmd:   StorageApplyCmd{storageSchemaTargetFlags: storageSchemaTargetFlags{Config: "/etc/schemabot/config.yaml"}},
+			rerun: "storage apply --config /etc/schemabot/config.yaml --allow-unsafe",
+		},
+		{
+			name: "a DSN is named, not repeated",
+			cmd: StorageApplyCmd{storageSchemaTargetFlags: storageSchemaTargetFlags{
+				DSN:     "postgres://schemabot:hunter2@db-1.example:5432/schemabot",
+				Dialect: "postgres",
+			}},
+			rerun: "storage apply --dsn <the same DSN> --dialect postgres --allow-unsafe",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rerun := tc.cmd.rerunWithAllowUnsafe()
+			assert.Equal(t, tc.rerun, rerun)
+			assert.NotContains(t, rerun, "hunter2", "a suggested command must not print the storage credentials")
 		})
 	}
 }
