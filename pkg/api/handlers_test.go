@@ -4380,6 +4380,10 @@ func TestProgressFromLocalStorageIncludesOperationProgressAndTableDeployment(t *
 	require.Len(t, resp.Tables, 2)
 	assert.Equal(t, "deploy-a", resp.Tables[0].Deployment)
 	assert.Equal(t, "deploy-b", resp.Tables[1].Deployment)
+	// One deployment can address several targets, so the deployment alone does
+	// not say which target a table's copy is running against.
+	assert.Equal(t, "target-a", resp.Tables[0].Target)
+	assert.Equal(t, "target-b", resp.Tables[1].Target)
 }
 
 func newActiveProgressServiceWithOperations(client tern.Client, apply *storage.Apply, operations storage.ApplyOperationStore) *Service {
