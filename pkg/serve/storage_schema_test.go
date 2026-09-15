@@ -23,9 +23,9 @@ import (
 //
 // The asymmetry is the point. A deployment that configured
 // allow_destructive_schema_changes has already decided for every boot, so a
-// convergence that ignored it would run less than the next boot runs — and
-// "apply is what a boot does", the property that makes this usable as a
-// pre-deploy step, would quietly stop holding there. In the other direction, a
+// convergence that ignored it would run less than the next boot runs — an apply
+// refusing on a deployment where a boot proceeds, which is the deployment an
+// operator converging ahead of a roll most needs it not to. In the other direction, a
 // request opting in is the explicit operator consent required before surplus
 // storage state is destroyed.
 func TestStorageSchemaAdapter_DestructivePolicy(t *testing.T) {

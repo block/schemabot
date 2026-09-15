@@ -60,6 +60,7 @@ func TestOutputStorageSchemaPlan_Converged(t *testing.T) {
 	assert.Contains(t, out, "PostgreSQL Schema Change Plan")
 	assert.Contains(t, out, "✓ No schema changes detected.")
 	assert.NotContains(t, out, "resolve the manual entries above")
+	assert.NotContains(t, out, "storage apply", "a converged database has no next step to name")
 	assert.NotContains(t, out, "📋 Plan:")
 }
 
