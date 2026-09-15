@@ -27,7 +27,7 @@ func previewUnsafeBlockedOutput() {
 		{Table: "orders", Reason: "DROP TABLE", ChangeType: "DROP TABLE"},
 		{Table: "products", Reason: "MODIFY COLUMN price_cents: INT → SMALLINT (potential data loss); DROP INDEX idx_category", ChangeType: "MODIFY COLUMN"},
 	}
-	WriteUnsafeChangesBlocked(changes, "testapp", "staging", "./schema/testapp")
+	WriteUnsafeChangesBlocked(changes, "apply -s ./schema/testapp -e staging --allow-unsafe")
 }
 
 func previewUnsafeAllowedOutput() {
@@ -38,7 +38,7 @@ func previewUnsafeAllowedOutput() {
 		{Table: "users", Reason: "DROP COLUMN email", ChangeType: "DROP COLUMN"},
 		{Table: "orders", Reason: "DROP TABLE", ChangeType: "DROP TABLE"},
 	}
-	WriteUnsafeWarningAllowed(changes)
+	WriteUnsafeWarningAllowed(changes, UnsafeConsentAllowFlag)
 }
 
 func previewLintAllOutput() {
