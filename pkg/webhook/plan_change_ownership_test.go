@@ -109,7 +109,7 @@ func TestRenderPlanComment_AttributedChangeNamesOwnerAndStillOffersApply(t *test
 
 	rendered := templates.RenderPlanComment(data)
 
-	assert.Contains(t, rendered, "🛑 **Check before applying**: 1 destructive change SchemaBot cannot attribute to this PR")
+	assert.Contains(t, rendered, "⚠️ **Check before applying**: 1 destructive change SchemaBot cannot attribute to this PR")
 	assert.Contains(t, rendered, "[block/schemabot#42](https://github.com/block/schemabot/pull/42)")
 	// Reconciling the live database to the declared schema stays the operator's
 	// call, so the attribution informs the decision without removing it.
@@ -170,7 +170,7 @@ func TestRenderPlanComment_LockedApplyCommentOmitsAttributedChanges(t *testing.T
 	data.LockAcquired = ""
 	planRendered := templates.RenderPlanComment(data)
 
-	assert.Contains(t, planRendered, "🛑 **Check before applying**")
+	assert.Contains(t, planRendered, "⚠️ **Check before applying**")
 	assert.Contains(t, planRendered, "[block/schemabot#42](https://github.com/block/schemabot/pull/42)")
 }
 
@@ -201,7 +201,7 @@ func TestRenderPlanComment_LockedApplyCommentKeepsUngatedAttributedChange(t *tes
 	rendered := templates.RenderPlanComment(data)
 
 	assert.Contains(t, rendered, "🔒 **Lock acquired by**")
-	assert.Contains(t, rendered, "🛑 **Check before applying**")
+	assert.Contains(t, rendered, "⚠️ **Check before applying**")
 	assert.Contains(t, rendered, "[block/schemabot#42](https://github.com/block/schemabot/pull/42)")
 }
 
@@ -231,7 +231,7 @@ func TestRenderPlanComment_ManualConfirmationKeepsAttributedChanges(t *testing.T
 	rendered := templates.RenderPlanComment(data)
 
 	assert.Contains(t, rendered, "⚠️ **Automatic apply paused**")
-	assert.Contains(t, rendered, "🛑 **Check before applying**")
+	assert.Contains(t, rendered, "⚠️ **Check before applying**")
 	assert.Contains(t, rendered, "[block/schemabot#42](https://github.com/block/schemabot/pull/42)")
 	assert.Contains(t, rendered, "schemabot apply-confirm -e staging")
 }
@@ -260,7 +260,7 @@ func TestRenderUnsafeChangesBlocked_CarriesAttributedChange(t *testing.T) {
 
 	rendered := templates.RenderUnsafeChangesBlocked(data)
 
-	assert.Contains(t, rendered, "🛑 **Check before applying**")
+	assert.Contains(t, rendered, "⚠️ **Check before applying**")
 	assert.Contains(t, rendered, "[block/schemabot#42](https://github.com/block/schemabot/pull/42)")
 	assert.Contains(t, rendered, "--allow-unsafe")
 }
@@ -302,7 +302,7 @@ func TestRenderMultiEnvPlanComment_AttributedChangeAnnotatesItsOwnEnvironmentOnl
 		Errors: map[string]string{},
 	})
 
-	assert.Contains(t, rendered, "🛑 **Check before applying**")
+	assert.Contains(t, rendered, "⚠️ **Check before applying**")
 	// The sequence walks the environments in order and is offered in full: the
 	// attribution belongs to staging's drop, not to production's unrelated add.
 	assert.Contains(t, rendered, "▶️ **To apply**")

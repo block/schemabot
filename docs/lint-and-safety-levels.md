@@ -168,7 +168,7 @@ rejected up front while they are present.
 | Icon | Where it appears | Meaning |
 |---|---|---|
 | ⛔ | Plan comment (**Cannot apply**), unsafe/blocked apply-rejection comments (**Apply rejected**), and the **Apply Blocked** headings where retrying unchanged refuses again (merged/closed PR, failing required checks, missing or untrusted prior-environment check, unlisted environment), plus CLI apply-blocked headings (**Apply blocked**) | Refusal: this will not or did not proceed |
-| ⚠️ | Plan comment (**Issues**), CLI plan output (**Unsafe Changes Detected**) | Caution: unsafe changes to review before applying |
+| ⚠️ | Plan comment (**Issues**), CLI plan output (**Unsafe Changes Detected**), the **Check before applying** heading for destructive changes SchemaBot cannot attribute to the PR, and the stale-base **Apply Blocked** heading cleared by rebasing | Caution: look at this before you apply |
 | 🚨 | Apply-rejection comment; CLI apply output | The `--allow-unsafe` instruction, or (CLI) the banner confirming it was supplied |
 | ⚙️ | Plan and locked apply comments (**Direct execution**) | Consent disclosure for native-DDL statements |
 | 💡 | Plan comment and CLI (**Lint Warnings**) | Advisory best-practice findings |
@@ -190,6 +190,11 @@ Presentation notes:
   fail-closed on a transient verification error (retry unchanged can succeed),
   and ⚠️ a stale-base rejection cleared by rebasing.
 - The severity vocabulary (🚨 ⛔ ❌ ⚠️ ℹ️) lives in `pkg/glyph`. The other
-  icons in this table — and state/consent icons such as ✅, 💡, ⚙️, and 🛑
-  (**Check before applying**, the unattributed-destructive-change gate) — are
+  icons in this table — and state/consent icons such as ✅, 💡, and ⚙️ — are
   deliberately outside it: they mark states and disclosures, not severities.
+  An icon qualifies for that exemption by reading as neutral next to the
+  severity glyphs. A stop sign does not, which is why **Check before
+  applying** — the unattributed-destructive-change gate — carries ⚠️ rather
+  than an icon of its own: it asks the operator to look before proceeding,
+  which is what ⚠️ already means, and a second glyph for that meaning would
+  sit at a severity the reader has no way to place against the five.
