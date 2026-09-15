@@ -30,6 +30,7 @@ func WritePullSchema(resp *apitypes.PullSchemaResponse) {
 	}
 	rows = append(rows, BoxRow{Label: "Tables", Value: strconv.Itoa(int(resp.TableCount))})
 	WriteBox(rows, "", nil)
+	writeTargetDivergence(resp.Targets)
 
 	for _, name := range sortedKeys(resp.Namespaces) {
 		ns := resp.Namespaces[name]
@@ -55,6 +56,86 @@ func WritePullSchema(resp *apitypes.PullSchemaResponse) {
 				body = colorizeJSON(body)
 			}
 			fmt.Println(body)
+		}
+	}
+}
+
+// divergenceLabels phrases each difference for a reader looking at the primary
+// target's schema: the DDL printed below is the primary's, so the wording says
+// what the other target has instead.
+var divergenceLabels = map[string]string{
+	apitypes.DivergenceDiffers:       "differs",
+	apitypes.DivergenceOnlyOnPrimary: "missing",
+	apitypes.DivergenceOnlyOnTarget:  "extra",
+}
+
+// targetDivergenceNames names each target of a pull so no two members of the
+// report read alike. A target name is opaque to SchemaBot and only unique
+// within the deployment that addresses it, so an environment whose deployments
+// address targets of the same name would otherwise print the same header twice
+// and leave the operator unable to tell which member a divergence belongs to.
+// Such a target is named by its full member identity; every other target keeps
+// the bare name, which is already the thing that distinguishes it.
+func targetDivergenceNames(targets []*apitypes.TargetDivergence) []string {
+	deploymentsByTarget := make(map[string]map[string]struct{}, len(targets))
+	for _, target := range targets {
+		if deploymentsByTarget[target.Target] == nil {
+			deploymentsByTarget[target.Target] = make(map[string]struct{}, 1)
+		}
+		deploymentsByTarget[target.Target][target.Deployment] = struct{}{}
+	}
+	names := make([]string, len(targets))
+	for i, target := range targets {
+		if len(deploymentsByTarget[target.Target]) > 1 {
+			names[i] = target.Deployment + "/" + target.Target
+			continue
+		}
+		names[i] = target.Target
+	}
+	return names
+}
+
+// writeTargetDivergence lists every target the environment addresses and how
+// each differs from the primary, whose schema is the DDL printed below. It
+// renders as "--" comments like the rest of the pull output, so redirecting a
+// multi-target pull into a .sql file still produces valid SQL.
+//
+// A target with no diverged tables is still listed: "these two hold the same
+// schema" is the answer an operator is usually looking for, and omitting the
+// converged targets would leave it indistinguishable from not having checked.
+// The primary is named on the same list for the same reason — an operator
+// counting targets against what they expect the environment to hold should not
+// have to add one back. An environment whose targets are expected to hold the
+// same schema carries no member list at all and prints nothing.
+func writeTargetDivergence(targets []*apitypes.TargetDivergence) {
+	if len(targets) == 0 {
+		return
+	}
+	names := targetDivergenceNames(targets)
+	for i, target := range targets {
+		name := emphasis("`" + names[i] + "`")
+		fmt.Println()
+		if target.Primary {
+			fmt.Println(annotation(fmt.Sprintf("-- Target %s — primary target, whose schema is below", name)))
+			continue
+		}
+		if len(target.DivergedTables) == 0 {
+			fmt.Println(annotation(fmt.Sprintf("-- Target %s — same schema as the primary target", name)))
+			continue
+		}
+		fmt.Println(annotation(fmt.Sprintf("-- Target %s — %d %s %s from the primary target",
+			name,
+			len(target.DivergedTables),
+			ui.Pluralize("table", len(target.DivergedTables)),
+			ui.PluralizeLabel("differs", "differ", len(target.DivergedTables)))))
+		for _, table := range target.DivergedTables {
+			label, ok := divergenceLabels[table.Difference]
+			if !ok {
+				// A difference this client does not know how to phrase is still
+				// reported, since dropping it would understate the divergence.
+				label = table.Difference
+			}
+			fmt.Println(annotation(fmt.Sprintf("--   %s.%s: %s", table.Namespace, table.Table, label)))
 		}
 	}
 }

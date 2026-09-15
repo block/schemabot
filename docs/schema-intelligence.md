@@ -310,6 +310,80 @@ A clean audit returns `lint: []`; an omitted field means lint was not requested.
 Pull runs schema-shape rules only. Rules about proposed changes, such as unsafe
 drops, require a plan. See [lint and safety levels](lint-and-safety-levels.md#auditing-a-live-schema-pull---lint).
 
+### Databases that span several targets
+
+A database whose environment lists `targets` addresses several targets at once,
+and each holds its own schema. There is no single live schema to return, so a
+pull returns the primary target's — the one a caller materializes — plus a
+`targets` array naming every target the environment addresses and how each of
+the others differs from the primary.
+
+```sh
+schemabot pull -d shop -e production
+```
+
+```sql
+-- Target `shop-001` — primary target, whose schema is below
+-- Target `shop-002` — same schema as the primary target
+-- Target `shop-003` — 2 tables differ from the primary target
+--   shop.audit_log: differs
+--   shop.order_events: missing
+```
+
+<details>
+<summary>API equivalent</summary>
+
+```http
+POST /api/pull
+Content-Type: application/json
+
+{"database": "shop", "environment": "production"}
+```
+
+```json
+{
+  "database": "shop",
+  "type": "mysql",
+  "environment": "production",
+  "table_count": 4,
+  "namespaces": {
+    "shop": {"tables": {"…": "CREATE TABLE …"}}
+  },
+  "targets": [
+    {"deployment": "commerce-a", "target": "shop-001", "table_count": 4, "primary": true},
+    {"deployment": "commerce-a", "target": "shop-002", "table_count": 4},
+    {"deployment": "commerce-a", "target": "shop-003", "table_count": 3, "diverged_tables": [
+      {"namespace": "shop", "table": "audit_log", "difference": "differs"},
+      {"namespace": "shop", "table": "order_events", "difference": "only_on_primary"}
+    ]}
+  ]
+}
+```
+
+</details>
+
+Read the array as the environment's whole member set. Exactly one entry carries
+`"primary": true`, and it is the target whose schema is in `namespaces`; it
+never carries `diverged_tables`, because it is the baseline the others are
+compared against. A reconciling caller can take the member set straight from
+this array rather than deriving it from target names.
+
+`difference` is one of:
+
+| Value | Meaning |
+|---|---|
+| `differs` | both targets hold the table, with different DDL |
+| `only_on_primary` | only the primary target holds the table |
+| `only_on_target` | only this target holds the table |
+
+An empty `diverged_tables` means the two targets genuinely agree. It never means
+the comparison was skipped: a target that cannot be pulled, or whose DDL cannot
+be parsed, fails the whole pull rather than being reported as converged. Tables
+are compared by their canonical parsed form, so formatting differences are not
+divergence.
+
+An environment that does not list `targets` carries no `targets` array at all.
+
 ### Engine support
 
 The envelope differs by dialect:
