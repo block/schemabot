@@ -87,7 +87,7 @@ func TestDiffStorageSchemaMySQL_EmptyDatabaseNeedsEveryTable(t *testing.T) {
 func TestApplyStorageSchemaMySQL_ConvergesEmptyDatabase(t *testing.T) {
 	sdb, db := openEnsureSchemaDatabase(t)
 
-	planned, remaining, err := ApplyStorageSchema(t.Context(), sdb.DSN, storageSchemaTestLogger())
+	planned, remaining, err := ApplyStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger())
 	require.NoError(t, err)
 
 	assert.NotEmpty(t, planned.Outstanding, "an empty database has statements to run")
@@ -135,7 +135,7 @@ func TestDiffStorageSchemaMySQL_ReportsMissingColumn(t *testing.T) {
 
 	// Applying the reported statement is what converges it, and nothing else
 	// is left behind.
-	_, remaining, err := ApplyStorageSchema(t.Context(), sdb.DSN, storageSchemaTestLogger())
+	_, remaining, err := ApplyStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger())
 	require.NoError(t, err)
 	assert.True(t, remaining.Converged(), "the reported statement should be the whole difference")
 	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "applies", "deployment"))
@@ -168,7 +168,7 @@ func TestDiffStorageSchemaMySQL_RefusesSurplusTable(t *testing.T) {
 	assert.Contains(t, statement.DDL, "DROP TABLE")
 	assert.NotEmpty(t, statement.Reason, "a refusal has to say why it was refused")
 
-	planned, remaining, err := ApplyStorageSchema(t.Context(), sdb.DSN, storageSchemaTestLogger())
+	planned, remaining, err := ApplyStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger())
 	require.NoError(t, err, "a convergence that refuses destructive statements still succeeds")
 	assert.Len(t, planned.Destructive, 1)
 	assert.Len(t, remaining.Destructive, 1, "the refused statement is still outstanding afterwards")
@@ -217,7 +217,7 @@ func TestDiffStorageSchemaMySQL_SurplusIndexIsNotProtected(t *testing.T) {
 
 	// And a convergence removes it, which is exactly what a boot of this binary
 	// would do to an index a later release owns.
-	_, remaining, err := ApplyStorageSchema(t.Context(), sdb.DSN, storageSchemaTestLogger())
+	_, remaining, err := ApplyStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger())
 	require.NoError(t, err)
 	assert.True(t, remaining.Converged())
 	assert.False(t, testutil.IndexExists(t, db, sdb.Name, "applies", "idx_applies_caller"),
@@ -274,7 +274,7 @@ func TestDiffStorageSchemaPostgres_ConvergesEmptyDatabase(t *testing.T) {
 	assert.Equal(t, postgresOpCreateTable, applies.Operation)
 	assert.Contains(t, strings.ToUpper(applies.DDL), "CREATE TABLE")
 
-	planned, remaining, err := ApplyStorageSchema(t.Context(), dsn, logger, postgres)
+	planned, remaining, err := ApplyStorageSchema(t.Context(), dsn, nil, logger, postgres)
 	require.NoError(t, err)
 	assert.Len(t, planned.Outstanding, len(tables))
 	assert.True(t, remaining.Converged(), "outstanding after convergence: %v", statementTables(remaining.Outstanding))
@@ -315,7 +315,7 @@ func TestDiffStorageSchemaPostgres_ReportsMissingColumn(t *testing.T) {
 	assert.Contains(t, strings.ToUpper(index.DDL), "CREATE INDEX")
 	assert.Contains(t, index.DDL, "deployment")
 
-	_, remaining, err := ApplyStorageSchema(t.Context(), dsn, logger, postgres)
+	_, remaining, err := ApplyStorageSchema(t.Context(), dsn, nil, logger, postgres)
 	require.NoError(t, err)
 	assert.True(t, remaining.Converged(), "outstanding after convergence: %v", remaining.Outstanding)
 	assert.True(t, testutil.PostgresColumnExists(t, db, "public", "applies", "deployment"))
@@ -332,7 +332,7 @@ func TestDiffStorageSchemaPostgres_ReportsMissingColumn(t *testing.T) {
 // catalog does not have it, which is why the answer stays correct on a database
 // a failed deploy left half converged.
 func TestDiffStorageSchemaMySQL_DiffsAgainstASuppliedSchema(t *testing.T) {
-	sdb, _ := openEnsureSchemaDatabase(t)
+	sdb, db := openEnsureSchemaDatabase(t)
 	require.NoError(t, EnsureSchema(sdb.DSN, storageSchemaTestLogger()))
 
 	converged, err := PlanStorageSchema(t.Context(), sdb.DSN, EmbeddedStorageSchema("v1.2.3"), storageSchemaTestLogger())
@@ -366,12 +366,76 @@ func TestDiffStorageSchemaMySQL_DiffsAgainstASuppliedSchema(t *testing.T) {
 	assert.Equal(t, "the schema files of release v1.4.0", report.SchemaSource)
 	assert.Equal(t, "v1.2.3", report.Version)
 
-	// A convergence has no way to run the supplied schema, so the column stays
-	// off the database until the release that declares it boots.
-	_, remaining, err := ApplyStorageSchema(t.Context(), sdb.DSN, storageSchemaTestLogger())
+	// The convergence runs the supplied schema, which is the whole point of the
+	// command: the column the next release declares is on the database before
+	// any pod of that release starts.
+	planned, remaining, err := ApplyStorageSchema(t.Context(), sdb.DSN, desired, storageSchemaTestLogger())
 	require.NoError(t, err)
-	assert.True(t, remaining.Converged(), "an apply converges the running binary's schema, not the supplied one")
-	assert.Equal(t, "the schema embedded in this binary", remaining.SchemaSource)
+	require.Len(t, planned.Outstanding, 1, "the supplied schema's one statement is what ran: %v", statementTables(planned.Outstanding))
+	assert.True(t, remaining.Converged(), "outstanding against the supplied schema after converging it: %v", statementTables(remaining.Outstanding))
+	assert.Equal(t, "the schema files of release v1.4.0", remaining.SchemaSource,
+		"a convergence is attributed to the schema whose files it ran")
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "applies", "release_note"),
+		"the supplied schema's column has to be on the database, or the convergence ran the embedded files instead")
+
+	// And it survives the running release. Against the schema this binary
+	// carries the column is now surplus, which is a DROP COLUMN — refused
+	// unless destroying storage state was permitted — so every pod of the
+	// deployed release leaves it in place until that release rolls (AV-9).
+	running, err := PlanStorageSchema(t.Context(), sdb.DSN, nil, storageSchemaTestLogger())
+	require.NoError(t, err)
+	assert.Empty(t, running.Outstanding, "nothing about the running schema runs automatically here: %v", statementTables(running.Outstanding))
+	surplus := statementFor(t, running.Destructive, "applies")
+	assert.Contains(t, surplus.DDL, "DROP COLUMN")
+	assert.Contains(t, surplus.DDL, "`release_note`")
+
+	require.NoError(t, EnsureSchema(sdb.DSN, storageSchemaTestLogger()), "a boot of the running release must not fail on surplus state")
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "applies", "release_note"),
+		"a pre-applied column survives a boot of the release that does not declare it")
+}
+
+// The PostgreSQL bootstrap converges the schema it is given too, which the
+// MySQL test cannot show for it: the two dialects read their files and compute
+// their drift in separate code, so a source that reached one and not the other
+// would converge the running release's schema while reporting the named one.
+//
+// The supplied set is deliberately one table. An empty storage database
+// converged against it has exactly that table afterwards, and would have every
+// storage table if the embedded files had been used instead.
+func TestApplyStorageSchemaPostgres_ConvergesASuppliedSchema(t *testing.T) {
+	dsn, db := startPostgresStorage(t)
+	logger := storageSchemaTestLogger()
+	postgres := WithDialect(schema.DialectPostgres)
+
+	desired, err := StorageSchemaFromFiles("the schema files of release v1.4.0", map[string]string{
+		"locks.sql": `CREATE TABLE IF NOT EXISTS "locks" (
+	"name" TEXT PRIMARY KEY,
+	"owner" TEXT NOT NULL
+)`,
+	})
+	require.NoError(t, err)
+
+	planned, remaining, err := ApplyStorageSchema(t.Context(), dsn, desired, logger, postgres)
+	require.NoError(t, err)
+	require.Len(t, planned.Outstanding, 1, "the supplied schema declares one table: %v", statementTables(planned.Outstanding))
+	assert.Equal(t, "locks", planned.Outstanding[0].Table)
+	assert.True(t, remaining.Converged(), "outstanding after converging the supplied schema: %v", statementTables(remaining.Outstanding))
+	assert.Equal(t, "the schema files of release v1.4.0", remaining.SchemaSource)
+
+	assert.True(t, postgresTableExists(t, db, "locks"), "the supplied schema's table must be created")
+	assert.False(t, postgresTableExists(t, db, "applies"),
+		"a table only the embedded schema declares must not appear, or the convergence ran the embedded files")
+}
+
+// postgresTableExists reports whether one table is in the storage database's
+// current schema.
+func postgresTableExists(t *testing.T, db *sql.DB, table string) bool {
+	t.Helper()
+	var exists bool
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		`SELECT EXISTS (SELECT 1 FROM information_schema.tables
+			WHERE table_schema = current_schema() AND table_name = $1)`, table).Scan(&exists))
+	return exists
 }
 
 // storageSchemaFilesForTest is the embedded MySQL schema as a file-name map, the

@@ -152,7 +152,7 @@ func (s *Service) handleStorageSchemaPlan(w http.ResponseWriter, r *http.Request
 	if !s.authorizeStorageSchemaOperation(w, r, storageSchemaPlanOperation) {
 		return
 	}
-	if err := validateStorageSchemaPlanRequest(req); err != nil {
+	if err := validateStorageSchemaSource(req.SchemaFiles, req.SchemaSource); err != nil {
 		s.logger.Warn("rejecting storage schema plan because its desired schema is incomplete",
 			"deployment", req.Deployment, "environment", req.Environment, "error", err)
 		s.writeError(w, http.StatusBadRequest, err.Error())
@@ -196,6 +196,12 @@ func (s *Service) handleStorageSchemaPlan(w http.ResponseWriter, r *http.Request
 // POST /api/storage/schema/apply. It runs the target instance's startup
 // bootstrap, under the advisory lock that bootstrap already takes, so two
 // operators running it at once serialize the same way two booting pods do.
+//
+// The schema it converges to is the target's own embedded files, or the ones
+// the request carries — a release an operator is rolling, which the target
+// cannot converge from files it does not have. Either way the bootstrap decides
+// what runs, so a supplied schema changes which statements are computed and
+// nothing about which of them are permitted (AV-9).
 func (s *Service) handleStorageSchemaApply(w http.ResponseWriter, r *http.Request) {
 	req, err := decodeStorageSchemaApplyRequest(r)
 	if err != nil {
@@ -203,6 +209,12 @@ func (s *Service) handleStorageSchemaApply(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if !s.authorizeStorageSchemaOperation(w, r, storageSchemaApplyOperation) {
+		return
+	}
+	if err := validateStorageSchemaSource(req.SchemaFiles, req.SchemaSource); err != nil {
+		s.logger.Warn("rejecting storage schema apply because the schema to converge to is incomplete",
+			"deployment", req.Deployment, "environment", req.Environment, "error", err)
+		s.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	target, err := s.resolveStorageSchemaTarget(req.Deployment, req.Environment)
@@ -216,6 +228,8 @@ func (s *Service) handleStorageSchemaApply(w http.ResponseWriter, r *http.Reques
 		"deployment", target.deployment,
 		"environment", target.environment,
 		"allow_destructive", req.AllowDestructive,
+		"schema_source", req.SchemaSource,
+		"schema_file_count", len(req.SchemaFiles),
 		"caller", operator)
 
 	ctx, cancel := s.extendOperatorWriteDeadline(w, r, storageSchemaApplyWriteBudget)
@@ -224,12 +238,16 @@ func (s *Service) handleStorageSchemaApply(w http.ResponseWriter, r *http.Reques
 	resp, err := target.service.StorageSchemaApply(ctx, &ternv1.StorageSchemaApplyRequest{
 		AllowDestructive: req.AllowDestructive,
 		Caller:           operator,
+		SchemaFiles:      req.SchemaFiles,
+		SchemaSource:     req.SchemaSource,
 	})
 	if err != nil {
 		s.logger.Error("storage schema apply failed",
 			"deployment", target.deployment,
 			"environment", target.environment,
 			"allow_destructive", req.AllowDestructive,
+			"schema_source", req.SchemaSource,
+			"schema_file_count", len(req.SchemaFiles),
 			"caller", operator,
 			"error", err)
 		s.writeStorageSchemaFailure(w, err, "storage schema apply failed")
@@ -440,19 +458,24 @@ func decodeOptionalStorageSchemaBody[T any](r *http.Request) (T, error) {
 	return req, nil
 }
 
-// validateStorageSchemaPlanRequest refuses a desired schema that is only half
-// supplied. The two fields travel together or not at all: files without a
-// source would produce a report that cannot say what it was diffed against,
-// and a source without files would label this server's own embedded schema
-// with somebody else's name — which is the one way a report of this kind can
-// be actively misleading rather than merely wrong.
-func validateStorageSchemaPlanRequest(req apitypes.StorageSchemaPlanRequest) error {
-	source := strings.TrimSpace(req.SchemaSource)
+// validateStorageSchemaSource refuses a schema that is only half supplied. The
+// two fields travel together or not at all: files without a source would
+// produce a report that cannot say which schema it describes, and a source
+// without files would label this server's own embedded schema with somebody
+// else's name — which is the one way an answer of this kind can be actively
+// misleading rather than merely wrong.
+//
+// Both routes validate through this, because on the convergence route the
+// misattribution is worse than a wrong report. A convergence that ran the
+// embedded schema under a release's name would tell an operator their storage
+// is ready for a release it was never compared against.
+func validateStorageSchemaSource(files map[string]string, schemaSource string) error {
+	source := strings.TrimSpace(schemaSource)
 	switch {
-	case len(req.SchemaFiles) > 0 && source == "":
-		return fmt.Errorf("schema_files was sent without schema_source: a report has to say which schema it was diffed against, so name the source (a release, a directory) alongside the files")
-	case len(req.SchemaFiles) == 0 && source != "":
-		return fmt.Errorf("schema_source %q was sent without schema_files: with no files the diff would run against this server's own embedded schema and report it under that name; send the files, or drop schema_source to ask about the embedded schema", source)
+	case len(files) > 0 && source == "":
+		return fmt.Errorf("schema_files was sent without schema_source: an answer has to say which schema it used, so name the source (a release, a directory) alongside the files")
+	case len(files) == 0 && source != "":
+		return fmt.Errorf("schema_source %q was sent without schema_files: with no files this server's own embedded schema would be used and reported under that name; send the files, or drop schema_source to use the embedded schema", source)
 	default:
 		return nil
 	}
