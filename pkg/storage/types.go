@@ -573,6 +573,17 @@ type Plan struct {
 	// invariant cannot be evaluated) rather than fail closed.
 	HeadSHA string
 
+	// PrimaryPlanIdentifier names the reviewed plan this one was produced
+	// alongside, for a rollout member planned against its own live schema. It is
+	// the durable link between a member's plan and the review round the operator
+	// approved: an apply created from the reviewed plan selects its members'
+	// plans by this identifier, so a plan from a later re-plan of the same commit
+	// is a different round and is never substituted for the reviewed one.
+	//
+	// Empty on the reviewed plan itself, and on every plan of an environment
+	// whose members all run the reviewed plan.
+	PrimaryPlanIdentifier string
+
 	// CreatedAt is when the plan was generated.
 	CreatedAt time.Time
 }
