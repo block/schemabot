@@ -45,7 +45,9 @@ func ensurePostgresSchema(parent context.Context, dsn string, logger *slog.Logge
 	ctx, cancel := context.WithTimeout(parent, o.convergenceTimeout)
 	defer cancel()
 
-	tables, files, err := readEmbeddedPostgresSchemaFiles()
+	// Nil is the embedded files, so a boot reads its own schema through the
+	// same call an operator converging a named release reads theirs.
+	tables, files, err := o.schemaSource.postgresSchemaFiles()
 	if err != nil {
 		return err
 	}
@@ -74,7 +76,8 @@ func ensurePostgresSchema(parent context.Context, dsn string, logger *slog.Logge
 			"dialect", schema.DialectPostgres,
 			"database", database,
 			"schema", schemaName,
-			"embedded_tables", len(tables),
+			"schema_source", o.schemaSource.Describe(),
+			"declared_tables", len(tables),
 		)
 	}
 

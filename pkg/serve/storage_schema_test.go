@@ -375,7 +375,7 @@ func TestStorageSchemaAdapter_RefusesWithoutStorageDSN(t *testing.T) {
 func TestStorageSchemaAdapter_DesiredSchemaDefaultsToThisBinary(t *testing.T) {
 	adapter := &storageSchemaAdapter{version: "v1.2.3", logger: slog.New(slog.DiscardHandler)}
 
-	desired, err := adapter.desiredSchema(&ternv1.StorageSchemaPlanRequest{})
+	desired, err := adapter.desiredSchema(nil, "", "diff")
 	require.NoError(t, err)
 	assert.Equal(t, "the schema embedded in v1.2.3", desired.Description)
 	assert.Empty(t, desired.Files, "the answering binary's own files are read here, not sent to it")
@@ -388,10 +388,9 @@ func TestStorageSchemaAdapter_DesiredSchemaDefaultsToThisBinary(t *testing.T) {
 func TestStorageSchemaAdapter_DesiredSchemaAcceptsASuppliedSchema(t *testing.T) {
 	adapter := &storageSchemaAdapter{version: "v1.2.3", dialect: schema.DialectMySQL, logger: slog.New(slog.DiscardHandler)}
 
-	desired, err := adapter.desiredSchema(&ternv1.StorageSchemaPlanRequest{
-		SchemaSource: "the schema files of release v1.4.0",
-		SchemaFiles:  map[string]string{"applies.sql": "CREATE TABLE `applies` (`id` BIGINT UNSIGNED PRIMARY KEY)"},
-	})
+	desired, err := adapter.desiredSchema(
+		map[string]string{"applies.sql": "CREATE TABLE `applies` (`id` BIGINT UNSIGNED PRIMARY KEY)"},
+		"the schema files of release v1.4.0", "diff")
 	require.NoError(t, err)
 	assert.Equal(t, "the schema files of release v1.4.0", desired.Description)
 	assert.Len(t, desired.Files, 1)
@@ -407,9 +406,9 @@ func TestStorageSchemaAdapter_DesiredSchemaAcceptsASuppliedSchema(t *testing.T) 
 func TestStorageSchemaAdapter_DesiredSchemaRefusesAnUnusableSchema(t *testing.T) {
 	adapter := &storageSchemaAdapter{version: "v1.2.3", logger: slog.New(slog.DiscardHandler)}
 
-	_, err := adapter.desiredSchema(&ternv1.StorageSchemaPlanRequest{
-		SchemaFiles: map[string]string{"applies.sql": "CREATE TABLE `applies` (`id` BIGINT UNSIGNED PRIMARY KEY)"},
-	})
+	_, err := adapter.desiredSchema(
+		map[string]string{"applies.sql": "CREATE TABLE `applies` (`id` BIGINT UNSIGNED PRIMARY KEY)"},
+		"", "diff")
 	require.Error(t, err, "files with no source leave the report unable to attribute its answer")
 	assert.Contains(t, err.Error(), "needs a description")
 	assert.ErrorIs(t, err, tern.ErrInvalidStorageSchemaRequest)
@@ -442,10 +441,7 @@ func TestStorageSchemaAdapter_DesiredSchemaRefusesUnparseableContent(t *testing.
 		t.Run(tc.name, func(t *testing.T) {
 			adapter := &storageSchemaAdapter{version: "v1.2.3", dialect: tc.dialect, logger: slog.New(slog.DiscardHandler)}
 
-			_, err := adapter.desiredSchema(&ternv1.StorageSchemaPlanRequest{
-				SchemaSource: "the schema files in ./schema",
-				SchemaFiles:  tc.files,
-			})
+			_, err := adapter.desiredSchema(tc.files, "the schema files in ./schema", "diff")
 			require.Error(t, err)
 			assert.ErrorIs(t, err, tern.ErrInvalidStorageSchemaRequest)
 			assert.Contains(t, err.Error(), `schema file "applies.sql"`, "the refusal has to name the file the caller must fix")
@@ -460,10 +456,11 @@ func TestStorageSchemaAdapter_DesiredSchemaRefusesUnparseableContent(t *testing.
 func TestStorageSchemaAdapter_DesiredSchemaBlamesAnUnparseableDialectOnTheServer(t *testing.T) {
 	adapter := &storageSchemaAdapter{version: "v1.2.3", dialect: schema.Dialect("cockroach"), logger: slog.New(slog.DiscardHandler)}
 
-	_, err := adapter.desiredSchema(&ternv1.StorageSchemaPlanRequest{
-		SchemaSource: "the schema files in ./schema",
-		SchemaFiles:  map[string]string{"applies.sql": "CREATE TABLE applies (id BIGINT)"},
-	})
+	_, err := adapter.desiredSchema(
+		map[string]string{"applies.sql": "CREATE TABLE applies (id BIGINT)"},
+		"the schema files in ./schema",
+		"diff",
+	)
 	require.Error(t, err)
 	assert.NotErrorIs(t, err, tern.ErrInvalidStorageSchemaRequest)
 	assert.Contains(t, err.Error(), "no statement parser registered")

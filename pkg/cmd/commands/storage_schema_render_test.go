@@ -28,7 +28,7 @@ func TestOutputStorageSchemaPlan_RendersAsAPlan(t *testing.T) {
 	}
 
 	out := captureStdout(func() {
-		require.NoError(t, outputStorageSchemaPlan(report, false, "", nil))
+		require.NoError(t, outputStorageSchemaPlan(report, false, "", storageSchemaPlanHints(report)))
 	})
 
 	assert.Contains(t, out, "MySQL Schema Change Plan")
@@ -37,6 +37,8 @@ func TestOutputStorageSchemaPlan_RendersAsAPlan(t *testing.T) {
 	assert.Contains(t, out, "+ checks")
 	assert.Contains(t, out, "~ applies")
 	assert.Contains(t, out, "📋 Plan: 1 table to create, 1 table to alter")
+	assert.Contains(t, out, "re-run this as `storage apply` with the same flags",
+		"the plan names the next step, which is the same command with the same schema selector")
 	assert.NotContains(t, out, "(mysql)",
 		"the title already names the family; repeating it in the database line is noise")
 }
@@ -386,6 +388,23 @@ func TestStorageSchemaEngineLabel(t *testing.T) {
 	assert.Equal(t, "PostgreSQL", storageSchemaEngineLabel("postgres"))
 	assert.Equal(t, "Storage", storageSchemaEngineLabel(""),
 		"a report that names no dialect still gets a title rather than a blank one")
+}
+
+// A plan always compares the database against a release the operator named, so
+// its next step is the same command with `apply` in place of `plan`, since the
+// apply converges the schema the plan named rather than whichever one the
+// answering binary happens to carry.
+func TestStorageSchemaPlanHints(t *testing.T) {
+	hints := storageSchemaPlanHints(&apitypes.StorageSchemaReport{
+		Database:     "schemabot",
+		Host:         "db-1.example",
+		Dialect:      "mysql",
+		SchemaSource: "the schema files of release v1.4.0",
+	})
+	require.Len(t, hints, 1)
+	assert.Contains(t, hints[0], "schemabot on db-1.example")
+	assert.Contains(t, hints[0], "the schema files of release v1.4.0")
+	assert.Contains(t, hints[0], "re-run this as `storage apply` with the same flags")
 }
 
 // A report is labelled with the database, the server it is on, its family, and

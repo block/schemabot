@@ -41,7 +41,8 @@ func TestStorageSchemaSourceFlags_ValidateSource(t *testing.T) {
 
 	err = (&storageSchemaSourceFlags{Repo: "example/mirror"}).validateSource()
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "missing flags")
+	assert.Contains(t, err.Error(), "--release-repo only applies with --release",
+		"the flag left on the line is named rather than reported as a missing selector")
 
 	err = (&storageSchemaSourceFlags{SchemaDir: "./schema/mysql", Repo: "example/mirror"}).validateSource()
 	require.Error(t, err)
@@ -105,13 +106,13 @@ func TestRefuseInsecureRedirect(t *testing.T) {
 
 // A command that names no release asks the target about its own embedded
 // schema: resolving reads nothing, fetches nothing, and needs no dialect. An
-// apply's preview is the caller that does this — the schema a convergence runs
-// is the answering binary's own, so it is asked rather than handed a copy.
+// convergence that names no release is the caller that does this — the schema a convergence runs
+// is then the answering binary's own, so it is asked rather than handed a copy.
 func TestStorageSchemaSourceFlags_ResolveTargetsOwnSchema(t *testing.T) {
 	desired, err := (&storageSchemaSourceFlags{}).resolve(t.Context(), func() (schema.Dialect, error) {
 		t.Fatal("the dialect must not be resolved for the answering binary's own schema")
 		return "", nil
-	})
+	}, false)
 	require.NoError(t, err)
 	assert.Nil(t, desired, "a nil source is the answering binary's own embedded schema")
 }
@@ -127,7 +128,7 @@ func TestStorageSchemaFromDirectory(t *testing.T) {
 		[]byte("CREATE TABLE `checks` (`id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY)"), 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "README.md"), []byte("not schema"), 0o600))
 
-	desired, err := (&storageSchemaSourceFlags{SchemaDir: dir}).resolve(t.Context(), mysqlDialect)
+	desired, err := (&storageSchemaSourceFlags{SchemaDir: dir}).resolve(t.Context(), mysqlDialect, false)
 	require.NoError(t, err)
 	require.NotNil(t, desired)
 	assert.Equal(t, fmt.Sprintf("the schema files in %s", dir), desired.Description)
@@ -140,7 +141,7 @@ func TestStorageSchemaFromDirectory(t *testing.T) {
 // would propose dropping every existing storage table, which reads as a
 // storage database that needs destroying rather than as a mistyped path.
 func TestStorageSchemaFromDirectory_RefusesEmptyDirectory(t *testing.T) {
-	_, err := (&storageSchemaSourceFlags{SchemaDir: t.TempDir()}).resolve(t.Context(), mysqlDialect)
+	_, err := (&storageSchemaSourceFlags{SchemaDir: t.TempDir()}).resolve(t.Context(), mysqlDialect, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no .sql files in --schema-dir")
 	assert.Contains(t, err.Error(), "one .sql file per storage table")
@@ -154,7 +155,7 @@ func TestStorageSchemaFromDirectory_NamesDialectSubdirectories(t *testing.T) {
 	require.NoError(t, os.Mkdir(filepath.Join(dir, string(schema.DialectMySQL)), 0o750))
 	require.NoError(t, os.Mkdir(filepath.Join(dir, string(schema.DialectPostgres)), 0o750))
 
-	_, err := (&storageSchemaSourceFlags{SchemaDir: dir}).resolve(t.Context(), mysqlDialect)
+	_, err := (&storageSchemaSourceFlags{SchemaDir: dir}).resolve(t.Context(), mysqlDialect, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), filepath.Join(dir, "mysql"))
 	assert.Contains(t, err.Error(), filepath.Join(dir, "postgres"))
@@ -164,7 +165,7 @@ func TestStorageSchemaFromDirectory_NamesDialectSubdirectories(t *testing.T) {
 // schema.
 func TestStorageSchemaFromDirectory_RefusesMissingDirectory(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "not-a-checkout")
-	_, err := (&storageSchemaSourceFlags{SchemaDir: missing}).resolve(t.Context(), mysqlDialect)
+	_, err := (&storageSchemaSourceFlags{SchemaDir: missing}).resolve(t.Context(), mysqlDialect, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), missing)
 }
@@ -212,7 +213,7 @@ func TestStorageSchemaFromRelease(t *testing.T) {
 	})
 
 	flags := &storageSchemaSourceFlags{Release: "v1.4.0", Repo: "example/schemabot"}
-	desired, err := flags.resolve(t.Context(), mysqlDialect)
+	desired, err := flags.resolve(t.Context(), mysqlDialect, false)
 	require.NoError(t, err)
 	require.NotNil(t, desired)
 	assert.Equal(t, "the schema files of release v1.4.0 in example/schemabot", desired.Description)
@@ -232,12 +233,12 @@ func TestStorageSchemaFromRelease_FetchesTheStorageDialectsFiles(t *testing.T) {
 	})
 
 	flags := &storageSchemaSourceFlags{Release: "v1.4.0", Repo: "example/schemabot"}
-	desired, err := flags.resolve(t.Context(), func() (schema.Dialect, error) { return schema.DialectPostgres, nil })
+	desired, err := flags.resolve(t.Context(), func() (schema.Dialect, error) { return schema.DialectPostgres, nil }, false)
 	require.NoError(t, err)
 	require.NotNil(t, desired)
 	assert.Contains(t, desired.Files["applies.sql"], `CREATE TABLE "applies"`)
 
-	_, err = flags.resolve(t.Context(), mysqlDialect)
+	_, err = flags.resolve(t.Context(), mysqlDialect, false)
 	require.Error(t, err, "the MySQL directory is not published by this fixture")
 	assert.Contains(t, err.Error(), "pkg/schema/mysql")
 }
@@ -248,7 +249,7 @@ func TestStorageSchemaFromRelease_FetchesTheStorageDialectsFiles(t *testing.T) {
 func TestStorageSchemaFromRelease_RefusesUnknownTag(t *testing.T) {
 	releaseSchemaServer(t, "pkg/schema/mysql", map[string]string{})
 
-	_, err := (&storageSchemaSourceFlags{Release: "v9.9.9", Repo: "example/schemabot"}).resolve(t.Context(), mysqlDialect)
+	_, err := (&storageSchemaSourceFlags{Release: "v9.9.9", Repo: "example/schemabot"}).resolve(t.Context(), mysqlDialect, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "v9.9.9")
 	assert.Contains(t, err.Error(), "no .sql files")
@@ -264,7 +265,7 @@ func TestStorageSchemaFromRelease_RefusalNamesTheRemedy(t *testing.T) {
 	t.Cleanup(server.Close)
 	t.Setenv("GITHUB_API_URL", server.URL)
 
-	_, err := (&storageSchemaSourceFlags{Release: "v1.4.0", Repo: "example/private"}).resolve(t.Context(), mysqlDialect)
+	_, err := (&storageSchemaSourceFlags{Release: "v1.4.0", Repo: "example/private"}).resolve(t.Context(), mysqlDialect, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "GITHUB_TOKEN")
 	assert.Contains(t, err.Error(), "--schema-dir")
@@ -281,7 +282,7 @@ func TestStorageSchemaFromRelease_NotFoundNamesTheTokenToo(t *testing.T) {
 	t.Cleanup(server.Close)
 	t.Setenv("GITHUB_API_URL", server.URL)
 
-	_, err := (&storageSchemaSourceFlags{Release: "v1.4.0", Repo: "example/private"}).resolve(t.Context(), mysqlDialect)
+	_, err := (&storageSchemaSourceFlags{Release: "v1.4.0", Repo: "example/private"}).resolve(t.Context(), mysqlDialect, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "check the tag spelling")
 	assert.Contains(t, err.Error(), "GITHUB_TOKEN")
@@ -312,7 +313,7 @@ func TestStorageSchemaFromRelease_RateLimitIsNotAPermissionFailure(t *testing.T)
 			t.Cleanup(server.Close)
 			t.Setenv("GITHUB_API_URL", server.URL)
 
-			_, err := (&storageSchemaSourceFlags{Release: "v1.4.0", Repo: "example/schemabot"}).resolve(t.Context(), mysqlDialect)
+			_, err := (&storageSchemaSourceFlags{Release: "v1.4.0", Repo: "example/schemabot"}).resolve(t.Context(), mysqlDialect, false)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "rate-limited")
 			assert.Contains(t, err.Error(), "--schema-dir")
@@ -332,7 +333,7 @@ func TestStorageSchemaFromRelease_PermissionFailureWithBudgetLeft(t *testing.T) 
 	t.Cleanup(server.Close)
 	t.Setenv("GITHUB_API_URL", server.URL)
 
-	_, err := (&storageSchemaSourceFlags{Release: "v1.4.0", Repo: "example/private"}).resolve(t.Context(), mysqlDialect)
+	_, err := (&storageSchemaSourceFlags{Release: "v1.4.0", Repo: "example/private"}).resolve(t.Context(), mysqlDialect, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not allowed to read")
 	assert.NotContains(t, err.Error(), "rate-limited")
@@ -351,7 +352,7 @@ func TestStorageSchemaFromRelease_SendsTheToken(t *testing.T) {
 	t.Setenv("GITHUB_API_URL", server.URL)
 	t.Setenv("GITHUB_TOKEN", "fetch-token")
 
-	_, err := (&storageSchemaSourceFlags{Release: "v1.4.0", Repo: "example/private"}).resolve(t.Context(), mysqlDialect)
+	_, err := (&storageSchemaSourceFlags{Release: "v1.4.0", Repo: "example/private"}).resolve(t.Context(), mysqlDialect, false)
 	require.Error(t, err, "an empty listing is still refused")
 	assert.Equal(t, "Bearer fetch-token", authorization)
 }
@@ -365,7 +366,7 @@ func TestStorageSchemaRelease_RefusesTokenOverPlaintext(t *testing.T) {
 	t.Setenv("GITHUB_API_URL", "http://ghe.example")
 	t.Setenv("GITHUB_TOKEN", "fetch-token")
 
-	_, err := (&storageSchemaSourceFlags{Release: "v1.4.0", Repo: "example/private"}).resolve(t.Context(), mysqlDialect)
+	_, err := (&storageSchemaSourceFlags{Release: "v1.4.0", Repo: "example/private"}).resolve(t.Context(), mysqlDialect, false)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, cmdclient.ErrInsecureTokenTransport)
 	assert.Contains(t, err.Error(), "GITHUB_API_URL is http://ghe.example")
@@ -389,20 +390,66 @@ func TestStorageSchemaRelease_WarnsOnPlaintextWithoutAToken(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "")
 	t.Setenv("GH_TOKEN", "")
 
-	stderr := captureStderr(t, warnIfReleaseHostIsPlaintext)
+	stderr := captureStderr(t, func() {
+		_, err := (&storageSchemaSourceFlags{Release: "v1.4.0"}).resolve(t.Context(), mysqlDialect, false)
+		require.Error(t, err, "the host does not answer; the warning does not stand in for that")
+	})
 	assert.Contains(t, stderr, "read from http://ghe.example over plaintext")
 	assert.Contains(t, stderr, "treat this report as unverified")
 }
 
 // A token turns the same host into a refusal at the request that would carry
-// it, so the warning does not also fire — an operator told "treat this as
+// it, so the warning does not also fire: an operator told "treat this as
 // unverified" about a fetch that never happened is being told about the wrong
 // thing.
 func TestStorageSchemaRelease_QuietOnPlaintextWithAToken(t *testing.T) {
 	t.Setenv("GITHUB_API_URL", "http://ghe.example")
 	t.Setenv("GITHUB_TOKEN", "fetch-token")
 
-	assert.Empty(t, captureStderr(t, warnIfReleaseHostIsPlaintext))
+	stderr := captureStderr(t, func() {
+		_, err := (&storageSchemaSourceFlags{Release: "v1.4.0"}).resolve(t.Context(), mysqlDialect, false)
+		require.Error(t, err, "a token over plaintext is refused at the request, so nothing is fetched")
+	})
+	assert.Empty(t, stderr)
+}
+
+// A convergence over that same plaintext path is refused instead of warned.
+// What a rewrite costs a diff is a misleading report; what it costs a
+// convergence is the storage database, since whatever DDL arrives is what runs
+// against it — and it arrives having parsed exactly as a real schema would, so
+// nothing further along has anything to catch. The refusal lands before the
+// fetch, and names both ways out.
+func TestStorageSchemaRelease_RefusesToConvergePlaintextRelease(t *testing.T) {
+	t.Setenv("GITHUB_API_URL", "http://ghe.example")
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("GH_TOKEN", "")
+
+	stderr := captureStderr(t, func() {
+		_, err := (&storageSchemaSourceFlags{Release: "v1.4.0"}).resolve(t.Context(), mysqlDialect, true)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "refusing to converge a release read from http://ghe.example over plaintext")
+		assert.Contains(t, err.Error(), "--schema-dir")
+		assert.NotContains(t, err.Error(), "no such host", "the refusal lands before the fetch, not after it fails")
+	})
+	assert.Empty(t, stderr, "a convergence is refused, so there is nothing to warn about")
+}
+
+// The convergence refusal follows the same definition of an insecure host as
+// everything else here, so a mirror on this machine converges: an operator
+// fetching a release from loopback has no network path for anything to sit on.
+func TestStorageSchemaRelease_ConvergesFromLoopbackMirror(t *testing.T) {
+	_, refs := releaseSchemaServer(t, "pkg/schema/mysql", map[string]string{
+		"applies.sql": "CREATE TABLE `applies` (`id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY)",
+	})
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("GH_TOKEN", "")
+
+	flags := &storageSchemaSourceFlags{Release: "v1.4.0", Repo: "example/schemabot"}
+	source, err := flags.resolve(t.Context(), mysqlDialect, true)
+	require.NoError(t, err)
+	require.NotNil(t, source)
+	assert.Contains(t, source.Files, "applies.sql")
+	assert.NotEmpty(t, *refs, "the fetch really ran")
 }
 
 // The warning follows the token refusal's definition of an insecure host, so a
@@ -417,7 +464,7 @@ func TestStorageSchemaRelease_QuietOnLoopback(t *testing.T) {
 
 	stderr := captureStderr(t, func() {
 		flags := &storageSchemaSourceFlags{Release: "v1.4.0", Repo: "example/schemabot"}
-		source, err := flags.resolve(t.Context(), mysqlDialect)
+		source, err := flags.resolve(t.Context(), mysqlDialect, false)
 		require.NoError(t, err)
 		require.NotNil(t, source)
 	})
@@ -439,27 +486,31 @@ func TestEscapePathSegments(t *testing.T) {
 	assert.Equal(t, "", escapePathSegments(""))
 }
 
-// A convergence runs the schema embedded in the binary running it, so the
-// diff's release selectors are refused on `storage apply` — with the two ways
-// to converge a release named, since that is what the operator is reaching
-// for.
-func TestStorageSchemaSourceRefusal(t *testing.T) {
-	require.NoError(t, storageSchemaSourceRefusal("", "", ""))
+// Naming no schema is allowed where the command has a meaning for it — a
+// convergence of the answering binary's own — while the combinations that are
+// wrong on either command are still refused. The two checks are separate so
+// the apply can take the first without taking the requirement the diff has.
+func TestStorageSchemaSourceFlags_ValidateSourceCombination(t *testing.T) {
+	require.NoError(t, (&storageSchemaSourceFlags{}).validateSourceCombination(),
+		"naming nothing is a convergence of the answering binary's own schema, not an error")
+	require.NoError(t, (&storageSchemaSourceFlags{Release: "v1.4.0"}).validateSourceCombination())
+	require.NoError(t, (&storageSchemaSourceFlags{SchemaDir: "./schema/mysql"}).validateSourceCombination())
 
-	release := storageSchemaSourceRefusal("", "v1.4.0", "")
-	require.Error(t, release)
-	assert.Contains(t, release.Error(), "--release cannot be used with a convergence")
-	assert.Contains(t, release.Error(), "run that release's binary")
-	assert.Contains(t, release.Error(), "storage plan")
+	both := (&storageSchemaSourceFlags{Release: "v1.4.0", SchemaDir: "./schema/mysql"}).validateSourceCombination()
+	require.Error(t, both)
+	assert.Contains(t, both.Error(), "--release and --schema-dir can't be used together")
 
-	dir := storageSchemaSourceRefusal("./schema/mysql", "", "")
-	require.Error(t, dir)
-	assert.Contains(t, dir.Error(), "--schema-dir cannot be used with a convergence")
+	orphanRepo := (&storageSchemaSourceFlags{Repo: "example/mirror"}).validateSourceCombination()
+	require.Error(t, orphanRepo)
+	assert.Contains(t, orphanRepo.Error(), "--release-repo only applies with --release")
+}
 
-	// --release-repo is the flag most likely to be left on the line after the
-	// one it modifies has been dropped, so it earns the same refusal rather
-	// than Kong's bare "unknown flag".
-	repo := storageSchemaSourceRefusal("", "", "block/schemabot")
-	require.Error(t, repo)
-	assert.Contains(t, repo.Error(), "--release-repo cannot be used with a convergence")
+// namedSource reports the selector the operator used, which is what decides
+// whether the convergence is of a schema the answering binary vouched for.
+func TestStorageSchemaSourceFlags_NamedSource(t *testing.T) {
+	assert.Empty(t, (&storageSchemaSourceFlags{}).namedSource())
+	assert.Empty(t, (&storageSchemaSourceFlags{Release: "   "}).namedSource(),
+		"whitespace names no release")
+	assert.Equal(t, "--release", (&storageSchemaSourceFlags{Release: "v1.4.0"}).namedSource())
+	assert.Equal(t, "--schema-dir", (&storageSchemaSourceFlags{SchemaDir: "./schema/mysql"}).namedSource())
 }

@@ -40,6 +40,11 @@ type StorageSchemaPlanResponse struct {
 
 // StorageSchemaApplyRequest is the HTTP request for
 // POST /api/storage/schema/apply.
+//
+// Every field is optional. The defaults converge the addressed server's own
+// storage to its own embedded schema, which is what its next boot would
+// converge; SchemaFiles is how an operator converges it to a release that is
+// about to roll instead.
 type StorageSchemaApplyRequest struct {
 	// Deployment names the data plane whose storage to converge. Empty
 	// converges the storage of the server the request is made to.
@@ -68,6 +73,13 @@ type StorageSchemaApplyRequest struct {
 	// fails its own lock wait. A value above the target's maximum is refused
 	// rather than clamped.
 	TimeoutSeconds int64 `json:"timeout_seconds,omitempty"`
+	// SchemaFiles is the schema to converge to, as file name → file contents.
+	// Empty converges the answering binary's own embedded schema.
+	SchemaFiles map[string]string `json:"schema_files,omitempty"`
+	// SchemaSource says where SchemaFiles came from, in words, for the reports
+	// to attribute the convergence to. Required with SchemaFiles and never
+	// inferred.
+	SchemaSource string `json:"schema_source,omitempty"`
 }
 
 // StorageSchemaApplyResponse is the HTTP response for

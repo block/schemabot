@@ -124,10 +124,20 @@ func storageApplyOptions(opts []EnsureSchemaOption) []EnsureSchemaOption {
 // command that converged storage differently from a boot would be a second
 // implementation of the one path that must not have two.
 //
-// It takes no schema source, and the absence is the safety property rather than
-// an omission: a convergence runs the schema embedded in the binary running it,
-// so "apply is what a boot does" holds by construction (AV-9). A caller that
-// wants a later release's schema on a database runs that release's binary.
+// desired is the schema to converge to; nil is the embedded schema of this
+// binary, which is what a boot converges to. An operator rolling a later
+// release supplies that release's files, so the storage is ready before the
+// first pod of it starts — which is the whole reason this is reachable as a
+// command and not only as a boot.
+//
+// Supplying files moves the schema and nothing else. It does not widen what
+// runs: the destructive refusal and the manual-remediation gate decide the same
+// way they decide for a boot, so a file set that would have to drop a storage
+// table is refused here exactly as it would be at startup (AV-9). What it does
+// move is the *reason* those gates matter, because a file set the caller
+// assembled can be incomplete in a way a binary's own embedded set cannot, and
+// an incomplete one reports the storage's own tables as surplus. That report is
+// a set of destructive statements, which is the disposition that is refused.
 //
 // Two reports bracket the run, because "what happened" and "what is left" are
 // different questions and an operator mid-incident needs both:
@@ -165,9 +175,15 @@ func storageApplyOptions(opts []EnsureSchemaOption) []EnsureSchemaOption {
 // terminal holding the DSN — so every entry point should get the operator's
 // ceiling without having to remember to ask for it. A caller passing
 // WithConvergenceTimeout still wins, since caller options are applied last.
-func ApplyStorageSchema(ctx context.Context, dsn string, logger *slog.Logger, opts ...EnsureSchemaOption) (planned, remaining *StorageSchemaReport, err error) {
+func ApplyStorageSchema(ctx context.Context, dsn string, desired *StorageSchemaSource, logger *slog.Logger, opts ...EnsureSchemaOption) (planned, remaining *StorageSchemaReport, err error) {
 	opts = storageApplyOptions(opts)
-	planned, err = PlanStorageSchema(ctx, dsn, nil, logger, opts...)
+	// The three reads either side of the convergence and the convergence
+	// itself all resolve the desired schema from this one value, so the plan
+	// an operator approved, the files that run, and the report of what is left
+	// cannot describe three different schemas.
+	converge := append(append([]EnsureSchemaOption(nil), opts...), WithStorageSchema(desired))
+
+	planned, err = PlanStorageSchema(ctx, dsn, desired, logger, opts...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("diff storage schema before converging it: %w", err)
 	}
@@ -196,16 +212,17 @@ func ApplyStorageSchema(ctx context.Context, dsn string, logger *slog.Logger, op
 	logger.Info("converging storage schema on operator request",
 		"dialect", planned.Dialect,
 		"database", planned.Database,
+		"schema_source", planned.SchemaSource,
 		"outstanding_count", len(planned.Outstanding),
 		"destructive_count", len(planned.Destructive),
 		"destructive_allowed", planned.DestructiveAllowed,
 		"convergence_timeout", newEnsureSchemaOptions(opts...).convergenceTimeout,
 	)
-	if err := ensureSchema(ctx, dsn, logger, opts...); err != nil {
-		return planned, nil, fmt.Errorf("converge storage schema on database %q (%s): %w", planned.Database, planned.Dialect, err)
+	if err := ensureSchema(ctx, dsn, logger, converge...); err != nil {
+		return planned, nil, fmt.Errorf("converge storage schema on database %q (%s) to %s: %w", planned.Database, planned.Dialect, planned.SchemaSource, err)
 	}
 
-	remaining, err = PlanStorageSchema(ctx, dsn, nil, logger, opts...)
+	remaining, err = PlanStorageSchema(ctx, dsn, desired, logger, opts...)
 	if err != nil {
 		// The convergence succeeded; only the confirming read failed. Report
 		// that distinctly — an operator must not read a failed verification as
