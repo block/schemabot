@@ -400,15 +400,22 @@ func TestEscapePathSegments(t *testing.T) {
 // to converge a release named, since that is what the operator is reaching
 // for.
 func TestStorageSchemaSourceRefusal(t *testing.T) {
-	require.NoError(t, storageSchemaSourceRefusal("", ""))
+	require.NoError(t, storageSchemaSourceRefusal("", "", ""))
 
-	release := storageSchemaSourceRefusal("", "v1.4.0")
+	release := storageSchemaSourceRefusal("", "v1.4.0", "")
 	require.Error(t, release)
 	assert.Contains(t, release.Error(), "--release cannot be used with a convergence")
 	assert.Contains(t, release.Error(), "run that release's binary")
 	assert.Contains(t, release.Error(), "storage plan")
 
-	dir := storageSchemaSourceRefusal("./schema/mysql", "")
+	dir := storageSchemaSourceRefusal("./schema/mysql", "", "")
 	require.Error(t, dir)
 	assert.Contains(t, dir.Error(), "--schema-dir cannot be used with a convergence")
+
+	// --release-repo is the flag most likely to be left on the line after the
+	// one it modifies has been dropped, so it earns the same refusal rather
+	// than Kong's bare "unknown flag".
+	repo := storageSchemaSourceRefusal("", "", "block/schemabot")
+	require.Error(t, repo)
+	assert.Contains(t, repo.Error(), "--release-repo cannot be used with a convergence")
 }

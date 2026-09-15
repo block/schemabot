@@ -58,7 +58,7 @@ type CLI struct {
 	Settings   commands.SettingsCmd   `cmd:"" help:"View or update schema change settings"`
 	Webhooks   commands.WebhooksCmd   `cmd:"" help:"Manage GitHub App webhook deliveries"`
 	Checks     commands.ChecksCmd     `cmd:"" help:"Manage SchemaBot Check Runs on PRs"`
-	Storage    commands.StorageCmd    `cmd:"" help:"Operate directly on SchemaBot's storage database"`
+	Storage    commands.StorageCmd    `cmd:"" help:"Inspect and maintain SchemaBot's own storage database"`
 	Local      commands.LocalCmd      `cmd:"" hidden:"" help:"Internal local runtime host"`
 	Serve      commands.ServeCmd      `cmd:"" help:"Start the SchemaBot HTTP API server"`
 }
@@ -94,7 +94,7 @@ func main() {
 	// Hosting a local runtime does not use a remote profile or its credentials.
 	var localEndpoint string
 	if !strings.HasPrefix(ctx.Command(), "local ") && ctx.Command() != "init" {
-		if usesLocalRuntime(ctx.Command()) {
+		if usesLocalRuntime(ctx.Command(), &cli) {
 			localCtx, cancelLocal := context.WithTimeout(context.Background(), 30*time.Second)
 			connection, err := client.ResolveLocalConnection(localCtx, cli.Endpoint, cli.Profile, cli.Token, version)
 			cancelLocal()
@@ -165,8 +165,9 @@ func main() {
 	cancelRun()
 	if err != nil {
 		// ErrSilent means the error was already displayed, so only the status
-		// is left to report. A command that asked for a particular status gets
-		// it (see commands.ExitCodeFor); everything else is the usual 1.
+		// is left to report. A command may ask for its own status when a caller
+		// scripting it needs to tell two successful-but-different outcomes
+		// apart (see commands.ExitCodeFor); anything else exits 1.
 		if !errors.Is(err, commands.ErrSilent) {
 			fmt.Fprintf(os.Stderr, "\033[31mError: %v\033[0m\n", err)
 		}
@@ -175,7 +176,7 @@ func main() {
 }
 
 // Only commands that use the schema API may implicitly start a selected runtime.
-func usesLocalRuntime(command string) bool {
+func usesLocalRuntime(command string, cli *CLI) bool {
 	parts := strings.Fields(command)
 	if len(parts) == 0 {
 		return false
@@ -183,6 +184,12 @@ func usesLocalRuntime(command string) bool {
 	switch parts[0] {
 	case "plan", "onboard", "pull", "apply", "progress", "cutover", "stop", "cancel", "start", "release", "revert", "skip-revert", "rollback", "databases", "unlock", "locks", "logs", "status", "list-plans":
 		return true
+	case "storage":
+		// A storage subcommand reaches its database either through the API or
+		// by opening it directly, and only the first needs an endpoint. The
+		// direct path exists for when no server is up, so starting a runtime
+		// for it would be work the operator asked this command to avoid.
+		return len(parts) > 1 && cli.Storage.UsesAPI(parts[1])
 	default:
 		return false
 	}
