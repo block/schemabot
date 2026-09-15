@@ -55,7 +55,7 @@ func TestTelemetryResourceToleratesForeignSchemaURL(t *testing.T) {
 
 	attrs := make(map[attribute.Key]string)
 	for _, kv := range res.Attributes() {
-		attrs[kv.Key] = kv.Value.Emit()
+		attrs[kv.Key] = kv.Value.String()
 	}
 	assert.Equal(t, "schemabot", attrs[semconv.ServiceNameKey], "service-name override must survive the merge")
 	assert.Equal(t, "host-value", attrs["host.attr"], "base resource attributes must survive the merge")
@@ -905,7 +905,7 @@ func findSpan(spans tracetest.SpanStubs, name string) *tracetest.SpanStub {
 func spanAttrs(s *tracetest.SpanStub) map[string]string {
 	attrs := make(map[string]string)
 	for _, a := range s.Attributes {
-		attrs[string(a.Key)] = a.Value.Emit()
+		attrs[string(a.Key)] = a.Value.String()
 	}
 	return attrs
 }
