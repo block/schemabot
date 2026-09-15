@@ -766,7 +766,7 @@ func TestResumeApplyPlanLoadStorageErrorStaysRecoverable(t *testing.T) {
 	observer := &terminalRecordingObserver{}
 	client.SetObserver(apply.ID, observer)
 
-	err := client.resumeApplyWithTasks(t.Context(), apply, tasks, nil, false, false)
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
 
 	require.ErrorIs(t, err, storageErr)
 	assert.ErrorContains(t, err, "apply-recover-plan")
@@ -796,7 +796,7 @@ func TestResumeApplyContinuesPastARefusedCancelInTheRevertWindow(t *testing.T) {
 	}}}
 	client.storage.(*exactProgressStorage).controlRequests = requests
 
-	err := client.resumeApplyWithTasks(t.Context(), apply, tasks, nil, false, false)
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
 
 	require.ErrorIs(t, err, storageErr, "the resume must have continued past the refusal to reach the plan load")
 	assert.Equal(t, state.Task.RevertWindow, tasks[0].State, "the cut-over task keeps its revert window")
@@ -814,7 +814,7 @@ func TestResumeApplyMissingPlanFailsApply(t *testing.T) {
 	observer := &terminalRecordingObserver{}
 	client.SetObserver(apply.ID, observer)
 
-	err := client.resumeApplyWithTasks(t.Context(), apply, tasks, nil, false, false)
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
 
 	require.NoError(t, err)
 	assert.True(t, state.IsState(applyStore.apply.State, state.Apply.Failed),
@@ -842,7 +842,7 @@ func TestResumeApplyMissingPlanAdoptsConcurrentTerminalState(t *testing.T) {
 	observer := &terminalRecordingObserver{}
 	client.SetObserver(apply.ID, observer)
 
-	err := client.resumeApplyWithTasks(t.Context(), apply, tasks, nil, false, false)
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
 
 	require.NoError(t, err)
 	assert.True(t, state.IsState(applyStore.apply.State, state.Apply.Stopped),
@@ -1204,7 +1204,7 @@ func TestResumeApplyWithTasks_RefusesSequentialResumeOfRevertPhaseTask(t *testin
 			tasks[0].State = tc.taskState
 			taskStore.tasks = tasks
 
-			err := c.resumeApplyWithTasks(t.Context(), apply, tasks, nil, false, false)
+			err := c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
 
 			require.ErrorIs(t, err, errRevertPhaseTaskInSequentialResume)
 			assert.True(t, state.IsState(tasks[0].State, tc.taskState),
@@ -1251,7 +1251,7 @@ func TestResumeApplyWithTasks_RevertPhaseSiblingDoesNotVouchForLandedStatement(t
 			tasks[1].State = siblingState
 			taskStore.tasks = tasks
 
-			err := c.resumeApplyWithTasks(t.Context(), apply, tasks, nil, false, false)
+			err := c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
 
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "sibling task task_name ("+siblingState+"), which will not run it")
@@ -1439,4 +1439,40 @@ func TestStartDeferredDeployRejectsMixedNamespaces(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "tasks span multiple namespaces")
 	assert.ErrorContains(t, err, apply.ApplyIdentifier)
+}
+
+// The local drive resolves the plan from the operation it drives, so a rollout
+// member planned against its own live schema runs its own DDL rather than the
+// reviewed primary's.
+func TestLocalClientDrivePlanID(t *testing.T) {
+	c := &LocalClient{}
+	apply := &storage.Apply{ApplyIdentifier: "apply-1", PlanID: 10}
+
+	t.Run("a whole-apply drive runs the apply's plan", func(t *testing.T) {
+		planID, err := c.drivePlanID(apply, nil)
+		require.NoError(t, err)
+		assert.Equal(t, int64(10), planID)
+	})
+
+	t.Run("a member that shares the reviewed plan runs the apply's plan", func(t *testing.T) {
+		planID, err := c.drivePlanID(apply, &storage.ApplyOperation{ID: 1, Target: "testapp-001"})
+		require.NoError(t, err)
+		assert.Equal(t, int64(10), planID)
+	})
+
+	t.Run("a member planned on its own runs its own plan", func(t *testing.T) {
+		planID, err := c.drivePlanID(apply, &storage.ApplyOperation{ID: 2, Target: "testapp-002", PlanID: 11})
+		require.NoError(t, err)
+		assert.Equal(t, int64(11), planID)
+	})
+
+	t.Run("an operation with no plan on either row is not drivable", func(t *testing.T) {
+		_, err := c.drivePlanID(&storage.Apply{ApplyIdentifier: "apply-2"}, &storage.ApplyOperation{ID: 3, Deployment: "eu"})
+		require.Error(t, err)
+	})
+
+	t.Run("a whole-apply drive with no plan is not drivable", func(t *testing.T) {
+		_, err := c.drivePlanID(&storage.Apply{ApplyIdentifier: "apply-3"}, nil)
+		require.Error(t, err)
+	})
 }
