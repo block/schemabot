@@ -530,7 +530,7 @@ func TestRenderPlanComment_PausedCommentNeverReadsAsAnApplyInFlight(t *testing.T
 		{Namespace: "testapp", Tables: []string{"orders"}, Reason: engine.DiscardStatementDiffers, Age: "3h 12m"},
 	}
 	out := RenderPlanComment(disclosed)
-	assert.Contains(t, out, "Review the plan above, then confirm manually")
+	assert.Contains(t, out, "**Automatic apply paused** — review the plan above, then confirm manually:")
 	assert.NotContains(t, out, "**Applying automatically**",
 		"an empty reason means the cause is disclosed above, never that the apply is proceeding")
 	assert.Equal(t, 1, strings.Count(out, "⚠️"),
@@ -550,6 +550,6 @@ func TestRenderPlanComment_PausedCommentNeverReadsAsAnApplyInFlight(t *testing.T
 	running := base
 	out = RenderPlanComment(running)
 	assert.Contains(t, out, "**Applying automatically**")
-	assert.NotContains(t, out, "Review the plan above, then confirm manually")
+	assert.NotContains(t, out, "review the plan above, then confirm manually")
 	assert.NotContains(t, out, "Automatic apply paused")
 }

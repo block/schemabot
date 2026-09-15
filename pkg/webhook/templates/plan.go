@@ -406,8 +406,16 @@ func RenderPlanComment(data PlanCommentData) string {
 			// Automatic apply was downgraded to manual confirmation — show unlock since user needs to act
 			if data.AutoConfirmDowngradeReason != "" {
 				fmt.Fprintf(&sb, glyph.Attention+" **%s**: %s\n\n", data.downgradeHeading(), data.AutoConfirmDowngradeReason)
+				sb.WriteString("Review the plan above, then confirm manually:\n")
+			} else {
+				// A section above already carries the cause under its own
+				// glyph, so the outcome and the instruction share a single
+				// unmarked line. Spending a second marker here would put the
+				// same warning in front of the reader twice, and dropping the
+				// outcome entirely would leave an operator who just issued the
+				// command with no word that it did not run.
+				fmt.Fprintf(&sb, "**%s** — review the plan above, then confirm manually:\n", data.downgradeHeading())
 			}
-			sb.WriteString("Review the plan above, then confirm manually:\n")
 			fmt.Fprintf(&sb, "```\n%s\n```\n", applyConfirmCmd)
 			sb.WriteString("\n🔓 To discard this plan and unlock, comment:\n")
 			sb.WriteString("```\nschemabot unlock\n```\n")

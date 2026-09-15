@@ -249,7 +249,7 @@ These statements run synchronously outside the schema change engine: writes to e
 
 ---
 
-Review the plan above, then confirm manually:
+**Automatic apply paused** — review the plan above, then confirm manually:
 ```
 schemabot apply-confirm -e staging
 ```
@@ -388,7 +388,7 @@ Applying restarts the copy from zero rows. To keep the work already done, apply 
 
 ---
 
-Review the plan above, then confirm manually:
+**Automatic apply paused** — review the plan above, then confirm manually:
 ```
 schemabot apply-confirm -e staging
 ```
@@ -426,7 +426,7 @@ Applying restarts the copy from zero rows. To keep the work already done, apply 
 
 ---
 
-Review the plan above, then confirm manually:
+**Apply stopped** — review the plan above, then confirm manually:
 ```
 schemabot apply-confirm -e staging
 ```
