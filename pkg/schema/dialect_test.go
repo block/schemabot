@@ -116,6 +116,11 @@ func TestSupportsFeature(t *testing.T) {
 		{name: "postgres deferred cutover", databaseType: "postgres", feature: FeatureDeferredCutover},
 		{name: "unknown database type", databaseType: "unknown", feature: FeatureDeferredCutover},
 		{name: "unknown feature", databaseType: "mysql", feature: Feature("unknown")},
+		{name: "mysql multi-target", databaseType: "mysql", feature: FeatureMultiTarget, want: true},
+		{name: "vitess multi-target", databaseType: "vitess", feature: FeatureMultiTarget},
+		{name: "strata multi-target", databaseType: "strata", feature: FeatureMultiTarget},
+		{name: "postgres multi-target", databaseType: "postgres", feature: FeatureMultiTarget},
+		{name: "unknown database type multi-target", databaseType: "unknown", feature: FeatureMultiTarget},
 	}
 
 	for _, tt := range tests {
