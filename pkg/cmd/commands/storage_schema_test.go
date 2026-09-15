@@ -435,19 +435,32 @@ func TestStorageApplyCmd_ManualRemediationOutranksTheDestructiveRefusal(t *testi
 			Reason:    "definition is NOT NULL without a DEFAULT",
 		}},
 	}
-	endpoint, routes := storageSchemaTestServer(t, plan, nil, nil)
+	for _, unattended := range []bool{false, true} {
+		name := "attended"
+		if unattended {
+			name = "unattended"
+		}
+		t.Run(name, func(t *testing.T) {
+			endpoint, routes := storageSchemaTestServer(t, plan, nil, nil)
 
-	var err error
-	out := captureStdout(func() {
-		cmd := StorageApplyCmd{}
-		err = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
-	})
+			var err error
+			out := captureStdout(func() {
+				cmd := StorageApplyCmd{AutoApprove: unattended}
+				err = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
+			})
 
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "need manual remediation first",
-		"the refusal an operator can act on is named, not left to an exit status")
-	assert.Contains(t, out, "Needs manual remediation")
-	assert.Equal(t, []string{"POST /api/storage/schema/plan"}, *routes, "nothing converges either way")
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "need manual remediation first",
+				"the refusal an operator can act on is named, not left to an exit status")
+			assert.Contains(t, out, "Needs manual remediation",
+				"the error says these are listed above, so they are listed on both paths")
+			assert.Contains(t, out, "checks: definition is NOT NULL without a DEFAULT",
+				"the entry names the table and what has to be resolved by hand")
+			assert.NotContains(t, out, "Apply blocked",
+				"a manual entry makes the destructive statement unreachable, so refusing it separately would name the wrong remedy")
+			assert.Equal(t, []string{"POST /api/storage/schema/plan"}, *routes, "nothing converges either way")
+		})
+	}
 }
 
 // The command a refusal offers addresses the same storage database the refusal
