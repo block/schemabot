@@ -303,14 +303,18 @@ func (cmd *StorageApplyCmd) Run(ctx context.Context, g *Globals) error {
 		}
 	}
 
+	// Both refusals run on the attended and the unattended path alike, so an
+	// operator and a pre-deploy job are told the same thing. Manual first: it
+	// gates the whole drift set, which makes a destructive statement behind it
+	// unreachable rather than merely refused.
+	if err := blockManualStorageApply(report, cmd.AutoApprove, cmd.rerunWithAllowUnsafe()); err != nil {
+		return err
+	}
 	if err := blockDestructiveStorageApply(report, cmd.AutoApprove, cmd.rerunWithAllowUnsafe()); err != nil {
 		return err
 	}
 
 	if !cmd.AutoApprove {
-		if len(report.Manual) > 0 {
-			return fmt.Errorf("refusing to converge storage schema on %s: %d change(s) need manual remediation first (listed above)", storageSchemaDatabaseLabel(report), len(report.Manual))
-		}
 		confirmed, err := confirmAction(
 			storageSchemaConfirmation(report),
 			"\nApply cancelled.",
@@ -385,17 +389,32 @@ func (cmd *StorageApplyCmd) rerunWithAllowUnsafe() string {
 // withPlan prints the plan for an unattended run, which has not printed one
 // yet. Naming refused statements without showing them would send the operator
 // back to `storage plan` to find out what was refused.
-func blockDestructiveStorageApply(report *apitypes.StorageSchemaReport, withPlan bool, rerun string) error {
-	if report.DestructiveAllowed || len(report.Destructive) == 0 {
+// blockManualStorageApply stops a convergence that cannot run at all.
+//
+// A manual entry gates the whole drift set: the bootstrap refuses every
+// statement in the report until an operator resolves it by hand. So it is the
+// refusal to report even when destructive statements are present too — those
+// are not reachable until this one is resolved — which is why it runs before
+// the destructive gate rather than after it.
+//
+// withPlan prints the plan for an unattended run, which has not printed one
+// yet. The error says the entries are listed above, and on that path nothing
+// has listed them.
+func blockManualStorageApply(report *apitypes.StorageSchemaReport, withPlan bool, rerun string) error {
+	if len(report.Manual) == 0 {
 		return nil
 	}
-	if len(report.Manual) > 0 {
-		// A manual entry gates the whole drift set, so it is the refusal to
-		// report: it has to be resolved before a destructive statement is even
-		// reachable. The plan renders every statement as gated while one is
-		// outstanding and prints no refusal for the destructive ones, so
-		// stopping here would exit non-zero with nothing on screen saying why.
-		// The manual refusal names itself on both paths.
+	if withPlan {
+		if err := outputStorageSchemaPlan(report, true, rerun, nil); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("refusing to converge storage schema on %s: %d change(s) need manual remediation first (listed above)",
+		storageSchemaDatabaseLabel(report), len(report.Manual))
+}
+
+func blockDestructiveStorageApply(report *apitypes.StorageSchemaReport, withPlan bool, rerun string) error {
+	if report.DestructiveAllowed || len(report.Destructive) == 0 {
 		return nil
 	}
 	if withPlan {
