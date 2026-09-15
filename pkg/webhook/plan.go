@@ -758,21 +758,6 @@ const msgDeferCutoverAllDirect = "`--defer-cutover` has no effect on this plan: 
 // The format verb takes the environment for the coached command.
 const msgDeferCutoverAllDirectConfirm = "`--defer-cutover` has no effect on this plan: every change runs directly as native DDL, which has no cutover to defer. The pending confirmation is preserved — re-run `schemabot apply-confirm -e %s` without the flag."
 
-// msgCopyDiscardDowngrade explains why an apply that would throw away an
-// unfinished copy stopped for confirmation. It states the cause only: the
-// comment already renders the confirm command copy-pasteably on the next line,
-// and the section above already says what is destroyed. It deliberately does
-// not name the flag that skips the stop — the point of stopping is that the
-// operator reads the disclosure first, so the bypass does not belong next to
-// it.
-//
-// It must also stay distinct from the wording of the disclosure it points at.
-// Both lines carry the attention glyph, so a footer that repeats the
-// disclosure's own heading spends a second warning on a sentence the reader
-// has already read, and the one fact the footer adds — that a decision is now
-// required — competes with a copy of the cause for the same attention.
-const msgCopyDiscardDowngrade = "An unfinished copy on the target would be discarded"
-
 // shardedDirectChanges collects direct-execution per-shard changes, grouped by
 // (table, reason) so a change present on several shards lists them together
 // rather than repeating. Returns nil when the plan carries no per-shard

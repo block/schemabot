@@ -186,7 +186,7 @@ func (h *Handler) executeApply(
 		// lands must leave no consent behind: the next attempt stops and asks
 		// again rather than dispatching over a disclosure nobody read.
 		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			msgCopyDiscardDowngrade); err != nil {
+			templates.CopyDiscardDowngradeReason(len(discarded))); err != nil {
 			h.logger.Error("failed to post the comment disclosing the discard, so no consent was recorded",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "plan_id", planResp.PlanID, "error", err)

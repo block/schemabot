@@ -17,6 +17,7 @@ import (
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
+	"github.com/block/schemabot/pkg/webhook/templates"
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/utils"
 	gh "github.com/google/go-github/v86/github"
@@ -593,7 +594,7 @@ func TestE2EApplyConfirmProceedsWhenDiscardWasDisclosed(t *testing.T) {
 	require.Eventually(t, func() bool {
 		select {
 		case body := <-f.result.comments:
-			assert.NotContains(t, body, msgCopyDiscardDowngrade,
+			assert.NotContains(t, body, templates.CopyDiscardDowngradeReason(1),
 				"a discard the operator already agreed to must not stop the apply again")
 			return strings.Contains(body, "Schema Change Applied")
 		default:

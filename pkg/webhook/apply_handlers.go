@@ -469,7 +469,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		if headSHA != "" {
 			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 		}
-		commentData.AutoConfirmDowngradeReason = msgCopyDiscardDowngrade
+		commentData.AutoConfirmDowngradeReason = templates.CopyDiscardDowngradeReason(len(discarded))
 		if postErr := h.postPendingConfirmation(ctx, repo, pr, installationID, database, dbType, environment, planResp.PlanID,
 			templates.RenderPlanComment(commentData), "copy-discard downgrade disclosure post failure"); postErr != nil {
 			return true, fmt.Errorf("apply command copy-discard downgrade disclosure %s#%d: %w", repo, pr, postErr)
