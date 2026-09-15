@@ -52,8 +52,9 @@ type storageSchemaAdapter struct {
 	version string
 	// configAllowsDestructive is the deployment's standing storage policy
 	// (storage.allow_destructive_schema_changes). A boot converges under it, so
-	// an operator convergence must too — otherwise "apply is what a boot does"
-	// would stop being true on exactly the deployments that opted in.
+	// an operator convergence must too — an operator may name which schema
+	// runs, never the policy it runs under, and otherwise the two would
+	// disagree on exactly the deployments that opted in.
 	configAllowsDestructive bool
 	// localHosted marks a server the local runtime hosts, where no route to a
 	// destructive storage bootstrap exists at all (AZ-6).
@@ -321,9 +322,9 @@ func (a *storageSchemaAdapter) checkBootTarget(dsn string) error {
 // The two directions are not symmetric and the asymmetry is the point. A
 // deployment that configured allow_destructive_schema_changes has already made
 // the decision for every boot; a convergence that ignored it would run less
-// than the next boot runs, so "apply is what a boot does" — the property that
-// makes this usable as a pre-deploy convergence step — would quietly stop
-// holding there. In the other direction, a request opting in is exactly the
+// than the next boot runs — an apply refusing on a deployment where a boot
+// proceeds, which is the deployment an operator converging ahead of a roll most
+// needs it not to. In the other direction, a request opting in is exactly the
 // explicit operator consent AV-9 asks for before surplus storage state is
 // destroyed, arriving through a command an admin had to issue rather than
 // through a config file nobody re-read.
