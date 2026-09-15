@@ -104,6 +104,7 @@ import (
 	spirittable "github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
 	ps "github.com/planetscale/planetscale-go/planetscale"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
@@ -163,14 +164,14 @@ type LocalConfig struct {
 	// checksum_yield_timeout).
 	Metadata map[string]string
 
-	// SchemaOverrides maps a requested (canonical) MySQL namespace to the
+	// SchemaOverrides maps a requested canonical namespace to the
 	// physical schema name on this target, for targets whose physical schema
 	// names embed environment or region. When non-empty it is a strict
 	// allowlist consulted wherever a namespace is turned into a connection
 	// schema: a requested namespace without a mapping fails rather than
 	// falling back to the canonical name. Empty preserves the default
 	// behavior where the requested namespace is the physical schema. MySQL
-	// only, and requires a namespace-free TargetDSN.
+	// mappings require a namespace-free TargetDSN.
 	SchemaOverrides map[string]string
 
 	// WakeOperator notifies the owner loop after durable work is recorded — a
@@ -262,22 +263,21 @@ var _ Client = (*LocalClient)(nil)
 // NewLocalClient creates a new local Tern client that calls the Spirit engine directly.
 // The storage parameter should be SchemaBot's storage instance for plan/task management.
 func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) (*LocalClient, error) {
-	// Schema overrides select a MySQL connection schema, so they only make
-	// sense for MySQL and only with a namespace-free target DSN (a DSN that
-	// already names a database would silently win over the mapping). Enforce
-	// the full mapping contract here as well as at inventory-config load so a
+	// Enforce the full mapping contract here as well as at inventory-config load so a
 	// custom resolver cannot hand an invalid combination straight to the
 	// client, and clone the map so the client's view cannot be mutated later.
 	if len(cfg.SchemaOverrides) > 0 {
 		if err := inventory.ValidateSchemaOverrides(cfg.Type, cfg.SchemaOverrides); err != nil {
 			return nil, fmt.Errorf("local client for database %q: %w", cfg.Database, err)
 		}
-		hasDatabase, err := mysqlDSNHasDatabase(cfg.TargetDSN)
-		if err != nil {
-			return nil, fmt.Errorf("inspect MySQL target DSN for schema overrides: %w", err)
-		}
-		if hasDatabase {
-			return nil, fmt.Errorf("schema overrides require a namespace-free target DSN; the DSN already names a database")
+		if cfg.Type == storage.DatabaseTypeMySQL {
+			hasDatabase, err := mysqlDSNHasDatabase(cfg.TargetDSN)
+			if err != nil {
+				return nil, fmt.Errorf("inspect MySQL target DSN for schema overrides: %w", err)
+			}
+			if hasDatabase {
+				return nil, fmt.Errorf("schema overrides require a namespace-free target DSN; the DSN already names a database")
+			}
 		}
 		cfg.SchemaOverrides = maps.Clone(cfg.SchemaOverrides)
 	}
@@ -492,7 +492,7 @@ func (c *LocalClient) credentialsForMySQLNamespace(namespace string) (*engine.Cr
 	if namespace == "" {
 		return nil, fmt.Errorf("MySQL namespace is required for a namespace-free target DSN")
 	}
-	physical, err := c.physicalMySQLNamespace(namespace)
+	physical, err := c.physicalNamespace(namespace)
 	if err != nil {
 		return nil, err
 	}
@@ -506,18 +506,21 @@ func (c *LocalClient) credentialsForMySQLNamespace(namespace string) (*engine.Cr
 	}, nil
 }
 
-// physicalMySQLNamespace resolves the physical schema name for a requested
+// physicalNamespace resolves the physical schema name for a requested
 // (canonical) namespace. Without configured overrides the requested namespace
 // is the physical schema. With overrides the map is a strict allowlist: an
 // unmapped namespace fails rather than falling back to the canonical name, so
 // a request misrouted to this target cannot land in the wrong physical schema.
-func (c *LocalClient) physicalMySQLNamespace(namespace string) (string, error) {
+func (c *LocalClient) physicalNamespace(namespace string) (string, error) {
 	if len(c.config.SchemaOverrides) == 0 {
 		return namespace, nil
 	}
 	physical, ok := c.config.SchemaOverrides[namespace]
 	if !ok {
-		return "", fmt.Errorf("target does not authorize MySQL namespace %q; configured schema overrides map only %v", namespace, slices.Sorted(maps.Keys(c.config.SchemaOverrides)))
+		if c.config.Type == storage.DatabaseTypeMySQL {
+			return "", fmt.Errorf("target does not authorize MySQL namespace %q; configured schema overrides map only %v", namespace, slices.Sorted(maps.Keys(c.config.SchemaOverrides)))
+		}
+		return "", fmt.Errorf("target does not authorize namespace %q; configured schema overrides map only %v", namespace, slices.Sorted(maps.Keys(c.config.SchemaOverrides)))
 	}
 	c.logger.Debug("resolved schema override for namespace",
 		"database", c.config.Database,
@@ -525,6 +528,93 @@ func (c *LocalClient) physicalMySQLNamespace(namespace string) (string, error) {
 		"physical_schema", physical,
 	)
 	return physical, nil
+}
+
+func (c *LocalClient) canonicalNamespace(namespace string) (string, error) {
+	if len(c.config.SchemaOverrides) == 0 {
+		return namespace, nil
+	}
+	for canonical, physical := range c.config.SchemaOverrides {
+		if physical == namespace {
+			return canonical, nil
+		}
+	}
+	return "", fmt.Errorf("engine returned unauthorized physical namespace %q; configured schema overrides map only %v", namespace, slices.Sorted(maps.Values(c.config.SchemaOverrides)))
+}
+
+func (c *LocalClient) physicalSchemaFiles(schemaFiles schema.SchemaFiles) (schema.SchemaFiles, error) {
+	physicalFiles := make(schema.SchemaFiles, len(schemaFiles))
+	for namespace, files := range schemaFiles {
+		physical, err := c.physicalNamespace(namespace)
+		if err != nil {
+			return nil, fmt.Errorf("resolve schema files namespace %q: %w", namespace, err)
+		}
+		if _, exists := physicalFiles[physical]; exists {
+			return nil, fmt.Errorf("schema files map multiple namespaces to physical namespace %q", physical)
+		}
+		physicalFiles[physical] = files
+	}
+	return physicalFiles, nil
+}
+
+func (c *LocalClient) canonicalizePlanResult(result *engine.PlanResult) error {
+	for i := range result.Changes {
+		canonical, err := c.canonicalNamespace(result.Changes[i].Namespace)
+		if err != nil {
+			return fmt.Errorf("canonicalize planned namespace: %w", err)
+		}
+		result.Changes[i].Namespace = canonical
+	}
+	return nil
+}
+
+// remapsPostgresNamespaces reports whether this target translates canonical
+// namespaces to physical PostgreSQL schemas at the engine boundary. MySQL
+// resolves its overrides through per-namespace credentials instead.
+func (c *LocalClient) remapsPostgresNamespaces() bool {
+	return c.config.Type == storage.DatabaseTypePostgres && len(c.config.SchemaOverrides) > 0
+}
+
+func (c *LocalClient) applyWithEngine(ctx context.Context, eng engine.Engine, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	if !c.remapsPostgresNamespaces() {
+		return eng.Apply(ctx, req)
+	}
+	requestCopy := *req
+	requestCopy.Changes = slices.Clone(req.Changes)
+	for i := range requestCopy.Changes {
+		physical, err := c.physicalNamespace(requestCopy.Changes[i].Namespace)
+		if err != nil {
+			return nil, fmt.Errorf("prepare PostgreSQL apply namespace: %w", err)
+		}
+		requestCopy.Changes[i].Namespace = physical
+	}
+	physicalFiles, err := c.physicalSchemaFiles(req.SchemaFiles)
+	if err != nil {
+		return nil, fmt.Errorf("prepare PostgreSQL apply schema files: %w", err)
+	}
+	requestCopy.SchemaFiles = physicalFiles
+	return eng.Apply(ctx, &requestCopy)
+}
+
+func (c *LocalClient) progressWithEngine(ctx context.Context, eng engine.Engine, req *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	result, err := eng.Progress(ctx, req)
+	if err != nil {
+		return result, err
+	}
+	if result == nil {
+		return nil, nil
+	}
+	if !c.remapsPostgresNamespaces() {
+		return result, nil
+	}
+	for i := range result.Tables {
+		canonical, resolveErr := c.canonicalNamespace(result.Tables[i].Namespace)
+		if resolveErr != nil {
+			return nil, fmt.Errorf("canonicalize PostgreSQL progress namespace: %w", resolveErr)
+		}
+		result.Tables[i].Namespace = canonical
+	}
+	return result, nil
 }
 
 func (c *LocalClient) credentialsForTask(task *storage.Task) (*engine.Credentials, error) {
@@ -661,6 +751,9 @@ func (c *LocalClient) deferredCutoverSignalExists(ctx context.Context, apply *st
 }
 
 func (c *LocalClient) normalizeSchemaFiles(schemaFiles schema.SchemaFiles) (schema.SchemaFiles, error) {
+	if c.config.Type == storage.DatabaseTypePostgres {
+		return schemaFiles, nil
+	}
 	if c.config.Type != storage.DatabaseTypeMySQL {
 		return schemaFiles, nil
 	}
@@ -722,12 +815,33 @@ func (c *LocalClient) pullSchemaFromEngine(ctx context.Context, req *ternv1.Pull
 		"type", c.config.Type,
 		"namespace", req.GetNamespace(),
 	)
-	resp, err := puller.PullSchema(ctx, req)
+	engineReq := req
+	canonical := req.GetNamespace()
+	if c.remapsPostgresNamespaces() {
+		if canonical == "" {
+			canonical = slices.Sorted(maps.Keys(c.config.SchemaOverrides))[0]
+		}
+		physical, resolveErr := c.physicalNamespace(canonical)
+		if resolveErr != nil {
+			return nil, fmt.Errorf("resolve PostgreSQL pull namespace: %w", resolveErr)
+		}
+		engineReq = proto.Clone(req).(*ternv1.PullSchemaRequest)
+		engineReq.Namespace = physical
+	}
+	resp, err := puller.PullSchema(ctx, engineReq)
 	if err != nil {
 		return nil, fmt.Errorf("engine pull schema for database %s type %s: %w", c.config.Database, c.config.Type, err)
 	}
 	if resp == nil {
 		return nil, fmt.Errorf("engine pull schema for database %s type %s returned a nil response", c.config.Database, c.config.Type)
+	}
+	if engineReq != req {
+		physical := engineReq.GetNamespace()
+		pulled, ok := resp.Namespaces[physical]
+		if !ok {
+			return nil, fmt.Errorf("engine pull response omitted requested physical namespace %q", physical)
+		}
+		resp.Namespaces = map[string]*ternv1.PulledNamespace{canonical: pulled}
 	}
 	return resp, nil
 }
@@ -1335,7 +1449,7 @@ func (c *LocalClient) credentialsForMySQLPullNamespace(namespace string) (*engin
 	if namespace == "" {
 		return nil, "", fmt.Errorf("MySQL namespace is required for a namespace-free target DSN")
 	}
-	physical, err := c.physicalMySQLNamespace(namespace)
+	physical, err := c.physicalNamespace(namespace)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1632,7 +1746,24 @@ func (c *LocalClient) planWithEngine(ctx context.Context, req *ternv1.PlanReques
 		return nil, fmt.Errorf("no engine configured for type: %s", c.config.Type)
 	}
 	if c.config.Type != storage.DatabaseTypeMySQL {
-		return c.planNamespaceWithEngine(ctx, eng, req, database, schemaFiles, c.credentials())
+		engineSchemaFiles := schemaFiles
+		if c.remapsPostgresNamespaces() {
+			var err error
+			engineSchemaFiles, err = c.physicalSchemaFiles(schemaFiles)
+			if err != nil {
+				return nil, fmt.Errorf("prepare PostgreSQL plan namespaces: %w", err)
+			}
+		}
+		result, err := c.planNamespaceWithEngine(ctx, eng, req, database, engineSchemaFiles, c.credentials())
+		if err != nil {
+			return nil, err
+		}
+		if c.remapsPostgresNamespaces() {
+			if err := c.canonicalizePlanResult(result); err != nil {
+				return nil, err
+			}
+		}
+		return result, nil
 	}
 	hasDatabase, err := mysqlDSNHasDatabase(c.config.TargetDSN)
 	if err != nil {

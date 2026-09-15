@@ -10,6 +10,32 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestValidateSchemaOverrides(t *testing.T) {
+	tests := []struct {
+		name         string
+		databaseType string
+		overrides    map[string]string
+		wantError    string
+	}{
+		{name: "PostgreSQL hyphenated physical name", databaseType: "postgres", overrides: map[string]string{"svc": "svc-database-qa"}},
+		{name: "PostgreSQL double quote", databaseType: "postgres", overrides: map[string]string{"svc": `svc"qa`}, wantError: "must not contain a double quote"},
+		{name: "PostgreSQL byte limit", databaseType: "postgres", overrides: map[string]string{"svc": strings.Repeat("a", 64)}, wantError: "63-byte identifier limit"},
+		{name: "PostgreSQL one mapping limit", databaseType: "postgres", overrides: map[string]string{"svc": "svc-qa", "audit": "audit-qa"}, wantError: "exactly one mapping"},
+		{name: "MySQL rule unchanged", databaseType: "mysql", overrides: map[string]string{"svc": "svc-qa"}, wantError: "only [a-zA-Z0-9_$] is allowed"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateSchemaOverrides(tt.databaseType, tt.overrides)
+			if tt.wantError == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tt.wantError)
+		})
+	}
+}
+
 func TestStaticResolverEnumerate(t *testing.T) {
 	t.Setenv("TARGET_CONFIG", `{"host":"db.example","port":3306}`)
 	t.Setenv("TARGET_PASSWORD", "secret")

@@ -1570,7 +1570,7 @@ func (c *LocalClient) resolveFailedEngineCancel(ctx context.Context, eng engine.
 	if engine.IsUnsupportedOperation(cancelErr) {
 		return fmt.Errorf("cancel engine for task %s: %w", task.TaskIdentifier, cancelErr)
 	}
-	progress, probeErr := eng.Progress(ctx, &engine.ProgressRequest{
+	progress, probeErr := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
 		Database:    c.config.Database,
 		Credentials: creds,
 		ResumeState: resumeState,
@@ -1622,7 +1622,7 @@ func (c *LocalClient) resolveFailedEngineStop(ctx context.Context, eng engine.En
 	if engine.IsUnsupportedOperation(stopErr) {
 		return c.wrapFailedEngineStop(task, stopErr)
 	}
-	progress, probeErr := eng.Progress(ctx, &engine.ProgressRequest{
+	progress, probeErr := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
 		Database:    c.config.Database,
 		Credentials: creds,
 		ResumeState: resumeState,
@@ -1712,7 +1712,7 @@ func (c *LocalClient) snapshotEngineProgress(ctx context.Context, eng engine.Eng
 		c.logger.Debug("skipping engine progress snapshot because no live engine work was stopped", "database", c.config.Database, "type", c.config.Type)
 		return none
 	}
-	progress, err := eng.Progress(ctx, &engine.ProgressRequest{
+	progress, err := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
 		Database:    c.config.Database,
 		Credentials: creds,
 	})

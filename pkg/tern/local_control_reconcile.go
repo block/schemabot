@@ -180,7 +180,7 @@ func (c *LocalClient) readEngineProgressForTask(ctx context.Context, eng engine.
 	if err != nil {
 		return nil, fmt.Errorf("load engine resume state for task %s: %w", task.TaskIdentifier, err)
 	}
-	res, err := eng.Progress(ctx, &engine.ProgressRequest{
+	res, err := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
 		Database:    c.config.Database,
 		Credentials: creds,
 		ResumeState: resumeState,
