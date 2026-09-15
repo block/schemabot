@@ -249,8 +249,6 @@ These statements run synchronously outside the schema change engine: writes to e
 
 ---
 
-⚠️ **Automatic apply paused**: Plan contains direct-execution changes — review the disclosure and confirm manually
-
 Review the plan above, then confirm manually:
 ```
 schemabot apply-confirm -e staging
@@ -390,8 +388,6 @@ Applying restarts the copy from zero rows. To keep the work already done, apply 
 
 ---
 
-⚠️ **Automatic apply paused**: An unfinished copy on the target would be discarded
-
 Review the plan above, then confirm manually:
 ```
 schemabot apply-confirm -e staging
@@ -429,8 +425,6 @@ Applying restarts the copy from zero rows. To keep the work already done, apply 
 
 
 ---
-
-⚠️ **Apply stopped**: An unfinished copy on the target would be discarded
 
 Review the plan above, then confirm manually:
 ```

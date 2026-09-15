@@ -48,66 +48,10 @@ func TestRenderPlanComment_DiscardedCopyWarnsWhileTheDecisionIsTheOperators(t *t
 	// copy is still there and confirming is what destroys it, so the warning
 	// and its remedy belong on the comment the confirmation acts on.
 	data.IsLocked = true
-	data.AutoConfirmDowngradeReason = CopyDiscardDowngradeReason(len(data.DiscardedCopies))
+	data.PendingManualConfirmation = true
 	paused := RenderPlanComment(data)
 	assert.Contains(t, paused, "⚠️ **Applying destroys work in progress**")
 	assert.Contains(t, paused, "apply the schema change that started it")
-}
-
-// The footer that pauses the apply and the disclosure it points at are two
-// renderings of one fact, so they have to agree about how many copies are at
-// stake. The footer summarises rather than repeats, which is what lets the two
-// disagree silently: the disclosure counts its entries, and a footer fixed at
-// one wording keeps claiming a single copy while the section above it lists
-// several.
-func TestCopyDiscardDowngradeReason_AgreesWithTheDisclosureItSummarises(t *testing.T) {
-	copies := []ExistingCopyData{
-		{Namespace: "testapp", Tables: []string{"orders"}, Reason: engine.DiscardStatementDiffers, Age: "3h 12m"},
-		{Namespace: "testapp", Tables: []string{"payments"}, Reason: engine.DiscardStatementDiffers, Age: "1h 04m"},
-	}
-
-	for _, tc := range []struct {
-		name      string
-		copies    []ExistingCopyData
-		heading   string
-		reason    string
-		otherness string
-	}{
-		{
-			name:      "one copy",
-			copies:    copies[:1],
-			heading:   "1 unfinished copy on the target",
-			reason:    "An unfinished copy on the target would be discarded",
-			otherness: "Unfinished copies",
-		},
-		{
-			name:      "several copies",
-			copies:    copies,
-			heading:   "2 unfinished copies on the target",
-			reason:    "Unfinished copies on the target would be discarded",
-			otherness: "An unfinished copy",
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			data := PlanCommentData{
-				Database: "testapp", Environment: "staging", IsMySQL: true, IsLocked: true,
-				Changes: []KeyspaceChangeData{{
-					Keyspace:   "testapp",
-					Statements: []string{"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)"},
-				}},
-				DiscardedCopies:            tc.copies,
-				AutoConfirmDowngradeReason: CopyDiscardDowngradeReason(len(tc.copies)),
-			}
-
-			plan := RenderPlanComment(data)
-			assert.Contains(t, plan, tc.heading, "the disclosure counts the copies it lists")
-			assert.Contains(t, plan, tc.reason, "the footer agrees with that count in number")
-			assert.NotContains(t, plan, tc.otherness,
-				"a footer in the wrong number contradicts the section it points at")
-			assert.NotContains(t, plan, strings.TrimSuffix(tc.heading, " on the target")+" would be discarded",
-				"the footer names the copies without reprinting the count the disclosure already gave")
-		})
-	}
 }
 
 // An apply that is already running has nothing to ask and no move to offer: the
@@ -562,4 +506,50 @@ func TestRenderPlanComment_NoCopySectionOnCleanTarget(t *testing.T) {
 	})
 
 	assert.NotContains(t, out, "work in progress")
+}
+
+// A downgrade is two facts: that the comment is waiting on the operator, and
+// why. They are separate fields because a cause already disclosed above leaves
+// the second empty, and the comment must still read as a question. This pins
+// the pairing in both directions — a paused comment never announces an apply
+// in flight, and a cause never renders on one that is not paused.
+func TestRenderPlanComment_PausedCommentNeverReadsAsAnApplyInFlight(t *testing.T) {
+	base := PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true, IsLocked: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)"},
+		}},
+	}
+
+	// Paused with the cause disclosed above: the footer carries the instruction
+	// alone, and the comment is still a question.
+	disclosed := base
+	disclosed.PendingManualConfirmation = true
+	disclosed.DiscardedCopies = []ExistingCopyData{
+		{Namespace: "testapp", Tables: []string{"orders"}, Reason: engine.DiscardStatementDiffers, Age: "3h 12m"},
+	}
+	out := RenderPlanComment(disclosed)
+	assert.Contains(t, out, "Review the plan above, then confirm manually")
+	assert.NotContains(t, out, "**Applying automatically**",
+		"an empty reason means the cause is disclosed above, never that the apply is proceeding")
+	assert.Equal(t, 1, strings.Count(out, "⚠️"),
+		"the cause is surfaced once, by the section that explains it in full")
+
+	// Paused with nothing above to explain it: the footer states the cause,
+	// because it is the only place it appears.
+	alone := base
+	alone.PendingManualConfirmation = true
+	alone.AutoConfirmDowngradeReason = "Could not verify plan — confirm manually"
+	out = RenderPlanComment(alone)
+	assert.Contains(t, out, "⚠️ **Automatic apply paused**: Could not verify plan — confirm manually")
+	assert.NotContains(t, out, "**Applying automatically**")
+
+	// Not paused: an apply already under way asks nothing, so no confirm
+	// instruction and no cause reach the reader.
+	running := base
+	out = RenderPlanComment(running)
+	assert.Contains(t, out, "**Applying automatically**")
+	assert.NotContains(t, out, "Review the plan above, then confirm manually")
+	assert.NotContains(t, out, "Automatic apply paused")
 }

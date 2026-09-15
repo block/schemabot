@@ -225,6 +225,7 @@ func TestRenderPlanComment_ManualConfirmationKeepsAttributedChanges(t *testing.T
 		IsLocked:                   true,
 		LockOwner:                  "block/schemabot#7",
 		LockAcquired:               "2026-08-22 00:13:52 UTC",
+		PendingManualConfirmation:  true,
 		AutoConfirmDowngradeReason: "Could not verify plan — confirm manually",
 	}
 

@@ -149,37 +149,6 @@ func copyNoun(count int) string {
 	return ui.PluralizeLabel("copy", "copies", count)
 }
 
-// CopyDiscardDowngradeReason explains why an apply that would throw away an
-// unfinished copy stopped for confirmation. It states the cause only: the
-// comment already renders the confirm command copy-pasteably on the next line,
-// and the section above already says what is destroyed. It deliberately does
-// not name the flag that skips the stop — the point of stopping is that the
-// operator reads the disclosure first, so the bypass does not belong next to
-// it.
-//
-// It must also stay distinct from the wording of the disclosure it points at.
-// Both lines carry the attention glyph, so a footer that repeats the
-// disclosure's own heading spends a second warning on a sentence the reader
-// has already read, and the one fact the footer adds — that a decision is now
-// required — competes with a copy of the cause for the same attention.
-//
-// It agrees with the disclosure in number but never restates the count. The
-// disclosure heads with "%d unfinished %s on the target", so a footer fixed at
-// the singular contradicts it the moment a re-plan discards two copies, and a
-// footer that repeats the number reprints the fragment this wording exists to
-// stop reprinting. Taking only the noun keeps it true at every count while
-// still adding nothing back.
-//
-// It lives here, beside the disclosure it must not echo, so the two cannot
-// drift apart: the preview fixtures call it rather than spelling it out, which
-// is what keeps the TEMPLATES.md drift check honest.
-func CopyDiscardDowngradeReason(copies int) string {
-	if copies == 1 {
-		return "An unfinished copy on the target would be discarded"
-	}
-	return "Unfinished copies on the target would be discarded"
-}
-
 // writeExistingCopyEntries writes one entry per copy: the tables it covers,
 // where they live, whether it is still being made or how stale it is, and why
 // it cannot be resumed.

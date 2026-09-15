@@ -423,7 +423,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	if len(planResp.DirectChanges()) > 0 {
 		h.logger.Info("automatic apply downgraded: plan contains direct-execution changes",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
-		commentData.AutoConfirmDowngradeReason = "Plan contains direct-execution changes — review the disclosure and confirm manually"
+		// The direct-execution section above names the statements and what
+		// running them costs, so the footer carries the instruction alone.
+		commentData.PendingManualConfirmation = true
 		if postErr := h.postPendingConfirmation(ctx, repo, pr, installationID, database, dbType, environment, planResp.PlanID,
 			templates.RenderPlanComment(commentData), "direct-execution downgrade disclosure post failure"); postErr != nil {
 			return true, fmt.Errorf("apply command direct-execution downgrade disclosure %s#%d: %w", repo, pr, postErr)
@@ -469,7 +471,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		if headSHA != "" {
 			h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 		}
-		commentData.AutoConfirmDowngradeReason = templates.CopyDiscardDowngradeReason(len(discarded))
+		// The discard section above names the copies and the remedy, so the
+		// footer carries the instruction alone.
+		commentData.PendingManualConfirmation = true
 		if postErr := h.postPendingConfirmation(ctx, repo, pr, installationID, database, dbType, environment, planResp.PlanID,
 			templates.RenderPlanComment(commentData), "copy-discard downgrade disclosure post failure"); postErr != nil {
 			return true, fmt.Errorf("apply command copy-discard downgrade disclosure %s#%d: %w", repo, pr, postErr)
@@ -484,6 +488,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	if planErr != nil || storedPlan == nil {
 		h.logger.Info("automatic apply downgraded: could not load plan for DDL comparison",
 			"repo", repo, "pr", pr, "planID", planResp.PlanID, "error", planErr)
+		commentData.PendingManualConfirmation = true
 		commentData.AutoConfirmDowngradeReason = "Could not verify plan — confirm manually"
 		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 		headSHA, checkRunErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)

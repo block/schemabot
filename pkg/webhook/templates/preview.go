@@ -178,7 +178,7 @@ func PreviewCommentPlanDirect() string {
 		DirectChanges: []DirectChangeData{
 			{Table: "users", Reason: "dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows"},
 		},
-		AutoConfirmDowngradeReason: "Plan contains direct-execution changes — review the disclosure and confirm manually",
+		PendingManualConfirmation: true,
 	})
 }
 
@@ -249,7 +249,7 @@ func PreviewCommentPlanCopyDiscardedPaused() string {
 				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
 			},
 		},
-		AutoConfirmDowngradeReason: CopyDiscardDowngradeReason(1),
+		PendingManualConfirmation: true,
 	})
 }
 
@@ -287,8 +287,8 @@ func PreviewCommentPlanCopyDiscardedStopped() string {
 				Statement: "ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`)",
 			},
 		},
-		AutoConfirmDowngradeReason: CopyDiscardDowngradeReason(1),
-		StoppedConfirmedApply:      true,
+		PendingManualConfirmation: true,
+		StoppedConfirmedApply:     true,
 	})
 }
 
@@ -1253,6 +1253,7 @@ func PreviewCommentApplyPlanDowngraded() string {
 		IsLocked:                   true,
 		LockOwner:                  "acme/myapp#42",
 		LockAcquired:               "2026-03-14 10:30:00 UTC",
+		PendingManualConfirmation:  true,
 		AutoConfirmDowngradeReason: "Schema changes differ from auto-plan — review and confirm manually",
 	})
 }

@@ -160,7 +160,21 @@ type PlanCommentData struct {
 	LockAcquired string // formatted timestamp
 
 	// Automatic apply state
-	AutoConfirmDowngradeReason string // Non-empty when automatic apply downgraded to manual confirmation
+
+	// PendingManualConfirmation marks a locked comment that is waiting on the
+	// operator rather than announcing an apply already under way. It is the
+	// state itself, not evidence of it, so a downgrade whose cause is disclosed
+	// in a section above can leave the reason below empty without the comment
+	// reading as an apply in flight.
+	PendingManualConfirmation bool
+
+	// AutoConfirmDowngradeReason states why the apply stopped, for the footer
+	// that carries the confirm instruction. It is set only when no section
+	// above already explains the cause: the disclosures head with their own
+	// glyph and name the tables at stake, so a footer that restates one spends
+	// a second marker on a sentence the reader just met. Empty means the cause
+	// is disclosed above, never that the apply is proceeding.
+	AutoConfirmDowngradeReason string
 
 	// StoppedConfirmedApply marks a downgrade that stopped an apply the
 	// operator confirmed themselves rather than pausing an automatic one, so
@@ -216,7 +230,7 @@ type DeploymentDriftEntry struct {
 // already out of reach. The footer reads the same predicate, so the two cannot
 // disagree about whether the reader still has a decision to make.
 func (d PlanCommentData) applyingWithoutConfirmation() bool {
-	return d.IsLocked && d.AutoConfirmDowngradeReason == ""
+	return d.IsLocked && !d.PendingManualConfirmation
 }
 
 // downgradeHeading names what the comment stopped. An operator who issued
@@ -390,7 +404,9 @@ func RenderPlanComment(data PlanCommentData) string {
 
 		if !data.applyingWithoutConfirmation() {
 			// Automatic apply was downgraded to manual confirmation — show unlock since user needs to act
-			fmt.Fprintf(&sb, glyph.Attention+" **%s**: %s\n\n", data.downgradeHeading(), data.AutoConfirmDowngradeReason)
+			if data.AutoConfirmDowngradeReason != "" {
+				fmt.Fprintf(&sb, glyph.Attention+" **%s**: %s\n\n", data.downgradeHeading(), data.AutoConfirmDowngradeReason)
+			}
 			sb.WriteString("Review the plan above, then confirm manually:\n")
 			fmt.Fprintf(&sb, "```\n%s\n```\n", applyConfirmCmd)
 			sb.WriteString("\n🔓 To discard this plan and unlock, comment:\n")
@@ -428,7 +444,7 @@ func writeApplyInstruction(sb *strings.Builder, command string) {
 // unsafe opt-in gate, where no consent was ever solicited and this comment is
 // the operator's notice.
 func attributionStillActionable(data PlanCommentData) bool {
-	if !data.IsLocked || data.AutoConfirmDowngradeReason != "" {
+	if !data.IsLocked || data.PendingManualConfirmation {
 		return true
 	}
 	for _, change := range data.AttributedChanges {
