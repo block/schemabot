@@ -1201,7 +1201,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 	// schema change. The changes are rebuilt from the stored tasks so the
 	// engine keys per-table progress on the same namespace/table pairs the
 	// tasks carry.
-	result, err := eng.Apply(ctx, &engine.ApplyRequest{
+	result, err := c.applyWithEngine(ctx, eng, &engine.ApplyRequest{
 		Database:     apply.Database,
 		PlanID:       plan.PlanIdentifier,
 		Changes:      groupedResumeChanges(tasks, plan),
@@ -1752,7 +1752,7 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		resumeState = &engine.ResumeState{MigrationContext: stored.MigrationContext, Metadata: stored.Metadata}
 	}
 
-	result, err := eng.Apply(ctx, &engine.ApplyRequest{
+	result, err := c.applyWithEngine(ctx, eng, &engine.ApplyRequest{
 		Database:      apply.Database,
 		PlanID:        plan.PlanIdentifier,
 		Changes:       changes,
@@ -1840,7 +1840,7 @@ func (c *LocalClient) driveFinalizerToTerminal(ctx context.Context, eng engine.E
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		res, err := eng.Progress(ctx, &engine.ProgressRequest{
+		res, err := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
 			Database:    apply.Database,
 			Credentials: creds,
 			ResumeState: resumeState,

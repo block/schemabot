@@ -1319,8 +1319,10 @@ The schema source is held to the same standard, and checked twice. A repository 
 it count as a source for a database only because server config says so, verified when the plan is
 made and verified again before the apply runs. Config that cannot answer the question is a
 refusal, never a default. *Breaks if violated:* a change reviewed against one database is applied
-to another. *Enforced:* server-side routing (`pkg/tern/target_router.go`) and source policy
-(`pkg/webhook/schema_source_policy.go`).
+to another. *Enforced:* server-side routing (`pkg/tern/target_router.go`), the schema override
+allowlist (`pkg/tern/local_client.go`, validated by `pkg/inventory/static.go`), the PostgreSQL
+apply's check that planned DDL names the schema it targets (`pkg/engine/postgres/apply.go`), and
+source policy (`pkg/webhook/schema_source_policy.go`).
 
 ### AZ-2: Authorization fails closed at every tier
 

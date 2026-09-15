@@ -3115,6 +3115,40 @@ func TestValidateOptimisticApplyRefusesNonNativeShape(t *testing.T) {
 	assert.Contains(t, err.Error(), "does not execute this statement shape yet")
 }
 
+// TestValidateOptimisticApplyRefusesSchemaRouteDrift pins that an apply is
+// refused before any work is queued when the planned DDL names one schema and
+// the request addresses another: the request's schema is what preflight
+// proves, and the statement's qualification is what executes, so the two must
+// agree. An unqualified statement makes no such claim and is accepted.
+func TestValidateOptimisticApplyRefusesSchemaRouteDrift(t *testing.T) {
+	request := func(ddl string) *engine.ApplyRequest {
+		return &engine.ApplyRequest{
+			Database: "app",
+			Changes: []engine.SchemaChange{{Namespace: "svc_qa", TableChanges: []engine.TableChange{{
+				Table: "users",
+				DDL:   ddl,
+			}}}},
+			Credentials: &engine.Credentials{DSN: "postgres://localhost/app"},
+		}
+	}
+
+	_, err := validateOptimisticApply(request("ALTER TABLE svc.users ADD COLUMN email text"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `planned statement 1 names schema "svc" but the apply targets schema "svc_qa"`)
+
+	_, err = validateOptimisticApply(request("CREATE TABLE svc.users (id bigint PRIMARY KEY);\nCREATE UNIQUE INDEX users_id_key ON svc.users (id)"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `planned statement 1 names schema "svc" but the apply targets schema "svc_qa"`, "a create set is checked statement by statement")
+
+	change, err := validateOptimisticApply(request("ALTER TABLE svc_qa.users ADD COLUMN email text"))
+	require.NoError(t, err)
+	assert.Equal(t, "svc_qa", change.namespace)
+
+	change, err = validateOptimisticApply(request("ALTER TABLE users ADD COLUMN email text"))
+	require.NoError(t, err)
+	assert.Equal(t, "svc_qa", change.namespace)
+}
+
 func TestValidateOptimisticApplyAcceptsCreateSet(t *testing.T) {
 	req := &engine.ApplyRequest{
 		Database: "app",

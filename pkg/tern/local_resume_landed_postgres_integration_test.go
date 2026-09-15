@@ -11,14 +11,79 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/utils"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/testutil"
 )
+
+// This scenario plans and applies through LocalClient while the target schema
+// has a quoted physical name. The engine receives that physical name, while
+// the durable task keeps the canonical namespace used by the repository.
+func TestLocalClientPostgresSchemaOverridePlanAndApply(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	const (
+		database  = "schema_override"
+		canonical = "svc"
+		physical  = "svc-database-qa"
+	)
+	_, storageDSN := setupMySQLContainer(t)
+	setupStorageSchema(t, storageDSN)
+	cleanupTasks(t, storageDSN)
+	targetDSN, targetDB := testutil.StartPostgres(t, database)
+	_, err := targetDB.ExecContext(t.Context(), "CREATE SCHEMA "+pgx.Identifier{physical}.Sanitize())
+	require.NoError(t, err)
+	_, err = targetDB.ExecContext(t.Context(), "CREATE TABLE "+pgx.Identifier{physical, "users"}.Sanitize()+" (id bigint PRIMARY KEY)")
+	require.NoError(t, err)
+
+	stor := createStorage(t, storageDSN)
+	defer utils.CloseAndLog(stor)
+	client, err := NewLocalClient(LocalConfig{
+		Database:        database,
+		Type:            storage.DatabaseTypePostgres,
+		TargetDSN:       targetDSN,
+		SchemaOverrides: map[string]string{canonical: physical},
+	}, stor, slog.Default())
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	plan, err := client.Plan(t.Context(), &ternv1.PlanRequest{
+		Database: database,
+		Type:     storage.DatabaseTypePostgres,
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			canonical: {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text);"}},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, plan.Changes, 1)
+	assert.Equal(t, canonical, plan.Changes[0].Namespace)
+	require.Len(t, plan.Changes[0].TableChanges, 1)
+
+	applyResponse, err := client.Apply(t.Context(), &ternv1.ApplyRequest{
+		PlanId:      plan.PlanId,
+		Environment: localClientTestEnvironment,
+		DdlChanges:  plan.Changes[0].TableChanges,
+	})
+	require.NoError(t, err)
+	require.True(t, applyResponse.Accepted, applyResponse.ErrorMessage)
+	driveQueuedApply(t, stor, client, applyResponse.ApplyId)
+
+	apply, err := stor.Applies().GetByApplyIdentifier(t.Context(), applyResponse.ApplyId)
+	require.NoError(t, err)
+	tasks, err := stor.Tasks().GetByApplyID(t.Context(), apply.ID)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, canonical, tasks[0].Namespace)
+	assert.True(t, postgresColumnExists(t, targetDB, physical, "users", "email"))
+}
 
 // This scenario covers a PostgreSQL apply whose plan carries two statements
 // for one table, driven as one task per statement, that lost its driver after

@@ -329,15 +329,16 @@ target_resolver:
         # namespace-free endpoint/credentials
 ```
 
-The canonical namespace stays the name everywhere SchemaBot stores or shows it — requests, plans, tasks, drift comparison, pull responses. The physical name only enters the data plane where MySQL is actually addressed: the connection schema in the DSN and `information_schema` predicates.
+The canonical namespace stays the name everywhere SchemaBot labels a namespace — requests, plans, tasks, drift comparison, pull responses. The physical name only enters the data plane where the engine addresses the schema. The one place it is visible to a reviewer is the DDL itself: PostgreSQL statements are schema-qualified, so the SQL a plan shows and an apply executes names the physical schema, exactly as it will run on the target. SchemaBot never rewrites DDL to hide that, and an apply whose stored DDL names a different schema than the target now maps the namespace to is refused rather than executed.
 
 ### Rules
 
-- MySQL only, and currently exactly one mapping per target.
-- The target DSN must be namespace-free; a DSN that already names a database is rejected at config load.
+- MySQL and PostgreSQL are supported, with exactly one mapping per target.
+- A MySQL target DSN must be namespace-free; a DSN that already names a database is rejected at config load. A PostgreSQL DSN names the database while the override selects a schema within it.
 - A non-empty map is a strict allowlist: a requested namespace without a mapping fails rather than falling back to the canonical name, so a misrouted request cannot land in the wrong physical schema.
 - An empty/omitted map preserves the default behavior: the requested namespace is the physical schema.
-- Schema names must be unquoted-identifier-safe (`[a-zA-Z0-9_$]`, at most 64 characters).
+- MySQL schema names must be unquoted-identifier-safe (`[a-zA-Z0-9_$]`, at most 64 characters).
+- PostgreSQL schema names must be non-empty and at most 63 bytes, with no double quote, NUL, or leading or trailing whitespace. Other characters, including hyphens, are supported because identifiers are quoted by the PostgreSQL engine.
 
 ## Summary
 

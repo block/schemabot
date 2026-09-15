@@ -210,6 +210,9 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 	if _, err := preflight.RequiredTier(statements); err != nil {
 		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: SchemaBot's PostgreSQL support does not execute this statement shape yet", tc.Table)
 	}
+	if err := plannedSchemaMatchesTarget(statements, req.Changes[0].Namespace); err != nil {
+		return nativeApply{}, fmt.Errorf("apply PostgreSQL table %q: %w", tc.Table, err)
+	}
 	concurrentIndex := false
 	if len(statements) == 1 {
 		// The tier derivation above parsed this statement already, so a
@@ -221,6 +224,25 @@ func validateOptimisticApply(req *engine.ApplyRequest) (nativeApply, error) {
 		}
 	}
 	return nativeApply{namespace: req.Changes[0].Namespace, table: tc.Table, sql: tc.DDL, steps: len(statements), concurrentIndex: concurrentIndex}, nil
+}
+
+// plannedSchemaMatchesTarget refuses an apply whose planned DDL names a
+// different schema than the one the request addresses. The plan qualified
+// every statement with the schema it was made against and the apply preflights
+// the request's namespace, so the two agree unless the route to the physical
+// schema changed after planning; executing then would preflight one schema and
+// alter another. An unqualified statement carries no claim to check.
+func plannedSchemaMatchesTarget(statements []string, namespace string) error {
+	for i, sql := range statements {
+		statement, err := pgstatement.ParseOne(sql)
+		if err != nil {
+			return fmt.Errorf("parse planned statement %d: %w", i+1, err)
+		}
+		if planned := statement.Schema(); planned != "" && planned != namespace {
+			return fmt.Errorf("planned statement %d names schema %q but the apply targets schema %q; the target's schema route changed after planning, so plan again", i+1, planned, namespace)
+		}
+	}
+	return nil
 }
 
 // postgresCreateSetStatements parses one statement or a greenfield create set

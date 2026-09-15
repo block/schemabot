@@ -619,7 +619,7 @@ func (c *LocalClient) tryResolveStaleTask(ctx context.Context, t *storage.Task, 
 	// identity reads the idle sentinel and resolves as abandoned. Engines
 	// that ignore identity (Spirit) or require resume metadata instead
 	// (PlanetScale) behave exactly as before.
-	result, err := eng.Progress(ctx, &engine.ProgressRequest{
+	result, err := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
 		Database:    database,
 		Credentials: c.credentials(),
 		ResumeState: &engine.ResumeState{MigrationContext: t.TaskIdentifier},

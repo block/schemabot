@@ -19,8 +19,9 @@ type Target struct {
 	DatabaseType string
 	DSN          string
 	Metadata     map[string]string
-	// SchemaOverrides maps a requested (canonical) MySQL namespace to the
-	// physical schema name on this target. When non-empty it is a strict
+	// SchemaOverrides maps a requested (canonical) namespace to the physical
+	// schema name on this target: a database on MySQL, a schema within the
+	// DSN's database on PostgreSQL. When non-empty it is a strict
 	// allowlist: a requested namespace without a mapping fails rather than
 	// falling back to the canonical name. Empty preserves the default
 	// behavior where the requested namespace is the physical schema.

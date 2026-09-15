@@ -205,7 +205,7 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 	// Sequential mode: one DDL per engine call. The task identifier is used as the
 	// engine resume key (ResumeState.MigrationContext) so each table's schema
 	// change is tracked independently.
-	result, err := c.getEngine().Apply(ctx, sequentialEngineApplyRequest(task, options, taskCreds, logger))
+	result, err := c.applyWithEngine(ctx, c.getEngine(), sequentialEngineApplyRequest(task, options, taskCreds, logger))
 
 	if err != nil {
 		if c.shouldRetryEngineError(err) {
@@ -575,7 +575,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				return taskContinue
 			}
 
-			result, err := eng.Progress(ctx, &engine.ProgressRequest{
+			result, err := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
 				Database:    task.Database,
 				Credentials: creds,
 				ResumeState: resumeState,
