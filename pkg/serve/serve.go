@@ -303,6 +303,22 @@ type Server struct {
 	// probe never outlives the resolver and clients svc.Close tears down.
 	probeCancel context.CancelFunc
 	probeDone   chan struct{}
+	// dialect is the storage database's family, resolved once at build time so
+	// every later storage operation — including the operator-facing storage
+	// schema surface — routes to the same family the bootstrap converged.
+	dialect schema.Dialect
+	// storageDSN is the DSN the storage pool was opened with. It names the
+	// database this instance booted against, which is the only database its
+	// storage schema surface may read or converge.
+	storageDSN string
+	// storageSchema is the one adapter that answers for that database, built
+	// once by Build and shared by the HTTP routes and the gRPC service, so the
+	// two surfaces cannot come to disagree about which storage they describe.
+	storageSchema tern.StorageSchemaService
+	// version is the build's SchemaBot version. Storage schema reports carry
+	// it for attribution: the diff itself is computed from this binary's
+	// embedded files, and the version only says whose files they were.
+	version string
 }
 
 // registerPlanetScaleMTLS registers the configured planetscale.mtls
@@ -347,14 +363,17 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		opt(&o)
 	}
 	logger := o.logger
-	if o.version == "" {
+	version := o.version
+	if version == "" {
 		// A host binary that embeds SchemaBot supplies its own logger and has no
 		// reason to know SchemaBot's version. Read it from the module graph, which
 		// is where an embedded dependency's version lives, so every log line
-		// identifies which SchemaBot the pod is running.
-		logger = logger.With("schemabot_version", moduleVersion())
+		// identifies which SchemaBot the pod is running — and so does every
+		// storage schema report, which attributes its embedded files to a build.
+		version = moduleVersion()
+		logger = logger.With("schemabot_version", version)
 	}
-	logger.Info("building server", "version", o.version, "commit", o.commit, "built", o.date)
+	logger.Info("building server", "version", version, "commit", o.commit, "built", o.date)
 
 	// Register PlanetScale mTLS before anything else so a worker with
 	// missing or unreadable certificate material fails startup immediately
@@ -396,7 +415,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	// budget lets the pod wait the window out instead of crash-looping
 	// through it.
 	logger.Info("ensuring storage schema", "dialect", dialect)
-	db, err := bootStorage(ctx, cfg, dialect, logger)
+	db, storageDSN, err := bootStorage(ctx, cfg, dialect, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -508,8 +527,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	if router, ok := dataPlaneClient.(*tern.TargetRouter); ok {
 		targetResolver = router.Resolver()
 	}
-	success = true
-	return &Server{
+	srv := &Server{
 		cfg:             cfg,
 		svc:             svc,
 		storage:         store,
@@ -520,7 +538,17 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		telemetry:       telemetry,
 		authz:           authz,
 		engines:         o.engines,
-	}, nil
+		dialect:         dialect,
+		storageDSN:      storageDSN,
+		version:         version,
+	}
+
+	if err := srv.registerStorageSchema(svc); err != nil {
+		return nil, err
+	}
+
+	success = true
+	return srv, nil
 }
 
 // Storage boot retry policy. The budget is sized so that even a final attempt
@@ -543,15 +571,18 @@ const inProcessWebhookDrainTimeout = 25 * time.Second
 // failed attempts until the boot budget is spent. The DSN is re-resolved on
 // every attempt so file-backed references pick up credentials rotated while
 // the server waits.
-func bootStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.Dialect, logger *slog.Logger) (*sql.DB, error) {
+// It returns the DSN the successful attempt used alongside the pool, so the
+// rest of the server can name the storage it actually booted against rather
+// than re-resolving a value that may have moved since.
+func bootStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.Dialect, logger *slog.Logger) (*sql.DB, string, error) {
 	deadline := time.Now().Add(storageBootRetryBudget)
 	for attempt := 1; ; attempt++ {
-		db, err := connectStorage(ctx, cfg, dialect, logger)
+		db, dsn, err := connectStorage(ctx, cfg, dialect, logger)
 		if err == nil {
-			return db, nil
+			return db, dsn, nil
 		}
 		if time.Until(deadline) < storageBootRetryInterval {
-			return nil, fmt.Errorf("storage not ready after %d attempts over %s: %w", attempt, storageBootRetryBudget, err)
+			return nil, "", fmt.Errorf("storage not ready after %d attempts over %s: %w", attempt, storageBootRetryBudget, err)
 		}
 		logger.Warn("storage not ready, retrying",
 			"attempt", attempt,
@@ -560,50 +591,92 @@ func bootStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.Dial
 			"error", err)
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("storage boot canceled after %d attempts: %w", attempt, ctx.Err())
+			return nil, "", fmt.Errorf("storage boot canceled after %d attempts: %w", attempt, ctx.Err())
 		case <-time.After(storageBootRetryInterval):
 		}
 	}
 }
 
 // connectStorage runs a single storage boot attempt: resolve the DSN, apply
-// the storage schema, open the pool, and verify it with a ping.
-func connectStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.Dialect, logger *slog.Logger) (*sql.DB, error) {
+// the storage schema, open the pool, and verify it with a ping. It returns the
+// DSN it used so the caller holds the one this pool is dialing.
+func connectStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.Dialect, logger *slog.Logger) (*sql.DB, string, error) {
 	const pingTimeout = 10 * time.Second
 	dsn, err := cfg.StorageDSN()
 	if err != nil {
-		return nil, fmt.Errorf("resolve storage DSN: %w", err)
+		return nil, "", fmt.Errorf("resolve storage DSN: %w", err)
 	}
 	if err := api.EnsureSchema(dsn, logger,
 		api.WithAllowDestructiveSchemaChanges(cfg.Storage.AllowDestructiveSchemaChanges),
 		api.WithPostgresStatementTimeout(cfg.Postgres.StatementTimeoutOrDefault()),
 		api.WithDialect(dialect)); err != nil {
-		return nil, fmt.Errorf("ensure storage schema: %w", err)
+		return nil, "", fmt.Errorf("ensure storage schema: %w", err)
 	}
-	db, err := openStoragePool(dialect, dsn, cfg)
+	db, err := openStoragePool(dialect, dsn, cfg, pinnedStorageDSN(dialect, dsn, cfg, logger))
 	if err != nil {
-		return nil, fmt.Errorf("open storage database: %w", err)
+		return nil, "", fmt.Errorf("open storage database: %w", err)
 	}
 	pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
 	defer cancel()
 	if err := db.PingContext(pingCtx); err != nil {
 		utils.CloseAndLog(db)
-		return nil, fmt.Errorf("ping storage database: %w", err)
+		return nil, "", fmt.Errorf("ping storage database: %w", err)
 	}
-	return db, nil
+	return db, dsn, nil
+}
+
+// pinnedStorageDSN is the reload callback the storage pool re-resolves through
+// after an authentication failure, narrowed to the one thing a reload is for.
+//
+// A rotated credential must be picked up without a restart, so the DSN is
+// re-read from the live configuration. The database it names must not move,
+// because everything downstream of the boot assumes it did not: the schema this
+// server bootstrapped is on the database it booted against, and nothing
+// bootstraps the new one. Without this guard an authentication failure is all
+// it takes — the pool re-resolves, a config that now names another database
+// answers the dial, and the server proceeds against storage whose schema it
+// never converged.
+//
+// So the reload refuses a DSN whose address or database name has changed and
+// keeps the pool on the database it booted against, failing the connection
+// rather than silently relocating. Adopting new storage is a restart.
+func pinnedStorageDSN(dialect schema.Dialect, bootDSN string, cfg *api.ServerConfig, logger *slog.Logger) func() (string, error) {
+	boot, bootErr := storageTargetFor(dialect, bootDSN)
+	return func() (string, error) {
+		if bootErr != nil {
+			return "", fmt.Errorf("read the storage target this server booted against: %w", bootErr)
+		}
+		next, err := cfg.StorageDSN()
+		if err != nil {
+			return "", fmt.Errorf("re-resolve storage DSN: %w", err)
+		}
+		resolved, err := storageTargetFor(dialect, next)
+		if err != nil {
+			return "", fmt.Errorf("read the storage target the current configuration names: %w", err)
+		}
+		if resolved != boot {
+			logger.Error("refusing to reconnect storage: the configured storage has moved since this server booted",
+				"booted_against", boot.String(),
+				"now_configured", resolved.String(),
+				"dialect", dialect)
+			return "", fmt.Errorf("the configured storage now names %s, but this server booted against %s; "+
+				"its storage schema was converged on the database it booted against, so restart it to adopt the new storage", resolved, boot)
+		}
+		return next, nil
+	}
 }
 
 // openStoragePool opens the long-lived reloadable storage pool for the
-// configured dialect. Both connectors re-resolve the DSN through
-// cfg.StorageDSN on authentication failure so a rotated storage credential
-// is picked up without a restart. The dispatch fails closed: a dialect
-// without a connector returns an error instead of dialing with another
-// family's driver.
-func openStoragePool(dialect schema.Dialect, dsn string, cfg *api.ServerConfig) (*sql.DB, error) {
+// configured dialect. Both connectors re-resolve the DSN through reload on
+// authentication failure so a rotated storage credential is picked up without a
+// restart; reload is pinnedStorageDSN, which permits exactly that and refuses a
+// database that has moved. The dispatch fails closed: a dialect without a
+// connector returns an error instead of dialing with another family's driver.
+func openStoragePool(dialect schema.Dialect, dsn string, cfg *api.ServerConfig, reload func() (string, error)) (*sql.DB, error) {
 	connectTimeout := cfg.Storage.Pool.ConnectTimeoutOrZero()
 	switch dialect {
 	case schema.DialectMySQL:
-		return mysqlconn.OpenReloadable(dsn, cfg.StorageDSN,
+		return mysqlconn.OpenReloadable(dsn, reload,
 			mysqlconn.WithConnectTimeout(connectTimeout))
 	case schema.DialectPostgres:
 		// The storage pool carries a statement budget of its own so steady-state
@@ -611,7 +684,7 @@ func openStoragePool(dialect schema.Dialect, dsn string, cfg *api.ServerConfig) 
 		// whatever the platform imposed at the role or database level. It is
 		// the ordinary-query budget, not the bootstrap's DDL budget: this pool
 		// never executes DDL.
-		return postgresconn.OpenReloadable(dsn, cfg.StorageDSN,
+		return postgresconn.OpenReloadable(dsn, reload,
 			postgresconn.WithConnectTimeout(connectTimeout),
 			postgresconn.WithStatementTimeout(cfg.Postgres.StatementTimeoutOrDefault()))
 	default:
@@ -671,7 +744,15 @@ func (s *Server) RegisterGRPC(ctx context.Context, gs *grpc.Server) error {
 		s.svc.SetDefaultTernClient(built)
 		client = built
 	}
-	tern.NewServer(client, s.logger).Register(gs)
+	// The storage-schema service answers for this instance's own storage
+	// database, which is the only way a control plane can read it: a data
+	// plane's storage is reachable from the data plane, and the gRPC endpoint
+	// is the connection that already exists between the two.
+	opts := []tern.ServerOption{}
+	if s.storageSchema != nil {
+		opts = append(opts, tern.WithStorageSchemaService(s.storageSchema))
+	}
+	tern.NewServer(client, s.logger, opts...).Register(gs)
 	return nil
 }
 
