@@ -23,6 +23,15 @@ type ExecutionTarget struct {
 	Target       string
 }
 
+// MemberID is the rollout-member identity of this execution target: the
+// deployment it routes through and the target it addresses, together. A
+// deployment name alone does not identify a member, because one deployment can
+// address several targets; callers that compare, order, or report members must
+// use this pair rather than the deployment.
+func (t ExecutionTarget) MemberID() string {
+	return t.Deployment + "/" + t.Target
+}
+
 // Resolver resolves logical SchemaBot targets to concrete execution targets.
 type Resolver interface {
 	ResolveTargets(ctx context.Context, req Request) ([]ExecutionTarget, error)
