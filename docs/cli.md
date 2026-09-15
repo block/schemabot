@@ -13,6 +13,7 @@ to see what is changing across your fleet.
 | Manage a PlanetScale deploy request | [Deploy, follow shards, and control cutover](#manage-planetscale-deploy-requests) |
 | Understand a merge check that will not clear | [Explain a blocked check](#explain-a-blocked-check) |
 | Build an integration | [Use structured output](#use-the-cli-from-scripts-and-agents) |
+| Converge SchemaBot's own storage schema | [Storage schema guide](storage-schema.md) |
 
 The examples use a MySQL database named `shop` in `staging`.
 Substitute a database and environment from your server's inventory. The local
