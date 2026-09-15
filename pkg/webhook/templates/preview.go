@@ -1009,18 +1009,79 @@ func sampleLintWarnings() []LintViolationData {
 	}
 }
 
+// PreviewCommentPlanPrimaryKeyWarning renders an index addition on an existing
+// table whose unchanged varchar primary key raises an advisory finding.
+func PreviewCommentPlanPrimaryKeyWarning() string {
+	return RenderPlanComment(PlanCommentData{
+		Database: "testapp", SchemaName: "testapp", Environment: "staging",
+		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
+		IsMySQL: true, DatabaseType: "mysql", LintRuleNames: []string{"primary_key"},
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `customers` ADD INDEX `idx_created_at` (`created_at`);"},
+		}},
+		LintViolations: []LintViolationData{{
+			Table: "customers", LinterName: "primary_key",
+			Message: `Primary key column "id" has type "varchar"`,
+		}},
+	})
+}
+
+// PreviewCommentPlanPrimaryKeyIssue renders a new table whose varchar primary
+// key requires explicit acknowledgement, with the same guide beside the issue.
+func PreviewCommentPlanPrimaryKeyIssue() string {
+	return RenderPlanComment(PlanCommentData{
+		Database: "testapp", SchemaName: "testapp", Environment: "staging",
+		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
+		IsMySQL: true, DatabaseType: "mysql", LintRuleNames: []string{"primary_key"},
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"CREATE TABLE `customers` (\n  `id` varchar(64) NOT NULL,\n  `created_at` datetime(3) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{{
+			Table: "customers", Reason: `[ERROR] primary_key: Primary key column "id" has type "varchar"`,
+		}},
+	})
+}
+
+// PreviewCommentPlanRelatedGuidance shows multiple rules contributing distinct
+// guides while repeated primary key warnings contribute only one link.
+func PreviewCommentPlanRelatedGuidance() string {
+	data := PlanCommentData{
+		Database: "testapp", SchemaName: "testapp", Environment: "staging",
+		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
+		IsMySQL: true, DatabaseType: "mysql", LintRuleNames: []string{"rename_column"},
+		HasUnsafeChanges: true,
+		UnsafeChanges:    []UnsafeChangeData{{Table: "users", Reason: `[ERROR] rename_column: Column rename detected in table "users": "email" to "email_address". Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled`}},
+	}
+	change := KeyspaceChangeData{
+		Keyspace: "testapp", Statements: []string{"ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;"},
+	}
+	for _, table := range []string{"customers", "orders", "invoices", "shipments", "sessions", "events"} {
+		change.Statements = append(change.Statements, fmt.Sprintf("ALTER TABLE `%s` ADD INDEX `idx_created_at` (`created_at`);", table))
+		data.LintRuleNames = append(data.LintRuleNames, "primary_key")
+		data.LintViolations = append(data.LintViolations, LintViolationData{
+			Table: table, LinterName: "primary_key", Message: `Primary key column "id" has type "varchar"`,
+		})
+	}
+	data.Changes = []KeyspaceChangeData{change}
+	return RenderPlanComment(data)
+}
+
 // PreviewCommentPlanManyLintWarnings renders a plan whose lint findings exceed
 // the fold threshold, exercising the collapsed details block grouped by table.
 func PreviewCommentPlanManyLintWarnings() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:     "testapp",
-		SchemaName:   "testapp",
-		Environment:  "staging",
-		HeadSHA:      previewHeadSHA,
-		Repository:   previewRepository,
-		RequestedBy:  previewRequestedBy,
-		IsMySQL:      true,
-		DatabaseType: "mysql",
+		Database:      "testapp",
+		LintRuleNames: []string{"primary_key"},
+		SchemaName:    "testapp",
+		Environment:   "staging",
+		HeadSHA:       previewHeadSHA,
+		Repository:    previewRepository,
+		RequestedBy:   previewRequestedBy,
+		IsMySQL:       true,
+		DatabaseType:  "mysql",
 		Changes: []KeyspaceChangeData{
 			{
 				Keyspace: "testapp",
@@ -1035,10 +1096,10 @@ func PreviewCommentPlanManyLintWarnings() string {
 			{Table: "order_events", Reason: `Index "idx_events_archived" should be made invisible before dropping to ensure it's not needed`},
 		},
 		LintViolations: []LintViolationData{
-			{Message: `Primary key column "order_ref" has type "varchar"`, Table: "orders", LinterName: "pk_type"},
+			{Message: `Primary key column "order_ref" has type "varchar"`, Table: "orders", LinterName: "primary_key"},
 			{Message: `Index "idx_status_created" has "DATETIME" column "created_at" in position 3 of 5. "DATETIME" columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.`, Table: "order_events", LinterName: "datetime_index_position"},
 			{Message: `Index "idx_region_created" has "DATETIME" column "created_at" in position 4 of 5. "DATETIME" columns are typically queried with range predicates (>, >=, <, <=, BETWEEN), and a range on a non-last index column prevents the optimizer from using subsequent columns for sorted access.`, Table: "order_events", LinterName: "datetime_index_position"},
-			{Message: `Primary key column "event_id" has type "mediumint"`, Table: "order_events", LinterName: "pk_type"},
+			{Message: `Primary key column "event_id" has type "mediumint"`, Table: "order_events", LinterName: "primary_key"},
 			{Message: `Index "idx_status_created" on columns ("status", "region", "created_at", "event_id", "order_pk") has a redundant PRIMARY KEY suffix "order_pk" — a leading prefix of the PRIMARY KEY appearing at the end of the index. InnoDB automatically appends the full PK columns ("order_pk", "event_id") to secondary indexes, so spelling out part of the PK at the end of the index is redundant.`, Table: "order_events", LinterName: "redundant_indexes"},
 			{Message: `Column "event_id" in table "order_events" has type "mediumint(9)" but 2 other table(s) use type "int(11)" (e.g. shipments, invoices)`, Table: "order_events", LinterName: "type_pedantic"},
 		},
@@ -1163,6 +1224,10 @@ func PreviewCommentLintErrorsBlocked() string {
 		UnsafeChanges: []UnsafeChangeData{
 			{Table: "orders", Reason: `[ERROR] primary_key: Primary key column "id" has type "int"; [WARNING] has_timestamp: Column "created_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.`},
 			{Table: "users", Reason: `[ERROR] rename_column: Column rename detected in table "users": "email" to "email_address". Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled`},
+		},
+		LintRuleNames: []string{"primary_key", "has_timestamp", "rename_column"},
+		LintViolations: []LintViolationData{
+			{Message: `Column "created_at" uses "TIMESTAMP" which overflows on 2038-01-19. Consider using "DATETIME" instead.`, Table: "orders", LinterName: "has_timestamp"},
 		},
 	})
 }

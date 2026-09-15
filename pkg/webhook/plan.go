@@ -1058,11 +1058,20 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 
 	data.DiscardedCopies, data.AdoptedCopies, data.RunningCopies = splitExistingCopies(planResp.ExistingCopies)
 
+	// Preserve rule IDs before splitting findings between Issues and warnings.
+	// The renderer maps these to guides without parsing human-facing messages.
+	for _, finding := range planResp.LintResults {
+		if finding != nil && finding.Linter != "" {
+			data.LintRuleNames = append(data.LintRuleNames, finding.Linter)
+		}
+	}
+
 	// Add lint violations (error-severity results are shown via UnsafeChanges instead)
 	for _, w := range planResp.LintNonErrors() {
 		data.LintViolations = append(data.LintViolations, templates.LintViolationData{
-			Message: w.Message,
-			Table:   w.Table,
+			Message:    w.Message,
+			Table:      w.Table,
+			LinterName: w.Linter,
 		})
 	}
 

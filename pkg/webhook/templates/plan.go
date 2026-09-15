@@ -110,7 +110,10 @@ type PlanCommentData struct {
 
 	Changes        []KeyspaceChangeData
 	LintViolations []LintViolationData
-	Errors         []string
+
+	// LintRuleNames includes rule IDs from findings of every severity.
+	LintRuleNames []string
+	Errors        []string
 
 	// IgnoredNamespaces lists the namespaces whose schema files were excluded
 	// from this plan by the repository's ignore_namespaces config — only entries
@@ -359,6 +362,7 @@ func RenderPlanComment(data PlanCommentData) string {
 	if len(data.LintViolations) > 0 && !data.IsLocked {
 		writeLintViolations(&sb, data.LintViolations)
 	}
+	writeRelatedGuidance(&sb, data.disclosesEverySeverity())
 
 	// Errors
 	if len(data.Errors) > 0 {
@@ -1593,6 +1597,14 @@ func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
 			writeEnvironmentPlanSection(&sb, plan)
 		}
 	}
+
+	var guidanceScopes []guidanceScope
+	for _, env := range data.Environments {
+		if plan := data.Plans[env]; plan != nil && data.Errors[env] == "" {
+			guidanceScopes = append(guidanceScopes, plan.disclosesEverySeverity())
+		}
+	}
+	writeRelatedGuidance(&sb, guidanceScopes...)
 
 	// Footer with apply instructions
 	sb.WriteString("---\n\n")
