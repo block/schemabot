@@ -168,7 +168,7 @@ rejected up front while they are present.
 | Icon | Where it appears | Meaning |
 |---|---|---|
 | ⛔ | Plan comment (**Cannot apply**), unsafe/blocked apply-rejection comments (**Apply rejected**), and the **Apply Blocked** headings where retrying unchanged refuses again (merged/closed PR, failing required checks, missing or untrusted prior-environment check, unlisted environment), plus CLI apply-blocked headings (**Apply blocked**) | Refusal: this will not or did not proceed |
-| ⚠️ | Plan comment (**Issues**), CLI plan output (**Unsafe Changes Detected**) | Caution: unsafe changes to review before applying |
+| ⚠️ | Plan comment (**Issues**), CLI plan output (**Unsafe Changes Detected**), the **Check before applying** heading for destructive changes SchemaBot cannot attribute to the PR, and the stale-base **Apply Blocked** heading cleared by rebasing | Caution: look at this before you apply |
 | 🚨 | Apply-rejection comment; CLI apply output | The `--allow-unsafe` instruction, or (CLI) the banner confirming it was supplied |
 | ⚙️ | Plan and locked apply comments (**Direct execution**) | Consent disclosure for native-DDL statements |
 | 💡 | Plan comment and CLI (**Lint Warnings**) | Advisory best-practice findings |

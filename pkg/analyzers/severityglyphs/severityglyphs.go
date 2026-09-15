@@ -4,6 +4,10 @@
 // per meaning, one meaning per glyph — and every rendering site references
 // the named constant, so the vocabulary cannot drift surface by surface.
 //
+// It also flags glyphs that are not vocabulary members but read as severity
+// beside them (🛑), naming the member each one collapses into, so a sixth
+// level cannot enter through a glyph the vocabulary never defined.
+//
 // The analyzer inspects decoded string values, so escape-spelled glyphs
 // (e.g. "❌") are caught the same as literal ones. It matches on the
 // base codepoints (⚠ U+26A0, ℹ U+2139), so variation-selector forms are
@@ -58,7 +62,7 @@ var severityGlyphs = []struct {
 // drifts.
 var Analyzer = &analysis.Analyzer{
 	Name:     "severityglyphs",
-	Doc:      "flags severity glyph literals (🚨 ⛔ ❌ ⚠️ ℹ️) in non-test files; use the named pkg/glyph constants (callers exclude pkg/glyph itself from the package set)",
+	Doc:      "flags severity glyph literals (🚨 ⛔ ❌ ⚠️ ℹ️), and glyphs that read as severity without being vocabulary members (🛑), in non-test files; use the named pkg/glyph constants (callers exclude pkg/glyph itself from the package set)",
 	Requires: []*analysis.Analyzer{inspect.Analyzer},
 	Run:      run,
 }
