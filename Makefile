@@ -136,7 +136,7 @@ help: ## Show this help message
 	@echo "$$HELP_HEADER"
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
-lint: check-closeandlog check-webhookheaders ## Run all linters (golangci-lint + custom analyzers)
+lint: check-closeandlog check-webhookheaders check-severityglyphs ## Run all linters (golangci-lint + custom analyzers)
 	@echo "Running golangci-lint..."
 	@docker run --rm -v $$(pwd):/app -w /app golangci/golangci-lint:latest golangci-lint run --timeout=5m
 	@echo "Running golangci-lint (consumer module)..."
@@ -150,6 +150,17 @@ check-closeandlog: ## Run closeandlog analyzer (flags _ = x.Close() patterns)
 check-webhookheaders: ## Run webhookheaders analyzer (flags inline `## ...` markdown headers in pkg/webhook handlers)
 	@echo "Running webhookheaders analyzer..."
 	@go run ./cmd/webhookheaders-check $$(go list ./pkg/webhook/... | grep -v '/templates$$')
+
+# pkg/glyph is the vocabulary's home and pkg/analyzers/severityglyphs names the
+# glyphs in its own diagnostics, so both are excluded the same way the
+# pre-commit hook excludes them.
+#
+# The default build is the whole surface: the analyzer skips _test.go files, and
+# no non-test file sits behind a build tag, so a tagged pass would add no
+# coverage while failing on the packages whose files all belong to another tag.
+check-severityglyphs: ## Run severityglyphs analyzer (flags severity glyph literals outside pkg/glyph)
+	@echo "Running severityglyphs analyzer..."
+	@go run ./cmd/severityglyphs-check $$(go list ./... | grep -v '/pkg/glyph$$' | grep -v '/pkg/analyzers/severityglyphs')
 
 lint-fix: ## Run golangci-lint with auto-fix enabled
 	@echo "Running golangci-lint with auto-fix..."
