@@ -320,6 +320,11 @@ const (
 	ApplyOperationKindGroupFinalizer = "group_finalizer"
 )
 
+// OperationKeyDelimiter separates the components of an operation key. A
+// component containing it would make the key ambiguous to split, so producers
+// refuse the delimiter inside a component rather than escaping it.
+const OperationKeyDelimiter = "/"
+
 // ShardOperationKey builds the operation key for one shard's work on one table
 // ("<namespace>/<shard>/<table>"). It is the canonical key for shard-scoped
 // work operations: the control plane's sharded fan-out stamps it on each
@@ -327,7 +332,67 @@ const (
 // plane's operation row, and the task loaders match shard-tagged task rows
 // against it to distinguish drive tasks from reflected per-shard progress rows.
 func ShardOperationKey(namespace, shard, table string) string {
-	return namespace + "/" + shard + "/" + table
+	return namespace + OperationKeyDelimiter + shard + OperationKeyDelimiter + table
+}
+
+// TargetOperationKey builds the operation key for one target's work when a
+// single apply addresses several targets. The target leads the key because it
+// is the coarsest scope: an apply's members are its targets, and any narrower
+// division of one target's work hangs off it.
+//
+// scopedKey is the narrower key within that target, or empty for work that
+// covers the whole target. Passing a ShardOperationKey composes the two, so a
+// sharded target yields one key per (target, namespace, shard, table):
+//
+//	TargetOperationKey("orders-002", "")                                 -> "orders-002"
+//	TargetOperationKey("orders-002", ShardOperationKey("main", "-80", "t")) -> "orders-002/main/-80/t"
+func TargetOperationKey(target, scopedKey string) string {
+	if scopedKey == "" {
+		return target
+	}
+	return target + OperationKeyDelimiter + scopedKey
+}
+
+// CutTargetPrefix removes an operation key's leading target component, reporting
+// whether the key carried one.
+//
+// A key names its target only when that target's deployment addresses more than
+// one, so a reader meets both shapes and cannot tell them apart by inspection: a
+// target named after the namespace it holds produces the same leading component
+// either way. The operation row carries its target, so the prefix is matched
+// rather than guessed — but matching it is not proof that the key is qualified,
+// which is why this reports what it did instead of deciding. Parse the key
+// unqualified first and only fall back to the cut form, so a shape that already
+// reads as a whole key is never mistaken for a qualified one.
+func CutTargetPrefix(target, operationKey string) (scopedKey string, qualified bool) {
+	if target == "" {
+		return operationKey, false
+	}
+	return strings.CutPrefix(operationKey, target+OperationKeyDelimiter)
+}
+
+// PlanIDForOperation resolves which plan an operation executes: its own when it
+// has one, and its parent apply's otherwise. Members of one apply share the
+// apply's plan when they are planned together, and carry their own plan when
+// each was planned against its own live schema.
+//
+// An operation with no plan on either row is not executable — a dispatch would
+// have no DDL to run — so that case is an error rather than a zero return the
+// caller might mistake for a valid plan.
+func PlanIDForOperation(apply *Apply, op *ApplyOperation) (int64, error) {
+	if op == nil {
+		return 0, fmt.Errorf("resolve plan for operation: no operation")
+	}
+	if op.PlanID != 0 {
+		return op.PlanID, nil
+	}
+	if apply == nil {
+		return 0, fmt.Errorf("resolve plan for operation on deployment %q (operation key %q): operation has no plan and its apply was not loaded", op.Deployment, op.OperationKey)
+	}
+	if apply.PlanID == 0 {
+		return 0, fmt.Errorf("resolve plan for operation on deployment %q (operation key %q): neither the operation nor apply %s names a plan", op.Deployment, op.OperationKey, apply.ApplyIdentifier)
+	}
+	return apply.PlanID, nil
 }
 
 // EngineForType returns the engine name for a database type.
@@ -858,6 +923,17 @@ type ApplyOperation struct {
 	// ApplyID points to applies.id. Unique together with Deployment and
 	// OperationKey.
 	ApplyID int64
+
+	// PlanID points to the plans.id this operation executes, when the operation
+	// has a plan of its own. Zero means the operation executes its parent
+	// apply's plan; resolve it with PlanIDForOperation rather than reading this
+	// field directly, so the fallback is applied consistently.
+	//
+	// An operation carries its own plan when the members of one apply do not
+	// share a single desired-vs-live diff — each member is planned against its
+	// own live schema, so each gets its own persisted plan row. Members that do
+	// share the parent's plan leave this zero.
+	PlanID int64
 
 	// Deployment is the Tern deployment name this child row targets
 	// (e.g. "region-a", "payments-eu"). Drawn from the resolved
