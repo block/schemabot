@@ -4077,13 +4077,13 @@ func TestLocalClient_SchemaOverrides(t *testing.T) {
 		assert.Equal(t, "root@tcp(localhost:3306)/bikeshare_eu_qa", checker.req.Credentials.DSN)
 	})
 
-	t.Run("NewLocalClient rejects overrides for non-MySQL targets", func(t *testing.T) {
+	t.Run("NewLocalClient rejects overrides for Vitess targets", func(t *testing.T) {
 		_, err := NewLocalClient(LocalConfig{
 			Database:        "bikeshare",
 			Type:            storage.DatabaseTypeVitess,
 			SchemaOverrides: overrides,
 		}, nil, slog.Default())
-		require.ErrorContains(t, err, "only supported for mysql")
+		require.ErrorContains(t, err, `only supported for mysql and postgres, not "vitess"`)
 	})
 
 	t.Run("NewLocalClient rejects more than one mapping", func(t *testing.T) {

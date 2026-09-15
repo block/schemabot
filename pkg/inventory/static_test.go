@@ -21,6 +21,13 @@ func TestValidateSchemaOverrides(t *testing.T) {
 		{name: "PostgreSQL double quote", databaseType: "postgres", overrides: map[string]string{"svc": `svc"qa`}, wantError: "must not contain a double quote"},
 		{name: "PostgreSQL byte limit", databaseType: "postgres", overrides: map[string]string{"svc": strings.Repeat("a", 64)}, wantError: "63-byte identifier limit"},
 		{name: "PostgreSQL one mapping limit", databaseType: "postgres", overrides: map[string]string{"svc": "svc-qa", "audit": "audit-qa"}, wantError: "exactly one mapping"},
+		{name: "PostgreSQL empty physical name", databaseType: "postgres", overrides: map[string]string{"svc": ""}, wantError: `value "" for key "svc": schema name must not be empty`},
+		{name: "PostgreSQL empty canonical key", databaseType: "postgres", overrides: map[string]string{"": "svc-qa"}, wantError: `key "": schema name must not be empty`},
+		{name: "PostgreSQL trailing whitespace", databaseType: "postgres", overrides: map[string]string{"svc": "svc-qa "}, wantError: "must not have leading or trailing whitespace"},
+		{name: "PostgreSQL leading whitespace", databaseType: "postgres", overrides: map[string]string{"svc": " svc-qa"}, wantError: "must not have leading or trailing whitespace"},
+		{name: "PostgreSQL interior space accepted", databaseType: "postgres", overrides: map[string]string{"svc": "svc qa"}},
+		{name: "PostgreSQL NUL", databaseType: "postgres", overrides: map[string]string{"svc": "svc\x00qa"}, wantError: "must not contain NUL"},
+		{name: "PostgreSQL canonical key held to the same rules", databaseType: "postgres", overrides: map[string]string{`svc"`: "svc-qa"}, wantError: `key "svc\"": schema name must not contain a double quote`},
 		{name: "MySQL rule unchanged", databaseType: "mysql", overrides: map[string]string{"svc": "svc-qa"}, wantError: "only [a-zA-Z0-9_$] is allowed"},
 	}
 
@@ -590,9 +597,9 @@ func TestNewStaticResolverValidatesSchemaOverrides(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name:    "non-mysql target",
+			name:    "vitess target",
 			config:  target(map[string]string{"bikeshare": "bikeshare_eu_qa"}, "vitess"),
-			wantErr: "schema_overrides is only supported for mysql",
+			wantErr: `schema_overrides is only supported for mysql and postgres, not "vitess"`,
 		},
 		{
 			name: "more than one mapping",

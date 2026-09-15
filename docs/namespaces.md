@@ -329,7 +329,7 @@ target_resolver:
         # namespace-free endpoint/credentials
 ```
 
-The canonical namespace stays the name everywhere SchemaBot stores or shows it — requests, plans, tasks, drift comparison, pull responses. The physical name only enters the data plane where the engine addresses the schema.
+The canonical namespace stays the name everywhere SchemaBot labels a namespace — requests, plans, tasks, drift comparison, pull responses. The physical name only enters the data plane where the engine addresses the schema. The one place it is visible to a reviewer is the DDL itself: PostgreSQL statements are schema-qualified, so the SQL a plan shows and an apply executes names the physical schema, exactly as it will run on the target. SchemaBot never rewrites DDL to hide that, and an apply whose stored DDL names a different schema than the target now maps the namespace to is refused rather than executed.
 
 ### Rules
 

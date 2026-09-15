@@ -786,4 +786,63 @@ func TestConnectionIdentityHash(t *testing.T) {
 
 	mysqlWithMetadata := &inventory.Target{Target: "t", DatabaseType: storage.DatabaseTypeMySQL, DSN: rotationOldDSN, Metadata: map[string]string{"pending_drops": "true"}}
 	assert.Equal(t, connectionIdentityHash(mysqlOld), connectionIdentityHash(mysqlWithMetadata), "non-credential metadata does not change the identity")
+
+	overridden := func(physical string) *inventory.Target {
+		return &inventory.Target{Target: "t", DatabaseType: storage.DatabaseTypePostgres, DSN: "postgres://app:secret@orders-db:5432/orders", SchemaOverrides: map[string]string{"svc": physical}}
+	}
+	assert.Equal(t, connectionIdentityHash(overridden("svc_qa")), connectionIdentityHash(overridden("svc_qa")))
+	assert.NotEqual(t, connectionIdentityHash(postgres("")), connectionIdentityHash(overridden("svc_qa")), "adding a schema override is a new connection identity")
+	assert.NotEqual(t, connectionIdentityHash(overridden("svc_qa")), connectionIdentityHash(overridden("svc_qa2")), "re-pointing a namespace at another physical schema is a new connection identity")
+	assert.NotEqual(t, connectionIdentityHash(overridden("svc_qa")), connectionIdentityHash(&inventory.Target{Target: "t", DatabaseType: storage.DatabaseTypePostgres, DSN: "postgres://app:secret@orders-db:5432/orders", SchemaOverrides: map[string]string{"svc_qa": "svc"}}), "the canonical and physical sides of a mapping are not interchangeable")
+}
+
+// TestTargetRouterSchemaOverrideChangeRotatesGeneration pins that editing only
+// a target's schema overrides retires the cached client: the client captures
+// the mapping at construction, so a resolver that now points the namespace at
+// a different physical schema must produce a new client rather than keep
+// routing through the old mapping.
+func TestTargetRouterSchemaOverrideChangeRotatesGeneration(t *testing.T) {
+	resolver := &overridingResolver{physical: "svc_qa"}
+	created := make(map[string]*targetRouterRecordingClient)
+	router := newTargetRouterForTest(t, resolver, nil, nil, created)
+	planSvc := func() {
+		_, err := router.Plan(t.Context(), &ternv1.PlanRequest{
+			Database:    "svc",
+			Type:        storage.DatabaseTypePostgres,
+			Environment: "production",
+			Target:      "dsid-svc-prod",
+		})
+		require.NoError(t, err)
+	}
+
+	planSvc()
+	planSvc()
+	require.Len(t, created, 1, "an unchanged mapping reuses the generation")
+	first := created["svc"]
+	assert.Equal(t, map[string]string{"svc": "svc_qa"}, first.schemaOverrides)
+
+	resolver.physical = "svc_qa2"
+	planSvc()
+
+	require.Len(t, created, 2, "a re-pointed mapping publishes a new generation")
+	second := created["svc#2"]
+	require.NotNil(t, second)
+	assert.Equal(t, map[string]string{"svc": "svc_qa2"}, second.schemaOverrides)
+	assert.True(t, first.closed, "the generation built on the old mapping owns no apply and is closed")
+	assert.False(t, second.closed)
+}
+
+// overridingResolver resolves one PostgreSQL target whose schema override a
+// test can re-point between requests, with the DSN held constant.
+type overridingResolver struct {
+	physical string
+}
+
+func (r *overridingResolver) ResolveTarget(_ context.Context, req inventory.Request) (*inventory.Target, error) {
+	return &inventory.Target{
+		Target:          req.Target,
+		DatabaseType:    storage.DatabaseTypePostgres,
+		DSN:             "postgres://app:secret@svc-db:5432/app",
+		SchemaOverrides: map[string]string{"svc": r.physical},
+	}, nil
 }

@@ -557,6 +557,11 @@ func (c *LocalClient) physicalSchemaFiles(schemaFiles schema.SchemaFiles) (schem
 	return physicalFiles, nil
 }
 
+// canonicalizePlanResult rewrites every namespace the engine reported back to
+// the canonical name the caller requested: the planned changes and the two
+// disclosures (existing copies, exempt tables) that name a namespace an
+// operator will go and look at. A plan that only carries a disclosure must
+// canonicalize it too, or the physical name leaks onto the review surface.
 func (c *LocalClient) canonicalizePlanResult(result *engine.PlanResult) error {
 	for i := range result.Changes {
 		canonical, err := c.canonicalNamespace(result.Changes[i].Namespace)
@@ -564,6 +569,20 @@ func (c *LocalClient) canonicalizePlanResult(result *engine.PlanResult) error {
 			return fmt.Errorf("canonicalize planned namespace: %w", err)
 		}
 		result.Changes[i].Namespace = canonical
+	}
+	for _, existing := range result.ExistingCopies {
+		canonical, err := c.canonicalNamespace(existing.Namespace)
+		if err != nil {
+			return fmt.Errorf("canonicalize existing copy namespace: %w", err)
+		}
+		existing.Namespace = canonical
+	}
+	for _, exempt := range result.ExemptTables {
+		canonical, err := c.canonicalNamespace(exempt.Namespace)
+		if err != nil {
+			return fmt.Errorf("canonicalize exempt tables namespace: %w", err)
+		}
+		exempt.Namespace = canonical
 	}
 	return nil
 }
@@ -607,12 +626,28 @@ func (c *LocalClient) progressWithEngine(ctx context.Context, eng engine.Engine,
 	if !c.remapsPostgresNamespaces() {
 		return result, nil
 	}
+	// A table's namespace on a progress report is a display label the engine
+	// fills in when it can, not a routing key, and the apply it describes is
+	// already running. So the label is canonicalized when it maps, left empty
+	// when the engine did not set it, and left as reported (with a warning)
+	// when it names a schema this target does not map: failing the poll would
+	// turn a healthy apply into a dead one over a label.
 	for i := range result.Tables {
-		canonical, resolveErr := c.canonicalNamespace(result.Tables[i].Namespace)
-		if resolveErr != nil {
-			return nil, fmt.Errorf("canonicalize PostgreSQL progress namespace: %w", resolveErr)
+		table := &result.Tables[i]
+		if table.Namespace == "" {
+			continue
 		}
-		result.Tables[i].Namespace = canonical
+		canonical, resolveErr := c.canonicalNamespace(table.Namespace)
+		if resolveErr != nil {
+			c.logger.Warn("PostgreSQL progress names a schema this target does not map; reporting the label as the engine returned it",
+				"database", c.config.Database,
+				"table", table.Table,
+				"reported_namespace", table.Namespace,
+				"error", resolveErr,
+			)
+			continue
+		}
+		table.Namespace = canonical
 	}
 	return result, nil
 }
@@ -751,9 +786,6 @@ func (c *LocalClient) deferredCutoverSignalExists(ctx context.Context, apply *st
 }
 
 func (c *LocalClient) normalizeSchemaFiles(schemaFiles schema.SchemaFiles) (schema.SchemaFiles, error) {
-	if c.config.Type == storage.DatabaseTypePostgres {
-		return schemaFiles, nil
-	}
 	if c.config.Type != storage.DatabaseTypeMySQL {
 		return schemaFiles, nil
 	}

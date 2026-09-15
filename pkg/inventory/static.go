@@ -50,14 +50,16 @@ type StaticTarget struct {
 	// negligible. Prefer file: refs.
 	DSNFrom  *StaticDSNFromConfig `yaml:"dsn_from,omitempty"`
 	Metadata map[string]string    `yaml:"metadata,omitempty"`
-	// SchemaOverrides maps a requested (canonical) MySQL namespace to the
-	// physical schema name on this target, for targets whose physical schema
-	// names embed environment or region (e.g. bikeshare → bikeshare_eu_qa).
-	// The target DSN stays namespace-free; the mapped physical name is injected
-	// per operation instead of the requested namespace. When non-empty it is a
-	// strict allowlist: a requested namespace without a mapping fails rather
-	// than falling back to the canonical name, so a misrouted request cannot
-	// land in the wrong physical schema. MySQL only; currently limited to a
+	// SchemaOverrides maps a requested (canonical) namespace to the physical
+	// schema name on this target, for targets whose physical schema names
+	// embed environment or region (e.g. bikeshare → bikeshare_eu_qa). On MySQL
+	// the physical name is a database, so the target DSN stays namespace-free
+	// and the mapped name is injected per operation. On PostgreSQL the DSN
+	// names the database and the physical name is a schema within it, swapped
+	// in at the engine boundary. When non-empty it is a strict allowlist: a
+	// requested namespace without a mapping fails rather than falling back to
+	// the canonical name, so a misrouted request cannot land in the wrong
+	// physical schema. MySQL and PostgreSQL only; currently limited to a
 	// single mapping per target.
 	SchemaOverrides map[string]string `yaml:"schema_overrides,omitempty"`
 }
