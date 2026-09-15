@@ -84,3 +84,26 @@ func TestStorageSchemaReportAppliedCount(t *testing.T) {
 	planned.DestructiveAllowed = true
 	assert.Equal(t, 3, planned.appliedCount())
 }
+
+// remainingCount is what the post-convergence log line reports, so it has to
+// agree with Converged about what counts as left over. A manual entry on its
+// own is the case where a count that skipped one set logged zero next to a
+// report that is not converged.
+func TestStorageSchemaReportRemainingCount(t *testing.T) {
+	manualOnly := &StorageSchemaReport{
+		Manual: []StorageSchemaStatement{{Table: "plans", Reason: "column needs a backfill"}},
+	}
+	assert.False(t, manualOnly.Converged())
+	assert.Equal(t, 1, manualOnly.remainingCount(), "a manual entry is still outstanding work")
+
+	all := &StorageSchemaReport{
+		Outstanding: []StorageSchemaStatement{{Table: "applies"}},
+		Destructive: []StorageSchemaStatement{{Table: "stale_state"}},
+		Manual:      []StorageSchemaStatement{{Table: "plans"}},
+	}
+	assert.Equal(t, 3, all.remainingCount())
+
+	converged := &StorageSchemaReport{}
+	assert.True(t, converged.Converged())
+	assert.Equal(t, 0, converged.remainingCount())
+}
