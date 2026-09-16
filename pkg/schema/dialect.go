@@ -18,6 +18,13 @@ const (
 	DialectPostgres Dialect = "postgres"
 
 	FeatureDeferredCutover Feature = "deferred cutover"
+	// FeatureMultiTarget covers addressing several distinct targets from one
+	// database entry, where each target holds its own schema and is planned and
+	// applied on its own. Every operator-facing surface — the plan comment,
+	// progress, the terminal summary — has to represent N targets rather than
+	// one, and that presentation is built per engine, so the feature is enabled
+	// per engine as the work lands rather than assumed available everywhere.
+	FeatureMultiTarget Feature = "multi-target"
 )
 
 // DialectForDatabaseType maps a database_type to its database family for
@@ -45,6 +52,8 @@ func SupportsFeature(databaseType string, feature Feature) bool {
 	switch feature {
 	case FeatureDeferredCutover:
 		return databaseType == "mysql" || databaseType == "vitess"
+	case FeatureMultiTarget:
+		return databaseType == "mysql"
 	default:
 		return false
 	}
