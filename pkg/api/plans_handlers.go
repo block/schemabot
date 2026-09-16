@@ -211,6 +211,11 @@ func storedPlanResponseFromStorage(plan *storage.Plan) *apitypes.StoredPlanRespo
 // planContentFromStorage reconstructs the POST /api/plan response shape from a
 // stored plan so both render through the same code paths. Lint results and
 // errors are not persisted with a plan, so they are always empty here.
+//
+// The member the plan was created against is carried as both halves of its
+// identity. Reporting the deployment alone would read as the member addressing
+// the unnamed target, which is a different member than the one the row records
+// whenever that deployment addresses a named one.
 func planContentFromStorage(plan *storage.Plan) *apitypes.PlanResponse {
 	resp := &apitypes.PlanResponse{
 		PlanID:       plan.PlanIdentifier,
@@ -218,6 +223,7 @@ func planContentFromStorage(plan *storage.Plan) *apitypes.PlanResponse {
 		DatabaseType: plan.DatabaseType,
 		Environment:  plan.Environment,
 		Deployment:   plan.Deployment,
+		Target:       plan.Target,
 		Engine:       storage.EngineForType(plan.DatabaseType),
 		Changes:      []*apitypes.SchemaChangeResponse{},
 		LintResults:  []*apitypes.LintViolationResponse{},
