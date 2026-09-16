@@ -846,3 +846,104 @@ func TestStorageSchemaTargetSuffix(t *testing.T) {
 	assert.Empty(t, storageSchemaTargetSuffix("", ""))
 	assert.Equal(t, " for deployment west in production", storageSchemaTargetSuffix("west", "production"))
 }
+
+// The storage target is resolved once per run. Every resolution of a config
+// using storage.dsn_from is a fresh read of secret references, so a second one
+// can answer differently than the first — and the run that resolved twice would
+// be the one that converged a database its own preview never looked at.
+func TestStorageSchemaTargetFlags_ResolveTheTargetOnce(t *testing.T) {
+	flags := storageSchemaTargetFlags{DSN: "postgres://schemabot@db-1.example:5432/schemabot"}
+	first, err := flags.target()
+	require.NoError(t, err)
+	assert.Equal(t, "--dsn flag", first.source)
+	require.NotNil(t, flags.resolvedTarget)
+
+	// The selectors are emptied, so a second resolution has nothing to resolve
+	// from: an answer at all is the memo answering.
+	flags.DSN = ""
+	second, err := flags.target()
+	require.NoError(t, err)
+	assert.Same(t, first, second, "the target is resolved once; a second read is the same database, not another lookup")
+}
+
+// The resolution travels with the flags that named it. An apply hands its
+// target flags to its own preview, and it is that hand-off — a struct copy —
+// that has to carry the resolved database rather than the selectors that would
+// resolve one again.
+func TestStorageSchemaTargetFlags_CopyCarriesTheResolution(t *testing.T) {
+	flags := storageSchemaTargetFlags{DSN: "schemabot@tcp(db-1.example:3306)/schemabot"}
+	resolved, err := flags.target()
+	require.NoError(t, err)
+
+	preview := StoragePlanCmd{storageSchemaTargetFlags: flags}
+	preview.DSN = ""
+	carried, err := preview.target()
+	require.NoError(t, err)
+	assert.Same(t, resolved, carried, "the preview addresses the database the apply resolved")
+}
+
+// A refused --json convergence is reported as JSON. It is the case a program
+// most needs to read, and nothing ran, so every statement the plan found is
+// still outstanding and both halves of the response are the same report. A
+// human plan printed instead would be unparseable text where a caller expects
+// an object, and the destructive gate alone would print nothing at all.
+func TestStorageApplyCmd_RefusalIsReportedAsJSON(t *testing.T) {
+	tests := []struct {
+		name  string
+		plan  *apitypes.StorageSchemaReport
+		human string
+	}{
+		{
+			name:  "manual remediation",
+			human: "Needs manual remediation",
+			plan: &apitypes.StorageSchemaReport{
+				Dialect:      "postgres",
+				Database:     "schemabot",
+				Host:         "db-1.example",
+				SchemaSource: "the schema embedded in v1.4.0",
+				Manual: []apitypes.StorageSchemaStatement{{
+					Table:     "checks",
+					Operation: "add_column",
+					DDL:       `ALTER TABLE "checks" ADD COLUMN "head_sha" varchar(64) NOT NULL`,
+					Reason:    "definition is NOT NULL without a DEFAULT",
+				}},
+			},
+		},
+		{
+			name:  "destructive statement",
+			human: "Apply blocked",
+			plan: &apitypes.StorageSchemaReport{
+				Dialect:      "mysql",
+				Database:     "schemabot",
+				Host:         "db-1.example",
+				SchemaSource: "the schema embedded in v1.4.0",
+				Destructive: []apitypes.StorageSchemaStatement{
+					{Table: "stale_state", Operation: "drop_table", DDL: "DROP TABLE `stale_state`", Reason: "DROP TABLE destroys data"},
+				},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			endpoint, routes := storageSchemaTestServer(t, tc.plan, nil, nil)
+
+			var err error
+			out := captureStdout(func() {
+				cmd := StorageApplyCmd{AutoApprove: true, JSON: true}
+				err = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
+			})
+
+			require.Error(t, err)
+			assert.Equal(t, []string{"POST /api/storage/schema/plan"}, *routes, "a refusal converges nothing")
+			assert.NotContains(t, out, tc.human, "a program reads this surface, so the refusal is the response shape")
+
+			var response apitypes.StorageSchemaApplyResponse
+			require.NoError(t, json.Unmarshal([]byte(out), &response), "the whole of stdout is the response")
+			require.NotNil(t, response.Planned)
+			require.NotNil(t, response.Remaining)
+			assert.Equal(t, tc.plan.Manual, response.Remaining.Manual)
+			assert.Equal(t, tc.plan.Destructive, response.Remaining.Destructive)
+			assert.Equal(t, response.Planned, response.Remaining, "nothing ran, so what was planned is what is still outstanding")
+		})
+	}
+}

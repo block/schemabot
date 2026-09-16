@@ -358,11 +358,13 @@ not, so a maintenance script keyed on the status gets them right:
 | a change needs manual remediation, so nothing ran | non-zero |
 | the target could not be read, or the DDL failed | non-zero |
 
+<<<<<<< HEAD
 Both non-zero refusals mean the same thing: nothing converged, and a person has
 to decide something before anything does. A script keyed on the status can
 therefore treat them alike and re-read the plan for which one it hit. Under
 `--json` a refusal comes back in the shape a convergence does, so nothing has to
-be re-read to learn which statements were refused.
+be re-read to learn which statements were refused: nothing ran, so the planned
+and the remaining halves of the report are the same.
 
 The one place a refused destructive statement is *not* a failure is a startup
 bootstrap, which skips it and converges the safe remainder (AV-9). That
@@ -487,6 +489,11 @@ runs out, and being told that beats discovering it by sitting there.
 The line only ever appears when a convergence is detected. Its absence is not a
 statement that the database is idle: the same read answers "nothing running"
 and "could not tell", so a plan never claims the second as the first.
+=======
+Under `--json` a refusal comes back in the shape a convergence does, so nothing
+has to be re-read to learn which statements were refused: nothing ran, so the
+planned and the remaining halves of the report are the same.
+>>>>>>> 00d0a351 (fix(cli): answer a refused storage convergence in JSON, and resolve its target once)
 
 ## Converging a release before it rolls
 
