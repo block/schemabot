@@ -168,6 +168,7 @@ func connectionIdentityHash(resolved *inventory.Target) string {
 	for _, canonical := range slices.Sorted(maps.Keys(resolved.SchemaOverrides)) {
 		parts = append(parts, canonical+"\x01"+resolved.SchemaOverrides[canonical])
 	}
+	parts = append(parts, resolved.TableOwner)
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return hex.EncodeToString(sum[:6])
 }
@@ -1033,6 +1034,7 @@ func (r *TargetRouter) clientForTarget(ctx context.Context, target, databaseType
 		TargetDSN:       resolved.DSN,
 		Metadata:        maps.Clone(resolved.Metadata),
 		SchemaOverrides: maps.Clone(resolved.SchemaOverrides),
+		TableOwner:      resolved.TableOwner,
 	}, r.storage, r.logger)
 	if err != nil {
 		publish.done()

@@ -43,6 +43,32 @@ func TestValidateSchemaOverrides(t *testing.T) {
 	}
 }
 
+func TestValidateTableOwner(t *testing.T) {
+	tests := []struct {
+		name, databaseType, owner, wantError string
+	}{
+		{name: "omitted on MySQL", databaseType: "mysql"},
+		{name: "PostgreSQL role", databaseType: "postgres", owner: "app_owner"},
+		{name: "MySQL rejected", databaseType: "mysql", owner: "app_owner", wantError: `only supported for postgres, not "mysql"`},
+		{name: "Vitess rejected", databaseType: "vitess", owner: "app_owner", wantError: `only supported for postgres, not "vitess"`},
+		{name: "byte limit", databaseType: "postgres", owner: strings.Repeat("a", 64), wantError: "63-byte identifier limit"},
+		{name: "double quote", databaseType: "postgres", owner: `app"owner`, wantError: "must not contain a double quote"},
+		{name: "NUL", databaseType: "postgres", owner: "app\x00owner", wantError: "must not contain NUL"},
+		{name: "leading whitespace", databaseType: "postgres", owner: " app_owner", wantError: "leading or trailing whitespace"},
+		{name: "trailing whitespace", databaseType: "postgres", owner: "app_owner ", wantError: "leading or trailing whitespace"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateTableOwner(tt.databaseType, tt.owner)
+			if tt.wantError == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tt.wantError)
+		})
+	}
+}
+
 func TestStaticResolverEnumerate(t *testing.T) {
 	t.Setenv("TARGET_CONFIG", `{"host":"db.example","port":3306}`)
 	t.Setenv("TARGET_PASSWORD", "secret")
@@ -559,6 +585,22 @@ func TestStaticResolverResolveTargetSchemaOverrides(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, map[string]string{"bikeshare": "bikeshare_eu_qa"}, got.SchemaOverrides)
+}
+
+func TestStaticResolverResolveTargetTableOwner(t *testing.T) {
+	resolver, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
+		"bikeshare": {
+			DatabaseType: "postgres",
+			DSN:          "postgres://engine:secret@localhost:5432/bikeshare?sslmode=disable",
+			TableOwner:   "app_owner",
+		},
+	}})
+	require.NoError(t, err)
+
+	got, err := resolver.ResolveTarget(t.Context(), Request{Target: "bikeshare"})
+
+	require.NoError(t, err)
+	assert.Equal(t, "app_owner", got.TableOwner)
 }
 
 func TestStaticResolverResolveTargetClonesSchemaOverrides(t *testing.T) {

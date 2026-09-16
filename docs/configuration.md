@@ -139,12 +139,21 @@ target_resolver:
   targets:
     orders-pg:
       type: postgres
+      table_owner: "app_owner"
       dsn_from:
         config_ref: "secretsmanager:orders-pg-config"
         username: "schemabot"
         password_ref: "secretsmanager:orders-pg-password"
         ca_ref: "embedded:rds-global"   # optional; see below
 ```
+
+`table_owner` selects the role that owns greenfield tables. Create steps use
+`SET LOCAL ROLE` so that role's default privileges apply. Grant the owner role
+to the connected engine role (`GRANT app_owner TO engine`) and grant the owner
+role `USAGE` and `CREATE` on each target schema. The setting is valid only for
+PostgreSQL targets; when omitted, tables are created as the connected role.
+
+`table_owner` is one role per target, deliberately scalar. A per-namespace map mirroring `schema_overrides` is a later extension for a target whose schemas have different owners; no such target exists today.
 
 The referenced config document is JSON with top-level `host`, `port`, and
 `dbname` fields by default; set `config_paths` to read other keys:

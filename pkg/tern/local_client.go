@@ -174,6 +174,10 @@ type LocalConfig struct {
 	// mappings require a namespace-free TargetDSN.
 	SchemaOverrides map[string]string
 
+	// TableOwner is the PostgreSQL role used for greenfield table creation.
+	// Empty preserves creation as the connected role.
+	TableOwner string
+
 	// WakeOperator notifies the owner loop after durable work is recorded — a
 	// queued apply from a dispatch, or an external control request. The callback
 	// must not execute the work itself; it only nudges the storage-claiming
@@ -281,6 +285,9 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 		}
 		cfg.SchemaOverrides = maps.Clone(cfg.SchemaOverrides)
 	}
+	if err := inventory.ValidateTableOwner(cfg.Type, cfg.TableOwner); err != nil {
+		return nil, fmt.Errorf("local client for database %q: %w", cfg.Database, err)
+	}
 
 	// For Vitess databases, create a PlanetScale engine with a client factory
 	// that points at the API base URL from metadata (e.g., "http://localscale:8080").
@@ -342,7 +349,7 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 		postgresEngine: postgres.NewForTarget(cfg.PostgresNativeSafeTableSizeLimitBytes, cfg.PostgresConcurrentIndexMaxDuration, cfg.Database, &engine.Credentials{
 			DSN:      cfg.TargetDSN,
 			Metadata: maps.Clone(cfg.Metadata),
-		}),
+		}).WithTableOwner(cfg.TableOwner),
 		customEngine:      customEngine,
 		psClientFunc:      psClientFunc,
 		logger:            logger,

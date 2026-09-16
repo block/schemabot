@@ -288,7 +288,9 @@ func (e *Engine) runOptimisticApply(ctx context.Context, conn targetConn, change
 	}
 	execute := e.execute
 	if execute == nil {
-		execute = executeOptimistic
+		execute = func(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64, tracker *progress.Tracker, logger *slog.Logger) error {
+			return executeOptimistic(ctx, conn, change, tableSizeLimit, tracker, logger, e.tableOwner)
+		}
 	}
 	err := execute(ctx, conn, change, e.tableSizeLimit, tracker, logger)
 	if err == nil {
@@ -647,6 +649,9 @@ func refusalForCause(err error, table string) *refusal {
 	if errors.Is(err, executor.ErrCreateNamesUnverified) {
 		return createNamesUnverifiedRefusal(table)
 	}
+	if errors.Is(err, executor.ErrCreateOwnerUnverified) {
+		return createOwnerUnverifiedRefusal(table)
+	}
 	if errors.Is(err, preflight.ErrTableNotFound) {
 		return tableNotFoundRefusal(table)
 	}
@@ -660,6 +665,10 @@ func refusalForCause(err error, table string) *refusal {
 	var mismatchErr *executor.CreateNameMismatchError
 	if errors.As(err, &mismatchErr) {
 		return createNameMismatchRefusal(createNameMismatchCause(table, mismatchErr, sequenceStepClause(err)))
+	}
+	var ownerMismatchErr *executor.CreateOwnerMismatchError
+	if errors.As(err, &ownerMismatchErr) {
+		return createOwnerMismatchRefusal(table, ownerMismatchErr)
 	}
 	if errors.Is(err, preflight.ErrSchemaNotFound) {
 		return &refusal{reason: "schema-not-found",
@@ -718,7 +727,8 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		return tableNotFoundRefusal(table), true
 	case executor.CodeEmptySequence, executor.CodeUnsupportedSequenceStep,
 		executor.CodeUnsupportedPartitionedParent, executor.CodeNotConcurrentIndexBuild,
-		executor.CodeUnnamedIndex, executor.CodeUnqualifiedTable:
+		executor.CodeUnnamedIndex, executor.CodeUnqualifiedTable,
+		executor.CodeInvalidBlockingBudget, executor.CodeUnsupportedAcceptedBlocking:
 		// Shape refusals: the executor refused the statement's form at
 		// admission, so retrying the identical plan refails the same way.
 		return &refusal{reason: "unsupported-statement-shape",
@@ -759,7 +769,7 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		executor.CodeCancelledExternally, executor.CodeInvalidIndexOwnLeftover,
 		executor.CodeInvalidIndexAbandoned, executor.CodeInvalidIndexBuildInFlight,
 		executor.CodeInvalidIndexBuilderUnobservable, executor.CodeInvalidIndexUnproven,
-		executor.CodeExecutionFailed:
+		executor.CodeExecutionFailed, executor.CodeBlockingOutcomeUnknown:
 		// Operational outcomes: a bounded lock race, the caller's own
 		// context ending or an external stop, an invalid-index state a retry
 		// recovers or an operator clears or waits out, or a failure outside
@@ -1014,6 +1024,23 @@ func createNamesUnverifiedRefusal(table string) *refusal {
 	}
 }
 
+func createOwnerMismatchRefusal(table string, mismatch *executor.CreateOwnerMismatchError) *refusal {
+	return &refusal{
+		reason: "create-owner-mismatch",
+		cause: fmt.Sprintf("the CREATE TABLE for %s committed with owner %s instead of %s",
+			quotedTable(table), strconv.Quote(mismatch.Actual), strconv.Quote(mismatch.Expected)),
+		remedy: "nothing was repaired; inspect or drop the table, then " + replanRemedy,
+	}
+}
+
+func createOwnerUnverifiedRefusal(table string) *refusal {
+	return &refusal{
+		reason: "create-owner-unverified",
+		cause:  fmt.Sprintf("the CREATE TABLE for %s committed but its owner could not be read back", quotedTable(table)),
+		remedy: "nothing was repaired; inspect or drop the table, then " + replanRemedy,
+	}
+}
+
 func tableNotFoundRefusal(table string) *refusal {
 	return &refusal{
 		reason: "table-not-found",
@@ -1025,7 +1052,7 @@ func tableNotFoundRefusal(table string) *refusal {
 // executeOptimistic runs the planned change through pg-sprite's executors,
 // each feeding the tracker so a concurrent Progress poll reads the step and
 // statement in flight.
-func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64, tracker *progress.Tracker, logger *slog.Logger) error {
+func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64, tracker *progress.Tracker, logger *slog.Logger, tableOwner string) error {
 	poolCfg, err := spritePoolConfig(conn.dsn, conn.caCertPath)
 	if err != nil {
 		return fmt.Errorf("prepare pg-sprite apply pool for table %q: %w", change.table, err)
@@ -1048,7 +1075,7 @@ func executeOptimistic(ctx context.Context, conn targetConn, change nativeApply,
 		// The off-ladder create tier has its own preflight sequence: the
 		// ladder checks below state facts about an existing table, and a
 		// greenfield target has none.
-		return executeCreate(ctx, pool, change, statements, tracker)
+		return executeCreate(ctx, pool, change, statements, tracker, tableOwner)
 	}
 	if len(statements) != 1 {
 		return fmt.Errorf("execute PostgreSQL table %q: privilege tier %s requires exactly one statement, got %d", change.table, tier, len(statements))
@@ -1126,7 +1153,7 @@ func applyTablePreflightLimit(change nativeApply, tableSizeLimit int64) int64 {
 // nothing about apply time. The table size gate deliberately does not run:
 // it bounds rewrites of existing data, and a table that does not exist yet
 // has none.
-func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, statements []string, tracker *progress.Tracker) error {
+func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, statements []string, tracker *progress.Tracker, tableOwner string) error {
 	// The planned statements arrive schema-qualified; the desired-schema
 	// contract wants the unqualified form and the executor pins the schema
 	// from the absence proof instead.
@@ -1142,7 +1169,7 @@ func executeCreate(ctx context.Context, pool *pgxpool.Pool, change nativeApply, 
 	if err != nil {
 		return fmt.Errorf("parse planned CREATE TABLE for table %q: %w", change.table, err)
 	}
-	role, err := preflight.CheckCreatePrivileges(ctx, pool, change.namespace)
+	role, err := preflight.CheckCreatePrivilegesAs(ctx, pool, change.namespace, tableOwner)
 	if err != nil {
 		return fmt.Errorf("check creation access in PostgreSQL schema %q: %w", change.namespace, err)
 	}

@@ -155,6 +155,18 @@ func TestClassifyRefusal(t *testing.T) {
 			wantDetail: []string{`the CREATE TABLE for "users" committed but the table does not own a name the schema file claims`, createNameMismatchRemedy},
 		},
 		{
+			name:       "create owner mismatch leaves the committed table untouched",
+			err:        &executor.CreateOwnerMismatchError{Expected: "app_owner", Actual: "engine"},
+			wantReason: "create-owner-mismatch",
+			wantDetail: []string{`the CREATE TABLE for "users" committed with owner "engine" instead of "app_owner"`, "nothing was repaired"},
+		},
+		{
+			name:       "unverified create owner leaves the committed table untouched",
+			err:        fmt.Errorf("read owner: %w", executor.ErrCreateOwnerUnverified),
+			wantReason: "create-owner-unverified",
+			wantDetail: []string{`the CREATE TABLE for "users" committed`, "owner could not be read back", "nothing was repaired"},
+		},
+		{
 			name: "unverified create names refuse because a retry collides with the committed table",
 			err: fmt.Errorf("execute: %w", &executor.SequenceStepError{
 				Step: 1, Total: 2, Err: fmt.Errorf("%w: %w", executor.ErrCreateNamesUnverified, context.Canceled),
@@ -3230,7 +3242,7 @@ func TestExecuteOptimisticRefusesUnreadableCABundle(t *testing.T) {
 		caCertPath: filepath.Join(t.TempDir(), "missing.pem"),
 	}
 
-	err := executeOptimistic(t.Context(), conn, nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE widgets (id bigint PRIMARY KEY)"}, DefaultNativeSafeTableSizeLimitBytes, newTestTracker(t), slog.Default())
+	err := executeOptimistic(t.Context(), conn, nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE widgets (id bigint PRIMARY KEY)"}, DefaultNativeSafeTableSizeLimitBytes, newTestTracker(t), slog.Default(), "")
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "open pg-sprite apply pool")

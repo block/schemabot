@@ -26,6 +26,9 @@ type Target struct {
 	// falling back to the canonical name. Empty preserves the default
 	// behavior where the requested namespace is the physical schema.
 	SchemaOverrides map[string]string
+	// TableOwner is the PostgreSQL role used for greenfield table creation.
+	// Empty preserves creation as the connected role.
+	TableOwner string
 }
 
 // Resolver resolves opaque execution targets to inventory records.

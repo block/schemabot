@@ -275,7 +275,8 @@ storage:
 target_resolver:
   targets:
     example-target:
-      type: mysql
+      type: postgres
+      table_owner: app_owner
       dsn_from:
         config_ref: secretsmanager:/example/schemabot/target-credentials
         password_ref: secretsmanager:/example/schemabot/target-credentials#password
@@ -286,11 +287,30 @@ target_resolver:
 	cfg, err := LoadServerConfigFromFile(configPath)
 	require.NoError(t, err)
 	target := cfg.TargetResolver.Targets["example-target"]
-	assert.Equal(t, "mysql", target.DatabaseType)
+	assert.Equal(t, "postgres", target.DatabaseType)
+	assert.Equal(t, "app_owner", target.TableOwner)
 	require.NotNil(t, target.DSNFrom)
 	assert.Equal(t, "schemabot", target.DSNFrom.Username)
 	assert.Equal(t, "secretsmanager:/example/schemabot/target-credentials", target.DSNFrom.ConfigRef)
 	assert.Equal(t, "secretsmanager:/example/schemabot/target-credentials#password", target.DSNFrom.PasswordRef)
+}
+
+func TestLoadServerConfigFromFileRejectsTableOwnerForMySQL(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := `
+storage:
+  dsn: env:MYSQL_DSN
+target_resolver:
+  targets:
+    example-target:
+      type: mysql
+      dsn: root@tcp(localhost:3306)/
+      table_owner: app_owner
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(content), 0644), "write config file")
+
+	_, err := LoadServerConfigFromFile(configPath)
+	require.ErrorContains(t, err, `table_owner is only supported for postgres, not "mysql"`)
 }
 
 func TestLoadServerConfigFromFile_NotFound(t *testing.T) {

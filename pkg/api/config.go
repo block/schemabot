@@ -1678,6 +1678,9 @@ func (c *ServerConfig) ValidateExperimentalStrata() error {
 		if err := check(fmt.Sprintf("target %q", name), target.DatabaseType); err != nil {
 			return err
 		}
+		if err := inventory.ValidateTableOwner(strings.ToLower(strings.TrimSpace(target.DatabaseType)), target.TableOwner); err != nil {
+			return fmt.Errorf("target %q: %w", name, err)
+		}
 	}
 	for index, resolver := range c.TargetResolver.Etre {
 		if err := check(fmt.Sprintf("target_resolver.etre[%d]", index), resolver.DatabaseType); err != nil {
