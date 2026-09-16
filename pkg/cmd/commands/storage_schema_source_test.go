@@ -76,10 +76,23 @@ func TestRefuseInsecureRedirect(t *testing.T) {
 
 	// Without a token there is nothing to protect on the wire, so a plaintext
 	// mirror is left alone — it is how a public release is fetched with no
-	// credentials at all.
+	// credentials at all. The hop is still said out loud: the warning on the
+	// configured base URL cannot speak for a host a redirect chose, and the
+	// files arrive over this channel rather than that one.
 	anonymous, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://api.example/repos", nil)
 	require.NoError(t, err)
-	require.NoError(t, refuseInsecureRedirect(anonymous, nil))
+	stderr := captureStderr(t, func() {
+		require.NoError(t, refuseInsecureRedirect(anonymous, nil))
+	})
+	assert.Contains(t, stderr, "read from http://api.example over plaintext")
+
+	// A hop that stays on https carries no such warning, so the one above
+	// means the downgrade rather than the redirect.
+	secure, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://api.example/repos", nil)
+	require.NoError(t, err)
+	assert.Empty(t, captureStderr(t, func() {
+		require.NoError(t, refuseInsecureRedirect(secure, nil))
+	}))
 
 	var chain []*http.Request
 	for range maxStorageSchemaRedirects {
@@ -257,6 +270,23 @@ func TestStorageSchemaFromRelease_RefusalNamesTheRemedy(t *testing.T) {
 	assert.Contains(t, err.Error(), "--schema-dir")
 }
 
+// GitHub reports a repository the caller may not read as missing, so the 404
+// remediation has to name the token as well as the tag. An operator whose only
+// problem is an unset GITHUB_TOKEN would otherwise spend a deploy window
+// re-checking a tag that was never wrong.
+func TestStorageSchemaFromRelease_NotFoundNamesTheTokenToo(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(server.Close)
+	t.Setenv("GITHUB_API_URL", server.URL)
+
+	_, err := (&storageSchemaSourceFlags{Release: "v1.4.0", Repo: "example/private"}).resolve(t.Context(), mysqlDialect)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "check the tag spelling")
+	assert.Contains(t, err.Error(), "GITHUB_TOKEN")
+}
+
 // A rate limit and a permission failure arrive as the same status, and only the
 // headers separate them. They get different remediations because they have
 // different fixes: an operator told to re-issue a token mid-deploy will retry
@@ -346,19 +376,33 @@ func TestStorageSchemaRelease_RefusesTokenOverPlaintext(t *testing.T) {
 // is no token to leak, and a plaintext mirror is a legitimate thing to point
 // $GITHUB_API_URL at — but the desired side of the diff then arrives over a
 // channel anyone on the path can rewrite, and a report built on a rewritten
-// schema reads exactly like a real one. The fetch still has to fail on its own
-// terms afterwards; the warning is not a substitute for the error.
+// schema reads exactly like a real one.
+//
+// The warning is exercised where it is decided rather than through a fetch:
+// an off-box hostname would make this a live DNS lookup and a dial, which the
+// unit layer does not do, and a resolver that wildcards unknown names would
+// hang it for the whole fetch budget. The call site is covered by
+// TestStorageSchemaRelease_QuietOnLoopback, which fetches for real and asserts
+// the warning stays off.
 func TestStorageSchemaRelease_WarnsOnPlaintextWithoutAToken(t *testing.T) {
 	t.Setenv("GITHUB_API_URL", "http://ghe.example")
 	t.Setenv("GITHUB_TOKEN", "")
 	t.Setenv("GH_TOKEN", "")
 
-	stderr := captureStderr(t, func() {
-		_, err := (&storageSchemaSourceFlags{Release: "v1.4.0"}).resolve(t.Context(), mysqlDialect)
-		require.Error(t, err, "the host does not answer; the warning does not stand in for that")
-	})
+	stderr := captureStderr(t, warnIfReleaseHostIsPlaintext)
 	assert.Contains(t, stderr, "read from http://ghe.example over plaintext")
 	assert.Contains(t, stderr, "treat this report as unverified")
+}
+
+// A token turns the same host into a refusal at the request that would carry
+// it, so the warning does not also fire — an operator told "treat this as
+// unverified" about a fetch that never happened is being told about the wrong
+// thing.
+func TestStorageSchemaRelease_QuietOnPlaintextWithAToken(t *testing.T) {
+	t.Setenv("GITHUB_API_URL", "http://ghe.example")
+	t.Setenv("GITHUB_TOKEN", "fetch-token")
+
+	assert.Empty(t, captureStderr(t, warnIfReleaseHostIsPlaintext))
 }
 
 // The warning follows the token refusal's definition of an insecure host, so a

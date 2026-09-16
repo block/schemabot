@@ -289,6 +289,12 @@ func refuseInsecureRedirect(request *http.Request, via []*http.Request) error {
 		return fmt.Errorf("stopped after %d redirects fetching release schema files", maxStorageSchemaRedirects)
 	}
 	if request.Header.Get("Authorization") == "" {
+		// Nothing to leak on this hop, so it is followed. The schema still
+		// arrives over whatever channel the redirect chose, though, and the
+		// warning on the configured base URL cannot speak for a host the
+		// operator never named — so the downgrade says so here instead of
+		// passing silently.
+		warnPlaintextSchemaSource(request.URL)
 		return nil
 	}
 	if err := cmdclient.GuardInsecureToken(request.URL); err != nil {
@@ -331,30 +337,44 @@ func storageSchemaReleaseDirectory(dialect schema.Dialect) (string, error) {
 // applied to a database.
 //
 // It asks GuardInsecureToken what counts as insecure rather than testing the
-// scheme itself, so "plaintext host" has one definition in the CLI â including
+// scheme itself, so "plaintext host" has one definition in the CLI — including
 // its loopback carve-out, which is right here for the same reason: a mirror on
 // the loopback interface has no network path for anything to sit on.
 func warnIfReleaseHostIsPlaintext() {
-	base := storageSchemaReleaseAPIBase()
 	if storageSchemaReleaseToken() != "" {
 		// A token makes this a refusal instead, at the request that would
-		// carry it â see getReleaseContents.
+		// carry it — see getReleaseContents.
 		return
 	}
-	parsed, err := url.Parse(base)
-	if err != nil || cmdclient.GuardInsecureToken(parsed) == nil {
+	parsed, err := url.Parse(storageSchemaReleaseAPIBase())
+	if err != nil {
+		// An unparseable base is the fetch's problem to report, with the
+		// reason; a warning about a URL nothing could read would only add
+		// noise to the error that follows.
+		return
+	}
+	warnPlaintextSchemaSource(parsed)
+}
+
+// warnPlaintextSchemaSource says once, for one URL, that the desired side of
+// the diff is arriving over a channel anyone on the path can rewrite. It is
+// shared by the configured base URL and by every hop a redirect adds, because
+// the property being warned about belongs to the channel the files actually
+// travel over rather than to the address an operator typed.
+func warnPlaintextSchemaSource(u *url.URL) {
+	if cmdclient.GuardInsecureToken(u) == nil {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "%s The schema being compared against is read from %s over plaintext, so anything on the network path can change it before it arrives: treat this report as unverified.\n\n",
-		glyph.Attention, base)
+		glyph.Attention, u.Scheme+"://"+u.Host)
 }
 
 // escapePathSegments escapes a value for use inside a URL path while leaving
 // its separators alone.
 //
 // Escaping the whole value is wrong here: both values this is called with are
-// legitimately multi-segment â an owner/name repository and a directory path
-// within it â and PathEscape would turn their separators into %2F, so every
+// legitimately multi-segment — an owner/name repository and a directory path
+// within it — and PathEscape would turn their separators into %2F, so every
 // fetch would 404 against a path that does exist. Escaping per segment keeps
 // the structure and still encodes a segment carrying a character the path
 // grammar reserves.
@@ -458,7 +478,13 @@ func getReleaseContents(ctx context.Context, client *http.Client, repo, tag, pat
 func releaseContentsError(response *http.Response, repo, tag, path string) error {
 	switch {
 	case response.StatusCode == http.StatusNotFound:
-		return fmt.Errorf("release %s in %s has no %s: check the tag spelling, or pass --release-repo if the release is published elsewhere", tag, repo, path)
+		// 404 is also what GitHub answers for a repository the caller is not
+		// allowed to see, so it cannot be reported as a spelling mistake
+		// alone. An operator whose only problem is a missing token would
+		// otherwise re-check a tag that was never wrong, mid-deploy, while
+		// the advice that would have worked sits in a branch this status
+		// never reaches.
+		return fmt.Errorf("release %s in %s has no %s: check the tag spelling, pass --release-repo if the release is published elsewhere, or — if the repository is private — set GITHUB_TOKEN to a token that can read it, since GitHub reports a repository it will not show you as missing", tag, repo, path)
 	case releaseFetchRateLimited(response):
 		return fmt.Errorf("GitHub rate-limited the fetch of %s at %s from %s (HTTP %d): wait for the limit to reset, or set GITHUB_TOKEN for the larger authenticated budget — or use --schema-dir to read the files from a checkout and not spend any budget at all", path, tag, repo, response.StatusCode)
 	case response.StatusCode == http.StatusUnauthorized, response.StatusCode == http.StatusForbidden:
