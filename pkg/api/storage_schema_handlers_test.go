@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -543,6 +544,62 @@ func TestStorageSchemaRoutes_AllowAdmin(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	assert.True(t, decodePlanResponse(t, rec).Report.Converged)
+}
+
+// slowStorageSchemaService answers after a delay, standing in for the storage
+// database a diff reads and the bootstrap a convergence runs — both of which
+// routinely take longer than the server-wide write timeout allows.
+type slowStorageSchemaService struct {
+	delay time.Duration
+	*fakeStorageSchemaService
+}
+
+func (s *slowStorageSchemaService) StorageSchemaPlan(ctx context.Context, req *ternv1.StorageSchemaPlanRequest) (*ternv1.StorageSchemaPlanResponse, error) {
+	time.Sleep(s.delay)
+	return s.fakeStorageSchemaService.StorageSchemaPlan(ctx, req)
+}
+
+func (s *slowStorageSchemaService) StorageSchemaApply(ctx context.Context, req *ternv1.StorageSchemaApplyRequest) (*ternv1.StorageSchemaApplyResponse, error) {
+	time.Sleep(s.delay)
+	return s.fakeStorageSchemaService.StorageSchemaApply(ctx, req)
+}
+
+// Both routes outlive the server-wide write timeout, because the work they wait
+// on is bounded by budgets larger than it: a diff by its own timeout, and a
+// convergence by the bootstrap's. Without the lift the answer is computed and
+// then never delivered — the connection closes under a request that succeeded,
+// which is the one outcome that leaves an operator unable to tell whether their
+// storage was converged.
+func TestStorageSchemaRoutes_OutliveTheServerWideWriteTimeout(t *testing.T) {
+	svc := newStorageSchemaService(t, &ServerConfig{})
+	svc.SetStorageSchemaService(&slowStorageSchemaService{
+		delay: 300 * time.Millisecond,
+		fakeStorageSchemaService: &fakeStorageSchemaService{
+			planResp: &ternv1.StorageSchemaPlanResponse{Report: storageSchemaReportMessage("schemabot_storage")},
+			applyResp: &ternv1.StorageSchemaApplyResponse{
+				Planned:   storageSchemaReportMessage("schemabot_storage"),
+				Remaining: storageSchemaReportMessage("schemabot_storage"),
+			},
+		},
+	})
+
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+	server := httptest.NewUnstartedServer(mux)
+	server.Config.WriteTimeout = 50 * time.Millisecond
+	server.Start()
+	t.Cleanup(server.Close)
+
+	for _, path := range []string{"/api/storage/schema/plan", "/api/storage/schema/apply"} {
+		t.Run(path, func(t *testing.T) {
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.URL+path, strings.NewReader(`{}`))
+			require.NoError(t, err)
+			resp, err := server.Client().Do(req)
+			require.NoError(t, err, "the route must answer past the server-wide write timeout")
+			defer resp.Body.Close()
+			assert.Equal(t, http.StatusOK, resp.StatusCode)
+		})
+	}
 }
 
 // A half-supplied desired schema is refused. Files with no source produce a
