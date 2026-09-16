@@ -416,7 +416,7 @@ func TestPullRateLimitMetricClampsCallerSuppliedEnvironment(t *testing.T) {
 			for _, dp := range sum.DataPoints {
 				environment, found := dp.Attributes.Value(attribute.Key("environment"))
 				require.True(t, found, "every decision carries an environment attribute")
-				environments[environment.Emit()]++
+				environments[environment.String()]++
 			}
 		}
 	}

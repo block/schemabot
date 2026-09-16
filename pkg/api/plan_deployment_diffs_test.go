@@ -43,6 +43,13 @@ func twoDeploymentService(t *testing.T, eu, us *mockTernClient) *Service {
 	}, logger)
 }
 
+// productionMember names one rollout member of the testapp/production set. Both
+// deployments address the same target, so the deployment half is what
+// distinguishes them here.
+func productionMember(deployment string) routing.ExecutionTarget {
+	return routing.ExecutionTarget{Deployment: deployment, Target: "testapp"}
+}
+
 // productionTargets resolves the testapp/production deployment set the producer
 // tests exercise, so each PlanDeploymentDiffs call is given the same resolved
 // targets the rollup would pass in.
@@ -102,7 +109,7 @@ func TestPlanDeploymentDiffs_PrimaryReusesReviewedPlan(t *testing.T) {
 		}},
 	}
 
-	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, "eu", productionTargets(t, svc))
+	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, productionMember("eu"), productionTargets(t, svc))
 	require.NoError(t, err)
 	require.Len(t, results, 2)
 
@@ -126,7 +133,7 @@ func TestPlanDeploymentDiffs_DiffsAllDeploymentsWhenNoPrimary(t *testing.T) {
 	us := &mockTernClient{planDiffResp: alterUsersDiff("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")}
 	svc := twoDeploymentService(t, eu, us)
 
-	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), nil, "", productionTargets(t, svc))
+	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), nil, routing.ExecutionTarget{}, productionTargets(t, svc))
 	require.NoError(t, err)
 	require.Len(t, results, 2)
 
@@ -144,7 +151,7 @@ func TestPlanDeploymentDiffs_PerDeploymentErrorIsCaptured(t *testing.T) {
 	us := &mockTernClient{planDiffErr: errors.New("deployment unreachable")}
 	svc := twoDeploymentService(t, eu, us)
 
-	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), nil, "", productionTargets(t, svc))
+	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), nil, routing.ExecutionTarget{}, productionTargets(t, svc))
 	require.NoError(t, err, "a single deployment failure must not abort the rollup")
 	require.Len(t, results, 2)
 
@@ -206,7 +213,7 @@ func TestPlanDeploymentDiffs_PreservesShards(t *testing.T) {
 		}},
 	}
 
-	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, "eu", productionTargets(t, svc))
+	results, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, productionMember("eu"), productionTargets(t, svc))
 	require.NoError(t, err)
 	require.Len(t, results, 2)
 
@@ -235,7 +242,7 @@ func TestPlanDeploymentDiffs_PrimaryDeploymentMismatchFailsClosed(t *testing.T) 
 	primaryPlan := &ternv1.PlanResponse{PlanId: "plan_eu", Engine: ternv1.Engine_ENGINE_SPIRIT}
 
 	// targets[0] is "eu", but the reviewed plan was created against "us".
-	_, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, "us", productionTargets(t, svc))
+	_, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, productionMember("us"), productionTargets(t, svc))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "primary invariant violated")
 	assert.Nil(t, eu.planDiffReq, "must fail before diffing any deployment")
@@ -252,7 +259,7 @@ func TestPlanDeploymentDiffs_PrimaryPlanWithoutOriginFailsClosed(t *testing.T) {
 
 	primaryPlan := &ternv1.PlanResponse{PlanId: "plan_eu", Engine: ternv1.Engine_ENGINE_SPIRIT}
 
-	_, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, "", productionTargets(t, svc))
+	_, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), primaryPlan, routing.ExecutionTarget{}, productionTargets(t, svc))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no origin deployment")
 }
@@ -262,7 +269,7 @@ func TestPlanDeploymentDiffs_PrimaryPlanWithoutOriginFailsClosed(t *testing.T) {
 func TestPlanDeploymentDiffs_NoTargetsError(t *testing.T) {
 	svc := twoDeploymentService(t, &mockTernClient{}, &mockTernClient{})
 
-	_, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), nil, "", nil)
+	_, err := svc.PlanDeploymentDiffs(t.Context(), planDiffReq(t), nil, routing.ExecutionTarget{}, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no deployment targets")
 }
