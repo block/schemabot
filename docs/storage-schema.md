@@ -393,6 +393,7 @@ $ schemabot storage apply
 
 📋 Plan: 1 table to alter
 
+
 Do you want to apply these changes to schemabot on db-1.example (mysql)? Only 'yes' will be accepted: yes
 ✓ Ran 1 statement against schemabot on db-1.example. Nothing is outstanding.
 ```
@@ -423,7 +424,7 @@ $ schemabot storage plan --release v1.4.0
 ╰──────────────────────────────────────────────╯
 
 ⚠️ Unsafe Changes Detected:
-  1. check_gate_audit: DROP TABLE destroys data
+  1. check_gate_audit: Unsafe operation detected: "DROP TABLE `check_gate_audit`"
 
 
 These are what schemabot on db-1.example needs in order to match the schema files of release v1.4.0. To converge them, run that release's binary against this database — its container image is that release — or let the release's first boot converge them.
@@ -443,7 +444,7 @@ $ schemabot storage apply
 ╰─────────────────────────────────────────────╯
 
 ⛔ Apply blocked: 1 unsafe change(s) detected
-  1. check_gate_audit: DROP TABLE destroys data
+  1. check_gate_audit: Unsafe operation detected: "DROP TABLE `check_gate_audit`"
 
 🚨 To proceed with these destructive changes, re-run with --allow-unsafe:
 
@@ -467,7 +468,7 @@ $ schemabot storage apply
 ╰─────────────────────────────────────────────╯
 
 ⛔ Needs manual remediation; nothing converges until these are resolved by hand:
-  1. checks: column is NOT NULL without a DEFAULT
+  1. checks: storage table "checks" is missing column "blocked_reason" whose definition is NOT NULL without a DEFAULT; add it manually or ship the column with a DEFAULT
 
 
 Error: refusing to converge storage schema on schemabot on db-2.example (postgres): 1 change(s) need manual remediation first (listed above)
@@ -613,7 +614,7 @@ The four indexes below are the ones a long-lived database is most likely to be
 missing. `storage plan` names whichever of them this database actually needs;
 this list is here for the ones worth pre-creating rather than leaving to a boot.
 Each index is declared in both dialect directories, under a different name in
-each — PostgreSQL index names are database-wide, so they carry the table, while
+each — PostgreSQL index names are schema-wide, so they carry the table, while
 MySQL's are scoped to the table and do not. Create the spelling for the dialect
 your storage runs:
 
