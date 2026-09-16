@@ -203,6 +203,13 @@ Leave the flag false during normal operation and revert it after the removal
 converges. `--allow-unsafe` on the CLI opts in for one invocation; it
 widens the deployment's standing policy and never narrows it.
 
+A locally hosted server is the exception: it never runs destructive storage
+statements, so it refuses the request that opts in rather than honoring it and
+tells you to re-run without the flag or address a deployed server. Local
+hosting cannot say who issued a command, and a local host can be pointed at a
+real deployment's storage, so consent arriving that way is not the consent the
+widening is granted for.
+
 A startup bootstrap and `storage apply` differ in what they do about a
 statement nothing has permitted, and the difference is the point. A booting pod
 skips it and converges the safe remainder, because refusing to start over
@@ -399,10 +406,13 @@ Do you want to apply these changes to schemabot on db-1.example (mysql)? Only 'y
 ```
 
 A preview that finds nothing outstanding still offers the run, and taking it is
-worth a moment: the bootstrap converges more than the catalog. It also clears
-the schema change engine's leftover tables, which outlive a convergence that was
-interrupted and which a diff of the catalog cannot see, so a database whose
-catalog matches can still be carrying them.
+worth a moment: the bootstrap converges more than the catalog. On MySQL it also
+clears the schema change engine's leftover tables, which outlive a convergence
+that was interrupted and which a diff of the catalog cannot see, so a database
+whose catalog matches can still be carrying them. On PostgreSQL there are no
+such tables to clear, and the run re-checks the shape of every storage table
+instead — that each expected index exists, is valid, and is unique where the
+schema requires it — which a catalog diff of columns does not cover.
 
 The preview names the schema embedded in the binary that will run the
 convergence, which is the one thing on this screen the operator cannot choose.
