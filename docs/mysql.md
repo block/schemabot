@@ -22,8 +22,8 @@ and [supported operations and limitations](https://github.com/block/spirit#unsup
 
 ## How a change runs
 
-Spirit first tries instant DDL, then its supported subset of native in-place operations.
-The operation and the actual target table determine which path can run:
+For a single-table `ALTER`, Spirit first tries instant DDL, then its supported subset of native
+in-place operations. The operation and the actual target table determine which path can run:
 
 ![Three DDL examples show Spirit choosing instant column addition, native index rename, or an online copy for an index add](../assets/spirit-ddl-selection.gif)
 
@@ -59,6 +59,9 @@ Spirit's copy uses automatic write-thread scaling by default in SchemaBot, incre
 when capacity permits and backing off under pressure. It still needs room for the replacement
 table and a lock at cutover. For a long-running change, plan for the application's load as well
 as the copy; see [capacity and automatic scaling](throttle.md#capacity-and-automatic-scaling).
+
+For more background, watch Morgan Tocker's [Introducing Spirit](https://www.youtube.com/watch?v=-d-NOzKZxdI)
+talk at MySQL Belgian Days 2024.
 
 ## Checkpointing and resuming a change
 
