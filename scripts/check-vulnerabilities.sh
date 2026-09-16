@@ -28,7 +28,16 @@ GOVULNCHECK_VERSION="${GOVULNCHECK_VERSION:-v1.6.0}"
 GOBIN="$(go env GOPATH)/bin"
 GOVULNCHECK="${GOBIN}/govulncheck"
 
-if [ ! -x "$GOVULNCHECK" ]; then
+# Reuse an existing binary only when it is the pinned version. A developer who
+# already has a different govulncheck installed would otherwise get a different
+# answer from the one CI gets, from the same command, with nothing on screen
+# saying why.
+installed=""
+if [ -x "$GOVULNCHECK" ]; then
+    installed="$("$GOVULNCHECK" -version 2>/dev/null | awk '/^Scanner:/ { print $2 }')" || installed=""
+fi
+
+if [ "$installed" != "govulncheck@${GOVULNCHECK_VERSION}" ]; then
     echo "Installing govulncheck ${GOVULNCHECK_VERSION}..."
     GOFLAGS=-mod=mod go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
 fi
@@ -36,6 +45,10 @@ fi
 # The consumer module has its own go.mod and pins newer versions than the root
 # module, so the root package pattern never reaches it and its graph can carry
 # an advisory the root module's does not.
+#
+# Both modules are scanned even when the first one fails, so a single run
+# reports everything there is to fix. `|| status=$?` assigns only on failure,
+# so a later passing scan cannot clear an earlier failure.
 status=0
 
 echo "Scanning root module..."
