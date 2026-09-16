@@ -63,6 +63,27 @@ func MultiTargetDeployments(members []ExecutionTarget) map[string]bool {
 	return multi
 }
 
+// DisplayNames returns the operator-facing name of each member of a rollout, in
+// the order given. MemberID is the identity every comparison must use, but it is
+// not always the right thing to show: a deployment that addresses exactly one
+// target is already unambiguous, and naming it "deployment/target" everywhere
+// would add a second half that never distinguishes anything. So a member is
+// named by its deployment alone unless its deployment addresses more than one
+// distinct target in this rollout, in which case every member of that deployment
+// is named by its full MemberID.
+func DisplayNames(members []ExecutionTarget) []string {
+	multi := MultiTargetDeployments(members)
+	names := make([]string, len(members))
+	for i, m := range members {
+		if multi[m.Deployment] {
+			names[i] = m.MemberID()
+			continue
+		}
+		names[i] = m.Deployment
+	}
+	return names
+}
+
 // Resolver resolves logical SchemaBot targets to concrete execution targets.
 type Resolver interface {
 	ResolveTargets(ctx context.Context, req Request) ([]ExecutionTarget, error)
