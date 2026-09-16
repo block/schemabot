@@ -168,18 +168,13 @@ type PlanCommentData struct {
 	// reading as an apply in flight.
 	PendingManualConfirmation bool
 
-	// AutoConfirmDowngradeReason states why the apply stopped, as a cause
-	// alone: the footer supplies the instruction that follows it, so a reason
-	// ending in "confirm manually" renders that sentence twice. It is set only
-	// when no section above already explains the cause, since the disclosures
-	// head with their own glyph and name the tables at stake. Empty means the
-	// cause is disclosed above, never that the apply is proceeding.
-	AutoConfirmDowngradeReason string
-
-	// StoppedConfirmedApply marks a downgrade that stopped an apply the
-	// operator confirmed themselves rather than pausing an automatic one, so
-	// the comment names what actually stopped.
-	StoppedConfirmedApply bool
+	// PausedApplyCause discloses why the apply is waiting, as a section among
+	// the other disclosures rather than a line in the footer. Every warning on
+	// this comment is then in one region, marked the same way and carrying the
+	// same kind of detail, and the footer is the same sentence on every
+	// comment. Nil when a disclosure above already explains the cause, never a
+	// signal that the apply is proceeding.
+	PausedApplyCause *PausedApplyCauseData
 
 	RecoveredApplyOwnedCheckState bool
 
@@ -233,15 +228,14 @@ func (d PlanCommentData) applyingWithoutConfirmation() bool {
 	return d.IsLocked && !d.PendingManualConfirmation
 }
 
-// downgradeHeading names what the comment stopped. An operator who issued
-// apply-confirm themselves paused nothing automatic, so telling them an
-// automatic apply was paused would describe a schema change that was never in
-// flight.
-func (d PlanCommentData) downgradeHeading() string {
-	if d.StoppedConfirmedApply {
-		return "Apply stopped"
-	}
-	return "Automatic apply paused"
+// PausedApplyCauseData is a cause the rest of the comment does not already
+// disclose, in the shape every other disclosure uses: a heading naming what is
+// wrong, the specifics behind it, and what the operator can do. Entries may be
+// empty where the cause has no per-table detail to give.
+type PausedApplyCauseData struct {
+	Heading string
+	Entries []string
+	Remedy  string
 }
 
 // KeyspaceChangeData contains changes for a single keyspace/schema.
@@ -359,6 +353,14 @@ func RenderPlanComment(data PlanCommentData) string {
 		writeRunningCopies(&sb, data.RunningCopies, data.applyingWithoutConfirmation())
 	}
 
+	// Why the apply is waiting, when no disclosure above says so. It sits here
+	// rather than in the footer so every warning on the comment is in one
+	// region: the reader meets them in one pass, and the footer stays the same
+	// sentence whatever paused the apply.
+	if data.PausedApplyCause != nil {
+		writePausedApplyCause(&sb, data.PausedApplyCause)
+	}
+
 	// Unsafe changes warning — shown on the plan comment for review, omitted on
 	// the locked apply comment: unsafe changes only reach an apply after the
 	// operator acknowledged them with --allow-unsafe (apply-confirm re-checks
@@ -404,19 +406,10 @@ func RenderPlanComment(data PlanCommentData) string {
 
 		if !data.applyingWithoutConfirmation() {
 			// Automatic apply was downgraded to manual confirmation — show unlock since user needs to act
-			// One line states the outcome, the cause when the reader has not
-			// already met it, and what to do, in that order. A cause disclosed
-			// in a section above is left to that section: it heads with its own
-			// glyph and names the tables at stake, so repeating it here would
-			// put the same warning in front of the reader twice. The glyph
-			// follows the cause for the same reason — it marks a warning the
-			// comment makes nowhere else.
-			if data.AutoConfirmDowngradeReason != "" {
-				fmt.Fprintf(&sb, glyph.Attention+" **%s**: %s — review the plan above, then confirm manually:\n",
-					data.downgradeHeading(), data.AutoConfirmDowngradeReason)
-			} else {
-				fmt.Fprintf(&sb, "**%s** — review the plan above, then confirm manually:\n", data.downgradeHeading())
-			}
+			// The same sentence on every paused comment, whatever paused it.
+			// The cause is a disclosure above, so the footer is only ever the
+			// decision the reader is being asked for.
+			sb.WriteString("**Confirmation required** — review the plan above, then confirm manually:\n")
 			fmt.Fprintf(&sb, "```\n%s\n```\n", applyConfirmCmd)
 			sb.WriteString("\n🔓 To discard this plan and unlock, comment:\n")
 			sb.WriteString("```\nschemabot unlock\n```\n")
@@ -1228,6 +1221,20 @@ func directConsentCopy(databaseType string, isMySQL bool) (headerNoun, footer st
 // policy routes to native DDL, naming each table and the planner's reason
 // (which carries the row estimate). The fixed footer discloses the semantics
 // the operator consents to by confirming the apply.
+// writePausedApplyCause renders the cause in the same shape as the disclosures
+// around it, so a reader scanning for warnings finds this one where they find
+// the rest rather than below the plan in the footer.
+func writePausedApplyCause(sb *strings.Builder, cause *PausedApplyCauseData) {
+	fmt.Fprintf(sb, glyph.Attention+" **%s**\n", cause.Heading)
+	for _, entry := range cause.Entries {
+		fmt.Fprintf(sb, "- %s\n", entry)
+	}
+	if cause.Remedy != "" {
+		fmt.Fprintf(sb, "\n%s\n", cause.Remedy)
+	}
+	sb.WriteString("\n")
+}
+
 func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databaseType string, isMySQL bool) {
 	headerNoun, footer := directConsentCopy(databaseType, isMySQL)
 	n := len(changes)

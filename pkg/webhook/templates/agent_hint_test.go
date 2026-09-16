@@ -119,7 +119,6 @@ func TestLockedApplyPlanCarriesTheAgentHint(t *testing.T) {
 	data.IsLocked = true
 	data.LockOwner = "octocat"
 	data.PendingManualConfirmation = true
-	data.AutoConfirmDowngradeReason = "the plan changed since it was approved"
 
 	rendered := RenderPlanComment(data)
 

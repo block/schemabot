@@ -91,7 +91,7 @@ func TestE2EDirectPlanDowngradesToConfirmThenApplies(t *testing.T) {
 	case body := <-result.comments:
 		assert.Contains(t, body, "⚙️ **Direct execution**", "the locked comment discloses the direct change")
 		assert.Contains(t, body, "runs as native MySQL DDL")
-		assert.Contains(t, body, "**Automatic apply paused** — review the plan above, then confirm manually:")
+		assert.Contains(t, body, "**Confirmation required** — review the plan above, then confirm manually:")
 		assert.NotContains(t, body, glyph.Attention,
 			"the direct-execution disclosure above carries its own glyph and names the statement")
 	case <-time.After(webhookIntegrationPollDeadline):

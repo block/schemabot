@@ -489,7 +489,11 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		h.logger.Info("automatic apply downgraded: could not load plan for DDL comparison",
 			"repo", repo, "pr", pr, "planID", planResp.PlanID, "error", planErr)
 		commentData.PendingManualConfirmation = true
-		commentData.AutoConfirmDowngradeReason = "Could not verify plan"
+		commentData.PausedApplyCause = &templates.PausedApplyCauseData{
+			Heading: "The plan this apply would be checked against could not be read",
+			Remedy: "Nothing has run. The statements above were planned fresh from this pull request; " +
+				"review them, then confirm to apply them.",
+		}
 		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 		headSHA, checkRunErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
 		if checkRunErr != nil {

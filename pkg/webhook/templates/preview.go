@@ -288,7 +288,6 @@ func PreviewCommentPlanCopyDiscardedStopped() string {
 			},
 		},
 		PendingManualConfirmation: true,
-		StoppedConfirmedApply:     true,
 	})
 }
 
@@ -1241,20 +1240,27 @@ func PreviewCommentApplyPlanUnsafe() string {
 // manual confirmation after automatic apply was downgraded by a safety recheck.
 func PreviewCommentApplyPlanDowngraded() string {
 	return RenderPlanComment(PlanCommentData{
-		Database:                   "testapp",
-		SchemaName:                 "testapp",
-		Environment:                "staging",
-		HeadSHA:                    previewHeadSHA,
-		Repository:                 previewRepository,
-		RequestedBy:                previewRequestedBy,
-		IsMySQL:                    true,
-		DatabaseType:               "mysql",
-		Changes:                    samplePlanChanges(),
-		IsLocked:                   true,
-		LockOwner:                  "acme/myapp#42",
-		LockAcquired:               "2026-03-14 10:30:00 UTC",
-		PendingManualConfirmation:  true,
-		AutoConfirmDowngradeReason: "Schema changes differ from auto-plan",
+		Database:                  "testapp",
+		SchemaName:                "testapp",
+		Environment:               "staging",
+		HeadSHA:                   previewHeadSHA,
+		Repository:                previewRepository,
+		RequestedBy:               previewRequestedBy,
+		IsMySQL:                   true,
+		DatabaseType:              "mysql",
+		Changes:                   samplePlanChanges(),
+		IsLocked:                  true,
+		LockOwner:                 "acme/myapp#42",
+		LockAcquired:              "2026-03-14 10:30:00 UTC",
+		PendingManualConfirmation: true,
+		PausedApplyCause: &PausedApplyCauseData{
+			Heading: "Schema changes differ from the plan this apply was started from",
+			Entries: []string{
+				"`products` (alter) is in this plan but not in the one this apply was started from",
+				"`shipments` (create) was in the plan this apply was started from but is not in this one",
+			},
+			Remedy: "The statements above are what will run. Review them, then confirm to apply them.",
+		},
 	})
 }
 

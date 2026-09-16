@@ -1,15 +1,19 @@
 package webhook
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
@@ -142,7 +146,7 @@ func (h *Handler) executeApply(
 		h.logger.Info("automatic apply downgraded: DDL drift detected",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
 		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			"Schema changes differ from auto-plan"); err != nil {
+			planDriftCause(planResp, storedPlan)); err != nil {
 			h.logger.Error("failed to post the DDL-drift downgrade comment",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "error", err)
@@ -157,8 +161,10 @@ func (h *Handler) executeApply(
 	if storedPlan != nil && len(planResp.DirectChanges()) > 0 {
 		h.logger.Info("automatic apply downgraded: plan contains direct-execution changes",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
+		// The direct-execution disclosure is already on this comment, naming
+		// the statements and what running them costs.
 		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			"Plan contains direct-execution changes — review the disclosure and confirm manually"); err != nil {
+			nil); err != nil {
 			h.logger.Error("failed to post the direct-execution downgrade comment",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "error", err)
@@ -186,7 +192,7 @@ func (h *Handler) executeApply(
 		// lands must leave no consent behind: the next attempt stops and asks
 		// again rather than dispatching over a disclosure nobody read.
 		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			""); err != nil {
+			nil); err != nil {
 			h.logger.Error("failed to post the comment disclosing the discard, so no consent was recorded",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "plan_id", planResp.PlanID, "error", err)
@@ -380,7 +386,8 @@ func applyExecutionErrorMessage(err error) string {
 func (h *Handler) postAutoConfirmDowngrade(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult,
-	planResp *apitypes.PlanResponse, environment string, result CommandResult, requestedBy, reason string,
+	planResp *apitypes.PlanResponse, environment string, result CommandResult, requestedBy string,
+	cause *templates.PausedApplyCauseData,
 ) error {
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
@@ -390,10 +397,7 @@ func (h *Handler) postAutoConfirmDowngrade(
 	commentData.DeferCutover = result.DeferCutover
 	commentData.SkipRevert = result.SkipRevert
 	commentData.PendingManualConfirmation = true
-	commentData.AutoConfirmDowngradeReason = reason
-	// An operator who ran apply-confirm themselves paused nothing automatic, so
-	// the comment names what actually stopped: their own apply.
-	commentData.StoppedConfirmedApply = result.Action == action.ApplyConfirm
+	commentData.PausedApplyCause = cause
 	return h.postCommentReportingError(repo, pr, installationID, templates.RenderPlanComment(commentData))
 }
 
@@ -472,6 +476,48 @@ type planChangeIdentity struct {
 	table     string
 	operation string
 	ddl       string
+}
+
+// planDriftEntryCap bounds the drift disclosure. A re-plan that differs in
+// dozens of changes has already told the reader what they need — the plan they
+// are looking at is not the one the apply started from — and listing every one
+// buries the statements above it.
+const planDriftEntryCap = 8
+
+// planDriftCause describes how the re-plan differs from the plan the apply was
+// started from, per table, so the reader can see what moved without diffing two
+// comments themselves. The DDL itself is not repeated: the statements that will
+// run are already fenced above this disclosure.
+func planDriftCause(planResp *apitypes.PlanResponse, storedPlan *storage.Plan) *templates.PausedApplyCauseData {
+	now := responsePlanIdentities(planResp)
+	started := storedPlanIdentities(storedPlan)
+
+	var entries []string
+	appendEntries := func(from, against map[planChangeIdentity]int, phrase string) {
+		identities := slices.SortedFunc(maps.Keys(from), func(a, b planChangeIdentity) int {
+			return cmp.Or(cmp.Compare(a.table, b.table), cmp.Compare(a.operation, b.operation))
+		})
+		for _, id := range identities {
+			if against[id] >= from[id] {
+				continue
+			}
+			entries = append(entries, fmt.Sprintf("`%s` (%s) %s", id.table, id.operation, phrase))
+		}
+	}
+	appendEntries(now, started, "is in this plan but not in the one this apply was started from")
+	appendEntries(started, now, "was in the plan this apply was started from but is not in this one")
+
+	if len(entries) > planDriftEntryCap {
+		remaining := len(entries) - planDriftEntryCap
+		entries = append(entries[:planDriftEntryCap:planDriftEntryCap],
+			fmt.Sprintf("and %d more %s", remaining, ui.PluralizeLabel("change", "changes", remaining)))
+	}
+
+	return &templates.PausedApplyCauseData{
+		Heading: "Schema changes differ from the plan this apply was started from",
+		Entries: entries,
+		Remedy:  "The statements above are what will run. Review them, then confirm to apply them.",
+	}
 }
 
 // ddlMatchesStoredPlan reports whether the re-plan describes the same set of

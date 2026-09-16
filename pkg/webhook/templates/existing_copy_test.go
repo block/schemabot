@@ -508,12 +508,12 @@ func TestRenderPlanComment_NoCopySectionOnCleanTarget(t *testing.T) {
 	assert.NotContains(t, out, "work in progress")
 }
 
-// A downgrade is two facts: that the comment is waiting on the operator, and
-// why. They are separate fields because a cause already disclosed above leaves
-// the second empty, and the comment must still read as a question. This pins
-// the pairing in both directions — a paused comment never announces an apply
-// in flight, and a cause never renders on one that is not paused.
-func TestRenderPlanComment_PausedCommentNeverReadsAsAnApplyInFlight(t *testing.T) {
+// Every paused comment closes on the same sentence, and every warning on it
+// sits in the disclosure region above the plan. This pins both halves: the
+// footer never varies with what paused the apply, and the cause is marked once
+// whether a disclosure already covers it or the paused-cause section supplies
+// it.
+func TestRenderPlanComment_PausedCommentsCloseTheSameWayAndWarnOnce(t *testing.T) {
 	base := PlanCommentData{
 		Database: "testapp", Environment: "staging", IsMySQL: true, IsLocked: true,
 		Changes: []KeyspaceChangeData{{
@@ -521,37 +521,45 @@ func TestRenderPlanComment_PausedCommentNeverReadsAsAnApplyInFlight(t *testing.T
 			Statements: []string{"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)"},
 		}},
 	}
+	const footer = "**Confirmation required** — review the plan above, then confirm manually:"
 
-	// Paused with the cause disclosed above: the footer carries the instruction
-	// alone, and the comment is still a question.
+	// A disclosure above already explains the pause, so no paused-cause
+	// section is set and the comment warns once.
 	disclosed := base
 	disclosed.PendingManualConfirmation = true
 	disclosed.DiscardedCopies = []ExistingCopyData{
 		{Namespace: "testapp", Tables: []string{"orders"}, Reason: engine.DiscardStatementDiffers, Age: "3h 12m"},
 	}
 	out := RenderPlanComment(disclosed)
-	assert.Contains(t, out, "**Automatic apply paused** — review the plan above, then confirm manually:")
+	assert.Contains(t, out, footer)
 	assert.NotContains(t, out, "**Applying automatically**",
-		"an empty reason means the cause is disclosed above, never that the apply is proceeding")
+		"a nil cause means the reason is disclosed above, never that the apply is proceeding")
 	assert.Equal(t, 1, strings.Count(out, "⚠️"),
 		"the cause is surfaced once, by the section that explains it in full")
 
-	// Paused with nothing above to explain it: the footer states the cause,
-	// because it is the only place it appears.
+	// Nothing above explains the pause, so the cause is its own disclosure —
+	// same region, same marker, same closing sentence.
 	alone := base
 	alone.PendingManualConfirmation = true
-	alone.AutoConfirmDowngradeReason = "Could not verify plan"
+	alone.PausedApplyCause = &PausedApplyCauseData{
+		Heading: "The plan this apply would be checked against could not be read",
+		Entries: []string{"`orders` (alter) is in this plan"},
+		Remedy:  "Nothing has run. Review the statements above, then confirm to apply them.",
+	}
 	out = RenderPlanComment(alone)
-	assert.Contains(t, out, "⚠️ **Automatic apply paused**: Could not verify plan — review the plan above, then confirm manually:")
-	assert.Equal(t, 1, strings.Count(out, "⚠️"),
-		"nothing above states this cause, so the footer is where the warning is made")
+	assert.Contains(t, out, "⚠️ **The plan this apply would be checked against could not be read**\n"+
+		"- `orders` (alter) is in this plan\n")
+	assert.Contains(t, out, "Nothing has run. Review the statements above, then confirm to apply them.")
+	assert.Contains(t, out, footer)
+	assert.Equal(t, 1, strings.Count(out, "⚠️"))
 	assert.NotContains(t, out, "**Applying automatically**")
+	assert.Less(t, strings.Index(out, "⚠️"), strings.Index(out, footer),
+		"the warning belongs above the plan with the other disclosures, not in the footer")
 
-	// Not paused: an apply already under way asks nothing, so no confirm
-	// instruction and no cause reach the reader.
-	running := base
-	out = RenderPlanComment(running)
+	// An apply already under way asks nothing, so neither the closing sentence
+	// nor a cause reaches the reader.
+	out = RenderPlanComment(base)
 	assert.Contains(t, out, "**Applying automatically**")
 	assert.NotContains(t, out, "review the plan above, then confirm manually")
-	assert.NotContains(t, out, "Automatic apply paused")
+	assert.NotContains(t, out, "Confirmation required")
 }

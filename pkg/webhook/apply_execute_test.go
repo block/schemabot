@@ -267,3 +267,56 @@ func TestDisclosureDescribesThisApply(t *testing.T) {
 		})
 	}
 }
+
+// The drift disclosure names what moved, per table, so the operator can see it
+// without diffing two comments themselves. It reports both directions — a
+// change this plan added, and one the plan behind the apply had that this one
+// does not — since either is a reason to look again before confirming.
+func TestPlanDriftCause(t *testing.T) {
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{
+			{Namespace: "mydb", TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "users", ChangeType: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+				{TableName: "products", ChangeType: "alter", DDL: "ALTER TABLE `products` ADD INDEX `idx_sku` (`sku`)"},
+			}},
+		},
+	}
+	storedPlan := &storage.Plan{
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"mydb": {Tables: []storage.TableChange{
+				{Table: "users", Operation: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+				{Table: "shipments", Operation: "create", DDL: "CREATE TABLE `shipments` (`id` bigint)"},
+			}},
+		},
+	}
+
+	cause := planDriftCause(planResp, storedPlan)
+
+	assert.Equal(t, "Schema changes differ from the plan this apply was started from", cause.Heading)
+	assert.Equal(t, []string{
+		"`products` (alter) is in this plan but not in the one this apply was started from",
+		"`shipments` (create) was in the plan this apply was started from but is not in this one",
+	}, cause.Entries, "the unchanged `users` alter is not drift and is not listed")
+	assert.Contains(t, cause.Remedy, "The statements above are what will run")
+}
+
+// A re-plan that differs in dozens of changes has already made its point, and
+// listing every one buries the statements the operator came to read.
+func TestPlanDriftCauseCapsTheEntryList(t *testing.T) {
+	var tableChanges []*apitypes.TableChangeResponse
+	for i := range planDriftEntryCap + 3 {
+		tableChanges = append(tableChanges, &apitypes.TableChangeResponse{
+			TableName:  fmt.Sprintf("t%02d", i),
+			ChangeType: "create",
+			DDL:        fmt.Sprintf("CREATE TABLE `t%02d` (`id` bigint)", i),
+		})
+	}
+
+	cause := planDriftCause(
+		&apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{{Namespace: "mydb", TableChanges: tableChanges}}},
+		&storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"mydb": {}}},
+	)
+
+	assert.Len(t, cause.Entries, planDriftEntryCap+1)
+	assert.Equal(t, "and 3 more changes", cause.Entries[planDriftEntryCap])
+}
