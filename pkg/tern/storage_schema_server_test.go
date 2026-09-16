@@ -133,3 +133,82 @@ func TestServerStorageSchemaInternalAnswersNameNoInfrastructure(t *testing.T) {
 	assert.NotContains(t, message, "db.example")
 	assert.NotContains(t, message, "hunter2")
 }
+
+// storageSchemaStaticService answers both RPCs with a fixed report, standing in
+// for a data plane whose adapter read its own storage.
+type storageSchemaStaticService struct {
+	plan  *ternv1.StorageSchemaPlanResponse
+	apply *ternv1.StorageSchemaApplyResponse
+}
+
+func (s storageSchemaStaticService) StorageSchemaPlan(context.Context, *ternv1.StorageSchemaPlanRequest) (*ternv1.StorageSchemaPlanResponse, error) {
+	return s.plan, nil
+}
+
+func (s storageSchemaStaticService) StorageSchemaApply(context.Context, *ternv1.StorageSchemaApplyRequest) (*ternv1.StorageSchemaApplyResponse, error) {
+	return s.apply, nil
+}
+
+// What the adapter answered is what the caller reads, over a real connection.
+// Every statement a control plane renders — including the one the data plane
+// refused as destructive — crosses the wire here, so a report that arrived
+// short a list, or with one list's statements under another's name, would tell
+// an operator that a DROP runs automatically or that nothing is outstanding at
+// all.
+func TestServerStorageSchemaAnswersWhatTheAdapterReported(t *testing.T) {
+	outstanding := &ternv1.StorageSchemaStatement{
+		Table:     "apply_operations",
+		Operation: "add_column",
+		Ddl:       `ALTER TABLE "apply_operations" ADD COLUMN "operation_kind" varchar(32) NOT NULL DEFAULT 'work'`,
+	}
+	destructive := &ternv1.StorageSchemaStatement{
+		Table:     "vitess_tasks",
+		Operation: "drop_table",
+		Ddl:       `DROP TABLE "vitess_tasks"`,
+		Reason:    "DROP TABLE destroys data",
+	}
+	report := &ternv1.StorageSchemaReport{
+		Dialect:      "postgres",
+		Database:     "schemabot",
+		Host:         "storage.db.example:5432",
+		SchemaSource: "the schema embedded in v0.1.68",
+		Version:      "v0.1.68",
+		Outstanding:  []*ternv1.StorageSchemaStatement{outstanding},
+		Destructive:  []*ternv1.StorageSchemaStatement{destructive},
+	}
+	client := newRetryTestClient(t, NewServer(nil, slog.New(slog.DiscardHandler),
+		WithStorageSchemaService(storageSchemaStaticService{
+			plan: &ternv1.StorageSchemaPlanResponse{Report: report},
+			apply: &ternv1.StorageSchemaApplyResponse{
+				Planned:   report,
+				Remaining: &ternv1.StorageSchemaReport{Dialect: "postgres", Database: "schemabot", Destructive: []*ternv1.StorageSchemaStatement{destructive}},
+			},
+		})))
+
+	plan, err := client.StorageSchemaPlan(t.Context(), &ternv1.StorageSchemaPlanRequest{})
+	require.NoError(t, err)
+	require.NotNil(t, plan.GetReport())
+	assert.Equal(t, "schemabot", plan.GetReport().GetDatabase())
+	assert.Equal(t, "storage.db.example:5432", plan.GetReport().GetHost())
+	assert.Equal(t, "the schema embedded in v0.1.68", plan.GetReport().GetSchemaSource())
+	require.Len(t, plan.GetReport().GetOutstanding(), 1)
+	assert.Equal(t, "apply_operations", plan.GetReport().GetOutstanding()[0].GetTable())
+	assert.Contains(t, plan.GetReport().GetOutstanding()[0].GetDdl(), "operation_kind")
+	require.Len(t, plan.GetReport().GetDestructive(), 1)
+	assert.Equal(t, "DROP TABLE destroys data", plan.GetReport().GetDestructive()[0].GetReason(),
+		"a refused statement arrives with why it was refused, not as one that runs")
+
+	// Both halves of a convergence arrive: what ran and what is still
+	// outstanding are different answers, and an operator deciding whether the
+	// storage is ready reads the difference between them.
+	apply, err := client.StorageSchemaApply(t.Context(), &ternv1.StorageSchemaApplyRequest{Caller: "operator@example.com"})
+	require.NoError(t, err)
+	require.NotNil(t, apply.GetPlanned())
+	require.NotNil(t, apply.GetRemaining())
+	require.Len(t, apply.GetPlanned().GetOutstanding(), 1)
+	assert.Equal(t, "apply_operations", apply.GetPlanned().GetOutstanding()[0].GetTable())
+	assert.Empty(t, apply.GetRemaining().GetOutstanding(), "the column converged")
+	require.Len(t, apply.GetRemaining().GetDestructive(), 1)
+	assert.Equal(t, "vitess_tasks", apply.GetRemaining().GetDestructive()[0].GetTable(),
+		"the refused statement is still outstanding")
+}
