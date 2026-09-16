@@ -150,7 +150,7 @@ func writeStorageSchemaBody(report *apitypes.StorageSchemaReport, isApply bool, 
 			severity = glyph.Refused
 		}
 		templates.WriteChangeNotice(severity,
-			"Needs manual remediation; nothing converges until these are resolved by hand:",
+			"Needs manual remediation; nothing converges until these are resolved:",
 			storageSchemaNotices(report.Manual))
 	}
 
@@ -254,7 +254,7 @@ func outputStorageSchemaConvergence(planned, remaining *apitypes.StorageSchemaRe
 		return nil
 	}
 	return writeStorageSchemaBody(remaining, true, rerun, []string{
-		"These were not run. A destructive statement is refused unless --allow-unsafe is passed; a manual entry has to be resolved by hand before anything else converges.",
+		"These were not run. A destructive statement is refused unless --allow-unsafe is passed; a manual remediation blocks everything else until it is resolved.",
 	})
 }
 
