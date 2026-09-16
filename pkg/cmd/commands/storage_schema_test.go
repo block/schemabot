@@ -415,10 +415,9 @@ func TestStorageApplyCmd_DestructiveStatementsBlockTheConvergence(t *testing.T) 
 }
 
 // A manual-remediation entry is the refusal an operator is told about, even
-// when destructive statements are outstanding too. It gates the whole drift
-// set, so the destructive ones are not yet reachable — and the plan renders
-// everything as gated while one is outstanding, so stopping on the destructive
-// statements instead would exit non-zero with nothing on screen saying why.
+// when destructive statements are outstanding too. It blocks the whole drift
+// set, so the destructive ones are not yet reachable, and offering consent for
+// them would name a flag that permits a DROP and converges nothing.
 func TestStorageApplyCmd_ManualRemediationOutranksTheDestructiveRefusal(t *testing.T) {
 	plan := &apitypes.StorageSchemaReport{
 		Dialect:      "mysql",
