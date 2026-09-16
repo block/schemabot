@@ -670,6 +670,14 @@ func refusalForCause(err error, table string) *refusal {
 	if errors.As(err, &ownerMismatchErr) {
 		return createOwnerMismatchRefusal(table, ownerMismatchErr)
 	}
+	if errors.Is(err, preflight.ErrCreateOwnerNotFound) {
+		// The owner is target configuration and the server has no such
+		// role: the same environmental class as a missing grant, decided
+		// before anything runs, but with no grantee for a GRANT to name.
+		return &refusal{reason: "insufficient-privileges",
+			cause:  fmt.Sprintf("the configured table owner for %s is not a role on the target", quotedTable(table)),
+			remedy: "create the role or correct the target's table_owner, then re-plan"}
+	}
 	if errors.Is(err, preflight.ErrSchemaNotFound) {
 		return &refusal{reason: "schema-not-found",
 			cause:  fmt.Sprintf("the schema that would hold table %s does not exist on the target", quotedTable(table)),
@@ -703,6 +711,17 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		// decides the verdict before control reaches here; this arm keeps
 		// the switch total and gives the bare code the same verdict.
 		return createNamesUnverifiedRefusal(table), true
+	case executor.CodeCreateOwnerMismatch:
+		// Like the name mismatch, the code is only ever carried by the typed
+		// error naming both roles, which refusalForCause decides on first;
+		// this arm gives the bare code the same verdict with a cause that
+		// knows only that the owner differs.
+		return createOwnerMismatchRefusal(table, nil), true
+	case executor.CodeCreateOwnerUnverified:
+		// The sentinel is present whenever this code is, so refusalForCause
+		// decides the verdict before control reaches here; this arm keeps
+		// the switch total and gives the bare code the same verdict.
+		return createOwnerUnverifiedRefusal(table), true
 	case executor.CodeDuplicateCreateName:
 		// The cause says only what the set did; the remedy names the
 		// relation kinds that can repeat a name — a CREATE INDEX name that
@@ -728,12 +747,29 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 	case executor.CodeEmptySequence, executor.CodeUnsupportedSequenceStep,
 		executor.CodeUnsupportedPartitionedParent, executor.CodeNotConcurrentIndexBuild,
 		executor.CodeUnnamedIndex, executor.CodeUnqualifiedTable,
-		executor.CodeInvalidBlockingBudget, executor.CodeUnsupportedAcceptedBlocking:
+		executor.CodeUnsupportedAcceptedBlocking:
 		// Shape refusals: the executor refused the statement's form at
 		// admission, so retrying the identical plan refails the same way.
 		return &refusal{reason: "unsupported-statement-shape",
 			cause:  fmt.Sprintf("the planned statement for %s is not a shape the native-safe path can run", quotedTable(table)),
 			remedy: "rewrite the schema change and re-plan"}, true
+	case executor.CodeInvalidBlockingBudget:
+		// The bound is the engine's configuration, not the statement's
+		// form: no edit to a schema file changes it, so the remedy points
+		// at the budget instead of at the schema change.
+		return &refusal{reason: "invalid-blocking-budget",
+			cause:  fmt.Sprintf("the blocking budget for the change to %s is not a bound the engine can enforce", quotedTable(table)),
+			remedy: "correct the engine's blocking budget configuration, then re-run"}, true
+	case executor.CodeBlockingOutcomeUnknown:
+		// The statement's commit was sent and its answer never arrived, so
+		// whether the change landed is open. The engine leaves the retry
+		// decision to its adapter; SchemaBot's retry re-runs the identical
+		// statement, which replays a committed blocking DDL onto its own
+		// result, so the apply fails closed until an operator has read the
+		// catalog.
+		return &refusal{reason: "blocking-outcome-unknown",
+			cause:  fmt.Sprintf("whether the blocking statement for %s committed is unknown", quotedTable(table)),
+			remedy: "inspect the target catalog before re-running"}, true
 	case executor.CodeBudgetStatementExceeded:
 		// Normally consumed upstream by the typed BudgetError arm, which
 		// renders the budget's own figures; this mapping keeps the outcome
@@ -769,13 +805,12 @@ func refusalForOutcome(code executor.Code, table string) (*refusal, bool) {
 		executor.CodeCancelledExternally, executor.CodeInvalidIndexOwnLeftover,
 		executor.CodeInvalidIndexAbandoned, executor.CodeInvalidIndexBuildInFlight,
 		executor.CodeInvalidIndexBuilderUnobservable, executor.CodeInvalidIndexUnproven,
-		executor.CodeExecutionFailed, executor.CodeBlockingOutcomeUnknown:
+		executor.CodeExecutionFailed:
 		// Operational outcomes: a bounded lock race, the caller's own
 		// context ending or an external stop, an invalid-index state a retry
 		// recovers or an operator clears or waits out, or a failure outside
-		// the typed set.
-		// A retry can succeed once conditions change, so none is a permanent
-		// refusal.
+		// the typed set. A retry can succeed once conditions change, so
+		// none is a permanent refusal.
 		return nil, true
 	}
 	return nil, false
@@ -1024,15 +1059,28 @@ func createNamesUnverifiedRefusal(table string) *refusal {
 	}
 }
 
+// createOwnerMismatchRefusal names both roles when the typed error carries
+// them; a nil mismatch is the bare code, which knows only that the owner
+// differs. Either way the table stands as committed: the executor never
+// repairs ownership, so the operator inspects or drops it before a re-plan.
 func createOwnerMismatchRefusal(table string, mismatch *executor.CreateOwnerMismatchError) *refusal {
+	cause := fmt.Sprintf("the CREATE TABLE for %s committed under a role other than the configured owner", quotedTable(table))
+	if mismatch != nil {
+		cause = fmt.Sprintf("the CREATE TABLE for %s committed with owner %s instead of %s",
+			quotedTable(table), strconv.Quote(mismatch.Actual), strconv.Quote(mismatch.Expected))
+	}
 	return &refusal{
 		reason: "create-owner-mismatch",
-		cause: fmt.Sprintf("the CREATE TABLE for %s committed with owner %s instead of %s",
-			quotedTable(table), strconv.Quote(mismatch.Actual), strconv.Quote(mismatch.Expected)),
+		cause:  cause,
 		remedy: "nothing was repaired; inspect or drop the table, then " + replanRemedy,
 	}
 }
 
+// createOwnerUnverifiedRefusal is decided by the wrap, not by the cause it
+// carries, for the same reason as createNamesUnverifiedRefusal: pg-sprite
+// leaves the outcome retryable because the owner read could be repeated on
+// its own, but SchemaBot's retry re-runs the identical plan, whose CREATE
+// TABLE has already committed.
 func createOwnerUnverifiedRefusal(table string) *refusal {
 	return &refusal{
 		reason: "create-owner-unverified",

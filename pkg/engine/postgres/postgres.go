@@ -555,8 +555,9 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 			blockChangesAtTier(changes, tiers, tier, r.detail)
 			continue
 		}
-		// Any other refusal is a property of the table itself — vanished, or
-		// not an ordinary table — so it holds for every executable step.
+		// Any other refusal is a property of the table itself — vanished,
+		// not an ordinary table, or to be created for an owner the target
+		// has no role for — so it holds for every executable step.
 		blockExecutableChanges(changes, r.detail)
 		return changes, nil
 	}

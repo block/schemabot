@@ -152,8 +152,12 @@ target_resolver:
 to the connected engine role (`GRANT app_owner TO engine`) and grant the owner
 role `USAGE` and `CREATE` on each target schema. The setting is valid only for
 PostgreSQL targets; when omitted, tables are created as the connected role.
+An owner the engine role cannot assume, or one the target has no role for,
+blocks the create step at plan time with the grant or correction it needs.
 
-`table_owner` is one role per target, deliberately scalar. A per-namespace map mirroring `schema_overrides` is a later extension for a target whose schemas have different owners; no such target exists today.
+`table_owner` is one role per target, deliberately scalar. A per-namespace
+map mirroring `schema_overrides` is a later extension for a target whose
+schemas have different owners; no such target exists today.
 
 The referenced config document is JSON with top-level `host`, `port`, and
 `dbname` fields by default; set `config_paths` to read other keys:

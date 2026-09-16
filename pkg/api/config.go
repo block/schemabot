@@ -1678,9 +1678,6 @@ func (c *ServerConfig) ValidateExperimentalStrata() error {
 		if err := check(fmt.Sprintf("target %q", name), target.DatabaseType); err != nil {
 			return err
 		}
-		if err := inventory.ValidateTableOwner(strings.ToLower(strings.TrimSpace(target.DatabaseType)), target.TableOwner); err != nil {
-			return fmt.Errorf("target %q: %w", name, err)
-		}
 	}
 	for index, resolver := range c.TargetResolver.Etre {
 		if err := check(fmt.Sprintf("target_resolver.etre[%d]", index), resolver.DatabaseType); err != nil {
@@ -1690,9 +1687,25 @@ func (c *ServerConfig) ValidateExperimentalStrata() error {
 	return nil
 }
 
+// validateTargetTableOwners rejects a table_owner on a static target whose
+// engine has no such setting or whose value is not a well-formed role name.
+// The same check runs when the static resolver is built; running it here
+// too surfaces the fault at config load, as with every other static field.
+func (c *ServerConfig) validateTargetTableOwners() error {
+	for name, target := range c.TargetResolver.Targets {
+		if err := inventory.ValidateTableOwner(strings.ToLower(strings.TrimSpace(target.DatabaseType)), target.TableOwner); err != nil {
+			return fmt.Errorf("target %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
 // Validate checks the configuration for required fields and consistency.
 func (c *ServerConfig) Validate() error {
 	if err := c.ValidateExperimentalStrata(); err != nil {
+		return err
+	}
+	if err := c.validateTargetTableOwners(); err != nil {
 		return err
 	}
 	// The database registry is required for the control plane and for a

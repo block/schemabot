@@ -155,11 +155,13 @@ func (g *targetClientGeneration) idle() bool {
 // connects with and where on it a namespace lands, safe to compare and to
 // log. It covers the DSN, the engine's connection metadata — for Vitess the
 // API fields that stand in for a DSN, for PostgreSQL the CA the connection
-// verifies against — and the schema overrides, so a rotated password, service
-// token, or certificate changes the hash, and so does re-pointing a canonical
-// namespace at a different physical schema: a client built with the old
-// mapping must retire rather than keep routing to the schema it captured at
-// construction. Nothing else about the route changes it.
+// verifies against — the schema overrides, and the table owner, so a rotated
+// password, service token, or certificate changes the hash, and so does
+// re-pointing a canonical namespace at a different physical schema or
+// changing the role new tables are created under: a client built with the
+// old mapping or owner must retire rather than keep routing to the schema,
+// or creating under the role, it captured at construction. Nothing else
+// about the route changes it.
 func connectionIdentityHash(resolved *inventory.Target) string {
 	parts := []string{resolved.DSN}
 	for _, key := range inventory.ConnectionMetadataKeys(resolved.DatabaseType) {
