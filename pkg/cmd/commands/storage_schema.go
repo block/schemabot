@@ -59,11 +59,13 @@ type storageSchemaTargetFlags struct {
 // as "no DSN" would send the command through the API instead and report a
 // different database than the operator addressed (AZ-5).
 //
-// Only a flag routes, never the environment. $SCHEMABOT_CONFIG_FILE stands in
-// for --config once a direct connection is already chosen, but it cannot choose
-// one: an operator who runs this with no target flags asked for the server's
-// storage, and an exported variable in their shell must not turn that into a
-// direct connection to whatever database the config names.
+// Only a flag routes, never the environment. $SCHEMABOT_CONFIG_FILE is the
+// fallback --config source for the storage maintenance commands, which are
+// direct-only and have no other path to take; on these two it is never read,
+// because a direct connection is already chosen by then or not at all. An
+// operator who runs these with no target flags asked for the server's storage,
+// and an exported variable in their shell must not turn that into a direct
+// connection to whatever database the config names.
 func (f *storageSchemaTargetFlags) direct() bool {
 	return f.DSN != "" || f.Config != ""
 }
