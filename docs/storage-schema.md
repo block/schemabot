@@ -255,8 +255,6 @@ $ schemabot storage plan --release v1.4.0
        ALTER TABLE `checks` ADD COLUMN `blocked_reason` varchar(64) NOT NULL DEFAULT '' AFTER `state`;
 
 📋 Plan: 1 table to create, 2 tables to alter
-
-These are what schemabot on db-1.example needs in order to match the schema files of release v1.4.0. To converge them, run that release's binary against this database — its container image is that release — or let the release's first boot converge them.
 ```
 
 It is the same rendering `schemabot plan` gives for a database SchemaBot
@@ -316,8 +314,6 @@ Production
        ALTER TABLE `applies` ADD COLUMN `driver_note` varchar(255) NOT NULL DEFAULT '' AFTER `lease_owner`;
 
 📋 Plan: 1 table to alter
-
-These are what schemabot on db-1.example (deployment west) needs in order to match the schema files of release v1.4.0. To converge them, run that release's binary against this database — its container image is that release — or let the release's first boot converge them.
 ```
 
 Because the storage schema is declarative, one plan against the release you are
@@ -435,9 +431,6 @@ $ schemabot storage plan --release v1.4.0
 
 ⚠️ Unsafe Changes Detected:
   1. check_gate_audit: Unsafe operation detected: "DROP TABLE `check_gate_audit`"
-
-
-These are what schemabot on db-1.example needs in order to match the schema files of release v1.4.0. To converge them, run that release's binary against this database — its container image is that release — or let the release's first boot converge them.
 ```
 
 `storage apply` then stops on it, exactly the way `apply` stops on a destructive
