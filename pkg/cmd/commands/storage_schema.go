@@ -145,7 +145,7 @@ func (cmd *StoragePlanCmd) Run(ctx context.Context, g *Globals) error {
 		if err := encoder.Encode(apitypes.StorageSchemaPlanResponse{Report: report}); err != nil {
 			return fmt.Errorf("encode storage schema report: %w", err)
 		}
-	} else if err := outputStorageSchemaPlan(report, false, "", storageSchemaPlanHints(report)); err != nil {
+	} else if err := outputStorageSchemaPlan(report, false, "", nil); err != nil {
 		return err
 	}
 	if report.Converged {
