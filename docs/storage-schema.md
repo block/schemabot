@@ -470,7 +470,7 @@ $ schemabot storage apply
 │  Schema: the schema embedded in v1.2.3      │
 ╰─────────────────────────────────────────────╯
 
-⛔ Needs manual remediation; nothing converges until these are resolved by hand:
+⛔ Needs manual remediation; nothing converges until these are resolved:
   1. checks: storage table "checks" is missing column "blocked_reason" whose definition is NOT NULL without a DEFAULT; add it manually or ship the column with a DEFAULT
 
 
