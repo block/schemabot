@@ -94,7 +94,8 @@ func (s *Service) resolveStorageSchemaTarget(deployment, environment string) (*s
 		}
 		service := s.localStorageSchemaService()
 		if service == nil {
-			return nil, fmt.Errorf("this server does not expose its own storage schema: it was built without a storage schema service, so there is no storage it can name; name a deployment to read a data plane's storage instead")
+			return nil, storageSchemaTargetFault(http.StatusNotImplemented,
+				"this server does not expose its own storage schema: it was built without a storage schema service, so there is no storage it can name; name a deployment to read a data plane's storage instead")
 		}
 		return &storageSchemaTarget{service: service}, nil
 	}
@@ -114,7 +115,8 @@ func (s *Service) resolveStorageSchemaTarget(deployment, environment string) (*s
 		// gets the fact and where to look; the cause stays here.
 		s.logger.Error("could not resolve the data plane client for a storage schema request",
 			"deployment", deployment, "environment", environment, "error", err)
-		return nil, fmt.Errorf("the data plane for deployment %q in environment %q could not be reached: its endpoint is configured but the client could not be built, so check this server's logs for the cause", deployment, environment)
+		return nil, storageSchemaTargetFault(http.StatusServiceUnavailable,
+			"the data plane for deployment %q in environment %q could not be reached: its endpoint is configured but the client could not be built, so check this server's logs for the cause", deployment, environment)
 	}
 	service, ok := client.(tern.StorageSchemaService)
 	if !ok {
@@ -122,7 +124,8 @@ func (s *Service) resolveStorageSchemaTarget(deployment, environment string) (*s
 		// the routing config is ambiguous, not that the storage is local.
 		// Saying so beats reporting this server's storage under the
 		// deployment's name.
-		return nil, fmt.Errorf("deployment %q environment %q has a configured data plane endpoint but resolves to an in-process client (%T), so its storage cannot be read remotely; check that no locally configured database shares the name %q",
+		return nil, storageSchemaTargetFault(http.StatusInternalServerError,
+			"deployment %q environment %q has a configured data plane endpoint but resolves to an in-process client (%T), so its storage cannot be read remotely; check that no locally configured database shares the name %q",
 			deployment, environment, client, deployment)
 	}
 	return &storageSchemaTarget{deployment: deployment, environment: environment, service: service}, nil
@@ -156,9 +159,7 @@ func (s *Service) handleStorageSchemaPlan(w http.ResponseWriter, r *http.Request
 	}
 	target, err := s.resolveStorageSchemaTarget(req.Deployment, req.Environment)
 	if err != nil {
-		s.logger.Warn("rejecting storage schema plan because its target could not be resolved",
-			"deployment", req.Deployment, "environment", req.Environment, "error", err)
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		s.refuseStorageSchemaTarget(w, storageSchemaPlanOperation, req.Deployment, req.Environment, err)
 		return
 	}
 
@@ -202,9 +203,7 @@ func (s *Service) handleStorageSchemaApply(w http.ResponseWriter, r *http.Reques
 	}
 	target, err := s.resolveStorageSchemaTarget(req.Deployment, req.Environment)
 	if err != nil {
-		s.logger.Warn("rejecting storage schema apply because its target could not be resolved",
-			"deployment", req.Deployment, "environment", req.Environment, "error", err)
-		s.writeError(w, http.StatusBadRequest, err.Error())
+		s.refuseStorageSchemaTarget(w, storageSchemaApplyOperation, req.Deployment, req.Environment, err)
 		return
 	}
 
@@ -244,6 +243,59 @@ func (s *Service) handleStorageSchemaApply(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	s.writeJSON(w, http.StatusOK, apitypes.StorageSchemaApplyResponse{Planned: planned, Remaining: remaining})
+}
+
+// storageSchemaTargetError carries the status a target-resolution failure
+// should be answered with, for the failures that are not the caller's fault.
+//
+// The distinction is whether the caller can do anything about it. A deployment
+// and environment that name no configured data plane is theirs to fix and stays
+// a 400. A server built without its own storage schema service, a configured
+// data plane whose client will not build, and a routing config that resolves a
+// remote deployment to an in-process client are all this server's to fix — and
+// answering those 400 tells a pre-deploy gate that its request was malformed,
+// so it stops rather than retrying or escalating. The remote paths already map
+// the same two conditions to 501 and 503 (see writeStorageSchemaFailure), so
+// these are the local spellings of the same answers.
+type storageSchemaTargetError struct {
+	status int
+	err    error
+}
+
+func (e *storageSchemaTargetError) Error() string { return e.err.Error() }
+
+func (e *storageSchemaTargetError) Unwrap() error { return e.err }
+
+func storageSchemaTargetFault(status int, format string, args ...any) error {
+	return &storageSchemaTargetError{status: status, err: fmt.Errorf(format, args...)}
+}
+
+// refuseStorageSchemaTarget answers a request whose target could not be
+// resolved, at the status the cause earns and the log level it earns.
+//
+// A caller's mistake is a warning: the response says what to fix and nobody
+// needs to read this server's logs. A server fault is an error, because the
+// response deliberately does not carry the cause and the operator's next stop
+// is these logs.
+func (s *Service) refuseStorageSchemaTarget(w http.ResponseWriter, operation, deployment, environment string, err error) {
+	status := http.StatusBadRequest
+	var fault *storageSchemaTargetError
+	if errors.As(err, &fault) {
+		status = fault.status
+	}
+	attrs := []any{
+		"operation", operation,
+		"deployment", deployment,
+		"environment", environment,
+		"status", status,
+		"error", err,
+	}
+	if status >= http.StatusInternalServerError {
+		s.logger.Error("refusing a storage schema request: its target could not be resolved", attrs...)
+	} else {
+		s.logger.Warn("refusing a storage schema request: its target was not named in a way this server can resolve", attrs...)
+	}
+	s.writeError(w, status, err.Error())
 }
 
 // writeStorageSchemaFailure answers a failed storage schema call with the

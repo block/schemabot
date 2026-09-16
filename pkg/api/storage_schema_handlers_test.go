@@ -173,12 +173,14 @@ func TestHandleStorageSchemaPlan_ForwardsAllowDestructive(t *testing.T) {
 
 // A server with no storage schema service refuses rather than guessing at a
 // storage DSN: a guess reads the wrong database and reports it as the right
-// one.
+// one. It answers 501, matching what the same condition answers when it is a
+// remote deployment that does not serve these RPCs — the build is short a
+// capability, which is not something the caller's request can fix.
 func TestHandleStorageSchemaPlan_RefusesWithoutLocalService(t *testing.T) {
 	svc := newStorageSchemaService(t, &ServerConfig{})
 
 	rec := storageSchemaPlanRequestFor(t, svc, "")
-	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Equal(t, http.StatusNotImplemented, rec.Code)
 	assert.Contains(t, rec.Body.String(), "does not expose its own storage schema")
 	assert.Contains(t, rec.Body.String(), "name a deployment")
 }
@@ -243,9 +245,84 @@ func TestHandleStorageSchemaPlan_RefusesNonRoutableDeployment(t *testing.T) {
 	svc.RegisterTernClient("west", "production", &mockTernClient{})
 
 	rec := storageSchemaPlanRequestFor(t, svc, `{"deployment":"west","environment":"production"}`)
-	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
 	assert.Contains(t, rec.Body.String(), "in-process client")
 	assert.Contains(t, rec.Body.String(), "west")
+}
+
+// A target that cannot be resolved is answered at the status its cause earns,
+// because a caller acts on the class and not on the text. A request that names
+// a target this server cannot make sense of is the caller's to fix and stays
+// 4xx. A build with no storage schema service, and a routing config that sends
+// a remote deployment to an in-process client, are this server's to fix — and
+// answering those 400 tells a pre-deploy gate its request was malformed, so it
+// stops instead of retrying or escalating.
+func TestStorageSchemaTarget_StatusFollowsWhoseFaultItIs(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   *ServerConfig
+		local    bool
+		routable bool
+		body     string
+		want     int
+	}{
+		{
+			name:   "no storage schema service in this build",
+			config: &ServerConfig{},
+			body:   "",
+			want:   http.StatusNotImplemented,
+		},
+		{
+			name:     "configured deployment resolves in-process",
+			config:   storageSchemaRoutingConfig(),
+			local:    true,
+			routable: true,
+			body:     `{"deployment":"west","environment":"production"}`,
+			want:     http.StatusInternalServerError,
+		},
+		{
+			name:   "deployment this server has no endpoint for",
+			config: storageSchemaRoutingConfig(),
+			local:  true,
+			body:   `{"deployment":"east","environment":"production"}`,
+			want:   http.StatusBadRequest,
+		},
+		{
+			name:   "deployment without an environment",
+			config: storageSchemaRoutingConfig(),
+			local:  true,
+			body:   `{"deployment":"west"}`,
+			want:   http.StatusBadRequest,
+		},
+		{
+			name:   "environment without a deployment",
+			config: storageSchemaRoutingConfig(),
+			local:  true,
+			body:   `{"environment":"production"}`,
+			want:   http.StatusBadRequest,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := newStorageSchemaService(t, tc.config)
+			if tc.local {
+				svc.SetStorageSchemaService(&fakeStorageSchemaService{
+					planResp:  &ternv1.StorageSchemaPlanResponse{Report: storageSchemaReportMessage("control_plane_storage")},
+					applyResp: &ternv1.StorageSchemaApplyResponse{Planned: storageSchemaReportMessage("control_plane_storage"), Remaining: storageSchemaReportMessage("control_plane_storage")},
+				})
+			}
+			if tc.routable {
+				svc.RegisterTernClient("west", "production", &mockTernClient{})
+			}
+
+			plan := storageSchemaPlanRequestFor(t, svc, tc.body)
+			assert.Equal(t, tc.want, plan.Code, "plan: %s", plan.Body.String())
+
+			apply := storageSchemaApplyRequest(t, svc, tc.body)
+			assert.Equal(t, tc.want, apply.Code, "apply answers the same target failure the same way: %s", apply.Body.String())
+		})
+	}
 }
 
 // Naming half a target is refused with the half that is missing, on both
