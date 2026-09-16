@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -124,6 +125,42 @@ func TestMetricsEndpoint(t *testing.T) {
 
 	body := w.Body.String()
 	assert.Contains(t, body, "target_info")
+}
+
+// A server managing a large fleet records one attribute set per repository on
+// the GitHub rate limit gauges. Every set must reach the exporter: folding the
+// excess into a single otel.metric.overflow series would leave an operator
+// reading remaining budget during an incident with one arbitrary repository's
+// value rather than the repository they asked about.
+func TestMetricsCollectEveryAttributeSet(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	tel, err := SetupTelemetry(logger)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, tel.Shutdown(t.Context())) })
+
+	const repositories = 2500
+	for i := range repositories {
+		metrics.RecordGitHubRateLimit(t.Context(), metrics.GitHubRateLimitSample{
+			Operation:  metrics.GitHubOperationFetchPullRequest,
+			Resource:   metrics.GitHubRateLimitResourceCore,
+			Repository: "org/repo-" + strconv.Itoa(i),
+			Limit:      5000,
+			Remaining:  int64(i),
+			Used:       5000 - int64(i),
+		})
+	}
+
+	req := httptest.NewRequestWithContext(t.Context(), "GET", "/metrics", nil)
+	w := httptest.NewRecorder()
+	tel.MetricsHandler.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	body := w.Body.String()
+	assert.NotContains(t, body, "otel_metric_overflow",
+		"attribute sets were folded into an overflow series instead of being collected")
+	assert.Equal(t, repositories, strings.Count(body, "schemabot_github_rate_limit_remaining{"),
+		"every repository should collect as its own series")
 }
 
 func TestRecordPlanMetric(t *testing.T) {
