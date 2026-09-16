@@ -119,13 +119,19 @@ func writeStorageSchemaBody(report *apitypes.StorageSchemaReport, isApply bool, 
 	// written after the summary.
 	var blocked func()
 	if len(destructive) > 0 {
-		// The three dispositions a destructive change can be in are the three
-		// the rest of the CLI already renders, so they are rendered by the same
+		// The dispositions a destructive change can be in are the ones the rest
+		// of the CLI already renders, so they are rendered by the same
 		// templates: a plan disclosing one, an apply refusing one, and consent
 		// already in effect. Each carries the severity glyph its own heading
 		// earns, and each lists a statement the way `plan` and `apply` list an
 		// unsafe change.
 		switch {
+		case len(report.Manual) > 0:
+			// A manual entry blocks the whole set, so these are neither about
+			// to run nor the thing standing in the way: consent would permit
+			// them and converge nothing. They are disclosed as what they are,
+			// and the remediation below names the remedy that does unblock.
+			templates.WriteUnsafeChangesWarning(storageSchemaNotices(report.Destructive))
 		case report.DestructiveAllowed:
 			// The consent is not necessarily a flag: a deployment's storage
 			// policy can permit these with nothing on the command line.

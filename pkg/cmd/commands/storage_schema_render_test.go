@@ -527,6 +527,41 @@ func TestOutputStorageSchemaPlan_SectionOrder(t *testing.T) {
 	assert.Less(t, strings.Index(out, "Apply blocked"), strings.Index(out, "schemabot storage apply --allow-unsafe"))
 }
 
+// A manual entry outranks the destructive refusal. Both statements are printed
+// and counted, but the remedy on screen is the one that unblocks: passing
+// --allow-unsafe would permit the DROP and still converge nothing.
+func TestOutputStorageSchemaPlan_ManualOutranksTheDestructiveRefusal(t *testing.T) {
+	report := &apitypes.StorageSchemaReport{
+		Dialect:      "mysql",
+		Database:     "schemabot",
+		SchemaSource: "the schema embedded in v1.4.0",
+		Destructive: []apitypes.StorageSchemaStatement{
+			{Table: "stale_state", Operation: "drop_table", DDL: "DROP TABLE `stale_state`", Reason: "DROP TABLE destroys data"},
+		},
+		Manual: []apitypes.StorageSchemaStatement{{
+			Table: "checks", Operation: "add_column",
+			DDL:    "ALTER TABLE `checks` ADD COLUMN `head_sha` varchar(64) NOT NULL",
+			Reason: "column is NOT NULL without a DEFAULT",
+		}},
+	}
+
+	for _, isApply := range []bool{false, true} {
+		out := captureStdout(func() {
+			require.NoError(t, outputStorageSchemaPlan(report, isApply, "storage apply --allow-unsafe", nil))
+		})
+
+		assert.Contains(t, out, "- stale_state")
+		assert.Contains(t, out, "~ checks")
+		assert.Contains(t, out, glyph.Attention+" Unsafe Changes Detected:",
+			"the destructive statement is still disclosed as destructive")
+		assert.Contains(t, out, "Needs manual remediation")
+		assert.NotContains(t, out, "Apply blocked")
+		assert.NotContains(t, out, "--allow-unsafe",
+			"the flag would permit the DROP and converge nothing, so it is not the remedy to offer")
+		assert.Contains(t, out, "📋 Plan: 1 table to alter, 1 table to drop")
+	}
+}
+
 // Each disposition renders its own SQL section. On MySQL the formatter
 // combines a table's alters into one statement, so an ALTER split into a safe
 // half and a refused half would be recombined into a statement nothing is
