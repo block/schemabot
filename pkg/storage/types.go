@@ -353,24 +353,6 @@ func TargetOperationKey(target, scopedKey string) string {
 	return target + OperationKeyDelimiter + scopedKey
 }
 
-// CutTargetPrefix removes an operation key's leading target component, reporting
-// whether the key carried one.
-//
-// A key names its target only when that target's deployment addresses more than
-// one, so a reader meets both shapes and cannot tell them apart by inspection: a
-// target named after the namespace it holds produces the same leading component
-// either way. The operation row carries its target, so the prefix is matched
-// rather than guessed — but matching it is not proof that the key is qualified,
-// which is why this reports what it did instead of deciding. Parse the key
-// unqualified first and only fall back to the cut form, so a shape that already
-// reads as a whole key is never mistaken for a qualified one.
-func CutTargetPrefix(target, operationKey string) (scopedKey string, qualified bool) {
-	if target == "" {
-		return operationKey, false
-	}
-	return strings.CutPrefix(operationKey, target+OperationKeyDelimiter)
-}
-
 // PlanIDForOperation resolves which plan an operation executes: its own when it
 // has one, and its parent apply's otherwise. Members of one apply share the
 // apply's plan when they are planned together, and carry their own plan when
