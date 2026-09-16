@@ -10,6 +10,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -185,4 +186,40 @@ func TestProgressOperationsCarryOperationKey(t *testing.T) {
 	require.Len(t, decoded.Operations, 2)
 	assert.Equal(t, "commerce/-80/users", decoded.Operations[0].OperationKey)
 	assert.Equal(t, "commerce/80-/users", decoded.Operations[1].OperationKey)
+}
+
+// The operation-id map that attributes tasks to rollout members carries the
+// whole routing pair. One deployment can address several targets, each copying
+// the same tables against its own schema, so a task attributed to the deployment
+// alone would not say which member's progress it reports.
+func TestProgressOperationsMapCarriesTheRoutingPair(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "primary", Target: "testapp-001", State: state.Apply.Running},
+		{ID: 2, Deployment: "primary", Target: "testapp-002", State: state.Apply.Pending},
+		{ID: 3, Deployment: "eu-west", Target: "orders-eu", State: state.Apply.Pending},
+	}
+
+	_, memberByOperationID := progressOperationsFromRows(ops)
+	require.Len(t, memberByOperationID, 3)
+	assert.Equal(t, routing.ExecutionTarget{Deployment: "primary", Target: "testapp-001"}, memberByOperationID[1])
+	assert.Equal(t, routing.ExecutionTarget{Deployment: "primary", Target: "testapp-002"}, memberByOperationID[2])
+	assert.Equal(t, routing.ExecutionTarget{Deployment: "eu-west", Target: "orders-eu"}, memberByOperationID[3])
+}
+
+// A table's target survives the API's JSON encoding, so the CLI can scope each
+// member's section to the copies that member actually ran.
+func TestTableProgressResponseEncodesTarget(t *testing.T) {
+	encoded, err := json.Marshal(&apitypes.ProgressResponse{
+		State: state.Apply.Running,
+		Tables: []*apitypes.TableProgressResponse{
+			{TableName: "users", Deployment: "primary", Target: "testapp-002", Status: state.Task.Running},
+		},
+	})
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), `"target":"testapp-002"`)
+
+	var decoded apitypes.ProgressResponse
+	require.NoError(t, json.Unmarshal(encoded, &decoded))
+	require.Len(t, decoded.Tables, 1)
+	assert.Equal(t, "testapp-002", decoded.Tables[0].Target)
 }
