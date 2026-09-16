@@ -318,6 +318,15 @@ func TestOutputStorageSchemaConvergence_MixedRunsReportTheRefusalOnce(t *testing
 	assert.Contains(t, out, "✓ Ran 1 statement against")
 	assert.Equal(t, 1, strings.Count(out, glyph.Refused+" Apply blocked"))
 	assert.Equal(t, 1, strings.Count(out, "schemabot "+rerun))
+	assert.Contains(t, lastLineOf(out), "schemabot "+rerun,
+		"the command an operator copies is the last thing on screen, not a paragraph above it")
+}
+
+// lastLineOf is the final non-empty line of rendered output, which is where a
+// copyable command has to land to be the one an operator's eye stops on.
+func lastLineOf(out string) string {
+	lines := strings.Split(strings.TrimRight(out, "\n \t"), "\n")
+	return lines[len(lines)-1]
 }
 
 // The summary line counts what the convergence would actually run. Promising

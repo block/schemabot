@@ -155,10 +155,13 @@ func writeStorageSchemaBody(report *apitypes.StorageSchemaReport, isApply bool, 
 	}
 
 	templates.WritePlanSummary(storageSchemaRunnable(report, outstanding, destructive))
+	// Hints before the refusal, so the command an operator copies is the last
+	// thing on screen on every path that prints one. A hint explains what was
+	// left behind; the refusal ends with the line that does something about it.
+	writeStorageSchemaHints(hints)
 	if blocked != nil {
 		blocked()
 	}
-	writeStorageSchemaHints(hints)
 	return nil
 }
 
