@@ -429,9 +429,19 @@ $ schemabot storage plan --release v1.4.0
 │  Schema: the schema files of release v1.4.0  │
 ╰──────────────────────────────────────────────╯
 
+     - check_gate_audit
+       DROP TABLE `check_gate_audit`;
+
 ⚠️ Unsafe Changes Detected:
   1. check_gate_audit: Unsafe operation detected: "DROP TABLE `check_gate_audit`"
+
+📋 Plan: 1 table to drop
 ```
+
+The plan prints and counts the whole difference between the two schemas,
+whatever each statement's disposition, and the sections under it say which of
+it will run. That is how every plan in the CLI reads: the summary is the
+difference, not a promise.
 
 `storage apply` then stops on it, exactly the way `apply` stops on a destructive
 schema change, and converges nothing until you say otherwise — including under
@@ -445,6 +455,11 @@ $ schemabot storage apply
 │  Database: schemabot on db-1.example        │
 │  Schema: the schema embedded in v1.4.0      │
 ╰─────────────────────────────────────────────╯
+
+     - check_gate_audit
+       DROP TABLE `check_gate_audit`;
+
+📋 Plan: 1 table to drop
 
 ⛔ Apply blocked: 1 unsafe change(s) detected
   1. check_gate_audit: Unsafe operation detected: "DROP TABLE `check_gate_audit`"
@@ -470,8 +485,13 @@ $ schemabot storage apply
 │  Schema: the schema embedded in v1.2.3      │
 ╰─────────────────────────────────────────────╯
 
+     ~ checks
+       ALTER TABLE checks ADD COLUMN blocked_reason varchar(64) NOT NULL;
+
 ⛔ Needs manual remediation; nothing converges until these are resolved:
   1. checks: storage table "checks" is missing column "blocked_reason" whose definition is NOT NULL without a DEFAULT; add it manually or ship the column with a DEFAULT
+
+📋 Plan: 1 table to alter
 
 
 Error: refusing to converge storage schema on schemabot on db-2.example (postgres): 1 change(s) need manual remediation first (listed above)
