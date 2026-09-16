@@ -299,7 +299,8 @@ not, so a maintenance script keyed on the status gets them right:
 | the target could not be read, or the DDL failed | non-zero |
 
 Under `--json` a refusal comes back in the shape a convergence does, so nothing
-has to be re-read to learn which statements were refused.
+has to be re-read to learn which statements were refused: nothing ran, so the
+planned and the remaining halves of the report are the same.
 
 ## Converging a release before it rolls
 
