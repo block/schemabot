@@ -6,7 +6,9 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"maps"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -33,17 +35,25 @@ func TestKnownDirectWriteAuthOperationsCoverNamedCallSites(t *testing.T) {
 	// response writer and the request.
 	const operationArgument = 2
 	gates := map[string]bool{
-		"authorizeDirectWrite":            true,
-		"authorizeDirectAdminWrite":       true,
-		"finishDirectWriteDecision":       true,
-		"authorizeDirectWriteForPlan":     true,
-		"authorizeStorageSchemaOperation": true,
+		"authorizeDirectWrite":              true,
+		"authorizeDirectAdminWrite":         true,
+		"authorizeDirectDatabaseWrite":      true,
+		"authorizeDirectWriteForStoredPlan": true,
+		"finishDirectWriteDecision":         true,
+		"authorizeStorageSchemaOperation":   true,
 	}
 
 	constants := map[string]string{}
 	callSites := map[string][]string{}
 	fileSet := token.NewFileSet()
 	root := filepath.Join("..", "..")
+
+	// Every constant first, then every call site. Collecting and scanning in
+	// one walk resolves only the constants declared in already-walked files, so
+	// a gate named through a constant from a later-sorting file reads as
+	// "named by a parameter" and is skipped — which is a missing registry entry
+	// going undetected, the one thing this test exists to catch.
+	parsed := map[string]*ast.File{}
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -61,7 +71,15 @@ func TestKnownDirectWriteAuthOperationsCoverNamedCallSites(t *testing.T) {
 		if parseErr != nil {
 			return fmt.Errorf("parse %s: %w", path, parseErr)
 		}
+		parsed[path] = file
 		collectStringConstants(file, filepath.Dir(path), constants)
+		return nil
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, parsed, "no non-test Go files found; the scan root is wrong")
+
+	for _, path := range slices.Sorted(maps.Keys(parsed)) {
+		file := parsed[path]
 		ast.Inspect(file, func(node ast.Node) bool {
 			call, ok := node.(*ast.CallExpr)
 			if !ok {
@@ -81,10 +99,23 @@ func TestKnownDirectWriteAuthOperationsCoverNamedCallSites(t *testing.T) {
 			callSites[operation] = append(callSites[operation], fmt.Sprintf("%s:%d", path, fileSet.Position(call.Pos()).Line))
 			return true
 		})
-		return nil
-	})
-	require.NoError(t, err)
+	}
 	require.NotEmpty(t, callSites, "no named direct-write authorization call sites found; the scan root or gate matching is broken")
+
+	// Every gate this test claims to watch has to exist. A gate named wrong
+	// matches nothing, the scan stays green on the call sites it does find, and
+	// the operations behind the misspelled gate are never checked at all.
+	declared := map[string]bool{}
+	for _, file := range parsed {
+		for _, decl := range file.Decls {
+			if fn, ok := decl.(*ast.FuncDecl); ok {
+				declared[fn.Name.Name] = true
+			}
+		}
+	}
+	for gate := range gates {
+		assert.True(t, declared[gate], "gate %q is not a function in this repository, so the call sites it is meant to cover are never scanned", gate)
+	}
 
 	for operation, sites := range callSites {
 		assert.True(t, knownDirectWriteAuthOperations[operation],
