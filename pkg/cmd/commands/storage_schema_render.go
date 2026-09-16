@@ -41,10 +41,12 @@ func writeStorageSchemaHeader(report *apitypes.StorageSchemaReport, isApply bool
 	}
 }
 
-// storageSchemaHeaderDatabase names the database inside the box, where the
-// title already carries the dialect and the line below carries the environment.
-// It is storageSchemaDatabaseLabel without the two facts the box states
-// elsewhere — an error message has nowhere else to put them, a box does.
+// storageSchemaHeaderDatabase names the database inside the box: the database,
+// and the server it is on, because "which database does this point at" is the
+// question an operator has before acting on any of it and the answer has to be
+// legible without re-deriving it from a DSN or a config file. The dialect and
+// the environment are left out — the title and the line below carry them. A
+// server that reports no name of its own is left out rather than guessed at.
 func storageSchemaHeaderDatabase(report *apitypes.StorageSchemaReport) string {
 	database := report.Database
 	if database == "" {
@@ -239,14 +241,16 @@ func outputStorageSchemaConvergence(planned, remaining *apitypes.StorageSchemaRe
 		// refused the whole set — a ✓ over a run that changed nothing reads as
 		// a success an operator has to disprove from the sections below it.
 		fmt.Printf("%s Ran no statements against %s; the storage schema is unchanged.\n\n", glyph.Refused, database)
-		if withPlan {
-			// What remains is what was planned, which the plan above already
-			// listed with the apply's own severity. Printing the same sections
-			// again would report one refusal twice.
-			return nil
-		}
 	} else {
 		fmt.Printf("✓ Ran %d %s against %s.\n\n", applied, ui.Pluralize("statement", applied), database)
+	}
+	if withPlan {
+		// What remains is a subset of what was planned, and the plan above
+		// listed all of it with the apply's own severity. Printing those
+		// sections again reports one refusal twice — including on a run that
+		// applied something and refused something, where the count of what ran
+		// is the only new fact and the refusal below it is not.
+		return nil
 	}
 	return writeStorageSchemaBody(remaining, true, rerun, []string{
 		"These were not run. A destructive statement is refused unless --allow-unsafe is passed; a manual entry has to be resolved by hand before anything else converges.",
@@ -340,32 +344,6 @@ func storageSchemaOperationLabel(operation string) string {
 	label := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(operation)), "_", " ")
 	if label == "" {
 		return "change"
-	}
-	return label
-}
-
-// storageSchemaDatabaseLabel names the database a report is about, as an
-// operator would say it: the database, the server it is on, its dialect, and
-// the deployment it belongs to when the report came from one.
-//
-// The server is in the label because "which database does this point at" is the
-// question an operator has before they act on any of it, and the answer has to
-// be legible without re-deriving it from a DSN, a config file, or a deployment
-// name. A server that does not report a name of its own is left out rather than
-// guessed at.
-func storageSchemaDatabaseLabel(report *apitypes.StorageSchemaReport) string {
-	label := report.Database
-	if label == "" {
-		label = "the storage database"
-	}
-	if report.Host != "" {
-		label += " on " + report.Host
-	}
-	if report.Dialect != "" {
-		label += fmt.Sprintf(" (%s)", report.Dialect)
-	}
-	if report.Deployment != "" {
-		label += fmt.Sprintf(", deployment %s in %s", report.Deployment, report.Environment)
 	}
 	return label
 }
