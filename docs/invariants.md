@@ -327,7 +327,9 @@ needing manual remediation aborts the pass rather than leaving storage half-conv
 violated:* the first instance of a rolling deploy drops state the rest of the fleet is still
 reading. *Enforced:* the per-dialect bootstrappers (`pkg/api/ensure_schema.go`,
 `pkg/api/ensure_schema_postgres.go`), which the operator-facing storage schema surface calls rather
-than reimplements (`pkg/api/storage_schema.go`).
+than reimplements (`pkg/api/storage_schema.go`); the instance's own storage is the only target a
+remote caller can address, and the deployment's permission is only ever widened, in the adapter that
+answers for it (`pkg/serve/storage_schema.go`).
 
 ### AV-10: Anything the PR can do, the CLI can do
 
@@ -1370,7 +1372,9 @@ State storage must use an explicit connection and a different database name from
 target in the same database family. This name check does not establish isolation for dynamically
 resolved targets. Local hosting never permits destructive storage bootstrap.
 
-*Enforced:* `pkg/serve/local.go`, `pkg/auth/local.go`, and `pkg/api/storage_isolation.go`.
+*Enforced:* `pkg/serve/local.go`, `pkg/auth/local.go`, and `pkg/api/storage_isolation.go`; the request
+that opts in to destructive storage statements is refused rather than honored on a locally hosted server
+in `pkg/serve/storage_schema.go`.
 
 ### AZ-7: Local registration preserves existing work
 

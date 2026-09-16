@@ -2,14 +2,18 @@ package testutil
 
 import (
 	"context"
-	"fmt"
+	"net"
 	"net/url"
+	"strconv"
 	"testing"
+	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib" // pgx database/sql driver for the readiness probe below
+	"github.com/moby/moby/api/types/network"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/network"
+	tcnetwork "github.com/testcontainers/testcontainers-go/network"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
@@ -35,6 +39,29 @@ const (
 	pgBouncerPassword      = "test"
 )
 
+// pgBouncerStartupTimeout bounds the wait for PgBouncer to serve a query. A
+// pooler that has not become usable by then is a failed setup rather than one
+// worth waiting longer on.
+const pgBouncerStartupTimeout = 30 * time.Second
+
+// pgBouncerDSN builds the connection string a client uses to reach PgBouncer
+// on its mapped host port.
+//
+// The readiness probe and the returned DSN are built here rather than
+// separately so the probe exercises the same handshake the tests themselves
+// perform. A probe that proved something narrower than the caller's own
+// connection would be back to reporting ready before ready.
+func pgBouncerDSN(host, port, database string) string {
+	pooled := url.URL{
+		Scheme:   "postgres",
+		User:     url.UserPassword(pgBouncerUser, pgBouncerPassword),
+		Host:     net.JoinHostPort(host, port),
+		Path:     "/" + database,
+		RawQuery: "sslmode=disable",
+	}
+	return pooled.String()
+}
+
 // StartPostgresBehindPgBouncer starts a PostgreSQL container with a PgBouncer
 // container in front of it on a shared Docker network, and returns the DSN
 // through PgBouncer alongside the DSN straight to PostgreSQL. Both reach the
@@ -48,7 +75,7 @@ func StartPostgresBehindPgBouncer(t *testing.T, database string, mode PgBouncerP
 	t.Helper()
 	ctx := t.Context()
 
-	nw, err := network.New(ctx)
+	nw, err := tcnetwork.New(ctx)
 	require.NoError(t, err, "failed to create docker network")
 	t.Cleanup(func() {
 		// The test's context is already cancelled by the time cleanup runs, so
@@ -64,7 +91,7 @@ func StartPostgresBehindPgBouncer(t *testing.T, database string, mode PgBouncerP
 		postgres.WithUsername(pgBouncerUser),
 		postgres.WithPassword(pgBouncerPassword),
 		postgres.BasicWaitStrategies(),
-		network.WithNetwork([]string{pgBouncerUpstreamAlias}, nw),
+		tcnetwork.WithNetwork([]string{pgBouncerUpstreamAlias}, nw),
 	)
 	t.Cleanup(func() {
 		if err := testcontainers.TerminateContainer(pg); err != nil {
@@ -99,7 +126,19 @@ func StartPostgresBehindPgBouncer(t *testing.T, database string, mode PgBouncerP
 			},
 			ExposedPorts: []string{pgBouncerPort + "/tcp"},
 			Networks:     []string{nw.Name},
-			WaitingFor:   wait.ForListeningPort(pgBouncerPort + "/tcp"),
+			// Readiness is gated on a real query through the pooler, not on the
+			// mapped port accepting. Docker's port forwarder accepts on the
+			// host side as soon as the mapping exists, so a port wait is
+			// satisfied before PgBouncer is listening inside the container --
+			// and the forwarder then resets the connection, which surfaces on
+			// the client as a reset partway through the startup handshake
+			// rather than as a refused dial. The upstream PostgreSQL container
+			// gets a query-based wait of its own above; this gives the pooler
+			// in front of it the same guarantee, and additionally cannot pass
+			// until PgBouncer can reach that upstream and authenticate.
+			WaitingFor: wait.ForSQL(pgBouncerPort+"/tcp", "pgx", func(host string, port network.Port) string {
+				return pgBouncerDSN(host, port.Port(), database)
+			}).WithStartupTimeout(pgBouncerStartupTimeout),
 		},
 		Started: true,
 	})
@@ -115,12 +154,5 @@ func StartPostgresBehindPgBouncer(t *testing.T, database string, mode PgBouncerP
 	port, err := ContainerPort(ctx, bouncer, pgBouncerPort+"/tcp")
 	require.NoError(t, err, "failed to get pgbouncer port")
 
-	pooled := url.URL{
-		Scheme:   "postgres",
-		User:     url.UserPassword(pgBouncerUser, pgBouncerPassword),
-		Host:     fmt.Sprintf("%s:%d", host, port),
-		Path:     "/" + database,
-		RawQuery: "sslmode=disable",
-	}
-	return pooled.String(), directDSN
+	return pgBouncerDSN(host, strconv.Itoa(port), database), directDSN
 }
