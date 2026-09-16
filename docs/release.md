@@ -257,11 +257,14 @@ the old shape until an operator opts in with
 still starts, running against a database where the drop never happened, so the
 code in that release has to tolerate the old shape too.
 
-Diff the embedded schema files. On MySQL, additive changes need no action. On
-PostgreSQL, new tables, metadata-only columns, and standalone indexes land
-automatically. A new index builds as a plain `CREATE INDEX` under the startup
-budget, so on a deployment with a long history it belongs in the release notes
-with its statement so operators can pre-create it — finish the `CREATE INDEX
+Diff the embedded schema files. On MySQL, a new table or column converges on
+its own, but a new index does not come for free: the engine runs an index add
+as a table copy, inside the same startup budget, so on a deployment with a long
+history it belongs in the release notes with its statement. On PostgreSQL, new
+tables, metadata-only columns, and standalone indexes land automatically. A new
+index builds as a plain `CREATE INDEX` under the startup budget, so on a
+deployment with a long history it belongs in the release notes with its
+statement so operators can pre-create it — finish the `CREATE INDEX
 CONCURRENTLY` before rolling the release, since a pod that starts while the
 build is still running fails closed until it completes. A new column whose shape
 needs manual remediation — `NOT NULL` without a `DEFAULT`, generated or
