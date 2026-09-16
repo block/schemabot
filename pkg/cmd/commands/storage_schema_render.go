@@ -41,12 +41,10 @@ func writeStorageSchemaHeader(report *apitypes.StorageSchemaReport, isApply bool
 	}
 }
 
-// storageSchemaHeaderDatabase names the database inside the box: the database,
-// and the server it is on, because "which database does this point at" is the
-// question an operator has before acting on any of it and the answer has to be
-// legible without re-deriving it from a DSN or a config file. The dialect and
-// the environment are left out — the title and the line below carry them. A
-// server that reports no name of its own is left out rather than guessed at.
+// storageSchemaHeaderDatabase names the database inside the box, where the
+// title already carries the dialect and the line below carries the environment.
+// It is storageSchemaDatabaseLabel without the two facts the box states
+// elsewhere — an error message has nowhere else to put them, a box does.
 func storageSchemaHeaderDatabase(report *apitypes.StorageSchemaReport) string {
 	database := report.Database
 	if database == "" {
@@ -344,6 +342,41 @@ func storageSchemaOperationLabel(operation string) string {
 	label := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(operation)), "_", " ")
 	if label == "" {
 		return "change"
+	}
+	return label
+}
+
+// storageSchemaDatabaseLabel names the database a report is about, as an
+// operator would say it: the database, the server it is on, its dialect, and
+// the deployment it belongs to when the report came from one.
+//
+// The server is in the label because "which database does this point at" is the
+// question an operator has before they act on any of it, and the answer has to
+// be legible without re-deriving it from a DSN, a config file, or a deployment
+// name. A server that does not report a name of its own is left out rather than
+// guessed at.
+//
+// The deployment clause names the environment only when there is one to name.
+// A deployment with no environment is refused where a request is resolved, so
+// the pairing should not arrive here — but a label is read during an incident,
+// and "deployment west in " ends a sentence with a preposition and no object,
+// which reads as a truncated label rather than as a missing field.
+func storageSchemaDatabaseLabel(report *apitypes.StorageSchemaReport) string {
+	label := report.Database
+	if label == "" {
+		label = "the storage database"
+	}
+	if report.Host != "" {
+		label += " on " + report.Host
+	}
+	if report.Dialect != "" {
+		label += fmt.Sprintf(" (%s)", report.Dialect)
+	}
+	switch {
+	case report.Deployment != "" && report.Environment != "":
+		label += fmt.Sprintf(", deployment %s in %s", report.Deployment, report.Environment)
+	case report.Deployment != "":
+		label += fmt.Sprintf(", deployment %s", report.Deployment)
 	}
 	return label
 }

@@ -401,18 +401,30 @@ func TestStorageSchemaPlanHints(t *testing.T) {
 	assert.NotContains(t, hints[0], "storage apply")
 }
 
-// The header box names the database and the server it is on, and leaves the
-// family and the environment to the lines that state them.
+// A report is labelled with the database, the server it is on, its family, and
+// the deployment it came from, so an error naming it is unambiguous. The header
+// box drops the family and the environment, which it states on their own lines.
 func TestStorageSchemaHeaderDatabase(t *testing.T) {
 	full := &apitypes.StorageSchemaReport{
 		Database: "schemabot", Host: "10.0.0.7", Dialect: "postgres", Deployment: "west", Environment: "production",
 	}
+	assert.Equal(t, "schemabot on 10.0.0.7 (postgres), deployment west in production", storageSchemaDatabaseLabel(full))
 	assert.Equal(t, "schemabot on 10.0.0.7 (deployment west)", storageSchemaHeaderDatabase(full))
-	assert.Equal(t, "schemabot", storageSchemaHeaderDatabase(&apitypes.StorageSchemaReport{
+	assert.Equal(t, "schemabot (mysql)", storageSchemaDatabaseLabel(&apitypes.StorageSchemaReport{
 		Database: "schemabot", Dialect: "mysql",
 	}), "a server that reports no name of its own is left out rather than guessed at")
+	assert.Equal(t, "schemabot on db-1.example (mysql)", storageSchemaDatabaseLabel(&apitypes.StorageSchemaReport{
+		Database: "schemabot", Host: "db-1.example", Dialect: "mysql",
+	}))
+	assert.Equal(t, "the storage database", storageSchemaDatabaseLabel(&apitypes.StorageSchemaReport{}))
 	assert.Equal(t, "the storage database", storageSchemaHeaderDatabase(&apitypes.StorageSchemaReport{}),
 		"a report with no database name still reads as a sentence")
+
+	// A deployment with no environment ends the label rather than trailing a
+	// preposition with nothing after it.
+	assert.Equal(t, "schemabot (postgres), deployment west", storageSchemaDatabaseLabel(&apitypes.StorageSchemaReport{
+		Database: "schemabot", Dialect: "postgres", Deployment: "west",
+	}))
 }
 
 // Every list entry names what stands in the way of its statement. A statement
