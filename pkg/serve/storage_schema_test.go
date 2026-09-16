@@ -28,7 +28,7 @@ import (
 // pre-deploy step, would quietly stop holding there. In the other direction, a
 // request opting in is the explicit operator consent required before surplus
 // storage state is destroyed.
-func TestStorageSchemaAdapter_EffectiveAllowDestructive(t *testing.T) {
+func TestStorageSchemaAdapter_DestructivePolicy(t *testing.T) {
 	tests := []struct {
 		name          string
 		configAllows  bool
@@ -42,10 +42,94 @@ func TestStorageSchemaAdapter_EffectiveAllowDestructive(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			adapter := &storageSchemaAdapter{configAllowsDestructive: tc.configAllows}
-			assert.Equal(t, tc.want, adapter.effectiveAllowDestructive(tc.requestAllows))
+			adapter := &storageSchemaAdapter{
+				configAllowsDestructive: tc.configAllows,
+				logger:                  slog.New(slog.DiscardHandler),
+			}
+			allow, err := adapter.destructivePolicy(tc.requestAllows)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, allow)
 		})
 	}
+}
+
+// A locally hosted server has no route to a destructive storage bootstrap, so
+// the per-request opt-in that a deployed server honors is refused here instead
+// of applied (AZ-6).
+//
+// It refuses rather than silently running the safe remainder: an operator who
+// asked for the destructive statements needs to learn their opt-in did not
+// apply, not read a convergence report that looks as though it did. The local
+// runtime cannot say who issued the command, and a local host can be pointed at
+// a real deployment's storage, so consent arriving this way is not the consent
+// the widening is granted for.
+func TestStorageSchemaAdapter_DestructivePolicyRefusesTheOptInWhenLocallyHosted(t *testing.T) {
+	adapter := &storageSchemaAdapter{
+		localHosted: true,
+		logger:      slog.New(slog.DiscardHandler),
+	}
+
+	allow, err := adapter.destructivePolicy(true)
+	require.Error(t, err)
+	assert.False(t, allow)
+	assert.ErrorIs(t, err, tern.ErrInvalidStorageSchemaRequest, "the request is what is wrong, not this server")
+	assert.Contains(t, err.Error(), "locally hosted")
+	assert.Contains(t, err.Error(), "re-run without the destructive opt-in",
+		"the refusal names the way forward that does converge everything else")
+}
+
+// Local hosting refuses the destructive opt-in without refusing the request
+// that never asked for it: an ordinary local convergence still runs.
+func TestStorageSchemaAdapter_DestructivePolicyAllowsAnOrdinaryLocalConvergence(t *testing.T) {
+	adapter := &storageSchemaAdapter{
+		localHosted: true,
+		logger:      slog.New(slog.DiscardHandler),
+	}
+
+	allow, err := adapter.destructivePolicy(false)
+	require.NoError(t, err)
+	assert.False(t, allow)
+}
+
+// The server carries its local hosting into the adapter it builds, so the
+// refusal is the whole server's and not a property of an adapter a test
+// assembled by hand.
+func TestNewStorageSchemaServiceCarriesLocalHosting(t *testing.T) {
+	srv := &Server{
+		cfg:         &api.ServerConfig{Storage: api.StorageConfig{DSN: "schemabot:pw@tcp(db.example:3306)/schemabot"}},
+		dialect:     schema.DialectMySQL,
+		storageDSN:  "schemabot:pw@tcp(db.example:3306)/schemabot",
+		localHosted: true,
+		logger:      slog.New(slog.DiscardHandler),
+	}
+
+	adapter, err := srv.newStorageSchemaService()
+	require.NoError(t, err)
+
+	_, err = adapter.destructivePolicy(true)
+	require.ErrorIs(t, err, tern.ErrInvalidStorageSchemaRequest)
+}
+
+// The refusal is reached through the path every RPC takes, not only by calling
+// the policy helper directly: target resolves the bootstrap options, so a
+// destructive opt-in on a locally hosted server never reaches a convergence.
+func TestStorageSchemaAdapter_TargetRefusesTheDestructiveOptInWhenLocallyHosted(t *testing.T) {
+	const dsn = "root:secret@tcp(127.0.0.1:3306)/schemabot"
+	adapter := &storageSchemaAdapter{
+		resolveDSN:  func() (string, error) { return dsn, nil },
+		bootTarget:  bootTargetFor(t, schema.DialectMySQL, dsn),
+		dialect:     schema.DialectMySQL,
+		localHosted: true,
+		logger:      slog.New(slog.DiscardHandler),
+	}
+
+	_, _, err := adapter.target(true)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, tern.ErrInvalidStorageSchemaRequest)
+
+	_, opts, err := adapter.target(false)
+	require.NoError(t, err, "the same server still converges what is safe")
+	assert.Len(t, opts, 3)
 }
 
 // The adapter's storage is fixed at construction and nothing on the wire moves

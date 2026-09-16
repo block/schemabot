@@ -27,7 +27,8 @@ import (
 //
 // Two things a caller may influence, and neither reaches the database a
 // convergence writes to. Whether destructive statements run only ever widens
-// what the local config already allows (see effectiveAllowDestructive). A
+// what the local config already allows, and on a locally hosted server not even
+// that (see destructivePolicy). A
 // desired schema sent with a diff replaces the files the comparison reads, and
 // is accepted only there: the convergence RPC carries no schema, so an apply
 // always runs this binary's own (see desiredSchema).
@@ -51,6 +52,9 @@ type storageSchemaAdapter struct {
 	// an operator convergence must too — otherwise "apply is what a boot does"
 	// would stop being true on exactly the deployments that opted in.
 	configAllowsDestructive bool
+	// localHosted marks a server the local runtime hosts, where no route to a
+	// destructive storage bootstrap exists at all (AZ-6).
+	localHosted bool
 	// postgresStatementTimeout is the budget the bootstrap runs its catalog
 	// reads under, so a diff cannot succeed under a budget the convergence
 	// would then fail on, or the reverse. It carries the PostgreSQL
@@ -74,6 +78,7 @@ func (s *Server) newStorageSchemaService() (*storageSchemaAdapter, error) {
 		dialect:                  s.dialect,
 		version:                  attributableVersion(s.version),
 		configAllowsDestructive:  s.cfg.Storage.AllowDestructiveSchemaChanges,
+		localHosted:              s.localHosted,
 		postgresStatementTimeout: s.cfg.Postgres.StatementTimeoutOrDefault(),
 		logger:                   s.logger,
 	}, nil
@@ -224,9 +229,13 @@ func (a *storageSchemaAdapter) target(requestAllowsDestructive bool) (string, []
 	if err := a.checkBootTarget(dsn); err != nil {
 		return "", nil, err
 	}
+	allowDestructive, err := a.destructivePolicy(requestAllowsDestructive)
+	if err != nil {
+		return "", nil, err
+	}
 	return dsn, []api.EnsureSchemaOption{
 		api.WithDialect(a.dialect),
-		api.WithAllowDestructiveSchemaChanges(a.effectiveAllowDestructive(requestAllowsDestructive)),
+		api.WithAllowDestructiveSchemaChanges(allowDestructive),
 		api.WithPostgresStatementTimeout(a.postgresStatementTimeout),
 	}, nil
 }
@@ -258,8 +267,10 @@ func (a *storageSchemaAdapter) checkBootTarget(dsn string) error {
 		"the storage schema surface only answers for the database this instance is running on, so restart it to adopt the new storage", resolved, a.bootTarget)
 }
 
-// effectiveAllowDestructive is the local policy widened by an explicit
-// per-request opt-in, never narrowed by its absence.
+// destructivePolicy resolves whether this call may run destructive statements:
+// the deployment's policy widened by an explicit per-request opt-in, never
+// narrowed by its absence — and never widened at all on a locally hosted
+// server, which refuses the request instead.
 //
 // The two directions are not symmetric and the asymmetry is the point. A
 // deployment that configured allow_destructive_schema_changes has already made
@@ -270,6 +281,22 @@ func (a *storageSchemaAdapter) checkBootTarget(dsn string) error {
 // explicit operator consent AV-9 asks for before surplus storage state is
 // destroyed, arriving through a command an admin had to issue rather than
 // through a config file nobody re-read.
-func (a *storageSchemaAdapter) effectiveAllowDestructive(requestAllowsDestructive bool) bool {
-	return a.configAllowsDestructive || requestAllowsDestructive
+//
+// Local hosting is the exception because there the consent cannot be trusted to
+// mean what it says: the local runtime has no authorization to identify who
+// issued the command, and the storage it would destroy is a real deployment's
+// whenever a local host has been pointed at one. It refuses the whole request
+// rather than running the safe remainder under a flag it ignored, so an
+// operator learns their opt-in did not apply instead of reading a report that
+// looks like it did (AZ-6).
+func (a *storageSchemaAdapter) destructivePolicy(requestAllowsDestructive bool) (bool, error) {
+	if requestAllowsDestructive && a.localHosted {
+		a.logger.Warn("refusing a storage schema request that opts in to destructive statements: this server is locally hosted",
+			"dialect", a.dialect,
+			"boot_target", a.bootTarget.String(),
+		)
+		return false, fmt.Errorf("%w: this server is locally hosted, which never runs destructive storage schema statements; "+
+			"re-run without the destructive opt-in to converge everything else, or address a deployed server to run them", tern.ErrInvalidStorageSchemaRequest)
+	}
+	return a.configAllowsDestructive || requestAllowsDestructive, nil
 }

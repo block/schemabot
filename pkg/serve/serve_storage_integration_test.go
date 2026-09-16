@@ -13,6 +13,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/testutil"
 )
 
@@ -123,4 +124,48 @@ func TestStorageDialectDispatchFailsClosed(t *testing.T) {
 	_, err = openStoragePool(schema.Dialect("oracle"), "unused", cfg, slog.New(slog.DiscardHandler))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `no storage connector for storage dialect "oracle"`)
+}
+
+// Build carries local hosting from the option onto the server, so the adapter
+// the server registers refuses a destructive convergence when the local
+// runtime hosts it (AZ-6).
+//
+// The wiring under test only exists on a server Build returned, and Build
+// bootstraps storage before it assembles one, so this needs a real database.
+// Both servers are built against the same one: the option is then the only
+// difference between a request that is refused and the same request honored.
+func TestBuildCarriesLocalHostingToTheStorageSchemaAdapter(t *testing.T) {
+	dsn, _ := testutil.StartPostgres(t, "schemabot")
+	logger := slog.New(slog.DiscardHandler)
+	newConfig := func() *api.ServerConfig {
+		return &api.ServerConfig{
+			Storage: api.StorageConfig{DSN: dsn, Dialect: "postgres"},
+			Databases: map[string]api.DatabaseConfig{
+				"appdb": {
+					Type: "mysql",
+					Environments: map[string]api.EnvironmentConfig{
+						"staging": {DSN: "root@tcp(localhost)/appdb"},
+					},
+				},
+			},
+		}
+	}
+
+	local, err := Build(t.Context(), newConfig(), WithLogger(logger), withLocalHosting())
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, local.Close()) })
+	localAdapter, ok := local.storageSchema.(*storageSchemaAdapter)
+	require.True(t, ok, "the server registers its own adapter")
+	_, err = localAdapter.destructivePolicy(true)
+	require.ErrorIs(t, err, tern.ErrInvalidStorageSchemaRequest,
+		"a locally hosted server has no route to a destructive storage bootstrap")
+
+	deployed, err := Build(t.Context(), newConfig(), WithLogger(logger))
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, deployed.Close()) })
+	deployedAdapter, ok := deployed.storageSchema.(*storageSchemaAdapter)
+	require.True(t, ok, "the server registers its own adapter")
+	allow, err := deployedAdapter.destructivePolicy(true)
+	require.NoError(t, err)
+	assert.True(t, allow, "the same request is honored on a normally hosted server")
 }

@@ -55,6 +55,20 @@ type options struct {
 	date       string
 	engines    map[string]tern.EngineFactory
 	authorizer auth.Authorizer
+	// localHosted marks a server hosted by RunLocal. It is not a config field
+	// because it is not the operator's to set: it says which entry point built
+	// this server, and the local one carries boundaries the normal one does
+	// not (AZ-6).
+	localHosted bool
+}
+
+// withLocalHosting marks the server as hosted by the local runtime. It is
+// unexported because the only caller that may claim it is RunLocal — a
+// deployment that could assert local hosting through a config file or an
+// embedder option could assert the boundaries AZ-6 grants it without accepting
+// them, and a deployment that could deny it could drop them.
+func withLocalHosting() Option {
+	return func(o *options) { o.localHosted = true }
 }
 
 // WithLogger sets the logger Run uses. A nil logger is ignored so Run keeps
@@ -334,6 +348,9 @@ type Server struct {
 	// once by Build and shared by the HTTP routes and the gRPC service, so the
 	// two surfaces cannot come to disagree about which storage they describe.
 	storageSchema tern.StorageSchemaService
+	// localHosted marks a server the local runtime hosts, which carries
+	// boundaries a normally hosted one does not (AZ-6).
+	localHosted bool
 	// version is the build's SchemaBot version as the logs carry it, which
 	// means it may be the unidentifiable-build sentinel. Storage schema
 	// reports attribute this binary's embedded files to it, and take it
@@ -562,6 +579,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		dialect:         dialect,
 		storageDSN:      storageDSN,
 		version:         version,
+		localHosted:     o.localHosted,
 	}
 
 	if err := srv.registerStorageSchema(svc); err != nil {

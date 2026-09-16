@@ -1372,7 +1372,9 @@ State storage must use an explicit connection and a different database name from
 target in the same database family. This name check does not establish isolation for dynamically
 resolved targets. Local hosting never permits destructive storage bootstrap.
 
-*Enforced:* `pkg/serve/local.go`, `pkg/auth/local.go`, and `pkg/api/storage_isolation.go`.
+*Enforced:* `pkg/serve/local.go`, `pkg/auth/local.go`, and `pkg/api/storage_isolation.go`; the request
+that opts in to destructive storage statements is refused rather than honored on a locally hosted server
+in `pkg/serve/storage_schema.go`.
 
 ### AZ-7: Local registration preserves existing work
 
